@@ -20,7 +20,7 @@ cleanup() {
     fi
     if [[ ${network_policy_mutated} == true ]]; then
         "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
-            -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/port","value":8081}]' \
+            -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/protocol","value":"TCP"}]' \
             >/dev/null 2>&1 || true
     fi
     if [[ ${network_policy_deleted} == true ]]; then
@@ -411,7 +411,7 @@ if [[ ${network_policy_allow_response} != "unf-networkpolicy-ok" ]]; then
 fi
 
 "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
-    -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/port","value":"allowed"}]' \
+    -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/protocol","value":"SCTP"}]' \
     >/dev/null
 network_policy_mutated=true
 if ! wait_for_controller_policy_counts 0 1 "${enforced_policy_revision}"; then
@@ -425,7 +425,7 @@ if ! wait_for_policy_transition "${enforced_policy_revision}"; then
 fi
 
 "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
-    -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/port","value":8081}]' \
+    -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/protocol","value":"TCP"}]' \
     >/dev/null
 if ! wait_for_controller_policy_counts 1 0 "${rejected_policy_revision}"; then
     echo "controller did not readmit the restored NetworkPolicy" >&2

@@ -43,10 +43,12 @@ The current slice supports pod `matchLabels` and `matchExpressions` (`In`,
 `NotIn`, `Exists`, and `DoesNotExist`), same-namespace peers, exact namespace
 selection through `kubernetes.io/metadata.name`, general Namespace `matchLabels`
 and `matchExpressions`, numeric TCP/UDP ports, wildcard sources/ports, and ingress
-default isolation. It deliberately rejects egress, IP blocks, named ports, port
-ranges, SCTP, and protocol-only port entries. These errors prevent a policy from
-being accepted with weaker or different semantics. Native policy has the higher
-default precedence; the compatibility baseline uses reserved priority `1_000_000`.
+default isolation. Named TCP/UDP ports are preserved in IR, resolved against each
+selected destination Pod's declared container ports, and lowered to numeric BPF
+keys. It deliberately rejects egress, IP blocks, port ranges, SCTP, and protocol-
+only port entries. These errors prevent a policy from being accepted with weaker
+or different semantics. Native policy has the higher default precedence; the
+compatibility baseline uses reserved priority `1_000_000`.
 
 The controller watches these objects cluster-wide, keeps accepted and rejected
 compatibility state separate, and combines accepted IR with native policy in each
@@ -55,3 +57,8 @@ compiled version and advances the policy revision when the effective dataplane
 state changes. Namespace metadata is joined into endpoints during policy lowering
 and explanation; a label change advances policy state without changing workload
 identity. Controller status exposes accepted and rejected object counts.
+
+Because the fast path is identity-keyed, named-port mappings participate in the
+canonical identity key. Pods with the same labels but different mappings receive
+different identities; changing a mapping intentionally advances identity and
+policy state rather than widening an allow across both workloads.

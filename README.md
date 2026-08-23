@@ -28,7 +28,7 @@ Implemented in the repository:
 - deterministic L3/L4 policy compiler, shadow decisions, and property tests;
 - a supported ingress `NetworkPolicy` adapter that reuses the same IR, additive
   evaluator semantics, controller snapshots, and dataplane lowering as native
-  policy;
+  policy, including pod/Namespace expressions and named TCP/UDP ports;
 - a kube-rs controller watching Pods, Namespaces, SecurityPolicies, and
   NetworkPolicies, with accepted/rejected compatibility status;
 - controller health, readiness, metrics, status, and userspace explanation APIs;

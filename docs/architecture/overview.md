@@ -28,8 +28,9 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
 ## Phase 1 through 3 data flows
 
 1. kube-rs watches Pods, Namespaces, SecurityPolicies, and NetworkPolicies.
-2. Pod metadata becomes provisional network identities; Namespace labels remain
-   separate selector metadata and do not churn identity IDs.
+2. Pod metadata becomes provisional network identities. Namespace labels remain
+   separate selector metadata, while policy-relevant named-port mappings join the
+   canonical identity key so incompatible destinations cannot alias.
 3. SecurityPolicies and the supported NetworkPolicy ingress subset compile into
    the same provenance-preserving IR; unsupported compatibility objects are
    rejected without retaining stale compiled state.

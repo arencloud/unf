@@ -140,7 +140,7 @@ spec:
                   - client
       ports:
         - protocol: TCP
-          port: 8081
+          port: allowed
 ---
 apiVersion: network.unf.io/v1alpha1
 kind: SecurityPolicy

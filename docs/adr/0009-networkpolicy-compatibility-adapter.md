@@ -25,9 +25,11 @@ default range, so an explicitly managed native policy can override the baseline.
 The translator accepts pod and Namespace `matchLabels` plus normalized
 `matchExpressions`, local pod peers, exact `kubernetes.io/metadata.name`
 selectors, numeric TCP/UDP ports, and wildcards. Core policy IR represents `In`,
-`NotIn`, `Exists`, and `DoesNotExist` independently of Kubernetes types. It
-returns typed errors for egress, IP blocks, named/ranged ports, protocol-only
-entries, SCTP, and malformed metadata/ports or selector requirements.
+`NotIn`, `Exists`, and `DoesNotExist` independently of Kubernetes types. Named
+TCP/UDP ports remain named in IR, resolve per destination from watched Pod
+container metadata, and lower to numeric dataplane entries. It returns typed
+errors for egress, IP blocks, ranged ports, protocol-only entries, SCTP, and
+malformed metadata/ports or selector requirements.
 
 The controller watches `NetworkPolicy` objects cluster-wide and assigns each a
 stable compatibility policy ID. Accepted IR joins native policy in the revisioned
@@ -36,6 +38,9 @@ removes any stale accepted IR and advances the policy revision when effective
 state changed. The controller RBAC grants read-only watch access to the resource.
 Watched Namespace labels are joined into endpoint selector metadata during policy
 lowering. Label changes advance policy state without changing identity IDs.
+Named-port mappings are policy-relevant endpoint metadata and therefore
+participate in the canonical identity key; different mappings cannot alias in an
+identity-keyed dataplane.
 
 ## Alternatives
 
@@ -49,6 +54,6 @@ priority policies would give isolation defaults incorrect precedence.
 
 The supported compatibility slice is deterministic, explainable, and verified
 through the same Phase 2 dataplane compiler in a two-node cluster. Rejection
-details do not yet have a dedicated API endpoint; named/ranged ports and IP blocks
-need richer resolution, and egress needs a direction-aware IR and hook. These
-remain visible Phase 3 work rather than broader support claims.
+details do not yet have a dedicated API endpoint; port ranges and IP blocks need
+richer dataplane representation, and egress needs a direction-aware IR and hook.
+These remain visible Phase 3 work rather than broader support claims.

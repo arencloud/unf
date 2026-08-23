@@ -115,6 +115,22 @@ pub struct Endpoint {
     pub service_account: String,
     pub application: Option<String>,
     pub labels: BTreeMap<String, String>,
+    pub named_ports: BTreeMap<NamedPort, u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NamedPort {
+    pub name: String,
+    pub protocol: Protocol,
+}
+
+impl Endpoint {
+    fn resolve_named_port(&self, name: &str, protocol: Protocol) -> Option<u16> {
+        self.named_ports
+            .iter()
+            .find(|(named_port, _)| named_port.name == name && named_port.protocol == protocol)
+            .map(|(_, port)| *port)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,9 +147,16 @@ pub struct PolicyRule {
     pub source: IdentitySelector,
     pub destination: IdentitySelector,
     pub protocol: Option<Protocol>,
-    pub port: Option<u16>,
+    pub destination_port: DestinationPort,
     pub action: PolicyAction,
     pub provenance: RuleProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DestinationPort {
+    Any,
+    Number(u16),
+    Named(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,7 +268,7 @@ impl PolicyCompiler {
                     source,
                     target.clone(),
                     None,
-                    None,
+                    DestinationPort::Any,
                     action,
                     source_index,
                 )?;
@@ -263,7 +286,7 @@ impl PolicyCompiler {
                         source.clone(),
                         target.clone(),
                         Some(protocol),
-                        Some(protocol_port.port),
+                        DestinationPort::Number(protocol_port.port),
                         action,
                         source_index,
                     )?;
@@ -297,7 +320,7 @@ pub(crate) fn push_rule(
     source: IdentitySelector,
     destination: IdentitySelector,
     protocol: Option<Protocol>,
-    port: Option<u16>,
+    destination_port: DestinationPort,
     action: PolicyAction,
     source_index: usize,
 ) -> Result<(), PolicyCompileError> {
@@ -310,7 +333,7 @@ pub(crate) fn push_rule(
         source,
         destination,
         protocol,
-        port,
+        destination_port,
         action,
         provenance: RuleProvenance {
             policy_id,
@@ -420,7 +443,17 @@ pub fn compile_dataplane_entries(
                 .filter(|policy| policy.target.matches(destination))
                 .flat_map(|policy| &policy.rules)
                 .filter(|rule| rule.source.matches(source) && rule.destination.matches(destination))
-                .filter_map(|rule| Some((rule.protocol?, rule.port?)))
+                .filter_map(|rule| {
+                    let protocol = rule.protocol?;
+                    let port = match &rule.destination_port {
+                        DestinationPort::Any => return None,
+                        DestinationPort::Number(port) => *port,
+                        DestinationPort::Named(name) => {
+                            destination.resolve_named_port(name, protocol)?
+                        }
+                    };
+                    Some((protocol, port))
+                })
                 .collect();
             for (protocol, port) in exact_tuples {
                 let decision = evaluate(
@@ -613,7 +646,14 @@ fn rule_matches(rule: &PolicyRule, flow: Flow<'_>) -> bool {
     rule.source.matches(flow.source)
         && rule.destination.matches(flow.destination)
         && rule.protocol.is_none_or(|value| value == flow.protocol)
-        && rule.port.is_none_or(|value| value == flow.destination_port)
+        && match &rule.destination_port {
+            DestinationPort::Any => true,
+            DestinationPort::Number(port) => *port == flow.destination_port,
+            DestinationPort::Named(name) => flow
+                .destination
+                .resolve_named_port(name, flow.protocol)
+                .is_some_and(|port| port == flow.destination_port),
+        }
 }
 
 #[cfg(test)]
@@ -632,6 +672,7 @@ mod tests {
             service_account: "default".to_owned(),
             application: Some(application.to_owned()),
             labels: BTreeMap::new(),
+            named_ports: BTreeMap::new(),
         }
     }
 

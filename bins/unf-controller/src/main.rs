@@ -26,8 +26,8 @@ use tracing::{error, info, warn};
 use unf_api::SecurityPolicy;
 use unf_common::{PolicyId, Protocol, Revision};
 use unf_policy::{
-    Endpoint, Flow, NetworkPolicyCompiler, PolicyCompiler, PolicyIr, compile_dataplane_entries,
-    evaluate,
+    Endpoint, Flow, NamedPort, NetworkPolicyCompiler, PolicyCompiler, PolicyIr,
+    compile_dataplane_entries, evaluate,
 };
 use unf_state::{
     IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
@@ -326,8 +326,22 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
         .or_else(|| labels.get("app"))
         .cloned();
     let workload = application.clone().unwrap_or_else(|| name.clone());
-    let identity_key =
-        canonical_identity_key("local", &namespace, &service_account, &workload, &labels);
+    let named_ports = match pod_named_ports(pod) {
+        Ok(named_ports) => named_ports,
+        Err(error) => {
+            state.metrics.errors.inc();
+            warn!(%error, namespace, name, "Pod named-port admission failed");
+            return;
+        }
+    };
+    let identity_key = canonical_identity_key(
+        "local",
+        &namespace,
+        &service_account,
+        &workload,
+        &labels,
+        &named_ports,
+    );
     let identity_id = provisional_identity_id(&identity_key);
     let identity = NetworkIdentity {
         id: identity_id,
@@ -356,6 +370,7 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
         service_account,
         application,
         labels,
+        named_ports,
     };
     let record = PodRecord {
         namespace,
@@ -367,6 +382,39 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
         bump_policy_revision(state);
     }
     state.metrics.reconciles.inc();
+}
+
+fn pod_named_ports(pod: &Pod) -> Result<BTreeMap<NamedPort, u16>> {
+    let mut named_ports = BTreeMap::new();
+    for container in pod.spec.iter().flat_map(|spec| &spec.containers) {
+        for port in container.ports.iter().flatten() {
+            let Some(name) = &port.name else {
+                continue;
+            };
+            let protocol = match port.protocol.as_deref().unwrap_or("TCP") {
+                "TCP" => Protocol::Tcp,
+                "UDP" => Protocol::Udp,
+                _ => continue,
+            };
+            let number = u16::try_from(port.container_port)
+                .with_context(|| format!("named port {name:?} is outside the u16 range"))?;
+            if number == 0 {
+                return Err(anyhow!("named port {name:?} cannot map to port zero"));
+            }
+            let key = NamedPort {
+                name: name.clone(),
+                protocol,
+            };
+            if let Some(existing) = named_ports.insert(key, number)
+                && existing != number
+            {
+                return Err(anyhow!(
+                    "named port {name:?} has conflicting mappings {existing} and {number}"
+                ));
+            }
+        }
+    }
+    Ok(named_ports)
 }
 
 fn pod_addresses(pod: &Pod) -> BTreeSet<IpAddr> {
@@ -845,6 +893,7 @@ fn canonical_identity_key(
     service_account: &str,
     workload: &str,
     labels: &BTreeMap<String, String>,
+    named_ports: &BTreeMap<NamedPort, u16>,
 ) -> String {
     fn append_component(key: &mut String, value: &str) {
         key.push('|');
@@ -853,7 +902,7 @@ fn canonical_identity_key(
         key.push_str(value);
     }
 
-    let mut key = "v1".to_owned();
+    let mut key = "v2".to_owned();
     append_component(&mut key, cluster);
     append_component(&mut key, namespace);
     append_component(&mut key, service_account);
@@ -862,6 +911,12 @@ fn canonical_identity_key(
     for (label, value) in labels {
         append_component(&mut key, label);
         append_component(&mut key, value);
+    }
+    append_component(&mut key, &named_ports.len().to_string());
+    for (named_port, number) in named_ports {
+        append_component(&mut key, &named_port.name);
+        append_component(&mut key, &(named_port.protocol as u8).to_string());
+        append_component(&mut key, &number.to_string());
     }
     key
 }
@@ -909,7 +964,7 @@ fn init_tracing() {
 mod tests {
     use super::*;
 
-    fn network_policy(port: &serde_json::Value) -> NetworkPolicy {
+    fn network_policy(port: &serde_json::Value, protocol: &str) -> NetworkPolicy {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
@@ -927,7 +982,7 @@ mod tests {
                         },
                         "podSelector": {"matchLabels": {"app": "client"}}
                     }],
-                    "ports": [{"protocol": "TCP", "port": port}]
+                    "ports": [{"protocol": protocol, "port": port}]
                 }]
             }
         }))
@@ -946,6 +1001,26 @@ mod tests {
         .expect("test Namespace is valid Kubernetes JSON")
     }
 
+    fn pod_with_named_ports() -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "server", "namespace": "backend"},
+            "spec": {
+                "containers": [{
+                    "name": "server",
+                    "image": "example.invalid/server",
+                    "ports": [
+                        {"name": "http", "containerPort": 8081},
+                        {"name": "dns", "containerPort": 5353, "protocol": "UDP"},
+                        {"name": "sctp", "containerPort": 7777, "protocol": "SCTP"}
+                    ]
+                }]
+            }
+        }))
+        .expect("test Pod is valid Kubernetes JSON")
+    }
+
     #[test]
     fn canonical_identity_key_is_order_independent_and_label_sensitive() {
         let left = BTreeMap::from([
@@ -956,10 +1031,24 @@ mod tests {
             ("track".to_owned(), "stable".to_owned()),
             ("app".to_owned(), "server".to_owned()),
         ]);
-        let base = canonical_identity_key("local", "backend", "default", "server", &left);
+        let base = canonical_identity_key(
+            "local",
+            "backend",
+            "default",
+            "server",
+            &left,
+            &BTreeMap::new(),
+        );
         assert_eq!(
             base,
-            canonical_identity_key("local", "backend", "default", "server", &right)
+            canonical_identity_key(
+                "local",
+                "backend",
+                "default",
+                "server",
+                &right,
+                &BTreeMap::new(),
+            )
         );
 
         let changed = BTreeMap::from([
@@ -968,7 +1057,14 @@ mod tests {
         ]);
         assert_ne!(
             base,
-            canonical_identity_key("local", "backend", "default", "server", &changed)
+            canonical_identity_key(
+                "local",
+                "backend",
+                "default",
+                "server",
+                &changed,
+                &BTreeMap::new(),
+            )
         );
     }
 
@@ -976,9 +1072,56 @@ mod tests {
     fn canonical_identity_key_is_unambiguous_for_delimiters() {
         let labels = BTreeMap::new();
         assert_ne!(
-            canonical_identity_key("local", "a|1:b", "c", "d", &labels),
-            canonical_identity_key("local", "a", "1:b|c", "d", &labels)
+            canonical_identity_key("local", "a|1:b", "c", "d", &labels, &BTreeMap::new(),),
+            canonical_identity_key("local", "a", "1:b|c", "d", &labels, &BTreeMap::new(),)
         );
+    }
+
+    #[test]
+    fn canonical_identity_key_includes_named_port_mappings() {
+        let labels = BTreeMap::from([("app".to_owned(), "server".to_owned())]);
+        let named_port = NamedPort {
+            name: "http".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        let first = BTreeMap::from([(named_port.clone(), 8080)]);
+        let second = BTreeMap::from([(named_port, 9090)]);
+        assert_ne!(
+            canonical_identity_key("local", "backend", "default", "server", &labels, &first),
+            canonical_identity_key("local", "backend", "default", "server", &labels, &second,)
+        );
+    }
+
+    #[test]
+    fn pod_named_ports_extract_supported_protocols_and_reject_conflicts() {
+        let mut pod = pod_with_named_ports();
+        let ports = pod_named_ports(&pod).expect("valid named ports resolve");
+        assert_eq!(
+            ports[&NamedPort {
+                name: "http".to_owned(),
+                protocol: Protocol::Tcp,
+            }],
+            8081
+        );
+        assert_eq!(
+            ports[&NamedPort {
+                name: "dns".to_owned(),
+                protocol: Protocol::Udp,
+            }],
+            5353
+        );
+        assert_eq!(ports.len(), 2, "unsupported SCTP metadata is ignored");
+
+        let containers = &mut pod.spec.as_mut().expect("spec exists").containers;
+        containers.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "other",
+                "image": "example.invalid/other",
+                "ports": [{"name": "http", "containerPort": 9090}]
+            }))
+            .expect("test Container is valid Kubernetes JSON"),
+        );
+        assert!(pod_named_ports(&pod).is_err());
     }
 
     #[test]
@@ -986,7 +1129,7 @@ mod tests {
         let state = new_state(true);
         apply_network_policy_event(
             &state,
-            Event::Apply(network_policy(&serde_json::json!(8081))),
+            Event::Apply(network_policy(&serde_json::json!("http"), "TCP")),
         );
         assert_eq!(read_lock(&state.network_policies).len(), 1);
         assert_eq!(read_lock(&state.compiled_network_policies).len(), 1);
@@ -995,7 +1138,7 @@ mod tests {
 
         apply_network_policy_event(
             &state,
-            Event::Apply(network_policy(&serde_json::json!("http"))),
+            Event::Apply(network_policy(&serde_json::json!("http"), "SCTP")),
         );
         assert!(read_lock(&state.network_policies).is_empty());
         assert!(read_lock(&state.compiled_network_policies).is_empty());

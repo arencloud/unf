@@ -7,8 +7,8 @@ use thiserror::Error;
 use unf_common::{PolicyAction, PolicyId, Protocol};
 
 use crate::{
-    IdentitySelector, LabelExpression, LabelExpressionOperator, PolicyEnforcementMode, PolicyIr,
-    PolicyOrigin, PolicyRule, push_rule,
+    DestinationPort, IdentitySelector, LabelExpression, LabelExpressionOperator,
+    PolicyEnforcementMode, PolicyIr, PolicyOrigin, PolicyRule, push_rule,
 };
 
 /// Compatibility policies sit below the native policy priority range by
@@ -51,11 +51,10 @@ pub enum NetworkPolicyCompileError {
         rule_index: usize,
         peer_index: usize,
     },
-    #[error("ingress rule {rule_index} port {port_index} uses unsupported named port {name:?}")]
-    UnsupportedNamedPort {
+    #[error("ingress rule {rule_index} port {port_index} contains an empty named port")]
+    InvalidNamedPort {
         rule_index: usize,
         port_index: usize,
-        name: String,
     },
     #[error(
         "ingress rule {rule_index} port {port_index} matches a protocol without a numeric port, which the current BPF key cannot represent"
@@ -127,7 +126,7 @@ impl NetworkPolicyCompiler {
                         source.clone(),
                         target.clone(),
                         *protocol,
-                        *port,
+                        port.clone(),
                         PolicyAction::Allow,
                         rule_index,
                     )
@@ -307,7 +306,7 @@ fn label_expression(
     })
 }
 
-type PortTuple = (Option<Protocol>, Option<u16>);
+type PortTuple = (Option<Protocol>, DestinationPort);
 
 fn ports(
     policy_ports: Option<Vec<NetworkPolicyPort>>,
@@ -315,7 +314,7 @@ fn ports(
 ) -> Result<Vec<PortTuple>, NetworkPolicyCompileError> {
     let policy_ports = policy_ports.unwrap_or_default();
     if policy_ports.is_empty() {
-        return Ok(vec![(None, None)]);
+        return Ok(vec![(None, DestinationPort::Any)]);
     }
     policy_ports
         .into_iter()
@@ -328,7 +327,7 @@ fn port_tuple(
     port: NetworkPolicyPort,
     rule_index: usize,
     port_index: usize,
-) -> Result<(Option<Protocol>, Option<u16>), NetworkPolicyCompileError> {
+) -> Result<PortTuple, NetworkPolicyCompileError> {
     let protocol = match port.protocol.as_deref().unwrap_or("TCP") {
         "TCP" => Protocol::Tcp,
         "UDP" => Protocol::Udp,
@@ -340,47 +339,49 @@ fn port_tuple(
             });
         }
     };
-    let numeric_port = match port.port {
+    let destination_port = match port.port {
         Some(IntOrString::Int(value)) => {
-            Some(
+            let port =
                 u16::try_from(value).map_err(|_| NetworkPolicyCompileError::InvalidPort {
                     rule_index,
                     port_index,
                     port: value,
-                })?,
-            )
+                })?;
+            if port == 0 {
+                return Err(NetworkPolicyCompileError::InvalidPort {
+                    rule_index,
+                    port_index,
+                    port: 0,
+                });
+            }
+            DestinationPort::Number(port)
         }
-        Some(IntOrString::String(name)) => {
-            return Err(NetworkPolicyCompileError::UnsupportedNamedPort {
+        Some(IntOrString::String(name)) if !name.is_empty() => DestinationPort::Named(name),
+        Some(IntOrString::String(_)) => {
+            return Err(NetworkPolicyCompileError::InvalidNamedPort {
                 rule_index,
                 port_index,
-                name,
             });
         }
-        None => None,
+        None => {
+            return Err(NetworkPolicyCompileError::UnsupportedProtocolOnlyPort {
+                rule_index,
+                port_index,
+            });
+        }
     };
-    if numeric_port == Some(0) {
-        return Err(NetworkPolicyCompileError::InvalidPort {
-            rule_index,
-            port_index,
-            port: 0,
-        });
+    if let Some(end_port) = port.end_port {
+        match &destination_port {
+            DestinationPort::Number(numeric_port) if i32::from(*numeric_port) == end_port => {}
+            _ => {
+                return Err(NetworkPolicyCompileError::UnsupportedPortRange {
+                    rule_index,
+                    port_index,
+                });
+            }
+        }
     }
-    let numeric_port =
-        numeric_port.ok_or(NetworkPolicyCompileError::UnsupportedProtocolOnlyPort {
-            rule_index,
-            port_index,
-        })?;
-    if port
-        .end_port
-        .is_some_and(|end_port| i32::from(numeric_port) != end_port)
-    {
-        return Err(NetworkPolicyCompileError::UnsupportedPortRange {
-            rule_index,
-            port_index,
-        });
-    }
-    Ok((Some(protocol), Some(numeric_port)))
+    Ok((Some(protocol), destination_port))
 }
 
 #[cfg(test)]
@@ -392,7 +393,7 @@ mod tests {
     use unf_common::{IdentityId, PolicyReason, Verdict};
 
     use super::*;
-    use crate::{Endpoint, Flow, compile_dataplane_entries, evaluate};
+    use crate::{Endpoint, Flow, NamedPort, compile_dataplane_entries, evaluate};
 
     fn labels(values: &[(&str, &str)]) -> BTreeMap<String, String> {
         values
@@ -440,6 +441,7 @@ mod tests {
             service_account: "default".to_owned(),
             application: Some(app.to_owned()),
             labels: labels(&[("app", app)]),
+            named_ports: BTreeMap::new(),
         }
     }
 
@@ -579,7 +581,7 @@ mod tests {
         assert_eq!(compiled.rules.len(), 1);
         assert_eq!(compiled.rules[0].source, IdentitySelector::default());
         assert_eq!(compiled.rules[0].protocol, None);
-        assert_eq!(compiled.rules[0].port, None);
+        assert_eq!(compiled.rules[0].destination_port, DestinationPort::Any);
     }
 
     #[test]
@@ -807,6 +809,96 @@ mod tests {
     }
 
     #[test]
+    fn named_ports_resolve_against_each_destination() {
+        let compiled = NetworkPolicyCompiler::compile(
+            PolicyId::new(7),
+            policy(vec![NetworkPolicyIngressRule {
+                from: None,
+                ports: Some(vec![NetworkPolicyPort {
+                    port: Some(IntOrString::String("http".to_owned())),
+                    protocol: Some("TCP".to_owned()),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }]),
+        )
+        .expect("named port policy compiles");
+        assert_eq!(
+            compiled.rules[0].destination_port,
+            DestinationPort::Named("http".to_owned())
+        );
+        let source = endpoint(1, "frontend", "client");
+        let mut destination = endpoint(2, "backend", "server");
+        destination.named_ports.insert(
+            NamedPort {
+                name: "http".to_owned(),
+                protocol: Protocol::Tcp,
+            },
+            8081,
+        );
+        let mut alternate = endpoint(3, "backend", "server");
+        alternate.named_ports.insert(
+            NamedPort {
+                name: "http".to_owned(),
+                protocol: Protocol::Tcp,
+            },
+            9090,
+        );
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source: &source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8081,
+                },
+            )
+            .verdict,
+            Verdict::Allow
+        );
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source: &source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8082,
+                },
+            )
+            .verdict,
+            Verdict::Deny
+        );
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source: &source,
+                    destination: &alternate,
+                    protocol: Protocol::Tcp,
+                    destination_port: 9090,
+                },
+            )
+            .verdict,
+            Verdict::Allow
+        );
+        let entries = compile_dataplane_entries(&[compiled], &[source, destination, alternate])
+            .expect("named port lowers through the shared dataplane compiler");
+        assert!(entries.iter().any(|entry| {
+            entry.key.destination_identity == IdentityId::new(2)
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 8081
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.key.destination_identity == IdentityId::new(3)
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 9090
+                && entry.decision.verdict == Verdict::Allow
+        }));
+    }
+
+    #[test]
     fn unsupported_features_fail_explicitly() {
         let ip_block_policy = policy(vec![NetworkPolicyIngressRule {
             from: Some(vec![NetworkPolicyPeer {
@@ -823,16 +915,16 @@ mod tests {
             Err(NetworkPolicyCompileError::UnsupportedIpBlock { .. })
         ));
 
-        let named_port_policy = policy(vec![NetworkPolicyIngressRule {
+        let empty_named_port_policy = policy(vec![NetworkPolicyIngressRule {
             from: None,
             ports: Some(vec![NetworkPolicyPort {
-                port: Some(IntOrString::String("http".to_owned())),
+                port: Some(IntOrString::String(String::new())),
                 ..NetworkPolicyPort::default()
             }]),
         }]);
         assert!(matches!(
-            NetworkPolicyCompiler::compile(PolicyId::new(7), named_port_policy),
-            Err(NetworkPolicyCompileError::UnsupportedNamedPort { .. })
+            NetworkPolicyCompiler::compile(PolicyId::new(7), empty_named_port_policy),
+            Err(NetworkPolicyCompileError::InvalidNamedPort { .. })
         ));
 
         let protocol_only_policy = policy(vec![NetworkPolicyIngressRule {
