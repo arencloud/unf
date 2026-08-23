@@ -23,7 +23,7 @@ repeatable test are both present in this repository.
 |---|---|---|---|
 | Phase 1 — observation foundation | **Verified** | Master prompt §101: controller, identity state, policy compiler, agent/Aya/TC flow events, and successful `unfctl status` | `make fmt-check lint test`, `make ebpf`, `make kind-test` |
 | Phase 2 — identity and policy enforcement | **Verified** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | `make fmt-check lint test`, `make ebpf`, and `make kind-test` verify the complete gate |
-| Phase 3 — compatibility and simulation | **Planned** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | No implementation claim |
+| Phase 3 — compatibility and simulation | **In progress** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | Ingress adapter foundation and additive shared-engine semantics are unit verified; controller integration and remaining gate items are open |
 | Full CNI and later fabric capabilities | **Planned** | §104 and later roadmap gates | Explicitly out of current scope |
 
 Sections 98–99 describe the richer first enforcement and enriched-observability
@@ -102,6 +102,19 @@ gate.
 - The development DaemonSet is privileged; narrow capabilities and OpenShift SCC/
   SELinux validation remain required.
 - kind verification is Kubernetes evidence, not an OpenShift support claim.
+
+## Phase 3 work breakdown
+
+| Deliverable | State | Exit evidence |
+|---|---|---|
+| NetworkPolicy ingress translator foundation | **Implemented** | Unit tests cover allow/default isolation, wildcards, local/exact-namespace peers, and explicit unsupported-feature errors |
+| Additive compatibility semantics | **Implemented** | Multiple selecting policies combine allows in the shared evaluator and lower through the shared dataplane compiler |
+| NetworkPolicy controller watch and live enforcement | **Planned** | Live object reconciliation, status, allow/drop, deletion, and restart convergence |
+| Full ingress selector/port compatibility | **Planned** | Match expressions, namespace labels, named/ranged ports, IP blocks, and conformance cases |
+| Egress NetworkPolicy compatibility | **Planned** | Direction-aware IR and dataplane enforcement evidence |
+| Policy simulation foundation | **Planned** | Proposed-policy evaluation against a versioned topology/flow snapshot |
+| Better topology state | **Planned** | Versioned node/workload/service relationships with query tests |
+| Historical flow export | **Planned** | Stable exporter contract plus bounded-buffer/backpressure tests |
 
 ## Updating this tracker
 

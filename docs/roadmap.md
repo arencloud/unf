@@ -38,7 +38,12 @@ matrix and reproducible evidence.
 
 ## Phase 3 — compatibility and simulation
 
-- Kubernetes NetworkPolicy adapter into the same IR;
+**Gate: in progress.**
+
+- Implemented foundation: ingress `NetworkPolicy` translation into the same IR,
+  additive compatibility semantics in the shared evaluator, shared dataplane
+  lowering, and explicit errors for unsupported semantics;
+- Next: controller watch/live enforcement and broader ingress conformance;
 - shadow rollout and offline impact analysis;
 - topology snapshots and flow exporter interface;
 - failure, scale, and OpenShift validation.

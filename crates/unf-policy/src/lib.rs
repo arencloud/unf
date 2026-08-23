@@ -1,5 +1,11 @@
 //! Kubernetes-independent policy IR, compilation, and deterministic evaluation.
 
+mod network_policy;
+
+pub use network_policy::{
+    KUBERNETES_NETWORK_POLICY_PRIORITY, NetworkPolicyCompileError, NetworkPolicyCompiler,
+};
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -87,10 +93,17 @@ pub struct PolicyIr {
     pub name: String,
     pub namespace: String,
     pub priority: u32,
+    pub origin: PolicyOrigin,
     pub target: IdentitySelector,
     pub default_action: PolicyAction,
     pub enforcement_mode: PolicyEnforcementMode,
     pub rules: Vec<PolicyRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyOrigin {
+    Native,
+    KubernetesNetworkPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +227,7 @@ impl PolicyCompiler {
             name,
             namespace,
             priority: spec.priority,
+            origin: PolicyOrigin::Native,
             target,
             default_action: convert_action(spec.default_action),
             enforcement_mode: match spec.enforcement_mode {
@@ -226,7 +240,7 @@ impl PolicyCompiler {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn push_rule(
+pub(crate) fn push_rule(
     rules: &mut Vec<PolicyRule>,
     policy_id: PolicyId,
     policy_name: &str,
@@ -427,10 +441,15 @@ fn decide_for_mode(
     mode: PolicyEnforcementMode,
 ) -> Option<(Verdict, DecisionReason, Option<PolicyId>, Option<RuleId>)> {
     let mut candidates = Vec::new();
-    for policy in policies
+    let policies_for_mode: Vec<_> = policies
         .iter()
         .copied()
         .filter(|policy| policy.enforcement_mode == mode)
+        .collect();
+    for policy in policies_for_mode
+        .iter()
+        .copied()
+        .filter(|policy| policy.origin == PolicyOrigin::Native)
     {
         let matched = policy.rules.iter().filter(|rule| rule_matches(rule, flow));
         let mut enforcing_rules = matched
@@ -455,6 +474,46 @@ fn decide_for_mode(
                 DecisionReason::DefaultAction,
             ));
         }
+    }
+
+    let compatibility_policies: Vec<_> = policies_for_mode
+        .iter()
+        .copied()
+        .filter(|policy| policy.origin == PolicyOrigin::KubernetesNetworkPolicy)
+        .collect();
+    let compatibility_rules: Vec<_> = compatibility_policies
+        .iter()
+        .flat_map(|policy| &policy.rules)
+        .filter(|rule| rule_matches(rule, flow))
+        .collect();
+    if compatibility_rules.is_empty() {
+        let mut defaults: Vec<_> = compatibility_policies
+            .iter()
+            .filter(|policy| policy.default_action != PolicyAction::Audit)
+            .map(|policy| {
+                (
+                    policy.priority,
+                    policy.default_action,
+                    policy.id,
+                    None,
+                    DecisionReason::DefaultAction,
+                )
+            })
+            .collect();
+        defaults.sort_by(compare_decisions);
+        if let Some(default) = defaults.first() {
+            candidates.push(*default);
+        }
+    } else {
+        candidates.extend(compatibility_rules.into_iter().map(|rule| {
+            (
+                KUBERNETES_NETWORK_POLICY_PRIORITY,
+                rule.action,
+                rule.provenance.policy_id,
+                Some(rule.id),
+                DecisionReason::ExplicitRule,
+            )
+        }));
     }
 
     candidates.sort_by(compare_decisions);

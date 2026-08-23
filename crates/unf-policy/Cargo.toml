@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+k8s-openapi.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 unf-api = { path = "../unf-api" }
@@ -14,7 +15,6 @@ unf-common = { path = "../unf-common" }
 unf-state = { path = "../unf-state" }
 
 [dev-dependencies]
-k8s-openapi.workspace = true
 proptest.workspace = true
 
 [lints]

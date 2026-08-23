@@ -5,7 +5,7 @@
 | `unf-common` | IDs, revisions, protocols, verdicts, policy reasons | Kubernetes or Aya clients |
 | `unf-ebpf-common` | Versioned fixed-layout flow and BPF map ABIs | Variable strings or allocation |
 | `unf-api` | CRD schema and serialization | Policy evaluation |
-| `unf-policy` | Conversion, IR, deterministic evaluation, identity-tuple lowering | Kubernetes watches or BPF map mutation |
+| `unf-policy` | Native and NetworkPolicy conversion, shared IR, deterministic evaluation, identity-tuple lowering | Kubernetes watches or BPF map mutation |
 | `unf-state` | Revision snapshots and identity metadata | Transport or controller loops |
 | `unf-controller` | Watches and desired-state reconciliation | Packet parsing |
 | `unf-agent` | Capability detection, Aya lifecycle, events | Kubernetes policy semantics |

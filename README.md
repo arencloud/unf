@@ -23,6 +23,8 @@ Implemented in the repository:
 - versioned userspace/eBPF flow ABI and strongly typed numeric IDs;
 - `SecurityPolicy` `network.unf.io/v1alpha1` API and generated CRD;
 - deterministic L3/L4 policy compiler, shadow decisions, and property tests;
+- an ingress `NetworkPolicy` translation foundation that reuses the same IR,
+  additive evaluator semantics, and dataplane lowering as native policy;
 - a kube-rs controller watching Pods, Namespaces, and SecurityPolicies;
 - controller health, readiness, metrics, status, and userspace explanation APIs;
 - an Aya agent capable of loading and attaching the TC observation program;
