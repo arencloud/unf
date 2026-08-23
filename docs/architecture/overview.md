@@ -25,7 +25,7 @@ The policy compiler is a pure userspace library. Kubernetes types pass through a
 conversion boundary before they reach domain policy IR. The kernel sees only
 fixed-size numeric state and does no selector or Kubernetes interpretation.
 
-## Phase 1 data flows
+## Phase 1 and 2 data flows
 
 1. kube-rs watches Pods, Namespaces, and SecurityPolicies.
 2. Pod metadata becomes provisional network identities.
@@ -35,10 +35,11 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    IPv4 identity snapshot, consumes compact events, and exposes health and metrics.
 6. The controller resolves policy selectors to identity tuples; each agent stages
    and atomically activates the resulting policy revision in dual BPF map banks.
+7. TC reads the active revision, emits actual and shadow provenance, and returns
+   `TC_ACT_SHOT` only for a validated actual deny.
 
-Identity and policy state are now distributed to the kernel as Phase 2 slices.
-TC does not read the active policy bank yet, so observation and userspace shadow
-explanation remain non-enforcing.
+Identity and policy state are distributed to the kernel and consumed directly in
+the Phase 2 fast path. Shadow mode remains non-enforcing by construction.
 
 ## Dependency rule
 

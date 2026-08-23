@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_common::{IdentityId, PolicyId, PolicyReason, RuleId, Verdict};
 use unf_ebpf_common::{
-    FlowEvent, FlowKey, IdentityMapValue, Ipv4IdentityKey, POLICY_BANK_COUNT,
+    FLOW_ABI_VERSION, FlowEvent, FlowKey, IdentityMapValue, Ipv4IdentityKey, POLICY_BANK_COUNT,
     POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
 };
@@ -496,6 +496,16 @@ async fn consume_events(
                         source_port = u16::from_be_bytes(event.flow.source_port),
                         destination_port = u16::from_be_bytes(event.flow.destination_port),
                         protocol = event.flow.protocol,
+                        policy_revision = event.policy_revision,
+                        policy_id = event.policy_id.get(),
+                        rule_id = event.rule_id.get(),
+                        verdict = ?event.verdict,
+                        reason = event.reason,
+                        shadow_policy_id = event.shadow_policy_id.get(),
+                        shadow_rule_id = event.shadow_rule_id.get(),
+                        shadow_verdict = event.shadow_verdict,
+                        shadow_reason = event.shadow_reason,
+                        direction = event.direction,
                         interface_index = event.interface_index,
                         "flow observed"
                     );
@@ -1068,13 +1078,21 @@ fn decode_event(bytes: &[u8]) -> Option<FlowEvent> {
     if bytes.len() != size_of::<FlowEvent>() {
         return None;
     }
-    let verdict = match bytes[72] {
+    let version = u16::from_ne_bytes(copy_bytes(bytes, 84)?);
+    let size = u16::from_ne_bytes(copy_bytes(bytes, 86)?);
+    if version != FLOW_ABI_VERSION || usize::from(size) != size_of::<FlowEvent>() {
+        return None;
+    }
+    let verdict = match bytes[88] {
         0 => Verdict::Unknown,
         1 => Verdict::Allow,
         2 => Verdict::Deny,
         3 => Verdict::Audit,
         _ => return None,
     };
+    if bytes[91] > Verdict::Audit as u8 {
+        return None;
+    }
     Some(FlowEvent {
         timestamp_ns: u64::from_ne_bytes(copy_bytes(bytes, 0)?),
         flow: FlowKey {
@@ -1088,15 +1106,20 @@ fn decode_event(bytes: &[u8]) -> Option<FlowEvent> {
             address_family: bytes[53],
             reserved: copy_bytes(bytes, 54)?,
         },
-        policy_id: PolicyId::new(u32::from_ne_bytes(copy_bytes(bytes, 56)?)),
-        rule_id: RuleId::new(u32::from_ne_bytes(copy_bytes(bytes, 60)?)),
-        interface_index: u32::from_ne_bytes(copy_bytes(bytes, 64)?),
-        version: u16::from_ne_bytes(copy_bytes(bytes, 68)?),
-        size: u16::from_ne_bytes(copy_bytes(bytes, 70)?),
+        policy_revision: u64::from_ne_bytes(copy_bytes(bytes, 56)?),
+        policy_id: PolicyId::new(u32::from_ne_bytes(copy_bytes(bytes, 64)?)),
+        rule_id: RuleId::new(u32::from_ne_bytes(copy_bytes(bytes, 68)?)),
+        shadow_policy_id: PolicyId::new(u32::from_ne_bytes(copy_bytes(bytes, 72)?)),
+        shadow_rule_id: RuleId::new(u32::from_ne_bytes(copy_bytes(bytes, 76)?)),
+        interface_index: u32::from_ne_bytes(copy_bytes(bytes, 80)?),
+        version,
+        size,
         verdict,
-        direction: bytes[73],
-        reason: bytes[74],
-        reserved: bytes[75],
+        direction: bytes[89],
+        reason: bytes[90],
+        shadow_verdict: bytes[91],
+        shadow_reason: bytes[92],
+        reserved: copy_bytes(bytes, 93)?,
     })
 }
 
@@ -1164,7 +1187,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         policy_map_entries: state.policy_map_entries.load(Ordering::Acquire),
         active_policy_bank: state.active_policy_bank.load(Ordering::Acquire),
         capabilities: state.capabilities.clone(),
-        limitation: "identity and policy maps are connected; TC enforcement is not enabled",
+        limitation: "TC policy enforcement is active; maps are unpinned and status is node-local",
     })
 }
 
@@ -1189,10 +1212,19 @@ mod tests {
 
     #[test]
     fn event_decoder_preserves_fixed_layout_bytes() {
-        let bytes = [0_u8; size_of::<FlowEvent>()];
-        let event = decode_event(&bytes).expect("zero event is valid");
+        let mut bytes = [0_u8; size_of::<FlowEvent>()];
+        bytes[84..86].copy_from_slice(&FLOW_ABI_VERSION.to_ne_bytes());
+        let event_size = u16::try_from(size_of::<FlowEvent>()).expect("event ABI fits in u16");
+        bytes[86..88].copy_from_slice(&event_size.to_ne_bytes());
+        let event = decode_event(&bytes).expect("versioned event is valid");
         assert_eq!(event.timestamp_ns, 0);
         assert_eq!(event.flow.source_port, [0, 0]);
+    }
+
+    #[test]
+    fn event_decoder_rejects_an_unknown_abi() {
+        let bytes = [0_u8; size_of::<FlowEvent>()];
+        assert!(decode_event(&bytes).is_none());
     }
 
     #[test]

@@ -10,7 +10,7 @@
 | `unf-controller` | Watches and desired-state reconciliation | Packet parsing |
 | `unf-agent` | Capability detection, Aya lifecycle, events | Kubernetes policy semantics |
 | `unfctl` | Operator-facing status and explanation | Fabric state ownership |
-| `unf-ebpf-tc` | Bounded packet parsing and telemetry | Selectors or enrichment strings |
+| `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, and telemetry | Selectors or enrichment strings |
 
 The allowed dependency direction is from binaries toward libraries and from API
 conversion toward domain types. Kernel ABI types depend only on `no_std`

@@ -518,7 +518,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         revisions,
         limitations: [
             "desired state and identity allocations are currently in-memory only",
-            "identity and policy state are distributed; TC enforcement is not enabled",
+            "dataplane status is node-local and policy maps are currently unpinned",
         ],
     }))
 }
@@ -590,8 +590,8 @@ async fn explain(
         destination: resolved(destination),
         decision,
         policy_revision: revision,
-        dataplane_enforcement: false,
-        note: "policy desired state is distributed; TC enforcement is not enabled",
+        dataplane_enforcement: true,
+        note: "decision is enforceable after traffic-path nodes report this policy revision as applied",
     }))
 }
 

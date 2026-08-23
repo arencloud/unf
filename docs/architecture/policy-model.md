@@ -26,5 +26,6 @@ future simulation, and eventually a digital-twin query layer.
 The Phase 2 lowering step resolves selectors against admitted identities and
 precomputes deterministic exact and fallback decisions. Actual and shadow
 verdicts retain policy/rule/reason provenance in the versioned BPF value. Dual
-banks make distribution transactional, but TC lookup and enforcement remain the
-next dataplane gate.
+banks make distribution transactional. TC reads only the active bank: enforce
+decisions can allow or drop, while shadow decisions are emitted as counterfactual
+telemetry and never change forwarding.

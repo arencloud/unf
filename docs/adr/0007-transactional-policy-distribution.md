@@ -48,9 +48,9 @@ Policy distribution now has a single atomic activation point and observable
 desired/applied revisions. The initial compiler expands known source and
 destination identity pairs, so its cost and map cardinality are quadratic in the
 number of distinct identities; scale tests and a more compact representation are
-required before production. Maps are still unpinned, transport is unauthenticated
-inside the prototype cluster, and the TC program does not consume the active
-policy bank yet. Therefore this decision does not claim enforcement.
+required before production. Maps are still unpinned and transport is
+unauthenticated inside the prototype cluster. ADR 0008 connects TC enforcement
+to the active bank without changing this distribution protocol.
 
 ## Open questions
 

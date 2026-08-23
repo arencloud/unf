@@ -43,10 +43,12 @@ spec:
       command:
         - sh
         - -c
-        - mkdir -p /www && echo unf-demo-ok > /www/index.html && httpd -f -p 8080 -h /www
+        - mkdir -p /www && echo unf-demo-ok > /www/index.html && httpd -p 9090 -h /www && httpd -f -p 8080 -h /www
       ports:
         - name: http
           containerPort: 8080
+        - name: denied
+          containerPort: 9090
 ---
 apiVersion: v1
 kind: Service
@@ -60,6 +62,9 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+    - name: denied
+      port: 9090
+      targetPort: denied
 ---
 apiVersion: network.unf.io/v1alpha1
 kind: SecurityPolicy
@@ -78,5 +83,12 @@ spec:
         - protocol: Tcp
           port: 8080
       action: Allow
+    - from:
+        namespace: frontend
+        application: client
+      protocols:
+        - protocol: Tcp
+          port: 9090
+      action: Deny
   defaultAction: Deny
-  enforcementMode: Shadow
+  enforcementMode: Enforce

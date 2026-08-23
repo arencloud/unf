@@ -76,11 +76,12 @@ make kind-test
 
 `kind-deploy` builds the userspace images and eBPF object, loads both images into
 the nodes, and applies the CRD and workloads. `kind-test` installs the demo,
-checks a cross-node HTTP request, confirms a port 8080 ring-buffer event, and
-validates allow/default-deny shadow explanations. The host kernel is shared with
-kind nodes. `make kind-down` deletes only the named `unf-dev` cluster.
+proves cross-node port 8080 allow and open-port 9090 deny, switches the same
+policy through shadow pass-through and back, and validates revisioned event and
+CLI provenance. The host kernel is shared with kind nodes. `make kind-down`
+deletes only the named `unf-dev` cluster.
 
-The DaemonSet attaches ingress observation to every non-loopback node interface
+The DaemonSet attaches ingress classification to every non-loopback node interface
 and discovers newly created pod veths. A packet can therefore produce multiple
 interface-level events; aggregation and deduplication are later telemetry work.
 

@@ -2,16 +2,16 @@
 
 UNF is an early-stage, Rust-first network observability and policy project for
 Kubernetes and OpenShift. Its long-term goal is an identity-aware, explainable,
-multi-cluster eBPF network fabric. Phase 1 is an observation foundation and the
-current Phase 2 work is deliberately incremental. UNF is **not production-ready
-or a CNI replacement**.
+multi-cluster eBPF network fabric. Phase 1 established observation; Phase 2 adds
+the first identity-aware L3/L4 enforcement path. UNF is **not production-ready or
+a CNI replacement**.
 
 ## Project status
 
-Phase 1's observation gate is verified in a two-node kind cluster. Phase 2 is now
-in progress: collision-checked identities and resolved policy decisions are
-revisioned and distributed into each node's BPF maps, while observed flows carry
-identity IDs. Enforcement is not implemented yet. See the authoritative
+Phase 1's observation gate and Phase 2's first enforcement gate are verified in
+a two-node kind cluster. Collision-checked identities and transactional policy
+revisions now drive TC allow/drop decisions with actual and shadow provenance.
+See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
 gates, evidence, limitations, and current work. The shorter
 [roadmap](docs/roadmap.md) describes future direction.
@@ -26,15 +26,16 @@ Implemented in the repository:
 - a kube-rs controller watching Pods, Namespaces, and SecurityPolicies;
 - controller health, readiness, metrics, status, and userspace explanation APIs;
 - an Aya agent capable of loading and attaching the TC observation program;
-- an IPv4 TCP/UDP TC parser with counters and bounded ring-buffer events;
+- an IPv4 TCP/UDP TC parser with counters, bounded ring-buffer events, and
+  active-bank L3/L4 allow/drop decisions;
 - revisioned controller-to-agent IPv4 identity snapshots and a versioned BPF map;
 - selector-resolved policy snapshots and dual-bank transactional BPF policy maps;
 - `unfctl status` and `unfctl explain` against live controller state;
-- a reproducible two-node kind demo covering cross-node traffic, live eBPF
-  observation, and shadow-policy explanations.
+- a reproducible two-node kind demo covering cross-node allow/drop, shadow
+  pass-through, revisioned eBPF provenance, and live policy explanations.
 
-Not implemented yet: dataplane policy lookup/enforcement, service load balancing,
-routing, IPAM/CNI, encryption, or multi-cluster transport.
+Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
+multi-cluster transport, or production fail-closed recovery.
 
 ## Repository layout
 

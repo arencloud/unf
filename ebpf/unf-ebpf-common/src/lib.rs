@@ -4,7 +4,7 @@
 
 use unf_common::{IdentityId, PolicyId, RuleId, Verdict};
 
-pub const FLOW_ABI_VERSION: u16 = 1;
+pub const FLOW_ABI_VERSION: u16 = 2;
 pub const IDENTITY_MAP_ABI_VERSION: u16 = 1;
 pub const POLICY_MAP_ABI_VERSION: u16 = 1;
 pub const POLICY_BANK_COUNT: u8 = 2;
@@ -36,6 +36,7 @@ pub enum ReasonCode {
     DenyExplicit = 2,
     DenyDefault = 3,
     IdentityUnknown = 4,
+    AllowDefault = 5,
 }
 
 /// Network-byte-order flow tuple. IPv4 addresses occupy the first four bytes.
@@ -59,15 +60,20 @@ pub struct FlowKey {
 pub struct FlowEvent {
     pub timestamp_ns: u64,
     pub flow: FlowKey,
+    pub policy_revision: u64,
     pub policy_id: PolicyId,
     pub rule_id: RuleId,
+    pub shadow_policy_id: PolicyId,
+    pub shadow_rule_id: RuleId,
     pub interface_index: u32,
     pub version: u16,
     pub size: u16,
     pub verdict: Verdict,
     pub direction: u8,
     pub reason: u8,
-    pub reserved: u8,
+    pub shadow_verdict: u8,
+    pub shadow_reason: u8,
+    pub reserved: [u8; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +151,7 @@ pub struct PolicyMapConfig {
 }
 
 const _: () = assert!(core::mem::size_of::<FlowKey>() == 48);
-const _: () = assert!(core::mem::size_of::<FlowEvent>() == 80);
+const _: () = assert!(core::mem::size_of::<FlowEvent>() == 96);
 const _: () = assert!(core::mem::size_of::<Ipv4IdentityKey>() == 4);
 const _: () = assert!(core::mem::size_of::<IdentityMapValue>() == 16);
 const _: () = assert!(core::mem::size_of::<PolicyMapKey>() == 12);
@@ -160,7 +166,7 @@ mod tests {
     fn abi_layout_is_stable() {
         assert_eq!(core::mem::align_of::<FlowKey>(), 4);
         assert_eq!(core::mem::align_of::<FlowEvent>(), 8);
-        assert_eq!(core::mem::size_of::<FlowEvent>(), 80);
+        assert_eq!(core::mem::size_of::<FlowEvent>(), 96);
         assert_eq!(core::mem::align_of::<IdentityMapValue>(), 8);
         assert_eq!(core::mem::size_of::<IdentityMapValue>(), 16);
         assert_eq!(core::mem::align_of::<PolicyMapKey>(), 4);

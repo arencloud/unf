@@ -18,7 +18,7 @@ matrix and reproducible evidence.
 
 ## Phase 2 — identity and policy enforcement
 
-**Gate: in progress.**
+**Initial enforcement gate: verified.** Production hardening remains in progress.
 
 - Implemented foundation: collision-checked identity admission, Pod-IP desired-
   state index, update/removal garbage collection, and controller status counts.
@@ -28,10 +28,13 @@ matrix and reproducible evidence.
 - Implemented and two-node kind verified: selector-to-identity lowering,
   versioned dual-bank policy maps, atomic revision activation/restoration, and
   agent desired/applied policy status;
-- Next: applied node status aggregation and TC policy lookup;
-- L3/L4 allow/deny with explicit reason codes;
-- denied flow telemetry and accurate live `unfctl explain`;
-- last-known-good and fail-safe behavior tests.
+- Implemented and two-node kind verified: active-bank TC lookup, IPv4 TCP/UDP
+  allow/drop, shadow pass-through, Flow ABI v2 actual/shadow provenance, and
+  enforcement-aware `unfctl explain`;
+- Verified manually: the last active bank continued enforcing across a controller
+  interruption and agents reconverged to the restarted controller epoch;
+- Next: applied node status aggregation, pinned last-known-good recovery, agent
+  restart fencing, and pressure/fault-injection tests.
 
 ## Phase 3 — compatibility and simulation
 
