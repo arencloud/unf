@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use k8s_openapi::api::networking::v1::{NetworkPolicy, NetworkPolicyPeer, NetworkPolicyPort};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
@@ -32,8 +32,6 @@ pub enum NetworkPolicyCompileError {
     UnsupportedPolicyType { policy_type: String },
     #[error("NetworkPolicy policyTypes must include Ingress")]
     MissingIngressPolicyType,
-    #[error("{field} matchExpressions are not supported yet")]
-    UnsupportedMatchExpressions { field: &'static str },
     #[error("{field} matchExpression for key {key:?} uses invalid operator {operator:?}")]
     InvalidMatchExpressionOperator {
         field: &'static str,
@@ -50,13 +48,6 @@ pub enum NetworkPolicyCompileError {
     },
     #[error("ingress rule {rule_index} peer {peer_index} uses unsupported ipBlock")]
     UnsupportedIpBlock {
-        rule_index: usize,
-        peer_index: usize,
-    },
-    #[error(
-        "ingress rule {rule_index} peer {peer_index} namespaceSelector currently supports only an empty selector or kubernetes.io/metadata.name"
-    )]
-    UnsupportedNamespaceSelector {
         rule_index: usize,
         peer_index: usize,
     },
@@ -207,47 +198,59 @@ fn peer_selector(
     rule_index: usize,
     peer_index: usize,
 ) -> Result<IdentitySelector, NetworkPolicyCompileError> {
-    if peer.ip_block.is_some() {
+    let NetworkPolicyPeer {
+        ip_block,
+        namespace_selector,
+        pod_selector,
+    } = peer;
+    if ip_block.is_some() {
         return Err(NetworkPolicyCompileError::UnsupportedIpBlock {
             rule_index,
             peer_index,
         });
     }
-    let namespace = match peer.namespace_selector {
-        Some(selector) => namespace_from_selector(selector, rule_index, peer_index)?,
-        None if peer.pod_selector.is_some() => Some(policy_namespace.to_owned()),
-        None => None,
+    let namespace_selector = match namespace_selector {
+        Some(selector) => namespace_identity_selector(selector)?,
+        None if pod_selector.is_some() => NamespaceIdentitySelector {
+            namespace: Some(policy_namespace.to_owned()),
+            ..NamespaceIdentitySelector::default()
+        },
+        None => NamespaceIdentitySelector::default(),
     };
-    match peer.pod_selector {
-        Some(selector) => pod_identity_selector(selector, namespace, "peer podSelector"),
-        None => Ok(IdentitySelector {
-            namespace,
-            ..IdentitySelector::default()
-        }),
-    }
+    let mut identity_selector = pod_selector.map_or_else(
+        || Ok(IdentitySelector::default()),
+        |selector| pod_identity_selector(selector, None, "peer podSelector"),
+    )?;
+    identity_selector.namespace = namespace_selector.namespace;
+    identity_selector.namespace_match_labels = namespace_selector.match_labels;
+    identity_selector.namespace_match_expressions = namespace_selector.match_expressions;
+    Ok(identity_selector)
 }
 
-fn namespace_from_selector(
+#[derive(Default)]
+struct NamespaceIdentitySelector {
+    namespace: Option<String>,
+    match_labels: BTreeMap<String, String>,
+    match_expressions: Vec<LabelExpression>,
+}
+
+fn namespace_identity_selector(
     selector: LabelSelector,
-    rule_index: usize,
-    peer_index: usize,
-) -> Result<Option<String>, NetworkPolicyCompileError> {
-    reject_expressions(&selector, "peer namespaceSelector")?;
-    let labels = selector.match_labels.unwrap_or_default();
-    if labels.is_empty() {
-        return Ok(None);
-    }
-    if labels.len() == 1 {
-        return labels.get(NAMESPACE_NAME_LABEL).cloned().map(Some).ok_or(
-            NetworkPolicyCompileError::UnsupportedNamespaceSelector {
-                rule_index,
-                peer_index,
-            },
-        );
-    }
-    Err(NetworkPolicyCompileError::UnsupportedNamespaceSelector {
-        rule_index,
-        peer_index,
+) -> Result<NamespaceIdentitySelector, NetworkPolicyCompileError> {
+    let mut match_labels = selector.match_labels.unwrap_or_default();
+    let namespace = match_labels.remove(NAMESPACE_NAME_LABEL);
+    let match_expressions = selector
+        .match_expressions
+        .unwrap_or_default()
+        .into_iter()
+        .map(|requirement| label_expression(requirement, "peer namespaceSelector"))
+        .collect::<Result<BTreeSet<_>, _>>()?
+        .into_iter()
+        .collect();
+    Ok(NamespaceIdentitySelector {
+        namespace,
+        match_labels,
+        match_expressions,
     })
 }
 
@@ -302,21 +305,6 @@ fn label_expression(
         operator,
         values,
     })
-}
-
-fn reject_expressions(
-    selector: &LabelSelector,
-    field: &'static str,
-) -> Result<(), NetworkPolicyCompileError> {
-    if selector
-        .match_expressions
-        .as_ref()
-        .is_some_and(|requirements| !requirements.is_empty())
-    {
-        Err(NetworkPolicyCompileError::UnsupportedMatchExpressions { field })
-    } else {
-        Ok(())
-    }
 }
 
 type PortTuple = (Option<Protocol>, Option<u16>);
@@ -448,6 +436,7 @@ mod tests {
         Endpoint {
             identity: IdentityId::new(id),
             namespace: namespace.to_owned(),
+            namespace_labels: labels(&[(NAMESPACE_NAME_LABEL, namespace)]),
             service_account: "default".to_owned(),
             application: Some(app.to_owned()),
             labels: labels(&[("app", app)]),
@@ -760,6 +749,64 @@ mod tests {
     }
 
     #[test]
+    fn namespace_label_selectors_match_source_namespace_metadata() {
+        let compiled = NetworkPolicyCompiler::compile(
+            PolicyId::new(7),
+            policy(vec![NetworkPolicyIngressRule {
+                from: Some(vec![NetworkPolicyPeer {
+                    namespace_selector: Some(LabelSelector {
+                        match_labels: Some(labels(&[("environment", "production")])),
+                        match_expressions: Some(vec![
+                            expression("team", "In", &["checkout", "platform"]),
+                            expression("disabled", "DoesNotExist", &[]),
+                        ]),
+                    }),
+                    pod_selector: Some(selector(&[("app", "client")])),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: None,
+            }]),
+        )
+        .expect("namespace label selector compiles");
+        let mut source = endpoint(1, "frontend", "client");
+        source.namespace_labels.extend(labels(&[
+            ("environment", "production"),
+            ("team", "checkout"),
+        ]));
+        let destination = endpoint(2, "backend", "server");
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source: &source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8080,
+                },
+            )
+            .verdict,
+            Verdict::Allow
+        );
+
+        source
+            .namespace_labels
+            .insert("environment".to_owned(), "staging".to_owned());
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source: &source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8080,
+                },
+            )
+            .verdict,
+            Verdict::Deny
+        );
+    }
+
+    #[test]
     fn unsupported_features_fail_explicitly() {
         let ip_block_policy = policy(vec![NetworkPolicyIngressRule {
             from: Some(vec![NetworkPolicyPeer {
@@ -774,21 +821,6 @@ mod tests {
         assert!(matches!(
             NetworkPolicyCompiler::compile(PolicyId::new(7), ip_block_policy),
             Err(NetworkPolicyCompileError::UnsupportedIpBlock { .. })
-        ));
-
-        let expression_policy = policy(vec![NetworkPolicyIngressRule {
-            from: Some(vec![NetworkPolicyPeer {
-                namespace_selector: Some(LabelSelector {
-                    match_expressions: Some(vec![expression("environment", "In", &["production"])]),
-                    ..LabelSelector::default()
-                }),
-                ..NetworkPolicyPeer::default()
-            }]),
-            ports: None,
-        }]);
-        assert!(matches!(
-            NetworkPolicyCompiler::compile(PolicyId::new(7), expression_policy),
-            Err(NetworkPolicyCompileError::UnsupportedMatchExpressions { .. })
         ));
 
         let named_port_policy = policy(vec![NetworkPolicyIngressRule {

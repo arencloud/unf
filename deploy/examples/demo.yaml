@@ -2,6 +2,9 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: frontend
+  labels:
+    environment: production
+    team: checkout
 ---
 apiVersion: v1
 kind: Namespace
@@ -123,7 +126,12 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: frontend
+              environment: production
+            matchExpressions:
+              - key: team
+                operator: In
+                values:
+                  - checkout
           podSelector:
             matchExpressions:
               - key: app.kubernetes.io/name

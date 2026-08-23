@@ -55,7 +55,7 @@ struct ControllerState {
     identity_epoch: u64,
     offline: bool,
     pods: RwLock<BTreeMap<String, PodRecord>>,
-    namespaces: RwLock<BTreeMap<String, Namespace>>,
+    namespaces: RwLock<BTreeMap<String, BTreeMap<String, String>>>,
     security_policies: RwLock<BTreeMap<String, SecurityPolicy>>,
     compiled_security_policies: RwLock<BTreeMap<String, PolicyIr>>,
     network_policies: RwLock<BTreeMap<String, NetworkPolicy>>,
@@ -352,6 +352,7 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
     let endpoint = Endpoint {
         identity: identity_id,
         namespace: namespace.clone(),
+        namespace_labels: BTreeMap::new(),
         service_account,
         application,
         labels,
@@ -418,17 +419,46 @@ async fn watch_namespaces(
 }
 
 fn apply_namespace_event(state: &ControllerState, event: Event<Namespace>) {
+    let _policy_state_guard = write_lock(&state.policy_state_guard);
     match event {
         Event::Apply(namespace) | Event::InitApply(namespace) => {
-            write_lock(&state.namespaces).insert(namespace.name_any(), namespace);
+            let name = namespace.name_any();
+            let labels = normalized_namespace_labels(&name, &namespace);
+            let previous = write_lock(&state.namespaces).insert(name, labels.clone());
             state.metrics.reconciles.inc();
+            if previous.as_ref() != Some(&labels) {
+                bump_policy_revision(state);
+            }
         }
         Event::Delete(namespace) => {
-            write_lock(&state.namespaces).remove(&namespace.name_any());
+            if write_lock(&state.namespaces)
+                .remove(&namespace.name_any())
+                .is_some()
+            {
+                bump_policy_revision(state);
+            }
         }
-        Event::Init => write_lock(&state.namespaces).clear(),
+        Event::Init => {
+            let had_namespaces = !read_lock(&state.namespaces).is_empty();
+            write_lock(&state.namespaces).clear();
+            if had_namespaces {
+                bump_policy_revision(state);
+            }
+        }
         Event::InitDone => {}
     }
+}
+
+fn normalized_namespace_labels(name: &str, namespace: &Namespace) -> BTreeMap<String, String> {
+    let mut labels: BTreeMap<_, _> = namespace
+        .metadata
+        .labels
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    labels.insert("kubernetes.io/metadata.name".to_owned(), name.to_owned());
+    labels
 }
 
 async fn watch_policies(
@@ -662,10 +692,7 @@ fn dataplane_policy_state(
 ) -> Result<(Revision, Vec<unf_state::PolicyMapEntry>), ApiError> {
     let _policy_state_guard = read_lock(&state.policy_state_guard);
     let policies = compiled_policies(state);
-    let endpoints: Vec<_> = read_lock(&state.pods)
-        .values()
-        .map(|pod| pod.endpoint.clone())
-        .collect();
+    let endpoints = endpoints_with_namespace_labels(state);
     let entries = compile_dataplane_entries(&policies, &endpoints)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok((mutex_lock(&state.revisions).policy, entries))
@@ -686,6 +713,9 @@ async fn explain(
     let destination = pods
         .get(&request.to)
         .ok_or_else(|| ApiError::not_found(format!("destination pod {} not found", request.to)))?;
+    let namespaces = read_lock(&state.namespaces);
+    let source_endpoint = endpoint_with_namespace_labels(&source.endpoint, &namespaces);
+    let destination_endpoint = endpoint_with_namespace_labels(&destination.endpoint, &namespaces);
     let protocol = match request.protocol {
         RequestProtocol::Tcp => Protocol::Tcp,
         RequestProtocol::Udp => Protocol::Udp,
@@ -694,8 +724,8 @@ async fn explain(
     let decision = evaluate(
         &policies,
         Flow {
-            source: &source.endpoint,
-            destination: &destination.endpoint,
+            source: &source_endpoint,
+            destination: &destination_endpoint,
             protocol,
             destination_port: request.port,
         },
@@ -709,6 +739,31 @@ async fn explain(
         dataplane_enforcement: true,
         note: "decision is enforceable after traffic-path nodes report this policy revision as applied",
     }))
+}
+
+fn endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Endpoint> {
+    let namespaces = read_lock(&state.namespaces);
+    read_lock(&state.pods)
+        .values()
+        .map(|pod| endpoint_with_namespace_labels(&pod.endpoint, &namespaces))
+        .collect()
+}
+
+fn endpoint_with_namespace_labels(
+    endpoint: &Endpoint,
+    namespaces: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Endpoint {
+    let mut endpoint = endpoint.clone();
+    endpoint.namespace_labels = namespaces
+        .get(&endpoint.namespace)
+        .cloned()
+        .unwrap_or_else(|| {
+            BTreeMap::from([(
+                "kubernetes.io/metadata.name".to_owned(),
+                endpoint.namespace.clone(),
+            )])
+        });
+    endpoint
 }
 
 fn compiled_policies(state: &ControllerState) -> Vec<PolicyIr> {
@@ -879,6 +934,18 @@ mod tests {
         .expect("test NetworkPolicy is valid Kubernetes JSON")
     }
 
+    fn namespace(environment: &str) -> Namespace {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "frontend",
+                "labels": {"environment": environment}
+            }
+        }))
+        .expect("test Namespace is valid Kubernetes JSON")
+    }
+
     #[test]
     fn canonical_identity_key_is_order_independent_and_label_sensitive() {
         let left = BTreeMap::from([
@@ -934,5 +1001,26 @@ mod tests {
         assert!(read_lock(&state.compiled_network_policies).is_empty());
         assert_eq!(read_lock(&state.rejected_network_policies).len(), 1);
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(2));
+    }
+
+    #[test]
+    fn namespace_label_changes_advance_policy_revision_without_identity_churn() {
+        let state = new_state(true);
+        apply_namespace_event(&state, Event::Apply(namespace("production")));
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(1));
+        assert_eq!(mutex_lock(&state.revisions).identity, Revision::default());
+        assert_eq!(
+            read_lock(&state.namespaces)["frontend"]["kubernetes.io/metadata.name"],
+            "frontend"
+        );
+
+        let mut unchanged = namespace("production");
+        unchanged.metadata.resource_version = Some("2".to_owned());
+        apply_namespace_event(&state, Event::Apply(unchanged));
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(1));
+
+        apply_namespace_event(&state, Event::Apply(namespace("staging")));
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(2));
+        assert_eq!(mutex_lock(&state.revisions).identity, Revision::default());
     }
 }

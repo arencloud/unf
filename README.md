@@ -39,8 +39,8 @@ Implemented in the repository:
 - selector-resolved policy snapshots and dual-bank transactional BPF policy maps;
 - `unfctl status` and `unfctl explain` against live controller state;
 - a reproducible two-node kind demo covering native and NetworkPolicy cross-node
-  allow/drop, rejection/deletion recovery, shadow pass-through, revisioned eBPF
-  provenance, and live policy explanations.
+  allow/drop, namespace-selector convergence, rejection/deletion recovery, shadow
+  pass-through, revisioned eBPF provenance, and live policy explanations.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
 multi-cluster transport, or production fail-closed recovery.

@@ -28,7 +28,8 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
 ## Phase 1 through 3 data flows
 
 1. kube-rs watches Pods, Namespaces, SecurityPolicies, and NetworkPolicies.
-2. Pod metadata becomes provisional network identities.
+2. Pod metadata becomes provisional network identities; Namespace labels remain
+   separate selector metadata and do not churn identity IDs.
 3. SecurityPolicies and the supported NetworkPolicy ingress subset compile into
    the same provenance-preserving IR; unsupported compatibility objects are
    rejected without retaining stale compiled state.
@@ -37,6 +38,8 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    IPv4 identity snapshot, consumes compact events, and exposes health and metrics.
 6. The controller resolves policy selectors to identity tuples; each agent stages
    and atomically activates the resulting policy revision in dual BPF map banks.
+   Namespace label changes advance this policy revision when selector results can
+   change.
 7. TC reads the active revision, emits actual and shadow provenance, and returns
    `TC_ACT_SHOT` only for a validated actual deny.
 

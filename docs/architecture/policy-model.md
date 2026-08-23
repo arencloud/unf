@@ -41,16 +41,17 @@ and BPF map compiler; there is no second enforcement engine.
 
 The current slice supports pod `matchLabels` and `matchExpressions` (`In`,
 `NotIn`, `Exists`, and `DoesNotExist`), same-namespace peers, exact namespace
-selection through `kubernetes.io/metadata.name`, numeric TCP/UDP ports, wildcard
-sources/ports, and ingress default isolation. It deliberately rejects egress,
-IP blocks, namespace-selector expressions and general namespace-label selectors,
-named ports, port ranges, SCTP, and protocol-only port entries. These errors
-prevent a policy from being accepted with weaker or different semantics. Native
-policy has the higher default precedence; the compatibility baseline uses
-reserved priority `1_000_000`.
+selection through `kubernetes.io/metadata.name`, general Namespace `matchLabels`
+and `matchExpressions`, numeric TCP/UDP ports, wildcard sources/ports, and ingress
+default isolation. It deliberately rejects egress, IP blocks, named ports, port
+ranges, SCTP, and protocol-only port entries. These errors prevent a policy from
+being accepted with weaker or different semantics. Native policy has the higher
+default precedence; the compatibility baseline uses reserved priority `1_000_000`.
 
 The controller watches these objects cluster-wide, keeps accepted and rejected
 compatibility state separate, and combines accepted IR with native policy in each
 revisioned agent snapshot. A rejected update or deletion removes any previously
 compiled version and advances the policy revision when the effective dataplane
-state changes. Controller status exposes accepted and rejected object counts.
+state changes. Namespace metadata is joined into endpoints during policy lowering
+and explanation; a label change advances policy state without changing workload
+identity. Controller status exposes accepted and rejected object counts.

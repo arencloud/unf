@@ -11,6 +11,7 @@ controller_forward_pid=
 policy_mutated=false
 network_policy_mutated=false
 network_policy_deleted=false
+namespace_mutated=false
 
 cleanup() {
     if [[ ${policy_mutated} == true ]]; then
@@ -24,6 +25,10 @@ cleanup() {
     fi
     if [[ ${network_policy_deleted} == true ]]; then
         "${kc[@]}" apply -f "${project_root}/deploy/examples/demo.yaml" >/dev/null 2>&1 || true
+    fi
+    if [[ ${namespace_mutated} == true ]]; then
+        "${kc[@]}" label namespace frontend environment=production team=checkout --overwrite \
+            >/dev/null 2>&1 || true
     fi
     if [[ -n ${controller_forward_pid} ]]; then
         kill "${controller_forward_pid}" 2>/dev/null || true
@@ -361,6 +366,50 @@ if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${network_policy_deny_line}" \
     exit 1
 fi
 
+namespace_identity_revision=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json status \
+    | sed -nE 's/.*"identity": ([0-9]+).*/\1/p')
+"${kc[@]}" label namespace frontend environment=staging --overwrite >/dev/null
+namespace_mutated=true
+if ! wait_for_controller_policy_counts 1 0 "${enforced_policy_revision}"; then
+    echo "controller did not revise policy state after the Namespace label change" >&2
+    exit 1
+fi
+namespace_denied_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${enforced_policy_revision}"; then
+    echo "agents did not activate the Namespace label change" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:8081 >/dev/null 2>&1; then
+    echo "namespace selector continued allowing a non-matching Namespace" >&2
+    exit 1
+fi
+
+"${kc[@]}" label namespace frontend environment=production --overwrite >/dev/null
+if ! wait_for_controller_policy_counts 1 0 "${namespace_denied_revision}"; then
+    echo "controller did not revise policy state after the Namespace label restore" >&2
+    exit 1
+fi
+if ! wait_for_policy_transition "${namespace_denied_revision}"; then
+    echo "agents did not activate the restored Namespace selector match" >&2
+    exit 1
+fi
+namespace_mutated=false
+namespace_identity_after=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json status \
+    | sed -nE 's/.*"identity": ([0-9]+).*/\1/p')
+if [[ ${namespace_identity_after} != "${namespace_identity_revision}" ]]; then
+    echo "Namespace label changes unexpectedly changed identity revision" >&2
+    exit 1
+fi
+network_policy_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:8081)
+if [[ ${network_policy_allow_response} != "unf-networkpolicy-ok" ]]; then
+    echo "restored Namespace selector did not restore the allow flow" >&2
+    exit 1
+fi
+
 "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
     -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/port","value":"allowed"}]' \
     >/dev/null
@@ -423,4 +472,4 @@ if "${kc[@]}" exec -n frontend client -- \
     exit 1
 fi
 
-echo "kind verification passed: native/NetworkPolicy enforcement, rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: native/NetworkPolicy enforcement, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"

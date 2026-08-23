@@ -22,6 +22,8 @@ pub use unf_common::PolicyReason as DecisionReason;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentitySelector {
     pub namespace: Option<String>,
+    pub namespace_match_labels: BTreeMap<String, String>,
+    pub namespace_match_expressions: Vec<LabelExpression>,
     pub service_account: Option<String>,
     pub application: Option<String>,
     pub match_labels: BTreeMap<String, String>,
@@ -49,6 +51,14 @@ impl IdentitySelector {
         self.namespace
             .as_ref()
             .is_none_or(|expected| expected == &endpoint.namespace)
+            && self
+                .namespace_match_labels
+                .iter()
+                .all(|(key, value)| endpoint.namespace_labels.get(key) == Some(value))
+            && self
+                .namespace_match_expressions
+                .iter()
+                .all(|expression| expression.matches(&endpoint.namespace_labels))
             && self
                 .service_account
                 .as_ref()
@@ -87,6 +97,8 @@ impl From<ApiSelector> for IdentitySelector {
     fn from(value: ApiSelector) -> Self {
         Self {
             namespace: value.namespace,
+            namespace_match_labels: BTreeMap::new(),
+            namespace_match_expressions: Vec::new(),
             service_account: value.service_account,
             application: value.application,
             match_labels: value.match_labels,
@@ -99,6 +111,7 @@ impl From<ApiSelector> for IdentitySelector {
 pub struct Endpoint {
     pub identity: IdentityId,
     pub namespace: String,
+    pub namespace_labels: BTreeMap<String, String>,
     pub service_account: String,
     pub application: Option<String>,
     pub labels: BTreeMap<String, String>,
@@ -615,6 +628,7 @@ mod tests {
         Endpoint {
             identity: IdentityId::new(id),
             namespace: namespace.to_owned(),
+            namespace_labels: BTreeMap::new(),
             service_account: "default".to_owned(),
             application: Some(application.to_owned()),
             labels: BTreeMap::new(),

@@ -42,8 +42,9 @@ matrix and reproducible evidence.
 
 - Implemented and two-node kind verified: supported ingress `NetworkPolicy`
   translation, additive semantics, controller reconciliation/status, shared
-  dataplane enforcement/provenance, pod label-expression selectors, and
-  rejection/deletion recovery;
+  dataplane enforcement/provenance, pod/Namespace label-expression selectors,
+  namespace relabel convergence without identity churn, and rejection/deletion
+  recovery;
 - Next: broader ingress selector/port conformance and policy simulation;
 - shadow rollout and offline impact analysis;
 - topology snapshots and flow exporter interface;
