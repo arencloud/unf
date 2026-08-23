@@ -39,14 +39,15 @@ matching compatibility allow wins over the other compatibility policies'
 isolation defaults. The result then passes through the existing identity-tuple
 and BPF map compiler; there is no second enforcement engine.
 
-The first slice supports pod `matchLabels`, same-namespace peers, exact namespace
+The current slice supports pod `matchLabels` and `matchExpressions` (`In`,
+`NotIn`, `Exists`, and `DoesNotExist`), same-namespace peers, exact namespace
 selection through `kubernetes.io/metadata.name`, numeric TCP/UDP ports, wildcard
 sources/ports, and ingress default isolation. It deliberately rejects egress,
-IP blocks, match expressions, general namespace-label selectors, named ports,
-port ranges, SCTP, and protocol-only port entries. These errors prevent a policy
-from being accepted with weaker or different semantics. Native policy has the
-higher default precedence; the compatibility baseline uses reserved priority
-`1_000_000`.
+IP blocks, namespace-selector expressions and general namespace-label selectors,
+named ports, port ranges, SCTP, and protocol-only port entries. These errors
+prevent a policy from being accepted with weaker or different semantics. Native
+policy has the higher default precedence; the compatibility baseline uses
+reserved priority `1_000_000`.
 
 The controller watches these objects cluster-wide, keeps accepted and rejected
 compatibility state separate, and combines accepted IR with native policy in each

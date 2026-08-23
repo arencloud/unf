@@ -111,10 +111,10 @@ gate.
 
 | Deliverable | State | Exit evidence |
 |---|---|---|
-| NetworkPolicy ingress translator foundation | **Verified** | Unit tests cover allow/default isolation, wildcards, local/exact-namespace peers, and explicit unsupported-feature errors; `make kind-test` exercises the supported form |
+| NetworkPolicy ingress translator foundation | **Verified** | Unit tests cover allow/default isolation, pod label expressions, wildcards, local/exact-namespace peers, and explicit unsupported-feature errors; `make kind-test` exercises expression-based target and peer selectors |
 | Additive compatibility semantics | **Verified** | Multiple selecting policies combine allows in the shared evaluator and lower through the shared dataplane compiler; the live adapter uses that same engine |
 | NetworkPolicy controller watch and live enforcement | **Verified** | `make kind-test` covers reconciliation/status, explicit allow, isolation drop, revisioned provenance, rejection/removal/recovery, and deletion/recreation |
-| Full ingress selector/port compatibility | **Planned** | Match expressions, namespace labels, named/ranged ports, IP blocks, and conformance cases |
+| Full ingress selector/port compatibility | **In progress** | Pod label expressions are implemented; namespace labels/expressions, named/ranged ports, IP blocks, and broader conformance cases remain |
 | Egress NetworkPolicy compatibility | **Planned** | Direction-aware IR and dataplane enforcement evidence |
 | Policy simulation foundation | **Planned** | Proposed-policy evaluation against a versioned topology/flow snapshot |
 | Better topology state | **Planned** | Versioned node/workload/service relationships with query tests |

@@ -25,6 +25,22 @@ pub struct IdentitySelector {
     pub service_account: Option<String>,
     pub application: Option<String>,
     pub match_labels: BTreeMap<String, String>,
+    pub match_expressions: Vec<LabelExpression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LabelExpression {
+    pub key: String,
+    pub operator: LabelExpressionOperator,
+    pub values: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum LabelExpressionOperator {
+    In,
+    NotIn,
+    Exists,
+    DoesNotExist,
 }
 
 impl IdentitySelector {
@@ -45,6 +61,25 @@ impl IdentitySelector {
                 .match_labels
                 .iter()
                 .all(|(key, value)| endpoint.labels.get(key) == Some(value))
+            && self
+                .match_expressions
+                .iter()
+                .all(|expression| expression.matches(&endpoint.labels))
+    }
+}
+
+impl LabelExpression {
+    fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
+        match self.operator {
+            LabelExpressionOperator::In => labels
+                .get(&self.key)
+                .is_some_and(|value| self.values.contains(value)),
+            LabelExpressionOperator::NotIn => labels
+                .get(&self.key)
+                .is_none_or(|value| !self.values.contains(value)),
+            LabelExpressionOperator::Exists => labels.contains_key(&self.key),
+            LabelExpressionOperator::DoesNotExist => !labels.contains_key(&self.key),
+        }
     }
 }
 
@@ -55,6 +90,7 @@ impl From<ApiSelector> for IdentitySelector {
             service_account: value.service_account,
             application: value.application,
             match_labels: value.match_labels,
+            match_expressions: Vec::new(),
         }
     }
 }

@@ -1,11 +1,14 @@
+use std::collections::BTreeSet;
+
 use k8s_openapi::api::networking::v1::{NetworkPolicy, NetworkPolicyPeer, NetworkPolicyPort};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use thiserror::Error;
 use unf_common::{PolicyAction, PolicyId, Protocol};
 
 use crate::{
-    IdentitySelector, PolicyEnforcementMode, PolicyIr, PolicyOrigin, PolicyRule, push_rule,
+    IdentitySelector, LabelExpression, LabelExpressionOperator, PolicyEnforcementMode, PolicyIr,
+    PolicyOrigin, PolicyRule, push_rule,
 };
 
 /// Compatibility policies sit below the native policy priority range by
@@ -31,6 +34,20 @@ pub enum NetworkPolicyCompileError {
     MissingIngressPolicyType,
     #[error("{field} matchExpressions are not supported yet")]
     UnsupportedMatchExpressions { field: &'static str },
+    #[error("{field} matchExpression for key {key:?} uses invalid operator {operator:?}")]
+    InvalidMatchExpressionOperator {
+        field: &'static str,
+        key: String,
+        operator: String,
+    },
+    #[error(
+        "{field} matchExpression for key {key:?} with operator {operator:?} has invalid values"
+    )]
+    InvalidMatchExpressionValues {
+        field: &'static str,
+        key: String,
+        operator: String,
+    },
     #[error("ingress rule {rule_index} peer {peer_index} uses unsupported ipBlock")]
     UnsupportedIpBlock {
         rule_index: usize,
@@ -239,11 +256,51 @@ fn pod_identity_selector(
     namespace: Option<String>,
     field: &'static str,
 ) -> Result<IdentitySelector, NetworkPolicyCompileError> {
-    reject_expressions(&selector, field)?;
+    let match_expressions = selector
+        .match_expressions
+        .unwrap_or_default()
+        .into_iter()
+        .map(|requirement| label_expression(requirement, field))
+        .collect::<Result<BTreeSet<_>, _>>()?
+        .into_iter()
+        .collect();
     Ok(IdentitySelector {
         namespace,
         match_labels: selector.match_labels.unwrap_or_default(),
+        match_expressions,
         ..IdentitySelector::default()
+    })
+}
+
+fn label_expression(
+    requirement: LabelSelectorRequirement,
+    field: &'static str,
+) -> Result<LabelExpression, NetworkPolicyCompileError> {
+    let values: BTreeSet<_> = requirement.values.unwrap_or_default().into_iter().collect();
+    let operator = match requirement.operator.as_str() {
+        "In" if !values.is_empty() => LabelExpressionOperator::In,
+        "NotIn" if !values.is_empty() => LabelExpressionOperator::NotIn,
+        "Exists" if values.is_empty() => LabelExpressionOperator::Exists,
+        "DoesNotExist" if values.is_empty() => LabelExpressionOperator::DoesNotExist,
+        "In" | "NotIn" | "Exists" | "DoesNotExist" => {
+            return Err(NetworkPolicyCompileError::InvalidMatchExpressionValues {
+                field,
+                key: requirement.key,
+                operator: requirement.operator,
+            });
+        }
+        _ => {
+            return Err(NetworkPolicyCompileError::InvalidMatchExpressionOperator {
+                field,
+                key: requirement.key,
+                operator: requirement.operator,
+            });
+        }
+    };
+    Ok(LabelExpression {
+        key: requirement.key,
+        operator,
+        values,
     })
 }
 
@@ -360,6 +417,14 @@ mod tests {
         LabelSelector {
             match_labels: Some(labels(values)),
             ..LabelSelector::default()
+        }
+    }
+
+    fn expression(key: &str, operator: &str, values: &[&str]) -> LabelSelectorRequirement {
+        LabelSelectorRequirement {
+            key: key.to_owned(),
+            operator: operator.to_owned(),
+            values: Some(values.iter().map(|value| (*value).to_owned()).collect()),
         }
     }
 
@@ -548,6 +613,153 @@ mod tests {
     }
 
     #[test]
+    fn pod_match_expressions_follow_kubernetes_semantics() {
+        let mut expression_policy = policy(vec![NetworkPolicyIngressRule {
+            from: Some(vec![NetworkPolicyPeer {
+                namespace_selector: Some(selector(&[(NAMESPACE_NAME_LABEL, "frontend")])),
+                pod_selector: Some(LabelSelector {
+                    match_expressions: Some(vec![
+                        expression("app", "In", &["client", "worker"]),
+                        expression("blocked", "NotIn", &["yes"]),
+                        expression("managed", "Exists", &[]),
+                    ]),
+                    ..LabelSelector::default()
+                }),
+                ..NetworkPolicyPeer::default()
+            }]),
+            ports: None,
+        }]);
+        expression_policy
+            .spec
+            .as_mut()
+            .expect("spec exists")
+            .pod_selector = Some(LabelSelector {
+            match_expressions: Some(vec![
+                expression("app", "In", &["server"]),
+                expression("tier", "NotIn", &["edge"]),
+                expression("managed", "Exists", &[]),
+                expression("skip", "DoesNotExist", &[]),
+            ]),
+            ..LabelSelector::default()
+        });
+        let compiled = NetworkPolicyCompiler::compile(PolicyId::new(7), expression_policy)
+            .expect("pod matchExpressions compile");
+        let mut source = endpoint(1, "frontend", "client");
+        source
+            .labels
+            .insert("managed".to_owned(), "true".to_owned());
+        let mut destination = endpoint(2, "backend", "server");
+        destination
+            .labels
+            .insert("tier".to_owned(), "core".to_owned());
+        destination
+            .labels
+            .insert("managed".to_owned(), "true".to_owned());
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source: &source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8080,
+                }
+            )
+            .verdict,
+            Verdict::Allow
+        );
+
+        source.labels.insert("blocked".to_owned(), "yes".to_owned());
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source: &source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8080,
+                }
+            )
+            .verdict,
+            Verdict::Deny
+        );
+
+        destination.labels.remove("managed");
+        assert_eq!(
+            evaluate(
+                &[compiled],
+                Flow {
+                    source: &source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8080,
+                }
+            )
+            .reason,
+            PolicyReason::NoApplicablePolicy
+        );
+    }
+
+    #[test]
+    fn pod_match_expression_order_is_canonical() {
+        let mut first = policy(Vec::new());
+        first.spec.as_mut().expect("spec exists").pod_selector = Some(LabelSelector {
+            match_expressions: Some(vec![
+                expression("tier", "NotIn", &["edge"]),
+                expression("app", "In", &["server", "api"]),
+            ]),
+            ..LabelSelector::default()
+        });
+        let mut second = first.clone();
+        second
+            .spec
+            .as_mut()
+            .expect("spec exists")
+            .pod_selector
+            .as_mut()
+            .expect("selector exists")
+            .match_expressions
+            .as_mut()
+            .expect("expressions exist")
+            .reverse();
+        assert_eq!(
+            NetworkPolicyCompiler::compile(PolicyId::new(7), first),
+            NetworkPolicyCompiler::compile(PolicyId::new(7), second)
+        );
+    }
+
+    #[test]
+    fn invalid_pod_match_expressions_fail_explicitly() {
+        let mut invalid_values = policy(Vec::new());
+        invalid_values
+            .spec
+            .as_mut()
+            .expect("spec exists")
+            .pod_selector = Some(LabelSelector {
+            match_expressions: Some(vec![expression("app", "In", &[])]),
+            ..LabelSelector::default()
+        });
+        assert!(matches!(
+            NetworkPolicyCompiler::compile(PolicyId::new(7), invalid_values),
+            Err(NetworkPolicyCompileError::InvalidMatchExpressionValues { .. })
+        ));
+
+        let mut invalid_operator = policy(Vec::new());
+        invalid_operator
+            .spec
+            .as_mut()
+            .expect("spec exists")
+            .pod_selector = Some(LabelSelector {
+            match_expressions: Some(vec![expression("app", "Equals", &["server"])]),
+            ..LabelSelector::default()
+        });
+        assert!(matches!(
+            NetworkPolicyCompiler::compile(PolicyId::new(7), invalid_operator),
+            Err(NetworkPolicyCompileError::InvalidMatchExpressionOperator { .. })
+        ));
+    }
+
+    #[test]
     fn unsupported_features_fail_explicitly() {
         let ip_block_policy = policy(vec![NetworkPolicyIngressRule {
             from: Some(vec![NetworkPolicyPeer {
@@ -564,19 +776,16 @@ mod tests {
             Err(NetworkPolicyCompileError::UnsupportedIpBlock { .. })
         ));
 
-        let mut expression_policy = policy(Vec::new());
-        expression_policy
-            .spec
-            .as_mut()
-            .expect("spec exists")
-            .pod_selector = Some(LabelSelector {
-            match_expressions: Some(vec![LabelSelectorRequirement {
-                key: "app".to_owned(),
-                operator: "In".to_owned(),
-                values: Some(vec!["server".to_owned()]),
+        let expression_policy = policy(vec![NetworkPolicyIngressRule {
+            from: Some(vec![NetworkPolicyPeer {
+                namespace_selector: Some(LabelSelector {
+                    match_expressions: Some(vec![expression("environment", "In", &["production"])]),
+                    ..LabelSelector::default()
+                }),
+                ..NetworkPolicyPeer::default()
             }]),
-            ..LabelSelector::default()
-        });
+            ports: None,
+        }]);
         assert!(matches!(
             NetworkPolicyCompiler::compile(PolicyId::new(7), expression_policy),
             Err(NetworkPolicyCompileError::UnsupportedMatchExpressions { .. })

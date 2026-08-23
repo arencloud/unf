@@ -22,11 +22,13 @@ identity-tuple/BPF lowering.
 
 Compatibility policy uses reserved priority `1_000_000`, below the native policy
 default range, so an explicitly managed native policy can override the baseline.
-The first translator accepts pod `matchLabels`, local pod peers, empty or exact
-`kubernetes.io/metadata.name` namespace selectors, numeric TCP/UDP ports, and
-wildcards. It returns typed errors for egress, IP blocks, match expressions,
-general namespace-label selectors, named/ranged ports, protocol-only entries,
-SCTP, and malformed metadata/ports.
+The translator accepts pod `matchLabels` and normalized `matchExpressions`, local
+pod peers, empty or exact `kubernetes.io/metadata.name` namespace selectors,
+numeric TCP/UDP ports, and wildcards. Core policy IR represents `In`, `NotIn`,
+`Exists`, and `DoesNotExist` independently of Kubernetes types. It returns typed
+errors for egress, IP blocks, namespace-selector expressions, general namespace-
+label selectors, named/ranged ports, protocol-only entries, SCTP, and malformed
+metadata/ports or selector requirements.
 
 The controller watches `NetworkPolicy` objects cluster-wide and assigns each a
 stable compatibility policy ID. Accepted IR joins native policy in the revisioned
