@@ -22,7 +22,7 @@ repeatable test are both present in this repository.
 | Phase | State | Gate | Evidence |
 |---|---|---|---|
 | Phase 1 — observation foundation | **Verified** | Master prompt §101: controller, identity state, policy compiler, agent/Aya/TC flow events, and successful `unfctl status` | `make fmt-check lint test`, `make ebpf`, `make kind-test` |
-| Phase 2 — identity and policy enforcement | **In progress** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | Identity admission/index slice implemented; enforcement gate remains open |
+| Phase 2 — identity and policy enforcement | **In progress** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | Identity distribution verified; transactional policy distribution implemented; enforcement gate remains open |
 | Phase 3 — compatibility and simulation | **Planned** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | No implementation claim |
 | Full CNI and later fabric capabilities | **Planned** | §104 and later roadmap gates | Explicitly out of current scope |
 
@@ -39,8 +39,9 @@ completed by Phase 1's observation-only shadow evaluation.
 | eBPF target build and manifest rendering | Passed: `make ebpf` and `kubectl kustomize deploy` |
 | Two-node cluster integration | Passed: `make kind-test` |
 | Demo dataplane | `frontend/client` reached `backend/server:8080`; the worker agent emitted the flow with nonzero source and destination identities |
-| Agent state | Two ready agents; BPF loaded; both applied the controller epoch/revision and populated six IPv4 entries |
-| Controller state | Ready; 16 watched Pods, 14 admitted identities, 6 indexed non-host-network Pod IPs, one compiled policy |
+| Agent state | Two ready agents; BPF loaded; both applied identity revision 19 and policy revision 21 with six identity and 15 active policy entries |
+| Controller state | Ready; 16 watched Pods, 14 admitted identities, 6 indexed non-host-network Pod IPs, one compiled policy, 15 resolved policy entries |
+| Transactional policy update | The kind verifier changed policy priority, required a higher revision on the opposite bank, restored the policy, and required a second convergence |
 | Restart recovery | Both running agents accepted a new controller epoch and converged from revision 33 to the restarted controller's revision 20 without restarting the dataplane |
 | Policy explanation | Port 8080 matched the explicit shadow allow; port 9090 matched shadow default deny |
 
@@ -74,7 +75,8 @@ gate.
 | Controller integration and identity counts | **Verified** | `make kind-test` requires nonzero admitted identities and indexed Pod IPs |
 | Versioned BPF identity map schema | **Verified** | ABI tests plus `make kind-test` require a populated live kernel map |
 | Controller-to-agent revisioned distribution | **Verified** | Both node agents report desired/applied epoch and revision convergence; controller-restart recovery exercised live |
-| Transactional policy map set | **Planned** | Failed update preserves last-known-good active revision |
+| Selector-to-identity policy lowering | **Verified** | Unit tests cover exact/default, shadow provenance, conflicts, and deterministic ordering; `make kind-test` requires nonzero resolved entries |
+| Transactional policy map set | **Verified** | `make kind-test` stages a changed policy on the opposite bank, verifies a higher applied revision, restores it, and verifies reconvergence |
 | TC identity lookup | **Verified** | Cross-node demo flow carries nonzero source and destination IDs |
 | L3/L4 policy decision | **Planned** | Deterministic policy/rule provenance and reason code in events |
 | Enforcement | **Planned** | 8080 passes and 9090 is dropped in kind |
@@ -84,8 +86,10 @@ gate.
 ## Current limitations
 
 - TC remains observation-only and always passes traffic.
-- Identity desired state is distributed but remains in-memory and unpinned;
-  compiled policy is not distributed to agent/BPF maps.
+- Identity and compiled policy desired state are distributed but remain in-memory
+  and their BPF maps are unpinned.
+- TC does not read `POLICY_CONFIG`/`POLICY_RULES` yet, so distributed decisions
+  cannot affect forwarding.
 - Resolved IPv4 flows carry identity IDs. Policy, rule, and interface IDs remain
   zero until their Phase 2 lookup/provenance paths are connected.
 - Dynamic attachment can observe one packet on multiple interfaces; flow

@@ -10,8 +10,13 @@ unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 temporary_dir=$(mktemp -d)
 controller_forward_pid=
 agent_forward_pid=
+policy_mutated=false
 
 cleanup() {
+    if [[ ${policy_mutated} == true ]]; then
+        "${kc[@]}" patch securitypolicy -n backend frontend-to-backend \
+            --type=merge -p '{"spec":{"priority":100}}' >/dev/null 2>&1 || true
+    fi
     if [[ -n ${controller_forward_pid} ]]; then
         kill "${controller_forward_pid}" 2>/dev/null || true
     fi
@@ -49,6 +54,7 @@ controller_status=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json status)
 grep -Eq '"identities": [1-9][0-9]*' <<<"${controller_status}"
 grep -Eq '"indexed_pod_ips": [1-9][0-9]*' <<<"${controller_status}"
+grep -Eq '"resolved_policy_entries": [1-9][0-9]*' <<<"${controller_status}"
 
 allow_explanation=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json \
@@ -73,19 +79,75 @@ for _ in {1..20}; do
     desired_epoch=$(sed -nE 's/.*"desired_identity_epoch":([0-9]+).*/\1/p' <<<"${agent_status}")
     applied_epoch=$(sed -nE 's/.*"applied_identity_epoch":([0-9]+).*/\1/p' <<<"${agent_status}")
     map_entries=$(sed -nE 's/.*"identity_map_entries":([0-9]+).*/\1/p' <<<"${agent_status}")
+    desired_policy_revision=$(sed -nE 's/.*"desired_policy_revision":([0-9]+).*/\1/p' <<<"${agent_status}")
+    applied_policy_revision=$(sed -nE 's/.*"applied_policy_revision":([0-9]+).*/\1/p' <<<"${agent_status}")
+    desired_policy_epoch=$(sed -nE 's/.*"desired_policy_epoch":([0-9]+).*/\1/p' <<<"${agent_status}")
+    applied_policy_epoch=$(sed -nE 's/.*"applied_policy_epoch":([0-9]+).*/\1/p' <<<"${agent_status}")
+    policy_entries=$(sed -nE 's/.*"policy_map_entries":([0-9]+).*/\1/p' <<<"${agent_status}")
     if [[ -n ${desired_revision} && ${desired_revision} == "${applied_revision}" \
         && -n ${desired_epoch} && ${desired_epoch} == "${applied_epoch}" \
-        && ${map_entries:-0} -gt 0 ]]; then
+        && ${map_entries:-0} -gt 0 \
+        && -n ${desired_policy_revision} && ${desired_policy_revision} == "${applied_policy_revision}" \
+        && -n ${desired_policy_epoch} && ${desired_policy_epoch} == "${applied_policy_epoch}" \
+        && ${policy_entries:-0} -gt 0 ]]; then
         identity_synced=true
         break
     fi
     sleep 1
 done
 if [[ ${identity_synced} != true ]]; then
-    echo "UNF agent did not apply the controller identity revision" >&2
+    echo "UNF agent did not apply the controller identity and policy revisions" >&2
     exit 1
 fi
 grep -q '"bpf_loaded":true' <<<"${agent_status}"
+grep -Eq '"active_policy_bank":[01]' <<<"${agent_status}"
+
+initial_policy_revision=${applied_policy_revision}
+initial_policy_bank=$(sed -nE 's/.*"active_policy_bank":([0-9]+).*/\1/p' <<<"${agent_status}")
+"${kc[@]}" patch securitypolicy -n backend frontend-to-backend \
+    --type=merge -p '{"spec":{"priority":101}}' >/dev/null
+policy_mutated=true
+policy_switched=false
+for _ in {1..30}; do
+    agent_status=$(curl --fail --silent "http://127.0.0.1:${agent_port}/v1/status" || true)
+    desired_policy_revision=$(sed -nE 's/.*"desired_policy_revision":([0-9]+).*/\1/p' <<<"${agent_status}")
+    applied_policy_revision=$(sed -nE 's/.*"applied_policy_revision":([0-9]+).*/\1/p' <<<"${agent_status}")
+    active_policy_bank=$(sed -nE 's/.*"active_policy_bank":([0-9]+).*/\1/p' <<<"${agent_status}")
+    if [[ -n ${applied_policy_revision} \
+        && ${applied_policy_revision} -gt ${initial_policy_revision} \
+        && ${desired_policy_revision} == "${applied_policy_revision}" \
+        && ${active_policy_bank} != "${initial_policy_bank}" ]]; then
+        policy_switched=true
+        break
+    fi
+    sleep 1
+done
+if [[ ${policy_switched} != true ]]; then
+    echo "UNF agent did not atomically switch to the staged policy bank" >&2
+    exit 1
+fi
+
+staged_policy_revision=${applied_policy_revision}
+"${kc[@]}" patch securitypolicy -n backend frontend-to-backend \
+    --type=merge -p '{"spec":{"priority":100}}' >/dev/null
+policy_mutated=false
+policy_restored=false
+for _ in {1..30}; do
+    agent_status=$(curl --fail --silent "http://127.0.0.1:${agent_port}/v1/status" || true)
+    desired_policy_revision=$(sed -nE 's/.*"desired_policy_revision":([0-9]+).*/\1/p' <<<"${agent_status}")
+    applied_policy_revision=$(sed -nE 's/.*"applied_policy_revision":([0-9]+).*/\1/p' <<<"${agent_status}")
+    if [[ -n ${applied_policy_revision} \
+        && ${applied_policy_revision} -gt ${staged_policy_revision} \
+        && ${desired_policy_revision} == "${applied_policy_revision}" ]]; then
+        policy_restored=true
+        break
+    fi
+    sleep 1
+done
+if [[ ${policy_restored} != true ]]; then
+    echo "UNF agent did not converge after restoring the demo policy" >&2
+    exit 1
+fi
 
 response=$("${kc[@]}" exec -n frontend client -- \
     wget -qO- http://server.backend.svc.cluster.local:8080)
@@ -102,4 +164,4 @@ if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${flow_line}" \
     exit 1
 fi
 
-echo "kind verification passed: identity distribution, enriched eBPF flow, and shadow explanations"
+echo "kind verification passed: transactional policy/identity distribution, enriched eBPF flow, and shadow explanations"

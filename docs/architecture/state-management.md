@@ -13,13 +13,13 @@ into the collision-checked registry so entries and revision are snapshotted unde
 one lock. The snapshot also carries a controller-process epoch, allowing agents to
 distinguish a restart from a stale lower revision.
 
-Agents poll the internal identity snapshot endpoint and publish desired/applied
-epoch and revision. A revision is acknowledged only after the versioned
-`IDENTITY_V4` map is reconciled. This first identity update path validates before
-mutation and restores the cached prior contents after an error, but it is not the
-atomic active/staging mechanism required before enforcement. See ADR 0006.
+Agents poll internal identity and policy snapshot endpoints and publish each
+desired/applied epoch and revision. Identity reconciliation retains its
+observation-safe rollback behavior. Policy reconciliation uses two banks: the
+inactive bank is populated and read back before one `POLICY_CONFIG` write selects
+it. See ADRs 0006 and 0007.
 
-The planned node update lifecycle is:
+The policy node update lifecycle is now implemented as:
 
 ```text
 compile N+1 -> populate staging maps -> validate -> atomically select N+1
@@ -28,8 +28,9 @@ compile N+1 -> populate staging maps -> validate -> atomically select N+1
 
 Existing applied state must remain usable if the controller or Kubernetes API is
 temporarily unavailable. New state must never partially overwrite active maps.
-Pinned map ownership, schema migrations, persistence, and last-known-good recovery
-are Phase 2 design gates, not claims of the current prototype.
+The prior bank remains active through any pre-switch failure. Pinned map
+ownership, schema migrations, persistence across agent restart, and controller
+acknowledgement aggregation remain Phase 2 design gates.
 
 Kubernetes watches remain the controller input. Internal HTTP snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

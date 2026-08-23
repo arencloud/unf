@@ -24,9 +24,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_api::SecurityPolicy;
 use unf_common::{PolicyId, Protocol, Revision};
-use unf_policy::{Endpoint, Flow, PolicyCompiler, PolicyIr, evaluate};
+use unf_policy::{Endpoint, Flow, PolicyCompiler, PolicyIr, compile_dataplane_entries, evaluate};
 use unf_state::{
-    IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, RevisionSet, provisional_identity_id,
+    IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
+    PolicyStateSnapshot, RevisionSet, provisional_identity_id,
 };
 
 #[derive(Debug, Parser)]
@@ -53,13 +54,14 @@ struct ControllerState {
     namespaces: RwLock<BTreeMap<String, Namespace>>,
     policies: RwLock<BTreeMap<String, SecurityPolicy>>,
     compiled: RwLock<BTreeMap<String, PolicyIr>>,
+    policy_state_guard: RwLock<()>,
     identities: Mutex<IdentityRegistry>,
     revisions: Mutex<RevisionSet>,
     registry: Mutex<Registry>,
     metrics: ControllerMetrics,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PodRecord {
     namespace: String,
     name: String,
@@ -76,6 +78,7 @@ struct StatusBody {
     namespaces: usize,
     security_policies: usize,
     compiled_policies: usize,
+    resolved_policy_entries: usize,
     identities: usize,
     indexed_pod_ips: usize,
     identity_epoch: u64,
@@ -142,6 +145,7 @@ async fn main() -> Result<()> {
         .route("/metrics", get(metrics))
         .route("/v1/status", get(status))
         .route("/v1/state/identities", get(identity_snapshot))
+        .route("/v1/state/policies", get(policy_snapshot))
         .route("/v1/explain", post(explain))
         .with_state(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind(args.listen)
@@ -198,6 +202,7 @@ fn new_state(offline: bool) -> ControllerState {
         namespaces: RwLock::new(BTreeMap::new()),
         policies: RwLock::new(BTreeMap::new()),
         compiled: RwLock::new(BTreeMap::new()),
+        policy_state_guard: RwLock::new(()),
         identities: Mutex::new(IdentityRegistry::default()),
         revisions: Mutex::new(RevisionSet::default()),
         registry: Mutex::new(registry),
@@ -250,16 +255,28 @@ async fn watch_pods(api: Api<Pod>, state: Arc<ControllerState>, cancellation: Ca
 }
 
 fn apply_pod_event(state: &ControllerState, event: Event<Pod>) {
+    let _policy_state_guard = write_lock(&state.policy_state_guard);
     match event {
         Event::Apply(pod) | Event::InitApply(pod) => upsert_pod(state, &pod),
         Event::Delete(pod) => {
             let key = object_key(&pod);
-            write_lock(&state.pods).remove(&key);
+            let removed = write_lock(&state.pods).remove(&key);
             mutex_lock(&state.identities).remove_pod(&key);
+            if let Some(removed) = removed
+                && !read_lock(&state.pods)
+                    .values()
+                    .any(|pod| pod.endpoint.identity == removed.endpoint.identity)
+            {
+                bump_policy_revision(state);
+            }
         }
         Event::Init => {
+            let had_pods = !read_lock(&state.pods).is_empty();
             write_lock(&state.pods).clear();
             mutex_lock(&state.identities).clear();
+            if had_pods {
+                bump_policy_revision(state);
+            }
         }
         Event::InitDone => {}
     }
@@ -285,7 +302,8 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
         .or_else(|| labels.get("app"))
         .cloned();
     let workload = application.clone().unwrap_or_else(|| name.clone());
-    let identity_key = format!("local/{namespace}/{service_account}/{workload}");
+    let identity_key =
+        canonical_identity_key("local", &namespace, &service_account, &workload, &labels);
     let identity_id = provisional_identity_id(&identity_key);
     let identity = NetworkIdentity {
         id: identity_id,
@@ -314,14 +332,15 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
         application,
         labels,
     };
-    write_lock(&state.pods).insert(
-        key,
-        PodRecord {
-            namespace,
-            name,
-            endpoint,
-        },
-    );
+    let record = PodRecord {
+        namespace,
+        name,
+        endpoint,
+    };
+    let previous = write_lock(&state.pods).insert(key, record.clone());
+    if previous.as_ref() != Some(&record) {
+        bump_policy_revision(state);
+    }
     state.metrics.reconciles.inc();
 }
 
@@ -411,17 +430,19 @@ async fn watch_policies(
 }
 
 fn apply_policy_event(state: &ControllerState, event: Event<SecurityPolicy>) {
+    let _policy_state_guard = write_lock(&state.policy_state_guard);
     match event {
         Event::Apply(policy) | Event::InitApply(policy) => {
             let key = object_key(&policy);
             let id = stable_policy_id(&key);
             match PolicyCompiler::compile(id, policy.clone()) {
                 Ok(ir) => {
-                    write_lock(&state.compiled).insert(key.clone(), ir);
+                    let previous = write_lock(&state.compiled).insert(key.clone(), ir.clone());
                     write_lock(&state.policies).insert(key, policy);
                     state.metrics.reconciles.inc();
-                    let mut revisions = mutex_lock(&state.revisions);
-                    revisions.policy = revisions.policy.next();
+                    if previous.as_ref() != Some(&ir) {
+                        bump_policy_revision(state);
+                    }
                 }
                 Err(error) => {
                     state.metrics.errors.inc();
@@ -432,13 +453,17 @@ fn apply_policy_event(state: &ControllerState, event: Event<SecurityPolicy>) {
         Event::Delete(policy) => {
             let key = object_key(&policy);
             write_lock(&state.policies).remove(&key);
-            write_lock(&state.compiled).remove(&key);
-            let mut revisions = mutex_lock(&state.revisions);
-            revisions.policy = revisions.policy.next();
+            if write_lock(&state.compiled).remove(&key).is_some() {
+                bump_policy_revision(state);
+            }
         }
         Event::Init => {
             write_lock(&state.policies).clear();
+            let had_policies = !read_lock(&state.compiled).is_empty();
             write_lock(&state.compiled).clear();
+            if had_policies {
+                bump_policy_revision(state);
+            }
         }
         Event::InitDone => {}
     }
@@ -467,11 +492,13 @@ async fn metrics(State(state): State<Arc<ControllerState>>) -> Response {
     }
 }
 
-async fn status(State(state): State<Arc<ControllerState>>) -> Json<StatusBody> {
+async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<StatusBody>, ApiError> {
+    let (_, policy_entries) = dataplane_policy_state(&state)?;
+    let resolved_policy_entries = policy_entries.len();
     let identities = mutex_lock(&state.identities);
     let mut revisions = mutex_lock(&state.revisions).clone();
     revisions.identity = identities.revision();
-    Json(StatusBody {
+    Ok(Json(StatusBody {
         component: "unf-controller",
         healthy: true,
         ready: state.ready.load(Ordering::Acquire),
@@ -484,21 +511,48 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Json<StatusBody> {
         namespaces: read_lock(&state.namespaces).len(),
         security_policies: read_lock(&state.policies).len(),
         compiled_policies: read_lock(&state.compiled).len(),
+        resolved_policy_entries,
         identities: identities.identity_count(),
         indexed_pod_ips: identities.address_count(),
         identity_epoch: state.identity_epoch,
         revisions,
         limitations: [
             "desired state and identity allocations are currently in-memory only",
-            "identity state is distributed; policy maps and enforcement are not enabled",
+            "identity and policy state are distributed; TC enforcement is not enabled",
         ],
-    })
+    }))
 }
 
 async fn identity_snapshot(
     State(state): State<Arc<ControllerState>>,
 ) -> Json<IdentityStateSnapshot> {
     Json(mutex_lock(&state.identities).ipv4_snapshot(state.identity_epoch))
+}
+
+async fn policy_snapshot(
+    State(state): State<Arc<ControllerState>>,
+) -> Result<Json<PolicyStateSnapshot>, ApiError> {
+    let (revision, entries) = dataplane_policy_state(&state)?;
+    Ok(Json(PolicyStateSnapshot {
+        schema_version: POLICY_SNAPSHOT_SCHEMA_VERSION,
+        source_epoch: state.identity_epoch,
+        revision,
+        entries,
+    }))
+}
+
+fn dataplane_policy_state(
+    state: &ControllerState,
+) -> Result<(Revision, Vec<unf_state::PolicyMapEntry>), ApiError> {
+    let _policy_state_guard = read_lock(&state.policy_state_guard);
+    let policies: Vec<_> = read_lock(&state.compiled).values().cloned().collect();
+    let endpoints: Vec<_> = read_lock(&state.pods)
+        .values()
+        .map(|pod| pod.endpoint.clone())
+        .collect();
+    let entries = compile_dataplane_entries(&policies, &endpoints)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok((mutex_lock(&state.revisions).policy, entries))
 }
 
 async fn explain(
@@ -508,6 +562,7 @@ async fn explain(
     if request.port == 0 {
         return Err(ApiError::bad_request("port must be between 1 and 65535"));
     }
+    let _policy_state_guard = read_lock(&state.policy_state_guard);
     let pods = read_lock(&state.pods);
     let source = pods
         .get(&request.from)
@@ -536,7 +591,7 @@ async fn explain(
         decision,
         policy_revision: revision,
         dataplane_enforcement: false,
-        note: "Phase 1 explanation is userspace-only; TC enforcement is not enabled",
+        note: "policy desired state is distributed; TC enforcement is not enabled",
     }))
 }
 
@@ -569,6 +624,13 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -591,6 +653,38 @@ fn object_key(resource: &impl ResourceExt) -> String {
 
 fn stable_policy_id(key: &str) -> PolicyId {
     PolicyId::new(provisional_identity_id(key).get())
+}
+
+fn canonical_identity_key(
+    cluster: &str,
+    namespace: &str,
+    service_account: &str,
+    workload: &str,
+    labels: &BTreeMap<String, String>,
+) -> String {
+    fn append_component(key: &mut String, value: &str) {
+        key.push('|');
+        key.push_str(&value.len().to_string());
+        key.push(':');
+        key.push_str(value);
+    }
+
+    let mut key = "v1".to_owned();
+    append_component(&mut key, cluster);
+    append_component(&mut key, namespace);
+    append_component(&mut key, service_account);
+    append_component(&mut key, workload);
+    append_component(&mut key, &labels.len().to_string());
+    for (label, value) in labels {
+        append_component(&mut key, label);
+        append_component(&mut key, value);
+    }
+    key
+}
+
+fn bump_policy_revision(state: &ControllerState) {
+    let mut revisions = mutex_lock(&state.revisions);
+    revisions.policy = revisions.policy.next();
 }
 
 fn controller_epoch() -> u64 {
@@ -625,4 +719,44 @@ fn init_tracing() {
                 .unwrap_or_else(|_| "unf_controller=info".into()),
         )
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_identity_key_is_order_independent_and_label_sensitive() {
+        let left = BTreeMap::from([
+            ("app".to_owned(), "server".to_owned()),
+            ("track".to_owned(), "stable".to_owned()),
+        ]);
+        let right = BTreeMap::from([
+            ("track".to_owned(), "stable".to_owned()),
+            ("app".to_owned(), "server".to_owned()),
+        ]);
+        let base = canonical_identity_key("local", "backend", "default", "server", &left);
+        assert_eq!(
+            base,
+            canonical_identity_key("local", "backend", "default", "server", &right)
+        );
+
+        let changed = BTreeMap::from([
+            ("app".to_owned(), "server".to_owned()),
+            ("track".to_owned(), "canary".to_owned()),
+        ]);
+        assert_ne!(
+            base,
+            canonical_identity_key("local", "backend", "default", "server", &changed)
+        );
+    }
+
+    #[test]
+    fn canonical_identity_key_is_unambiguous_for_delimiters() {
+        let labels = BTreeMap::new();
+        assert_ne!(
+            canonical_identity_key("local", "a|1:b", "c", "d", &labels),
+            canonical_identity_key("local", "a", "1:b|c", "d", &labels)
+        );
+    }
 }

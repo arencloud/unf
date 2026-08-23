@@ -2813,6 +2813,7 @@ dependencies = [
  "thiserror",
  "unf-api",
  "unf-common",
+ "unf-state",
 ]
 
 [[package]]

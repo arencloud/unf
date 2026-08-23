@@ -45,7 +45,8 @@ making IP the trust principal. HTTP is intentionally an internal prototype
 transport; authentication, authorization, backoff/jitter, and scale behavior are
 required before production. Identity reconciliation can be transiently mixed
 during an update, although failure rolls back best-effort and no deny verdict is
-enabled. Policy enforcement still requires a transactional active/staging design.
+enabled. Policy enforcement still requires a transactional active/staging design;
+ADR 0007 subsequently defines and implements that policy distribution mechanism.
 
 ## Open questions
 

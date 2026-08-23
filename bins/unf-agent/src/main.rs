@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use aya::Ebpf;
-use aya::maps::{HashMap as AyaHashMap, MapData, RingBuf};
+use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData, RingBuf};
 use aya::programs::{SchedClassifier, TcAttachType, tc};
 use clap::{Parser, ValueEnum};
 use prometheus_client::encoding::text::encode;
@@ -24,9 +24,16 @@ use serde::Serialize;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use unf_common::{IdentityId, PolicyId, RuleId, Verdict};
-use unf_ebpf_common::{FlowEvent, FlowKey, IdentityMapValue, Ipv4IdentityKey};
-use unf_state::{IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping};
+use unf_common::{IdentityId, PolicyId, PolicyReason, RuleId, Verdict};
+use unf_ebpf_common::{
+    FlowEvent, FlowKey, IdentityMapValue, Ipv4IdentityKey, POLICY_BANK_COUNT,
+    POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
+    POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
+};
+use unf_state::{
+    IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
+    POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord, PolicyMapEntry, PolicyStateSnapshot,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF per-node eBPF agent")]
@@ -61,6 +68,10 @@ struct AgentMetrics {
     desired_identity_revision: Gauge,
     applied_identity_revision: Gauge,
     identity_map_entries: Gauge,
+    policy_sync_errors: Counter,
+    desired_policy_revision: Gauge,
+    applied_policy_revision: Gauge,
+    policy_map_entries: Gauge,
 }
 
 struct AgentState {
@@ -72,6 +83,12 @@ struct AgentState {
     desired_identity_epoch: AtomicU64,
     applied_identity_epoch: AtomicU64,
     identity_map_entries: AtomicU64,
+    desired_policy_revision: AtomicU64,
+    applied_policy_revision: AtomicU64,
+    desired_policy_epoch: AtomicU64,
+    applied_policy_epoch: AtomicU64,
+    policy_map_entries: AtomicU64,
+    active_policy_bank: AtomicU64,
     capabilities: KernelCapabilities,
     registry: Mutex<Registry>,
     metrics: AgentMetrics,
@@ -80,6 +97,17 @@ struct AgentState {
 struct IdentitySynchronizer {
     map: AyaHashMap<MapData, [u8; 4], [u8; 16]>,
     applied: BTreeMap<[u8; 4], [u8; 16]>,
+    applied_epoch: u64,
+    controller_url: Option<String>,
+    client: reqwest::Client,
+    interval: Duration,
+}
+
+struct PolicySynchronizer {
+    map: AyaHashMap<MapData, [u8; 12], [u8; 32]>,
+    config: AyaArray<MapData, [u8; 24]>,
+    banks: [BTreeMap<[u8; 12], [u8; 32]>; POLICY_BANK_COUNT as usize],
+    active_bank: u8,
     applied_epoch: u64,
     controller_url: Option<String>,
     client: reqwest::Client,
@@ -134,6 +162,12 @@ struct AgentStatus {
     desired_identity_epoch: u64,
     applied_identity_epoch: u64,
     identity_map_entries: u64,
+    desired_policy_revision: u64,
+    applied_policy_revision: u64,
+    desired_policy_epoch: u64,
+    applied_policy_epoch: u64,
+    policy_map_entries: u64,
+    active_policy_bank: u64,
     capabilities: KernelCapabilities,
     limitation: &'static str,
 }
@@ -225,6 +259,10 @@ fn new_state(capabilities: KernelCapabilities) -> AgentState {
         desired_identity_revision: Gauge::default(),
         applied_identity_revision: Gauge::default(),
         identity_map_entries: Gauge::default(),
+        policy_sync_errors: Counter::default(),
+        desired_policy_revision: Gauge::default(),
+        applied_policy_revision: Gauge::default(),
+        policy_map_entries: Gauge::default(),
     };
     let mut registry = Registry::default();
     registry.register(
@@ -262,6 +300,26 @@ fn new_state(capabilities: KernelCapabilities) -> AgentState {
         "IPv4 identity entries currently applied to the BPF map",
         metrics.identity_map_entries.clone(),
     );
+    registry.register(
+        "unf_policy_sync_errors",
+        "Controller policy snapshots rejected or not applied",
+        metrics.policy_sync_errors.clone(),
+    );
+    registry.register(
+        "unf_policy_revision_desired",
+        "Latest effective policy revision observed from the controller",
+        metrics.desired_policy_revision.clone(),
+    );
+    registry.register(
+        "unf_policy_revision_applied",
+        "Policy revision atomically activated in the BPF map set",
+        metrics.applied_policy_revision.clone(),
+    );
+    registry.register(
+        "unf_policy_map_entries",
+        "Policy entries in the active BPF map bank",
+        metrics.policy_map_entries.clone(),
+    );
     AgentState {
         ready: AtomicBool::new(false),
         bpf_loaded: AtomicBool::new(false),
@@ -271,6 +329,12 @@ fn new_state(capabilities: KernelCapabilities) -> AgentState {
         desired_identity_epoch: AtomicU64::new(0),
         applied_identity_epoch: AtomicU64::new(0),
         identity_map_entries: AtomicU64::new(0),
+        desired_policy_revision: AtomicU64::new(0),
+        applied_policy_revision: AtomicU64::new(0),
+        desired_policy_epoch: AtomicU64::new(0),
+        applied_policy_epoch: AtomicU64::new(0),
+        policy_map_entries: AtomicU64::new(0),
+        active_policy_bank: AtomicU64::new(0),
         capabilities,
         registry: Mutex::new(registry),
         metrics,
@@ -294,6 +358,16 @@ async fn run_dataplane(
             .context("eBPF object does not contain IDENTITY_V4 map")?,
     )
     .context("open IDENTITY_V4 map")?;
+    let policy_map = AyaHashMap::<_, [u8; 12], [u8; 32]>::try_from(
+        ebpf.take_map("POLICY_RULES")
+            .context("eBPF object does not contain POLICY_RULES map")?,
+    )
+    .context("open POLICY_RULES map")?;
+    let policy_config = AyaArray::<_, [u8; 24]>::try_from(
+        ebpf.take_map("POLICY_CONFIG")
+            .context("eBPF object does not contain POLICY_CONFIG map")?,
+    )
+    .context("open POLICY_CONFIG map")?;
     let program_name = match config.direction {
         Direction::Ingress => "unf_observe_ingress",
         Direction::Egress => "unf_observe_egress",
@@ -338,11 +412,32 @@ async fn run_dataplane(
         applied_epoch: 0,
         controller_url: config
             .controller_url
+            .clone()
             .map(|url| url.trim_end_matches('/').to_owned()),
         client: reqwest::Client::new(),
         interval: config.identity_sync_interval,
     };
-    consume_events(ring, &mut attachments, &mut identities, state, cancellation).await;
+    let mut policies = PolicySynchronizer {
+        map: policy_map,
+        config: policy_config,
+        banks: [BTreeMap::new(), BTreeMap::new()],
+        active_bank: 0,
+        applied_epoch: 0,
+        controller_url: config
+            .controller_url
+            .map(|url| url.trim_end_matches('/').to_owned()),
+        client: reqwest::Client::new(),
+        interval: config.identity_sync_interval,
+    };
+    consume_events(
+        ring,
+        &mut attachments,
+        &mut identities,
+        &mut policies,
+        state,
+        cancellation,
+    )
+    .await;
     state.ready.store(false, Ordering::Release);
     state.bpf_loaded.store(false, Ordering::Release);
     state.metrics.bpf_loaded.set(0);
@@ -353,12 +448,14 @@ async fn consume_events(
     mut ring: RingBuf<aya::maps::MapData>,
     attachments: &mut InterfaceAttachments<'_>,
     identities: &mut IdentitySynchronizer,
+    policies: &mut PolicySynchronizer,
     state: &AgentState,
     cancellation: CancellationToken,
 ) {
     let mut event_interval = tokio::time::interval(Duration::from_millis(25));
     let mut interface_interval = tokio::time::interval(Duration::from_secs(1));
     let mut identity_interval = tokio::time::interval(identities.interval);
+    let mut policy_interval = tokio::time::interval(policies.interval);
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
@@ -371,6 +468,12 @@ async fn consume_events(
                 if let Err(error) = synchronize_identities(identities, state).await {
                     state.metrics.identity_sync_errors.inc();
                     warn!(?error, "identity synchronization failed");
+                }
+            }
+            _ = policy_interval.tick(), if policies.controller_url.is_some() => {
+                if let Err(error) = synchronize_policies(policies, state).await {
+                    state.metrics.policy_sync_errors.inc();
+                    warn!(?error, "policy synchronization failed");
                 }
             }
             _ = event_interval.tick() => {
@@ -560,6 +663,356 @@ fn restore_identity_entries(
     Ok(())
 }
 
+async fn synchronize_policies(
+    synchronizer: &mut PolicySynchronizer,
+    state: &AgentState,
+) -> Result<()> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("policy synchronization requires a controller URL")?;
+    let snapshot: PolicyStateSnapshot = synchronizer
+        .client
+        .get(format!("{controller_url}/v1/state/policies"))
+        .send()
+        .await
+        .context("request controller policy snapshot")?
+        .error_for_status()
+        .context("controller rejected policy snapshot request")?
+        .json()
+        .await
+        .context("decode controller policy snapshot")?;
+    if snapshot.schema_version != POLICY_SNAPSHOT_SCHEMA_VERSION {
+        bail!(
+            "unsupported policy snapshot schema {}; expected {}",
+            snapshot.schema_version,
+            POLICY_SNAPSHOT_SCHEMA_VERSION
+        );
+    }
+
+    let desired_revision = snapshot.revision.get();
+    state
+        .desired_policy_epoch
+        .store(snapshot.source_epoch, Ordering::Release);
+    state
+        .desired_policy_revision
+        .store(desired_revision, Ordering::Release);
+    state
+        .metrics
+        .desired_policy_revision
+        .set(metric_value(desired_revision));
+
+    let applied_revision = state.applied_policy_revision.load(Ordering::Acquire);
+    if snapshot.source_epoch == synchronizer.applied_epoch {
+        if desired_revision == applied_revision {
+            return Ok(());
+        }
+        if desired_revision < applied_revision {
+            bail!(
+                "stale policy revision {desired_revision} from epoch {}; applied revision is {applied_revision}",
+                snapshot.source_epoch
+            );
+        }
+    }
+
+    let staging_bank = (synchronizer.active_bank + 1) % POLICY_BANK_COUNT;
+    let desired = desired_policy_entries(&snapshot.entries, desired_revision, staging_bank)?;
+    apply_policy_entries(
+        synchronizer,
+        desired,
+        snapshot.source_epoch,
+        desired_revision,
+        staging_bank,
+    )?;
+    synchronizer.applied_epoch = snapshot.source_epoch;
+    state
+        .applied_policy_epoch
+        .store(snapshot.source_epoch, Ordering::Release);
+    state
+        .applied_policy_revision
+        .store(desired_revision, Ordering::Release);
+    state.policy_map_entries.store(
+        synchronizer.banks[usize::from(synchronizer.active_bank)].len() as u64,
+        Ordering::Release,
+    );
+    state
+        .active_policy_bank
+        .store(u64::from(synchronizer.active_bank), Ordering::Release);
+    state
+        .metrics
+        .applied_policy_revision
+        .set(metric_value(desired_revision));
+    state.metrics.policy_map_entries.set(metric_value(
+        synchronizer.banks[usize::from(synchronizer.active_bank)].len() as u64,
+    ));
+    info!(
+        policy_epoch = snapshot.source_epoch,
+        policy_revision = desired_revision,
+        entries = synchronizer.banks[usize::from(synchronizer.active_bank)].len(),
+        active_bank = synchronizer.active_bank,
+        "policy snapshot activated"
+    );
+    Ok(())
+}
+
+fn desired_policy_entries(
+    entries: &[PolicyMapEntry],
+    revision: u64,
+    bank: u8,
+) -> Result<BTreeMap<[u8; 12], [u8; 32]>> {
+    if bank >= POLICY_BANK_COUNT {
+        bail!("invalid policy bank {bank}");
+    }
+    let mut desired = BTreeMap::new();
+    for entry in entries {
+        validate_policy_entry(entry)?;
+        let key = encode_policy_key(entry, bank);
+        let value = encode_policy_value(entry, revision);
+        if desired.insert(key, value).is_some() {
+            bail!("controller snapshot contains a duplicate policy key");
+        }
+    }
+    Ok(desired)
+}
+
+fn validate_policy_entry(entry: &PolicyMapEntry) -> Result<()> {
+    if entry.key.source_identity.get() == 0 || entry.key.destination_identity.get() == 0 {
+        bail!("policy entry contains reserved identity ID zero");
+    }
+    match (entry.key.protocol, entry.key.destination_port) {
+        (0, 0) | (6 | 17, 1..=u16::MAX) => {}
+        _ => bail!("policy entry contains an invalid protocol/port wildcard combination"),
+    }
+    validate_policy_decision(&entry.decision)?;
+    if let Some(shadow) = &entry.shadow {
+        validate_policy_decision(shadow)?;
+    }
+    Ok(())
+}
+
+fn validate_policy_decision(decision: &PolicyDecisionRecord) -> Result<()> {
+    if !matches!(decision.verdict, Verdict::Allow | Verdict::Deny) {
+        bail!("policy map decision must be allow or deny");
+    }
+    if decision.policy_id.is_some_and(|id| id.get() == 0) {
+        bail!("policy entry contains reserved policy ID zero");
+    }
+    match decision.reason {
+        PolicyReason::NoApplicablePolicy => {
+            if decision.policy_id.is_some() || decision.rule_id.is_some() {
+                bail!("no-applicable-policy decision cannot contain policy provenance");
+            }
+        }
+        PolicyReason::ExplicitRule => {
+            if decision.policy_id.is_none() || decision.rule_id.is_none() {
+                bail!("explicit policy decision requires policy and rule provenance");
+            }
+        }
+        PolicyReason::DefaultAction => {
+            if decision.policy_id.is_none() || decision.rule_id.is_some() {
+                bail!("default policy decision requires a policy and no rule");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_policy_key(entry: &PolicyMapEntry, bank: u8) -> [u8; 12] {
+    let mut encoded = [0_u8; 12];
+    encoded[0..4].copy_from_slice(&entry.key.source_identity.get().to_ne_bytes());
+    encoded[4..8].copy_from_slice(&entry.key.destination_identity.get().to_ne_bytes());
+    encoded[8..10].copy_from_slice(&entry.key.destination_port.to_be_bytes());
+    encoded[10] = entry.key.protocol;
+    encoded[11] = bank;
+    encoded
+}
+
+fn encode_policy_value(entry: &PolicyMapEntry, revision: u64) -> [u8; 32] {
+    let mut encoded = [0_u8; 32];
+    let mut flags = 0_u16;
+    if let Some(policy_id) = entry.decision.policy_id {
+        flags |= POLICY_FLAG_HAS_POLICY;
+        encoded[0..4].copy_from_slice(&policy_id.get().to_ne_bytes());
+    }
+    if let Some(rule_id) = entry.decision.rule_id {
+        flags |= POLICY_FLAG_HAS_RULE;
+        encoded[4..8].copy_from_slice(&rule_id.get().to_ne_bytes());
+    }
+    if let Some(shadow) = entry.shadow {
+        flags |= POLICY_FLAG_HAS_SHADOW;
+        if let Some(policy_id) = shadow.policy_id {
+            flags |= POLICY_FLAG_SHADOW_HAS_POLICY;
+            encoded[8..12].copy_from_slice(&policy_id.get().to_ne_bytes());
+        }
+        if let Some(rule_id) = shadow.rule_id {
+            flags |= POLICY_FLAG_SHADOW_HAS_RULE;
+            encoded[12..16].copy_from_slice(&rule_id.get().to_ne_bytes());
+        }
+        encoded[30] = shadow.verdict as u8;
+        encoded[31] = shadow.reason as u8;
+    }
+    encoded[16..24].copy_from_slice(&revision.to_ne_bytes());
+    encoded[24..26].copy_from_slice(&POLICY_MAP_ABI_VERSION.to_ne_bytes());
+    encoded[26..28].copy_from_slice(&flags.to_ne_bytes());
+    encoded[28] = entry.decision.verdict as u8;
+    encoded[29] = entry.decision.reason as u8;
+    encoded
+}
+
+fn encode_policy_config(
+    source_epoch: u64,
+    revision: u64,
+    entry_count: usize,
+    active_bank: u8,
+) -> Result<[u8; 24]> {
+    let entry_count = u32::try_from(entry_count).context("policy entry count exceeds u32")?;
+    let mut encoded = [0_u8; 24];
+    encoded[0..8].copy_from_slice(&source_epoch.to_ne_bytes());
+    encoded[8..16].copy_from_slice(&revision.to_ne_bytes());
+    encoded[16..20].copy_from_slice(&entry_count.to_ne_bytes());
+    encoded[20..22].copy_from_slice(&POLICY_MAP_ABI_VERSION.to_ne_bytes());
+    encoded[22] = active_bank;
+    Ok(encoded)
+}
+
+fn apply_policy_entries(
+    synchronizer: &mut PolicySynchronizer,
+    desired: BTreeMap<[u8; 12], [u8; 32]>,
+    source_epoch: u64,
+    revision: u64,
+    staging_bank: u8,
+) -> Result<()> {
+    let staging_index = usize::from(staging_bank);
+    let previous_staging = synchronizer.banks[staging_index].clone();
+    if let Err(error) = replace_policy_entries(&mut synchronizer.map, &previous_staging, &desired) {
+        return Err(rollback_policy_stage(
+            &mut synchronizer.map,
+            &previous_staging,
+            staging_bank,
+            &error.context("stage policy map bank"),
+        ));
+    }
+    if let Err(error) = validate_staged_policy_entries(&synchronizer.map, &desired) {
+        return Err(rollback_policy_stage(
+            &mut synchronizer.map,
+            &previous_staging,
+            staging_bank,
+            &error,
+        ));
+    }
+    let config = match encode_policy_config(source_epoch, revision, desired.len(), staging_bank) {
+        Ok(config) => config,
+        Err(error) => {
+            return Err(rollback_policy_stage(
+                &mut synchronizer.map,
+                &previous_staging,
+                staging_bank,
+                &error,
+            ));
+        }
+    };
+    if let Err(error) = synchronizer.config.set(0, config, 0) {
+        return Err(rollback_policy_stage(
+            &mut synchronizer.map,
+            &previous_staging,
+            staging_bank,
+            &anyhow!(error).context("atomically activate staged policy bank"),
+        ));
+    }
+
+    let previous_active = synchronizer.active_bank;
+    synchronizer.banks[staging_index] = desired;
+    synchronizer.active_bank = staging_bank;
+    let previous_index = usize::from(previous_active);
+    if previous_active != staging_bank {
+        if let Err(error) =
+            clear_policy_bank(&mut synchronizer.map, &synchronizer.banks[previous_index])
+        {
+            warn!(
+                ?error,
+                bank = previous_active,
+                "could not garbage-collect old policy bank"
+            );
+        } else {
+            synchronizer.banks[previous_index].clear();
+        }
+    }
+    Ok(())
+}
+
+fn validate_staged_policy_entries(
+    map: &AyaHashMap<MapData, [u8; 12], [u8; 32]>,
+    desired: &BTreeMap<[u8; 12], [u8; 32]>,
+) -> Result<()> {
+    for (key, expected) in desired {
+        let actual = map
+            .get(key, 0)
+            .with_context(|| format!("read staged policy map key {key:?}"))?;
+        if &actual != expected {
+            bail!("staged policy map validation mismatch for key {key:?}");
+        }
+    }
+    Ok(())
+}
+
+fn rollback_policy_stage(
+    map: &mut AyaHashMap<MapData, [u8; 12], [u8; 32]>,
+    previous: &BTreeMap<[u8; 12], [u8; 32]>,
+    bank: u8,
+    cause: &anyhow::Error,
+) -> anyhow::Error {
+    restore_policy_entries(map, previous, bank).map_or_else(
+        |rollback| anyhow!("policy update failed: {cause:#}; rollback also failed: {rollback:#}"),
+        |()| anyhow!("policy update failed and staging bank was rolled back: {cause:#}"),
+    )
+}
+
+fn replace_policy_entries(
+    map: &mut AyaHashMap<MapData, [u8; 12], [u8; 32]>,
+    current: &BTreeMap<[u8; 12], [u8; 32]>,
+    desired: &BTreeMap<[u8; 12], [u8; 32]>,
+) -> Result<()> {
+    for (key, value) in desired {
+        map.insert(key, value, 0)
+            .with_context(|| format!("insert policy map key {key:?}"))?;
+    }
+    for key in current.keys().filter(|key| !desired.contains_key(*key)) {
+        map.remove(key)
+            .with_context(|| format!("remove stale policy map key {key:?}"))?;
+    }
+    Ok(())
+}
+
+fn restore_policy_entries(
+    map: &mut AyaHashMap<MapData, [u8; 12], [u8; 32]>,
+    previous: &BTreeMap<[u8; 12], [u8; 32]>,
+    bank: u8,
+) -> Result<()> {
+    let bank_keys: Vec<_> = map
+        .keys()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|key| key[11] == bank)
+        .collect();
+    for key in bank_keys {
+        map.remove(&key)?;
+    }
+    for (key, value) in previous {
+        map.insert(key, value, 0)?;
+    }
+    Ok(())
+}
+
+fn clear_policy_bank(
+    map: &mut AyaHashMap<MapData, [u8; 12], [u8; 32]>,
+    entries: &BTreeMap<[u8; 12], [u8; 32]>,
+) -> Result<()> {
+    for key in entries.keys() {
+        map.remove(key)?;
+    }
+    Ok(())
+}
+
 fn metric_value(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -704,8 +1157,14 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         desired_identity_epoch: state.desired_identity_epoch.load(Ordering::Acquire),
         applied_identity_epoch: state.applied_identity_epoch.load(Ordering::Acquire),
         identity_map_entries: state.identity_map_entries.load(Ordering::Acquire),
+        desired_policy_revision: state.desired_policy_revision.load(Ordering::Acquire),
+        applied_policy_revision: state.applied_policy_revision.load(Ordering::Acquire),
+        desired_policy_epoch: state.desired_policy_epoch.load(Ordering::Acquire),
+        applied_policy_epoch: state.applied_policy_epoch.load(Ordering::Acquire),
+        policy_map_entries: state.policy_map_entries.load(Ordering::Acquire),
+        active_policy_bank: state.active_policy_bank.load(Ordering::Acquire),
         capabilities: state.capabilities.clone(),
-        limitation: "identity lookup is connected; policy maps and enforcement are not enabled",
+        limitation: "identity and policy maps are connected; TC enforcement is not enabled",
     })
 }
 
@@ -778,5 +1237,70 @@ mod tests {
             identity_id: IdentityId::new(0),
         }];
         assert!(desired_identity_entries(&mappings, 7).is_err());
+    }
+
+    fn policy_entry() -> PolicyMapEntry {
+        PolicyMapEntry {
+            key: unf_state::PolicyMapKey {
+                source_identity: IdentityId::new(11),
+                destination_identity: IdentityId::new(22),
+                protocol: 6,
+                destination_port: 8080,
+            },
+            decision: PolicyDecisionRecord {
+                verdict: Verdict::Allow,
+                reason: PolicyReason::ExplicitRule,
+                policy_id: Some(PolicyId::new(7)),
+                rule_id: Some(RuleId::new(0)),
+            },
+            shadow: Some(PolicyDecisionRecord {
+                verdict: Verdict::Deny,
+                reason: PolicyReason::DefaultAction,
+                policy_id: Some(PolicyId::new(8)),
+                rule_id: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn policy_snapshot_encoding_matches_shared_abi_layout() {
+        let desired = desired_policy_entries(&[policy_entry()], 17, 1).expect("policy is valid");
+        let (key, value) = desired.first_key_value().expect("one encoded entry");
+        assert_eq!(u32::from_ne_bytes(key[0..4].try_into().unwrap()), 11);
+        assert_eq!(u32::from_ne_bytes(key[4..8].try_into().unwrap()), 22);
+        assert_eq!(u16::from_be_bytes(key[8..10].try_into().unwrap()), 8080);
+        assert_eq!(key[10], 6);
+        assert_eq!(key[11], 1);
+        assert_eq!(u32::from_ne_bytes(value[0..4].try_into().unwrap()), 7);
+        assert_eq!(u32::from_ne_bytes(value[8..12].try_into().unwrap()), 8);
+        assert_eq!(u64::from_ne_bytes(value[16..24].try_into().unwrap()), 17);
+        assert_eq!(
+            u16::from_ne_bytes(value[24..26].try_into().unwrap()),
+            POLICY_MAP_ABI_VERSION
+        );
+        let flags = u16::from_ne_bytes(value[26..28].try_into().unwrap());
+        assert_eq!(
+            flags,
+            POLICY_FLAG_HAS_POLICY
+                | POLICY_FLAG_HAS_RULE
+                | POLICY_FLAG_HAS_SHADOW
+                | POLICY_FLAG_SHADOW_HAS_POLICY
+        );
+    }
+
+    #[test]
+    fn policy_snapshot_rejects_invalid_wildcard() {
+        let mut entry = policy_entry();
+        entry.key.protocol = 0;
+        assert!(desired_policy_entries(&[entry], 17, 1).is_err());
+    }
+
+    #[test]
+    fn policy_config_encoding_contains_atomic_revision_pointer() {
+        let config = encode_policy_config(9, 17, 3, 1).expect("config is valid");
+        assert_eq!(u64::from_ne_bytes(config[0..8].try_into().unwrap()), 9);
+        assert_eq!(u64::from_ne_bytes(config[8..16].try_into().unwrap()), 17);
+        assert_eq!(u32::from_ne_bytes(config[16..20].try_into().unwrap()), 3);
+        assert_eq!(config[22], 1);
     }
 }

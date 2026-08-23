@@ -25,8 +25,10 @@ matrix and reproducible evidence.
 - Implemented and two-node kind verified: versioned IPv4 BPF identity map,
   epoch/revision-based controller-to-agent snapshot distribution, enriched flow
   identities, and reconvergence after a controller epoch change;
-- Next: policy map distribution and applied node status aggregation;
-- versioned policy map schema and transactional revision switch;
+- Implemented and two-node kind verified: selector-to-identity lowering,
+  versioned dual-bank policy maps, atomic revision activation/restoration, and
+  agent desired/applied policy status;
+- Next: applied node status aggregation and TC policy lookup;
 - L3/L4 allow/deny with explicit reason codes;
 - denied flow telemetry and accurate live `unfctl explain`;
 - last-known-good and fail-safe behavior tests.

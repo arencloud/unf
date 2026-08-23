@@ -6,6 +6,13 @@ use unf_common::{IdentityId, PolicyId, RuleId, Verdict};
 
 pub const FLOW_ABI_VERSION: u16 = 1;
 pub const IDENTITY_MAP_ABI_VERSION: u16 = 1;
+pub const POLICY_MAP_ABI_VERSION: u16 = 1;
+pub const POLICY_BANK_COUNT: u8 = 2;
+pub const POLICY_FLAG_HAS_POLICY: u16 = 1 << 0;
+pub const POLICY_FLAG_HAS_RULE: u16 = 1 << 1;
+pub const POLICY_FLAG_HAS_SHADOW: u16 = 1 << 2;
+pub const POLICY_FLAG_SHADOW_HAS_POLICY: u16 = 1 << 3;
+pub const POLICY_FLAG_SHADOW_HAS_RULE: u16 = 1 << 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -98,10 +105,52 @@ impl IdentityMapValue {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct PolicyMapKey {
+    pub source_identity: IdentityId,
+    pub destination_identity: IdentityId,
+    /// Destination port in network byte order; zero means wildcard fallback.
+    pub destination_port: [u8; 2],
+    /// IP protocol number; zero means wildcard fallback.
+    pub protocol: u8,
+    pub bank: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct PolicyMapValue {
+    pub policy_id: PolicyId,
+    pub rule_id: RuleId,
+    pub shadow_policy_id: PolicyId,
+    pub shadow_rule_id: RuleId,
+    pub revision: u64,
+    pub schema_version: u16,
+    pub flags: u16,
+    pub verdict: u8,
+    pub reason: u8,
+    pub shadow_verdict: u8,
+    pub shadow_reason: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct PolicyMapConfig {
+    pub source_epoch: u64,
+    pub revision: u64,
+    pub entry_count: u32,
+    pub schema_version: u16,
+    pub active_bank: u8,
+    pub flags: u8,
+}
+
 const _: () = assert!(core::mem::size_of::<FlowKey>() == 48);
 const _: () = assert!(core::mem::size_of::<FlowEvent>() == 80);
 const _: () = assert!(core::mem::size_of::<Ipv4IdentityKey>() == 4);
 const _: () = assert!(core::mem::size_of::<IdentityMapValue>() == 16);
+const _: () = assert!(core::mem::size_of::<PolicyMapKey>() == 12);
+const _: () = assert!(core::mem::size_of::<PolicyMapValue>() == 32);
+const _: () = assert!(core::mem::size_of::<PolicyMapConfig>() == 24);
 
 #[cfg(test)]
 mod tests {
@@ -114,5 +163,11 @@ mod tests {
         assert_eq!(core::mem::size_of::<FlowEvent>(), 80);
         assert_eq!(core::mem::align_of::<IdentityMapValue>(), 8);
         assert_eq!(core::mem::size_of::<IdentityMapValue>(), 16);
+        assert_eq!(core::mem::align_of::<PolicyMapKey>(), 4);
+        assert_eq!(core::mem::size_of::<PolicyMapKey>(), 12);
+        assert_eq!(core::mem::align_of::<PolicyMapValue>(), 8);
+        assert_eq!(core::mem::size_of::<PolicyMapValue>(), 32);
+        assert_eq!(core::mem::align_of::<PolicyMapConfig>(), 8);
+        assert_eq!(core::mem::size_of::<PolicyMapConfig>(), 24);
     }
 }

@@ -23,5 +23,8 @@ Port zero is rejected. Only TCP and UDP are in the first CRD. The evaluator is
 pure and accepts resolved endpoints, making it usable by the controller, tests,
 future simulation, and eventually a digital-twin query layer.
 
-Dataplane enforcement is Phase 2. Its compact rule representation must preserve a
-userspace mapping back to the current provenance.
+The Phase 2 lowering step resolves selectors against admitted identities and
+precomputes deterministic exact and fallback decisions. Actual and shadow
+verdicts retain policy/rule/reason provenance in the versioned BPF value. Dual
+banks make distribution transactional, but TC lookup and enforcement remain the
+next dataplane gate.

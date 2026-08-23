@@ -24,6 +24,11 @@ deletion removes addresses and garbage-collects identities with no remaining Pod
 references. Host-network Pod addresses are not eligible for workload indexing
 because several Pods can legitimately share the node address.
 
+The canonical key is length-delimited and includes every selector-relevant
+field: cluster, namespace, service account, application/workload, and the sorted
+label set. Pods may share an identity only when all of that metadata is equal;
+this prevents label selectors from resolving one numeric identity ambiguously.
+
 ## Alternatives
 
 A central sequential allocator would avoid hash collisions but immediately adds

@@ -4,12 +4,12 @@
 use aya_ebpf::bindings::TC_ACT_PIPE;
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::{classifier, map};
-use aya_ebpf::maps::{HashMap, PerCpuArray, RingBuf};
+use aya_ebpf::maps::{Array, HashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::TcContext;
 use unf_common::{IdentityId, PolicyId, RuleId, Verdict};
 use unf_ebpf_common::{
     AddressFamily, Direction, FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_MAP_ABI_VERSION,
-    IdentityMapValue, Ipv4IdentityKey, ReasonCode,
+    IdentityMapValue, Ipv4IdentityKey, PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode,
 };
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -27,6 +27,15 @@ static FLOW_COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 #[map]
 static IDENTITY_V4: HashMap<Ipv4IdentityKey, IdentityMapValue> =
     HashMap::with_max_entries(65_536, BPF_F_NO_PREALLOC);
+
+/// Dual-bank policy state. Userspace stages the inactive bank and atomically
+/// changes POLICY_CONFIG[0] only after validating the complete snapshot.
+#[map]
+static POLICY_RULES: HashMap<PolicyMapKey, PolicyMapValue> =
+    HashMap::with_max_entries(262_144, BPF_F_NO_PREALLOC);
+
+#[map]
+static POLICY_CONFIG: Array<PolicyMapConfig> = Array::with_max_entries(1, 0);
 
 #[classifier]
 pub fn unf_observe_ingress(ctx: TcContext) -> i32 {

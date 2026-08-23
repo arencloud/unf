@@ -1,7 +1,7 @@
 //! Kubernetes-independent policy IR, compilation, and deterministic evaluation.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -9,6 +9,9 @@ use unf_api::{
     Action, EnforcementMode, SecurityPolicy, TransportProtocol, WorkloadSelector as ApiSelector,
 };
 use unf_common::{IdentityId, PolicyAction, PolicyId, Protocol, RuleId, Verdict};
+use unf_state::{PolicyDecisionRecord, PolicyMapEntry, PolicyMapKey};
+
+pub use unf_common::PolicyReason as DecisionReason;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentitySelector {
@@ -104,13 +107,6 @@ pub struct Flow<'a> {
     pub destination_port: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DecisionReason {
-    NoApplicablePolicy,
-    ExplicitRule,
-    DefaultAction,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyDecision {
     pub verdict: Verdict,
@@ -134,6 +130,12 @@ pub enum PolicyCompileError {
     InvalidPort { rule_index: usize },
     #[error("policy contains more rules than can be represented by RuleId")]
     TooManyRules,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DataplaneCompileError {
+    #[error("identity ID {identity_id:?} has conflicting endpoint metadata")]
+    IdentityMetadataConflict { identity_id: IdentityId },
 }
 
 pub struct PolicyCompiler;
@@ -307,6 +309,116 @@ pub fn evaluate(policies: &[PolicyIr], flow: Flow<'_>) -> PolicyDecision {
     }
 }
 
+/// Resolves selector-based policy IR into deterministic identity-tuple entries.
+///
+/// Port zero and protocol zero are reserved for the fallback entry evaluated
+/// after excluding every exact L3/L4 rule. The eBPF fast path can therefore use
+/// one exact lookup followed by one wildcard lookup without interpreting
+/// selectors or policy priority.
+///
+/// # Errors
+///
+/// Returns [`DataplaneCompileError::IdentityMetadataConflict`] if one numeric
+/// identity is associated with different endpoint metadata.
+pub fn compile_dataplane_entries(
+    policies: &[PolicyIr],
+    endpoints: &[Endpoint],
+) -> Result<Vec<PolicyMapEntry>, DataplaneCompileError> {
+    let mut unique_endpoints = BTreeMap::<IdentityId, &Endpoint>::new();
+    for endpoint in endpoints {
+        if let Some(existing) = unique_endpoints.insert(endpoint.identity, endpoint)
+            && existing != endpoint
+        {
+            return Err(DataplaneCompileError::IdentityMetadataConflict {
+                identity_id: endpoint.identity,
+            });
+        }
+    }
+
+    let mut entries = Vec::new();
+    for source in unique_endpoints.values() {
+        for destination in unique_endpoints.values() {
+            let fallback = evaluate(
+                policies,
+                Flow {
+                    source,
+                    destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 0,
+                },
+            );
+            let fallback_entry = policy_map_entry(source, destination, 0, 0, &fallback);
+            if has_policy_provenance(&fallback) {
+                entries.push(fallback_entry);
+            }
+
+            let exact_tuples: BTreeSet<_> = policies
+                .iter()
+                .filter(|policy| policy.target.matches(destination))
+                .flat_map(|policy| &policy.rules)
+                .filter(|rule| rule.source.matches(source) && rule.destination.matches(destination))
+                .filter_map(|rule| Some((rule.protocol?, rule.port?)))
+                .collect();
+            for (protocol, port) in exact_tuples {
+                let decision = evaluate(
+                    policies,
+                    Flow {
+                        source,
+                        destination,
+                        protocol,
+                        destination_port: port,
+                    },
+                );
+                let entry = policy_map_entry(source, destination, protocol as u8, port, &decision);
+                if has_policy_provenance(&decision)
+                    && (entry.decision != fallback_entry.decision
+                        || entry.shadow != fallback_entry.shadow)
+                {
+                    entries.push(entry);
+                }
+            }
+        }
+    }
+    entries.sort_by_key(|entry| entry.key);
+    Ok(entries)
+}
+
+fn has_policy_provenance(decision: &PolicyDecision) -> bool {
+    decision.policy_id.is_some() || decision.shadow_policy_id.is_some()
+}
+
+fn policy_map_entry(
+    source: &Endpoint,
+    destination: &Endpoint,
+    protocol: u8,
+    destination_port: u16,
+    decision: &PolicyDecision,
+) -> PolicyMapEntry {
+    PolicyMapEntry {
+        key: PolicyMapKey {
+            source_identity: source.identity,
+            destination_identity: destination.identity,
+            protocol,
+            destination_port,
+        },
+        decision: PolicyDecisionRecord {
+            verdict: decision.verdict,
+            reason: decision.reason,
+            policy_id: decision.policy_id,
+            rule_id: decision.rule_id,
+        },
+        shadow: decision
+            .shadow_verdict
+            .zip(decision.shadow_reason)
+            .map(|(verdict, reason)| PolicyDecisionRecord {
+                verdict,
+                reason,
+                policy_id: decision.shadow_policy_id,
+                rule_id: decision.shadow_rule_id,
+            }),
+    }
+}
+
 type RankedDecision = (u32, PolicyAction, PolicyId, Option<RuleId>, DecisionReason);
 
 fn decide_for_mode(
@@ -404,14 +516,18 @@ mod tests {
 
     use super::*;
 
-    fn endpoint(namespace: &str, application: &str) -> Endpoint {
+    fn endpoint_with_id(id: u32, namespace: &str, application: &str) -> Endpoint {
         Endpoint {
-            identity: IdentityId::new(1),
+            identity: IdentityId::new(id),
             namespace: namespace.to_owned(),
             service_account: "default".to_owned(),
             application: Some(application.to_owned()),
             labels: BTreeMap::new(),
         }
+    }
+
+    fn endpoint(namespace: &str, application: &str) -> Endpoint {
+        endpoint_with_id(1, namespace, application)
     }
 
     fn policy(
@@ -596,6 +712,105 @@ mod tests {
         assert_eq!(decision.shadow_reason, Some(DecisionReason::ExplicitRule));
         assert_eq!(decision.shadow_policy_id, Some(PolicyId::new(1)));
         assert_eq!(decision.shadow_rule_id, Some(RuleId::new(0)));
+    }
+
+    #[test]
+    fn dataplane_compilation_emits_exact_and_default_decisions() {
+        let source = endpoint_with_id(11, "frontend", "client");
+        let destination = endpoint_with_id(22, "backend", "server");
+        let compiled_policy = policy(
+            7,
+            100,
+            Action::Allow,
+            Action::Deny,
+            EnforcementMode::Enforce,
+            Some(8080),
+        );
+        let entries = compile_dataplane_entries(
+            std::slice::from_ref(&compiled_policy),
+            &[source.clone(), destination.clone()],
+        )
+        .expect("dataplane policy compiles");
+        assert_eq!(
+            entries,
+            compile_dataplane_entries(
+                std::slice::from_ref(&compiled_policy),
+                &[destination, source]
+            )
+            .expect("endpoint order does not affect output")
+        );
+        assert!(entries.windows(2).all(|pair| pair[0].key < pair[1].key));
+
+        let exact = entries
+            .iter()
+            .find(|entry| {
+                entry.key.source_identity == IdentityId::new(11)
+                    && entry.key.destination_identity == IdentityId::new(22)
+                    && entry.key.protocol == Protocol::Tcp as u8
+                    && entry.key.destination_port == 8080
+            })
+            .expect("exact allow entry exists");
+        assert_eq!(exact.decision.verdict, Verdict::Allow);
+        assert_eq!(exact.decision.reason, DecisionReason::ExplicitRule);
+        assert_eq!(exact.decision.policy_id, Some(PolicyId::new(7)));
+        assert_eq!(exact.decision.rule_id, Some(RuleId::new(0)));
+
+        let fallback = entries
+            .iter()
+            .find(|entry| {
+                entry.key.source_identity == IdentityId::new(11)
+                    && entry.key.destination_identity == IdentityId::new(22)
+                    && entry.key.protocol == 0
+                    && entry.key.destination_port == 0
+            })
+            .expect("default deny entry exists");
+        assert_eq!(fallback.decision.verdict, Verdict::Deny);
+        assert_eq!(fallback.decision.reason, DecisionReason::DefaultAction);
+        assert_eq!(fallback.decision.rule_id, None);
+    }
+
+    #[test]
+    fn dataplane_compilation_preserves_shadow_decision() {
+        let source = endpoint_with_id(11, "frontend", "client");
+        let destination = endpoint_with_id(22, "backend", "server");
+        let entries = compile_dataplane_entries(
+            &[policy(
+                7,
+                100,
+                Action::Deny,
+                Action::Deny,
+                EnforcementMode::Shadow,
+                None,
+            )],
+            &[source, destination],
+        )
+        .expect("shadow dataplane policy compiles");
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                entry.key.source_identity == IdentityId::new(11)
+                    && entry.key.destination_identity == IdentityId::new(22)
+            })
+            .expect("shadow entry exists");
+
+        assert_eq!(entry.decision.verdict, Verdict::Allow);
+        assert_eq!(entry.decision.policy_id, None);
+        let shadow = entry.shadow.expect("shadow provenance is retained");
+        assert_eq!(shadow.verdict, Verdict::Deny);
+        assert_eq!(shadow.reason, DecisionReason::ExplicitRule);
+        assert_eq!(shadow.policy_id, Some(PolicyId::new(7)));
+    }
+
+    #[test]
+    fn dataplane_compilation_rejects_conflicting_identity_metadata() {
+        let left = endpoint_with_id(11, "frontend", "client");
+        let right = endpoint_with_id(11, "backend", "server");
+        assert_eq!(
+            compile_dataplane_entries(&[], &[left, right]),
+            Err(DataplaneCompileError::IdentityMetadataConflict {
+                identity_id: IdentityId::new(11),
+            })
+        );
     }
 
     proptest! {

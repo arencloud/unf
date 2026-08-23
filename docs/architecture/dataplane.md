@@ -18,11 +18,13 @@ increments a per-CPU counter, and submits a compact event. It always returns
 | `FLOW_COUNTERS` | constant `u32` slot 0 | per-CPU `u64` | eBPF program | increment per parsed flow; program lifetime | one entry; forwarding continues if lookup fails |
 | `FLOW_EVENTS` | none (ring) | `FlowEvent` ABI v1 | eBPF producer, agent consumer | ephemeral, unpinned | 256 KiB; events drop under pressure, forwarding continues |
 | `IDENTITY_V4` | IPv4 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent map writer; TC reader | revisioned reconciliation; program lifetime, currently unpinned | 65,536 entries; unknown/mismatched identity resolves to ID zero and forwarding continues |
+| `POLICY_RULES` | source/destination identity, protocol, destination port, bank | actual/shadow verdict and policy/rule/reason provenance, schema, revision | controller compiler; agent transactional writer | inactive bank is populated and validated before activation; currently unpinned | 262,144 entries across two banks; active bank remains selected when staging fails |
+| `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, entry count, schema, active bank | agent writer; future TC reader | one atomic write activates a complete bank | one entry; failed activation preserves the previous pointer |
 
 `FlowEvent` carries no Kubernetes strings. TC now resolves IPv4 addresses through
-`IDENTITY_V4`; userspace will later enrich policy and rule IDs. Both event and map
-ABIs use fixed C layouts, explicit schema/version fields, and compile-time size
-assertions.
+`IDENTITY_V4`. Resolved policy state is now staged in `POLICY_RULES`, but TC does
+not read it yet, so event policy and rule IDs remain zero. Event and map ABIs use
+fixed C layouts, explicit schema/version fields, and compile-time size assertions.
 
 ## Build boundary
 
@@ -32,5 +34,5 @@ tests still run on stable in the host workspace. See ADR 0002.
 
 ## Next dataplane milestone
 
-Compile and distribute a transactional policy map set, then add lookup-only shadow
-classification before enabling any `TC_ACT_SHOT` result.
+Read the active transactional policy bank for lookup-only classification and
+provenance, then enable a separately verified `TC_ACT_SHOT` enforcement path.

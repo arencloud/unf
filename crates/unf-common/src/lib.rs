@@ -51,7 +51,7 @@ impl Revision {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum Protocol {
@@ -77,6 +77,16 @@ pub enum Verdict {
     Allow = 1,
     Deny = 2,
     Audit = 3,
+}
+
+/// Stable machine-readable provenance for an effective policy decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(u8)]
+pub enum PolicyReason {
+    NoApplicablePolicy = 0,
+    ExplicitRule = 1,
+    DefaultAction = 2,
 }
 
 #[cfg(test)]

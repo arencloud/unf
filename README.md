@@ -9,9 +9,9 @@ or a CNI replacement**.
 ## Project status
 
 Phase 1's observation gate is verified in a two-node kind cluster. Phase 2 is now
-in progress: collision-checked identities are revisioned, distributed into each
-node's BPF map, and attached to observed flows; enforcement is not implemented
-yet. See the authoritative
+in progress: collision-checked identities and resolved policy decisions are
+revisioned and distributed into each node's BPF maps, while observed flows carry
+identity IDs. Enforcement is not implemented yet. See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
 gates, evidence, limitations, and current work. The shorter
 [roadmap](docs/roadmap.md) describes future direction.
@@ -28,12 +28,13 @@ Implemented in the repository:
 - an Aya agent capable of loading and attaching the TC observation program;
 - an IPv4 TCP/UDP TC parser with counters and bounded ring-buffer events;
 - revisioned controller-to-agent IPv4 identity snapshots and a versioned BPF map;
+- selector-resolved policy snapshots and dual-bank transactional BPF policy maps;
 - `unfctl status` and `unfctl explain` against live controller state;
 - a reproducible two-node kind demo covering cross-node traffic, live eBPF
   observation, and shadow-policy explanations.
 
-Not implemented yet: policy distribution to BPF maps, dataplane enforcement,
-service load balancing, routing, IPAM/CNI, encryption, or multi-cluster transport.
+Not implemented yet: dataplane policy lookup/enforcement, service load balancing,
+routing, IPAM/CNI, encryption, or multi-cluster transport.
 
 ## Repository layout
 

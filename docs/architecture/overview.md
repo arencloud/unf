@@ -11,7 +11,7 @@ Kubernetes / OpenShift API
           v
    unf-controller ---- HTTP status/explain ---- unfctl
           |
-   desired state (identity snapshot: epoch + revision)
+   desired state (identity + policy snapshots: epoch + revision)
           |
        internal HTTP polling
           |
@@ -33,10 +33,12 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
 4. `unfctl explain` asks the controller to resolve two Pods and evaluate the IR.
 5. The agent loads the Aya object, attaches TC, applies the controller's revisioned
    IPv4 identity snapshot, consumes compact events, and exposes health and metrics.
+6. The controller resolves policy selectors to identity tuples; each agent stages
+   and atomically activates the resulting policy revision in dual BPF map banks.
 
-Identity state is now distributed to the kernel as the first Phase 2 slice. Policy
-state is not distributed, so observation and userspace shadow explanation remain
-non-enforcing.
+Identity and policy state are now distributed to the kernel as Phase 2 slices.
+TC does not read the active policy bank yet, so observation and userspace shadow
+explanation remain non-enforcing.
 
 ## Dependency rule
 

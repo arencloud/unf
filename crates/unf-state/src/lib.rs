@@ -5,9 +5,10 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use unf_common::{IdentityId, Revision};
+use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevisionSet {
@@ -65,6 +66,39 @@ pub struct IdentityStateSnapshot {
     pub source_epoch: u64,
     pub revision: Revision,
     pub entries: Vec<Ipv4IdentityMapping>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PolicyMapKey {
+    pub source_identity: IdentityId,
+    pub destination_identity: IdentityId,
+    /// IP protocol number, or zero for a wildcard fallback.
+    pub protocol: u8,
+    /// Destination port, or zero for a wildcard fallback.
+    pub destination_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDecisionRecord {
+    pub verdict: Verdict,
+    pub reason: PolicyReason,
+    pub policy_id: Option<PolicyId>,
+    pub rule_id: Option<RuleId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyMapEntry {
+    pub key: PolicyMapKey,
+    pub decision: PolicyDecisionRecord,
+    pub shadow: Option<PolicyDecisionRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyStateSnapshot {
+    pub schema_version: u16,
+    pub source_epoch: u64,
+    pub revision: Revision,
+    pub entries: Vec<PolicyMapEntry>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
