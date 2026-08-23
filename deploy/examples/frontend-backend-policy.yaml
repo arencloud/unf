@@ -1,0 +1,19 @@
+apiVersion: network.unf.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: frontend-to-backend
+  namespace: backend
+spec:
+  target:
+    application: server
+  priority: 100
+  ingress:
+    - from:
+        namespace: frontend
+        application: client
+      protocols:
+        - protocol: Tcp
+          port: 8080
+      action: Allow
+  defaultAction: Deny
+  enforcementMode: Shadow

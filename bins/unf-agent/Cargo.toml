@@ -1,0 +1,27 @@
+[package]
+name = "unf-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aya.workspace = true
+axum.workspace = true
+clap.workspace = true
+prometheus-client.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+unf-common = { path = "../../crates/unf-common" }
+unf-ebpf-common = { path = "../../ebpf/unf-ebpf-common" }
+unf-state = { path = "../../crates/unf-state" }
+
+[lints]
+workspace = true

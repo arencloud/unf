@@ -1,0 +1,45 @@
+# Rust build output (host and nested eBPF workspaces)
+target/
+
+# Native and eBPF build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.d
+
+# Test, coverage, and profiling output
+/coverage/
+*.profraw
+*.profdata
+*.lcov
+
+# Local environment and secret files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Workspace-local development tools
+.tools/
+.artifacts/
+
+# IDE and editor settings
+.idea/
+.vscode/
+
+# Local project prompts
+.master-prompt/
+
+# Operating system metadata
+.DS_Store
+Thumbs.db

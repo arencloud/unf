@@ -1,0 +1,20 @@
+[package]
+name = "unf-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+unf-api = { path = "../unf-api" }
+unf-common = { path = "../unf-common" }
+
+[dev-dependencies]
+k8s-openapi.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,151 @@
+//! Kubernetes-facing APIs. Domain policy evaluation lives in `unf-policy`.
+
+use std::collections::BTreeMap;
+
+use kube::CustomResource;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+#[derive(CustomResource, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "network.unf.io",
+    version = "v1alpha1",
+    kind = "SecurityPolicy",
+    plural = "securitypolicies",
+    namespaced,
+    status = "SecurityPolicyStatus",
+    shortname = "unfsp"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityPolicySpec {
+    pub target: WorkloadSelector,
+    #[serde(default)]
+    pub ingress: Vec<IngressRule>,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    #[serde(default)]
+    pub default_action: Action,
+    #[serde(default)]
+    pub enforcement_mode: EnforcementMode,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityPolicyStatus {
+    #[serde(default)]
+    pub observed_generation: Option<i64>,
+    #[serde(default)]
+    pub compiled_revision: Option<u64>,
+    #[serde(default)]
+    pub conditions: Vec<PolicyCondition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyCondition {
+    pub condition_type: String,
+    pub status: String,
+    pub reason: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadSelector {
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub service_account: Option<String>,
+    #[serde(default)]
+    pub application: Option<String>,
+    #[serde(default)]
+    pub match_labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct IngressRule {
+    #[serde(default)]
+    pub from: WorkloadSelector,
+    #[serde(default)]
+    pub protocols: Vec<ProtocolPort>,
+    pub action: Action,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolPort {
+    pub protocol: TransportProtocol,
+    #[schemars(range(min = 1))]
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "PascalCase")]
+pub enum TransportProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "PascalCase")]
+pub enum Action {
+    Allow,
+    #[default]
+    Deny,
+    Audit,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "PascalCase")]
+pub enum EnforcementMode {
+    #[default]
+    Enforce,
+    Shadow,
+}
+
+const fn default_priority() -> u32 {
+    1_000
+}
+
+#[cfg(test)]
+mod tests {
+    use kube::CustomResourceExt;
+
+    use super::*;
+
+    #[test]
+    fn generated_crd_contains_structural_schema() {
+        let value = serde_json::to_value(SecurityPolicy::crd()).expect("CRD serializes");
+        assert_eq!(value["spec"]["group"], "network.unf.io");
+        assert!(value["spec"]["versions"][0]["schema"]["openAPIV3Schema"].is_object());
+    }
+
+    #[test]
+    fn checked_in_crd_matches_rust_schema() {
+        let checked_in: serde_json::Value = serde_yaml::from_str(include_str!(
+            "../../../deploy/crds/network.unf.io_securitypolicies.yaml"
+        ))
+        .expect("checked-in CRD is valid YAML");
+        let generated = serde_json::to_value(SecurityPolicy::crd()).expect("CRD serializes");
+        assert_eq!(checked_in, generated, "run `make generate-crds`");
+    }
+
+    #[test]
+    fn defaults_are_safe() {
+        let yaml = r"
+apiVersion: network.unf.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: deny-by-default
+  namespace: backend
+spec:
+  target:
+    application: api
+";
+        let policy: SecurityPolicy = serde_yaml::from_str(yaml).expect("valid policy");
+        assert_eq!(policy.spec.default_action, Action::Deny);
+        assert_eq!(policy.spec.enforcement_mode, EnforcementMode::Enforce);
+        assert_eq!(policy.spec.priority, 1_000);
+    }
+}

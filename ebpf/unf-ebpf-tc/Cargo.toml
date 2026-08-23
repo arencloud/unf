@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["."]
+
+[package]
+name = "unf-ebpf-tc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+
+[dependencies]
+aya-ebpf = "0.2.1"
+unf-common = { path = "../../crates/unf-common", default-features = false }
+unf-ebpf-common = { path = "../unf-ebpf-common" }
+
+[[bin]]
+name = "unf-ebpf-tc"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[lints.rust]
+unsafe_code = "warn"

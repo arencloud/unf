@@ -1,0 +1,23 @@
+ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm
+FROM ${RUST_IMAGE} AS builder
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY bins ./bins
+COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
+
+RUN cargo build --locked --release --package unf-controller --package unf-agent
+
+FROM docker.io/library/debian:bookworm-slim
+
+ARG UNF_PACKAGE
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder "/src/target/release/${UNF_PACKAGE}" /usr/local/bin/unf-component
+COPY .artifacts/unf-ebpf-tc /opt/unf/ebpf/unf-ebpf-tc
+
+ENTRYPOINT ["/usr/local/bin/unf-component"]

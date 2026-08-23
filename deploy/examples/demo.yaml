@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: frontend
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backend
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: frontend
+  labels:
+    app.kubernetes.io/name: client
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-control-plane
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: client
+      image: docker.io/library/busybox:1.37.0
+      command: ["sh", "-c", "sleep infinity"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server
+  namespace: backend
+  labels:
+    app.kubernetes.io/name: server
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-worker
+  containers:
+    - name: server
+      image: docker.io/library/busybox:1.37.0
+      command:
+        - sh
+        - -c
+        - mkdir -p /www && echo unf-demo-ok > /www/index.html && httpd -f -p 8080 -h /www
+      ports:
+        - name: http
+          containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: server
+  namespace: backend
+spec:
+  selector:
+    app.kubernetes.io/name: server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: network.unf.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: frontend-to-backend
+  namespace: backend
+spec:
+  target:
+    application: server
+  priority: 100
+  ingress:
+    - from:
+        namespace: frontend
+        application: client
+      protocols:
+        - protocol: Tcp
+          port: 8080
+      action: Allow
+  defaultAction: Deny
+  enforcementMode: Shadow

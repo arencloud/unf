@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = [
+    "bins/unf-agent",
+    "bins/unf-controller",
+    "bins/unfctl",
+    "crates/unf-api",
+    "crates/unf-common",
+    "crates/unf-policy",
+    "crates/unf-state",
+    "ebpf/unf-ebpf-common",
+]
+exclude = ["ebpf/unf-ebpf-tc"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/unf-project/unf"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+aya = "0.14.0"
+axum = "0.8.9"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+futures = "0.3.31"
+k8s-openapi = { version = "0.28.0", features = ["v1_32", "schemars"] }
+kube = { version = "4.2.0", features = ["client", "derive", "runtime", "rustls-tls"] }
+prometheus-client = "0.25.0"
+proptest = "1.9.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
+schemars = "1.2.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml = "0.9.34"
+thiserror = "2.0.18"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

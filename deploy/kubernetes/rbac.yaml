@@ -1,0 +1,27 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unf-controller
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["network.unf.io"]
+    resources: ["securitypolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["network.unf.io"]
+    resources: ["securitypolicies/status"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: unf-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unf-controller
+subjects:
+  - kind: ServiceAccount
+    name: unf-controller
+    namespace: unf-system
