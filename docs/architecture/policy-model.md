@@ -30,7 +30,7 @@ banks make distribution transactional. TC reads only the active bank: enforce
 decisions can allow or drop, while shadow decisions are emitted as counterfactual
 telemetry and never change forwarding.
 
-## Kubernetes NetworkPolicy compatibility foundation
+## Kubernetes NetworkPolicy compatibility
 
 Phase 3 starts with a translator from the supported ingress subset of Kubernetes
 `NetworkPolicy` into the same `PolicyIr`. `PolicyOrigin` lets the evaluator apply
@@ -47,3 +47,9 @@ port ranges, SCTP, and protocol-only port entries. These errors prevent a policy
 from being accepted with weaker or different semantics. Native policy has the
 higher default precedence; the compatibility baseline uses reserved priority
 `1_000_000`.
+
+The controller watches these objects cluster-wide, keeps accepted and rejected
+compatibility state separate, and combines accepted IR with native policy in each
+revisioned agent snapshot. A rejected update or deletion removes any previously
+compiled version and advances the policy revision when the effective dataplane
+state changes. Controller status exposes accepted and rejected object counts.

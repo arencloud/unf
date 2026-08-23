@@ -78,7 +78,9 @@ make kind-test
 the nodes, and applies the CRD and workloads. `kind-test` installs the demo,
 proves cross-node port 8080 allow and open-port 9090 deny, switches the same
 policy through shadow pass-through and back, and validates revisioned event and
-CLI provenance. The host kernel is shared with kind nodes. `make kind-down`
+CLI provenance. It also exercises a supported ingress `NetworkPolicy`: cross-node
+allow and default-isolation drop, unsupported-update rejection and recovery, and
+deletion/recreation convergence. The host kernel is shared with kind nodes. `make kind-down`
 deletes only the named `unf-dev` cluster.
 
 The DaemonSet attaches ingress classification to every non-loopback node interface

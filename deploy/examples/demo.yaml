@@ -66,6 +66,68 @@ spec:
       port: 9090
       targetPort: denied
 ---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: np-server
+  namespace: backend
+  labels:
+    app: np-server
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-worker
+  containers:
+    - name: server
+      image: docker.io/library/busybox:1.37.0
+      command:
+        - sh
+        - -c
+        - mkdir -p /www && echo unf-networkpolicy-ok > /www/index.html && httpd -p 9091 -h /www && httpd -f -p 8081 -h /www
+      ports:
+        - name: allowed
+          containerPort: 8081
+        - name: denied
+          containerPort: 9091
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: np-server
+  namespace: backend
+spec:
+  selector:
+    app: np-server
+  ports:
+    - name: allowed
+      port: 8081
+      targetPort: allowed
+    - name: denied
+      port: 9091
+      targetPort: denied
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-to-np-server
+  namespace: backend
+spec:
+  podSelector:
+    matchLabels:
+      app: np-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: frontend
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: client
+      ports:
+        - protocol: TCP
+          port: 8081
+---
 apiVersion: network.unf.io/v1alpha1
 kind: SecurityPolicy
 metadata:

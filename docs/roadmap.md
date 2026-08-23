@@ -40,10 +40,10 @@ matrix and reproducible evidence.
 
 **Gate: in progress.**
 
-- Implemented foundation: ingress `NetworkPolicy` translation into the same IR,
-  additive compatibility semantics in the shared evaluator, shared dataplane
-  lowering, and explicit errors for unsupported semantics;
-- Next: controller watch/live enforcement and broader ingress conformance;
+- Implemented and two-node kind verified: supported ingress `NetworkPolicy`
+  translation, additive semantics, controller reconciliation/status, shared
+  dataplane enforcement/provenance, and rejection/deletion recovery;
+- Next: broader ingress selector/port conformance and policy simulation;
 - shadow rollout and offline impact analysis;
 - topology snapshots and flow exporter interface;
 - failure, scale, and OpenShift validation.

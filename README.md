@@ -2,8 +2,9 @@
 
 UNF is an early-stage, Rust-first network observability and policy project for
 Kubernetes and OpenShift. Its long-term goal is an identity-aware, explainable,
-multi-cluster eBPF network fabric. Phase 1 established observation; Phase 2 adds
-the first identity-aware L3/L4 enforcement path. UNF is **not production-ready or
+multi-cluster eBPF network fabric. Phase 1 established observation; Phase 2 added
+the first identity-aware L3/L4 enforcement path, and Phase 3 is adding Kubernetes
+compatibility. UNF is **not production-ready or
 a CNI replacement**.
 
 ## Project status
@@ -11,6 +12,8 @@ a CNI replacement**.
 Phase 1's observation gate and Phase 2's first enforcement gate are verified in
 a two-node kind cluster. Collision-checked identities and transactional policy
 revisions now drive TC allow/drop decisions with actual and shadow provenance.
+The first supported ingress `NetworkPolicy` slice is also live-verified through
+the same controller, policy engine, and dataplane.
 See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
 gates, evidence, limitations, and current work. The shorter
@@ -23,9 +26,11 @@ Implemented in the repository:
 - versioned userspace/eBPF flow ABI and strongly typed numeric IDs;
 - `SecurityPolicy` `network.unf.io/v1alpha1` API and generated CRD;
 - deterministic L3/L4 policy compiler, shadow decisions, and property tests;
-- an ingress `NetworkPolicy` translation foundation that reuses the same IR,
-  additive evaluator semantics, and dataplane lowering as native policy;
-- a kube-rs controller watching Pods, Namespaces, and SecurityPolicies;
+- a supported ingress `NetworkPolicy` adapter that reuses the same IR, additive
+  evaluator semantics, controller snapshots, and dataplane lowering as native
+  policy;
+- a kube-rs controller watching Pods, Namespaces, SecurityPolicies, and
+  NetworkPolicies, with accepted/rejected compatibility status;
 - controller health, readiness, metrics, status, and userspace explanation APIs;
 - an Aya agent capable of loading and attaching the TC observation program;
 - an IPv4 TCP/UDP TC parser with counters, bounded ring-buffer events, and
@@ -33,8 +38,9 @@ Implemented in the repository:
 - revisioned controller-to-agent IPv4 identity snapshots and a versioned BPF map;
 - selector-resolved policy snapshots and dual-bank transactional BPF policy maps;
 - `unfctl status` and `unfctl explain` against live controller state;
-- a reproducible two-node kind demo covering cross-node allow/drop, shadow
-  pass-through, revisioned eBPF provenance, and live policy explanations.
+- a reproducible two-node kind demo covering native and NetworkPolicy cross-node
+  allow/drop, rejection/deletion recovery, shadow pass-through, revisioned eBPF
+  provenance, and live policy explanations.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
 multi-cluster transport, or production fail-closed recovery.

@@ -25,11 +25,13 @@ The policy compiler is a pure userspace library. Kubernetes types pass through a
 conversion boundary before they reach domain policy IR. The kernel sees only
 fixed-size numeric state and does no selector or Kubernetes interpretation.
 
-## Phase 1 and 2 data flows
+## Phase 1 through 3 data flows
 
-1. kube-rs watches Pods, Namespaces, and SecurityPolicies.
+1. kube-rs watches Pods, Namespaces, SecurityPolicies, and NetworkPolicies.
 2. Pod metadata becomes provisional network identities.
-3. SecurityPolicies compile deterministically into provenance-preserving IR.
+3. SecurityPolicies and the supported NetworkPolicy ingress subset compile into
+   the same provenance-preserving IR; unsupported compatibility objects are
+   rejected without retaining stale compiled state.
 4. `unfctl explain` asks the controller to resolve two Pods and evaluate the IR.
 5. The agent loads the Aya object, attaches TC, applies the controller's revisioned
    IPv4 identity snapshot, consumes compact events, and exposes health and metrics.

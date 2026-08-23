@@ -1,6 +1,6 @@
 # ADR 0009: NetworkPolicy compatibility through the shared policy engine
 
-Status: Accepted for the first Phase 3 compatibility slice
+Status: Accepted and live verified for the first Phase 3 compatibility slice
 
 ## Context
 
@@ -28,6 +28,12 @@ wildcards. It returns typed errors for egress, IP blocks, match expressions,
 general namespace-label selectors, named/ranged ports, protocol-only entries,
 SCTP, and malformed metadata/ports.
 
+The controller watches `NetworkPolicy` objects cluster-wide and assigns each a
+stable compatibility policy ID. Accepted IR joins native policy in the revisioned
+snapshot. Rejected objects are counted separately; a rejected update or deletion
+removes any stale accepted IR and advances the policy revision when effective
+state changed. The controller RBAC grants read-only watch access to the resource.
+
 ## Alternatives
 
 A separate NetworkPolicy evaluator would allow behavior to diverge before BPF
@@ -38,9 +44,8 @@ priority policies would give isolation defaults incorrect precedence.
 
 ## Consequences
 
-The compatibility foundation is deterministic, explainable, and testable without
-a cluster, and its supported results already lower through the Phase 2 dataplane
-compiler. It is not yet cluster integration: the controller does not watch
-`NetworkPolicy`, general namespace labels are absent from endpoint identity
-metadata, and egress needs a direction-aware IR and hook. These remain visible
-Phase 3 work rather than partial support claims.
+The supported compatibility slice is deterministic, explainable, and verified
+through the same Phase 2 dataplane compiler in a two-node cluster. General
+namespace labels are absent from endpoint identity metadata, rejection details
+do not yet have a dedicated API endpoint, and egress needs a direction-aware IR
+and hook. These remain visible Phase 3 work rather than broader support claims.

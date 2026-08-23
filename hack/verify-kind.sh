@@ -9,11 +9,21 @@ unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 temporary_dir=$(mktemp -d)
 controller_forward_pid=
 policy_mutated=false
+network_policy_mutated=false
+network_policy_deleted=false
 
 cleanup() {
     if [[ ${policy_mutated} == true ]]; then
         "${kc[@]}" patch securitypolicy -n backend frontend-to-backend \
             --type=merge -p '{"spec":{"enforcementMode":"Enforce"}}' >/dev/null 2>&1 || true
+    fi
+    if [[ ${network_policy_mutated} == true ]]; then
+        "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+            -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/port","value":8081}]' \
+            >/dev/null 2>&1 || true
+    fi
+    if [[ ${network_policy_deleted} == true ]]; then
+        "${kc[@]}" apply -f "${project_root}/deploy/examples/demo.yaml" >/dev/null 2>&1 || true
     fi
     if [[ -n ${controller_forward_pid} ]]; then
         kill "${controller_forward_pid}" 2>/dev/null || true
@@ -35,10 +45,13 @@ json_number() {
 
 wait_for_policy_transition() {
     local floor_revision=$1
-    local all_converged status desired applied bank pod candidate_revision
+    local all_converged status desired applied bank pod candidate_revision controller_revision
     for _ in {1..30}; do
         all_converged=true
         candidate_revision=
+        controller_revision=$("${unfctl}" \
+            --controller-url "http://127.0.0.1:${controller_port}" --output json status \
+            | sed -nE 's/.*"policy": ([0-9]+).*/\1/p')
         for pod in "${agent_pods[@]}"; do
             status=$(agent_status "${pod}" || true)
             desired=$(json_number desired_policy_revision <<<"${status}")
@@ -55,6 +68,9 @@ wait_for_policy_transition() {
             fi
             candidate_revision=${applied}
         done
+        if [[ -z ${candidate_revision} || ${candidate_revision} != "${controller_revision}" ]]; then
+            all_converged=false
+        fi
         if [[ ${all_converged} == true ]]; then
             transition_revision=${candidate_revision}
             for pod in "${agent_pods[@]}"; do
@@ -71,6 +87,28 @@ wait_for_policy_transition() {
 all_agent_logs() {
     "${kc[@]}" -n unf-system logs -l app.kubernetes.io/name=unf-agent \
         --all-containers=true --prefix=true --since=30s --tail=-1
+}
+
+wait_for_controller_policy_counts() {
+    local accepted=$1
+    local rejected=$2
+    local floor_revision=$3
+    local status actual_accepted actual_rejected revision
+    for _ in {1..30}; do
+        status=$("${unfctl}" \
+            --controller-url "http://127.0.0.1:${controller_port}" --output json status)
+        actual_accepted=$(sed -nE 's/.*"network_policies": ([0-9]+).*/\1/p' <<<"${status}")
+        actual_rejected=$(sed -nE 's/.*"rejected_network_policies": ([0-9]+).*/\1/p' \
+            <<<"${status}")
+        revision=$(sed -nE 's/.*"policy": ([0-9]+).*/\1/p' <<<"${status}")
+        if [[ ${actual_accepted} == "${accepted}" && ${actual_rejected} == "${rejected}" \
+            && -n ${revision} && ${revision} -gt ${floor_revision} ]]; then
+            controller_state_revision=${revision}
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 "${kc[@]}" wait --for=condition=Ready nodes --all --timeout=120s
@@ -100,6 +138,8 @@ controller_status=$("${unfctl}" \
 grep -Eq '"identities": [1-9][0-9]*' <<<"${controller_status}"
 grep -Eq '"indexed_pod_ips": [1-9][0-9]*' <<<"${controller_status}"
 grep -Eq '"resolved_policy_entries": [1-9][0-9]*' <<<"${controller_status}"
+grep -Eq '"network_policies": [1-9][0-9]*' <<<"${controller_status}"
+grep -q '"rejected_network_policies": 0' <<<"${controller_status}"
 
 allow_explanation=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json \
@@ -116,11 +156,33 @@ grep -q '"verdict": "Deny"' <<<"${deny_explanation}"
 grep -Eq '"policy_id": [1-9][0-9]*' <<<"${deny_explanation}"
 grep -Eq '"rule_id": [1-9][0-9]*' <<<"${deny_explanation}"
 
+network_policy_allow_explanation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/client --to backend/np-server --protocol tcp --port 8081)
+grep -q '"reason": "ExplicitRule"' <<<"${network_policy_allow_explanation}"
+grep -q '"verdict": "Allow"' <<<"${network_policy_allow_explanation}"
+grep -Eq '"policy_id": [1-9][0-9]*' <<<"${network_policy_allow_explanation}"
+
+network_policy_deny_explanation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/client --to backend/np-server --protocol tcp --port 9091)
+grep -q '"reason": "DefaultAction"' <<<"${network_policy_deny_explanation}"
+grep -q '"verdict": "Deny"' <<<"${network_policy_deny_explanation}"
+grep -Eq '"policy_id": [1-9][0-9]*' <<<"${network_policy_deny_explanation}"
+
 declare -A policy_banks
 initial_synced=false
 for _ in {1..30}; do
     initial_synced=true
     expected_policy_revision=
+    controller_status=$("${unfctl}" \
+        --controller-url "http://127.0.0.1:${controller_port}" --output json status)
+    controller_identity_epoch=$(sed -nE 's/.*"identity_epoch": ([0-9]+).*/\1/p' \
+        <<<"${controller_status}")
+    controller_identity_revision=$(sed -nE 's/.*"identity": ([0-9]+).*/\1/p' \
+        <<<"${controller_status}")
+    controller_policy_revision=$(sed -nE 's/.*"policy": ([0-9]+).*/\1/p' \
+        <<<"${controller_status}")
     for pod in "${agent_pods[@]}"; do
         status=$(agent_status "${pod}" || true)
         desired_identity=$(json_number desired_identity_revision <<<"${status}")
@@ -134,10 +196,14 @@ for _ in {1..30}; do
         applied_policy_epoch=$(json_number applied_policy_epoch <<<"${status}")
         policy_entries=$(json_number policy_map_entries <<<"${status}")
         if [[ -z ${desired_identity} || ${desired_identity} != "${applied_identity}" \
+            || ${applied_identity} != "${controller_identity_revision}" \
             || -z ${desired_epoch} || ${desired_epoch} != "${applied_epoch}" \
+            || ${applied_epoch} != "${controller_identity_epoch}" \
             || ${identity_entries:-0} -eq 0 \
             || -z ${desired_policy} || ${desired_policy} != "${applied_policy}" \
+            || ${applied_policy} != "${controller_policy_revision}" \
             || -z ${desired_policy_epoch} || ${desired_policy_epoch} != "${applied_policy_epoch}" \
+            || ${applied_policy_epoch} != "${controller_identity_epoch}" \
             || ${policy_entries:-0} -eq 0 ]] \
             || ! grep -q '"bpf_loaded":true' <<<"${status}"; then
             initial_synced=false
@@ -166,6 +232,12 @@ if [[ ${local_response} != "unf-demo-ok" ]]; then
     echo "demo server is not listening on the deny-test port" >&2
     exit 1
 fi
+network_policy_local_response=$("${kc[@]}" exec -n backend np-server -- \
+    wget -T 2 -t 1 -qO- http://127.0.0.1:9091)
+if [[ ${network_policy_local_response} != "unf-networkpolicy-ok" ]]; then
+    echo "NetworkPolicy demo server is not listening on the deny-test port" >&2
+    exit 1
+fi
 
 allow_response=$("${kc[@]}" exec -n frontend client -- \
     wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080)
@@ -192,6 +264,18 @@ shadow_response=$("${kc[@]}" exec -n frontend client -- \
     wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:9090)
 if [[ ${shadow_response} != "unf-demo-ok" ]]; then
     echo "shadow mode changed forwarding behavior" >&2
+    exit 1
+fi
+
+network_policy_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:8081)
+if [[ ${network_policy_allow_response} != "unf-networkpolicy-ok" ]]; then
+    echo "NetworkPolicy compatibility allow flow failed" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:9091 >/dev/null 2>&1; then
+    echo "NetworkPolicy compatibility default deny did not drop the open port" >&2
     exit 1
 fi
 sleep 1
@@ -225,6 +309,17 @@ if "${kc[@]}" exec -n frontend client -- \
     echo "restored enforce mode did not drop the explicit deny flow" >&2
     exit 1
 fi
+network_policy_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:8081)
+if [[ ${network_policy_allow_response} != "unf-networkpolicy-ok" ]]; then
+    echo "NetworkPolicy compatibility allow failed after policy reconvergence" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:9091 >/dev/null 2>&1; then
+    echo "NetworkPolicy compatibility deny failed after policy reconvergence" >&2
+    exit 1
+fi
 sleep 1
 
 flow_logs=$(all_agent_logs)
@@ -233,6 +328,12 @@ allow_line=$(grep '"destination_port":8080' <<<"${flow_logs}" \
     | tail -n 1 || true)
 deny_line=$(grep '"destination_port":9090' <<<"${flow_logs}" \
     | grep '"verdict":"Deny"' | grep '"reason":2' \
+    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
+network_policy_allow_line=$(grep '"destination_port":8081' <<<"${flow_logs}" \
+    | grep '"verdict":"Allow"' | grep '"reason":1' \
+    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
+network_policy_deny_line=$(grep '"destination_port":9091' <<<"${flow_logs}" \
+    | grep '"verdict":"Deny"' | grep '"reason":3' \
     | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
 if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${allow_line}" \
     || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${allow_line}" \
@@ -247,5 +348,79 @@ if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${deny_line}" \
     echo "UNF did not emit revisioned explicit-deny provenance" >&2
     exit 1
 fi
+if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${network_policy_allow_line}" \
+    || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${network_policy_allow_line}" \
+    || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${network_policy_allow_line}"; then
+    echo "UNF did not emit NetworkPolicy allow provenance" >&2
+    exit 1
+fi
+if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${network_policy_deny_line}" \
+    || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${network_policy_deny_line}" \
+    || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${network_policy_deny_line}"; then
+    echo "UNF did not emit NetworkPolicy default-deny provenance" >&2
+    exit 1
+fi
 
-echo "kind verification passed: transactional policy activation, enforce allow/drop, shadow pass-through, and revisioned provenance"
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/port","value":"allowed"}]' \
+    >/dev/null
+network_policy_mutated=true
+if ! wait_for_controller_policy_counts 0 1 "${enforced_policy_revision}"; then
+    echo "controller did not report the unsupported NetworkPolicy update" >&2
+    exit 1
+fi
+rejected_policy_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${enforced_policy_revision}"; then
+    echo "agents did not remove the rejected NetworkPolicy revision" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/port","value":8081}]' \
+    >/dev/null
+if ! wait_for_controller_policy_counts 1 0 "${rejected_policy_revision}"; then
+    echo "controller did not readmit the restored NetworkPolicy" >&2
+    exit 1
+fi
+restored_policy_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${rejected_policy_revision}"; then
+    echo "agents did not activate the restored NetworkPolicy" >&2
+    exit 1
+fi
+network_policy_mutated=false
+
+"${kc[@]}" delete networkpolicy -n backend frontend-to-np-server >/dev/null
+network_policy_deleted=true
+if ! wait_for_controller_policy_counts 0 0 "${restored_policy_revision}"; then
+    echo "controller did not remove the deleted NetworkPolicy" >&2
+    exit 1
+fi
+deleted_policy_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${restored_policy_revision}"; then
+    echo "agents did not activate NetworkPolicy deletion" >&2
+    exit 1
+fi
+deleted_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:9091)
+if [[ ${deleted_response} != "unf-networkpolicy-ok" ]]; then
+    echo "NetworkPolicy deletion did not restore forwarding" >&2
+    exit 1
+fi
+
+"${kc[@]}" apply -f "${project_root}/deploy/examples/demo.yaml" >/dev/null
+if ! wait_for_controller_policy_counts 1 0 "${deleted_policy_revision}"; then
+    echo "controller did not reconcile the recreated NetworkPolicy" >&2
+    exit 1
+fi
+if ! wait_for_policy_transition "${deleted_policy_revision}"; then
+    echo "agents did not activate the recreated NetworkPolicy" >&2
+    exit 1
+fi
+network_policy_deleted=false
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:9091 >/dev/null 2>&1; then
+    echo "recreated NetworkPolicy did not restore default-deny enforcement" >&2
+    exit 1
+fi
+
+echo "kind verification passed: native/NetworkPolicy enforcement, rejection/deletion recovery, shadow mode, transactional activation, and provenance"

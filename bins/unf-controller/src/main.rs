@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Namespace, Pod};
+use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, ResourceExt};
 use prometheus_client::encoding::text::encode;
@@ -24,7 +25,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_api::SecurityPolicy;
 use unf_common::{PolicyId, Protocol, Revision};
-use unf_policy::{Endpoint, Flow, PolicyCompiler, PolicyIr, compile_dataplane_entries, evaluate};
+use unf_policy::{
+    Endpoint, Flow, NetworkPolicyCompiler, PolicyCompiler, PolicyIr, compile_dataplane_entries,
+    evaluate,
+};
 use unf_state::{
     IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
     PolicyStateSnapshot, RevisionSet, provisional_identity_id,
@@ -52,8 +56,11 @@ struct ControllerState {
     offline: bool,
     pods: RwLock<BTreeMap<String, PodRecord>>,
     namespaces: RwLock<BTreeMap<String, Namespace>>,
-    policies: RwLock<BTreeMap<String, SecurityPolicy>>,
-    compiled: RwLock<BTreeMap<String, PolicyIr>>,
+    security_policies: RwLock<BTreeMap<String, SecurityPolicy>>,
+    compiled_security_policies: RwLock<BTreeMap<String, PolicyIr>>,
+    network_policies: RwLock<BTreeMap<String, NetworkPolicy>>,
+    compiled_network_policies: RwLock<BTreeMap<String, PolicyIr>>,
+    rejected_network_policies: RwLock<BTreeMap<String, String>>,
     policy_state_guard: RwLock<()>,
     identities: Mutex<IdentityRegistry>,
     revisions: Mutex<RevisionSet>,
@@ -77,6 +84,8 @@ struct StatusBody {
     pods: usize,
     namespaces: usize,
     security_policies: usize,
+    network_policies: usize,
+    rejected_network_policies: usize,
     compiled_policies: usize,
     resolved_policy_entries: usize,
     identities: usize,
@@ -200,8 +209,11 @@ fn new_state(offline: bool) -> ControllerState {
         offline,
         pods: RwLock::new(BTreeMap::new()),
         namespaces: RwLock::new(BTreeMap::new()),
-        policies: RwLock::new(BTreeMap::new()),
-        compiled: RwLock::new(BTreeMap::new()),
+        security_policies: RwLock::new(BTreeMap::new()),
+        compiled_security_policies: RwLock::new(BTreeMap::new()),
+        network_policies: RwLock::new(BTreeMap::new()),
+        compiled_network_policies: RwLock::new(BTreeMap::new()),
+        rejected_network_policies: RwLock::new(BTreeMap::new()),
         policy_state_guard: RwLock::new(()),
         identities: Mutex::new(IdentityRegistry::default()),
         revisions: Mutex::new(RevisionSet::default()),
@@ -230,9 +242,21 @@ fn spawn_watchers(
         watch_namespaces(namespace_api, namespace_state, namespace_cancel).await;
     });
 
-    let policy_api = Api::<SecurityPolicy>::all(client);
+    let policy_api = Api::<SecurityPolicy>::all(client.clone());
+    let network_policy_state = Arc::clone(&state);
+    let network_policy_cancel = cancellation.clone();
     tasks.spawn(async move {
         watch_policies(policy_api, state, cancellation).await;
+    });
+
+    let network_policy_api = Api::<NetworkPolicy>::all(client);
+    tasks.spawn(async move {
+        watch_network_policies(
+            network_policy_api,
+            network_policy_state,
+            network_policy_cancel,
+        )
+        .await;
     });
 }
 
@@ -437,8 +461,9 @@ fn apply_policy_event(state: &ControllerState, event: Event<SecurityPolicy>) {
             let id = stable_policy_id(&key);
             match PolicyCompiler::compile(id, policy.clone()) {
                 Ok(ir) => {
-                    let previous = write_lock(&state.compiled).insert(key.clone(), ir.clone());
-                    write_lock(&state.policies).insert(key, policy);
+                    let previous = write_lock(&state.compiled_security_policies)
+                        .insert(key.clone(), ir.clone());
+                    write_lock(&state.security_policies).insert(key, policy);
                     state.metrics.reconciles.inc();
                     if previous.as_ref() != Some(&ir) {
                         bump_policy_revision(state);
@@ -446,21 +471,109 @@ fn apply_policy_event(state: &ControllerState, event: Event<SecurityPolicy>) {
                 }
                 Err(error) => {
                     state.metrics.errors.inc();
+                    let removed = write_lock(&state.compiled_security_policies)
+                        .remove(&key)
+                        .is_some();
+                    write_lock(&state.security_policies).remove(&key);
+                    if removed {
+                        bump_policy_revision(state);
+                    }
                     warn!(%error, %key, "policy compilation failed");
                 }
             }
         }
         Event::Delete(policy) => {
             let key = object_key(&policy);
-            write_lock(&state.policies).remove(&key);
-            if write_lock(&state.compiled).remove(&key).is_some() {
+            write_lock(&state.security_policies).remove(&key);
+            if write_lock(&state.compiled_security_policies)
+                .remove(&key)
+                .is_some()
+            {
                 bump_policy_revision(state);
             }
         }
         Event::Init => {
-            write_lock(&state.policies).clear();
-            let had_policies = !read_lock(&state.compiled).is_empty();
-            write_lock(&state.compiled).clear();
+            write_lock(&state.security_policies).clear();
+            let had_policies = !read_lock(&state.compiled_security_policies).is_empty();
+            write_lock(&state.compiled_security_policies).clear();
+            if had_policies {
+                bump_policy_revision(state);
+            }
+        }
+        Event::InitDone => {}
+    }
+}
+
+async fn watch_network_policies(
+    api: Api<NetworkPolicy>,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    let stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    tokio::pin!(stream);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            item = stream.try_next() => match item {
+                Ok(Some(event)) => apply_network_policy_event(&state, event),
+                Ok(None) => break,
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, "NetworkPolicy watch error");
+                }
+            }
+        }
+    }
+}
+
+fn apply_network_policy_event(state: &ControllerState, event: Event<NetworkPolicy>) {
+    let _policy_state_guard = write_lock(&state.policy_state_guard);
+    match event {
+        Event::Apply(policy) | Event::InitApply(policy) => {
+            let key = object_key(&policy);
+            let id = stable_policy_id(&format!("networkpolicy:{key}"));
+            match NetworkPolicyCompiler::compile(id, policy.clone()) {
+                Ok(ir) => {
+                    let previous = write_lock(&state.compiled_network_policies)
+                        .insert(key.clone(), ir.clone());
+                    write_lock(&state.network_policies).insert(key.clone(), policy);
+                    write_lock(&state.rejected_network_policies).remove(&key);
+                    state.metrics.reconciles.inc();
+                    if previous.as_ref() != Some(&ir) {
+                        bump_policy_revision(state);
+                    }
+                }
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    let removed = write_lock(&state.compiled_network_policies)
+                        .remove(&key)
+                        .is_some();
+                    write_lock(&state.network_policies).remove(&key);
+                    write_lock(&state.rejected_network_policies)
+                        .insert(key.clone(), error.to_string());
+                    if removed {
+                        bump_policy_revision(state);
+                    }
+                    warn!(%error, %key, "NetworkPolicy compilation failed");
+                }
+            }
+        }
+        Event::Delete(policy) => {
+            let key = object_key(&policy);
+            write_lock(&state.network_policies).remove(&key);
+            write_lock(&state.rejected_network_policies).remove(&key);
+            if write_lock(&state.compiled_network_policies)
+                .remove(&key)
+                .is_some()
+            {
+                bump_policy_revision(state);
+            }
+        }
+        Event::Init => {
+            write_lock(&state.network_policies).clear();
+            write_lock(&state.rejected_network_policies).clear();
+            let had_policies = !read_lock(&state.compiled_network_policies).is_empty();
+            write_lock(&state.compiled_network_policies).clear();
             if had_policies {
                 bump_policy_revision(state);
             }
@@ -509,8 +622,11 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         },
         pods: read_lock(&state.pods).len(),
         namespaces: read_lock(&state.namespaces).len(),
-        security_policies: read_lock(&state.policies).len(),
-        compiled_policies: read_lock(&state.compiled).len(),
+        security_policies: read_lock(&state.security_policies).len(),
+        network_policies: read_lock(&state.network_policies).len(),
+        rejected_network_policies: read_lock(&state.rejected_network_policies).len(),
+        compiled_policies: read_lock(&state.compiled_security_policies).len()
+            + read_lock(&state.compiled_network_policies).len(),
         resolved_policy_entries,
         identities: identities.identity_count(),
         indexed_pod_ips: identities.address_count(),
@@ -545,7 +661,7 @@ fn dataplane_policy_state(
     state: &ControllerState,
 ) -> Result<(Revision, Vec<unf_state::PolicyMapEntry>), ApiError> {
     let _policy_state_guard = read_lock(&state.policy_state_guard);
-    let policies: Vec<_> = read_lock(&state.compiled).values().cloned().collect();
+    let policies = compiled_policies(state);
     let endpoints: Vec<_> = read_lock(&state.pods)
         .values()
         .map(|pod| pod.endpoint.clone())
@@ -574,7 +690,7 @@ async fn explain(
         RequestProtocol::Tcp => Protocol::Tcp,
         RequestProtocol::Udp => Protocol::Udp,
     };
-    let policies: Vec<PolicyIr> = read_lock(&state.compiled).values().cloned().collect();
+    let policies = compiled_policies(&state);
     let decision = evaluate(
         &policies,
         Flow {
@@ -593,6 +709,19 @@ async fn explain(
         dataplane_enforcement: true,
         note: "decision is enforceable after traffic-path nodes report this policy revision as applied",
     }))
+}
+
+fn compiled_policies(state: &ControllerState) -> Vec<PolicyIr> {
+    let mut policies: Vec<_> = read_lock(&state.compiled_security_policies)
+        .values()
+        .cloned()
+        .collect();
+    policies.extend(
+        read_lock(&state.compiled_network_policies)
+            .values()
+            .cloned(),
+    );
+    policies
 }
 
 fn resolved(pod: &PodRecord) -> ResolvedEndpoint {
@@ -725,6 +854,31 @@ fn init_tracing() {
 mod tests {
     use super::*;
 
+    fn network_policy(port: &serde_json::Value) -> NetworkPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": "allow-client",
+                "namespace": "backend"
+            },
+            "spec": {
+                "podSelector": {"matchLabels": {"app": "np-server"}},
+                "policyTypes": ["Ingress"],
+                "ingress": [{
+                    "from": [{
+                        "namespaceSelector": {
+                            "matchLabels": {"kubernetes.io/metadata.name": "frontend"}
+                        },
+                        "podSelector": {"matchLabels": {"app": "client"}}
+                    }],
+                    "ports": [{"protocol": "TCP", "port": port}]
+                }]
+            }
+        }))
+        .expect("test NetworkPolicy is valid Kubernetes JSON")
+    }
+
     #[test]
     fn canonical_identity_key_is_order_independent_and_label_sensitive() {
         let left = BTreeMap::from([
@@ -758,5 +912,27 @@ mod tests {
             canonical_identity_key("local", "a|1:b", "c", "d", &labels),
             canonical_identity_key("local", "a", "1:b|c", "d", &labels)
         );
+    }
+
+    #[test]
+    fn network_policy_reconciliation_removes_stale_state_on_rejection() {
+        let state = new_state(true);
+        apply_network_policy_event(
+            &state,
+            Event::Apply(network_policy(&serde_json::json!(8081))),
+        );
+        assert_eq!(read_lock(&state.network_policies).len(), 1);
+        assert_eq!(read_lock(&state.compiled_network_policies).len(), 1);
+        assert!(read_lock(&state.rejected_network_policies).is_empty());
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(1));
+
+        apply_network_policy_event(
+            &state,
+            Event::Apply(network_policy(&serde_json::json!("http"))),
+        );
+        assert!(read_lock(&state.network_policies).is_empty());
+        assert!(read_lock(&state.compiled_network_policies).is_empty());
+        assert_eq!(read_lock(&state.rejected_network_policies).len(), 1);
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(2));
     }
 }

@@ -23,7 +23,7 @@ repeatable test are both present in this repository.
 |---|---|---|---|
 | Phase 1 — observation foundation | **Verified** | Master prompt §101: controller, identity state, policy compiler, agent/Aya/TC flow events, and successful `unfctl status` | `make fmt-check lint test`, `make ebpf`, `make kind-test` |
 | Phase 2 — identity and policy enforcement | **Verified** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | `make fmt-check lint test`, `make ebpf`, and `make kind-test` verify the complete gate |
-| Phase 3 — compatibility and simulation | **In progress** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | Ingress adapter foundation and additive shared-engine semantics are unit verified; controller integration and remaining gate items are open |
+| Phase 3 — compatibility and simulation | **In progress** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | The supported ingress adapter is controller-integrated and live verified; broader compatibility, simulation, topology, and export remain open |
 | Full CNI and later fabric capabilities | **Planned** | §104 and later roadmap gates | Explicitly out of current scope |
 
 Sections 98–99 describe the richer first enforcement and enriched-observability
@@ -38,13 +38,14 @@ completed by Phase 1's observation-only shadow evaluation.
 | Stable userspace formatting, lint, and tests | Passed: `make fmt-check lint test` |
 | eBPF target build and manifest rendering | Passed: `make ebpf` and `kubectl kustomize deploy` |
 | Two-node cluster integration | Passed: `make kind-test` |
-| Demo dataplane | Open port 8080 passed and open port 9090 was dropped in enforce mode; 9090 passed when the same policy switched to shadow and dropped again after restore |
-| Agent state | Two ready agents; BPF loaded; after controller recovery both applied identity/policy revision 17 with six identity and 16 active policy entries |
-| Controller state | Ready after restart; 16 watched Pods, 14 admitted identities, 6 indexed non-host-network Pod IPs, one compiled policy, 16 resolved policy entries |
+| Demo dataplane | Native policy: open port 8080 passed and 9090 dropped, passed in shadow, then dropped after restore. NetworkPolicy: port 8081 passed and independently open port 9091 dropped |
+| Agent state | Two ready agents with BPF loaded; both applied identity revision 21 and policy revision 31 in controller epoch 7677355261639323637, with 7 identity and 33 active policy entries |
+| Controller state | Ready with 17 watched Pods, 15 admitted identities, 7 indexed non-host-network Pod IPs, one native policy, one accepted NetworkPolicy, zero rejected NetworkPolicies, and 33 resolved entries |
 | Transactional policy update | The verifier switched enforce → shadow → enforce, requiring a higher revision and opposite bank on every agent for both transitions |
 | Interruption recovery | With the controller scaled to zero, the active bank continued allowing 8080 and denying 9090; both agents then accepted the restarted controller epoch and reconverged |
 | Dataplane provenance | ABI v2 events matched the applied revision and carried nonzero identities plus actual/shadow policy and explicit-deny rule provenance |
-| Policy explanation | Port 8080 reported explicit allow and port 9090 explicit deny with dataplane enforcement truthfully enabled |
+| NetworkPolicy lifecycle | An unsupported named-port update was rejected and removed stale compiled state; restoring it reconverged. Deletion allowed 9091 and recreation restored the drop |
+| Policy explanation | Native 8080/9090 and compatibility 8081/9091 decisions reported the expected explicit/default provenance with dataplane enforcement truthfully enabled |
 
 The kind cluster is disposable and its object counts can change as system Pods
 roll. The repeatable commands, rather than these snapshot counts, are the release
@@ -58,7 +59,7 @@ gate.
 | Versioned userspace/BPF ABI | **Verified** | `unf-common`, `unf-ebpf-common` | ABI layout and typed-ID unit tests |
 | SecurityPolicy API and generated CRD | **Verified** | `unf-api`, checked-in CRD | Schema drift and structural schema tests |
 | Deterministic policy compiler/evaluator | **Verified** | `unf-policy` | Unit and property tests for rules, defaults, priorities, conflicts, and order independence |
-| Kubernetes desired state | **Verified** | Pod, Namespace, and SecurityPolicy watchers | Live controller reports watched/compiled objects and zero reconcile errors |
+| Kubernetes desired state | **Verified** | Pod, Namespace, SecurityPolicy, and supported NetworkPolicy watchers | Live controller reports watched/compiled objects and explicit compatibility rejection counts |
 | Identity state | **Verified** | Metadata-derived numeric identities; Phase 2 registry adds collision admission and Pod-IP indexes | Identity unit tests and live explain resolution |
 | Agent and Aya loader | **Verified** | Privileged per-node DaemonSet and dynamic non-loopback TC attachment | Two ready agents report `bpf_loaded: true` |
 | TC observation | **Verified** | Bounded Ethernet/IPv4/TCP/UDP parsing, counters, ring buffer, pass-only verdict | Cross-node port 8080 event asserted by `hack/verify-kind.sh` |
@@ -96,6 +97,9 @@ gate.
   decisions fail open with revision-zero observed/identity-unknown provenance.
 - Applied policy status is node-local; the controller and CLI do not yet aggregate
   node acknowledgements.
+- The NetworkPolicy adapter intentionally accepts only the documented ingress
+  subset. Unsupported objects are counted as rejected but rejection details do
+  not yet have a dedicated API endpoint.
 - Interface index is currently zero in emitted events.
 - Dynamic attachment can observe one packet on multiple interfaces; flow
   aggregation and deduplication are not implemented.
@@ -107,9 +111,9 @@ gate.
 
 | Deliverable | State | Exit evidence |
 |---|---|---|
-| NetworkPolicy ingress translator foundation | **Implemented** | Unit tests cover allow/default isolation, wildcards, local/exact-namespace peers, and explicit unsupported-feature errors |
-| Additive compatibility semantics | **Implemented** | Multiple selecting policies combine allows in the shared evaluator and lower through the shared dataplane compiler |
-| NetworkPolicy controller watch and live enforcement | **Planned** | Live object reconciliation, status, allow/drop, deletion, and restart convergence |
+| NetworkPolicy ingress translator foundation | **Verified** | Unit tests cover allow/default isolation, wildcards, local/exact-namespace peers, and explicit unsupported-feature errors; `make kind-test` exercises the supported form |
+| Additive compatibility semantics | **Verified** | Multiple selecting policies combine allows in the shared evaluator and lower through the shared dataplane compiler; the live adapter uses that same engine |
+| NetworkPolicy controller watch and live enforcement | **Verified** | `make kind-test` covers reconciliation/status, explicit allow, isolation drop, revisioned provenance, rejection/removal/recovery, and deletion/recreation |
 | Full ingress selector/port compatibility | **Planned** | Match expressions, namespace labels, named/ranged ports, IP blocks, and conformance cases |
 | Egress NetworkPolicy compatibility | **Planned** | Direction-aware IR and dataplane enforcement evidence |
 | Policy simulation foundation | **Planned** | Proposed-policy evaluation against a versioned topology/flow snapshot |

@@ -64,6 +64,7 @@ kind-demo:
 	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev apply -f deploy/examples/demo.yaml
 	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev wait --for=condition=Ready pod/client -n frontend --timeout=120s
 	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev wait --for=condition=Ready pod/server -n backend --timeout=120s
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev wait --for=condition=Ready pod/np-server -n backend --timeout=120s
 	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev exec -n frontend client -- wget -qO- http://server.backend.svc.cluster.local:8080
 
 kind-test: cli kind-demo
