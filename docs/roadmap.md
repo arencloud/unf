@@ -54,8 +54,13 @@ matrix and reproducible evidence.
   debris are rejected with actionable errors while primary allow/deny state
   remains unchanged; permanent dataplane startup failure exits for orchestrator
   retry;
-- Next: deterministic physical staging-map pressure/rollback evidence and
-  legacy-kernel/OpenShift handoff validation.
+- Implemented and two-node kind verified: deterministic reserved-key pressure
+  fills the shared physical `POLICY_RULES` map with inactive-bank keys, forces a
+  real kernel staging failure, and proves rollback preserves the active
+  revision/bank and traffic; after scoped cleanup, the waiting revision activates
+  and enforcement restores;
+- Next: legacy-kernel/OpenShift handoff validation, explicit stale-state cleanup,
+  and authenticated/durable agent acknowledgements.
 
 ## Phase 3 — compatibility and simulation
 

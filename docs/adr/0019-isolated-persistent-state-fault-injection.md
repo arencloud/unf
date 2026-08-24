@@ -50,6 +50,6 @@ decoder unit coverage, without risking the active last-known-good state. The
 test helper is intentionally privileged because bpffs mutation requires it; it
 is an explicit example fixture and is not part of the production kustomization.
 
-These scenarios validate structural and transactional recovery boundaries, not
-physical map exhaustion. Deterministic map-pressure injection remains separate
-work and must preserve the active bank while forcing a staging write to fail.
+These scenarios validate structural recovery boundaries without altering the
+primary maps. Physical inactive-bank exhaustion and transactional rollback are
+covered separately by ADR 0020.

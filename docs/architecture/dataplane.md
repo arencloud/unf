@@ -99,11 +99,15 @@ ABI v2 link directory and atomically updates that link to the newly loaded
 program. On older kernels, it owns a fixed priority/handle tuple per direction
 and replaces the legacy netlink filter in place. The old program therefore
 remains attached until the replacement program is loaded and handed over.
-Invalid map state never becomes a deny by accident. ABI v1 pin directories are
-not removed automatically; operators may delete them only after validating an
-ABI v2 rollout. See ADRs 0008, 0016, 0017, 0018, and 0019. Permanent startup
-validation failures terminate the agent after readiness is fenced so the
-orchestrator can retry after repair.
+Invalid map state never becomes a deny by accident. The kind gate also fills the
+shared physical `POLICY_RULES` map using reserved keys tagged for the inactive
+bank, requires the staging failure to preserve the selected bank and applied
+revision, then removes only those keys and verifies that the waiting revision
+activates.
+ABI v1 pin directories are not removed automatically; operators may delete them
+only after validating an ABI v2 rollout. See ADRs 0008 and 0016 through 0020.
+Permanent startup validation failures terminate the agent after readiness is
+fenced so the orchestrator can retry after repair.
 
 ## Build boundary
 
@@ -113,6 +117,6 @@ tests still run on stable in the host workspace. See ADR 0002.
 
 ## Next dataplane milestone
 
-Test deterministic physical map-pressure failure while preserving the active
-bank, then validate the legacy netlink handoff path on an older supported kernel
-and OpenShift host.
+Validate the legacy netlink handoff path on an older supported kernel and an
+OpenShift host, then define authenticated acknowledgements and explicit stale ABI
+directory cleanup.

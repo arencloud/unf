@@ -9,6 +9,9 @@ unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 temporary_dir=$(mktemp -d)
 controller_forward_pid=
 handoff_probe_pid=
+map_pressure_pid=
+map_pressure_helper=
+pressure_inactive_bank=
 controller_scaled_down=false
 policy_mutated=false
 network_policy_mutated=false
@@ -28,6 +31,13 @@ cleanup() {
             >/dev/null 2>&1 || true
         kill "${handoff_probe_pid}" 2>/dev/null || true
         wait "${handoff_probe_pid}" 2>/dev/null || true
+    fi
+    if [[ -n ${map_pressure_pid} ]]; then
+        if [[ -n ${map_pressure_helper} ]]; then
+            "${kc[@]}" -n unf-system exec "${map_pressure_helper}" -- \
+                touch /run/unf-test/pressure-stop >/dev/null 2>&1 || true
+        fi
+        wait "${map_pressure_pid}" 2>/dev/null || true
     fi
     if [[ ${controller_scaled_down} == true ]]; then
         "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 \
@@ -52,6 +62,12 @@ cleanup() {
             [[ -n ${helper} ]] || continue
             "${kc[@]}" -n unf-system exec "${helper}" -- \
                 rm -rf /sys/fs/bpf/unf/fault-tests-v2 >/dev/null 2>&1 || true
+            if [[ -n ${pressure_inactive_bank} ]]; then
+                "${kc[@]}" -n unf-system exec "${helper}" -- \
+                    /usr/local/bin/unf-bpf-map-pressure clear \
+                    /sys/fs/bpf/unf/v2/POLICY_RULES "${pressure_inactive_bank}" \
+                    >/dev/null 2>&1 || true
+            fi
         done < <("${kc[@]}" -n unf-system get pods \
             -l app.kubernetes.io/name=unf-bpf-fault-helper \
             -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
@@ -109,6 +125,12 @@ start_controller_forward() {
 
 agent_status() {
     "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${1}/proxy/v1/status"
+}
+
+agent_metric() {
+    local agent=$1 metric=$2
+    "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${agent}/proxy/metrics" \
+        | awk -v metric="${metric}" '$1 == metric { print $2; exit }'
 }
 
 json_number() {
@@ -1646,6 +1668,137 @@ if "${kc[@]}" exec -n frontend client -- \
     exit 1
 fi
 
+pressure_status=$(agent_status "${restart_agent}")
+pressure_applied_revision=$(json_number applied_policy_revision <<<"${pressure_status}")
+pressure_active_bank=$(json_number active_policy_bank <<<"${pressure_status}")
+pressure_errors_before=$(agent_metric \
+    "${restart_agent}" unf_policy_sync_errors_total)
+if [[ -z ${pressure_applied_revision} || -z ${pressure_errors_before} \
+    || ( ${pressure_active_bank} != 0 && ${pressure_active_bank} != 1 ) ]]; then
+    echo "agent did not expose a valid pressure-test baseline" >&2
+    exit 1
+fi
+pressure_inactive_bank=$((1 - pressure_active_bank))
+map_pressure_helper=${fault_helper}
+"${kc[@]}" -n unf-system exec "${fault_helper}" -- \
+    rm -f /run/unf-test/pressure-ready /run/unf-test/pressure-stop
+"${kc[@]}" -n unf-system exec "${fault_helper}" -- \
+    /usr/local/bin/unf-bpf-map-pressure hold \
+    /sys/fs/bpf/unf/v2/POLICY_RULES "${pressure_inactive_bank}" \
+    /run/unf-test/pressure-ready /run/unf-test/pressure-stop \
+    >"${temporary_dir}/map-pressure.log" 2>&1 &
+map_pressure_pid=$!
+pressure_ready=false
+for _ in {1..60}; do
+    if "${kc[@]}" -n unf-system exec "${fault_helper}" -- \
+        test -s /run/unf-test/pressure-ready >/dev/null 2>&1; then
+        pressure_ready=true
+        break
+    fi
+    if ! kill -0 "${map_pressure_pid}" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+if [[ ${pressure_ready} != true ]]; then
+    cat "${temporary_dir}/map-pressure.log" >&2
+    echo "physical policy map pressure did not reach capacity" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch securitypolicy -n backend frontend-to-backend --type=merge \
+    -p '{"spec":{"enforcementMode":"Shadow"}}' >/dev/null
+policy_mutated=true
+pressure_failure_observed=false
+pressure_failed_revision=
+for _ in {1..60}; do
+    status=$(agent_status "${restart_agent}" || true)
+    desired=$(json_number desired_policy_revision <<<"${status}")
+    applied=$(json_number applied_policy_revision <<<"${status}")
+    bank=$(json_number active_policy_bank <<<"${status}")
+    errors=$(agent_metric "${restart_agent}" unf_policy_sync_errors_total || true)
+    if [[ -n ${desired} && ${desired} -gt ${pressure_applied_revision} \
+        && ${applied} == "${pressure_applied_revision}" \
+        && ${bank} == "${pressure_active_bank}" \
+        && -n ${errors} && ${errors} -gt ${pressure_errors_before} ]]; then
+        pressure_failed_revision=${desired}
+        pressure_failure_observed=true
+        break
+    fi
+    sleep 1
+done
+if [[ ${pressure_failure_observed} != true ]]; then
+    cat "${temporary_dir}/map-pressure.log" >&2
+    echo "agent did not preserve the active revision under physical map pressure" >&2
+    exit 1
+fi
+pressure_agent_logs=$("${kc[@]}" -n unf-system logs "${restart_agent}" --since=90s)
+if ! grep -q 'policy update failed' <<<"${pressure_agent_logs}" \
+    || ! grep -q 'stage identity policy map bank' <<<"${pressure_agent_logs}"; then
+    echo "agent did not report the staging-map pressure failure and rollback" >&2
+    exit 1
+fi
+pressure_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080)
+if [[ ${pressure_allow_response} != "unf-demo-ok" ]]; then
+    echo "map pressure disturbed the selected bank's allowed flow" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:9090 >/dev/null 2>&1; then
+    echo "map pressure disturbed the selected bank's denied flow" >&2
+    exit 1
+fi
+
+"${kc[@]}" -n unf-system exec "${fault_helper}" -- \
+    touch /run/unf-test/pressure-stop >/dev/null
+if ! wait "${map_pressure_pid}"; then
+    cat "${temporary_dir}/map-pressure.log" >&2
+    echo "physical map pressure cleanup failed" >&2
+    exit 1
+fi
+map_pressure_pid=
+if ! grep -q 'pressure map reached capacity' "${temporary_dir}/map-pressure.log"; then
+    cat "${temporary_dir}/map-pressure.log" >&2
+    echo "pressure helper did not confirm physical map exhaustion" >&2
+    exit 1
+fi
+if ! wait_for_policy_batch_convergence "${pressure_applied_revision}"; then
+    echo "agents did not apply the waiting policy revision after pressure cleanup" >&2
+    exit 1
+fi
+pressure_recovered_status=$(agent_status "${restart_agent}")
+pressure_recovered_revision=$(json_number applied_policy_revision \
+    <<<"${pressure_recovered_status}")
+pressure_recovered_bank=$(json_number active_policy_bank \
+    <<<"${pressure_recovered_status}")
+if [[ ${pressure_recovered_revision} != "${pressure_failed_revision}" \
+    || ${pressure_recovered_bank} == "${pressure_active_bank}" ]]; then
+    echo "agent did not activate the previously failed revision after pressure cleanup" >&2
+    exit 1
+fi
+pressure_shadow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:9090)
+if [[ ${pressure_shadow_response} != "unf-demo-ok" ]]; then
+    echo "recovered shadow revision did not become active after pressure cleanup" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch securitypolicy -n backend frontend-to-backend --type=merge \
+    -p '{"spec":{"enforcementMode":"Enforce"}}' >/dev/null
+if ! wait_for_policy_batch_convergence "${pressure_recovered_revision}"; then
+    echo "agents did not restore enforcement after the pressure test" >&2
+    exit 1
+fi
+policy_mutated=false
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:9090 >/dev/null 2>&1; then
+    echo "restoring enforcement after map pressure did not restore the deny" >&2
+    exit 1
+fi
+pressure_inactive_bank=
+map_pressure_helper=
+
 "${kc[@]}" -n unf-system exec "${fault_helper}" -- rm -rf "${fault_root}"
 "${kc[@]}" delete -f "${project_root}/deploy/examples/bpf-fault-helper.yaml" >/dev/null
 bpf_fault_helper_created=false
@@ -1763,4 +1916,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: isolated partial-pin/active-config/inactive-stage fault rejection, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

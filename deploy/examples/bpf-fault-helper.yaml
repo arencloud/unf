@@ -33,8 +33,12 @@ spec:
           volumeMounts:
             - name: bpffs
               mountPath: /sys/fs/bpf
+            - name: runtime
+              mountPath: /run/unf-test
       volumes:
         - name: bpffs
           hostPath:
             path: /sys/fs/bpf
             type: Directory
+        - name: runtime
+          emptyDir: {}

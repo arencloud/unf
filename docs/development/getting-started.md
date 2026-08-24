@@ -167,8 +167,13 @@ Before that replacement, `make kind-test` temporarily deploys the privileged
 [BPF fault helper](../../deploy/examples/bpf-fault-helper.yaml) fixture. It builds
 isolated bpffs alias sets and requires the exact agent binary to reject partial
 pins, malformed active policy config, and invalid inactive-bank debris. The
-helper never changes the primary ABI v2 pins, is removed immediately after the
-probes, and is not part of the production kustomization.
+same helper then uses reserved inactive-bank keys to fill the shared physical
+`POLICY_RULES` map until the kernel rejects staging. The verifier requires the
+desired revision to advance while the applied revision and selected bank stay
+fixed, rechecks the established allow/deny flows, releases pressure, and requires
+that waiting revision to activate before restoring enforcement. Cleanup removes
+only the scoped synthetic keys and fault aliases; the helper is removed before
+offline replacement and is not part of the production kustomization.
 
 The DaemonSet attaches ingress classification to every non-loopback node interface
 and discovers newly created pod veths. A packet can therefore produce multiple

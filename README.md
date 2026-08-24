@@ -79,6 +79,10 @@ Implemented in the repository:
 - isolated kind fault injection proving partial pin sets, malformed active
   configuration, and corrupt inactive-stage values are rejected without
   disturbing the live last-known-good dataplane;
+- deterministic kind map-pressure injection using inactive-bank synthetic keys
+  to fill the shared physical policy map, proving capacity failure cannot advance
+  the applied revision or disturb active traffic and that retry succeeds after
+  scoped cleanup;
 - `unfctl status`, `unfctl topology`, `unfctl flows`, and `unfctl explain` against live
   controller state;
 - `unfctl policy simulate <security-policy.yaml>` with table/JSON/YAML

@@ -5,8 +5,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY images/ipv6-extension-probe.c /tmp/ipv6-extension-probe.c
+COPY images/bpf-map-pressure.c /tmp/bpf-map-pressure.c
 RUN gcc -std=c11 -O2 -Wall -Wextra -Werror \
-    -o /usr/local/bin/unf-ipv6-extension-probe /tmp/ipv6-extension-probe.c
+    -o /usr/local/bin/unf-ipv6-extension-probe /tmp/ipv6-extension-probe.c \
+    && gcc -std=c11 -O2 -Wall -Wextra -Werror \
+    -o /usr/local/bin/unf-bpf-map-pressure /tmp/bpf-map-pressure.c
 
 FROM docker.io/library/debian:bookworm-slim
 
@@ -15,6 +18,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=probe-builder /usr/local/bin/unf-ipv6-extension-probe \
-    /usr/local/bin/unf-ipv6-extension-probe
+  /usr/local/bin/unf-ipv6-extension-probe
+COPY --from=probe-builder /usr/local/bin/unf-bpf-map-pressure \
+  /usr/local/bin/unf-bpf-map-pressure
 
 ENTRYPOINT ["/usr/bin/socat"]
