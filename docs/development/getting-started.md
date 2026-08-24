@@ -86,7 +86,9 @@ bounded IPv4 `ipBlock` allow/exception behavior and oversized-block rejection,
 Namespace relabel, and deletion/recreation convergence.
 The verifier also queries topology schema v1, creates and removes a selector
 Service, and requires both Service membership and independent topology revision
-transitions.
+transitions. It also requires agents to export the live frontend-to-backend flow,
+queries bounded history, and verifies observation-weighted historical policy
+impact.
 The host kernel is shared with kind nodes. `make kind-down`
 deletes only the named `unf-dev` cluster.
 
@@ -103,15 +105,18 @@ relationships with:
 
 ```bash
 target/debug/unfctl --controller-url http://127.0.0.1:9962 topology
+target/debug/unfctl --controller-url http://127.0.0.1:9962 flows
 ```
 
-It uses a bounded current-topology probe matrix; it is not a historical-flow
-report. `make kind-test` verifies the predicted 8080 denial, unchanged policy
-revision, and continued live 8080 allow after simulation.
+Simulation reports its bounded current-topology probe matrix separately from the
+revisioned, 4,096-key in-memory history. `make kind-test` verifies the predicted
+8080 denial in both inputs, unchanged policy revision, and continued live 8080
+allow after simulation.
 
 The DaemonSet attaches ingress classification to every non-loopback node interface
 and discovers newly created pod veths. A packet can therefore produce multiple
-interface-level events; aggregation and deduplication are later telemetry work.
+interface-level events. Logical-key aggregation is implemented, but cross-interface
+deduplication and durable history remain later telemetry work.
 
 ## Fedora, RHEL, and OpenShift
 

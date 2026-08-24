@@ -25,16 +25,17 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_api::SecurityPolicy;
-use unf_common::{PolicyId, Protocol, Revision, Verdict};
+use unf_common::{IdentityId, PolicyId, Protocol, Revision, Verdict};
 use unf_policy::{
     DestinationPort, Endpoint, Flow, Ipv4Endpoint, NamedPort, NetworkPolicyCompiler,
     PolicyCompiler, PolicyIr, compile_dataplane_entries, compile_ipv4_dataplane_entries, evaluate,
 };
 use unf_state::{
-    IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
-    PolicyStateSnapshot, RevisionSet, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode,
-    TopologyService, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
-    provisional_identity_id,
+    FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowHistorySnapshot,
+    FlowHistoryStore, IdentityRegistry, IdentityStateSnapshot, NetworkIdentity,
+    POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyStateSnapshot, RevisionSet,
+    TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode, TopologyService, TopologyServicePort,
+    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
 };
 
 #[derive(Debug, Parser)]
@@ -51,6 +52,8 @@ struct Args {
 struct ControllerMetrics {
     reconciles: Counter,
     errors: Counter,
+    telemetry_batches: Counter,
+    telemetry_observations: Counter,
 }
 
 struct ControllerState {
@@ -68,6 +71,7 @@ struct ControllerState {
     rejected_network_policies: RwLock<BTreeMap<String, String>>,
     policy_state_guard: RwLock<()>,
     identities: Mutex<IdentityRegistry>,
+    flow_history: Mutex<FlowHistoryStore>,
     revisions: Mutex<RevisionSet>,
     registry: Mutex<Registry>,
     metrics: ControllerMetrics,
@@ -109,6 +113,9 @@ struct StatusBody {
     resolved_policy_entries: usize,
     identities: usize,
     indexed_pod_ips: usize,
+    retained_flows: usize,
+    retained_flow_observations: u64,
+    telemetry_dropped_events: u64,
     identity_epoch: u64,
     revisions: RevisionSet,
     limitations: [&'static str; 2],
@@ -139,7 +146,7 @@ struct ExplainResponse {
     note: &'static str,
 }
 
-const POLICY_SIMULATION_SCHEMA_VERSION: u16 = 1;
+const POLICY_SIMULATION_SCHEMA_VERSION: u16 = 2;
 const POLICY_SIMULATION_FLOW_LIMIT: usize = 10_000;
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +167,7 @@ struct PolicySimulationSnapshot {
     identity_revision: Revision,
     policy_revision: Revision,
     topology_revision: Revision,
+    flow_history_revision: Revision,
     pods: usize,
     flow_source: &'static str,
 }
@@ -186,6 +194,37 @@ struct PolicySimulationChange {
     proposed: unf_policy::PolicyDecision,
 }
 
+#[derive(Debug, Default, Serialize)]
+struct PolicySimulationHistoricalSummary {
+    retained_flows: usize,
+    retained_observations: u64,
+    evaluated_flows: usize,
+    evaluated_observations: u64,
+    skipped_unresolved_flows: usize,
+    remain_allowed_observations: u64,
+    remain_denied_observations: u64,
+    would_be_allowed_observations: u64,
+    would_be_denied_observations: u64,
+    verdict_change_flows: usize,
+    decision_change_flows: usize,
+    affected_observations: u64,
+    affected_workloads: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicySimulationHistoricalChange {
+    source: ResolvedEndpoint,
+    destination: ResolvedEndpoint,
+    protocol: &'static str,
+    destination_port: u16,
+    observed_events: u64,
+    first_received_unix_ms: u64,
+    last_received_unix_ms: u64,
+    reporting_nodes: Vec<String>,
+    current: unf_policy::PolicyDecision,
+    proposed: unf_policy::PolicyDecision,
+}
+
 #[derive(Debug, Serialize)]
 struct PolicySimulationResponse {
     schema_version: u16,
@@ -194,8 +233,11 @@ struct PolicySimulationResponse {
     operation: PolicySimulationOperation,
     snapshot: PolicySimulationSnapshot,
     affected_destinations: usize,
+    affected_services: Vec<String>,
     summary: PolicySimulationSummary,
     changes: Vec<PolicySimulationChange>,
+    historical_summary: PolicySimulationHistoricalSummary,
+    historical_changes: Vec<PolicySimulationHistoricalChange>,
     note: &'static str,
 }
 
@@ -235,6 +277,8 @@ async fn main() -> Result<()> {
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
         .route("/v1/topology", get(topology))
+        .route("/v1/flows", get(flow_history))
+        .route("/v1/telemetry/flows", post(ingest_flows))
         .route("/v1/explain", post(explain))
         .route("/v1/policy/simulate", post(simulate_policy))
         .with_state(Arc::clone(&state));
@@ -284,6 +328,16 @@ fn new_state(offline: bool) -> ControllerState {
         "Kubernetes object reconciliation errors",
         metrics.errors.clone(),
     );
+    registry.register(
+        "unf_telemetry_batches",
+        "Flow telemetry batches accepted from node agents",
+        metrics.telemetry_batches.clone(),
+    );
+    registry.register(
+        "unf_telemetry_observations",
+        "Aggregated flow-event observations accepted from node agents",
+        metrics.telemetry_observations.clone(),
+    );
     ControllerState {
         ready: AtomicBool::new(offline),
         identity_epoch: controller_epoch(),
@@ -299,6 +353,7 @@ fn new_state(offline: bool) -> ControllerState {
         rejected_network_policies: RwLock::new(BTreeMap::new()),
         policy_state_guard: RwLock::new(()),
         identities: Mutex::new(IdentityRegistry::default()),
+        flow_history: Mutex::new(FlowHistoryStore::default()),
         revisions: Mutex::new(RevisionSet::default()),
         registry: Mutex::new(registry),
         metrics,
@@ -997,8 +1052,10 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
             identities.address_count(),
         )
     };
+    let history = mutex_lock(&state.flow_history).snapshot(state.identity_epoch);
     let mut revisions = mutex_lock(&state.revisions).clone();
     revisions.identity = identity_revision;
+    revisions.telemetry = history.revision;
     Ok(Json(StatusBody {
         component: "unf-controller",
         healthy: true,
@@ -1020,6 +1077,11 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         resolved_policy_entries,
         identities: identity_count,
         indexed_pod_ips,
+        retained_flows: history.retained_flows,
+        retained_flow_observations: history.retained_observations,
+        telemetry_dropped_events: history
+            .agent_dropped_events
+            .saturating_add(history.evicted_observations),
         identity_epoch: state.identity_epoch,
         revisions,
         limitations: [
@@ -1112,6 +1174,102 @@ fn topology_snapshot(state: &ControllerState) -> TopologyStateSnapshot {
     }
 }
 
+async fn flow_history(State(state): State<Arc<ControllerState>>) -> Json<FlowHistorySnapshot> {
+    let _policy_state_guard = read_lock(&state.policy_state_guard);
+    Json(flow_history_snapshot(&state))
+}
+
+fn flow_history_snapshot(state: &ControllerState) -> FlowHistorySnapshot {
+    let mut snapshot = mutex_lock(&state.flow_history).snapshot(state.identity_epoch);
+    let pods = read_lock(&state.pods);
+    for entry in &mut snapshot.entries {
+        entry.source_workloads = pods
+            .iter()
+            .filter(|(_, pod)| pod.endpoint.identity == entry.key.source_identity)
+            .map(|(reference, _)| reference.clone())
+            .collect();
+        entry.destination_workloads = pods
+            .iter()
+            .filter(|(_, pod)| pod.endpoint.identity == entry.key.destination_identity)
+            .map(|(reference, _)| reference.clone())
+            .collect();
+    }
+    snapshot
+}
+
+async fn ingest_flows(
+    State(state): State<Arc<ControllerState>>,
+    Json(batch): Json<FlowExportBatch>,
+) -> Result<StatusCode, ApiError> {
+    validate_flow_export_batch(&batch)?;
+    let observations = batch
+        .entries
+        .iter()
+        .map(|entry| entry.observed_events)
+        .fold(0_u64, u64::saturating_add);
+    let revision = {
+        let mut history = mutex_lock(&state.flow_history);
+        history.ingest(batch, unix_time_millis());
+        history.revision()
+    };
+    mutex_lock(&state.revisions).telemetry = revision;
+    state.metrics.telemetry_batches.inc();
+    state.metrics.telemetry_observations.inc_by(observations);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
+    if batch.schema_version != FLOW_EXPORT_SCHEMA_VERSION {
+        return Err(ApiError::bad_request(format!(
+            "unsupported flow export schema {}; expected {}",
+            batch.schema_version, FLOW_EXPORT_SCHEMA_VERSION
+        )));
+    }
+    if batch.node_name.is_empty()
+        || batch.node_name.len() > 253
+        || batch.node_name.chars().any(char::is_control)
+    {
+        return Err(ApiError::bad_request(
+            "node_name must contain 1 to 253 non-control characters",
+        ));
+    }
+    if batch.entries.len() > FLOW_EXPORT_BATCH_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "flow export batch contains {} entries; limit is {FLOW_EXPORT_BATCH_LIMIT}",
+            batch.entries.len()
+        )));
+    }
+    for entry in &batch.entries {
+        if entry.key.destination_identity.get() == 0 {
+            return Err(ApiError::bad_request(
+                "flow export destination_identity must be resolved",
+            ));
+        }
+        if entry.observed_events == 0 {
+            return Err(ApiError::bad_request(
+                "flow export observed_events must be greater than zero",
+            ));
+        }
+        if !matches!(entry.key.protocol, 1 | 6 | 17) {
+            return Err(ApiError::bad_request(format!(
+                "unsupported flow export IP protocol {}",
+                entry.key.protocol
+            )));
+        }
+        if matches!(entry.key.protocol, 6 | 17) && entry.key.destination_port == 0 {
+            return Err(ApiError::bad_request(
+                "TCP/UDP flow export destination_port must be greater than zero",
+            ));
+        }
+        if entry.decision.reason > 5 || entry.shadow.is_some_and(|shadow| shadow.reason > 5) {
+            return Err(ApiError::bad_request(
+                "flow export decision reason must be a known ABI reason code",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn dataplane_policy_state(
     state: &ControllerState,
 ) -> Result<
@@ -1188,6 +1346,7 @@ async fn simulate_policy(
 
     let _policy_state_guard = read_lock(&state.policy_state_guard);
     let pod_records: Vec<_> = read_lock(&state.pods).values().cloned().collect();
+    let flow_history = mutex_lock(&state.flow_history).snapshot(state.identity_epoch);
     let namespaces = read_lock(&state.namespaces).clone();
     let current_policies = compiled_policies(&state);
     let current_candidate = read_lock(&state.compiled_security_policies)
@@ -1198,17 +1357,7 @@ async fn simulate_policy(
     } else {
         PolicySimulationOperation::Add
     };
-    let mut proposed_policies: Vec<_> = read_lock(&state.compiled_security_policies)
-        .iter()
-        .filter(|(existing_key, _)| *existing_key != &key)
-        .map(|(_, policy)| policy.clone())
-        .collect();
-    proposed_policies.extend(
-        read_lock(&state.compiled_network_policies)
-            .values()
-            .cloned(),
-    );
-    proposed_policies.push(candidate.clone());
+    let proposed_policies = simulation_proposed_policies(&state, &key, candidate.clone());
 
     let endpoints: Vec<_> = pod_records
         .iter()
@@ -1225,6 +1374,8 @@ async fn simulate_policy(
         })
         .map(|(index, _)| index)
         .collect();
+    let affected_services =
+        simulation_affected_services(&state, &pod_records, &affected_destinations);
 
     let mut flow_count = 0_usize;
     let mut destination_tuples = BTreeMap::new();
@@ -1252,6 +1403,13 @@ async fn simulate_policy(
         &current_policies,
         &proposed_policies,
     );
+    let (historical_summary, historical_changes) = evaluate_historical_simulation(
+        &flow_history,
+        &pod_records,
+        &endpoints,
+        &current_policies,
+        &proposed_policies,
+    );
 
     let identity_revision = mutex_lock(&state.identities).revision();
     let revisions = mutex_lock(&state.revisions).clone();
@@ -1265,14 +1423,171 @@ async fn simulate_policy(
             identity_revision,
             policy_revision: revisions.policy,
             topology_revision: revisions.topology,
+            flow_history_revision: flow_history.revision,
             pods: pod_records.len(),
             flow_source: "current-topology representative matrix",
         },
         affected_destinations: affected_destinations.len(),
+        affected_services,
         summary,
         changes,
-        note: "read-only what-if result; the candidate was not applied and historical flows are not included",
+        historical_summary,
+        historical_changes,
+        note: "read-only what-if result; the candidate was not applied and retained history is bounded in-memory telemetry",
     }))
+}
+
+fn simulation_proposed_policies(
+    state: &ControllerState,
+    candidate_key: &str,
+    candidate: PolicyIr,
+) -> Vec<PolicyIr> {
+    let mut policies: Vec<_> = read_lock(&state.compiled_security_policies)
+        .iter()
+        .filter(|(existing_key, _)| existing_key.as_str() != candidate_key)
+        .map(|(_, policy)| policy.clone())
+        .collect();
+    policies.extend(
+        read_lock(&state.compiled_network_policies)
+            .values()
+            .cloned(),
+    );
+    policies.push(candidate);
+    policies
+}
+
+fn simulation_affected_services(
+    state: &ControllerState,
+    pods: &[PodRecord],
+    affected_destinations: &BTreeSet<usize>,
+) -> Vec<String> {
+    read_lock(&state.services)
+        .iter()
+        .filter(|(_, service)| {
+            !service.selector.is_empty()
+                && affected_destinations.iter().any(|index| {
+                    let pod = &pods[*index];
+                    pod.namespace == service.namespace
+                        && service
+                            .selector
+                            .iter()
+                            .all(|(key, value)| pod.endpoint.labels.get(key) == Some(value))
+                })
+        })
+        .map(|(reference, _)| reference.clone())
+        .collect()
+}
+
+fn evaluate_historical_simulation(
+    history: &FlowHistorySnapshot,
+    pod_records: &[PodRecord],
+    endpoints: &[Endpoint],
+    current_policies: &[PolicyIr],
+    proposed_policies: &[PolicyIr],
+) -> (
+    PolicySimulationHistoricalSummary,
+    Vec<PolicySimulationHistoricalChange>,
+) {
+    let endpoint_indexes: BTreeMap<IdentityId, usize> = pod_records
+        .iter()
+        .enumerate()
+        .map(|(index, pod)| (pod.endpoint.identity, index))
+        .collect();
+    let mut summary = PolicySimulationHistoricalSummary {
+        retained_flows: history.retained_flows,
+        retained_observations: history.retained_observations,
+        ..PolicySimulationHistoricalSummary::default()
+    };
+    let mut changes = Vec::new();
+    let mut affected_workloads = BTreeSet::new();
+    for entry in &history.entries {
+        let Some(source_index) = endpoint_indexes.get(&entry.key.source_identity).copied() else {
+            summary.skipped_unresolved_flows += 1;
+            continue;
+        };
+        let Some(destination_index) = endpoint_indexes
+            .get(&entry.key.destination_identity)
+            .copied()
+        else {
+            summary.skipped_unresolved_flows += 1;
+            continue;
+        };
+        let protocol = match entry.key.protocol {
+            6 => Protocol::Tcp,
+            17 => Protocol::Udp,
+            _ => {
+                summary.skipped_unresolved_flows += 1;
+                continue;
+            }
+        };
+        let flow = Flow {
+            source: &endpoints[source_index],
+            destination: &endpoints[destination_index],
+            protocol,
+            destination_port: entry.key.destination_port,
+            source_ipv4: entry.key.source_ipv4.or_else(|| {
+                pod_records[source_index]
+                    .ipv4_addresses
+                    .iter()
+                    .next()
+                    .copied()
+            }),
+        };
+        let current = evaluate(current_policies, flow);
+        let proposed = evaluate(proposed_policies, flow);
+        summary.evaluated_flows += 1;
+        summary.evaluated_observations = summary
+            .evaluated_observations
+            .saturating_add(entry.observed_events);
+        match (current.verdict, proposed.verdict) {
+            (Verdict::Allow, Verdict::Deny) => {
+                summary.would_be_denied_observations = summary
+                    .would_be_denied_observations
+                    .saturating_add(entry.observed_events);
+            }
+            (Verdict::Deny, Verdict::Allow) => {
+                summary.would_be_allowed_observations = summary
+                    .would_be_allowed_observations
+                    .saturating_add(entry.observed_events);
+            }
+            (_, Verdict::Allow) => {
+                summary.remain_allowed_observations = summary
+                    .remain_allowed_observations
+                    .saturating_add(entry.observed_events);
+            }
+            (_, Verdict::Deny) => {
+                summary.remain_denied_observations = summary
+                    .remain_denied_observations
+                    .saturating_add(entry.observed_events);
+            }
+            _ => {}
+        }
+        if current.verdict != proposed.verdict {
+            summary.verdict_change_flows += 1;
+        }
+        if current != proposed {
+            summary.decision_change_flows += 1;
+            summary.affected_observations = summary
+                .affected_observations
+                .saturating_add(entry.observed_events);
+            affected_workloads.insert(source_index);
+            affected_workloads.insert(destination_index);
+            changes.push(PolicySimulationHistoricalChange {
+                source: resolved(&pod_records[source_index]),
+                destination: resolved(&pod_records[destination_index]),
+                protocol: protocol_name(protocol),
+                destination_port: entry.key.destination_port,
+                observed_events: entry.observed_events,
+                first_received_unix_ms: entry.first_received_unix_ms,
+                last_received_unix_ms: entry.last_received_unix_ms,
+                reporting_nodes: entry.reporting_nodes.clone(),
+                current,
+                proposed,
+            });
+        }
+    }
+    summary.affected_workloads = affected_workloads.len();
+    (summary, changes)
 }
 
 fn evaluate_simulation_matrix(
@@ -1573,6 +1888,14 @@ fn controller_epoch() -> u64 {
     time_component ^ u64::from(std::process::id())
 }
 
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1762,6 +2085,33 @@ mod tests {
             }
         }))
         .expect("test Service is valid Kubernetes JSON")
+    }
+
+    fn flow_batch(observed_events: u64) -> FlowExportBatch {
+        FlowExportBatch {
+            schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+            node_name: "worker-a".to_owned(),
+            dropped_events: 2,
+            entries: vec![unf_state::FlowExportRecord {
+                key: unf_state::FlowHistoryKey {
+                    source_identity: IdentityId::new(1),
+                    destination_identity: IdentityId::new(2),
+                    source_ipv4: Some("10.42.0.10".parse().expect("valid test address")),
+                    destination_ipv4: Some("10.42.1.20".parse().expect("valid test address")),
+                    protocol: 6,
+                    destination_port: 8080,
+                },
+                policy_revision: Revision::new(7),
+                decision: unf_state::FlowExportDecision {
+                    verdict: Verdict::Allow,
+                    reason: 1,
+                    policy_id: Some(PolicyId::new(9)),
+                    rule_id: Some(unf_common::RuleId::new(0)),
+                },
+                shadow: None,
+                observed_events,
+            }],
+        }
     }
 
     #[test]
@@ -1973,6 +2323,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flow_ingestion_is_validated_revisioned_and_enriched() {
+        let state = Arc::new(new_state(true));
+        write_lock(&state.pods).insert(
+            "frontend/client".to_owned(),
+            pod_record(1, "frontend", "client", "client"),
+        );
+        write_lock(&state.pods).insert(
+            "backend/server".to_owned(),
+            pod_record(2, "backend", "server", "server"),
+        );
+        assert_eq!(
+            ingest_flows(State(Arc::clone(&state)), Json(flow_batch(5)))
+                .await
+                .expect("valid flow batch is accepted"),
+            StatusCode::NO_CONTENT
+        );
+        let snapshot = flow_history_snapshot(&state);
+        assert_eq!(snapshot.revision, Revision::new(1));
+        assert_eq!(snapshot.retained_flows, 1);
+        assert_eq!(snapshot.retained_observations, 5);
+        assert_eq!(snapshot.agent_dropped_events, 2);
+        assert_eq!(snapshot.entries[0].source_workloads, ["frontend/client"]);
+        assert_eq!(
+            snapshot.entries[0].destination_workloads,
+            ["backend/server"]
+        );
+        assert_eq!(mutex_lock(&state.revisions).telemetry, Revision::new(1));
+
+        let mut invalid = flow_batch(1);
+        invalid.schema_version = FLOW_EXPORT_SCHEMA_VERSION + 1;
+        let error = ingest_flows(State(state), Json(invalid))
+            .await
+            .expect_err("unknown flow schema is rejected");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn policy_simulation_detects_replacement_without_mutating_state() {
         let state = Arc::new(new_state(true));
         write_lock(&state.pods).insert(
@@ -1990,6 +2377,18 @@ mod tests {
         )
         .expect("current policy compiles");
         write_lock(&state.compiled_security_policies).insert(key.to_owned(), current.clone());
+        write_lock(&state.services).insert(
+            "backend/server".to_owned(),
+            ServiceRecord {
+                namespace: "backend".to_owned(),
+                name: "server".to_owned(),
+                service_type: "ClusterIP".to_owned(),
+                cluster_ips: BTreeSet::new(),
+                selector: BTreeMap::from([("app".to_owned(), "server".to_owned())]),
+                ports: Vec::new(),
+            },
+        );
+        mutex_lock(&state.flow_history).ingest(flow_batch(12), 100);
         mutex_lock(&state.revisions).policy = Revision::new(7);
 
         let response = simulate_policy(
@@ -2008,7 +2407,9 @@ mod tests {
         ));
         assert_eq!(response.policy, key);
         assert_eq!(response.snapshot.policy_revision, Revision::new(7));
+        assert_eq!(response.snapshot.flow_history_revision, Revision::new(1));
         assert_eq!(response.affected_destinations, 1);
+        assert_eq!(response.affected_services, ["backend/server"]);
         assert_eq!(response.summary.evaluated_flows, 6);
         assert_eq!(response.summary.would_be_denied, 1);
         assert_eq!(response.summary.would_be_allowed, 0);
@@ -2020,6 +2421,11 @@ mod tests {
         assert_eq!(response.changes[0].destination_port, 8080);
         assert_eq!(response.changes[0].current.verdict, Verdict::Allow);
         assert_eq!(response.changes[0].proposed.verdict, Verdict::Deny);
+        assert_eq!(response.historical_summary.retained_flows, 1);
+        assert_eq!(response.historical_summary.evaluated_flows, 1);
+        assert_eq!(response.historical_summary.would_be_denied_observations, 12);
+        assert_eq!(response.historical_changes.len(), 1);
+        assert_eq!(response.historical_changes[0].observed_events, 12);
 
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(7));
         assert_eq!(

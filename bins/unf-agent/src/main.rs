@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,20 +21,25 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use serde::Serialize;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use unf_common::{IdentityId, PolicyId, PolicyReason, RuleId, Verdict};
+use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 use unf_ebpf_common::{
     FLOW_ABI_VERSION, FlowEvent, FlowKey, IdentityMapValue, Ipv4IdentityKey, POLICY_BANK_COUNT,
     POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
 };
 use unf_state::{
-    IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
-    Ipv4PolicyMapEntry, POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION,
-    PolicyDecisionRecord, PolicyMapEntry, PolicyStateSnapshot,
+    FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowExportDecision,
+    FlowExportRecord, FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot,
+    Ipv4IdentityMapping, Ipv4PolicyMapEntry, POLICY_MAP_BANK_ENTRY_LIMIT,
+    POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord, PolicyMapEntry, PolicyStateSnapshot,
 };
+
+const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
+const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF per-node eBPF agent")]
@@ -53,6 +58,10 @@ struct Args {
     controller_url: Option<String>,
     #[arg(long, env = "UNF_IDENTITY_SYNC_SECONDS", default_value_t = 2)]
     identity_sync_seconds: u64,
+    #[arg(long, env = "UNF_NODE_NAME", default_value = "unknown")]
+    node_name: String,
+    #[arg(long, env = "UNF_FLOW_EXPORT_SECONDS", default_value_t = 1)]
+    flow_export_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -73,6 +82,9 @@ struct AgentMetrics {
     desired_policy_revision: Gauge,
     applied_policy_revision: Gauge,
     policy_map_entries: Gauge,
+    telemetry_dropped_events: Counter,
+    telemetry_export_errors: Counter,
+    telemetry_exported_events: Counter,
 }
 
 struct AgentState {
@@ -90,6 +102,9 @@ struct AgentState {
     applied_policy_epoch: AtomicU64,
     policy_map_entries: AtomicU64,
     active_policy_bank: AtomicU64,
+    queued_flow_exports: AtomicU64,
+    dropped_flow_exports: AtomicU64,
+    exported_flow_events: AtomicU64,
     capabilities: KernelCapabilities,
     registry: Mutex<Registry>,
     metrics: AgentMetrics,
@@ -131,6 +146,8 @@ struct DataplaneConfig {
     direction: Direction,
     controller_url: Option<String>,
     identity_sync_interval: Duration,
+    node_name: String,
+    flow_export_interval: Duration,
 }
 
 struct InterfaceAttachments<'program> {
@@ -178,6 +195,9 @@ struct AgentStatus {
     applied_policy_epoch: u64,
     policy_map_entries: u64,
     active_policy_bank: u64,
+    queued_flow_exports: u64,
+    dropped_flow_exports: u64,
+    exported_flow_events: u64,
     capabilities: KernelCapabilities,
     limitation: &'static str,
 }
@@ -200,6 +220,8 @@ async fn main() -> Result<()> {
             let direction = args.direction;
             let controller_url = args.controller_url.clone();
             let identity_sync_interval = Duration::from_secs(args.identity_sync_seconds.max(1));
+            let node_name = args.node_name.clone();
+            let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
             tasks.spawn(async move {
                 let config = DataplaneConfig {
                     object,
@@ -208,8 +230,10 @@ async fn main() -> Result<()> {
                     direction,
                     controller_url,
                     identity_sync_interval,
+                    node_name,
+                    flow_export_interval,
                 };
-                if let Err(error) = run_dataplane(config, &state, cancellation).await {
+                if let Err(error) = run_dataplane(config, Arc::clone(&state), cancellation).await {
                     error!(?error, "eBPF dataplane stopped");
                     state.ready.store(false, Ordering::Release);
                 }
@@ -273,8 +297,37 @@ fn new_state(capabilities: KernelCapabilities) -> AgentState {
         desired_policy_revision: Gauge::default(),
         applied_policy_revision: Gauge::default(),
         policy_map_entries: Gauge::default(),
+        telemetry_dropped_events: Counter::default(),
+        telemetry_export_errors: Counter::default(),
+        telemetry_exported_events: Counter::default(),
     };
     let mut registry = Registry::default();
+    register_agent_metrics(&mut registry, &metrics);
+    AgentState {
+        ready: AtomicBool::new(false),
+        bpf_loaded: AtomicBool::new(false),
+        observed_flows: AtomicU64::new(0),
+        desired_identity_revision: AtomicU64::new(0),
+        applied_identity_revision: AtomicU64::new(0),
+        desired_identity_epoch: AtomicU64::new(0),
+        applied_identity_epoch: AtomicU64::new(0),
+        identity_map_entries: AtomicU64::new(0),
+        desired_policy_revision: AtomicU64::new(0),
+        applied_policy_revision: AtomicU64::new(0),
+        desired_policy_epoch: AtomicU64::new(0),
+        applied_policy_epoch: AtomicU64::new(0),
+        policy_map_entries: AtomicU64::new(0),
+        active_policy_bank: AtomicU64::new(0),
+        queued_flow_exports: AtomicU64::new(0),
+        dropped_flow_exports: AtomicU64::new(0),
+        exported_flow_events: AtomicU64::new(0),
+        capabilities,
+        registry: Mutex::new(registry),
+        metrics,
+    }
+}
+
+fn register_agent_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
     registry.register(
         "unf_flow",
         "Flow events consumed from the eBPF ring buffer",
@@ -330,30 +383,26 @@ fn new_state(capabilities: KernelCapabilities) -> AgentState {
         "Policy entries in the active BPF map bank",
         metrics.policy_map_entries.clone(),
     );
-    AgentState {
-        ready: AtomicBool::new(false),
-        bpf_loaded: AtomicBool::new(false),
-        observed_flows: AtomicU64::new(0),
-        desired_identity_revision: AtomicU64::new(0),
-        applied_identity_revision: AtomicU64::new(0),
-        desired_identity_epoch: AtomicU64::new(0),
-        applied_identity_epoch: AtomicU64::new(0),
-        identity_map_entries: AtomicU64::new(0),
-        desired_policy_revision: AtomicU64::new(0),
-        applied_policy_revision: AtomicU64::new(0),
-        desired_policy_epoch: AtomicU64::new(0),
-        applied_policy_epoch: AtomicU64::new(0),
-        policy_map_entries: AtomicU64::new(0),
-        active_policy_bank: AtomicU64::new(0),
-        capabilities,
-        registry: Mutex::new(registry),
-        metrics,
-    }
+    registry.register(
+        "unf_telemetry_dropped_events",
+        "Flow events dropped by bounded userspace export buffering",
+        metrics.telemetry_dropped_events.clone(),
+    );
+    registry.register(
+        "unf_telemetry_export_errors",
+        "Flow export batches that could not reach the controller",
+        metrics.telemetry_export_errors.clone(),
+    );
+    registry.register(
+        "unf_telemetry_exported_events",
+        "Aggregated flow-event observations accepted by the controller",
+        metrics.telemetry_exported_events.clone(),
+    );
 }
 
 async fn run_dataplane(
     config: DataplaneConfig,
-    state: &AgentState,
+    state: Arc<AgentState>,
     cancellation: CancellationToken,
 ) -> Result<()> {
     let mut ebpf = Ebpf::load_file(&config.object)
@@ -407,14 +456,15 @@ async fn run_dataplane(
     state.bpf_loaded.store(true, Ordering::Release);
     state.metrics.bpf_loaded.set(1);
     state.ready.store(true, Ordering::Release);
+    let controller_url = config
+        .controller_url
+        .as_deref()
+        .map(|url| url.trim_end_matches('/').to_owned());
     let mut identities = IdentitySynchronizer {
         map: identity_map,
         applied: BTreeMap::new(),
         applied_epoch: 0,
-        controller_url: config
-            .controller_url
-            .clone()
-            .map(|url| url.trim_end_matches('/').to_owned()),
+        controller_url: controller_url.clone(),
         client: reqwest::Client::new(),
         interval: config.identity_sync_interval,
     };
@@ -426,25 +476,63 @@ async fn run_dataplane(
         ipv4_banks: [BTreeMap::new(), BTreeMap::new()],
         active_bank: 0,
         applied_epoch: 0,
-        controller_url: config
-            .controller_url
-            .map(|url| url.trim_end_matches('/').to_owned()),
+        controller_url: controller_url.clone(),
         client: reqwest::Client::new(),
         interval: config.identity_sync_interval,
     };
+    let (flow_export_sender, flow_export_task) =
+        spawn_flow_exporter(controller_url, &config, &state, &cancellation);
     consume_events(
         ring,
         &mut attachments,
         &mut identities,
         &mut policies,
-        state,
+        &state,
+        flow_export_sender.as_ref(),
         cancellation,
     )
     .await;
+    drop(flow_export_sender);
+    if let Some(task) = flow_export_task
+        && let Err(error) = task.await
+    {
+        warn!(%error, "flow exporter task failed");
+    }
     state.ready.store(false, Ordering::Release);
     state.bpf_loaded.store(false, Ordering::Release);
     state.metrics.bpf_loaded.set(0);
     Ok(())
+}
+
+fn spawn_flow_exporter(
+    controller_url: Option<String>,
+    config: &DataplaneConfig,
+    state: &Arc<AgentState>,
+    cancellation: &CancellationToken,
+) -> (
+    Option<mpsc::Sender<FlowExportRecord>>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    let Some(controller_url) = controller_url else {
+        return (None, None);
+    };
+    let (sender, receiver) = mpsc::channel(FLOW_EXPORT_CHANNEL_CAPACITY);
+    let exporter_state = Arc::clone(state);
+    let exporter_cancel = cancellation.clone();
+    let node_name = config.node_name.clone();
+    let interval = config.flow_export_interval;
+    let task = tokio::spawn(async move {
+        export_flow_batches(
+            controller_url,
+            node_name,
+            receiver,
+            exporter_state,
+            exporter_cancel,
+            interval,
+        )
+        .await;
+    });
+    (Some(sender), Some(task))
 }
 
 fn take_policy_maps(ebpf: &mut Ebpf) -> Result<PolicyMaps> {
@@ -472,6 +560,7 @@ async fn consume_events(
     identities: &mut IdentitySynchronizer,
     policies: &mut PolicySynchronizer,
     state: &AgentState,
+    flow_export_sender: Option<&mpsc::Sender<FlowExportRecord>>,
     cancellation: CancellationToken,
 ) {
     let mut event_interval = tokio::time::interval(Duration::from_millis(25));
@@ -510,6 +599,11 @@ async fn consume_events(
                     };
                     state.metrics.flow_events.inc();
                     state.observed_flows.fetch_add(1, Ordering::Relaxed);
+                    if let Some(sender) = flow_export_sender
+                        && event.flow.destination_identity.get() != 0
+                    {
+                        enqueue_flow_export(sender, state, flow_export_record(&event));
+                    }
                     info!(
                         source_identity = event.flow.source_identity.get(),
                         destination_identity = event.flow.destination_identity.get(),
@@ -535,6 +629,181 @@ async fn consume_events(
             }
         }
     }
+}
+
+fn enqueue_flow_export(
+    sender: &mpsc::Sender<FlowExportRecord>,
+    state: &AgentState,
+    record: FlowExportRecord,
+) {
+    state.queued_flow_exports.fetch_add(1, Ordering::Relaxed);
+    match sender.try_send(record) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
+            state.queued_flow_exports.fetch_sub(1, Ordering::Relaxed);
+            record_telemetry_drop(state, 1);
+        }
+    }
+}
+
+fn record_telemetry_drop(state: &AgentState, count: u64) {
+    state
+        .dropped_flow_exports
+        .fetch_add(count, Ordering::Relaxed);
+    state.metrics.telemetry_dropped_events.inc_by(count);
+}
+
+fn flow_export_record(event: &FlowEvent) -> FlowExportRecord {
+    FlowExportRecord {
+        key: FlowHistoryKey {
+            source_identity: event.flow.source_identity,
+            destination_identity: event.flow.destination_identity,
+            source_ipv4: event_ipv4(event.flow.address_family, event.flow.source_address),
+            destination_ipv4: event_ipv4(event.flow.address_family, event.flow.destination_address),
+            protocol: event.flow.protocol,
+            destination_port: u16::from_be_bytes(event.flow.destination_port),
+        },
+        policy_revision: Revision::new(event.policy_revision),
+        decision: FlowExportDecision {
+            verdict: event.verdict,
+            reason: event.reason,
+            policy_id: nonzero_policy_id(event.policy_id),
+            rule_id: rule_id_for_reason(event.rule_id, event.reason),
+        },
+        shadow: verdict_from_u8(event.shadow_verdict).map(|verdict| FlowExportDecision {
+            verdict,
+            reason: event.shadow_reason,
+            policy_id: nonzero_policy_id(event.shadow_policy_id),
+            rule_id: rule_id_for_reason(event.shadow_rule_id, event.shadow_reason),
+        }),
+        observed_events: 1,
+    }
+}
+
+fn event_ipv4(address_family: u8, address: [u8; 16]) -> Option<Ipv4Addr> {
+    (address_family == 4).then(|| Ipv4Addr::new(address[0], address[1], address[2], address[3]))
+}
+
+fn nonzero_policy_id(id: PolicyId) -> Option<PolicyId> {
+    (id.get() != 0).then_some(id)
+}
+
+fn rule_id_for_reason(id: RuleId, reason: u8) -> Option<RuleId> {
+    matches!(reason, 1 | 2).then_some(id)
+}
+
+const fn verdict_from_u8(verdict: u8) -> Option<Verdict> {
+    match verdict {
+        1 => Some(Verdict::Allow),
+        2 => Some(Verdict::Deny),
+        3 => Some(Verdict::Audit),
+        _ => None,
+    }
+}
+
+async fn export_flow_batches(
+    controller_url: String,
+    node_name: String,
+    mut receiver: mpsc::Receiver<FlowExportRecord>,
+    state: Arc<AgentState>,
+    cancellation: CancellationToken,
+    export_interval: Duration,
+) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            state.metrics.telemetry_export_errors.inc();
+            error!(%error, "could not construct flow telemetry HTTP client");
+            return;
+        }
+    };
+    let mut interval = tokio::time::interval(export_interval);
+    let mut pending = BTreeMap::new();
+    let mut last_reported_drops = 0_u64;
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            record = receiver.recv() => match record {
+                Some(record) => {
+                    state.queued_flow_exports.fetch_sub(1, Ordering::Relaxed);
+                    let dropped = aggregate_pending_flow(
+                        &mut pending,
+                        record,
+                        FLOW_EXPORT_PENDING_CAPACITY,
+                    );
+                    if dropped != 0 {
+                        record_telemetry_drop(&state, dropped);
+                    }
+                }
+                None => break,
+            },
+            _ = interval.tick() => {
+                let dropped_events = state.dropped_flow_exports.load(Ordering::Relaxed);
+                if pending.is_empty() && dropped_events == last_reported_drops {
+                    continue;
+                }
+                let entries: Vec<_> = pending
+                    .values()
+                    .take(FLOW_EXPORT_BATCH_LIMIT)
+                    .cloned()
+                    .collect();
+                let batch = FlowExportBatch {
+                    schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                    node_name: node_name.clone(),
+                    dropped_events,
+                    entries: entries.clone(),
+                };
+                let result = client
+                    .post(format!("{controller_url}/v1/telemetry/flows"))
+                    .json(&batch)
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status);
+                match result {
+                    Ok(_) => {
+                        let exported = entries
+                            .iter()
+                            .map(|record| record.observed_events)
+                            .fold(0_u64, u64::saturating_add);
+                        for entry in entries {
+                            pending.remove(&entry.key);
+                        }
+                        state.exported_flow_events.fetch_add(exported, Ordering::Relaxed);
+                        state.metrics.telemetry_exported_events.inc_by(exported);
+                        last_reported_drops = dropped_events;
+                    }
+                    Err(error) => {
+                        state.metrics.telemetry_export_errors.inc();
+                        warn!(%error, pending = pending.len(), "flow telemetry export failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn aggregate_pending_flow(
+    pending: &mut BTreeMap<FlowHistoryKey, FlowExportRecord>,
+    record: FlowExportRecord,
+    capacity: usize,
+) -> u64 {
+    if let Some(existing) = pending.get_mut(&record.key) {
+        existing.policy_revision = record.policy_revision;
+        existing.decision = record.decision;
+        existing.shadow = record.shadow;
+        existing.observed_events = existing
+            .observed_events
+            .saturating_add(record.observed_events);
+        return 0;
+    }
+    if pending.len() == capacity {
+        return record.observed_events;
+    }
+    pending.insert(record.key.clone(), record);
+    0
 }
 
 async fn synchronize_identities(
@@ -1324,6 +1593,9 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         applied_policy_epoch: state.applied_policy_epoch.load(Ordering::Acquire),
         policy_map_entries: state.policy_map_entries.load(Ordering::Acquire),
         active_policy_bank: state.active_policy_bank.load(Ordering::Acquire),
+        queued_flow_exports: state.queued_flow_exports.load(Ordering::Relaxed),
+        dropped_flow_exports: state.dropped_flow_exports.load(Ordering::Relaxed),
+        exported_flow_events: state.exported_flow_events.load(Ordering::Relaxed),
         capabilities: state.capabilities.clone(),
         limitation: "TC policy enforcement is active; maps are unpinned and status is node-local",
     })
@@ -1369,6 +1641,108 @@ mod tests {
     fn capability_detection_is_total() {
         let capabilities = detect_capabilities();
         assert!(!capabilities.kernel_release.is_empty());
+    }
+
+    fn test_agent_state() -> AgentState {
+        new_state(KernelCapabilities {
+            kernel_release: "test".to_owned(),
+            btf: true,
+            bpffs: true,
+            cgroup_v2: true,
+        })
+    }
+
+    fn test_flow_record(port: u16) -> FlowExportRecord {
+        FlowExportRecord {
+            key: FlowHistoryKey {
+                source_identity: IdentityId::new(1),
+                destination_identity: IdentityId::new(2),
+                source_ipv4: Some(Ipv4Addr::new(10, 42, 0, 1)),
+                destination_ipv4: Some(Ipv4Addr::new(10, 42, 1, 2)),
+                protocol: 6,
+                destination_port: port,
+            },
+            policy_revision: Revision::new(7),
+            decision: FlowExportDecision {
+                verdict: Verdict::Allow,
+                reason: 1,
+                policy_id: Some(PolicyId::new(9)),
+                rule_id: Some(RuleId::new(0)),
+            },
+            shadow: None,
+            observed_events: 1,
+        }
+    }
+
+    #[test]
+    fn bounded_export_queue_drops_telemetry_without_blocking() {
+        let state = test_agent_state();
+        let (sender, _receiver) = mpsc::channel(1);
+        enqueue_flow_export(&sender, &state, test_flow_record(8080));
+        enqueue_flow_export(&sender, &state, test_flow_record(8081));
+        assert_eq!(state.queued_flow_exports.load(Ordering::Relaxed), 1);
+        assert_eq!(state.dropped_flow_exports.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn pending_flow_aggregation_is_bounded_and_saturating() {
+        let mut pending = BTreeMap::new();
+        let mut first = test_flow_record(8080);
+        first.observed_events = u64::MAX;
+        assert_eq!(aggregate_pending_flow(&mut pending, first, 1), 0);
+        assert_eq!(
+            aggregate_pending_flow(&mut pending, test_flow_record(8080), 1),
+            0
+        );
+        assert_eq!(
+            pending[&test_flow_record(8080).key].observed_events,
+            u64::MAX
+        );
+        assert_eq!(
+            aggregate_pending_flow(&mut pending, test_flow_record(8081), 1),
+            1
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn flow_export_conversion_preserves_identity_and_provenance() {
+        let event = FlowEvent {
+            timestamp_ns: 17,
+            flow: FlowKey {
+                source_identity: IdentityId::new(1),
+                destination_identity: IdentityId::new(2),
+                source_address: [10, 42, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                destination_address: [10, 42, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                source_port: 32_000_u16.to_be_bytes(),
+                destination_port: 8080_u16.to_be_bytes(),
+                protocol: 6,
+                address_family: 4,
+                reserved: [0; 2],
+            },
+            policy_revision: 7,
+            policy_id: PolicyId::new(9),
+            rule_id: RuleId::new(0),
+            shadow_policy_id: PolicyId::new(10),
+            shadow_rule_id: RuleId::new(0),
+            interface_index: 3,
+            version: FLOW_ABI_VERSION,
+            size: u16::try_from(size_of::<FlowEvent>()).expect("event size fits"),
+            verdict: Verdict::Allow,
+            direction: 1,
+            reason: 1,
+            shadow_verdict: 2,
+            shadow_reason: 2,
+            reserved: [0; 3],
+        };
+        let record = flow_export_record(&event);
+        assert_eq!(record.key.source_ipv4, Some(Ipv4Addr::new(10, 42, 0, 1)));
+        assert_eq!(record.key.destination_port, 8080);
+        assert_eq!(record.decision.rule_id, Some(RuleId::new(0)));
+        assert_eq!(
+            record.shadow.expect("shadow decision exists").verdict,
+            Verdict::Deny
+        );
     }
 
     #[test]

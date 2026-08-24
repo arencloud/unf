@@ -50,10 +50,13 @@ matrix and reproducible evidence.
   rejection/deletion recovery; revision-fenced, read-only native policy
   simulation over a bounded current-topology probe matrix; versioned Node,
   workload-placement, Service, and selector-membership topology snapshots;
+  destination-resolved agent flow export through bounded non-blocking queues,
+  revisioned 4,096-key controller history, `unfctl flows`, and
+  observation-weighted historical simulation impact;
 - Next: broader ingress conformance, EndpointSlice-aware backend readiness, and
-  historical flow inputs for policy impact analysis;
+  authenticated/durable telemetry transport with time-window queries;
 - shadow rollout and offline impact analysis;
-- topology history and flow exporter interface;
+- topology history and external flow-export backends;
 - failure, scale, and OpenShift validation.
 
 Full CNI/IPAM, routing, service load balancing, egress, encryption, L7, and

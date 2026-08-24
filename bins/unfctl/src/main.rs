@@ -29,6 +29,8 @@ enum Command {
     Status,
     /// Show the current versioned Node, workload, and Service topology.
     Topology,
+    /// Show bounded flow history exported by node agents.
+    Flows,
     /// Explain a policy decision using live controller state.
     Explain {
         /// Source pod as namespace/name.
@@ -104,6 +106,7 @@ async fn run() -> Result<()> {
         Command::Topology => {
             get_json(&client, &format!("{}/v1/topology", cli.controller_url)).await?
         }
+        Command::Flows => get_json(&client, &format!("{}/v1/flows", cli.controller_url)).await?,
         Command::Explain {
             from,
             to,
@@ -191,6 +194,13 @@ fn print_value(value: &Value, output: Output) -> Result<()> {
 
 fn print_table(value: &Value) {
     if value.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && value.get("retained_flows").is_some()
+        && value.get("entries").is_some()
+    {
+        print_flow_history_table(value);
+        return;
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(1)
         && value.get("nodes").is_some()
         && value.get("workloads").is_some()
         && value.get("services").is_some()
@@ -198,10 +208,7 @@ fn print_table(value: &Value) {
         print_topology_table(value);
         return;
     }
-    if value.get("schema_version").and_then(Value::as_u64) == Some(1)
-        && value.get("summary").is_some()
-        && value.get("operation").is_some()
-    {
+    if value.get("summary").is_some() && value.get("operation").is_some() {
         print_simulation_table(value);
         return;
     }
@@ -215,6 +222,77 @@ fn print_table(value: &Value) {
         }
     } else {
         println!("{value}");
+    }
+}
+
+fn print_flow_history_table(value: &Value) {
+    println!("Flow History");
+    println!(
+        "snapshot                 revision={} epoch={}",
+        number_field(value, "revision"),
+        number_field(value, "source_epoch")
+    );
+    println!(
+        "retention                flows={}/{} observations={} evicted={} agent_dropped={}",
+        number_field(value, "retained_flows"),
+        number_field(value, "capacity"),
+        number_field(value, "retained_observations"),
+        number_field(value, "evicted_observations"),
+        number_field(value, "agent_dropped_events")
+    );
+    if let Some(entries) = value.get("entries").and_then(Value::as_array) {
+        for entry in entries.iter().take(50) {
+            let key = &entry["key"];
+            let sources = joined_strings(&entry["source_workloads"]);
+            let destinations = joined_strings(&entry["destination_workloads"]);
+            println!(
+                "flow                     {} -> {} {}/{} verdict={} observations={} nodes={}",
+                if sources.is_empty() {
+                    identity_label(key, "source_identity")
+                } else {
+                    sources
+                },
+                if destinations.is_empty() {
+                    identity_label(key, "destination_identity")
+                } else {
+                    destinations
+                },
+                protocol_label(number_field(key, "protocol")),
+                number_field(key, "destination_port"),
+                text_field(&entry["decision"], "verdict"),
+                number_field(entry, "observed_events"),
+                joined_strings(&entry["reporting_nodes"]),
+            );
+        }
+        if entries.len() > 50 {
+            println!("flows omitted            {}", entries.len() - 50);
+        }
+    }
+}
+
+fn joined_strings(value: &Value) -> String {
+    value
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
+fn identity_label(value: &Value, field: &str) -> String {
+    format!("identity:{}", number_field(value, field))
+}
+
+const fn protocol_label(protocol: u64) -> &'static str {
+    match protocol {
+        1 => "icmp",
+        6 => "tcp",
+        17 => "udp",
+        _ => "unknown",
     }
 }
 
@@ -295,10 +373,11 @@ fn print_simulation_table(value: &Value) {
         text_field(value, "operation")
     );
     println!(
-        "snapshot                 identity={} policy={} topology={} epoch={}",
+        "snapshot                 identity={} policy={} topology={} history={} epoch={}",
         number_field(snapshot, "identity_revision"),
         number_field(snapshot, "policy_revision"),
         number_field(snapshot, "topology_revision"),
+        number_field(snapshot, "flow_history_revision"),
         number_field(snapshot, "identity_epoch")
     );
     println!(
@@ -336,6 +415,23 @@ fn print_simulation_table(value: &Value) {
     println!(
         "affected workloads       {}",
         number_field(summary, "affected_workloads")
+    );
+    println!(
+        "affected services        {}",
+        joined_strings(&value["affected_services"])
+    );
+    let historical = &value["historical_summary"];
+    println!(
+        "historical flows         evaluated={}/{} observations={}/{} skipped={}",
+        number_field(historical, "evaluated_flows"),
+        number_field(historical, "retained_flows"),
+        number_field(historical, "evaluated_observations"),
+        number_field(historical, "retained_observations"),
+        number_field(historical, "skipped_unresolved_flows")
+    );
+    println!(
+        "historical would deny    {} observations",
+        number_field(historical, "would_be_denied_observations")
     );
     if let Some(changes) = value.get("changes").and_then(Value::as_array) {
         for change in changes.iter().take(20) {
@@ -398,5 +494,13 @@ mod tests {
             .expect("topology command parses");
         assert!(matches!(cli.command, Command::Topology));
         assert!(matches!(cli.output, Output::Yaml));
+    }
+
+    #[test]
+    fn flows_command_parses() {
+        let cli = Cli::try_parse_from(["unfctl", "flows", "--output", "json"])
+            .expect("flows command parses");
+        assert!(matches!(cli.command, Command::Flows));
+        assert!(matches!(cli.output, Output::Json));
     }
 }

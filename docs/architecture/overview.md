@@ -9,7 +9,7 @@ pod interfaces nor owns routing. This makes the initial adoption path reversible
 Kubernetes / OpenShift API
           |
           v
-   unf-controller ---- HTTP status/topology/explain/simulate ---- unfctl
+   unf-controller ---- HTTP status/topology/flows/explain/simulate ---- unfctl
           |
    desired state (identity + policy snapshots: epoch + revision)
           |
@@ -43,6 +43,9 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    revision.
 5. The agent loads the Aya object, attaches TC, applies the controller's revisioned
    IPv4 identity snapshot, consumes compact events, and exposes health and metrics.
+   Destination-resolved events enter a bounded non-blocking queue, aggregate by
+   logical L3/L4 flow, and export in capped batches. Queue pressure drops telemetry
+   while forwarding continues.
 6. The controller resolves policy selectors to identity tuples and bounded
    IPv4-source tuples; each agent stages both dual-bank maps and atomically
    activates the resulting policy revision with one configuration write.
@@ -50,6 +53,9 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    change.
 7. TC reads the active revision, emits actual and shadow provenance, and returns
    `TC_ACT_SHOT` only for a validated actual deny.
+8. The controller retains at most 4,096 logical flow keys in memory, enriches
+   current identities on query, and feeds the revisioned snapshot into policy
+   simulation separately from representative topology probes.
 
 Identity and policy state are distributed to the kernel and consumed directly in
 the Phase 2 fast path. Shadow mode remains non-enforcing by construction.

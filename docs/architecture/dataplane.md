@@ -32,6 +32,13 @@ Config and values must have the expected schema and identical nonzero revision.
 Event and map ABIs use fixed C layouts, explicit schema/version fields, and
 compile-time size assertions.
 
+Userspace flow export preserves forwarding priority. Destination-resolved events
+enter a 4,096-record non-blocking channel and a 2,048-key pending aggregator. A
+full bound increments `unf_telemetry_dropped_events_total` and discards telemetry
+immediately; it never blocks TC consumption or changes the verdict already
+returned by eBPF. HTTP batches contain at most 512 logical flows. Controller
+retention is independently capped at 4,096 keys with eviction accounting.
+
 Bounded NetworkPolicy `endPort` ranges are expanded into exact keys before
 distribution. The compatibility compiler caps one inclusive range at 1,024
 ports, while the shared lowering path caps the complete snapshot at the physical

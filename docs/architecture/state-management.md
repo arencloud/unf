@@ -4,7 +4,7 @@ Independent revision domains prevent a single opaque version from hiding partial
 state:
 
 ```text
-identity | policy | service | routing | topology
+identity | policy | service | routing | topology | telemetry
 ```
 
 Phase 1 incremented identity and policy revisions as watcher events changed the
@@ -24,6 +24,12 @@ Topology-only placement and Service changes do not advance policy revision.
 This relationship is selector intent, not an EndpointSlice readiness report.
 Runtime backend readiness and historical snapshot persistence remain future
 state domains. See [ADR 0011](../adr/0011-versioned-topology-snapshots.md).
+
+Telemetry revision advances when the controller accepts a changed node export.
+The current flow-history store retains 4,096 deterministic logical keys and
+tracks observation totals, controller evictions, and cumulative agent-side drops.
+It is a bounded current-process analysis window, not durable storage. See
+[ADR 0012](../adr/0012-bounded-flow-history-export.md).
 
 Agents poll internal identity and policy snapshot endpoints and publish each
 desired/applied epoch and revision. Identity reconciliation retains its

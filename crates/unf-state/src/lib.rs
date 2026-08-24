@@ -10,6 +10,9 @@ use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 1;
+pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
+pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
 /// One half of the dual-bank eBPF policy map's 262,144-entry capacity.
 pub const POLICY_MAP_BANK_ENTRY_LIMIT: usize = 131_072;
 
@@ -20,6 +23,218 @@ pub struct RevisionSet {
     pub service: Revision,
     pub routing: Revision,
     pub topology: Revision,
+    pub telemetry: Revision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FlowHistoryKey {
+    pub source_identity: IdentityId,
+    pub destination_identity: IdentityId,
+    pub source_ipv4: Option<Ipv4Addr>,
+    pub destination_ipv4: Option<Ipv4Addr>,
+    pub protocol: u8,
+    pub destination_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowExportDecision {
+    pub verdict: Verdict,
+    pub reason: u8,
+    pub policy_id: Option<PolicyId>,
+    pub rule_id: Option<RuleId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowExportRecord {
+    pub key: FlowHistoryKey,
+    pub policy_revision: Revision,
+    pub decision: FlowExportDecision,
+    pub shadow: Option<FlowExportDecision>,
+    pub observed_events: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowExportBatch {
+    pub schema_version: u16,
+    pub node_name: String,
+    pub dropped_events: u64,
+    pub entries: Vec<FlowExportRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowHistoryEntry {
+    pub key: FlowHistoryKey,
+    pub source_workloads: Vec<String>,
+    pub destination_workloads: Vec<String>,
+    pub policy_revision: Revision,
+    pub decision: FlowExportDecision,
+    pub shadow: Option<FlowExportDecision>,
+    pub observed_events: u64,
+    pub first_received_unix_ms: u64,
+    pub last_received_unix_ms: u64,
+    pub reporting_nodes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowHistorySnapshot {
+    pub schema_version: u16,
+    pub source_epoch: u64,
+    pub revision: Revision,
+    pub capacity: usize,
+    pub retained_flows: usize,
+    pub retained_observations: u64,
+    pub evicted_flows: u64,
+    pub evicted_observations: u64,
+    pub agent_dropped_events: u64,
+    pub entries: Vec<FlowHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetainedFlow {
+    record: FlowExportRecord,
+    first_received_unix_ms: u64,
+    last_received_unix_ms: u64,
+    reporting_nodes: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowHistoryStore {
+    capacity: usize,
+    revision: Revision,
+    entries: BTreeMap<FlowHistoryKey, RetainedFlow>,
+    evicted_flows: u64,
+    evicted_observations: u64,
+    agent_dropped_events: u64,
+    agent_last_dropped_events: BTreeMap<String, u64>,
+}
+
+impl Default for FlowHistoryStore {
+    fn default() -> Self {
+        Self::with_capacity(FLOW_HISTORY_CAPACITY)
+    }
+}
+
+impl FlowHistoryStore {
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            revision: Revision::default(),
+            entries: BTreeMap::new(),
+            evicted_flows: 0,
+            evicted_observations: 0,
+            agent_dropped_events: 0,
+            agent_last_dropped_events: BTreeMap::new(),
+        }
+    }
+
+    pub fn ingest(&mut self, batch: FlowExportBatch, received_unix_ms: u64) -> bool {
+        let FlowExportBatch {
+            node_name,
+            dropped_events,
+            entries,
+            ..
+        } = batch;
+        let previous_dropped = self
+            .agent_last_dropped_events
+            .insert(node_name.clone(), dropped_events)
+            .unwrap_or(0);
+        let new_drops = if dropped_events >= previous_dropped {
+            dropped_events - previous_dropped
+        } else {
+            dropped_events
+        };
+        self.agent_dropped_events = self.agent_dropped_events.saturating_add(new_drops);
+        let mut changed = new_drops != 0;
+        for record in entries {
+            changed = true;
+            if let Some(retained) = self.entries.get_mut(&record.key) {
+                retained.record.policy_revision = record.policy_revision;
+                retained.record.decision = record.decision;
+                retained.record.shadow = record.shadow;
+                retained.record.observed_events = retained
+                    .record
+                    .observed_events
+                    .saturating_add(record.observed_events);
+                retained.last_received_unix_ms = received_unix_ms;
+                retained.reporting_nodes.insert(node_name.clone());
+                continue;
+            }
+            if self.capacity == 0 {
+                self.evicted_flows = self.evicted_flows.saturating_add(1);
+                self.evicted_observations = self
+                    .evicted_observations
+                    .saturating_add(record.observed_events);
+                continue;
+            }
+            if self.entries.len() == self.capacity
+                && let Some(eviction_key) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(key, retained)| (retained.last_received_unix_ms, *key))
+                    .map(|(key, _)| key.clone())
+                && let Some(evicted) = self.entries.remove(&eviction_key)
+            {
+                self.evicted_flows = self.evicted_flows.saturating_add(1);
+                self.evicted_observations = self
+                    .evicted_observations
+                    .saturating_add(evicted.record.observed_events);
+            }
+            self.entries.insert(
+                record.key.clone(),
+                RetainedFlow {
+                    record,
+                    first_received_unix_ms: received_unix_ms,
+                    last_received_unix_ms: received_unix_ms,
+                    reporting_nodes: BTreeSet::from([node_name.clone()]),
+                },
+            );
+        }
+        if changed {
+            self.revision = self.revision.next();
+        }
+        changed
+    }
+
+    #[must_use]
+    pub fn snapshot(&self, source_epoch: u64) -> FlowHistorySnapshot {
+        let entries: Vec<_> = self
+            .entries
+            .values()
+            .map(|retained| FlowHistoryEntry {
+                key: retained.record.key.clone(),
+                source_workloads: Vec::new(),
+                destination_workloads: Vec::new(),
+                policy_revision: retained.record.policy_revision,
+                decision: retained.record.decision,
+                shadow: retained.record.shadow,
+                observed_events: retained.record.observed_events,
+                first_received_unix_ms: retained.first_received_unix_ms,
+                last_received_unix_ms: retained.last_received_unix_ms,
+                reporting_nodes: retained.reporting_nodes.iter().cloned().collect(),
+            })
+            .collect();
+        FlowHistorySnapshot {
+            schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+            source_epoch,
+            revision: self.revision,
+            capacity: self.capacity,
+            retained_flows: entries.len(),
+            retained_observations: entries
+                .iter()
+                .map(|entry| entry.observed_events)
+                .fold(0_u64, u64::saturating_add),
+            evicted_flows: self.evicted_flows,
+            evicted_observations: self.evicted_observations,
+            agent_dropped_events: self.agent_dropped_events,
+            entries,
+        }
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,5 +782,106 @@ mod tests {
         let decoded: TopologyStateSnapshot =
             serde_json::from_slice(&encoded).expect("topology snapshot deserializes");
         assert_eq!(decoded, snapshot);
+    }
+
+    fn flow_record(
+        source: u32,
+        destination: u32,
+        port: u16,
+        observations: u64,
+    ) -> FlowExportRecord {
+        FlowExportRecord {
+            key: FlowHistoryKey {
+                source_identity: IdentityId::new(source),
+                destination_identity: IdentityId::new(destination),
+                source_ipv4: None,
+                destination_ipv4: None,
+                protocol: 6,
+                destination_port: port,
+            },
+            policy_revision: Revision::new(7),
+            decision: FlowExportDecision {
+                verdict: Verdict::Allow,
+                reason: 1,
+                policy_id: Some(PolicyId::new(9)),
+                rule_id: Some(RuleId::new(2)),
+            },
+            shadow: None,
+            observed_events: observations,
+        }
+    }
+
+    #[test]
+    fn flow_history_aggregates_nodes_and_observations_deterministically() {
+        let mut store = FlowHistoryStore::with_capacity(2);
+        assert!(store.ingest(
+            FlowExportBatch {
+                schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                node_name: "worker-a".to_owned(),
+                dropped_events: 3,
+                entries: vec![flow_record(1, 2, 8080, 4)],
+            },
+            100,
+        ));
+        assert!(store.ingest(
+            FlowExportBatch {
+                schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                node_name: "worker-b".to_owned(),
+                dropped_events: 1,
+                entries: vec![flow_record(1, 2, 8080, 6)],
+            },
+            200,
+        ));
+        let snapshot = store.snapshot(17);
+        assert_eq!(snapshot.revision, Revision::new(2));
+        assert_eq!(snapshot.retained_flows, 1);
+        assert_eq!(snapshot.retained_observations, 10);
+        assert_eq!(snapshot.agent_dropped_events, 4);
+        assert_eq!(
+            snapshot.entries[0].reporting_nodes,
+            ["worker-a", "worker-b"]
+        );
+        assert_eq!(snapshot.entries[0].first_received_unix_ms, 100);
+        assert_eq!(snapshot.entries[0].last_received_unix_ms, 200);
+    }
+
+    #[test]
+    fn flow_history_evicts_the_oldest_entry_at_capacity() {
+        let mut store = FlowHistoryStore::with_capacity(2);
+        for (port, received) in [(8080, 100), (8081, 200), (8082, 300)] {
+            store.ingest(
+                FlowExportBatch {
+                    schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                    node_name: "worker-a".to_owned(),
+                    dropped_events: 0,
+                    entries: vec![flow_record(1, 2, port, u64::from(port - 8079))],
+                },
+                received,
+            );
+        }
+        let snapshot = store.snapshot(17);
+        assert_eq!(snapshot.retained_flows, 2);
+        assert_eq!(snapshot.evicted_flows, 1);
+        assert_eq!(snapshot.evicted_observations, 1);
+        assert_eq!(snapshot.entries[0].key.destination_port, 8081);
+        assert_eq!(snapshot.entries[1].key.destination_port, 8082);
+    }
+
+    #[test]
+    fn zero_capacity_flow_history_drops_without_growing() {
+        let mut store = FlowHistoryStore::with_capacity(0);
+        store.ingest(
+            FlowExportBatch {
+                schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                node_name: "worker-a".to_owned(),
+                dropped_events: 0,
+                entries: vec![flow_record(1, 2, 8080, 7)],
+            },
+            100,
+        );
+        let snapshot = store.snapshot(17);
+        assert_eq!(snapshot.retained_flows, 0);
+        assert_eq!(snapshot.evicted_flows, 1);
+        assert_eq!(snapshot.evicted_observations, 7);
     }
 }

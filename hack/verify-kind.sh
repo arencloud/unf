@@ -150,6 +150,25 @@ wait_for_topology_transition() {
     return 1
 }
 
+wait_for_historical_demo_flow() {
+    local snapshot
+    for _ in {1..30}; do
+        snapshot=$("${unfctl}" \
+            --controller-url "http://127.0.0.1:${controller_port}" --output json flows)
+        if grep -q '"source_workloads": \[' <<<"${snapshot}" \
+            && grep -q '"frontend/client"' <<<"${snapshot}" \
+            && grep -q '"backend/server"' <<<"${snapshot}" \
+            && grep -q '"destination_port": 8080' <<<"${snapshot}"; then
+            flow_history=${snapshot}
+            return 0
+        fi
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080 >/dev/null
+        sleep 1
+    done
+    return 1
+}
+
 "${kc[@]}" wait --for=condition=Ready nodes --all --timeout=120s
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=120s
 "${kc[@]}" -n unf-system rollout status daemonset/unf-agent --timeout=120s
@@ -329,14 +348,30 @@ if [[ ${policy_revision_after_topology} != "${initial_policy_revision}" ]]; then
     exit 1
 fi
 
+if ! wait_for_historical_demo_flow; then
+    echo "controller did not retain the exported frontend-to-backend flow" >&2
+    exit 1
+fi
+grep -q '"schema_version": 1' <<<"${flow_history}"
+grep -Eq '"revision": [1-9][0-9]*' <<<"${flow_history}"
+grep -q '"capacity": 4096' <<<"${flow_history}"
+grep -Eq '"retained_flows": [1-9][0-9]*' <<<"${flow_history}"
+grep -Eq '"retained_observations": [1-9][0-9]*' <<<"${flow_history}"
+grep -q '"unf-dev-worker"' <<<"${flow_history}"
+
 policy_simulation=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json \
     policy simulate "${project_root}/deploy/examples/simulation-deny.yaml")
-grep -q '"schema_version": 1' <<<"${policy_simulation}"
+grep -q '"schema_version": 2' <<<"${policy_simulation}"
 grep -q '"operation": "replace"' <<<"${policy_simulation}"
 grep -q '"flow_source": "current-topology representative matrix"' <<<"${policy_simulation}"
 grep -Eq '"would_be_denied": [1-9][0-9]*' <<<"${policy_simulation}"
 grep -Eq '"decision_changes": [1-9][0-9]*' <<<"${policy_simulation}"
+grep -Eq '"flow_history_revision": [1-9][0-9]*' <<<"${policy_simulation}"
+grep -Eq '"evaluated_observations": [1-9][0-9]*' <<<"${policy_simulation}"
+grep -Eq '"would_be_denied_observations": [1-9][0-9]*' <<<"${policy_simulation}"
+grep -q '"affected_services": \[' <<<"${policy_simulation}"
+grep -q '"backend/server"' <<<"${policy_simulation}"
 grep -q '"reference": "frontend/client"' <<<"${policy_simulation}"
 grep -q '"reference": "backend/server"' <<<"${policy_simulation}"
 grep -q '"destination_port": 8080' <<<"${policy_simulation}"
@@ -804,4 +839,4 @@ if "${kc[@]}" exec -n frontend client -- \
     exit 1
 fi
 
-echo "kind verification passed: versioned topology, read-only policy simulation, native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: bounded historical flow export, history-aware simulation, versioned topology, native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
