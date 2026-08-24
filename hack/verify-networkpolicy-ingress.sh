@@ -121,44 +121,59 @@ wait_for_current_policy_sync() {
     return 1
 }
 
-expect_allow() {
+expect_address_allow() {
     local namespace=$1
     local pod=$2
-    local port=$3
+    local address=$3
+    local port=$4
     local response
     response=$("${kc[@]}" exec -n "${namespace}" "${pod}" -- \
-        wget -T 2 -t 1 -qO- "http://${server_ip}:${port}")
+        wget -T 2 -t 1 -qO- "http://${address}:${port}")
     if [[ ${response} != "unf-upstream-ok" ]]; then
-        echo "expected ${namespace}/${pod} TCP/${port} to be allowed" >&2
+        echo "expected ${namespace}/${pod} to reach ${address} TCP/${port}" >&2
         exit 1
     fi
 }
 
-expect_deny() {
+expect_address_deny() {
     local namespace=$1
     local pod=$2
-    local port=$3
+    local address=$3
+    local port=$4
     if "${kc[@]}" exec -n "${namespace}" "${pod}" -- \
-        wget -T 2 -t 1 -qO- "http://${server_ip}:${port}" >/dev/null 2>&1; then
-        echo "expected ${namespace}/${pod} TCP/${port} to be denied" >&2
+        wget -T 2 -t 1 -qO- "http://${address}:${port}" >/dev/null 2>&1; then
+        echo "expected ${namespace}/${pod} to be denied to ${address} TCP/${port}" >&2
+        exit 1
+    fi
+}
+
+expect_allow() {
+    expect_address_allow "$1" "$2" "${server_ip}" "$3"
+}
+
+expect_deny() {
+    expect_address_deny "$1" "$2" "${server_ip}" "$3"
+}
+
+expect_explanation_to() {
+    local source=$1
+    local destination=$2
+    local port=$3
+    local verdict=$4
+    local reason=$5
+    local explanation
+    explanation=$("${unfctl}" --controller-url "${controller_url}" --output json \
+        explain --from "${source}" --to "${target_namespace}/${destination}" \
+        --protocol tcp --port "${port}")
+    if ! grep -q "\"verdict\": \"${verdict}\"" <<<"${explanation}" \
+        || ! grep -q "\"reason\": \"${reason}\"" <<<"${explanation}"; then
+        echo "unexpected explanation for ${source} to ${destination} TCP/${port}" >&2
         exit 1
     fi
 }
 
 expect_explanation() {
-    local source=$1
-    local port=$2
-    local verdict=$3
-    local reason=$4
-    local explanation
-    explanation=$("${unfctl}" --controller-url "${controller_url}" --output json \
-        explain --from "${source}" --to "${target_namespace}/server" \
-        --protocol tcp --port "${port}")
-    if ! grep -q "\"verdict\": \"${verdict}\"" <<<"${explanation}" \
-        || ! grep -q "\"reason\": \"${reason}\"" <<<"${explanation}"; then
-        echo "unexpected explanation for ${source} TCP/${port}" >&2
-        exit 1
-    fi
+    expect_explanation_to "$1" server "$2" "$3" "$4"
 }
 
 mapfile -t agent_pods < <("${kc[@]}" -n unf-system get pods \
@@ -179,14 +194,22 @@ if ! wait_for_current_policy_sync; then
 fi
 "${kc[@]}" apply -f "${fixture}" >/dev/null
 "${kc[@]}" wait --for=condition=Ready pod/server -n "${target_namespace}" --timeout=120s
+"${kc[@]}" wait --for=condition=Ready pod/alternate-server -n "${target_namespace}" \
+    --timeout=120s
 "${kc[@]}" wait --for=condition=Ready pod/same-client -n "${target_namespace}" \
     --timeout=120s
 "${kc[@]}" wait --for=condition=Ready pod/client -n "${source_a_namespace}" --timeout=120s
 "${kc[@]}" wait --for=condition=Ready pod/client -n "${source_b_namespace}" --timeout=120s
 server_ip=$("${kc[@]}" get pod -n "${target_namespace}" server \
     -o jsonpath='{.status.podIP}')
+alternate_server_ip=$("${kc[@]}" get pod -n "${target_namespace}" alternate-server \
+    -o jsonpath='{.status.podIP}')
 if [[ ! ${server_ip} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "upstream conformance server has no IPv4 Pod address" >&2
+    exit 1
+fi
+if [[ ! ${alternate_server_ip} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "upstream conformance alternate server has no IPv4 Pod address" >&2
     exit 1
 fi
 for port in 8087 8088; do
@@ -194,6 +217,12 @@ for port in 8087 8088; do
         wget -T 2 -t 1 -qO- "http://127.0.0.1:${port}")
     if [[ ${response} != "unf-upstream-ok" ]]; then
         echo "upstream conformance server is not listening on TCP/${port}" >&2
+        exit 1
+    fi
+    alternate_response=$("${kc[@]}" exec -n "${target_namespace}" alternate-server -- \
+        wget -T 2 -t 1 -qO- "http://127.0.0.1:${port}")
+    if [[ ${alternate_response} != "unf-upstream-ok" ]]; then
+        echo "upstream conformance alternate server is not listening on TCP/${port}" >&2
         exit 1
     fi
 done
@@ -381,6 +410,51 @@ done
 expect_explanation "${source_b_namespace}/client" 8087 Allow NoApplicablePolicy
 
 previous_revision=${policy_revision}
+"${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: named-port-destinations
+  namespace: ${target_namespace}
+spec:
+  podSelector:
+    matchLabels:
+      named-port-target: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              conformance-group: a
+      ports:
+        - protocol: TCP
+          port: web
+EOF
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "multi-destination named-port policy did not converge"
+expect_address_allow "${source_a_namespace}" client "${server_ip}" 8087
+expect_address_deny "${source_a_namespace}" client "${server_ip}" 8088
+expect_address_allow "${source_a_namespace}" client "${alternate_server_ip}" 8088
+expect_address_deny "${source_a_namespace}" client "${alternate_server_ip}" 8087
+expect_address_deny "${source_b_namespace}" client "${server_ip}" 8087
+expect_address_deny "${source_b_namespace}" client "${alternate_server_ip}" 8088
+expect_explanation_to "${source_a_namespace}/client" server 8087 Allow ExplicitRule
+expect_explanation_to \
+    "${source_a_namespace}/client" alternate-server 8088 Allow ExplicitRule
+expect_explanation_to "${source_a_namespace}/client" server 8088 Deny DefaultAction
+expect_explanation_to \
+    "${source_a_namespace}/client" alternate-server 8087 Deny DefaultAction
+
+previous_revision=${policy_revision}
+"${kc[@]}" delete networkpolicy -n "${target_namespace}" \
+    named-port-destinations >/dev/null
+require_policy_state "$((baseline_count + 2))" "${baseline_rejected}" \
+    "${previous_revision}" "multi-destination named-port deletion did not reconverge"
+expect_address_allow "${source_a_namespace}" client "${server_ip}" 8088
+expect_address_allow "${source_a_namespace}" client "${alternate_server_ip}" 8087
+
+previous_revision=${policy_revision}
 cleanup
 for namespace in "${target_namespace}" "${source_a_namespace}" "${source_b_namespace}"; do
     if ! "${kc[@]}" wait --for=delete namespace/"${namespace}" --timeout=120s >/dev/null; then
@@ -393,4 +467,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned ingress conformance passed: target Pod label isolation/recovery, default deny, same-namespace PodSelector, empty NamespaceSelector, selector AND, peer OR, matchExpressions with label recovery, multiple ingress rules, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned ingress conformance passed: destination-specific named ports, target Pod label isolation/recovery, default deny, same-namespace PodSelector, empty NamespaceSelector, selector AND, peer OR, matchExpressions with label recovery, multiple ingress rules, stacked additive policies, and allow-all precedence"

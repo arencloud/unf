@@ -26,6 +26,7 @@ metadata:
   namespace: unf-np-target
   labels:
     app: upstream-server
+    named-port-target: "true"
 spec:
   nodeSelector:
     kubernetes.io/hostname: unf-dev-worker
@@ -41,10 +42,44 @@ spec:
           httpd -p 8088 -h /www
           exec httpd -f -p 8087 -h /www
       ports:
-        - name: first
+        - name: web
           containerPort: 8087
           protocol: TCP
-        - name: second
+        - name: other
+          containerPort: 8088
+          protocol: TCP
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: alternate-server
+  namespace: unf-np-target
+  labels:
+    app: upstream-alternate-server
+    named-port-target: "true"
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-control-plane
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: server
+      image: docker.io/library/busybox:1.37.0
+      command:
+        - sh
+        - -c
+        - |
+          mkdir -p /www
+          echo unf-upstream-ok > /www/index.html
+          httpd -p 8087 -h /www
+          exec httpd -f -p 8088 -h /www
+      ports:
+        - name: other
+          containerPort: 8087
+          protocol: TCP
+        - name: web
           containerPort: 8088
           protocol: TCP
 ---
