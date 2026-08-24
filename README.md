@@ -76,6 +76,9 @@ Implemented in the repository:
 - persistent TC attachment handoff using pinned, atomically updated TCX links on
   Linux 6.6+ and stable legacy netlink filters on older kernels, with the active
   attachment mode exposed by each agent;
+- isolated kind fault injection proving partial pin sets, malformed active
+  configuration, and corrupt inactive-stage values are rejected without
+  disturbing the live last-known-good dataplane;
 - `unfctl status`, `unfctl topology`, `unfctl flows`, and `unfctl explain` against live
   controller state;
 - `unfctl policy simulate <security-policy.yaml>` with table/JSON/YAML

@@ -163,6 +163,13 @@ has a fresh matching acknowledgement. Each agent also reports
 replacement, the verifier continuously probes the denied TCP/9090 path and
 requires zero successful requests before the replacement is Ready.
 
+Before that replacement, `make kind-test` temporarily deploys the privileged
+[BPF fault helper](../../deploy/examples/bpf-fault-helper.yaml) fixture. It builds
+isolated bpffs alias sets and requires the exact agent binary to reject partial
+pins, malformed active policy config, and invalid inactive-bank debris. The
+helper never changes the primary ABI v2 pins, is removed immediately after the
+probes, and is not part of the production kustomization.
+
 The DaemonSet attaches ingress classification to every non-loopback node interface
 and discovers newly created pod veths. A packet can therefore produce multiple
 interface-level events. Logical-key aggregation is implemented, but cross-interface

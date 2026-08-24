@@ -49,8 +49,13 @@ matrix and reproducible evidence.
   link cleanup and the stable-priority/handle legacy netlink fallback are
   implemented and locally tested; the fallback still needs live validation on
   an older kernel;
-- Next: pressure/partial-pin/inactive-stage/active-config corruption
-  fault-injection tests and legacy-kernel/OpenShift handoff validation.
+- Implemented and two-node kind verified: isolated live-kernel fault sets prove
+  eight-of-nine pins, malformed active policy config, and corrupt inactive-bank
+  debris are rejected with actionable errors while primary allow/deny state
+  remains unchanged; permanent dataplane startup failure exits for orchestrator
+  retry;
+- Next: deterministic physical staging-map pressure/rollback evidence and
+  legacy-kernel/OpenShift handoff validation.
 
 ## Phase 3 — compatibility and simulation
 

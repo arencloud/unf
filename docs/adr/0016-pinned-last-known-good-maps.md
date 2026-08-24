@@ -5,8 +5,10 @@ Status: Accepted for Phase 2 restart recovery
 Amended by [ADR 0017](0017-transactional-identity-banks.md), which moves the
 default pin layout from the six-map ABI v1 set to the nine-map ABI v2 set, and
 [ADR 0018](0018-persistent-tc-attachment-handoff.md), which closes the separate
-classifier handoff interval. The decision below records the initial recovery
-boundary.
+classifier handoff interval, and
+[ADR 0019](0019-isolated-persistent-state-fault-injection.md), which adds live
+rejection evidence for malformed persistent state. The decision below records
+the initial recovery boundary.
 
 ## Context
 
@@ -48,3 +50,8 @@ The original decision left identity reconciliation single-bank and TC links
 process-owned. ADR 0017 replaced identity state with transactional dual banks,
 and ADR 0018 added persistent TCX/legacy attachment replacement. Those later
 decisions supersede the two remaining restart gaps recorded here.
+
+ADR 0019 subsequently verifies partial-set, malformed active-config, and corrupt
+inactive-stage rejection against live kernel maps while leaving the production
+pin set untouched. A permanent startup validation failure now terminates the
+agent so Kubernetes can retry after repair.

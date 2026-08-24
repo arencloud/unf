@@ -98,10 +98,12 @@ agent pins one TCX link per interface index in the configured direction below th
 ABI v2 link directory and atomically updates that link to the newly loaded
 program. On older kernels, it owns a fixed priority/handle tuple per direction
 and replaces the legacy netlink filter in place. The old program therefore
-remains attached until the replacement program is loaded and handed over. Invalid map state never
-becomes a deny by accident. ABI v1 pin directories are not removed automatically;
-operators may delete them only after validating an ABI v2 rollout. See ADRs 0008,
-0016, 0017, and 0018.
+remains attached until the replacement program is loaded and handed over.
+Invalid map state never becomes a deny by accident. ABI v1 pin directories are
+not removed automatically; operators may delete them only after validating an
+ABI v2 rollout. See ADRs 0008, 0016, 0017, 0018, and 0019. Permanent startup
+validation failures terminate the agent after readiness is fenced so the
+orchestrator can retry after repair.
 
 ## Build boundary
 
@@ -111,6 +113,6 @@ tests still run on stable in the host workspace. See ADR 0002.
 
 ## Next dataplane milestone
 
-Test explicit map-pressure, partial-pin, inactive-stage, and active-config
-corruption failure modes, then validate the legacy netlink handoff path on an
-older supported kernel and OpenShift host.
+Test deterministic physical map-pressure failure while preserving the active
+bank, then validate the legacy netlink handoff path on an older supported kernel
+and OpenShift host.

@@ -70,7 +70,10 @@ restore service without the controller. On Linux 6.6+, per-interface TCX links
 are pinned and atomically updated to the replacement program; older kernels use
 stable legacy netlink filter identities for in-place replacement. Explicit
 ABI-directory cleanup operations and acknowledgement authentication/durability
-remain hardening work. See ADRs 0016, 0017, and 0018.
+remain hardening work. Isolated live-kernel probes verify that partial pin sets,
+invalid active config, and corrupt inactive-stage debris are rejected before
+adoption without mutating the primary pin set. Permanent startup validation
+failures terminate for orchestrator retry. See ADRs 0016 through 0019.
 
 Kubernetes watches remain the controller input. Internal HTTP snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

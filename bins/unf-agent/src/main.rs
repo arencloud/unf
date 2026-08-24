@@ -287,11 +287,15 @@ async fn main() -> Result<()> {
     let state = Arc::new(new_state(detect_capabilities(), args.node_name.clone()));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
+    let (dataplane_failure_tx, mut dataplane_failure_rx) = mpsc::channel(1);
+    let mut dataplane_configured = false;
 
     match (&args.ebpf_object, &args.interface, args.all_interfaces) {
         (Some(object), interface, all_interfaces) if interface.is_some() || all_interfaces => {
+            dataplane_configured = true;
             let state = Arc::clone(&state);
             let cancellation = cancellation.clone();
+            let dataplane_failure_tx = dataplane_failure_tx.clone();
             let object = object.clone();
             let interface = interface.clone();
             let direction = args.direction;
@@ -315,6 +319,7 @@ async fn main() -> Result<()> {
                 if let Err(error) = run_dataplane(config, Arc::clone(&state), cancellation).await {
                     error!(?error, "eBPF dataplane stopped");
                     state.ready.store(false, Ordering::Release);
+                    let _ = dataplane_failure_tx.send(error).await;
                 }
             });
         }
@@ -324,6 +329,7 @@ async fn main() -> Result<()> {
         }
         _ => bail!("--ebpf-object must be paired with either --interface or --all-interfaces"),
     }
+    drop(dataplane_failure_tx);
 
     let app = Router::new()
         .route("/healthz", get(health))
@@ -345,14 +351,21 @@ async fn main() -> Result<()> {
         }
     });
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("listen for shutdown signal")?;
+    let dataplane_failure = tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.context("listen for shutdown signal")?;
+            None
+        }
+        failure = dataplane_failure_rx.recv(), if dataplane_configured => failure,
+    };
     cancellation.cancel();
     while let Some(result) = tasks.join_next().await {
         if let Err(error) = result {
             error!(%error, "agent task failed");
         }
+    }
+    if let Some(error) = dataplane_failure {
+        return Err(error).context("eBPF dataplane failed");
     }
     Ok(())
 }

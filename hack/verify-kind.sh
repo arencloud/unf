@@ -19,6 +19,7 @@ network_policy_conformance_created=false
 network_policy_sctp_created=false
 namespace_mutated=false
 topology_service_created=false
+bpf_fault_helper_created=false
 network_policy_selector_peer='[{"namespaceSelector":{"matchLabels":{"environment":"production"},"matchExpressions":[{"key":"team","operator":"In","values":["checkout"]}]},"podSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["client"]}]}}]'
 
 cleanup() {
@@ -44,6 +45,18 @@ cleanup() {
     fi
     if [[ ${topology_service_created} == true ]]; then
         "${kc[@]}" delete -f "${project_root}/deploy/examples/topology-probe.yaml" \
+            --ignore-not-found >/dev/null 2>&1 || true
+    fi
+    if [[ ${bpf_fault_helper_created} == true ]]; then
+        while read -r helper; do
+            [[ -n ${helper} ]] || continue
+            "${kc[@]}" -n unf-system exec "${helper}" -- \
+                rm -rf /sys/fs/bpf/unf/fault-tests-v2 >/dev/null 2>&1 || true
+        done < <("${kc[@]}" -n unf-system get pods \
+            -l app.kubernetes.io/name=unf-bpf-fault-helper \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+        "${kc[@]}" delete -f \
+            "${project_root}/deploy/examples/bpf-fault-helper.yaml" \
             --ignore-not-found >/dev/null 2>&1 || true
     fi
     if [[ ${policy_mutated} == true ]]; then
@@ -114,6 +127,44 @@ expected_attachment_mode() {
         echo tcx_pinned
     else
         echo legacy_netlink
+    fi
+}
+
+prepare_fault_map_set() {
+    local helper=$1 target=$2 omitted=$3
+    "${kc[@]}" -n unf-system exec "${helper}" -- sh -eu -c '
+        source=/sys/fs/bpf/unf/v2
+        target=$1
+        omitted=$2
+        rm -rf "${target}"
+        mkdir -p "${target}"
+        for map in \
+            IDENTITY_V4 IDENTITY_V4_B IDENTITY_V6 IDENTITY_V6_B \
+            IDENTITY_CONFIG POLICY_RULES POLICY_IPV4 POLICY_IPV6 POLICY_CONFIG
+        do
+            if [ "${map}" = "${omitted}" ]; then
+                continue
+            fi
+            bpftool map pin pinned "${source}/${map}" "${target}/${map}"
+        done
+    ' sh "${target}" "${omitted}"
+}
+
+expect_agent_startup_rejection() {
+    local agent=$1 pin_path=$2 expected=$3 output
+    if output=$("${kc[@]}" -n unf-system exec "${agent}" -- \
+        env -u UNF_CONTROLLER_URL /usr/local/bin/unf-component \
+        --listen 127.0.0.1:19964 \
+        --all-interfaces \
+        --ebpf-object /opt/unf/ebpf/unf-ebpf-tc \
+        --bpf-pin-path "${pin_path}" 2>&1); then
+        echo "faulted persistent state unexpectedly passed agent startup" >&2
+        return 1
+    fi
+    if ! grep -Fq "${expected}" <<<"${output}"; then
+        echo "agent rejected faulted state without the expected reason: ${expected}" >&2
+        printf '%s\n' "${output}" >&2
+        return 1
     fi
 }
 
@@ -1521,6 +1572,84 @@ if [[ -z ${restart_agent} ]]; then
     exit 1
 fi
 
+"${kc[@]}" apply -f "${project_root}/deploy/examples/bpf-fault-helper.yaml" >/dev/null
+bpf_fault_helper_created=true
+"${kc[@]}" -n unf-system rollout status daemonset/unf-bpf-fault-helper --timeout=120s
+fault_helper=$("${kc[@]}" -n unf-system get pods \
+    -l app.kubernetes.io/name=unf-bpf-fault-helper \
+    -o jsonpath="{range .items[?(@.spec.nodeName=='${server_node}')]}{.metadata.name}{'\n'}{end}" \
+    | head -n 1)
+if [[ -z ${fault_helper} ]]; then
+    echo "could not identify the BPF fault helper on the demo server node" >&2
+    exit 1
+fi
+
+fault_root=/sys/fs/bpf/unf/fault-tests-v2
+partial_pin_path=${fault_root}/partial
+prepare_fault_map_set "${fault_helper}" "${partial_pin_path}" POLICY_CONFIG
+expect_agent_startup_rejection \
+    "${restart_agent}" "${partial_pin_path}" "partial persistent BPF map set"
+
+corrupt_config_path=${fault_root}/active-config
+prepare_fault_map_set "${fault_helper}" "${corrupt_config_path}" POLICY_CONFIG
+"${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
+    target=$1
+    bpftool map create "${target}/POLICY_CONFIG" \
+        type array key 4 value 24 entries 1 name POLICY_CONFIG
+    bpftool map update pinned "${target}/POLICY_CONFIG" \
+        key hex 00 00 00 00 \
+        value hex \
+        01 00 00 00 00 00 00 00 \
+        00 00 00 00 00 00 00 00 \
+        00 00 00 00 00 00 00 00
+' sh "${corrupt_config_path}"
+expect_agent_startup_rejection \
+    "${restart_agent}" "${corrupt_config_path}" \
+    "persistent policy config is invalid or incompatible"
+
+restart_status=$(agent_status "${restart_agent}")
+active_policy_bank=$(json_number active_policy_bank <<<"${restart_status}")
+if [[ ${active_policy_bank} != 0 && ${active_policy_bank} != 1 ]]; then
+    echo "agent did not report a valid active policy bank for fault injection" >&2
+    exit 1
+fi
+inactive_policy_bank=$((1 - active_policy_bank))
+inactive_stage_path=${fault_root}/inactive-stage
+prepare_fault_map_set "${fault_helper}" "${inactive_stage_path}" POLICY_RULES
+"${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
+    target=$1
+    inactive_bank=$2
+    bpftool map create "${target}/POLICY_RULES" \
+        type hash key 12 value 32 entries 262144 name POLICY_RULES
+    bpftool map update pinned "${target}/POLICY_RULES" \
+        key hex \
+        00 00 00 00 00 00 00 00 00 00 00 "${inactive_bank}" \
+        value hex \
+        00 00 00 00 00 00 00 00 \
+        00 00 00 00 00 00 00 00 \
+        00 00 00 00 00 00 00 00 \
+        00 00 00 00 00 00 00 00
+' sh "${inactive_stage_path}" "${inactive_policy_bank}"
+expect_agent_startup_rejection \
+    "${restart_agent}" "${inactive_stage_path}" \
+    "persistent policy map contains an incompatible value"
+
+fault_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080)
+if [[ ${fault_allow_response} != "unf-demo-ok" ]]; then
+    echo "isolated persistent-state fault injection disturbed the allowed flow" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:9090 >/dev/null 2>&1; then
+    echo "isolated persistent-state fault injection disturbed deny enforcement" >&2
+    exit 1
+fi
+
+"${kc[@]}" -n unf-system exec "${fault_helper}" -- rm -rf "${fault_root}"
+"${kc[@]}" delete -f "${project_root}/deploy/examples/bpf-fault-helper.yaml" >/dev/null
+bpf_fault_helper_created=false
+
 "${kc[@]}" exec -n frontend client -- sh -c '
     rm -f /tmp/unf-handoff-stop /tmp/unf-handoff-breach
     while [ ! -e /tmp/unf-handoff-stop ]; do
@@ -1634,4 +1763,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: isolated partial-pin/active-config/inactive-stage fault rejection, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
