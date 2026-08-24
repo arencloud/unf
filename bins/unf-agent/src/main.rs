@@ -12,10 +12,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use aya::Ebpf;
 use aya::maps::lpm_trie::{Key as LpmKey, LpmTrie as AyaLpmTrie};
-use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData, RingBuf};
+use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, IterableMap, MapData, RingBuf};
 use aya::programs::{SchedClassifier, TcAttachType, tc};
+use aya::{Ebpf, EbpfLoader};
 use clap::{Parser, ValueEnum};
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
@@ -42,6 +42,17 @@ use unf_state::{
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v1";
+const PERSISTENT_MAP_NAMES: [&str; 6] = [
+    "IDENTITY_V4",
+    "IDENTITY_V6",
+    "POLICY_RULES",
+    "POLICY_IPV4",
+    "POLICY_IPV6",
+    "POLICY_CONFIG",
+];
+const IDENTITY_MAP_CAPACITY: u32 = 65_536;
+const POLICY_MAP_CAPACITY: u32 = 262_144;
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF per-node eBPF agent")]
@@ -64,6 +75,8 @@ struct Args {
     node_name: String,
     #[arg(long, env = "UNF_FLOW_EXPORT_SECONDS", default_value_t = 1)]
     flow_export_seconds: u64,
+    #[arg(long, env = "UNF_BPF_PIN_PATH", default_value = DEFAULT_BPF_PIN_PATH)]
+    bpf_pin_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -166,6 +179,13 @@ struct DataplaneConfig {
     identity_sync_interval: Duration,
     node_name: String,
     flow_export_interval: Duration,
+    bpf_pin_path: PathBuf,
+}
+
+struct RecoveredDataplane {
+    identity_revision: Option<u64>,
+    policy_epoch: Option<u64>,
+    policy_revision: Option<u64>,
 }
 
 struct InterfaceAttachments<'program> {
@@ -229,6 +249,7 @@ async fn main() -> Result<()> {
             let identity_sync_interval = Duration::from_secs(args.identity_sync_seconds.max(1));
             let node_name = args.node_name.clone();
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
+            let bpf_pin_path = args.bpf_pin_path.clone();
             tasks.spawn(async move {
                 let config = DataplaneConfig {
                     object,
@@ -239,6 +260,7 @@ async fn main() -> Result<()> {
                     identity_sync_interval,
                     node_name,
                     flow_export_interval,
+                    bpf_pin_path,
                 };
                 if let Err(error) = run_dataplane(config, Arc::clone(&state), cancellation).await {
                     error!(?error, "eBPF dataplane stopped");
@@ -427,8 +449,7 @@ async fn run_dataplane(
     state: Arc<AgentState>,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    let mut ebpf = Ebpf::load_file(&config.object)
-        .with_context(|| format!("load eBPF object {}", config.object.display()))?;
+    let (mut ebpf, pins_existed) = load_persistent_ebpf(&config)?;
     let ring = RingBuf::try_from(
         ebpf.take_map("FLOW_EVENTS")
             .context("eBPF object does not contain FLOW_EVENTS ring buffer")?,
@@ -437,6 +458,18 @@ async fn run_dataplane(
     let (ipv4_identity_map, ipv6_identity_map) = take_identity_maps(&mut ebpf)?;
     let (policy_map, ipv4_policy_map, ipv6_policy_map, policy_config) =
         take_policy_maps(&mut ebpf)?;
+    let controller_url = config
+        .controller_url
+        .as_deref()
+        .map(|url| url.trim_end_matches('/').to_owned());
+    let (mut identities, mut policies) = new_synchronizers(
+        (ipv4_identity_map, ipv6_identity_map),
+        (policy_map, ipv4_policy_map, ipv6_policy_map, policy_config),
+        controller_url.clone(),
+        config.identity_sync_interval,
+    );
+    let recovered = recover_persistent_dataplane(&mut identities, &mut policies, pins_existed)?;
+    apply_recovered_state(&state, &identities, &policies, &recovered);
     let program_name = match config.direction {
         Direction::Ingress => "unf_observe_ingress",
         Direction::Egress => "unf_observe_egress",
@@ -474,35 +507,24 @@ async fn run_dataplane(
     }
     state.bpf_loaded.store(true, Ordering::Release);
     state.metrics.bpf_loaded.set(1);
-    state.ready.store(true, Ordering::Release);
-    let controller_url = config
-        .controller_url
-        .as_deref()
-        .map(|url| url.trim_end_matches('/').to_owned());
-    let mut identities = IdentitySynchronizer {
-        ipv4_map: ipv4_identity_map,
-        ipv6_map: ipv6_identity_map,
-        ipv4_applied: BTreeMap::new(),
-        ipv6_applied: BTreeMap::new(),
-        applied_epoch: 0,
-        controller_url: controller_url.clone(),
-        client: reqwest::Client::new(),
-        interval: config.identity_sync_interval,
-    };
-    let mut policies = PolicySynchronizer {
-        identity_map: policy_map,
-        ipv4_map: ipv4_policy_map,
-        ipv6_map: ipv6_policy_map,
-        config: policy_config,
-        identity_banks: [BTreeMap::new(), BTreeMap::new()],
-        ipv4_banks: [BTreeMap::new(), BTreeMap::new()],
-        ipv6_banks: [BTreeMap::new(), BTreeMap::new()],
-        active_bank: 0,
-        applied_epoch: 0,
-        controller_url: controller_url.clone(),
-        client: reqwest::Client::new(),
-        interval: config.identity_sync_interval,
-    };
+    let recovered_ready = recovered.identity_revision.is_some()
+        && recovered.policy_epoch.is_some()
+        && recovered.policy_revision.is_some();
+    state.ready.store(
+        controller_url.is_none() || recovered_ready,
+        Ordering::Release,
+    );
+    if recovered_ready {
+        info!(
+            identity_revision = recovered.identity_revision,
+            policy_epoch = recovered.policy_epoch,
+            policy_revision = recovered.policy_revision,
+            active_policy_bank = policies.active_bank,
+            "validated pinned last-known-good dataplane"
+        );
+    } else if controller_url.is_some() {
+        info!("waiting for initial identity and policy snapshots before becoming ready");
+    }
     let (flow_export_sender, flow_export_task) =
         spawn_flow_exporter(controller_url.clone(), &config, &state, &cancellation);
     let status_report_task =
@@ -526,11 +548,366 @@ async fn run_dataplane(
     Ok(())
 }
 
+fn new_synchronizers(
+    identity_maps: IdentityMaps,
+    policy_maps: PolicyMaps,
+    controller_url: Option<String>,
+    interval: Duration,
+) -> (IdentitySynchronizer, PolicySynchronizer) {
+    let (ipv4_map, ipv6_map) = identity_maps;
+    let (identity_map, ipv4_policy_map, ipv6_policy_map, config) = policy_maps;
+    (
+        IdentitySynchronizer {
+            ipv4_map,
+            ipv6_map,
+            ipv4_applied: BTreeMap::new(),
+            ipv6_applied: BTreeMap::new(),
+            applied_epoch: 0,
+            controller_url: controller_url.clone(),
+            client: reqwest::Client::new(),
+            interval,
+        },
+        PolicySynchronizer {
+            identity_map,
+            ipv4_map: ipv4_policy_map,
+            ipv6_map: ipv6_policy_map,
+            config,
+            identity_banks: [BTreeMap::new(), BTreeMap::new()],
+            ipv4_banks: [BTreeMap::new(), BTreeMap::new()],
+            ipv6_banks: [BTreeMap::new(), BTreeMap::new()],
+            active_bank: 0,
+            applied_epoch: 0,
+            controller_url,
+            client: reqwest::Client::new(),
+            interval,
+        },
+    )
+}
+
 async fn await_background_task(task: Option<tokio::task::JoinHandle<()>>, name: &'static str) {
     if let Some(task) = task
         && let Err(error) = task.await
     {
         warn!(%error, task = name, "background task failed");
+    }
+}
+
+fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool)> {
+    if !config.bpf_pin_path.is_absolute() {
+        bail!(
+            "BPF pin path must be absolute: {}",
+            config.bpf_pin_path.display()
+        );
+    }
+    fs::create_dir_all(&config.bpf_pin_path)
+        .with_context(|| format!("create BPF pin directory {}", config.bpf_pin_path.display()))?;
+    let existing = PERSISTENT_MAP_NAMES
+        .iter()
+        .filter(|name| config.bpf_pin_path.join(name).exists())
+        .count();
+    if existing != 0 && existing != PERSISTENT_MAP_NAMES.len() {
+        bail!(
+            "partial persistent BPF map set in {} ({existing}/{} pins); refusing unsafe startup",
+            config.bpf_pin_path.display(),
+            PERSISTENT_MAP_NAMES.len()
+        );
+    }
+
+    let mut loader = EbpfLoader::new();
+    for name in PERSISTENT_MAP_NAMES {
+        loader.map_pin_path(name, config.bpf_pin_path.join(name));
+    }
+    let ebpf = loader
+        .load_file(&config.object)
+        .with_context(|| format!("load eBPF object {}", config.object.display()))?;
+    Ok((ebpf, existing == PERSISTENT_MAP_NAMES.len()))
+}
+
+fn recover_persistent_dataplane(
+    identities: &mut IdentitySynchronizer,
+    policies: &mut PolicySynchronizer,
+    pins_existed: bool,
+) -> Result<RecoveredDataplane> {
+    validate_map_capacity(
+        "IDENTITY_V4",
+        identities.ipv4_map.map(),
+        IDENTITY_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "IDENTITY_V6",
+        identities.ipv6_map.map(),
+        IDENTITY_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "POLICY_RULES",
+        policies.identity_map.map(),
+        POLICY_MAP_CAPACITY,
+    )?;
+    validate_map_capacity("POLICY_IPV4", policies.ipv4_map.map(), POLICY_MAP_CAPACITY)?;
+    validate_map_capacity("POLICY_IPV6", policies.ipv6_map.map(), POLICY_MAP_CAPACITY)?;
+    validate_map_capacity("POLICY_CONFIG", policies.config.map(), 1)?;
+
+    let identity_revision = recover_identity_entries(identities)?;
+    recover_policy_entries(policies)?;
+    let config = policies
+        .config
+        .get(&0, 0)
+        .context("read persistent policy config")?;
+    let decoded = decode_recovered_policy_config(config)?;
+    let (policy_epoch, policy_revision) = if let Some((epoch, revision, count, bank)) = decoded {
+        let active_count = policy_entry_count_for_bank(policies, bank);
+        if active_count != u64::from(count) {
+            bail!(
+                "persistent policy config declares {count} active entries but bank {bank} contains {active_count}"
+            );
+        }
+        validate_active_policy_revision(policies, bank, revision)?;
+        policies.active_bank = bank;
+        policies.applied_epoch = epoch;
+        (Some(epoch), Some(revision))
+    } else {
+        (None, None)
+    };
+
+    if pins_existed {
+        info!(
+            identity_entries = identity_entry_count(identities),
+            identity_revision, policy_epoch, policy_revision, "persistent BPF maps reopened"
+        );
+    }
+    Ok(RecoveredDataplane {
+        identity_revision,
+        policy_epoch,
+        policy_revision,
+    })
+}
+
+fn validate_map_capacity(name: &str, map: &MapData, expected: u32) -> Result<()> {
+    let info = map
+        .info()
+        .with_context(|| format!("inspect persistent {name} map"))?;
+    if info.max_entries() != expected {
+        bail!(
+            "persistent {name} capacity is {}; expected {expected}",
+            info.max_entries()
+        );
+    }
+    Ok(())
+}
+
+fn recover_identity_entries(identities: &mut IdentitySynchronizer) -> Result<Option<u64>> {
+    let mut revision = None;
+    for entry in &identities.ipv4_map {
+        let (key, value) = entry.context("iterate persistent IPv4 identities")?;
+        validate_recovered_identity_value(&value, &mut revision)?;
+        identities.ipv4_applied.insert(key, value);
+    }
+    for entry in &identities.ipv6_map {
+        let (key, value) = entry.context("iterate persistent IPv6 identities")?;
+        validate_recovered_identity_value(&value, &mut revision)?;
+        identities.ipv6_applied.insert(key, value);
+    }
+    Ok(revision)
+}
+
+fn validate_recovered_identity_value(value: &[u8; 16], revision: &mut Option<u64>) -> Result<()> {
+    let identity_id = u32::from_ne_bytes(value[0..4].try_into().expect("fixed identity ID"));
+    let schema = u16::from_ne_bytes(value[4..6].try_into().expect("fixed identity schema"));
+    let flags = u16::from_ne_bytes(value[6..8].try_into().expect("fixed identity flags"));
+    let entry_revision =
+        u64::from_ne_bytes(value[8..16].try_into().expect("fixed identity revision"));
+    if identity_id == 0 || schema != unf_ebpf_common::IDENTITY_MAP_ABI_VERSION || flags != 0 {
+        bail!("persistent identity map contains an invalid value");
+    }
+    if entry_revision == 0 {
+        bail!("persistent identity map contains revision zero");
+    }
+    if revision.is_some_and(|current| current != entry_revision) {
+        bail!("persistent identity maps contain mixed revisions");
+    }
+    *revision = Some(entry_revision);
+    Ok(())
+}
+
+fn recover_policy_entries(policies: &mut PolicySynchronizer) -> Result<()> {
+    for entry in &policies.identity_map {
+        let (key, value) = entry.context("iterate persistent identity policies")?;
+        let bank = policy_bank(key[11])?;
+        validate_recovered_policy_value(&value)?;
+        policies.identity_banks[bank].insert(key, value);
+    }
+    for entry in &policies.ipv4_map {
+        let (key, value) = entry.context("iterate persistent IPv4 policies")?;
+        let bank = policy_bank(key[11])?;
+        validate_recovered_policy_value(&value)?;
+        policies.ipv4_banks[bank].insert(key, value);
+    }
+    for entry in &policies.ipv6_map {
+        let (key, value) = entry.context("iterate persistent IPv6 policies")?;
+        let data = key.data();
+        let bank = policy_bank(data[7])?;
+        validate_recovered_policy_value(&value)?;
+        policies.ipv6_banks[bank].insert((key.prefix_len(), data), value);
+    }
+    Ok(())
+}
+
+fn policy_bank(bank: u8) -> Result<usize> {
+    if bank >= POLICY_BANK_COUNT {
+        bail!("persistent policy map contains invalid bank {bank}");
+    }
+    Ok(usize::from(bank))
+}
+
+fn validate_recovered_policy_value(value: &[u8; 32]) -> Result<()> {
+    let revision = u64::from_ne_bytes(value[16..24].try_into().expect("fixed policy revision"));
+    let schema = u16::from_ne_bytes(value[24..26].try_into().expect("fixed policy schema"));
+    let flags = u16::from_ne_bytes(value[26..28].try_into().expect("fixed policy flags"));
+    let known_flags = POLICY_FLAG_HAS_POLICY
+        | POLICY_FLAG_HAS_RULE
+        | POLICY_FLAG_HAS_SHADOW
+        | POLICY_FLAG_SHADOW_HAS_POLICY
+        | POLICY_FLAG_SHADOW_HAS_RULE;
+    let actual_valid = recovered_verdict_reason_is_valid(value[28], value[29])
+        && recovered_provenance_is_valid(flags, value[29], false);
+    let shadow_valid = if flags & POLICY_FLAG_HAS_SHADOW != 0 {
+        recovered_verdict_reason_is_valid(value[30], value[31])
+            && recovered_provenance_is_valid(flags, value[31], true)
+    } else {
+        flags & (POLICY_FLAG_SHADOW_HAS_POLICY | POLICY_FLAG_SHADOW_HAS_RULE) == 0
+            && value[8..16] == [0; 8]
+            && value[30..32] == [0; 2]
+    };
+    if revision == 0
+        || schema != POLICY_MAP_ABI_VERSION
+        || flags & !known_flags != 0
+        || !actual_valid
+        || !shadow_valid
+    {
+        bail!("persistent policy map contains an incompatible value");
+    }
+    Ok(())
+}
+
+fn recovered_verdict_reason_is_valid(verdict: u8, reason: u8) -> bool {
+    matches!((verdict, reason), (1, 0..=2) | (2, 1 | 2))
+}
+
+fn recovered_provenance_is_valid(flags: u16, reason: u8, shadow: bool) -> bool {
+    let (policy_flag, rule_flag) = if shadow {
+        (POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE)
+    } else {
+        (POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE)
+    };
+    let has_policy = flags & policy_flag != 0;
+    let has_rule = flags & rule_flag != 0;
+    match reason {
+        reason if reason == PolicyReason::NoApplicablePolicy as u8 => !has_policy && !has_rule,
+        reason if reason == PolicyReason::ExplicitRule as u8 => has_policy && has_rule,
+        reason if reason == PolicyReason::DefaultAction as u8 => has_policy && !has_rule,
+        _ => false,
+    }
+}
+
+fn decode_recovered_policy_config(config: [u8; 24]) -> Result<Option<(u64, u64, u32, u8)>> {
+    if config == [0; 24] {
+        return Ok(None);
+    }
+    let epoch = u64::from_ne_bytes(config[0..8].try_into().expect("fixed policy epoch"));
+    let revision = u64::from_ne_bytes(config[8..16].try_into().expect("fixed policy revision"));
+    let count = u32::from_ne_bytes(config[16..20].try_into().expect("fixed policy count"));
+    let schema = u16::from_ne_bytes(config[20..22].try_into().expect("fixed policy schema"));
+    let bank = config[22];
+    if epoch == 0
+        || revision == 0
+        || schema != POLICY_MAP_ABI_VERSION
+        || bank >= POLICY_BANK_COUNT
+        || config[23] != 0
+    {
+        bail!("persistent policy config is invalid or incompatible");
+    }
+    Ok(Some((epoch, revision, count, bank)))
+}
+
+fn policy_entry_count_for_bank(policies: &PolicySynchronizer, bank: u8) -> u64 {
+    let bank = usize::from(bank);
+    (policies.identity_banks[bank].len()
+        + policies.ipv4_banks[bank].len()
+        + policies.ipv6_banks[bank].len()) as u64
+}
+
+fn validate_active_policy_revision(
+    policies: &PolicySynchronizer,
+    bank: u8,
+    revision: u64,
+) -> Result<()> {
+    let bank = usize::from(bank);
+    for value in policies.identity_banks[bank]
+        .values()
+        .chain(policies.ipv4_banks[bank].values())
+        .chain(policies.ipv6_banks[bank].values())
+    {
+        let entry_revision =
+            u64::from_ne_bytes(value[16..24].try_into().expect("fixed policy revision"));
+        if entry_revision != revision {
+            bail!("persistent active policy bank contains a mixed revision");
+        }
+    }
+    Ok(())
+}
+
+fn apply_recovered_state(
+    state: &AgentState,
+    identities: &IdentitySynchronizer,
+    policies: &PolicySynchronizer,
+    recovered: &RecoveredDataplane,
+) {
+    let identity_entries = identity_entry_count(identities);
+    state
+        .identity_map_entries
+        .store(identity_entries, Ordering::Release);
+    state
+        .ipv4_identity_map_entries
+        .store(identities.ipv4_applied.len() as u64, Ordering::Release);
+    state
+        .ipv6_identity_map_entries
+        .store(identities.ipv6_applied.len() as u64, Ordering::Release);
+    state
+        .metrics
+        .identity_map_entries
+        .set(metric_value(identity_entries));
+    state
+        .metrics
+        .ipv4_identity_map_entries
+        .set(metric_value(identities.ipv4_applied.len() as u64));
+    state
+        .metrics
+        .ipv6_identity_map_entries
+        .set(metric_value(identities.ipv6_applied.len() as u64));
+    if let Some(revision) = recovered.identity_revision {
+        state
+            .applied_identity_revision
+            .store(revision, Ordering::Release);
+        state
+            .metrics
+            .applied_identity_revision
+            .set(metric_value(revision));
+    }
+    if let (Some(epoch), Some(revision)) = (recovered.policy_epoch, recovered.policy_revision) {
+        state.applied_policy_epoch.store(epoch, Ordering::Release);
+        state
+            .applied_policy_revision
+            .store(revision, Ordering::Release);
+        let entries = active_policy_entry_count(policies);
+        state.policy_map_entries.store(entries, Ordering::Release);
+        state
+            .active_policy_bank
+            .store(u64::from(policies.active_bank), Ordering::Release);
+        state
+            .metrics
+            .applied_policy_revision
+            .set(metric_value(revision));
+        state.metrics.policy_map_entries.set(metric_value(entries));
     }
 }
 
@@ -643,12 +1020,16 @@ async fn consume_events(
                 if let Err(error) = synchronize_identities(identities, state).await {
                     state.metrics.identity_sync_errors.inc();
                     warn!(?error, "identity synchronization failed");
+                } else {
+                    refresh_controller_readiness(state);
                 }
             }
             _ = policy_interval.tick(), if policies.controller_url.is_some() => {
                 if let Err(error) = synchronize_policies(policies, state).await {
                     state.metrics.policy_sync_errors.inc();
                     warn!(?error, "policy synchronization failed");
+                } else {
+                    refresh_controller_readiness(state);
                 }
             }
             _ = event_interval.tick() => {
@@ -693,6 +1074,14 @@ async fn consume_events(
                 }
             }
         }
+    }
+}
+
+fn refresh_controller_readiness(state: &AgentState) {
+    let synchronized = state.applied_identity_epoch.load(Ordering::Acquire) != 0
+        && state.applied_policy_epoch.load(Ordering::Acquire) != 0;
+    if synchronized && state.bpf_loaded.load(Ordering::Acquire) {
+        state.ready.store(true, Ordering::Release);
     }
 }
 
@@ -1956,7 +2345,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         dropped_flow_exports: state.dropped_flow_exports.load(Ordering::Relaxed),
         exported_flow_events: state.exported_flow_events.load(Ordering::Relaxed),
         capabilities: state.capabilities.clone(),
-        limitation: "TC policy enforcement is active; maps are unpinned and acknowledgements use unauthenticated prototype transport",
+        limitation: "TC policy enforcement uses pinned last-known-good maps; identity updates are not yet dual-bank and acknowledgements use unauthenticated prototype transport",
     })
 }
 
@@ -2349,5 +2738,73 @@ mod tests {
         assert_eq!(u64::from_ne_bytes(config[8..16].try_into().unwrap()), 17);
         assert_eq!(u32::from_ne_bytes(config[16..20].try_into().unwrap()), 3);
         assert_eq!(config[22], 1);
+    }
+
+    #[test]
+    fn recovered_policy_config_accepts_only_committed_abi_state() {
+        let config = encode_policy_config(9, 17, 3, 1).expect("config is valid");
+        assert_eq!(
+            decode_recovered_policy_config(config).expect("config recovers"),
+            Some((9, 17, 3, 1))
+        );
+        assert_eq!(
+            decode_recovered_policy_config([0; 24]).expect("zero means no committed snapshot"),
+            None
+        );
+
+        let mut invalid_bank = config;
+        invalid_bank[22] = POLICY_BANK_COUNT;
+        assert!(decode_recovered_policy_config(invalid_bank).is_err());
+        let mut invalid_flags = config;
+        invalid_flags[23] = 1;
+        assert!(decode_recovered_policy_config(invalid_flags).is_err());
+    }
+
+    #[test]
+    fn recovered_identity_values_must_form_one_coherent_revision() {
+        let first = encode_identity_value(IdentityMapValue::new(IdentityId::new(42), 17));
+        let second = encode_identity_value(IdentityMapValue::new(IdentityId::new(84), 18));
+        let mut revision = None;
+        validate_recovered_identity_value(&first, &mut revision).expect("first value is valid");
+        assert_eq!(revision, Some(17));
+        assert!(validate_recovered_identity_value(&second, &mut revision).is_err());
+
+        let mut invalid_schema = first;
+        invalid_schema[4..6].copy_from_slice(&u16::MAX.to_ne_bytes());
+        assert!(validate_recovered_identity_value(&invalid_schema, &mut None).is_err());
+    }
+
+    #[test]
+    fn recovered_policy_values_reject_corrupt_decisions_and_flags() {
+        let valid = encode_policy_value(&policy_entry(), 17);
+        validate_recovered_policy_value(&valid).expect("encoded policy value recovers");
+
+        let mut invalid_verdict = valid;
+        invalid_verdict[28] = Verdict::Unknown as u8;
+        assert!(validate_recovered_policy_value(&invalid_verdict).is_err());
+
+        let mut orphaned_shadow = valid;
+        let flags = u16::from_ne_bytes(orphaned_shadow[26..28].try_into().unwrap())
+            & !POLICY_FLAG_HAS_SHADOW;
+        orphaned_shadow[26..28].copy_from_slice(&flags.to_ne_bytes());
+        assert!(validate_recovered_policy_value(&orphaned_shadow).is_err());
+
+        let mut unknown_flag = valid;
+        let flags = u16::from_ne_bytes(unknown_flag[26..28].try_into().unwrap()) | (1 << 15);
+        unknown_flag[26..28].copy_from_slice(&flags.to_ne_bytes());
+        assert!(validate_recovered_policy_value(&unknown_flag).is_err());
+    }
+
+    #[test]
+    fn controller_readiness_waits_for_both_snapshot_epochs() {
+        let state = test_agent_state();
+        state.bpf_loaded.store(true, Ordering::Release);
+        state.applied_identity_epoch.store(7, Ordering::Release);
+        refresh_controller_readiness(&state);
+        assert!(!state.ready.load(Ordering::Acquire));
+
+        state.applied_policy_epoch.store(7, Ordering::Release);
+        refresh_controller_readiness(&state);
+        assert!(state.ready.load(Ordering::Acquire));
     }
 }

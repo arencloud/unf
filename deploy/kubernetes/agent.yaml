@@ -29,6 +29,8 @@ spec:
             - --all-interfaces
             - --ebpf-object
             - /opt/unf/ebpf/unf-ebpf-tc
+            - --bpf-pin-path
+            - /sys/fs/bpf/unf/v1
             - --controller-url
             - http://unf-controller.unf-system.svc.cluster.local:9962
           env:

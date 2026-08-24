@@ -60,10 +60,16 @@ compile N+1 -> populate staging maps -> validate -> atomically select N+1
 ```
 
 Existing applied state must remain usable if the controller or Kubernetes API is
-temporarily unavailable. New state must never partially overwrite active maps.
-The prior bank remains active through any pre-switch failure. Pinned map
-ownership, schema migrations, persistence across agent restart, and controller
-acknowledgement authentication/durability remain Phase 2 design gates.
+temporarily unavailable. New policy state never partially overwrites active maps;
+the prior bank remains active through any pre-switch failure. Enforcement maps
+are now pinned under an ABI-versioned bpffs directory, reopened with strict
+all-or-none validation, and reconstructed into userspace caches after restart.
+Fresh startup readiness is fenced until identity and policy both reconcile, while
+a complete validated last-known-good set may restore service without the
+controller. Identity activation is still single-bank and TC links remain
+process-owned; transactional identity updates, atomic attachment handoff, schema
+migration operations, and acknowledgement authentication/durability remain Phase
+2 design gates. See ADR 0016.
 
 Kubernetes watches remain the controller input. Internal HTTP snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

@@ -45,7 +45,7 @@ completed by Phase 1's observation-only shadow evaluation.
 | Topology state | Schema v3 returned 2 ready Nodes, 17 placed workloads, 5 Services, and 7 dual-stack non-host-network workloads; the EndpointSlice readiness/deletion lifecycle passed without policy-revision mutation |
 | Flow history | Schema v2 retained bounded IPv4, IPv6, and SCTP logical flows; direct IPv6 `frontend/client` → `backend/server` TCP/8080 was enriched with both workload references and exact addresses, while both agents reported zero export drops |
 | Transactional policy update | The verifier switched enforce → shadow → enforce and exercised TCP/SCTP protocol-wildcard plus IPv4/IPv6 block mutations, requiring a higher revision and opposite bank on every agent for single-resource transitions; snapshot schema v3 stages all three policy maps before one activation write |
-| Interruption recovery | With the controller scaled to zero, the active bank continued allowing 8080 and denying 9090; both agents then accepted the restarted controller epoch and reconverged |
+| Interruption recovery | With the controller scaled to zero, the server-node agent was deleted and its replacement became Ready from 14 pinned identity entries plus the validated active policy revision; TCP/8080 remained allowed and open TCP/9090 denied before the controller returned, then both agents accepted the restarted epoch and reconverged |
 | Dataplane provenance | ABI v2 TCP and SCTP events matched the applied revision and carried nonzero identities plus actual/shadow policy and explicit-deny rule provenance |
 | NetworkPolicy lifecycle | Named port `allowed` resolved to TCP/8081; one `web` name resolved independently to TCP/8087 and TCP/8088 across two destination Pods while each opposite open port stayed denied; exact and protocol-only UDP rules allowed request/response traffic without broadening same-port TCP or non-matching peers, and deletion restored both protocols; the inclusive 8082–8083 range enforced both boundaries and excluded 8084; a protocol-only TCP entry allowed arbitrary TCP/9091 without allowing UDP/9091 and removal restored isolation; exact IPv4 and prefix IPv6 blocks allowed the client, nested exceptions denied it, and exception removal recovered; Namespace relabel removed/restored the allow without identity churn; oversized range/block updates removed stale state and recovered; deletion allowed 9091 and recreation restored the drop; omitted `podSelector`, `policyTypes`, and protocol produced namespace-wide/default-ingress/default-TCP behavior, while target narrowing restored non-isolated traffic; named SCTP and protocol-only SCTP rules enforced and reconverged across nodes |
 | Upstream-aligned ingress matrix | A disposable three-Namespace matrix proved exact/protocol-only UDP peer and TCP isolation with deletion recovery, destination-specific named-port resolution across two server Pods, destination Pod-label selection/isolation/recovery, default deny, same-Namespace PodSelector scope, empty/exact-name NamespaceSelector selection, Namespace `NotIn` exclusion, selector AND, peer OR, Pod/Namespace `matchExpressions`, source-label deny/recovery, source/port pairing across multiple ingress rules, stacked per-source/per-port additive allows, allow-all precedence, truthful explanations, and cleanup to the baseline policy counts |
@@ -89,7 +89,8 @@ gate.
 | L3/L4 policy decision | **Verified** | Exact/fallback active-bank lookup plus ABI v2 revision, verdict, reason, policy, rule, and shadow provenance |
 | Enforcement | **Verified** | `make kind-test` proves IPv4/IPv6 8080 allow and open-port 9090 drop, shadow pass-through, and restored drop |
 | Accurate live explanation | **Verified** | CLI actual decisions and IDs are checked while every traffic-path agent reports the active revision applied |
-| Failure behavior | **In progress** | Last-known-good enforcement survived a controller interruption; pinned map recovery, agent restart fencing, and pressure/fault injection remain |
+| Pinned last-known-good restart recovery | **Verified** | Six-map all-or-none ABI directory, capacity/content validation, rollback-cache reconstruction, and fresh-start readiness fencing; `make kind-test` replaces the server-node agent with the controller offline, requires recovered revisions/readiness, and rechecks allow/drop before controller restoration |
+| Pressure and corruption failure injection | **In progress** | Malformed config plus mixed/corrupt identity/policy value rejection has unit coverage and partial-pin startup rejection is implemented; live map-pressure, partial-pin, mixed-identity-revision, and attachment-handoff fault scenarios remain |
 
 ## Current limitations
 
@@ -99,9 +100,11 @@ gate.
   initial/atomic Fragment, and AH are supported. Non-initial IPv4/IPv6
   fragments, IPv6 jumbograms, ESP/No Next Header, malformed or over-limit
   chains, and other protocols fail open.
-- Identity and compiled policy desired state remain in-memory and their BPF maps
-  are unpinned. Agent restart therefore has a resynchronization window where the
-  overlay intentionally fails open.
+- Identity and compiled policy desired state remain in-memory, but their six
+  enforcement maps are pinned and strictly validated across agent restart.
+  Identity mutation remains single-bank, so a crash during reconciliation is
+  fenced on recovery rather than adopted; TC links remain process-owned, leaving
+  an attachment interval before the replacement agent reattaches.
 - Unknown destination identities, missing/incompatible map config, invalid
   values, and absent identity/IP decisions fail open with revision-zero
   observed/identity-unknown provenance. Unknown source identities can be enforced

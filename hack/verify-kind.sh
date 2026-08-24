@@ -8,6 +8,7 @@ controller_port=${UNF_CONTROLLER_TEST_PORT:-19962}
 unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 temporary_dir=$(mktemp -d)
 controller_forward_pid=
+controller_scaled_down=false
 policy_mutated=false
 network_policy_mutated=false
 network_policy_protocol_mutated=false
@@ -20,6 +21,10 @@ topology_service_created=false
 network_policy_selector_peer='[{"namespaceSelector":{"matchLabels":{"environment":"production"},"matchExpressions":[{"key":"team","operator":"In","values":["checkout"]}]},"podSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["client"]}]}}]'
 
 cleanup() {
+    if [[ ${controller_scaled_down} == true ]]; then
+        "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 \
+            >/dev/null 2>&1 || true
+    fi
     if [[ ${network_policy_sctp_created} == true ]]; then
         "${kc[@]}" delete -f \
             "${project_root}/deploy/examples/networkpolicy-sctp.yaml" \
@@ -68,6 +73,19 @@ cleanup() {
 trap cleanup EXIT
 
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
+
+start_controller_forward() {
+    "${kc[@]}" -n unf-system port-forward service/unf-controller \
+        "${controller_port}:9962" >"${temporary_dir}/controller-forward.log" 2>&1 &
+    controller_forward_pid=$!
+    for _ in {1..20}; do
+        if curl --fail --silent "http://127.0.0.1:${controller_port}/readyz" >/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
 
 agent_status() {
     "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${1}/proxy/v1/status"
@@ -331,16 +349,10 @@ if [[ ${#agent_pods[@]} -eq 0 ]]; then
     exit 1
 fi
 
-"${kc[@]}" -n unf-system port-forward service/unf-controller \
-    "${controller_port}:9962" >"${temporary_dir}/controller-forward.log" 2>&1 &
-controller_forward_pid=$!
-for _ in {1..20}; do
-    if curl --fail --silent "http://127.0.0.1:${controller_port}/readyz" >/dev/null; then
-        break
-    fi
-    sleep 1
-done
-curl --fail --silent "http://127.0.0.1:${controller_port}/readyz" >/dev/null
+if ! start_controller_forward; then
+    echo "controller port-forward did not become ready" >&2
+    exit 1
+fi
 
 controller_status=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json status)
@@ -1469,6 +1481,82 @@ if ! wait_for_aggregated_agent_convergence "${#agent_pods[@]}"; then
     exit 1
 fi
 
+server_node=$("${kc[@]}" -n backend get pod server -o jsonpath='{.spec.nodeName}')
+restart_agent=$("${kc[@]}" -n unf-system get pods \
+    -l app.kubernetes.io/name=unf-agent \
+    -o jsonpath="{range .items[?(@.spec.nodeName=='${server_node}')]}{.metadata.name}{'\n'}{end}" \
+    | head -n 1)
+if [[ -z ${restart_agent} ]]; then
+    echo "could not identify the agent on the demo server node" >&2
+    exit 1
+fi
+
+"${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=0 >/dev/null
+controller_scaled_down=true
+"${kc[@]}" -n unf-system wait --for=delete pod \
+    -l app.kubernetes.io/name=unf-controller --timeout=120s
+"${kc[@]}" -n unf-system delete pod "${restart_agent}" --wait=true >/dev/null
+
+recovered_agent=
+for _ in {1..60}; do
+    recovered_agent=$("${kc[@]}" -n unf-system get pods \
+        -l app.kubernetes.io/name=unf-agent \
+        -o jsonpath="{range .items[?(@.spec.nodeName=='${server_node}')]}{.metadata.name}{'\n'}{end}" \
+        | grep -v "^${restart_agent}$" | head -n 1 || true)
+    if [[ -n ${recovered_agent} ]] && "${kc[@]}" -n unf-system wait \
+        --for=condition=Ready "pod/${recovered_agent}" --timeout=2s >/dev/null 2>&1; then
+        break
+    fi
+    recovered_agent=
+    sleep 1
+done
+if [[ -z ${recovered_agent} ]]; then
+    echo "replacement agent did not become Ready from pinned state with the controller offline" >&2
+    exit 1
+fi
+recovered_status=$(agent_status "${recovered_agent}")
+if ! grep -q '"ready":true' <<<"${recovered_status}" \
+    || ! grep -Eq '"applied_identity_revision":[1-9][0-9]*' <<<"${recovered_status}" \
+    || ! grep -Eq '"applied_policy_revision":[1-9][0-9]*' <<<"${recovered_status}"; then
+    echo "replacement agent did not expose validated recovered revisions" >&2
+    exit 1
+fi
+recovered_agent_logs=$("${kc[@]}" -n unf-system logs "${recovered_agent}")
+if ! grep -q 'validated pinned last-known-good dataplane' <<<"${recovered_agent_logs}"; then
+    echo "replacement agent did not report pinned last-known-good validation" >&2
+    exit 1
+fi
+recovered_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080)
+if [[ ${recovered_allow_response} != "unf-demo-ok" ]]; then
+    echo "pinned agent recovery lost the allowed flow while the controller was offline" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:9090 >/dev/null 2>&1; then
+    echo "pinned agent recovery lost deny enforcement while the controller was offline" >&2
+    exit 1
+fi
+
+"${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 >/dev/null
+controller_scaled_down=false
+"${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=120s
+if [[ -n ${controller_forward_pid} ]]; then
+    kill "${controller_forward_pid}" 2>/dev/null || true
+    wait "${controller_forward_pid}" 2>/dev/null || true
+    controller_forward_pid=
+fi
+if ! start_controller_forward; then
+    echo "controller port-forward did not recover after the restart test" >&2
+    exit 1
+fi
+mapfile -t agent_pods < <("${kc[@]}" -n unf-system get pods \
+    -l app.kubernetes.io/name=unf-agent -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+if ! wait_for_aggregated_agent_convergence "${#agent_pods[@]}"; then
+    echo "agents did not reconverge after pinned restart recovery" >&2
+    exit 1
+fi
+
 "${kc[@]}" -n kube-system rollout status daemonset/kindnet --timeout=120s
 if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' \
@@ -1477,4 +1565,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: controller-aggregated two-node agent convergence, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

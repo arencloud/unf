@@ -37,8 +37,11 @@ matrix and reproducible evidence.
   enforcement-aware `unfctl explain`;
 - Verified manually: the last active bank continued enforcing across a controller
   interruption and agents reconverged to the restarted controller epoch;
-- Next: pinned last-known-good recovery, agent restart fencing, and
-  pressure/fault-injection tests.
+- Implemented and two-node kind verified: ABI-versioned pinned enforcement maps,
+  strict recovery validation, and readiness fencing; the verifier restarts a
+  node agent with the controller offline before checking allow/deny state;
+- Next: dual-bank identity activation, atomic/pinned TC attachment handoff, and
+  pressure/corruption fault-injection tests.
 
 ## Phase 3 — compatibility and simulation
 

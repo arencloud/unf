@@ -26,12 +26,12 @@ key layout without an ABI change.
 |---|---|---|---|---|---|
 | `FLOW_COUNTERS` | constant `u32` slot 0 | per-CPU `u64` | eBPF program | increment per parsed flow; program lifetime | one entry; forwarding continues if lookup fails |
 | `FLOW_EVENTS` | none (ring) | `FlowEvent` ABI v2 | eBPF producer, agent consumer | ephemeral, unpinned | 256 KiB; events drop under pressure without changing the already-computed forwarding decision |
-| `IDENTITY_V4` | IPv4 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent map writer; TC reader | revisioned reconciliation; program lifetime, currently unpinned | 65,536 entries; unknown/mismatched identity resolves to ID zero and forwarding continues |
-| `IDENTITY_V6` | 16 IPv6 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent map writer; TC reader | reconciled and rolled back with `IDENTITY_V4`; program lifetime, currently unpinned | 65,536 entries; unknown/mismatched identity resolves to ID zero and forwarding continues |
-| `POLICY_RULES` | source/destination identity, protocol, destination port, bank | actual/shadow verdict and policy/rule/reason provenance, schema, revision | controller compiler; agent transactional writer | stale inactive keys are removed, then the inactive bank is populated and validated before activation; currently unpinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries, and the active bank remains selected when staging fails |
-| `POLICY_IPV4` | exact/fallback source IPv4, destination identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller IPv4-aware compiler; agent transactional writer | staged and validated alongside `POLICY_RULES` under the same inactive bank; currently unpinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
-| `POLICY_IPV6` | destination identity, port, protocol, bank, and source IPv6 prefix | same policy decision/provenance value as `POLICY_RULES` | controller IPv6-aware compiler; agent transactional writer; TC LPM reader | staged and validated alongside the other policy maps under the same inactive bank; currently unpinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
-| `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks in all three policy maps | one entry; failed activation preserves the previous pointer |
+| `IDENTITY_V4` | IPv4 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent map writer; TC reader | revisioned reconciliation; pinned under `/sys/fs/bpf/unf/v1` | 65,536 entries; unknown/mismatched identity resolves to ID zero and forwarding continues |
+| `IDENTITY_V6` | 16 IPv6 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent map writer; TC reader | reconciled and rolled back with `IDENTITY_V4`; pinned under the same ABI directory | 65,536 entries; unknown/mismatched identity resolves to ID zero and forwarding continues |
+| `POLICY_RULES` | source/destination identity, protocol, destination port, bank | actual/shadow verdict and policy/rule/reason provenance, schema, revision | controller compiler; agent transactional writer | stale inactive keys are removed, then populated and validated before activation; pinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries, and the active bank remains selected when staging fails |
+| `POLICY_IPV4` | exact/fallback source IPv4, destination identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller IPv4-aware compiler; agent transactional writer | staged and validated alongside `POLICY_RULES`; pinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
+| `POLICY_IPV6` | destination identity, port, protocol, bank, and source IPv6 prefix | same policy decision/provenance value as `POLICY_RULES` | controller IPv6-aware compiler; agent transactional writer; TC LPM reader | staged and validated alongside the other policy maps; pinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
+| `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks; pinned | one entry; failed activation preserves the previous pointer |
 
 `FlowEvent` carries no Kubernetes strings. ABI v2 records the applied policy
 revision, actual verdict/reason/policy/rule, and optional shadow
@@ -73,16 +73,27 @@ broader external prefixes. See ADR 0014.
 
 ## Failure behavior
 
-An interrupted stage cannot replace the active bank, and controller interruption
-leaves the last activated revision in use. This overlay prototype deliberately
+An interrupted policy stage cannot replace the active bank, and controller
+interruption leaves the last activated revision in use. The six enforcement maps
+are an all-or-none pinned set in an ABI-versioned bpffs directory. On startup the
+agent checks map capacities, reconstructs rollback caches, validates identity
+coherence and the active policy count/bank/revision, and refuses partial or
+malformed persistent state. A controller-managed fresh process stays NotReady
+until both initial snapshots apply; a complete validated last-known-good set may
+restore readiness while the controller is unavailable.
+
+This overlay prototype deliberately
 fails open when the destination identity is unknown, config is absent or
 incompatible, an IPv6 extension chain is unsupported, malformed, or exceeds its
 bounds, or no valid identity/IP entry exists. A source without an identity
 can still be enforced when a valid IPv4 exact/fallback or IPv6 prefix entry exists.
-Fail-open events are marked observed/identity-unknown with revision zero. Agent
-restart also recreates unpinned maps before resynchronizing, so this is not yet a
-production fail-closed design. Invalid map state never becomes a deny by
-accident. See ADR 0008.
+Fail-open events are marked observed/identity-unknown with revision zero. Identity
+maps are not yet dual-bank, so process death during identity mutation can leave a
+mixed revision that the next process fences instead of adopting. TC attachments
+are also process-owned, leaving a restart interval before the replacement agent
+attaches; persistent maps remove the post-attach resynchronization window, not
+that attachment interval. Invalid map state never becomes a deny by accident.
+See ADRs 0008 and 0016.
 
 ## Build boundary
 
@@ -92,5 +103,5 @@ tests still run on stable in the host workspace. See ADR 0002.
 
 ## Next dataplane milestone
 
-Persist last-known-good state across agent restart, aggregate applied node status,
-and test explicit control-plane and map-pressure failure modes.
+Add transactional identity banks and atomic/pinned TC attachment replacement,
+then test explicit map-pressure and corruption failure modes.

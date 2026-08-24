@@ -6,6 +6,16 @@ kubeconfig=${KUBECONFIG:-"${project_root}/.tools/kind-unf-dev.kubeconfig"}
 context=${KUBE_CONTEXT:-kind-unf-dev}
 
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
+container_runtime=${KIND_PROVIDER:-podman}
+
+# kind's node image leaves /sys/fs/bpf as an unmounted sysfs directory. The
+# production DaemonSet expects the host to provide bpffs, so reproduce that
+# node prerequisite explicitly in the disposable fixture.
+mapfile -t kind_nodes < <("${kc[@]}" get nodes -o name | sed 's|node/||')
+for node in "${kind_nodes[@]}"; do
+    sudo "${container_runtime}" exec "${node}" sh -c \
+        'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
+done
 
 # The pinned kind node image selects legacy ip6tables inside kindnet, while
 # some development kernels expose the IPv6 NAT table only through nftables.

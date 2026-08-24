@@ -1306,7 +1306,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         agents,
         limitations: [
             "desired state and identity allocations are currently in-memory only",
-            "agent acknowledgements use unauthenticated prototype transport and policy maps are currently unpinned",
+            "agent acknowledgements use unauthenticated prototype transport; identity updates are single-bank and TC attachments remain process-owned",
         ],
     }))
 }

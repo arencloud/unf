@@ -74,8 +74,10 @@ make kind-deploy
 make kind-test
 ```
 
-`kind-up` also selects the nftables IPv6 frontend inside the pinned kindnet image
-and waits for that DaemonSet to become ready. This keeps the dual-stack fixture
+`kind-up` mounts bpffs at `/sys/fs/bpf` inside every disposable kind node,
+matching the agent DaemonSet's host prerequisite. It also selects the nftables
+IPv6 frontend inside the pinned kindnet image and waits for that DaemonSet to
+become ready. This keeps the dual-stack fixture
 reproducible on development kernels without the legacy IPv6 NAT table.
 
 `kind-deploy` builds the userspace images, eBPF object, and test-tools image with
