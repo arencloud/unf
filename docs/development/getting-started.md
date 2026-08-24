@@ -59,8 +59,11 @@ sudo target/debug/unf-agent \
   --ebpf-object ebpf/unf-ebpf-tc/target/bpfel-unknown-none/release/unf-ebpf-tc
 ```
 
-TC attachment changes host network state. The agent currently leaves the clsact
-qdisc in place when it exits; use a disposable environment for testing.
+TC attachment changes host network state. On Linux 6.6+, the agent leaves its
+per-interface TCX links pinned below `/sys/fs/bpf/unf/v2/links` so a replacement
+can update them atomically. On older kernels it leaves the clsact qdisc and its
+stable legacy filters in place for in-place replacement. Use a disposable
+environment for testing; explicit production cleanup tooling is not implemented.
 
 ## kind
 
@@ -155,7 +158,10 @@ revisioned, 4,096-key in-memory history. `make kind-test` verifies the predicted
 8080 denial in both inputs, unchanged policy revision, and continued live 8080
 allow after simulation. Status reports per-node desired/applied identity and
 policy revisions and marks the watched Node set converged only while every agent
-has a fresh matching acknowledgement.
+has a fresh matching acknowledgement. Each agent also reports
+`tc_attachment_mode` as `tcx_pinned` or `legacy_netlink`. During offline
+replacement, the verifier continuously probes the denied TCP/9090 path and
+requires zero successful requests before the replacement is Ready.
 
 The DaemonSet attaches ingress classification to every non-loopback node interface
 and discovers newly created pod veths. A packet can therefore produce multiple

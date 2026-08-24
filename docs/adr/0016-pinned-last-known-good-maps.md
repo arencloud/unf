@@ -3,8 +3,10 @@
 Status: Accepted for Phase 2 restart recovery
 
 Amended by [ADR 0017](0017-transactional-identity-banks.md), which moves the
-default pin layout from the six-map ABI v1 set to the nine-map ABI v2 set. The
-decision below records the initial recovery boundary.
+default pin layout from the six-map ABI v1 set to the nine-map ABI v2 set, and
+[ADR 0018](0018-persistent-tc-attachment-handoff.md), which closes the separate
+classifier handoff interval. The decision below records the initial recovery
+boundary.
 
 ## Context
 
@@ -42,9 +44,7 @@ the controller offline, restarting the agent on the demo server node, requiring
 recovered readiness/revisions, and rechecking the allowed and denied flows before
 restoring the controller.
 
-Identity reconciliation remains single-bank. A crash during its mutation can
-produce mixed revisions; recovery rejects that state and holds readiness rather
-than claiming last-known-good safety. TC links are still process-owned, so there is
-an attachment interval between the old process exiting and the replacement
-attaching. Dual-bank identity activation and atomic pinned TCX link replacement
-(with a documented legacy-netlink strategy) are separate hardening gates.
+The original decision left identity reconciliation single-bank and TC links
+process-owned. ADR 0017 replaced identity state with transactional dual banks,
+and ADR 0018 added persistent TCX/legacy attachment replacement. Those later
+decisions supersede the two remaining restart gaps recorded here.

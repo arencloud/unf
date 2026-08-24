@@ -2,6 +2,9 @@
 
 Status: Accepted for Phase 2 identity consistency
 
+Attachment continuity is specified separately by
+[ADR 0018](0018-persistent-tc-attachment-handoff.md).
+
 ## Context
 
 Policy updates already stage complete inactive banks and activate them with one
@@ -53,6 +56,6 @@ adds one array lookup per parsed packet, while preserving the existing address
 key layouts.
 
 ABI v1 pins are intentionally not deleted or migrated in place. Operators may
-remove the old directory after validating the v2 rollout. TC attachments remain
-process-owned, so attachment handoff and its restart interval are a separate
-hardening gate.
+remove the old directory after validating the v2 rollout. At the time of this
+decision TC attachments remained process-owned; ADR 0018 subsequently introduced
+pinned TCX and persistent legacy-netlink handoff.

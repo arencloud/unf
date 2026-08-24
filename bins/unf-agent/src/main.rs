@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,7 +15,10 @@ use axum::routing::get;
 use axum::{Json, Router};
 use aya::maps::lpm_trie::{Key as LpmKey, LpmTrie as AyaLpmTrie};
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, IterableMap, MapData, RingBuf};
-use aya::programs::{SchedClassifier, TcAttachType, tc};
+use aya::programs::links::{FdLink, LinkError, PinnedLink};
+use aya::programs::tc::{NlOptions, SchedClassifierLink, TcAttachOptions, TcError, TcHandle};
+use aya::programs::{LinkOrder, SchedClassifier, TcAttachType, tc};
+use aya::sys::SyscallError;
 use aya::{Ebpf, EbpfLoader};
 use clap::{Parser, ValueEnum};
 use prometheus_client::encoding::text::encode;
@@ -57,6 +61,8 @@ const PERSISTENT_MAP_NAMES: [&str; 9] = [
 ];
 const IDENTITY_MAP_CAPACITY: u32 = 65_536;
 const POLICY_MAP_CAPACITY: u32 = 262_144;
+const LEGACY_TC_PRIORITY: u16 = 0x554e;
+const LEGACY_TC_HANDLE_MAJOR: u16 = 0x554e;
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF per-node eBPF agent")]
@@ -83,7 +89,7 @@ struct Args {
     bpf_pin_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Direction {
     Ingress,
     Egress,
@@ -129,6 +135,7 @@ struct AgentState {
     queued_flow_exports: AtomicU64,
     dropped_flow_exports: AtomicU64,
     exported_flow_events: AtomicU64,
+    tc_attachment_mode: AtomicU64,
     capabilities: KernelCapabilities,
     registry: Mutex<Registry>,
     metrics: AgentMetrics,
@@ -205,7 +212,9 @@ struct InterfaceAttachments<'program> {
     all_interfaces: bool,
     attach_type: TcAttachType,
     direction: Direction,
-    attached: HashSet<String>,
+    mode: TcAttachmentMode,
+    pin_root: PathBuf,
+    attached: HashMap<String, u32>,
 }
 
 impl InterfaceAttachments<'_> {
@@ -214,8 +223,36 @@ impl InterfaceAttachments<'_> {
             self.program,
             self.attach_type,
             self.direction,
+            self.mode,
+            &self.pin_root,
             &mut self.attached,
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+enum TcAttachmentMode {
+    None = 0,
+    TcxPinned = 1,
+    LegacyNetlink = 2,
+}
+
+impl TcAttachmentMode {
+    const fn status_label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::TcxPinned => "tcx_pinned",
+            Self::LegacyNetlink => "legacy_netlink",
+        }
+    }
+
+    const fn from_state(value: u64) -> Self {
+        match value {
+            1 => Self::TcxPinned,
+            2 => Self::LegacyNetlink,
+            _ => Self::None,
+        }
     }
 }
 
@@ -237,6 +274,7 @@ struct AgentStatus {
     queued_flow_exports: u64,
     dropped_flow_exports: u64,
     exported_flow_events: u64,
+    tc_attachment_mode: &'static str,
     capabilities: KernelCapabilities,
     limitation: &'static str,
 }
@@ -367,6 +405,7 @@ fn new_state(capabilities: KernelCapabilities, node_name: String) -> AgentState 
         queued_flow_exports: AtomicU64::new(0),
         dropped_flow_exports: AtomicU64::new(0),
         exported_flow_events: AtomicU64::new(0),
+        tc_attachment_mode: AtomicU64::new(TcAttachmentMode::None as u64),
         capabilities,
         registry: Mutex::new(registry),
         metrics,
@@ -482,41 +521,14 @@ async fn run_dataplane(
     );
     let recovered = recover_persistent_dataplane(&mut identities, &mut policies, pins_existed)?;
     apply_recovered_state(&state, &identities, &policies, &recovered);
-    let program_name = match config.direction {
-        Direction::Ingress => "unf_observe_ingress",
-        Direction::Egress => "unf_observe_egress",
-    };
-    let program: &mut SchedClassifier = ebpf
-        .program_mut(program_name)
-        .with_context(|| format!("eBPF object does not contain program {program_name}"))?
-        .try_into()
-        .context("unf_observe is not a TC classifier")?;
-    program.load().context("load TC classifier into kernel")?;
-    let attach_type = match config.direction {
-        Direction::Ingress => TcAttachType::Ingress,
-        Direction::Egress => TcAttachType::Egress,
-    };
-    let mut attachments = InterfaceAttachments {
-        program,
-        all_interfaces: config.all_interfaces,
-        attach_type,
-        direction: config.direction,
-        attached: HashSet::new(),
-    };
-    if config.all_interfaces {
-        attachments.refresh()?;
-        if attachments.attached.is_empty() {
-            bail!("no non-loopback network interfaces are available");
-        }
-    } else if let Some(interface) = config.interface.as_deref() {
-        attach_interface(
-            attachments.program,
-            interface,
-            attachments.attach_type,
-            attachments.direction,
-        )?;
-        attachments.attached.insert(interface.to_owned());
-    }
+    let mut attachments = attach_dataplane_program(
+        &mut ebpf,
+        &config,
+        kernel_supports_tcx(&state.capabilities.kernel_release),
+    )?;
+    state
+        .tc_attachment_mode
+        .store(attachments.mode as u64, Ordering::Release);
     state.bpf_loaded.store(true, Ordering::Release);
     state.metrics.bpf_loaded.set(1);
     let recovered_ready = recovered_dataplane_is_ready(&recovered);
@@ -558,6 +570,60 @@ async fn run_dataplane(
     state.bpf_loaded.store(false, Ordering::Release);
     state.metrics.bpf_loaded.set(0);
     Ok(())
+}
+
+fn attach_dataplane_program<'ebpf>(
+    ebpf: &'ebpf mut Ebpf,
+    config: &DataplaneConfig,
+    tcx_supported: bool,
+) -> Result<InterfaceAttachments<'ebpf>> {
+    let program_name = match config.direction {
+        Direction::Ingress => "unf_observe_ingress",
+        Direction::Egress => "unf_observe_egress",
+    };
+    let program: &mut SchedClassifier = ebpf
+        .program_mut(program_name)
+        .with_context(|| format!("eBPF object does not contain program {program_name}"))?
+        .try_into()
+        .context("unf_observe is not a TC classifier")?;
+    program.load().context("load TC classifier into kernel")?;
+    let attach_type = match config.direction {
+        Direction::Ingress => TcAttachType::Ingress,
+        Direction::Egress => TcAttachType::Egress,
+    };
+    let mode = if tcx_supported {
+        TcAttachmentMode::TcxPinned
+    } else {
+        TcAttachmentMode::LegacyNetlink
+    };
+    let mut attachments = InterfaceAttachments {
+        program,
+        all_interfaces: config.all_interfaces,
+        attach_type,
+        direction: config.direction,
+        mode,
+        pin_root: config.bpf_pin_path.join("links"),
+        attached: HashMap::new(),
+    };
+    if config.all_interfaces {
+        attachments.refresh()?;
+        if attachments.attached.is_empty() {
+            bail!("no non-loopback network interfaces are available");
+        }
+    } else if let Some(interface) = config.interface.as_deref() {
+        let if_index = interface_index(interface)?;
+        attach_interface(
+            attachments.program,
+            interface,
+            if_index,
+            attachments.attach_type,
+            attachments.direction,
+            attachments.mode,
+            &attachments.pin_root,
+        )?;
+        attachments.attached.insert(interface.to_owned(), if_index);
+    }
+    Ok(attachments)
 }
 
 fn recovered_dataplane_is_ready(recovered: &RecoveredDataplane) -> bool {
@@ -2464,47 +2530,256 @@ fn refresh_interfaces(
     program: &mut SchedClassifier,
     attach_type: TcAttachType,
     direction: Direction,
-    attached: &mut HashSet<String>,
+    mode: TcAttachmentMode,
+    pin_root: &Path,
+    attached: &mut HashMap<String, u32>,
 ) -> Result<()> {
     let discovered = discover_interfaces()?;
-    attached.retain(|interface| discovered.contains(interface));
-    let unattached: Vec<_> = discovered.difference(attached).cloned().collect();
-    for interface in unattached {
-        match attach_interface(program, &interface, attach_type, direction) {
+    attached.retain(|interface, if_index| discovered.get(interface) == Some(if_index));
+    let unattached: Vec<_> = discovered
+        .iter()
+        .filter(|(interface, if_index)| attached.get(*interface) != Some(*if_index))
+        .map(|(interface, if_index)| (interface.clone(), *if_index))
+        .collect();
+    for (interface, if_index) in unattached {
+        match attach_interface(
+            program,
+            &interface,
+            if_index,
+            attach_type,
+            direction,
+            mode,
+            pin_root,
+        ) {
             Ok(()) => {
-                attached.insert(interface);
+                attached.insert(interface, if_index);
             }
             Err(error) => warn!(?error, %interface, "could not attach TC observation program"),
         }
     }
+    if mode == TcAttachmentMode::TcxPinned {
+        cleanup_stale_tcx_links(pin_root, direction, discovered.values().copied())?;
+    }
     Ok(())
 }
 
-fn discover_interfaces() -> Result<HashSet<String>> {
-    let interfaces = fs::read_dir("/sys/class/net")
-        .context("enumerate network interfaces")?
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|interface| interface != "lo")
-        .collect();
+fn discover_interfaces() -> Result<HashMap<String, u32>> {
+    let mut interfaces = HashMap::new();
+    for entry in fs::read_dir("/sys/class/net").context("enumerate network interfaces")? {
+        let entry = entry.context("read network interface directory entry")?;
+        let Some(interface) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        if interface == "lo" {
+            continue;
+        }
+        let if_index = interface_index(&interface)?;
+        interfaces.insert(interface, if_index);
+    }
     Ok(interfaces)
+}
+
+fn interface_index(interface: &str) -> Result<u32> {
+    let value = fs::read_to_string(Path::new("/sys/class/net").join(interface).join("ifindex"))
+        .with_context(|| format!("read interface index for {interface}"))?;
+    value
+        .trim()
+        .parse()
+        .with_context(|| format!("parse interface index for {interface}"))
 }
 
 fn attach_interface(
     program: &mut SchedClassifier,
     interface: &str,
+    if_index: u32,
+    attach_type: TcAttachType,
+    direction: Direction,
+    mode: TcAttachmentMode,
+    pin_root: &Path,
+) -> Result<()> {
+    match mode {
+        TcAttachmentMode::TcxPinned => {
+            attach_pinned_tcx(
+                program,
+                interface,
+                if_index,
+                attach_type,
+                direction,
+                pin_root,
+            )?;
+        }
+        TcAttachmentMode::LegacyNetlink => {
+            attach_persistent_netlink(program, interface, attach_type, direction)?;
+        }
+        TcAttachmentMode::None => bail!("TC attachment mode was not selected"),
+    }
+    Ok(())
+}
+
+fn attach_pinned_tcx(
+    program: &mut SchedClassifier,
+    interface: &str,
+    if_index: u32,
+    attach_type: TcAttachType,
+    direction: Direction,
+    pin_root: &Path,
+) -> Result<()> {
+    fs::create_dir_all(pin_root)
+        .with_context(|| format!("create TCX link pin directory {}", pin_root.display()))?;
+    let pin_path = tcx_link_pin_path(pin_root, direction, if_index);
+    match PinnedLink::from_pin(&pin_path) {
+        Ok(pinned) => {
+            let link = SchedClassifierLink::try_from(FdLink::from(pinned))
+                .context("pinned attachment is not a TCX link")?;
+            let link_id = program
+                .attach_to_link(link)
+                .with_context(|| format!("atomically replace TCX program on {interface}"))?;
+            let link = program.take_link(link_id)?;
+            let fd_link = FdLink::try_from(link).context("updated attachment is not TCX")?;
+            drop(fd_link);
+            info!(
+                %interface,
+                if_index,
+                ?direction,
+                pin = %pin_path.display(),
+                "TCX observation program atomically replaced"
+            );
+        }
+        Err(error) if pinned_link_is_missing(&error) => {
+            let link_id = program
+                .attach_with_options(
+                    interface,
+                    attach_type,
+                    TcAttachOptions::TcxOrder(LinkOrder::last()),
+                )
+                .with_context(|| format!("attach TCX classifier to {interface}"))?;
+            let link = program.take_link(link_id)?;
+            let fd_link = FdLink::try_from(link).context("new attachment is not TCX")?;
+            let pinned = fd_link
+                .pin(&pin_path)
+                .with_context(|| format!("pin TCX link at {}", pin_path.display()))?;
+            drop(pinned);
+            info!(
+                %interface,
+                if_index,
+                ?direction,
+                pin = %pin_path.display(),
+                "TCX observation program attached and pinned"
+            );
+        }
+        Err(error) => {
+            return Err(anyhow!(error))
+                .with_context(|| format!("open TCX link pin {}", pin_path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn pinned_link_is_missing(error: &LinkError) -> bool {
+    matches!(
+        error,
+        LinkError::SyscallError(SyscallError { io_error, .. })
+            if io_error.kind() == io::ErrorKind::NotFound
+    )
+}
+
+fn tcx_link_pin_path(pin_root: &Path, direction: Direction, if_index: u32) -> PathBuf {
+    pin_root.join(format!("tcx-{}-{if_index}", direction_label(direction)))
+}
+
+const fn direction_label(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Ingress => "ingress",
+        Direction::Egress => "egress",
+    }
+}
+
+fn cleanup_stale_tcx_links(
+    pin_root: &Path,
+    direction: Direction,
+    active_ifindices: impl Iterator<Item = u32>,
+) -> Result<()> {
+    if !pin_root.exists() {
+        return Ok(());
+    }
+    let active: HashSet<_> = active_ifindices.collect();
+    let prefix = format!("tcx-{}-", direction_label(direction));
+    for entry in fs::read_dir(pin_root)
+        .with_context(|| format!("enumerate TCX link pins in {}", pin_root.display()))?
+    {
+        let entry = entry.context("read TCX link pin directory entry")?;
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        let Some(if_index) = name
+            .strip_prefix(&prefix)
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if active.contains(&if_index) {
+            continue;
+        }
+        fs::remove_file(entry.path())
+            .with_context(|| format!("remove stale TCX link pin {}", entry.path().display()))?;
+        info!(if_index, ?direction, pin = %entry.path().display(), "stale TCX link pin removed");
+    }
+    Ok(())
+}
+
+fn attach_persistent_netlink(
+    program: &mut SchedClassifier,
+    interface: &str,
     attach_type: TcAttachType,
     direction: Direction,
 ) -> Result<()> {
-    if let Err(error) = tc::qdisc_add_clsact(interface) {
-        // EEXIST is expected when another TC program already created clsact.
-        warn!(%error, %interface, "could not create clsact qdisc; attach will still be attempted");
+    match tc::qdisc_add_clsact(interface) {
+        Ok(()) | Err(TcError::AlreadyAttached) => {}
+        Err(error) => {
+            warn!(%error, %interface, "could not create clsact qdisc; attach will still be attempted");
+        }
     }
-    program
-        .attach(interface, attach_type)
-        .with_context(|| format!("attach TC classifier to {interface}"))?;
-    info!(%interface, ?direction, "TC observation program attached");
+    let handle = legacy_tc_handle(direction);
+    let existing =
+        SchedClassifierLink::attached(interface, attach_type, LEGACY_TC_PRIORITY, handle, None)?;
+    let (link_id, replaced) = if let Ok(link_id) = program.attach_to_link(existing) {
+        (link_id, true)
+    } else {
+        let link_id = program
+            .attach_with_options(
+                interface,
+                attach_type,
+                TcAttachOptions::Netlink(NlOptions {
+                    priority: LEGACY_TC_PRIORITY,
+                    handle,
+                    classid: None,
+                }),
+            )
+            .with_context(|| format!("attach persistent netlink classifier to {interface}"))?;
+        (link_id, false)
+    };
+    let link = program.take_link(link_id)?;
+    // Legacy TC filters are kernel-owned rather than fd-owned. Taking the link
+    // out of Aya and intentionally forgetting its detach guard keeps the fixed
+    // priority/handle installed across process exit for replacement on restart.
+    std::mem::forget(link);
+    info!(
+        %interface,
+        ?direction,
+        priority = LEGACY_TC_PRIORITY,
+        handle = u32::from(handle),
+        replaced,
+        "persistent netlink TC observation program installed"
+    );
     Ok(())
+}
+
+const fn legacy_tc_handle(direction: Direction) -> TcHandle {
+    let minor = match direction {
+        Direction::Ingress => 1,
+        Direction::Egress => 2,
+    };
+    TcHandle::new(LEGACY_TC_HANDLE_MAJOR, minor)
 }
 
 fn decode_event(bytes: &[u8]) -> Option<FlowEvent> {
@@ -2561,9 +2836,10 @@ fn copy_bytes<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
 }
 
 fn detect_capabilities() -> KernelCapabilities {
+    let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map_or_else(|_| "unknown".to_owned(), |value| value.trim().to_owned());
     KernelCapabilities {
-        kernel_release: fs::read_to_string("/proc/sys/kernel/osrelease")
-            .map_or_else(|_| "unknown".to_owned(), |value| value.trim().to_owned()),
+        kernel_release,
         btf: Path::new("/sys/kernel/btf/vmlinux").is_file(),
         bpffs: fs::read_to_string("/proc/mounts").is_ok_and(|mounts| {
             mounts.lines().any(|line| {
@@ -2576,6 +2852,23 @@ fn detect_capabilities() -> KernelCapabilities {
         }),
         cgroup_v2: Path::new("/sys/fs/cgroup/cgroup.controllers").is_file(),
     }
+}
+
+fn kernel_supports_tcx(release: &str) -> bool {
+    let mut components = release.split(['.', '-']);
+    let Some(major) = components
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    let Some(minor) = components
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    (major, minor) >= (6, 6)
 }
 
 async fn health() -> &'static str {
@@ -2610,8 +2903,12 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         queued_flow_exports: state.queued_flow_exports.load(Ordering::Relaxed),
         dropped_flow_exports: state.dropped_flow_exports.load(Ordering::Relaxed),
         exported_flow_events: state.exported_flow_events.load(Ordering::Relaxed),
+        tc_attachment_mode: TcAttachmentMode::from_state(
+            state.tc_attachment_mode.load(Ordering::Acquire),
+        )
+        .status_label(),
         capabilities: state.capabilities.clone(),
-        limitation: "TC policy enforcement uses transactional pinned identity/policy maps; TC attachments remain process-owned and acknowledgements use unauthenticated prototype transport",
+        limitation: "TC policy enforcement uses transactional pinned maps and persistent atomic attachment replacement; acknowledgements use unauthenticated prototype transport",
     })
 }
 
@@ -2655,6 +2952,28 @@ mod tests {
     fn capability_detection_is_total() {
         let capabilities = detect_capabilities();
         assert!(!capabilities.kernel_release.is_empty());
+    }
+
+    #[test]
+    fn tcx_capability_follows_the_kernel_introduction_boundary() {
+        assert!(!kernel_supports_tcx("6.5.13-200.fc38.x86_64"));
+        assert!(kernel_supports_tcx("6.6.0"));
+        assert!(kernel_supports_tcx("7.1.4-204.fc44.x86_64"));
+        assert!(!kernel_supports_tcx("unknown"));
+    }
+
+    #[test]
+    fn attachment_names_and_legacy_handles_are_direction_stable() {
+        assert_eq!(
+            tcx_link_pin_path(
+                Path::new("/sys/fs/bpf/unf/v2/links"),
+                Direction::Ingress,
+                17
+            ),
+            Path::new("/sys/fs/bpf/unf/v2/links/tcx-ingress-17")
+        );
+        assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
+        assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
     }
 
     fn test_agent_state() -> AgentState {

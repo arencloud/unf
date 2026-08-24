@@ -8,6 +8,7 @@ controller_port=${UNF_CONTROLLER_TEST_PORT:-19962}
 unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 temporary_dir=$(mktemp -d)
 controller_forward_pid=
+handoff_probe_pid=
 controller_scaled_down=false
 policy_mutated=false
 network_policy_mutated=false
@@ -21,6 +22,12 @@ topology_service_created=false
 network_policy_selector_peer='[{"namespaceSelector":{"matchLabels":{"environment":"production"},"matchExpressions":[{"key":"team","operator":"In","values":["checkout"]}]},"podSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["client"]}]}}]'
 
 cleanup() {
+    if [[ -n ${handoff_probe_pid} ]]; then
+        "${kc[@]}" exec -n frontend client -- touch /tmp/unf-handoff-stop \
+            >/dev/null 2>&1 || true
+        kill "${handoff_probe_pid}" 2>/dev/null || true
+        wait "${handoff_probe_pid}" 2>/dev/null || true
+    fi
     if [[ ${controller_scaled_down} == true ]]; then
         "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 \
             >/dev/null 2>&1 || true
@@ -94,6 +101,20 @@ agent_status() {
 json_number() {
     local field=$1
     sed -nE "s/.*\"${field}\":([0-9]+).*/\1/p"
+}
+
+expected_attachment_mode() {
+    local status=$1
+    local version major minor
+    version=$(sed -nE \
+        's/.*"kernel_release":"([0-9]+)\.([0-9]+)[^"]*".*/\1 \2/p' <<<"${status}")
+    read -r major minor <<<"${version}"
+    if [[ -n ${major:-} && -n ${minor:-} \
+        && ( ${major} -gt 6 || ( ${major} -eq 6 && ${minor} -ge 6 ) ) ]]; then
+        echo tcx_pinned
+    else
+        echo legacy_netlink
+    fi
 }
 
 wait_for_aggregated_agent_convergence() {
@@ -420,6 +441,7 @@ for _ in {1..30}; do
         <<<"${controller_status}")
     for pod in "${agent_pods[@]}"; do
         status=$(agent_status "${pod}" || true)
+        attachment_mode=$(expected_attachment_mode "${status}")
         desired_identity=$(json_number desired_identity_revision <<<"${status}")
         applied_identity=$(json_number applied_identity_revision <<<"${status}")
         desired_epoch=$(json_number desired_identity_epoch <<<"${status}")
@@ -444,7 +466,15 @@ for _ in {1..30}; do
             || -z ${desired_policy_epoch} || ${desired_policy_epoch} != "${applied_policy_epoch}" \
             || ${applied_policy_epoch} != "${controller_identity_epoch}" \
             || ${policy_entries:-0} -eq 0 ]] \
-            || ! grep -q '"bpf_loaded":true' <<<"${status}"; then
+            || ! grep -q '"bpf_loaded":true' <<<"${status}" \
+            || ! grep -q "\"tc_attachment_mode\":\"${attachment_mode}\"" <<<"${status}"; then
+            initial_synced=false
+            break
+        fi
+        if [[ ${attachment_mode} == tcx_pinned ]] \
+            && ! "${kc[@]}" -n unf-system exec "${pod}" -- sh -c \
+                'find /sys/fs/bpf/unf/v2/links -maxdepth 1 -type f -name "tcx-ingress-*" | grep -q .' \
+                >/dev/null 2>&1; then
             initial_synced=false
             break
         fi
@@ -1491,6 +1521,31 @@ if [[ -z ${restart_agent} ]]; then
     exit 1
 fi
 
+"${kc[@]}" exec -n frontend client -- sh -c '
+    rm -f /tmp/unf-handoff-stop /tmp/unf-handoff-breach
+    while [ ! -e /tmp/unf-handoff-stop ]; do
+        attempt=0
+        while [ "${attempt}" -lt 16 ]; do
+            (
+                if wget -T 1 -t 1 -qO- \
+                    http://server.backend.svc.cluster.local:9090 >/dev/null 2>&1; then
+                    echo policy-bypass >>/tmp/unf-handoff-breach
+                fi
+            ) &
+            attempt=$((attempt + 1))
+        done
+        wait
+    done
+    test ! -s /tmp/unf-handoff-breach
+' >"${temporary_dir}/handoff-probe.log" 2>&1 &
+handoff_probe_pid=$!
+sleep 1
+if ! kill -0 "${handoff_probe_pid}" 2>/dev/null; then
+    cat "${temporary_dir}/handoff-probe.log" >&2
+    echo "continuous deny probe did not start before agent replacement" >&2
+    exit 1
+fi
+
 "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=0 >/dev/null
 controller_scaled_down=true
 "${kc[@]}" -n unf-system wait --for=delete pod \
@@ -1514,17 +1569,29 @@ if [[ -z ${recovered_agent} ]]; then
     echo "replacement agent did not become Ready from pinned state with the controller offline" >&2
     exit 1
 fi
+"${kc[@]}" exec -n frontend client -- touch /tmp/unf-handoff-stop >/dev/null
+if ! wait "${handoff_probe_pid}"; then
+    cat "${temporary_dir}/handoff-probe.log" >&2
+    echo "deny enforcement opened during TC attachment replacement" >&2
+    exit 1
+fi
+handoff_probe_pid=
 recovered_status=$(agent_status "${recovered_agent}")
+recovered_attachment_mode=$(expected_attachment_mode "${recovered_status}")
 if ! grep -q '"ready":true' <<<"${recovered_status}" \
     || ! grep -Eq '"applied_identity_epoch":[1-9][0-9]*' <<<"${recovered_status}" \
     || ! grep -Eq '"applied_identity_revision":[1-9][0-9]*' <<<"${recovered_status}" \
-    || ! grep -Eq '"applied_policy_revision":[1-9][0-9]*' <<<"${recovered_status}"; then
+    || ! grep -Eq '"applied_policy_revision":[1-9][0-9]*' <<<"${recovered_status}" \
+    || ! grep -q "\"tc_attachment_mode\":\"${recovered_attachment_mode}\"" \
+        <<<"${recovered_status}"; then
     echo "replacement agent did not expose the validated recovered identity epoch and revisions" >&2
     exit 1
 fi
 recovered_agent_logs=$("${kc[@]}" -n unf-system logs "${recovered_agent}")
 if ! grep -q 'validated pinned last-known-good dataplane' <<<"${recovered_agent_logs}" \
-    || ! grep -Eq '"active_identity_bank":[01]' <<<"${recovered_agent_logs}"; then
+    || ! grep -Eq '"active_identity_bank":[01]' <<<"${recovered_agent_logs}" \
+    || ! grep -Eq 'TCX observation program atomically replaced|persistent netlink TC observation program installed' \
+        <<<"${recovered_agent_logs}"; then
     echo "replacement agent did not report pinned last-known-good validation" >&2
     exit 1
 fi
@@ -1567,4 +1634,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

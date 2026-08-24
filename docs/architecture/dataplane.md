@@ -93,12 +93,15 @@ incompatible, an IPv6 extension chain is unsupported, malformed, or exceeds its
 bounds, or no valid identity/IP entry exists. A source without an identity
 can still be enforced when a valid IPv4 exact/fallback or IPv6 prefix entry exists.
 Fail-open events are marked observed/identity-unknown with revision zero. TC
-attachments are process-owned, leaving a restart interval before the replacement
-agent attaches; persistent transactional maps remove the post-attach
-resynchronization window, not that attachment interval. Invalid map state never
+attachments use persistent replacement identities. On Linux 6.6 and newer, the
+agent pins one TCX link per interface index in the configured direction below the
+ABI v2 link directory and atomically updates that link to the newly loaded
+program. On older kernels, it owns a fixed priority/handle tuple per direction
+and replaces the legacy netlink filter in place. The old program therefore
+remains attached until the replacement program is loaded and handed over. Invalid map state never
 becomes a deny by accident. ABI v1 pin directories are not removed automatically;
 operators may delete them only after validating an ABI v2 rollout. See ADRs 0008,
-0016, and 0017.
+0016, 0017, and 0018.
 
 ## Build boundary
 
@@ -108,5 +111,6 @@ tests still run on stable in the host workspace. See ADR 0002.
 
 ## Next dataplane milestone
 
-Add atomic/pinned TC attachment replacement, then test explicit map-pressure,
-partial-pin, inactive-stage, and active-config corruption failure modes.
+Test explicit map-pressure, partial-pin, inactive-stage, and active-config
+corruption failure modes, then validate the legacy netlink handoff path on an
+older supported kernel and OpenShift host.

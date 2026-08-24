@@ -66,10 +66,11 @@ failure. Nine enforcement maps are pinned under the `/sys/fs/bpf/unf/v2` ABI
 directory, reopened with strict all-or-none validation, and reconstructed into
 userspace caches after restart. Fresh startup readiness is fenced until identity
 and policy both reconcile, while a complete validated last-known-good set may
-restore service without the controller. TC links remain process-owned; atomic
-attachment handoff, explicit ABI-directory cleanup operations, and
-acknowledgement authentication/durability remain Phase 2 design gates. See ADRs
-0016 and 0017.
+restore service without the controller. On Linux 6.6+, per-interface TCX links
+are pinned and atomically updated to the replacement program; older kernels use
+stable legacy netlink filter identities for in-place replacement. Explicit
+ABI-directory cleanup operations and acknowledgement authentication/durability
+remain hardening work. See ADRs 0016, 0017, and 0018.
 
 Kubernetes watches remain the controller input. Internal HTTP snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

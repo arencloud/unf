@@ -30,6 +30,10 @@ atomic configuration-map writes. All nine enforcement maps persist in an
 ABI-versioned bpffs directory; replacement agents validate and adopt
 last-known-good identity/policy state, while fresh or incompatible startup
 remains fenced from readiness until reconciliation.
+TC attachments now survive agent replacement: kernels supporting TCX use
+per-interface pinned links and atomic link updates, while older kernels use a
+stable legacy netlink filter tuple for in-place replacement. The two-node kind
+gate continuously probes an explicitly denied flow through TCX agent handoff.
 See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
 gates, evidence, limitations, and current work. The shorter
@@ -69,6 +73,9 @@ Implemented in the repository:
 - nine pinned enforcement maps with all-or-none validation, active-bank and
   revision checks, userspace cache recovery, and controller-independent
   replacement-agent readiness;
+- persistent TC attachment handoff using pinned, atomically updated TCX links on
+  Linux 6.6+ and stable legacy netlink filters on older kernels, with the active
+  attachment mode exposed by each agent;
 - `unfctl status`, `unfctl topology`, `unfctl flows`, and `unfctl explain` against live
   controller state;
 - `unfctl policy simulate <security-policy.yaml>` with table/JSON/YAML
