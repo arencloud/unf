@@ -44,7 +44,8 @@ matrix and reproducible evidence.
   translation, additive semantics, controller reconciliation/status, shared
   dataplane enforcement/provenance, pod/Namespace label-expression selectors,
   destination-aware named-port lowering, namespace relabel convergence without
-  identity churn, and rejection/deletion recovery;
+  identity churn, bounded numeric `endPort` ranges with map-capacity guards, and
+  rejection/deletion recovery;
 - Next: broader ingress selector/port conformance and policy simulation;
 - shadow rollout and offline impact analysis;
 - topology snapshots and flow exporter interface;

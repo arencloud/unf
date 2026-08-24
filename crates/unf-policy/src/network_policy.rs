@@ -14,6 +14,8 @@ use crate::{
 /// Compatibility policies sit below the native policy priority range by
 /// default. A native policy can deliberately override this baseline.
 pub const KUBERNETES_NETWORK_POLICY_PRIORITY: u32 = 1_000_000;
+/// Prevents one selector pair from expanding an unbounded number of exact BPF keys.
+pub const KUBERNETES_NETWORK_POLICY_MAX_PORT_RANGE_WIDTH: u32 = 1_024;
 const NAMESPACE_NAME_LABEL: &str = "kubernetes.io/metadata.name";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -56,6 +58,11 @@ pub enum NetworkPolicyCompileError {
         rule_index: usize,
         port_index: usize,
     },
+    #[error("ingress rule {rule_index} port {port_index} combines a named port with endPort")]
+    InvalidNamedPortRange {
+        rule_index: usize,
+        port_index: usize,
+    },
     #[error(
         "ingress rule {rule_index} port {port_index} matches a protocol without a numeric port, which the current BPF key cannot represent"
     )]
@@ -63,10 +70,21 @@ pub enum NetworkPolicyCompileError {
         rule_index: usize,
         port_index: usize,
     },
-    #[error("ingress rule {rule_index} port {port_index} uses unsupported port range")]
-    UnsupportedPortRange {
+    #[error("ingress rule {rule_index} port {port_index} contains invalid range {start}..={end}")]
+    InvalidPortRange {
         rule_index: usize,
         port_index: usize,
+        start: i32,
+        end: i32,
+    },
+    #[error(
+        "ingress rule {rule_index} port {port_index} range width {width} exceeds limit {limit}"
+    )]
+    PortRangeTooLarge {
+        rule_index: usize,
+        port_index: usize,
+        width: u32,
+        limit: u32,
     },
     #[error("ingress rule {rule_index} port {port_index} uses unsupported protocol {protocol:?}")]
     UnsupportedProtocol {
@@ -341,22 +359,64 @@ fn port_tuple(
     };
     let destination_port = match port.port {
         Some(IntOrString::Int(value)) => {
-            let port =
+            let start =
                 u16::try_from(value).map_err(|_| NetworkPolicyCompileError::InvalidPort {
                     rule_index,
                     port_index,
                     port: value,
                 })?;
-            if port == 0 {
+            if start == 0 {
                 return Err(NetworkPolicyCompileError::InvalidPort {
                     rule_index,
                     port_index,
                     port: 0,
                 });
             }
-            DestinationPort::Number(port)
+            match port.end_port {
+                None => DestinationPort::Number(start),
+                Some(end_value) => {
+                    let end = u16::try_from(end_value).map_err(|_| {
+                        NetworkPolicyCompileError::InvalidPortRange {
+                            rule_index,
+                            port_index,
+                            start: value,
+                            end: end_value,
+                        }
+                    })?;
+                    if end < start {
+                        return Err(NetworkPolicyCompileError::InvalidPortRange {
+                            rule_index,
+                            port_index,
+                            start: value,
+                            end: end_value,
+                        });
+                    }
+                    let width = u32::from(end) - u32::from(start) + 1;
+                    if width > KUBERNETES_NETWORK_POLICY_MAX_PORT_RANGE_WIDTH {
+                        return Err(NetworkPolicyCompileError::PortRangeTooLarge {
+                            rule_index,
+                            port_index,
+                            width,
+                            limit: KUBERNETES_NETWORK_POLICY_MAX_PORT_RANGE_WIDTH,
+                        });
+                    }
+                    if start == end {
+                        DestinationPort::Number(start)
+                    } else {
+                        DestinationPort::Range { start, end }
+                    }
+                }
+            }
         }
-        Some(IntOrString::String(name)) if !name.is_empty() => DestinationPort::Named(name),
+        Some(IntOrString::String(name)) if !name.is_empty() => {
+            if port.end_port.is_some() {
+                return Err(NetworkPolicyCompileError::InvalidNamedPortRange {
+                    rule_index,
+                    port_index,
+                });
+            }
+            DestinationPort::Named(name)
+        }
         Some(IntOrString::String(_)) => {
             return Err(NetworkPolicyCompileError::InvalidNamedPort {
                 rule_index,
@@ -370,17 +430,6 @@ fn port_tuple(
             });
         }
     };
-    if let Some(end_port) = port.end_port {
-        match &destination_port {
-            DestinationPort::Number(numeric_port) if i32::from(*numeric_port) == end_port => {}
-            _ => {
-                return Err(NetworkPolicyCompileError::UnsupportedPortRange {
-                    rule_index,
-                    port_index,
-                });
-            }
-        }
-    }
     Ok((Some(protocol), destination_port))
 }
 
@@ -896,6 +945,119 @@ mod tests {
                 && entry.key.destination_port == 9090
                 && entry.decision.verdict == Verdict::Allow
         }));
+    }
+
+    #[test]
+    fn bounded_port_ranges_evaluate_and_lower_to_exact_entries() {
+        let compiled = NetworkPolicyCompiler::compile(
+            PolicyId::new(7),
+            policy(vec![NetworkPolicyIngressRule {
+                from: None,
+                ports: Some(vec![NetworkPolicyPort {
+                    port: Some(IntOrString::Int(8082)),
+                    end_port: Some(8084),
+                    protocol: Some("TCP".to_owned()),
+                }]),
+            }]),
+        )
+        .expect("bounded port range compiles");
+        assert_eq!(
+            compiled.rules[0].destination_port,
+            DestinationPort::Range {
+                start: 8082,
+                end: 8084,
+            }
+        );
+        let source = endpoint(1, "frontend", "client");
+        let destination = endpoint(2, "backend", "server");
+        for port in 8082..=8084 {
+            assert_eq!(
+                evaluate(
+                    std::slice::from_ref(&compiled),
+                    Flow {
+                        source: &source,
+                        destination: &destination,
+                        protocol: Protocol::Tcp,
+                        destination_port: port,
+                    },
+                )
+                .verdict,
+                Verdict::Allow
+            );
+        }
+        for port in [8081, 8085] {
+            assert_eq!(
+                evaluate(
+                    std::slice::from_ref(&compiled),
+                    Flow {
+                        source: &source,
+                        destination: &destination,
+                        protocol: Protocol::Tcp,
+                        destination_port: port,
+                    },
+                )
+                .verdict,
+                Verdict::Deny
+            );
+        }
+        let entries = compile_dataplane_entries(&[compiled], &[source, destination])
+            .expect("bounded range lowers to exact dataplane entries");
+        let lowered_ports: BTreeSet<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry.key.destination_identity == IdentityId::new(2)
+                    && entry.key.protocol == Protocol::Tcp as u8
+            })
+            .map(|entry| entry.key.destination_port)
+            .collect();
+        assert_eq!(lowered_ports, BTreeSet::from([8082, 8083, 8084]));
+    }
+
+    #[test]
+    fn invalid_and_oversized_port_ranges_fail_explicitly() {
+        let ranged_policy = |port, end_port| {
+            policy(vec![NetworkPolicyIngressRule {
+                from: None,
+                ports: Some(vec![NetworkPolicyPort {
+                    port: Some(port),
+                    end_port: Some(end_port),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }])
+        };
+        let maximum_range = NetworkPolicyCompiler::compile(
+            PolicyId::new(7),
+            ranged_policy(IntOrString::Int(1), 1024),
+        )
+        .expect("a range at the inclusive width limit compiles");
+        assert_eq!(
+            maximum_range.rules[0].destination_port,
+            DestinationPort::Range {
+                start: 1,
+                end: 1024,
+            }
+        );
+        assert!(matches!(
+            NetworkPolicyCompiler::compile(
+                PolicyId::new(7),
+                ranged_policy(IntOrString::Int(8084), 8082),
+            ),
+            Err(NetworkPolicyCompileError::InvalidPortRange { .. })
+        ));
+        assert!(matches!(
+            NetworkPolicyCompiler::compile(
+                PolicyId::new(7),
+                ranged_policy(IntOrString::Int(1), 1025),
+            ),
+            Err(NetworkPolicyCompileError::PortRangeTooLarge { .. })
+        ));
+        assert!(matches!(
+            NetworkPolicyCompiler::compile(
+                PolicyId::new(7),
+                ranged_policy(IntOrString::String("http".to_owned()), 8082),
+            ),
+            Err(NetworkPolicyCompileError::InvalidNamedPortRange { .. })
+        ));
     }
 
     #[test]

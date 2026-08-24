@@ -28,7 +28,9 @@ Implemented in the repository:
 - deterministic L3/L4 policy compiler, shadow decisions, and property tests;
 - a supported ingress `NetworkPolicy` adapter that reuses the same IR, additive
   evaluator semantics, controller snapshots, and dataplane lowering as native
-  policy, including pod/Namespace expressions and named TCP/UDP ports;
+  policy, including pod/Namespace expressions, named TCP/UDP ports, and bounded
+  inclusive TCP/UDP `endPort` ranges with deterministic exact-key lowering and
+  explicit compiler/dataplane capacity limits;
 - a kube-rs controller watching Pods, Namespaces, SecurityPolicies, and
   NetworkPolicies, with accepted/rejected compatibility status;
 - controller health, readiness, metrics, status, and userspace explanation APIs;
@@ -40,7 +42,8 @@ Implemented in the repository:
 - `unfctl status` and `unfctl explain` against live controller state;
 - a reproducible two-node kind demo covering native and NetworkPolicy cross-node
   allow/drop, namespace-selector convergence, rejection/deletion recovery, shadow
-  pass-through, revisioned eBPF provenance, and live policy explanations.
+  pass-through, bounded range enforcement/rejection recovery, revisioned eBPF
+  provenance, and live policy explanations.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
 multi-cluster transport, or production fail-closed recovery.

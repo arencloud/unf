@@ -38,14 +38,14 @@ completed by Phase 1's observation-only shadow evaluation.
 | Stable userspace formatting, lint, and tests | Passed: `make fmt-check lint test` |
 | eBPF target build and manifest rendering | Passed: `make ebpf` and `kubectl kustomize deploy` |
 | Two-node cluster integration | Passed: `make kind-test` |
-| Demo dataplane | Native policy: open port 8080 passed and 9090 dropped, passed in shadow, then dropped after restore. NetworkPolicy: port 8081 passed and independently open port 9091 dropped |
-| Agent state | Two ready agents with BPF loaded; both applied identity revision 21 and policy revision 31 in controller epoch 7677355261639323637, with 7 identity and 33 active policy entries |
-| Controller state | Ready with 17 watched Pods, 15 admitted identities, 7 indexed non-host-network Pod IPs, one native policy, one accepted NetworkPolicy, zero rejected NetworkPolicies, and 33 resolved entries |
+| Demo dataplane | Native policy: open port 8080 passed and 9090 dropped, passed in shadow, then dropped after restore. NetworkPolicy: named port 8081 and range endpoints 8082–8083 passed; independently open adjacent port 8084 and default-deny port 9091 dropped |
+| Agent state | Two ready agents with BPF loaded; both applied identity revision 27 and policy revision 43 in controller epoch 7677493421753490726, with 7 identity and 35 active policy entries |
+| Controller state | Ready with 17 watched Pods, 15 admitted identities, 7 indexed non-host-network Pod IPs, one native policy, one accepted NetworkPolicy, zero rejected NetworkPolicies, and 35 resolved entries |
 | Transactional policy update | The verifier switched enforce → shadow → enforce, requiring a higher revision and opposite bank on every agent for both transitions |
 | Interruption recovery | With the controller scaled to zero, the active bank continued allowing 8080 and denying 9090; both agents then accepted the restarted controller epoch and reconverged |
 | Dataplane provenance | ABI v2 events matched the applied revision and carried nonzero identities plus actual/shadow policy and explicit-deny rule provenance |
-| NetworkPolicy lifecycle | Named port `allowed` resolved to TCP/8081; Namespace relabel removed/restored the allow without identity churn; an unsupported SCTP update removed stale state and recovered; deletion allowed 9091 and recreation restored the drop |
-| Policy explanation | Native 8080/9090 and compatibility 8081/9091 decisions reported the expected explicit/default provenance with dataplane enforcement truthfully enabled |
+| NetworkPolicy lifecycle | Named port `allowed` resolved to TCP/8081; the inclusive 8082–8083 range enforced both boundaries and excluded 8084; Namespace relabel removed/restored the allow without identity churn; an oversized range update removed stale state and recovered; deletion allowed 9091 and recreation restored the drop |
+| Policy explanation | Native 8080/9090 and compatibility 8081–8084/9091 decisions reported the expected explicit/default provenance with dataplane enforcement truthfully enabled |
 
 The kind cluster is disposable and its object counts can change as system Pods
 roll. The repeatable commands, rather than these snapshot counts, are the release
@@ -98,8 +98,10 @@ gate.
 - Applied policy status is node-local; the controller and CLI do not yet aggregate
   node acknowledgements.
 - The NetworkPolicy adapter intentionally accepts only the documented ingress
-  subset. Unsupported objects are counted as rejected but rejection details do
-  not yet have a dedicated API endpoint.
+  subset. Numeric ranges are limited to 1,024 inclusive ports, and complete
+  snapshots to 131,072 entries per bank. Unsupported or oversized objects are
+  counted as rejected but rejection details do not yet have a dedicated API
+  endpoint.
 - Interface index is currently zero in emitted events.
 - Dynamic attachment can observe one packet on multiple interfaces; flow
   aggregation and deduplication are not implemented.
@@ -111,10 +113,11 @@ gate.
 
 | Deliverable | State | Exit evidence |
 |---|---|---|
-| NetworkPolicy ingress translator foundation | **Verified** | Unit tests cover allow/default isolation, pod/Namespace expressions, named ports, wildcards, local/exact-namespace peers, and explicit unsupported-feature errors; `make kind-test` exercises expressions and named-port resolution |
+| NetworkPolicy ingress translator foundation | **Verified** | Unit tests cover allow/default isolation, pod/Namespace expressions, named ports, bounded numeric ranges, wildcards, local/exact-namespace peers, and explicit unsupported-feature errors; `make kind-test` exercises expressions, named-port resolution, and range boundaries |
 | Additive compatibility semantics | **Verified** | Multiple selecting policies combine allows in the shared evaluator and lower through the shared dataplane compiler; the live adapter uses that same engine |
 | NetworkPolicy controller watch and live enforcement | **Verified** | `make kind-test` covers reconciliation/status, explicit allow, isolation drop, revisioned provenance, rejection/removal/recovery, and deletion/recreation |
-| Full ingress selector/port compatibility | **In progress** | Pod/Namespace expressions and named TCP/UDP ports are live verified; ranged ports, IP blocks, and broader conformance cases remain |
+| Full ingress selector/port compatibility | **In progress** | Pod/Namespace expressions, named TCP/UDP ports, and inclusive numeric ranges up to 1,024 ports are live verified; IP blocks and broader conformance cases remain |
+| Dataplane policy capacity safety | **Verified** | Shared lowering and agent snapshot validation cap each transactional bank at 131,072 entries; staging deletes stale inactive keys before insertions, and unit tests exercise the exact boundary |
 | Egress NetworkPolicy compatibility | **Planned** | Direction-aware IR and dataplane enforcement evidence |
 | Policy simulation foundation | **Planned** | Proposed-policy evaluation against a versioned topology/flow snapshot |
 | Better topology state | **Planned** | Versioned node/workload/service relationships with query tests |

@@ -19,7 +19,7 @@ return `TC_ACT_PIPE`.
 | `FLOW_COUNTERS` | constant `u32` slot 0 | per-CPU `u64` | eBPF program | increment per parsed flow; program lifetime | one entry; forwarding continues if lookup fails |
 | `FLOW_EVENTS` | none (ring) | `FlowEvent` ABI v2 | eBPF producer, agent consumer | ephemeral, unpinned | 256 KiB; events drop under pressure without changing the already-computed forwarding decision |
 | `IDENTITY_V4` | IPv4 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent map writer; TC reader | revisioned reconciliation; program lifetime, currently unpinned | 65,536 entries; unknown/mismatched identity resolves to ID zero and forwarding continues |
-| `POLICY_RULES` | source/destination identity, protocol, destination port, bank | actual/shadow verdict and policy/rule/reason provenance, schema, revision | controller compiler; agent transactional writer | inactive bank is populated and validated before activation; currently unpinned | 262,144 entries across two banks; active bank remains selected when staging fails |
+| `POLICY_RULES` | source/destination identity, protocol, destination port, bank | actual/shadow verdict and policy/rule/reason provenance, schema, revision | controller compiler; agent transactional writer | stale inactive keys are removed, then the inactive bank is populated and validated before activation; currently unpinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries, and the active bank remains selected when staging fails |
 | `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, entry count, schema, active bank | agent writer; TC reader | one atomic write activates a complete bank | one entry; failed activation preserves the previous pointer |
 
 `FlowEvent` carries no Kubernetes strings. ABI v2 records the applied policy
@@ -29,6 +29,12 @@ then a protocol/port-zero fallback in the bank selected by `POLICY_CONFIG`.
 Config and values must have the expected schema and identical nonzero revision.
 Event and map ABIs use fixed C layouts, explicit schema/version fields, and
 compile-time size assertions.
+
+Bounded NetworkPolicy `endPort` ranges are expanded into exact keys before
+distribution. The compatibility compiler caps one inclusive range at 1,024
+ports, while the shared lowering path caps the complete snapshot at the physical
+131,072-entry allocation for one bank. The agent validates the same snapshot
+bound before encoding or mutating the inactive bank.
 
 ## Failure behavior
 

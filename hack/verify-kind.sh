@@ -20,7 +20,7 @@ cleanup() {
     fi
     if [[ ${network_policy_mutated} == true ]]; then
         "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
-            -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/protocol","value":"TCP"}]' \
+            -p '[{"op":"replace","path":"/spec/ingress/0/ports/1/endPort","value":8083}]' \
             >/dev/null 2>&1 || true
     fi
     if [[ ${network_policy_deleted} == true ]]; then
@@ -175,6 +175,19 @@ grep -q '"reason": "DefaultAction"' <<<"${network_policy_deny_explanation}"
 grep -q '"verdict": "Deny"' <<<"${network_policy_deny_explanation}"
 grep -Eq '"policy_id": [1-9][0-9]*' <<<"${network_policy_deny_explanation}"
 
+for port in 8082 8083; do
+    range_explanation=$("${unfctl}" \
+        --controller-url "http://127.0.0.1:${controller_port}" --output json \
+        explain --from frontend/client --to backend/np-server --protocol tcp --port "${port}")
+    grep -q '"reason": "ExplicitRule"' <<<"${range_explanation}"
+    grep -q '"verdict": "Allow"' <<<"${range_explanation}"
+done
+outside_range_explanation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/client --to backend/np-server --protocol tcp --port 8084)
+grep -q '"reason": "DefaultAction"' <<<"${outside_range_explanation}"
+grep -q '"verdict": "Deny"' <<<"${outside_range_explanation}"
+
 declare -A policy_banks
 initial_synced=false
 for _ in {1..30}; do
@@ -243,6 +256,12 @@ if [[ ${network_policy_local_response} != "unf-networkpolicy-ok" ]]; then
     echo "NetworkPolicy demo server is not listening on the deny-test port" >&2
     exit 1
 fi
+network_policy_range_local_response=$("${kc[@]}" exec -n backend np-server -- \
+    wget -T 2 -t 1 -qO- http://127.0.0.1:8084)
+if [[ ${network_policy_range_local_response} != "unf-networkpolicy-ok" ]]; then
+    echo "NetworkPolicy demo server is not listening outside the allowed port range" >&2
+    exit 1
+fi
 
 allow_response=$("${kc[@]}" exec -n frontend client -- \
     wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080)
@@ -276,6 +295,19 @@ network_policy_allow_response=$("${kc[@]}" exec -n frontend client -- \
     wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:8081)
 if [[ ${network_policy_allow_response} != "unf-networkpolicy-ok" ]]; then
     echo "NetworkPolicy compatibility allow flow failed" >&2
+    exit 1
+fi
+for port in 8082 8083; do
+    range_response=$("${kc[@]}" exec -n frontend client -- \
+        wget -T 2 -t 1 -qO- "http://np-server.backend.svc.cluster.local:${port}")
+    if [[ ${range_response} != "unf-networkpolicy-ok" ]]; then
+        echo "NetworkPolicy compatibility range flow ${port} failed" >&2
+        exit 1
+    fi
+done
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:8084 >/dev/null 2>&1; then
+    echo "NetworkPolicy compatibility range allowed adjacent open port 8084" >&2
     exit 1
 fi
 if "${kc[@]}" exec -n frontend client -- \
@@ -320,6 +352,19 @@ if [[ ${network_policy_allow_response} != "unf-networkpolicy-ok" ]]; then
     echo "NetworkPolicy compatibility allow failed after policy reconvergence" >&2
     exit 1
 fi
+for port in 8082 8083; do
+    range_response=$("${kc[@]}" exec -n frontend client -- \
+        wget -T 2 -t 1 -qO- "http://np-server.backend.svc.cluster.local:${port}")
+    if [[ ${range_response} != "unf-networkpolicy-ok" ]]; then
+        echo "NetworkPolicy range flow ${port} failed after policy reconvergence" >&2
+        exit 1
+    fi
+done
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:8084 >/dev/null 2>&1; then
+    echo "NetworkPolicy range allowed adjacent port after policy reconvergence" >&2
+    exit 1
+fi
 if "${kc[@]}" exec -n frontend client -- \
     wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:9091 >/dev/null 2>&1; then
     echo "NetworkPolicy compatibility deny failed after policy reconvergence" >&2
@@ -339,6 +384,9 @@ network_policy_allow_line=$(grep '"destination_port":8081' <<<"${flow_logs}" \
     | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
 network_policy_deny_line=$(grep '"destination_port":9091' <<<"${flow_logs}" \
     | grep '"verdict":"Deny"' | grep '"reason":3' \
+    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
+network_policy_range_line=$(grep '"destination_port":8083' <<<"${flow_logs}" \
+    | grep '"verdict":"Allow"' | grep '"reason":1' \
     | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
 if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${allow_line}" \
     || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${allow_line}" \
@@ -363,6 +411,12 @@ if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${network_policy_deny_line}" \
     || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${network_policy_deny_line}" \
     || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${network_policy_deny_line}"; then
     echo "UNF did not emit NetworkPolicy default-deny provenance" >&2
+    exit 1
+fi
+if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${network_policy_range_line}" \
+    || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${network_policy_range_line}" \
+    || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${network_policy_range_line}"; then
+    echo "UNF did not emit NetworkPolicy port-range allow provenance" >&2
     exit 1
 fi
 
@@ -391,6 +445,7 @@ if ! wait_for_controller_policy_counts 1 0 "${namespace_denied_revision}"; then
     echo "controller did not revise policy state after the Namespace label restore" >&2
     exit 1
 fi
+restored_namespace_policy_revision=${controller_state_revision}
 if ! wait_for_policy_transition "${namespace_denied_revision}"; then
     echo "agents did not activate the restored Namespace selector match" >&2
     exit 1
@@ -411,21 +466,21 @@ if [[ ${network_policy_allow_response} != "unf-networkpolicy-ok" ]]; then
 fi
 
 "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
-    -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/protocol","value":"SCTP"}]' \
+    -p '[{"op":"replace","path":"/spec/ingress/0/ports/1/endPort","value":65535}]' \
     >/dev/null
 network_policy_mutated=true
-if ! wait_for_controller_policy_counts 0 1 "${enforced_policy_revision}"; then
-    echo "controller did not report the unsupported NetworkPolicy update" >&2
+if ! wait_for_controller_policy_counts 0 1 "${restored_namespace_policy_revision}"; then
+    echo "controller did not report the oversized NetworkPolicy range update" >&2
     exit 1
 fi
 rejected_policy_revision=${controller_state_revision}
-if ! wait_for_policy_transition "${enforced_policy_revision}"; then
+if ! wait_for_policy_transition "${restored_namespace_policy_revision}"; then
     echo "agents did not remove the rejected NetworkPolicy revision" >&2
     exit 1
 fi
 
 "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
-    -p '[{"op":"replace","path":"/spec/ingress/0/ports/0/protocol","value":"TCP"}]' \
+    -p '[{"op":"replace","path":"/spec/ingress/0/ports/1/endPort","value":8083}]' \
     >/dev/null
 if ! wait_for_controller_policy_counts 1 0 "${rejected_policy_revision}"; then
     echo "controller did not readmit the restored NetworkPolicy" >&2
@@ -472,4 +527,4 @@ if "${kc[@]}" exec -n frontend client -- \
     exit 1
 fi
 
-echo "kind verification passed: native/NetworkPolicy enforcement, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: native/NetworkPolicy enforcement, bounded port ranges, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"

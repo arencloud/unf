@@ -27,9 +27,14 @@ The translator accepts pod and Namespace `matchLabels` plus normalized
 selectors, numeric TCP/UDP ports, and wildcards. Core policy IR represents `In`,
 `NotIn`, `Exists`, and `DoesNotExist` independently of Kubernetes types. Named
 TCP/UDP ports remain named in IR, resolve per destination from watched Pod
-container metadata, and lower to numeric dataplane entries. It returns typed
-errors for egress, IP blocks, ranged ports, protocol-only entries, SCTP, and
-malformed metadata/ports or selector requirements.
+container metadata, and lower to numeric dataplane entries. Inclusive numeric
+`endPort` ranges remain ranges in IR and lower to exact dataplane entries. A
+range may span at most 1,024 ports, and the shared compiler refuses more than
+131,072 entries in either transactional bank; the agent validates that bank
+limit again before staging a snapshot. It returns typed errors for egress, IP
+blocks, oversized/reversed ranges, named ports combined with `endPort`,
+protocol-only entries, SCTP, and malformed metadata/ports or selector
+requirements.
 
 The controller watches `NetworkPolicy` objects cluster-wide and assigns each a
 stable compatibility policy ID. Accepted IR joins native policy in the revisioned
@@ -54,6 +59,9 @@ priority policies would give isolation defaults incorrect precedence.
 
 The supported compatibility slice is deterministic, explainable, and verified
 through the same Phase 2 dataplane compiler in a two-node cluster. Rejection
-details do not yet have a dedicated API endpoint; port ranges and IP blocks need
-richer dataplane representation, and egress needs a direction-aware IR and hook.
-These remain visible Phase 3 work rather than broader support claims.
+details do not yet have a dedicated API endpoint. Exact-key range expansion is
+simple and matches the existing fast path, but intentionally trades map entries
+for range support; per-range and per-bank limits make that cost explicit and
+fail compilation instead of weakening policy. IP blocks still need a richer
+dataplane representation, and egress needs a direction-aware IR and hook. These
+remain visible Phase 3 work rather than broader support claims.

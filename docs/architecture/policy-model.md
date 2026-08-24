@@ -45,10 +45,16 @@ selection through `kubernetes.io/metadata.name`, general Namespace `matchLabels`
 and `matchExpressions`, numeric TCP/UDP ports, wildcard sources/ports, and ingress
 default isolation. Named TCP/UDP ports are preserved in IR, resolved against each
 selected destination Pod's declared container ports, and lowered to numeric BPF
-keys. It deliberately rejects egress, IP blocks, port ranges, SCTP, and protocol-
-only port entries. These errors prevent a policy from being accepted with weaker
-or different semantics. Native policy has the higher default precedence; the
-compatibility baseline uses reserved priority `1_000_000`.
+keys. Inclusive numeric `endPort` ranges of at most 1,024 ports are preserved in
+IR and expanded deterministically into exact numeric keys during dataplane
+lowering. Wider ranges are rejected before they can multiply across identity
+pairs. The shared compiler also rejects a snapshot that would exceed one bank's
+131,072-entry allocation, and the agent independently validates the same bound.
+The adapter deliberately rejects egress, IP blocks, SCTP, protocol-only port
+entries, and named ports combined with `endPort`. These errors prevent a policy
+from being accepted with weaker or different semantics. Native policy has the
+higher default precedence; the compatibility baseline uses reserved priority
+`1_000_000`.
 
 The controller watches these objects cluster-wide, keeps accepted and rejected
 compatibility state separate, and combines accepted IR with native policy in each

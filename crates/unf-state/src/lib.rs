@@ -9,6 +9,8 @@ use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+/// One half of the dual-bank eBPF policy map's 262,144-entry capacity.
+pub const POLICY_MAP_BANK_ENTRY_LIMIT: usize = 131_072;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevisionSet {

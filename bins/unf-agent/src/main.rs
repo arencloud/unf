@@ -32,7 +32,8 @@ use unf_ebpf_common::{
 };
 use unf_state::{
     IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
-    POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord, PolicyMapEntry, PolicyStateSnapshot,
+    POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord,
+    PolicyMapEntry, PolicyStateSnapshot,
 };
 
 #[derive(Debug, Parser)]
@@ -773,6 +774,7 @@ fn desired_policy_entries(
     if bank >= POLICY_BANK_COUNT {
         bail!("invalid policy bank {bank}");
     }
+    validate_policy_bank_capacity(entries.len())?;
     let mut desired = BTreeMap::new();
     for entry in entries {
         validate_policy_entry(entry)?;
@@ -783,6 +785,15 @@ fn desired_policy_entries(
         }
     }
     Ok(desired)
+}
+
+fn validate_policy_bank_capacity(entry_count: usize) -> Result<()> {
+    if entry_count > POLICY_MAP_BANK_ENTRY_LIMIT {
+        bail!(
+            "controller snapshot contains {entry_count} entries; policy bank limit is {POLICY_MAP_BANK_ENTRY_LIMIT}"
+        );
+    }
+    Ok(())
 }
 
 fn validate_policy_entry(entry: &PolicyMapEntry) -> Result<()> {
@@ -982,13 +993,13 @@ fn replace_policy_entries(
     current: &BTreeMap<[u8; 12], [u8; 32]>,
     desired: &BTreeMap<[u8; 12], [u8; 32]>,
 ) -> Result<()> {
-    for (key, value) in desired {
-        map.insert(key, value, 0)
-            .with_context(|| format!("insert policy map key {key:?}"))?;
-    }
     for key in current.keys().filter(|key| !desired.contains_key(*key)) {
         map.remove(key)
             .with_context(|| format!("remove stale policy map key {key:?}"))?;
+    }
+    for (key, value) in desired {
+        map.insert(key, value, 0)
+            .with_context(|| format!("insert policy map key {key:?}"))?;
     }
     Ok(())
 }
@@ -1325,6 +1336,12 @@ mod tests {
         let mut entry = policy_entry();
         entry.key.protocol = 0;
         assert!(desired_policy_entries(&[entry], 17, 1).is_err());
+    }
+
+    #[test]
+    fn policy_snapshot_rejects_entries_beyond_one_bank() {
+        assert!(validate_policy_bank_capacity(POLICY_MAP_BANK_ENTRY_LIMIT).is_ok());
+        assert!(validate_policy_bank_capacity(POLICY_MAP_BANK_ENTRY_LIMIT + 1).is_err());
     }
 
     #[test]

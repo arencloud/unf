@@ -3,7 +3,8 @@
 mod network_policy;
 
 pub use network_policy::{
-    KUBERNETES_NETWORK_POLICY_PRIORITY, NetworkPolicyCompileError, NetworkPolicyCompiler,
+    KUBERNETES_NETWORK_POLICY_MAX_PORT_RANGE_WIDTH, KUBERNETES_NETWORK_POLICY_PRIORITY,
+    NetworkPolicyCompileError, NetworkPolicyCompiler,
 };
 
 use std::cmp::Ordering;
@@ -15,7 +16,7 @@ use unf_api::{
     Action, EnforcementMode, SecurityPolicy, TransportProtocol, WorkloadSelector as ApiSelector,
 };
 use unf_common::{IdentityId, PolicyAction, PolicyId, Protocol, RuleId, Verdict};
-use unf_state::{PolicyDecisionRecord, PolicyMapEntry, PolicyMapKey};
+use unf_state::{POLICY_MAP_BANK_ENTRY_LIMIT, PolicyDecisionRecord, PolicyMapEntry, PolicyMapKey};
 
 pub use unf_common::PolicyReason as DecisionReason;
 
@@ -157,6 +158,7 @@ pub enum DestinationPort {
     Any,
     Number(u16),
     Named(String),
+    Range { start: u16, end: u16 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +223,8 @@ pub enum PolicyCompileError {
 pub enum DataplaneCompileError {
     #[error("identity ID {identity_id:?} has conflicting endpoint metadata")]
     IdentityMetadataConflict { identity_id: IdentityId },
+    #[error("compiled policy contains more than {limit} entries for one dataplane bank")]
+    EntryLimitExceeded { limit: usize },
 }
 
 pub struct PolicyCompiler;
@@ -435,7 +439,7 @@ pub fn compile_dataplane_entries(
             );
             let fallback_entry = policy_map_entry(source, destination, 0, 0, &fallback);
             if has_policy_provenance(&fallback) {
-                entries.push(fallback_entry);
+                push_dataplane_entry(&mut entries, fallback_entry)?;
             }
 
             let exact_tuples: BTreeSet<_> = policies
@@ -443,17 +447,7 @@ pub fn compile_dataplane_entries(
                 .filter(|policy| policy.target.matches(destination))
                 .flat_map(|policy| &policy.rules)
                 .filter(|rule| rule.source.matches(source) && rule.destination.matches(destination))
-                .filter_map(|rule| {
-                    let protocol = rule.protocol?;
-                    let port = match &rule.destination_port {
-                        DestinationPort::Any => return None,
-                        DestinationPort::Number(port) => *port,
-                        DestinationPort::Named(name) => {
-                            destination.resolve_named_port(name, protocol)?
-                        }
-                    };
-                    Some((protocol, port))
-                })
+                .flat_map(|rule| exact_rule_ports(rule, destination))
                 .collect();
             for (protocol, port) in exact_tuples {
                 let decision = evaluate(
@@ -470,13 +464,47 @@ pub fn compile_dataplane_entries(
                     && (entry.decision != fallback_entry.decision
                         || entry.shadow != fallback_entry.shadow)
                 {
-                    entries.push(entry);
+                    push_dataplane_entry(&mut entries, entry)?;
                 }
             }
         }
     }
     entries.sort_by_key(|entry| entry.key);
     Ok(entries)
+}
+
+fn exact_rule_ports(rule: &PolicyRule, destination: &Endpoint) -> Vec<(Protocol, u16)> {
+    let Some(protocol) = rule.protocol else {
+        return Vec::new();
+    };
+    match &rule.destination_port {
+        DestinationPort::Any => Vec::new(),
+        DestinationPort::Number(port) => vec![(protocol, *port)],
+        DestinationPort::Named(name) => destination
+            .resolve_named_port(name, protocol)
+            .map_or_else(Vec::new, |port| vec![(protocol, port)]),
+        DestinationPort::Range { start, end } => {
+            (*start..=*end).map(|port| (protocol, port)).collect()
+        }
+    }
+}
+
+fn push_dataplane_entry(
+    entries: &mut Vec<PolicyMapEntry>,
+    entry: PolicyMapEntry,
+) -> Result<(), DataplaneCompileError> {
+    ensure_dataplane_capacity(entries.len())?;
+    entries.push(entry);
+    Ok(())
+}
+
+fn ensure_dataplane_capacity(entry_count: usize) -> Result<(), DataplaneCompileError> {
+    if entry_count >= POLICY_MAP_BANK_ENTRY_LIMIT {
+        return Err(DataplaneCompileError::EntryLimitExceeded {
+            limit: POLICY_MAP_BANK_ENTRY_LIMIT,
+        });
+    }
+    Ok(())
 }
 
 fn has_policy_provenance(decision: &PolicyDecision) -> bool {
@@ -653,6 +681,9 @@ fn rule_matches(rule: &PolicyRule, flow: Flow<'_>) -> bool {
                 .destination
                 .resolve_named_port(name, flow.protocol)
                 .is_some_and(|port| port == flow.destination_port),
+            DestinationPort::Range { start, end } => {
+                (*start..=*end).contains(&flow.destination_port)
+            }
         }
 }
 
@@ -961,6 +992,17 @@ mod tests {
                 identity_id: IdentityId::new(11),
             })
         );
+    }
+
+    #[test]
+    fn dataplane_capacity_guard_rejects_a_full_bank() {
+        assert_eq!(
+            ensure_dataplane_capacity(POLICY_MAP_BANK_ENTRY_LIMIT),
+            Err(DataplaneCompileError::EntryLimitExceeded {
+                limit: POLICY_MAP_BANK_ENTRY_LIMIT,
+            })
+        );
+        assert!(ensure_dataplane_capacity(POLICY_MAP_BANK_ENTRY_LIMIT - 1).is_ok());
     }
 
     proptest! {

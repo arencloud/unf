@@ -85,12 +85,18 @@ spec:
       command:
         - sh
         - -c
-        - mkdir -p /www && echo unf-networkpolicy-ok > /www/index.html && httpd -p 9091 -h /www && httpd -f -p 8081 -h /www
+        - mkdir -p /www && echo unf-networkpolicy-ok > /www/index.html && httpd -p 9091 -h /www && httpd -p 8082 -h /www && httpd -p 8083 -h /www && httpd -p 8084 -h /www && httpd -f -p 8081 -h /www
       ports:
         - name: allowed
           containerPort: 8081
         - name: denied
           containerPort: 9091
+        - name: range-start
+          containerPort: 8082
+        - name: range-end
+          containerPort: 8083
+        - name: outside-range
+          containerPort: 8084
 ---
 apiVersion: v1
 kind: Service
@@ -107,6 +113,15 @@ spec:
     - name: denied
       port: 9091
       targetPort: denied
+    - name: range-start
+      port: 8082
+      targetPort: range-start
+    - name: range-end
+      port: 8083
+      targetPort: range-end
+    - name: outside-range
+      port: 8084
+      targetPort: outside-range
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -141,6 +156,9 @@ spec:
       ports:
         - protocol: TCP
           port: allowed
+        - protocol: TCP
+          port: 8082
+          endPort: 8083
 ---
 apiVersion: network.unf.io/v1alpha1
 kind: SecurityPolicy
