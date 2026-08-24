@@ -48,15 +48,17 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    Destination-resolved events enter a bounded non-blocking queue, aggregate by
    logical L3/L4 flow, and export in capped batches. Queue pressure drops telemetry
    while forwarding continues.
-6. The controller resolves policy selectors to identity tuples and bounded
-   IPv4-source tuples; each agent stages both dual-bank maps and atomically
-   activates the resulting policy revision with one configuration write.
+6. The controller resolves policy selectors to identity tuples, bounded exact
+   IPv4-source tuples, and bounded IPv6 prefixes; each agent stages all three
+   dual-bank maps and atomically activates the resulting policy revision with one
+   configuration write.
    Namespace label changes advance this policy revision when selector results can
    change.
-7. TC parses direct-header IPv4/IPv6 TCP, UDP, and SCTP, reads the active
-   family-neutral identity policy revision, emits actual and shadow provenance,
-   and returns `TC_ACT_SHOT` only for a validated actual deny. IPv6 extension
-   headers remain fail-open.
+7. TC parses IPv4/IPv6 TCP, UDP, and SCTP, including verifier-bounded traversal
+   of supported IPv6 extension headers, reads the active family-neutral identity
+   policy revision, emits actual and shadow provenance, and returns
+   `TC_ACT_SHOT` only for a validated actual deny. Unsupported, malformed,
+   non-initial, jumbogram, and over-limit IPv6 chains fail open.
 8. The controller retains at most 4,096 logical flow keys in memory, enriches
    current identities on query, and feeds the revisioned snapshot into policy
    simulation separately from representative topology probes.

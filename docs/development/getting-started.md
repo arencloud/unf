@@ -78,13 +78,17 @@ make kind-test
 and waits for that DaemonSet to become ready. This keeps the dual-stack fixture
 reproducible on development kernels without the legacy IPv6 NAT table.
 
-`kind-deploy` builds the userspace images, eBPF object, and test-only SCTP `socat`
-image, loads them into the nodes, and applies the CRD and workloads. `kind-test`
+`kind-deploy` builds the userspace images, eBPF object, and test-tools image with
+SCTP `socat` plus the IPv6 extension-header probe, loads them into the nodes, and
+applies the CRD and workloads. `kind-test`
 installs the demo, proves cross-node IPv4/IPv6 port 8080 allow and open-port 9090
 deny,
 switches the same policy through shadow pass-through and back, and validates
-revisioned event and CLI provenance. It also exercises a supported ingress
-`NetworkPolicy`: cross-node IPv4/IPv6 allow and default-isolation drop,
+revisioned event and CLI provenance. Real UDP packets carrying Hop-by-Hop,
+Destination Options, and combined IPv6 extension headers must also produce the
+expected native allow/explicit-deny decisions and provenance. It also exercises
+a supported ingress `NetworkPolicy`: cross-node IPv4/IPv6 allow and
+default-isolation drop,
 unsupported-update rejection and recovery, and
 named-port resolution, protocol-only TCP activation/removal without UDP
 broadening, bounded `endPort` boundary enforcement and oversized-range rejection,

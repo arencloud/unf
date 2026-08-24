@@ -14,7 +14,7 @@ spec:
       effect: NoSchedule
   containers:
     - name: client
-      image: localhost/unf-sctp-test:dev
+      image: localhost/unf-test-tools:ipv6-ext-v1
       imagePullPolicy: Never
       command: ["sleep", "infinity"]
 ---
@@ -30,7 +30,7 @@ spec:
     kubernetes.io/hostname: unf-dev-worker
   containers:
     - name: server
-      image: localhost/unf-sctp-test:dev
+      image: localhost/unf-test-tools:ipv6-ext-v1
       imagePullPolicy: Never
       command:
         - sh

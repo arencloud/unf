@@ -3,6 +3,7 @@
 KIND := .tools/bin/kind
 KIND_PROVIDER ?= podman
 KIND_KUBECONFIG := $(CURDIR)/.tools/kind-unf-dev.kubeconfig
+TEST_TOOLS_IMAGE := localhost/unf-test-tools:ipv6-ext-v1
 
 build:
 	cargo build --workspace
@@ -41,7 +42,7 @@ artifacts: ebpf
 images: artifacts
 	podman build --build-arg UNF_PACKAGE=unf-controller --tag localhost/unf-controller:dev --file images/Containerfile .
 	podman build --build-arg UNF_PACKAGE=unf-agent --tag localhost/unf-agent:dev --file images/Containerfile .
-	podman build --tag localhost/unf-sctp-test:dev --file images/SctpTestContainerfile .
+	podman build --tag $(TEST_TOOLS_IMAGE) --file images/SctpTestContainerfile .
 
 kind-tool:
 	mkdir -p .tools/bin
@@ -56,10 +57,10 @@ kind-load: images
 	ln -sf $$(command -v podman) .tools/bin/docker
 	podman save localhost/unf-controller:dev | sudo podman load
 	podman save localhost/unf-agent:dev | sudo podman load
-	podman save localhost/unf-sctp-test:dev | sudo podman load
+	podman save $(TEST_TOOLS_IMAGE) | sudo podman load
 	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev localhost/unf-controller:dev
 	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev localhost/unf-agent:dev
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev localhost/unf-sctp-test:dev
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(TEST_TOOLS_IMAGE)
 
 kind-deploy: kind-load
 	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev apply -k deploy

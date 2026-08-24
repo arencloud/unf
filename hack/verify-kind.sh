@@ -603,6 +603,50 @@ if "${kc[@]}" exec -n frontend client -- \
     echo "native policy IPv6 explicit deny did not drop the open port" >&2
     exit 1
 fi
+"${kc[@]}" exec -n frontend client -- \
+    unf-ipv6-extension-probe "${server_ipv6}" 8087 hop
+"${kc[@]}" exec -n frontend client -- \
+    unf-ipv6-extension-probe "${server_ipv6}" 8088 destination
+"${kc[@]}" exec -n frontend client -- \
+    unf-ipv6-extension-probe "${server_ipv6}" 8089 both
+"${kc[@]}" exec -n frontend client -- \
+    unf-ipv6-extension-probe "${server_ipv6}" 9097 hop
+extension_probe_logs=
+for _ in {1..20}; do
+    extension_probe_logs=$(all_agent_logs)
+    if grep -q '"destination_port":8087' <<<"${extension_probe_logs}" \
+        && grep -q '"destination_port":8088' <<<"${extension_probe_logs}" \
+        && grep -q '"destination_port":8089' <<<"${extension_probe_logs}" \
+        && grep -q '"destination_port":9097' <<<"${extension_probe_logs}"; then
+        break
+    fi
+    sleep 1
+done
+for port in 8087 8088 8089; do
+    extension_allow_line=$(grep "\"destination_port\":${port}" \
+        <<<"${extension_probe_logs}" | grep '"protocol":17' \
+        | grep '"address_family":6' | grep '"verdict":"Allow"' \
+        | grep '"reason":1' | grep "\"policy_revision\":${initial_policy_revision}" \
+        | tail -n 1 || true)
+    if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${extension_allow_line}" \
+        || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${extension_allow_line}" \
+        || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${extension_allow_line}"; then
+        echo "UNF did not emit revisioned IPv6 extension-header allow provenance for UDP/${port}" >&2
+        exit 1
+    fi
+done
+extension_deny_line=$(grep '"destination_port":9097' \
+    <<<"${extension_probe_logs}" | grep '"protocol":17' \
+    | grep '"address_family":6' | grep '"verdict":"Deny"' \
+    | grep '"reason":2' | grep "\"policy_revision\":${initial_policy_revision}" \
+    | tail -n 1 || true)
+if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${extension_deny_line}" \
+    || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${extension_deny_line}" \
+    || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${extension_deny_line}" \
+    || ! grep -Eq '"rule_id":[1-9][0-9]*' <<<"${extension_deny_line}"; then
+    echo "UNF did not enforce the IPv6 extension-header explicit deny" >&2
+    exit 1
+fi
 ipv6_network_policy_allow_response=$("${kc[@]}" exec -n frontend client -- \
     wget -T 2 -t 1 -qO- "http://[${network_policy_server_ipv6}]:8081")
 if [[ ${ipv6_network_policy_allow_response} != "unf-networkpolicy-ok" ]]; then
@@ -1381,4 +1425,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

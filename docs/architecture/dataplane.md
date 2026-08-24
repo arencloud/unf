@@ -6,13 +6,16 @@ UNF starts with TC classifier programs because TC works with an existing CNI and
 provides both ingress and egress attachment without owning the pod lifecycle. XDP,
 cgroup, and socket hooks will only be introduced for measured feature needs.
 
-The parser accepts Ethernet with direct-header IPv4 or IPv6 TCP, UDP, and SCTP.
-It validates the IPv4 header length, skips non-initial IPv4 fragments, validates
-the fixed IPv6 header, reads the flow tuple with bounded helpers, increments a
+The parser accepts Ethernet with IPv4 or IPv6 TCP, UDP, and SCTP. It validates
+the IPv4 header length, skips non-initial IPv4 fragments, validates the fixed
+IPv6 header, and traverses at most six IPv6 extension headers and 256 extension
+bytes. Hop-by-Hop is accepted only first; Routing, Destination Options,
+initial/atomic Fragment, and AH are supported. Jumbograms, ESP/No Next Header,
+non-initial fragments, malformed or over-limit chains, and unsupported protocols
+fail open. The parser reads the flow tuple with bounded helpers, increments a
 per-CPU counter, resolves identities, and reads the atomically active policy bank.
-IPv6 extension headers, including Fragment headers, deliberately fail open in
-this bounded first slice. An actual deny returns `TC_ACT_SHOT`; allow and
-shadow-only deny return `TC_ACT_PIPE`.
+An actual deny returns `TC_ACT_SHOT`; allow and shadow-only deny return
+`TC_ACT_PIPE`.
 SCTP's common header exposes source and destination ports in the same first four
 transport bytes, so protocol 132 uses the existing exact/protocol-wildcard policy
 key layout without an ABI change.
@@ -27,7 +30,8 @@ key layout without an ABI change.
 | `IDENTITY_V6` | 16 IPv6 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent map writer; TC reader | reconciled and rolled back with `IDENTITY_V4`; program lifetime, currently unpinned | 65,536 entries; unknown/mismatched identity resolves to ID zero and forwarding continues |
 | `POLICY_RULES` | source/destination identity, protocol, destination port, bank | actual/shadow verdict and policy/rule/reason provenance, schema, revision | controller compiler; agent transactional writer | stale inactive keys are removed, then the inactive bank is populated and validated before activation; currently unpinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries, and the active bank remains selected when staging fails |
 | `POLICY_IPV4` | exact/fallback source IPv4, destination identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller IPv4-aware compiler; agent transactional writer | staged and validated alongside `POLICY_RULES` under the same inactive bank; currently unpinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
-| `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks in both policy maps | one entry; failed activation preserves the previous pointer |
+| `POLICY_IPV6` | destination identity, port, protocol, bank, and source IPv6 prefix | same policy decision/provenance value as `POLICY_RULES` | controller IPv6-aware compiler; agent transactional writer; TC LPM reader | staged and validated alongside the other policy maps under the same inactive bank; currently unpinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
+| `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks in all three policy maps | one entry; failed activation preserves the previous pointer |
 
 `FlowEvent` carries no Kubernetes strings. ABI v2 records the applied policy
 revision, actual verdict/reason/policy/rule, and optional shadow
@@ -72,8 +76,8 @@ broader external prefixes. See ADR 0014.
 An interrupted stage cannot replace the active bank, and controller interruption
 leaves the last activated revision in use. This overlay prototype deliberately
 fails open when the destination identity is unknown, config is absent or
-incompatible, the IPv6 packet uses an extension header, or no valid identity/IP
-entry exists. A source without an identity
+incompatible, an IPv6 extension chain is unsupported, malformed, or exceeds its
+bounds, or no valid identity/IP entry exists. A source without an identity
 can still be enforced when a valid IPv4 exact/fallback or IPv6 prefix entry exists.
 Fail-open events are marked observed/identity-unknown with revision zero. Agent
 restart also recreates unpinned maps before resynchronizing, so this is not yet a
@@ -89,5 +93,4 @@ tests still run on stable in the host workspace. See ADR 0002.
 ## Next dataplane milestone
 
 Persist last-known-good state across agent restart, aggregate applied node status,
-add IPv6 extension-header traversal,
 and test explicit control-plane and map-pressure failure modes.

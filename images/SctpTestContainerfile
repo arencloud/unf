@@ -1,7 +1,20 @@
+FROM docker.io/library/debian:bookworm-slim AS probe-builder
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY images/ipv6-extension-probe.c /tmp/ipv6-extension-probe.c
+RUN gcc -std=c11 -O2 -Wall -Wextra -Werror \
+    -o /usr/local/bin/unf-ipv6-extension-probe /tmp/ipv6-extension-probe.c
+
 FROM docker.io/library/debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends socat \
+    && apt-get install --yes --no-install-recommends socat wget \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=probe-builder /usr/local/bin/unf-ipv6-extension-probe \
+    /usr/local/bin/unf-ipv6-extension-probe
 
 ENTRYPOINT ["/usr/bin/socat"]

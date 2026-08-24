@@ -10,11 +10,12 @@ use aya_ebpf::programs::TcContext;
 use unf_common::{IdentityId, PolicyId, PolicyReason, RuleId, Verdict};
 use unf_ebpf_common::{
     AddressFamily, Direction, FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_MAP_ABI_VERSION,
-    IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, Ipv6IdentityKey, Ipv6PolicyMapData,
-    POLICY_BANK_COUNT,
-    POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
+    IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT, IPV6_NEXT_HEADER_HOP_BY_HOP,
+    IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, Ipv6ExtensionStep, Ipv6IdentityKey,
+    Ipv6PolicyMapData, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
+    POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
-    PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode,
+    PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, ipv6_extension_step,
 };
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -150,20 +151,15 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction) -> i32 {
     if version >> 4 != 6 {
         return TC_ACT_PIPE;
     }
-    let Ok(protocol) = ctx.load::<u8>(ETHERNET_HEADER_LEN + 6) else {
+    let Some((protocol, transport_offset)) = ipv6_transport(ctx) else {
         return TC_ACT_PIPE;
     };
-    // Extension headers are deliberately fail-open in this first IPv6 slice.
-    if !supported_transport(protocol) {
-        return TC_ACT_PIPE;
-    }
     let Ok(source_address) = ctx.load::<[u8; 16]>(ETHERNET_HEADER_LEN + 8) else {
         return TC_ACT_PIPE;
     };
     let Ok(destination_address) = ctx.load::<[u8; 16]>(ETHERNET_HEADER_LEN + 24) else {
         return TC_ACT_PIPE;
     };
-    let transport_offset = ETHERNET_HEADER_LEN + 40;
     let Ok(source_port) = ctx.load::<[u8; 2]>(transport_offset) else {
         return TC_ACT_PIPE;
     };
@@ -183,6 +179,51 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction) -> i32 {
         None,
         Some(source_address),
     )
+}
+
+#[inline(always)]
+fn ipv6_transport(ctx: &TcContext) -> Option<(u8, usize)> {
+    let payload_length = u16::from_be(ctx.load::<u16>(ETHERNET_HEADER_LEN + 4).ok()?);
+    // Jumbograms require parsing the Hop-by-Hop Jumbo Payload option and remain
+    // outside this bounded parser.
+    if payload_length == 0 {
+        return None;
+    }
+    let payload_start = ETHERNET_HEADER_LEN + 40;
+    let payload_end = payload_start + payload_length as usize;
+    let mut next_header = ctx.load::<u8>(ETHERNET_HEADER_LEN + 6).ok()?;
+    let mut offset = payload_start;
+    let mut extension_bytes = 0_usize;
+
+    for depth in 0..=IPV6_EXTENSION_HEADER_LIMIT {
+        if supported_transport(next_header) {
+            if offset + 4 > payload_end {
+                return None;
+            }
+            return Some((next_header, offset));
+        }
+        if depth == IPV6_EXTENSION_HEADER_LIMIT
+            || (next_header == IPV6_NEXT_HEADER_HOP_BY_HOP && depth != 0)
+            || offset + 8 > payload_end
+        {
+            return None;
+        }
+        let header = ctx.load::<[u8; 8]>(offset).ok()?;
+        let Ipv6ExtensionStep::Continue {
+            next_header: following,
+            length,
+        } = ipv6_extension_step(next_header, header)
+        else {
+            return None;
+        };
+        extension_bytes += length;
+        if extension_bytes > IPV6_EXTENSION_BYTE_LIMIT || offset + length > payload_end {
+            return None;
+        }
+        offset += length;
+        next_header = following;
+    }
+    None
 }
 
 #[inline(always)]

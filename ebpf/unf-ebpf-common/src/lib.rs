@@ -13,6 +13,59 @@ pub const POLICY_FLAG_HAS_RULE: u16 = 1 << 1;
 pub const POLICY_FLAG_HAS_SHADOW: u16 = 1 << 2;
 pub const POLICY_FLAG_SHADOW_HAS_POLICY: u16 = 1 << 3;
 pub const POLICY_FLAG_SHADOW_HAS_RULE: u16 = 1 << 4;
+pub const IPV6_EXTENSION_HEADER_LIMIT: u8 = 6;
+pub const IPV6_EXTENSION_BYTE_LIMIT: usize = 256;
+
+pub const IPV6_NEXT_HEADER_HOP_BY_HOP: u8 = 0;
+pub const IPV6_NEXT_HEADER_ROUTING: u8 = 43;
+pub const IPV6_NEXT_HEADER_FRAGMENT: u8 = 44;
+pub const IPV6_NEXT_HEADER_ESP: u8 = 50;
+pub const IPV6_NEXT_HEADER_AUTHENTICATION: u8 = 51;
+pub const IPV6_NEXT_HEADER_NONE: u8 = 59;
+pub const IPV6_NEXT_HEADER_DESTINATION_OPTIONS: u8 = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ipv6ExtensionStep {
+    Transport,
+    Continue { next_header: u8, length: usize },
+    Unsupported,
+}
+
+/// Decodes one IPv6 extension-header boundary from its first eight bytes.
+///
+/// Transport protocols are returned without inspecting `header`. Opaque,
+/// terminal, malformed, and non-initial-fragment headers are unsupported.
+#[must_use]
+pub const fn ipv6_extension_step(next_header: u8, header: [u8; 8]) -> Ipv6ExtensionStep {
+    match next_header {
+        6 | 17 | 132 => Ipv6ExtensionStep::Transport,
+        IPV6_NEXT_HEADER_HOP_BY_HOP
+        | IPV6_NEXT_HEADER_ROUTING
+        | IPV6_NEXT_HEADER_DESTINATION_OPTIONS => Ipv6ExtensionStep::Continue {
+            next_header: header[0],
+            length: (header[1] as usize + 1) * 8,
+        },
+        IPV6_NEXT_HEADER_FRAGMENT => {
+            let fragment = u16::from_be_bytes([header[2], header[3]]);
+            if fragment & 0xfff8 == 0 {
+                Ipv6ExtensionStep::Continue {
+                    next_header: header[0],
+                    length: 8,
+                }
+            } else {
+                Ipv6ExtensionStep::Unsupported
+            }
+        }
+        IPV6_NEXT_HEADER_AUTHENTICATION if header[1] >= 1 => Ipv6ExtensionStep::Continue {
+            next_header: header[0],
+            length: (header[1] as usize + 2) * 4,
+        },
+        IPV6_NEXT_HEADER_ESP | IPV6_NEXT_HEADER_NONE | IPV6_NEXT_HEADER_AUTHENTICATION => {
+            Ipv6ExtensionStep::Unsupported
+        }
+        _ => Ipv6ExtensionStep::Unsupported,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -223,5 +276,64 @@ mod tests {
         assert_eq!(core::mem::size_of::<PolicyMapValue>(), 32);
         assert_eq!(core::mem::align_of::<PolicyMapConfig>(), 8);
         assert_eq!(core::mem::size_of::<PolicyMapConfig>(), 24);
+    }
+
+    #[test]
+    fn ipv6_extension_steps_validate_lengths_and_fragments() {
+        assert_eq!(ipv6_extension_step(6, [0; 8]), Ipv6ExtensionStep::Transport);
+        assert_eq!(
+            ipv6_extension_step(IPV6_NEXT_HEADER_HOP_BY_HOP, [17, 1, 0, 0, 0, 0, 0, 0]),
+            Ipv6ExtensionStep::Continue {
+                next_header: 17,
+                length: 16,
+            }
+        );
+        assert_eq!(
+            ipv6_extension_step(IPV6_NEXT_HEADER_ROUTING, [6, 2, 0, 0, 0, 0, 0, 0]),
+            Ipv6ExtensionStep::Continue {
+                next_header: 6,
+                length: 24,
+            }
+        );
+        assert_eq!(
+            ipv6_extension_step(
+                IPV6_NEXT_HEADER_DESTINATION_OPTIONS,
+                [17, 0, 0, 0, 0, 0, 0, 0]
+            ),
+            Ipv6ExtensionStep::Continue {
+                next_header: 17,
+                length: 8,
+            }
+        );
+        assert_eq!(
+            ipv6_extension_step(IPV6_NEXT_HEADER_FRAGMENT, [132, 0, 0, 1, 0, 0, 0, 0]),
+            Ipv6ExtensionStep::Continue {
+                next_header: 132,
+                length: 8,
+            }
+        );
+        assert_eq!(
+            ipv6_extension_step(IPV6_NEXT_HEADER_FRAGMENT, [6, 0, 0, 8, 0, 0, 0, 0]),
+            Ipv6ExtensionStep::Unsupported
+        );
+        assert_eq!(
+            ipv6_extension_step(IPV6_NEXT_HEADER_AUTHENTICATION, [6, 1, 0, 0, 0, 0, 0, 0]),
+            Ipv6ExtensionStep::Continue {
+                next_header: 6,
+                length: 12,
+            }
+        );
+        assert_eq!(
+            ipv6_extension_step(IPV6_NEXT_HEADER_AUTHENTICATION, [6, 0, 0, 0, 0, 0, 0, 0]),
+            Ipv6ExtensionStep::Unsupported
+        );
+        assert_eq!(
+            ipv6_extension_step(IPV6_NEXT_HEADER_ESP, [0; 8]),
+            Ipv6ExtensionStep::Unsupported
+        );
+        assert_eq!(
+            ipv6_extension_step(IPV6_NEXT_HEADER_NONE, [0; 8]),
+            Ipv6ExtensionStep::Unsupported
+        );
     }
 }

@@ -46,8 +46,9 @@ against an existing connection by setting `KUBECONFIG`, `KUBE_CONTEXT`,
 
 The matrix covers only behavior already represented faithfully by the current
 ingress IR; its DNS-based traffic assertions currently select IPv4. The main kind
-verifier separately proves direct-address IPv6 selector and bounded `ipBlock`
-allow/default-deny/exception recovery. Egress, IPv6 extension headers/fragments,
-unbounded compiler output, and
+verifier separately proves direct-address IPv6 selector, bounded `ipBlock`
+allow/default-deny/exception recovery, and bounded extension-header traversal.
+Egress, non-initial fragments, IPv6 jumbograms/ESP/reassembly, malformed or
+over-limit extension chains, unbounded compiler output, and
 complete upstream suite execution remain outside this claim. Those gaps stay visible in the authoritative
 [project tracker](../project-status.md).

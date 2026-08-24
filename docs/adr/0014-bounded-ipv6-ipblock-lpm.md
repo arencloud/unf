@@ -37,5 +37,6 @@ The agent stages and validates all three inactive banks before one
   shared evaluator as the source of truth.
 - The policy-map ABI advances to version 2 and requires an eBPF object containing
   `POLICY_IPV6`.
-- IPv6 extension headers remain fail-open and are a separate milestone.
+- IPv6 extension headers remained fail-open in this slice; ADR 0015 later added
+  bounded traversal with explicit unsupported and malformed fail-open cases.
 - LPM trie support requires Linux 4.20 or newer.

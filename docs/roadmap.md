@@ -28,10 +28,12 @@ matrix and reproducible evidence.
 - Implemented and two-node kind verified: selector-to-identity lowering,
   versioned dual-bank policy maps, atomic revision activation/restoration, and
   agent desired/applied policy status;
-- Implemented: active-bank TC lookup and direct-header IPv4/IPv6 TCP/UDP/SCTP
-  allow/drop. Dual-stack two-node kind verifies IPv6 TCP plus existing IPv4
-  TCP/SCTP scenarios, shadow pass-through, Flow ABI v2 actual/shadow provenance,
-  and enforcement-aware `unfctl explain`;
+- Implemented: active-bank TC lookup and IPv4/IPv6 TCP/UDP/SCTP allow/drop,
+  including verifier-bounded IPv6 Hop-by-Hop, Routing, Destination Options,
+  initial/atomic Fragment, and AH traversal. Dual-stack two-node kind verifies
+  IPv6 TCP and real extension-header UDP allow/deny plus existing IPv4 TCP/SCTP
+  scenarios, shadow pass-through, Flow ABI v2 actual/shadow provenance, and
+  enforcement-aware `unfctl explain`;
 - Verified manually: the last active bank continued enforcing across a controller
   interruption and agents reconverged to the restarted controller epoch;
 - Next: applied node status aggregation, pinned last-known-good recovery, agent
@@ -63,9 +65,8 @@ matrix and reproducible evidence.
   revisioned 4,096-key controller history, `unfctl flows`, and
   observation-weighted historical simulation impact; resolved-identity IPv6
   distribution, enforcement, provenance, topology schema v3, and flow-export
-  schema v2;
-- Next: IPv6 extension-header traversal and remaining upstream
-  ingress conformance, plus
+  schema v2; bounded IPv6 extension-header traversal with real packet fixtures;
+- Next: remaining upstream ingress conformance, plus
   authenticated/durable telemetry transport with time-window queries;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;

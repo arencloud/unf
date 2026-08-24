@@ -3,6 +3,7 @@
 ## Status
 
 Accepted; implemented for direct-header TCP/UDP/SCTP and live verified for TCP.
+ADR 0015 later added bounded extension-header traversal.
 
 ## Context
 
@@ -41,6 +42,6 @@ state. Existing policy snapshot and flow-event ABIs remain unchanged. Identity,
 topology, and flow-export consumers must accept their respective new schema
 versions.
 
-The implementation does not claim arbitrary IPv6 packet coverage. Extension-
-header traversal needs verifier-bounded parsing, and IPv6 prefix policy needs an
-explicit compact representation and capacity model before enforcement.
+This slice did not claim arbitrary IPv6 packet coverage. ADR 0014 later added
+bounded IPv6 prefix policy, and ADR 0015 added verifier-bounded extension-header
+traversal while retaining explicit fail-open boundaries.

@@ -27,7 +27,7 @@ spec:
       effect: NoSchedule
   containers:
     - name: client
-      image: docker.io/library/busybox:1.37.0
+      image: localhost/unf-test-tools:ipv6-ext-v1
       command: ["sh", "-c", "sleep infinity"]
 ---
 apiVersion: v1
@@ -176,6 +176,12 @@ spec:
       protocols:
         - protocol: Tcp
           port: 8080
+        - protocol: Udp
+          port: 8087
+        - protocol: Udp
+          port: 8088
+        - protocol: Udp
+          port: 8089
       action: Allow
     - from:
         namespace: frontend
@@ -183,6 +189,8 @@ spec:
       protocols:
         - protocol: Tcp
           port: 9090
+        - protocol: Udp
+          port: 9097
       action: Deny
   defaultAction: Deny
   enforcementMode: Enforce
