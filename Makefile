@@ -50,6 +50,7 @@ kind-tool:
 kind-up: kind-tool
 	sudo env KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) create cluster --name unf-dev --config hack/kind-config.yaml --wait 5m
 	sudo chown $$(id -u):$$(id -g) $(KIND_KUBECONFIG)
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/configure-kind.sh
 
 kind-load: images
 	ln -sf $$(command -v podman) .tools/bin/docker

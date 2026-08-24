@@ -45,7 +45,8 @@ against an existing connection by setting `KUBECONFIG`, `KUBE_CONTEXT`,
 ## Deliberate exclusions
 
 The matrix covers only behavior already represented faithfully by the current
-ingress IR and IPv4 dataplane. Egress, IPv6, unbounded CIDRs, fragments after the
-initial fragment, and complete upstream suite execution remain outside this
-claim. Those gaps stay visible in the authoritative
+ingress IR; its DNS-based traffic assertions currently select IPv4. The main kind
+verifier separately proves direct-address IPv6 selector allow/default-deny.
+Egress, IPv6 `ipBlock`, IPv6 extension headers/fragments, unbounded CIDRs, and
+complete upstream suite execution remain outside this claim. Those gaps stay visible in the authoritative
 [project tracker](../project-status.md).

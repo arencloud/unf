@@ -17,7 +17,7 @@ label set. This is intentionally stricter than grouping only by application:
 selector-visible metadata must not disagree for two Pods that share a numeric
 identity.
 
-Pod IP will become an index from observed packets to identity. It will not be the
+Pod IP is an index from observed IPv4 or IPv6 packets to identity. It is not the
 security principal. The design deliberately includes cluster identity so later
 multi-cluster connectivity does not assume globally unique Pod CIDRs.
 
@@ -29,4 +29,6 @@ decisions still converge in the shared evaluator before lowering.
 
 Identity BPF distribution and controller-epoch recovery are verified. Map pinning,
 durable allocation, multi-controller ownership, and explicit unknown-identity
-enforcement semantics remain open. See ADRs 0005 and 0006.
+enforcement semantics remain open. IPv6 `ipBlock` remains a separate address-
+policy design problem and is not implied by dual-stack identity resolution. See
+ADRs 0005, 0006, and 0013.

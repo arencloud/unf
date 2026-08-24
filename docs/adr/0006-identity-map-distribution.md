@@ -1,6 +1,6 @@
 # ADR 0006: Versioned identity map and revisioned snapshot distribution
 
-Status: Accepted for the Phase 2 identity slice
+Status: Accepted for the Phase 2 identity slice; dual-stack amendment verified
 
 ## Context
 
@@ -16,13 +16,15 @@ The controller exposes a read-only HTTP identity snapshot containing:
 - a wire-schema version;
 - a controller-process epoch;
 - a monotonic revision within that epoch;
-- sorted IPv4 address-to-identity entries.
+- sorted IPv4 and IPv6 address-to-identity entry sets.
 
 Agents poll the internal controller Service, validate the complete snapshot, and
-reconcile a dedicated `IDENTITY_V4` BPF hash map. Each fixed-size value contains
-the numeric identity, map-schema version, flags, and desired revision. Agents
-publish desired/applied epoch and revision plus map entry count through status and
-Prometheus metrics.
+reconcile dedicated `IDENTITY_V4` and `IDENTITY_V6` BPF hash maps. Each
+fixed-size value contains the numeric identity, map-schema version, flags, and desired revision. Agents
+publish desired/applied epoch and revision plus total/per-family map entry counts
+through status and Prometheus metrics. Identity snapshot schema v2 added the
+separate address-family entry sets; an update is marked applied only after both
+maps succeed, and rollback restores both cached families.
 
 The epoch distinguishes a restarted controller from a stale response: revisions
 must not decrease within one epoch, while a new epoch can begin at any revision.
@@ -53,5 +55,5 @@ ADR 0007 subsequently defines and implements that policy distribution mechanism.
 - mutually authenticated controller-agent transport and node authorization;
 - persisted controller epoch/allocation state and HA controller ownership;
 - map pinning and agent restart recovery;
-- IPv6 identity map layout;
+- compact prefix-policy representation for IPv6 `ipBlock`;
 - map-in-map compatibility and measured policy update costs.

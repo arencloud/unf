@@ -19,7 +19,9 @@ applying it. Versioned topology snapshots expose Nodes, workload placement,
 Services, selector intent, and EndpointSlice-derived runtime backend readiness.
 Node agents also export
 destination-resolved flow observations into bounded, revisioned in-memory history
-for operator queries and policy impact analysis.
+for operator queries and policy impact analysis. The resolved-identity fast path
+is now dual-stack for direct-header IPv4/IPv6 TCP/UDP/SCTP; native policy and
+selector-based NetworkPolicy IPv6 TCP decisions are live-verified.
 See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
 gates, evidence, limitations, and current work. The shorter
@@ -49,16 +51,18 @@ Implemented in the repository:
 - bounded non-blocking agent telemetry export and a 4,096-flow controller history
   with explicit drop/eviction accounting;
 - an Aya agent capable of loading and attaching the TC observation program;
-- an IPv4 TCP/UDP/SCTP TC parser with counters, bounded ring-buffer events, and
-  active-bank L3/L4 allow/drop decisions;
-- revisioned controller-to-agent IPv4 identity snapshots and a versioned BPF map;
+- direct-header IPv4/IPv6 TCP/UDP/SCTP TC parsing with counters, bounded
+  ring-buffer events, and active-bank L3/L4 allow/drop decisions;
+- revisioned controller-to-agent dual-stack identity snapshots and separate
+  versioned IPv4/IPv6 BPF maps;
 - selector-resolved policy snapshots and dual-bank transactional BPF policy maps;
 - `unfctl status`, `unfctl topology`, `unfctl flows`, and `unfctl explain` against live
   controller state;
 - `unfctl policy simulate <security-policy.yaml>` with table/JSON/YAML
   representative and historical impact summaries plus current/proposed provenance;
-- a reproducible two-node kind demo covering native and NetworkPolicy cross-node
-  allow/drop, namespace-selector convergence, rejection/deletion recovery, shadow
+- a reproducible dual-stack two-node kind demo covering native and NetworkPolicy
+  cross-node IPv4/IPv6 allow/drop, namespace-selector convergence,
+  rejection/deletion recovery, shadow
   pass-through, protocol-only port activation/recovery, bounded range/ipBlock
   enforcement and rejection recovery, named/protocol-only SCTP enforcement,
   namespace-wide target isolation/defaulting, same-Namespace and all-Namespace
@@ -67,7 +71,8 @@ Implemented in the repository:
   versioned EndpointSlice backend-readiness lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
-multi-cluster transport, or production fail-closed recovery.
+multi-cluster transport, IPv6 `ipBlock`, IPv6 extension-header traversal, or
+production fail-closed recovery.
 
 ## Repository layout
 

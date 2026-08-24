@@ -6,11 +6,13 @@ UNF starts with TC classifier programs because TC works with an existing CNI and
 provides both ingress and egress attachment without owning the pod lifecycle. XDP,
 cgroup, and socket hooks will only be introduced for measured feature needs.
 
-The parser accepts Ethernet/IPv4 TCP, UDP, and SCTP. It validates the IPv4 header
-length, skips non-initial fragments, reads the flow tuple with bounded helpers,
-increments a per-CPU counter, resolves identities, and reads the atomically active
-policy bank. An actual deny returns `TC_ACT_SHOT`; allow and shadow-only deny
-return `TC_ACT_PIPE`.
+The parser accepts Ethernet with direct-header IPv4 or IPv6 TCP, UDP, and SCTP.
+It validates the IPv4 header length, skips non-initial IPv4 fragments, validates
+the fixed IPv6 header, reads the flow tuple with bounded helpers, increments a
+per-CPU counter, resolves identities, and reads the atomically active policy bank.
+IPv6 extension headers, including Fragment headers, deliberately fail open in
+this bounded first slice. An actual deny returns `TC_ACT_SHOT`; allow and
+shadow-only deny return `TC_ACT_PIPE`.
 SCTP's common header exposes source and destination ports in the same first four
 transport bytes, so protocol 132 uses the existing exact/protocol-wildcard policy
 key layout without an ABI change.
@@ -22,6 +24,7 @@ key layout without an ABI change.
 | `FLOW_COUNTERS` | constant `u32` slot 0 | per-CPU `u64` | eBPF program | increment per parsed flow; program lifetime | one entry; forwarding continues if lookup fails |
 | `FLOW_EVENTS` | none (ring) | `FlowEvent` ABI v2 | eBPF producer, agent consumer | ephemeral, unpinned | 256 KiB; events drop under pressure without changing the already-computed forwarding decision |
 | `IDENTITY_V4` | IPv4 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent map writer; TC reader | revisioned reconciliation; program lifetime, currently unpinned | 65,536 entries; unknown/mismatched identity resolves to ID zero and forwarding continues |
+| `IDENTITY_V6` | 16 IPv6 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent map writer; TC reader | reconciled and rolled back with `IDENTITY_V4`; program lifetime, currently unpinned | 65,536 entries; unknown/mismatched identity resolves to ID zero and forwarding continues |
 | `POLICY_RULES` | source/destination identity, protocol, destination port, bank | actual/shadow verdict and policy/rule/reason provenance, schema, revision | controller compiler; agent transactional writer | stale inactive keys are removed, then the inactive bank is populated and validated before activation; currently unpinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries, and the active bank remains selected when staging fails |
 | `POLICY_IPV4` | exact/fallback source IPv4, destination identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller IPv4-aware compiler; agent transactional writer | staged and validated alongside `POLICY_RULES` under the same inactive bank; currently unpinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
 | `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks in both policy maps | one entry; failed activation preserves the previous pointer |
@@ -40,7 +43,9 @@ enter a 4,096-record non-blocking channel and a 2,048-key pending aggregator. A
 full bound increments `unf_telemetry_dropped_events_total` and discards telemetry
 immediately; it never blocks TC consumption or changes the verdict already
 returned by eBPF. HTTP batches contain at most 512 logical flows. Controller
-retention is independently capped at 4,096 keys with eviction accounting.
+retention is independently capped at 4,096 keys with eviction accounting. Flow
+export schema v2 carries exactly one complete IPv4 or IPv6 address pair per key;
+topology schema v3 exposes both address families for each workload.
 
 Bounded NetworkPolicy `endPort` ranges are expanded into exact keys before
 distribution. The compatibility compiler caps one inclusive range at 1,024
@@ -61,7 +66,8 @@ validates both inactive banks before the single `POLICY_CONFIG` activation write
 An interrupted stage cannot replace the active bank, and controller interruption
 leaves the last activated revision in use. This overlay prototype deliberately
 fails open when the destination identity is unknown, config is absent or
-incompatible, or no valid identity/IP entry exists. A source without an identity
+incompatible, the IPv6 packet uses an extension header, or no valid identity/IP
+entry exists. A source without an identity
 can still be enforced when a valid IPv4 exact or external-fallback entry exists.
 Fail-open events are marked observed/identity-unknown with revision zero. Agent
 restart also recreates unpinned maps before resynchronizing, so this is not yet a
@@ -77,4 +83,5 @@ tests still run on stable in the host workspace. See ADR 0002.
 ## Next dataplane milestone
 
 Persist last-known-good state across agent restart, aggregate applied node status,
+add bounded IPv6 prefix-policy representation and extension-header traversal,
 and test explicit control-plane and map-pressure failure modes.

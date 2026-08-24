@@ -9,13 +9,14 @@ use aya_ebpf::programs::TcContext;
 use unf_common::{IdentityId, PolicyId, PolicyReason, RuleId, Verdict};
 use unf_ebpf_common::{
     AddressFamily, Direction, FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_MAP_ABI_VERSION,
-    IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, POLICY_BANK_COUNT,
+    IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, Ipv6IdentityKey, POLICY_BANK_COUNT,
     POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode,
 };
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
+const ETHERTYPE_IPV6: u16 = 0x86dd;
 const PROTOCOL_TCP: u8 = 6;
 const PROTOCOL_UDP: u8 = 17;
 const PROTOCOL_SCTP: u8 = 132;
@@ -30,6 +31,10 @@ static FLOW_COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
 static IDENTITY_V4: HashMap<Ipv4IdentityKey, IdentityMapValue> =
+    HashMap::with_max_entries(65_536, BPF_F_NO_PREALLOC);
+
+#[map]
+static IDENTITY_V6: HashMap<Ipv6IdentityKey, IdentityMapValue> =
     HashMap::with_max_entries(65_536, BPF_F_NO_PREALLOC);
 
 /// Dual-bank policy state. Userspace stages the inactive bank and atomically
@@ -62,10 +67,15 @@ fn observe(ctx: &TcContext, direction: Direction) -> i32 {
     let Ok(ether_type) = ctx.load::<u16>(12) else {
         return TC_ACT_PIPE;
     };
-    if u16::from_be(ether_type) != ETHERTYPE_IPV4 {
-        return TC_ACT_PIPE;
+    match u16::from_be(ether_type) {
+        ETHERTYPE_IPV4 => observe_ipv4(ctx, direction),
+        ETHERTYPE_IPV6 => observe_ipv6(ctx, direction),
+        _ => TC_ACT_PIPE,
     }
+}
 
+#[inline(always)]
+fn observe_ipv4(ctx: &TcContext, direction: Direction) -> i32 {
     let Ok(version_ihl) = ctx.load::<u8>(ETHERNET_HEADER_LEN) else {
         return TC_ACT_PIPE;
     };
@@ -88,7 +98,7 @@ fn observe(ctx: &TcContext, direction: Direction) -> i32 {
     let Ok(protocol) = ctx.load::<u8>(ETHERNET_HEADER_LEN + 9) else {
         return TC_ACT_PIPE;
     };
-    if protocol != PROTOCOL_TCP && protocol != PROTOCOL_UDP && protocol != PROTOCOL_SCTP {
+    if !supported_transport(protocol) {
         return TC_ACT_PIPE;
     }
 
@@ -106,6 +116,85 @@ fn observe(ctx: &TcContext, direction: Direction) -> i32 {
         return TC_ACT_PIPE;
     };
 
+    let mut source_address = [0_u8; 16];
+    source_address[..4].copy_from_slice(&source_ipv4);
+    let mut destination_address = [0_u8; 16];
+    destination_address[..4].copy_from_slice(&destination_ipv4);
+    emit_flow(
+        direction,
+        source_address,
+        destination_address,
+        source_port,
+        destination_port,
+        protocol,
+        AddressFamily::Ipv4,
+        lookup_identity_v4(source_ipv4),
+        lookup_identity_v4(destination_ipv4),
+        Some(source_ipv4),
+    )
+}
+
+#[inline(always)]
+fn observe_ipv6(ctx: &TcContext, direction: Direction) -> i32 {
+    let Ok(version) = ctx.load::<u8>(ETHERNET_HEADER_LEN) else {
+        return TC_ACT_PIPE;
+    };
+    if version >> 4 != 6 {
+        return TC_ACT_PIPE;
+    }
+    let Ok(protocol) = ctx.load::<u8>(ETHERNET_HEADER_LEN + 6) else {
+        return TC_ACT_PIPE;
+    };
+    // Extension headers are deliberately fail-open in this first IPv6 slice.
+    if !supported_transport(protocol) {
+        return TC_ACT_PIPE;
+    }
+    let Ok(source_address) = ctx.load::<[u8; 16]>(ETHERNET_HEADER_LEN + 8) else {
+        return TC_ACT_PIPE;
+    };
+    let Ok(destination_address) = ctx.load::<[u8; 16]>(ETHERNET_HEADER_LEN + 24) else {
+        return TC_ACT_PIPE;
+    };
+    let transport_offset = ETHERNET_HEADER_LEN + 40;
+    let Ok(source_port) = ctx.load::<[u8; 2]>(transport_offset) else {
+        return TC_ACT_PIPE;
+    };
+    let Ok(destination_port) = ctx.load::<[u8; 2]>(transport_offset + 2) else {
+        return TC_ACT_PIPE;
+    };
+    emit_flow(
+        direction,
+        source_address,
+        destination_address,
+        source_port,
+        destination_port,
+        protocol,
+        AddressFamily::Ipv6,
+        lookup_identity_v6(source_address),
+        lookup_identity_v6(destination_address),
+        None,
+    )
+}
+
+#[inline(always)]
+const fn supported_transport(protocol: u8) -> bool {
+    protocol == PROTOCOL_TCP || protocol == PROTOCOL_UDP || protocol == PROTOCOL_SCTP
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn emit_flow(
+    direction: Direction,
+    source_address: [u8; 16],
+    destination_address: [u8; 16],
+    source_port: [u8; 2],
+    destination_port: [u8; 2],
+    protocol: u8,
+    address_family: AddressFamily,
+    source_identity: IdentityId,
+    destination_identity: IdentityId,
+    source_ipv4: Option<[u8; 4]>,
+) -> i32 {
     if let Some(counter) = FLOW_COUNTERS.get_ptr_mut(0) {
         // SAFETY: get_ptr_mut returned a non-null pointer to the current CPU's
         // u64 slot at the valid, constant map index 0. No other CPU aliases it.
@@ -115,15 +204,9 @@ fn observe(ctx: &TcContext, direction: Direction) -> i32 {
         };
     }
 
-    let mut source_address = [0_u8; 16];
-    source_address[..4].copy_from_slice(&source_ipv4);
-    let mut destination_address = [0_u8; 16];
-    destination_address[..4].copy_from_slice(&destination_ipv4);
     // SAFETY: this helper has no preconditions and returns monotonic kernel time.
     #[allow(unsafe_code)]
     let timestamp_ns = unsafe { bpf_ktime_get_ns() };
-    let source_identity = lookup_identity(source_ipv4);
-    let destination_identity = lookup_identity(destination_ipv4);
     let decision = lookup_policy(
         source_ipv4,
         source_identity,
@@ -141,7 +224,7 @@ fn observe(ctx: &TcContext, direction: Direction) -> i32 {
             source_port,
             destination_port,
             protocol,
-            address_family: AddressFamily::Ipv4 as u8,
+            address_family: address_family as u8,
             reserved: [0; 2],
         },
         policy_revision: decision.policy_revision,
@@ -204,7 +287,7 @@ impl DataplaneDecision {
 
 #[inline(always)]
 fn lookup_policy(
-    source_ipv4: [u8; 4],
+    source_ipv4: Option<[u8; 4]>,
     source_identity: IdentityId,
     destination_identity: IdentityId,
     destination_port: [u8; 2],
@@ -223,56 +306,60 @@ fn lookup_policy(
         return DataplaneDecision::observed(ReasonCode::Observed);
     }
 
-    let ipv4_exact = Ipv4PolicyMapKey {
-        source_address: source_ipv4,
-        destination_identity,
-        destination_port,
-        protocol,
-        bank: config.active_bank,
-    };
-    let ipv4_source_fallback = Ipv4PolicyMapKey {
-        source_address: source_ipv4,
-        destination_identity,
-        destination_port: [0; 2],
-        protocol: 0,
-        bank: config.active_bank,
-    };
-    let ipv4_source_protocol_fallback = Ipv4PolicyMapKey {
-        source_address: source_ipv4,
-        destination_identity,
-        destination_port: [0; 2],
-        protocol,
-        bank: config.active_bank,
-    };
-    let ipv4_external_exact = Ipv4PolicyMapKey {
-        source_address: [0; 4],
-        destination_identity,
-        destination_port,
-        protocol,
-        bank: config.active_bank,
-    };
-    let ipv4_external_fallback = Ipv4PolicyMapKey {
-        source_address: [0; 4],
-        destination_identity,
-        destination_port: [0; 2],
-        protocol: 0,
-        bank: config.active_bank,
-    };
-    let ipv4_external_protocol_fallback = Ipv4PolicyMapKey {
-        source_address: [0; 4],
-        destination_identity,
-        destination_port: [0; 2],
-        protocol,
-        bank: config.active_bank,
-    };
-    if let Some(value) = lookup_ipv4_policy_value(&ipv4_exact, config.revision)
-        .or_else(|| lookup_ipv4_policy_value(&ipv4_source_protocol_fallback, config.revision))
-        .or_else(|| lookup_ipv4_policy_value(&ipv4_source_fallback, config.revision))
-        .or_else(|| lookup_ipv4_policy_value(&ipv4_external_exact, config.revision))
-        .or_else(|| lookup_ipv4_policy_value(&ipv4_external_protocol_fallback, config.revision))
-        .or_else(|| lookup_ipv4_policy_value(&ipv4_external_fallback, config.revision))
-    {
-        return decode_policy_value(value, config.revision);
+    if let Some(source_ipv4) = source_ipv4 {
+        let ipv4_exact = Ipv4PolicyMapKey {
+            source_address: source_ipv4,
+            destination_identity,
+            destination_port,
+            protocol,
+            bank: config.active_bank,
+        };
+        let ipv4_source_fallback = Ipv4PolicyMapKey {
+            source_address: source_ipv4,
+            destination_identity,
+            destination_port: [0; 2],
+            protocol: 0,
+            bank: config.active_bank,
+        };
+        let ipv4_source_protocol_fallback = Ipv4PolicyMapKey {
+            source_address: source_ipv4,
+            destination_identity,
+            destination_port: [0; 2],
+            protocol,
+            bank: config.active_bank,
+        };
+        let ipv4_external_exact = Ipv4PolicyMapKey {
+            source_address: [0; 4],
+            destination_identity,
+            destination_port,
+            protocol,
+            bank: config.active_bank,
+        };
+        let ipv4_external_fallback = Ipv4PolicyMapKey {
+            source_address: [0; 4],
+            destination_identity,
+            destination_port: [0; 2],
+            protocol: 0,
+            bank: config.active_bank,
+        };
+        let ipv4_external_protocol_fallback = Ipv4PolicyMapKey {
+            source_address: [0; 4],
+            destination_identity,
+            destination_port: [0; 2],
+            protocol,
+            bank: config.active_bank,
+        };
+        if let Some(value) = lookup_ipv4_policy_value(&ipv4_exact, config.revision)
+            .or_else(|| lookup_ipv4_policy_value(&ipv4_source_protocol_fallback, config.revision))
+            .or_else(|| lookup_ipv4_policy_value(&ipv4_source_fallback, config.revision))
+            .or_else(|| lookup_ipv4_policy_value(&ipv4_external_exact, config.revision))
+            .or_else(|| {
+                lookup_ipv4_policy_value(&ipv4_external_protocol_fallback, config.revision)
+            })
+            .or_else(|| lookup_ipv4_policy_value(&ipv4_external_fallback, config.revision))
+        {
+            return decode_policy_value(value, config.revision);
+        }
     }
     if source_identity.get() == 0 {
         return DataplaneDecision::observed(ReasonCode::IdentityUnknown);
@@ -447,12 +534,28 @@ const fn valid_provenance(flags: u16, reason: u8, shadow: bool) -> bool {
 }
 
 #[inline(always)]
-fn lookup_identity(address: [u8; 4]) -> IdentityId {
+fn lookup_identity_v4(address: [u8; 4]) -> IdentityId {
     let key = Ipv4IdentityKey::new(address);
     // SAFETY: IDENTITY_V4 uses BPF_F_NO_PREALLOC, values have a fixed Copy ABI,
     // and the reference is copied immediately without escaping this lookup.
     #[allow(unsafe_code)]
     let value = unsafe { IDENTITY_V4.get(&key).copied() };
+    value.map_or(IdentityId::new(0), |value| {
+        if value.schema_version == IDENTITY_MAP_ABI_VERSION {
+            value.identity_id
+        } else {
+            IdentityId::new(0)
+        }
+    })
+}
+
+#[inline(always)]
+fn lookup_identity_v6(address: [u8; 16]) -> IdentityId {
+    let key = Ipv6IdentityKey::new(address);
+    // SAFETY: IDENTITY_V6 uses BPF_F_NO_PREALLOC, values have a fixed Copy ABI,
+    // and the reference is copied immediately without escaping this lookup.
+    #[allow(unsafe_code)]
+    let value = unsafe { IDENTITY_V6.get(&key).copied() };
     value.map_or(IdentityId::new(0), |value| {
         if value.schema_version == IDENTITY_MAP_ABI_VERSION {
             value.identity_id

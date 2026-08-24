@@ -92,6 +92,20 @@ impl Ipv4IdentityKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
+pub struct Ipv6IdentityKey {
+    /// IPv6 address in network byte order.
+    pub address: [u8; 16],
+}
+
+impl Ipv6IdentityKey {
+    #[must_use]
+    pub const fn new(address: [u8; 16]) -> Self {
+        Self { address }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct IdentityMapValue {
     pub identity_id: IdentityId,
     pub schema_version: u16,
@@ -166,6 +180,7 @@ pub struct PolicyMapConfig {
 const _: () = assert!(core::mem::size_of::<FlowKey>() == 48);
 const _: () = assert!(core::mem::size_of::<FlowEvent>() == 96);
 const _: () = assert!(core::mem::size_of::<Ipv4IdentityKey>() == 4);
+const _: () = assert!(core::mem::size_of::<Ipv6IdentityKey>() == 16);
 const _: () = assert!(core::mem::size_of::<IdentityMapValue>() == 16);
 const _: () = assert!(core::mem::size_of::<PolicyMapKey>() == 12);
 const _: () = assert!(core::mem::size_of::<Ipv4PolicyMapKey>() == 12);
@@ -183,6 +198,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<FlowEvent>(), 96);
         assert_eq!(core::mem::align_of::<IdentityMapValue>(), 8);
         assert_eq!(core::mem::size_of::<IdentityMapValue>(), 16);
+        assert_eq!(core::mem::align_of::<Ipv6IdentityKey>(), 1);
+        assert_eq!(core::mem::size_of::<Ipv6IdentityKey>(), 16);
         assert_eq!(core::mem::align_of::<PolicyMapKey>(), 4);
         assert_eq!(core::mem::size_of::<PolicyMapKey>(), 12);
         assert_eq!(core::mem::align_of::<Ipv4PolicyMapKey>(), 4);

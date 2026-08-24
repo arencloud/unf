@@ -263,7 +263,41 @@ wait_for_historical_demo_flow() {
     return 1
 }
 
+wait_for_historical_ipv6_demo_flow() {
+    local snapshot compact
+    for _ in {1..30}; do
+        snapshot=$("${unfctl}" \
+            --controller-url "http://127.0.0.1:${controller_port}" --output json flows)
+        compact=$(tr -d '\n' <<<"${snapshot}")
+        if grep -q '"source_ipv6": "' <<<"${compact}" \
+            && grep -q '"destination_ipv6": "' <<<"${compact}" \
+            && grep -q '"destination_port": 8080' <<<"${compact}" \
+            && grep -q '"frontend/client"' <<<"${compact}" \
+            && grep -q '"backend/server"' <<<"${compact}"; then
+            ipv6_flow_history=${snapshot}
+            return 0
+        fi
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- "http://[${server_ipv6}]:8080" >/dev/null
+        sleep 1
+    done
+    return 1
+}
+
+pod_ipv4() {
+    "${kc[@]}" get pod -n "$1" "$2" \
+        -o jsonpath='{range .status.podIPs[*]}{.ip}{"\n"}{end}' \
+        | awk 'index($0, ".") > 0 && index($0, ":") == 0 { print; exit }'
+}
+
+pod_ipv6() {
+    "${kc[@]}" get pod -n "$1" "$2" \
+        -o jsonpath='{range .status.podIPs[*]}{.ip}{"\n"}{end}' \
+        | awk 'index($0, ":") > 0 { print; exit }'
+}
+
 "${kc[@]}" wait --for=condition=Ready nodes --all --timeout=120s
+"${kc[@]}" -n kube-system rollout status daemonset/kindnet --timeout=120s
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=120s
 "${kc[@]}" -n unf-system rollout status daemonset/unf-agent --timeout=120s
 
@@ -356,6 +390,8 @@ for _ in {1..30}; do
         desired_epoch=$(json_number desired_identity_epoch <<<"${status}")
         applied_epoch=$(json_number applied_identity_epoch <<<"${status}")
         identity_entries=$(json_number identity_map_entries <<<"${status}")
+        ipv4_identity_entries=$(json_number ipv4_identity_map_entries <<<"${status}")
+        ipv6_identity_entries=$(json_number ipv6_identity_map_entries <<<"${status}")
         desired_policy=$(json_number desired_policy_revision <<<"${status}")
         applied_policy=$(json_number applied_policy_revision <<<"${status}")
         desired_policy_epoch=$(json_number desired_policy_epoch <<<"${status}")
@@ -366,6 +402,8 @@ for _ in {1..30}; do
             || -z ${desired_epoch} || ${desired_epoch} != "${applied_epoch}" \
             || ${applied_epoch} != "${controller_identity_epoch}" \
             || ${identity_entries:-0} -eq 0 \
+            || ${ipv4_identity_entries:-0} -eq 0 \
+            || ${ipv6_identity_entries:-0} -eq 0 \
             || -z ${desired_policy} || ${desired_policy} != "${applied_policy}" \
             || ${applied_policy} != "${controller_policy_revision}" \
             || -z ${desired_policy_epoch} || ${desired_policy_epoch} != "${applied_policy_epoch}" \
@@ -395,7 +433,8 @@ initial_policy_revision=${expected_policy_revision}
 
 initial_topology=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json topology)
-grep -q '"schema_version": 2' <<<"${initial_topology}"
+compact_initial_topology=$(tr -d '\n' <<<"${initial_topology}")
+grep -q '"schema_version": 3' <<<"${initial_topology}"
 grep -Eq '"revision": [1-9][0-9]*' <<<"${initial_topology}"
 grep -Eq '"identity_revision": [1-9][0-9]*' <<<"${initial_topology}"
 grep -q '"name": "unf-dev-control-plane"' <<<"${initial_topology}"
@@ -405,6 +444,8 @@ grep -q '"reference": "backend/server"' <<<"${initial_topology}"
 grep -q '"reference": "backend/np-server"' <<<"${initial_topology}"
 grep -q '"node_name": "unf-dev-control-plane"' <<<"${initial_topology}"
 grep -q '"node_name": "unf-dev-worker"' <<<"${initial_topology}"
+grep -Eq '"ipv6_addresses": \[[[:space:]]*"[^" ]*:[^" ]*"' \
+    <<<"${compact_initial_topology}"
 grep -q '"selected_workloads": \[' <<<"${initial_topology}"
 initial_topology_revision=$(sed -nE 's/.*"revision": ([0-9]+).*/\1/p' \
     <<<"${initial_topology}")
@@ -459,16 +500,31 @@ if [[ ${policy_revision_after_topology} != "${initial_policy_revision}" ]]; then
     exit 1
 fi
 
+client_ipv6=$(pod_ipv6 frontend client)
+server_ipv6=$(pod_ipv6 backend server)
+network_policy_server_ipv6=$(pod_ipv6 backend np-server)
+if [[ -z ${client_ipv6} || -z ${server_ipv6} || -z ${network_policy_server_ipv6} ]]; then
+    echo "demo Pods do not all have IPv6 addresses" >&2
+    exit 1
+fi
+
 if ! wait_for_historical_demo_flow; then
     echo "controller did not retain the exported frontend-to-backend flow" >&2
     exit 1
 fi
-grep -q '"schema_version": 1' <<<"${flow_history}"
+grep -q '"schema_version": 2' <<<"${flow_history}"
 grep -Eq '"revision": [1-9][0-9]*' <<<"${flow_history}"
 grep -q '"capacity": 4096' <<<"${flow_history}"
 grep -Eq '"retained_flows": [1-9][0-9]*' <<<"${flow_history}"
 grep -Eq '"retained_observations": [1-9][0-9]*' <<<"${flow_history}"
 grep -q '"unf-dev-worker"' <<<"${flow_history}"
+
+if ! wait_for_historical_ipv6_demo_flow; then
+    echo "controller did not retain the exported IPv6 frontend-to-backend flow" >&2
+    exit 1
+fi
+grep -q "\"source_ipv6\": \"${client_ipv6}\"" <<<"${ipv6_flow_history}"
+grep -q "\"destination_ipv6\": \"${server_ipv6}\"" <<<"${ipv6_flow_history}"
 
 policy_simulation=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json \
@@ -498,7 +554,7 @@ if [[ ${policy_revision_after_simulation} != "${initial_policy_revision}" ]]; th
     exit 1
 fi
 
-client_ip=$("${kc[@]}" get pod -n frontend client -o jsonpath='{.status.podIP}')
+client_ip=$(pod_ipv4 frontend client)
 if [[ ! ${client_ip} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "frontend client does not have an IPv4 Pod address" >&2
     exit 1
@@ -533,6 +589,29 @@ fi
 if "${kc[@]}" exec -n frontend client -- \
     wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:9090 >/dev/null 2>&1; then
     echo "enforce mode did not drop the explicit deny flow" >&2
+    exit 1
+fi
+
+ipv6_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- "http://[${server_ipv6}]:8080")
+if [[ ${ipv6_allow_response} != "unf-demo-ok" ]]; then
+    echo "native policy IPv6 allow flow failed" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- "http://[${server_ipv6}]:9090" >/dev/null 2>&1; then
+    echo "native policy IPv6 explicit deny did not drop the open port" >&2
+    exit 1
+fi
+ipv6_network_policy_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- "http://[${network_policy_server_ipv6}]:8081")
+if [[ ${ipv6_network_policy_allow_response} != "unf-networkpolicy-ok" ]]; then
+    echo "NetworkPolicy IPv6 selector allow flow failed" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- "http://[${network_policy_server_ipv6}]:9091" >/dev/null 2>&1; then
+    echo "NetworkPolicy IPv6 default deny did not drop the open port" >&2
     exit 1
 fi
 
@@ -613,6 +692,28 @@ if [[ ${network_policy_allow_response} != "unf-networkpolicy-ok" ]]; then
     echo "NetworkPolicy compatibility allow failed after policy reconvergence" >&2
     exit 1
 fi
+ipv6_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- "http://[${server_ipv6}]:8080")
+if [[ ${ipv6_allow_response} != "unf-demo-ok" ]]; then
+    echo "IPv6 allow flow failed after restoring enforce mode" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- "http://[${server_ipv6}]:9090" >/dev/null 2>&1; then
+    echo "restored enforce mode did not drop the IPv6 explicit deny flow" >&2
+    exit 1
+fi
+ipv6_network_policy_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- "http://[${network_policy_server_ipv6}]:8081")
+if [[ ${ipv6_network_policy_allow_response} != "unf-networkpolicy-ok" ]]; then
+    echo "NetworkPolicy IPv6 allow failed after policy reconvergence" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- "http://[${network_policy_server_ipv6}]:9091" >/dev/null 2>&1; then
+    echo "NetworkPolicy IPv6 deny failed after policy reconvergence" >&2
+    exit 1
+fi
 for port in 8082 8083; do
     range_response=$("${kc[@]}" exec -n frontend client -- \
         wget -T 2 -t 1 -qO- "http://np-server.backend.svc.cluster.local:${port}")
@@ -649,6 +750,18 @@ network_policy_deny_line=$(grep '"destination_port":9091' <<<"${flow_logs}" \
 network_policy_range_line=$(grep '"destination_port":8083' <<<"${flow_logs}" \
     | grep '"verdict":"Allow"' | grep '"reason":1' \
     | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
+ipv6_allow_line=$(grep '"destination_port":8080' <<<"${flow_logs}" \
+    | grep '"address_family":6' | grep '"verdict":"Allow"' \
+    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
+ipv6_deny_line=$(grep '"destination_port":9090' <<<"${flow_logs}" \
+    | grep '"address_family":6' | grep '"verdict":"Deny"' | grep '"reason":2' \
+    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
+ipv6_network_policy_allow_line=$(grep '"destination_port":8081' <<<"${flow_logs}" \
+    | grep '"address_family":6' | grep '"verdict":"Allow"' | grep '"reason":1' \
+    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
+ipv6_network_policy_deny_line=$(grep '"destination_port":9091' <<<"${flow_logs}" \
+    | grep '"address_family":6' | grep '"verdict":"Deny"' | grep '"reason":3' \
+    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
 if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${allow_line}" \
     || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${allow_line}" \
     || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${allow_line}"; then
@@ -678,6 +791,33 @@ if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${network_policy_range_line}" 
     || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${network_policy_range_line}" \
     || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${network_policy_range_line}"; then
     echo "UNF did not emit NetworkPolicy port-range allow provenance" >&2
+    exit 1
+fi
+if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${ipv6_allow_line}" \
+    || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${ipv6_allow_line}" \
+    || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${ipv6_allow_line}"; then
+    echo "UNF did not emit revisioned IPv6 allow provenance" >&2
+    exit 1
+fi
+if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${ipv6_deny_line}" \
+    || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${ipv6_deny_line}" \
+    || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${ipv6_deny_line}" \
+    || ! grep -Eq '"rule_id":[1-9][0-9]*' <<<"${ipv6_deny_line}"; then
+    echo "UNF did not emit revisioned IPv6 explicit-deny provenance" >&2
+    exit 1
+fi
+if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${ipv6_network_policy_allow_line}" \
+    || ! grep -Eq '"destination_identity":[1-9][0-9]*' \
+        <<<"${ipv6_network_policy_allow_line}" \
+    || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${ipv6_network_policy_allow_line}"; then
+    echo "UNF did not emit NetworkPolicy IPv6 allow provenance" >&2
+    exit 1
+fi
+if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${ipv6_network_policy_deny_line}" \
+    || ! grep -Eq '"destination_identity":[1-9][0-9]*' \
+        <<<"${ipv6_network_policy_deny_line}" \
+    || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${ipv6_network_policy_deny_line}"; then
+    echo "UNF did not emit NetworkPolicy IPv6 default-deny provenance" >&2
     exit 1
 fi
 
@@ -1182,4 +1322,12 @@ KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
     UNF_CONTROLLER_URL="http://127.0.0.1:${controller_port}" UNFCTL="${unfctl}" \
     "${project_root}/hack/verify-networkpolicy-ingress.sh"
 
-echo "kind verification passed: upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP NetworkPolicy conformance, EndpointSlice backend readiness, bounded historical flow export, history-aware simulation, versioned topology, native/NetworkPolicy enforcement, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+"${kc[@]}" -n kube-system rollout status daemonset/kindnet --timeout=120s
+if "${kc[@]}" -n kube-system get pods -l app=kindnet \
+    -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' \
+    | grep -vq '^0$'; then
+    echo "kindnet restarted during dual-stack verification" >&2
+    exit 1
+fi
+
+echo "kind verification passed: dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges and IPv4 ipBlocks, lifecycle recovery, shadow mode, transactional activation, and provenance"

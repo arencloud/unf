@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -87,6 +87,7 @@ struct PodRecord {
     node_name: Option<String>,
     endpoint: Endpoint,
     ipv4_addresses: BTreeSet<std::net::Ipv4Addr>,
+    ipv6_addresses: BTreeSet<Ipv6Addr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -559,10 +560,17 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
         node_name: pod.spec.as_ref().and_then(|spec| spec.node_name.clone()),
         endpoint,
         ipv4_addresses: addresses
-            .into_iter()
+            .iter()
             .filter_map(|address| match address {
-                IpAddr::V4(address) => Some(address),
+                IpAddr::V4(address) => Some(*address),
                 IpAddr::V6(_) => None,
+            })
+            .collect(),
+        ipv6_addresses: addresses
+            .iter()
+            .filter_map(|address| match address {
+                IpAddr::V4(_) => None,
+                IpAddr::V6(address) => Some(*address),
             })
             .collect(),
     };
@@ -1267,7 +1275,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
 async fn identity_snapshot(
     State(state): State<Arc<ControllerState>>,
 ) -> Json<IdentityStateSnapshot> {
-    Json(mutex_lock(&state.identities).ipv4_snapshot(state.identity_epoch))
+    Json(mutex_lock(&state.identities).identity_snapshot(state.identity_epoch))
 }
 
 async fn policy_snapshot(
@@ -1314,6 +1322,7 @@ fn topology_snapshot(state: &ControllerState) -> TopologyStateSnapshot {
             application: pod.endpoint.application.clone(),
             labels: pod.endpoint.labels.clone(),
             ipv4_addresses: pod.ipv4_addresses.iter().copied().collect(),
+            ipv6_addresses: pod.ipv6_addresses.iter().copied().collect(),
         })
         .collect();
     let services = read_lock(&state.services)
@@ -1425,6 +1434,16 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
         )));
     }
     for entry in &batch.entries {
+        let ipv4_pair = entry.key.source_ipv4.is_some() && entry.key.destination_ipv4.is_some();
+        let ipv6_pair = entry.key.source_ipv6.is_some() && entry.key.destination_ipv6.is_some();
+        if ipv4_pair == ipv6_pair
+            || entry.key.source_ipv4.is_some() != entry.key.destination_ipv4.is_some()
+            || entry.key.source_ipv6.is_some() != entry.key.destination_ipv6.is_some()
+        {
+            return Err(ApiError::bad_request(
+                "flow export must contain exactly one complete IPv4 or IPv6 address pair",
+            ));
+        }
         if entry.key.destination_identity.get() == 0 {
             return Err(ApiError::bad_request(
                 "flow export destination_identity must be resolved",
@@ -2178,6 +2197,7 @@ mod tests {
                 named_ports: BTreeMap::new(),
             },
             ipv4_addresses: BTreeSet::new(),
+            ipv6_addresses: BTreeSet::new(),
         }
     }
 
@@ -2251,7 +2271,13 @@ mod tests {
                 "nodeName": node_name,
                 "containers": [{"name": "client", "image": "example.invalid/client"}]
             },
-            "status": {"podIP": "10.42.0.10", "podIPs": [{"ip": "10.42.0.10"}]}
+            "status": {
+                "podIP": "10.42.0.10",
+                "podIPs": [
+                    {"ip": "10.42.0.10"},
+                    {"ip": "fd00:10:42::10"}
+                ]
+            }
         }))
         .expect("test scheduled Pod is valid Kubernetes JSON")
     }
@@ -2341,6 +2367,8 @@ mod tests {
                     destination_identity: IdentityId::new(2),
                     source_ipv4: Some("10.42.0.10".parse().expect("valid test address")),
                     destination_ipv4: Some("10.42.1.20".parse().expect("valid test address")),
+                    source_ipv6: None,
+                    destination_ipv6: None,
                     protocol: 6,
                     destination_port: 8080,
                 },
@@ -2525,6 +2553,13 @@ mod tests {
         apply_pod_event(&state, Event::Apply(scheduled_pod("worker-a")));
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(1));
         assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(1));
+        assert_eq!(
+            read_lock(&state.pods)["frontend/client"]
+                .ipv6_addresses
+                .len(),
+            1
+        );
+        assert_eq!(mutex_lock(&state.identities).address_count(), 2);
 
         let mut rescheduled = scheduled_pod("worker-b");
         rescheduled.metadata.resource_version = Some("2".to_owned());
@@ -2596,7 +2631,7 @@ mod tests {
         assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(2));
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::default());
         let snapshot = topology_snapshot(&state);
-        assert_eq!(snapshot.schema_version, 2);
+        assert_eq!(snapshot.schema_version, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION);
         assert_eq!(snapshot.services[0].selected_workloads, ["frontend/client"]);
         assert_eq!(snapshot.services[0].backends.len(), 1);
         let backend = &snapshot.services[0].backends[0];
@@ -2664,6 +2699,22 @@ mod tests {
         sctp.entries[0].key.protocol = Protocol::Sctp as u8;
         sctp.entries[0].key.destination_port = 8086;
         validate_flow_export_batch(&sctp).expect("SCTP flow export is accepted");
+
+        let mut ipv6 = flow_batch(1);
+        ipv6.entries[0].key.source_ipv4 = None;
+        ipv6.entries[0].key.destination_ipv4 = None;
+        ipv6.entries[0].key.source_ipv6 = Some("fd00:10:42::10".parse().unwrap());
+        ipv6.entries[0].key.destination_ipv6 = Some("fd00:10:42:1::20".parse().unwrap());
+        validate_flow_export_batch(&ipv6).expect("complete IPv6 flow export is accepted");
+
+        let mut mixed_family = flow_batch(1);
+        mixed_family.entries[0].key.source_ipv6 = Some("fd00:10:42::10".parse().unwrap());
+        mixed_family.entries[0].key.destination_ipv6 = Some("fd00:10:42:1::20".parse().unwrap());
+        assert!(validate_flow_export_batch(&mixed_family).is_err());
+
+        let mut incomplete_ipv6 = ipv6;
+        incomplete_ipv6.entries[0].key.destination_ipv6 = None;
+        assert!(validate_flow_export_batch(&incomplete_ipv6).is_err());
 
         let mut invalid = flow_batch(1);
         invalid.schema_version = FLOW_EXPORT_SCHEMA_VERSION + 1;

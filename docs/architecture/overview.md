@@ -43,7 +43,8 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    current/proposed decisions over a probe matrix fenced to the reported topology
    revision.
 5. The agent loads the Aya object, attaches TC, applies the controller's revisioned
-   IPv4 identity snapshot, consumes compact events, and exposes health and metrics.
+   dual-stack identity snapshot to separate IPv4/IPv6 maps, consumes compact
+   events, and exposes health and per-family map metrics.
    Destination-resolved events enter a bounded non-blocking queue, aggregate by
    logical L3/L4 flow, and export in capped batches. Queue pressure drops telemetry
    while forwarding continues.
@@ -52,8 +53,10 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    activates the resulting policy revision with one configuration write.
    Namespace label changes advance this policy revision when selector results can
    change.
-7. TC reads the active revision, emits actual and shadow provenance, and returns
-   `TC_ACT_SHOT` only for a validated actual deny.
+7. TC parses direct-header IPv4/IPv6 TCP, UDP, and SCTP, reads the active
+   family-neutral identity policy revision, emits actual and shadow provenance,
+   and returns `TC_ACT_SHOT` only for a validated actual deny. IPv6 extension
+   headers remain fail-open.
 8. The controller retains at most 4,096 logical flow keys in memory, enriches
    current identities on query, and feeds the revisioned snapshot into policy
    simulation separately from representative topology probes.

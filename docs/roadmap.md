@@ -22,15 +22,16 @@ matrix and reproducible evidence.
 
 - Implemented foundation: collision-checked identity admission, Pod-IP desired-
   state index, update/removal garbage collection, and controller status counts.
-- Implemented and two-node kind verified: versioned IPv4 BPF identity map,
+- Implemented and dual-stack two-node kind verified: versioned IPv4/IPv6 BPF identity maps,
   epoch/revision-based controller-to-agent snapshot distribution, enriched flow
   identities, and reconvergence after a controller epoch change;
 - Implemented and two-node kind verified: selector-to-identity lowering,
   versioned dual-bank policy maps, atomic revision activation/restoration, and
   agent desired/applied policy status;
-- Implemented and two-node kind verified: active-bank TC lookup, IPv4 TCP/UDP
-  allow/drop, shadow pass-through, Flow ABI v2 actual/shadow provenance, and
-  enforcement-aware `unfctl explain`;
+- Implemented: active-bank TC lookup and direct-header IPv4/IPv6 TCP/UDP/SCTP
+  allow/drop. Dual-stack two-node kind verifies IPv6 TCP plus existing IPv4
+  TCP/SCTP scenarios, shadow pass-through, Flow ABI v2 actual/shadow provenance,
+  and enforcement-aware `unfctl explain`;
 - Verified manually: the last active bank continued enforcing across a controller
   interruption and agents reconverged to the restarted controller epoch;
 - Next: applied node status aggregation, pinned last-known-good recovery, agent
@@ -60,8 +61,11 @@ matrix and reproducible evidence.
   termination, Node/zone, Pod target, address, and port provenance;
   destination-resolved agent flow export through bounded non-blocking queues,
   revisioned 4,096-key controller history, `unfctl flows`, and
-  observation-weighted historical simulation impact;
-- Next: IPv6 and remaining upstream ingress conformance, plus
+  observation-weighted historical simulation impact; resolved-identity IPv6
+  distribution, enforcement, provenance, topology schema v3, and flow-export
+  schema v2;
+- Next: IPv6 `ipBlock`, IPv6 extension-header traversal, and remaining upstream
+  ingress conformance, plus
   authenticated/durable telemetry transport with time-window queries;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;

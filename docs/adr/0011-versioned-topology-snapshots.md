@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted and live verified for topology schema v2.
+Accepted and live verified for topology schema v3.
 
 ## Context
 
@@ -16,10 +16,11 @@ domain.
 ## Decision
 
 The controller watches Nodes, Services, and EndpointSlices in addition to Pods and
-publishes `GET /v1/topology`. Schema v2 contains:
+publishes `GET /v1/topology`. Schema v3 contains:
 
 - normalized Node name, readiness, and labels;
-- each Pod workload's identity, labels, addresses, and node placement;
+- each Pod workload's identity, labels, separate IPv4/IPv6 addresses, and node
+  placement;
 - Service type, cluster IPs, selector, ports, and selected workload references;
 - EndpointSlice-derived runtime backends with slice/address provenance, resolved
   Pod target, Node/zone, ports, and ready/serving/terminating conditions;
@@ -55,3 +56,6 @@ affected selectorless Service through a ready Pod backend. The snapshot is still
 in-memory/current-state only: EndpointSlice conditions are Kubernetes-reported
 state, not active health probes. Topology history, pagination, filtering, routing
 relationships, and durable storage require later schema or endpoint additions.
+
+Schema v3 is the dual-stack extension of schema v2; all Node, Service, and
+EndpointSlice semantics are unchanged.

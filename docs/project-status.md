@@ -23,7 +23,7 @@ repeatable test are both present in this repository.
 |---|---|---|---|
 | Phase 1 — observation foundation | **Verified** | Master prompt §101: controller, identity state, policy compiler, agent/Aya/TC flow events, and successful `unfctl status` | `make fmt-check lint test`, `make ebpf`, `make kind-test` |
 | Phase 2 — identity and policy enforcement | **Verified** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | `make fmt-check lint test`, `make ebpf`, and `make kind-test` verify the complete gate |
-| Phase 3 — compatibility and simulation | **In progress** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | The supported ingress adapter, history-aware read-only policy simulation, EndpointSlice-aware topology schema v2, and bounded historical export are live verified; broader compatibility remains open |
+| Phase 3 — compatibility and simulation | **In progress** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | The supported ingress adapter, resolved-identity IPv6 dataplane, history-aware read-only policy simulation, EndpointSlice-aware topology schema v3, and bounded dual-stack historical export are live verified; broader compatibility remains open |
 | Full CNI and later fabric capabilities | **Planned** | §104 and later roadmap gates | Explicitly out of current scope |
 
 Sections 98–99 describe the richer first enforcement and enriched-observability
@@ -38,18 +38,19 @@ completed by Phase 1's observation-only shadow evaluation.
 | Stable userspace formatting, lint, and tests | Passed: `make fmt-check lint test` |
 | eBPF target build and manifest rendering | Passed: `make ebpf` and `kubectl kustomize deploy` |
 | Two-node cluster integration | Passed: `make kind-test` |
-| Demo dataplane | Native policy: open port 8080 passed and 9090 dropped, passed in shadow, then dropped after restore. NetworkPolicy: named port 8081 and range endpoints 8082–8083 passed; a temporary TCP-only wildcard allowed independently open port 9091 while UDP remained default-denied, and removal restored the TCP drop; an exact IPv4 block allowed 8081 and its `except` denied it; a policy with omitted target selector selected the backend Namespace, allowed default-TCP 8085 to its probe, denied probe port 9092, then selector narrowing restored 9092 for the no-longer-selected Pod; named SCTP/8086 passed, isolated SCTP/9093 dropped, a protocol-only SCTP rule activated 9093, and removal restored its drop |
-| Agent state | Two ready agents with BPF loaded; both applied identity revision 96 and policy revision 228 in controller epoch 7677549857574155835, with 7 identity-map and 55 combined active policy-map entries; they exported 2,358 and 9,891 observations with zero queued/dropped at capture |
-| Controller state | Ready with 2 watched Nodes, 17 watched Pods, 8 watched Namespaces, 5 watched Services, 5 watched EndpointSlices, 15 admitted identities, 7 indexed non-host-network Pod IPs, one native policy, one accepted NetworkPolicy, zero rejected NetworkPolicies, 55 resolved identity/IPv4 entries, and zero reported telemetry drops |
-| Topology state | Schema v2 returned 2 ready Nodes, 17 placed workloads, 5 Services, and their EndpointSlice backends at topology revision 182/service revision 58; a selectorless `frontend/topology-probe` exposed a not-ready backend for `frontend/client`, changed it to ready, removed it on EndpointSlice deletion, then removed the Service, while policy revision remained unchanged |
-| Flow history | Schema v1 retained 821 logical flows/12,353 observations at telemetry revision 1,893 in its 4,096-key bound, including 20 protocol-132 SCTP flows; `frontend/client` → `backend/server` TCP/8080 remained enriched and attributed to `unf-dev-worker`, while both agents reported zero export drops |
+| Dual-stack cluster fixture | Both kindnet Pods stayed Ready with zero restarts through the complete verifier; `kind-up` applies the reproducible nftables compatibility setup and `make kind-test` gates CNI readiness at start and finish |
+| Demo dataplane | On the dual-stack two-node fixture, native policy allowed TCP/8080 and explicitly denied open TCP/9090 over both IPv4 and direct IPv6; selector-based NetworkPolicy allowed 8081 and default-denied open 9091 over both families. Existing shadow, range, IPv4 block/exception, omitted-default, SCTP, lifecycle, and upstream-aligned ingress scenarios also passed |
+| Agent state | Two ready agents with BPF loaded; both converged on the same controller epoch and identity/policy revisions with 14 identity entries each (7 IPv4 + 7 IPv6), 55 active policy entries, and zero queued/dropped exports at capture |
+| Controller state | Ready with 2 watched Nodes, 17 watched Pods, 8 watched Namespaces, 5 watched Services, 5 watched EndpointSlices, 15 admitted identities, 14 indexed non-host-network Pod IPs, one native policy, one accepted NetworkPolicy, zero rejected NetworkPolicies, 55 resolved identity/IPv4 entries, and zero reported telemetry drops |
+| Topology state | Schema v3 returned 2 ready Nodes, 17 placed workloads, 5 Services, and 7 dual-stack non-host-network workloads; the EndpointSlice readiness/deletion lifecycle passed without policy-revision mutation |
+| Flow history | Schema v2 retained bounded IPv4, IPv6, and SCTP logical flows; direct IPv6 `frontend/client` → `backend/server` TCP/8080 was enriched with both workload references and exact addresses, while both agents reported zero export drops |
 | Transactional policy update | The verifier switched enforce → shadow → enforce and exercised TCP/SCTP protocol-wildcard and IPv4-block mutations, requiring a higher revision and opposite bank on every agent for single-resource transitions; snapshot schema v2 stages both policy maps before one activation write |
 | Interruption recovery | With the controller scaled to zero, the active bank continued allowing 8080 and denying 9090; both agents then accepted the restarted controller epoch and reconverged |
 | Dataplane provenance | ABI v2 TCP and SCTP events matched the applied revision and carried nonzero identities plus actual/shadow policy and explicit-deny rule provenance |
 | NetworkPolicy lifecycle | Named port `allowed` resolved to TCP/8081; the inclusive 8082–8083 range enforced both boundaries and excluded 8084; a protocol-only TCP entry allowed arbitrary TCP/9091 without allowing UDP/9091 and removal restored isolation; an exact IPv4 block allowed the client, a nested exception denied it, and exception removal recovered; Namespace relabel removed/restored the allow without identity churn; oversized range/block updates removed stale state and recovered; deletion allowed 9091 and recreation restored the drop; omitted `podSelector`, `policyTypes`, and protocol produced namespace-wide/default-ingress/default-TCP behavior, while target narrowing restored non-isolated traffic; named SCTP and protocol-only SCTP rules enforced and reconverged across nodes |
 | Upstream-aligned ingress matrix | A disposable three-Namespace matrix proved default deny, same-Namespace PodSelector scope, empty NamespaceSelector selection, selector AND, peer OR, stacked per-source/per-port additive allows, allow-all precedence, deletion recovery, truthful explanations, and cleanup to the baseline policy counts |
 | Policy explanation | Native 8080/9090, compatibility exact/range/protocol-only TCP/UDP/SCTP ports, bounded IPv4 block/exception transitions, and namespace-wide target/defaulting transitions reported the expected explicit/default/no-applicable-policy provenance with dataplane enforcement truthfully enabled |
-| Policy simulation | Schema v2 evaluated 85 topology-derived flows at identity revision 96/policy revision 228/topology revision 182 and 735 of 821 retained historical flows/2,544 observations at history revision 1,893; it predicted one representative and 84 observed TCP/8080 denials, reported `backend/server` affected, explicitly skipped 86 stale-identity flows including cleaned-up conformance workloads, left live policy state unchanged, and TCP/8080 remained allowed |
+| Policy simulation | Schema v2 evaluated 85 topology-derived flows and the bounded dual-stack history, predicted the TCP/8080 denial, reported `backend/server` affected, explicitly counted stale-identity history, left live policy state unchanged, and TCP/8080 remained allowed |
 
 The kind cluster is disposable and its object counts can change as system Pods
 roll. The repeatable commands, rather than these snapshot counts, are the release
@@ -66,7 +67,7 @@ gate.
 | Kubernetes desired state | **Verified** | Node, Pod, Namespace, Service, EndpointSlice, SecurityPolicy, and supported NetworkPolicy watchers | Live controller reports watched/compiled objects, backend topology relationships, and explicit compatibility rejection counts |
 | Identity state | **Verified** | Metadata-derived numeric identities; Phase 2 registry adds collision admission and Pod-IP indexes | Identity unit tests and live explain resolution |
 | Agent and Aya loader | **Verified** | Privileged per-node DaemonSet and dynamic non-loopback TC attachment | Two ready agents report `bpf_loaded: true` |
-| TC observation | **Verified** | Bounded Ethernet/IPv4/TCP/UDP/SCTP parsing, counters, ring buffer, allow/drop verdict | Cross-node TCP/8080 and SCTP/8086 events asserted by `hack/verify-kind.sh` |
+| TC observation | **Verified** | Bounded Ethernet/direct-header IPv4/IPv6 TCP/UDP/SCTP parsing, counters, ring buffer, allow/drop verdict | Cross-node IPv4/IPv6 TCP/8080 and SCTP/8086 events asserted by `hack/verify-kind.sh` |
 | Health, metrics, and structured events | **Verified** | Controller/agent HTTP endpoints and JSON tracing | kind verifier plus endpoint checks |
 | CLI status and explanation | **Verified** | Live controller-backed `unfctl` status, topology, flows, explain, and simulation commands | Structured topology/history plus shadow explicit-allow and default-deny provenance asserted in kind |
 | Reproducible local environment | **Verified** | Rootful Podman kind workflow, local kubeconfig, local images | `make kind-up kind-deploy kind-test` |
@@ -79,21 +80,21 @@ gate.
 | Collision-safe identity admission | **Verified** | Reject reserved/colliding IDs without state mutation |
 | Pod-IP to identity desired-state index | **Verified** | Update, conflict, lookup, deletion, and GC unit tests |
 | Controller integration and identity counts | **Verified** | `make kind-test` requires nonzero admitted identities and indexed Pod IPs |
-| Versioned BPF identity map schema | **Verified** | ABI tests plus `make kind-test` require a populated live kernel map |
+| Versioned BPF identity map schema | **Verified** | ABI tests plus `make kind-test` require populated IPv4 and IPv6 kernel maps on both agents |
 | Controller-to-agent revisioned distribution | **Verified** | Both node agents report desired/applied epoch and revision convergence; controller-restart recovery exercised live |
 | Selector-to-identity policy lowering | **Verified** | Unit tests cover exact/default, shadow provenance, conflicts, and deterministic ordering; `make kind-test` requires nonzero resolved entries |
 | Transactional policy map set | **Verified** | `make kind-test` stages a changed policy on the opposite bank, verifies a higher applied revision, restores it, and verifies reconvergence |
-| TC identity lookup | **Verified** | Cross-node demo flow carries nonzero source and destination IDs |
+| TC identity lookup | **Verified** | Cross-node IPv4 and IPv6 demo flows carry nonzero source and destination IDs |
 | L3/L4 policy decision | **Verified** | Exact/fallback active-bank lookup plus ABI v2 revision, verdict, reason, policy, rule, and shadow provenance |
-| Enforcement | **Verified** | `make kind-test` proves 8080 allow, open-port 9090 drop, shadow pass-through, and restored drop |
+| Enforcement | **Verified** | `make kind-test` proves IPv4/IPv6 8080 allow and open-port 9090 drop, shadow pass-through, and restored drop |
 | Accurate live explanation | **Verified** | CLI actual decisions and IDs are checked while every traffic-path agent reports the active revision applied |
 | Failure behavior | **In progress** | Last-known-good enforcement survived a controller interruption; pinned map recovery, agent restart fencing, and pressure/fault injection remain |
 
 ## Current limitations
 
-- Enforcement currently covers resolved-identity IPv4 TCP/UDP/SCTP exact and wildcard
-  decisions; IPv6, fragments beyond the initial fragment, and other protocols
-  fail open.
+- Enforcement currently covers resolved-identity direct-header IPv4/IPv6
+  TCP/UDP/SCTP exact and wildcard decisions. Non-initial IPv4 fragments, IPv6
+  extension headers/fragments, and other protocols fail open.
 - Identity and compiled policy desired state remain in-memory and their BPF maps
   are unpinned. Agent restart therefore has a resynchronization window where the
   overlay intentionally fails open.
@@ -112,7 +113,7 @@ gate.
   channels/pending state and controller retention are bounded with explicit drop
   and eviction counters, but history is not durable, authenticated, sampled, or
   deduplicated across interface-level observations.
-- Topology schema v2 reports current in-memory Node, Pod workload, Service intent,
+- Topology schema v3 reports current in-memory Node, dual-stack Pod workload, Service intent,
   and EndpointSlice runtime relationships. Conditions are Kubernetes-reported
   state rather than active traffic health; topology history, filtering,
   pagination, and routing/load-balancing behavior are not implemented.
@@ -122,7 +123,7 @@ gate.
   limited to 1,024 inclusive ports, and complete
   identity-keyed snapshots to 131,072 entries per bank. IPv4 blocks support
   `except` but are limited to 1,024 addresses each and 131,072 IPv4 entries per
-  bank; IPv6/unbounded blocks remain unsupported. Unsupported or oversized
+  bank; IPv6 `ipBlock`/unbounded blocks remain unsupported. Unsupported or oversized
   objects are counted as rejected but rejection details do not yet have a
   dedicated API endpoint.
 - Interface index is currently zero in emitted events.
@@ -140,15 +141,16 @@ gate.
 | NetworkPolicy ingress translator foundation | **Verified** | Unit tests cover allow/default isolation, omitted namespace-wide target/default ingress/default TCP, pod/Namespace expressions, named and protocol-only TCP/UDP/SCTP ports, bounded numeric ranges, bounded IPv4 blocks/exceptions, wildcards, local/exact-namespace peers, and explicit unsupported-feature errors; `make kind-test` exercises each supported peer/port form |
 | Additive compatibility semantics | **Verified** | Multiple selecting policies combine allows in the shared evaluator and lower through the shared dataplane compiler; the live adapter uses that same engine |
 | NetworkPolicy controller watch and live enforcement | **Verified** | `make kind-test` covers reconciliation/status, explicit allow, isolation drop, revisioned provenance, rejection/removal/recovery, and deletion/recreation |
-| Full ingress peer/port compatibility | **In progress** | Pod/Namespace expressions, namespace-wide omitted targets, implicit ingress policy type for egress-omitted objects, default TCP protocol, non-selected Pod behavior, named and protocol-only TCP/UDP/SCTP ports, inclusive numeric ranges up to 1,024 ports, IPv4 blocks up to 1,024 addresses with `except`, same/all-Namespace peer scope, selector AND, peer OR, stacked additive allows, and allow-all precedence are live verified; IPv6, unbounded blocks, egress, and remaining upstream conformance remain |
+| Full ingress peer/port compatibility | **In progress** | Pod/Namespace expressions, namespace-wide omitted targets, implicit ingress policy type for egress-omitted objects, default TCP protocol, non-selected Pod behavior, named and protocol-only TCP/UDP/SCTP ports, inclusive numeric ranges up to 1,024 ports, IPv4 blocks up to 1,024 addresses with `except`, same/all-Namespace peer scope, selector AND, peer OR, stacked additive allows, allow-all precedence, and resolved-identity IPv6 selector traffic are live verified; IPv6 `ipBlock`, unbounded blocks, egress, and remaining upstream conformance remain |
 | Upstream-aligned ingress matrix | **Verified** | `hack/verify-networkpolicy-ingress.sh` maps supported upstream scenarios to revision-converged cross-node traffic and explanation checks, then deletes its three exact test Namespaces and requires baseline policy counts; scope and exclusions are recorded in `docs/development/networkpolicy-conformance.md` |
 | IPv4 SCTP ingress dataplane | **Verified** | Protocol 132 is parsed, explained, simulated, accepted in telemetry, and lowered through exact/protocol-wildcard keys; `make kind-test` proves cross-node named allow, default drop, wildcard activation/removal, revisioned provenance, and enriched history |
+| Resolved-identity IPv6 dataplane | **Verified** | Identity snapshot v2 and `IDENTITY_V6` distribute Pod identities; direct-header TCP/UDP/SCTP reuse family-neutral policy keys; topology v3 and flow export v2 carry IPv6. `make kind-test` requires dual-stack native/NetworkPolicy allow-drop, per-family map counts, provenance, and enriched IPv6 history |
 | IPv4 `ipBlock` dataplane | **Verified** | Snapshot schema v2 carries exact/fallback source-IP decisions; `POLICY_IPV4` and `POLICY_RULES` stage under one bank/revision; unit tests cover CIDR validation/lowering and `make kind-test` covers allow, exception deny, recovery, provenance, and oversized-block rejection |
 | Dataplane policy capacity safety | **Verified** | Shared lowering and agent snapshot validation cap each identity and IPv4 transactional bank at 131,072 entries; staging deletes stale inactive keys before insertions, and unit tests exercise the exact boundary |
 | Egress NetworkPolicy compatibility | **Planned** | Direction-aware IR and dataplane enforcement evidence |
 | Policy simulation foundation | **Verified** | Versioned read-only add/replace API and `unfctl policy simulate` compare current/proposed provenance over a bounded topology-derived matrix and retained flow history; unit tests prove no state mutation and historical weighting, while `make kind-test` proves predicted deny, revision stability, and unchanged live forwarding |
-| Better topology state | **Verified** | Topology schema v2 preserves selector intent and adds EndpointSlice-derived address/port, Pod target, Node/zone, and ready/serving/terminating backend state; unit tests prove normalization, idempotence, stale-state removal, and revision isolation, while `make kind-test` exercises not-ready → ready → deleted backend and Service deletion transitions without policy-revision mutation |
-| Historical flow export | **Verified** | Schema v1, non-blocking 4,096-record agent channel, 2,048-key pending aggregation, 512-entry HTTP batches, 4,096-key revisioned controller retention, drop/eviction metrics, `unfctl flows`, and history-aware simulation; unit tests cover bounds/aggregation/eviction and `make kind-test` requires an enriched live cross-node flow |
+| Better topology state | **Verified** | Topology schema v3 preserves selector intent, adds per-workload IPv6 addresses, and retains EndpointSlice-derived address/port, Pod target, Node/zone, and ready/serving/terminating backend state; unit tests prove normalization, idempotence, stale-state removal, and revision isolation, while `make kind-test` exercises dual-stack state and not-ready → ready → deleted backend transitions without policy-revision mutation |
+| Historical flow export | **Verified** | Schema v2, non-blocking 4,096-record agent channel, 2,048-key pending aggregation, 512-entry HTTP batches, 4,096-key revisioned controller retention, dual-stack address validation, drop/eviction metrics, `unfctl flows`, and history-aware simulation; unit tests cover bounds/aggregation/eviction and `make kind-test` requires enriched IPv4 and IPv6 cross-node flows |
 
 ## Updating this tracker
 

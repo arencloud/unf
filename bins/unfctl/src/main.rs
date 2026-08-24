@@ -194,8 +194,10 @@ fn print_value(value: &Value, output: Output) -> Result<()> {
 }
 
 fn print_table(value: &Value) {
-    if value.get("schema_version").and_then(Value::as_u64) == Some(1)
-        && value.get("retained_flows").is_some()
+    if matches!(
+        value.get("schema_version").and_then(Value::as_u64),
+        Some(1 | 2)
+    ) && value.get("retained_flows").is_some()
         && value.get("entries").is_some()
     {
         print_flow_history_table(value);
@@ -203,7 +205,7 @@ fn print_table(value: &Value) {
     }
     if matches!(
         value.get("schema_version").and_then(Value::as_u64),
-        Some(1 | 2)
+        Some(1..=3)
     ) && value.get("nodes").is_some()
         && value.get("workloads").is_some()
         && value.get("services").is_some()
@@ -325,25 +327,22 @@ fn print_topology_table(value: &Value) {
         );
     }
     for workload in workloads {
-        let addresses = workload["ipv4_addresses"]
-            .as_array()
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
-            .unwrap_or_default();
+        let ipv4_addresses = joined_strings(&workload["ipv4_addresses"]);
+        let ipv6_addresses = joined_strings(&workload["ipv6_addresses"]);
         println!(
-            "workload                 {} node={} identity={} ipv4={}",
+            "workload                 {} node={} identity={} ipv4={} ipv6={}",
             text_field(workload, "reference"),
             workload["node_name"].as_str().unwrap_or("unassigned"),
             number_field(workload, "identity_id"),
-            if addresses.is_empty() {
+            if ipv4_addresses.is_empty() {
                 "-"
             } else {
-                &addresses
+                &ipv4_addresses
+            },
+            if ipv6_addresses.is_empty() {
+                "-"
+            } else {
+                &ipv6_addresses
             }
         );
     }

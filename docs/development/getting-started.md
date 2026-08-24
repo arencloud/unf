@@ -66,7 +66,7 @@ qdisc in place when it exits; use a disposable environment for testing.
 
 The local workflow currently uses Podman, `sudo`, Go, and `kubectl`. It installs a
 workspace-local pinned kind binary, keeps kubeconfig under `.tools/`, and creates
-a rootful two-node cluster so the agent can load BPF programs:
+a rootful dual-stack two-node cluster so the agent can load BPF programs:
 
 ```bash
 make kind-up
@@ -74,13 +74,18 @@ make kind-deploy
 make kind-test
 ```
 
+`kind-up` also selects the nftables IPv6 frontend inside the pinned kindnet image
+and waits for that DaemonSet to become ready. This keeps the dual-stack fixture
+reproducible on development kernels without the legacy IPv6 NAT table.
+
 `kind-deploy` builds the userspace images, eBPF object, and test-only SCTP `socat`
 image, loads them into the nodes, and applies the CRD and workloads. `kind-test`
-installs the demo, proves cross-node port 8080 allow and open-port 9090 deny,
+installs the demo, proves cross-node IPv4/IPv6 port 8080 allow and open-port 9090
+deny,
 switches the same policy through shadow pass-through and back, and validates
 revisioned event and CLI provenance. It also exercises a supported ingress
-`NetworkPolicy`: cross-node allow and default-isolation drop, unsupported-update
-rejection and recovery, and
+`NetworkPolicy`: cross-node IPv4/IPv6 allow and default-isolation drop,
+unsupported-update rejection and recovery, and
 named-port resolution, protocol-only TCP activation/removal without UDP
 broadening, bounded `endPort` boundary enforcement and oversized-range rejection,
 bounded IPv4 `ipBlock` allow/exception behavior and oversized-block rejection,
@@ -102,13 +107,15 @@ allow-all precedence across three source contexts and two ports. Its dedicated
 verifier requires every mutation to converge on both agents and deletes its three
 test Namespaces before returning. The exact scope and upstream mapping are tracked
 in [networkpolicy-conformance.md](networkpolicy-conformance.md).
-The verifier also queries topology schema v2 and creates a selectorless Service
+The verifier also queries topology schema v3, requires dual-stack workload
+addresses and populated per-family identity maps, and creates a selectorless Service
 with a manually managed EndpointSlice. It requires the backend to transition from
 not ready to ready, verifies deletion removes runtime state while selector intent
 stays empty, and proves the independent topology/service revisions advance without
 changing policy revision. It also requires agents to export the live
 frontend-to-backend flow, queries bounded history, and verifies
-observation-weighted historical policy impact.
+observation-weighted historical policy impact. Flow history schema v2 must retain
+an enriched direct-address IPv6 flow.
 The host kernel is shared with kind nodes. `make kind-down`
 deletes only the named `unf-dev` cluster.
 

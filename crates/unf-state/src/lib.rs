@@ -1,16 +1,16 @@
 //! Revisioned control-plane state and stable identity metadata.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 
-pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
-pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
-pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 1;
+pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
+pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 2;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
 /// One half of the dual-bank eBPF policy map's 262,144-entry capacity.
@@ -32,6 +32,8 @@ pub struct FlowHistoryKey {
     pub destination_identity: IdentityId,
     pub source_ipv4: Option<Ipv4Addr>,
     pub destination_ipv4: Option<Ipv4Addr>,
+    pub source_ipv6: Option<Ipv6Addr>,
+    pub destination_ipv6: Option<Ipv6Addr>,
     pub protocol: u8,
     pub destination_port: u16,
 }
@@ -255,6 +257,7 @@ pub struct TopologyWorkload {
     pub application: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub ipv4_addresses: Vec<Ipv4Addr>,
+    pub ipv6_addresses: Vec<Ipv6Addr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -352,12 +355,19 @@ pub struct Ipv4IdentityMapping {
     pub identity_id: IdentityId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ipv6IdentityMapping {
+    pub address: Ipv6Addr,
+    pub identity_id: IdentityId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityStateSnapshot {
     pub schema_version: u16,
     pub source_epoch: u64,
     pub revision: Revision,
-    pub entries: Vec<Ipv4IdentityMapping>,
+    pub ipv4_entries: Vec<Ipv4IdentityMapping>,
+    pub ipv6_entries: Vec<Ipv6IdentityMapping>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -568,8 +578,8 @@ impl IdentityRegistry {
     }
 
     #[must_use]
-    pub fn ipv4_snapshot(&self, source_epoch: u64) -> IdentityStateSnapshot {
-        let entries = self
+    pub fn identity_snapshot(&self, source_epoch: u64) -> IdentityStateSnapshot {
+        let ipv4_entries = self
             .addresses
             .iter()
             .filter_map(|(address, (_, identity_id))| match address {
@@ -580,11 +590,23 @@ impl IdentityRegistry {
                 IpAddr::V6(_) => None,
             })
             .collect();
+        let ipv6_entries = self
+            .addresses
+            .iter()
+            .filter_map(|(address, (_, identity_id))| match address {
+                IpAddr::V4(_) => None,
+                IpAddr::V6(address) => Some(Ipv6IdentityMapping {
+                    address: *address,
+                    identity_id: *identity_id,
+                }),
+            })
+            .collect();
         IdentityStateSnapshot {
             schema_version: IDENTITY_SNAPSHOT_SCHEMA_VERSION,
             source_epoch,
             revision: self.revision,
-            entries,
+            ipv4_entries,
+            ipv6_entries,
         }
     }
 }
@@ -738,14 +760,20 @@ mod tests {
                 [
                     "10.244.1.4".parse().expect("valid test address"),
                     "10.244.1.3".parse().expect("valid test address"),
+                    "fd00:10:244:1::4".parse().expect("valid test address"),
+                    "fd00:10:244:1::3".parse().expect("valid test address"),
                 ],
             )
             .expect("identity is admitted");
-        let first = registry.ipv4_snapshot(7);
+        let first = registry.identity_snapshot(7);
         assert_eq!(first.schema_version, IDENTITY_SNAPSHOT_SCHEMA_VERSION);
         assert_eq!(first.source_epoch, 7);
         assert_eq!(first.revision, Revision::new(1));
-        assert_eq!(first.entries[0].address, Ipv4Addr::new(10, 244, 1, 3));
+        assert_eq!(first.ipv4_entries[0].address, Ipv4Addr::new(10, 244, 1, 3));
+        assert_eq!(
+            first.ipv6_entries[0].address,
+            "fd00:10:244:1::3".parse::<Ipv6Addr>().unwrap()
+        );
 
         registry
             .admit_pod(
@@ -755,6 +783,8 @@ mod tests {
                 [
                     "10.244.1.4".parse().expect("valid test address"),
                     "10.244.1.3".parse().expect("valid test address"),
+                    "fd00:10:244:1::4".parse().expect("valid test address"),
+                    "fd00:10:244:1::3".parse().expect("valid test address"),
                 ],
             )
             .expect("idempotent update succeeds");
@@ -783,6 +813,7 @@ mod tests {
                 application: Some("client".to_owned()),
                 labels: BTreeMap::from([("app".to_owned(), "client".to_owned())]),
                 ipv4_addresses: vec![Ipv4Addr::new(10, 42, 0, 10)],
+                ipv6_addresses: vec!["fd00:10:42::10".parse().unwrap()],
             }],
             services: vec![TopologyService {
                 reference: "frontend/client".to_owned(),
@@ -834,6 +865,8 @@ mod tests {
                 destination_identity: IdentityId::new(destination),
                 source_ipv4: None,
                 destination_ipv4: None,
+                source_ipv6: None,
+                destination_ipv6: None,
                 protocol: 6,
                 destination_port: port,
             },

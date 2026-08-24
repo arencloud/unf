@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,14 +27,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 use unf_ebpf_common::{
-    FLOW_ABI_VERSION, FlowEvent, FlowKey, IdentityMapValue, Ipv4IdentityKey, POLICY_BANK_COUNT,
-    POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
+    FLOW_ABI_VERSION, FlowEvent, FlowKey, IdentityMapValue, Ipv4IdentityKey, Ipv6IdentityKey,
+    POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
 };
 use unf_state::{
     FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowExportDecision,
     FlowExportRecord, FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot,
-    Ipv4IdentityMapping, Ipv4PolicyMapEntry, POLICY_MAP_BANK_ENTRY_LIMIT,
+    Ipv4IdentityMapping, Ipv4PolicyMapEntry, Ipv6IdentityMapping, POLICY_MAP_BANK_ENTRY_LIMIT,
     POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord, PolicyMapEntry, PolicyStateSnapshot,
 };
 
@@ -78,6 +78,8 @@ struct AgentMetrics {
     desired_identity_revision: Gauge,
     applied_identity_revision: Gauge,
     identity_map_entries: Gauge,
+    ipv4_identity_map_entries: Gauge,
+    ipv6_identity_map_entries: Gauge,
     policy_sync_errors: Counter,
     desired_policy_revision: Gauge,
     applied_policy_revision: Gauge,
@@ -96,6 +98,8 @@ struct AgentState {
     desired_identity_epoch: AtomicU64,
     applied_identity_epoch: AtomicU64,
     identity_map_entries: AtomicU64,
+    ipv4_identity_map_entries: AtomicU64,
+    ipv6_identity_map_entries: AtomicU64,
     desired_policy_revision: AtomicU64,
     applied_policy_revision: AtomicU64,
     desired_policy_epoch: AtomicU64,
@@ -111,8 +115,10 @@ struct AgentState {
 }
 
 struct IdentitySynchronizer {
-    map: AyaHashMap<MapData, [u8; 4], [u8; 16]>,
-    applied: BTreeMap<[u8; 4], [u8; 16]>,
+    ipv4_map: AyaHashMap<MapData, [u8; 4], [u8; 16]>,
+    ipv6_map: AyaHashMap<MapData, [u8; 16], [u8; 16]>,
+    ipv4_applied: BTreeMap<[u8; 4], [u8; 16]>,
+    ipv6_applied: BTreeMap<[u8; 16], [u8; 16]>,
     applied_epoch: u64,
     controller_url: Option<String>,
     client: reqwest::Client,
@@ -137,6 +143,10 @@ type PolicyMaps = (
     EncodedPolicyMap,
     EncodedPolicyMap,
     AyaArray<MapData, [u8; 24]>,
+);
+type IdentityMaps = (
+    AyaHashMap<MapData, [u8; 4], [u8; 16]>,
+    AyaHashMap<MapData, [u8; 16], [u8; 16]>,
 );
 
 struct DataplaneConfig {
@@ -189,6 +199,8 @@ struct AgentStatus {
     desired_identity_epoch: u64,
     applied_identity_epoch: u64,
     identity_map_entries: u64,
+    ipv4_identity_map_entries: u64,
+    ipv6_identity_map_entries: u64,
     desired_policy_revision: u64,
     applied_policy_revision: u64,
     desired_policy_epoch: u64,
@@ -293,6 +305,8 @@ fn new_state(capabilities: KernelCapabilities) -> AgentState {
         desired_identity_revision: Gauge::default(),
         applied_identity_revision: Gauge::default(),
         identity_map_entries: Gauge::default(),
+        ipv4_identity_map_entries: Gauge::default(),
+        ipv6_identity_map_entries: Gauge::default(),
         policy_sync_errors: Counter::default(),
         desired_policy_revision: Gauge::default(),
         applied_policy_revision: Gauge::default(),
@@ -312,6 +326,8 @@ fn new_state(capabilities: KernelCapabilities) -> AgentState {
         desired_identity_epoch: AtomicU64::new(0),
         applied_identity_epoch: AtomicU64::new(0),
         identity_map_entries: AtomicU64::new(0),
+        ipv4_identity_map_entries: AtomicU64::new(0),
+        ipv6_identity_map_entries: AtomicU64::new(0),
         desired_policy_revision: AtomicU64::new(0),
         applied_policy_revision: AtomicU64::new(0),
         desired_policy_epoch: AtomicU64::new(0),
@@ -360,8 +376,18 @@ fn register_agent_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
     );
     registry.register(
         "unf_identity_map_entries",
-        "IPv4 identity entries currently applied to the BPF map",
+        "IPv4 and IPv6 identity entries currently applied to BPF maps",
         metrics.identity_map_entries.clone(),
+    );
+    registry.register(
+        "unf_ipv4_identity_map_entries",
+        "IPv4 identity entries currently applied to the BPF map",
+        metrics.ipv4_identity_map_entries.clone(),
+    );
+    registry.register(
+        "unf_ipv6_identity_map_entries",
+        "IPv6 identity entries currently applied to the BPF map",
+        metrics.ipv6_identity_map_entries.clone(),
     );
     registry.register(
         "unf_policy_sync_errors",
@@ -412,11 +438,7 @@ async fn run_dataplane(
             .context("eBPF object does not contain FLOW_EVENTS ring buffer")?,
     )
     .context("open FLOW_EVENTS ring buffer")?;
-    let identity_map = AyaHashMap::<_, [u8; 4], [u8; 16]>::try_from(
-        ebpf.take_map("IDENTITY_V4")
-            .context("eBPF object does not contain IDENTITY_V4 map")?,
-    )
-    .context("open IDENTITY_V4 map")?;
+    let (ipv4_identity_map, ipv6_identity_map) = take_identity_maps(&mut ebpf)?;
     let (policy_map, ipv4_policy_map, policy_config) = take_policy_maps(&mut ebpf)?;
     let program_name = match config.direction {
         Direction::Ingress => "unf_observe_ingress",
@@ -461,8 +483,10 @@ async fn run_dataplane(
         .as_deref()
         .map(|url| url.trim_end_matches('/').to_owned());
     let mut identities = IdentitySynchronizer {
-        map: identity_map,
-        applied: BTreeMap::new(),
+        ipv4_map: ipv4_identity_map,
+        ipv6_map: ipv6_identity_map,
+        ipv4_applied: BTreeMap::new(),
+        ipv6_applied: BTreeMap::new(),
         applied_epoch: 0,
         controller_url: controller_url.clone(),
         client: reqwest::Client::new(),
@@ -502,6 +526,20 @@ async fn run_dataplane(
     state.bpf_loaded.store(false, Ordering::Release);
     state.metrics.bpf_loaded.set(0);
     Ok(())
+}
+
+fn take_identity_maps(ebpf: &mut Ebpf) -> Result<IdentityMaps> {
+    let ipv4 = AyaHashMap::<_, [u8; 4], [u8; 16]>::try_from(
+        ebpf.take_map("IDENTITY_V4")
+            .context("eBPF object does not contain IDENTITY_V4 map")?,
+    )
+    .context("open IDENTITY_V4 map")?;
+    let ipv6 = AyaHashMap::<_, [u8; 16], [u8; 16]>::try_from(
+        ebpf.take_map("IDENTITY_V6")
+            .context("eBPF object does not contain IDENTITY_V6 map")?,
+    )
+    .context("open IDENTITY_V6 map")?;
+    Ok((ipv4, ipv6))
 }
 
 fn spawn_flow_exporter(
@@ -612,6 +650,7 @@ async fn consume_events(
                         source_port = u16::from_be_bytes(event.flow.source_port),
                         destination_port = u16::from_be_bytes(event.flow.destination_port),
                         protocol = event.flow.protocol,
+                        address_family = event.flow.address_family,
                         policy_revision = event.policy_revision,
                         policy_id = event.policy_id.get(),
                         rule_id = event.rule_id.get(),
@@ -660,6 +699,8 @@ fn flow_export_record(event: &FlowEvent) -> FlowExportRecord {
             destination_identity: event.flow.destination_identity,
             source_ipv4: event_ipv4(event.flow.address_family, event.flow.source_address),
             destination_ipv4: event_ipv4(event.flow.address_family, event.flow.destination_address),
+            source_ipv6: event_ipv6(event.flow.address_family, event.flow.source_address),
+            destination_ipv6: event_ipv6(event.flow.address_family, event.flow.destination_address),
             protocol: event.flow.protocol,
             destination_port: u16::from_be_bytes(event.flow.destination_port),
         },
@@ -682,6 +723,10 @@ fn flow_export_record(event: &FlowEvent) -> FlowExportRecord {
 
 fn event_ipv4(address_family: u8, address: [u8; 16]) -> Option<Ipv4Addr> {
     (address_family == 4).then(|| Ipv4Addr::new(address[0], address[1], address[2], address[3]))
+}
+
+fn event_ipv6(address_family: u8, address: [u8; 16]) -> Option<Ipv6Addr> {
+    (address_family == 6).then(|| Ipv6Addr::from(address))
 }
 
 fn nonzero_policy_id(id: PolicyId) -> Option<PolicyId> {
@@ -858,8 +903,9 @@ async fn synchronize_identities(
         }
     }
 
-    let desired = desired_identity_entries(&snapshot.entries, desired_revision)?;
-    apply_identity_entries(synchronizer, desired)?;
+    let desired_ipv4 = desired_ipv4_identity_entries(&snapshot.ipv4_entries, desired_revision)?;
+    let desired_ipv6 = desired_ipv6_identity_entries(&snapshot.ipv6_entries, desired_revision)?;
+    apply_identity_entries(synchronizer, desired_ipv4, desired_ipv6)?;
     synchronizer.applied_epoch = snapshot.source_epoch;
     state
         .applied_identity_epoch
@@ -869,7 +915,13 @@ async fn synchronize_identities(
         .store(desired_revision, Ordering::Release);
     state
         .identity_map_entries
-        .store(synchronizer.applied.len() as u64, Ordering::Release);
+        .store(identity_entry_count(synchronizer), Ordering::Release);
+    state
+        .ipv4_identity_map_entries
+        .store(synchronizer.ipv4_applied.len() as u64, Ordering::Release);
+    state
+        .ipv6_identity_map_entries
+        .store(synchronizer.ipv6_applied.len() as u64, Ordering::Release);
     state
         .metrics
         .applied_identity_revision
@@ -877,17 +929,30 @@ async fn synchronize_identities(
     state
         .metrics
         .identity_map_entries
-        .set(metric_value(synchronizer.applied.len() as u64));
+        .set(metric_value(identity_entry_count(synchronizer)));
+    state
+        .metrics
+        .ipv4_identity_map_entries
+        .set(metric_value(synchronizer.ipv4_applied.len() as u64));
+    state
+        .metrics
+        .ipv6_identity_map_entries
+        .set(metric_value(synchronizer.ipv6_applied.len() as u64));
     info!(
         identity_epoch = snapshot.source_epoch,
         identity_revision = desired_revision,
-        entries = synchronizer.applied.len(),
+        ipv4_entries = synchronizer.ipv4_applied.len(),
+        ipv6_entries = synchronizer.ipv6_applied.len(),
         "identity snapshot applied"
     );
     Ok(())
 }
 
-fn desired_identity_entries(
+fn identity_entry_count(synchronizer: &IdentitySynchronizer) -> u64 {
+    (synchronizer.ipv4_applied.len() + synchronizer.ipv6_applied.len()) as u64
+}
+
+fn desired_ipv4_identity_entries(
     mappings: &[Ipv4IdentityMapping],
     revision: u64,
 ) -> Result<BTreeMap<[u8; 4], [u8; 16]>> {
@@ -908,6 +973,27 @@ fn desired_identity_entries(
     Ok(desired)
 }
 
+fn desired_ipv6_identity_entries(
+    mappings: &[Ipv6IdentityMapping],
+    revision: u64,
+) -> Result<BTreeMap<[u8; 16], [u8; 16]>> {
+    let mut desired = BTreeMap::new();
+    for mapping in mappings {
+        if mapping.identity_id.get() == 0 {
+            bail!("controller snapshot contains reserved identity ID zero");
+        }
+        let key = Ipv6IdentityKey::new(mapping.address.octets());
+        let value = IdentityMapValue::new(mapping.identity_id, revision);
+        let encoded = encode_identity_value(value);
+        if let Some(existing) = desired.insert(key.address, encoded)
+            && existing != encoded
+        {
+            bail!("controller snapshot contains a conflicting duplicate IPv6 address");
+        }
+    }
+    Ok(desired)
+}
+
 fn encode_identity_value(value: IdentityMapValue) -> [u8; 16] {
     let mut encoded = [0_u8; 16];
     encoded[0..4].copy_from_slice(&value.identity_id.get().to_ne_bytes());
@@ -919,22 +1005,38 @@ fn encode_identity_value(value: IdentityMapValue) -> [u8; 16] {
 
 fn apply_identity_entries(
     synchronizer: &mut IdentitySynchronizer,
-    desired: BTreeMap<[u8; 4], [u8; 16]>,
+    desired_ipv4: BTreeMap<[u8; 4], [u8; 16]>,
+    desired_ipv6: BTreeMap<[u8; 16], [u8; 16]>,
 ) -> Result<()> {
-    let previous = synchronizer.applied.clone();
-    if let Err(error) = replace_identity_entries(&mut synchronizer.map, &previous, &desired) {
-        if let Err(rollback_error) = restore_identity_entries(&mut synchronizer.map, &previous) {
+    let previous_ipv4 = synchronizer.ipv4_applied.clone();
+    let previous_ipv6 = synchronizer.ipv6_applied.clone();
+    let result =
+        replace_ipv4_identity_entries(&mut synchronizer.ipv4_map, &previous_ipv4, &desired_ipv4)
+            .and_then(|()| {
+                replace_ipv6_identity_entries(
+                    &mut synchronizer.ipv6_map,
+                    &previous_ipv6,
+                    &desired_ipv6,
+                )
+            });
+    if let Err(error) = result {
+        let ipv4_rollback =
+            restore_ipv4_identity_entries(&mut synchronizer.ipv4_map, &previous_ipv4);
+        let ipv6_rollback =
+            restore_ipv6_identity_entries(&mut synchronizer.ipv6_map, &previous_ipv6);
+        if ipv4_rollback.is_err() || ipv6_rollback.is_err() {
             return Err(anyhow!(
-                "identity map update failed: {error:#}; rollback also failed: {rollback_error:#}"
+                "identity map update failed: {error:#}; IPv4 rollback: {ipv4_rollback:?}; IPv6 rollback: {ipv6_rollback:?}"
             ));
         }
         return Err(error).context("identity map update rolled back");
     }
-    synchronizer.applied = desired;
+    synchronizer.ipv4_applied = desired_ipv4;
+    synchronizer.ipv6_applied = desired_ipv6;
     Ok(())
 }
 
-fn replace_identity_entries(
+fn replace_ipv4_identity_entries(
     map: &mut AyaHashMap<MapData, [u8; 4], [u8; 16]>,
     current: &BTreeMap<[u8; 4], [u8; 16]>,
     desired: &BTreeMap<[u8; 4], [u8; 16]>,
@@ -950,9 +1052,39 @@ fn replace_identity_entries(
     Ok(())
 }
 
-fn restore_identity_entries(
+fn restore_ipv4_identity_entries(
     map: &mut AyaHashMap<MapData, [u8; 4], [u8; 16]>,
     previous: &BTreeMap<[u8; 4], [u8; 16]>,
+) -> Result<()> {
+    let keys: Vec<_> = map.keys().collect::<Result<_, _>>()?;
+    for key in keys {
+        map.remove(&key)?;
+    }
+    for (key, value) in previous {
+        map.insert(key, value, 0)?;
+    }
+    Ok(())
+}
+
+fn replace_ipv6_identity_entries(
+    map: &mut AyaHashMap<MapData, [u8; 16], [u8; 16]>,
+    current: &BTreeMap<[u8; 16], [u8; 16]>,
+    desired: &BTreeMap<[u8; 16], [u8; 16]>,
+) -> Result<()> {
+    for (key, value) in desired {
+        map.insert(key, value, 0)
+            .with_context(|| format!("insert IPv6 identity map key {key:?}"))?;
+    }
+    for key in current.keys().filter(|key| !desired.contains_key(*key)) {
+        map.remove(key)
+            .with_context(|| format!("remove stale IPv6 identity map key {key:?}"))?;
+    }
+    Ok(())
+}
+
+fn restore_ipv6_identity_entries(
+    map: &mut AyaHashMap<MapData, [u8; 16], [u8; 16]>,
+    previous: &BTreeMap<[u8; 16], [u8; 16]>,
 ) -> Result<()> {
     let keys: Vec<_> = map.keys().collect::<Result<_, _>>()?;
     for key in keys {
@@ -1587,6 +1719,8 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         desired_identity_epoch: state.desired_identity_epoch.load(Ordering::Acquire),
         applied_identity_epoch: state.applied_identity_epoch.load(Ordering::Acquire),
         identity_map_entries: state.identity_map_entries.load(Ordering::Acquire),
+        ipv4_identity_map_entries: state.ipv4_identity_map_entries.load(Ordering::Acquire),
+        ipv6_identity_map_entries: state.ipv6_identity_map_entries.load(Ordering::Acquire),
         desired_policy_revision: state.desired_policy_revision.load(Ordering::Acquire),
         applied_policy_revision: state.applied_policy_revision.load(Ordering::Acquire),
         desired_policy_epoch: state.desired_policy_epoch.load(Ordering::Acquire),
@@ -1659,6 +1793,8 @@ mod tests {
                 destination_identity: IdentityId::new(2),
                 source_ipv4: Some(Ipv4Addr::new(10, 42, 0, 1)),
                 destination_ipv4: Some(Ipv4Addr::new(10, 42, 1, 2)),
+                source_ipv6: None,
+                destination_ipv6: None,
                 protocol: 6,
                 destination_port: port,
             },
@@ -1707,7 +1843,7 @@ mod tests {
 
     #[test]
     fn flow_export_conversion_preserves_identity_and_provenance() {
-        let event = FlowEvent {
+        let mut event = FlowEvent {
             timestamp_ns: 17,
             flow: FlowKey {
                 source_identity: IdentityId::new(1),
@@ -1743,6 +1879,16 @@ mod tests {
             record.shadow.expect("shadow decision exists").verdict,
             Verdict::Deny
         );
+
+        let source_ipv6: Ipv6Addr = "fd00:10:42::1".parse().unwrap();
+        let destination_ipv6: Ipv6Addr = "fd00:10:42:1::2".parse().unwrap();
+        event.flow.source_address = source_ipv6.octets();
+        event.flow.destination_address = destination_ipv6.octets();
+        event.flow.address_family = 6;
+        let ipv6_record = flow_export_record(&event);
+        assert_eq!(ipv6_record.key.source_ipv4, None);
+        assert_eq!(ipv6_record.key.source_ipv6, Some(source_ipv6));
+        assert_eq!(ipv6_record.key.destination_ipv6, Some(destination_ipv6));
     }
 
     #[test]
@@ -1769,9 +1915,27 @@ mod tests {
                 identity_id: IdentityId::new(42),
             },
         ];
-        let desired = desired_identity_entries(&mappings, 7).expect("snapshot is valid");
+        let desired = desired_ipv4_identity_entries(&mappings, 7).expect("snapshot is valid");
         assert_eq!(desired.len(), 2);
         assert_eq!(desired.keys().next(), Some(&[10, 244, 1, 3]));
+
+        let ipv6_mappings = vec![
+            Ipv6IdentityMapping {
+                address: "fd00:10:244:1::4".parse().unwrap(),
+                identity_id: IdentityId::new(84),
+            },
+            Ipv6IdentityMapping {
+                address: "fd00:10:244:1::3".parse().unwrap(),
+                identity_id: IdentityId::new(42),
+            },
+        ];
+        let desired_ipv6 =
+            desired_ipv6_identity_entries(&ipv6_mappings, 7).expect("snapshot is valid");
+        assert_eq!(desired_ipv6.len(), 2);
+        assert_eq!(
+            desired_ipv6.keys().next().copied(),
+            Some("fd00:10:244:1::3".parse::<Ipv6Addr>().unwrap().octets())
+        );
     }
 
     #[test]
@@ -1780,7 +1944,12 @@ mod tests {
             address: "10.244.1.3".parse().unwrap(),
             identity_id: IdentityId::new(0),
         }];
-        assert!(desired_identity_entries(&mappings, 7).is_err());
+        assert!(desired_ipv4_identity_entries(&mappings, 7).is_err());
+        let ipv6_mappings = [Ipv6IdentityMapping {
+            address: "fd00:10:244:1::3".parse().unwrap(),
+            identity_id: IdentityId::new(0),
+        }];
+        assert!(desired_ipv6_identity_entries(&ipv6_mappings, 7).is_err());
     }
 
     fn policy_entry() -> PolicyMapEntry {
