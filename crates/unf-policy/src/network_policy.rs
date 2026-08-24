@@ -1419,6 +1419,84 @@ mod tests {
     }
 
     #[test]
+    fn upstream_expression_rules_preserve_source_port_pairing() {
+        let mut same_namespace = endpoint(1, "backend", "same-client");
+        same_namespace
+            .labels
+            .extend(labels(&[("conformance-source", "same")]));
+        let mut source_a = endpoint(2, "source-a", "client");
+        source_a
+            .labels
+            .extend(labels(&[("conformance-source", "selected")]));
+        source_a
+            .namespace_labels
+            .extend(labels(&[("conformance-group", "a")]));
+        let mut source_b = endpoint(3, "source-b", "client");
+        source_b
+            .labels
+            .extend(labels(&[("conformance-source", "selected")]));
+        source_b
+            .namespace_labels
+            .extend(labels(&[("conformance-group", "b")]));
+        let destination = endpoint(4, "backend", "server");
+
+        let expression_selector = |group: &str| LabelSelector {
+            match_expressions: Some(vec![expression("conformance-group", "In", &[group])]),
+            ..LabelSelector::default()
+        };
+        let selected_source = LabelSelector {
+            match_expressions: Some(vec![
+                expression("conformance-source", "In", &["selected"]),
+                expression("blocked", "DoesNotExist", &[]),
+            ]),
+            ..LabelSelector::default()
+        };
+        let rule = |group: &str, port: i32| NetworkPolicyIngressRule {
+            from: Some(vec![NetworkPolicyPeer {
+                namespace_selector: Some(expression_selector(group)),
+                pod_selector: Some(selected_source.clone()),
+                ..NetworkPolicyPeer::default()
+            }]),
+            ports: Some(vec![NetworkPolicyPort {
+                port: Some(IntOrString::Int(port)),
+                protocol: Some("TCP".to_owned()),
+                ..NetworkPolicyPort::default()
+            }]),
+        };
+        let compiled = NetworkPolicyCompiler::compile(
+            PolicyId::new(14),
+            policy(vec![rule("a", 8087), rule("b", 8088)]),
+        )
+        .expect("multiple expression-based ingress rules compile");
+        let verdict = |source: &Endpoint, port| {
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: port,
+                    source_ipv4: None,
+                    source_ipv6: None,
+                },
+            )
+            .verdict
+        };
+
+        assert_eq!(verdict(&source_a, 8087), Verdict::Allow);
+        assert_eq!(verdict(&source_a, 8088), Verdict::Deny);
+        assert_eq!(verdict(&source_b, 8087), Verdict::Deny);
+        assert_eq!(verdict(&source_b, 8088), Verdict::Allow);
+        assert_eq!(verdict(&same_namespace, 8087), Verdict::Deny);
+        assert_eq!(verdict(&same_namespace, 8088), Verdict::Deny);
+
+        source_b
+            .labels
+            .insert("blocked".to_owned(), "true".to_owned());
+        assert_eq!(verdict(&source_b, 8088), Verdict::Deny);
+    }
+
+    #[test]
     fn named_ports_resolve_against_each_destination() {
         let compiled = NetworkPolicyCompiler::compile(
             PolicyId::new(7),

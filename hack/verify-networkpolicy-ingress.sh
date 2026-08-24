@@ -256,6 +256,33 @@ expect_deny "${source_a_namespace}" client 8087
 
 previous_revision=${policy_revision}
 "${kc[@]}" patch networkpolicy -n "${target_namespace}" ingress-matrix --type=merge \
+    -p '{"spec":{"ingress":[{"from":[{"namespaceSelector":{"matchExpressions":[{"key":"conformance-group","operator":"In","values":["a"]}]},"podSelector":{"matchExpressions":[{"key":"conformance-source","operator":"In","values":["selected"]},{"key":"blocked","operator":"DoesNotExist"}]}}],"ports":[{"protocol":"TCP","port":8087}]},{"from":[{"namespaceSelector":{"matchExpressions":[{"key":"conformance-group","operator":"In","values":["b"]}]},"podSelector":{"matchExpressions":[{"key":"conformance-source","operator":"Exists"},{"key":"blocked","operator":"DoesNotExist"}]}}],"ports":[{"protocol":"TCP","port":8088}]}]}}' \
+    >/dev/null
+require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
+    "${previous_revision}" "expression-based multi-rule policy did not converge"
+expect_allow "${source_a_namespace}" client 8087
+expect_deny "${source_a_namespace}" client 8088
+expect_deny "${source_b_namespace}" client 8087
+expect_allow "${source_b_namespace}" client 8088
+expect_deny "${target_namespace}" same-client 8087
+expect_deny "${target_namespace}" same-client 8088
+expect_explanation "${source_a_namespace}/client" 8087 Allow ExplicitRule
+expect_explanation "${source_b_namespace}/client" 8088 Allow ExplicitRule
+
+previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${source_b_namespace}" client blocked=true --overwrite >/dev/null
+require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
+    "${previous_revision}" "DoesNotExist source-label transition did not converge"
+expect_deny "${source_b_namespace}" client 8088
+
+previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${source_b_namespace}" client blocked- >/dev/null
+require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
+    "${previous_revision}" "DoesNotExist source-label recovery did not converge"
+expect_allow "${source_b_namespace}" client 8088
+
+previous_revision=${policy_revision}
+"${kc[@]}" patch networkpolicy -n "${target_namespace}" ingress-matrix --type=merge \
     -p '{"spec":{"ingress":[{"from":[{"namespaceSelector":{"matchLabels":{"conformance-group":"a"}}}],"ports":[{"protocol":"TCP","port":8087}]}]}}' \
     >/dev/null
 "${kc[@]}" apply -f - >/dev/null <<EOF
@@ -337,4 +364,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned ingress conformance passed: default deny, same-namespace PodSelector, empty NamespaceSelector, selector AND, peer OR, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned ingress conformance passed: default deny, same-namespace PodSelector, empty NamespaceSelector, selector AND, peer OR, matchExpressions with label recovery, multiple ingress rules, stacked additive policies, and allow-all precedence"

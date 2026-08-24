@@ -19,6 +19,8 @@ and the upstream
 | An empty `namespaceSelector` selects every Namespace | All three source Namespaces reach TCP/8087 while TCP/8088 remains isolated | Unit matrix and two-node traffic |
 | `podSelector` and `namespaceSelector` in one peer are ANDed | Only the selected Pod in source Namespace A is allowed | Unit matrix, explanation, and two-node traffic |
 | Separate peers in one `from` list are ORed | The same-Namespace Pod or any Pod from source Namespace B is allowed | Unit matrix and two-node traffic |
+| Pod and Namespace `matchExpressions` retain selector semantics | `In`, `Exists`, and `DoesNotExist` combine within peers; adding/removing the excluded Pod label denies and restores traffic after revision convergence | Unit matrix, two-node label mutation, and recovery traffic |
+| Separate ingress rules are additive without mixing their peer/port pairs | Namespace A reaches only TCP/8087 while Namespace B reaches only TCP/8088; the same-Namespace source reaches neither | Unit matrix, explanations, and two-node traffic |
 | Selecting policies combine allows additively | One policy allows Namespace A on TCP/8087 and another allows Namespace B on TCP/8088 | Existing additive evaluator test plus two-node traffic |
 | An allow-all policy takes precedence over other isolation policies | A temporary `ingress: [{}]` permits both ports from every source; deletion restores the stacked rules | Two-node mutation and recovery traffic |
 

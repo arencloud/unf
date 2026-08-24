@@ -70,7 +70,8 @@ Implemented in the repository:
   IPv4/IPv6 `ipBlock`
   enforcement and rejection recovery, named/protocol-only SCTP enforcement,
   namespace-wide target isolation/defaulting, same-Namespace and all-Namespace
-  peers, peer OR/selector AND semantics, stacked additive allows and allow-all
+  peers, peer OR/selector AND semantics, Pod/Namespace expressions, multiple
+  ingress rules, label-driven recovery, stacked additive allows and allow-all
   recovery, revisioned eBPF provenance, and live policy explanations, plus a
   versioned EndpointSlice backend-readiness lifecycle.
 

@@ -55,7 +55,9 @@ matrix and reproducible evidence.
   rejection/deletion recovery; IPv4 SCTP parsing/enforcement, live explanation,
   revisioned provenance, and historical export; an upstream-aligned live ingress
   matrix for default deny, same/all-Namespace peers, selector AND, peer OR,
-  stacked additive policies, and allow-all precedence/recovery;
+  Pod/Namespace `matchExpressions`, multiple ingress-rule source/port pairing,
+  label-driven recovery, stacked additive policies, and allow-all
+  precedence/recovery;
   revision-fenced, read-only native policy simulation over a bounded
   current-topology probe matrix; versioned Node,
   workload-placement, Service, and selector-membership topology snapshots;
