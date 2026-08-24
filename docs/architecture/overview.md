@@ -27,8 +27,8 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
 
 ## Phase 1 through 3 data flows
 
-1. kube-rs watches Nodes, Pods, Namespaces, Services, SecurityPolicies, and
-   NetworkPolicies.
+1. kube-rs watches Nodes, Pods, Namespaces, Services, EndpointSlices,
+   SecurityPolicies, and NetworkPolicies.
 2. Pod metadata becomes provisional network identities. Namespace labels remain
    separate selector metadata, while policy-relevant named-port mappings join the
    canonical identity key so incompatible destinations cannot alias.
@@ -36,8 +36,9 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    the same provenance-preserving IR; unsupported compatibility objects are
    rejected without retaining stale compiled state.
 4. `unfctl topology` queries a versioned snapshot of Nodes, Pod placement,
-   Services, and selector-derived Service membership. `unfctl explain` asks the
-   controller to resolve two Pods and evaluate the IR.
+   Services, selector-derived intent, and EndpointSlice runtime backends with
+   readiness/serving/termination state. `unfctl explain` asks the controller to
+   resolve two Pods and evaluate the IR.
    `unfctl policy simulate` compiles a candidate without applying it and compares
    current/proposed decisions over a probe matrix fenced to the reported topology
    revision.

@@ -34,8 +34,8 @@ verdict and full-decision change counts; affected workloads; and each changed
 flow with current/proposed provenance. `unfctl policy simulate <file>` exposes the
 API in table, JSON, or YAML form. It also evaluates the bounded ADR 0012 history,
 reports observation-weighted impact and unresolved-flow skips separately, and
-identifies selector-affected Services. Schema v1 was the representative-matrix-only
-foundation.
+identifies Services affected through selector intent or ready EndpointSlice Pod
+backends. Schema v1 was the representative-matrix-only foundation.
 
 ## Alternatives
 

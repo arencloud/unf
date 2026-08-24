@@ -200,8 +200,10 @@ fn print_table(value: &Value) {
         print_flow_history_table(value);
         return;
     }
-    if value.get("schema_version").and_then(Value::as_u64) == Some(1)
-        && value.get("nodes").is_some()
+    if matches!(
+        value.get("schema_version").and_then(Value::as_u64),
+        Some(1 | 2)
+    ) && value.get("nodes").is_some()
         && value.get("workloads").is_some()
         && value.get("services").is_some()
     {
@@ -354,12 +356,37 @@ fn print_topology_table(value: &Value) {
                     .join(",")
             })
             .unwrap_or_default();
+        let backends = service["backends"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice);
+        let ready_backends = backends
+            .iter()
+            .filter(|backend| {
+                backend["ready"].as_bool().unwrap_or(false)
+                    && !backend["terminating"].as_bool().unwrap_or(false)
+            })
+            .count();
         println!(
-            "service                  {} type={} selected={}",
+            "service                  {} type={} selected={} ready_backends={}/{}",
             text_field(service, "reference"),
             text_field(service, "service_type"),
-            if selected.is_empty() { "-" } else { &selected }
+            if selected.is_empty() { "-" } else { &selected },
+            ready_backends,
+            backends.len()
         );
+        for backend in backends {
+            println!(
+                "backend                  service={} workload={} addresses={} ready={} serving={} terminating={} node={} zone={}",
+                text_field(service, "reference"),
+                backend["target_workload"].as_str().unwrap_or("-"),
+                joined_strings(&backend["addresses"]),
+                backend["ready"].as_bool().unwrap_or(false),
+                backend["serving"].as_bool().unwrap_or(false),
+                backend["terminating"].as_bool().unwrap_or(false),
+                backend["node_name"].as_str().unwrap_or("-"),
+                backend["zone"].as_str().unwrap_or("-")
+            );
+        }
     }
 }
 

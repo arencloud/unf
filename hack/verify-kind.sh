@@ -150,6 +150,48 @@ wait_for_topology_transition() {
     return 1
 }
 
+wait_for_topology_probe_backend() {
+    local floor_revision=$1
+    local expected_ready=$2
+    local snapshot compact revision
+    for _ in {1..30}; do
+        snapshot=$("${unfctl}" \
+            --controller-url "http://127.0.0.1:${controller_port}" --output json topology)
+        compact=$(tr -d '\n' <<<"${snapshot}")
+        revision=$(sed -nE 's/.*"revision": ([0-9]+).*/\1/p' <<<"${snapshot}")
+        if [[ -n ${revision} && ${revision} -gt ${floor_revision} ]] \
+            && grep -q '"reference": "frontend/topology-probe"' <<<"${compact}" \
+            && grep -q "\"endpoint_slice\": \"frontend/topology-probe-manual\".*\"ready\": ${expected_ready}.*\"target_workload\": \"frontend/client\"" \
+                <<<"${compact}"; then
+            topology_state_revision=${revision}
+            topology_probe_snapshot=${snapshot}
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+wait_for_topology_probe_backend_removal() {
+    local floor_revision=$1
+    local snapshot compact revision
+    for _ in {1..30}; do
+        snapshot=$("${unfctl}" \
+            --controller-url "http://127.0.0.1:${controller_port}" --output json topology)
+        compact=$(tr -d '\n' <<<"${snapshot}")
+        revision=$(sed -nE 's/.*"revision": ([0-9]+).*/\1/p' <<<"${snapshot}")
+        if [[ -n ${revision} && ${revision} -gt ${floor_revision} ]] \
+            && grep -q '"reference": "frontend/topology-probe"' <<<"${compact}" \
+            && ! grep -q '"endpoint_slice": "frontend/topology-probe-manual"' \
+                <<<"${compact}"; then
+            topology_state_revision=${revision}
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 wait_for_historical_demo_flow() {
     local snapshot
     for _ in {1..30}; do
@@ -197,6 +239,7 @@ grep -Eq '"identities": [1-9][0-9]*' <<<"${controller_status}"
 grep -Eq '"indexed_pod_ips": [1-9][0-9]*' <<<"${controller_status}"
 grep -Eq '"resolved_policy_entries": [1-9][0-9]*' <<<"${controller_status}"
 grep -Eq '"network_policies": [1-9][0-9]*' <<<"${controller_status}"
+grep -Eq '"endpoint_slices": [1-9][0-9]*' <<<"${controller_status}"
 grep -q '"rejected_network_policies": 0' <<<"${controller_status}"
 
 allow_explanation=$("${unfctl}" \
@@ -300,7 +343,7 @@ initial_policy_revision=${expected_policy_revision}
 
 initial_topology=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json topology)
-grep -q '"schema_version": 1' <<<"${initial_topology}"
+grep -q '"schema_version": 2' <<<"${initial_topology}"
 grep -Eq '"revision": [1-9][0-9]*' <<<"${initial_topology}"
 grep -Eq '"identity_revision": [1-9][0-9]*' <<<"${initial_topology}"
 grep -q '"name": "unf-dev-control-plane"' <<<"${initial_topology}"
@@ -316,19 +359,35 @@ initial_topology_revision=$(sed -nE 's/.*"revision": ([0-9]+).*/\1/p' \
 
 "${kc[@]}" apply -f "${project_root}/deploy/examples/topology-probe.yaml" >/dev/null
 topology_service_created=true
-if ! wait_for_topology_transition "${initial_topology_revision}"; then
-    echo "controller did not advance topology after Service creation" >&2
+if ! wait_for_topology_probe_backend "${initial_topology_revision}" false; then
+    echo "controller did not expose the not-ready EndpointSlice backend" >&2
     exit 1
 fi
 created_topology_revision=${topology_state_revision}
-created_topology=$("${unfctl}" \
-    --controller-url "http://127.0.0.1:${controller_port}" --output json topology)
-grep -q '"reference": "frontend/topology-probe"' <<<"${created_topology}"
-grep -q '"selected_workloads": \[' <<<"${created_topology}"
-grep -q '"frontend/client"' <<<"${created_topology}"
+compact_topology_probe=$(tr -d '\n' <<<"${topology_probe_snapshot}")
+grep -q '"selected_workloads": \[\]' <<<"${compact_topology_probe}"
+grep -q '"serving": true' <<<"${compact_topology_probe}"
+grep -q '"terminating": false' <<<"${compact_topology_probe}"
+grep -q '"port": 8080' <<<"${compact_topology_probe}"
 
-"${kc[@]}" delete -f "${project_root}/deploy/examples/topology-probe.yaml" >/dev/null
-if ! wait_for_topology_transition "${created_topology_revision}"; then
+"${kc[@]}" patch endpointslice -n frontend topology-probe-manual --type=json \
+    -p '[{"op":"replace","path":"/endpoints/0/conditions/ready","value":true}]' >/dev/null
+if ! wait_for_topology_probe_backend "${created_topology_revision}" true; then
+    echo "controller did not advance topology after EndpointSlice readiness changed" >&2
+    exit 1
+fi
+ready_topology_revision=${topology_state_revision}
+
+"${kc[@]}" delete endpointslice -n frontend topology-probe-manual >/dev/null
+if ! wait_for_topology_probe_backend_removal "${ready_topology_revision}"; then
+    echo "controller did not remove the deleted EndpointSlice backend" >&2
+    exit 1
+fi
+backend_removed_topology_revision=${topology_state_revision}
+
+"${kc[@]}" delete -f "${project_root}/deploy/examples/topology-probe.yaml" \
+    --ignore-not-found >/dev/null
+if ! wait_for_topology_transition "${backend_removed_topology_revision}"; then
     echo "controller did not advance topology after Service deletion" >&2
     exit 1
 fi
@@ -839,4 +898,4 @@ if "${kc[@]}" exec -n frontend client -- \
     exit 1
 fi
 
-echo "kind verification passed: bounded historical flow export, history-aware simulation, versioned topology, native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: EndpointSlice backend readiness, bounded historical flow export, history-aware simulation, versioned topology, native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"

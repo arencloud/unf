@@ -84,11 +84,13 @@ named-port resolution, protocol-only TCP activation/removal without UDP
 broadening, bounded `endPort` boundary enforcement and oversized-range rejection,
 bounded IPv4 `ipBlock` allow/exception behavior and oversized-block rejection,
 Namespace relabel, and deletion/recreation convergence.
-The verifier also queries topology schema v1, creates and removes a selector
-Service, and requires both Service membership and independent topology revision
-transitions. It also requires agents to export the live frontend-to-backend flow,
-queries bounded history, and verifies observation-weighted historical policy
-impact.
+The verifier also queries topology schema v2 and creates a selectorless Service
+with a manually managed EndpointSlice. It requires the backend to transition from
+not ready to ready, verifies deletion removes runtime state while selector intent
+stays empty, and proves the independent topology/service revisions advance without
+changing policy revision. It also requires agents to export the live
+frontend-to-backend flow, queries bounded history, and verifies
+observation-weighted historical policy impact.
 The host kernel is shared with kind nodes. `make kind-down`
 deletes only the named `unf-dev` cluster.
 
@@ -100,8 +102,8 @@ target/debug/unfctl --controller-url http://127.0.0.1:9962 \
 ```
 
 The result is fenced to the reported identity epoch/revision, policy revision,
-and topology revision. Inspect the same current Node/workload/Service
-relationships with:
+and topology revision. Inspect the same current Node/workload/Service and runtime
+backend relationships with:
 
 ```bash
 target/debug/unfctl --controller-url http://127.0.0.1:9962 topology

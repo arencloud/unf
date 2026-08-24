@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Service};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::runtime::watcher::{self, Event};
@@ -34,8 +35,9 @@ use unf_state::{
     FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowHistorySnapshot,
     FlowHistoryStore, IdentityRegistry, IdentityStateSnapshot, NetworkIdentity,
     POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyStateSnapshot, RevisionSet,
-    TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode, TopologyService, TopologyServicePort,
-    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
+    TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode, TopologyService, TopologyServiceBackend,
+    TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
+    provisional_identity_id,
 };
 
 #[derive(Debug, Parser)]
@@ -63,6 +65,7 @@ struct ControllerState {
     pods: RwLock<BTreeMap<String, PodRecord>>,
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
     services: RwLock<BTreeMap<String, ServiceRecord>>,
+    endpoint_slices: RwLock<BTreeMap<String, EndpointSliceRecord>>,
     namespaces: RwLock<BTreeMap<String, BTreeMap<String, String>>>,
     security_policies: RwLock<BTreeMap<String, SecurityPolicy>>,
     compiled_security_policies: RwLock<BTreeMap<String, PolicyIr>>,
@@ -96,6 +99,12 @@ struct ServiceRecord {
     ports: Vec<TopologyServicePort>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EndpointSliceRecord {
+    service_reference: String,
+    backends: Vec<TopologyServiceBackend>,
+}
+
 #[derive(Debug, Serialize)]
 struct StatusBody {
     component: &'static str,
@@ -105,6 +114,7 @@ struct StatusBody {
     pods: usize,
     nodes: usize,
     services: usize,
+    endpoint_slices: usize,
     namespaces: usize,
     security_policies: usize,
     network_policies: usize,
@@ -345,6 +355,7 @@ fn new_state(offline: bool) -> ControllerState {
         pods: RwLock::new(BTreeMap::new()),
         nodes: RwLock::new(BTreeMap::new()),
         services: RwLock::new(BTreeMap::new()),
+        endpoint_slices: RwLock::new(BTreeMap::new()),
         namespaces: RwLock::new(BTreeMap::new()),
         security_policies: RwLock::new(BTreeMap::new()),
         compiled_security_policies: RwLock::new(BTreeMap::new()),
@@ -392,6 +403,18 @@ fn spawn_watchers(
     let service_api = Api::<Service>::all(client.clone());
     tasks.spawn(async move {
         watch_services(service_api, service_state, service_cancel).await;
+    });
+
+    let endpoint_slice_state = Arc::clone(&state);
+    let endpoint_slice_cancel = cancellation.clone();
+    let endpoint_slice_api = Api::<EndpointSlice>::all(client.clone());
+    tasks.spawn(async move {
+        watch_endpoint_slices(
+            endpoint_slice_api,
+            endpoint_slice_state,
+            endpoint_slice_cancel,
+        )
+        .await;
     });
 
     let policy_api = Api::<SecurityPolicy>::all(client.clone());
@@ -867,6 +890,153 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
     })
 }
 
+async fn watch_endpoint_slices(
+    api: Api<EndpointSlice>,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    let stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    tokio::pin!(stream);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            item = stream.try_next() => match item {
+                Ok(Some(event)) => apply_endpoint_slice_event(&state, event),
+                Ok(None) => break,
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, "EndpointSlice watch error");
+                }
+            }
+        }
+    }
+}
+
+fn apply_endpoint_slice_event(state: &ControllerState, event: Event<EndpointSlice>) {
+    let _policy_state_guard = write_lock(&state.policy_state_guard);
+    match event {
+        Event::Apply(endpoint_slice) | Event::InitApply(endpoint_slice) => {
+            let key = object_key(&endpoint_slice);
+            match endpoint_slice_record(&endpoint_slice) {
+                Ok(record) => {
+                    let previous = write_lock(&state.endpoint_slices).insert(key, record.clone());
+                    state.metrics.reconciles.inc();
+                    if previous.as_ref() != Some(&record) {
+                        bump_service_and_topology_revision(state);
+                    }
+                }
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    if write_lock(&state.endpoint_slices).remove(&key).is_some() {
+                        bump_service_and_topology_revision(state);
+                    }
+                    warn!(%error, %key, "EndpointSlice topology admission failed");
+                }
+            }
+        }
+        Event::Delete(endpoint_slice) => {
+            if write_lock(&state.endpoint_slices)
+                .remove(&object_key(&endpoint_slice))
+                .is_some()
+            {
+                bump_service_and_topology_revision(state);
+            }
+        }
+        Event::Init => {
+            let had_endpoint_slices = !read_lock(&state.endpoint_slices).is_empty();
+            write_lock(&state.endpoint_slices).clear();
+            if had_endpoint_slices {
+                bump_service_and_topology_revision(state);
+            }
+        }
+        Event::InitDone => {}
+    }
+}
+
+fn endpoint_slice_record(endpoint_slice: &EndpointSlice) -> Result<EndpointSliceRecord> {
+    let namespace = endpoint_slice.namespace().ok_or_else(|| {
+        anyhow!(
+            "EndpointSlice {} is missing namespace",
+            endpoint_slice.name_any()
+        )
+    })?;
+    let name = endpoint_slice.name_any();
+    let service_name = endpoint_slice
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("kubernetes.io/service-name"))
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            anyhow!("EndpointSlice {namespace}/{name} is missing kubernetes.io/service-name")
+        })?;
+    let slice_reference = format!("{namespace}/{name}");
+    let ports = endpoint_slice
+        .ports
+        .iter()
+        .flatten()
+        .map(|port| {
+            let number = port.port.map(u16::try_from).transpose().with_context(|| {
+                format!("EndpointSlice {slice_reference} contains a port outside the u16 range")
+            })?;
+            if number == Some(0) {
+                return Err(anyhow!(
+                    "EndpointSlice {slice_reference} cannot contain port zero"
+                ));
+            }
+            Ok(TopologyServiceBackendPort {
+                name: port.name.clone(),
+                protocol: port.protocol.clone().unwrap_or_else(|| "TCP".to_owned()),
+                port: number,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut ports = ports;
+    ports.sort();
+
+    let mut backends = Vec::with_capacity(endpoint_slice.endpoints.len());
+    for endpoint in &endpoint_slice.endpoints {
+        let mut addresses = endpoint.addresses.clone();
+        addresses.sort();
+        addresses.dedup();
+        let conditions = endpoint.conditions.as_ref();
+        let ready = conditions.and_then(|value| value.ready).unwrap_or(true);
+        let serving = conditions.and_then(|value| value.serving).unwrap_or(ready);
+        let terminating = conditions
+            .and_then(|value| value.terminating)
+            .unwrap_or(false);
+        let target_workload = endpoint.target_ref.as_ref().and_then(|target| {
+            if target.kind.as_deref() != Some("Pod") {
+                return None;
+            }
+            target.name.as_ref().map(|name| {
+                format!(
+                    "{}/{}",
+                    target.namespace.as_deref().unwrap_or(&namespace),
+                    name
+                )
+            })
+        });
+        backends.push(TopologyServiceBackend {
+            endpoint_slice: slice_reference.clone(),
+            address_type: endpoint_slice.address_type.clone(),
+            addresses,
+            target_workload,
+            node_name: endpoint.node_name.clone(),
+            zone: endpoint.zone.clone(),
+            ready,
+            serving,
+            terminating,
+            ports: ports.clone(),
+        });
+    }
+    backends.sort();
+    Ok(EndpointSliceRecord {
+        service_reference: format!("{namespace}/{service_name}"),
+        backends,
+    })
+}
+
 async fn watch_policies(
     api: Api<SecurityPolicy>,
     state: Arc<ControllerState>,
@@ -1068,6 +1238,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         pods: read_lock(&state.pods).len(),
         nodes: read_lock(&state.nodes).len(),
         services: read_lock(&state.services).len(),
+        endpoint_slices: read_lock(&state.endpoint_slices).len(),
         namespaces: read_lock(&state.namespaces).len(),
         security_policies: read_lock(&state.security_policies).len(),
         network_policies: read_lock(&state.network_policies).len(),
@@ -1117,6 +1288,17 @@ async fn topology(State(state): State<Arc<ControllerState>>) -> Json<TopologySta
 
 fn topology_snapshot(state: &ControllerState) -> TopologyStateSnapshot {
     let pods = read_lock(&state.pods);
+    let mut service_backends: BTreeMap<String, Vec<TopologyServiceBackend>> = BTreeMap::new();
+    for endpoint_slice in read_lock(&state.endpoint_slices).values() {
+        service_backends
+            .entry(endpoint_slice.service_reference.clone())
+            .or_default()
+            .extend(endpoint_slice.backends.iter().cloned());
+    }
+    for backends in service_backends.values_mut() {
+        backends.sort();
+        backends.dedup();
+    }
     let nodes = read_lock(&state.nodes).values().cloned().collect();
     let workloads = pods
         .iter()
@@ -1158,6 +1340,7 @@ fn topology_snapshot(state: &ControllerState) -> TopologyStateSnapshot {
                 selector: service.selector.clone(),
                 ports: service.ports.clone(),
                 selected_workloads,
+                backends: service_backends.get(reference).cloned().unwrap_or_default(),
             }
         })
         .collect();
@@ -1461,18 +1644,37 @@ fn simulation_affected_services(
     pods: &[PodRecord],
     affected_destinations: &BTreeSet<usize>,
 ) -> Vec<String> {
+    let affected_workloads: BTreeSet<_> = affected_destinations
+        .iter()
+        .map(|index| format!("{}/{}", pods[*index].namespace, pods[*index].name))
+        .collect();
+    let runtime_services: BTreeSet<_> = read_lock(&state.endpoint_slices)
+        .values()
+        .filter(|endpoint_slice| {
+            endpoint_slice.backends.iter().any(|backend| {
+                backend.ready
+                    && !backend.terminating
+                    && backend
+                        .target_workload
+                        .as_ref()
+                        .is_some_and(|target| affected_workloads.contains(target))
+            })
+        })
+        .map(|endpoint_slice| endpoint_slice.service_reference.clone())
+        .collect();
     read_lock(&state.services)
         .iter()
-        .filter(|(_, service)| {
-            !service.selector.is_empty()
-                && affected_destinations.iter().any(|index| {
-                    let pod = &pods[*index];
-                    pod.namespace == service.namespace
-                        && service
-                            .selector
-                            .iter()
-                            .all(|(key, value)| pod.endpoint.labels.get(key) == Some(value))
-                })
+        .filter(|(reference, service)| {
+            runtime_services.contains(*reference)
+                || (!service.selector.is_empty()
+                    && affected_destinations.iter().any(|index| {
+                        let pod = &pods[*index];
+                        pod.namespace == service.namespace
+                            && service
+                                .selector
+                                .iter()
+                                .all(|(key, value)| pod.endpoint.labels.get(key) == Some(value))
+                    }))
         })
         .map(|(reference, _)| reference.clone())
         .collect()
@@ -2087,6 +2289,37 @@ mod tests {
         .expect("test Service is valid Kubernetes JSON")
     }
 
+    fn endpoint_slice(ready: bool) -> EndpointSlice {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "client-abc",
+                "namespace": "frontend",
+                "labels": {"kubernetes.io/service-name": "client"}
+            },
+            "addressType": "IPv4",
+            "ports": [{"name": "http", "protocol": "TCP", "port": 8080}],
+            "endpoints": [{
+                "addresses": ["10.42.0.10"],
+                "conditions": {
+                    "ready": ready,
+                    "serving": true,
+                    "terminating": false
+                },
+                "nodeName": "worker-a",
+                "zone": "zone-a",
+                "targetRef": {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "namespace": "frontend",
+                    "name": "client"
+                }
+            }]
+        }))
+        .expect("test EndpointSlice is valid Kubernetes JSON")
+    }
+
     fn flow_batch(observed_events: u64) -> FlowExportBatch {
         FlowExportBatch {
             schema_version: FLOW_EXPORT_SCHEMA_VERSION,
@@ -2305,6 +2538,7 @@ mod tests {
         assert_eq!(snapshot.workloads[0].node_name.as_deref(), Some("worker-a"));
         assert_eq!(snapshot.services.len(), 1);
         assert_eq!(snapshot.services[0].selected_workloads, ["frontend/client"]);
+        assert!(snapshot.services[0].backends.is_empty());
         assert_eq!(
             snapshot.services[0].ports[0].target_port.as_deref(),
             Some("8080")
@@ -2320,6 +2554,55 @@ mod tests {
         assert_eq!(mutex_lock(&state.revisions).service, Revision::new(2));
         assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(3));
         assert!(topology_snapshot(&state).services.is_empty());
+    }
+
+    #[test]
+    fn endpoint_slice_readiness_is_revisioned_and_removes_stale_state() {
+        let state = new_state(true);
+        write_lock(&state.pods).insert(
+            "frontend/client".to_owned(),
+            pod_record(1, "frontend", "client", "client"),
+        );
+        apply_service_event(&state, Event::Apply(service()));
+
+        apply_endpoint_slice_event(&state, Event::Apply(endpoint_slice(false)));
+        assert_eq!(mutex_lock(&state.revisions).service, Revision::new(2));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(2));
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::default());
+        let snapshot = topology_snapshot(&state);
+        assert_eq!(snapshot.schema_version, 2);
+        assert_eq!(snapshot.services[0].selected_workloads, ["frontend/client"]);
+        assert_eq!(snapshot.services[0].backends.len(), 1);
+        let backend = &snapshot.services[0].backends[0];
+        assert_eq!(backend.target_workload.as_deref(), Some("frontend/client"));
+        assert_eq!(backend.addresses, ["10.42.0.10"]);
+        assert!(!backend.ready);
+        assert!(backend.serving);
+        assert!(!backend.terminating);
+        assert_eq!(backend.ports[0].port, Some(8080));
+
+        let mut metadata_only = endpoint_slice(false);
+        metadata_only.metadata.resource_version = Some("2".to_owned());
+        apply_endpoint_slice_event(&state, Event::Apply(metadata_only));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(2));
+
+        apply_endpoint_slice_event(&state, Event::Apply(endpoint_slice(true)));
+        assert_eq!(mutex_lock(&state.revisions).service, Revision::new(3));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(3));
+        assert!(topology_snapshot(&state).services[0].backends[0].ready);
+
+        let mut malformed = endpoint_slice(true);
+        malformed.metadata.labels = None;
+        apply_endpoint_slice_event(&state, Event::Apply(malformed));
+        assert_eq!(mutex_lock(&state.revisions).service, Revision::new(4));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(4));
+        assert!(topology_snapshot(&state).services[0].backends.is_empty());
+
+        apply_endpoint_slice_event(&state, Event::Apply(endpoint_slice(true)));
+        apply_endpoint_slice_event(&state, Event::Delete(endpoint_slice(true)));
+        assert_eq!(mutex_lock(&state.revisions).service, Revision::new(6));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(6));
+        assert!(topology_snapshot(&state).services[0].backends.is_empty());
     }
 
     #[tokio::test]
@@ -2384,8 +2667,26 @@ mod tests {
                 name: "server".to_owned(),
                 service_type: "ClusterIP".to_owned(),
                 cluster_ips: BTreeSet::new(),
-                selector: BTreeMap::from([("app".to_owned(), "server".to_owned())]),
+                selector: BTreeMap::new(),
                 ports: Vec::new(),
+            },
+        );
+        write_lock(&state.endpoint_slices).insert(
+            "backend/server-abc".to_owned(),
+            EndpointSliceRecord {
+                service_reference: "backend/server".to_owned(),
+                backends: vec![TopologyServiceBackend {
+                    endpoint_slice: "backend/server-abc".to_owned(),
+                    address_type: "IPv4".to_owned(),
+                    addresses: vec!["10.42.1.20".to_owned()],
+                    target_workload: Some("backend/server".to_owned()),
+                    node_name: Some("worker-a".to_owned()),
+                    zone: None,
+                    ready: true,
+                    serving: true,
+                    terminating: false,
+                    ports: Vec::new(),
+                }],
             },
         );
         mutex_lock(&state.flow_history).ingest(flow_batch(12), 100);

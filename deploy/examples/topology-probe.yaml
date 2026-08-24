@@ -4,10 +4,36 @@ metadata:
   name: topology-probe
   namespace: frontend
 spec:
-  selector:
-    app.kubernetes.io/name: client
   ports:
     - name: http
       protocol: TCP
       port: 8080
       targetPort: 8080
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: topology-probe-manual
+  namespace: frontend
+  labels:
+    kubernetes.io/service-name: topology-probe
+    endpointslice.kubernetes.io/managed-by: unf-verifier
+addressType: IPv4
+ports:
+  - name: http
+    protocol: TCP
+    port: 8080
+endpoints:
+  - addresses:
+      - 10.244.0.250
+    conditions:
+      ready: false
+      serving: true
+      terminating: false
+    nodeName: unf-dev-control-plane
+    zone: test-zone
+    targetRef:
+      apiVersion: v1
+      kind: Pod
+      namespace: frontend
+      name: client

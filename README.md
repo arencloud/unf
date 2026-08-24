@@ -16,7 +16,8 @@ The supported ingress `NetworkPolicy` slices are live-verified through the same
 controller, policy engine, and dataplane. A read-only policy simulation foundation
 now compares candidate native policy against revision-fenced live topology without
 applying it. Versioned topology snapshots expose Nodes, workload placement,
-Services, and selector-derived Service membership. Node agents also export
+Services, selector intent, and EndpointSlice-derived runtime backend readiness.
+Node agents also export
 destination-resolved flow observations into bounded, revisioned in-memory history
 for operator queries and policy impact analysis.
 See the authoritative
@@ -37,7 +38,7 @@ Implemented in the repository:
   ports, bounded inclusive TCP/UDP `endPort` ranges, bounded IPv4 `ipBlock` peers
   with `except`, deterministic exact/wildcard-key lowering, and explicit
   compiler/dataplane capacity limits;
-- a kube-rs controller watching Nodes, Pods, Namespaces, Services,
+- a kube-rs controller watching Nodes, Pods, Namespaces, Services, EndpointSlices,
   SecurityPolicies, and NetworkPolicies, with accepted/rejected compatibility
   status;
 - controller health, readiness, metrics, status, and userspace explanation APIs;
@@ -57,7 +58,7 @@ Implemented in the repository:
   allow/drop, namespace-selector convergence, rejection/deletion recovery, shadow
   pass-through, protocol-only port activation/recovery, bounded range/ipBlock
   enforcement and rejection recovery, revisioned eBPF provenance, and live
-  policy explanations, plus a versioned Service relationship lifecycle.
+  policy explanations, plus a versioned EndpointSlice backend-readiness lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
 multi-cluster transport, or production fail-closed recovery.

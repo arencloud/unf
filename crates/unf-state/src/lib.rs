@@ -9,7 +9,7 @@ use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
-pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 1;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
@@ -265,6 +265,27 @@ pub struct TopologyServicePort {
     pub target_port: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TopologyServiceBackendPort {
+    pub name: Option<String>,
+    pub protocol: String,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TopologyServiceBackend {
+    pub endpoint_slice: String,
+    pub address_type: String,
+    pub addresses: Vec<String>,
+    pub target_workload: Option<String>,
+    pub node_name: Option<String>,
+    pub zone: Option<String>,
+    pub ready: bool,
+    pub serving: bool,
+    pub terminating: bool,
+    pub ports: Vec<TopologyServiceBackendPort>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopologyService {
     pub reference: String,
@@ -275,6 +296,7 @@ pub struct TopologyService {
     pub selector: BTreeMap<String, String>,
     pub ports: Vec<TopologyServicePort>,
     pub selected_workloads: Vec<String>,
+    pub backends: Vec<TopologyServiceBackend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -776,6 +798,22 @@ mod tests {
                     target_port: Some("8080".to_owned()),
                 }],
                 selected_workloads: vec!["frontend/client".to_owned()],
+                backends: vec![TopologyServiceBackend {
+                    endpoint_slice: "frontend/client-abc".to_owned(),
+                    address_type: "IPv4".to_owned(),
+                    addresses: vec!["10.42.0.10".to_owned()],
+                    target_workload: Some("frontend/client".to_owned()),
+                    node_name: Some("worker-a".to_owned()),
+                    zone: Some("zone-a".to_owned()),
+                    ready: true,
+                    serving: true,
+                    terminating: false,
+                    ports: vec![TopologyServiceBackendPort {
+                        name: Some("http".to_owned()),
+                        protocol: "TCP".to_owned(),
+                        port: Some(8080),
+                    }],
+                }],
             }],
         };
         let encoded = serde_json::to_vec(&snapshot).expect("topology snapshot serializes");

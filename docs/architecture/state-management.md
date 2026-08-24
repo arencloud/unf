@@ -13,17 +13,20 @@ into the collision-checked registry so entries and revision are snapshotted unde
 one lock. The snapshot also carries a controller-process epoch, allowing agents to
 distinguish a restart from a stale lower revision.
 
-Topology schema v1 is a controller query snapshot with the same process epoch.
-It joins semantic Node readiness/labels, Pod identity and node placement, and
-Service configuration. Service membership is derived from selectors against the
-watched Pod labels. Pod, Node, and Service changes advance the topology revision;
-Service changes also advance the service revision. Kubernetes resource versions
-and status fields outside this normalized model do not create revision churn.
-Topology-only placement and Service changes do not advance policy revision.
+Topology schema v2 is a controller query snapshot with the same process epoch. It
+joins semantic Node readiness/labels, Pod identity and placement, Service
+configuration/selector intent, and EndpointSlice runtime backends. Each backend
+retains address type/addresses, resolved Pod target, Node/zone, ports, and
+ready/serving/terminating conditions. Pod, Node, Service, and normalized
+EndpointSlice changes advance the topology revision; Service and EndpointSlice
+changes also advance the service revision. Kubernetes resource-version churn
+outside this model is ignored. Topology-only changes do not advance policy
+revision. Schema v1 remains the selector-intent-only predecessor. See
+[ADR 0011](../adr/0011-versioned-topology-snapshots.md).
 
-This relationship is selector intent, not an EndpointSlice readiness report.
-Runtime backend readiness and historical snapshot persistence remain future
-state domains. See [ADR 0011](../adr/0011-versioned-topology-snapshots.md).
+Backend readiness is current Kubernetes control-plane state, not an active
+traffic probe or load-balancing implementation. Historical snapshot persistence,
+pagination, and routing relationships remain future state domains.
 
 Telemetry revision advances when the controller accepts a changed node export.
 The current flow-history store retains 4,096 deterministic logical keys and

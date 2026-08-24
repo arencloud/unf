@@ -50,11 +50,13 @@ matrix and reproducible evidence.
   rejection/deletion recovery; revision-fenced, read-only native policy
   simulation over a bounded current-topology probe matrix; versioned Node,
   workload-placement, Service, and selector-membership topology snapshots;
+  EndpointSlice-backed runtime relationships with readiness, serving,
+  termination, Node/zone, Pod target, address, and port provenance;
   destination-resolved agent flow export through bounded non-blocking queues,
   revisioned 4,096-key controller history, `unfctl flows`, and
   observation-weighted historical simulation impact;
-- Next: broader ingress conformance, EndpointSlice-aware backend readiness, and
-  authenticated/durable telemetry transport with time-window queries;
+- Next: broader ingress conformance and authenticated/durable telemetry transport
+  with time-window queries;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, and OpenShift validation.
