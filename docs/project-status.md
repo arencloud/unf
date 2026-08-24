@@ -45,7 +45,8 @@ completed by Phase 1's observation-only shadow evaluation.
 | Topology state | Schema v3 returned 2 ready Nodes, 17 placed workloads, 5 Services, and 7 dual-stack non-host-network workloads; the EndpointSlice readiness/deletion lifecycle passed without policy-revision mutation |
 | Flow history | Schema v2 retained bounded IPv4, IPv6, and SCTP logical flows; direct IPv6 `frontend/client` → `backend/server` TCP/8080 was enriched with both workload references and exact addresses, while both agents reported zero export drops |
 | Transactional policy update | The verifier switched enforce → shadow → enforce and exercised TCP/SCTP protocol-wildcard plus IPv4/IPv6 block mutations, requiring a higher revision and opposite bank on every agent for single-resource transitions; snapshot schema v3 stages all three policy maps before one activation write |
-| Interruption recovery | With the controller scaled to zero, the server-node agent was deleted and its replacement became Ready from 14 pinned identity entries plus the validated active policy revision; TCP/8080 remained allowed and open TCP/9090 denied before the controller returned, then both agents accepted the restarted epoch and reconverged |
+| Transactional identity update | Identity ABI v2 staged IPv4 and IPv6 in inactive physical maps and activated both with one `IDENTITY_CONFIG` write; repeated Pod/label lifecycle mutations remained dual-stack enforced, and both nodes exposed the complete nine-pin `/sys/fs/bpf/unf/v2` set after the suite |
+| Interruption recovery | With the controller scaled to zero, the server-node agent was deleted and its replacement became Ready from 14 pinned identity entries plus validated identity epoch/revision/active bank and active policy revision; TCP/8080 remained allowed and open TCP/9090 denied before the controller returned, then both agents accepted the restarted epoch and reconverged |
 | Dataplane provenance | ABI v2 TCP and SCTP events matched the applied revision and carried nonzero identities plus actual/shadow policy and explicit-deny rule provenance |
 | NetworkPolicy lifecycle | Named port `allowed` resolved to TCP/8081; one `web` name resolved independently to TCP/8087 and TCP/8088 across two destination Pods while each opposite open port stayed denied; exact and protocol-only UDP rules allowed request/response traffic without broadening same-port TCP or non-matching peers, and deletion restored both protocols; the inclusive 8082–8083 range enforced both boundaries and excluded 8084; a protocol-only TCP entry allowed arbitrary TCP/9091 without allowing UDP/9091 and removal restored isolation; exact IPv4 and prefix IPv6 blocks allowed the client, nested exceptions denied it, and exception removal recovered; Namespace relabel removed/restored the allow without identity churn; oversized range/block updates removed stale state and recovered; deletion allowed 9091 and recreation restored the drop; omitted `podSelector`, `policyTypes`, and protocol produced namespace-wide/default-ingress/default-TCP behavior, while target narrowing restored non-isolated traffic; named SCTP and protocol-only SCTP rules enforced and reconverged across nodes |
 | Upstream-aligned ingress matrix | A disposable three-Namespace matrix proved exact/protocol-only UDP peer and TCP isolation with deletion recovery, destination-specific named-port resolution across two server Pods, destination Pod-label selection/isolation/recovery, default deny, same-Namespace PodSelector scope, empty/exact-name NamespaceSelector selection, Namespace `NotIn` exclusion, selector AND, peer OR, Pod/Namespace `matchExpressions`, source-label deny/recovery, source/port pairing across multiple ingress rules, stacked per-source/per-port additive allows, allow-all precedence, truthful explanations, and cleanup to the baseline policy counts |
@@ -83,14 +84,15 @@ gate.
 | Versioned BPF identity map schema | **Verified** | ABI tests plus `make kind-test` require populated IPv4 and IPv6 kernel maps on both agents |
 | Controller-to-agent revisioned distribution | **Verified** | Both node agents report desired/applied epoch and revision convergence; controller-restart recovery exercised live |
 | Controller-aggregated node acknowledgements | **Verified** | Schema v1 agent reports are validated and timestamped; controller/CLI status distinguishes expected, missing, stale, unexpected, and converged agents, while `make kind-test` requires both watched Nodes to match current identity/policy epoch and revisions |
+| Transactional identity map set | **Verified** | Identity ABI v2 stages separate inactive IPv4/IPv6 maps, validates both, and selects them with one `IDENTITY_CONFIG` write; ABI/agent tests cover the fixed config and recovery rules, while `make kind-test` exercises repeated identity changes, dual-stack enforcement, and offline restart recovery |
 | Selector-to-identity policy lowering | **Verified** | Unit tests cover exact/default, shadow provenance, conflicts, and deterministic ordering; `make kind-test` requires nonzero resolved entries |
 | Transactional policy map set | **Verified** | `make kind-test` stages a changed policy on the opposite bank, verifies a higher applied revision, restores it, and verifies reconvergence |
 | TC identity lookup | **Verified** | Cross-node IPv4 and IPv6 demo flows carry nonzero source and destination IDs |
 | L3/L4 policy decision | **Verified** | Exact/fallback active-bank lookup plus ABI v2 revision, verdict, reason, policy, rule, and shadow provenance |
 | Enforcement | **Verified** | `make kind-test` proves IPv4/IPv6 8080 allow and open-port 9090 drop, shadow pass-through, and restored drop |
 | Accurate live explanation | **Verified** | CLI actual decisions and IDs are checked while every traffic-path agent reports the active revision applied |
-| Pinned last-known-good restart recovery | **Verified** | Six-map all-or-none ABI directory, capacity/content validation, rollback-cache reconstruction, and fresh-start readiness fencing; `make kind-test` replaces the server-node agent with the controller offline, requires recovered revisions/readiness, and rechecks allow/drop before controller restoration |
-| Pressure and corruption failure injection | **In progress** | Malformed config plus mixed/corrupt identity/policy value rejection has unit coverage and partial-pin startup rejection is implemented; live map-pressure, partial-pin, mixed-identity-revision, and attachment-handoff fault scenarios remain |
+| Pinned last-known-good restart recovery | **Verified** | Nine-map all-or-none ABI v2 directory, capacity/content and active-config validation, two-bank cache reconstruction, and fresh-start readiness fencing; `make kind-test` replaces the server-node agent with the controller offline, requires recovered identity epoch/revisions/active-bank validation, and rechecks allow/drop before controller restoration |
+| Pressure and corruption failure injection | **In progress** | Malformed config plus corrupt identity/policy value rejection has unit coverage and partial-pin startup rejection is implemented; live map-pressure, partial-pin, inactive-stage, active-config corruption, and attachment-handoff fault scenarios remain |
 
 ## Current limitations
 
@@ -100,11 +102,11 @@ gate.
   initial/atomic Fragment, and AH are supported. Non-initial IPv4/IPv6
   fragments, IPv6 jumbograms, ESP/No Next Header, malformed or over-limit
   chains, and other protocols fail open.
-- Identity and compiled policy desired state remain in-memory, but their six
-  enforcement maps are pinned and strictly validated across agent restart.
-  Identity mutation remains single-bank, so a crash during reconciliation is
-  fenced on recovery rather than adopted; TC links remain process-owned, leaving
-  an attachment interval before the replacement agent reattaches.
+- Identity and compiled policy desired state remain in-memory, but their nine
+  dual-bank enforcement maps are pinned and strictly validated across agent
+  restart. TC links remain process-owned, leaving an attachment interval before
+  the replacement agent reattaches. ABI v1 pins require explicit operator cleanup
+  after a validated v2 rollout.
 - Unknown destination identities, missing/incompatible map config, invalid
   values, and absent identity/IP decisions fail open with revision-zero
   observed/identity-unknown provenance. Unknown source identities can be enforced
@@ -121,9 +123,10 @@ gate.
   channels/pending state and controller retention are bounded with explicit drop
   and eviction counters, but history is not durable, authenticated, sampled, or
   deduplicated across interface-level observations.
-- Topology schema v3 reports current in-memory Node, dual-stack Pod workload, Service intent,
-  and EndpointSlice runtime relationships. Conditions are Kubernetes-reported
-  state rather than active traffic health; topology history, filtering,
+- Topology schema v3 reports current in-memory Node, dual-stack Pod workload,
+  Service intent, and EndpointSlice runtime relationships. Conditions are
+  Kubernetes-reported state rather than active traffic health; topology history,
+  filtering,
   pagination, and routing/load-balancing behavior are not implemented.
 - The NetworkPolicy adapter intentionally accepts only the documented ingress
   subset. Omitted target selectors, policy types, and port protocols follow the

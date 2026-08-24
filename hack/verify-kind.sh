@@ -1516,13 +1516,15 @@ if [[ -z ${recovered_agent} ]]; then
 fi
 recovered_status=$(agent_status "${recovered_agent}")
 if ! grep -q '"ready":true' <<<"${recovered_status}" \
+    || ! grep -Eq '"applied_identity_epoch":[1-9][0-9]*' <<<"${recovered_status}" \
     || ! grep -Eq '"applied_identity_revision":[1-9][0-9]*' <<<"${recovered_status}" \
     || ! grep -Eq '"applied_policy_revision":[1-9][0-9]*' <<<"${recovered_status}"; then
-    echo "replacement agent did not expose validated recovered revisions" >&2
+    echo "replacement agent did not expose the validated recovered identity epoch and revisions" >&2
     exit 1
 fi
 recovered_agent_logs=$("${kc[@]}" -n unf-system logs "${recovered_agent}")
-if ! grep -q 'validated pinned last-known-good dataplane' <<<"${recovered_agent_logs}"; then
+if ! grep -q 'validated pinned last-known-good dataplane' <<<"${recovered_agent_logs}" \
+    || ! grep -Eq '"active_identity_bank":[01]' <<<"${recovered_agent_logs}"; then
     echo "replacement agent did not report pinned last-known-good validation" >&2
     exit 1
 fi

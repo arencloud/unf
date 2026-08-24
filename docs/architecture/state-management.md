@@ -38,11 +38,11 @@ It is a bounded current-process analysis window, not durable storage. See
 [ADR 0012](../adr/0012-bounded-flow-history-export.md).
 
 Agents poll internal identity and policy snapshot endpoints and publish each
-desired/applied epoch and revision. Identity schema v2 reconciles separate IPv4
-and IPv6 maps and rolls both back to cached state if either update fails. Policy
-reconciliation uses two banks: the
-inactive identity-keyed and IPv4-keyed banks are populated and read back before
-one `POLICY_CONFIG` write selects both. See ADRs 0006 and 0007.
+desired/applied epoch and revision. Identity schema v2 is written to inactive
+physical IPv4/IPv6 maps, read back, and activated together by one
+`IDENTITY_CONFIG` write. Policy reconciliation similarly populates inactive
+identity-keyed, IPv4-keyed, and IPv6-prefix banks before one `POLICY_CONFIG` write
+selects all three. See ADRs 0006, 0007, and 0017.
 
 Each agent also posts a schema v1 acknowledgement containing its Node name,
 readiness, BPF load state, desired/applied identity and policy epoch/revisions,
@@ -52,24 +52,24 @@ Controller and CLI status classify expected agents as missing, stale after ten
 seconds, or converged; fresh reports from unknown Nodes remain visible as
 unexpected without permanently degrading status after Node removal.
 
-The policy node update lifecycle is now implemented as:
+The identity and policy node update lifecycle is now implemented as:
 
 ```text
-compile N+1 -> populate staging maps -> validate -> atomically select N+1
-            -> agent acknowledges applied revision -> retire N
+compile N+1 -> populate all staging maps -> read back and validate
+            -> atomically select N+1 -> acknowledge applied revision -> retire N
 ```
 
 Existing applied state must remain usable if the controller or Kubernetes API is
-temporarily unavailable. New policy state never partially overwrites active maps;
-the prior bank remains active through any pre-switch failure. Enforcement maps
-are now pinned under an ABI-versioned bpffs directory, reopened with strict
-all-or-none validation, and reconstructed into userspace caches after restart.
-Fresh startup readiness is fenced until identity and policy both reconcile, while
-a complete validated last-known-good set may restore service without the
-controller. Identity activation is still single-bank and TC links remain
-process-owned; transactional identity updates, atomic attachment handoff, schema
-migration operations, and acknowledgement authentication/durability remain Phase
-2 design gates. See ADR 0016.
+temporarily unavailable. New identity and policy state never partially
+overwrites active maps; each prior bank remains selected through any pre-switch
+failure. Nine enforcement maps are pinned under the `/sys/fs/bpf/unf/v2` ABI
+directory, reopened with strict all-or-none validation, and reconstructed into
+userspace caches after restart. Fresh startup readiness is fenced until identity
+and policy both reconcile, while a complete validated last-known-good set may
+restore service without the controller. TC links remain process-owned; atomic
+attachment handoff, explicit ABI-directory cleanup operations, and
+acknowledgement authentication/durability remain Phase 2 design gates. See ADRs
+0016 and 0017.
 
 Kubernetes watches remain the controller input. Internal HTTP snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

@@ -30,7 +30,7 @@ spec:
             - --ebpf-object
             - /opt/unf/ebpf/unf-ebpf-tc
             - --bpf-pin-path
-            - /sys/fs/bpf/unf/v1
+            - /sys/fs/bpf/unf/v2
             - --controller-url
             - http://unf-controller.unf-system.svc.cluster.local:9962
           env:

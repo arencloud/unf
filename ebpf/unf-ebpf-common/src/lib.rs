@@ -5,7 +5,8 @@
 use unf_common::{IdentityId, PolicyId, RuleId, Verdict};
 
 pub const FLOW_ABI_VERSION: u16 = 2;
-pub const IDENTITY_MAP_ABI_VERSION: u16 = 1;
+pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
+pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 2;
 pub const POLICY_BANK_COUNT: u8 = 2;
 pub const POLICY_FLAG_HAS_POLICY: u16 = 1 << 0;
@@ -180,6 +181,17 @@ impl IdentityMapValue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
+pub struct IdentityMapConfig {
+    pub source_epoch: u64,
+    pub revision: u64,
+    pub entry_count: u32,
+    pub schema_version: u16,
+    pub active_bank: u8,
+    pub flags: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct PolicyMapKey {
     pub source_identity: IdentityId,
     pub destination_identity: IdentityId,
@@ -247,6 +259,7 @@ const _: () = assert!(core::mem::size_of::<FlowEvent>() == 96);
 const _: () = assert!(core::mem::size_of::<Ipv4IdentityKey>() == 4);
 const _: () = assert!(core::mem::size_of::<Ipv6IdentityKey>() == 16);
 const _: () = assert!(core::mem::size_of::<IdentityMapValue>() == 16);
+const _: () = assert!(core::mem::size_of::<IdentityMapConfig>() == 24);
 const _: () = assert!(core::mem::size_of::<PolicyMapKey>() == 12);
 const _: () = assert!(core::mem::size_of::<Ipv4PolicyMapKey>() == 12);
 const _: () = assert!(core::mem::size_of::<Ipv6PolicyMapData>() == 24);
@@ -264,6 +277,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<FlowEvent>(), 96);
         assert_eq!(core::mem::align_of::<IdentityMapValue>(), 8);
         assert_eq!(core::mem::size_of::<IdentityMapValue>(), 16);
+        assert_eq!(core::mem::align_of::<IdentityMapConfig>(), 8);
+        assert_eq!(core::mem::size_of::<IdentityMapConfig>(), 24);
         assert_eq!(core::mem::align_of::<Ipv6IdentityKey>(), 1);
         assert_eq!(core::mem::size_of::<Ipv6IdentityKey>(), 16);
         assert_eq!(core::mem::align_of::<PolicyMapKey>(), 4);

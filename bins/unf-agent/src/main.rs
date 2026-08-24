@@ -28,9 +28,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 use unf_ebpf_common::{
-    FLOW_ABI_VERSION, FlowEvent, FlowKey, IdentityMapValue, Ipv4IdentityKey, Ipv6IdentityKey,
-    POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
-    POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
+    FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey,
+    Ipv6IdentityKey, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
+    POLICY_FLAG_HAS_SHADOW, POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE,
+    POLICY_MAP_ABI_VERSION,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, FLOW_EXPORT_BATCH_LIMIT,
@@ -42,10 +43,13 @@ use unf_state::{
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v1";
-const PERSISTENT_MAP_NAMES: [&str; 6] = [
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v2";
+const PERSISTENT_MAP_NAMES: [&str; 9] = [
     "IDENTITY_V4",
+    "IDENTITY_V4_B",
     "IDENTITY_V6",
+    "IDENTITY_V6_B",
+    "IDENTITY_CONFIG",
     "POLICY_RULES",
     "POLICY_IPV4",
     "POLICY_IPV6",
@@ -131,10 +135,12 @@ struct AgentState {
 }
 
 struct IdentitySynchronizer {
-    ipv4_map: AyaHashMap<MapData, [u8; 4], [u8; 16]>,
-    ipv6_map: AyaHashMap<MapData, [u8; 16], [u8; 16]>,
-    ipv4_applied: BTreeMap<[u8; 4], [u8; 16]>,
-    ipv6_applied: BTreeMap<[u8; 16], [u8; 16]>,
+    ipv4_maps: [EncodedIpv4IdentityMap; IDENTITY_BANK_COUNT as usize],
+    ipv6_maps: [EncodedIpv6IdentityMap; IDENTITY_BANK_COUNT as usize],
+    config: AyaArray<MapData, [u8; 24]>,
+    ipv4_banks: [EncodedIpv4IdentityBank; IDENTITY_BANK_COUNT as usize],
+    ipv6_banks: [EncodedIpv6IdentityBank; IDENTITY_BANK_COUNT as usize],
+    active_bank: u8,
     applied_epoch: u64,
     controller_url: Option<String>,
     client: reqwest::Client,
@@ -157,6 +163,10 @@ struct PolicySynchronizer {
 }
 
 type EncodedPolicyMap = AyaHashMap<MapData, [u8; 12], [u8; 32]>;
+type EncodedIpv4IdentityMap = AyaHashMap<MapData, [u8; 4], [u8; 16]>;
+type EncodedIpv6IdentityMap = AyaHashMap<MapData, [u8; 16], [u8; 16]>;
+type EncodedIpv4IdentityBank = BTreeMap<[u8; 4], [u8; 16]>;
+type EncodedIpv6IdentityBank = BTreeMap<[u8; 16], [u8; 16]>;
 type EncodedIpv6PolicyKey = (u32, [u8; 24]);
 type EncodedIpv6PolicyBank = BTreeMap<EncodedIpv6PolicyKey, [u8; 32]>;
 type PolicyMaps = (
@@ -166,8 +176,9 @@ type PolicyMaps = (
     AyaArray<MapData, [u8; 24]>,
 );
 type IdentityMaps = (
-    AyaHashMap<MapData, [u8; 4], [u8; 16]>,
-    AyaHashMap<MapData, [u8; 16], [u8; 16]>,
+    [EncodedIpv4IdentityMap; IDENTITY_BANK_COUNT as usize],
+    [EncodedIpv6IdentityMap; IDENTITY_BANK_COUNT as usize],
+    AyaArray<MapData, [u8; 24]>,
 );
 
 struct DataplaneConfig {
@@ -183,6 +194,7 @@ struct DataplaneConfig {
 }
 
 struct RecoveredDataplane {
+    identity_epoch: Option<u64>,
     identity_revision: Option<u64>,
     policy_epoch: Option<u64>,
     policy_revision: Option<u64>,
@@ -455,7 +467,7 @@ async fn run_dataplane(
             .context("eBPF object does not contain FLOW_EVENTS ring buffer")?,
     )
     .context("open FLOW_EVENTS ring buffer")?;
-    let (ipv4_identity_map, ipv6_identity_map) = take_identity_maps(&mut ebpf)?;
+    let identity_maps = take_identity_maps(&mut ebpf)?;
     let (policy_map, ipv4_policy_map, ipv6_policy_map, policy_config) =
         take_policy_maps(&mut ebpf)?;
     let controller_url = config
@@ -463,7 +475,7 @@ async fn run_dataplane(
         .as_deref()
         .map(|url| url.trim_end_matches('/').to_owned());
     let (mut identities, mut policies) = new_synchronizers(
-        (ipv4_identity_map, ipv6_identity_map),
+        identity_maps,
         (policy_map, ipv4_policy_map, ipv6_policy_map, policy_config),
         controller_url.clone(),
         config.identity_sync_interval,
@@ -507,18 +519,18 @@ async fn run_dataplane(
     }
     state.bpf_loaded.store(true, Ordering::Release);
     state.metrics.bpf_loaded.set(1);
-    let recovered_ready = recovered.identity_revision.is_some()
-        && recovered.policy_epoch.is_some()
-        && recovered.policy_revision.is_some();
+    let recovered_ready = recovered_dataplane_is_ready(&recovered);
     state.ready.store(
         controller_url.is_none() || recovered_ready,
         Ordering::Release,
     );
     if recovered_ready {
         info!(
+            identity_epoch = recovered.identity_epoch,
             identity_revision = recovered.identity_revision,
             policy_epoch = recovered.policy_epoch,
             policy_revision = recovered.policy_revision,
+            active_identity_bank = identities.active_bank,
             active_policy_bank = policies.active_bank,
             "validated pinned last-known-good dataplane"
         );
@@ -548,20 +560,29 @@ async fn run_dataplane(
     Ok(())
 }
 
+fn recovered_dataplane_is_ready(recovered: &RecoveredDataplane) -> bool {
+    recovered.identity_epoch.is_some()
+        && recovered.identity_revision.is_some()
+        && recovered.policy_epoch.is_some()
+        && recovered.policy_revision.is_some()
+}
+
 fn new_synchronizers(
     identity_maps: IdentityMaps,
     policy_maps: PolicyMaps,
     controller_url: Option<String>,
     interval: Duration,
 ) -> (IdentitySynchronizer, PolicySynchronizer) {
-    let (ipv4_map, ipv6_map) = identity_maps;
+    let (ipv4_maps, ipv6_maps, identity_config) = identity_maps;
     let (identity_map, ipv4_policy_map, ipv6_policy_map, config) = policy_maps;
     (
         IdentitySynchronizer {
-            ipv4_map,
-            ipv6_map,
-            ipv4_applied: BTreeMap::new(),
-            ipv6_applied: BTreeMap::new(),
+            ipv4_maps,
+            ipv6_maps,
+            config: identity_config,
+            ipv4_banks: [BTreeMap::new(), BTreeMap::new()],
+            ipv6_banks: [BTreeMap::new(), BTreeMap::new()],
+            active_bank: 0,
             applied_epoch: 0,
             controller_url: controller_url.clone(),
             client: reqwest::Client::new(),
@@ -628,16 +649,19 @@ fn recover_persistent_dataplane(
     policies: &mut PolicySynchronizer,
     pins_existed: bool,
 ) -> Result<RecoveredDataplane> {
-    validate_map_capacity(
-        "IDENTITY_V4",
-        identities.ipv4_map.map(),
-        IDENTITY_MAP_CAPACITY,
-    )?;
-    validate_map_capacity(
-        "IDENTITY_V6",
-        identities.ipv6_map.map(),
-        IDENTITY_MAP_CAPACITY,
-    )?;
+    for (name, map) in ["IDENTITY_V4", "IDENTITY_V4_B"]
+        .into_iter()
+        .zip(&identities.ipv4_maps)
+    {
+        validate_map_capacity(name, map.map(), IDENTITY_MAP_CAPACITY)?;
+    }
+    for (name, map) in ["IDENTITY_V6", "IDENTITY_V6_B"]
+        .into_iter()
+        .zip(&identities.ipv6_maps)
+    {
+        validate_map_capacity(name, map.map(), IDENTITY_MAP_CAPACITY)?;
+    }
+    validate_map_capacity("IDENTITY_CONFIG", identities.config.map(), 1)?;
     validate_map_capacity(
         "POLICY_RULES",
         policies.identity_map.map(),
@@ -647,7 +671,28 @@ fn recover_persistent_dataplane(
     validate_map_capacity("POLICY_IPV6", policies.ipv6_map.map(), POLICY_MAP_CAPACITY)?;
     validate_map_capacity("POLICY_CONFIG", policies.config.map(), 1)?;
 
-    let identity_revision = recover_identity_entries(identities)?;
+    recover_identity_entries(identities)?;
+    let identity_config = identities
+        .config
+        .get(&0, 0)
+        .context("read persistent identity config")?;
+    let decoded_identity = decode_recovered_identity_config(identity_config)?;
+    let (identity_epoch, identity_revision) = if let Some((epoch, revision, count, bank)) =
+        decoded_identity
+    {
+        let active_count = identity_entry_count_for_bank(identities, bank);
+        if active_count != u64::from(count) {
+            bail!(
+                "persistent identity config declares {count} active entries but bank {bank} contains {active_count}"
+            );
+        }
+        validate_active_identity_revision(identities, bank, revision)?;
+        identities.active_bank = bank;
+        identities.applied_epoch = epoch;
+        (Some(epoch), Some(revision))
+    } else {
+        (None, None)
+    };
     recover_policy_entries(policies)?;
     let config = policies
         .config
@@ -672,10 +717,15 @@ fn recover_persistent_dataplane(
     if pins_existed {
         info!(
             identity_entries = identity_entry_count(identities),
-            identity_revision, policy_epoch, policy_revision, "persistent BPF maps reopened"
+            identity_epoch,
+            identity_revision,
+            policy_epoch,
+            policy_revision,
+            "persistent BPF maps reopened"
         );
     }
     Ok(RecoveredDataplane {
+        identity_epoch,
         identity_revision,
         policy_epoch,
         policy_revision,
@@ -695,22 +745,29 @@ fn validate_map_capacity(name: &str, map: &MapData, expected: u32) -> Result<()>
     Ok(())
 }
 
-fn recover_identity_entries(identities: &mut IdentitySynchronizer) -> Result<Option<u64>> {
-    let mut revision = None;
-    for entry in &identities.ipv4_map {
-        let (key, value) = entry.context("iterate persistent IPv4 identities")?;
-        validate_recovered_identity_value(&value, &mut revision)?;
-        identities.ipv4_applied.insert(key, value);
+fn recover_identity_entries(identities: &mut IdentitySynchronizer) -> Result<()> {
+    for bank in 0..usize::from(IDENTITY_BANK_COUNT) {
+        let ipv4_entries = identities.ipv4_maps[bank]
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .context("iterate persistent IPv4 identities")?;
+        for (key, value) in ipv4_entries {
+            validate_recovered_identity_value(&value)?;
+            identities.ipv4_banks[bank].insert(key, value);
+        }
+        let ipv6_entries = identities.ipv6_maps[bank]
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .context("iterate persistent IPv6 identities")?;
+        for (key, value) in ipv6_entries {
+            validate_recovered_identity_value(&value)?;
+            identities.ipv6_banks[bank].insert(key, value);
+        }
     }
-    for entry in &identities.ipv6_map {
-        let (key, value) = entry.context("iterate persistent IPv6 identities")?;
-        validate_recovered_identity_value(&value, &mut revision)?;
-        identities.ipv6_applied.insert(key, value);
-    }
-    Ok(revision)
+    Ok(())
 }
 
-fn validate_recovered_identity_value(value: &[u8; 16], revision: &mut Option<u64>) -> Result<()> {
+fn validate_recovered_identity_value(value: &[u8; 16]) -> Result<u64> {
     let identity_id = u32::from_ne_bytes(value[0..4].try_into().expect("fixed identity ID"));
     let schema = u16::from_ne_bytes(value[4..6].try_into().expect("fixed identity schema"));
     let flags = u16::from_ne_bytes(value[6..8].try_into().expect("fixed identity flags"));
@@ -722,10 +779,37 @@ fn validate_recovered_identity_value(value: &[u8; 16], revision: &mut Option<u64
     if entry_revision == 0 {
         bail!("persistent identity map contains revision zero");
     }
-    if revision.is_some_and(|current| current != entry_revision) {
-        bail!("persistent identity maps contain mixed revisions");
+    Ok(entry_revision)
+}
+
+fn decode_recovered_identity_config(config: [u8; 24]) -> Result<Option<(u64, u64, u32, u8)>> {
+    decode_recovered_config(
+        config,
+        unf_ebpf_common::IDENTITY_MAP_ABI_VERSION,
+        IDENTITY_BANK_COUNT,
+        "identity",
+    )
+}
+
+fn identity_entry_count_for_bank(identities: &IdentitySynchronizer, bank: u8) -> u64 {
+    let bank = usize::from(bank);
+    (identities.ipv4_banks[bank].len() + identities.ipv6_banks[bank].len()) as u64
+}
+
+fn validate_active_identity_revision(
+    identities: &IdentitySynchronizer,
+    bank: u8,
+    revision: u64,
+) -> Result<()> {
+    let bank = usize::from(bank);
+    for value in identities.ipv4_banks[bank]
+        .values()
+        .chain(identities.ipv6_banks[bank].values())
+    {
+        if validate_recovered_identity_value(value)? != revision {
+            bail!("persistent active identity bank contains a mixed revision");
+        }
     }
-    *revision = Some(entry_revision);
     Ok(())
 }
 
@@ -810,6 +894,15 @@ fn recovered_provenance_is_valid(flags: u16, reason: u8, shadow: bool) -> bool {
 }
 
 fn decode_recovered_policy_config(config: [u8; 24]) -> Result<Option<(u64, u64, u32, u8)>> {
+    decode_recovered_config(config, POLICY_MAP_ABI_VERSION, POLICY_BANK_COUNT, "policy")
+}
+
+fn decode_recovered_config(
+    config: [u8; 24],
+    expected_schema: u16,
+    bank_count: u8,
+    state_name: &str,
+) -> Result<Option<(u64, u64, u32, u8)>> {
     if config == [0; 24] {
         return Ok(None);
     }
@@ -820,11 +913,11 @@ fn decode_recovered_policy_config(config: [u8; 24]) -> Result<Option<(u64, u64, 
     let bank = config[22];
     if epoch == 0
         || revision == 0
-        || schema != POLICY_MAP_ABI_VERSION
-        || bank >= POLICY_BANK_COUNT
+        || schema != expected_schema
+        || bank >= bank_count
         || config[23] != 0
     {
-        bail!("persistent policy config is invalid or incompatible");
+        bail!("persistent {state_name} config is invalid or incompatible");
     }
     Ok(Some((epoch, revision, count, bank)))
 }
@@ -863,28 +956,30 @@ fn apply_recovered_state(
     recovered: &RecoveredDataplane,
 ) {
     let identity_entries = identity_entry_count(identities);
+    let identity_bank = usize::from(identities.active_bank);
     state
         .identity_map_entries
         .store(identity_entries, Ordering::Release);
-    state
-        .ipv4_identity_map_entries
-        .store(identities.ipv4_applied.len() as u64, Ordering::Release);
-    state
-        .ipv6_identity_map_entries
-        .store(identities.ipv6_applied.len() as u64, Ordering::Release);
+    state.ipv4_identity_map_entries.store(
+        identities.ipv4_banks[identity_bank].len() as u64,
+        Ordering::Release,
+    );
+    state.ipv6_identity_map_entries.store(
+        identities.ipv6_banks[identity_bank].len() as u64,
+        Ordering::Release,
+    );
     state
         .metrics
         .identity_map_entries
         .set(metric_value(identity_entries));
-    state
-        .metrics
-        .ipv4_identity_map_entries
-        .set(metric_value(identities.ipv4_applied.len() as u64));
-    state
-        .metrics
-        .ipv6_identity_map_entries
-        .set(metric_value(identities.ipv6_applied.len() as u64));
-    if let Some(revision) = recovered.identity_revision {
+    state.metrics.ipv4_identity_map_entries.set(metric_value(
+        identities.ipv4_banks[identity_bank].len() as u64,
+    ));
+    state.metrics.ipv6_identity_map_entries.set(metric_value(
+        identities.ipv6_banks[identity_bank].len() as u64,
+    ));
+    if let (Some(epoch), Some(revision)) = (recovered.identity_epoch, recovered.identity_revision) {
+        state.applied_identity_epoch.store(epoch, Ordering::Release);
         state
             .applied_identity_revision
             .store(revision, Ordering::Release);
@@ -912,17 +1007,32 @@ fn apply_recovered_state(
 }
 
 fn take_identity_maps(ebpf: &mut Ebpf) -> Result<IdentityMaps> {
-    let ipv4 = AyaHashMap::<_, [u8; 4], [u8; 16]>::try_from(
+    let ipv4_a = AyaHashMap::<_, [u8; 4], [u8; 16]>::try_from(
         ebpf.take_map("IDENTITY_V4")
             .context("eBPF object does not contain IDENTITY_V4 map")?,
     )
     .context("open IDENTITY_V4 map")?;
-    let ipv6 = AyaHashMap::<_, [u8; 16], [u8; 16]>::try_from(
+    let ipv4_b = AyaHashMap::<_, [u8; 4], [u8; 16]>::try_from(
+        ebpf.take_map("IDENTITY_V4_B")
+            .context("eBPF object does not contain IDENTITY_V4_B map")?,
+    )
+    .context("open IDENTITY_V4_B map")?;
+    let ipv6_a = AyaHashMap::<_, [u8; 16], [u8; 16]>::try_from(
         ebpf.take_map("IDENTITY_V6")
             .context("eBPF object does not contain IDENTITY_V6 map")?,
     )
     .context("open IDENTITY_V6 map")?;
-    Ok((ipv4, ipv6))
+    let ipv6_b = AyaHashMap::<_, [u8; 16], [u8; 16]>::try_from(
+        ebpf.take_map("IDENTITY_V6_B")
+            .context("eBPF object does not contain IDENTITY_V6_B map")?,
+    )
+    .context("open IDENTITY_V6_B map")?;
+    let config = AyaArray::<_, [u8; 24]>::try_from(
+        ebpf.take_map("IDENTITY_CONFIG")
+            .context("eBPF object does not contain IDENTITY_CONFIG map")?,
+    )
+    .context("open IDENTITY_CONFIG map")?;
+    Ok(([ipv4_a, ipv4_b], [ipv6_a, ipv6_b], config))
 }
 
 fn spawn_flow_exporter(
@@ -1378,7 +1488,15 @@ async fn synchronize_identities(
 
     let desired_ipv4 = desired_ipv4_identity_entries(&snapshot.ipv4_entries, desired_revision)?;
     let desired_ipv6 = desired_ipv6_identity_entries(&snapshot.ipv6_entries, desired_revision)?;
-    apply_identity_entries(synchronizer, desired_ipv4, desired_ipv6)?;
+    let staging_bank = (synchronizer.active_bank + 1) % IDENTITY_BANK_COUNT;
+    apply_identity_entries(
+        synchronizer,
+        desired_ipv4,
+        desired_ipv6,
+        snapshot.source_epoch,
+        desired_revision,
+        staging_bank,
+    )?;
     synchronizer.applied_epoch = snapshot.source_epoch;
     state
         .applied_identity_epoch
@@ -1389,12 +1507,14 @@ async fn synchronize_identities(
     state
         .identity_map_entries
         .store(identity_entry_count(synchronizer), Ordering::Release);
-    state
-        .ipv4_identity_map_entries
-        .store(synchronizer.ipv4_applied.len() as u64, Ordering::Release);
-    state
-        .ipv6_identity_map_entries
-        .store(synchronizer.ipv6_applied.len() as u64, Ordering::Release);
+    state.ipv4_identity_map_entries.store(
+        synchronizer.ipv4_banks[usize::from(synchronizer.active_bank)].len() as u64,
+        Ordering::Release,
+    );
+    state.ipv6_identity_map_entries.store(
+        synchronizer.ipv6_banks[usize::from(synchronizer.active_bank)].len() as u64,
+        Ordering::Release,
+    );
     state
         .metrics
         .applied_identity_revision
@@ -1403,26 +1523,25 @@ async fn synchronize_identities(
         .metrics
         .identity_map_entries
         .set(metric_value(identity_entry_count(synchronizer)));
-    state
-        .metrics
-        .ipv4_identity_map_entries
-        .set(metric_value(synchronizer.ipv4_applied.len() as u64));
-    state
-        .metrics
-        .ipv6_identity_map_entries
-        .set(metric_value(synchronizer.ipv6_applied.len() as u64));
+    state.metrics.ipv4_identity_map_entries.set(metric_value(
+        synchronizer.ipv4_banks[usize::from(synchronizer.active_bank)].len() as u64,
+    ));
+    state.metrics.ipv6_identity_map_entries.set(metric_value(
+        synchronizer.ipv6_banks[usize::from(synchronizer.active_bank)].len() as u64,
+    ));
     info!(
         identity_epoch = snapshot.source_epoch,
         identity_revision = desired_revision,
-        ipv4_entries = synchronizer.ipv4_applied.len(),
-        ipv6_entries = synchronizer.ipv6_applied.len(),
+        ipv4_entries = synchronizer.ipv4_banks[usize::from(synchronizer.active_bank)].len(),
+        ipv6_entries = synchronizer.ipv6_banks[usize::from(synchronizer.active_bank)].len(),
+        active_identity_bank = synchronizer.active_bank,
         "identity snapshot applied"
     );
     Ok(())
 }
 
 fn identity_entry_count(synchronizer: &IdentitySynchronizer) -> u64 {
-    (synchronizer.ipv4_applied.len() + synchronizer.ipv6_applied.len()) as u64
+    identity_entry_count_for_bank(synchronizer, synchronizer.active_bank)
 }
 
 fn desired_ipv4_identity_entries(
@@ -1478,56 +1597,180 @@ fn encode_identity_value(value: IdentityMapValue) -> [u8; 16] {
 
 fn apply_identity_entries(
     synchronizer: &mut IdentitySynchronizer,
-    desired_ipv4: BTreeMap<[u8; 4], [u8; 16]>,
-    desired_ipv6: BTreeMap<[u8; 16], [u8; 16]>,
+    desired_ipv4: EncodedIpv4IdentityBank,
+    desired_ipv6: EncodedIpv6IdentityBank,
+    source_epoch: u64,
+    revision: u64,
+    staging_bank: u8,
 ) -> Result<()> {
-    let previous_ipv4 = synchronizer.ipv4_applied.clone();
-    let previous_ipv6 = synchronizer.ipv6_applied.clone();
-    let result =
-        replace_ipv4_identity_entries(&mut synchronizer.ipv4_map, &previous_ipv4, &desired_ipv4)
+    if staging_bank >= IDENTITY_BANK_COUNT {
+        bail!("invalid identity staging bank {staging_bank}");
+    }
+    let staging = usize::from(staging_bank);
+    let previous_ipv4 = synchronizer.ipv4_banks[staging].clone();
+    let previous_ipv6 = synchronizer.ipv6_banks[staging].clone();
+    if let Err(error) = replace_ipv4_identity_entries(
+        &mut synchronizer.ipv4_maps[staging],
+        &previous_ipv4,
+        &desired_ipv4,
+    ) {
+        return Err(rollback_identity_stage(
+            synchronizer,
+            &previous_ipv4,
+            &previous_ipv6,
+            staging_bank,
+            &error.context("stage IPv4 identity bank"),
+        ));
+    }
+    if let Err(error) = replace_ipv6_identity_entries(
+        &mut synchronizer.ipv6_maps[staging],
+        &previous_ipv6,
+        &desired_ipv6,
+    ) {
+        return Err(rollback_identity_stage(
+            synchronizer,
+            &previous_ipv4,
+            &previous_ipv6,
+            staging_bank,
+            &error.context("stage IPv6 identity bank"),
+        ));
+    }
+    let validation =
+        validate_staged_ipv4_identity_entries(&synchronizer.ipv4_maps[staging], &desired_ipv4)
             .and_then(|()| {
-                replace_ipv6_identity_entries(
-                    &mut synchronizer.ipv6_map,
-                    &previous_ipv6,
+                validate_staged_ipv6_identity_entries(
+                    &synchronizer.ipv6_maps[staging],
                     &desired_ipv6,
                 )
             });
-    if let Err(error) = result {
-        let ipv4_rollback =
-            restore_ipv4_identity_entries(&mut synchronizer.ipv4_map, &previous_ipv4);
-        let ipv6_rollback =
-            restore_ipv6_identity_entries(&mut synchronizer.ipv6_map, &previous_ipv6);
-        if ipv4_rollback.is_err() || ipv6_rollback.is_err() {
-            return Err(anyhow!(
-                "identity map update failed: {error:#}; IPv4 rollback: {ipv4_rollback:?}; IPv6 rollback: {ipv6_rollback:?}"
+    if let Err(error) = validation {
+        return Err(rollback_identity_stage(
+            synchronizer,
+            &previous_ipv4,
+            &previous_ipv6,
+            staging_bank,
+            &error,
+        ));
+    }
+    let config = match encode_identity_config(
+        source_epoch,
+        revision,
+        desired_ipv4.len() + desired_ipv6.len(),
+        staging_bank,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            return Err(rollback_identity_stage(
+                synchronizer,
+                &previous_ipv4,
+                &previous_ipv6,
+                staging_bank,
+                &error,
             ));
         }
-        return Err(error).context("identity map update rolled back");
+    };
+    if let Err(error) = synchronizer.config.set(0, config, 0) {
+        return Err(rollback_identity_stage(
+            synchronizer,
+            &previous_ipv4,
+            &previous_ipv6,
+            staging_bank,
+            &anyhow!(error).context("atomically activate staged identity bank"),
+        ));
     }
-    synchronizer.ipv4_applied = desired_ipv4;
-    synchronizer.ipv6_applied = desired_ipv6;
+
+    synchronizer.ipv4_banks[staging] = desired_ipv4;
+    synchronizer.ipv6_banks[staging] = desired_ipv6;
+    synchronizer.active_bank = staging_bank;
     Ok(())
 }
 
-fn replace_ipv4_identity_entries(
-    map: &mut AyaHashMap<MapData, [u8; 4], [u8; 16]>,
-    current: &BTreeMap<[u8; 4], [u8; 16]>,
-    desired: &BTreeMap<[u8; 4], [u8; 16]>,
+fn encode_identity_config(
+    source_epoch: u64,
+    revision: u64,
+    entry_count: usize,
+    active_bank: u8,
+) -> Result<[u8; 24]> {
+    encode_map_config(
+        source_epoch,
+        revision,
+        entry_count,
+        unf_ebpf_common::IDENTITY_MAP_ABI_VERSION,
+        active_bank,
+        IDENTITY_BANK_COUNT,
+        "identity",
+    )
+}
+
+fn validate_staged_ipv4_identity_entries(
+    map: &EncodedIpv4IdentityMap,
+    desired: &EncodedIpv4IdentityBank,
 ) -> Result<()> {
-    for (key, value) in desired {
-        map.insert(key, value, 0)
-            .with_context(|| format!("insert IPv4 identity map key {key:?}"))?;
+    for (key, expected) in desired {
+        let actual = map
+            .get(key, 0)
+            .with_context(|| format!("read staged IPv4 identity key {key:?}"))?;
+        if &actual != expected {
+            bail!("staged IPv4 identity validation mismatch for key {key:?}");
+        }
     }
+    Ok(())
+}
+
+fn validate_staged_ipv6_identity_entries(
+    map: &EncodedIpv6IdentityMap,
+    desired: &EncodedIpv6IdentityBank,
+) -> Result<()> {
+    for (key, expected) in desired {
+        let actual = map
+            .get(key, 0)
+            .with_context(|| format!("read staged IPv6 identity key {key:?}"))?;
+        if &actual != expected {
+            bail!("staged IPv6 identity validation mismatch for key {key:?}");
+        }
+    }
+    Ok(())
+}
+
+fn rollback_identity_stage(
+    synchronizer: &mut IdentitySynchronizer,
+    previous_ipv4: &EncodedIpv4IdentityBank,
+    previous_ipv6: &EncodedIpv6IdentityBank,
+    bank: u8,
+    cause: &anyhow::Error,
+) -> anyhow::Error {
+    let bank = usize::from(bank);
+    let ipv4 = restore_ipv4_identity_entries(&mut synchronizer.ipv4_maps[bank], previous_ipv4);
+    let ipv6 = restore_ipv6_identity_entries(&mut synchronizer.ipv6_maps[bank], previous_ipv6);
+    match (ipv4, ipv6) {
+        (Ok(()), Ok(())) => {
+            anyhow!("identity update failed and staging banks were rolled back: {cause:#}")
+        }
+        (ipv4, ipv6) => anyhow!(
+            "identity update failed: {cause:#}; IPv4 rollback: {ipv4:?}; IPv6 rollback: {ipv6:?}"
+        ),
+    }
+}
+
+fn replace_ipv4_identity_entries(
+    map: &mut EncodedIpv4IdentityMap,
+    current: &EncodedIpv4IdentityBank,
+    desired: &EncodedIpv4IdentityBank,
+) -> Result<()> {
     for key in current.keys().filter(|key| !desired.contains_key(*key)) {
         map.remove(key)
             .with_context(|| format!("remove stale IPv4 identity map key {key:?}"))?;
+    }
+    for (key, value) in desired {
+        map.insert(key, value, 0)
+            .with_context(|| format!("insert IPv4 identity map key {key:?}"))?;
     }
     Ok(())
 }
 
 fn restore_ipv4_identity_entries(
-    map: &mut AyaHashMap<MapData, [u8; 4], [u8; 16]>,
-    previous: &BTreeMap<[u8; 4], [u8; 16]>,
+    map: &mut EncodedIpv4IdentityMap,
+    previous: &EncodedIpv4IdentityBank,
 ) -> Result<()> {
     let keys: Vec<_> = map.keys().collect::<Result<_, _>>()?;
     for key in keys {
@@ -1540,24 +1783,23 @@ fn restore_ipv4_identity_entries(
 }
 
 fn replace_ipv6_identity_entries(
-    map: &mut AyaHashMap<MapData, [u8; 16], [u8; 16]>,
-    current: &BTreeMap<[u8; 16], [u8; 16]>,
-    desired: &BTreeMap<[u8; 16], [u8; 16]>,
+    map: &mut EncodedIpv6IdentityMap,
+    current: &EncodedIpv6IdentityBank,
+    desired: &EncodedIpv6IdentityBank,
 ) -> Result<()> {
-    for (key, value) in desired {
-        map.insert(key, value, 0)
-            .with_context(|| format!("insert IPv6 identity map key {key:?}"))?;
-    }
     for key in current.keys().filter(|key| !desired.contains_key(*key)) {
         map.remove(key)
             .with_context(|| format!("remove stale IPv6 identity map key {key:?}"))?;
+    }
+    for (key, value) in desired {
+        map.insert(key, value, 0)?;
     }
     Ok(())
 }
 
 fn restore_ipv6_identity_entries(
-    map: &mut AyaHashMap<MapData, [u8; 16], [u8; 16]>,
-    previous: &BTreeMap<[u8; 16], [u8; 16]>,
+    map: &mut EncodedIpv6IdentityMap,
+    previous: &EncodedIpv6IdentityBank,
 ) -> Result<()> {
     let keys: Vec<_> = map.keys().collect::<Result<_, _>>()?;
     for key in keys {
@@ -1906,12 +2148,36 @@ fn encode_policy_config(
     entry_count: usize,
     active_bank: u8,
 ) -> Result<[u8; 24]> {
-    let entry_count = u32::try_from(entry_count).context("policy entry count exceeds u32")?;
+    encode_map_config(
+        source_epoch,
+        revision,
+        entry_count,
+        POLICY_MAP_ABI_VERSION,
+        active_bank,
+        POLICY_BANK_COUNT,
+        "policy",
+    )
+}
+
+fn encode_map_config(
+    source_epoch: u64,
+    revision: u64,
+    entry_count: usize,
+    schema_version: u16,
+    active_bank: u8,
+    bank_count: u8,
+    state_name: &str,
+) -> Result<[u8; 24]> {
+    if active_bank >= bank_count {
+        bail!("invalid {state_name} bank {active_bank}");
+    }
+    let entry_count = u32::try_from(entry_count)
+        .with_context(|| format!("{state_name} entry count exceeds u32"))?;
     let mut encoded = [0_u8; 24];
     encoded[0..8].copy_from_slice(&source_epoch.to_ne_bytes());
     encoded[8..16].copy_from_slice(&revision.to_ne_bytes());
     encoded[16..20].copy_from_slice(&entry_count.to_ne_bytes());
-    encoded[20..22].copy_from_slice(&POLICY_MAP_ABI_VERSION.to_ne_bytes());
+    encoded[20..22].copy_from_slice(&schema_version.to_ne_bytes());
     encoded[22] = active_bank;
     Ok(encoded)
 }
@@ -2345,7 +2611,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         dropped_flow_exports: state.dropped_flow_exports.load(Ordering::Relaxed),
         exported_flow_events: state.exported_flow_events.load(Ordering::Relaxed),
         capabilities: state.capabilities.clone(),
-        limitation: "TC policy enforcement uses pinned last-known-good maps; identity updates are not yet dual-bank and acknowledgements use unauthenticated prototype transport",
+        limitation: "TC policy enforcement uses transactional pinned identity/policy maps; TC attachments remain process-owned and acknowledgements use unauthenticated prototype transport",
     })
 }
 
@@ -2761,17 +3027,35 @@ mod tests {
     }
 
     #[test]
-    fn recovered_identity_values_must_form_one_coherent_revision() {
+    fn recovered_identity_values_are_validated_before_bank_selection() {
         let first = encode_identity_value(IdentityMapValue::new(IdentityId::new(42), 17));
         let second = encode_identity_value(IdentityMapValue::new(IdentityId::new(84), 18));
-        let mut revision = None;
-        validate_recovered_identity_value(&first, &mut revision).expect("first value is valid");
-        assert_eq!(revision, Some(17));
-        assert!(validate_recovered_identity_value(&second, &mut revision).is_err());
+        assert_eq!(
+            validate_recovered_identity_value(&first).expect("first value is valid"),
+            17
+        );
+        assert_eq!(
+            validate_recovered_identity_value(&second).expect("inactive revision is valid"),
+            18
+        );
 
         let mut invalid_schema = first;
         invalid_schema[4..6].copy_from_slice(&u16::MAX.to_ne_bytes());
-        assert!(validate_recovered_identity_value(&invalid_schema, &mut None).is_err());
+        assert!(validate_recovered_identity_value(&invalid_schema).is_err());
+    }
+
+    #[test]
+    fn identity_config_encoding_is_an_atomic_bank_pointer() {
+        let config = encode_identity_config(9, 17, 14, 1).expect("config is valid");
+        assert_eq!(
+            decode_recovered_identity_config(config).expect("config recovers"),
+            Some((9, 17, 14, 1))
+        );
+        assert_eq!(
+            u16::from_ne_bytes(config[20..22].try_into().unwrap()),
+            unf_ebpf_common::IDENTITY_MAP_ABI_VERSION
+        );
+        assert!(encode_identity_config(9, 17, 14, IDENTITY_BANK_COUNT).is_err());
     }
 
     #[test]

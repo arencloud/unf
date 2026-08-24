@@ -25,9 +25,11 @@ cluster convergence for every watched Node. The resolved-identity fast path
 is now dual-stack for IPv4/IPv6 TCP/UDP/SCTP, including verifier-bounded IPv6
 extension-header traversal; native policy and selector-based NetworkPolicy IPv6
 decisions are live-verified.
-Enforcement maps now persist in an ABI-versioned bpffs directory; replacement
-agents validate and adopt last-known-good identity/policy state, while fresh or
-incompatible startup remains fenced from readiness until reconciliation.
+Identity and policy updates now use independent transactional banks selected by
+atomic configuration-map writes. All nine enforcement maps persist in an
+ABI-versioned bpffs directory; replacement agents validate and adopt
+last-known-good identity/policy state, while fresh or incompatible startup
+remains fenced from readiness until reconciliation.
 See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
 gates, evidence, limitations, and current work. The shorter
@@ -61,11 +63,12 @@ Implemented in the repository:
 - IPv4/IPv6 TCP/UDP/SCTP TC parsing, including bounded IPv6 extension-header
   traversal, with counters, bounded ring-buffer events, and active-bank L3/L4
   allow/drop decisions;
-- revisioned controller-to-agent dual-stack identity snapshots and separate
-  versioned IPv4/IPv6 BPF maps;
+- revisioned controller-to-agent dual-stack identity snapshots and transactional
+  dual-bank IPv4/IPv6 BPF maps selected by one atomic configuration write;
 - selector-resolved policy snapshots and dual-bank transactional BPF policy maps;
-- pinned enforcement maps with all-or-none validation, userspace cache recovery,
-  and controller-independent replacement-agent readiness;
+- nine pinned enforcement maps with all-or-none validation, active-bank and
+  revision checks, userspace cache recovery, and controller-independent
+  replacement-agent readiness;
 - `unfctl status`, `unfctl topology`, `unfctl flows`, and `unfctl explain` against live
   controller state;
 - `unfctl policy simulate <security-policy.yaml>` with table/JSON/YAML

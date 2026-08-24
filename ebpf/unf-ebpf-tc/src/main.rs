@@ -9,10 +9,11 @@ use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, RingBuf};
 use aya_ebpf::programs::TcContext;
 use unf_common::{IdentityId, PolicyId, PolicyReason, RuleId, Verdict};
 use unf_ebpf_common::{
-    AddressFamily, Direction, FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_MAP_ABI_VERSION,
+    AddressFamily, Direction, FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT,
+    IDENTITY_MAP_ABI_VERSION,
     IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT, IPV6_NEXT_HEADER_HOP_BY_HOP,
-    IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, Ipv6ExtensionStep, Ipv6IdentityKey,
-    Ipv6PolicyMapData, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
+    IdentityMapConfig, IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, Ipv6ExtensionStep,
+    Ipv6IdentityKey, Ipv6PolicyMapData, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
     POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, ipv6_extension_step,
@@ -37,8 +38,19 @@ static IDENTITY_V4: HashMap<Ipv4IdentityKey, IdentityMapValue> =
     HashMap::with_max_entries(65_536, BPF_F_NO_PREALLOC);
 
 #[map]
+static IDENTITY_V4_B: HashMap<Ipv4IdentityKey, IdentityMapValue> =
+    HashMap::with_max_entries(65_536, BPF_F_NO_PREALLOC);
+
+#[map]
 static IDENTITY_V6: HashMap<Ipv6IdentityKey, IdentityMapValue> =
     HashMap::with_max_entries(65_536, BPF_F_NO_PREALLOC);
+
+#[map]
+static IDENTITY_V6_B: HashMap<Ipv6IdentityKey, IdentityMapValue> =
+    HashMap::with_max_entries(65_536, BPF_F_NO_PREALLOC);
+
+#[map]
+static IDENTITY_CONFIG: Array<IdentityMapConfig> = Array::with_max_entries(1, 0);
 
 /// Dual-bank policy state. Userspace stages the inactive bank and atomically
 /// changes POLICY_CONFIG[0] only after validating the complete snapshot.
@@ -128,6 +140,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction) -> i32 {
     source_address[..4].copy_from_slice(&source_ipv4);
     let mut destination_address = [0_u8; 16];
     destination_address[..4].copy_from_slice(&destination_ipv4);
+    let identity_config = active_identity_config();
     emit_flow(
         direction,
         source_address,
@@ -136,8 +149,8 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction) -> i32 {
         destination_port,
         protocol,
         AddressFamily::Ipv4,
-        lookup_identity_v4(source_ipv4),
-        lookup_identity_v4(destination_ipv4),
+        lookup_identity_v4(source_ipv4, identity_config),
+        lookup_identity_v4(destination_ipv4, identity_config),
         Some(source_ipv4),
         None,
     )
@@ -166,6 +179,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction) -> i32 {
     let Ok(destination_port) = ctx.load::<[u8; 2]>(transport_offset + 2) else {
         return TC_ACT_PIPE;
     };
+    let identity_config = active_identity_config();
     emit_flow(
         direction,
         source_address,
@@ -174,8 +188,8 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction) -> i32 {
         destination_port,
         protocol,
         AddressFamily::Ipv6,
-        lookup_identity_v6(source_address),
-        lookup_identity_v6(destination_address),
+        lookup_identity_v6(source_address, identity_config),
+        lookup_identity_v6(destination_address, identity_config),
         None,
         Some(source_address),
     )
@@ -627,14 +641,40 @@ const fn valid_provenance(flags: u16, reason: u8, shadow: bool) -> bool {
 }
 
 #[inline(always)]
-fn lookup_identity_v4(address: [u8; 4]) -> IdentityId {
+fn active_identity_config() -> Option<IdentityMapConfig> {
+    let config = IDENTITY_CONFIG.get(0).copied()?;
+    if config.source_epoch == 0
+        || config.schema_version != IDENTITY_MAP_ABI_VERSION
+        || config.active_bank >= IDENTITY_BANK_COUNT
+        || config.revision == 0
+        || config.flags != 0
+    {
+        return None;
+    }
+    Some(config)
+}
+
+#[inline(always)]
+fn lookup_identity_v4(
+    address: [u8; 4],
+    config: Option<IdentityMapConfig>,
+) -> IdentityId {
+    let Some(config) = config else {
+        return IdentityId::new(0);
+    };
     let key = Ipv4IdentityKey::new(address);
-    // SAFETY: IDENTITY_V4 uses BPF_F_NO_PREALLOC, values have a fixed Copy ABI,
-    // and the reference is copied immediately without escaping this lookup.
+    // SAFETY: both identity maps use BPF_F_NO_PREALLOC, values have a fixed Copy
+    // ABI, and the reference is copied immediately without escaping this lookup.
     #[allow(unsafe_code)]
-    let value = unsafe { IDENTITY_V4.get(&key).copied() };
+    let value = unsafe {
+        if config.active_bank == 0 {
+            IDENTITY_V4.get(&key).copied()
+        } else {
+            IDENTITY_V4_B.get(&key).copied()
+        }
+    };
     value.map_or(IdentityId::new(0), |value| {
-        if value.schema_version == IDENTITY_MAP_ABI_VERSION {
+        if value.schema_version == IDENTITY_MAP_ABI_VERSION && value.revision == config.revision {
             value.identity_id
         } else {
             IdentityId::new(0)
@@ -643,14 +683,26 @@ fn lookup_identity_v4(address: [u8; 4]) -> IdentityId {
 }
 
 #[inline(always)]
-fn lookup_identity_v6(address: [u8; 16]) -> IdentityId {
+fn lookup_identity_v6(
+    address: [u8; 16],
+    config: Option<IdentityMapConfig>,
+) -> IdentityId {
+    let Some(config) = config else {
+        return IdentityId::new(0);
+    };
     let key = Ipv6IdentityKey::new(address);
-    // SAFETY: IDENTITY_V6 uses BPF_F_NO_PREALLOC, values have a fixed Copy ABI,
-    // and the reference is copied immediately without escaping this lookup.
+    // SAFETY: both identity maps use BPF_F_NO_PREALLOC, values have a fixed Copy
+    // ABI, and the reference is copied immediately without escaping this lookup.
     #[allow(unsafe_code)]
-    let value = unsafe { IDENTITY_V6.get(&key).copied() };
+    let value = unsafe {
+        if config.active_bank == 0 {
+            IDENTITY_V6.get(&key).copied()
+        } else {
+            IDENTITY_V6_B.get(&key).copied()
+        }
+    };
     value.map_or(IdentityId::new(0), |value| {
-        if value.schema_version == IDENTITY_MAP_ABI_VERSION {
+        if value.schema_version == IDENTITY_MAP_ABI_VERSION && value.revision == config.revision {
             value.identity_id
         } else {
             IdentityId::new(0)

@@ -2,6 +2,10 @@
 
 Status: Accepted for Phase 2 restart recovery
 
+Amended by [ADR 0017](0017-transactional-identity-banks.md), which moves the
+default pin layout from the six-map ABI v1 set to the nine-map ABI v2 set. The
+decision below records the initial recovery boundary.
+
 ## Context
 
 The policy compiler already activates one validated inactive bank with a single

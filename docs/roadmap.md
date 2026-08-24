@@ -40,8 +40,11 @@ matrix and reproducible evidence.
 - Implemented and two-node kind verified: ABI-versioned pinned enforcement maps,
   strict recovery validation, and readiness fencing; the verifier restarts a
   node agent with the controller offline before checking allow/deny state;
-- Next: dual-bank identity activation, atomic/pinned TC attachment handoff, and
-  pressure/corruption fault-injection tests.
+- Implemented and two-node kind verified: transactional dual-bank IPv4/IPv6
+  identity staging, read-back validation, single-write activation, rollback, and
+  offline-controller restart recovery through the ABI v2 nine-map pin set;
+- Next: atomic/pinned TC attachment handoff and pressure/partial-pin/corruption
+  fault-injection tests.
 
 ## Phase 3 — compatibility and simulation
 
