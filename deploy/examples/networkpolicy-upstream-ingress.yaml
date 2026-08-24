@@ -86,6 +86,43 @@ spec:
 apiVersion: v1
 kind: Pod
 metadata:
+  name: protocol-server
+  namespace: unf-np-target
+  labels:
+    app: upstream-protocol-server
+    protocol-target: "true"
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-worker
+  containers:
+    - name: server
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
+      command:
+        - sh
+        - -c
+        - |
+          socat TCP4-LISTEN:8090,reuseaddr,fork EXEC:/bin/cat &
+          socat TCP4-LISTEN:8091,reuseaddr,fork EXEC:/bin/cat &
+          socat UDP4-RECVFROM:8091,reuseaddr,fork EXEC:/bin/cat &
+          exec socat UDP4-RECVFROM:8090,reuseaddr,fork EXEC:/bin/cat
+      ports:
+        - name: exact-udp
+          containerPort: 8090
+          protocol: UDP
+        - name: other-udp
+          containerPort: 8091
+          protocol: UDP
+        - name: exact-tcp
+          containerPort: 8090
+          protocol: TCP
+        - name: other-tcp
+          containerPort: 8091
+          protocol: TCP
+---
+apiVersion: v1
+kind: Pod
+metadata:
   name: same-client
   namespace: unf-np-target
   labels:
@@ -99,7 +136,8 @@ spec:
       effect: NoSchedule
   containers:
     - name: client
-      image: docker.io/library/busybox:1.37.0
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
       command: ["sh", "-c", "sleep infinity"]
 ---
 apiVersion: v1
@@ -118,7 +156,8 @@ spec:
       effect: NoSchedule
   containers:
     - name: client
-      image: docker.io/library/busybox:1.37.0
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
       command: ["sh", "-c", "sleep infinity"]
 ---
 apiVersion: v1
@@ -137,7 +176,8 @@ spec:
       effect: NoSchedule
   containers:
     - name: client
-      image: docker.io/library/busybox:1.37.0
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
       command: ["sh", "-c", "sleep infinity"]
 ---
 apiVersion: networking.k8s.io/v1

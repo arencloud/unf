@@ -155,21 +155,63 @@ expect_deny() {
     expect_address_deny "$1" "$2" "${server_ip}" "$3"
 }
 
-expect_explanation_to() {
+protocol_exchange() {
+    local namespace=$1
+    local pod=$2
+    local protocol=$3
+    local address=$4
+    local port=$5
+    local endpoint
+    case ${protocol} in
+        tcp) endpoint="TCP4:${address}:${port}" ;;
+        udp) endpoint="UDP4-DATAGRAM:${address}:${port}" ;;
+        *) echo "unsupported echo protocol ${protocol}" >&2; return 2 ;;
+    esac
+    {
+        printf 'unf-protocol-ok'
+        sleep 0.2
+    } | "${kc[@]}" exec -i -n "${namespace}" "${pod}" -- \
+        timeout 3 socat -T 1 - "${endpoint}" 2>/dev/null
+}
+
+expect_protocol_allow() {
+    local response
+    response=$(protocol_exchange "$@" || true)
+    if [[ ${response} != "unf-protocol-ok" ]]; then
+        echo "expected $1/$2 $3 to reach $4 port $5" >&2
+        exit 1
+    fi
+}
+
+expect_protocol_deny() {
+    local response
+    response=$(protocol_exchange "$@" || true)
+    if [[ ${response} == "unf-protocol-ok" ]]; then
+        echo "expected $1/$2 $3 to be denied to $4 port $5" >&2
+        exit 1
+    fi
+}
+
+expect_protocol_explanation_to() {
     local source=$1
     local destination=$2
-    local port=$3
-    local verdict=$4
-    local reason=$5
+    local protocol=$3
+    local port=$4
+    local verdict=$5
+    local reason=$6
     local explanation
     explanation=$("${unfctl}" --controller-url "${controller_url}" --output json \
         explain --from "${source}" --to "${target_namespace}/${destination}" \
-        --protocol tcp --port "${port}")
+        --protocol "${protocol}" --port "${port}")
     if ! grep -q "\"verdict\": \"${verdict}\"" <<<"${explanation}" \
         || ! grep -q "\"reason\": \"${reason}\"" <<<"${explanation}"; then
-        echo "unexpected explanation for ${source} to ${destination} TCP/${port}" >&2
+        echo "unexpected explanation for ${source} to ${destination} ${protocol}/${port}" >&2
         exit 1
     fi
+}
+
+expect_explanation_to() {
+    expect_protocol_explanation_to "$1" "$2" tcp "$3" "$4" "$5"
 }
 
 expect_explanation() {
@@ -196,6 +238,8 @@ fi
 "${kc[@]}" wait --for=condition=Ready pod/server -n "${target_namespace}" --timeout=120s
 "${kc[@]}" wait --for=condition=Ready pod/alternate-server -n "${target_namespace}" \
     --timeout=120s
+"${kc[@]}" wait --for=condition=Ready pod/protocol-server -n "${target_namespace}" \
+    --timeout=120s
 "${kc[@]}" wait --for=condition=Ready pod/same-client -n "${target_namespace}" \
     --timeout=120s
 "${kc[@]}" wait --for=condition=Ready pod/client -n "${source_a_namespace}" --timeout=120s
@@ -204,12 +248,18 @@ server_ip=$("${kc[@]}" get pod -n "${target_namespace}" server \
     -o jsonpath='{.status.podIP}')
 alternate_server_ip=$("${kc[@]}" get pod -n "${target_namespace}" alternate-server \
     -o jsonpath='{.status.podIP}')
+protocol_server_ip=$("${kc[@]}" get pod -n "${target_namespace}" protocol-server \
+    -o jsonpath='{.status.podIP}')
 if [[ ! ${server_ip} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "upstream conformance server has no IPv4 Pod address" >&2
     exit 1
 fi
 if [[ ! ${alternate_server_ip} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "upstream conformance alternate server has no IPv4 Pod address" >&2
+    exit 1
+fi
+if [[ ! ${protocol_server_ip} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "upstream conformance protocol server has no IPv4 Pod address" >&2
     exit 1
 fi
 for port in 8087 8088; do
@@ -455,6 +505,76 @@ expect_address_allow "${source_a_namespace}" client "${server_ip}" 8088
 expect_address_allow "${source_a_namespace}" client "${alternate_server_ip}" 8087
 
 previous_revision=${policy_revision}
+for protocol in tcp udp; do
+    for port in 8090 8091; do
+        expect_protocol_allow \
+            "${source_a_namespace}" client "${protocol}" "${protocol_server_ip}" "${port}"
+    done
+done
+"${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: udp-protocol
+  namespace: ${target_namespace}
+spec:
+  podSelector:
+    matchLabels:
+      protocol-target: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              conformance-group: a
+      ports:
+        - protocol: UDP
+          port: 8090
+EOF
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "exact UDP policy did not converge"
+expect_protocol_allow \
+    "${source_a_namespace}" client udp "${protocol_server_ip}" 8090
+expect_protocol_deny \
+    "${source_a_namespace}" client udp "${protocol_server_ip}" 8091
+expect_protocol_deny \
+    "${source_a_namespace}" client tcp "${protocol_server_ip}" 8090
+expect_protocol_deny \
+    "${source_b_namespace}" client udp "${protocol_server_ip}" 8090
+expect_protocol_explanation_to \
+    "${source_a_namespace}/client" protocol-server udp 8090 Allow ExplicitRule
+expect_protocol_explanation_to \
+    "${source_a_namespace}/client" protocol-server udp 8091 Deny DefaultAction
+expect_protocol_explanation_to \
+    "${source_a_namespace}/client" protocol-server tcp 8090 Deny DefaultAction
+
+previous_revision=${policy_revision}
+"${kc[@]}" patch networkpolicy -n "${target_namespace}" udp-protocol --type=json \
+    -p '[{"op":"remove","path":"/spec/ingress/0/ports/0/port"}]' >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "protocol-only UDP policy did not converge"
+expect_protocol_allow \
+    "${source_a_namespace}" client udp "${protocol_server_ip}" 8091
+expect_protocol_deny \
+    "${source_a_namespace}" client tcp "${protocol_server_ip}" 8091
+expect_protocol_deny \
+    "${source_b_namespace}" client udp "${protocol_server_ip}" 8091
+expect_protocol_explanation_to \
+    "${source_a_namespace}/client" protocol-server udp 8091 Allow ExplicitRule
+expect_protocol_explanation_to \
+    "${source_a_namespace}/client" protocol-server tcp 8091 Deny DefaultAction
+
+previous_revision=${policy_revision}
+"${kc[@]}" delete networkpolicy -n "${target_namespace}" udp-protocol >/dev/null
+require_policy_state "$((baseline_count + 2))" "${baseline_rejected}" \
+    "${previous_revision}" "UDP policy deletion did not reconverge"
+expect_protocol_allow \
+    "${source_a_namespace}" client udp "${protocol_server_ip}" 8091
+expect_protocol_allow \
+    "${source_a_namespace}" client tcp "${protocol_server_ip}" 8090
+
+previous_revision=${policy_revision}
 cleanup
 for namespace in "${target_namespace}" "${source_a_namespace}" "${source_b_namespace}"; do
     if ! "${kc[@]}" wait --for=delete namespace/"${namespace}" --timeout=120s >/dev/null; then
@@ -467,4 +587,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned ingress conformance passed: destination-specific named ports, target Pod label isolation/recovery, default deny, same-namespace PodSelector, empty NamespaceSelector, selector AND, peer OR, matchExpressions with label recovery, multiple ingress rules, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned ingress conformance passed: exact/protocol-only UDP isolation, destination-specific named ports, target Pod label isolation/recovery, default deny, same-namespace PodSelector, empty NamespaceSelector, selector AND, peer OR, matchExpressions with label recovery, multiple ingress rules, stacked additive policies, and allow-all precedence"

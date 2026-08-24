@@ -112,8 +112,10 @@ destination Pod-label isolation/recovery, stacked additive policies, and
 temporary allow-all precedence across three source contexts and two ports. Its
 two selected servers also map one `web` port name to different numeric ports;
 the verifier requires destination-specific allow/deny and deletion recovery.
-It also requires every mutation to converge on both agents and deletes its three
-test Namespaces before returning.
+A dual-protocol echo target proves exact and protocol-only UDP rules do not
+broaden TCP or non-matching peers and recover after deletion. The verifier also
+requires every mutation to converge on both agents and deletes its three test
+Namespaces before returning.
 The exact scope and upstream mapping are tracked
 in [networkpolicy-conformance.md](networkpolicy-conformance.md).
 The verifier also queries topology schema v3, requires dual-stack workload
