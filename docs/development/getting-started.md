@@ -80,9 +80,10 @@ proves cross-node port 8080 allow and open-port 9090 deny, switches the same
 policy through shadow pass-through and back, and validates revisioned event and
 CLI provenance. It also exercises a supported ingress `NetworkPolicy`: cross-node
 allow and default-isolation drop, unsupported-update rejection and recovery, and
-named-port resolution plus bounded `endPort` boundary enforcement, oversized-
-range rejection, bounded IPv4 `ipBlock` allow/exception behavior and oversized-
-block rejection, Namespace relabel, and deletion/recreation convergence.
+named-port resolution, protocol-only TCP activation/removal without UDP
+broadening, bounded `endPort` boundary enforcement and oversized-range rejection,
+bounded IPv4 `ipBlock` allow/exception behavior and oversized-block rejection,
+Namespace relabel, and deletion/recreation convergence.
 The host kernel is shared with kind nodes. `make kind-down`
 deletes only the named `unf-dev` cluster.
 

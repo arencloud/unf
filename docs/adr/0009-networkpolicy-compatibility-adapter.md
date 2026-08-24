@@ -28,13 +28,16 @@ selectors, numeric TCP/UDP ports, and wildcards. Core policy IR represents `In`,
 `NotIn`, `Exists`, and `DoesNotExist` independently of Kubernetes types. Named
 TCP/UDP ports remain named in IR, resolve per destination from watched Pod
 container metadata, and lower to numeric dataplane entries. Inclusive numeric
-`endPort` ranges remain ranges in IR and lower to exact dataplane entries. A
-range may span at most 1,024 ports, and the shared compiler refuses more than
-131,072 entries in either transactional bank; the agent validates that bank
-limit again before staging a snapshot. It returns typed errors for egress, IP
-blocks wider than 1,024 IPv4 addresses, IPv6/reserved-address blocks,
+`endPort` ranges remain ranges in IR and lower to exact dataplane entries.
+Protocol-only TCP/UDP entries remain protocol-scoped wildcards in IR and lower to
+fixed-size `(protocol, port=0)` keys; `(protocol=0, port=0)` remains the
+all-protocol global fallback. A range may span at most 1,024 ports, and the
+shared compiler refuses more than 131,072 entries in either transactional bank;
+the agent validates that bank limit again before staging a snapshot. It returns
+typed errors for egress, IP blocks wider than 1,024 IPv4 addresses,
+IPv6/reserved-address blocks,
 out-of-block exceptions, oversized/reversed port ranges, named ports combined
-with `endPort`, protocol-only entries, SCTP, and malformed metadata/ports or
+with `endPort`, SCTP, and malformed metadata/ports or
 selector requirements. Bounded IPv4 `ipBlock` peers, including `except`, remain
 in IR and expand into exact-source keys plus an external-source fallback in a
 separate dual-bank map.

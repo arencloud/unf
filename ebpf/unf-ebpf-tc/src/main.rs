@@ -236,6 +236,13 @@ fn lookup_policy(
         protocol: 0,
         bank: config.active_bank,
     };
+    let ipv4_source_protocol_fallback = Ipv4PolicyMapKey {
+        source_address: source_ipv4,
+        destination_identity,
+        destination_port: [0; 2],
+        protocol,
+        bank: config.active_bank,
+    };
     let ipv4_external_exact = Ipv4PolicyMapKey {
         source_address: [0; 4],
         destination_identity,
@@ -250,9 +257,18 @@ fn lookup_policy(
         protocol: 0,
         bank: config.active_bank,
     };
+    let ipv4_external_protocol_fallback = Ipv4PolicyMapKey {
+        source_address: [0; 4],
+        destination_identity,
+        destination_port: [0; 2],
+        protocol,
+        bank: config.active_bank,
+    };
     if let Some(value) = lookup_ipv4_policy_value(&ipv4_exact, config.revision)
+        .or_else(|| lookup_ipv4_policy_value(&ipv4_source_protocol_fallback, config.revision))
         .or_else(|| lookup_ipv4_policy_value(&ipv4_source_fallback, config.revision))
         .or_else(|| lookup_ipv4_policy_value(&ipv4_external_exact, config.revision))
+        .or_else(|| lookup_ipv4_policy_value(&ipv4_external_protocol_fallback, config.revision))
         .or_else(|| lookup_ipv4_policy_value(&ipv4_external_fallback, config.revision))
     {
         return decode_policy_value(value, config.revision);
@@ -275,7 +291,15 @@ fn lookup_policy(
         protocol: 0,
         bank: config.active_bank,
     };
+    let protocol_fallback = PolicyMapKey {
+        source_identity,
+        destination_identity,
+        destination_port: [0; 2],
+        protocol,
+        bank: config.active_bank,
+    };
     let value = lookup_policy_value(&exact, config.revision)
+        .or_else(|| lookup_policy_value(&protocol_fallback, config.revision))
         .or_else(|| lookup_policy_value(&fallback, config.revision));
     let Some(value) = value else {
         return DataplaneDecision::observed(ReasonCode::Observed);

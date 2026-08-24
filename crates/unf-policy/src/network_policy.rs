@@ -99,13 +99,6 @@ pub enum NetworkPolicyCompileError {
         rule_index: usize,
         port_index: usize,
     },
-    #[error(
-        "ingress rule {rule_index} port {port_index} matches a protocol without a numeric port, which the current BPF key cannot represent"
-    )]
-    UnsupportedProtocolOnlyPort {
-        rule_index: usize,
-        port_index: usize,
-    },
     #[error("ingress rule {rule_index} port {port_index} contains invalid range {start}..={end}")]
     InvalidPortRange {
         rule_index: usize,
@@ -539,10 +532,13 @@ fn port_tuple(
                 port_index,
             });
         }
+        None if port.end_port.is_none() => DestinationPort::Any,
         None => {
-            return Err(NetworkPolicyCompileError::UnsupportedProtocolOnlyPort {
+            return Err(NetworkPolicyCompileError::InvalidPortRange {
                 rule_index,
                 port_index,
+                start: 0,
+                end: port.end_port.unwrap_or_default(),
             });
         }
     };
@@ -754,6 +750,111 @@ mod tests {
         assert_eq!(compiled.rules.len(), 1);
         assert_eq!(compiled.rules[0].source, IdentitySelector::default());
         assert_eq!(compiled.rules[0].protocol, None);
+        assert_eq!(compiled.rules[0].destination_port, DestinationPort::Any);
+    }
+
+    #[test]
+    fn protocol_only_ports_lower_without_broadening_other_protocols() {
+        let compiled = NetworkPolicyCompiler::compile(
+            PolicyId::new(7),
+            policy(vec![NetworkPolicyIngressRule {
+                from: None,
+                ports: Some(vec![NetworkPolicyPort::default()]),
+            }]),
+        )
+        .expect("protocol-only TCP port compiles");
+        assert_eq!(compiled.rules[0].protocol, Some(Protocol::Tcp));
+        assert_eq!(compiled.rules[0].destination_port, DestinationPort::Any);
+
+        let source = endpoint(1, "frontend", "client");
+        let destination = endpoint(2, "backend", "server");
+        for port in [1, 8080, u16::MAX] {
+            assert_eq!(
+                evaluate(
+                    std::slice::from_ref(&compiled),
+                    Flow {
+                        source: &source,
+                        destination: &destination,
+                        protocol: Protocol::Tcp,
+                        destination_port: port,
+                        source_ipv4: None,
+                    },
+                )
+                .verdict,
+                Verdict::Allow
+            );
+        }
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source: &source,
+                    destination: &destination,
+                    protocol: Protocol::Udp,
+                    destination_port: 8080,
+                    source_ipv4: None,
+                },
+            )
+            .verdict,
+            Verdict::Deny
+        );
+
+        let identity_entries = compile_dataplane_entries(
+            std::slice::from_ref(&compiled),
+            &[source.clone(), destination.clone()],
+        )
+        .expect("protocol wildcard lowers into the identity policy map");
+        assert!(identity_entries.iter().any(|entry| {
+            entry.key.source_identity == source.identity
+                && entry.key.destination_identity == destination.identity
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 0
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(identity_entries.iter().any(|entry| {
+            entry.key.source_identity == source.identity
+                && entry.key.destination_identity == destination.identity
+                && entry.key.protocol == 0
+                && entry.key.destination_port == 0
+                && entry.decision.verdict == Verdict::Deny
+        }));
+
+        let source_address = Ipv4Addr::new(10, 0, 0, 1);
+        let ipv4_entries = compile_ipv4_dataplane_entries(
+            &[compiled],
+            &[source.clone(), destination.clone()],
+            &[Ipv4Endpoint {
+                address: source_address,
+                endpoint: source,
+            }],
+        )
+        .expect("protocol wildcard lowers into the IPv4 policy map");
+        assert!(ipv4_entries.iter().any(|entry| {
+            entry.key.source_address == source_address
+                && entry.key.destination_identity == destination.identity
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 0
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(!ipv4_entries.iter().any(|entry| {
+            entry.key.protocol == Protocol::Udp as u8 && entry.key.destination_port == 0
+        }));
+    }
+
+    #[test]
+    fn udp_protocol_only_port_is_supported() {
+        let compiled = NetworkPolicyCompiler::compile(
+            PolicyId::new(7),
+            policy(vec![NetworkPolicyIngressRule {
+                from: None,
+                ports: Some(vec![NetworkPolicyPort {
+                    protocol: Some("UDP".to_owned()),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }]),
+        )
+        .expect("protocol-only UDP port compiles");
+        assert_eq!(compiled.rules[0].protocol, Some(Protocol::Udp));
         assert_eq!(compiled.rules[0].destination_port, DestinationPort::Any);
     }
 
@@ -1347,15 +1448,6 @@ mod tests {
         assert!(matches!(
             NetworkPolicyCompiler::compile(PolicyId::new(7), empty_named_port_policy),
             Err(NetworkPolicyCompileError::InvalidNamedPort { .. })
-        ));
-
-        let protocol_only_policy = policy(vec![NetworkPolicyIngressRule {
-            from: None,
-            ports: Some(vec![NetworkPolicyPort::default()]),
-        }]);
-        assert!(matches!(
-            NetworkPolicyCompiler::compile(PolicyId::new(7), protocol_only_policy),
-            Err(NetworkPolicyCompileError::UnsupportedProtocolOnlyPort { .. })
         ));
 
         let mut egress_policy = policy(Vec::new());

@@ -74,9 +74,9 @@ pub struct IdentityStateSnapshot {
 pub struct PolicyMapKey {
     pub source_identity: IdentityId,
     pub destination_identity: IdentityId,
-    /// IP protocol number, or zero for a wildcard fallback.
+    /// IP protocol number, or zero for a global wildcard fallback.
     pub protocol: u8,
-    /// Destination port, or zero for a wildcard fallback.
+    /// Destination port, or zero for a protocol-specific or global wildcard.
     pub destination_port: u16,
 }
 
@@ -100,9 +100,9 @@ pub struct Ipv4PolicyMapKey {
     /// Exact source address, or `0.0.0.0` for an external-source fallback.
     pub source_address: Ipv4Addr,
     pub destination_identity: IdentityId,
-    /// IP protocol number, or zero for a wildcard fallback.
+    /// IP protocol number, or zero for a global wildcard fallback.
     pub protocol: u8,
-    /// Destination port, or zero for a wildcard fallback.
+    /// Destination port, or zero for a protocol-specific or global wildcard.
     pub destination_port: u16,
 }
 

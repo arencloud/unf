@@ -851,7 +851,7 @@ fn validate_policy_entry(entry: &PolicyMapEntry) -> Result<()> {
         bail!("policy entry contains reserved identity ID zero");
     }
     match (entry.key.protocol, entry.key.destination_port) {
-        (0, 0) | (6 | 17, 1..=u16::MAX) => {}
+        (0, 0) | (6 | 17, 0..=u16::MAX) => {}
         _ => bail!("policy entry contains an invalid protocol/port wildcard combination"),
     }
     validate_policy_decision(&entry.decision)?;
@@ -866,7 +866,7 @@ fn validate_ipv4_policy_entry(entry: &Ipv4PolicyMapEntry) -> Result<()> {
         bail!("IPv4 policy entry contains reserved destination identity ID zero");
     }
     match (entry.key.protocol, entry.key.destination_port) {
-        (0, 0) | (6 | 17, 1..=u16::MAX) => {}
+        (0, 0) | (6 | 17, 0..=u16::MAX) => {}
         _ => bail!("IPv4 policy entry contains an invalid protocol/port wildcard combination"),
     }
     validate_policy_decision(&entry.decision)?;
@@ -1487,6 +1487,28 @@ mod tests {
         let mut entry = policy_entry();
         entry.key.protocol = 0;
         assert!(desired_policy_entries(&[entry], 17, 1).is_err());
+    }
+
+    #[test]
+    fn policy_snapshot_accepts_protocol_specific_wildcard() {
+        let mut identity_entry = policy_entry();
+        identity_entry.key.destination_port = 0;
+        assert!(desired_policy_entries(&[identity_entry], 17, 1).is_ok());
+
+        let mut ipv4_entry = Ipv4PolicyMapEntry {
+            key: unf_state::Ipv4PolicyMapKey {
+                source_address: "10.244.1.3".parse().unwrap(),
+                destination_identity: identity_entry.key.destination_identity,
+                protocol: identity_entry.key.protocol,
+                destination_port: 0,
+            },
+            decision: identity_entry.decision,
+            shadow: identity_entry.shadow,
+        };
+        assert!(desired_ipv4_policy_entries(&[ipv4_entry], 17, 1).is_ok());
+        ipv4_entry.key.protocol = 0;
+        ipv4_entry.key.destination_port = 8080;
+        assert!(desired_ipv4_policy_entries(&[ipv4_entry], 17, 1).is_err());
     }
 
     #[test]

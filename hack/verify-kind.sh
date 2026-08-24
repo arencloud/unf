@@ -10,6 +10,7 @@ temporary_dir=$(mktemp -d)
 controller_forward_pid=
 policy_mutated=false
 network_policy_mutated=false
+network_policy_protocol_mutated=false
 network_policy_peer_mutated=false
 network_policy_deleted=false
 namespace_mutated=false
@@ -23,6 +24,11 @@ cleanup() {
     if [[ ${network_policy_mutated} == true ]]; then
         "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
             -p '[{"op":"replace","path":"/spec/ingress/0/ports/1/endPort","value":8083}]' \
+            >/dev/null 2>&1 || true
+    fi
+    if [[ ${network_policy_protocol_mutated} == true ]]; then
+        "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+            -p '[{"op":"remove","path":"/spec/ingress/0/ports/2"}]' \
             >/dev/null 2>&1 || true
     fi
     if [[ ${network_policy_peer_mutated} == true ]]; then
@@ -435,17 +441,75 @@ if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${network_policy_range_line}" 
     exit 1
 fi
 
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p '[{"op":"add","path":"/spec/ingress/0/ports/-","value":{"protocol":"TCP"}}]' \
+    >/dev/null
+network_policy_protocol_mutated=true
+if ! wait_for_controller_policy_counts 1 0 "${enforced_policy_revision}"; then
+    echo "controller did not compile the protocol-only NetworkPolicy port" >&2
+    exit 1
+fi
+protocol_wildcard_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${enforced_policy_revision}"; then
+    echo "agents did not activate the protocol-only NetworkPolicy port" >&2
+    exit 1
+fi
+protocol_wildcard_tcp_explanation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/client --to backend/np-server --protocol tcp --port 9091)
+grep -q '"reason": "ExplicitRule"' <<<"${protocol_wildcard_tcp_explanation}"
+grep -q '"verdict": "Allow"' <<<"${protocol_wildcard_tcp_explanation}"
+protocol_wildcard_udp_explanation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/client --to backend/np-server --protocol udp --port 9091)
+grep -q '"reason": "DefaultAction"' <<<"${protocol_wildcard_udp_explanation}"
+grep -q '"verdict": "Deny"' <<<"${protocol_wildcard_udp_explanation}"
+protocol_wildcard_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:9091)
+if [[ ${protocol_wildcard_response} != "unf-networkpolicy-ok" ]]; then
+    echo "protocol-only TCP NetworkPolicy port did not allow an arbitrary TCP port" >&2
+    exit 1
+fi
+sleep 1
+protocol_wildcard_line=$(all_agent_logs | grep '"destination_port":9091' \
+    | grep '"verdict":"Allow"' | grep '"reason":1' \
+    | grep "\"policy_revision\":${protocol_wildcard_revision}" | tail -n 1 || true)
+if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${protocol_wildcard_line}" \
+    || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${protocol_wildcard_line}" \
+    || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${protocol_wildcard_line}"; then
+    echo "UNF did not emit protocol-only NetworkPolicy allow provenance" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p '[{"op":"remove","path":"/spec/ingress/0/ports/2"}]' >/dev/null
+if ! wait_for_controller_policy_counts 1 0 "${protocol_wildcard_revision}"; then
+    echo "controller did not restore the exact-port NetworkPolicy" >&2
+    exit 1
+fi
+restored_protocol_policy_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${protocol_wildcard_revision}"; then
+    echo "agents did not remove the protocol-only NetworkPolicy wildcard" >&2
+    exit 1
+fi
+network_policy_protocol_mutated=false
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:9091 >/dev/null 2>&1; then
+    echo "removing the protocol-only NetworkPolicy port did not restore default deny" >&2
+    exit 1
+fi
+
 namespace_identity_revision=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json status \
     | sed -nE 's/.*"identity": ([0-9]+).*/\1/p')
 "${kc[@]}" label namespace frontend environment=staging --overwrite >/dev/null
 namespace_mutated=true
-if ! wait_for_controller_policy_counts 1 0 "${enforced_policy_revision}"; then
+if ! wait_for_controller_policy_counts 1 0 "${restored_protocol_policy_revision}"; then
     echo "controller did not revise policy state after the Namespace label change" >&2
     exit 1
 fi
 namespace_denied_revision=${controller_state_revision}
-if ! wait_for_policy_transition "${enforced_policy_revision}"; then
+if ! wait_for_policy_transition "${restored_protocol_policy_revision}"; then
     echo "agents did not activate the Namespace label change" >&2
     exit 1
 fi
@@ -646,4 +710,4 @@ if "${kc[@]}" exec -n frontend client -- \
     exit 1
 fi
 
-echo "kind verification passed: native/NetworkPolicy enforcement, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"

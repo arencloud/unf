@@ -116,9 +116,9 @@ impl IdentityMapValue {
 pub struct PolicyMapKey {
     pub source_identity: IdentityId,
     pub destination_identity: IdentityId,
-    /// Destination port in network byte order; zero means wildcard fallback.
+    /// Destination port in network byte order; zero means protocol/global wildcard.
     pub destination_port: [u8; 2],
-    /// IP protocol number; zero means wildcard fallback.
+    /// IP protocol number; zero means global wildcard fallback.
     pub protocol: u8,
     pub bank: u8,
 }
@@ -129,9 +129,9 @@ pub struct Ipv4PolicyMapKey {
     /// Exact source IPv4 address in network byte order; zero is a fallback.
     pub source_address: [u8; 4],
     pub destination_identity: IdentityId,
-    /// Destination port in network byte order; zero means wildcard fallback.
+    /// Destination port in network byte order; zero means protocol/global wildcard.
     pub destination_port: [u8; 2],
-    /// IP protocol number; zero means wildcard fallback.
+    /// IP protocol number; zero means global wildcard fallback.
     pub protocol: u8,
     pub bank: u8,
 }

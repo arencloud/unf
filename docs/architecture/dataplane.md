@@ -25,8 +25,9 @@ return `TC_ACT_PIPE`.
 
 `FlowEvent` carries no Kubernetes strings. ABI v2 records the applied policy
 revision, actual verdict/reason/policy/rule, and optional shadow
-verdict/reason/policy/rule. TC performs an exact protocol/port lookup first and
-then a protocol/port-zero fallback in the bank selected by `POLICY_CONFIG`.
+verdict/reason/policy/rule. In `POLICY_RULES`, TC looks up the exact protocol/port,
+then the same protocol with port zero, then the protocol/port-zero global fallback
+in the bank selected by `POLICY_CONFIG`.
 Config and values must have the expected schema and identical nonzero revision.
 Event and map ABIs use fixed C layouts, explicit schema/version fields, and
 compile-time size assertions.
@@ -37,13 +38,13 @@ ports, while the shared lowering path caps the complete snapshot at the physical
 131,072-entry allocation for one bank. The agent validates the same snapshot
 bound before encoding or mutating the inactive bank.
 
-Bounded IPv4 `ipBlock` peers use `POLICY_IPV4`. TC checks an exact source/port
-entry, exact-source fallback, arbitrary-external/port entry, then the external
-fallback before consulting `POLICY_RULES`. The controller emits exact entries for
-known Pod addresses and bounded block addresses, preserving the shared evaluator's
-native/compatibility precedence. Snapshot schema v2 carries both entry sets; the
-agent stages and validates both inactive banks before the single `POLICY_CONFIG`
-activation write.
+Bounded IPv4 `ipBlock` peers use `POLICY_IPV4`. For an exact source and then the
+arbitrary-external source, TC checks exact protocol/port, protocol-specific
+port-zero, and global protocol/port-zero entries before consulting
+`POLICY_RULES`. The controller emits exact entries for known Pod addresses and
+bounded block addresses, preserving the shared evaluator's native/compatibility
+precedence. Snapshot schema v2 carries both entry sets; the agent stages and
+validates both inactive banks before the single `POLICY_CONFIG` activation write.
 
 ## Failure behavior
 

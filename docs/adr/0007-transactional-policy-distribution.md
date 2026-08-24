@@ -13,8 +13,9 @@ independent of Kubernetes selectors and controller watch order.
 
 The controller resolves the normalized policy IR against admitted endpoint
 identities. It emits sorted entries for exact identity/protocol/port decisions
-and a protocol/port-zero fallback for wildcard rules and policy defaults. Each
-decision retains actual and shadow verdict, policy ID, rule ID, and a stable
+plus two wildcard levels: `(protocol, port=0)` for protocol-only rules, followed
+by `(protocol=0, port=0)` for all-protocol rules and policy defaults. Each decision
+retains actual and shadow verdict, policy ID, rule ID, and a stable
 machine-readable reason.
 
 Agents poll an epoch/revision policy snapshot and manage two logical banks in

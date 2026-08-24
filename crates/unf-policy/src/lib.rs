@@ -500,10 +500,11 @@ pub fn evaluate(policies: &[PolicyIr], flow: Flow<'_>) -> PolicyDecision {
 
 /// Resolves selector-based policy IR into deterministic identity-tuple entries.
 ///
-/// Port zero and protocol zero are reserved for the fallback entry evaluated
-/// after excluding every exact L3/L4 rule. The eBPF fast path can therefore use
-/// one exact lookup followed by one wildcard lookup without interpreting
-/// selectors or policy priority.
+/// Port and protocol zero together represent the global fallback evaluated
+/// without protocol-specific rules. A concrete protocol with port zero is a
+/// protocol-specific wildcard. The eBPF fast path can therefore resolve exact,
+/// protocol-wide, then global decisions without interpreting selectors or
+/// policy priority.
 ///
 /// # Errors
 ///
@@ -513,6 +514,7 @@ pub fn compile_dataplane_entries(
     policies: &[PolicyIr],
     endpoints: &[Endpoint],
 ) -> Result<Vec<PolicyMapEntry>, DataplaneCompileError> {
+    let global_policies = global_fallback_policies(policies);
     let mut unique_endpoints = BTreeMap::<IdentityId, &Endpoint>::new();
     for endpoint in endpoints {
         if let Some(existing) = unique_endpoints.insert(endpoint.identity, endpoint)
@@ -527,8 +529,8 @@ pub fn compile_dataplane_entries(
     let mut entries = Vec::new();
     for source in unique_endpoints.values() {
         for destination in unique_endpoints.values() {
-            let fallback = evaluate(
-                policies,
+            let global_fallback = evaluate(
+                &global_policies,
                 Flow {
                     source,
                     destination,
@@ -537,9 +539,42 @@ pub fn compile_dataplane_entries(
                     source_ipv4: None,
                 },
             );
-            let fallback_entry = policy_map_entry(source, destination, 0, 0, &fallback);
-            if has_policy_provenance(&fallback) {
-                push_dataplane_entry(&mut entries, fallback_entry)?;
+            let global_entry = policy_map_entry(source, destination, 0, 0, &global_fallback);
+            if has_policy_provenance(&global_fallback) {
+                push_dataplane_entry(&mut entries, global_entry)?;
+            }
+
+            let wildcard_protocols: BTreeSet<_> = policies
+                .iter()
+                .filter(|policy| policy.target.matches(destination))
+                .flat_map(|policy| &policy.rules)
+                .filter(|rule| {
+                    rule.source.matches_source(source, None)
+                        && rule.destination.matches(destination)
+                        && rule.destination_port == DestinationPort::Any
+                })
+                .filter_map(|rule| rule.protocol)
+                .collect();
+            let mut protocol_entries = BTreeMap::new();
+            for protocol in wildcard_protocols {
+                let decision = evaluate(
+                    policies,
+                    Flow {
+                        source,
+                        destination,
+                        protocol,
+                        destination_port: 0,
+                        source_ipv4: None,
+                    },
+                );
+                let entry = policy_map_entry(source, destination, protocol as u8, 0, &decision);
+                if has_policy_provenance(&decision)
+                    && (entry.decision != global_entry.decision
+                        || entry.shadow != global_entry.shadow)
+                {
+                    push_dataplane_entry(&mut entries, entry)?;
+                }
+                protocol_entries.insert(protocol, entry);
             }
 
             let exact_tuples: BTreeSet<_> = policies
@@ -564,9 +599,9 @@ pub fn compile_dataplane_entries(
                     },
                 );
                 let entry = policy_map_entry(source, destination, protocol as u8, port, &decision);
+                let inherited = protocol_entries.get(&protocol).unwrap_or(&global_entry);
                 if has_policy_provenance(&decision)
-                    && (entry.decision != fallback_entry.decision
-                        || entry.shadow != fallback_entry.shadow)
+                    && (entry.decision != inherited.decision || entry.shadow != inherited.shadow)
                 {
                     push_dataplane_entry(&mut entries, entry)?;
                 }
@@ -592,6 +627,7 @@ pub fn compile_ipv4_dataplane_entries(
     endpoints: &[Endpoint],
     ipv4_endpoints: &[Ipv4Endpoint],
 ) -> Result<Vec<Ipv4PolicyMapEntry>, DataplaneCompileError> {
+    let global_policies = global_fallback_policies(policies);
     let mut destinations = BTreeMap::<IdentityId, &Endpoint>::new();
     for endpoint in endpoints {
         if let Some(existing) = destinations.insert(endpoint.identity, endpoint)
@@ -648,6 +684,7 @@ pub fn compile_ipv4_dataplane_entries(
         for destination in destinations.values() {
             compile_ipv4_pair(
                 policies,
+                &global_policies,
                 source,
                 Some(address),
                 address,
@@ -665,6 +702,7 @@ pub fn compile_ipv4_dataplane_entries(
     }) {
         compile_ipv4_pair(
             policies,
+            &global_policies,
             &external,
             None,
             Ipv4Addr::UNSPECIFIED,
@@ -679,14 +717,15 @@ pub fn compile_ipv4_dataplane_entries(
 
 fn compile_ipv4_pair(
     policies: &[PolicyIr],
+    global_policies: &[PolicyIr],
     source: &Endpoint,
     source_ipv4: Option<Ipv4Addr>,
     source_address: Ipv4Addr,
     destination: &Endpoint,
     entries: &mut Vec<Ipv4PolicyMapEntry>,
 ) -> Result<(), DataplaneCompileError> {
-    let fallback = evaluate(
-        policies,
+    let global_fallback = evaluate(
+        global_policies,
         Flow {
             source,
             destination,
@@ -695,9 +734,42 @@ fn compile_ipv4_pair(
             source_ipv4,
         },
     );
-    let fallback_entry = ipv4_policy_map_entry(source_address, destination, 0, 0, &fallback);
-    if has_policy_provenance(&fallback) {
-        push_ipv4_dataplane_entry(entries, fallback_entry)?;
+    let global_entry = ipv4_policy_map_entry(source_address, destination, 0, 0, &global_fallback);
+    if has_policy_provenance(&global_fallback) {
+        push_ipv4_dataplane_entry(entries, global_entry)?;
+    }
+
+    let wildcard_protocols: BTreeSet<_> = policies
+        .iter()
+        .filter(|policy| policy.target.matches(destination))
+        .flat_map(|policy| &policy.rules)
+        .filter(|rule| {
+            rule.source.matches_source(source, source_ipv4)
+                && rule.destination.matches(destination)
+                && rule.destination_port == DestinationPort::Any
+        })
+        .filter_map(|rule| rule.protocol)
+        .collect();
+    let mut protocol_entries = BTreeMap::new();
+    for protocol in wildcard_protocols {
+        let decision = evaluate(
+            policies,
+            Flow {
+                source,
+                destination,
+                protocol,
+                destination_port: 0,
+                source_ipv4,
+            },
+        );
+        let entry =
+            ipv4_policy_map_entry(source_address, destination, protocol as u8, 0, &decision);
+        if has_policy_provenance(&decision)
+            && (entry.decision != global_entry.decision || entry.shadow != global_entry.shadow)
+        {
+            push_ipv4_dataplane_entry(entries, entry)?;
+        }
+        protocol_entries.insert(protocol, entry);
     }
 
     let exact_tuples: BTreeSet<_> = policies
@@ -722,13 +794,25 @@ fn compile_ipv4_pair(
         );
         let entry =
             ipv4_policy_map_entry(source_address, destination, protocol as u8, port, &decision);
+        let inherited = protocol_entries.get(&protocol).unwrap_or(&global_entry);
         if has_policy_provenance(&decision)
-            && (entry.decision != fallback_entry.decision || entry.shadow != fallback_entry.shadow)
+            && (entry.decision != inherited.decision || entry.shadow != inherited.shadow)
         {
             push_ipv4_dataplane_entry(entries, entry)?;
         }
     }
     Ok(())
+}
+
+fn global_fallback_policies(policies: &[PolicyIr]) -> Vec<PolicyIr> {
+    policies
+        .iter()
+        .cloned()
+        .map(|mut policy| {
+            policy.rules.retain(|rule| rule.protocol.is_none());
+            policy
+        })
+        .collect()
 }
 
 fn external_endpoint() -> Endpoint {
