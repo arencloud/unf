@@ -18,6 +18,7 @@ use unf_ebpf_common::{
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const PROTOCOL_TCP: u8 = 6;
 const PROTOCOL_UDP: u8 = 17;
+const PROTOCOL_SCTP: u8 = 132;
 const ETHERNET_HEADER_LEN: usize = 14;
 const BPF_F_NO_PREALLOC: u32 = 1;
 
@@ -87,7 +88,7 @@ fn observe(ctx: &TcContext, direction: Direction) -> i32 {
     let Ok(protocol) = ctx.load::<u8>(ETHERNET_HEADER_LEN + 9) else {
         return TC_ACT_PIPE;
     };
-    if protocol != PROTOCOL_TCP && protocol != PROTOCOL_UDP {
+    if protocol != PROTOCOL_TCP && protocol != PROTOCOL_UDP && protocol != PROTOCOL_SCTP {
         return TC_ACT_PIPE;
     }
 

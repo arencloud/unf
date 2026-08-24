@@ -44,21 +44,22 @@ matrix and reproducible evidence.
   translation, additive semantics, controller reconciliation/status, shared
   dataplane enforcement/provenance, pod/Namespace label-expression selectors,
   destination-aware named-port lowering, namespace relabel convergence without
-  identity churn, protocol-only TCP/UDP wildcard lowering, bounded numeric
+  identity churn, protocol-only TCP/UDP/SCTP wildcard lowering, bounded numeric
   `endPort` ranges with map-capacity guards, and bounded IPv4 `ipBlock`/`except`
   exact-source enforcement with atomic two-map activation, namespace-wide
   targets from omitted `podSelector`, implicit ingress `policyTypes` for
   egress-omitted objects, default TCP ports, and non-selected Pod behavior, plus
-  rejection/deletion recovery;
-  revision-fenced, read-only native policy
-  simulation over a bounded current-topology probe matrix; versioned Node,
+  rejection/deletion recovery; IPv4 SCTP parsing/enforcement, live explanation,
+  revisioned provenance, and historical export;
+  revision-fenced, read-only native policy simulation over a bounded
+  current-topology probe matrix; versioned Node,
   workload-placement, Service, and selector-membership topology snapshots;
   EndpointSlice-backed runtime relationships with readiness, serving,
   termination, Node/zone, Pod target, address, and port provenance;
   destination-resolved agent flow export through bounded non-blocking queues,
   revisioned 4,096-key controller history, `unfctl flows`, and
   observation-weighted historical simulation impact;
-- Next: IPv6/SCTP and broader upstream ingress conformance, plus
+- Next: IPv6 and broader upstream ingress conformance, plus
   authenticated/durable telemetry transport with time-window queries;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;

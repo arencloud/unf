@@ -72,6 +72,7 @@ enum Output {
 enum Protocol {
     Tcp,
     Udp,
+    Sctp,
 }
 
 #[derive(Debug, Serialize)]
@@ -294,6 +295,7 @@ const fn protocol_label(protocol: u64) -> &'static str {
         1 => "icmp",
         6 => "tcp",
         17 => "udp",
+        132 => "sctp",
         _ => "unknown",
     }
 }
@@ -529,5 +531,29 @@ mod tests {
             .expect("flows command parses");
         assert!(matches!(cli.command, Command::Flows));
         assert!(matches!(cli.output, Output::Json));
+    }
+
+    #[test]
+    fn sctp_explain_command_parses() {
+        let cli = Cli::try_parse_from([
+            "unfctl",
+            "explain",
+            "--from",
+            "frontend/sctp-client",
+            "--to",
+            "backend/sctp-server",
+            "--protocol",
+            "sctp",
+            "--port",
+            "8086",
+        ])
+        .expect("SCTP explain command parses");
+        assert!(matches!(
+            cli.command,
+            Command::Explain {
+                protocol: Protocol::Sctp,
+                ..
+            }
+        ));
     }
 }

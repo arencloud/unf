@@ -24,23 +24,24 @@ Compatibility policy uses reserved priority `1_000_000`, below the native policy
 default range, so an explicitly managed native policy can override the baseline.
 The translator accepts pod and Namespace `matchLabels` plus normalized
 `matchExpressions`, local pod peers, exact `kubernetes.io/metadata.name`
-selectors, numeric TCP/UDP ports, and wildcards. Core policy IR represents `In`,
-`NotIn`, `Exists`, and `DoesNotExist` independently of Kubernetes types. Named
-TCP/UDP ports remain named in IR, resolve per destination from watched Pod
-container metadata, and lower to numeric dataplane entries. Inclusive numeric
-`endPort` ranges remain ranges in IR and lower to exact dataplane entries.
-Protocol-only TCP/UDP entries remain protocol-scoped wildcards in IR and lower to
-fixed-size `(protocol, port=0)` keys; `(protocol=0, port=0)` remains the
-all-protocol global fallback. A range may span at most 1,024 ports, and the
-shared compiler refuses more than 131,072 entries in either transactional bank;
+selectors, numeric TCP/UDP/SCTP ports, and wildcards. Core policy IR represents
+`In`, `NotIn`, `Exists`, and `DoesNotExist` independently of Kubernetes types.
+Named TCP/UDP/SCTP ports remain named in IR, resolve per destination from watched
+Pod container metadata, and lower to numeric dataplane entries. Inclusive
+numeric `endPort` ranges remain ranges in IR and lower to exact dataplane entries.
+Protocol-only TCP/UDP/SCTP entries remain protocol-scoped wildcards in IR and
+lower to fixed-size `(protocol, port=0)` keys; `(protocol=0, port=0)` remains the
+all-protocol global fallback. SCTP uses its IANA protocol number 132 and the same
+source/destination port positions as the other supported transports. A range may
+span at most 1,024 ports, and the shared compiler refuses more than 131,072
+entries in either transactional bank;
 the agent validates that bank limit again before staging a snapshot. It returns
 typed errors for egress, IP blocks wider than 1,024 IPv4 addresses,
-IPv6/reserved-address blocks,
-out-of-block exceptions, oversized/reversed port ranges, named ports combined
-with `endPort`, SCTP, and malformed metadata/ports or
-selector requirements. Bounded IPv4 `ipBlock` peers, including `except`, remain
-in IR and expand into exact-source keys plus an external-source fallback in a
-separate dual-bank map.
+IPv6/reserved-address blocks, out-of-block exceptions, oversized/reversed port
+ranges, named ports combined with `endPort`, and malformed metadata/ports or
+selector requirements. Bounded
+IPv4 `ipBlock` peers, including `except`, remain in IR and expand into
+exact-source keys plus an external-source fallback in a separate dual-bank map.
 
 Kubernetes API defaults are resolved at the compatibility boundary. An omitted
 `spec.podSelector` is the empty selector and therefore selects every Pod in the
@@ -80,5 +81,8 @@ fail compilation instead of weakening policy. Unbounded and IPv6 IP blocks still
 need a compact prefix representation, and egress needs a direction-aware IR and
 hook. The live verifier also creates a policy with omitted target selector,
 policy types, and port protocol, proves namespace-wide TCP isolation, then
-narrows the target and proves the no-longer-selected Pod is non-isolated. These
-remain bounded compatibility claims rather than full upstream conformance.
+narrows the target and proves the no-longer-selected Pod is non-isolated. A
+separate cross-node fixture proves named SCTP allow/default isolation,
+protocol-only SCTP wildcard activation/removal, revisioned dataplane provenance,
+and enriched historical export. These remain bounded compatibility claims rather
+than full upstream conformance.

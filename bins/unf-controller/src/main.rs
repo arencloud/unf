@@ -144,6 +144,7 @@ struct ExplainRequest {
 enum RequestProtocol {
     Tcp,
     Udp,
+    Sctp,
 }
 
 #[derive(Debug, Serialize)]
@@ -587,6 +588,7 @@ fn pod_named_ports(pod: &Pod) -> Result<BTreeMap<NamedPort, u16>> {
             let protocol = match port.protocol.as_deref().unwrap_or("TCP") {
                 "TCP" => Protocol::Tcp,
                 "UDP" => Protocol::Udp,
+                "SCTP" => Protocol::Sctp,
                 _ => continue,
             };
             let number = u16::try_from(port.container_port)
@@ -1433,15 +1435,15 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
                 "flow export observed_events must be greater than zero",
             ));
         }
-        if !matches!(entry.key.protocol, 1 | 6 | 17) {
+        if !matches!(entry.key.protocol, 1 | 6 | 17 | 132) {
             return Err(ApiError::bad_request(format!(
                 "unsupported flow export IP protocol {}",
                 entry.key.protocol
             )));
         }
-        if matches!(entry.key.protocol, 6 | 17) && entry.key.destination_port == 0 {
+        if matches!(entry.key.protocol, 6 | 17 | 132) && entry.key.destination_port == 0 {
             return Err(ApiError::bad_request(
-                "TCP/UDP flow export destination_port must be greater than zero",
+                "TCP/UDP/SCTP flow export destination_port must be greater than zero",
             ));
         }
         if entry.decision.reason > 5 || entry.shadow.is_some_and(|shadow| shadow.reason > 5) {
@@ -1495,6 +1497,7 @@ async fn explain(
     let protocol = match request.protocol {
         RequestProtocol::Tcp => Protocol::Tcp,
         RequestProtocol::Udp => Protocol::Udp,
+        RequestProtocol::Sctp => Protocol::Sctp,
     };
     let policies = compiled_policies(&state);
     let decision = evaluate(
@@ -1714,13 +1717,9 @@ fn evaluate_historical_simulation(
             summary.skipped_unresolved_flows += 1;
             continue;
         };
-        let protocol = match entry.key.protocol {
-            6 => Protocol::Tcp,
-            17 => Protocol::Udp,
-            _ => {
-                summary.skipped_unresolved_flows += 1;
-                continue;
-            }
+        let Some(protocol) = history_protocol(entry.key.protocol) else {
+            summary.skipped_unresolved_flows += 1;
+            continue;
         };
         let flow = Flow {
             source: &endpoints[source_index],
@@ -1867,8 +1866,9 @@ fn simulation_protocol_ports(
             let protocols: &[Protocol] = match rule.protocol {
                 Some(Protocol::Tcp) => &[Protocol::Tcp],
                 Some(Protocol::Udp) => &[Protocol::Udp],
+                Some(Protocol::Sctp) => &[Protocol::Sctp],
                 Some(Protocol::Icmp) => continue,
-                None => &[Protocol::Tcp, Protocol::Udp],
+                None => &[Protocol::Tcp, Protocol::Udp, Protocol::Sctp],
             };
             for protocol in protocols {
                 match &rule.destination_port {
@@ -1892,7 +1892,7 @@ fn simulation_protocol_ports(
             }
         }
     }
-    for protocol in [Protocol::Tcp, Protocol::Udp] {
+    for protocol in [Protocol::Tcp, Protocol::Udp, Protocol::Sctp] {
         if let Some(port) = (1..=u16::MAX).find(|port| !tuples.contains(&(protocol, *port))) {
             tuples.insert((protocol, port));
         }
@@ -1904,7 +1904,17 @@ const fn protocol_name(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Tcp => "tcp",
         Protocol::Udp => "udp",
+        Protocol::Sctp => "sctp",
         Protocol::Icmp => "icmp",
+    }
+}
+
+const fn history_protocol(protocol: u8) -> Option<Protocol> {
+    match protocol {
+        6 => Some(Protocol::Tcp),
+        17 => Some(Protocol::Udp),
+        132 => Some(Protocol::Sctp),
+        _ => None,
     }
 }
 
@@ -2436,7 +2446,14 @@ mod tests {
             }],
             5353
         );
-        assert_eq!(ports.len(), 2, "unsupported SCTP metadata is ignored");
+        assert_eq!(
+            ports[&NamedPort {
+                name: "sctp".to_owned(),
+                protocol: Protocol::Sctp,
+            }],
+            7777
+        );
+        assert_eq!(ports.len(), 3);
 
         let containers = &mut pod.spec.as_mut().expect("spec exists").containers;
         containers.push(
@@ -2451,7 +2468,7 @@ mod tests {
     }
 
     #[test]
-    fn network_policy_reconciliation_removes_stale_state_on_rejection() {
+    fn network_policy_reconciliation_accepts_sctp_and_removes_stale_state_on_rejection() {
         let state = new_state(true);
         apply_network_policy_event(
             &state,
@@ -2466,10 +2483,19 @@ mod tests {
             &state,
             Event::Apply(network_policy(&serde_json::json!("http"), "SCTP")),
         );
+        assert_eq!(read_lock(&state.network_policies).len(), 1);
+        assert_eq!(read_lock(&state.compiled_network_policies).len(), 1);
+        assert!(read_lock(&state.rejected_network_policies).is_empty());
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(2));
+
+        apply_network_policy_event(
+            &state,
+            Event::Apply(network_policy(&serde_json::json!("http"), "ICMP")),
+        );
         assert!(read_lock(&state.network_policies).is_empty());
         assert!(read_lock(&state.compiled_network_policies).is_empty());
         assert_eq!(read_lock(&state.rejected_network_policies).len(), 1);
-        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(2));
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(3));
     }
 
     #[test]
@@ -2634,6 +2660,11 @@ mod tests {
         );
         assert_eq!(mutex_lock(&state.revisions).telemetry, Revision::new(1));
 
+        let mut sctp = flow_batch(1);
+        sctp.entries[0].key.protocol = Protocol::Sctp as u8;
+        sctp.entries[0].key.destination_port = 8086;
+        validate_flow_export_batch(&sctp).expect("SCTP flow export is accepted");
+
         let mut invalid = flow_batch(1);
         invalid.schema_version = FLOW_EXPORT_SCHEMA_VERSION + 1;
         let error = ingest_flows(State(state), Json(invalid))
@@ -2711,7 +2742,7 @@ mod tests {
         assert_eq!(response.snapshot.flow_history_revision, Revision::new(1));
         assert_eq!(response.affected_destinations, 1);
         assert_eq!(response.affected_services, ["backend/server"]);
-        assert_eq!(response.summary.evaluated_flows, 6);
+        assert_eq!(response.summary.evaluated_flows, 8);
         assert_eq!(response.summary.would_be_denied, 1);
         assert_eq!(response.summary.would_be_allowed, 0);
         assert_eq!(response.summary.verdict_changes, 1);
@@ -2758,8 +2789,8 @@ mod tests {
         .0;
 
         assert!(matches!(response.operation, PolicySimulationOperation::Add));
-        assert_eq!(response.summary.evaluated_flows, 6);
-        assert_eq!(response.summary.would_be_denied, 6);
+        assert_eq!(response.summary.evaluated_flows, 8);
+        assert_eq!(response.summary.would_be_denied, 8);
         assert!(read_lock(&state.compiled_security_policies).is_empty());
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::default());
     }

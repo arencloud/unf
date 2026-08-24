@@ -1,0 +1,7 @@
+FROM docker.io/library/debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends socat \
+    && rm -rf /var/lib/apt/lists/*
+
+ENTRYPOINT ["/usr/bin/socat"]

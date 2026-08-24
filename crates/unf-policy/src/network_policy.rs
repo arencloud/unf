@@ -454,6 +454,7 @@ fn port_tuple(
     let protocol = match port.protocol.as_deref().unwrap_or("TCP") {
         "TCP" => Protocol::Tcp,
         "UDP" => Protocol::Udp,
+        "SCTP" => Protocol::Sctp,
         value => {
             return Err(NetworkPolicyCompileError::UnsupportedProtocol {
                 rule_index,
@@ -923,6 +924,83 @@ mod tests {
         .expect("protocol-only UDP port compiles");
         assert_eq!(compiled.rules[0].protocol, Some(Protocol::Udp));
         assert_eq!(compiled.rules[0].destination_port, DestinationPort::Any);
+    }
+
+    #[test]
+    fn sctp_named_and_protocol_only_ports_evaluate_and_lower() {
+        let named = NetworkPolicyCompiler::compile(
+            PolicyId::new(7),
+            policy(vec![NetworkPolicyIngressRule {
+                from: None,
+                ports: Some(vec![NetworkPolicyPort {
+                    protocol: Some("SCTP".to_owned()),
+                    port: Some(IntOrString::String("association".to_owned())),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }]),
+        )
+        .expect("named SCTP port compiles");
+        let source = endpoint(1, "frontend", "client");
+        let mut destination = endpoint(2, "backend", "server");
+        destination.named_ports.insert(
+            NamedPort {
+                name: "association".to_owned(),
+                protocol: Protocol::Sctp,
+            },
+            8086,
+        );
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&named),
+                Flow {
+                    source: &source,
+                    destination: &destination,
+                    protocol: Protocol::Sctp,
+                    destination_port: 8086,
+                    source_ipv4: None,
+                },
+            )
+            .verdict,
+            Verdict::Allow
+        );
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&named),
+                Flow {
+                    source: &source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8086,
+                    source_ipv4: None,
+                },
+            )
+            .verdict,
+            Verdict::Deny
+        );
+        let entries = compile_dataplane_entries(&[named], &[source, destination])
+            .expect("named SCTP port lowers into the identity policy map");
+        assert!(entries.iter().any(|entry| {
+            entry.key.protocol == Protocol::Sctp as u8
+                && entry.key.destination_port == 8086
+                && entry.decision.verdict == Verdict::Allow
+        }));
+
+        let protocol_only = NetworkPolicyCompiler::compile(
+            PolicyId::new(8),
+            policy(vec![NetworkPolicyIngressRule {
+                from: None,
+                ports: Some(vec![NetworkPolicyPort {
+                    protocol: Some("SCTP".to_owned()),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }]),
+        )
+        .expect("protocol-only SCTP port compiles");
+        assert_eq!(protocol_only.rules[0].protocol, Some(Protocol::Sctp));
+        assert_eq!(
+            protocol_only.rules[0].destination_port,
+            DestinationPort::Any
+        );
     }
 
     #[test]

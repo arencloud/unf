@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sctp-client
+  namespace: frontend
+  labels:
+    app.kubernetes.io/name: sctp-client
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-control-plane
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: client
+      image: localhost/unf-sctp-test:dev
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sctp-server
+  namespace: backend
+  labels:
+    app.kubernetes.io/name: sctp-server
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-worker
+  containers:
+    - name: server
+      image: localhost/unf-sctp-test:dev
+      imagePullPolicy: Never
+      command:
+        - sh
+        - -c
+        - socat SCTP-LISTEN:9093,reuseaddr,fork EXEC:/bin/cat & exec socat SCTP-LISTEN:8086,reuseaddr,fork EXEC:/bin/cat
+      ports:
+        - name: association
+          containerPort: 8086
+          protocol: SCTP
+        - name: isolated
+          containerPort: 9093
+          protocol: SCTP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-sctp-client
+  namespace: backend
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sctp-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: frontend
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sctp-client
+      ports:
+        - protocol: SCTP
+          port: association

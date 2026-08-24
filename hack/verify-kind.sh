@@ -14,11 +14,17 @@ network_policy_protocol_mutated=false
 network_policy_peer_mutated=false
 network_policy_deleted=false
 network_policy_conformance_created=false
+network_policy_sctp_created=false
 namespace_mutated=false
 topology_service_created=false
 network_policy_selector_peer='[{"namespaceSelector":{"matchLabels":{"environment":"production"},"matchExpressions":[{"key":"team","operator":"In","values":["checkout"]}]},"podSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["client"]}]}}]'
 
 cleanup() {
+    if [[ ${network_policy_sctp_created} == true ]]; then
+        "${kc[@]}" delete -f \
+            "${project_root}/deploy/examples/networkpolicy-sctp.yaml" \
+            --ignore-not-found >/dev/null 2>&1 || true
+    fi
     if [[ ${network_policy_conformance_created} == true ]]; then
         "${kc[@]}" delete -f \
             "${project_root}/deploy/examples/networkpolicy-conformance.yaml" \
@@ -1033,5 +1039,143 @@ if ! wait_for_policy_batch_convergence "${narrowed_conformance_revision}"; then
     echo "agents did not remove the conformance NetworkPolicy" >&2
     exit 1
 fi
+post_conformance_revision=${transition_revision}
 
-echo "kind verification passed: namespace-wide/default-TCP NetworkPolicy conformance, EndpointSlice backend readiness, bounded historical flow export, history-aware simulation, versioned topology, native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+"${kc[@]}" apply -f "${project_root}/deploy/examples/networkpolicy-sctp.yaml" >/dev/null
+network_policy_sctp_created=true
+"${kc[@]}" wait --for=condition=Ready pod/sctp-client -n frontend --timeout=120s
+"${kc[@]}" wait --for=condition=Ready pod/sctp-server -n backend --timeout=120s
+sctp_server_ip=$("${kc[@]}" get pod -n backend sctp-server \
+    -o jsonpath='{.status.podIP}')
+if [[ -z ${sctp_server_ip} ]]; then
+    echo "SCTP conformance server has no Pod IP" >&2
+    exit 1
+fi
+sctp_exchange() {
+    local payload=$1
+    local port=$2
+    local timeout_seconds=${3:-3}
+    local command_timeout=$((timeout_seconds + 2))
+    {
+        printf '%s' "${payload}"
+        sleep 1
+    } | "${kc[@]}" exec -i -n frontend sctp-client -- \
+        timeout "${command_timeout}" socat -T "${timeout_seconds}" - \
+            "SCTP:${sctp_server_ip}:${port}"
+}
+if ! wait_for_controller_policy_counts 2 0 "${post_conformance_revision}"; then
+    echo "controller did not accept the SCTP NetworkPolicy" >&2
+    exit 1
+fi
+if ! wait_for_policy_batch_convergence "${post_conformance_revision}"; then
+    echo "agents did not activate SCTP NetworkPolicy isolation" >&2
+    exit 1
+fi
+sctp_policy_revision=${transition_revision}
+sctp_allow=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/sctp-client --to backend/sctp-server \
+    --protocol sctp --port 8086)
+grep -q '"reason": "ExplicitRule"' <<<"${sctp_allow}"
+grep -q '"verdict": "Allow"' <<<"${sctp_allow}"
+sctp_deny=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/sctp-client --to backend/sctp-server \
+    --protocol sctp --port 9093)
+grep -q '"reason": "DefaultAction"' <<<"${sctp_deny}"
+grep -q '"verdict": "Deny"' <<<"${sctp_deny}"
+sctp_response=$(sctp_exchange unf-sctp-ok 8086)
+if [[ ${sctp_response} != "unf-sctp-ok" ]]; then
+    echo "named-port SCTP NetworkPolicy allow failed" >&2
+    exit 1
+fi
+if sctp_exchange unf-sctp-deny 9093 2 >/dev/null 2>&1; then
+    echo "SCTP NetworkPolicy isolation did not drop the non-allowed port" >&2
+    exit 1
+fi
+
+sctp_provenance=
+sctp_history=
+for _ in {1..20}; do
+    sctp_provenance=$(all_agent_logs | grep '"destination_port":8086' \
+        | grep '"protocol":132' | grep '"verdict":"Allow"' | grep '"reason":1' \
+        | grep "\"policy_revision\":${sctp_policy_revision}" | tail -n 1 || true)
+    sctp_history=$("${unfctl}" \
+        --controller-url "http://127.0.0.1:${controller_port}" --output json flows)
+    if grep -Eq '"source_identity":[1-9][0-9]*' <<<"${sctp_provenance}" \
+        && grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${sctp_provenance}" \
+        && grep -Eq '"policy_id":[1-9][0-9]*' <<<"${sctp_provenance}" \
+        && grep -q '"protocol": 132' <<<"${sctp_history}" \
+        && grep -q '"frontend/sctp-client"' <<<"${sctp_history}" \
+        && grep -q '"backend/sctp-server"' <<<"${sctp_history}"; then
+        break
+    fi
+    sctp_exchange unf-sctp-ok 8086 >/dev/null
+    sleep 1
+done
+if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${sctp_provenance}" \
+    || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${sctp_provenance}" \
+    || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${sctp_provenance}"; then
+    echo "UNF did not emit revisioned SCTP allow provenance" >&2
+    exit 1
+fi
+if ! grep -q '"protocol": 132' <<<"${sctp_history}" \
+    || ! grep -q '"frontend/sctp-client"' <<<"${sctp_history}" \
+    || ! grep -q '"backend/sctp-server"' <<<"${sctp_history}"; then
+    echo "controller did not retain the enriched SCTP flow" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend allow-sctp-client --type=json \
+    -p '[{"op":"add","path":"/spec/ingress/0/ports/-","value":{"protocol":"SCTP"}}]' \
+    >/dev/null
+if ! wait_for_controller_policy_counts 2 0 "${sctp_policy_revision}"; then
+    echo "controller did not compile the protocol-only SCTP port" >&2
+    exit 1
+fi
+if ! wait_for_policy_transition "${sctp_policy_revision}"; then
+    echo "agents did not activate the protocol-only SCTP port" >&2
+    exit 1
+fi
+sctp_wildcard_revision=${transition_revision}
+sctp_wildcard=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/sctp-client --to backend/sctp-server \
+    --protocol sctp --port 9093)
+grep -q '"reason": "ExplicitRule"' <<<"${sctp_wildcard}"
+grep -q '"verdict": "Allow"' <<<"${sctp_wildcard}"
+sctp_wildcard_response=$(sctp_exchange unf-sctp-wildcard 9093)
+if [[ ${sctp_wildcard_response} != "unf-sctp-wildcard" ]]; then
+    echo "protocol-only SCTP NetworkPolicy allow failed" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend allow-sctp-client --type=json \
+    -p '[{"op":"remove","path":"/spec/ingress/0/ports/1"}]' >/dev/null
+if ! wait_for_controller_policy_counts 2 0 "${sctp_wildcard_revision}"; then
+    echo "controller did not restore the named SCTP port" >&2
+    exit 1
+fi
+if ! wait_for_policy_transition "${sctp_wildcard_revision}"; then
+    echo "agents did not remove the protocol-only SCTP port" >&2
+    exit 1
+fi
+sctp_restored_revision=${transition_revision}
+if sctp_exchange unf-sctp-deny 9093 2 >/dev/null 2>&1; then
+    echo "removing the protocol-only SCTP port did not restore isolation" >&2
+    exit 1
+fi
+
+"${kc[@]}" delete -f "${project_root}/deploy/examples/networkpolicy-sctp.yaml" \
+    >/dev/null
+network_policy_sctp_created=false
+if ! wait_for_controller_policy_counts 1 0 "${sctp_restored_revision}"; then
+    echo "controller did not remove the SCTP NetworkPolicy" >&2
+    exit 1
+fi
+if ! wait_for_policy_batch_convergence "${sctp_restored_revision}"; then
+    echo "agents did not remove the SCTP NetworkPolicy" >&2
+    exit 1
+fi
+
+echo "kind verification passed: named/protocol-only SCTP and namespace-wide/default-TCP NetworkPolicy conformance, EndpointSlice backend readiness, bounded historical flow export, history-aware simulation, versioned topology, native/NetworkPolicy enforcement, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"

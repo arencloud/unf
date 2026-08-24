@@ -34,11 +34,11 @@ Implemented in the repository:
 - deterministic L3/L4 policy compiler, shadow decisions, and property tests;
 - a supported ingress `NetworkPolicy` adapter that reuses the same IR, additive
   evaluator semantics, controller snapshots, and dataplane lowering as native
-  policy, including pod/Namespace expressions, named and protocol-only TCP/UDP
-  ports, bounded inclusive TCP/UDP `endPort` ranges, bounded IPv4 `ipBlock` peers
-  with `except`, namespace-wide targets from an omitted `podSelector`, Kubernetes
-  ingress/TCP defaults, deterministic exact/wildcard-key lowering, and explicit
-  compiler/dataplane capacity limits;
+  policy, including pod/Namespace expressions, named and protocol-only
+  TCP/UDP/SCTP ports, bounded inclusive TCP/UDP/SCTP `endPort` ranges, bounded
+  IPv4 `ipBlock` peers with `except`, namespace-wide targets from an omitted
+  `podSelector`, Kubernetes ingress/TCP defaults, deterministic exact/wildcard-key
+  lowering, and explicit compiler/dataplane capacity limits;
 - a kube-rs controller watching Nodes, Pods, Namespaces, Services, EndpointSlices,
   SecurityPolicies, and NetworkPolicies, with accepted/rejected compatibility
   status;
@@ -47,7 +47,7 @@ Implemented in the repository:
 - bounded non-blocking agent telemetry export and a 4,096-flow controller history
   with explicit drop/eviction accounting;
 - an Aya agent capable of loading and attaching the TC observation program;
-- an IPv4 TCP/UDP TC parser with counters, bounded ring-buffer events, and
+- an IPv4 TCP/UDP/SCTP TC parser with counters, bounded ring-buffer events, and
   active-bank L3/L4 allow/drop decisions;
 - revisioned controller-to-agent IPv4 identity snapshots and a versioned BPF map;
 - selector-resolved policy snapshots and dual-bank transactional BPF policy maps;
@@ -58,9 +58,10 @@ Implemented in the repository:
 - a reproducible two-node kind demo covering native and NetworkPolicy cross-node
   allow/drop, namespace-selector convergence, rejection/deletion recovery, shadow
   pass-through, protocol-only port activation/recovery, bounded range/ipBlock
-  enforcement and rejection recovery, namespace-wide target isolation/defaulting,
-  revisioned eBPF provenance, and live policy explanations, plus a versioned
-  EndpointSlice backend-readiness lifecycle.
+  enforcement and rejection recovery, named/protocol-only SCTP enforcement,
+  namespace-wide target isolation/defaulting, revisioned eBPF provenance, and
+  live policy explanations, plus a versioned EndpointSlice backend-readiness
+  lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
 multi-cluster transport, or production fail-closed recovery.

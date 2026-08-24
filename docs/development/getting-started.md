@@ -74,12 +74,13 @@ make kind-deploy
 make kind-test
 ```
 
-`kind-deploy` builds the userspace images and eBPF object, loads both images into
-the nodes, and applies the CRD and workloads. `kind-test` installs the demo,
-proves cross-node port 8080 allow and open-port 9090 deny, switches the same
-policy through shadow pass-through and back, and validates revisioned event and
-CLI provenance. It also exercises a supported ingress `NetworkPolicy`: cross-node
-allow and default-isolation drop, unsupported-update rejection and recovery, and
+`kind-deploy` builds the userspace images, eBPF object, and test-only SCTP `socat`
+image, loads them into the nodes, and applies the CRD and workloads. `kind-test`
+installs the demo, proves cross-node port 8080 allow and open-port 9090 deny,
+switches the same policy through shadow pass-through and back, and validates
+revisioned event and CLI provenance. It also exercises a supported ingress
+`NetworkPolicy`: cross-node allow and default-isolation drop, unsupported-update
+rejection and recovery, and
 named-port resolution, protocol-only TCP activation/removal without UDP
 broadening, bounded `endPort` boundary enforcement and oversized-range rejection,
 bounded IPv4 `ipBlock` allow/exception behavior and oversized-block rejection,
@@ -90,6 +91,10 @@ requires the namespace-wide target to isolate the probe's non-allowed port while
 allowing default-TCP 8085, narrows the target selector, and requires the
 no-longer-selected probe Pod to return to the Kubernetes non-isolated default
 before cleaning up the fixture.
+Finally, `deploy/examples/networkpolicy-sctp.yaml` creates a cross-node SCTP echo
+pair. The verifier requires named SCTP/8086 to pass, SCTP/9093 to drop by default,
+a protocol-only SCTP rule to activate 9093, removal to restore the drop, and the
+allowed protocol-132 flow to carry revisioned provenance into bounded history.
 The verifier also queries topology schema v2 and creates a selectorless Service
 with a manually managed EndpointSlice. It requires the backend to transition from
 not ready to ready, verifies deletion removes runtime state while selector intent

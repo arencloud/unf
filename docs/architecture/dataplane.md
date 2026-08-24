@@ -6,11 +6,14 @@ UNF starts with TC classifier programs because TC works with an existing CNI and
 provides both ingress and egress attachment without owning the pod lifecycle. XDP,
 cgroup, and socket hooks will only be introduced for measured feature needs.
 
-The parser accepts Ethernet/IPv4 TCP and UDP. It validates the IPv4 header
+The parser accepts Ethernet/IPv4 TCP, UDP, and SCTP. It validates the IPv4 header
 length, skips non-initial fragments, reads the flow tuple with bounded helpers,
 increments a per-CPU counter, resolves identities, and reads the atomically active
 policy bank. An actual deny returns `TC_ACT_SHOT`; allow and shadow-only deny
 return `TC_ACT_PIPE`.
+SCTP's common header exposes source and destination ports in the same first four
+transport bytes, so protocol 132 uses the existing exact/protocol-wildcard policy
+key layout without an ABI change.
 
 ## Maps
 

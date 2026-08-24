@@ -1120,7 +1120,7 @@ fn validate_policy_entry(entry: &PolicyMapEntry) -> Result<()> {
         bail!("policy entry contains reserved identity ID zero");
     }
     match (entry.key.protocol, entry.key.destination_port) {
-        (0, 0) | (6 | 17, 0..=u16::MAX) => {}
+        (0, 0) | (6 | 17 | 132, 0..=u16::MAX) => {}
         _ => bail!("policy entry contains an invalid protocol/port wildcard combination"),
     }
     validate_policy_decision(&entry.decision)?;
@@ -1135,7 +1135,7 @@ fn validate_ipv4_policy_entry(entry: &Ipv4PolicyMapEntry) -> Result<()> {
         bail!("IPv4 policy entry contains reserved destination identity ID zero");
     }
     match (entry.key.protocol, entry.key.destination_port) {
-        (0, 0) | (6 | 17, 0..=u16::MAX) => {}
+        (0, 0) | (6 | 17 | 132, 0..=u16::MAX) => {}
         _ => bail!("IPv4 policy entry contains an invalid protocol/port wildcard combination"),
     }
     validate_policy_decision(&entry.decision)?;
@@ -1880,6 +1880,8 @@ mod tests {
             shadow: identity_entry.shadow,
         };
         assert!(desired_ipv4_policy_entries(&[ipv4_entry], 17, 1).is_ok());
+        identity_entry.key.protocol = unf_common::Protocol::Sctp as u8;
+        assert!(desired_policy_entries(&[identity_entry], 17, 1).is_ok());
         ipv4_entry.key.protocol = 0;
         ipv4_entry.key.destination_port = 8080;
         assert!(desired_ipv4_policy_entries(&[ipv4_entry], 17, 1).is_err());

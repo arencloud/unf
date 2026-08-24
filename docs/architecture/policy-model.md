@@ -42,14 +42,14 @@ and BPF map compiler; there is no second enforcement engine.
 The current slice supports pod `matchLabels` and `matchExpressions` (`In`,
 `NotIn`, `Exists`, and `DoesNotExist`), same-namespace peers, exact namespace
 selection through `kubernetes.io/metadata.name`, general Namespace `matchLabels`
-and `matchExpressions`, numeric TCP/UDP ports, explicit protocol-only TCP/UDP
-entries, wildcard sources/ports, and ingress default isolation. Protocol-only
-entries remain `DestinationPort::Any` for their concrete protocol and lower to a
-protocol/port-zero BPF key. Named TCP/UDP ports are preserved in IR, resolved
-against each selected destination Pod's declared container ports, and lowered to
-numeric BPF keys. Inclusive numeric `endPort` ranges of at most 1,024 ports are
-preserved in IR and expanded deterministically into exact numeric keys during
-dataplane lowering. Wider ranges are rejected before they can multiply across
+and `matchExpressions`, numeric TCP/UDP/SCTP ports, explicit protocol-only
+TCP/UDP/SCTP entries, wildcard sources/ports, and ingress default isolation.
+Protocol-only entries remain `DestinationPort::Any` for their concrete protocol
+and lower to a protocol/port-zero BPF key. Named TCP/UDP/SCTP ports are preserved
+in IR, resolved against each selected destination Pod's declared container ports,
+and lowered to numeric BPF keys. Inclusive numeric `endPort` ranges of at most
+1,024 ports are preserved in IR and expanded deterministically into exact keys
+during dataplane lowering. Wider ranges are rejected before they can multiply across
 identity pairs. The shared compiler also rejects a snapshot that would exceed
 one bank's 131,072-entry allocation, and the agent independently validates the
 same bound.
@@ -65,7 +65,7 @@ addresses; IPv6, `0.0.0.0`, wider blocks, out-of-block exceptions, and peers tha
 combine `ipBlock` with selectors are rejected. A source-IP fallback represents
 arbitrary external sources, so compatibility isolation does not silently fail
 open merely because the source has no workload identity. The adapter deliberately
-rejects egress, SCTP, and named ports combined with `endPort`. These errors
+rejects egress and named ports combined with `endPort`. These errors
 prevent a policy from being accepted with weaker or different semantics. Native
 policy has the higher default precedence; the compatibility baseline uses
 reserved priority `1_000_000`.
@@ -91,7 +91,7 @@ in-memory add-or-replace proposal. The controller captures the identity epoch,
 identity revision, policy revision, topology revision, and Pod topology under one
 read fence. It
 evaluates current and proposed policy over all Pod sources, affected destinations,
-every referenced concrete port, and representative TCP/UDP fallback ports.
+every referenced concrete port, and representative TCP/UDP/SCTP fallback ports.
 
 The versioned response retains both decisions and provenance, separates verdict
 changes from provenance-only changes, and reports affected workloads. Simulation
