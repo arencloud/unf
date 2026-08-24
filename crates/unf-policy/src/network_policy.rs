@@ -751,6 +751,49 @@ mod tests {
     }
 
     #[test]
+    fn target_label_lifecycle_changes_policy_applicability() {
+        let mut lifecycle_policy = policy(Vec::new());
+        lifecycle_policy
+            .spec
+            .as_mut()
+            .expect("test policy has spec")
+            .pod_selector = Some(selector(&[("conformance-target", "isolated")]));
+        let compiled = NetworkPolicyCompiler::compile(PolicyId::new(8), lifecycle_policy)
+            .expect("target-label policy compiles");
+        let source = endpoint(1, "frontend", "client");
+        let mut destination = endpoint(2, "backend", "server");
+        let decision = |destination: &Endpoint| {
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source: &source,
+                    destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8087,
+                    source_ipv4: None,
+                    source_ipv6: None,
+                },
+            )
+        };
+
+        let unselected = decision(&destination);
+        assert_eq!(unselected.verdict, Verdict::Allow);
+        assert_eq!(unselected.reason, PolicyReason::NoApplicablePolicy);
+
+        destination
+            .labels
+            .insert("conformance-target".to_owned(), "isolated".to_owned());
+        let selected = decision(&destination);
+        assert_eq!(selected.verdict, Verdict::Deny);
+        assert_eq!(selected.reason, PolicyReason::DefaultAction);
+
+        destination.labels.remove("conformance-target");
+        let recovered = decision(&destination);
+        assert_eq!(recovered.verdict, Verdict::Allow);
+        assert_eq!(recovered.reason, PolicyReason::NoApplicablePolicy);
+    }
+
+    #[test]
     fn omitted_target_selector_defaults_to_all_pods_in_the_policy_namespace() {
         let mut namespace_policy = policy(vec![NetworkPolicyIngressRule {
             from: None,

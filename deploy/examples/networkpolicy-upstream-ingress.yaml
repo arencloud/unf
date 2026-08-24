@@ -113,7 +113,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: upstream-server
+      conformance-target: isolated
   policyTypes:
     - Ingress
   ingress: []

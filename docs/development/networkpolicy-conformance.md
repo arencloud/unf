@@ -15,6 +15,7 @@ and the upstream
 | Ingress contract | Local transition | Evidence |
 |---|---|---|
 | A selecting policy with no ingress rules isolates the destination | `ingress: []` denies all three sources | Unit matrix and two-node traffic |
+| Destination Pod label changes activate and remove policy isolation | The accepted policy initially selects no target and traffic is allowed; adding the target label produces default deny, while removing it with two policies still present restores non-isolated traffic | Unit lifecycle test, revision-converged Pod mutations, explanations, and two-node traffic |
 | A peer with only `podSelector` is scoped to the policy Namespace | Same-Namespace matching Pod is allowed; identically eligible remote Pods are denied | Unit matrix, explanation, and two-node traffic |
 | An empty `namespaceSelector` selects every Namespace | All three source Namespaces reach TCP/8087 while TCP/8088 remains isolated | Unit matrix and two-node traffic |
 | `podSelector` and `namespaceSelector` in one peer are ANDed | Only the selected Pod in source Namespace A is allowed | Unit matrix, explanation, and two-node traffic |

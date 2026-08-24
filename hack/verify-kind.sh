@@ -894,10 +894,16 @@ if [[ ${protocol_wildcard_response} != "unf-networkpolicy-ok" ]]; then
     echo "protocol-only TCP NetworkPolicy port did not allow an arbitrary TCP port" >&2
     exit 1
 fi
-sleep 1
-protocol_wildcard_line=$(all_agent_logs | grep '"destination_port":9091' \
-    | grep '"verdict":"Allow"' | grep '"reason":1' \
-    | grep "\"policy_revision\":${protocol_wildcard_revision}" | tail -n 1 || true)
+protocol_wildcard_line=
+for _ in {1..20}; do
+    protocol_wildcard_line=$(all_agent_logs | grep '"destination_port":9091' \
+        | grep '"verdict":"Allow"' | grep '"reason":1' \
+        | grep "\"policy_revision\":${protocol_wildcard_revision}" | tail -n 1 || true)
+    if [[ -n ${protocol_wildcard_line} ]]; then
+        break
+    fi
+    sleep 1
+done
 if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${protocol_wildcard_line}" \
     || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${protocol_wildcard_line}" \
     || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${protocol_wildcard_line}"; then
@@ -1425,4 +1431,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: upstream selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: upstream target/source label lifecycle and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

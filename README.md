@@ -71,8 +71,9 @@ Implemented in the repository:
   enforcement and rejection recovery, named/protocol-only SCTP enforcement,
   namespace-wide target isolation/defaulting, same-Namespace and all-Namespace
   peers, peer OR/selector AND semantics, Pod/Namespace expressions, multiple
-  ingress rules, label-driven recovery, stacked additive allows and allow-all
-  recovery, revisioned eBPF provenance, and live policy explanations, plus a
+  ingress rules, source and destination label-driven recovery, stacked additive
+  allows and allow-all recovery, revisioned eBPF provenance, and live policy
+  explanations, plus a
   versioned EndpointSlice backend-readiness lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,

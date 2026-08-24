@@ -199,10 +199,25 @@ for port in 8087 8088; do
 done
 if ! wait_for_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
     "${baseline_revision}"; then
-    echo "default-deny conformance policy did not converge" >&2
+    echo "unselected target policy did not converge" >&2
     exit 1
 fi
 
+for source in \
+    "${target_namespace} same-client" \
+    "${source_a_namespace} client" \
+    "${source_b_namespace} client"; do
+    read -r namespace pod <<<"${source}"
+    expect_allow "${namespace}" "${pod}" 8087
+    expect_allow "${namespace}" "${pod}" 8088
+done
+expect_explanation "${source_a_namespace}/client" 8087 Allow NoApplicablePolicy
+
+previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${target_namespace}" server \
+    conformance-target=isolated --overwrite >/dev/null
+require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
+    "${previous_revision}" "target Pod label selection did not converge"
 for source in \
     "${target_namespace} same-client" \
     "${source_a_namespace} client" \
@@ -294,7 +309,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: upstream-server
+      conformance-target: isolated
   policyTypes:
     - Ingress
   ingress:
@@ -325,7 +340,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: upstream-server
+      conformance-target: isolated
   policyTypes:
     - Ingress
   ingress:
@@ -352,6 +367,20 @@ expect_allow "${source_a_namespace}" client 8087
 expect_allow "${source_b_namespace}" client 8088
 
 previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${target_namespace}" server conformance-target- >/dev/null
+require_policy_state "$((baseline_count + 2))" "${baseline_rejected}" \
+    "${previous_revision}" "target Pod label removal did not reconverge"
+for source in \
+    "${target_namespace} same-client" \
+    "${source_a_namespace} client" \
+    "${source_b_namespace} client"; do
+    read -r namespace pod <<<"${source}"
+    expect_allow "${namespace}" "${pod}" 8087
+    expect_allow "${namespace}" "${pod}" 8088
+done
+expect_explanation "${source_b_namespace}/client" 8087 Allow NoApplicablePolicy
+
+previous_revision=${policy_revision}
 cleanup
 for namespace in "${target_namespace}" "${source_a_namespace}" "${source_b_namespace}"; do
     if ! "${kc[@]}" wait --for=delete namespace/"${namespace}" --timeout=120s >/dev/null; then
@@ -364,4 +393,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned ingress conformance passed: default deny, same-namespace PodSelector, empty NamespaceSelector, selector AND, peer OR, matchExpressions with label recovery, multiple ingress rules, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned ingress conformance passed: target Pod label isolation/recovery, default deny, same-namespace PodSelector, empty NamespaceSelector, selector AND, peer OR, matchExpressions with label recovery, multiple ingress rules, stacked additive policies, and allow-all precedence"

@@ -107,9 +107,10 @@ allowed protocol-132 flow to carry revisioned provenance into bounded history.
 The disposable `deploy/examples/networkpolicy-upstream-ingress.yaml` matrix then
 checks default isolation, same-Namespace PodSelector scope, an empty
 NamespaceSelector, selector AND, peer OR, Pod/Namespace `matchExpressions`,
-multiple ingress-rule source/port pairing, Pod-label deny/recovery, stacked
-additive policies, and temporary allow-all precedence across three source
-contexts and two ports. Its dedicated verifier requires every mutation to
+multiple ingress-rule source/port pairing, source-label deny/recovery,
+destination Pod-label isolation/recovery, stacked additive policies, and
+temporary allow-all precedence across three source contexts and two ports. Its
+dedicated verifier requires every mutation to
 converge on both agents and deletes its three test Namespaces before returning.
 The exact scope and upstream mapping are tracked
 in [networkpolicy-conformance.md](networkpolicy-conformance.md).
