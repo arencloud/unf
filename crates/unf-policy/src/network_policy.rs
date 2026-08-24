@@ -1233,6 +1233,105 @@ mod tests {
     }
 
     #[test]
+    fn upstream_peer_matrix_preserves_namespace_scope_and_boolean_semantics() {
+        let mut same_namespace = endpoint(1, "backend", "same-client");
+        same_namespace.labels.extend(labels(&[("source", "same")]));
+        let mut source_a = endpoint(2, "source-a", "client");
+        source_a.labels.extend(labels(&[("source", "selected")]));
+        source_a
+            .namespace_labels
+            .extend(labels(&[("conformance-group", "a")]));
+        let mut source_b = endpoint(3, "source-b", "client");
+        source_b.labels.extend(labels(&[("source", "selected")]));
+        source_b
+            .namespace_labels
+            .extend(labels(&[("conformance-group", "b")]));
+        let destination = endpoint(4, "backend", "server");
+        let verdict = |compiled: &PolicyIr, source: &Endpoint| {
+            evaluate(
+                std::slice::from_ref(compiled),
+                Flow {
+                    source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8087,
+                    source_ipv4: None,
+                },
+            )
+            .verdict
+        };
+
+        let same_namespace_only = NetworkPolicyCompiler::compile(
+            PolicyId::new(10),
+            policy(vec![NetworkPolicyIngressRule {
+                from: Some(vec![NetworkPolicyPeer {
+                    pod_selector: Some(selector(&[("source", "same")])),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: None,
+            }]),
+        )
+        .expect("same-namespace PodSelector compiles");
+        assert_eq!(
+            verdict(&same_namespace_only, &same_namespace),
+            Verdict::Allow
+        );
+        assert_eq!(verdict(&same_namespace_only, &source_a), Verdict::Deny);
+
+        let every_namespace = NetworkPolicyCompiler::compile(
+            PolicyId::new(11),
+            policy(vec![NetworkPolicyIngressRule {
+                from: Some(vec![NetworkPolicyPeer {
+                    namespace_selector: Some(LabelSelector::default()),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: None,
+            }]),
+        )
+        .expect("empty NamespaceSelector compiles");
+        for source in [&same_namespace, &source_a, &source_b] {
+            assert_eq!(verdict(&every_namespace, source), Verdict::Allow);
+        }
+
+        let selectors_and = NetworkPolicyCompiler::compile(
+            PolicyId::new(12),
+            policy(vec![NetworkPolicyIngressRule {
+                from: Some(vec![NetworkPolicyPeer {
+                    namespace_selector: Some(selector(&[("conformance-group", "a")])),
+                    pod_selector: Some(selector(&[("source", "selected")])),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: None,
+            }]),
+        )
+        .expect("combined PodSelector and NamespaceSelector compiles");
+        assert_eq!(verdict(&selectors_and, &source_a), Verdict::Allow);
+        assert_eq!(verdict(&selectors_and, &source_b), Verdict::Deny);
+        assert_eq!(verdict(&selectors_and, &same_namespace), Verdict::Deny);
+
+        let peers_or = NetworkPolicyCompiler::compile(
+            PolicyId::new(13),
+            policy(vec![NetworkPolicyIngressRule {
+                from: Some(vec![
+                    NetworkPolicyPeer {
+                        pod_selector: Some(selector(&[("source", "same")])),
+                        ..NetworkPolicyPeer::default()
+                    },
+                    NetworkPolicyPeer {
+                        namespace_selector: Some(selector(&[("conformance-group", "b")])),
+                        ..NetworkPolicyPeer::default()
+                    },
+                ]),
+                ports: None,
+            }]),
+        )
+        .expect("multiple peers compile as alternatives");
+        assert_eq!(verdict(&peers_or, &same_namespace), Verdict::Allow);
+        assert_eq!(verdict(&peers_or, &source_b), Verdict::Allow);
+        assert_eq!(verdict(&peers_or, &source_a), Verdict::Deny);
+    }
+
+    #[test]
     fn named_ports_resolve_against_each_destination() {
         let compiled = NetworkPolicyCompiler::compile(
             PolicyId::new(7),

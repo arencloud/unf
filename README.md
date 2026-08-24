@@ -23,7 +23,9 @@ for operator queries and policy impact analysis.
 See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
 gates, evidence, limitations, and current work. The shorter
-[roadmap](docs/roadmap.md) describes future direction.
+[roadmap](docs/roadmap.md) describes future direction, and the
+[upstream-aligned ingress matrix](docs/development/networkpolicy-conformance.md)
+records the exact compatibility behaviors exercised against the dataplane.
 
 ## Current scope
 
@@ -59,9 +61,10 @@ Implemented in the repository:
   allow/drop, namespace-selector convergence, rejection/deletion recovery, shadow
   pass-through, protocol-only port activation/recovery, bounded range/ipBlock
   enforcement and rejection recovery, named/protocol-only SCTP enforcement,
-  namespace-wide target isolation/defaulting, revisioned eBPF provenance, and
-  live policy explanations, plus a versioned EndpointSlice backend-readiness
-  lifecycle.
+  namespace-wide target isolation/defaulting, same-Namespace and all-Namespace
+  peers, peer OR/selector AND semantics, stacked additive allows and allow-all
+  recovery, revisioned eBPF provenance, and live policy explanations, plus a
+  versioned EndpointSlice backend-readiness lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
 multi-cluster transport, or production fail-closed recovery.

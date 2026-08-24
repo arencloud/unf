@@ -84,5 +84,7 @@ policy types, and port protocol, proves namespace-wide TCP isolation, then
 narrows the target and proves the no-longer-selected Pod is non-isolated. A
 separate cross-node fixture proves named SCTP allow/default isolation,
 protocol-only SCTP wildcard activation/removal, revisioned dataplane provenance,
-and enriched historical export. These remain bounded compatibility claims rather
-than full upstream conformance.
+and enriched historical export. An upstream-aligned three-Namespace matrix proves
+same-Namespace PodSelector scope, empty NamespaceSelector behavior, selector AND,
+peer OR, stacked additive allows, and allow-all deletion recovery. These remain
+bounded compatibility claims rather than full upstream conformance.

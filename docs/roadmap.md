@@ -50,7 +50,9 @@ matrix and reproducible evidence.
   targets from omitted `podSelector`, implicit ingress `policyTypes` for
   egress-omitted objects, default TCP ports, and non-selected Pod behavior, plus
   rejection/deletion recovery; IPv4 SCTP parsing/enforcement, live explanation,
-  revisioned provenance, and historical export;
+  revisioned provenance, and historical export; an upstream-aligned live ingress
+  matrix for default deny, same/all-Namespace peers, selector AND, peer OR,
+  stacked additive policies, and allow-all precedence/recovery;
   revision-fenced, read-only native policy simulation over a bounded
   current-topology probe matrix; versioned Node,
   workload-placement, Service, and selector-membership topology snapshots;
@@ -59,7 +61,7 @@ matrix and reproducible evidence.
   destination-resolved agent flow export through bounded non-blocking queues,
   revisioned 4,096-key controller history, `unfctl flows`, and
   observation-weighted historical simulation impact;
-- Next: IPv6 and broader upstream ingress conformance, plus
+- Next: IPv6 and remaining upstream ingress conformance, plus
   authenticated/durable telemetry transport with time-window queries;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;

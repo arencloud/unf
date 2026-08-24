@@ -1178,4 +1178,8 @@ if ! wait_for_policy_batch_convergence "${sctp_restored_revision}"; then
     exit 1
 fi
 
-echo "kind verification passed: named/protocol-only SCTP and namespace-wide/default-TCP NetworkPolicy conformance, EndpointSlice backend readiness, bounded historical flow export, history-aware simulation, versioned topology, native/NetworkPolicy enforcement, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
+    UNF_CONTROLLER_URL="http://127.0.0.1:${controller_port}" UNFCTL="${unfctl}" \
+    "${project_root}/hack/verify-networkpolicy-ingress.sh"
+
+echo "kind verification passed: upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP NetworkPolicy conformance, EndpointSlice backend readiness, bounded historical flow export, history-aware simulation, versioned topology, native/NetworkPolicy enforcement, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
