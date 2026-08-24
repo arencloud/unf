@@ -41,7 +41,7 @@ completed by Phase 1's observation-only shadow evaluation.
 | Dual-stack cluster fixture | Both kindnet Pods stayed Ready with zero restarts through the complete verifier; `kind-up` applies the reproducible nftables compatibility setup and `make kind-test` gates CNI readiness at start and finish |
 | Demo dataplane | On the dual-stack two-node fixture, native policy allowed TCP/8080 and explicitly denied open TCP/9090 over both IPv4 and IPv6; real UDP packets carrying Hop-by-Hop, Destination Options, and combined extension headers allowed 8087–8089 and explicitly denied 9097 with revisioned provenance. Selector-based NetworkPolicy allowed 8081 and default-denied open 9091 over both families. Existing shadow, range, dual-stack block/exception, omitted-default, SCTP, lifecycle, and upstream-aligned ingress scenarios also passed |
 | Agent state | Two ready agents with BPF loaded; both converged on the same controller epoch and identity/policy revisions with 14 identity entries each (7 IPv4 + 7 IPv6), 151 active policy entries, and zero queued/dropped exports at capture |
-| Controller state | Ready with 2 watched Nodes, 17 watched Pods, 8 watched Namespaces, 5 watched Services, 5 watched EndpointSlices, 15 admitted identities, 14 indexed non-host-network Pod IPs, one native policy, one accepted NetworkPolicy, zero rejected NetworkPolicies, 151 resolved identity/IPv4/IPv6 entries, and zero reported telemetry drops |
+| Controller state | Ready with 2 watched Nodes, 17 watched Pods, 8 watched Namespaces, 5 watched Services, 5 watched EndpointSlices, 15 admitted identities, 14 indexed non-host-network Pod IPs, one native policy, one accepted NetworkPolicy, zero rejected NetworkPolicies, 151 resolved identity/IPv4/IPv6 entries, zero reported telemetry drops, and freshness-aware acknowledgements proving both expected agents converged |
 | Topology state | Schema v3 returned 2 ready Nodes, 17 placed workloads, 5 Services, and 7 dual-stack non-host-network workloads; the EndpointSlice readiness/deletion lifecycle passed without policy-revision mutation |
 | Flow history | Schema v2 retained bounded IPv4, IPv6, and SCTP logical flows; direct IPv6 `frontend/client` → `backend/server` TCP/8080 was enriched with both workload references and exact addresses, while both agents reported zero export drops |
 | Transactional policy update | The verifier switched enforce → shadow → enforce and exercised TCP/SCTP protocol-wildcard plus IPv4/IPv6 block mutations, requiring a higher revision and opposite bank on every agent for single-resource transitions; snapshot schema v3 stages all three policy maps before one activation write |
@@ -82,6 +82,7 @@ gate.
 | Controller integration and identity counts | **Verified** | `make kind-test` requires nonzero admitted identities and indexed Pod IPs |
 | Versioned BPF identity map schema | **Verified** | ABI tests plus `make kind-test` require populated IPv4 and IPv6 kernel maps on both agents |
 | Controller-to-agent revisioned distribution | **Verified** | Both node agents report desired/applied epoch and revision convergence; controller-restart recovery exercised live |
+| Controller-aggregated node acknowledgements | **Verified** | Schema v1 agent reports are validated and timestamped; controller/CLI status distinguishes expected, missing, stale, unexpected, and converged agents, while `make kind-test` requires both watched Nodes to match current identity/policy epoch and revisions |
 | Selector-to-identity policy lowering | **Verified** | Unit tests cover exact/default, shadow provenance, conflicts, and deterministic ordering; `make kind-test` requires nonzero resolved entries |
 | Transactional policy map set | **Verified** | `make kind-test` stages a changed policy on the opposite bank, verifies a higher applied revision, restores it, and verifies reconvergence |
 | TC identity lookup | **Verified** | Cross-node IPv4 and IPv6 demo flows carry nonzero source and destination IDs |
@@ -105,8 +106,9 @@ gate.
   values, and absent identity/IP decisions fail open with revision-zero
   observed/identity-unknown provenance. Unknown source identities can be enforced
   by a valid exact or external-fallback IPv4 policy entry.
-- Applied policy status is node-local; the controller and CLI do not yet aggregate
-  node acknowledgements.
+- Agent acknowledgements are freshness-aware and controller-aggregated, but use
+  unauthenticated in-cluster HTTP and current-process storage. Reports older than
+  ten seconds are marked stale; durable history and node authentication remain.
 - Policy simulation currently accepts one native `SecurityPolicy`, uses current
   Pods plus representative policy-derived TCP/UDP/SCTP probes, and rejects matrices
   above 10,000 flows. It separately evaluates retained history and observation

@@ -78,6 +78,29 @@ json_number() {
     sed -nE "s/.*\"${field}\":([0-9]+).*/\1/p"
 }
 
+wait_for_aggregated_agent_convergence() {
+    local expected_agents=$1
+    local status expected reporting missing stale converged unexpected
+    for _ in {1..30}; do
+        status=$("${unfctl}" \
+            --controller-url "http://127.0.0.1:${controller_port}" --output json status)
+        expected=$(sed -nE 's/.*"expected_agents": ([0-9]+).*/\1/p' <<<"${status}")
+        reporting=$(sed -nE 's/.*"reporting_agents": ([0-9]+).*/\1/p' <<<"${status}")
+        missing=$(sed -nE 's/.*"missing_agents": ([0-9]+).*/\1/p' <<<"${status}")
+        stale=$(sed -nE 's/.*"stale_agents": ([0-9]+).*/\1/p' <<<"${status}")
+        converged=$(sed -nE 's/.*"converged_agents": ([0-9]+).*/\1/p' <<<"${status}")
+        unexpected=$(sed -nE 's/.*"unexpected_agents": ([0-9]+).*/\1/p' <<<"${status}")
+        if [[ ${expected} == "${expected_agents}" && ${reporting} == "${expected_agents}" \
+            && ${converged} == "${expected_agents}" && ${missing} == 0 && ${stale} == 0 \
+            && ${unexpected} == 0 ]] && grep -q '"all_converged": true' <<<"${status}"; then
+            agent_convergence_status=${status}
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 wait_for_policy_transition() {
     local floor_revision=$1
     local all_converged status desired applied bank pod candidate_revision controller_revision
@@ -430,6 +453,24 @@ if [[ ${initial_synced} != true ]]; then
     exit 1
 fi
 initial_policy_revision=${expected_policy_revision}
+
+if ! wait_for_aggregated_agent_convergence "${#agent_pods[@]}"; then
+    echo "controller did not aggregate converged status from every node agent" >&2
+    exit 1
+fi
+grep -q '"schema_version": 1' <<<"${agent_convergence_status}"
+grep -q '"node_name": "unf-dev-control-plane"' <<<"${agent_convergence_status}"
+grep -q '"node_name": "unf-dev-worker"' <<<"${agent_convergence_status}"
+if [[ $(grep -c '"converged": true' <<<"${agent_convergence_status}") -ne 2 ]]; then
+    echo "controller did not expose two converged per-node acknowledgements" >&2
+    exit 1
+fi
+controller_status_table=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" status)
+grep -q '^Controller Status$' <<<"${controller_status_table}"
+grep -q 'agents.*converged=2/2.*all_converged=true' <<<"${controller_status_table}"
+grep -q 'agent.*unf-dev-control-plane.*converged=true' <<<"${controller_status_table}"
+grep -q 'agent.*unf-dev-worker.*converged=true' <<<"${controller_status_table}"
 
 initial_topology=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json topology)
@@ -1423,6 +1464,11 @@ KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
     UNF_CONTROLLER_URL="http://127.0.0.1:${controller_port}" UNFCTL="${unfctl}" \
     "${project_root}/hack/verify-networkpolicy-ingress.sh"
 
+if ! wait_for_aggregated_agent_convergence "${#agent_pods[@]}"; then
+    echo "controller did not retain cluster-wide agent convergence after the full matrix" >&2
+    exit 1
+fi
+
 "${kc[@]}" -n kube-system rollout status daemonset/kindnet --timeout=120s
 if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' \
@@ -1431,4 +1477,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: controller-aggregated two-node agent convergence, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

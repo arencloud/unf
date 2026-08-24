@@ -145,12 +145,15 @@ backend relationships with:
 ```bash
 target/debug/unfctl --controller-url http://127.0.0.1:9962 topology
 target/debug/unfctl --controller-url http://127.0.0.1:9962 flows
+target/debug/unfctl --controller-url http://127.0.0.1:9962 status
 ```
 
 Simulation reports its bounded current-topology probe matrix separately from the
 revisioned, 4,096-key in-memory history. `make kind-test` verifies the predicted
 8080 denial in both inputs, unchanged policy revision, and continued live 8080
-allow after simulation.
+allow after simulation. Status reports per-node desired/applied identity and
+policy revisions and marks the watched Node set converged only while every agent
+has a fresh matching acknowledgement.
 
 The DaemonSet attaches ingress classification to every non-loopback node interface
 and discovers newly created pod veths. A packet can therefore produce multiple

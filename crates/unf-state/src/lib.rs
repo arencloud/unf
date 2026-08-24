@@ -11,6 +11,7 @@ pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 2;
+pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 1;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
 /// One half of the dual-bank eBPF policy map's 262,144-entry capacity.
@@ -24,6 +25,49 @@ pub struct RevisionSet {
     pub routing: Revision,
     pub topology: Revision,
     pub telemetry: Revision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStateReport {
+    pub schema_version: u16,
+    pub node_name: String,
+    pub ready: bool,
+    pub bpf_loaded: bool,
+    pub desired_identity_revision: u64,
+    pub applied_identity_revision: u64,
+    pub desired_identity_epoch: u64,
+    pub applied_identity_epoch: u64,
+    pub identity_map_entries: u64,
+    pub ipv4_identity_map_entries: u64,
+    pub ipv6_identity_map_entries: u64,
+    pub desired_policy_revision: u64,
+    pub applied_policy_revision: u64,
+    pub desired_policy_epoch: u64,
+    pub applied_policy_epoch: u64,
+    pub policy_map_entries: u64,
+    pub active_policy_bank: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConvergenceEntry {
+    pub node_name: String,
+    pub fresh: bool,
+    pub converged: bool,
+    pub last_received_unix_ms: Option<u64>,
+    pub report: Option<AgentStateReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConvergenceSnapshot {
+    pub schema_version: u16,
+    pub expected_agents: usize,
+    pub reporting_agents: usize,
+    pub missing_agents: usize,
+    pub stale_agents: usize,
+    pub converged_agents: usize,
+    pub unexpected_agents: usize,
+    pub all_converged: bool,
+    pub nodes: Vec<AgentConvergenceEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

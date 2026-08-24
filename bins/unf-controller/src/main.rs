@@ -33,6 +33,7 @@ use unf_policy::{
     compile_ipv6_dataplane_entries, evaluate,
 };
 use unf_state::{
+    AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
     FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowHistorySnapshot,
     FlowHistoryStore, IdentityRegistry, IdentityStateSnapshot, NetworkIdentity,
     POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyStateSnapshot, RevisionSet,
@@ -40,6 +41,8 @@ use unf_state::{
     TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
     provisional_identity_id,
 };
+
+const AGENT_STATUS_FRESHNESS_MILLIS: u64 = 10_000;
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF Kubernetes desired-state controller")]
@@ -57,6 +60,7 @@ struct ControllerMetrics {
     errors: Counter,
     telemetry_batches: Counter,
     telemetry_observations: Counter,
+    agent_status_reports: Counter,
 }
 
 struct ControllerState {
@@ -76,9 +80,16 @@ struct ControllerState {
     policy_state_guard: RwLock<()>,
     identities: Mutex<IdentityRegistry>,
     flow_history: Mutex<FlowHistoryStore>,
+    agent_reports: RwLock<BTreeMap<String, StoredAgentReport>>,
     revisions: Mutex<RevisionSet>,
     registry: Mutex<Registry>,
     metrics: ControllerMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredAgentReport {
+    report: AgentStateReport,
+    last_received_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +148,7 @@ struct StatusBody {
     telemetry_dropped_events: u64,
     identity_epoch: u64,
     revisions: RevisionSet,
+    agents: AgentConvergenceSnapshot,
     limitations: [&'static str; 2],
 }
 
@@ -296,6 +308,10 @@ async fn main() -> Result<()> {
         .route("/v1/status", get(status))
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
+        .route(
+            "/v1/state/agents",
+            get(agent_state).post(ingest_agent_status),
+        )
         .route("/v1/topology", get(topology))
         .route("/v1/flows", get(flow_history))
         .route("/v1/telemetry/flows", post(ingest_flows))
@@ -358,6 +374,11 @@ fn new_state(offline: bool) -> ControllerState {
         "Aggregated flow-event observations accepted from node agents",
         metrics.telemetry_observations.clone(),
     );
+    registry.register(
+        "unf_agent_status_reports",
+        "Node-agent status acknowledgements accepted by the controller",
+        metrics.agent_status_reports.clone(),
+    );
     ControllerState {
         ready: AtomicBool::new(offline),
         identity_epoch: controller_epoch(),
@@ -375,6 +396,7 @@ fn new_state(offline: bool) -> ControllerState {
         policy_state_guard: RwLock::new(()),
         identities: Mutex::new(IdentityRegistry::default()),
         flow_history: Mutex::new(FlowHistoryStore::default()),
+        agent_reports: RwLock::new(BTreeMap::new()),
         revisions: Mutex::new(RevisionSet::default()),
         registry: Mutex::new(registry),
         metrics,
@@ -1246,6 +1268,12 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
     let mut revisions = mutex_lock(&state.revisions).clone();
     revisions.identity = identity_revision;
     revisions.telemetry = history.revision;
+    let agents = agent_convergence_snapshot(
+        &state,
+        identity_revision,
+        revisions.policy,
+        unix_time_millis(),
+    );
     Ok(Json(StatusBody {
         component: "unf-controller",
         healthy: true,
@@ -1275,11 +1303,163 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
             .saturating_add(history.evicted_observations),
         identity_epoch: state.identity_epoch,
         revisions,
+        agents,
         limitations: [
             "desired state and identity allocations are currently in-memory only",
-            "dataplane status is node-local and policy maps are currently unpinned",
+            "agent acknowledgements use unauthenticated prototype transport and policy maps are currently unpinned",
         ],
     }))
+}
+
+async fn agent_state(State(state): State<Arc<ControllerState>>) -> Json<AgentConvergenceSnapshot> {
+    let identity_revision = mutex_lock(&state.identities).revision();
+    let policy_revision = mutex_lock(&state.revisions).policy;
+    Json(agent_convergence_snapshot(
+        &state,
+        identity_revision,
+        policy_revision,
+        unix_time_millis(),
+    ))
+}
+
+async fn ingest_agent_status(
+    State(state): State<Arc<ControllerState>>,
+    Json(report): Json<AgentStateReport>,
+) -> Result<StatusCode, ApiError> {
+    validate_agent_status(&report)?;
+    write_lock(&state.agent_reports).insert(
+        report.node_name.clone(),
+        StoredAgentReport {
+            report,
+            last_received_unix_ms: unix_time_millis(),
+        },
+    );
+    state.metrics.agent_status_reports.inc();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
+    if report.schema_version != AGENT_STATUS_SCHEMA_VERSION {
+        return Err(ApiError::bad_request(format!(
+            "unsupported agent status schema {}; expected {}",
+            report.schema_version, AGENT_STATUS_SCHEMA_VERSION
+        )));
+    }
+    let valid_node_name = !report.node_name.is_empty()
+        && report.node_name.len() <= 253
+        && report
+            .node_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        && report
+            .node_name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && report
+            .node_name
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric);
+    if !valid_node_name {
+        return Err(ApiError::bad_request(
+            "node_name must be a valid 1 to 253 character Kubernetes node name",
+        ));
+    }
+    if report.active_policy_bank > 1 {
+        return Err(ApiError::bad_request(
+            "active_policy_bank must identify transactional bank 0 or 1",
+        ));
+    }
+    Ok(())
+}
+
+fn agent_convergence_snapshot(
+    state: &ControllerState,
+    identity_revision: Revision,
+    policy_revision: Revision,
+    now_unix_ms: u64,
+) -> AgentConvergenceSnapshot {
+    let expected_nodes: BTreeSet<_> = read_lock(&state.nodes).keys().cloned().collect();
+    let reports = read_lock(&state.agent_reports);
+    let unexpected_agents = reports
+        .iter()
+        .filter(|(node_name, stored)| {
+            !expected_nodes.contains(*node_name)
+                && now_unix_ms.saturating_sub(stored.last_received_unix_ms)
+                    <= AGENT_STATUS_FRESHNESS_MILLIS
+        })
+        .count();
+    let mut reporting_agents = 0;
+    let mut stale_agents = 0;
+    let mut converged_agents = 0;
+    let nodes = expected_nodes
+        .iter()
+        .map(|node_name| {
+            let stored = reports.get(node_name);
+            let fresh = stored.is_some_and(|stored| {
+                now_unix_ms.saturating_sub(stored.last_received_unix_ms)
+                    <= AGENT_STATUS_FRESHNESS_MILLIS
+            });
+            if stored.is_some() {
+                reporting_agents += 1;
+            }
+            if stored.is_some() && !fresh {
+                stale_agents += 1;
+            }
+            let converged = stored.is_some_and(|stored| {
+                fresh
+                    && agent_report_matches(
+                        &stored.report,
+                        state.identity_epoch,
+                        identity_revision,
+                        policy_revision,
+                    )
+            });
+            if converged {
+                converged_agents += 1;
+            }
+            AgentConvergenceEntry {
+                node_name: node_name.clone(),
+                fresh,
+                converged,
+                last_received_unix_ms: stored.map(|stored| stored.last_received_unix_ms),
+                report: stored.map(|stored| stored.report.clone()),
+            }
+        })
+        .collect();
+    let expected_agents = expected_nodes.len();
+    AgentConvergenceSnapshot {
+        schema_version: AGENT_STATUS_SCHEMA_VERSION,
+        expected_agents,
+        reporting_agents,
+        missing_agents: expected_agents.saturating_sub(reporting_agents),
+        stale_agents,
+        converged_agents,
+        unexpected_agents,
+        all_converged: expected_agents != 0
+            && converged_agents == expected_agents
+            && unexpected_agents == 0,
+        nodes,
+    }
+}
+
+fn agent_report_matches(
+    report: &AgentStateReport,
+    expected_epoch: u64,
+    identity_revision: Revision,
+    policy_revision: Revision,
+) -> bool {
+    report.ready
+        && report.bpf_loaded
+        && report.desired_identity_epoch == expected_epoch
+        && report.applied_identity_epoch == expected_epoch
+        && report.desired_identity_revision == identity_revision.get()
+        && report.applied_identity_revision == identity_revision.get()
+        && report.desired_policy_epoch == expected_epoch
+        && report.applied_policy_epoch == expected_epoch
+        && report.desired_policy_revision == policy_revision.get()
+        && report.applied_policy_revision == policy_revision.get()
 }
 
 async fn identity_snapshot(
@@ -2607,6 +2787,87 @@ mod tests {
         apply_namespace_event(&state, Event::Apply(namespace("staging")));
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(2));
         assert_eq!(mutex_lock(&state.revisions).identity, Revision::default());
+    }
+
+    #[test]
+    fn agent_status_aggregation_requires_fresh_matching_acknowledgements() {
+        let state = new_state(true);
+        apply_node_event(&state, Event::Apply(node(true)));
+        let report = AgentStateReport {
+            schema_version: AGENT_STATUS_SCHEMA_VERSION,
+            node_name: "worker-a".to_owned(),
+            ready: true,
+            bpf_loaded: true,
+            desired_identity_revision: 0,
+            applied_identity_revision: 0,
+            desired_identity_epoch: state.identity_epoch,
+            applied_identity_epoch: state.identity_epoch,
+            identity_map_entries: 2,
+            ipv4_identity_map_entries: 1,
+            ipv6_identity_map_entries: 1,
+            desired_policy_revision: 0,
+            applied_policy_revision: 0,
+            desired_policy_epoch: state.identity_epoch,
+            applied_policy_epoch: state.identity_epoch,
+            policy_map_entries: 1,
+            active_policy_bank: 0,
+        };
+        validate_agent_status(&report).expect("valid agent report is accepted");
+        let missing =
+            agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100);
+        assert_eq!(missing.expected_agents, 1);
+        assert_eq!(missing.missing_agents, 1);
+        assert!(!missing.all_converged);
+        write_lock(&state.agent_reports).insert(
+            report.node_name.clone(),
+            StoredAgentReport {
+                report: report.clone(),
+                last_received_unix_ms: 100,
+            },
+        );
+
+        let converged =
+            agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100);
+        assert_eq!(converged.expected_agents, 1);
+        assert_eq!(converged.reporting_agents, 1);
+        assert_eq!(converged.converged_agents, 1);
+        assert!(converged.all_converged);
+        assert!(converged.nodes[0].fresh);
+        assert!(converged.nodes[0].converged);
+
+        let mut unexpected_report = report.clone();
+        unexpected_report.node_name = "worker-b".to_owned();
+        write_lock(&state.agent_reports).insert(
+            unexpected_report.node_name.clone(),
+            StoredAgentReport {
+                report: unexpected_report,
+                last_received_unix_ms: 100,
+            },
+        );
+        let unexpected =
+            agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100);
+        assert_eq!(unexpected.unexpected_agents, 1);
+        assert!(!unexpected.all_converged);
+
+        let expired_snapshot = agent_convergence_snapshot(
+            &state,
+            Revision::default(),
+            Revision::default(),
+            AGENT_STATUS_FRESHNESS_MILLIS + 101,
+        );
+        assert_eq!(expired_snapshot.stale_agents, 1);
+        assert_eq!(expired_snapshot.unexpected_agents, 0);
+        assert_eq!(expired_snapshot.converged_agents, 0);
+        assert!(!expired_snapshot.all_converged);
+
+        let mismatched =
+            agent_convergence_snapshot(&state, Revision::new(1), Revision::default(), 100);
+        assert_eq!(mismatched.converged_agents, 0);
+        assert!(!mismatched.all_converged);
+
+        let mut invalid = report;
+        invalid.active_policy_bank = 2;
+        assert!(validate_agent_status(&invalid).is_err());
     }
 
     #[test]

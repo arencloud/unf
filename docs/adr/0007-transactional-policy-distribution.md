@@ -47,17 +47,20 @@ insufficient.
 ## Consequences
 
 Policy distribution now has a single atomic activation point and observable
-desired/applied revisions. The initial compiler expands known source and
-destination identity pairs, so its cost and map cardinality are quadratic in the
-number of distinct identities; scale tests and a more compact representation are
-required before production. Maps are still unpinned and transport is
-unauthenticated inside the prototype cluster. ADR 0008 connects TC enforcement
-to the active bank without changing this distribution protocol.
+desired/applied revisions. Agents periodically acknowledge their applied state;
+the controller aggregates fresh reports against watched Nodes and current
+identity/policy revisions for status and CLI inspection. The initial compiler
+expands known source and destination identity pairs, so its cost and map
+cardinality are quadratic in the number of distinct identities; scale tests and
+a more compact representation are required before production. Maps are still
+unpinned and transport is unauthenticated inside the prototype cluster. ADR 0008
+connects TC enforcement to the active bank without changing this distribution
+protocol.
 
 ## Open questions
 
 - measured entry count, update latency, and memory limits at production scale;
 - map-in-map compatibility and migration from the bank-in-key representation;
 - map pinning, agent restart recovery, and last-known-good persistence;
-- authenticated node-specific state distribution and acknowledgement aggregation;
+- authenticated node-specific state distribution and durable acknowledgements;
 - compact unbounded-CIDR, port-range, and external-identity representations.

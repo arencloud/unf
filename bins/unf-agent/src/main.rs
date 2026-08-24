@@ -33,11 +33,11 @@ use unf_ebpf_common::{
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
 };
 use unf_state::{
-    FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowExportDecision,
-    FlowExportRecord, FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot,
-    Ipv4IdentityMapping, Ipv4PolicyMapEntry, Ipv6IdentityMapping, Ipv6PolicyMapEntry,
-    POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord,
-    PolicyMapEntry, PolicyStateSnapshot,
+    AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, FLOW_EXPORT_BATCH_LIMIT,
+    FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowExportDecision, FlowExportRecord,
+    FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
+    Ipv4PolicyMapEntry, Ipv6IdentityMapping, Ipv6PolicyMapEntry, POLICY_MAP_BANK_ENTRY_LIMIT,
+    POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord, PolicyMapEntry, PolicyStateSnapshot,
 };
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
@@ -92,6 +92,7 @@ struct AgentMetrics {
 }
 
 struct AgentState {
+    node_name: String,
     ready: AtomicBool,
     bpf_loaded: AtomicBool,
     observed_flows: AtomicU64,
@@ -198,22 +199,9 @@ struct KernelCapabilities {
 struct AgentStatus {
     component: &'static str,
     healthy: bool,
-    ready: bool,
-    bpf_loaded: bool,
     observed_flows: u64,
-    desired_identity_revision: u64,
-    applied_identity_revision: u64,
-    desired_identity_epoch: u64,
-    applied_identity_epoch: u64,
-    identity_map_entries: u64,
-    ipv4_identity_map_entries: u64,
-    ipv6_identity_map_entries: u64,
-    desired_policy_revision: u64,
-    applied_policy_revision: u64,
-    desired_policy_epoch: u64,
-    applied_policy_epoch: u64,
-    policy_map_entries: u64,
-    active_policy_bank: u64,
+    #[serde(flatten)]
+    state: AgentStateReport,
     queued_flow_exports: u64,
     dropped_flow_exports: u64,
     exported_flow_events: u64,
@@ -226,7 +214,7 @@ async fn main() -> Result<()> {
     install_crypto_provider()?;
     init_tracing();
     let args = Args::parse();
-    let state = Arc::new(new_state(detect_capabilities()));
+    let state = Arc::new(new_state(detect_capabilities(), args.node_name.clone()));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
 
@@ -303,7 +291,7 @@ fn install_crypto_provider() -> Result<()> {
         .map_err(|_| anyhow!("install process-wide Rustls crypto provider"))
 }
 
-fn new_state(capabilities: KernelCapabilities) -> AgentState {
+fn new_state(capabilities: KernelCapabilities, node_name: String) -> AgentState {
     let metrics = AgentMetrics {
         flow_events: Counter::default(),
         invalid_events: Counter::default(),
@@ -325,6 +313,7 @@ fn new_state(capabilities: KernelCapabilities) -> AgentState {
     let mut registry = Registry::default();
     register_agent_metrics(&mut registry, &metrics);
     AgentState {
+        node_name,
         ready: AtomicBool::new(false),
         bpf_loaded: AtomicBool::new(false),
         observed_flows: AtomicU64::new(0),
@@ -515,7 +504,9 @@ async fn run_dataplane(
         interval: config.identity_sync_interval,
     };
     let (flow_export_sender, flow_export_task) =
-        spawn_flow_exporter(controller_url, &config, &state, &cancellation);
+        spawn_flow_exporter(controller_url.clone(), &config, &state, &cancellation);
+    let status_report_task =
+        spawn_agent_status_reporter(controller_url, &config, &state, &cancellation);
     consume_events(
         ring,
         &mut attachments,
@@ -527,15 +518,20 @@ async fn run_dataplane(
     )
     .await;
     drop(flow_export_sender);
-    if let Some(task) = flow_export_task
-        && let Err(error) = task.await
-    {
-        warn!(%error, "flow exporter task failed");
-    }
+    await_background_task(flow_export_task, "flow exporter").await;
+    await_background_task(status_report_task, "agent status reporter").await;
     state.ready.store(false, Ordering::Release);
     state.bpf_loaded.store(false, Ordering::Release);
     state.metrics.bpf_loaded.set(0);
     Ok(())
+}
+
+async fn await_background_task(task: Option<tokio::task::JoinHandle<()>>, name: &'static str) {
+    if let Some(task) = task
+        && let Err(error) = task.await
+    {
+        warn!(%error, task = name, "background task failed");
+    }
 }
 
 fn take_identity_maps(ebpf: &mut Ebpf) -> Result<IdentityMaps> {
@@ -581,6 +577,21 @@ fn spawn_flow_exporter(
         .await;
     });
     (Some(sender), Some(task))
+}
+
+fn spawn_agent_status_reporter(
+    controller_url: Option<String>,
+    config: &DataplaneConfig,
+    state: &Arc<AgentState>,
+    cancellation: &CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let controller_url = controller_url?;
+    let reporter_state = Arc::clone(state);
+    let reporter_cancel = cancellation.clone();
+    let interval = config.identity_sync_interval;
+    Some(tokio::spawn(async move {
+        report_agent_status(controller_url, reporter_state, reporter_cancel, interval).await;
+    }))
 }
 
 fn take_policy_maps(ebpf: &mut Ebpf) -> Result<PolicyMaps> {
@@ -842,6 +853,64 @@ async fn export_flow_batches(
                 }
             }
         }
+    }
+}
+
+async fn report_agent_status(
+    controller_url: String,
+    state: Arc<AgentState>,
+    cancellation: CancellationToken,
+    report_interval: Duration,
+) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            error!(%error, "could not construct agent status HTTP client");
+            return;
+        }
+    };
+    let mut interval = tokio::time::interval(report_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            _ = interval.tick() => {
+                let result = client
+                    .post(format!("{controller_url}/v1/state/agents"))
+                    .json(&agent_state_report(&state))
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status);
+                if let Err(error) = result {
+                    warn!(%error, "agent status acknowledgement failed");
+                }
+            }
+        }
+    }
+}
+
+fn agent_state_report(state: &AgentState) -> AgentStateReport {
+    AgentStateReport {
+        schema_version: AGENT_STATUS_SCHEMA_VERSION,
+        node_name: state.node_name.clone(),
+        ready: state.ready.load(Ordering::Acquire),
+        bpf_loaded: state.bpf_loaded.load(Ordering::Acquire),
+        desired_identity_revision: state.desired_identity_revision.load(Ordering::Acquire),
+        applied_identity_revision: state.applied_identity_revision.load(Ordering::Acquire),
+        desired_identity_epoch: state.desired_identity_epoch.load(Ordering::Acquire),
+        applied_identity_epoch: state.applied_identity_epoch.load(Ordering::Acquire),
+        identity_map_entries: state.identity_map_entries.load(Ordering::Acquire),
+        ipv4_identity_map_entries: state.ipv4_identity_map_entries.load(Ordering::Acquire),
+        ipv6_identity_map_entries: state.ipv6_identity_map_entries.load(Ordering::Acquire),
+        desired_policy_revision: state.desired_policy_revision.load(Ordering::Acquire),
+        applied_policy_revision: state.applied_policy_revision.load(Ordering::Acquire),
+        desired_policy_epoch: state.desired_policy_epoch.load(Ordering::Acquire),
+        applied_policy_epoch: state.applied_policy_epoch.load(Ordering::Acquire),
+        policy_map_entries: state.policy_map_entries.load(Ordering::Acquire),
+        active_policy_bank: state.active_policy_bank.load(Ordering::Acquire),
     }
 }
 
@@ -1881,27 +1950,13 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
     Json(AgentStatus {
         component: "unf-agent",
         healthy: true,
-        ready: state.ready.load(Ordering::Acquire),
-        bpf_loaded: state.bpf_loaded.load(Ordering::Acquire),
         observed_flows: state.observed_flows.load(Ordering::Relaxed),
-        desired_identity_revision: state.desired_identity_revision.load(Ordering::Acquire),
-        applied_identity_revision: state.applied_identity_revision.load(Ordering::Acquire),
-        desired_identity_epoch: state.desired_identity_epoch.load(Ordering::Acquire),
-        applied_identity_epoch: state.applied_identity_epoch.load(Ordering::Acquire),
-        identity_map_entries: state.identity_map_entries.load(Ordering::Acquire),
-        ipv4_identity_map_entries: state.ipv4_identity_map_entries.load(Ordering::Acquire),
-        ipv6_identity_map_entries: state.ipv6_identity_map_entries.load(Ordering::Acquire),
-        desired_policy_revision: state.desired_policy_revision.load(Ordering::Acquire),
-        applied_policy_revision: state.applied_policy_revision.load(Ordering::Acquire),
-        desired_policy_epoch: state.desired_policy_epoch.load(Ordering::Acquire),
-        applied_policy_epoch: state.applied_policy_epoch.load(Ordering::Acquire),
-        policy_map_entries: state.policy_map_entries.load(Ordering::Acquire),
-        active_policy_bank: state.active_policy_bank.load(Ordering::Acquire),
+        state: agent_state_report(&state),
         queued_flow_exports: state.queued_flow_exports.load(Ordering::Relaxed),
         dropped_flow_exports: state.dropped_flow_exports.load(Ordering::Relaxed),
         exported_flow_events: state.exported_flow_events.load(Ordering::Relaxed),
         capabilities: state.capabilities.clone(),
-        limitation: "TC policy enforcement is active; maps are unpinned and status is node-local",
+        limitation: "TC policy enforcement is active; maps are unpinned and acknowledgements use unauthenticated prototype transport",
     })
 }
 
@@ -1948,12 +2003,40 @@ mod tests {
     }
 
     fn test_agent_state() -> AgentState {
-        new_state(KernelCapabilities {
-            kernel_release: "test".to_owned(),
-            btf: true,
-            bpffs: true,
-            cgroup_v2: true,
-        })
+        new_state(
+            KernelCapabilities {
+                kernel_release: "test".to_owned(),
+                btf: true,
+                bpffs: true,
+                cgroup_v2: true,
+            },
+            "worker-a".to_owned(),
+        )
+    }
+
+    #[test]
+    fn agent_state_report_preserves_node_and_revision_acknowledgements() {
+        let state = test_agent_state();
+        state.ready.store(true, Ordering::Release);
+        state.bpf_loaded.store(true, Ordering::Release);
+        state.desired_identity_epoch.store(7, Ordering::Release);
+        state.applied_identity_epoch.store(7, Ordering::Release);
+        state.desired_identity_revision.store(11, Ordering::Release);
+        state.applied_identity_revision.store(11, Ordering::Release);
+        state.desired_policy_epoch.store(7, Ordering::Release);
+        state.applied_policy_epoch.store(7, Ordering::Release);
+        state.desired_policy_revision.store(13, Ordering::Release);
+        state.applied_policy_revision.store(13, Ordering::Release);
+
+        let report = agent_state_report(&state);
+        assert_eq!(report.schema_version, AGENT_STATUS_SCHEMA_VERSION);
+        assert_eq!(report.node_name, "worker-a");
+        assert!(report.ready);
+        assert!(report.bpf_loaded);
+        assert_eq!(report.applied_identity_epoch, 7);
+        assert_eq!(report.applied_identity_revision, 11);
+        assert_eq!(report.applied_policy_epoch, 7);
+        assert_eq!(report.applied_policy_revision, 13);
     }
 
     fn test_flow_record(port: u16) -> FlowExportRecord {

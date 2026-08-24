@@ -194,6 +194,12 @@ fn print_value(value: &Value, output: Output) -> Result<()> {
 }
 
 fn print_table(value: &Value) {
+    if value.get("component").and_then(Value::as_str) == Some("unf-controller")
+        && value.get("agents").is_some()
+    {
+        print_controller_status_table(value);
+        return;
+    }
     if matches!(
         value.get("schema_version").and_then(Value::as_u64),
         Some(1 | 2)
@@ -227,6 +233,63 @@ fn print_table(value: &Value) {
         }
     } else {
         println!("{value}");
+    }
+}
+
+fn print_controller_status_table(value: &Value) {
+    println!("Controller Status");
+    println!(
+        "control plane            ready={} mode={} epoch={}",
+        value.get("ready").and_then(Value::as_bool).unwrap_or(false),
+        text_field(value, "mode"),
+        number_field(value, "identity_epoch")
+    );
+    let revisions = &value["revisions"];
+    println!(
+        "revisions                identity={} policy={} topology={} telemetry={}",
+        number_field(revisions, "identity"),
+        number_field(revisions, "policy"),
+        number_field(revisions, "topology"),
+        number_field(revisions, "telemetry")
+    );
+    println!(
+        "objects                  nodes={} pods={} identities={} policies={}",
+        number_field(value, "nodes"),
+        number_field(value, "pods"),
+        number_field(value, "identities"),
+        number_field(value, "compiled_policies")
+    );
+    let agents = &value["agents"];
+    println!(
+        "agents                   converged={}/{} reporting={} missing={} stale={} unexpected={} all_converged={}",
+        number_field(agents, "converged_agents"),
+        number_field(agents, "expected_agents"),
+        number_field(agents, "reporting_agents"),
+        number_field(agents, "missing_agents"),
+        number_field(agents, "stale_agents"),
+        number_field(agents, "unexpected_agents"),
+        agents
+            .get("all_converged")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    if let Some(nodes) = agents.get("nodes").and_then(Value::as_array) {
+        for node in nodes {
+            let report = &node["report"];
+            println!(
+                "agent                    {} fresh={} converged={} identity={}/{} policy={}/{} bank={}",
+                text_field(node, "node_name"),
+                node.get("fresh").and_then(Value::as_bool).unwrap_or(false),
+                node.get("converged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                number_field(report, "applied_identity_revision"),
+                number_field(report, "desired_identity_revision"),
+                number_field(report, "applied_policy_revision"),
+                number_field(report, "desired_policy_revision"),
+                number_field(report, "active_policy_bank")
+            );
+        }
     }
 }
 

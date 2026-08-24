@@ -44,6 +44,14 @@ reconciliation uses two banks: the
 inactive identity-keyed and IPv4-keyed banks are populated and read back before
 one `POLICY_CONFIG` write selects both. See ADRs 0006 and 0007.
 
+Each agent also posts a schema v1 acknowledgement containing its Node name,
+readiness, BPF load state, desired/applied identity and policy epoch/revisions,
+active policy bank, and map counts. The controller timestamps reports on receipt
+and compares them with its watched Node set and current desired revisions.
+Controller and CLI status classify expected agents as missing, stale after ten
+seconds, or converged; fresh reports from unknown Nodes remain visible as
+unexpected without permanently degrading status after Node removal.
+
 The policy node update lifecycle is now implemented as:
 
 ```text
@@ -55,7 +63,7 @@ Existing applied state must remain usable if the controller or Kubernetes API is
 temporarily unavailable. New state must never partially overwrite active maps.
 The prior bank remains active through any pre-switch failure. Pinned map
 ownership, schema migrations, persistence across agent restart, and controller
-acknowledgement aggregation remain Phase 2 design gates.
+acknowledgement authentication/durability remain Phase 2 design gates.
 
 Kubernetes watches remain the controller input. Internal HTTP snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

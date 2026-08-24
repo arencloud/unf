@@ -27,7 +27,8 @@ matrix and reproducible evidence.
   identities, and reconvergence after a controller epoch change;
 - Implemented and two-node kind verified: selector-to-identity lowering,
   versioned dual-bank policy maps, atomic revision activation/restoration, and
-  agent desired/applied policy status;
+  agent desired/applied policy status. Schema-versioned agent acknowledgements
+  give the controller and CLI freshness-aware convergence for every watched Node;
 - Implemented: active-bank TC lookup and IPv4/IPv6 TCP/UDP/SCTP allow/drop,
   including verifier-bounded IPv6 Hop-by-Hop, Routing, Destination Options,
   initial/atomic Fragment, and AH traversal. Dual-stack two-node kind verifies
@@ -36,8 +37,8 @@ matrix and reproducible evidence.
   enforcement-aware `unfctl explain`;
 - Verified manually: the last active bank continued enforcing across a controller
   interruption and agents reconverged to the restarted controller epoch;
-- Next: applied node status aggregation, pinned last-known-good recovery, agent
-  restart fencing, and pressure/fault-injection tests.
+- Next: pinned last-known-good recovery, agent restart fencing, and
+  pressure/fault-injection tests.
 
 ## Phase 3 — compatibility and simulation
 
