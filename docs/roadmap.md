@@ -47,8 +47,10 @@ matrix and reproducible evidence.
   identity churn, protocol-only TCP/UDP wildcard lowering, bounded numeric
   `endPort` ranges with map-capacity guards, and bounded IPv4 `ipBlock`/`except`
   exact-source enforcement with atomic two-map activation, plus
-  rejection/deletion recovery;
-- Next: broader ingress selector/port conformance and policy simulation;
+  rejection/deletion recovery; revision-fenced, read-only native policy
+  simulation over a bounded current-topology probe matrix;
+- Next: broader ingress conformance, richer versioned topology, and historical
+  flow inputs for policy impact analysis;
 - shadow rollout and offline impact analysis;
 - topology snapshots and flow exporter interface;
 - failure, scale, and OpenShift validation.

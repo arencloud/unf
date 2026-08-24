@@ -9,7 +9,7 @@ pod interfaces nor owns routing. This makes the initial adoption path reversible
 Kubernetes / OpenShift API
           |
           v
-   unf-controller ---- HTTP status/explain ---- unfctl
+   unf-controller ---- HTTP status/explain/simulate ---- unfctl
           |
    desired state (identity + policy snapshots: epoch + revision)
           |
@@ -35,6 +35,8 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    the same provenance-preserving IR; unsupported compatibility objects are
    rejected without retaining stale compiled state.
 4. `unfctl explain` asks the controller to resolve two Pods and evaluate the IR.
+   `unfctl policy simulate` compiles a candidate without applying it and compares
+   current/proposed decisions over a revision-fenced topology probe matrix.
 5. The agent loads the Aya object, attaches TC, applies the controller's revisioned
    IPv4 identity snapshot, consumes compact events, and exposes health and metrics.
 6. The controller resolves policy selectors to identity tuples and bounded

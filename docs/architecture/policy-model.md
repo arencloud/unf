@@ -76,3 +76,19 @@ Because the fast path is identity-keyed, named-port mappings participate in the
 canonical identity key. Pods with the same labels but different mappings receive
 different identities; changing a mapping intentionally advances identity and
 policy state rather than widening an allow across both workloads.
+
+## Read-only policy simulation
+
+The Phase 3 simulation foundation compiles a candidate native `SecurityPolicy`
+through the same `PolicyCompiler` and compares the current policy set with an
+in-memory add-or-replace proposal. The controller captures the identity epoch,
+identity revision, policy revision, and Pod topology under one read fence. It
+evaluates current and proposed policy over all Pod sources, affected destinations,
+every referenced concrete port, and representative TCP/UDP fallback ports.
+
+The versioned response retains both decisions and provenance, separates verdict
+changes from provenance-only changes, and reports affected workloads. Simulation
+is read-only: it does not update controller collections, policy revisions, agent
+snapshots, or BPF maps. The matrix is capped at 10,000 flows and currently excludes
+historical traffic, external sources, services, and user-supplied flow sets. See
+[ADR 0010](../adr/0010-read-only-policy-simulation.md).

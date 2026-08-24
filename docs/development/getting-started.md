@@ -87,6 +87,18 @@ Namespace relabel, and deletion/recreation convergence.
 The host kernel is shared with kind nodes. `make kind-down`
 deletes only the named `unf-dev` cluster.
 
+To inspect the checked-in deny proposal without applying it:
+
+```bash
+target/debug/unfctl --controller-url http://127.0.0.1:9962 \
+  policy simulate deploy/examples/simulation-deny.yaml
+```
+
+The result is fenced to the reported identity epoch/revision and policy revision.
+It uses a bounded current-topology probe matrix; it is not a historical-flow
+report. `make kind-test` verifies the predicted 8080 denial, unchanged policy
+revision, and continued live 8080 allow after simulation.
+
 The DaemonSet attaches ingress classification to every non-loopback node interface
 and discovers newly created pod veths. A packet can therefore produce multiple
 interface-level events; aggregation and deduplication are later telemetry work.

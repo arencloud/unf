@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
@@ -5,9 +6,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::Value;
+use unf_api::SecurityPolicy;
 
 #[derive(Debug, Parser)]
-#[command(about = "Inspect and explain the UNF network fabric")]
+#[command(about = "Inspect, explain, and simulate the UNF network fabric")]
 struct Cli {
     #[arg(
         long,
@@ -38,6 +40,20 @@ enum Command {
         #[arg(long)]
         port: u16,
     },
+    /// Inspect policy intent without changing live desired state.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Compare a candidate `SecurityPolicy` with current topology and policy state.
+    Simulate {
+        /// `SecurityPolicy` YAML file to evaluate without applying.
+        policy_file: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -60,6 +76,11 @@ struct ExplainRequest<'a> {
     to: &'a str,
     protocol: Protocol,
     port: u16,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicySimulationRequest<'a> {
+    policy: &'a SecurityPolicy,
 }
 
 #[tokio::main]
@@ -96,6 +117,20 @@ async fn run() -> Result<()> {
                     protocol: *protocol,
                     port: *port,
                 },
+            )
+            .await?
+        }
+        Command::Policy {
+            command: PolicyCommand::Simulate { policy_file },
+        } => {
+            let contents = std::fs::read_to_string(policy_file)
+                .with_context(|| format!("read policy file {}", policy_file.display()))?;
+            let policy: SecurityPolicy = serde_yaml::from_str(&contents)
+                .with_context(|| format!("parse SecurityPolicy YAML {}", policy_file.display()))?;
+            post_json(
+                &client,
+                &format!("{}/v1/policy/simulate", cli.controller_url),
+                &PolicySimulationRequest { policy: &policy },
             )
             .await?
         }
@@ -150,6 +185,13 @@ fn print_value(value: &Value, output: Output) -> Result<()> {
 }
 
 fn print_table(value: &Value) {
+    if value.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && value.get("summary").is_some()
+        && value.get("operation").is_some()
+    {
+        print_simulation_table(value);
+        return;
+    }
     if let Some(object) = value.as_object() {
         for (key, value) in object {
             let rendered = match value {
@@ -160,5 +202,112 @@ fn print_table(value: &Value) {
         }
     } else {
         println!("{value}");
+    }
+}
+
+fn print_simulation_table(value: &Value) {
+    let summary = &value["summary"];
+    let snapshot = &value["snapshot"];
+    println!("Policy Simulation");
+    println!(
+        "policy                   {} ({})",
+        text_field(value, "policy"),
+        text_field(value, "operation")
+    );
+    println!(
+        "snapshot                 identity={} policy={} epoch={}",
+        number_field(snapshot, "identity_revision"),
+        number_field(snapshot, "policy_revision"),
+        number_field(snapshot, "identity_epoch")
+    );
+    println!(
+        "flow source              {}",
+        text_field(snapshot, "flow_source")
+    );
+    println!(
+        "evaluated flows          {}",
+        number_field(summary, "evaluated_flows")
+    );
+    println!(
+        "remain allowed           {}",
+        number_field(summary, "remain_allowed")
+    );
+    println!(
+        "remain denied            {}",
+        number_field(summary, "remain_denied")
+    );
+    println!(
+        "would be allowed         {}",
+        number_field(summary, "would_be_allowed")
+    );
+    println!(
+        "would be denied          {}",
+        number_field(summary, "would_be_denied")
+    );
+    println!(
+        "decision changes         {}",
+        number_field(summary, "decision_changes")
+    );
+    println!(
+        "verdict changes          {}",
+        number_field(summary, "verdict_changes")
+    );
+    println!(
+        "affected workloads       {}",
+        number_field(summary, "affected_workloads")
+    );
+    if let Some(changes) = value.get("changes").and_then(Value::as_array) {
+        for change in changes.iter().take(20) {
+            println!(
+                "change                   {} -> {} {}/{}: {} -> {}",
+                change["source"]["reference"].as_str().unwrap_or("?"),
+                change["destination"]["reference"].as_str().unwrap_or("?"),
+                change["protocol"].as_str().unwrap_or("?"),
+                change["destination_port"],
+                change["current"]["verdict"].as_str().unwrap_or("?"),
+                change["proposed"]["verdict"].as_str().unwrap_or("?"),
+            );
+        }
+        if changes.len() > 20 {
+            println!("changes omitted          {}", changes.len() - 20);
+        }
+    }
+    println!("note                     {}", text_field(value, "note"));
+}
+
+fn text_field<'a>(value: &'a Value, field: &str) -> &'a str {
+    value.get(field).and_then(Value::as_str).unwrap_or("?")
+}
+
+fn number_field(value: &Value, field: &str) -> u64 {
+    value.get(field).and_then(Value::as_u64).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_simulation_command_and_fixture_parse() {
+        let cli = Cli::try_parse_from([
+            "unfctl",
+            "policy",
+            "simulate",
+            "deploy/examples/simulation-deny.yaml",
+            "--output",
+            "json",
+        ])
+        .expect("policy simulation command parses");
+        assert!(matches!(
+            cli.command,
+            Command::Policy {
+                command: PolicyCommand::Simulate { .. }
+            }
+        ));
+        let policy: SecurityPolicy = serde_yaml::from_str(include_str!(
+            "../../../deploy/examples/simulation-deny.yaml"
+        ))
+        .expect("checked-in simulation fixture is valid");
+        assert_eq!(policy.metadata.name.as_deref(), Some("frontend-to-backend"));
     }
 }

@@ -24,10 +24,10 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_api::SecurityPolicy;
-use unf_common::{PolicyId, Protocol, Revision};
+use unf_common::{PolicyId, Protocol, Revision, Verdict};
 use unf_policy::{
-    Endpoint, Flow, Ipv4Endpoint, NamedPort, NetworkPolicyCompiler, PolicyCompiler, PolicyIr,
-    compile_dataplane_entries, compile_ipv4_dataplane_entries, evaluate,
+    DestinationPort, Endpoint, Flow, Ipv4Endpoint, NamedPort, NetworkPolicyCompiler,
+    PolicyCompiler, PolicyIr, compile_dataplane_entries, compile_ipv4_dataplane_entries, evaluate,
 };
 use unf_state::{
     IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
@@ -121,6 +121,65 @@ struct ExplainResponse {
     note: &'static str,
 }
 
+const POLICY_SIMULATION_SCHEMA_VERSION: u16 = 1;
+const POLICY_SIMULATION_FLOW_LIMIT: usize = 10_000;
+
+#[derive(Debug, Deserialize)]
+struct PolicySimulationRequest {
+    policy: SecurityPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PolicySimulationOperation {
+    Add,
+    Replace,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicySimulationSnapshot {
+    identity_epoch: u64,
+    identity_revision: Revision,
+    policy_revision: Revision,
+    pods: usize,
+    flow_source: &'static str,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct PolicySimulationSummary {
+    evaluated_flows: usize,
+    remain_allowed: usize,
+    remain_denied: usize,
+    would_be_allowed: usize,
+    would_be_denied: usize,
+    verdict_changes: usize,
+    decision_changes: usize,
+    affected_workloads: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicySimulationChange {
+    source: ResolvedEndpoint,
+    destination: ResolvedEndpoint,
+    protocol: &'static str,
+    destination_port: u16,
+    current: unf_policy::PolicyDecision,
+    proposed: unf_policy::PolicyDecision,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicySimulationResponse {
+    schema_version: u16,
+    policy: String,
+    policy_id: PolicyId,
+    operation: PolicySimulationOperation,
+    snapshot: PolicySimulationSnapshot,
+    affected_destinations: usize,
+    summary: PolicySimulationSummary,
+    changes: Vec<PolicySimulationChange>,
+    note: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct ResolvedEndpoint {
     reference: String,
@@ -157,6 +216,7 @@ async fn main() -> Result<()> {
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
         .route("/v1/explain", post(explain))
+        .route("/v1/policy/simulate", post(simulate_policy))
         .with_state(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
@@ -810,6 +870,219 @@ async fn explain(
     }))
 }
 
+async fn simulate_policy(
+    State(state): State<Arc<ControllerState>>,
+    Json(request): Json<PolicySimulationRequest>,
+) -> Result<Json<PolicySimulationResponse>, ApiError> {
+    let key = object_key(&request.policy);
+    let policy_id = stable_policy_id(&key);
+    let candidate = PolicyCompiler::compile(policy_id, request.policy)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+
+    let _policy_state_guard = read_lock(&state.policy_state_guard);
+    let pod_records: Vec<_> = read_lock(&state.pods).values().cloned().collect();
+    let namespaces = read_lock(&state.namespaces).clone();
+    let current_policies = compiled_policies(&state);
+    let current_candidate = read_lock(&state.compiled_security_policies)
+        .get(&key)
+        .cloned();
+    let operation = if current_candidate.is_some() {
+        PolicySimulationOperation::Replace
+    } else {
+        PolicySimulationOperation::Add
+    };
+    let mut proposed_policies: Vec<_> = read_lock(&state.compiled_security_policies)
+        .iter()
+        .filter(|(existing_key, _)| *existing_key != &key)
+        .map(|(_, policy)| policy.clone())
+        .collect();
+    proposed_policies.extend(
+        read_lock(&state.compiled_network_policies)
+            .values()
+            .cloned(),
+    );
+    proposed_policies.push(candidate.clone());
+
+    let endpoints: Vec<_> = pod_records
+        .iter()
+        .map(|pod| endpoint_with_namespace_labels(&pod.endpoint, &namespaces))
+        .collect();
+    let affected_destinations: BTreeSet<_> = endpoints
+        .iter()
+        .enumerate()
+        .filter(|(_, endpoint)| {
+            candidate.target.matches(endpoint)
+                || current_candidate
+                    .as_ref()
+                    .is_some_and(|policy| policy.target.matches(endpoint))
+        })
+        .map(|(index, _)| index)
+        .collect();
+
+    let mut flow_count = 0_usize;
+    let mut destination_tuples = BTreeMap::new();
+    for destination_index in &affected_destinations {
+        let tuples = simulation_protocol_ports(
+            &current_policies,
+            &proposed_policies,
+            &endpoints[*destination_index],
+        );
+        flow_count = flow_count
+            .checked_add(pod_records.len().saturating_mul(tuples.len()))
+            .ok_or_else(|| ApiError::bad_request("policy simulation flow count overflow"))?;
+        if flow_count > POLICY_SIMULATION_FLOW_LIMIT {
+            return Err(ApiError::unprocessable(format!(
+                "policy simulation requires {flow_count} topology-derived flows; limit is {POLICY_SIMULATION_FLOW_LIMIT}"
+            )));
+        }
+        destination_tuples.insert(*destination_index, tuples);
+    }
+
+    let (summary, changes) = evaluate_simulation_matrix(
+        &pod_records,
+        &endpoints,
+        &destination_tuples,
+        &current_policies,
+        &proposed_policies,
+    );
+
+    let revisions = mutex_lock(&state.revisions).clone();
+    let identity_revision = mutex_lock(&state.identities).revision();
+    Ok(Json(PolicySimulationResponse {
+        schema_version: POLICY_SIMULATION_SCHEMA_VERSION,
+        policy: key,
+        policy_id,
+        operation,
+        snapshot: PolicySimulationSnapshot {
+            identity_epoch: state.identity_epoch,
+            identity_revision,
+            policy_revision: revisions.policy,
+            pods: pod_records.len(),
+            flow_source: "current-topology representative matrix",
+        },
+        affected_destinations: affected_destinations.len(),
+        summary,
+        changes,
+        note: "read-only what-if result; the candidate was not applied and historical flows are not included",
+    }))
+}
+
+fn evaluate_simulation_matrix(
+    pod_records: &[PodRecord],
+    endpoints: &[Endpoint],
+    destination_tuples: &BTreeMap<usize, BTreeSet<(Protocol, u16)>>,
+    current_policies: &[PolicyIr],
+    proposed_policies: &[PolicyIr],
+) -> (PolicySimulationSummary, Vec<PolicySimulationChange>) {
+    let mut summary = PolicySimulationSummary::default();
+    let mut changes = Vec::new();
+    let mut affected_workloads = BTreeSet::new();
+    for (source_index, source) in endpoints.iter().enumerate() {
+        for (destination_index, tuples) in destination_tuples {
+            let destination = &endpoints[*destination_index];
+            for (protocol, destination_port) in tuples {
+                let flow = Flow {
+                    source,
+                    destination,
+                    protocol: *protocol,
+                    destination_port: *destination_port,
+                    source_ipv4: pod_records[source_index]
+                        .ipv4_addresses
+                        .iter()
+                        .next()
+                        .copied(),
+                };
+                let current = evaluate(current_policies, flow);
+                let proposed = evaluate(proposed_policies, flow);
+                summary.evaluated_flows += 1;
+                match (current.verdict, proposed.verdict) {
+                    (Verdict::Allow, Verdict::Deny) => summary.would_be_denied += 1,
+                    (Verdict::Deny, Verdict::Allow) => summary.would_be_allowed += 1,
+                    (_, Verdict::Allow) => summary.remain_allowed += 1,
+                    (_, Verdict::Deny) => summary.remain_denied += 1,
+                    _ => {}
+                }
+                if current.verdict != proposed.verdict {
+                    summary.verdict_changes += 1;
+                }
+                if current != proposed {
+                    summary.decision_changes += 1;
+                    affected_workloads.insert(source_index);
+                    affected_workloads.insert(*destination_index);
+                    changes.push(PolicySimulationChange {
+                        source: resolved(&pod_records[source_index]),
+                        destination: resolved(&pod_records[*destination_index]),
+                        protocol: protocol_name(*protocol),
+                        destination_port: *destination_port,
+                        current,
+                        proposed,
+                    });
+                }
+            }
+        }
+    }
+    summary.affected_workloads = affected_workloads.len();
+    (summary, changes)
+}
+
+fn simulation_protocol_ports(
+    current_policies: &[PolicyIr],
+    proposed_policies: &[PolicyIr],
+    destination: &Endpoint,
+) -> BTreeSet<(Protocol, u16)> {
+    let mut tuples = BTreeSet::new();
+    for policy in current_policies.iter().chain(proposed_policies) {
+        if !policy.target.matches(destination) {
+            continue;
+        }
+        for rule in &policy.rules {
+            if !rule.destination.matches(destination) {
+                continue;
+            }
+            let protocols: &[Protocol] = match rule.protocol {
+                Some(Protocol::Tcp) => &[Protocol::Tcp],
+                Some(Protocol::Udp) => &[Protocol::Udp],
+                Some(Protocol::Icmp) => continue,
+                None => &[Protocol::Tcp, Protocol::Udp],
+            };
+            for protocol in protocols {
+                match &rule.destination_port {
+                    DestinationPort::Any => {}
+                    DestinationPort::Number(port) => {
+                        tuples.insert((*protocol, *port));
+                    }
+                    DestinationPort::Named(name) => {
+                        let named_port = NamedPort {
+                            name: name.clone(),
+                            protocol: *protocol,
+                        };
+                        if let Some(port) = destination.named_ports.get(&named_port) {
+                            tuples.insert((*protocol, *port));
+                        }
+                    }
+                    DestinationPort::Range { start, end } => {
+                        tuples.extend((*start..=*end).map(|port| (*protocol, port)));
+                    }
+                }
+            }
+        }
+    }
+    for protocol in [Protocol::Tcp, Protocol::Udp] {
+        if let Some(port) = (1..=u16::MAX).find(|port| !tuples.contains(&(protocol, *port))) {
+            tuples.insert((protocol, port));
+        }
+    }
+    tuples
+}
+
+const fn protocol_name(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+        Protocol::Icmp => "icmp",
+    }
+}
+
 fn endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Endpoint> {
     let namespaces = read_lock(&state.namespaces);
     read_lock(&state.pods)
@@ -875,6 +1148,7 @@ fn resolved(pod: &PodRecord) -> ResolvedEndpoint {
     }
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -891,6 +1165,13 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn unprocessable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
             message: message.into(),
         }
     }
@@ -1001,6 +1282,49 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn security_policy(name: &str, action: &str) -> SecurityPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "SecurityPolicy",
+            "metadata": {
+                "name": name,
+                "namespace": "backend"
+            },
+            "spec": {
+                "target": {"application": "server"},
+                "priority": 100,
+                "ingress": [{
+                    "from": {
+                        "namespace": "frontend",
+                        "application": "client"
+                    },
+                    "protocols": [{"protocol": "Tcp", "port": 8080}],
+                    "action": action
+                }],
+                "defaultAction": "Deny",
+                "enforcementMode": "Enforce"
+            }
+        }))
+        .expect("test SecurityPolicy is valid Kubernetes JSON")
+    }
+
+    fn pod_record(id: u32, namespace: &str, name: &str, application: &str) -> PodRecord {
+        PodRecord {
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+            endpoint: Endpoint {
+                identity: unf_common::IdentityId::new(id),
+                namespace: namespace.to_owned(),
+                namespace_labels: BTreeMap::new(),
+                service_account: "default".to_owned(),
+                application: Some(application.to_owned()),
+                labels: BTreeMap::from([("app".to_owned(), application.to_owned())]),
+                named_ports: BTreeMap::new(),
+            },
+            ipv4_addresses: BTreeSet::new(),
+        }
+    }
 
     fn network_policy(port: &serde_json::Value, protocol: &str) -> NetworkPolicy {
         serde_json::from_value(serde_json::json!({
@@ -1203,5 +1527,120 @@ mod tests {
         apply_namespace_event(&state, Event::Apply(namespace("staging")));
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(2));
         assert_eq!(mutex_lock(&state.revisions).identity, Revision::default());
+    }
+
+    #[tokio::test]
+    async fn policy_simulation_detects_replacement_without_mutating_state() {
+        let state = Arc::new(new_state(true));
+        write_lock(&state.pods).insert(
+            "frontend/client".to_owned(),
+            pod_record(1, "frontend", "client", "client"),
+        );
+        write_lock(&state.pods).insert(
+            "backend/server".to_owned(),
+            pod_record(2, "backend", "server", "server"),
+        );
+        let key = "backend/frontend-to-backend";
+        let current = PolicyCompiler::compile(
+            stable_policy_id(key),
+            security_policy("frontend-to-backend", "Allow"),
+        )
+        .expect("current policy compiles");
+        write_lock(&state.compiled_security_policies).insert(key.to_owned(), current.clone());
+        mutex_lock(&state.revisions).policy = Revision::new(7);
+
+        let response = simulate_policy(
+            State(Arc::clone(&state)),
+            Json(PolicySimulationRequest {
+                policy: security_policy("frontend-to-backend", "Deny"),
+            }),
+        )
+        .await
+        .expect("candidate policy simulates")
+        .0;
+
+        assert!(matches!(
+            response.operation,
+            PolicySimulationOperation::Replace
+        ));
+        assert_eq!(response.policy, key);
+        assert_eq!(response.snapshot.policy_revision, Revision::new(7));
+        assert_eq!(response.affected_destinations, 1);
+        assert_eq!(response.summary.evaluated_flows, 6);
+        assert_eq!(response.summary.would_be_denied, 1);
+        assert_eq!(response.summary.would_be_allowed, 0);
+        assert_eq!(response.summary.verdict_changes, 1);
+        assert_eq!(response.changes.len(), 1);
+        assert_eq!(response.changes[0].source.reference, "frontend/client");
+        assert_eq!(response.changes[0].destination.reference, "backend/server");
+        assert_eq!(response.changes[0].protocol, "tcp");
+        assert_eq!(response.changes[0].destination_port, 8080);
+        assert_eq!(response.changes[0].current.verdict, Verdict::Allow);
+        assert_eq!(response.changes[0].proposed.verdict, Verdict::Deny);
+
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(7));
+        assert_eq!(
+            read_lock(&state.compiled_security_policies).get(key),
+            Some(&current)
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_simulation_supports_read_only_addition() {
+        let state = Arc::new(new_state(true));
+        write_lock(&state.pods).insert(
+            "frontend/client".to_owned(),
+            pod_record(1, "frontend", "client", "client"),
+        );
+        write_lock(&state.pods).insert(
+            "backend/server".to_owned(),
+            pod_record(2, "backend", "server", "server"),
+        );
+
+        let response = simulate_policy(
+            State(Arc::clone(&state)),
+            Json(PolicySimulationRequest {
+                policy: security_policy("candidate-deny", "Deny"),
+            }),
+        )
+        .await
+        .expect("new candidate policy simulates")
+        .0;
+
+        assert!(matches!(response.operation, PolicySimulationOperation::Add));
+        assert_eq!(response.summary.evaluated_flows, 6);
+        assert_eq!(response.summary.would_be_denied, 6);
+        assert!(read_lock(&state.compiled_security_policies).is_empty());
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::default());
+    }
+
+    #[tokio::test]
+    async fn policy_simulation_rejects_an_unbounded_topology_matrix() {
+        let state = Arc::new(new_state(true));
+        write_lock(&state.pods).insert(
+            "backend/server".to_owned(),
+            pod_record(1, "backend", "server", "server"),
+        );
+        for index in 0..3_333_u32 {
+            let name = format!("client-{index}");
+            write_lock(&state.pods).insert(
+                format!("frontend/{name}"),
+                pod_record(index + 2, "frontend", &name, "client"),
+            );
+        }
+
+        let error = simulate_policy(
+            State(Arc::clone(&state)),
+            Json(PolicySimulationRequest {
+                policy: security_policy("candidate-deny", "Deny"),
+            }),
+        )
+        .await
+        .expect_err("oversized simulation matrix is rejected");
+
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.message.contains("limit is 10000"));
+        assert!(read_lock(&state.compiled_security_policies).is_empty());
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::default());
     }
 }

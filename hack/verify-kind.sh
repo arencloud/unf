@@ -258,6 +258,28 @@ if [[ ${initial_synced} != true ]]; then
 fi
 initial_policy_revision=${expected_policy_revision}
 
+policy_simulation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    policy simulate "${project_root}/deploy/examples/simulation-deny.yaml")
+grep -q '"schema_version": 1' <<<"${policy_simulation}"
+grep -q '"operation": "replace"' <<<"${policy_simulation}"
+grep -q '"flow_source": "current-topology representative matrix"' <<<"${policy_simulation}"
+grep -Eq '"would_be_denied": [1-9][0-9]*' <<<"${policy_simulation}"
+grep -Eq '"decision_changes": [1-9][0-9]*' <<<"${policy_simulation}"
+grep -q '"reference": "frontend/client"' <<<"${policy_simulation}"
+grep -q '"reference": "backend/server"' <<<"${policy_simulation}"
+grep -q '"destination_port": 8080' <<<"${policy_simulation}"
+grep -q '"verdict": "Allow"' <<<"${policy_simulation}"
+grep -q '"verdict": "Deny"' <<<"${policy_simulation}"
+grep -q "\"policy_revision\": ${initial_policy_revision}" <<<"${policy_simulation}"
+policy_revision_after_simulation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json status \
+    | sed -nE 's/.*"policy": ([0-9]+).*/\1/p')
+if [[ ${policy_revision_after_simulation} != "${initial_policy_revision}" ]]; then
+    echo "read-only policy simulation changed the live policy revision" >&2
+    exit 1
+fi
+
 client_ip=$("${kc[@]}" get pod -n frontend client -o jsonpath='{.status.podIP}')
 if [[ ! ${client_ip} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "frontend client does not have an IPv4 Pod address" >&2
@@ -710,4 +732,4 @@ if "${kc[@]}" exec -n frontend client -- \
     exit 1
 fi
 
-echo "kind verification passed: native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: read-only policy simulation, native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"

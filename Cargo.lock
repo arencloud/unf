@@ -2831,11 +2831,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "k8s-openapi",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
+ "unf-api",
 ]
 
 [[package]]

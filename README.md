@@ -12,8 +12,10 @@ a CNI replacement**.
 Phase 1's observation gate and Phase 2's first enforcement gate are verified in
 a two-node kind cluster. Collision-checked identities and transactional policy
 revisions now drive TC allow/drop decisions with actual and shadow provenance.
-The first supported ingress `NetworkPolicy` slice is also live-verified through
-the same controller, policy engine, and dataplane.
+The supported ingress `NetworkPolicy` slices are live-verified through the same
+controller, policy engine, and dataplane. A read-only policy simulation foundation
+now compares candidate native policy against revision-fenced live topology without
+applying it.
 See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
 gates, evidence, limitations, and current work. The shorter
@@ -35,12 +37,15 @@ Implemented in the repository:
 - a kube-rs controller watching Pods, Namespaces, SecurityPolicies, and
   NetworkPolicies, with accepted/rejected compatibility status;
 - controller health, readiness, metrics, status, and userspace explanation APIs;
+- revision-fenced, read-only native policy simulation through the shared evaluator;
 - an Aya agent capable of loading and attaching the TC observation program;
 - an IPv4 TCP/UDP TC parser with counters, bounded ring-buffer events, and
   active-bank L3/L4 allow/drop decisions;
 - revisioned controller-to-agent IPv4 identity snapshots and a versioned BPF map;
 - selector-resolved policy snapshots and dual-bank transactional BPF policy maps;
 - `unfctl status` and `unfctl explain` against live controller state;
+- `unfctl policy simulate <security-policy.yaml>` with table/JSON/YAML impact
+  summaries and current/proposed provenance;
 - a reproducible two-node kind demo covering native and NetworkPolicy cross-node
   allow/drop, namespace-selector convergence, rejection/deletion recovery, shadow
   pass-through, protocol-only port activation/recovery, bounded range/ipBlock
