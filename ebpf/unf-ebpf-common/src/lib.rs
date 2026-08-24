@@ -125,6 +125,19 @@ pub struct PolicyMapKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
+pub struct Ipv4PolicyMapKey {
+    /// Exact source IPv4 address in network byte order; zero is a fallback.
+    pub source_address: [u8; 4],
+    pub destination_identity: IdentityId,
+    /// Destination port in network byte order; zero means wildcard fallback.
+    pub destination_port: [u8; 2],
+    /// IP protocol number; zero means wildcard fallback.
+    pub protocol: u8,
+    pub bank: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct PolicyMapValue {
     pub policy_id: PolicyId,
     pub rule_id: RuleId,
@@ -155,6 +168,7 @@ const _: () = assert!(core::mem::size_of::<FlowEvent>() == 96);
 const _: () = assert!(core::mem::size_of::<Ipv4IdentityKey>() == 4);
 const _: () = assert!(core::mem::size_of::<IdentityMapValue>() == 16);
 const _: () = assert!(core::mem::size_of::<PolicyMapKey>() == 12);
+const _: () = assert!(core::mem::size_of::<Ipv4PolicyMapKey>() == 12);
 const _: () = assert!(core::mem::size_of::<PolicyMapValue>() == 32);
 const _: () = assert!(core::mem::size_of::<PolicyMapConfig>() == 24);
 
@@ -171,6 +185,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<IdentityMapValue>(), 16);
         assert_eq!(core::mem::align_of::<PolicyMapKey>(), 4);
         assert_eq!(core::mem::size_of::<PolicyMapKey>(), 12);
+        assert_eq!(core::mem::align_of::<Ipv4PolicyMapKey>(), 4);
+        assert_eq!(core::mem::size_of::<Ipv4PolicyMapKey>(), 12);
         assert_eq!(core::mem::align_of::<PolicyMapValue>(), 8);
         assert_eq!(core::mem::size_of::<PolicyMapValue>(), 32);
         assert_eq!(core::mem::align_of::<PolicyMapConfig>(), 8);

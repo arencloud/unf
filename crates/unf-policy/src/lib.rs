@@ -3,12 +3,14 @@
 mod network_policy;
 
 pub use network_policy::{
+    KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES,
     KUBERNETES_NETWORK_POLICY_MAX_PORT_RANGE_WIDTH, KUBERNETES_NETWORK_POLICY_PRIORITY,
     NetworkPolicyCompileError, NetworkPolicyCompiler,
 };
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -16,7 +18,10 @@ use unf_api::{
     Action, EnforcementMode, SecurityPolicy, TransportProtocol, WorkloadSelector as ApiSelector,
 };
 use unf_common::{IdentityId, PolicyAction, PolicyId, Protocol, RuleId, Verdict};
-use unf_state::{POLICY_MAP_BANK_ENTRY_LIMIT, PolicyDecisionRecord, PolicyMapEntry, PolicyMapKey};
+use unf_state::{
+    Ipv4PolicyMapEntry, Ipv4PolicyMapKey, POLICY_MAP_BANK_ENTRY_LIMIT, PolicyDecisionRecord,
+    PolicyMapEntry, PolicyMapKey,
+};
 
 pub use unf_common::PolicyReason as DecisionReason;
 
@@ -29,6 +34,19 @@ pub struct IdentitySelector {
     pub application: Option<String>,
     pub match_labels: BTreeMap<String, String>,
     pub match_expressions: Vec<LabelExpression>,
+    pub ipv4_blocks: Vec<Ipv4Block>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Ipv4Cidr {
+    pub network: Ipv4Addr,
+    pub prefix_len: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Ipv4Block {
+    pub cidr: Ipv4Cidr,
+    pub except: Vec<Ipv4Cidr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -77,6 +95,75 @@ impl IdentitySelector {
                 .iter()
                 .all(|expression| expression.matches(&endpoint.labels))
     }
+
+    fn matches_source(&self, endpoint: &Endpoint, source_ipv4: Option<Ipv4Addr>) -> bool {
+        let external_source_matches =
+            endpoint.identity.get() != 0 || !self.ipv4_blocks.is_empty() || self.is_unconstrained();
+        external_source_matches
+            && self.matches(endpoint)
+            && (self.ipv4_blocks.is_empty()
+                || source_ipv4.is_some_and(|address| {
+                    self.ipv4_blocks.iter().any(|block| block.contains(address))
+                }))
+    }
+
+    fn is_unconstrained(&self) -> bool {
+        self.namespace.is_none()
+            && self.namespace_match_labels.is_empty()
+            && self.namespace_match_expressions.is_empty()
+            && self.service_account.is_none()
+            && self.application.is_none()
+            && self.match_labels.is_empty()
+            && self.match_expressions.is_empty()
+    }
+}
+
+impl Ipv4Cidr {
+    #[must_use]
+    pub fn contains(&self, address: Ipv4Addr) -> bool {
+        if self.prefix_len > 32 {
+            return false;
+        }
+        let mask = if self.prefix_len == 0 {
+            0
+        } else {
+            u32::MAX << (32 - self.prefix_len)
+        };
+        u32::from(address) & mask == u32::from(self.network)
+    }
+
+    #[must_use]
+    pub fn address_count(&self) -> u64 {
+        if self.prefix_len > 32 {
+            u64::MAX
+        } else {
+            1_u64 << (32 - self.prefix_len)
+        }
+    }
+
+    #[must_use]
+    pub fn contains_cidr(&self, other: &Self) -> bool {
+        self.prefix_len <= other.prefix_len && self.contains(other.network)
+    }
+
+    fn addresses(&self) -> impl Iterator<Item = Ipv4Addr> {
+        let start = u32::from(self.network);
+        let count = u32::try_from(self.address_count()).unwrap_or(u32::MAX);
+        (0..count).map(move |offset| Ipv4Addr::from(start + offset))
+    }
+}
+
+impl Ipv4Block {
+    #[must_use]
+    pub fn contains(&self, address: Ipv4Addr) -> bool {
+        self.cidr.contains(address) && !self.except.iter().any(|except| except.contains(address))
+    }
+
+    fn addresses(&self) -> impl Iterator<Item = Ipv4Addr> + '_ {
+        self.cidr
+            .addresses()
+            .filter(|address| self.contains(*address))
+    }
 }
 
 impl LabelExpression {
@@ -104,6 +191,7 @@ impl From<ApiSelector> for IdentitySelector {
             application: value.application,
             match_labels: value.match_labels,
             match_expressions: Vec::new(),
+            ipv4_blocks: Vec::new(),
         }
     }
 }
@@ -117,6 +205,12 @@ pub struct Endpoint {
     pub application: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub named_ports: BTreeMap<NamedPort, u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ipv4Endpoint {
+    pub address: Ipv4Addr,
+    pub endpoint: Endpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -192,6 +286,7 @@ pub struct Flow<'a> {
     pub destination: &'a Endpoint,
     pub protocol: Protocol,
     pub destination_port: u16,
+    pub source_ipv4: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +320,10 @@ pub enum DataplaneCompileError {
     IdentityMetadataConflict { identity_id: IdentityId },
     #[error("compiled policy contains more than {limit} entries for one dataplane bank")]
     EntryLimitExceeded { limit: usize },
+    #[error("source IPv4 address {address} has conflicting endpoint metadata")]
+    Ipv4MetadataConflict { address: Ipv4Addr },
+    #[error("IPv4 policy block contains {address_count} addresses, exceeding limit {limit}")]
+    Ipv4BlockTooLarge { address_count: u64, limit: u64 },
 }
 
 pub struct PolicyCompiler;
@@ -435,6 +534,7 @@ pub fn compile_dataplane_entries(
                     destination,
                     protocol: Protocol::Tcp,
                     destination_port: 0,
+                    source_ipv4: None,
                 },
             );
             let fallback_entry = policy_map_entry(source, destination, 0, 0, &fallback);
@@ -446,7 +546,10 @@ pub fn compile_dataplane_entries(
                 .iter()
                 .filter(|policy| policy.target.matches(destination))
                 .flat_map(|policy| &policy.rules)
-                .filter(|rule| rule.source.matches(source) && rule.destination.matches(destination))
+                .filter(|rule| {
+                    rule.source.matches_source(source, None)
+                        && rule.destination.matches(destination)
+                })
                 .flat_map(|rule| exact_rule_ports(rule, destination))
                 .collect();
             for (protocol, port) in exact_tuples {
@@ -457,6 +560,7 @@ pub fn compile_dataplane_entries(
                         destination,
                         protocol,
                         destination_port: port,
+                        source_ipv4: None,
                     },
                 );
                 let entry = policy_map_entry(source, destination, protocol as u8, port, &decision);
@@ -471,6 +575,172 @@ pub fn compile_dataplane_entries(
     }
     entries.sort_by_key(|entry| entry.key);
     Ok(entries)
+}
+
+/// Resolves IPv4-aware source rules into a second exact-source policy map.
+///
+/// Known Pod addresses retain their workload metadata. Addresses referenced only
+/// by an `ipBlock` use an external endpoint with identity zero, while source
+/// address zero is reserved as the arbitrary-external-source fallback.
+///
+/// # Errors
+///
+/// Returns an error for conflicting endpoint metadata or when exact-source
+/// expansion exceeds one dataplane bank.
+pub fn compile_ipv4_dataplane_entries(
+    policies: &[PolicyIr],
+    endpoints: &[Endpoint],
+    ipv4_endpoints: &[Ipv4Endpoint],
+) -> Result<Vec<Ipv4PolicyMapEntry>, DataplaneCompileError> {
+    let mut destinations = BTreeMap::<IdentityId, &Endpoint>::new();
+    for endpoint in endpoints {
+        if let Some(existing) = destinations.insert(endpoint.identity, endpoint)
+            && existing != endpoint
+        {
+            return Err(DataplaneCompileError::IdentityMetadataConflict {
+                identity_id: endpoint.identity,
+            });
+        }
+    }
+
+    let mut known_sources = BTreeMap::<Ipv4Addr, &Endpoint>::new();
+    for source in ipv4_endpoints {
+        if let Some(existing) = known_sources.insert(source.address, &source.endpoint)
+            && existing != &source.endpoint
+        {
+            return Err(DataplaneCompileError::Ipv4MetadataConflict {
+                address: source.address,
+            });
+        }
+    }
+
+    let ipv4_blocks: Vec<_> = policies
+        .iter()
+        .flat_map(|policy| &policy.rules)
+        .flat_map(|rule| &rule.source.ipv4_blocks)
+        .collect();
+    for block in &ipv4_blocks {
+        let address_count = block.cidr.address_count();
+        if address_count > KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES {
+            return Err(DataplaneCompileError::Ipv4BlockTooLarge {
+                address_count,
+                limit: KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES,
+            });
+        }
+    }
+
+    let mut source_addresses: BTreeSet<_> = known_sources.keys().copied().collect();
+    for address in ipv4_blocks.into_iter().flat_map(Ipv4Block::addresses) {
+        if address != Ipv4Addr::UNSPECIFIED
+            && source_addresses.insert(address)
+            && source_addresses.len() > POLICY_MAP_BANK_ENTRY_LIMIT
+        {
+            return Err(DataplaneCompileError::EntryLimitExceeded {
+                limit: POLICY_MAP_BANK_ENTRY_LIMIT,
+            });
+        }
+    }
+
+    let external = external_endpoint();
+    let mut entries = Vec::new();
+    for address in source_addresses {
+        let source = known_sources.get(&address).copied().unwrap_or(&external);
+        for destination in destinations.values() {
+            compile_ipv4_pair(
+                policies,
+                source,
+                Some(address),
+                address,
+                destination,
+                &mut entries,
+            )?;
+        }
+    }
+
+    for destination in destinations.values().filter(|destination| {
+        policies.iter().any(|policy| {
+            policy.origin == PolicyOrigin::KubernetesNetworkPolicy
+                && policy.target.matches(destination)
+        })
+    }) {
+        compile_ipv4_pair(
+            policies,
+            &external,
+            None,
+            Ipv4Addr::UNSPECIFIED,
+            destination,
+            &mut entries,
+        )?;
+    }
+
+    entries.sort_by_key(|entry| entry.key);
+    Ok(entries)
+}
+
+fn compile_ipv4_pair(
+    policies: &[PolicyIr],
+    source: &Endpoint,
+    source_ipv4: Option<Ipv4Addr>,
+    source_address: Ipv4Addr,
+    destination: &Endpoint,
+    entries: &mut Vec<Ipv4PolicyMapEntry>,
+) -> Result<(), DataplaneCompileError> {
+    let fallback = evaluate(
+        policies,
+        Flow {
+            source,
+            destination,
+            protocol: Protocol::Tcp,
+            destination_port: 0,
+            source_ipv4,
+        },
+    );
+    let fallback_entry = ipv4_policy_map_entry(source_address, destination, 0, 0, &fallback);
+    if has_policy_provenance(&fallback) {
+        push_ipv4_dataplane_entry(entries, fallback_entry)?;
+    }
+
+    let exact_tuples: BTreeSet<_> = policies
+        .iter()
+        .filter(|policy| policy.target.matches(destination))
+        .flat_map(|policy| &policy.rules)
+        .filter(|rule| {
+            rule.source.matches_source(source, source_ipv4) && rule.destination.matches(destination)
+        })
+        .flat_map(|rule| exact_rule_ports(rule, destination))
+        .collect();
+    for (protocol, port) in exact_tuples {
+        let decision = evaluate(
+            policies,
+            Flow {
+                source,
+                destination,
+                protocol,
+                destination_port: port,
+                source_ipv4,
+            },
+        );
+        let entry =
+            ipv4_policy_map_entry(source_address, destination, protocol as u8, port, &decision);
+        if has_policy_provenance(&decision)
+            && (entry.decision != fallback_entry.decision || entry.shadow != fallback_entry.shadow)
+        {
+            push_ipv4_dataplane_entry(entries, entry)?;
+        }
+    }
+    Ok(())
+}
+
+fn external_endpoint() -> Endpoint {
+    Endpoint {
+        identity: IdentityId::new(0),
+        namespace: String::new(),
+        namespace_labels: BTreeMap::new(),
+        service_account: String::new(),
+        application: None,
+        labels: BTreeMap::new(),
+        named_ports: BTreeMap::new(),
+    }
 }
 
 fn exact_rule_ports(rule: &PolicyRule, destination: &Endpoint) -> Vec<(Protocol, u16)> {
@@ -492,6 +762,15 @@ fn exact_rule_ports(rule: &PolicyRule, destination: &Endpoint) -> Vec<(Protocol,
 fn push_dataplane_entry(
     entries: &mut Vec<PolicyMapEntry>,
     entry: PolicyMapEntry,
+) -> Result<(), DataplaneCompileError> {
+    ensure_dataplane_capacity(entries.len())?;
+    entries.push(entry);
+    Ok(())
+}
+
+fn push_ipv4_dataplane_entry(
+    entries: &mut Vec<Ipv4PolicyMapEntry>,
+    entry: Ipv4PolicyMapEntry,
 ) -> Result<(), DataplaneCompileError> {
     ensure_dataplane_capacity(entries.len())?;
     entries.push(entry);
@@ -521,6 +800,38 @@ fn policy_map_entry(
     PolicyMapEntry {
         key: PolicyMapKey {
             source_identity: source.identity,
+            destination_identity: destination.identity,
+            protocol,
+            destination_port,
+        },
+        decision: PolicyDecisionRecord {
+            verdict: decision.verdict,
+            reason: decision.reason,
+            policy_id: decision.policy_id,
+            rule_id: decision.rule_id,
+        },
+        shadow: decision
+            .shadow_verdict
+            .zip(decision.shadow_reason)
+            .map(|(verdict, reason)| PolicyDecisionRecord {
+                verdict,
+                reason,
+                policy_id: decision.shadow_policy_id,
+                rule_id: decision.shadow_rule_id,
+            }),
+    }
+}
+
+fn ipv4_policy_map_entry(
+    source_address: Ipv4Addr,
+    destination: &Endpoint,
+    protocol: u8,
+    destination_port: u16,
+    decision: &PolicyDecision,
+) -> Ipv4PolicyMapEntry {
+    Ipv4PolicyMapEntry {
+        key: Ipv4PolicyMapKey {
+            source_address,
             destination_identity: destination.identity,
             protocol,
             destination_port,
@@ -671,7 +982,7 @@ fn matching_audits(policies: &[&PolicyIr], flow: Flow<'_>) -> Vec<RuleProvenance
 }
 
 fn rule_matches(rule: &PolicyRule, flow: Flow<'_>) -> bool {
-    rule.source.matches(flow.source)
+    rule.source.matches_source(flow.source, flow.source_ipv4)
         && rule.destination.matches(flow.destination)
         && rule.protocol.is_none_or(|value| value == flow.protocol)
         && match &rule.destination_port {
@@ -757,6 +1068,7 @@ mod tests {
             destination,
             protocol: Protocol::Tcp,
             destination_port: port,
+            source_ipv4: None,
         }
     }
 
@@ -871,6 +1183,7 @@ mod tests {
             destination: &destination,
             protocol: Protocol::Udp,
             destination_port: 53,
+            source_ipv4: None,
         };
         assert_eq!(evaluate(&[policy], flow).verdict, Verdict::Allow);
     }
@@ -1003,6 +1316,34 @@ mod tests {
             })
         );
         assert!(ensure_dataplane_capacity(POLICY_MAP_BANK_ENTRY_LIMIT - 1).is_ok());
+    }
+
+    #[test]
+    fn ipv4_lowering_revalidates_block_expansion_limit() {
+        let source = endpoint_with_id(1, "frontend", "client");
+        let destination = endpoint_with_id(2, "backend", "server");
+        let mut policy = policy(
+            1,
+            100,
+            Action::Allow,
+            Action::Deny,
+            EnforcementMode::Enforce,
+            Some(443),
+        );
+        policy.rules[0].source.ipv4_blocks.push(Ipv4Block {
+            cidr: Ipv4Cidr {
+                network: Ipv4Addr::new(10, 0, 0, 0),
+                prefix_len: 21,
+            },
+            except: Vec::new(),
+        });
+        assert_eq!(
+            compile_ipv4_dataplane_entries(&[policy], &[source, destination], &[]),
+            Err(DataplaneCompileError::Ipv4BlockTooLarge {
+                address_count: 2_048,
+                limit: KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES,
+            })
+        );
     }
 
     proptest! {

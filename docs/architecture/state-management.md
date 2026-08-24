@@ -16,8 +16,8 @@ distinguish a restart from a stale lower revision.
 Agents poll internal identity and policy snapshot endpoints and publish each
 desired/applied epoch and revision. Identity reconciliation retains its
 observation-safe rollback behavior. Policy reconciliation uses two banks: the
-inactive bank is populated and read back before one `POLICY_CONFIG` write selects
-it. See ADRs 0006 and 0007.
+inactive identity-keyed and IPv4-keyed banks are populated and read back before
+one `POLICY_CONFIG` write selects both. See ADRs 0006 and 0007.
 
 The policy node update lifecycle is now implemented as:
 

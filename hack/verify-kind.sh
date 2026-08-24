@@ -10,8 +10,10 @@ temporary_dir=$(mktemp -d)
 controller_forward_pid=
 policy_mutated=false
 network_policy_mutated=false
+network_policy_peer_mutated=false
 network_policy_deleted=false
 namespace_mutated=false
+network_policy_selector_peer='[{"namespaceSelector":{"matchLabels":{"environment":"production"},"matchExpressions":[{"key":"team","operator":"In","values":["checkout"]}]},"podSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["client"]}]}}]'
 
 cleanup() {
     if [[ ${policy_mutated} == true ]]; then
@@ -21,6 +23,11 @@ cleanup() {
     if [[ ${network_policy_mutated} == true ]]; then
         "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
             -p '[{"op":"replace","path":"/spec/ingress/0/ports/1/endPort","value":8083}]' \
+            >/dev/null 2>&1 || true
+    fi
+    if [[ ${network_policy_peer_mutated} == true ]]; then
+        "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+            -p "[{\"op\":\"replace\",\"path\":\"/spec/ingress/0/from\",\"value\":${network_policy_selector_peer}}]" \
             >/dev/null 2>&1 || true
     fi
     if [[ ${network_policy_deleted} == true ]]; then
@@ -244,6 +251,14 @@ if [[ ${initial_synced} != true ]]; then
     exit 1
 fi
 initial_policy_revision=${expected_policy_revision}
+
+client_ip=$("${kc[@]}" get pod -n frontend client -o jsonpath='{.status.podIP}')
+if [[ ! ${client_ip} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "frontend client does not have an IPv4 Pod address" >&2
+    exit 1
+fi
+IFS=. read -r client_ip_a client_ip_b client_ip_c client_ip_d <<<"${client_ip}"
+client_pair_cidr="${client_ip_a}.${client_ip_b}.${client_ip_c}.$((client_ip_d & 254))/31"
 
 local_response=$("${kc[@]}" exec -n backend server -- wget -T 2 -t 1 -qO- http://127.0.0.1:9090)
 if [[ ${local_response} != "unf-demo-ok" ]]; then
@@ -493,14 +508,118 @@ if ! wait_for_policy_transition "${rejected_policy_revision}"; then
 fi
 network_policy_mutated=false
 
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p "[{\"op\":\"replace\",\"path\":\"/spec/ingress/0/from\",\"value\":[{\"ipBlock\":{\"cidr\":\"${client_ip}/32\"}}]}]" \
+    >/dev/null
+network_policy_peer_mutated=true
+if ! wait_for_controller_policy_counts 1 0 "${restored_policy_revision}"; then
+    echo "controller did not compile the bounded NetworkPolicy ipBlock" >&2
+    exit 1
+fi
+ipblock_allow_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${restored_policy_revision}"; then
+    echo "agents did not atomically activate the bounded NetworkPolicy ipBlock" >&2
+    exit 1
+fi
+ipblock_allow_explanation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/client --to backend/np-server --protocol tcp --port 8081)
+grep -q '"reason": "ExplicitRule"' <<<"${ipblock_allow_explanation}"
+grep -q '"verdict": "Allow"' <<<"${ipblock_allow_explanation}"
+ipblock_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:8081)
+if [[ ${ipblock_allow_response} != "unf-networkpolicy-ok" ]]; then
+    echo "bounded NetworkPolicy ipBlock did not allow its exact source" >&2
+    exit 1
+fi
+sleep 1
+ipblock_allow_line=$(all_agent_logs | grep '"destination_port":8081' \
+    | grep '"verdict":"Allow"' | grep '"reason":1' \
+    | grep "\"policy_revision\":${ipblock_allow_revision}" | tail -n 1 || true)
+if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${ipblock_allow_line}" \
+    || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${ipblock_allow_line}" \
+    || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${ipblock_allow_line}"; then
+    echo "UNF did not emit revisioned ipBlock allow provenance" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p "[{\"op\":\"replace\",\"path\":\"/spec/ingress/0/from/0/ipBlock\",\"value\":{\"cidr\":\"${client_pair_cidr}\",\"except\":[\"${client_ip}/32\"]}}]" \
+    >/dev/null
+if ! wait_for_controller_policy_counts 1 0 "${ipblock_allow_revision}"; then
+    echo "controller did not compile the NetworkPolicy ipBlock exception" >&2
+    exit 1
+fi
+ipblock_except_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${ipblock_allow_revision}"; then
+    echo "agents did not atomically activate the NetworkPolicy ipBlock exception" >&2
+    exit 1
+fi
+ipblock_deny_explanation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/client --to backend/np-server --protocol tcp --port 8081)
+grep -q '"reason": "DefaultAction"' <<<"${ipblock_deny_explanation}"
+grep -q '"verdict": "Deny"' <<<"${ipblock_deny_explanation}"
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:8081 >/dev/null 2>&1; then
+    echo "NetworkPolicy ipBlock exception did not exclude its exact source" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p "[{\"op\":\"replace\",\"path\":\"/spec/ingress/0/from/0/ipBlock\",\"value\":{\"cidr\":\"${client_pair_cidr}\"}}]" \
+    >/dev/null
+if ! wait_for_controller_policy_counts 1 0 "${ipblock_except_revision}"; then
+    echo "controller did not restore the bounded NetworkPolicy ipBlock" >&2
+    exit 1
+fi
+ipblock_restored_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${ipblock_except_revision}"; then
+    echo "agents did not restore the bounded NetworkPolicy ipBlock allow" >&2
+    exit 1
+fi
+ipblock_restored_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:8081)
+if [[ ${ipblock_restored_response} != "unf-networkpolicy-ok" ]]; then
+    echo "removing the ipBlock exception did not restore its allow" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p '[{"op":"replace","path":"/spec/ingress/0/from/0/ipBlock","value":{"cidr":"10.0.0.0/21"}}]' \
+    >/dev/null
+if ! wait_for_controller_policy_counts 0 1 "${ipblock_restored_revision}"; then
+    echo "controller did not reject the oversized NetworkPolicy ipBlock" >&2
+    exit 1
+fi
+rejected_ipblock_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${ipblock_restored_revision}"; then
+    echo "agents did not remove the rejected NetworkPolicy ipBlock revision" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p "[{\"op\":\"replace\",\"path\":\"/spec/ingress/0/from\",\"value\":${network_policy_selector_peer}}]" \
+    >/dev/null
+if ! wait_for_controller_policy_counts 1 0 "${rejected_ipblock_revision}"; then
+    echo "controller did not readmit the restored NetworkPolicy selector peer" >&2
+    exit 1
+fi
+restored_ipblock_policy_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${rejected_ipblock_revision}"; then
+    echo "agents did not activate the restored NetworkPolicy selector peer" >&2
+    exit 1
+fi
+network_policy_peer_mutated=false
+
 "${kc[@]}" delete networkpolicy -n backend frontend-to-np-server >/dev/null
 network_policy_deleted=true
-if ! wait_for_controller_policy_counts 0 0 "${restored_policy_revision}"; then
+if ! wait_for_controller_policy_counts 0 0 "${restored_ipblock_policy_revision}"; then
     echo "controller did not remove the deleted NetworkPolicy" >&2
     exit 1
 fi
 deleted_policy_revision=${controller_state_revision}
-if ! wait_for_policy_transition "${restored_policy_revision}"; then
+if ! wait_for_policy_transition "${restored_ipblock_policy_revision}"; then
     echo "agents did not activate NetworkPolicy deletion" >&2
     exit 1
 fi
@@ -527,4 +646,4 @@ if "${kc[@]}" exec -n frontend client -- \
     exit 1
 fi
 
-echo "kind verification passed: native/NetworkPolicy enforcement, bounded port ranges, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: native/NetworkPolicy enforcement, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"

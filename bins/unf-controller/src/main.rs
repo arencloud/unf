@@ -26,8 +26,8 @@ use tracing::{error, info, warn};
 use unf_api::SecurityPolicy;
 use unf_common::{PolicyId, Protocol, Revision};
 use unf_policy::{
-    Endpoint, Flow, NamedPort, NetworkPolicyCompiler, PolicyCompiler, PolicyIr,
-    compile_dataplane_entries, evaluate,
+    Endpoint, Flow, Ipv4Endpoint, NamedPort, NetworkPolicyCompiler, PolicyCompiler, PolicyIr,
+    compile_dataplane_entries, compile_ipv4_dataplane_entries, evaluate,
 };
 use unf_state::{
     IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
@@ -73,6 +73,7 @@ struct PodRecord {
     namespace: String,
     name: String,
     endpoint: Endpoint,
+    ipv4_addresses: BTreeSet<std::net::Ipv4Addr>,
 }
 
 #[derive(Debug, Serialize)]
@@ -353,11 +354,12 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
         labels: labels.clone(),
     };
     let key = format!("{namespace}/{name}");
+    let addresses = pod_addresses(pod);
     if let Err(error) = mutex_lock(&state.identities).admit_pod(
         key.clone(),
         identity_key,
         &identity,
-        pod_addresses(pod),
+        addresses.iter().copied(),
     ) {
         state.metrics.errors.inc();
         warn!(%error, %key, "Pod identity admission failed");
@@ -376,6 +378,13 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
         namespace,
         name,
         endpoint,
+        ipv4_addresses: addresses
+            .into_iter()
+            .filter_map(|address| match address {
+                IpAddr::V4(address) => Some(address),
+                IpAddr::V6(_) => None,
+            })
+            .collect(),
     };
     let previous = write_lock(&state.pods).insert(key, record.clone());
     if previous.as_ref() != Some(&record) {
@@ -684,8 +693,8 @@ async fn metrics(State(state): State<Arc<ControllerState>>) -> Response {
 }
 
 async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<StatusBody>, ApiError> {
-    let (_, policy_entries) = dataplane_policy_state(&state)?;
-    let resolved_policy_entries = policy_entries.len();
+    let (_, policy_entries, ipv4_policy_entries) = dataplane_policy_state(&state)?;
+    let resolved_policy_entries = policy_entries.len() + ipv4_policy_entries.len();
     let identities = mutex_lock(&state.identities);
     let mut revisions = mutex_lock(&state.revisions).clone();
     revisions.identity = identities.revision();
@@ -726,24 +735,35 @@ async fn identity_snapshot(
 async fn policy_snapshot(
     State(state): State<Arc<ControllerState>>,
 ) -> Result<Json<PolicyStateSnapshot>, ApiError> {
-    let (revision, entries) = dataplane_policy_state(&state)?;
+    let (revision, entries, ipv4_entries) = dataplane_policy_state(&state)?;
     Ok(Json(PolicyStateSnapshot {
         schema_version: POLICY_SNAPSHOT_SCHEMA_VERSION,
         source_epoch: state.identity_epoch,
         revision,
         entries,
+        ipv4_entries,
     }))
 }
 
 fn dataplane_policy_state(
     state: &ControllerState,
-) -> Result<(Revision, Vec<unf_state::PolicyMapEntry>), ApiError> {
+) -> Result<
+    (
+        Revision,
+        Vec<unf_state::PolicyMapEntry>,
+        Vec<unf_state::Ipv4PolicyMapEntry>,
+    ),
+    ApiError,
+> {
     let _policy_state_guard = read_lock(&state.policy_state_guard);
     let policies = compiled_policies(state);
     let endpoints = endpoints_with_namespace_labels(state);
     let entries = compile_dataplane_entries(&policies, &endpoints)
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    Ok((mutex_lock(&state.revisions).policy, entries))
+    let ipv4_endpoints = ipv4_endpoints_with_namespace_labels(state);
+    let ipv4_entries = compile_ipv4_dataplane_entries(&policies, &endpoints, &ipv4_endpoints)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok((mutex_lock(&state.revisions).policy, entries, ipv4_entries))
 }
 
 async fn explain(
@@ -776,6 +796,7 @@ async fn explain(
             destination: &destination_endpoint,
             protocol,
             destination_port: request.port,
+            source_ipv4: source.ipv4_addresses.iter().next().copied(),
         },
     );
     let revision = mutex_lock(&state.revisions).policy;
@@ -794,6 +815,23 @@ fn endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Endpoint> {
     read_lock(&state.pods)
         .values()
         .map(|pod| endpoint_with_namespace_labels(&pod.endpoint, &namespaces))
+        .collect()
+}
+
+fn ipv4_endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Ipv4Endpoint> {
+    let namespaces = read_lock(&state.namespaces);
+    read_lock(&state.pods)
+        .values()
+        .flat_map(|pod| {
+            let endpoint = endpoint_with_namespace_labels(&pod.endpoint, &namespaces);
+            pod.ipv4_addresses
+                .iter()
+                .copied()
+                .map(move |address| Ipv4Endpoint {
+                    address,
+                    endpoint: endpoint.clone(),
+                })
+        })
         .collect()
 }
 

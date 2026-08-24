@@ -9,10 +9,10 @@ use aya_ebpf::programs::TcContext;
 use unf_common::{IdentityId, PolicyId, PolicyReason, RuleId, Verdict};
 use unf_ebpf_common::{
     AddressFamily, Direction, FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_MAP_ABI_VERSION,
-    IdentityMapValue, Ipv4IdentityKey, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY,
-    POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW, POLICY_FLAG_SHADOW_HAS_POLICY,
-    POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION, PolicyMapConfig, PolicyMapKey,
-    PolicyMapValue, ReasonCode,
+    IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, POLICY_BANK_COUNT,
+    POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
+    POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
+    PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode,
 };
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -35,6 +35,12 @@ static IDENTITY_V4: HashMap<Ipv4IdentityKey, IdentityMapValue> =
 /// changes POLICY_CONFIG[0] only after validating the complete snapshot.
 #[map]
 static POLICY_RULES: HashMap<PolicyMapKey, PolicyMapValue> =
+    HashMap::with_max_entries(262_144, BPF_F_NO_PREALLOC);
+
+/// Exact-source IPv4 compatibility decisions share the active policy bank and
+/// revision with identity-keyed policy state.
+#[map]
+static POLICY_IPV4: HashMap<Ipv4PolicyMapKey, PolicyMapValue> =
     HashMap::with_max_entries(262_144, BPF_F_NO_PREALLOC);
 
 #[map]
@@ -118,6 +124,7 @@ fn observe(ctx: &TcContext, direction: Direction) -> i32 {
     let source_identity = lookup_identity(source_ipv4);
     let destination_identity = lookup_identity(destination_ipv4);
     let decision = lookup_policy(
+        source_ipv4,
         source_identity,
         destination_identity,
         destination_port,
@@ -196,12 +203,13 @@ impl DataplaneDecision {
 
 #[inline(always)]
 fn lookup_policy(
+    source_ipv4: [u8; 4],
     source_identity: IdentityId,
     destination_identity: IdentityId,
     destination_port: [u8; 2],
     protocol: u8,
 ) -> DataplaneDecision {
-    if source_identity.get() == 0 || destination_identity.get() == 0 {
+    if destination_identity.get() == 0 {
         return DataplaneDecision::observed(ReasonCode::IdentityUnknown);
     }
     let Some(config) = POLICY_CONFIG.get(0).copied() else {
@@ -212,6 +220,45 @@ fn lookup_policy(
         || config.revision == 0
     {
         return DataplaneDecision::observed(ReasonCode::Observed);
+    }
+
+    let ipv4_exact = Ipv4PolicyMapKey {
+        source_address: source_ipv4,
+        destination_identity,
+        destination_port,
+        protocol,
+        bank: config.active_bank,
+    };
+    let ipv4_source_fallback = Ipv4PolicyMapKey {
+        source_address: source_ipv4,
+        destination_identity,
+        destination_port: [0; 2],
+        protocol: 0,
+        bank: config.active_bank,
+    };
+    let ipv4_external_exact = Ipv4PolicyMapKey {
+        source_address: [0; 4],
+        destination_identity,
+        destination_port,
+        protocol,
+        bank: config.active_bank,
+    };
+    let ipv4_external_fallback = Ipv4PolicyMapKey {
+        source_address: [0; 4],
+        destination_identity,
+        destination_port: [0; 2],
+        protocol: 0,
+        bank: config.active_bank,
+    };
+    if let Some(value) = lookup_ipv4_policy_value(&ipv4_exact, config.revision)
+        .or_else(|| lookup_ipv4_policy_value(&ipv4_source_fallback, config.revision))
+        .or_else(|| lookup_ipv4_policy_value(&ipv4_external_exact, config.revision))
+        .or_else(|| lookup_ipv4_policy_value(&ipv4_external_fallback, config.revision))
+    {
+        return decode_policy_value(value, config.revision);
+    }
+    if source_identity.get() == 0 {
+        return DataplaneDecision::observed(ReasonCode::IdentityUnknown);
     }
 
     let exact = PolicyMapKey {
@@ -234,6 +281,19 @@ fn lookup_policy(
         return DataplaneDecision::observed(ReasonCode::Observed);
     };
     decode_policy_value(value, config.revision)
+}
+
+#[inline(always)]
+fn lookup_ipv4_policy_value(key: &Ipv4PolicyMapKey, revision: u64) -> Option<PolicyMapValue> {
+    // SAFETY: POLICY_IPV4 uses BPF_F_NO_PREALLOC, values have a fixed Copy ABI,
+    // and the reference is copied immediately without escaping this lookup.
+    #[allow(unsafe_code)]
+    let value = unsafe { POLICY_IPV4.get(key).copied() }?;
+    if value.schema_version == POLICY_MAP_ABI_VERSION && value.revision == revision {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 #[inline(always)]

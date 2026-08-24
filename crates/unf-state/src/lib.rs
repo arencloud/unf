@@ -8,7 +8,7 @@ use thiserror::Error;
 use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
-pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 /// One half of the dual-bank eBPF policy map's 262,144-entry capacity.
 pub const POLICY_MAP_BANK_ENTRY_LIMIT: usize = 131_072;
 
@@ -95,12 +95,31 @@ pub struct PolicyMapEntry {
     pub shadow: Option<PolicyDecisionRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Ipv4PolicyMapKey {
+    /// Exact source address, or `0.0.0.0` for an external-source fallback.
+    pub source_address: Ipv4Addr,
+    pub destination_identity: IdentityId,
+    /// IP protocol number, or zero for a wildcard fallback.
+    pub protocol: u8,
+    /// Destination port, or zero for a wildcard fallback.
+    pub destination_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ipv4PolicyMapEntry {
+    pub key: Ipv4PolicyMapKey,
+    pub decision: PolicyDecisionRecord,
+    pub shadow: Option<PolicyDecisionRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyStateSnapshot {
     pub schema_version: u16,
     pub source_epoch: u64,
     pub revision: Revision,
     pub entries: Vec<PolicyMapEntry>,
+    pub ipv4_entries: Vec<Ipv4PolicyMapEntry>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

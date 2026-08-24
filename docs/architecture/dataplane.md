@@ -20,7 +20,8 @@ return `TC_ACT_PIPE`.
 | `FLOW_EVENTS` | none (ring) | `FlowEvent` ABI v2 | eBPF producer, agent consumer | ephemeral, unpinned | 256 KiB; events drop under pressure without changing the already-computed forwarding decision |
 | `IDENTITY_V4` | IPv4 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent map writer; TC reader | revisioned reconciliation; program lifetime, currently unpinned | 65,536 entries; unknown/mismatched identity resolves to ID zero and forwarding continues |
 | `POLICY_RULES` | source/destination identity, protocol, destination port, bank | actual/shadow verdict and policy/rule/reason provenance, schema, revision | controller compiler; agent transactional writer | stale inactive keys are removed, then the inactive bank is populated and validated before activation; currently unpinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries, and the active bank remains selected when staging fails |
-| `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, entry count, schema, active bank | agent writer; TC reader | one atomic write activates a complete bank | one entry; failed activation preserves the previous pointer |
+| `POLICY_IPV4` | exact/fallback source IPv4, destination identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller IPv4-aware compiler; agent transactional writer | staged and validated alongside `POLICY_RULES` under the same inactive bank; currently unpinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
+| `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks in both policy maps | one entry; failed activation preserves the previous pointer |
 
 `FlowEvent` carries no Kubernetes strings. ABI v2 records the applied policy
 revision, actual verdict/reason/policy/rule, and optional shadow
@@ -36,15 +37,25 @@ ports, while the shared lowering path caps the complete snapshot at the physical
 131,072-entry allocation for one bank. The agent validates the same snapshot
 bound before encoding or mutating the inactive bank.
 
+Bounded IPv4 `ipBlock` peers use `POLICY_IPV4`. TC checks an exact source/port
+entry, exact-source fallback, arbitrary-external/port entry, then the external
+fallback before consulting `POLICY_RULES`. The controller emits exact entries for
+known Pod addresses and bounded block addresses, preserving the shared evaluator's
+native/compatibility precedence. Snapshot schema v2 carries both entry sets; the
+agent stages and validates both inactive banks before the single `POLICY_CONFIG`
+activation write.
+
 ## Failure behavior
 
 An interrupted stage cannot replace the active bank, and controller interruption
 leaves the last activated revision in use. This overlay prototype deliberately
-fails open when an identity is unknown, config is absent or incompatible, or no
-valid entry exists; the event is marked observed/identity-unknown with revision
-zero. Agent restart also recreates unpinned maps before resynchronizing, so this
-is not yet a production fail-closed design. Invalid map state never becomes a
-deny by accident. See ADR 0008.
+fails open when the destination identity is unknown, config is absent or
+incompatible, or no valid identity/IP entry exists. A source without an identity
+can still be enforced when a valid IPv4 exact or external-fallback entry exists.
+Fail-open events are marked observed/identity-unknown with revision zero. Agent
+restart also recreates unpinned maps before resynchronizing, so this is not yet a
+production fail-closed design. Invalid map state never becomes a deny by
+accident. See ADR 0008.
 
 ## Build boundary
 

@@ -21,6 +21,12 @@ Pod IP will become an index from observed packets to identity. It will not be th
 security principal. The design deliberately includes cluster identity so later
 multi-cluster connectivity does not assume globally unique Pod CIDRs.
 
+Kubernetes `ipBlock` compatibility is an explicit address-based exception to
+identity selection, not a new workload identity. Bounded IPv4 source addresses
+are compiled into `POLICY_IPV4` while destination workload identity and normal
+policy provenance remain mandatory. Native identity policy and compatibility
+decisions still converge in the shared evaluator before lowering.
+
 Identity BPF distribution and controller-epoch recovery are verified. Map pinning,
 durable allocation, multi-controller ownership, and explicit unknown-identity
 enforcement semantics remain open. See ADRs 0005 and 0006.

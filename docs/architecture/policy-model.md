@@ -50,11 +50,16 @@ IR and expanded deterministically into exact numeric keys during dataplane
 lowering. Wider ranges are rejected before they can multiply across identity
 pairs. The shared compiler also rejects a snapshot that would exceed one bank's
 131,072-entry allocation, and the agent independently validates the same bound.
-The adapter deliberately rejects egress, IP blocks, SCTP, protocol-only port
-entries, and named ports combined with `endPort`. These errors prevent a policy
-from being accepted with weaker or different semantics. Native policy has the
-higher default precedence; the compatibility baseline uses reserved priority
-`1_000_000`.
+IPv4 `ipBlock` peers and nested `except` CIDRs are preserved in IR and expanded
+into an exact-source IPv4 policy map. One block may contain at most 1,024
+addresses; IPv6, `0.0.0.0`, wider blocks, out-of-block exceptions, and peers that
+combine `ipBlock` with selectors are rejected. A source-IP fallback represents
+arbitrary external sources, so compatibility isolation does not silently fail
+open merely because the source has no workload identity. The adapter also
+deliberately rejects egress, SCTP, protocol-only port entries, and named ports
+combined with `endPort`. These errors prevent a policy from being accepted with
+weaker or different semantics. Native policy has the higher default precedence;
+the compatibility baseline uses reserved priority `1_000_000`.
 
 The controller watches these objects cluster-wide, keeps accepted and rejected
 compatibility state separate, and combines accepted IR with native policy in each

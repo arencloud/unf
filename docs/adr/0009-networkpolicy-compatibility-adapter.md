@@ -32,9 +32,12 @@ container metadata, and lower to numeric dataplane entries. Inclusive numeric
 range may span at most 1,024 ports, and the shared compiler refuses more than
 131,072 entries in either transactional bank; the agent validates that bank
 limit again before staging a snapshot. It returns typed errors for egress, IP
-blocks, oversized/reversed ranges, named ports combined with `endPort`,
-protocol-only entries, SCTP, and malformed metadata/ports or selector
-requirements.
+blocks wider than 1,024 IPv4 addresses, IPv6/reserved-address blocks,
+out-of-block exceptions, oversized/reversed port ranges, named ports combined
+with `endPort`, protocol-only entries, SCTP, and malformed metadata/ports or
+selector requirements. Bounded IPv4 `ipBlock` peers, including `except`, remain
+in IR and expand into exact-source keys plus an external-source fallback in a
+separate dual-bank map.
 
 The controller watches `NetworkPolicy` objects cluster-wide and assigns each a
 stable compatibility policy ID. Accepted IR joins native policy in the revisioned
@@ -62,6 +65,6 @@ through the same Phase 2 dataplane compiler in a two-node cluster. Rejection
 details do not yet have a dedicated API endpoint. Exact-key range expansion is
 simple and matches the existing fast path, but intentionally trades map entries
 for range support; per-range and per-bank limits make that cost explicit and
-fail compilation instead of weakening policy. IP blocks still need a richer
-dataplane representation, and egress needs a direction-aware IR and hook. These
-remain visible Phase 3 work rather than broader support claims.
+fail compilation instead of weakening policy. Unbounded and IPv6 IP blocks still
+need a compact prefix representation, and egress needs a direction-aware IR and
+hook. These remain visible Phase 3 work rather than broader support claims.

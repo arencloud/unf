@@ -81,7 +81,8 @@ policy through shadow pass-through and back, and validates revisioned event and
 CLI provenance. It also exercises a supported ingress `NetworkPolicy`: cross-node
 allow and default-isolation drop, unsupported-update rejection and recovery, and
 named-port resolution plus bounded `endPort` boundary enforcement, oversized-
-range rejection, Namespace relabel, and deletion/recreation convergence.
+range rejection, bounded IPv4 `ipBlock` allow/exception behavior and oversized-
+block rejection, Namespace relabel, and deletion/recreation convergence.
 The host kernel is shared with kind nodes. `make kind-down`
 deletes only the named `unf-dev` cluster.
 

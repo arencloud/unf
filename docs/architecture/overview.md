@@ -37,8 +37,9 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
 4. `unfctl explain` asks the controller to resolve two Pods and evaluate the IR.
 5. The agent loads the Aya object, attaches TC, applies the controller's revisioned
    IPv4 identity snapshot, consumes compact events, and exposes health and metrics.
-6. The controller resolves policy selectors to identity tuples; each agent stages
-   and atomically activates the resulting policy revision in dual BPF map banks.
+6. The controller resolves policy selectors to identity tuples and bounded
+   IPv4-source tuples; each agent stages both dual-bank maps and atomically
+   activates the resulting policy revision with one configuration write.
    Namespace label changes advance this policy revision when selector results can
    change.
 7. TC reads the active revision, emits actual and shadow provenance, and returns

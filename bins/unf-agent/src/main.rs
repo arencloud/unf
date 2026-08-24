@@ -32,8 +32,8 @@ use unf_ebpf_common::{
 };
 use unf_state::{
     IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
-    POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord,
-    PolicyMapEntry, PolicyStateSnapshot,
+    Ipv4PolicyMapEntry, POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION,
+    PolicyDecisionRecord, PolicyMapEntry, PolicyStateSnapshot,
 };
 
 #[derive(Debug, Parser)]
@@ -105,15 +105,24 @@ struct IdentitySynchronizer {
 }
 
 struct PolicySynchronizer {
-    map: AyaHashMap<MapData, [u8; 12], [u8; 32]>,
+    identity_map: AyaHashMap<MapData, [u8; 12], [u8; 32]>,
+    ipv4_map: AyaHashMap<MapData, [u8; 12], [u8; 32]>,
     config: AyaArray<MapData, [u8; 24]>,
-    banks: [BTreeMap<[u8; 12], [u8; 32]>; POLICY_BANK_COUNT as usize],
+    identity_banks: [BTreeMap<[u8; 12], [u8; 32]>; POLICY_BANK_COUNT as usize],
+    ipv4_banks: [BTreeMap<[u8; 12], [u8; 32]>; POLICY_BANK_COUNT as usize],
     active_bank: u8,
     applied_epoch: u64,
     controller_url: Option<String>,
     client: reqwest::Client,
     interval: Duration,
 }
+
+type EncodedPolicyMap = AyaHashMap<MapData, [u8; 12], [u8; 32]>;
+type PolicyMaps = (
+    EncodedPolicyMap,
+    EncodedPolicyMap,
+    AyaArray<MapData, [u8; 24]>,
+);
 
 struct DataplaneConfig {
     object: PathBuf,
@@ -359,16 +368,7 @@ async fn run_dataplane(
             .context("eBPF object does not contain IDENTITY_V4 map")?,
     )
     .context("open IDENTITY_V4 map")?;
-    let policy_map = AyaHashMap::<_, [u8; 12], [u8; 32]>::try_from(
-        ebpf.take_map("POLICY_RULES")
-            .context("eBPF object does not contain POLICY_RULES map")?,
-    )
-    .context("open POLICY_RULES map")?;
-    let policy_config = AyaArray::<_, [u8; 24]>::try_from(
-        ebpf.take_map("POLICY_CONFIG")
-            .context("eBPF object does not contain POLICY_CONFIG map")?,
-    )
-    .context("open POLICY_CONFIG map")?;
+    let (policy_map, ipv4_policy_map, policy_config) = take_policy_maps(&mut ebpf)?;
     let program_name = match config.direction {
         Direction::Ingress => "unf_observe_ingress",
         Direction::Egress => "unf_observe_egress",
@@ -419,9 +419,11 @@ async fn run_dataplane(
         interval: config.identity_sync_interval,
     };
     let mut policies = PolicySynchronizer {
-        map: policy_map,
+        identity_map: policy_map,
+        ipv4_map: ipv4_policy_map,
         config: policy_config,
-        banks: [BTreeMap::new(), BTreeMap::new()],
+        identity_banks: [BTreeMap::new(), BTreeMap::new()],
+        ipv4_banks: [BTreeMap::new(), BTreeMap::new()],
         active_bank: 0,
         applied_epoch: 0,
         controller_url: config
@@ -443,6 +445,25 @@ async fn run_dataplane(
     state.bpf_loaded.store(false, Ordering::Release);
     state.metrics.bpf_loaded.set(0);
     Ok(())
+}
+
+fn take_policy_maps(ebpf: &mut Ebpf) -> Result<PolicyMaps> {
+    let policy_map = AyaHashMap::<_, [u8; 12], [u8; 32]>::try_from(
+        ebpf.take_map("POLICY_RULES")
+            .context("eBPF object does not contain POLICY_RULES map")?,
+    )
+    .context("open POLICY_RULES map")?;
+    let ipv4_policy_map = AyaHashMap::<_, [u8; 12], [u8; 32]>::try_from(
+        ebpf.take_map("POLICY_IPV4")
+            .context("eBPF object does not contain POLICY_IPV4 map")?,
+    )
+    .context("open POLICY_IPV4 map")?;
+    let policy_config = AyaArray::<_, [u8; 24]>::try_from(
+        ebpf.take_map("POLICY_CONFIG")
+            .context("eBPF object does not contain POLICY_CONFIG map")?,
+    )
+    .context("open POLICY_CONFIG map")?;
+    Ok((policy_map, ipv4_policy_map, policy_config))
 }
 
 async fn consume_events(
@@ -728,9 +749,12 @@ async fn synchronize_policies(
 
     let staging_bank = (synchronizer.active_bank + 1) % POLICY_BANK_COUNT;
     let desired = desired_policy_entries(&snapshot.entries, desired_revision, staging_bank)?;
+    let desired_ipv4 =
+        desired_ipv4_policy_entries(&snapshot.ipv4_entries, desired_revision, staging_bank)?;
     apply_policy_entries(
         synchronizer,
         desired,
+        desired_ipv4,
         snapshot.source_epoch,
         desired_revision,
         staging_bank,
@@ -742,10 +766,9 @@ async fn synchronize_policies(
     state
         .applied_policy_revision
         .store(desired_revision, Ordering::Release);
-    state.policy_map_entries.store(
-        synchronizer.banks[usize::from(synchronizer.active_bank)].len() as u64,
-        Ordering::Release,
-    );
+    state
+        .policy_map_entries
+        .store(active_policy_entry_count(synchronizer), Ordering::Release);
     state
         .active_policy_bank
         .store(u64::from(synchronizer.active_bank), Ordering::Release);
@@ -753,17 +776,23 @@ async fn synchronize_policies(
         .metrics
         .applied_policy_revision
         .set(metric_value(desired_revision));
-    state.metrics.policy_map_entries.set(metric_value(
-        synchronizer.banks[usize::from(synchronizer.active_bank)].len() as u64,
-    ));
+    state
+        .metrics
+        .policy_map_entries
+        .set(metric_value(active_policy_entry_count(synchronizer)));
     info!(
         policy_epoch = snapshot.source_epoch,
         policy_revision = desired_revision,
-        entries = synchronizer.banks[usize::from(synchronizer.active_bank)].len(),
+        entries = active_policy_entry_count(synchronizer),
         active_bank = synchronizer.active_bank,
         "policy snapshot activated"
     );
     Ok(())
+}
+
+fn active_policy_entry_count(synchronizer: &PolicySynchronizer) -> u64 {
+    let active = usize::from(synchronizer.active_bank);
+    (synchronizer.identity_banks[active].len() + synchronizer.ipv4_banks[active].len()) as u64
 }
 
 fn desired_policy_entries(
@@ -787,6 +816,27 @@ fn desired_policy_entries(
     Ok(desired)
 }
 
+fn desired_ipv4_policy_entries(
+    entries: &[Ipv4PolicyMapEntry],
+    revision: u64,
+    bank: u8,
+) -> Result<BTreeMap<[u8; 12], [u8; 32]>> {
+    if bank >= POLICY_BANK_COUNT {
+        bail!("invalid policy bank {bank}");
+    }
+    validate_policy_bank_capacity(entries.len())?;
+    let mut desired = BTreeMap::new();
+    for entry in entries {
+        validate_ipv4_policy_entry(entry)?;
+        let key = encode_ipv4_policy_key(entry, bank);
+        let value = encode_policy_decisions(&entry.decision, entry.shadow.as_ref(), revision);
+        if desired.insert(key, value).is_some() {
+            bail!("controller snapshot contains a duplicate IPv4 policy key");
+        }
+    }
+    Ok(desired)
+}
+
 fn validate_policy_bank_capacity(entry_count: usize) -> Result<()> {
     if entry_count > POLICY_MAP_BANK_ENTRY_LIMIT {
         bail!(
@@ -803,6 +853,21 @@ fn validate_policy_entry(entry: &PolicyMapEntry) -> Result<()> {
     match (entry.key.protocol, entry.key.destination_port) {
         (0, 0) | (6 | 17, 1..=u16::MAX) => {}
         _ => bail!("policy entry contains an invalid protocol/port wildcard combination"),
+    }
+    validate_policy_decision(&entry.decision)?;
+    if let Some(shadow) = &entry.shadow {
+        validate_policy_decision(shadow)?;
+    }
+    Ok(())
+}
+
+fn validate_ipv4_policy_entry(entry: &Ipv4PolicyMapEntry) -> Result<()> {
+    if entry.key.destination_identity.get() == 0 {
+        bail!("IPv4 policy entry contains reserved destination identity ID zero");
+    }
+    match (entry.key.protocol, entry.key.destination_port) {
+        (0, 0) | (6 | 17, 1..=u16::MAX) => {}
+        _ => bail!("IPv4 policy entry contains an invalid protocol/port wildcard combination"),
     }
     validate_policy_decision(&entry.decision)?;
     if let Some(shadow) = &entry.shadow {
@@ -848,18 +913,36 @@ fn encode_policy_key(entry: &PolicyMapEntry, bank: u8) -> [u8; 12] {
     encoded
 }
 
+fn encode_ipv4_policy_key(entry: &Ipv4PolicyMapEntry, bank: u8) -> [u8; 12] {
+    let mut encoded = [0_u8; 12];
+    encoded[0..4].copy_from_slice(&entry.key.source_address.octets());
+    encoded[4..8].copy_from_slice(&entry.key.destination_identity.get().to_ne_bytes());
+    encoded[8..10].copy_from_slice(&entry.key.destination_port.to_be_bytes());
+    encoded[10] = entry.key.protocol;
+    encoded[11] = bank;
+    encoded
+}
+
 fn encode_policy_value(entry: &PolicyMapEntry, revision: u64) -> [u8; 32] {
+    encode_policy_decisions(&entry.decision, entry.shadow.as_ref(), revision)
+}
+
+fn encode_policy_decisions(
+    decision: &PolicyDecisionRecord,
+    shadow: Option<&PolicyDecisionRecord>,
+    revision: u64,
+) -> [u8; 32] {
     let mut encoded = [0_u8; 32];
     let mut flags = 0_u16;
-    if let Some(policy_id) = entry.decision.policy_id {
+    if let Some(policy_id) = decision.policy_id {
         flags |= POLICY_FLAG_HAS_POLICY;
         encoded[0..4].copy_from_slice(&policy_id.get().to_ne_bytes());
     }
-    if let Some(rule_id) = entry.decision.rule_id {
+    if let Some(rule_id) = decision.rule_id {
         flags |= POLICY_FLAG_HAS_RULE;
         encoded[4..8].copy_from_slice(&rule_id.get().to_ne_bytes());
     }
-    if let Some(shadow) = entry.shadow {
+    if let Some(shadow) = shadow {
         flags |= POLICY_FLAG_HAS_SHADOW;
         if let Some(policy_id) = shadow.policy_id {
             flags |= POLICY_FLAG_SHADOW_HAS_POLICY;
@@ -875,8 +958,8 @@ fn encode_policy_value(entry: &PolicyMapEntry, revision: u64) -> [u8; 32] {
     encoded[16..24].copy_from_slice(&revision.to_ne_bytes());
     encoded[24..26].copy_from_slice(&POLICY_MAP_ABI_VERSION.to_ne_bytes());
     encoded[26..28].copy_from_slice(&flags.to_ne_bytes());
-    encoded[28] = entry.decision.verdict as u8;
-    encoded[29] = entry.decision.reason as u8;
+    encoded[28] = decision.verdict as u8;
+    encoded[29] = decision.reason as u8;
     encoded
 }
 
@@ -899,63 +982,99 @@ fn encode_policy_config(
 fn apply_policy_entries(
     synchronizer: &mut PolicySynchronizer,
     desired: BTreeMap<[u8; 12], [u8; 32]>,
+    desired_ipv4: BTreeMap<[u8; 12], [u8; 32]>,
     source_epoch: u64,
     revision: u64,
     staging_bank: u8,
 ) -> Result<()> {
     let staging_index = usize::from(staging_bank);
-    let previous_staging = synchronizer.banks[staging_index].clone();
-    if let Err(error) = replace_policy_entries(&mut synchronizer.map, &previous_staging, &desired) {
-        return Err(rollback_policy_stage(
-            &mut synchronizer.map,
-            &previous_staging,
+    let previous_identity = synchronizer.identity_banks[staging_index].clone();
+    let previous_ipv4 = synchronizer.ipv4_banks[staging_index].clone();
+    if let Err(error) =
+        replace_policy_entries(&mut synchronizer.identity_map, &previous_identity, &desired)
+    {
+        return Err(rollback_policy_stages(
+            synchronizer,
+            &previous_identity,
+            &previous_ipv4,
             staging_bank,
-            &error.context("stage policy map bank"),
+            &error.context("stage identity policy map bank"),
         ));
     }
-    if let Err(error) = validate_staged_policy_entries(&synchronizer.map, &desired) {
-        return Err(rollback_policy_stage(
-            &mut synchronizer.map,
-            &previous_staging,
+    if let Err(error) =
+        replace_policy_entries(&mut synchronizer.ipv4_map, &previous_ipv4, &desired_ipv4)
+    {
+        return Err(rollback_policy_stages(
+            synchronizer,
+            &previous_identity,
+            &previous_ipv4,
+            staging_bank,
+            &error.context("stage IPv4 policy map bank"),
+        ));
+    }
+    let validation = validate_staged_policy_entries(&synchronizer.identity_map, &desired)
+        .and_then(|()| validate_staged_policy_entries(&synchronizer.ipv4_map, &desired_ipv4));
+    if let Err(error) = validation {
+        return Err(rollback_policy_stages(
+            synchronizer,
+            &previous_identity,
+            &previous_ipv4,
             staging_bank,
             &error,
         ));
     }
-    let config = match encode_policy_config(source_epoch, revision, desired.len(), staging_bank) {
+    let entry_count = desired.len() + desired_ipv4.len();
+    let config = match encode_policy_config(source_epoch, revision, entry_count, staging_bank) {
         Ok(config) => config,
         Err(error) => {
-            return Err(rollback_policy_stage(
-                &mut synchronizer.map,
-                &previous_staging,
+            return Err(rollback_policy_stages(
+                synchronizer,
+                &previous_identity,
+                &previous_ipv4,
                 staging_bank,
                 &error,
             ));
         }
     };
     if let Err(error) = synchronizer.config.set(0, config, 0) {
-        return Err(rollback_policy_stage(
-            &mut synchronizer.map,
-            &previous_staging,
+        return Err(rollback_policy_stages(
+            synchronizer,
+            &previous_identity,
+            &previous_ipv4,
             staging_bank,
             &anyhow!(error).context("atomically activate staged policy bank"),
         ));
     }
 
     let previous_active = synchronizer.active_bank;
-    synchronizer.banks[staging_index] = desired;
+    synchronizer.identity_banks[staging_index] = desired;
+    synchronizer.ipv4_banks[staging_index] = desired_ipv4;
     synchronizer.active_bank = staging_bank;
     let previous_index = usize::from(previous_active);
     if previous_active != staging_bank {
-        if let Err(error) =
-            clear_policy_bank(&mut synchronizer.map, &synchronizer.banks[previous_index])
-        {
+        if let Err(error) = clear_policy_bank(
+            &mut synchronizer.identity_map,
+            &synchronizer.identity_banks[previous_index],
+        ) {
             warn!(
                 ?error,
                 bank = previous_active,
-                "could not garbage-collect old policy bank"
+                "could not garbage-collect old identity policy bank"
             );
         } else {
-            synchronizer.banks[previous_index].clear();
+            synchronizer.identity_banks[previous_index].clear();
+        }
+        if let Err(error) = clear_policy_bank(
+            &mut synchronizer.ipv4_map,
+            &synchronizer.ipv4_banks[previous_index],
+        ) {
+            warn!(
+                ?error,
+                bank = previous_active,
+                "could not garbage-collect old IPv4 policy bank"
+            );
+        } else {
+            synchronizer.ipv4_banks[previous_index].clear();
         }
     }
     Ok(())
@@ -976,16 +1095,24 @@ fn validate_staged_policy_entries(
     Ok(())
 }
 
-fn rollback_policy_stage(
-    map: &mut AyaHashMap<MapData, [u8; 12], [u8; 32]>,
-    previous: &BTreeMap<[u8; 12], [u8; 32]>,
+fn rollback_policy_stages(
+    synchronizer: &mut PolicySynchronizer,
+    previous_identity: &BTreeMap<[u8; 12], [u8; 32]>,
+    previous_ipv4: &BTreeMap<[u8; 12], [u8; 32]>,
     bank: u8,
     cause: &anyhow::Error,
 ) -> anyhow::Error {
-    restore_policy_entries(map, previous, bank).map_or_else(
-        |rollback| anyhow!("policy update failed: {cause:#}; rollback also failed: {rollback:#}"),
-        |()| anyhow!("policy update failed and staging bank was rolled back: {cause:#}"),
-    )
+    let identity_rollback =
+        restore_policy_entries(&mut synchronizer.identity_map, previous_identity, bank);
+    let ipv4_rollback = restore_policy_entries(&mut synchronizer.ipv4_map, previous_ipv4, bank);
+    match (identity_rollback, ipv4_rollback) {
+        (Ok(()), Ok(())) => {
+            anyhow!("policy update failed and staging banks were rolled back: {cause:#}")
+        }
+        (identity, ipv4) => anyhow!(
+            "policy update failed: {cause:#}; identity rollback: {identity:?}; IPv4 rollback: {ipv4:?}"
+        ),
+    }
 }
 
 fn replace_policy_entries(
@@ -1329,6 +1456,30 @@ mod tests {
                 | POLICY_FLAG_HAS_SHADOW
                 | POLICY_FLAG_SHADOW_HAS_POLICY
         );
+    }
+
+    #[test]
+    fn ipv4_policy_snapshot_encoding_matches_shared_abi_layout() {
+        let policy = policy_entry();
+        let entry = Ipv4PolicyMapEntry {
+            key: unf_state::Ipv4PolicyMapKey {
+                source_address: "10.244.1.3".parse().unwrap(),
+                destination_identity: policy.key.destination_identity,
+                protocol: policy.key.protocol,
+                destination_port: policy.key.destination_port,
+            },
+            decision: policy.decision,
+            shadow: policy.shadow,
+        };
+        let desired = desired_ipv4_policy_entries(&[entry], 17, 1).expect("IPv4 policy is valid");
+        let (key, value) = desired.first_key_value().expect("one encoded entry");
+        assert_eq!(&key[0..4], &[10, 244, 1, 3]);
+        assert_eq!(u32::from_ne_bytes(key[4..8].try_into().unwrap()), 22);
+        assert_eq!(u16::from_be_bytes(key[8..10].try_into().unwrap()), 8080);
+        assert_eq!(key[10], 6);
+        assert_eq!(key[11], 1);
+        assert_eq!(u32::from_ne_bytes(value[0..4].try_into().unwrap()), 7);
+        assert_eq!(u64::from_ne_bytes(value[16..24].try_into().unwrap()), 17);
     }
 
     #[test]
