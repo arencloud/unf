@@ -36,7 +36,8 @@ Implemented in the repository:
   evaluator semantics, controller snapshots, and dataplane lowering as native
   policy, including pod/Namespace expressions, named and protocol-only TCP/UDP
   ports, bounded inclusive TCP/UDP `endPort` ranges, bounded IPv4 `ipBlock` peers
-  with `except`, deterministic exact/wildcard-key lowering, and explicit
+  with `except`, namespace-wide targets from an omitted `podSelector`, Kubernetes
+  ingress/TCP defaults, deterministic exact/wildcard-key lowering, and explicit
   compiler/dataplane capacity limits;
 - a kube-rs controller watching Nodes, Pods, Namespaces, Services, EndpointSlices,
   SecurityPolicies, and NetworkPolicies, with accepted/rejected compatibility
@@ -57,8 +58,9 @@ Implemented in the repository:
 - a reproducible two-node kind demo covering native and NetworkPolicy cross-node
   allow/drop, namespace-selector convergence, rejection/deletion recovery, shadow
   pass-through, protocol-only port activation/recovery, bounded range/ipBlock
-  enforcement and rejection recovery, revisioned eBPF provenance, and live
-  policy explanations, plus a versioned EndpointSlice backend-readiness lifecycle.
+  enforcement and rejection recovery, namespace-wide target isolation/defaulting,
+  revisioned eBPF provenance, and live policy explanations, plus a versioned
+  EndpointSlice backend-readiness lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
 multi-cluster transport, or production fail-closed recovery.

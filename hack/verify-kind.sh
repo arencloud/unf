@@ -13,11 +13,17 @@ network_policy_mutated=false
 network_policy_protocol_mutated=false
 network_policy_peer_mutated=false
 network_policy_deleted=false
+network_policy_conformance_created=false
 namespace_mutated=false
 topology_service_created=false
 network_policy_selector_peer='[{"namespaceSelector":{"matchLabels":{"environment":"production"},"matchExpressions":[{"key":"team","operator":"In","values":["checkout"]}]},"podSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["client"]}]}}]'
 
 cleanup() {
+    if [[ ${network_policy_conformance_created} == true ]]; then
+        "${kc[@]}" delete -f \
+            "${project_root}/deploy/examples/networkpolicy-conformance.yaml" \
+            --ignore-not-found >/dev/null 2>&1 || true
+    fi
     if [[ ${topology_service_created} == true ]]; then
         "${kc[@]}" delete -f "${project_root}/deploy/examples/topology-probe.yaml" \
             --ignore-not-found >/dev/null 2>&1 || true
@@ -82,6 +88,46 @@ wait_for_policy_transition() {
             bank=$(json_number active_policy_bank <<<"${status}")
             if [[ -z ${applied} || ${applied} -le ${floor_revision} \
                 || ${desired} != "${applied}" || ${bank} == "${policy_banks[${pod}]}" ]]; then
+                all_converged=false
+                break
+            fi
+            if [[ -n ${candidate_revision} && ${candidate_revision} != "${applied}" ]]; then
+                all_converged=false
+                break
+            fi
+            candidate_revision=${applied}
+        done
+        if [[ -z ${candidate_revision} || ${candidate_revision} != "${controller_revision}" ]]; then
+            all_converged=false
+        fi
+        if [[ ${all_converged} == true ]]; then
+            transition_revision=${candidate_revision}
+            for pod in "${agent_pods[@]}"; do
+                status=$(agent_status "${pod}")
+                policy_banks[${pod}]=$(json_number active_policy_bank <<<"${status}")
+            done
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+wait_for_policy_batch_convergence() {
+    local floor_revision=$1
+    local all_converged status desired applied pod candidate_revision controller_revision
+    for _ in {1..30}; do
+        all_converged=true
+        candidate_revision=
+        controller_revision=$("${unfctl}" \
+            --controller-url "http://127.0.0.1:${controller_port}" --output json status \
+            | sed -nE 's/.*"policy": ([0-9]+).*/\1/p')
+        for pod in "${agent_pods[@]}"; do
+            status=$(agent_status "${pod}" || true)
+            desired=$(json_number desired_policy_revision <<<"${status}")
+            applied=$(json_number applied_policy_revision <<<"${status}")
+            if [[ -z ${applied} || ${applied} -le ${floor_revision} \
+                || ${desired} != "${applied}" ]]; then
                 all_converged=false
                 break
             fi
@@ -891,6 +937,7 @@ if ! wait_for_policy_transition "${deleted_policy_revision}"; then
     echo "agents did not activate the recreated NetworkPolicy" >&2
     exit 1
 fi
+recreated_policy_revision=${transition_revision}
 network_policy_deleted=false
 if "${kc[@]}" exec -n frontend client -- \
     wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:9091 >/dev/null 2>&1; then
@@ -898,4 +945,93 @@ if "${kc[@]}" exec -n frontend client -- \
     exit 1
 fi
 
-echo "kind verification passed: EndpointSlice backend readiness, bounded historical flow export, history-aware simulation, versioned topology, native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+"${kc[@]}" apply -f \
+    "${project_root}/deploy/examples/networkpolicy-conformance.yaml" >/dev/null
+network_policy_conformance_created=true
+"${kc[@]}" wait --for=condition=Ready pod/conformance-server -n backend --timeout=120s
+conformance_endpoint_observed=false
+for _ in {1..30}; do
+    if "${unfctl}" --controller-url "http://127.0.0.1:${controller_port}" \
+        --output json explain --from frontend/client --to backend/conformance-server \
+        --protocol tcp --port 8085 >/dev/null 2>&1; then
+        conformance_endpoint_observed=true
+        break
+    fi
+    sleep 1
+done
+if [[ ${conformance_endpoint_observed} != true ]]; then
+    echo "controller did not observe the NetworkPolicy conformance endpoint" >&2
+    exit 1
+fi
+if ! wait_for_controller_policy_counts 2 0 "${recreated_policy_revision}"; then
+    echo "controller did not accept the omitted-podSelector NetworkPolicy" >&2
+    exit 1
+fi
+if ! wait_for_policy_batch_convergence "${recreated_policy_revision}"; then
+    echo "agents did not activate namespace-wide default target isolation" >&2
+    exit 1
+fi
+conformance_policy_revision=${transition_revision}
+conformance_allow=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/client --to backend/conformance-server \
+    --protocol tcp --port 8085)
+grep -q '"reason": "ExplicitRule"' <<<"${conformance_allow}"
+grep -q '"verdict": "Allow"' <<<"${conformance_allow}"
+conformance_deny=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/client --to backend/conformance-server \
+    --protocol tcp --port 9092)
+grep -q '"reason": "DefaultAction"' <<<"${conformance_deny}"
+grep -q '"verdict": "Deny"' <<<"${conformance_deny}"
+conformance_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://conformance-server.backend.svc.cluster.local:8085)
+if [[ ${conformance_response} != "unf-conformance-ok" ]]; then
+    echo "default-TCP NetworkPolicy conformance allow failed" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- \
+        http://conformance-server.backend.svc.cluster.local:9092 >/dev/null 2>&1; then
+    echo "omitted podSelector did not isolate the conformance Pod" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend namespace-wide-default-target \
+    --type=merge -p '{"spec":{"podSelector":{"matchLabels":{"app":"np-server"}}}}' \
+    >/dev/null
+if ! wait_for_controller_policy_counts 2 0 "${conformance_policy_revision}"; then
+    echo "controller did not narrow the conformance policy target" >&2
+    exit 1
+fi
+if ! wait_for_policy_transition "${conformance_policy_revision}"; then
+    echo "agents did not activate the narrowed conformance target" >&2
+    exit 1
+fi
+narrowed_conformance_revision=${transition_revision}
+non_selected_explanation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    explain --from frontend/client --to backend/conformance-server \
+    --protocol tcp --port 9092)
+grep -q '"reason": "NoApplicablePolicy"' <<<"${non_selected_explanation}"
+grep -q '"verdict": "Allow"' <<<"${non_selected_explanation}"
+non_selected_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://conformance-server.backend.svc.cluster.local:9092)
+if [[ ${non_selected_response} != "unf-conformance-ok" ]]; then
+    echo "a Pod not selected by ingress policy remained isolated" >&2
+    exit 1
+fi
+
+"${kc[@]}" delete -f \
+    "${project_root}/deploy/examples/networkpolicy-conformance.yaml" >/dev/null
+network_policy_conformance_created=false
+if ! wait_for_controller_policy_counts 1 0 "${narrowed_conformance_revision}"; then
+    echo "controller did not remove the conformance NetworkPolicy" >&2
+    exit 1
+fi
+if ! wait_for_policy_batch_convergence "${narrowed_conformance_revision}"; then
+    echo "agents did not remove the conformance NetworkPolicy" >&2
+    exit 1
+fi
+
+echo "kind verification passed: namespace-wide/default-TCP NetworkPolicy conformance, EndpointSlice backend readiness, bounded historical flow export, history-aware simulation, versioned topology, native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"

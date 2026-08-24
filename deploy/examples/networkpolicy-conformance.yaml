@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: conformance-server
+  namespace: backend
+  labels:
+    app: conformance-server
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-worker
+  containers:
+    - name: server
+      image: docker.io/library/busybox:1.37.0
+      command:
+        - sh
+        - -c
+        - mkdir -p /www && echo unf-conformance-ok > /www/index.html && httpd -p 9092 -h /www && httpd -f -p 8085 -h /www
+      ports:
+        - name: allowed
+          containerPort: 8085
+        - name: non-selected
+          containerPort: 9092
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: conformance-server
+  namespace: backend
+spec:
+  selector:
+    app: conformance-server
+  ports:
+    - name: allowed
+      port: 8085
+      targetPort: allowed
+    - name: non-selected
+      port: 9092
+      targetPort: non-selected
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: namespace-wide-default-target
+  namespace: backend
+spec:
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              environment: production
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: client
+      ports:
+        - port: 8085

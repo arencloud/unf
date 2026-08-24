@@ -84,6 +84,12 @@ named-port resolution, protocol-only TCP activation/removal without UDP
 broadening, bounded `endPort` boundary enforcement and oversized-range rejection,
 bounded IPv4 `ipBlock` allow/exception behavior and oversized-block rejection,
 Namespace relabel, and deletion/recreation convergence.
+It then applies `deploy/examples/networkpolicy-conformance.yaml`, whose policy
+deliberately omits `podSelector`, `policyTypes`, and port protocol. The verifier
+requires the namespace-wide target to isolate the probe's non-allowed port while
+allowing default-TCP 8085, narrows the target selector, and requires the
+no-longer-selected probe Pod to return to the Kubernetes non-isolated default
+before cleaning up the fixture.
 The verifier also queries topology schema v2 and creates a selectorless Service
 with a manually managed EndpointSlice. It requires the backend to transition from
 not ready to ready, verifies deletion removes runtime state while selector intent

@@ -46,8 +46,11 @@ matrix and reproducible evidence.
   destination-aware named-port lowering, namespace relabel convergence without
   identity churn, protocol-only TCP/UDP wildcard lowering, bounded numeric
   `endPort` ranges with map-capacity guards, and bounded IPv4 `ipBlock`/`except`
-  exact-source enforcement with atomic two-map activation, plus
-  rejection/deletion recovery; revision-fenced, read-only native policy
+  exact-source enforcement with atomic two-map activation, namespace-wide
+  targets from omitted `podSelector`, implicit ingress `policyTypes` for
+  egress-omitted objects, default TCP ports, and non-selected Pod behavior, plus
+  rejection/deletion recovery;
+  revision-fenced, read-only native policy
   simulation over a bounded current-topology probe matrix; versioned Node,
   workload-placement, Service, and selector-membership topology snapshots;
   EndpointSlice-backed runtime relationships with readiness, serving,
@@ -55,8 +58,8 @@ matrix and reproducible evidence.
   destination-resolved agent flow export through bounded non-blocking queues,
   revisioned 4,096-key controller history, `unfctl flows`, and
   observation-weighted historical simulation impact;
-- Next: broader ingress conformance and authenticated/durable telemetry transport
-  with time-window queries;
+- Next: IPv6/SCTP and broader upstream ingress conformance, plus
+  authenticated/durable telemetry transport with time-window queries;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, and OpenShift validation.

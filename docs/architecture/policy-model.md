@@ -53,6 +53,12 @@ dataplane lowering. Wider ranges are rejected before they can multiply across
 identity pairs. The shared compiler also rejects a snapshot that would exceed
 one bank's 131,072-entry allocation, and the agent independently validates the
 same bound.
+At the translation boundary, an omitted target `podSelector` becomes the empty
+selector for all Pods in the policy Namespace. For the supported ingress-only
+shape with `egress` omitted, omitted `policyTypes` defaults to ingress, and an
+omitted port protocol defaults to TCP. The evaluator's existing
+no-applicable-policy behavior keeps Pods outside every ingress policy target
+non-isolated.
 IPv4 `ipBlock` peers and nested `except` CIDRs are preserved in IR and expanded
 into an exact-source IPv4 policy map. One block may contain at most 1,024
 addresses; IPv6, `0.0.0.0`, wider blocks, out-of-block exceptions, and peers that

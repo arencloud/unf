@@ -29,8 +29,6 @@ pub enum NetworkPolicyCompileError {
     MissingNamespace,
     #[error("NetworkPolicy spec is required")]
     MissingSpec,
-    #[error("NetworkPolicy spec.podSelector is required")]
-    MissingPodSelector,
     #[error("NetworkPolicy egress semantics are not supported yet")]
     UnsupportedEgress,
     #[error("NetworkPolicy policyType {policy_type:?} is not supported")]
@@ -155,9 +153,7 @@ impl NetworkPolicyCompiler {
         let spec = policy.spec.ok_or(NetworkPolicyCompileError::MissingSpec)?;
         validate_policy_types(spec.policy_types.as_deref(), spec.egress.as_deref())?;
 
-        let pod_selector = spec
-            .pod_selector
-            .ok_or(NetworkPolicyCompileError::MissingPodSelector)?;
+        let pod_selector = spec.pod_selector.unwrap_or_default();
         let target = pod_identity_selector(pod_selector, Some(namespace.clone()), "podSelector")?;
         let mut rules = Vec::<PolicyRule>::new();
         for (rule_index, ingress) in spec.ingress.unwrap_or_default().into_iter().enumerate() {
@@ -678,6 +674,77 @@ mod tests {
             )
             .verdict,
             Verdict::Deny
+        );
+    }
+
+    #[test]
+    fn omitted_target_selector_defaults_to_all_pods_in_the_policy_namespace() {
+        let mut namespace_policy = policy(vec![NetworkPolicyIngressRule {
+            from: None,
+            ports: Some(vec![NetworkPolicyPort {
+                port: Some(IntOrString::Int(8085)),
+                ..NetworkPolicyPort::default()
+            }]),
+        }]);
+        let spec = namespace_policy
+            .spec
+            .as_mut()
+            .expect("test policy has spec");
+        spec.pod_selector = None;
+        spec.policy_types = None;
+        let compiled = NetworkPolicyCompiler::compile(PolicyId::new(7), namespace_policy)
+            .expect("omitted podSelector defaults to an empty selector");
+
+        assert_eq!(compiled.target.namespace.as_deref(), Some("backend"));
+        assert!(compiled.target.match_labels.is_empty());
+        assert!(compiled.target.match_expressions.is_empty());
+        assert_eq!(compiled.rules[0].protocol, Some(Protocol::Tcp));
+
+        let source = endpoint(1, "frontend", "client");
+        let selected = endpoint(2, "backend", "database");
+        let non_selected = endpoint(3, "frontend", "database");
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source: &source,
+                    destination: &selected,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8085,
+                    source_ipv4: None,
+                },
+            )
+            .verdict,
+            Verdict::Allow
+        );
+        assert_eq!(
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source: &source,
+                    destination: &selected,
+                    protocol: Protocol::Udp,
+                    destination_port: 8085,
+                    source_ipv4: None,
+                },
+            )
+            .verdict,
+            Verdict::Deny,
+            "an omitted protocol defaults to TCP"
+        );
+        assert_eq!(
+            evaluate(
+                &[compiled],
+                Flow {
+                    source: &source,
+                    destination: &non_selected,
+                    protocol: Protocol::Tcp,
+                    destination_port: 9092,
+                    source_ipv4: None,
+                },
+            )
+            .reason,
+            PolicyReason::NoApplicablePolicy
         );
     }
 

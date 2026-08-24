@@ -1,6 +1,6 @@
 # ADR 0009: NetworkPolicy compatibility through the shared policy engine
 
-Status: Accepted and live verified for the first Phase 3 compatibility slice
+Status: Accepted and live verified for the supported Phase 3 ingress slices
 
 ## Context
 
@@ -42,6 +42,14 @@ selector requirements. Bounded IPv4 `ipBlock` peers, including `except`, remain
 in IR and expand into exact-source keys plus an external-source fallback in a
 separate dual-bank map.
 
+Kubernetes API defaults are resolved at the compatibility boundary. An omitted
+`spec.podSelector` is the empty selector and therefore selects every Pod in the
+policy Namespace. For the supported ingress-only shape with `egress` omitted,
+omitted `policyTypes` implies ingress, and an omitted port protocol means TCP. A
+Pod not selected by any ingress policy remains non-isolated. These defaults
+compile into ordinary shared IR selectors and rules; they are not special cases
+in the evaluator or dataplane.
+
 The controller watches `NetworkPolicy` objects cluster-wide and assigns each a
 stable compatibility policy ID. Accepted IR joins native policy in the revisioned
 snapshot. Rejected objects are counted separately; a rejected update or deletion
@@ -70,4 +78,7 @@ simple and matches the existing fast path, but intentionally trades map entries
 for range support; per-range and per-bank limits make that cost explicit and
 fail compilation instead of weakening policy. Unbounded and IPv6 IP blocks still
 need a compact prefix representation, and egress needs a direction-aware IR and
-hook. These remain visible Phase 3 work rather than broader support claims.
+hook. The live verifier also creates a policy with omitted target selector,
+policy types, and port protocol, proves namespace-wide TCP isolation, then
+narrows the target and proves the no-longer-selected Pod is non-isolated. These
+remain bounded compatibility claims rather than full upstream conformance.
