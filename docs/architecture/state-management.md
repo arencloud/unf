@@ -4,7 +4,7 @@ Independent revision domains prevent a single opaque version from hiding partial
 state:
 
 ```text
-identity | policy | service | routing
+identity | policy | service | routing | topology
 ```
 
 Phase 1 incremented identity and policy revisions as watcher events changed the
@@ -12,6 +12,18 @@ controller's in-memory snapshots. In Phase 2, identity revision ownership moved
 into the collision-checked registry so entries and revision are snapshotted under
 one lock. The snapshot also carries a controller-process epoch, allowing agents to
 distinguish a restart from a stale lower revision.
+
+Topology schema v1 is a controller query snapshot with the same process epoch.
+It joins semantic Node readiness/labels, Pod identity and node placement, and
+Service configuration. Service membership is derived from selectors against the
+watched Pod labels. Pod, Node, and Service changes advance the topology revision;
+Service changes also advance the service revision. Kubernetes resource versions
+and status fields outside this normalized model do not create revision churn.
+Topology-only placement and Service changes do not advance policy revision.
+
+This relationship is selector intent, not an EndpointSlice readiness report.
+Runtime backend readiness and historical snapshot persistence remain future
+state domains. See [ADR 0011](../adr/0011-versioned-topology-snapshots.md).
 
 Agents poll internal identity and policy snapshot endpoints and publish each
 desired/applied epoch and revision. Identity reconciliation retains its

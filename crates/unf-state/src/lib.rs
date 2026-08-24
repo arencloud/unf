@@ -9,6 +9,7 @@ use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 /// One half of the dual-bank eBPF policy map's 262,144-entry capacity.
 pub const POLICY_MAP_BANK_ENTRY_LIMIT: usize = 131_072;
 
@@ -18,6 +19,58 @@ pub struct RevisionSet {
     pub policy: Revision,
     pub service: Revision,
     pub routing: Revision,
+    pub topology: Revision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyNode {
+    pub name: String,
+    pub ready: bool,
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyWorkload {
+    pub reference: String,
+    pub identity_id: IdentityId,
+    pub namespace: String,
+    pub name: String,
+    pub node_name: Option<String>,
+    pub service_account: String,
+    pub application: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    pub ipv4_addresses: Vec<Ipv4Addr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TopologyServicePort {
+    pub name: Option<String>,
+    pub protocol: String,
+    pub port: u16,
+    pub target_port: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyService {
+    pub reference: String,
+    pub namespace: String,
+    pub name: String,
+    pub service_type: String,
+    pub cluster_ips: Vec<IpAddr>,
+    pub selector: BTreeMap<String, String>,
+    pub ports: Vec<TopologyServicePort>,
+    pub selected_workloads: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyStateSnapshot {
+    pub schema_version: u16,
+    pub source_epoch: u64,
+    pub revision: Revision,
+    pub identity_revision: Revision,
+    pub nodes: Vec<TopologyNode>,
+    pub workloads: Vec<TopologyWorkload>,
+    pub services: Vec<TopologyService>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -469,5 +522,50 @@ mod tests {
             )
             .expect("idempotent update succeeds");
         assert_eq!(registry.revision(), Revision::new(1));
+    }
+
+    #[test]
+    fn topology_snapshot_schema_round_trips() {
+        let snapshot = TopologyStateSnapshot {
+            schema_version: TOPOLOGY_SNAPSHOT_SCHEMA_VERSION,
+            source_epoch: 17,
+            revision: Revision::new(4),
+            identity_revision: Revision::new(3),
+            nodes: vec![TopologyNode {
+                name: "worker-a".to_owned(),
+                ready: true,
+                labels: BTreeMap::from([("zone".to_owned(), "a".to_owned())]),
+            }],
+            workloads: vec![TopologyWorkload {
+                reference: "frontend/client".to_owned(),
+                identity_id: IdentityId::new(42),
+                namespace: "frontend".to_owned(),
+                name: "client".to_owned(),
+                node_name: Some("worker-a".to_owned()),
+                service_account: "default".to_owned(),
+                application: Some("client".to_owned()),
+                labels: BTreeMap::from([("app".to_owned(), "client".to_owned())]),
+                ipv4_addresses: vec![Ipv4Addr::new(10, 42, 0, 10)],
+            }],
+            services: vec![TopologyService {
+                reference: "frontend/client".to_owned(),
+                namespace: "frontend".to_owned(),
+                name: "client".to_owned(),
+                service_type: "ClusterIP".to_owned(),
+                cluster_ips: vec!["10.43.0.10".parse().expect("valid test address")],
+                selector: BTreeMap::from([("app".to_owned(), "client".to_owned())]),
+                ports: vec![TopologyServicePort {
+                    name: Some("http".to_owned()),
+                    protocol: "TCP".to_owned(),
+                    port: 80,
+                    target_port: Some("8080".to_owned()),
+                }],
+                selected_workloads: vec!["frontend/client".to_owned()],
+            }],
+        };
+        let encoded = serde_json::to_vec(&snapshot).expect("topology snapshot serializes");
+        let decoded: TopologyStateSnapshot =
+            serde_json::from_slice(&encoded).expect("topology snapshot deserializes");
+        assert_eq!(decoded, snapshot);
     }
 }

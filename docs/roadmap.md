@@ -48,11 +48,12 @@ matrix and reproducible evidence.
   `endPort` ranges with map-capacity guards, and bounded IPv4 `ipBlock`/`except`
   exact-source enforcement with atomic two-map activation, plus
   rejection/deletion recovery; revision-fenced, read-only native policy
-  simulation over a bounded current-topology probe matrix;
-- Next: broader ingress conformance, richer versioned topology, and historical
-  flow inputs for policy impact analysis;
+  simulation over a bounded current-topology probe matrix; versioned Node,
+  workload-placement, Service, and selector-membership topology snapshots;
+- Next: broader ingress conformance, EndpointSlice-aware backend readiness, and
+  historical flow inputs for policy impact analysis;
 - shadow rollout and offline impact analysis;
-- topology snapshots and flow exporter interface;
+- topology history and flow exporter interface;
 - failure, scale, and OpenShift validation.
 
 Full CNI/IPAM, routing, service load balancing, egress, encryption, L7, and

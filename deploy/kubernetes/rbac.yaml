@@ -4,7 +4,7 @@ metadata:
   name: unf-controller
 rules:
   - apiGroups: [""]
-    resources: ["namespaces", "pods"]
+    resources: ["namespaces", "nodes", "pods", "services"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["network.unf.io"]
     resources: ["securitypolicies"]

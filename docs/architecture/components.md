@@ -6,10 +6,10 @@
 | `unf-ebpf-common` | Versioned fixed-layout flow and BPF map ABIs | Variable strings or allocation |
 | `unf-api` | CRD schema and serialization | Policy evaluation |
 | `unf-policy` | Native and NetworkPolicy conversion, shared IR, deterministic evaluation, identity-tuple lowering | Kubernetes watches or BPF map mutation |
-| `unf-state` | Revision snapshots and identity metadata | Transport or controller loops |
-| `unf-controller` | Watches, desired-state reconciliation, explanation, and read-only simulation orchestration | Packet parsing |
+| `unf-state` | Revision snapshots, topology schema, and identity metadata | Transport or controller loops |
+| `unf-controller` | Watches, desired-state and topology reconciliation, explanation, and read-only simulation orchestration | Packet parsing |
 | `unf-agent` | Capability detection, Aya lifecycle, events | Kubernetes policy semantics |
-| `unfctl` | Operator-facing status, explanation, and simulation | Fabric state ownership |
+| `unfctl` | Operator-facing status, topology, explanation, and simulation | Fabric state ownership |
 | `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, and telemetry | Selectors or enrichment strings |
 
 The allowed dependency direction is from binaries toward libraries and from API

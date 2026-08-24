@@ -12,8 +12,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::{Namespace, Pod};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, ResourceExt};
 use prometheus_client::encoding::text::encode;
@@ -31,7 +32,9 @@ use unf_policy::{
 };
 use unf_state::{
     IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
-    PolicyStateSnapshot, RevisionSet, provisional_identity_id,
+    PolicyStateSnapshot, RevisionSet, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode,
+    TopologyService, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
+    provisional_identity_id,
 };
 
 #[derive(Debug, Parser)]
@@ -55,6 +58,8 @@ struct ControllerState {
     identity_epoch: u64,
     offline: bool,
     pods: RwLock<BTreeMap<String, PodRecord>>,
+    nodes: RwLock<BTreeMap<String, TopologyNode>>,
+    services: RwLock<BTreeMap<String, ServiceRecord>>,
     namespaces: RwLock<BTreeMap<String, BTreeMap<String, String>>>,
     security_policies: RwLock<BTreeMap<String, SecurityPolicy>>,
     compiled_security_policies: RwLock<BTreeMap<String, PolicyIr>>,
@@ -72,8 +77,19 @@ struct ControllerState {
 struct PodRecord {
     namespace: String,
     name: String,
+    node_name: Option<String>,
     endpoint: Endpoint,
     ipv4_addresses: BTreeSet<std::net::Ipv4Addr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceRecord {
+    namespace: String,
+    name: String,
+    service_type: String,
+    cluster_ips: BTreeSet<IpAddr>,
+    selector: BTreeMap<String, String>,
+    ports: Vec<TopologyServicePort>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +99,8 @@ struct StatusBody {
     ready: bool,
     mode: &'static str,
     pods: usize,
+    nodes: usize,
+    services: usize,
     namespaces: usize,
     security_policies: usize,
     network_policies: usize,
@@ -141,6 +159,7 @@ struct PolicySimulationSnapshot {
     identity_epoch: u64,
     identity_revision: Revision,
     policy_revision: Revision,
+    topology_revision: Revision,
     pods: usize,
     flow_source: &'static str,
 }
@@ -215,6 +234,7 @@ async fn main() -> Result<()> {
         .route("/v1/status", get(status))
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
+        .route("/v1/topology", get(topology))
         .route("/v1/explain", post(explain))
         .route("/v1/policy/simulate", post(simulate_policy))
         .with_state(Arc::clone(&state));
@@ -269,6 +289,8 @@ fn new_state(offline: bool) -> ControllerState {
         identity_epoch: controller_epoch(),
         offline,
         pods: RwLock::new(BTreeMap::new()),
+        nodes: RwLock::new(BTreeMap::new()),
+        services: RwLock::new(BTreeMap::new()),
         namespaces: RwLock::new(BTreeMap::new()),
         security_policies: RwLock::new(BTreeMap::new()),
         compiled_security_policies: RwLock::new(BTreeMap::new()),
@@ -301,6 +323,20 @@ fn spawn_watchers(
     let namespace_api = Api::<Namespace>::all(client.clone());
     tasks.spawn(async move {
         watch_namespaces(namespace_api, namespace_state, namespace_cancel).await;
+    });
+
+    let node_state = Arc::clone(&state);
+    let node_cancel = cancellation.clone();
+    let node_api = Api::<Node>::all(client.clone());
+    tasks.spawn(async move {
+        watch_nodes(node_api, node_state, node_cancel).await;
+    });
+
+    let service_state = Arc::clone(&state);
+    let service_cancel = cancellation.clone();
+    let service_api = Api::<Service>::all(client.clone());
+    tasks.spawn(async move {
+        watch_services(service_api, service_state, service_cancel).await;
     });
 
     let policy_api = Api::<SecurityPolicy>::all(client.clone());
@@ -347,12 +383,15 @@ fn apply_pod_event(state: &ControllerState, event: Event<Pod>) {
             let key = object_key(&pod);
             let removed = write_lock(&state.pods).remove(&key);
             mutex_lock(&state.identities).remove_pod(&key);
-            if let Some(removed) = removed
-                && !read_lock(&state.pods)
-                    .values()
-                    .any(|pod| pod.endpoint.identity == removed.endpoint.identity)
-            {
-                bump_policy_revision(state);
+            if let Some(removed) = removed {
+                bump_topology_revision(state);
+                if !removed.ipv4_addresses.is_empty()
+                    || !read_lock(&state.pods)
+                        .values()
+                        .any(|pod| pod.endpoint.identity == removed.endpoint.identity)
+                {
+                    bump_policy_revision(state);
+                }
             }
         }
         Event::Init => {
@@ -361,6 +400,7 @@ fn apply_pod_event(state: &ControllerState, event: Event<Pod>) {
             mutex_lock(&state.identities).clear();
             if had_pods {
                 bump_policy_revision(state);
+                bump_topology_revision(state);
             }
         }
         Event::InitDone => {}
@@ -437,6 +477,7 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
     let record = PodRecord {
         namespace,
         name,
+        node_name: pod.spec.as_ref().and_then(|spec| spec.node_name.clone()),
         endpoint,
         ipv4_addresses: addresses
             .into_iter()
@@ -447,8 +488,13 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
             .collect(),
     };
     let previous = write_lock(&state.pods).insert(key, record.clone());
-    if previous.as_ref() != Some(&record) {
+    if previous.as_ref().is_none_or(|previous| {
+        previous.endpoint != record.endpoint || previous.ipv4_addresses != record.ipv4_addresses
+    }) {
         bump_policy_revision(state);
+    }
+    if previous.as_ref() != Some(&record) {
+        bump_topology_revision(state);
     }
     state.metrics.reconciles.inc();
 }
@@ -576,6 +622,194 @@ fn normalized_namespace_labels(name: &str, namespace: &Namespace) -> BTreeMap<St
         .collect();
     labels.insert("kubernetes.io/metadata.name".to_owned(), name.to_owned());
     labels
+}
+
+async fn watch_nodes(api: Api<Node>, state: Arc<ControllerState>, cancellation: CancellationToken) {
+    let stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    tokio::pin!(stream);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            item = stream.try_next() => match item {
+                Ok(Some(event)) => apply_node_event(&state, event),
+                Ok(None) => break,
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, "Node watch error");
+                }
+            }
+        }
+    }
+}
+
+fn apply_node_event(state: &ControllerState, event: Event<Node>) {
+    let _policy_state_guard = write_lock(&state.policy_state_guard);
+    match event {
+        Event::Apply(node) | Event::InitApply(node) => {
+            let normalized = topology_node(&node);
+            let previous =
+                write_lock(&state.nodes).insert(normalized.name.clone(), normalized.clone());
+            state.metrics.reconciles.inc();
+            if previous.as_ref() != Some(&normalized) {
+                bump_topology_revision(state);
+            }
+        }
+        Event::Delete(node) => {
+            if write_lock(&state.nodes).remove(&node.name_any()).is_some() {
+                bump_topology_revision(state);
+            }
+        }
+        Event::Init => {
+            let had_nodes = !read_lock(&state.nodes).is_empty();
+            write_lock(&state.nodes).clear();
+            if had_nodes {
+                bump_topology_revision(state);
+            }
+        }
+        Event::InitDone => {}
+    }
+}
+
+fn topology_node(node: &Node) -> TopologyNode {
+    let ready = node.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().flatten().any(|condition| {
+            condition.type_ == "Ready" && condition.status.eq_ignore_ascii_case("true")
+        })
+    });
+    TopologyNode {
+        name: node.name_any(),
+        ready,
+        labels: node
+            .metadata
+            .labels
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+    }
+}
+
+async fn watch_services(
+    api: Api<Service>,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    let stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    tokio::pin!(stream);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            item = stream.try_next() => match item {
+                Ok(Some(event)) => apply_service_event(&state, event),
+                Ok(None) => break,
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, "Service watch error");
+                }
+            }
+        }
+    }
+}
+
+fn apply_service_event(state: &ControllerState, event: Event<Service>) {
+    let _policy_state_guard = write_lock(&state.policy_state_guard);
+    match event {
+        Event::Apply(service) | Event::InitApply(service) => {
+            let key = object_key(&service);
+            match service_record(&service) {
+                Ok(record) => {
+                    let previous = write_lock(&state.services).insert(key, record.clone());
+                    state.metrics.reconciles.inc();
+                    if previous.as_ref() != Some(&record) {
+                        bump_service_and_topology_revision(state);
+                    }
+                }
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, %key, "Service topology admission failed");
+                }
+            }
+        }
+        Event::Delete(service) => {
+            if write_lock(&state.services)
+                .remove(&object_key(&service))
+                .is_some()
+            {
+                bump_service_and_topology_revision(state);
+            }
+        }
+        Event::Init => {
+            let had_services = !read_lock(&state.services).is_empty();
+            write_lock(&state.services).clear();
+            if had_services {
+                bump_service_and_topology_revision(state);
+            }
+        }
+        Event::InitDone => {}
+    }
+}
+
+fn service_record(service: &Service) -> Result<ServiceRecord> {
+    let namespace = service.namespace().unwrap_or_default();
+    let name = service.name_any();
+    let spec = service
+        .spec
+        .as_ref()
+        .ok_or_else(|| anyhow!("Service {namespace}/{name} is missing spec"))?;
+    let mut cluster_ips = BTreeSet::new();
+    let configured_ips = spec
+        .cluster_ips
+        .clone()
+        .or_else(|| spec.cluster_ip.clone().map(|address| vec![address]))
+        .unwrap_or_default();
+    for address in configured_ips {
+        if address == "None" {
+            continue;
+        }
+        cluster_ips.insert(address.parse().with_context(|| {
+            format!("Service {namespace}/{name} has invalid cluster IP {address:?}")
+        })?);
+    }
+    let mut ports = Vec::new();
+    for port in spec.ports.iter().flatten() {
+        let number = u16::try_from(port.port).with_context(|| {
+            format!(
+                "Service {namespace}/{name} port {} is outside the u16 range",
+                port.port
+            )
+        })?;
+        if number == 0 {
+            return Err(anyhow!(
+                "Service {namespace}/{name} cannot expose port zero"
+            ));
+        }
+        ports.push(TopologyServicePort {
+            name: port.name.clone(),
+            protocol: port.protocol.clone().unwrap_or_else(|| "TCP".to_owned()),
+            port: number,
+            target_port: Some(port.target_port.as_ref().map_or_else(
+                || number.to_string(),
+                |target| match target {
+                    IntOrString::Int(number) => number.to_string(),
+                    IntOrString::String(name) => name.clone(),
+                },
+            )),
+        });
+    }
+    ports.sort();
+    Ok(ServiceRecord {
+        namespace,
+        name,
+        service_type: spec.type_.clone().unwrap_or_else(|| "ClusterIP".to_owned()),
+        cluster_ips,
+        selector: spec
+            .selector
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        ports,
+    })
 }
 
 async fn watch_policies(
@@ -755,9 +989,16 @@ async fn metrics(State(state): State<Arc<ControllerState>>) -> Response {
 async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<StatusBody>, ApiError> {
     let (_, policy_entries, ipv4_policy_entries) = dataplane_policy_state(&state)?;
     let resolved_policy_entries = policy_entries.len() + ipv4_policy_entries.len();
-    let identities = mutex_lock(&state.identities);
+    let (identity_revision, identity_count, indexed_pod_ips) = {
+        let identities = mutex_lock(&state.identities);
+        (
+            identities.revision(),
+            identities.identity_count(),
+            identities.address_count(),
+        )
+    };
     let mut revisions = mutex_lock(&state.revisions).clone();
-    revisions.identity = identities.revision();
+    revisions.identity = identity_revision;
     Ok(Json(StatusBody {
         component: "unf-controller",
         healthy: true,
@@ -768,6 +1009,8 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
             "kubernetes"
         },
         pods: read_lock(&state.pods).len(),
+        nodes: read_lock(&state.nodes).len(),
+        services: read_lock(&state.services).len(),
         namespaces: read_lock(&state.namespaces).len(),
         security_policies: read_lock(&state.security_policies).len(),
         network_policies: read_lock(&state.network_policies).len(),
@@ -775,8 +1018,8 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         compiled_policies: read_lock(&state.compiled_security_policies).len()
             + read_lock(&state.compiled_network_policies).len(),
         resolved_policy_entries,
-        identities: identities.identity_count(),
-        indexed_pod_ips: identities.address_count(),
+        identities: identity_count,
+        indexed_pod_ips,
         identity_epoch: state.identity_epoch,
         revisions,
         limitations: [
@@ -803,6 +1046,70 @@ async fn policy_snapshot(
         entries,
         ipv4_entries,
     }))
+}
+
+async fn topology(State(state): State<Arc<ControllerState>>) -> Json<TopologyStateSnapshot> {
+    let _policy_state_guard = read_lock(&state.policy_state_guard);
+    Json(topology_snapshot(&state))
+}
+
+fn topology_snapshot(state: &ControllerState) -> TopologyStateSnapshot {
+    let pods = read_lock(&state.pods);
+    let nodes = read_lock(&state.nodes).values().cloned().collect();
+    let workloads = pods
+        .iter()
+        .map(|(reference, pod)| TopologyWorkload {
+            reference: reference.clone(),
+            identity_id: pod.endpoint.identity,
+            namespace: pod.namespace.clone(),
+            name: pod.name.clone(),
+            node_name: pod.node_name.clone(),
+            service_account: pod.endpoint.service_account.clone(),
+            application: pod.endpoint.application.clone(),
+            labels: pod.endpoint.labels.clone(),
+            ipv4_addresses: pod.ipv4_addresses.iter().copied().collect(),
+        })
+        .collect();
+    let services = read_lock(&state.services)
+        .iter()
+        .map(|(reference, service)| {
+            let selected_workloads = if service.selector.is_empty() {
+                Vec::new()
+            } else {
+                pods.iter()
+                    .filter(|(_, pod)| {
+                        pod.namespace == service.namespace
+                            && service
+                                .selector
+                                .iter()
+                                .all(|(key, value)| pod.endpoint.labels.get(key) == Some(value))
+                    })
+                    .map(|(reference, _)| reference.clone())
+                    .collect()
+            };
+            TopologyService {
+                reference: reference.clone(),
+                namespace: service.namespace.clone(),
+                name: service.name.clone(),
+                service_type: service.service_type.clone(),
+                cluster_ips: service.cluster_ips.iter().copied().collect(),
+                selector: service.selector.clone(),
+                ports: service.ports.clone(),
+                selected_workloads,
+            }
+        })
+        .collect();
+    let identity_revision = mutex_lock(&state.identities).revision();
+    let revisions = mutex_lock(&state.revisions).clone();
+    TopologyStateSnapshot {
+        schema_version: TOPOLOGY_SNAPSHOT_SCHEMA_VERSION,
+        source_epoch: state.identity_epoch,
+        revision: revisions.topology,
+        identity_revision,
+        nodes,
+        workloads,
+        services,
+    }
 }
 
 fn dataplane_policy_state(
@@ -946,8 +1253,8 @@ async fn simulate_policy(
         &proposed_policies,
     );
 
-    let revisions = mutex_lock(&state.revisions).clone();
     let identity_revision = mutex_lock(&state.identities).revision();
+    let revisions = mutex_lock(&state.revisions).clone();
     Ok(Json(PolicySimulationResponse {
         schema_version: POLICY_SIMULATION_SCHEMA_VERSION,
         policy: key,
@@ -957,6 +1264,7 @@ async fn simulate_policy(
             identity_epoch: state.identity_epoch,
             identity_revision,
             policy_revision: revisions.policy,
+            topology_revision: revisions.topology,
             pods: pod_records.len(),
             flow_source: "current-topology representative matrix",
         },
@@ -1245,6 +1553,17 @@ fn bump_policy_revision(state: &ControllerState) {
     revisions.policy = revisions.policy.next();
 }
 
+fn bump_topology_revision(state: &ControllerState) {
+    let mut revisions = mutex_lock(&state.revisions);
+    revisions.topology = revisions.topology.next();
+}
+
+fn bump_service_and_topology_revision(state: &ControllerState) {
+    let mut revisions = mutex_lock(&state.revisions);
+    revisions.service = revisions.service.next();
+    revisions.topology = revisions.topology.next();
+}
+
 fn controller_epoch() -> u64 {
     let time_component = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1313,6 +1632,7 @@ mod tests {
         PodRecord {
             namespace: namespace.to_owned(),
             name: name.to_owned(),
+            node_name: Some("worker-a".to_owned()),
             endpoint: Endpoint {
                 identity: unf_common::IdentityId::new(id),
                 namespace: namespace.to_owned(),
@@ -1381,6 +1701,67 @@ mod tests {
             }
         }))
         .expect("test Pod is valid Kubernetes JSON")
+    }
+
+    fn scheduled_pod(node_name: &str) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "client",
+                "namespace": "frontend",
+                "labels": {"app": "client"}
+            },
+            "spec": {
+                "nodeName": node_name,
+                "containers": [{"name": "client", "image": "example.invalid/client"}]
+            },
+            "status": {"podIP": "10.42.0.10", "podIPs": [{"ip": "10.42.0.10"}]}
+        }))
+        .expect("test scheduled Pod is valid Kubernetes JSON")
+    }
+
+    fn node(ready: bool) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "worker-a",
+                "labels": {"kubernetes.io/hostname": "worker-a"}
+            },
+            "status": {
+                "conditions": [{
+                    "type": "Ready",
+                    "status": if ready { "True" } else { "False" },
+                    "lastHeartbeatTime": "2026-08-24T00:00:00Z",
+                    "lastTransitionTime": "2026-08-24T00:00:00Z",
+                    "reason": "Test",
+                    "message": "test fixture"
+                }]
+            }
+        }))
+        .expect("test Node is valid Kubernetes JSON")
+    }
+
+    fn service() -> Service {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "client", "namespace": "frontend"},
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.43.0.10",
+                "clusterIPs": ["10.43.0.10"],
+                "selector": {"app": "client"},
+                "ports": [{
+                    "name": "http",
+                    "protocol": "TCP",
+                    "port": 80,
+                    "targetPort": 8080
+                }]
+            }
+        }))
+        .expect("test Service is valid Kubernetes JSON")
     }
 
     #[test]
@@ -1527,6 +1908,68 @@ mod tests {
         apply_namespace_event(&state, Event::Apply(namespace("staging")));
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(2));
         assert_eq!(mutex_lock(&state.revisions).identity, Revision::default());
+    }
+
+    #[test]
+    fn pod_placement_changes_only_advance_topology_revision() {
+        let state = new_state(true);
+        apply_pod_event(&state, Event::Apply(scheduled_pod("worker-a")));
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(1));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(1));
+
+        let mut rescheduled = scheduled_pod("worker-b");
+        rescheduled.metadata.resource_version = Some("2".to_owned());
+        apply_pod_event(&state, Event::Apply(rescheduled.clone()));
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(1));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(2));
+
+        rescheduled.metadata.resource_version = Some("3".to_owned());
+        apply_pod_event(&state, Event::Apply(rescheduled));
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(1));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(2));
+    }
+
+    #[test]
+    fn topology_snapshot_tracks_semantic_node_and_service_state() {
+        let state = new_state(true);
+        write_lock(&state.pods).insert(
+            "frontend/client".to_owned(),
+            pod_record(1, "frontend", "client", "client"),
+        );
+
+        apply_node_event(&state, Event::Apply(node(true)));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(1));
+        let mut unchanged_node = node(true);
+        unchanged_node.metadata.resource_version = Some("2".to_owned());
+        apply_node_event(&state, Event::Apply(unchanged_node));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(1));
+
+        apply_service_event(&state, Event::Apply(service()));
+        assert_eq!(mutex_lock(&state.revisions).service, Revision::new(1));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(2));
+        let snapshot = topology_snapshot(&state);
+        assert_eq!(snapshot.schema_version, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(snapshot.revision, Revision::new(2));
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert!(snapshot.nodes[0].ready);
+        assert_eq!(snapshot.workloads[0].node_name.as_deref(), Some("worker-a"));
+        assert_eq!(snapshot.services.len(), 1);
+        assert_eq!(snapshot.services[0].selected_workloads, ["frontend/client"]);
+        assert_eq!(
+            snapshot.services[0].ports[0].target_port.as_deref(),
+            Some("8080")
+        );
+
+        let mut unchanged_service = service();
+        unchanged_service.metadata.resource_version = Some("2".to_owned());
+        apply_service_event(&state, Event::Apply(unchanged_service));
+        assert_eq!(mutex_lock(&state.revisions).service, Revision::new(1));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(2));
+
+        apply_service_event(&state, Event::Delete(service()));
+        assert_eq!(mutex_lock(&state.revisions).service, Revision::new(2));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(3));
+        assert!(topology_snapshot(&state).services.is_empty());
     }
 
     #[tokio::test]

@@ -15,7 +15,8 @@ revisions now drive TC allow/drop decisions with actual and shadow provenance.
 The supported ingress `NetworkPolicy` slices are live-verified through the same
 controller, policy engine, and dataplane. A read-only policy simulation foundation
 now compares candidate native policy against revision-fenced live topology without
-applying it.
+applying it. Versioned topology snapshots expose Nodes, workload placement,
+Services, and selector-derived Service membership.
 See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
 gates, evidence, limitations, and current work. The shorter
@@ -34,8 +35,9 @@ Implemented in the repository:
   ports, bounded inclusive TCP/UDP `endPort` ranges, bounded IPv4 `ipBlock` peers
   with `except`, deterministic exact/wildcard-key lowering, and explicit
   compiler/dataplane capacity limits;
-- a kube-rs controller watching Pods, Namespaces, SecurityPolicies, and
-  NetworkPolicies, with accepted/rejected compatibility status;
+- a kube-rs controller watching Nodes, Pods, Namespaces, Services,
+  SecurityPolicies, and NetworkPolicies, with accepted/rejected compatibility
+  status;
 - controller health, readiness, metrics, status, and userspace explanation APIs;
 - revision-fenced, read-only native policy simulation through the shared evaluator;
 - an Aya agent capable of loading and attaching the TC observation program;
@@ -43,14 +45,15 @@ Implemented in the repository:
   active-bank L3/L4 allow/drop decisions;
 - revisioned controller-to-agent IPv4 identity snapshots and a versioned BPF map;
 - selector-resolved policy snapshots and dual-bank transactional BPF policy maps;
-- `unfctl status` and `unfctl explain` against live controller state;
+- `unfctl status`, `unfctl topology`, and `unfctl explain` against live
+  controller state;
 - `unfctl policy simulate <security-policy.yaml>` with table/JSON/YAML impact
   summaries and current/proposed provenance;
 - a reproducible two-node kind demo covering native and NetworkPolicy cross-node
   allow/drop, namespace-selector convergence, rejection/deletion recovery, shadow
   pass-through, protocol-only port activation/recovery, bounded range/ipBlock
   enforcement and rejection recovery, revisioned eBPF provenance, and live
-  policy explanations.
+  policy explanations, plus a versioned Service relationship lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
 multi-cluster transport, or production fail-closed recovery.

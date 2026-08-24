@@ -11,5 +11,8 @@ serde.workspace = true
 thiserror.workspace = true
 unf-common = { path = "../unf-common" }
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

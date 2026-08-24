@@ -14,9 +14,14 @@ network_policy_protocol_mutated=false
 network_policy_peer_mutated=false
 network_policy_deleted=false
 namespace_mutated=false
+topology_service_created=false
 network_policy_selector_peer='[{"namespaceSelector":{"matchLabels":{"environment":"production"},"matchExpressions":[{"key":"team","operator":"In","values":["checkout"]}]},"podSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["client"]}]}}]'
 
 cleanup() {
+    if [[ ${topology_service_created} == true ]]; then
+        "${kc[@]}" delete -f "${project_root}/deploy/examples/topology-probe.yaml" \
+            --ignore-not-found >/dev/null 2>&1 || true
+    fi
     if [[ ${policy_mutated} == true ]]; then
         "${kc[@]}" patch securitypolicy -n backend frontend-to-backend \
             --type=merge -p '{"spec":{"enforcementMode":"Enforce"}}' >/dev/null 2>&1 || true
@@ -122,6 +127,22 @@ wait_for_controller_policy_counts() {
         if [[ ${actual_accepted} == "${accepted}" && ${actual_rejected} == "${rejected}" \
             && -n ${revision} && ${revision} -gt ${floor_revision} ]]; then
             controller_state_revision=${revision}
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+wait_for_topology_transition() {
+    local floor_revision=$1
+    local snapshot revision
+    for _ in {1..30}; do
+        snapshot=$("${unfctl}" \
+            --controller-url "http://127.0.0.1:${controller_port}" --output json topology)
+        revision=$(sed -nE 's/.*"revision": ([0-9]+).*/\1/p' <<<"${snapshot}")
+        if [[ -n ${revision} && ${revision} -gt ${floor_revision} ]]; then
+            topology_state_revision=${revision}
             return 0
         fi
         sleep 1
@@ -258,6 +279,56 @@ if [[ ${initial_synced} != true ]]; then
 fi
 initial_policy_revision=${expected_policy_revision}
 
+initial_topology=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json topology)
+grep -q '"schema_version": 1' <<<"${initial_topology}"
+grep -Eq '"revision": [1-9][0-9]*' <<<"${initial_topology}"
+grep -Eq '"identity_revision": [1-9][0-9]*' <<<"${initial_topology}"
+grep -q '"name": "unf-dev-control-plane"' <<<"${initial_topology}"
+grep -q '"name": "unf-dev-worker"' <<<"${initial_topology}"
+grep -q '"reference": "frontend/client"' <<<"${initial_topology}"
+grep -q '"reference": "backend/server"' <<<"${initial_topology}"
+grep -q '"reference": "backend/np-server"' <<<"${initial_topology}"
+grep -q '"node_name": "unf-dev-control-plane"' <<<"${initial_topology}"
+grep -q '"node_name": "unf-dev-worker"' <<<"${initial_topology}"
+grep -q '"selected_workloads": \[' <<<"${initial_topology}"
+initial_topology_revision=$(sed -nE 's/.*"revision": ([0-9]+).*/\1/p' \
+    <<<"${initial_topology}")
+
+"${kc[@]}" apply -f "${project_root}/deploy/examples/topology-probe.yaml" >/dev/null
+topology_service_created=true
+if ! wait_for_topology_transition "${initial_topology_revision}"; then
+    echo "controller did not advance topology after Service creation" >&2
+    exit 1
+fi
+created_topology_revision=${topology_state_revision}
+created_topology=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json topology)
+grep -q '"reference": "frontend/topology-probe"' <<<"${created_topology}"
+grep -q '"selected_workloads": \[' <<<"${created_topology}"
+grep -q '"frontend/client"' <<<"${created_topology}"
+
+"${kc[@]}" delete -f "${project_root}/deploy/examples/topology-probe.yaml" >/dev/null
+if ! wait_for_topology_transition "${created_topology_revision}"; then
+    echo "controller did not advance topology after Service deletion" >&2
+    exit 1
+fi
+restored_topology_revision=${topology_state_revision}
+topology_service_created=false
+restored_topology=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json topology)
+if grep -q '"reference": "frontend/topology-probe"' <<<"${restored_topology}"; then
+    echo "deleted Service remained in the topology snapshot" >&2
+    exit 1
+fi
+policy_revision_after_topology=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json status \
+    | sed -nE 's/.*"policy": ([0-9]+).*/\1/p')
+if [[ ${policy_revision_after_topology} != "${initial_policy_revision}" ]]; then
+    echo "Service-only topology changes unexpectedly changed the policy revision" >&2
+    exit 1
+fi
+
 policy_simulation=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json \
     policy simulate "${project_root}/deploy/examples/simulation-deny.yaml")
@@ -272,6 +343,7 @@ grep -q '"destination_port": 8080' <<<"${policy_simulation}"
 grep -q '"verdict": "Allow"' <<<"${policy_simulation}"
 grep -q '"verdict": "Deny"' <<<"${policy_simulation}"
 grep -q "\"policy_revision\": ${initial_policy_revision}" <<<"${policy_simulation}"
+grep -q "\"topology_revision\": ${restored_topology_revision}" <<<"${policy_simulation}"
 policy_revision_after_simulation=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json status \
     | sed -nE 's/.*"policy": ([0-9]+).*/\1/p')
@@ -732,4 +804,4 @@ if "${kc[@]}" exec -n frontend client -- \
     exit 1
 fi
 
-echo "kind verification passed: read-only policy simulation, native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: versioned topology, read-only policy simulation, native/NetworkPolicy enforcement, protocol-only ports, bounded port ranges and IPv4 ipBlocks, namespace/rejection/deletion recovery, shadow mode, transactional activation, and provenance"

@@ -27,6 +27,8 @@ struct Cli {
 enum Command {
     /// Show controller health and state revisions.
     Status,
+    /// Show the current versioned Node, workload, and Service topology.
+    Topology,
     /// Explain a policy decision using live controller state.
     Explain {
         /// Source pod as namespace/name.
@@ -99,6 +101,9 @@ async fn run() -> Result<()> {
     let client = reqwest::Client::new();
     let value = match &cli.command {
         Command::Status => get_json(&client, &format!("{}/v1/status", cli.controller_url)).await?,
+        Command::Topology => {
+            get_json(&client, &format!("{}/v1/topology", cli.controller_url)).await?
+        }
         Command::Explain {
             from,
             to,
@@ -186,6 +191,14 @@ fn print_value(value: &Value, output: Output) -> Result<()> {
 
 fn print_table(value: &Value) {
     if value.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && value.get("nodes").is_some()
+        && value.get("workloads").is_some()
+        && value.get("services").is_some()
+    {
+        print_topology_table(value);
+        return;
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(1)
         && value.get("summary").is_some()
         && value.get("operation").is_some()
     {
@@ -205,6 +218,73 @@ fn print_table(value: &Value) {
     }
 }
 
+fn print_topology_table(value: &Value) {
+    let nodes = value["nodes"].as_array().map_or(&[][..], Vec::as_slice);
+    let workloads = value["workloads"].as_array().map_or(&[][..], Vec::as_slice);
+    let services = value["services"].as_array().map_or(&[][..], Vec::as_slice);
+    println!("Topology");
+    println!(
+        "snapshot                 topology={} identity={} epoch={}",
+        number_field(value, "revision"),
+        number_field(value, "identity_revision"),
+        number_field(value, "source_epoch")
+    );
+    println!(
+        "objects                  nodes={} workloads={} services={}",
+        nodes.len(),
+        workloads.len(),
+        services.len()
+    );
+    for node in nodes {
+        println!(
+            "node                     {} ready={}",
+            text_field(node, "name"),
+            node["ready"].as_bool().unwrap_or(false)
+        );
+    }
+    for workload in workloads {
+        let addresses = workload["ipv4_addresses"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        println!(
+            "workload                 {} node={} identity={} ipv4={}",
+            text_field(workload, "reference"),
+            workload["node_name"].as_str().unwrap_or("unassigned"),
+            number_field(workload, "identity_id"),
+            if addresses.is_empty() {
+                "-"
+            } else {
+                &addresses
+            }
+        );
+    }
+    for service in services {
+        let selected = service["selected_workloads"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        println!(
+            "service                  {} type={} selected={}",
+            text_field(service, "reference"),
+            text_field(service, "service_type"),
+            if selected.is_empty() { "-" } else { &selected }
+        );
+    }
+}
+
 fn print_simulation_table(value: &Value) {
     let summary = &value["summary"];
     let snapshot = &value["snapshot"];
@@ -215,9 +295,10 @@ fn print_simulation_table(value: &Value) {
         text_field(value, "operation")
     );
     println!(
-        "snapshot                 identity={} policy={} epoch={}",
+        "snapshot                 identity={} policy={} topology={} epoch={}",
         number_field(snapshot, "identity_revision"),
         number_field(snapshot, "policy_revision"),
+        number_field(snapshot, "topology_revision"),
         number_field(snapshot, "identity_epoch")
     );
     println!(
@@ -309,5 +390,13 @@ mod tests {
         ))
         .expect("checked-in simulation fixture is valid");
         assert_eq!(policy.metadata.name.as_deref(), Some("frontend-to-backend"));
+    }
+
+    #[test]
+    fn topology_command_parses() {
+        let cli = Cli::try_parse_from(["unfctl", "topology", "--output", "yaml"])
+            .expect("topology command parses");
+        assert!(matches!(cli.command, Command::Topology));
+        assert!(matches!(cli.output, Output::Yaml));
     }
 }

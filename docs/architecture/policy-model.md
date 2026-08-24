@@ -82,7 +82,8 @@ policy state rather than widening an allow across both workloads.
 The Phase 3 simulation foundation compiles a candidate native `SecurityPolicy`
 through the same `PolicyCompiler` and compares the current policy set with an
 in-memory add-or-replace proposal. The controller captures the identity epoch,
-identity revision, policy revision, and Pod topology under one read fence. It
+identity revision, policy revision, topology revision, and Pod topology under one
+read fence. It
 evaluates current and proposed policy over all Pod sources, affected destinations,
 every referenced concrete port, and representative TCP/UDP fallback ports.
 
