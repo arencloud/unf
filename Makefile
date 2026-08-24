@@ -63,6 +63,10 @@ kind-load: images
 
 kind-deploy: kind-load
 	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev apply -k deploy
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev rollout restart deployment/unf-controller -n unf-system
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev rollout restart daemonset/unf-agent -n unf-system
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev rollout status deployment/unf-controller -n unf-system --timeout=120s
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev rollout status daemonset/unf-agent -n unf-system --timeout=120s
 
 kind-demo:
 	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev apply -f deploy/examples/demo.yaml

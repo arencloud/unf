@@ -19,12 +19,13 @@ retains actual and shadow verdict, policy ID, rule ID, and a stable
 machine-readable reason.
 
 Agents poll an epoch/revision policy snapshot and manage two logical banks in
-`POLICY_RULES` plus `POLICY_IPV4`. The bank number is part of each fixed-size key.
-Snapshot schema v2 carries both entry sets. For revision `N+1`, an agent:
+`POLICY_RULES`, `POLICY_IPV4`, and the later `POLICY_IPV6` LPM trie. The bank
+number is part of each key. Snapshot schema v3 carries all three entry sets. For
+revision `N+1`, an agent:
 
-1. validates the complete snapshot and encodes both inactive banks;
-2. populates those banks without modifying either active bank;
-3. reads every staged entry in both maps back for validation;
+1. validates the complete snapshot and encodes all inactive banks;
+2. populates those banks without modifying any active bank;
+3. reads every staged entry in all maps back for validation;
 4. atomically writes `POLICY_CONFIG[0]` with the epoch, revision, count, and new
    active bank;
 5. acknowledges the revision and garbage-collects the old bank.
@@ -59,4 +60,4 @@ to the active bank without changing this distribution protocol.
 - map-in-map compatibility and migration from the bank-in-key representation;
 - map pinning, agent restart recovery, and last-known-good persistence;
 - authenticated node-specific state distribution and acknowledgement aggregation;
-- compact unbounded-CIDR, port-range, IPv6, and external-identity representations.
+- compact unbounded-CIDR, port-range, and external-identity representations.

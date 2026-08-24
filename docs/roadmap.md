@@ -46,8 +46,8 @@ matrix and reproducible evidence.
   dataplane enforcement/provenance, pod/Namespace label-expression selectors,
   destination-aware named-port lowering, namespace relabel convergence without
   identity churn, protocol-only TCP/UDP/SCTP wildcard lowering, bounded numeric
-  `endPort` ranges with map-capacity guards, and bounded IPv4 `ipBlock`/`except`
-  exact-source enforcement with atomic two-map activation, namespace-wide
+  `endPort` ranges with map-capacity guards, bounded IPv4 exact-source and IPv6
+  LPM `ipBlock`/`except` enforcement with atomic three-map activation, namespace-wide
   targets from omitted `podSelector`, implicit ingress `policyTypes` for
   egress-omitted objects, default TCP ports, and non-selected Pod behavior, plus
   rejection/deletion recovery; IPv4 SCTP parsing/enforcement, live explanation,
@@ -64,7 +64,7 @@ matrix and reproducible evidence.
   observation-weighted historical simulation impact; resolved-identity IPv6
   distribution, enforcement, provenance, topology schema v3, and flow-export
   schema v2;
-- Next: IPv6 `ipBlock`, IPv6 extension-header traversal, and remaining upstream
+- Next: IPv6 extension-header traversal and remaining upstream
   ingress conformance, plus
   authenticated/durable telemetry transport with time-window queries;
 - shadow rollout and offline impact analysis;

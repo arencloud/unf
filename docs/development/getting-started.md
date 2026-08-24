@@ -88,7 +88,7 @@ revisioned event and CLI provenance. It also exercises a supported ingress
 unsupported-update rejection and recovery, and
 named-port resolution, protocol-only TCP activation/removal without UDP
 broadening, bounded `endPort` boundary enforcement and oversized-range rejection,
-bounded IPv4 `ipBlock` allow/exception behavior and oversized-block rejection,
+bounded IPv4/IPv6 `ipBlock` allow/exception behavior and oversized-block rejection,
 Namespace relabel, and deletion/recreation convergence.
 It then applies `deploy/examples/networkpolicy-conformance.yaml`, whose policy
 deliberately omits `podSelector`, `policyTypes`, and port protocol. The verifier

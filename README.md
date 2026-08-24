@@ -40,7 +40,7 @@ Implemented in the repository:
   evaluator semantics, controller snapshots, and dataplane lowering as native
   policy, including pod/Namespace expressions, named and protocol-only
   TCP/UDP/SCTP ports, bounded inclusive TCP/UDP/SCTP `endPort` ranges, bounded
-  IPv4 `ipBlock` peers with `except`, namespace-wide targets from an omitted
+  IPv4 exact-source and IPv6 prefix `ipBlock` peers with `except`, namespace-wide targets from an omitted
   `podSelector`, Kubernetes ingress/TCP defaults, deterministic exact/wildcard-key
   lowering, and explicit compiler/dataplane capacity limits;
 - a kube-rs controller watching Nodes, Pods, Namespaces, Services, EndpointSlices,
@@ -63,7 +63,8 @@ Implemented in the repository:
 - a reproducible dual-stack two-node kind demo covering native and NetworkPolicy
   cross-node IPv4/IPv6 allow/drop, namespace-selector convergence,
   rejection/deletion recovery, shadow
-  pass-through, protocol-only port activation/recovery, bounded range/ipBlock
+  pass-through, protocol-only port activation/recovery, bounded range and
+  IPv4/IPv6 `ipBlock`
   enforcement and rejection recovery, named/protocol-only SCTP enforcement,
   namespace-wide target isolation/defaulting, same-Namespace and all-Namespace
   peers, peer OR/selector AND semantics, stacked additive allows and allow-all
@@ -71,7 +72,7 @@ Implemented in the repository:
   versioned EndpointSlice backend-readiness lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
-multi-cluster transport, IPv6 `ipBlock`, IPv6 extension-header traversal, or
+multi-cluster transport, IPv6 extension-header traversal, or
 production fail-closed recovery.
 
 ## Repository layout

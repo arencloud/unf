@@ -8,7 +8,7 @@ use thiserror::Error;
 use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
-pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 2;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
@@ -413,6 +413,24 @@ pub struct Ipv4PolicyMapEntry {
     pub shadow: Option<PolicyDecisionRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Ipv6PolicyMapKey {
+    pub source_network: Ipv6Addr,
+    pub source_prefix_len: u8,
+    pub destination_identity: IdentityId,
+    /// IP protocol number, or zero for a global wildcard fallback.
+    pub protocol: u8,
+    /// Destination port, or zero for a protocol-specific or global wildcard.
+    pub destination_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ipv6PolicyMapEntry {
+    pub key: Ipv6PolicyMapKey,
+    pub decision: PolicyDecisionRecord,
+    pub shadow: Option<PolicyDecisionRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyStateSnapshot {
     pub schema_version: u16,
@@ -420,6 +438,7 @@ pub struct PolicyStateSnapshot {
     pub revision: Revision,
     pub entries: Vec<PolicyMapEntry>,
     pub ipv4_entries: Vec<Ipv4PolicyMapEntry>,
+    pub ipv6_entries: Vec<Ipv6PolicyMapEntry>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

@@ -58,8 +58,14 @@ arbitrary-external source, TC checks exact protocol/port, protocol-specific
 port-zero, and global protocol/port-zero entries before consulting
 `POLICY_RULES`. The controller emits exact entries for known Pod addresses and
 bounded block addresses, preserving the shared evaluator's native/compatibility
-precedence. Snapshot schema v2 carries both entry sets; the agent stages and
-validates both inactive banks before the single `POLICY_CONFIG` activation write.
+precedence.
+
+IPv6 `ipBlock` peers use `POLICY_IPV6`, an LPM trie whose fixed destination,
+port, protocol, and bank dimensions precede the source address. Snapshot schema
+v3 carries identity, exact IPv4, and IPv6 prefix decisions; the agent stages and
+validates all three inactive banks before the single `POLICY_CONFIG` activation
+write. More-specific exception decisions and known-Pod `/128` decisions override
+broader external prefixes. See ADR 0014.
 
 ## Failure behavior
 
@@ -68,7 +74,7 @@ leaves the last activated revision in use. This overlay prototype deliberately
 fails open when the destination identity is unknown, config is absent or
 incompatible, the IPv6 packet uses an extension header, or no valid identity/IP
 entry exists. A source without an identity
-can still be enforced when a valid IPv4 exact or external-fallback entry exists.
+can still be enforced when a valid IPv4 exact/fallback or IPv6 prefix entry exists.
 Fail-open events are marked observed/identity-unknown with revision zero. Agent
 restart also recreates unpinned maps before resynchronizing, so this is not yet a
 production fail-closed design. Invalid map state never becomes a deny by
@@ -83,5 +89,5 @@ tests still run on stable in the host workspace. See ADR 0002.
 ## Next dataplane milestone
 
 Persist last-known-good state across agent restart, aggregate applied node status,
-add bounded IPv6 prefix-policy representation and extension-header traversal,
+add IPv6 extension-header traversal,
 and test explicit control-plane and map-pressure failure modes.

@@ -29,6 +29,6 @@ decisions still converge in the shared evaluator before lowering.
 
 Identity BPF distribution and controller-epoch recovery are verified. Map pinning,
 durable allocation, multi-controller ownership, and explicit unknown-identity
-enforcement semantics remain open. IPv6 `ipBlock` remains a separate address-
-policy design problem and is not implied by dual-stack identity resolution. See
-ADRs 0005, 0006, and 0013.
+enforcement semantics remain open. IPv6 `ipBlock` is enforced separately through
+bounded prefix-policy state and does not change identity allocation. See ADRs
+0005, 0006, 0013, and 0014.

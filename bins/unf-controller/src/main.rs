@@ -28,8 +28,9 @@ use tracing::{error, info, warn};
 use unf_api::SecurityPolicy;
 use unf_common::{IdentityId, PolicyId, Protocol, Revision, Verdict};
 use unf_policy::{
-    DestinationPort, Endpoint, Flow, Ipv4Endpoint, NamedPort, NetworkPolicyCompiler,
-    PolicyCompiler, PolicyIr, compile_dataplane_entries, compile_ipv4_dataplane_entries, evaluate,
+    DestinationPort, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort, NetworkPolicyCompiler,
+    PolicyCompiler, PolicyIr, compile_dataplane_entries, compile_ipv4_dataplane_entries,
+    compile_ipv6_dataplane_entries, evaluate,
 };
 use unf_state::{
     FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowHistorySnapshot,
@@ -89,6 +90,13 @@ struct PodRecord {
     ipv4_addresses: BTreeSet<std::net::Ipv4Addr>,
     ipv6_addresses: BTreeSet<Ipv6Addr>,
 }
+
+type DataplanePolicyState = (
+    Revision,
+    Vec<unf_state::PolicyMapEntry>,
+    Vec<unf_state::Ipv4PolicyMapEntry>,
+    Vec<unf_state::Ipv6PolicyMapEntry>,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServiceRecord {
@@ -1222,8 +1230,10 @@ async fn metrics(State(state): State<Arc<ControllerState>>) -> Response {
 }
 
 async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<StatusBody>, ApiError> {
-    let (_, policy_entries, ipv4_policy_entries) = dataplane_policy_state(&state)?;
-    let resolved_policy_entries = policy_entries.len() + ipv4_policy_entries.len();
+    let (_, policy_entries, ipv4_policy_entries, ipv6_policy_entries) =
+        dataplane_policy_state(&state)?;
+    let resolved_policy_entries =
+        policy_entries.len() + ipv4_policy_entries.len() + ipv6_policy_entries.len();
     let (identity_revision, identity_count, indexed_pod_ips) = {
         let identities = mutex_lock(&state.identities);
         (
@@ -1281,13 +1291,14 @@ async fn identity_snapshot(
 async fn policy_snapshot(
     State(state): State<Arc<ControllerState>>,
 ) -> Result<Json<PolicyStateSnapshot>, ApiError> {
-    let (revision, entries, ipv4_entries) = dataplane_policy_state(&state)?;
+    let (revision, entries, ipv4_entries, ipv6_entries) = dataplane_policy_state(&state)?;
     Ok(Json(PolicyStateSnapshot {
         schema_version: POLICY_SNAPSHOT_SCHEMA_VERSION,
         source_epoch: state.identity_epoch,
         revision,
         entries,
         ipv4_entries,
+        ipv6_entries,
     }))
 }
 
@@ -1474,16 +1485,7 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn dataplane_policy_state(
-    state: &ControllerState,
-) -> Result<
-    (
-        Revision,
-        Vec<unf_state::PolicyMapEntry>,
-        Vec<unf_state::Ipv4PolicyMapEntry>,
-    ),
-    ApiError,
-> {
+fn dataplane_policy_state(state: &ControllerState) -> Result<DataplanePolicyState, ApiError> {
     let _policy_state_guard = read_lock(&state.policy_state_guard);
     let policies = compiled_policies(state);
     let endpoints = endpoints_with_namespace_labels(state);
@@ -1492,7 +1494,15 @@ fn dataplane_policy_state(
     let ipv4_endpoints = ipv4_endpoints_with_namespace_labels(state);
     let ipv4_entries = compile_ipv4_dataplane_entries(&policies, &endpoints, &ipv4_endpoints)
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    Ok((mutex_lock(&state.revisions).policy, entries, ipv4_entries))
+    let ipv6_endpoints = ipv6_endpoints_with_namespace_labels(state);
+    let ipv6_entries = compile_ipv6_dataplane_entries(&policies, &endpoints, &ipv6_endpoints)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok((
+        mutex_lock(&state.revisions).policy,
+        entries,
+        ipv4_entries,
+        ipv6_entries,
+    ))
 }
 
 async fn explain(
@@ -1527,6 +1537,11 @@ async fn explain(
             protocol,
             destination_port: request.port,
             source_ipv4: source.ipv4_addresses.iter().next().copied(),
+            source_ipv6: source
+                .ipv4_addresses
+                .is_empty()
+                .then(|| source.ipv6_addresses.iter().next().copied())
+                .flatten(),
         },
     );
     let revision = mutex_lock(&state.revisions).policy;
@@ -1740,18 +1755,18 @@ fn evaluate_historical_simulation(
             summary.skipped_unresolved_flows += 1;
             continue;
         };
+        let (source_ipv4, source_ipv6) = source_addresses(
+            &pod_records[source_index],
+            entry.key.source_ipv4,
+            entry.key.source_ipv6,
+        );
         let flow = Flow {
             source: &endpoints[source_index],
             destination: &endpoints[destination_index],
             protocol,
             destination_port: entry.key.destination_port,
-            source_ipv4: entry.key.source_ipv4.or_else(|| {
-                pod_records[source_index]
-                    .ipv4_addresses
-                    .iter()
-                    .next()
-                    .copied()
-            }),
+            source_ipv4,
+            source_ipv6,
         };
         let current = evaluate(current_policies, flow);
         let proposed = evaluate(proposed_policies, flow);
@@ -1810,6 +1825,25 @@ fn evaluate_historical_simulation(
     (summary, changes)
 }
 
+fn source_addresses(
+    pod: &PodRecord,
+    source_ipv4: Option<std::net::Ipv4Addr>,
+    source_ipv6: Option<Ipv6Addr>,
+) -> (Option<std::net::Ipv4Addr>, Option<Ipv6Addr>) {
+    if source_ipv4.is_some() {
+        return (source_ipv4, None);
+    }
+    if source_ipv6.is_some() {
+        return (None, source_ipv6);
+    }
+    let source_ipv4 = pod.ipv4_addresses.iter().next().copied();
+    let source_ipv6 = source_ipv4
+        .is_none()
+        .then(|| pod.ipv6_addresses.iter().next().copied())
+        .flatten();
+    (source_ipv4, source_ipv6)
+}
+
 fn evaluate_simulation_matrix(
     pod_records: &[PodRecord],
     endpoints: &[Endpoint],
@@ -1834,6 +1868,17 @@ fn evaluate_simulation_matrix(
                         .iter()
                         .next()
                         .copied(),
+                    source_ipv6: pod_records[source_index]
+                        .ipv4_addresses
+                        .is_empty()
+                        .then(|| {
+                            pod_records[source_index]
+                                .ipv6_addresses
+                                .iter()
+                                .next()
+                                .copied()
+                        })
+                        .flatten(),
                 };
                 let current = evaluate(current_policies, flow);
                 let proposed = evaluate(proposed_policies, flow);
@@ -1955,6 +2000,23 @@ fn ipv4_endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Ipv4Endp
                 .iter()
                 .copied()
                 .map(move |address| Ipv4Endpoint {
+                    address,
+                    endpoint: endpoint.clone(),
+                })
+        })
+        .collect()
+}
+
+fn ipv6_endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Ipv6Endpoint> {
+    let namespaces = read_lock(&state.namespaces);
+    read_lock(&state.pods)
+        .values()
+        .flat_map(|pod| {
+            let endpoint = endpoint_with_namespace_labels(&pod.endpoint, &namespaces);
+            pod.ipv6_addresses
+                .iter()
+                .copied()
+                .map(move |address| Ipv6Endpoint {
                     address,
                     endpoint: endpoint.clone(),
                 })

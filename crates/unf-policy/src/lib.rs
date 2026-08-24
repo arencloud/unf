@@ -4,13 +4,14 @@ mod network_policy;
 
 pub use network_policy::{
     KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES,
+    KUBERNETES_NETWORK_POLICY_MAX_IPV6_IP_BLOCK_PREFIXES,
     KUBERNETES_NETWORK_POLICY_MAX_PORT_RANGE_WIDTH, KUBERNETES_NETWORK_POLICY_PRIORITY,
     NetworkPolicyCompileError, NetworkPolicyCompiler,
 };
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,8 +20,8 @@ use unf_api::{
 };
 use unf_common::{IdentityId, PolicyAction, PolicyId, Protocol, RuleId, Verdict};
 use unf_state::{
-    Ipv4PolicyMapEntry, Ipv4PolicyMapKey, POLICY_MAP_BANK_ENTRY_LIMIT, PolicyDecisionRecord,
-    PolicyMapEntry, PolicyMapKey,
+    Ipv4PolicyMapEntry, Ipv4PolicyMapKey, Ipv6PolicyMapEntry, Ipv6PolicyMapKey,
+    POLICY_MAP_BANK_ENTRY_LIMIT, PolicyDecisionRecord, PolicyMapEntry, PolicyMapKey,
 };
 
 pub use unf_common::PolicyReason as DecisionReason;
@@ -35,6 +36,7 @@ pub struct IdentitySelector {
     pub match_labels: BTreeMap<String, String>,
     pub match_expressions: Vec<LabelExpression>,
     pub ipv4_blocks: Vec<Ipv4Block>,
+    pub ipv6_blocks: Vec<Ipv6Block>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -47,6 +49,18 @@ pub struct Ipv4Cidr {
 pub struct Ipv4Block {
     pub cidr: Ipv4Cidr,
     pub except: Vec<Ipv4Cidr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Ipv6Cidr {
+    pub network: Ipv6Addr,
+    pub prefix_len: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Ipv6Block {
+    pub cidr: Ipv6Cidr,
+    pub except: Vec<Ipv6Cidr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -96,15 +110,32 @@ impl IdentitySelector {
                 .all(|expression| expression.matches(&endpoint.labels))
     }
 
-    fn matches_source(&self, endpoint: &Endpoint, source_ipv4: Option<Ipv4Addr>) -> bool {
-        let external_source_matches =
-            endpoint.identity.get() != 0 || !self.ipv4_blocks.is_empty() || self.is_unconstrained();
+    fn matches_source(
+        &self,
+        endpoint: &Endpoint,
+        source_ipv4: Option<Ipv4Addr>,
+        source_ipv6: Option<Ipv6Addr>,
+    ) -> bool {
+        let external_source_matches = endpoint.identity.get() != 0
+            || !self.ipv4_blocks.is_empty()
+            || !self.ipv6_blocks.is_empty()
+            || self.is_unconstrained();
         external_source_matches
             && self.matches(endpoint)
-            && (self.ipv4_blocks.is_empty()
-                || source_ipv4.is_some_and(|address| {
-                    self.ipv4_blocks.iter().any(|block| block.contains(address))
-                }))
+            && match (source_ipv4, source_ipv6) {
+                (Some(address), None) => {
+                    self.ipv6_blocks.is_empty()
+                        && (self.ipv4_blocks.is_empty()
+                            || self.ipv4_blocks.iter().any(|block| block.contains(address)))
+                }
+                (None, Some(address)) => {
+                    self.ipv4_blocks.is_empty()
+                        && (self.ipv6_blocks.is_empty()
+                            || self.ipv6_blocks.iter().any(|block| block.contains(address)))
+                }
+                (None, None) => self.ipv4_blocks.is_empty() && self.ipv6_blocks.is_empty(),
+                (Some(_), Some(_)) => false,
+            }
     }
 
     fn is_unconstrained(&self) -> bool {
@@ -166,6 +197,33 @@ impl Ipv4Block {
     }
 }
 
+impl Ipv6Cidr {
+    #[must_use]
+    pub fn contains(&self, address: Ipv6Addr) -> bool {
+        if self.prefix_len > 128 {
+            return false;
+        }
+        let mask = if self.prefix_len == 0 {
+            0
+        } else {
+            u128::MAX << (128 - self.prefix_len)
+        };
+        u128::from(address) & mask == u128::from(self.network)
+    }
+
+    #[must_use]
+    pub fn contains_cidr(&self, other: &Self) -> bool {
+        self.prefix_len <= other.prefix_len && self.contains(other.network)
+    }
+}
+
+impl Ipv6Block {
+    #[must_use]
+    pub fn contains(&self, address: Ipv6Addr) -> bool {
+        self.cidr.contains(address) && !self.except.iter().any(|except| except.contains(address))
+    }
+}
+
 impl LabelExpression {
     fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
         match self.operator {
@@ -192,6 +250,7 @@ impl From<ApiSelector> for IdentitySelector {
             match_labels: value.match_labels,
             match_expressions: Vec::new(),
             ipv4_blocks: Vec::new(),
+            ipv6_blocks: Vec::new(),
         }
     }
 }
@@ -210,6 +269,12 @@ pub struct Endpoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ipv4Endpoint {
     pub address: Ipv4Addr,
+    pub endpoint: Endpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ipv6Endpoint {
+    pub address: Ipv6Addr,
     pub endpoint: Endpoint,
 }
 
@@ -287,6 +352,7 @@ pub struct Flow<'a> {
     pub protocol: Protocol,
     pub destination_port: u16,
     pub source_ipv4: Option<Ipv4Addr>,
+    pub source_ipv6: Option<Ipv6Addr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +390,8 @@ pub enum DataplaneCompileError {
     Ipv4MetadataConflict { address: Ipv4Addr },
     #[error("IPv4 policy block contains {address_count} addresses, exceeding limit {limit}")]
     Ipv4BlockTooLarge { address_count: u64, limit: u64 },
+    #[error("source IPv6 address {address} has conflicting endpoint metadata")]
+    Ipv6MetadataConflict { address: Ipv6Addr },
 }
 
 pub struct PolicyCompiler;
@@ -537,6 +605,7 @@ pub fn compile_dataplane_entries(
                     protocol: Protocol::Tcp,
                     destination_port: 0,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             );
             let global_entry = policy_map_entry(source, destination, 0, 0, &global_fallback);
@@ -549,7 +618,7 @@ pub fn compile_dataplane_entries(
                 .filter(|policy| policy.target.matches(destination))
                 .flat_map(|policy| &policy.rules)
                 .filter(|rule| {
-                    rule.source.matches_source(source, None)
+                    rule.source.matches_source(source, None, None)
                         && rule.destination.matches(destination)
                         && rule.destination_port == DestinationPort::Any
                 })
@@ -565,6 +634,7 @@ pub fn compile_dataplane_entries(
                         protocol,
                         destination_port: 0,
                         source_ipv4: None,
+                        source_ipv6: None,
                     },
                 );
                 let entry = policy_map_entry(source, destination, protocol as u8, 0, &decision);
@@ -582,7 +652,7 @@ pub fn compile_dataplane_entries(
                 .filter(|policy| policy.target.matches(destination))
                 .flat_map(|policy| &policy.rules)
                 .filter(|rule| {
-                    rule.source.matches_source(source, None)
+                    rule.source.matches_source(source, None, None)
                         && rule.destination.matches(destination)
                 })
                 .flat_map(|rule| exact_rule_ports(rule, destination))
@@ -596,6 +666,7 @@ pub fn compile_dataplane_entries(
                         protocol,
                         destination_port: port,
                         source_ipv4: None,
+                        source_ipv6: None,
                     },
                 );
                 let entry = policy_map_entry(source, destination, protocol as u8, port, &decision);
@@ -715,6 +786,208 @@ pub fn compile_ipv4_dataplane_entries(
     Ok(entries)
 }
 
+/// Resolves IPv6-aware source rules into bounded longest-prefix-match entries.
+///
+/// Policy boundaries, exceptions, and known Pod addresses are represented as
+/// prefixes. A representative address outside all child boundaries determines
+/// the decision inherited by the remainder of each prefix.
+///
+/// # Errors
+///
+/// Returns an error for conflicting endpoint metadata or when the bounded
+/// prefix decisions exceed one dataplane bank.
+pub fn compile_ipv6_dataplane_entries(
+    policies: &[PolicyIr],
+    endpoints: &[Endpoint],
+    ipv6_endpoints: &[Ipv6Endpoint],
+) -> Result<Vec<Ipv6PolicyMapEntry>, DataplaneCompileError> {
+    let global_policies = global_fallback_policies(policies);
+    let mut destinations = BTreeMap::<IdentityId, &Endpoint>::new();
+    for endpoint in endpoints {
+        if let Some(existing) = destinations.insert(endpoint.identity, endpoint)
+            && existing != endpoint
+        {
+            return Err(DataplaneCompileError::IdentityMetadataConflict {
+                identity_id: endpoint.identity,
+            });
+        }
+    }
+
+    let mut known_sources = BTreeMap::<Ipv6Addr, &Endpoint>::new();
+    for source in ipv6_endpoints {
+        if let Some(existing) = known_sources.insert(source.address, &source.endpoint)
+            && existing != &source.endpoint
+        {
+            return Err(DataplaneCompileError::Ipv6MetadataConflict {
+                address: source.address,
+            });
+        }
+    }
+
+    let mut boundaries = BTreeSet::from([Ipv6Cidr {
+        network: Ipv6Addr::UNSPECIFIED,
+        prefix_len: 0,
+    }]);
+    for block in policies
+        .iter()
+        .flat_map(|policy| &policy.rules)
+        .flat_map(|rule| &rule.source.ipv6_blocks)
+    {
+        boundaries.insert(block.cidr.clone());
+        boundaries.extend(block.except.iter().cloned());
+    }
+    boundaries.extend(known_sources.keys().copied().map(|network| Ipv6Cidr {
+        network,
+        prefix_len: 128,
+    }));
+    if boundaries.len() > POLICY_MAP_BANK_ENTRY_LIMIT {
+        return Err(DataplaneCompileError::EntryLimitExceeded {
+            limit: POLICY_MAP_BANK_ENTRY_LIMIT,
+        });
+    }
+    let boundaries: Vec<_> = boundaries.into_iter().collect();
+    let external = external_endpoint();
+    let mut entries = Vec::new();
+    for destination in destinations.values() {
+        for boundary in &boundaries {
+            let excluded: Vec<_> = boundaries
+                .iter()
+                .filter(|candidate| {
+                    candidate.prefix_len > boundary.prefix_len && boundary.contains_cidr(candidate)
+                })
+                .collect();
+            let Some(address) = uncovered_ipv6_address(boundary, &excluded) else {
+                continue;
+            };
+            let source = known_sources.get(&address).copied().unwrap_or(&external);
+            compile_ipv6_pair(
+                policies,
+                &global_policies,
+                source,
+                address,
+                boundary,
+                destination,
+                &mut entries,
+            )?;
+        }
+    }
+    entries.sort_by_key(|entry| entry.key);
+    Ok(entries)
+}
+
+fn uncovered_ipv6_address(cidr: &Ipv6Cidr, excluded: &[&Ipv6Cidr]) -> Option<Ipv6Addr> {
+    if excluded.contains(&cidr) {
+        return None;
+    }
+    if excluded.iter().all(|item| !item.contains(cidr.network)) {
+        return Some(cidr.network);
+    }
+    if cidr.prefix_len == 128 {
+        return None;
+    }
+    let child_prefix = cidr.prefix_len + 1;
+    let step = 1_u128 << (128 - child_prefix);
+    for network in [u128::from(cidr.network), u128::from(cidr.network) + step] {
+        let child = Ipv6Cidr {
+            network: Ipv6Addr::from(network),
+            prefix_len: child_prefix,
+        };
+        let child_excluded: Vec<_> = excluded
+            .iter()
+            .copied()
+            .filter(|item| child.contains_cidr(item))
+            .collect();
+        if child_excluded.is_empty() {
+            return Some(child.network);
+        }
+        if let Some(address) = uncovered_ipv6_address(&child, &child_excluded) {
+            return Some(address);
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_ipv6_pair(
+    policies: &[PolicyIr],
+    global_policies: &[PolicyIr],
+    source: &Endpoint,
+    source_address: Ipv6Addr,
+    source_cidr: &Ipv6Cidr,
+    destination: &Endpoint,
+    entries: &mut Vec<Ipv6PolicyMapEntry>,
+) -> Result<(), DataplaneCompileError> {
+    let global_fallback = evaluate(
+        global_policies,
+        Flow {
+            source,
+            destination,
+            protocol: Protocol::Tcp,
+            destination_port: 0,
+            source_ipv4: None,
+            source_ipv6: Some(source_address),
+        },
+    );
+    let global_entry = ipv6_policy_map_entry(source_cidr, destination, 0, 0, &global_fallback);
+    if has_policy_provenance(&global_fallback) {
+        push_ipv6_dataplane_entry(entries, global_entry)?;
+    }
+
+    let wildcard_protocols: BTreeSet<_> = policies
+        .iter()
+        .filter(|policy| policy.target.matches(destination))
+        .flat_map(|policy| &policy.rules)
+        .filter(|rule| {
+            rule.destination.matches(destination) && rule.destination_port == DestinationPort::Any
+        })
+        .filter_map(|rule| rule.protocol)
+        .collect();
+    for protocol in wildcard_protocols {
+        let decision = evaluate(
+            policies,
+            Flow {
+                source,
+                destination,
+                protocol,
+                destination_port: 0,
+                source_ipv4: None,
+                source_ipv6: Some(source_address),
+            },
+        );
+        let entry = ipv6_policy_map_entry(source_cidr, destination, protocol as u8, 0, &decision);
+        if has_policy_provenance(&decision) {
+            push_ipv6_dataplane_entry(entries, entry)?;
+        }
+    }
+
+    let exact_tuples: BTreeSet<_> = policies
+        .iter()
+        .filter(|policy| policy.target.matches(destination))
+        .flat_map(|policy| &policy.rules)
+        .filter(|rule| rule.destination.matches(destination))
+        .flat_map(|rule| exact_rule_ports(rule, destination))
+        .collect();
+    for (protocol, port) in exact_tuples {
+        let decision = evaluate(
+            policies,
+            Flow {
+                source,
+                destination,
+                protocol,
+                destination_port: port,
+                source_ipv4: None,
+                source_ipv6: Some(source_address),
+            },
+        );
+        let entry =
+            ipv6_policy_map_entry(source_cidr, destination, protocol as u8, port, &decision);
+        if has_policy_provenance(&decision) {
+            push_ipv6_dataplane_entry(entries, entry)?;
+        }
+    }
+    Ok(())
+}
+
 fn compile_ipv4_pair(
     policies: &[PolicyIr],
     global_policies: &[PolicyIr],
@@ -732,6 +1005,7 @@ fn compile_ipv4_pair(
             protocol: Protocol::Tcp,
             destination_port: 0,
             source_ipv4,
+            source_ipv6: None,
         },
     );
     let global_entry = ipv4_policy_map_entry(source_address, destination, 0, 0, &global_fallback);
@@ -744,7 +1018,7 @@ fn compile_ipv4_pair(
         .filter(|policy| policy.target.matches(destination))
         .flat_map(|policy| &policy.rules)
         .filter(|rule| {
-            rule.source.matches_source(source, source_ipv4)
+            rule.source.matches_source(source, source_ipv4, None)
                 && rule.destination.matches(destination)
                 && rule.destination_port == DestinationPort::Any
         })
@@ -760,6 +1034,7 @@ fn compile_ipv4_pair(
                 protocol,
                 destination_port: 0,
                 source_ipv4,
+                source_ipv6: None,
             },
         );
         let entry =
@@ -777,7 +1052,8 @@ fn compile_ipv4_pair(
         .filter(|policy| policy.target.matches(destination))
         .flat_map(|policy| &policy.rules)
         .filter(|rule| {
-            rule.source.matches_source(source, source_ipv4) && rule.destination.matches(destination)
+            rule.source.matches_source(source, source_ipv4, None)
+                && rule.destination.matches(destination)
         })
         .flat_map(|rule| exact_rule_ports(rule, destination))
         .collect();
@@ -790,6 +1066,7 @@ fn compile_ipv4_pair(
                 protocol,
                 destination_port: port,
                 source_ipv4,
+                source_ipv6: None,
             },
         );
         let entry =
@@ -861,6 +1138,15 @@ fn push_ipv4_dataplane_entry(
     Ok(())
 }
 
+fn push_ipv6_dataplane_entry(
+    entries: &mut Vec<Ipv6PolicyMapEntry>,
+    entry: Ipv6PolicyMapEntry,
+) -> Result<(), DataplaneCompileError> {
+    ensure_dataplane_capacity(entries.len())?;
+    entries.push(entry);
+    Ok(())
+}
+
 fn ensure_dataplane_capacity(entry_count: usize) -> Result<(), DataplaneCompileError> {
     if entry_count >= POLICY_MAP_BANK_ENTRY_LIMIT {
         return Err(DataplaneCompileError::EntryLimitExceeded {
@@ -916,6 +1202,39 @@ fn ipv4_policy_map_entry(
     Ipv4PolicyMapEntry {
         key: Ipv4PolicyMapKey {
             source_address,
+            destination_identity: destination.identity,
+            protocol,
+            destination_port,
+        },
+        decision: PolicyDecisionRecord {
+            verdict: decision.verdict,
+            reason: decision.reason,
+            policy_id: decision.policy_id,
+            rule_id: decision.rule_id,
+        },
+        shadow: decision
+            .shadow_verdict
+            .zip(decision.shadow_reason)
+            .map(|(verdict, reason)| PolicyDecisionRecord {
+                verdict,
+                reason,
+                policy_id: decision.shadow_policy_id,
+                rule_id: decision.shadow_rule_id,
+            }),
+    }
+}
+
+fn ipv6_policy_map_entry(
+    source: &Ipv6Cidr,
+    destination: &Endpoint,
+    protocol: u8,
+    destination_port: u16,
+    decision: &PolicyDecision,
+) -> Ipv6PolicyMapEntry {
+    Ipv6PolicyMapEntry {
+        key: Ipv6PolicyMapKey {
+            source_network: source.network,
+            source_prefix_len: source.prefix_len,
             destination_identity: destination.identity,
             protocol,
             destination_port,
@@ -1066,7 +1385,8 @@ fn matching_audits(policies: &[&PolicyIr], flow: Flow<'_>) -> Vec<RuleProvenance
 }
 
 fn rule_matches(rule: &PolicyRule, flow: Flow<'_>) -> bool {
-    rule.source.matches_source(flow.source, flow.source_ipv4)
+    rule.source
+        .matches_source(flow.source, flow.source_ipv4, flow.source_ipv6)
         && rule.destination.matches(flow.destination)
         && rule.protocol.is_none_or(|value| value == flow.protocol)
         && match &rule.destination_port {
@@ -1153,6 +1473,7 @@ mod tests {
             protocol: Protocol::Tcp,
             destination_port: port,
             source_ipv4: None,
+            source_ipv6: None,
         }
     }
 
@@ -1268,6 +1589,7 @@ mod tests {
             protocol: Protocol::Udp,
             destination_port: 53,
             source_ipv4: None,
+            source_ipv6: None,
         };
         assert_eq!(evaluate(&[policy], flow).verdict, Verdict::Allow);
     }

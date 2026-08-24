@@ -61,8 +61,11 @@ no-applicable-policy behavior keeps Pods outside every ingress policy target
 non-isolated.
 IPv4 `ipBlock` peers and nested `except` CIDRs are preserved in IR and expanded
 into an exact-source IPv4 policy map. One block may contain at most 1,024
-addresses; IPv6, `0.0.0.0`, wider blocks, out-of-block exceptions, and peers that
-combine `ipBlock` with selectors are rejected. A source-IP fallback represents
+addresses. IPv6 blocks remain compact CIDR boundaries in an LPM policy map,
+support nested exceptions, and permit at most 1,024 boundaries per block; known
+Pod addresses become `/128` overrides and `/0` represents arbitrary external
+sources. `0.0.0.0`, wider IPv4 blocks, out-of-block or mixed-family exceptions,
+and peers that combine `ipBlock` with selectors are rejected. A source-IP fallback represents
 arbitrary external sources, so compatibility isolation does not silently fail
 open merely because the source has no workload identity. The adapter deliberately
 rejects egress and named ports combined with `endPort`. These errors

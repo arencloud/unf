@@ -6,7 +6,7 @@ use unf_common::{IdentityId, PolicyId, RuleId, Verdict};
 
 pub const FLOW_ABI_VERSION: u16 = 2;
 pub const IDENTITY_MAP_ABI_VERSION: u16 = 1;
-pub const POLICY_MAP_ABI_VERSION: u16 = 1;
+pub const POLICY_MAP_ABI_VERSION: u16 = 2;
 pub const POLICY_BANK_COUNT: u8 = 2;
 pub const POLICY_FLAG_HAS_POLICY: u16 = 1 << 0;
 pub const POLICY_FLAG_HAS_RULE: u16 = 1 << 1;
@@ -150,6 +150,18 @@ pub struct Ipv4PolicyMapKey {
     pub bank: u8,
 }
 
+/// The first 64 bits are exact policy dimensions; the final 128 bits are the
+/// source address matched by an LPM trie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv6PolicyMapData {
+    pub destination_identity: IdentityId,
+    pub destination_port: [u8; 2],
+    pub protocol: u8,
+    pub bank: u8,
+    pub source_address: [u8; 16],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct PolicyMapValue {
@@ -184,6 +196,7 @@ const _: () = assert!(core::mem::size_of::<Ipv6IdentityKey>() == 16);
 const _: () = assert!(core::mem::size_of::<IdentityMapValue>() == 16);
 const _: () = assert!(core::mem::size_of::<PolicyMapKey>() == 12);
 const _: () = assert!(core::mem::size_of::<Ipv4PolicyMapKey>() == 12);
+const _: () = assert!(core::mem::size_of::<Ipv6PolicyMapData>() == 24);
 const _: () = assert!(core::mem::size_of::<PolicyMapValue>() == 32);
 const _: () = assert!(core::mem::size_of::<PolicyMapConfig>() == 24);
 
@@ -204,6 +217,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<PolicyMapKey>(), 12);
         assert_eq!(core::mem::align_of::<Ipv4PolicyMapKey>(), 4);
         assert_eq!(core::mem::size_of::<Ipv4PolicyMapKey>(), 12);
+        assert_eq!(core::mem::align_of::<Ipv6PolicyMapData>(), 4);
+        assert_eq!(core::mem::size_of::<Ipv6PolicyMapData>(), 24);
         assert_eq!(core::mem::align_of::<PolicyMapValue>(), 8);
         assert_eq!(core::mem::size_of::<PolicyMapValue>(), 32);
         assert_eq!(core::mem::align_of::<PolicyMapConfig>(), 8);

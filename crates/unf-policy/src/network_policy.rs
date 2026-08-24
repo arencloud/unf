@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use k8s_openapi::api::networking::v1::{NetworkPolicy, NetworkPolicyPeer, NetworkPolicyPort};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
@@ -8,7 +8,7 @@ use thiserror::Error;
 use unf_common::{PolicyAction, PolicyId, Protocol};
 
 use crate::{
-    DestinationPort, IdentitySelector, Ipv4Block, Ipv4Cidr, LabelExpression,
+    DestinationPort, IdentitySelector, Ipv4Block, Ipv4Cidr, Ipv6Block, Ipv6Cidr, LabelExpression,
     LabelExpressionOperator, PolicyEnforcementMode, PolicyIr, PolicyOrigin, PolicyRule, push_rule,
 };
 
@@ -19,6 +19,8 @@ pub const KUBERNETES_NETWORK_POLICY_PRIORITY: u32 = 1_000_000;
 pub const KUBERNETES_NETWORK_POLICY_MAX_PORT_RANGE_WIDTH: u32 = 1_024;
 /// Bounds exact-source expansion for one IPv4 `ipBlock`.
 pub const KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES: u64 = 1_024;
+/// Bounds the CIDR boundary count for one compact IPv6 `ipBlock`.
+pub const KUBERNETES_NETWORK_POLICY_MAX_IPV6_IP_BLOCK_PREFIXES: usize = 1_024;
 const NAMESPACE_NAME_LABEL: &str = "kubernetes.io/metadata.name";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -56,7 +58,7 @@ pub enum NetworkPolicyCompileError {
         rule_index: usize,
         peer_index: usize,
     },
-    #[error("ingress rule {rule_index} peer {peer_index} contains invalid IPv4 CIDR {cidr:?}")]
+    #[error("ingress rule {rule_index} peer {peer_index} contains invalid IP CIDR {cidr:?}")]
     InvalidIpBlockCidr {
         rule_index: usize,
         peer_index: usize,
@@ -79,6 +81,15 @@ pub enum NetworkPolicyCompileError {
         peer_index: usize,
         address_count: u64,
         limit: u64,
+    },
+    #[error(
+        "ingress rule {rule_index} peer {peer_index} IPv6 ipBlock contains {prefix_count} CIDR boundaries, exceeding limit {limit}"
+    )]
+    Ipv6IpBlockTooManyPrefixes {
+        rule_index: usize,
+        peer_index: usize,
+        prefix_count: usize,
+        limit: usize,
     },
     #[error(
         "ingress rule {rule_index} peer {peer_index} ipBlock contains reserved source address 0.0.0.0"
@@ -278,6 +289,46 @@ fn ip_block_selector(
     peer_index: usize,
 ) -> Result<IdentitySelector, NetworkPolicyCompileError> {
     let cidr_text = ip_block.cidr;
+    if let Some(cidr) = parse_ipv6_cidr(&cidr_text) {
+        let mut except = ip_block
+            .except
+            .unwrap_or_default()
+            .into_iter()
+            .map(|except_text| {
+                let except = parse_ipv6_cidr(&except_text).ok_or_else(|| {
+                    NetworkPolicyCompileError::InvalidIpBlockCidr {
+                        rule_index,
+                        peer_index,
+                        cidr: except_text.clone(),
+                    }
+                })?;
+                if !cidr.contains_cidr(&except) {
+                    return Err(NetworkPolicyCompileError::IpBlockExceptOutsideCidr {
+                        rule_index,
+                        peer_index,
+                        cidr: cidr_text.clone(),
+                        except: except_text,
+                    });
+                }
+                Ok(except)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        except.sort();
+        except.dedup();
+        let prefix_count = 1 + except.len();
+        if prefix_count > KUBERNETES_NETWORK_POLICY_MAX_IPV6_IP_BLOCK_PREFIXES {
+            return Err(NetworkPolicyCompileError::Ipv6IpBlockTooManyPrefixes {
+                rule_index,
+                peer_index,
+                prefix_count,
+                limit: KUBERNETES_NETWORK_POLICY_MAX_IPV6_IP_BLOCK_PREFIXES,
+            });
+        }
+        return Ok(IdentitySelector {
+            ipv6_blocks: vec![Ipv6Block { cidr, except }],
+            ..IdentitySelector::default()
+        });
+    }
     let cidr = parse_ipv4_cidr(&cidr_text).ok_or_else(|| {
         NetworkPolicyCompileError::InvalidIpBlockCidr {
             rule_index,
@@ -328,6 +379,24 @@ fn ip_block_selector(
     Ok(IdentitySelector {
         ipv4_blocks: vec![Ipv4Block { cidr, except }],
         ..IdentitySelector::default()
+    })
+}
+
+fn parse_ipv6_cidr(value: &str) -> Option<Ipv6Cidr> {
+    let (address, prefix_len) = value.split_once('/')?;
+    let address: Ipv6Addr = address.parse().ok()?;
+    let prefix_len: u8 = prefix_len.parse().ok()?;
+    if prefix_len > 128 {
+        return None;
+    }
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix_len)
+    };
+    Some(Ipv6Cidr {
+        network: Ipv6Addr::from(u128::from(address) & mask),
+        prefix_len,
     })
 }
 
@@ -552,8 +621,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Endpoint, Flow, Ipv4Endpoint, NamedPort, compile_dataplane_entries,
-        compile_ipv4_dataplane_entries, evaluate,
+        Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort, compile_dataplane_entries,
+        compile_ipv4_dataplane_entries, compile_ipv6_dataplane_entries, evaluate,
     };
 
     fn labels(values: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -636,6 +705,7 @@ mod tests {
                 protocol: Protocol::Tcp,
                 destination_port: 8080,
                 source_ipv4: None,
+                source_ipv6: None,
             },
         );
         assert_eq!(allowed.verdict, Verdict::Allow);
@@ -650,6 +720,7 @@ mod tests {
                 protocol: Protocol::Tcp,
                 destination_port: 9090,
                 source_ipv4: None,
+                source_ipv6: None,
             },
         );
         assert_eq!(denied.verdict, Verdict::Deny);
@@ -671,6 +742,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 8080,
                     source_ipv4: None,
+                    source_ipv6: None,
                 }
             )
             .verdict,
@@ -713,6 +785,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 8085,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .verdict,
@@ -727,6 +800,7 @@ mod tests {
                     protocol: Protocol::Udp,
                     destination_port: 8085,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .verdict,
@@ -742,6 +816,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 9092,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .reason,
@@ -773,6 +848,7 @@ mod tests {
             protocol: Protocol::Tcp,
             destination_port: 8080,
             source_ipv4: None,
+            source_ipv6: None,
         };
         let allowed = evaluate(&policies, allowed_flow);
         assert_eq!(allowed.verdict, Verdict::Allow);
@@ -788,6 +864,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 9090,
                     source_ipv4: None,
+                    source_ipv6: None,
                 }
             )
             .verdict,
@@ -846,6 +923,7 @@ mod tests {
                         protocol: Protocol::Tcp,
                         destination_port: port,
                         source_ipv4: None,
+                        source_ipv6: None,
                     },
                 )
                 .verdict,
@@ -861,6 +939,7 @@ mod tests {
                     protocol: Protocol::Udp,
                     destination_port: 8080,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .verdict,
@@ -958,6 +1037,7 @@ mod tests {
                     protocol: Protocol::Sctp,
                     destination_port: 8086,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .verdict,
@@ -972,6 +1052,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 8086,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .verdict,
@@ -1074,6 +1155,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 8080,
                     source_ipv4: None,
+                    source_ipv6: None,
                 }
             )
             .verdict,
@@ -1090,6 +1172,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 8080,
                     source_ipv4: None,
+                    source_ipv6: None,
                 }
             )
             .verdict,
@@ -1106,6 +1189,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 8080,
                     source_ipv4: None,
+                    source_ipv6: None,
                 }
             )
             .reason,
@@ -1207,6 +1291,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 8080,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .verdict,
@@ -1225,6 +1310,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 8080,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .verdict,
@@ -1256,6 +1342,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 8087,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .verdict
@@ -1375,6 +1462,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 8081,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .verdict,
@@ -1389,6 +1477,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 8082,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .verdict,
@@ -1403,6 +1492,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     destination_port: 9090,
                     source_ipv4: None,
+                    source_ipv6: None,
                 },
             )
             .verdict,
@@ -1457,6 +1547,7 @@ mod tests {
                         protocol: Protocol::Tcp,
                         destination_port: port,
                         source_ipv4: None,
+                        source_ipv6: None,
                     },
                 )
                 .verdict,
@@ -1473,6 +1564,7 @@ mod tests {
                         protocol: Protocol::Tcp,
                         destination_port: port,
                         source_ipv4: None,
+                        source_ipv6: None,
                     },
                 )
                 .verdict,
@@ -1575,6 +1667,7 @@ mod tests {
                         protocol: Protocol::Tcp,
                         destination_port: 8080,
                         source_ipv4: Some(address),
+                        source_ipv6: None,
                     },
                 )
                 .verdict,
@@ -1621,6 +1714,78 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_ip_blocks_lower_prefixes_and_exception_overrides() {
+        let compiled = NetworkPolicyCompiler::compile(
+            PolicyId::new(8),
+            policy(vec![NetworkPolicyIngressRule {
+                from: Some(vec![NetworkPolicyPeer {
+                    ip_block: Some(IPBlock {
+                        cidr: "2001:db8:1::/64".to_owned(),
+                        except: Some(vec!["2001:db8:1:0:8000::/65".to_owned()]),
+                    }),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: Some(vec![NetworkPolicyPort {
+                    protocol: Some("TCP".to_owned()),
+                    port: Some(IntOrString::Int(8080)),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }]),
+        )
+        .expect("IPv6 ipBlock compiles without address expansion");
+        let source = endpoint(1, "frontend", "client");
+        let destination = endpoint(2, "backend", "server");
+        for (address, expected) in [
+            ("2001:db8:1::1", Verdict::Allow),
+            ("2001:db8:1:0:8000::1", Verdict::Deny),
+            ("2001:db8:2::1", Verdict::Deny),
+        ] {
+            assert_eq!(
+                evaluate(
+                    std::slice::from_ref(&compiled),
+                    Flow {
+                        source: &source,
+                        destination: &destination,
+                        protocol: Protocol::Tcp,
+                        destination_port: 8080,
+                        source_ipv4: None,
+                        source_ipv6: Some(address.parse().unwrap()),
+                    },
+                )
+                .verdict,
+                expected
+            );
+        }
+
+        let entries = compile_ipv6_dataplane_entries(
+            &[compiled],
+            &[source.clone(), destination.clone()],
+            &[Ipv6Endpoint {
+                address: "2001:db8:1::1".parse().unwrap(),
+                endpoint: source,
+            }],
+        )
+        .expect("IPv6 ipBlock lowers to bounded prefixes");
+        let decision = |prefix_len, protocol, port| {
+            entries
+                .iter()
+                .find(|entry| {
+                    entry.key.source_prefix_len == prefix_len
+                        && entry.key.destination_identity == destination.identity
+                        && entry.key.protocol == protocol
+                        && entry.key.destination_port == port
+                })
+                .map(|entry| entry.decision.verdict)
+        };
+        assert_eq!(
+            decision(64, Protocol::Tcp as u8, 8080),
+            Some(Verdict::Allow)
+        );
+        assert_eq!(decision(65, Protocol::Tcp as u8, 8080), Some(Verdict::Deny));
+        assert_eq!(decision(0, 0, 0), Some(Verdict::Deny));
+    }
+
+    #[test]
     fn invalid_and_oversized_ip_blocks_fail_explicitly() {
         let policy_with_block = |cidr: &str, except: Option<&str>| {
             policy(vec![NetworkPolicyIngressRule {
@@ -1636,19 +1801,29 @@ mod tests {
         };
         NetworkPolicyCompiler::compile(PolicyId::new(7), policy_with_block("10.0.0.0/22", None))
             .expect("a block at the exact address limit compiles");
+        let too_many_ipv6_exceptions = (0..KUBERNETES_NETWORK_POLICY_MAX_IPV6_IP_BLOCK_PREFIXES)
+            .map(|index| format!("2001:db8::{index:x}/128"))
+            .collect();
+        let oversized_ipv6 = policy(vec![NetworkPolicyIngressRule {
+            from: Some(vec![NetworkPolicyPeer {
+                ip_block: Some(IPBlock {
+                    cidr: "2001:db8::/64".to_owned(),
+                    except: Some(too_many_ipv6_exceptions),
+                }),
+                ..NetworkPolicyPeer::default()
+            }]),
+            ports: None,
+        }]);
+        assert!(matches!(
+            NetworkPolicyCompiler::compile(PolicyId::new(7), oversized_ipv6),
+            Err(NetworkPolicyCompileError::Ipv6IpBlockTooManyPrefixes { .. })
+        ));
         assert!(matches!(
             NetworkPolicyCompiler::compile(
                 PolicyId::new(7),
                 policy_with_block("10.0.0.0/21", None),
             ),
             Err(NetworkPolicyCompileError::IpBlockTooLarge { .. })
-        ));
-        assert!(matches!(
-            NetworkPolicyCompiler::compile(
-                PolicyId::new(7),
-                policy_with_block("2001:db8::/120", None),
-            ),
-            Err(NetworkPolicyCompileError::InvalidIpBlockCidr { .. })
         ));
         assert!(matches!(
             NetworkPolicyCompiler::compile(

@@ -4,12 +4,14 @@
 use aya_ebpf::bindings::{TC_ACT_PIPE, TC_ACT_SHOT};
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::{classifier, map};
-use aya_ebpf::maps::{Array, HashMap, PerCpuArray, RingBuf};
+use aya_ebpf::maps::lpm_trie::Key as LpmKey;
+use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, RingBuf};
 use aya_ebpf::programs::TcContext;
 use unf_common::{IdentityId, PolicyId, PolicyReason, RuleId, Verdict};
 use unf_ebpf_common::{
     AddressFamily, Direction, FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_MAP_ABI_VERSION,
-    IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, Ipv6IdentityKey, POLICY_BANK_COUNT,
+    IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, Ipv6IdentityKey, Ipv6PolicyMapData,
+    POLICY_BANK_COUNT,
     POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode,
@@ -48,6 +50,11 @@ static POLICY_RULES: HashMap<PolicyMapKey, PolicyMapValue> =
 #[map]
 static POLICY_IPV4: HashMap<Ipv4PolicyMapKey, PolicyMapValue> =
     HashMap::with_max_entries(262_144, BPF_F_NO_PREALLOC);
+
+/// Prefix-based IPv6 compatibility decisions share the dual-bank revision.
+#[map]
+static POLICY_IPV6: LpmTrie<Ipv6PolicyMapData, PolicyMapValue> =
+    LpmTrie::with_max_entries(262_144, 0);
 
 #[map]
 static POLICY_CONFIG: Array<PolicyMapConfig> = Array::with_max_entries(1, 0);
@@ -131,6 +138,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction) -> i32 {
         lookup_identity_v4(source_ipv4),
         lookup_identity_v4(destination_ipv4),
         Some(source_ipv4),
+        None,
     )
 }
 
@@ -173,6 +181,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction) -> i32 {
         lookup_identity_v6(source_address),
         lookup_identity_v6(destination_address),
         None,
+        Some(source_address),
     )
 }
 
@@ -194,6 +203,7 @@ fn emit_flow(
     source_identity: IdentityId,
     destination_identity: IdentityId,
     source_ipv4: Option<[u8; 4]>,
+    source_ipv6: Option<[u8; 16]>,
 ) -> i32 {
     if let Some(counter) = FLOW_COUNTERS.get_ptr_mut(0) {
         // SAFETY: get_ptr_mut returned a non-null pointer to the current CPU's
@@ -209,6 +219,7 @@ fn emit_flow(
     let timestamp_ns = unsafe { bpf_ktime_get_ns() };
     let decision = lookup_policy(
         source_ipv4,
+        source_ipv6,
         source_identity,
         destination_identity,
         destination_port,
@@ -288,6 +299,7 @@ impl DataplaneDecision {
 #[inline(always)]
 fn lookup_policy(
     source_ipv4: Option<[u8; 4]>,
+    source_ipv6: Option<[u8; 16]>,
     source_identity: IdentityId,
     destination_identity: IdentityId,
     destination_port: [u8; 2],
@@ -361,6 +373,35 @@ fn lookup_policy(
             return decode_policy_value(value, config.revision);
         }
     }
+    if let Some(source_ipv6) = source_ipv6 {
+        let exact = Ipv6PolicyMapData {
+            destination_identity,
+            destination_port,
+            protocol,
+            bank: config.active_bank,
+            source_address: source_ipv6,
+        };
+        let protocol_fallback = Ipv6PolicyMapData {
+            destination_identity,
+            destination_port: [0; 2],
+            protocol,
+            bank: config.active_bank,
+            source_address: source_ipv6,
+        };
+        let global_fallback = Ipv6PolicyMapData {
+            destination_identity,
+            destination_port: [0; 2],
+            protocol: 0,
+            bank: config.active_bank,
+            source_address: source_ipv6,
+        };
+        if let Some(value) = lookup_ipv6_policy_value(&exact, config.revision)
+            .or_else(|| lookup_ipv6_policy_value(&protocol_fallback, config.revision))
+            .or_else(|| lookup_ipv6_policy_value(&global_fallback, config.revision))
+        {
+            return decode_policy_value(value, config.revision);
+        }
+    }
     if source_identity.get() == 0 {
         return DataplaneDecision::observed(ReasonCode::IdentityUnknown);
     }
@@ -401,6 +442,17 @@ fn lookup_ipv4_policy_value(key: &Ipv4PolicyMapKey, revision: u64) -> Option<Pol
     // and the reference is copied immediately without escaping this lookup.
     #[allow(unsafe_code)]
     let value = unsafe { POLICY_IPV4.get(key).copied() }?;
+    if value.schema_version == POLICY_MAP_ABI_VERSION && value.revision == revision {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn lookup_ipv6_policy_value(key: &Ipv6PolicyMapData, revision: u64) -> Option<PolicyMapValue> {
+    let lookup = LpmKey::new(192, *key);
+    let value = POLICY_IPV6.get(&lookup).copied()?;
     if value.schema_version == POLICY_MAP_ABI_VERSION && value.revision == revision {
         Some(value)
     } else {

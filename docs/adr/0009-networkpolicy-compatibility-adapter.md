@@ -36,12 +36,13 @@ source/destination port positions as the other supported transports. A range may
 span at most 1,024 ports, and the shared compiler refuses more than 131,072
 entries in either transactional bank;
 the agent validates that bank limit again before staging a snapshot. It returns
-typed errors for egress, IP blocks wider than 1,024 IPv4 addresses,
-IPv6/reserved-address blocks, out-of-block exceptions, oversized/reversed port
+typed errors for egress, IP blocks wider than 1,024 IPv4 addresses, IPv6 blocks
+with more than 1,024 CIDR boundaries, reserved IPv4 blocks, out-of-block exceptions, oversized/reversed port
 ranges, named ports combined with `endPort`, and malformed metadata/ports or
 selector requirements. Bounded
 IPv4 `ipBlock` peers, including `except`, remain in IR and expand into
 exact-source keys plus an external-source fallback in a separate dual-bank map.
+ADR 0014 extends the same IR with bounded IPv6 prefix boundaries and LPM lowering.
 
 Kubernetes API defaults are resolved at the compatibility boundary. An omitted
 `spec.podSelector` is the empty selector and therefore selects every Pod in the

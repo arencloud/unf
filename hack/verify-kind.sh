@@ -953,15 +953,66 @@ fi
 network_policy_mutated=false
 
 "${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
-    -p "[{\"op\":\"replace\",\"path\":\"/spec/ingress/0/from\",\"value\":[{\"ipBlock\":{\"cidr\":\"${client_ip}/32\"}}]}]" \
+    -p '[{"op":"replace","path":"/spec/ingress/0/from","value":[{"ipBlock":{"cidr":"::/0"}}]}]' \
     >/dev/null
 network_policy_peer_mutated=true
 if ! wait_for_controller_policy_counts 1 0 "${restored_policy_revision}"; then
+    echo "controller did not compile the IPv6 NetworkPolicy ipBlock" >&2
+    exit 1
+fi
+ipv6_ipblock_allow_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${restored_policy_revision}"; then
+    echo "agents did not atomically activate the IPv6 NetworkPolicy ipBlock" >&2
+    exit 1
+fi
+ipv6_ipblock_allow_response=$("${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- "http://[${network_policy_server_ipv6}]:8081")
+if [[ ${ipv6_ipblock_allow_response} != "unf-networkpolicy-ok" ]]; then
+    echo "IPv6 NetworkPolicy ipBlock did not allow its exact source" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p "[{\"op\":\"replace\",\"path\":\"/spec/ingress/0/from/0/ipBlock\",\"value\":{\"cidr\":\"::/0\",\"except\":[\"${client_ipv6}/128\"]}}]" \
+    >/dev/null
+if ! wait_for_controller_policy_counts 1 0 "${ipv6_ipblock_allow_revision}"; then
+    echo "controller did not compile the IPv6 NetworkPolicy ipBlock exception" >&2
+    exit 1
+fi
+ipv6_ipblock_except_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${ipv6_ipblock_allow_revision}"; then
+    echo "agents did not activate the IPv6 NetworkPolicy ipBlock exception" >&2
+    exit 1
+fi
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- "http://[${network_policy_server_ipv6}]:8081" >/dev/null 2>&1; then
+    echo "IPv6 NetworkPolicy ipBlock exception did not exclude its source" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p '[{"op":"replace","path":"/spec/ingress/0/from/0/ipBlock","value":{"cidr":"::/0"}}]' \
+    >/dev/null
+if ! wait_for_controller_policy_counts 1 0 "${ipv6_ipblock_except_revision}"; then
+    echo "controller did not restore the IPv6 NetworkPolicy ipBlock" >&2
+    exit 1
+fi
+ipv6_ipblock_restored_revision=${controller_state_revision}
+if ! wait_for_policy_transition "${ipv6_ipblock_except_revision}"; then
+    echo "agents did not restore the IPv6 NetworkPolicy ipBlock allow" >&2
+    exit 1
+fi
+
+"${kc[@]}" patch networkpolicy -n backend frontend-to-np-server --type=json \
+    -p "[{\"op\":\"replace\",\"path\":\"/spec/ingress/0/from\",\"value\":[{\"ipBlock\":{\"cidr\":\"${client_ip}/32\"}}]}]" \
+    >/dev/null
+network_policy_peer_mutated=true
+if ! wait_for_controller_policy_counts 1 0 "${ipv6_ipblock_restored_revision}"; then
     echo "controller did not compile the bounded NetworkPolicy ipBlock" >&2
     exit 1
 fi
 ipblock_allow_revision=${controller_state_revision}
-if ! wait_for_policy_transition "${restored_policy_revision}"; then
+if ! wait_for_policy_transition "${ipv6_ipblock_restored_revision}"; then
     echo "agents did not atomically activate the bounded NetworkPolicy ipBlock" >&2
     exit 1
 fi
@@ -1330,4 +1381,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges and IPv4 ipBlocks, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

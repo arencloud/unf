@@ -24,7 +24,8 @@ NetworkPolicies have identical semantics across IP families.
 
 IPv6 extension headers, including Fragment headers, return `TC_ACT_PIPE` without
 policy evaluation or an event. `POLICY_IPV4` remains IPv4-only; IPv6 `ipBlock`
-and external prefix policy are explicitly unsupported. Flow export schema v2
+and external prefix policy were explicitly outside this slice and were added
+later by ADR 0014. Flow export schema v2
 requires one complete IPv4 or IPv6 address pair, and topology schema v3 publishes
 both families for workload inspection.
 
