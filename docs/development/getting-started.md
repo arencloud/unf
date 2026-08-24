@@ -106,7 +106,8 @@ a protocol-only SCTP rule to activate 9093, removal to restore the drop, and the
 allowed protocol-132 flow to carry revisioned provenance into bounded history.
 The disposable `deploy/examples/networkpolicy-upstream-ingress.yaml` matrix then
 checks default isolation, same-Namespace PodSelector scope, an empty
-NamespaceSelector, selector AND, peer OR, Pod/Namespace `matchExpressions`,
+NamespaceSelector, exact Namespace-name selection, Namespace `NotIn` exclusion,
+selector AND, peer OR, Pod/Namespace `matchExpressions`,
 multiple ingress-rule source/port pairing, source-label deny/recovery,
 destination Pod-label isolation/recovery, stacked additive policies, and
 temporary allow-all precedence across three source contexts and two ports. Its

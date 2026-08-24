@@ -329,6 +329,30 @@ expect_deny "${source_a_namespace}" client 8088
 
 previous_revision=${policy_revision}
 "${kc[@]}" patch networkpolicy -n "${target_namespace}" ingress-matrix --type=merge \
+    -p '{"spec":{"ingress":[{"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"unf-np-source-a"}}}],"ports":[{"protocol":"TCP","port":8087}]}]}}' \
+    >/dev/null
+require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
+    "${previous_revision}" "exact Namespace name selector policy did not converge"
+expect_allow "${source_a_namespace}" client 8087
+expect_deny "${source_b_namespace}" client 8087
+expect_deny "${target_namespace}" same-client 8087
+expect_explanation "${source_a_namespace}/client" 8087 Allow ExplicitRule
+expect_explanation "${source_b_namespace}/client" 8087 Deny DefaultAction
+
+previous_revision=${policy_revision}
+"${kc[@]}" patch networkpolicy -n "${target_namespace}" ingress-matrix --type=merge \
+    -p '{"spec":{"ingress":[{"from":[{"namespaceSelector":{"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"NotIn","values":["unf-np-target","unf-np-source-b"]}]}}],"ports":[{"protocol":"TCP","port":8087}]}]}}' \
+    >/dev/null
+require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
+    "${previous_revision}" "Namespace NotIn selector policy did not converge"
+expect_allow "${source_a_namespace}" client 8087
+expect_deny "${source_b_namespace}" client 8087
+expect_deny "${target_namespace}" same-client 8087
+expect_explanation "${source_a_namespace}/client" 8087 Allow ExplicitRule
+expect_explanation "${source_b_namespace}/client" 8087 Deny DefaultAction
+
+previous_revision=${policy_revision}
+"${kc[@]}" patch networkpolicy -n "${target_namespace}" ingress-matrix --type=merge \
     -p '{"spec":{"ingress":[{"from":[{"namespaceSelector":{"matchLabels":{"conformance-group":"a"}},"podSelector":{"matchLabels":{"conformance-source":"selected"}}}],"ports":[{"protocol":"TCP","port":8087}]}]}}' \
     >/dev/null
 require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
@@ -587,4 +611,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned ingress conformance passed: exact/protocol-only UDP isolation, destination-specific named ports, target Pod label isolation/recovery, default deny, same-namespace PodSelector, empty NamespaceSelector, selector AND, peer OR, matchExpressions with label recovery, multiple ingress rules, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned ingress conformance passed: exact/protocol-only UDP isolation, destination-specific named ports, target Pod label isolation/recovery, default deny, same-namespace PodSelector, empty/exact-name/NotIn NamespaceSelector, selector AND, peer OR, matchExpressions with label recovery, multiple ingress rules, stacked additive policies, and allow-all precedence"

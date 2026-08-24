@@ -54,8 +54,9 @@ matrix and reproducible evidence.
   egress-omitted objects, default TCP ports, and non-selected Pod behavior, plus
   rejection/deletion recovery; IPv4 SCTP parsing/enforcement, live explanation,
   revisioned provenance, and historical export; an upstream-aligned live ingress
-  matrix for default deny, same/all-Namespace peers, selector AND, peer OR,
-  Pod/Namespace `matchExpressions`, multiple ingress-rule source/port pairing,
+  matrix for default deny, same/all/exact-Namespace peers, Namespace `NotIn`
+  exclusion, selector AND, peer OR, Pod/Namespace `matchExpressions`,
+  multiple ingress-rule source/port pairing,
   exact/protocol-only UDP isolation, destination-specific named ports,
   destination selection lifecycle, source-label recovery, stacked additive
   policies, and allow-all precedence/recovery;

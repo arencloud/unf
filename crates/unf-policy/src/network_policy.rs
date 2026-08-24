@@ -1362,6 +1362,58 @@ mod tests {
     }
 
     #[test]
+    fn namespace_name_selectors_support_exact_and_not_in_matching() {
+        let same_namespace = endpoint(1, "backend", "same-client");
+        let source_a = endpoint(2, "source-a", "client");
+        let source_b = endpoint(3, "source-b", "client");
+        let destination = endpoint(4, "backend", "server");
+        let verdict = |compiled: &PolicyIr, source: &Endpoint| {
+            evaluate(
+                std::slice::from_ref(compiled),
+                Flow {
+                    source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8087,
+                    source_ipv4: None,
+                    source_ipv6: None,
+                },
+            )
+            .verdict
+        };
+        let compile = |selector| {
+            NetworkPolicyCompiler::compile(
+                PolicyId::new(15),
+                policy(vec![NetworkPolicyIngressRule {
+                    from: Some(vec![NetworkPolicyPeer {
+                        namespace_selector: Some(selector),
+                        ..NetworkPolicyPeer::default()
+                    }]),
+                    ports: None,
+                }]),
+            )
+            .expect("Namespace selector compiles")
+        };
+
+        let exact_namespace = compile(selector(&[(NAMESPACE_NAME_LABEL, "source-a")]));
+        assert_eq!(verdict(&exact_namespace, &source_a), Verdict::Allow);
+        assert_eq!(verdict(&exact_namespace, &source_b), Verdict::Deny);
+        assert_eq!(verdict(&exact_namespace, &same_namespace), Verdict::Deny);
+
+        let namespace_not_in = compile(LabelSelector {
+            match_expressions: Some(vec![expression(
+                NAMESPACE_NAME_LABEL,
+                "NotIn",
+                &["backend", "source-b"],
+            )]),
+            ..LabelSelector::default()
+        });
+        assert_eq!(verdict(&namespace_not_in, &source_a), Verdict::Allow);
+        assert_eq!(verdict(&namespace_not_in, &source_b), Verdict::Deny);
+        assert_eq!(verdict(&namespace_not_in, &same_namespace), Verdict::Deny);
+    }
+
+    #[test]
     fn upstream_peer_matrix_preserves_namespace_scope_and_boolean_semantics() {
         let mut same_namespace = endpoint(1, "backend", "same-client");
         same_namespace.labels.extend(labels(&[("source", "same")]));
