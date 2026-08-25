@@ -49,6 +49,7 @@ const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
 const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v2";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
+const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const CURRENT_BPF_ABI_VERSION: u16 = 2;
 const ABI_V1_MAP_NAMES: [&str; 6] = [
     "IDENTITY_V4",
@@ -91,6 +92,12 @@ struct Args {
     direction: Direction,
     #[arg(long, env = "UNF_CONTROLLER_URL")]
     controller_url: Option<String>,
+    #[arg(
+        long,
+        env = "UNF_CONTROLLER_CA_PATH",
+        default_value = DEFAULT_CONTROLLER_CA_PATH
+    )]
+    controller_ca_path: PathBuf,
     #[arg(long, env = "UNF_IDENTITY_SYNC_SECONDS", default_value_t = 2)]
     identity_sync_seconds: u64,
     #[arg(long, env = "UNF_NODE_NAME", default_value = "unknown")]
@@ -184,6 +191,7 @@ enum TcAttachmentPreference {
 
 struct AgentMetrics {
     flow_events: Counter,
+    management_flow_events_filtered: Counter,
     invalid_events: Counter,
     bpf_loaded: Gauge,
     identity_sync_errors: Counter,
@@ -239,7 +247,9 @@ struct IdentitySynchronizer {
     active_bank: u8,
     applied_epoch: u64,
     controller_url: Option<String>,
+    controller_management_port: Option<u16>,
     client: reqwest::Client,
+    agent_token_path: PathBuf,
     interval: Duration,
 }
 
@@ -255,6 +265,7 @@ struct PolicySynchronizer {
     applied_epoch: u64,
     controller_url: Option<String>,
     client: reqwest::Client,
+    agent_token_path: PathBuf,
     interval: Duration,
 }
 
@@ -283,12 +294,21 @@ struct DataplaneConfig {
     all_interfaces: bool,
     direction: Direction,
     controller_url: Option<String>,
+    controller_ca_path: PathBuf,
     identity_sync_interval: Duration,
     node_name: String,
     agent_token_path: PathBuf,
     flow_export_interval: Duration,
     bpf_pin_path: PathBuf,
     tc_attachment_preference: TcAttachmentPreference,
+}
+
+struct FlowExporterConfig {
+    controller_url: String,
+    client: reqwest::Client,
+    node_name: String,
+    token_path: PathBuf,
+    interval: Duration,
 }
 
 struct RecoveredDataplane {
@@ -416,6 +436,7 @@ async fn main() -> Result<()> {
             let interface = interface.clone();
             let direction = args.direction;
             let controller_url = args.controller_url.clone();
+            let controller_ca_path = args.controller_ca_path.clone();
             let identity_sync_interval = Duration::from_secs(args.identity_sync_seconds.max(1));
             let node_name = args.node_name.clone();
             let agent_token_path = args.agent_token_path.clone();
@@ -429,6 +450,7 @@ async fn main() -> Result<()> {
                     all_interfaces,
                     direction,
                     controller_url,
+                    controller_ca_path,
                     identity_sync_interval,
                     node_name,
                     agent_token_path,
@@ -776,6 +798,7 @@ fn new_state(
 ) -> AgentState {
     let metrics = AgentMetrics {
         flow_events: Counter::default(),
+        management_flow_events_filtered: Counter::default(),
         invalid_events: Counter::default(),
         bpf_loaded: Gauge::default(),
         identity_sync_errors: Counter::default(),
@@ -829,6 +852,11 @@ fn register_agent_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         "unf_flow",
         "Flow events consumed from the eBPF ring buffer",
         metrics.flow_events.clone(),
+    );
+    registry.register(
+        "unf_management_flow_events_filtered",
+        "Controller management flow events excluded from logs and telemetry",
+        metrics.management_flow_events_filtered.clone(),
     );
     registry.register(
         "unf_telemetry_invalid_events",
@@ -925,10 +953,18 @@ async fn run_dataplane(
         .controller_url
         .as_deref()
         .map(|url| url.trim_end_matches('/').to_owned());
+    let controller_client = match controller_url.as_deref() {
+        Some(url) => build_controller_client(url, &config.controller_ca_path)?,
+        None => reqwest::Client::new(),
+    };
+    let controller_management_port = controller_url.as_deref().map(controller_port).transpose()?;
     let (mut identities, mut policies) = new_synchronizers(
         identity_maps,
         (policy_map, ipv4_policy_map, ipv6_policy_map, policy_config),
         controller_url.clone(),
+        controller_management_port,
+        controller_client.clone(),
+        config.agent_token_path.clone(),
         config.identity_sync_interval,
     );
     let recovered = recover_persistent_dataplane(&mut identities, &mut policies, pins_existed)?;
@@ -964,10 +1000,20 @@ async fn run_dataplane(
     } else if controller_url.is_some() {
         info!("waiting for initial identity and policy snapshots before becoming ready");
     }
-    let (flow_export_sender, flow_export_task) =
-        spawn_flow_exporter(controller_url.clone(), &config, &state, &cancellation);
-    let status_report_task =
-        spawn_agent_status_reporter(controller_url, &config, &state, &cancellation);
+    let (flow_export_sender, flow_export_task) = spawn_flow_exporter(
+        controller_url.clone(),
+        controller_client.clone(),
+        &config,
+        &state,
+        &cancellation,
+    );
+    let status_report_task = spawn_agent_status_reporter(
+        controller_url,
+        controller_client,
+        &config,
+        &state,
+        &cancellation,
+    );
     consume_events(
         ring,
         &mut attachments,
@@ -1047,6 +1093,9 @@ fn new_synchronizers(
     identity_maps: IdentityMaps,
     policy_maps: PolicyMaps,
     controller_url: Option<String>,
+    controller_management_port: Option<u16>,
+    client: reqwest::Client,
+    agent_token_path: PathBuf,
     interval: Duration,
 ) -> (IdentitySynchronizer, PolicySynchronizer) {
     let (ipv4_maps, ipv6_maps, identity_config) = identity_maps;
@@ -1061,7 +1110,9 @@ fn new_synchronizers(
             active_bank: 0,
             applied_epoch: 0,
             controller_url: controller_url.clone(),
-            client: reqwest::Client::new(),
+            controller_management_port,
+            client: client.clone(),
+            agent_token_path: agent_token_path.clone(),
             interval,
         },
         PolicySynchronizer {
@@ -1075,10 +1126,52 @@ fn new_synchronizers(
             active_bank: 0,
             applied_epoch: 0,
             controller_url,
-            client: reqwest::Client::new(),
+            client,
+            agent_token_path,
             interval,
         },
     )
+}
+
+fn build_controller_client(controller_url: &str, ca_path: &Path) -> Result<reqwest::Client> {
+    if !controller_url.starts_with("https://") {
+        bail!("controller URL must use https:// when the dataplane is connected");
+    }
+    let ca_pem = fs::read(ca_path)
+        .with_context(|| format!("read controller CA certificate {}", ca_path.display()))?;
+    let ca = reqwest::Certificate::from_pem(&ca_pem)
+        .with_context(|| format!("parse controller CA certificate {}", ca_path.display()))?;
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .https_only(true)
+        .tls_certs_only([ca])
+        .build()
+        .context("construct CA-pinned controller HTTPS client")
+}
+
+fn controller_port(controller_url: &str) -> Result<u16> {
+    reqwest::Url::parse(controller_url)
+        .context("parse controller URL")?
+        .port_or_known_default()
+        .context("controller URL has no known port")
+}
+
+fn read_agent_token(path: &Path) -> Result<String> {
+    let token = fs::read_to_string(path)
+        .with_context(|| format!("read agent authentication token {}", path.display()))?;
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("agent authentication token is empty");
+    }
+    Ok(token.to_owned())
+}
+
+fn authenticated_get(
+    client: &reqwest::Client,
+    url: String,
+    token_path: &Path,
+) -> Result<reqwest::RequestBuilder> {
+    Ok(client.get(url).bearer_auth(read_agent_token(token_path)?))
 }
 
 async fn await_background_task(task: Option<tokio::task::JoinHandle<()>>, name: &'static str) {
@@ -1513,6 +1606,7 @@ fn take_identity_maps(ebpf: &mut Ebpf) -> Result<IdentityMaps> {
 
 fn spawn_flow_exporter(
     controller_url: Option<String>,
+    client: reqwest::Client,
     config: &DataplaneConfig,
     state: &Arc<AgentState>,
     cancellation: &CancellationToken,
@@ -1527,23 +1621,24 @@ fn spawn_flow_exporter(
     let exporter_state = Arc::clone(state);
     let exporter_cancel = cancellation.clone();
     let node_name = config.node_name.clone();
+    let token_path = config.agent_token_path.clone();
     let interval = config.flow_export_interval;
     let task = tokio::spawn(async move {
-        export_flow_batches(
+        let exporter = FlowExporterConfig {
             controller_url,
+            client,
             node_name,
-            receiver,
-            exporter_state,
-            exporter_cancel,
+            token_path,
             interval,
-        )
-        .await;
+        };
+        export_flow_batches(exporter, receiver, exporter_state, exporter_cancel).await;
     });
     (Some(sender), Some(task))
 }
 
 fn spawn_agent_status_reporter(
     controller_url: Option<String>,
+    client: reqwest::Client,
     config: &DataplaneConfig,
     state: &Arc<AgentState>,
     cancellation: &CancellationToken,
@@ -1556,6 +1651,7 @@ fn spawn_agent_status_reporter(
     Some(tokio::spawn(async move {
         report_agent_status(
             controller_url,
+            client,
             token_path,
             reporter_state,
             reporter_cancel,
@@ -1636,6 +1732,12 @@ async fn consume_events(
                         state.metrics.invalid_events.inc();
                         continue;
                     };
+                    if identities.controller_management_port
+                        .is_some_and(|port| is_controller_management_flow(&event, port))
+                    {
+                        state.metrics.management_flow_events_filtered.inc();
+                        continue;
+                    }
                     state.metrics.flow_events.inc();
                     state.observed_flows.fetch_add(1, Ordering::Relaxed);
                     if let Some(sender) = flow_export_sender
@@ -1669,6 +1771,12 @@ async fn consume_events(
             }
         }
     }
+}
+
+fn is_controller_management_flow(event: &FlowEvent, port: u16) -> bool {
+    event.flow.protocol == 6
+        && (u16::from_be_bytes(event.flow.source_port) == port
+            || u16::from_be_bytes(event.flow.destination_port) == port)
 }
 
 fn refresh_controller_readiness(state: &AgentState) {
@@ -1756,25 +1864,12 @@ const fn verdict_from_u8(verdict: u8) -> Option<Verdict> {
 }
 
 async fn export_flow_batches(
-    controller_url: String,
-    node_name: String,
+    config: FlowExporterConfig,
     mut receiver: mpsc::Receiver<FlowExportRecord>,
     state: Arc<AgentState>,
     cancellation: CancellationToken,
-    export_interval: Duration,
 ) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            state.metrics.telemetry_export_errors.inc();
-            error!(%error, "could not construct flow telemetry HTTP client");
-            return;
-        }
-    };
-    let mut interval = tokio::time::interval(export_interval);
+    let mut interval = tokio::time::interval(config.interval);
     let mut pending = BTreeMap::new();
     let mut last_reported_drops = 0_u64;
     loop {
@@ -1806,12 +1901,21 @@ async fn export_flow_batches(
                     .collect();
                 let batch = FlowExportBatch {
                     schema_version: FLOW_EXPORT_SCHEMA_VERSION,
-                    node_name: node_name.clone(),
+                    node_name: config.node_name.clone(),
                     dropped_events,
                     entries: entries.clone(),
                 };
-                let result = client
-                    .post(format!("{controller_url}/v1/telemetry/flows"))
+                let token = match read_agent_token(&config.token_path) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        state.metrics.telemetry_export_errors.inc();
+                        warn!(%error, "could not load flow telemetry authentication token");
+                        continue;
+                    }
+                };
+                let result = config.client
+                    .post(format!("{}/v1/telemetry/flows", config.controller_url))
+                    .bearer_auth(token)
                     .json(&batch)
                     .send()
                     .await
@@ -1841,33 +1945,20 @@ async fn export_flow_batches(
 
 async fn report_agent_status(
     controller_url: String,
+    client: reqwest::Client,
     token_path: PathBuf,
     state: Arc<AgentState>,
     cancellation: CancellationToken,
     report_interval: Duration,
 ) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            error!(%error, "could not construct agent status HTTP client");
-            return;
-        }
-    };
     let mut interval = tokio::time::interval(report_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
             _ = interval.tick() => {
-                let token = match fs::read_to_string(&token_path) {
-                    Ok(token) if !token.trim().is_empty() => token,
-                    Ok(_) => {
-                        warn!(path = %token_path.display(), "agent authentication token is empty");
-                        continue;
-                    }
+                let token = match read_agent_token(&token_path) {
+                    Ok(token) => token,
                     Err(error) => {
                         warn!(%error, path = %token_path.display(), "could not read agent authentication token");
                         continue;
@@ -1875,7 +1966,7 @@ async fn report_agent_status(
                 };
                 let result = client
                     .post(format!("{controller_url}/v1/state/agents"))
-                    .bearer_auth(token.trim())
+                    .bearer_auth(token)
                     .json(&agent_state_report(&state))
                     .send()
                     .await
@@ -1937,21 +2028,7 @@ async fn synchronize_identities(
     synchronizer: &mut IdentitySynchronizer,
     state: &AgentState,
 ) -> Result<()> {
-    let controller_url = synchronizer
-        .controller_url
-        .as_deref()
-        .context("identity synchronization requires a controller URL")?;
-    let snapshot: IdentityStateSnapshot = synchronizer
-        .client
-        .get(format!("{controller_url}/v1/state/identities"))
-        .send()
-        .await
-        .context("request controller identity snapshot")?
-        .error_for_status()
-        .context("controller rejected identity snapshot request")?
-        .json()
-        .await
-        .context("decode controller identity snapshot")?;
+    let snapshot = request_identity_snapshot(synchronizer).await?;
     if snapshot.schema_version != IDENTITY_SNAPSHOT_SCHEMA_VERSION {
         bail!(
             "unsupported identity snapshot schema {}; expected {}",
@@ -2037,6 +2114,28 @@ async fn synchronize_identities(
         "identity snapshot applied"
     );
     Ok(())
+}
+
+async fn request_identity_snapshot(
+    synchronizer: &IdentitySynchronizer,
+) -> Result<IdentityStateSnapshot> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("identity synchronization requires a controller URL")?;
+    authenticated_get(
+        &synchronizer.client,
+        format!("{controller_url}/v1/state/identities"),
+        &synchronizer.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request controller identity snapshot")?
+    .error_for_status()
+    .context("controller rejected identity snapshot request")?
+    .json()
+    .await
+    .context("decode controller identity snapshot")
 }
 
 fn identity_entry_count(synchronizer: &IdentitySynchronizer) -> u64 {
@@ -2318,17 +2417,19 @@ async fn synchronize_policies(
         .controller_url
         .as_deref()
         .context("policy synchronization requires a controller URL")?;
-    let snapshot: PolicyStateSnapshot = synchronizer
-        .client
-        .get(format!("{controller_url}/v1/state/policies"))
-        .send()
-        .await
-        .context("request controller policy snapshot")?
-        .error_for_status()
-        .context("controller rejected policy snapshot request")?
-        .json()
-        .await
-        .context("decode controller policy snapshot")?;
+    let snapshot: PolicyStateSnapshot = authenticated_get(
+        &synchronizer.client,
+        format!("{controller_url}/v1/state/policies"),
+        &synchronizer.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request controller policy snapshot")?
+    .error_for_status()
+    .context("controller rejected policy snapshot request")?
+    .json()
+    .await
+    .context("decode controller policy snapshot")?;
     if snapshot.schema_version != POLICY_SNAPSHOT_SCHEMA_VERSION {
         bail!(
             "unsupported policy snapshot schema {}; expected {}",
@@ -3673,6 +3774,10 @@ mod tests {
             record.shadow.expect("shadow decision exists").verdict,
             Verdict::Deny
         );
+        assert!(!is_controller_management_flow(&event, 9964));
+        event.flow.destination_port = 9964_u16.to_be_bytes();
+        assert!(is_controller_management_flow(&event, 9964));
+        event.flow.destination_port = 8080_u16.to_be_bytes();
 
         let source_ipv6: Ipv6Addr = "fd00:10:42::1".parse().unwrap();
         let destination_ipv6: Ipv6Addr = "fd00:10:42:1::2".parse().unwrap();
@@ -3683,6 +3788,16 @@ mod tests {
         assert_eq!(ipv6_record.key.source_ipv4, None);
         assert_eq!(ipv6_record.key.source_ipv6, Some(source_ipv6));
         assert_eq!(ipv6_record.key.destination_ipv6, Some(destination_ipv6));
+    }
+
+    #[test]
+    fn controller_management_port_uses_the_https_url_contract() {
+        assert_eq!(
+            controller_port("https://controller.example:9964").unwrap(),
+            9964
+        );
+        assert_eq!(controller_port("https://controller.example").unwrap(), 443);
+        assert!(controller_port("not a URL").is_err());
     }
 
     #[test]

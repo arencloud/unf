@@ -77,9 +77,9 @@ proves the legacy filter alone survives offline-controller agent replacement,
 then restores TCX before scoped legacy cleanup. A separate dry-run-first cleanup
 command recognizes only the v1/v2 map names, numeric UNF TCX link-pin names, and
 UNF legacy program names. It refuses unknown ABI content and requires explicit
-confirmation for current v2 removal. Acknowledgement authentication uses the
-Pod-bound TokenReview design in ADR 0023; durable report retention and encrypted
-internal transport remain hardening work.
+confirmation for current v2 removal. ADRs 0023 and 0024 place snapshots,
+acknowledgements, and telemetry behind dedicated TLS plus Pod-bound TokenReview;
+durable report retention and automated certificate rotation remain hardening work.
 
 Isolated live-kernel probes verify that partial pin sets,
 invalid active config, and corrupt inactive-stage debris are rejected before
@@ -87,8 +87,8 @@ adoption without mutating the primary pin set. A separate live pressure probe
 fills only the inactive identity-keyed policy bank, proves a staging insertion
 failure cannot advance applied state or alter active traffic, and verifies retry
 after scoped cleanup. Permanent startup validation failures terminate for
-orchestrator retry. See ADRs 0016 through 0023.
+orchestrator retry. See ADRs 0016 through 0024.
 
-Kubernetes watches remain the controller input. Internal HTTP snapshots are the
+Kubernetes watches remain the controller input. Internal HTTPS snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured
-scale, streaming, or transport-security requirements justify it.
+scale or streaming requirements justify it.

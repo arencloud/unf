@@ -50,6 +50,7 @@ completed by Phase 1's observation-only shadow evaluation.
 | TC attachment handoff | Each agent exposed direction-specific pins below `/sys/fs/bpf/unf/v2/links`; the replacement agent atomically updated existing TCX links and reported `tcx_pinned`. A second gate selected `legacy_netlink`, confirmed reserved priority 21838/handle `0x554e0001` filters, removed all UNF ingress TCX pins, and required uninterrupted deny enforcement plus `replaced=true` across offline-controller replacement. It restored TCX pins before removing the reserved legacy filters |
 | Scoped host-state cleanup | The deployed agent refused current v2 removal without confirmation and rejected unknown content injected into recognized v1 state without removing six known pins. Its dry run preserved those pins; execution removed v1 on both nodes while all nine v2 maps remained. After TCX restoration, the legacy gate proved another dry run preserved the reserved filters before the command removed only UNF-named ingress filters |
 | Agent acknowledgement authentication | Both agents converged with schema v2 Pod name/UID reports and dedicated-audience projected tokens accepted through Kubernetes TokenReview. The live gate rejected missing and invalid credentials with 401, accepted the real Pod token with 204, rejected the same valid token carrying a forged Node claim with 403, and required three authentication failures to be accounted without creating an unexpected agent |
+| Internal transport security | Agent-only routes were absent from public HTTP, the dedicated HTTPS port rejected the development CA when it was not explicitly trusted, and the real CA plus projected Pod token read a snapshot and submitted an acknowledgement. Both agents converged and exported retained flow history through the same CA-pinned, TokenReview-authenticated transport; management-port filtering prevented recursive telemetry from displacing workload provenance |
 | Persistent-state fault rejection | A short-lived bpffs helper built isolated map sets for eight-of-nine pins, malformed `POLICY_CONFIG`, and corrupt inactive-bank `POLICY_RULES` debris. The exact deployed agent exited nonzero with each expected cause, the primary pins were untouched, established allow/deny traffic remained correct, and the later offline replacement still recovered |
 | Physical map-pressure rollback | The helper filled the shared real `POLICY_RULES` map to its 262,144-entry physical limit with reserved synthetic keys tagged for the inactive bank. A Shadow update advanced desired state but the pressured agent retained its applied revision and bank, incremented `unf_policy_sync_errors_total`, logged the staging failure, and preserved active TCP/8080 allow plus TCP/9090 deny. Releasing pressure let the same waiting revision activate on the opposite bank; Shadow traffic passed and restored Enforce traffic denied again |
 | Dataplane provenance | ABI v2 TCP and SCTP events matched the applied revision and carried nonzero identities plus actual/shadow policy and explicit-deny rule provenance |
@@ -89,6 +90,7 @@ gate.
 | Versioned BPF identity map schema | **Verified** | ABI tests plus `make kind-test` require populated IPv4 and IPv6 kernel maps on both agents |
 | Controller-to-agent revisioned distribution | **Verified** | Both node agents report desired/applied epoch and revision convergence; controller-restart recovery exercised live |
 | Controller-aggregated node acknowledgements | **Verified** | Schema v2 reports carry Node and Pod identity. A dedicated-audience projected token is authenticated through TokenReview, then bound to the `unf-agent` service account, watched Pod UID, and authoritative Node placement before storage. Controller/CLI status distinguishes expected, missing, stale, unexpected, and converged agents; unit and kind tests reject missing/invalid credentials and cross-Node claims while both real agents converge |
+| Encrypted authenticated internal transport | **Verified** | Public HTTP exposes no snapshot or agent-write routes. Dedicated HTTPS serves identity/policy snapshots, acknowledgements, and telemetry; agents trust only `unf-internal-ca` and reread their projected token for every request. The controller bounds Kubernetes API load with a 64-entry/30-second successful-review cache while rechecking authoritative Pod identity and placement on every request; invalid credentials are not cached. Agent userspace counts but excludes the configured management TCP port from logs/export to prevent telemetry recursion. `make kind-test` covers plaintext isolation, missing CA, missing/invalid/valid credentials, forged Node claims, convergence, workload provenance, and flow export |
 | Transactional identity map set | **Verified** | Identity ABI v2 stages separate inactive IPv4/IPv6 maps, validates both, and selects them with one `IDENTITY_CONFIG` write; ABI/agent tests cover the fixed config and recovery rules, while `make kind-test` exercises repeated identity changes, dual-stack enforcement, and offline restart recovery |
 | Selector-to-identity policy lowering | **Verified** | Unit tests cover exact/default, shadow provenance, conflicts, and deterministic ordering; `make kind-test` requires nonzero resolved entries |
 | Transactional policy map set | **Verified** | `make kind-test` stages a changed policy on the opposite bank, verifies a higher applied revision, restores it, and verifies reconvergence |
@@ -127,20 +129,21 @@ gate.
   values, and absent identity/IP decisions fail open with revision-zero
   observed/identity-unknown provenance. Unknown source identities can be enforced
   by a valid exact or external-fallback IPv4 policy entry.
-- Agent acknowledgements are freshness-aware, controller-aggregated, and
-  authenticated with Pod-bound Kubernetes TokenReview identity. Reports older
-  than ten seconds are marked stale, but transport remains unencrypted internal
-  HTTP and report storage is current-process only. mTLS or an equivalent encrypted
-  service path, durable retention, and OpenShift validation remain.
+- Agent acknowledgements are freshness-aware, controller-aggregated, and use a
+  dedicated TLS service plus Pod-bound Kubernetes TokenReview identity. Reports
+  older than ten seconds are marked stale, but report storage is current-process
+  only. Certificate reload/rotation, durable retention, NetworkPolicy isolation,
+  and OpenShift validation remain.
 - Policy simulation currently accepts one native `SecurityPolicy`, uses current
   Pods plus representative policy-derived TCP/UDP/SCTP probes, and rejects matrices
   above 10,000 flows. It separately evaluates retained history and observation
   frequency, but has no time-window filtering, cannot evaluate external sources
   without a current identity, and accepts no user-supplied flow sets.
 - Flow history is advisory, destination-resolved, current-process telemetry. Agent
-  channels/pending state and controller retention are bounded with explicit drop
-  and eviction counters, but history is not durable, authenticated, sampled, or
-  deduplicated across interface-level observations.
+  export uses the authenticated internal TLS boundary, and channels/pending state
+  plus controller retention are bounded with explicit drop and eviction counters,
+  but history is not durable, sampled, or deduplicated across interface-level
+  observations.
 - Topology schema v3 reports current in-memory Node, dual-stack Pod workload,
   Service intent, and EndpointSlice runtime relationships. Conditions are
   Kubernetes-reported state rather than active traffic health; topology history,
@@ -183,7 +186,7 @@ gate.
 | Egress NetworkPolicy compatibility | **Planned** | Direction-aware IR and dataplane enforcement evidence |
 | Policy simulation foundation | **Verified** | Versioned read-only add/replace API and `unfctl policy simulate` compare current/proposed provenance over a bounded topology-derived matrix and retained flow history; unit tests prove no state mutation and historical weighting, while `make kind-test` proves predicted deny, revision stability, and unchanged live forwarding |
 | Better topology state | **Verified** | Topology schema v3 preserves selector intent, adds per-workload IPv6 addresses, and retains EndpointSlice-derived address/port, Pod target, Node/zone, and ready/serving/terminating backend state; unit tests prove normalization, idempotence, stale-state removal, and revision isolation, while `make kind-test` exercises dual-stack state and not-ready → ready → deleted backend transitions without policy-revision mutation |
-| Historical flow export | **Verified** | Schema v2, non-blocking 4,096-record agent channel, 2,048-key pending aggregation, 512-entry HTTP batches, 4,096-key revisioned controller retention, dual-stack address validation, drop/eviction metrics, `unfctl flows`, and history-aware simulation; unit tests cover bounds/aggregation/eviction and `make kind-test` requires enriched IPv4 and IPv6 cross-node flows |
+| Historical flow export | **Verified** | Schema v2, non-blocking 4,096-record agent channel, 2,048-key pending aggregation, 512-entry authenticated HTTPS batches, 4,096-key revisioned controller retention, dual-stack address validation, drop/eviction metrics, `unfctl flows`, and history-aware simulation; unit tests cover bounds/aggregation/eviction and `make kind-test` requires enriched IPv4 and IPv6 cross-node flows |
 
 ## Updating this tracker
 

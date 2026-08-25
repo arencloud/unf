@@ -33,7 +33,9 @@ spec:
             - --bpf-pin-path
             - /sys/fs/bpf/unf/v2
             - --controller-url
-            - http://unf-controller.unf-system.svc.cluster.local:9962
+            - https://unf-controller.unf-system.svc.cluster.local:9964
+            - --controller-ca-path
+            - /var/run/secrets/unf-internal-ca/ca.crt
           env:
             - name: UNF_NODE_NAME
               valueFrom:
@@ -71,6 +73,9 @@ spec:
             - name: agent-token
               mountPath: /var/run/secrets/unf-agent
               readOnly: true
+            - name: internal-ca
+              mountPath: /var/run/secrets/unf-internal-ca
+              readOnly: true
       volumes:
         - name: bpffs
           hostPath:
@@ -88,3 +93,7 @@ spec:
                   audience: unf-controller.unf-system.svc
                   expirationSeconds: 3600
                   path: token
+        - name: internal-ca
+          configMap:
+            name: unf-internal-ca
+            defaultMode: 0444

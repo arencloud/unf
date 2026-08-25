@@ -68,8 +68,12 @@ matrix and reproducible evidence.
   dedicated-audience projected service-account token, Kubernetes TokenReview,
   Pod name/UID binding, and watched Node placement. Anonymous, invalid-token, and
   valid-token/cross-Node claims fail closed without changing convergence state;
-- Next: legacy-kernel/OpenShift handoff and TokenReview validation, encrypted
-  internal transport, and durable agent acknowledgement retention.
+- Implemented and two-node kind verified: agent-only state, acknowledgement, and
+  telemetry routes use a separate TLS Service port, agents trust only the mounted
+  UNF CA, and every request uses Pod-bound TokenReview identity. Plaintext route
+  isolation, CA failure, credential failure, and live convergence/export are gated;
+- Next: legacy-kernel/OpenShift handoff, certificate/token validation and rotation,
+  and durable agent acknowledgement retention.
 
 ## Phase 3 — compatibility and simulation
 
@@ -102,8 +106,8 @@ matrix and reproducible evidence.
   observation-weighted historical simulation impact; resolved-identity IPv6
   distribution, enforcement, provenance, topology schema v3, and flow-export
   schema v2; bounded IPv6 extension-header traversal with real packet fixtures;
-- Next: remaining upstream ingress conformance, plus
-  authenticated/durable telemetry transport with time-window queries;
+- Next: remaining upstream ingress conformance, plus durable telemetry retention
+  with time-window queries;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, and OpenShift validation.

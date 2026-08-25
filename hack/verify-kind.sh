@@ -5,6 +5,9 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 kubeconfig=${KUBECONFIG:-"${project_root}/.tools/kind-unf-dev.kubeconfig"}
 context=${KUBE_CONTEXT:-kind-unf-dev}
 controller_port=${UNF_CONTROLLER_TEST_PORT:-19962}
+controller_internal_port=${UNF_CONTROLLER_INTERNAL_TEST_PORT:-19964}
+controller_internal_host=unf-controller.unf-system.svc.cluster.local
+controller_internal_url=https://${controller_internal_host}:${controller_internal_port}
 unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 temporary_dir=$(mktemp -d)
 controller_forward_pid=
@@ -121,8 +124,11 @@ trap cleanup EXIT
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
 
 start_controller_forward() {
+    "${kc[@]}" -n unf-system get configmap unf-internal-ca \
+        -o 'jsonpath={.data.ca\.crt}' >"${temporary_dir}/internal-ca.crt"
     "${kc[@]}" -n unf-system port-forward service/unf-controller \
-        "${controller_port}:9962" >"${temporary_dir}/controller-forward.log" 2>&1 &
+        "${controller_port}:9962" "${controller_internal_port}:9964" \
+        >"${temporary_dir}/controller-forward.log" 2>&1 &
     controller_forward_pid=$!
     for _ in {1..20}; do
         if curl --fail --silent "http://127.0.0.1:${controller_port}/readyz" >/dev/null; then
@@ -147,10 +153,13 @@ post_agent_status_with_token() {
     local token=$1 report=$2 response_path=$3
     printf 'Authorization: Bearer %s\n' "${token}" | curl \
         --silent --show-error --max-time 5 \
+        --noproxy '*' \
+        --cacert "${temporary_dir}/internal-ca.crt" \
+        --resolve "${controller_internal_host}:${controller_internal_port}:127.0.0.1" \
         --output "${response_path}" --write-out '%{http_code}' \
         --request POST --header @- --header 'Content-Type: application/json' \
         --data-binary "${report}" \
-        "http://127.0.0.1:${controller_port}/v1/state/agents"
+        "${controller_internal_url}/v1/state/agents"
 }
 
 json_number() {
@@ -589,6 +598,15 @@ if [[ ${initial_synced} != true ]]; then
 fi
 initial_policy_revision=${expected_policy_revision}
 
+for pod in "${agent_pods[@]}"; do
+    filtered_management_events=$(agent_metric \
+        "${pod}" unf_management_flow_events_filtered_total || true)
+    if [[ -z ${filtered_management_events} || ${filtered_management_events} -eq 0 ]]; then
+        echo "agent did not account for filtered controller management traffic" >&2
+        exit 1
+    fi
+done
+
 if ! wait_for_aggregated_agent_convergence "${#agent_pods[@]}"; then
     echo "controller did not aggregate converged status from every node agent" >&2
     exit 1
@@ -609,11 +627,31 @@ if ! grep -q '"schema_version":2' <<<"${authentication_report}" \
     echo "agent did not expose its schema v2 Pod-bound acknowledgement identity" >&2
     exit 1
 fi
-unauthenticated_code=$(curl --silent --show-error --max-time 5 \
+plaintext_snapshot_code=$(curl --silent --show-error --max-time 5 \
+    --output "${temporary_dir}/plaintext-snapshot.json" --write-out '%{http_code}' \
+    "http://127.0.0.1:${controller_port}/v1/state/identities")
+plaintext_report_code=$(curl --silent --show-error --max-time 5 \
+    --output "${temporary_dir}/plaintext-agent-report.json" --write-out '%{http_code}' \
+    --request POST --header 'Content-Type: application/json' \
+    --data-binary "${authentication_report}" \
+    "http://127.0.0.1:${controller_port}/v1/state/agents")
+if [[ ${plaintext_snapshot_code} != 404 || ${plaintext_report_code} != 405 ]]; then
+    echo "controller exposed an agent-only route on its plaintext public listener" >&2
+    exit 1
+fi
+if curl --fail --silent --show-error --max-time 5 --noproxy '*' \
+    --resolve "${controller_internal_host}:${controller_internal_port}:127.0.0.1" \
+    "${controller_internal_url}/v1/state/identities" >/dev/null 2>&1; then
+    echo "controller internal TLS unexpectedly validated without the UNF CA" >&2
+    exit 1
+fi
+unauthenticated_code=$(curl --silent --show-error --max-time 5 --noproxy '*' \
+    --cacert "${temporary_dir}/internal-ca.crt" \
+    --resolve "${controller_internal_host}:${controller_internal_port}:127.0.0.1" \
     --output "${temporary_dir}/unauthenticated-agent-report.json" \
     --write-out '%{http_code}' --request POST \
     --header 'Content-Type: application/json' --data-binary "${authentication_report}" \
-    "http://127.0.0.1:${controller_port}/v1/state/agents")
+    "${controller_internal_url}/v1/state/agents")
 if [[ ${unauthenticated_code} != 401 ]] \
     || ! grep -q 'missing bearer token' \
         "${temporary_dir}/unauthenticated-agent-report.json"; then
@@ -643,6 +681,13 @@ if [[ ${authenticated_code} != 204 ]]; then
     echo "controller rejected a valid Pod-bound agent token" >&2
     exit 1
 fi
+printf 'Authorization: Bearer %s\n' "${authentication_token}" | curl \
+    --fail --silent --show-error --max-time 5 --noproxy '*' \
+    --cacert "${temporary_dir}/internal-ca.crt" \
+    --resolve "${controller_internal_host}:${controller_internal_port}:127.0.0.1" \
+    --header @- "${controller_internal_url}/v1/state/identities" \
+    >"${temporary_dir}/authenticated-identity-snapshot.json"
+grep -q '"schema_version"' "${temporary_dir}/authenticated-identity-snapshot.json"
 forged_report=$(sed -E \
     's/"node_name":"[^"]+"/"node_name":"forged-node"/' \
     <<<"${authentication_report}")
@@ -757,6 +802,10 @@ grep -q '"capacity": 4096' <<<"${flow_history}"
 grep -Eq '"retained_flows": [1-9][0-9]*' <<<"${flow_history}"
 grep -Eq '"retained_observations": [1-9][0-9]*' <<<"${flow_history}"
 grep -q '"unf-dev-worker"' <<<"${flow_history}"
+if grep -q '"destination_port": 9964' <<<"${flow_history}"; then
+    echo "controller management traffic recursively entered flow history" >&2
+    exit 1
+fi
 
 if ! wait_for_historical_ipv6_demo_flow; then
     echo "controller did not retain the exported IPv6 frontend-to-backend flow" >&2
@@ -2099,4 +2148,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: Pod-bound TokenReview authentication with anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v2 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: split public/internal TLS routing with dedicated CA trust and Pod-bound TokenReview authentication, anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v2 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, authenticated flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

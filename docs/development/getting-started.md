@@ -19,6 +19,12 @@ kubectl kustomize deploy
 The checked-in manifests reference local `:dev` images. The Make targets below
 build and load them; no published image is implied.
 
+Connected deployment also requires Secret `unf-internal-tls` with `tls.crt` and
+`tls.key`, plus ConfigMap `unf-internal-ca` with `ca.crt`, in `unf-system`.
+Provision them from an approved issuer before applying the workloads. The kind
+target below creates disposable development credentials automatically; those
+credentials are not a production certificate mechanism.
+
 ## Kernel requirements for the prototype
 
 - Linux with eBPF syscall and TC classifier support;
@@ -117,6 +123,13 @@ make kind-deploy
 make kind-test
 ```
 
+`make kind-deploy` runs `hack/configure-internal-tls.sh` before applying the
+workloads. The script keeps its private CA and leaf key below ignored `.tools/`,
+publishes only the serving Secret and CA ConfigMap to the disposable cluster, and
+reuses an unexpired leaf on later deploys. Removing `.tools/kind-internal-tls`
+rotates the development trust on the next deploy and requires the controller and
+agents to roll together.
+
 `kind-up` mounts bpffs at `/sys/fs/bpf` inside every disposable kind node,
 matching the agent DaemonSet's host prerequisite. It also selects the nftables
 IPv6 frontend inside the pinned kindnet image and waits for that DaemonSet to
@@ -210,12 +223,14 @@ cross-Node credentials fail closed and are counted by
 replacement, the verifier continuously probes the denied TCP/9090 path and
 requires zero successful requests before the replacement is Ready.
 
-The projected credential is never written to logs or checked into the repository,
-but the prototype controller Service is still HTTP. Do not treat TokenReview as
-transport encryption; production deployment requires mTLS or an equivalent
-encrypted boundary. An OpenShift qualification run must additionally verify
-projected custom-audience tokens, TokenReview Pod extras, controller RBAC, SCC
-admission, and the selected encrypted service path.
+The projected credential is never written to logs or checked into the repository.
+Agent snapshots, acknowledgements, and flow telemetry use the controller's
+dedicated HTTPS port and a client trust store containing only `unf-internal-ca`;
+the public operator API remains HTTP. Certificate changes currently require a
+coordinated workload rollout. An OpenShift qualification run must additionally
+verify projected custom-audience tokens, TokenReview Pod extras, controller RBAC,
+platform certificate integration/rotation, SCC admission, and the selected
+encrypted Service or Route path.
 
 After the primary gate, `hack/verify-kind-legacy-netlink.sh` explicitly selects
 legacy mode when the host would normally choose TCX, confirms the reserved

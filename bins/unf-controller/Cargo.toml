@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+axum-server.workspace = true
 clap.workspace = true
 futures.workspace = true
 k8s-openapi.workspace = true

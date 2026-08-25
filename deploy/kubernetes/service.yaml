@@ -10,3 +10,6 @@ spec:
     - name: http
       port: 9962
       targetPort: http
+    - name: https-internal
+      port: 9964
+      targetPort: https-internal

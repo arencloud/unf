@@ -23,6 +23,11 @@ for operator queries and policy impact analysis. Agents publish revisioned statu
 acknowledgements using Pod-bound, audience-scoped Kubernetes tokens; TokenReview
 and authoritative Pod placement prevent anonymous or cross-Node claims. Controller
 and CLI status report freshness-aware cluster convergence for every watched Node.
+Identity/policy snapshots, acknowledgements, and flow telemetry use a separate
+TLS-only controller port; agents trust only the mounted UNF CA and authenticate
+every internal request with their rotating Pod credential. The reserved internal
+port is filtered from workload logs/export so management traffic cannot create a
+recursive telemetry loop.
 The resolved-identity fast path
 is now dual-stack for IPv4/IPv6 TCP/UDP/SCTP, including verifier-bounded IPv6
 extension-header traversal; native policy and selector-based NetworkPolicy IPv6
@@ -67,6 +72,8 @@ Implemented in the repository:
 - controller-aggregated per-node desired/applied identity and policy convergence;
 - schema v2 agent acknowledgements authenticated through audience-scoped,
   Pod-bound Kubernetes TokenReview identity and authoritative Node placement;
+- a split controller surface with public operator HTTP and CA-pinned,
+  TokenReview-authenticated internal HTTPS for agent snapshots and writes;
 - revision-fenced, read-only native policy simulation through the shared evaluator;
 - bounded non-blocking agent telemetry export and a 4,096-flow controller history
   with explicit drop/eviction accounting;
@@ -116,7 +123,7 @@ Implemented in the repository:
   explanations, plus a
   versioned EndpointSlice backend-readiness lifecycle.
 
-Not implemented yet: service load balancing, routing, IPAM/CNI, encryption,
+Not implemented yet: service load balancing, routing, IPAM/CNI, workload/data-plane encryption,
 multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production
 fail-closed recovery.
 

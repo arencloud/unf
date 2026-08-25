@@ -53,9 +53,9 @@ No static credential is checked into manifests or distributed by UNF, and one
 agent Pod cannot use its valid token to claim another Node. Token rotation and
 revocation follow Kubernetes service-account behavior.
 
-This secures acknowledgement identity, not transport confidentiality. The
-prototype controller endpoint remains internal HTTP, so bearer tokens and state
-traffic require an encrypted transport boundary before production use. Identity
-and policy snapshot reads and flow telemetry authentication are also outside this
-decision. Native OpenShift validation must confirm projected audience tokens,
-TokenReview extras/RBAC, SCC behavior, and the eventual encrypted service path.
+This decision established acknowledgement identity but did not originally provide
+transport confidentiality. ADR 0024 now places snapshots, acknowledgements, and
+flow telemetry on a dedicated TLS listener and applies the same Pod-bound
+TokenReview identity to every internal request. Native OpenShift validation must
+still confirm projected audience tokens, TokenReview extras/RBAC, SCC behavior,
+certificate integration, and the encrypted service path.

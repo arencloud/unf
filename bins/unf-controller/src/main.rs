@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use axum::extract::State;
@@ -10,6 +11,8 @@ use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use axum_server::Handle;
+use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
@@ -49,12 +52,32 @@ const AGENT_TOKEN_AUDIENCE: &str = "unf-controller.unf-system.svc";
 const AGENT_SERVICE_ACCOUNT_USERNAME: &str = "system:serviceaccount:unf-system:unf-agent";
 const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
 const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
+const AGENT_AUTHENTICATION_CACHE_TTL: Duration = Duration::from_secs(30);
+const AGENT_AUTHENTICATION_CACHE_CAPACITY: usize = 64;
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF Kubernetes desired-state controller")]
 struct Args {
     #[arg(long, env = "UNF_CONTROLLER_LISTEN", default_value = "0.0.0.0:9962")]
     listen: SocketAddr,
+    #[arg(
+        long,
+        env = "UNF_CONTROLLER_INTERNAL_LISTEN",
+        default_value = "0.0.0.0:9964"
+    )]
+    internal_listen: SocketAddr,
+    #[arg(
+        long,
+        env = "UNF_CONTROLLER_TLS_CERT",
+        default_value = "/var/run/secrets/unf-internal-tls/tls.crt"
+    )]
+    tls_cert: PathBuf,
+    #[arg(
+        long,
+        env = "UNF_CONTROLLER_TLS_KEY",
+        default_value = "/var/run/secrets/unf-internal-tls/tls.key"
+    )]
+    tls_key: PathBuf,
     /// Run the API server without connecting to Kubernetes (development only).
     #[arg(long)]
     offline: bool,
@@ -88,6 +111,7 @@ struct ControllerState {
     identities: Mutex<IdentityRegistry>,
     flow_history: Mutex<FlowHistoryStore>,
     agent_reports: RwLock<BTreeMap<String, StoredAgentReport>>,
+    agent_authentication_cache: Mutex<BTreeMap<String, CachedAgentAuthentication>>,
     token_review_client: Option<Client>,
     revisions: Mutex<RevisionSet>,
     registry: Mutex<Registry>,
@@ -98,6 +122,19 @@ struct ControllerState {
 struct StoredAgentReport {
     report: AgentStateReport,
     last_received_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedAgent {
+    node_name: String,
+    pod_name: String,
+    pod_uid: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedAgentAuthentication {
+    agent: AuthenticatedAgent,
+    validated_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,37 +354,35 @@ async fn main() -> Result<()> {
         state.ready.store(true, Ordering::Release);
     }
 
-    let app = Router::new()
+    let public_app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/metrics", get(metrics))
         .route("/v1/status", get(status))
-        .route("/v1/state/identities", get(identity_snapshot))
-        .route("/v1/state/policies", get(policy_snapshot))
-        .route(
-            "/v1/state/agents",
-            get(agent_state).post(ingest_agent_status),
-        )
+        .route("/v1/state/agents", get(agent_state))
         .route("/v1/topology", get(topology))
         .route("/v1/flows", get(flow_history))
-        .route("/v1/telemetry/flows", post(ingest_flows))
         .route("/v1/explain", post(explain))
         .route("/v1/policy/simulate", post(simulate_policy))
         .with_state(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("bind controller API to {}", args.listen))?;
-    info!(address = %args.listen, "controller API listening");
+    info!(address = %args.listen, "controller public API listening");
 
     let shutdown = cancellation.clone();
     tasks.spawn(async move {
-        if let Err(error) = axum::serve(listener, app)
+        if let Err(error) = axum::serve(listener, public_app)
             .with_graceful_shutdown(shutdown.cancelled_owned())
             .await
         {
-            error!(%error, "controller API server failed");
+            error!(%error, "controller public API server failed");
         }
     });
+
+    if !args.offline {
+        spawn_internal_api(&args, Arc::clone(&state), cancellation.clone(), &mut tasks).await?;
+    }
 
     tokio::signal::ctrl_c()
         .await
@@ -358,6 +393,58 @@ async fn main() -> Result<()> {
             error!(%error, "controller task failed");
         }
     }
+    Ok(())
+}
+
+async fn spawn_internal_api(
+    args: &Args,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+    tasks: &mut JoinSet<()>,
+) -> Result<()> {
+    let tls_config = RustlsConfig::from_pem_file(&args.tls_cert, &args.tls_key)
+        .await
+        .with_context(|| {
+            format!(
+                "load controller internal TLS certificate {} and key {}",
+                args.tls_cert.display(),
+                args.tls_key.display()
+            )
+        })?;
+    let internal_app = Router::new()
+        .route("/v1/state/identities", get(identity_snapshot))
+        .route("/v1/state/policies", get(policy_snapshot))
+        .route("/v1/state/agents", post(ingest_agent_status))
+        .route("/v1/telemetry/flows", post(ingest_flows))
+        .with_state(state);
+    let internal_listener =
+        std::net::TcpListener::bind(args.internal_listen).with_context(|| {
+            format!(
+                "bind controller internal TLS API to {}",
+                args.internal_listen
+            )
+        })?;
+    internal_listener
+        .set_nonblocking(true)
+        .context("configure controller internal TLS listener as nonblocking")?;
+    let internal_server = axum_server::from_tcp_rustls(internal_listener, tls_config)
+        .context("create controller internal TLS server")?;
+    let handle = Handle::new();
+    let shutdown_handle = handle.clone();
+    tasks.spawn(async move {
+        cancellation.cancelled().await;
+        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+    });
+    info!(address = %args.internal_listen, "controller authenticated internal TLS API listening");
+    tasks.spawn(async move {
+        if let Err(error) = internal_server
+            .handle(handle)
+            .serve(internal_app.into_make_service())
+            .await
+        {
+            error!(%error, "controller internal TLS API server failed");
+        }
+    });
     Ok(())
 }
 
@@ -402,7 +489,7 @@ fn new_state_with_client(offline: bool, token_review_client: Option<Client>) -> 
     );
     registry.register(
         "unf_agent_authentication_failures",
-        "Node-agent status acknowledgements rejected by authentication",
+        "Node-agent internal API requests rejected by authentication or identity binding",
         metrics.agent_authentication_failures.clone(),
     );
     ControllerState {
@@ -423,6 +510,7 @@ fn new_state_with_client(offline: bool, token_review_client: Option<Client>) -> 
         identities: Mutex::new(IdentityRegistry::default()),
         flow_history: Mutex::new(FlowHistoryStore::default()),
         agent_reports: RwLock::new(BTreeMap::new()),
+        agent_authentication_cache: Mutex::new(BTreeMap::new()),
         token_review_client,
         revisions: Mutex::new(RevisionSet::default()),
         registry: Mutex::new(registry),
@@ -1334,7 +1422,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         agents,
         limitations: [
             "desired state and identity allocations are currently in-memory only",
-            "agent acknowledgements use Pod-bound Kubernetes TokenReview authentication; internal HTTP transport is not yet encrypted and attachment replacement mode is reported by each agent",
+            "agent snapshots, telemetry, and acknowledgements use a dedicated TLS service plus Pod-bound Kubernetes TokenReview authentication; certificate rotation currently requires a coordinated workload rollout",
         ],
     }))
 }
@@ -1355,7 +1443,10 @@ async fn ingest_agent_status(
     headers: HeaderMap,
     Json(report): Json<AgentStateReport>,
 ) -> Result<StatusCode, ApiError> {
-    if let Err(error) = authenticate_agent_status(&state, &headers, &report).await {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    if let Err(error) =
+        validate_agent_claims(&agent, &report.node_name, &report.pod_name, &report.pod_uid)
+    {
         state.metrics.agent_authentication_failures.inc();
         return Err(error);
     }
@@ -1371,12 +1462,25 @@ async fn ingest_agent_status(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn authenticate_agent_status(
+async fn authenticate_internal_agent(
     state: &ControllerState,
     headers: &HeaderMap,
-    report: &AgentStateReport,
-) -> Result<(), ApiError> {
+) -> Result<AuthenticatedAgent, ApiError> {
+    let result = authenticate_internal_agent_inner(state, headers).await;
+    if result.is_err() {
+        state.metrics.agent_authentication_failures.inc();
+    }
+    result
+}
+
+async fn authenticate_internal_agent_inner(
+    state: &ControllerState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedAgent, ApiError> {
     let token = bearer_token(headers)?;
+    if let Some(agent) = cached_agent_authentication(state, token)? {
+        return Ok(agent);
+    }
     let client = state.token_review_client.as_ref().ok_or_else(|| {
         ApiError::service_unavailable("agent authentication requires Kubernetes TokenReview")
     })?;
@@ -1395,7 +1499,47 @@ async fn authenticate_agent_status(
         .status
         .as_ref()
         .ok_or_else(|| ApiError::unauthorized("agent token was not authenticated"))?;
-    validate_agent_token_identity(status, report, &read_lock(&state.pods))
+    let agent = validate_agent_token_identity(status, &read_lock(&state.pods))?;
+    cache_agent_authentication(state, token, agent.clone());
+    Ok(agent)
+}
+
+fn cached_agent_authentication(
+    state: &ControllerState,
+    token: &str,
+) -> Result<Option<AuthenticatedAgent>, ApiError> {
+    let now = Instant::now();
+    let cached = {
+        let mut cache = mutex_lock(&state.agent_authentication_cache);
+        cache.retain(|_, entry| {
+            now.duration_since(entry.validated_at) < AGENT_AUTHENTICATION_CACHE_TTL
+        });
+        cache.get(token).cloned()
+    };
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
+    validate_authoritative_agent(&cached.agent, &read_lock(&state.pods))?;
+    Ok(Some(cached.agent))
+}
+
+fn cache_agent_authentication(state: &ControllerState, token: &str, agent: AuthenticatedAgent) {
+    let mut cache = mutex_lock(&state.agent_authentication_cache);
+    if cache.len() >= AGENT_AUTHENTICATION_CACHE_CAPACITY
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.validated_at)
+            .map(|(token, _)| token.clone())
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(
+        token.to_owned(),
+        CachedAgentAuthentication {
+            agent,
+            validated_at: Instant::now(),
+        },
+    );
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -1413,9 +1557,8 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
 
 fn validate_agent_token_identity(
     status: &TokenReviewStatus,
-    report: &AgentStateReport,
     pods: &BTreeMap<String, PodRecord>,
-) -> Result<(), ApiError> {
+) -> Result<AuthenticatedAgent, ApiError> {
     if status.authenticated != Some(true) || status.error.is_some() {
         return Err(ApiError::unauthorized("agent token was not authenticated"));
     }
@@ -1441,23 +1584,58 @@ fn validate_agent_token_identity(
         .extra
         .as_ref()
         .ok_or_else(|| ApiError::forbidden("agent token is not bound to a Pod"))?;
-    if exact_extra_value(extra, POD_NAME_EXTRA) != Some(report.pod_name.as_str())
-        || exact_extra_value(extra, POD_UID_EXTRA) != Some(report.pod_uid.as_str())
-    {
-        return Err(ApiError::forbidden(
-            "agent report does not match its Pod-bound token",
-        ));
-    }
-    let pod_key = format!("unf-system/{}", report.pod_name);
+    let pod_name = exact_extra_value(extra, POD_NAME_EXTRA)
+        .ok_or_else(|| ApiError::forbidden("agent token has no unique Pod name"))?;
+    let pod_uid = exact_extra_value(extra, POD_UID_EXTRA)
+        .ok_or_else(|| ApiError::forbidden("agent token has no unique Pod UID"))?;
+    let pod_key = format!("unf-system/{pod_name}");
     let pod = pods
         .get(&pod_key)
         .ok_or_else(|| ApiError::forbidden("agent Pod is not present in watched state"))?;
-    if pod.uid != report.pod_uid
+    if pod.uid != pod_uid || pod.endpoint.service_account != "unf-agent" {
+        return Err(ApiError::forbidden(
+            "agent token does not match its authoritative Pod identity",
+        ));
+    }
+    let node_name = pod
+        .node_name
+        .clone()
+        .ok_or_else(|| ApiError::forbidden("agent Pod has no authoritative Node placement"))?;
+    Ok(AuthenticatedAgent {
+        node_name,
+        pod_name: pod_name.to_owned(),
+        pod_uid: pod_uid.to_owned(),
+    })
+}
+
+fn validate_agent_claims(
+    agent: &AuthenticatedAgent,
+    node_name: &str,
+    pod_name: &str,
+    pod_uid: &str,
+) -> Result<(), ApiError> {
+    if agent.node_name != node_name || agent.pod_name != pod_name || agent.pod_uid != pod_uid {
+        return Err(ApiError::forbidden(
+            "agent request does not match its authoritative Pod placement",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authoritative_agent(
+    agent: &AuthenticatedAgent,
+    pods: &BTreeMap<String, PodRecord>,
+) -> Result<(), ApiError> {
+    let pod_key = format!("unf-system/{}", agent.pod_name);
+    let pod = pods
+        .get(&pod_key)
+        .ok_or_else(|| ApiError::forbidden("agent Pod is not present in watched state"))?;
+    if pod.uid != agent.pod_uid
         || pod.endpoint.service_account != "unf-agent"
-        || pod.node_name.as_deref() != Some(report.node_name.as_str())
+        || pod.node_name.as_deref() != Some(agent.node_name.as_str())
     {
         return Err(ApiError::forbidden(
-            "agent report does not match its authoritative Pod placement",
+            "cached agent identity no longer matches authoritative Pod placement",
         ));
     }
     Ok(())
@@ -1607,13 +1785,19 @@ fn agent_report_matches(
 
 async fn identity_snapshot(
     State(state): State<Arc<ControllerState>>,
-) -> Json<IdentityStateSnapshot> {
-    Json(mutex_lock(&state.identities).identity_snapshot(state.identity_epoch))
+    headers: HeaderMap,
+) -> Result<Json<IdentityStateSnapshot>, ApiError> {
+    authenticate_internal_agent(&state, &headers).await?;
+    Ok(Json(
+        mutex_lock(&state.identities).identity_snapshot(state.identity_epoch),
+    ))
 }
 
 async fn policy_snapshot(
     State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
 ) -> Result<Json<PolicyStateSnapshot>, ApiError> {
+    authenticate_internal_agent(&state, &headers).await?;
     let (revision, entries, ipv4_entries, ipv6_entries) = dataplane_policy_state(&state)?;
     Ok(Json(PolicyStateSnapshot {
         schema_version: POLICY_SNAPSHOT_SCHEMA_VERSION,
@@ -1727,7 +1911,22 @@ fn flow_history_snapshot(state: &ControllerState) -> FlowHistorySnapshot {
 
 async fn ingest_flows(
     State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
     Json(batch): Json<FlowExportBatch>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    if agent.node_name != batch.node_name {
+        state.metrics.agent_authentication_failures.inc();
+        return Err(ApiError::forbidden(
+            "flow export does not match its authoritative Pod placement",
+        ));
+    }
+    ingest_flow_batch(&state, batch)
+}
+
+fn ingest_flow_batch(
+    state: &ControllerState,
+    batch: FlowExportBatch,
 ) -> Result<StatusCode, ApiError> {
     validate_flow_export_batch(&batch)?;
     let observations = batch
@@ -3002,24 +3201,41 @@ mod tests {
         pod.endpoint.service_account = "unf-agent".to_owned();
         let pods = BTreeMap::from([(format!("unf-system/{}", report.pod_name), pod)]);
         let status = successful_agent_token_review(&report);
-        validate_agent_token_identity(&status, &report, &pods)
+        let identity = validate_agent_token_identity(&status, &pods)
             .expect("Pod-bound UNF agent identity is accepted");
+        validate_agent_claims(
+            &identity,
+            &report.node_name,
+            &report.pod_name,
+            &report.pod_uid,
+        )
+        .expect("matching report claims are accepted");
 
         let mut wrong_node = report.clone();
         wrong_node.node_name = "worker-b".to_owned();
         assert_eq!(
-            validate_agent_token_identity(&status, &wrong_node, &pods)
-                .expect_err("cross-node claim is rejected")
-                .status,
+            validate_agent_claims(
+                &identity,
+                &wrong_node.node_name,
+                &wrong_node.pod_name,
+                &wrong_node.pod_uid,
+            )
+            .expect_err("cross-node claim is rejected")
+            .status,
             StatusCode::FORBIDDEN
         );
 
         let mut wrong_pod = report.clone();
         wrong_pod.pod_uid = "another-pod-uid".to_owned();
         assert_eq!(
-            validate_agent_token_identity(&status, &wrong_pod, &pods)
-                .expect_err("another Pod identity is rejected")
-                .status,
+            validate_agent_claims(
+                &identity,
+                &wrong_pod.node_name,
+                &wrong_pod.pod_name,
+                &wrong_pod.pod_uid,
+            )
+            .expect_err("another Pod identity is rejected")
+            .status,
             StatusCode::FORBIDDEN
         );
 
@@ -3030,7 +3246,7 @@ mod tests {
             .expect("review has user")
             .username = Some("system:serviceaccount:default:default".to_owned());
         assert_eq!(
-            validate_agent_token_identity(&wrong_service_account, &report, &pods)
+            validate_agent_token_identity(&wrong_service_account, &pods)
                 .expect_err("another service account is rejected")
                 .status,
             StatusCode::FORBIDDEN
@@ -3039,7 +3255,7 @@ mod tests {
         let mut wrong_audience = status;
         wrong_audience.audiences = Some(vec!["another-service".to_owned()]);
         assert_eq!(
-            validate_agent_token_identity(&wrong_audience, &report, &pods)
+            validate_agent_token_identity(&wrong_audience, &pods)
                 .expect_err("another audience is rejected")
                 .status,
             StatusCode::UNAUTHORIZED
@@ -3257,9 +3473,7 @@ mod tests {
             pod_record(2, "backend", "server", "server"),
         );
         assert_eq!(
-            ingest_flows(State(Arc::clone(&state)), Json(flow_batch(5)))
-                .await
-                .expect("valid flow batch is accepted"),
+            ingest_flow_batch(&state, flow_batch(5)).expect("valid flow batch is accepted"),
             StatusCode::NO_CONTENT
         );
         let snapshot = flow_history_snapshot(&state);
@@ -3297,9 +3511,8 @@ mod tests {
 
         let mut invalid = flow_batch(1);
         invalid.schema_version = FLOW_EXPORT_SCHEMA_VERSION + 1;
-        let error = ingest_flows(State(state), Json(invalid))
-            .await
-            .expect_err("unknown flow schema is rejected");
+        let error =
+            ingest_flow_batch(&state, invalid).expect_err("unknown flow schema is rejected");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
