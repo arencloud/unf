@@ -55,7 +55,8 @@ controller is unavailable. The design doubles physical identity-map capacity and
 adds one array lookup per parsed packet, while preserving the existing address
 key layouts.
 
-ABI v1 pins are intentionally not deleted or migrated in place. Operators may
-remove the old directory after validating the v2 rollout. At the time of this
-decision TC attachments remained process-owned; ADR 0018 subsequently introduced
-pinned TCX and persistent legacy-netlink handoff.
+ABI v1 pins are intentionally not deleted or migrated in place. After validating
+the v2 rollout, operators may use the dry-run-first, ownership-checked cleanup
+command defined by ADR 0022. At the time of this decision TC attachments remained
+process-owned; ADR 0018 subsequently introduced pinned TCX and persistent
+legacy-netlink handoff.

@@ -63,11 +63,47 @@ TC attachment changes host network state. On Linux 6.6+, the agent leaves its
 per-interface TCX links pinned below `/sys/fs/bpf/unf/v2/links` so a replacement
 can update them atomically. On older kernels it leaves the clsact qdisc and its
 stable legacy filters in place for in-place replacement. Use a disposable
-environment for testing; explicit production cleanup tooling is not implemented.
+environment for testing.
 Selection defaults to `auto`; `--tc-attachment-mode tcx-pinned` and
 `--tc-attachment-mode legacy-netlink` are explicit compatibility-test or
 controlled-migration overrides. An explicit mode that the host cannot support
 fails during attachment rather than silently changing modes.
+
+## Scoped host-state cleanup
+
+`unf-agent cleanup` plans removal by default and changes nothing without
+`--execute`. Retire ABI v1 only after validating the v2 rollout on the node:
+
+```bash
+sudo target/debug/unf-agent cleanup --abi-version 1
+sudo target/debug/unf-agent cleanup --abi-version 1 --execute
+```
+
+The planner derives `/sys/fs/bpf/unf/v1` from the fixed version argument. It
+accepts only the six known v1 map pins and recognized numeric UNF TCX link-pin
+names. It refuses symbolic links, non-directory targets, and any unknown direct
+content instead of recursively deleting it. A missing target is an idempotent
+no-op.
+
+Removing current v2 state is an uninstall or controlled-reset operation. First
+stop every agent using that node so no process is reading or recreating the maps
+or attachments, inspect the dry run, and provide the additional confirmation:
+
+```bash
+sudo target/debug/unf-agent cleanup \
+  --abi-version 2 --allow-current-abi \
+  --legacy-attachments --all-interfaces --legacy-direction both
+sudo target/debug/unf-agent cleanup \
+  --abi-version 2 --allow-current-abi \
+  --legacy-attachments --all-interfaces --legacy-direction both --execute
+```
+
+Legacy cleanup may instead target repeated `--interface NAME` values. It removes
+filters matching UNF's ingress/egress program names, treats absence as success,
+and never removes clsact or unrelated filters. Cleanup is a privileged per-node
+operation; the command does not coordinate a DaemonSet rollout or validate that
+replacement enforcement is active. During migration, restore and verify the new
+attachment mode before removing the old one.
 
 ## kind
 
@@ -173,7 +209,8 @@ priority/handle filters, removes every UNF ingress TCX pin, and repeats the
 offline-controller replacement under a continuous deny probe. It requires the
 replacement to report in-place netlink replacement, then rolls back to automatic
 TCX mode and confirms pins exist before deleting only the reserved legacy
-filters. On a pre-6.6 host already using legacy mode, the same script exercises
+filters through the production dry-run-first cleanup command. On a pre-6.6 host
+already using legacy mode, the same script exercises
 the native selection without the transition or cleanup step.
 
 Before that replacement, `make kind-test` temporarily deploys the privileged
@@ -185,8 +222,11 @@ same helper then uses reserved inactive-bank keys to fill the shared physical
 desired revision to advance while the applied revision and selected bank stay
 fixed, rechecks the established allow/deny flows, releases pressure, and requires
 that waiting revision to activate before restoring enforcement. Cleanup removes
-only the scoped synthetic keys and fault aliases; the helper is removed before
-offline replacement and is not part of the production kustomization.
+only the scoped synthetic keys and fault aliases. It also adds unknown content to
+a recognized v1 directory to prove refusal, verifies dry-run preservation, then
+uses the deployed agent command to remove v1 state on both nodes while all nine
+v2 pins remain. The helper is removed before offline replacement and is not part
+of the production kustomization.
 
 The DaemonSet attaches ingress classification to every non-loopback node interface
 and discovers newly created pod veths. A packet can therefore produce multiple

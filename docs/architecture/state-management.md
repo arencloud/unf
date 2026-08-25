@@ -71,15 +71,18 @@ are pinned and atomically updated to the replacement program; older kernels use
 stable legacy netlink filter identities for in-place replacement. Automatic mode
 selection has an explicit compatibility-test override; kind removes TCX coverage,
 proves the legacy filter alone survives offline-controller agent replacement,
-then restores TCX before scoped legacy cleanup. Explicit ABI-directory cleanup
-operations and acknowledgement authentication/durability remain hardening work.
+then restores TCX before scoped legacy cleanup. A separate dry-run-first cleanup
+command recognizes only the v1/v2 map names, numeric UNF TCX link-pin names, and
+UNF legacy program names. It refuses unknown ABI content and requires explicit
+confirmation for current v2 removal. Acknowledgement authentication/durability
+remain hardening work.
 Isolated live-kernel probes verify that partial pin sets,
 invalid active config, and corrupt inactive-stage debris are rejected before
 adoption without mutating the primary pin set. A separate live pressure probe
 fills only the inactive identity-keyed policy bank, proves a staging insertion
 failure cannot advance applied state or alter active traffic, and verifies retry
 after scoped cleanup. Permanent startup validation failures terminate for
-orchestrator retry. See ADRs 0016 through 0021.
+orchestrator retry. See ADRs 0016 through 0022.
 
 Kubernetes watches remain the controller input. Internal HTTP snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

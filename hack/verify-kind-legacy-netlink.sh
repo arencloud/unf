@@ -64,18 +64,26 @@ wait_for_agent_mode() {
     return 1
 }
 
+run_legacy_cleanup() {
+    local helper=$1 node agent
+    shift
+    node=$("${kc[@]}" -n unf-system get pod "${helper}" \
+        -o jsonpath='{.spec.nodeName}')
+    agent=$("${kc[@]}" -n unf-system get pods \
+        -l app.kubernetes.io/name=unf-agent \
+        -o jsonpath="{range .items[?(@.spec.nodeName=='${node}')]}{.metadata.name}{'\n'}{end}" \
+        | head -n 1)
+    if [[ -z ${agent} ]]; then
+        echo "could not identify the agent on helper node ${node}" >&2
+        return 1
+    fi
+    "${kc[@]}" -n unf-system exec "${agent}" -- \
+        /usr/local/bin/unf-component cleanup \
+        --legacy-attachments --all-interfaces --legacy-direction ingress "$@"
+}
+
 remove_legacy_filters() {
-    local helper=$1
-    "${kc[@]}" -n unf-system exec "${helper}" -- sh -eu -c '
-        for path in /sys/class/net/*; do
-            interface=${path##*/}
-            if [ "${interface}" = lo ]; then
-                continue
-            fi
-            tc filter delete dev "${interface}" ingress \
-                pref 21838 handle 0x554e0001 bpf >/dev/null 2>&1 || true
-        done
-    '
+    run_legacy_cleanup "$1" --execute
 }
 
 legacy_filter_exists() {
@@ -343,7 +351,23 @@ if [[ ${legacy_override_applied} == true ]]; then
             echo "TCX pins were not restored before legacy cleanup" >&2
             exit 1
         fi
-        remove_legacy_filters "${helper}"
+        legacy_cleanup_dry_run=$(run_legacy_cleanup "${helper}")
+        if ! grep -q 'UNF cleanup plan (dry-run)' <<<"${legacy_cleanup_dry_run}" \
+            || ! grep -q 'dry run only' <<<"${legacy_cleanup_dry_run}"; then
+            printf '%s\n' "${legacy_cleanup_dry_run}" >&2
+            echo "legacy cleanup did not expose its dry-run contract" >&2
+            exit 1
+        fi
+        if ! legacy_filter_exists "${helper}" >/dev/null 2>&1; then
+            echo "legacy cleanup dry run mutated the reserved filter" >&2
+            exit 1
+        fi
+        legacy_cleanup_execution=$(remove_legacy_filters "${helper}")
+        if ! grep -q 'UNF cleanup completed' <<<"${legacy_cleanup_execution}"; then
+            printf '%s\n' "${legacy_cleanup_execution}" >&2
+            echo "legacy cleanup did not confirm reserved-filter removal" >&2
+            exit 1
+        fi
         if legacy_filter_exists "${helper}" >/dev/null 2>&1; then
             echo "reserved legacy filter remained after scoped cleanup" >&2
             exit 1
@@ -356,4 +380,4 @@ fi
 "${kc[@]}" delete -f "${project_root}/deploy/examples/bpf-fault-helper.yaml" >/dev/null
 fault_helper_created=false
 
-echo "legacy netlink verification passed: explicit selection, reserved filter installation, TCX-independent allow/deny, in-place offline-controller replacement with continuous deny enforcement, and scoped TCX restoration/legacy cleanup"
+echo "legacy netlink verification passed: explicit selection, reserved filter installation, TCX-independent allow/deny, in-place offline-controller replacement with continuous deny enforcement, scoped TCX restoration, and dry-run-first production legacy cleanup"

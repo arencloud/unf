@@ -66,5 +66,6 @@ selection and host compatibility before receiving the same platform-support
 claim.
 
 Pinned links and persistent legacy filters need explicit operator cleanup during
-uninstall or ABI retirement. Automated production cleanup is separate work
-because deleting host networking state must be deliberate and scoped.
+uninstall or ABI retirement. ADR 0022 provides a dry-run-first per-node command
+that recognizes only UNF-owned pin and program names, refuses ambiguous state,
+and leaves rollout coordination deliberately external.

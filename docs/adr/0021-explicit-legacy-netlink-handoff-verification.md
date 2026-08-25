@@ -41,10 +41,11 @@ denied flow while replacing the server-node agent. The replacement must recover
 pinned policy state, report `legacy_netlink`, log `replaced=true`, retain the
 single reserved filter identity, allow TCP/8080, and deny TCP/9090 without a
 successful probe. Cleanup first returns agents to automatic TCX mode and confirms
-new TCX pins, then deletes only priority 21838/handle `0x554e0001` filters. A trap
-uses the same ordering after early failure. On a host whose automatic mode is
-already legacy, the transition and cleanup are omitted so native attachments are
-not disturbed.
+new TCX pins, then uses the ADR 0022 command to plan, preserve, and finally remove
+UNF-named ingress filters. The fixed priority 21838/handle `0x554e0001` assertion
+confirms the intended filters are gone. A trap uses the same ordering after early
+failure. On a host whose automatic mode is already legacy, the transition and
+cleanup are omitted so native attachments are not disturbed.
 
 ## Consequences
 
@@ -56,5 +57,6 @@ diagnostics, but `auto` remains the deployment default.
 This is not evidence that a pre-6.6 distribution kernel exposes every required
 BPF/netlink capability, nor that OpenShift SCC, SELinux, CRI-O, or host networking
 permits the design. Native older-kernel and OpenShift runs remain required before
-making those platform-support claims. Production uninstall and ABI-retirement
-cleanup also remain separate operator-facing work.
+making those platform-support claims. Production rollout and uninstall
+orchestration remain separate operator-facing work; the scoped node cleanup
+primitive is defined by ADR 0022.

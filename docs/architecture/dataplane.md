@@ -104,13 +104,20 @@ for compatibility validation and controlled migration. The kind gate selects
 legacy mode on the TCX-capable development kernel, removes the old UNF TCX pins,
 and proves that the reserved netlink filter alone preserves enforcement through
 replacement before restoring TCX and removing the legacy tuple.
+Operators can inspect and remove recognized persistent state with `unf-agent
+cleanup`. Planning is the default; `--execute` applies the plan. ABI cleanup
+accepts only the known v1/v2 map names and numeric UNF TCX link-pin names, refuses
+unknown directory content, and requires `--allow-current-abi` for v2. Legacy
+cleanup matches only UNF program names and leaves clsact and unrelated filters
+untouched.
 Invalid map state never becomes a deny by accident. The kind gate also fills the
 shared physical `POLICY_RULES` map using reserved keys tagged for the inactive
 bank, requires the staging failure to preserve the selected bank and applied
 revision, then removes only those keys and verifies that the waiting revision
 activates.
-ABI v1 pin directories are not removed automatically; operators may delete them
-only after validating an ABI v2 rollout. See ADRs 0008 and 0016 through 0021.
+ABI v1 pin directories are not removed automatically; operators may use the
+scoped cleanup command only after validating an ABI v2 rollout. See ADRs 0008
+and 0016 through 0022.
 Permanent startup validation failures terminate the agent after readiness is
 fenced so the orchestrator can retry after repair.
 
@@ -123,5 +130,4 @@ tests still run on stable in the host workspace. See ADR 0002.
 ## Next dataplane milestone
 
 Validate the legacy netlink handoff path on an older supported kernel and an
-OpenShift host, then define authenticated acknowledgements and explicit stale ABI
-directory cleanup.
+OpenShift host, then define authenticated agent acknowledgements.

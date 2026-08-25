@@ -34,6 +34,9 @@ TC attachments now survive agent replacement: kernels supporting TCX use
 per-interface pinned links and atomic link updates, while older kernels use a
 stable legacy netlink filter tuple for in-place replacement. The two-node kind
 gate continuously probes an explicitly denied flow through TCX agent handoff.
+The agent also provides a dry-run-first cleanup command for known ABI v1/v2 pins,
+TCX link pins, and UNF-named legacy filters; current ABI removal requires an
+additional explicit confirmation and unknown directory content is refused.
 See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
 gates, evidence, limitations, and current work. The shorter
@@ -79,6 +82,9 @@ Implemented in the repository:
 - explicit `auto`, `tcx-pinned`, and `legacy-netlink` attachment selection, with
   kind verification that removes TCX coverage, continuously probes enforcement
   through legacy in-place replacement, then restores TCX before scoped cleanup;
+- dry-run-first `unf-agent cleanup` planning for recognized ABI v1/v2 map and
+  TCX pins plus UNF-named legacy filters, with unknown-content refusal and an
+  explicit current-ABI confirmation gate;
 - isolated kind fault injection proving partial pin sets, malformed active
   configuration, and corrupt inactive-stage values are rejected without
   disturbing the live last-known-good dataplane;

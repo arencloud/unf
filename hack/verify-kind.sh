@@ -23,6 +23,8 @@ network_policy_sctp_created=false
 namespace_mutated=false
 topology_service_created=false
 bpf_fault_helper_created=false
+stale_abi_fixture_helper=
+stale_abi_unknown_helper=
 network_policy_selector_peer='[{"namespaceSelector":{"matchLabels":{"environment":"production"},"matchExpressions":[{"key":"team","operator":"In","values":["checkout"]}]},"podSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["client"]}]}}]'
 
 cleanup() {
@@ -58,6 +60,14 @@ cleanup() {
             --ignore-not-found >/dev/null 2>&1 || true
     fi
     if [[ ${bpf_fault_helper_created} == true ]]; then
+        if [[ -n ${stale_abi_unknown_helper} ]]; then
+            "${kc[@]}" -n unf-system exec "${stale_abi_unknown_helper}" -- \
+                rmdir /sys/fs/bpf/unf/v1/unknown-state >/dev/null 2>&1 || true
+        fi
+        if [[ -n ${stale_abi_fixture_helper} ]]; then
+            "${kc[@]}" -n unf-system exec "${stale_abi_fixture_helper}" -- \
+                rm -rf /sys/fs/bpf/unf/v1 >/dev/null 2>&1 || true
+        fi
         while read -r helper; do
             [[ -n ${helper} ]] || continue
             "${kc[@]}" -n unf-system exec "${helper}" -- \
@@ -1799,6 +1809,106 @@ fi
 pressure_inactive_bank=
 map_pressure_helper=
 
+if current_abi_refusal=$("${kc[@]}" -n unf-system exec "${restart_agent}" -- \
+    /usr/local/bin/unf-component cleanup --abi-version 2 --execute 2>&1); then
+    echo "cleanup accepted current ABI removal without explicit confirmation" >&2
+    exit 1
+fi
+if ! grep -q 'refusing to clean current ABI v2 without --allow-current-abi' \
+    <<<"${current_abi_refusal}"; then
+    printf '%s\n' "${current_abi_refusal}" >&2
+    echo "cleanup did not report the current-ABI confirmation requirement" >&2
+    exit 1
+fi
+if ! existing_v1_plan=$("${kc[@]}" -n unf-system exec "${restart_agent}" -- \
+    /usr/local/bin/unf-component cleanup --abi-version 1 2>&1); then
+    printf '%s\n' "${existing_v1_plan}" >&2
+    echo "pre-existing v1 state is outside the cleanup ownership boundary" >&2
+    exit 1
+fi
+if "${kc[@]}" -n unf-system exec "${fault_helper}" -- \
+    test ! -e /sys/fs/bpf/unf/v1; then
+    "${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
+        source=/sys/fs/bpf/unf/v2
+        target=/sys/fs/bpf/unf/v1
+        mkdir "${target}"
+        for map in \
+            IDENTITY_V4 IDENTITY_V6 POLICY_RULES POLICY_IPV4 POLICY_IPV6 POLICY_CONFIG
+        do
+            bpftool map pin pinned "${source}/${map}" "${target}/${map}"
+        done
+    '
+    stale_abi_fixture_helper=${fault_helper}
+fi
+"${kc[@]}" -n unf-system exec "${fault_helper}" -- \
+    mkdir /sys/fs/bpf/unf/v1/unknown-state
+stale_abi_unknown_helper=${fault_helper}
+
+if cleanup_refusal=$("${kc[@]}" -n unf-system exec "${restart_agent}" -- \
+    /usr/local/bin/unf-component cleanup --abi-version 1 --execute 2>&1); then
+    echo "cleanup accepted unrecognized stale ABI content" >&2
+    exit 1
+fi
+if ! grep -q 'unrecognized ABI state; refusing cleanup' <<<"${cleanup_refusal}"; then
+    printf '%s\n' "${cleanup_refusal}" >&2
+    echo "cleanup did not report its unknown-content refusal" >&2
+    exit 1
+fi
+"${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
+    target=/sys/fs/bpf/unf/v1
+    test "$(find "${target}" -maxdepth 1 -type f | wc -l)" -eq 6
+    test -d "${target}/unknown-state"
+    rmdir "${target}/unknown-state"
+'
+stale_abi_unknown_helper=
+
+cleanup_dry_run=$("${kc[@]}" -n unf-system exec "${restart_agent}" -- \
+    /usr/local/bin/unf-component cleanup --abi-version 1)
+if ! grep -q 'UNF cleanup plan (dry-run)' <<<"${cleanup_dry_run}" \
+    || ! grep -q 'dry run only' <<<"${cleanup_dry_run}"; then
+    printf '%s\n' "${cleanup_dry_run}" >&2
+    echo "cleanup did not expose its dry-run contract" >&2
+    exit 1
+fi
+"${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
+    test "$(find /sys/fs/bpf/unf/v1 -maxdepth 1 -type f | wc -l)" -eq 6
+'
+
+cleanup_execution=$("${kc[@]}" -n unf-system exec "${restart_agent}" -- \
+    /usr/local/bin/unf-component cleanup --abi-version 1 --execute)
+if ! grep -q 'UNF cleanup completed' <<<"${cleanup_execution}"; then
+    printf '%s\n' "${cleanup_execution}" >&2
+    echo "cleanup did not confirm stale ABI removal" >&2
+    exit 1
+fi
+"${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
+    test ! -e /sys/fs/bpf/unf/v1
+    test "$(find /sys/fs/bpf/unf/v2 -maxdepth 1 -type f | wc -l)" -eq 9
+'
+stale_abi_fixture_helper=
+
+mapfile -t cleanup_agents < <("${kc[@]}" -n unf-system get pods \
+    -l app.kubernetes.io/name=unf-agent \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+for cleanup_agent in "${cleanup_agents[@]}"; do
+    cleanup_execution=$("${kc[@]}" -n unf-system exec "${cleanup_agent}" -- \
+        /usr/local/bin/unf-component cleanup --abi-version 1 --execute)
+    if ! grep -q 'UNF cleanup completed' <<<"${cleanup_execution}"; then
+        printf '%s\n' "${cleanup_execution}" >&2
+        echo "cleanup did not complete on agent ${cleanup_agent}" >&2
+        exit 1
+    fi
+done
+while read -r cleanup_helper; do
+    [[ -n ${cleanup_helper} ]] || continue
+    "${kc[@]}" -n unf-system exec "${cleanup_helper}" -- sh -eu -c '
+        test ! -e /sys/fs/bpf/unf/v1
+        test "$(find /sys/fs/bpf/unf/v2 -maxdepth 1 -type f | wc -l)" -eq 9
+    '
+done < <("${kc[@]}" -n unf-system get pods \
+    -l app.kubernetes.io/name=unf-bpf-fault-helper \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+
 "${kc[@]}" -n unf-system exec "${fault_helper}" -- rm -rf "${fault_root}"
 "${kc[@]}" delete -f "${project_root}/deploy/examples/bpf-fault-helper.yaml" >/dev/null
 bpf_fault_helper_created=false
@@ -1916,4 +2026,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: scoped dry-run/refusal/execution cleanup of stale v1 state with v2 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

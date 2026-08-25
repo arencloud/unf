@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,7 +20,7 @@ use aya::programs::tc::{NlOptions, SchedClassifierLink, TcAttachOptions, TcError
 use aya::programs::{LinkOrder, SchedClassifier, TcAttachType, tc};
 use aya::sys::SyscallError;
 use aya::{Ebpf, EbpfLoader};
-use clap::{Parser, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
@@ -48,6 +48,15 @@ use unf_state::{
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
 const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v2";
+const CURRENT_BPF_ABI_VERSION: u16 = 2;
+const ABI_V1_MAP_NAMES: [&str; 6] = [
+    "IDENTITY_V4",
+    "IDENTITY_V6",
+    "POLICY_RULES",
+    "POLICY_IPV4",
+    "POLICY_IPV6",
+    "POLICY_CONFIG",
+];
 const PERSISTENT_MAP_NAMES: [&str; 9] = [
     "IDENTITY_V4",
     "IDENTITY_V4_B",
@@ -67,6 +76,8 @@ const LEGACY_TC_HANDLE_MAJOR: u16 = 0x554e;
 #[derive(Debug, Parser)]
 #[command(about = "UNF per-node eBPF agent")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<AgentCommand>,
     #[arg(long, env = "UNF_AGENT_LISTEN", default_value = "0.0.0.0:9963")]
     listen: SocketAddr,
     #[arg(long, env = "UNF_EBPF_OBJECT")]
@@ -96,10 +107,61 @@ struct Args {
     tc_attachment_mode: TcAttachmentPreference,
 }
 
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// Plan or execute narrowly scoped cleanup of UNF-owned host state.
+    Cleanup(CleanupArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+#[allow(clippy::struct_excessive_bools)] // Independent opt-in CLI switches are clearer as flags.
+struct CleanupArgs {
+    /// Parent directory containing versioned UNF bpffs state.
+    #[arg(long, default_value = "/sys/fs/bpf/unf")]
+    bpf_root: PathBuf,
+    /// Remove one known ABI directory (supported: 1 or 2).
+    #[arg(long)]
+    abi_version: Option<u16>,
+    /// Permit removal of the currently deployed ABI v2 directory.
+    #[arg(long, requires = "abi_version")]
+    allow_current_abi: bool,
+    /// Remove UNF-named persistent netlink filters.
+    #[arg(long)]
+    legacy_attachments: bool,
+    /// Target every current non-loopback interface for legacy cleanup.
+    #[arg(long, requires = "legacy_attachments", conflicts_with = "interfaces")]
+    all_interfaces: bool,
+    /// Target one interface for legacy cleanup; may be repeated.
+    #[arg(
+        long = "interface",
+        requires = "legacy_attachments",
+        conflicts_with = "all_interfaces"
+    )]
+    interfaces: Vec<String>,
+    /// Direction of legacy filters to remove.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "ingress",
+        requires = "legacy_attachments"
+    )]
+    legacy_direction: CleanupDirection,
+    /// Apply the plan. Without this flag cleanup is a non-mutating dry run.
+    #[arg(long)]
+    execute: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Direction {
     Ingress,
     Egress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CleanupDirection {
+    Ingress,
+    Egress,
+    Both,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -222,6 +284,23 @@ struct RecoveredDataplane {
     policy_revision: Option<u64>,
 }
 
+#[derive(Debug)]
+struct AbiCleanupPlan {
+    abi_directory: PathBuf,
+    map_pins: Vec<PathBuf>,
+    link_pins: Vec<PathBuf>,
+    links_directory: Option<PathBuf>,
+    directory_exists: bool,
+}
+
+#[derive(Debug)]
+struct LegacyCleanupTarget {
+    interface: String,
+    attach_type: TcAttachType,
+    program_name: &'static str,
+    direction: &'static str,
+}
+
 struct InterfaceAttachments<'program> {
     program: &'program mut SchedClassifier,
     all_interfaces: bool,
@@ -299,6 +378,9 @@ async fn main() -> Result<()> {
     install_crypto_provider()?;
     init_tracing();
     let args = Args::parse();
+    if let Some(AgentCommand::Cleanup(cleanup)) = &args.command {
+        return run_cleanup(cleanup);
+    }
     let state = Arc::new(new_state(detect_capabilities(), args.node_name.clone()));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
@@ -383,6 +465,278 @@ async fn main() -> Result<()> {
     }
     if let Some(error) = dataplane_failure {
         return Err(error).context("eBPF dataplane failed");
+    }
+    Ok(())
+}
+
+fn run_cleanup(args: &CleanupArgs) -> Result<()> {
+    if args.abi_version.is_none() && !args.legacy_attachments {
+        bail!("cleanup requires --abi-version or --legacy-attachments");
+    }
+    if args.allow_current_abi && args.abi_version != Some(CURRENT_BPF_ABI_VERSION) {
+        bail!("--allow-current-abi is valid only with --abi-version 2");
+    }
+
+    let abi_plan = args
+        .abi_version
+        .map(|version| plan_abi_cleanup(&args.bpf_root, version, args.allow_current_abi))
+        .transpose()?;
+    let legacy_targets = plan_legacy_cleanup(args)?;
+    let mode = if args.execute { "execute" } else { "dry-run" };
+    println!("UNF cleanup plan ({mode})");
+    if let Some(plan) = &abi_plan {
+        println!("ABI directory: {}", plan.abi_directory.display());
+        if !plan.directory_exists {
+            println!("  no matching ABI directory exists");
+        }
+        for path in &plan.link_pins {
+            println!("  remove TCX link pin: {}", path.display());
+        }
+        for path in &plan.map_pins {
+            println!("  remove map pin: {}", path.display());
+        }
+        if let Some(path) = &plan.links_directory {
+            println!("  remove empty link directory: {}", path.display());
+        }
+        if plan.directory_exists {
+            println!(
+                "  remove empty ABI directory: {}",
+                plan.abi_directory.display()
+            );
+        }
+    }
+    for target in &legacy_targets {
+        println!(
+            "legacy attachment: interface={} direction={} program={}",
+            target.interface, target.direction, target.program_name
+        );
+    }
+    if !args.execute {
+        println!("dry run only; rerun with --execute to apply this exact scope");
+        return Ok(());
+    }
+
+    for target in &legacy_targets {
+        match tc::qdisc_detach_program(&target.interface, target.attach_type, target.program_name) {
+            Ok(()) => println!(
+                "removed legacy attachment: interface={} direction={} program={}",
+                target.interface, target.direction, target.program_name
+            ),
+            Err(TcError::IoError(error)) if error.kind() == io::ErrorKind::NotFound => println!(
+                "no matching legacy attachment: interface={} direction={} program={}",
+                target.interface, target.direction, target.program_name
+            ),
+            Err(error) => {
+                return Err(anyhow!(error)).with_context(|| {
+                    format!(
+                        "remove legacy attachment {} {}",
+                        target.interface, target.direction
+                    )
+                });
+            }
+        }
+    }
+    if let Some(plan) = &abi_plan {
+        execute_abi_cleanup(plan)?;
+    }
+    println!("UNF cleanup completed");
+    Ok(())
+}
+
+fn plan_abi_cleanup(
+    bpf_root: &Path,
+    abi_version: u16,
+    allow_current_abi: bool,
+) -> Result<AbiCleanupPlan> {
+    if !matches!(abi_version, 1 | CURRENT_BPF_ABI_VERSION) {
+        bail!("unsupported ABI version {abi_version}; this binary recognizes only v1 and v2");
+    }
+    if abi_version == CURRENT_BPF_ABI_VERSION && !allow_current_abi {
+        bail!(
+            "refusing to clean current ABI v{CURRENT_BPF_ABI_VERSION} without --allow-current-abi"
+        );
+    }
+    validate_cleanup_root(bpf_root)?;
+    let abi_directory = bpf_root.join(format!("v{abi_version}"));
+    let mut plan = AbiCleanupPlan {
+        abi_directory: abi_directory.clone(),
+        map_pins: Vec::new(),
+        link_pins: Vec::new(),
+        links_directory: None,
+        directory_exists: false,
+    };
+    let metadata = match fs::symlink_metadata(&abi_directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(plan),
+        Err(error) => return Err(error).context("inspect ABI cleanup directory"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "ABI cleanup target must be a real directory: {}",
+            abi_directory.display()
+        );
+    }
+    plan.directory_exists = true;
+    let recognized_maps: &[&str] = if abi_version == 1 {
+        &ABI_V1_MAP_NAMES
+    } else {
+        &PERSISTENT_MAP_NAMES
+    };
+    let mut unknown = Vec::new();
+    for entry in fs::read_dir(&abi_directory)
+        .with_context(|| format!("inspect ABI directory {}", abi_directory.display()))?
+    {
+        let entry = entry.context("read ABI cleanup entry")?;
+        let name = entry.file_name();
+        let Some(name_text) = name.to_str() else {
+            unknown.push(entry.path());
+            continue;
+        };
+        let file_type = entry
+            .file_type()
+            .context("inspect ABI cleanup entry type")?;
+        if recognized_maps.contains(&name_text) && !file_type.is_dir() && !file_type.is_symlink() {
+            plan.map_pins.push(entry.path());
+        } else if name_text == "links" && file_type.is_dir() && !file_type.is_symlink() {
+            plan.links_directory = Some(entry.path());
+            inspect_cleanup_link_directory(&entry.path(), &mut plan.link_pins, &mut unknown)?;
+        } else {
+            unknown.push(entry.path());
+        }
+    }
+    plan.map_pins.sort();
+    plan.link_pins.sort();
+    if !unknown.is_empty() {
+        unknown.sort();
+        let paths = unknown
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("unrecognized ABI state; refusing cleanup: {paths}");
+    }
+    Ok(plan)
+}
+
+fn validate_cleanup_root(root: &Path) -> Result<()> {
+    if !root.is_absolute() || root == Path::new("/") {
+        bail!("BPF cleanup root must be an absolute, non-root directory");
+    }
+    if root
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        bail!("BPF cleanup root must not contain '.' or '..' components");
+    }
+    if let Ok(metadata) = fs::symlink_metadata(root)
+        && metadata.file_type().is_symlink()
+    {
+        bail!("BPF cleanup root must not be a symbolic link");
+    }
+    Ok(())
+}
+
+fn inspect_cleanup_link_directory(
+    directory: &Path,
+    link_pins: &mut Vec<PathBuf>,
+    unknown: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("inspect TCX link directory {}", directory.display()))?
+    {
+        let entry = entry.context("read TCX cleanup entry")?;
+        let name = entry.file_name();
+        let file_type = entry
+            .file_type()
+            .context("inspect TCX cleanup entry type")?;
+        if name.to_str().is_some_and(recognized_tcx_link_pin_name)
+            && !file_type.is_dir()
+            && !file_type.is_symlink()
+        {
+            link_pins.push(entry.path());
+        } else {
+            unknown.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn recognized_tcx_link_pin_name(name: &str) -> bool {
+    ["tcx-ingress-", "tcx-egress-"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_some_and(|if_index| if_index != 0)
+    })
+}
+
+fn plan_legacy_cleanup(args: &CleanupArgs) -> Result<Vec<LegacyCleanupTarget>> {
+    if !args.legacy_attachments {
+        return Ok(Vec::new());
+    }
+    if !args.all_interfaces && args.interfaces.is_empty() {
+        bail!("--legacy-attachments requires --all-interfaces or at least one --interface");
+    }
+    let interfaces: BTreeSet<String> = if args.all_interfaces {
+        discover_interfaces()?.into_keys().collect()
+    } else {
+        let mut interfaces = BTreeSet::new();
+        for interface in &args.interfaces {
+            validate_cleanup_interface_name(interface)?;
+            interface_index(interface)?;
+            interfaces.insert(interface.clone());
+        }
+        interfaces
+    };
+    let directions: &[(TcAttachType, &str, &str)] = match args.legacy_direction {
+        CleanupDirection::Ingress => &[(TcAttachType::Ingress, "ingress", "unf_observe_ingress")],
+        CleanupDirection::Egress => &[(TcAttachType::Egress, "egress", "unf_observe_egress")],
+        CleanupDirection::Both => &[
+            (TcAttachType::Ingress, "ingress", "unf_observe_ingress"),
+            (TcAttachType::Egress, "egress", "unf_observe_egress"),
+        ],
+    };
+    let mut targets = Vec::new();
+    for interface in interfaces {
+        for (attach_type, direction, program_name) in directions {
+            targets.push(LegacyCleanupTarget {
+                interface: interface.clone(),
+                attach_type: *attach_type,
+                program_name,
+                direction,
+            });
+        }
+    }
+    Ok(targets)
+}
+
+fn validate_cleanup_interface_name(interface: &str) -> Result<()> {
+    let mut components = Path::new(interface).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        bail!("cleanup interface must be one exact interface name");
+    }
+    if interface == "lo" {
+        bail!("loopback is not a UNF attachment target");
+    }
+    Ok(())
+}
+
+fn execute_abi_cleanup(plan: &AbiCleanupPlan) -> Result<()> {
+    for path in plan.link_pins.iter().chain(&plan.map_pins) {
+        fs::remove_file(path)
+            .with_context(|| format!("remove owned BPF pin {}", path.display()))?;
+        println!("removed BPF pin: {}", path.display());
+    }
+    if let Some(directory) = &plan.links_directory {
+        fs::remove_dir(directory)
+            .with_context(|| format!("remove empty TCX link directory {}", directory.display()))?;
+    }
+    if plan.directory_exists {
+        fs::remove_dir(&plan.abi_directory).with_context(|| {
+            format!(
+                "remove empty ABI directory {}",
+                plan.abi_directory.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -2971,6 +3325,103 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn cleanup_cli_is_dry_run_by_default() {
+        let args = Args::try_parse_from(["unf-agent", "cleanup", "--abi-version", "1"])
+            .expect("cleanup arguments parse");
+        let Some(AgentCommand::Cleanup(cleanup)) = args.command else {
+            panic!("cleanup subcommand is selected");
+        };
+        assert_eq!(cleanup.bpf_root, Path::new("/sys/fs/bpf/unf"));
+        assert_eq!(cleanup.abi_version, Some(1));
+        assert!(!cleanup.allow_current_abi);
+        assert!(!cleanup.execute);
+    }
+
+    #[test]
+    fn cleanup_recognizes_only_exact_tcx_pin_names() {
+        assert!(recognized_tcx_link_pin_name("tcx-ingress-1"));
+        assert!(recognized_tcx_link_pin_name("tcx-egress-4294967295"));
+        assert!(!recognized_tcx_link_pin_name("tcx-ingress-0"));
+        assert!(!recognized_tcx_link_pin_name("tcx-ingress-1-extra"));
+        assert!(!recognized_tcx_link_pin_name("unrelated-1"));
+    }
+
+    #[test]
+    fn cleanup_accepts_only_exact_non_loopback_interface_names() {
+        assert!(validate_cleanup_interface_name("eth0").is_ok());
+        assert!(validate_cleanup_interface_name("veth.example").is_ok());
+        assert!(validate_cleanup_interface_name("lo").is_err());
+        assert!(validate_cleanup_interface_name("../eth0").is_err());
+        assert!(validate_cleanup_interface_name("path/eth0").is_err());
+        assert!(validate_cleanup_interface_name("").is_err());
+    }
+
+    #[test]
+    fn cleanup_refuses_current_or_unrecognized_abi_without_explicit_authority() {
+        let temporary = tempdir().expect("temporary directory is created");
+        let root = temporary.path().join("unf");
+        assert!(plan_abi_cleanup(&root, CURRENT_BPF_ABI_VERSION, false).is_err());
+        assert!(plan_abi_cleanup(&root, 3, true).is_err());
+        assert!(plan_abi_cleanup(Path::new("relative"), 1, false).is_err());
+        assert!(plan_abi_cleanup(Path::new("/"), 1, false).is_err());
+    }
+
+    #[test]
+    fn cleanup_removes_only_planned_owned_abi_entries() {
+        let temporary = tempdir().expect("temporary directory is created");
+        let root = temporary.path().join("unf");
+        let abi = root.join("v1");
+        let links = abi.join("links");
+        fs::create_dir_all(&links).expect("fixture directories are created");
+        fs::write(abi.join("IDENTITY_V4"), []).expect("map fixture is created");
+        fs::write(abi.join("POLICY_CONFIG"), []).expect("map fixture is created");
+        fs::write(links.join("tcx-ingress-7"), []).expect("link fixture is created");
+        fs::write(root.join("operator-note"), []).expect("sibling fixture is created");
+
+        let plan = plan_abi_cleanup(&root, 1, false).expect("known fixture has a safe plan");
+        assert_eq!(plan.map_pins.len(), 2);
+        assert_eq!(plan.link_pins.len(), 1);
+        execute_abi_cleanup(&plan).expect("known fixture is removed");
+
+        assert!(!abi.exists());
+        assert!(root.join("operator-note").exists());
+    }
+
+    #[test]
+    fn cleanup_refuses_unknown_abi_content_without_mutation() {
+        let temporary = tempdir().expect("temporary directory is created");
+        let root = temporary.path().join("unf");
+        let abi = root.join("v1");
+        fs::create_dir_all(&abi).expect("fixture directory is created");
+        fs::write(abi.join("IDENTITY_V4"), []).expect("known fixture is created");
+        fs::write(abi.join("unknown-state"), []).expect("unknown fixture is created");
+
+        let error = plan_abi_cleanup(&root, 1, false).expect_err("unknown state is refused");
+        assert!(error.to_string().contains("unrecognized ABI state"));
+        assert!(abi.join("IDENTITY_V4").exists());
+        assert!(abi.join("unknown-state").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_refuses_symbolic_link_roots_and_targets() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir().expect("temporary directory is created");
+        let real_root = temporary.path().join("real-root");
+        fs::create_dir(&real_root).expect("real root is created");
+        let linked_root = temporary.path().join("linked-root");
+        symlink(&real_root, &linked_root).expect("root symlink is created");
+        assert!(plan_abi_cleanup(&linked_root, 1, false).is_err());
+
+        let target = real_root.join("target");
+        fs::create_dir(&target).expect("target is created");
+        symlink(&target, real_root.join("v1")).expect("ABI symlink is created");
+        assert!(plan_abi_cleanup(&real_root, 1, false).is_err());
+    }
 
     #[test]
     fn event_decoder_preserves_fixed_layout_bytes() {

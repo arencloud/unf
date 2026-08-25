@@ -59,8 +59,13 @@ matrix and reproducible evidence.
   real kernel staging failure, and proves rollback preserves the active
   revision/bank and traffic; after scoped cleanup, the waiting revision activates
   and enforcement restores;
-- Next: legacy-kernel/OpenShift handoff validation, explicit stale-state cleanup,
-  and authenticated/durable agent acknowledgements.
+- Implemented and two-node kind verified: dry-run-first host-state cleanup removes
+  only recognized ABI v1/v2 map pins, TCX link pins, and UNF-named legacy filters;
+  unknown ABI content is refused, current v2 requires explicit confirmation, and
+  live cleanup preserves the active v2 map set and restores TCX before removing
+  legacy filters;
+- Next: legacy-kernel/OpenShift handoff validation and authenticated/durable
+  agent acknowledgements.
 
 ## Phase 3 — compatibility and simulation
 
