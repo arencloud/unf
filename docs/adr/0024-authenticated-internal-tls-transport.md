@@ -66,9 +66,9 @@ all agents to converge and export retained flows through HTTPS, proves agent-onl
 routes are absent from plaintext port 9962, rejects TLS without the dedicated CA,
 rejects missing and invalid credentials, accepts a real projected Pod token for
 snapshot reads and acknowledgements, and rejects a forged Node claim.
-The OpenShift IPv4 gate repeats those boundaries with a platform-issued serving
-certificate, validates its DNS SAN and injected CA, and proves real projected
-tokens and cross-Node rejection under OpenShift TokenReview.
+The OpenShift IPv4-only and dual-stack gates repeat those boundaries with a
+platform-issued serving certificate, validate its DNS SAN and injected CA, and
+prove real projected tokens and cross-Node rejection under OpenShift TokenReview.
 
 ## Consequences
 
@@ -80,11 +80,11 @@ client-certificate mTLS is not required for this phase.
 Certificate files are loaded at process startup. Leaf or CA rotation therefore
 requires a coordinated controller and, when trust changes, agent rollout. Durable
 acknowledgement/history retention, automated production certificate rotation,
-NetworkPolicy isolation of the internal port, and OpenShift dual-stack validation
-remain separate work. A successfully reviewed token may remain accepted for up
+and NetworkPolicy isolation of the internal port remain separate work. A
+successfully reviewed token may remain accepted for up
 to 30 seconds while its Pod still exists at the same authoritative placement.
 Applications intentionally using the reserved controller TCP port are outside the
 workload telemetry surface for that agent configuration. OpenShift Service CA
 issuance, projected tokens/TokenReview, SCC/SELinux admission, and the encrypted
-Service path are IPv4 live-verified. Trust rotation still requires a separate
-gate because certificate files are loaded at startup.
+Service path are IPv4 and dual-stack live-verified. Trust rotation still requires
+a separate gate because certificate files are loaded at startup.

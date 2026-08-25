@@ -62,9 +62,10 @@ a stable identity, but can conflict with an independently configured filter usin
 that reserved tuple. Its implementation, selection boundary, and in-place
 replacement path now have unit and live-kernel coverage on Linux 7.1. Automatic
 legacy selection, reserved filters, rolling replacement, enforcing SELinux,
-BTF/bpffs, and IPv4 allow/drop are additionally verified on OpenShift 4.22 with
-RHCOS 9.8 kernel 5.14. Broader RHEL/OpenShift versions and OpenShift dual stack
-still require separate evidence before receiving those support claims.
+BTF/bpffs, and IPv4/IPv6 allow/drop are additionally verified on separate
+OpenShift 4.22 IPv4-only and dual-stack clusters with RHCOS 9.8 kernel 5.14.
+Broader RHEL/OpenShift versions still require separate evidence before receiving
+those support claims.
 
 Pinned links and persistent legacy filters need explicit operator cleanup during
 uninstall or ABI retirement. ADR 0022 provides a dry-run-first per-node command

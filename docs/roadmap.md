@@ -74,13 +74,13 @@ matrix and reproducible evidence.
   telemetry routes use a separate TLS Service port, agents trust only the mounted
   UNF CA, and every request uses Pod-bound TokenReview identity. Plaintext route
   isolation, CA failure, credential failure, and live convergence/export are gated;
-- Implemented and OpenShift IPv4 verified: a worker-scoped overlay uses
+- Implemented and OpenShift IPv4/dual-stack verified: a worker-scoped overlay uses
   `restricted-v2` for the controller, an explicit privileged agent SCC binding,
   OpenShift Service CA certificate/bundle injection, exact worker convergence,
-  Pod-bound TokenReview, and cross-worker policy provenance;
+  Pod-bound TokenReview, populated per-family identities, and cross-worker
+  IPv4/IPv6 policy provenance;
 - Next: automated certificate/trust rotation, durable agent acknowledgement
-  retention, a narrower production SCC/capability profile, and OpenShift
-  dual-stack qualification.
+  retention, and a narrower production SCC/capability profile.
 
 ## Phase 3 — compatibility and simulation
 
@@ -113,11 +113,13 @@ matrix and reproducible evidence.
   observation-weighted historical simulation impact; resolved-identity IPv6
   distribution, enforcement, provenance, topology schema v3, and flow-export
   schema v2; bounded IPv6 extension-header traversal with real packet fixtures;
+  separate dual-stack OpenShift cross-worker enforcement and history evidence on
+  RHCOS Linux 5.14 under Enforcing SELinux;
 - Next: remaining upstream ingress conformance, plus durable telemetry retention
   with time-window queries;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
-- failure and scale validation, plus remaining OpenShift dual-stack coverage.
+- failure, scale, upgrade, and broader OpenShift version validation.
 
 Full CNI/IPAM, routing, service load balancing, egress, encryption, L7, and
 multi-cluster transport remain research/planned work after these foundations.

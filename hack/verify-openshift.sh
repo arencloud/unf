@@ -12,7 +12,7 @@ public_port=${UNF_OPENSHIFT_PUBLIC_PORT:-29962}
 internal_port=${UNF_OPENSHIFT_INTERNAL_PORT:-29964}
 client_namespace=unf-qualification-client
 server_namespace=unf-qualification-server
-qualification_manifest=${project_root}/deploy/openshift/qualification-ipv4.yaml
+qualification_manifest=${project_root}/deploy/openshift/qualification.yaml
 kc=(oc --kubeconfig "${kubeconfig}" --context "${context}")
 temporary_dir=$(mktemp -d)
 port_forward_pid=
@@ -49,9 +49,20 @@ unhealthy_operators=$("${kc[@]}" get clusteroperators -o json | jq '[
     )
 ] | length')
 [[ ${unhealthy_operators} -eq 0 ]]
-ipv4_cluster_networks=$("${kc[@]}" get network.config.openshift.io cluster -o json \
-    | jq '[.status.clusterNetwork[].cidr | select(contains(":") | not)] | length')
+network_config=$("${kc[@]}" get network.config.openshift.io cluster -o json)
+ipv4_cluster_networks=$(jq \
+    '[.status.clusterNetwork[].cidr | select(contains(":") | not)] | length' \
+    <<<"${network_config}")
+ipv6_cluster_networks=$(jq \
+    '[.status.clusterNetwork[].cidr | select(contains(":"))] | length' \
+    <<<"${network_config}")
 [[ ${ipv4_cluster_networks} -gt 0 ]]
+dual_stack=false
+qualification_mode=IPv4
+if [[ ${ipv6_cluster_networks} -gt 0 ]]; then
+    dual_stack=true
+    qualification_mode=dual-stack
+fi
 
 mapfile -t workers < <("${kc[@]}" get nodes -l node-role.kubernetes.io/worker \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
@@ -86,7 +97,7 @@ for agent in "${agents[@]}"; do
         | jq -e '.metadata.labels | has("node-role.kubernetes.io/worker")' >/dev/null
     agent_status=$("${kc[@]}" get --raw \
         "/api/v1/namespaces/unf-system/pods/${agent}:9963/proxy/v1/status")
-    jq -e '
+    jq -e --argjson dual_stack "${dual_stack}" '
         .ready == true
         and .bpf_loaded == true
         and .tc_attachment_mode == "legacy_netlink"
@@ -94,7 +105,11 @@ for agent in "${agents[@]}"; do
         and .capabilities.bpffs == true
         and .capabilities.cgroup_v2 == true
         and .ipv4_identity_map_entries > 0
-        and .ipv6_identity_map_entries == 0
+        and (if $dual_stack then
+            .ipv6_identity_map_entries > 0
+        else
+            .ipv6_identity_map_entries == 0
+        end)
     ' <<<"${agent_status}" >/dev/null
     "${kc[@]}" -n unf-system exec "${agent}" -- sh -eu -c '
         test -r /sys/kernel/btf/vmlinux
@@ -192,10 +207,14 @@ identity_snapshot=$(curl --noproxy '*' --fail --silent \
     --resolve "${internal_host}:${internal_port}:127.0.0.1" \
     --header "Authorization: Bearer ${token}" \
     "${internal_url}/v1/state/identities")
-jq -e '
+jq -e --argjson dual_stack "${dual_stack}" '
     .schema_version >= 1
     and (.ipv4_entries | length) > 0
-    and (.ipv6_entries | length) == 0
+    and (if $dual_stack then
+        (.ipv6_entries | length) > 0
+    else
+        (.ipv6_entries | length) == 0
+    end)
 ' <<<"${identity_snapshot}" >/dev/null
 
 report=$("${kc[@]}" get --raw \
@@ -249,9 +268,20 @@ client_node=$("${kc[@]}" -n "${client_namespace}" get pod client \
     -o jsonpath='{.spec.nodeName}')
 server_node=$("${kc[@]}" -n "${server_namespace}" get pod server \
     -o jsonpath='{.spec.nodeName}')
-server_ip=$("${kc[@]}" -n "${server_namespace}" get pod server \
-    -o jsonpath='{.status.podIP}')
-[[ ${client_node} != "${server_node}" && ${server_ip} != *:* ]]
+client_addresses=$("${kc[@]}" -n "${client_namespace}" get pod client -o json)
+server_addresses=$("${kc[@]}" -n "${server_namespace}" get pod server -o json)
+client_ipv4=$(jq -r '[.status.podIPs[]?.ip | select(contains(":") | not)][0] // empty' \
+    <<<"${client_addresses}")
+client_ipv6=$(jq -r '[.status.podIPs[]?.ip | select(contains(":"))][0] // empty' \
+    <<<"${client_addresses}")
+server_ipv4=$(jq -r '[.status.podIPs[]?.ip | select(contains(":") | not)][0] // empty' \
+    <<<"${server_addresses}")
+server_ipv6=$(jq -r '[.status.podIPs[]?.ip | select(contains(":"))][0] // empty' \
+    <<<"${server_addresses}")
+[[ ${client_node} != "${server_node}" && -n ${client_ipv4} && -n ${server_ipv4} ]]
+if [[ ${dual_stack} == true ]]; then
+    [[ -n ${client_ipv6} && -n ${server_ipv6} ]]
+fi
 
 converged=false
 for _ in {1..90}; do
@@ -268,40 +298,83 @@ for _ in {1..90}; do
 done
 [[ ${converged} == true ]]
 
-allowed=$(timeout 12 "${kc[@]}" -n "${client_namespace}" exec client -- \
-    wget -qO- -T 2 -t 1 "http://${server_ip}:8080")
-[[ ${allowed} == unf-openshift-ok ]]
-if timeout 12 "${kc[@]}" -n "${client_namespace}" exec client -- \
-    wget -qO- -T 2 -t 1 "http://${server_ip}:9090" >/dev/null 2>&1; then
-    echo "OpenShift IPv4 qualification TCP/9090 unexpectedly passed" >&2
-    exit 1
+probe_allowed() {
+    local address=$1
+    local url_host=${address}
+    [[ ${address} != *:* ]] || url_host="[${address}]"
+    local response
+    response=$(timeout 12 "${kc[@]}" -n "${client_namespace}" exec client -- \
+        wget -qO- -T 2 -t 1 "http://${url_host}:8080")
+    [[ ${response} == unf-openshift-ok ]]
+}
+
+probe_denied() {
+    local address=$1
+    local url_host=${address}
+    [[ ${address} != *:* ]] || url_host="[${address}]"
+    if timeout 12 "${kc[@]}" -n "${client_namespace}" exec client -- \
+        wget -qO- -T 2 -t 1 "http://${url_host}:9090" >/dev/null 2>&1; then
+        echo "OpenShift ${qualification_mode} qualification TCP/9090 unexpectedly passed for ${address}" >&2
+        return 1
+    fi
+}
+
+probe_allowed "${server_ipv4}"
+probe_denied "${server_ipv4}"
+if [[ ${dual_stack} == true ]]; then
+    probe_allowed "${server_ipv6}"
+    probe_denied "${server_ipv6}"
 fi
 
 history_verified=false
 for _ in {1..20}; do
     flow_history=$("${kc[@]}" get --raw \
         "/api/v1/namespaces/unf-system/pods/${controller}:9962/proxy/v1/flows")
-    if jq -e '
+    if jq -e --argjson dual_stack "${dual_stack}" '
         any(.entries[];
             (.source_workloads | index("unf-qualification-client/client"))
             and (.destination_workloads | index("unf-qualification-server/server"))
+            and .key.source_ipv4 != null
+            and .key.destination_ipv4 != null
             and .key.destination_port == 8080
             and .decision.verdict == "Allow"
             and .decision.policy_id != null)
         and any(.entries[];
             (.source_workloads | index("unf-qualification-client/client"))
             and (.destination_workloads | index("unf-qualification-server/server"))
+            and .key.source_ipv4 != null
+            and .key.destination_ipv4 != null
             and .key.destination_port == 9090
             and .decision.verdict == "Deny"
             and .decision.policy_id != null)
+        and ($dual_stack == false or (
+            any(.entries[];
+                (.source_workloads | index("unf-qualification-client/client"))
+                and (.destination_workloads | index("unf-qualification-server/server"))
+                and .key.source_ipv6 != null
+                and .key.destination_ipv6 != null
+                and .key.destination_port == 8080
+                and .decision.verdict == "Allow"
+                and .decision.policy_id != null)
+            and any(.entries[];
+                (.source_workloads | index("unf-qualification-client/client"))
+                and (.destination_workloads | index("unf-qualification-server/server"))
+                and .key.source_ipv6 != null
+                and .key.destination_ipv6 != null
+                and .key.destination_port == 9090
+                and .decision.verdict == "Deny"
+                and .decision.policy_id != null)
+        ))
     ' <<<"${flow_history}" >/dev/null; then
         history_verified=true
         break
     fi
-    timeout 12 "${kc[@]}" -n "${client_namespace}" exec client -- \
-        wget -qO- -T 2 -t 1 "http://${server_ip}:8080" >/dev/null
-    timeout 12 "${kc[@]}" -n "${client_namespace}" exec client -- \
-        wget -qO- -T 2 -t 1 "http://${server_ip}:9090" >/dev/null 2>&1 || true
+    probe_allowed "${server_ipv4}"
+    probe_denied "${server_ipv4}"
+    if [[ ${dual_stack} == true ]]; then
+        probe_allowed "${server_ipv6}"
+        probe_denied "${server_ipv6}"
+    fi
     sleep 1
 done
 [[ ${history_verified} == true ]]
@@ -321,4 +394,4 @@ unhealthy_operators=$("${kc[@]}" get clusteroperators -o json | jq '[
 ] | length')
 [[ ${unhealthy_operators} -eq 0 ]]
 
-echo "OpenShift IPv4 qualification passed: restricted-v2 controller, privileged worker-only agents, enforcing SELinux, BTF/bpffs, native legacy netlink filters, Service CA TLS, Pod-bound TokenReview, two-worker convergence, IPv4 allow/drop provenance, and healthy cluster operators"
+echo "OpenShift ${qualification_mode} qualification passed: restricted-v2 controller, privileged worker-only agents, enforcing SELinux, BTF/bpffs, native legacy netlink filters, Service CA TLS, Pod-bound TokenReview, two-worker convergence, ${qualification_mode} allow/drop provenance, and healthy cluster operators"

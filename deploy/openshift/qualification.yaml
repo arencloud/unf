@@ -3,14 +3,14 @@ kind: Namespace
 metadata:
   name: unf-qualification-client
   labels:
-    unf.io/qualification: ipv4
+    unf.io/qualification: openshift
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
   name: unf-qualification-server
   labels:
-    unf.io/qualification: ipv4
+    unf.io/qualification: openshift
 ---
 apiVersion: v1
 kind: Pod
@@ -19,7 +19,7 @@ metadata:
   namespace: unf-qualification-client
   labels:
     app.kubernetes.io/name: client
-    unf.io/qualification-pair: ipv4
+    unf.io/qualification-pair: openshift
 spec:
   nodeSelector:
     node-role.kubernetes.io/worker: ""
@@ -30,7 +30,7 @@ spec:
       requiredDuringSchedulingIgnoredDuringExecution:
         - labelSelector:
             matchLabels:
-              unf.io/qualification-pair: ipv4
+              unf.io/qualification-pair: openshift
           namespaceSelector: {}
           topologyKey: kubernetes.io/hostname
   containers:
@@ -53,7 +53,7 @@ metadata:
   namespace: unf-qualification-server
   labels:
     app.kubernetes.io/name: server
-    unf.io/qualification-pair: ipv4
+    unf.io/qualification-pair: openshift
 spec:
   nodeSelector:
     node-role.kubernetes.io/worker: ""
@@ -62,7 +62,7 @@ spec:
       requiredDuringSchedulingIgnoredDuringExecution:
         - labelSelector:
             matchLabels:
-              unf.io/qualification-pair: ipv4
+              unf.io/qualification-pair: openshift
           namespaceSelector: {}
           topologyKey: kubernetes.io/hostname
   containers:
@@ -88,7 +88,7 @@ spec:
 apiVersion: network.unf.io/v1alpha1
 kind: SecurityPolicy
 metadata:
-  name: qualification-ipv4
+  name: qualification-cross-worker
   namespace: unf-qualification-server
 spec:
   target:

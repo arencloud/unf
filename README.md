@@ -41,12 +41,12 @@ TC attachments now survive agent replacement: kernels supporting TCX use
 per-interface pinned links and atomic link updates, while older kernels use a
 stable legacy netlink filter tuple for in-place replacement. The two-node kind
 gate continuously probes an explicitly denied flow through TCX agent handoff.
-An additional OpenShift IPv4 gate is live-verified on OpenShift 4.22/RHCOS 9.8
-with enforcing SELinux and a 5.14 kernel: the controller runs under
-`restricted-v2`, worker-only agents use the explicitly bound privileged SCC,
-native automatic selection installs legacy netlink filters, OpenShift Service CA
-secures the internal Service, and a cross-worker allow/drop scenario retains
-authenticated provenance. OpenShift dual-stack validation remains pending.
+Additional IPv4-only and dual-stack OpenShift gates are live-verified on
+OpenShift 4.22/RHCOS 9.8 with enforcing SELinux and a 5.14 kernel: the controller
+runs under `restricted-v2`, worker-only agents use the explicitly bound privileged
+SCC, native automatic selection installs legacy netlink filters, OpenShift
+Service CA secures the internal Service, and cross-worker IPv4/IPv6 allow/drop
+scenarios retain authenticated provenance.
 The agent also provides a dry-run-first cleanup command for known ABI v1/v2 pins,
 TCX link pins, and UNF-named legacy filters; current ABI removal requires an
 additional explicit confirmation and unknown directory content is refused.

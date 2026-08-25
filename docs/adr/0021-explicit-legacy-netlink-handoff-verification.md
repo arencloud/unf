@@ -54,10 +54,10 @@ the TCX-capable development host, and `make kind-test` exercises both attachment
 implementations. The mode override is also available for controlled compatibility
 diagnostics, but `auto` remains the deployment default.
 
-The separate OpenShift IPv4 gate now verifies automatic selection and reserved
-filters on RHCOS 9.8 kernel 5.14, plus SCC, enforcing SELinux, CRI-O, BTF/bpffs,
-Service CA, and cross-worker policy enforcement. That evidence applies to the
-recorded OpenShift environment only; broader versions and OpenShift dual stack
-remain unqualified. Production rollout and uninstall orchestration remain
-separate operator-facing work; the scoped node cleanup primitive is defined by
-ADR 0022.
+The separate OpenShift IPv4-only and dual-stack gates now verify automatic
+selection and reserved filters on RHCOS 9.8 kernel 5.14, plus SCC, enforcing
+SELinux, CRI-O, BTF/bpffs, Service CA, and cross-worker policy enforcement for
+every configured family. That evidence applies to the recorded OpenShift 4.22
+environments only; broader versions remain unqualified. Production rollout and
+uninstall orchestration remain separate operator-facing work; the scoped node
+cleanup primitive is defined by ADR 0022.

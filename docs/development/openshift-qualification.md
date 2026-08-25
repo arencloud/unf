@@ -42,6 +42,7 @@ preferred; insecure API TLS is acceptable only for an explicitly designated lab:
 
 ```bash
 chmod 600 .tools/cl01-audit.kubeconfig
+chmod 600 .tools/cl02-audit.kubeconfig
 ```
 
 The deploy workflow creates only a namespaced pull Secret from the dedicated
@@ -54,6 +55,13 @@ logged.
 make openshift-images
 make openshift-deploy
 make openshift-test
+```
+
+Select a non-default qualification cluster explicitly:
+
+```bash
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-deploy
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-test
 ```
 
 Override `OPENSHIFT_KUBECONFIG` or `QUAY_AUTH_FILE` when qualifying another
@@ -73,9 +81,10 @@ The overlay:
   context; and
 - uses the OpenShift Service CA instead of the disposable kind CA.
 
-`make openshift-test` creates two exact temporary qualification Namespaces and
-removes them on success or failure. It requires at least two Ready workers and
-proves:
+`make openshift-test` detects IPv4 and IPv6 cluster CIDRs, creates two exact
+temporary qualification Namespaces, and removes them on success or failure. It
+requires IPv4 plus at least two Ready workers; when IPv6 is configured, every
+IPv6 assertion becomes mandatory rather than optional. The gate proves:
 
 - restricted controller and privileged worker-agent SCC admission;
 - enforcing host SELinux, readable BTF, bpffs, cgroup v2, and the reserved
@@ -85,11 +94,14 @@ proves:
   a real projected-token snapshot, and cross-Node claim rejection;
 - freshness-aware convergence for exactly the selected workers;
 - cross-worker IPv4 TCP allow/drop with policy provenance and retained history;
-  and
+- on dual-stack clusters, dual-family Pod addresses, identity maps, authenticated
+  snapshots, IPv6 allow/drop, and retained IPv6 policy provenance; and
 - healthy OpenShift cluster operators before and after the gate.
 
-The IPv4 gate does not claim OpenShift IPv6 compatibility. Run a separate
-dual-stack qualification before making that claim.
+The same adaptive command is live-verified against separate IPv4-only and
+dual-stack OpenShift 4.22/RHCOS 9.8 clusters. One family does not silently satisfy
+the other: IPv4 is always required and a configured IPv6 cluster CIDR requires
+IPv6 Pod assignment, state distribution, enforcement, and history evidence.
 
 ## Operational boundary
 

@@ -230,10 +230,10 @@ the public operator API remains HTTP. Certificate changes currently require a
 coordinated workload rollout. The
 [OpenShift qualification workflow](openshift-qualification.md) uses the platform
 Service CA while preserving the external-PKI Secret/ConfigMap contract. Its IPv4
-gate verifies projected custom-audience tokens, TokenReview Pod extras,
-controller RBAC, Service CA TLS, SCC admission, enforcing SELinux, native legacy
-attachment, and the encrypted Service path. Automated rotation and OpenShift
-dual-stack evidence remain separate gates.
+and dual-stack gates verify projected custom-audience tokens, TokenReview Pod
+extras, controller RBAC, Service CA TLS, SCC admission, enforcing SELinux, native
+legacy attachment, the encrypted Service path, and per-family cross-worker
+enforcement/history. Automated certificate rotation remains a separate gate.
 
 After the primary gate, `hack/verify-kind-legacy-netlink.sh` explicitly selects
 legacy mode when the host would normally choose TCX, confirms the reserved
@@ -267,8 +267,9 @@ deduplication and durable history remain later telemetry work.
 
 ## Fedora, RHEL, and OpenShift
 
-Do not assume Ubuntu paths or AppArmor. `make openshift-test` now provides the
-RHEL CoreOS/CRI-O IPv4 evidence for SELinux, SCC, BTF, bpffs, Service CA,
-TokenReview, native legacy attachment, and enforcement. The existing kind gate
-remains the dual-stack/TCX evidence; OpenShift dual-stack and broader release
-coverage are not inferred from either environment.
+Do not assume Ubuntu paths or AppArmor. `make openshift-test` now provides
+separate RHEL CoreOS/CRI-O IPv4-only and dual-stack evidence for SELinux, SCC,
+BTF, bpffs, Service CA, TokenReview, native legacy attachment, and enforcement.
+The kind gate remains separate dual-stack/TCX evidence; broader versions, scale,
+upgrade behavior, and production SCC hardening are not inferred from these
+fixtures.
