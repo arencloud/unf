@@ -1,9 +1,15 @@
-.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images kind-tool kind-up kind-load kind-deploy kind-demo kind-test kind-down
+.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images openshift-images openshift-deploy openshift-test kind-tool kind-up kind-load kind-deploy kind-demo kind-test kind-down
 
 KIND := .tools/bin/kind
 KIND_PROVIDER ?= podman
 KIND_KUBECONFIG := $(CURDIR)/.tools/kind-unf-dev.kubeconfig
 TEST_TOOLS_IMAGE := localhost/unf-test-tools:ipv6-ext-v1
+QUAY_AUTH_FILE ?= $(CURDIR)/.tools/quay-auth.json
+UNF_DEV_IMAGE_TAG ?= dev
+UNF_CONTROLLER_DEV_IMAGE ?= quay.io/arencloud/unf-controller-dev:$(UNF_DEV_IMAGE_TAG)
+UNF_AGENT_DEV_IMAGE ?= quay.io/arencloud/unf-agent-dev:$(UNF_DEV_IMAGE_TAG)
+UNF_TEST_TOOLS_DEV_IMAGE ?= quay.io/arencloud/unf-test-tools-dev:$(UNF_DEV_IMAGE_TAG)
+OPENSHIFT_KUBECONFIG ?= $(CURDIR)/.tools/cl01-audit.kubeconfig
 
 build:
 	cargo build --workspace
@@ -43,6 +49,17 @@ images: artifacts
 	podman build --build-arg UNF_PACKAGE=unf-controller --tag localhost/unf-controller:dev --file images/Containerfile .
 	podman build --build-arg UNF_PACKAGE=unf-agent --tag localhost/unf-agent:dev --file images/Containerfile .
 	podman build --tag $(TEST_TOOLS_IMAGE) --file images/SctpTestContainerfile .
+
+openshift-images: images
+	podman push --authfile $(QUAY_AUTH_FILE) localhost/unf-controller:dev docker://$(UNF_CONTROLLER_DEV_IMAGE)
+	podman push --authfile $(QUAY_AUTH_FILE) localhost/unf-agent:dev docker://$(UNF_AGENT_DEV_IMAGE)
+	podman push --authfile $(QUAY_AUTH_FILE) $(TEST_TOOLS_IMAGE) docker://$(UNF_TEST_TOOLS_DEV_IMAGE)
+
+openshift-deploy:
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) hack/deploy-openshift.sh
+
+openshift-test:
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) hack/verify-openshift.sh
 
 kind-tool:
 	mkdir -p .tools/bin

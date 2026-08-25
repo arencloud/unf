@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unf-internal-ca
+  namespace: unf-system
+  annotations:
+    service.beta.openshift.io/inject-cabundle: "true"

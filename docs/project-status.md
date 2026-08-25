@@ -22,7 +22,7 @@ repeatable test are both present in this repository.
 | Phase | State | Gate | Evidence |
 |---|---|---|---|
 | Phase 1 — observation foundation | **Verified** | Master prompt §101: controller, identity state, policy compiler, agent/Aya/TC flow events, and successful `unfctl status` | `make fmt-check lint test`, `make ebpf`, `make kind-test` |
-| Phase 2 — identity and policy enforcement | **Verified** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | `make fmt-check lint test`, `make ebpf`, and `make kind-test` verify the complete gate |
+| Phase 2 — identity and policy enforcement | **Verified** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | `make fmt-check lint test`, `make ebpf`, and `make kind-test` verify the complete gate; `make openshift-test` qualifies the current IPv4 OpenShift platform slice |
 | Phase 3 — compatibility and simulation | **In progress** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | The supported ingress adapter, resolved-identity IPv6 dataplane, history-aware read-only policy simulation, EndpointSlice-aware topology schema v3, and bounded dual-stack historical export are live verified; broader compatibility remains open |
 | Full CNI and later fabric capabilities | **Planned** | §104 and later roadmap gates | Explicitly out of current scope |
 
@@ -51,6 +51,7 @@ completed by Phase 1's observation-only shadow evaluation.
 | Scoped host-state cleanup | The deployed agent refused current v2 removal without confirmation and rejected unknown content injected into recognized v1 state without removing six known pins. Its dry run preserved those pins; execution removed v1 on both nodes while all nine v2 maps remained. After TCX restoration, the legacy gate proved another dry run preserved the reserved filters before the command removed only UNF-named ingress filters |
 | Agent acknowledgement authentication | Both agents converged with schema v2 Pod name/UID reports and dedicated-audience projected tokens accepted through Kubernetes TokenReview. The live gate rejected missing and invalid credentials with 401, accepted the real Pod token with 204, rejected the same valid token carrying a forged Node claim with 403, and required three authentication failures to be accounted without creating an unexpected agent |
 | Internal transport security | Agent-only routes were absent from public HTTP, the dedicated HTTPS port rejected the development CA when it was not explicitly trusted, and the real CA plus projected Pod token read a snapshot and submitted an acknowledgement. Both agents converged and exported retained flow history through the same CA-pinned, TokenReview-authenticated transport; management-port filtering prevented recursive telemetry from displacing workload provenance |
+| OpenShift IPv4 qualification | Passed: `make openshift-test` on OpenShift 4.22.9 / Kubernetes 1.35.6 with two RHCOS 9.8 workers on Linux 5.14. The controller ran under `restricted-v2`, agents ran only on workers under the privileged SCC, SELinux remained Enforcing, BTF/bpffs/cgroup v2 and native `legacy_netlink` filters were verified, OpenShift Service CA TLS and Pod-bound TokenReview positive/negative paths passed, exactly two selected agents converged, cross-worker TCP/8080 allowed while TCP/9090 dropped with retained provenance, and all 34 cluster operators remained healthy |
 | Persistent-state fault rejection | A short-lived bpffs helper built isolated map sets for eight-of-nine pins, malformed `POLICY_CONFIG`, and corrupt inactive-bank `POLICY_RULES` debris. The exact deployed agent exited nonzero with each expected cause, the primary pins were untouched, established allow/deny traffic remained correct, and the later offline replacement still recovered |
 | Physical map-pressure rollback | The helper filled the shared real `POLICY_RULES` map to its 262,144-entry physical limit with reserved synthetic keys tagged for the inactive bank. A Shadow update advanced desired state but the pressured agent retained its applied revision and bank, incremented `unf_policy_sync_errors_total`, logged the staging failure, and preserved active TCP/8080 allow plus TCP/9090 deny. Releasing pressure let the same waiting revision activate on the opposite bank; Shadow traffic passed and restored Enforce traffic denied again |
 | Dataplane provenance | ABI v2 TCP and SCTP events matched the applied revision and carried nonzero identities plus actual/shadow policy and explicit-deny rule provenance |
@@ -59,9 +60,12 @@ completed by Phase 1's observation-only shadow evaluation.
 | Policy explanation | Native 8080/9090, compatibility exact/range/protocol-only TCP/UDP/SCTP ports, bounded block/exception transitions, and namespace-wide target/defaulting transitions reported the expected explicit/default/no-applicable-policy provenance with dataplane enforcement truthfully enabled |
 | Policy simulation | Schema v2 evaluated 85 topology-derived flows and the bounded dual-stack history, predicted the TCP/8080 denial, reported `backend/server` affected, explicitly counted stale-identity history, left live policy state unchanged, and TCP/8080 remained allowed |
 
-The kind cluster is disposable and its object counts can change as system Pods
-roll. The repeatable commands, rather than these snapshot counts, are the release
-gate.
+The kind fixture and the two temporary OpenShift qualification Namespaces are
+disposable, and object counts can change as system Pods roll. The OpenShift
+product deployment intentionally remains in `unf-system`; its host filters must
+be removed with the coordinated cleanup procedure before uninstalling the
+DaemonSet. The repeatable commands, rather than these snapshot counts, are the
+release gate.
 
 ## Phase 1 acceptance matrix
 
@@ -89,8 +93,9 @@ gate.
 | Controller integration and identity counts | **Verified** | `make kind-test` requires nonzero admitted identities and indexed Pod IPs |
 | Versioned BPF identity map schema | **Verified** | ABI tests plus `make kind-test` require populated IPv4 and IPv6 kernel maps on both agents |
 | Controller-to-agent revisioned distribution | **Verified** | Both node agents report desired/applied epoch and revision convergence; controller-restart recovery exercised live |
-| Controller-aggregated node acknowledgements | **Verified** | Schema v2 reports carry Node and Pod identity. A dedicated-audience projected token is authenticated through TokenReview, then bound to the `unf-agent` service account, watched Pod UID, and authoritative Node placement before storage. Controller/CLI status distinguishes expected, missing, stale, unexpected, and converged agents; unit and kind tests reject missing/invalid credentials and cross-Node claims while both real agents converge |
-| Encrypted authenticated internal transport | **Verified** | Public HTTP exposes no snapshot or agent-write routes. Dedicated HTTPS serves identity/policy snapshots, acknowledgements, and telemetry; agents trust only `unf-internal-ca` and reread their projected token for every request. The controller bounds Kubernetes API load with a 64-entry/30-second successful-review cache while rechecking authoritative Pod identity and placement on every request; invalid credentials are not cached. Agent userspace counts but excludes the configured management TCP port from logs/export to prevent telemetry recursion. `make kind-test` covers plaintext isolation, missing CA, missing/invalid/valid credentials, forged Node claims, convergence, workload provenance, and flow export |
+| Controller-aggregated node acknowledgements | **Verified** | Schema v2 reports carry Node and Pod identity. A dedicated-audience projected token is authenticated through TokenReview, then bound to the `unf-agent` service account, watched Pod UID, and authoritative Node placement before storage. Controller/CLI status distinguishes expected, missing, stale, unexpected, and converged agents; an optional exact label selector defines the expected agent population. Unit, kind, and OpenShift tests reject missing/invalid credentials and cross-Node claims while all selected agents converge |
+| Encrypted authenticated internal transport | **Verified** | Public HTTP exposes no snapshot or agent-write routes. Dedicated HTTPS serves identity/policy snapshots, acknowledgements, and telemetry; agents trust only `unf-internal-ca` and reread their projected token for every request. The controller bounds Kubernetes API load with a 64-entry/30-second successful-review cache while rechecking authoritative Pod identity and placement on every request; invalid credentials are not cached. Agent userspace counts but excludes the configured management TCP port from logs/export to prevent telemetry recursion. `make kind-test` covers the supplied-Secret CA mode; `make openshift-test` covers OpenShift Service CA injection. Both gates cover plaintext isolation, missing CA, missing/invalid/valid credentials, forged Node claims, convergence, workload provenance, and flow export |
+| OpenShift IPv4 platform qualification | **Verified** | `make openshift-test` repeatably verifies restricted controller execution, worker-only privileged agents, native Linux 5.14 legacy TC attachment under Enforcing SELinux, OpenShift Service CA and TokenReview transport, selected-node convergence, cross-worker allow/drop provenance, and healthy cluster operators; dual-stack OpenShift remains a separate Phase 3 gate |
 | Transactional identity map set | **Verified** | Identity ABI v2 stages separate inactive IPv4/IPv6 maps, validates both, and selects them with one `IDENTITY_CONFIG` write; ABI/agent tests cover the fixed config and recovery rules, while `make kind-test` exercises repeated identity changes, dual-stack enforcement, and offline restart recovery |
 | Selector-to-identity policy lowering | **Verified** | Unit tests cover exact/default, shadow provenance, conflicts, and deterministic ordering; `make kind-test` requires nonzero resolved entries |
 | Transactional policy map set | **Verified** | `make kind-test` stages a changed policy on the opposite bank, verifies a higher applied revision, restores it, and verifies reconvergence |
@@ -99,7 +104,7 @@ gate.
 | Enforcement | **Verified** | `make kind-test` proves IPv4/IPv6 8080 allow and open-port 9090 drop, shadow pass-through, and restored drop |
 | Accurate live explanation | **Verified** | CLI actual decisions and IDs are checked while every traffic-path agent reports the active revision applied |
 | Pinned last-known-good restart recovery | **Verified** | Nine-map all-or-none ABI v2 directory, capacity/content and active-config validation, two-bank cache reconstruction, and fresh-start readiness fencing; `make kind-test` replaces the server-node agent with the controller offline, requires recovered identity epoch/revisions/active-bank validation, and rechecks allow/drop before controller restoration |
-| Persistent TC attachment handoff | **Verified** | `make kind-test` on Linux 7.1 continuously probes an explicitly denied flow through both pinned TCX atomic replacement and an explicitly selected legacy netlink replacement. The legacy gate confirms the fixed tuple, removes TCX coverage, requires in-place replacement evidence, then restores TCX before scoped cleanup. Native pre-6.6 and OpenShift host validation remain portability work |
+| Persistent TC attachment handoff | **Verified** | `make kind-test` on Linux 7.1 continuously probes an explicitly denied flow through both pinned TCX atomic replacement and an explicitly selected legacy netlink replacement. The legacy gate confirms the fixed tuple, removes TCX coverage, requires in-place replacement evidence, then restores TCX before scoped cleanup. `make openshift-test` verifies native legacy selection and reserved filters on OpenShift/RHCOS Linux 5.14 with Enforcing SELinux; broader kernel/platform coverage remains portability work |
 | Scoped host-state cleanup | **Verified** | `unf-agent cleanup` is dry-run-first, recognizes only v1/v2 map and numeric TCX pin names, refuses unknown/symlink state, gates current v2 behind `--allow-current-abi`, and removes only UNF-named legacy filters without deleting clsact. Unit tests cover its ownership boundary; `make kind-test` proves refusal and non-mutation, removes v1 across both nodes while preserving nine v2 maps, then dry-runs and executes legacy cleanup only after TCX restoration |
 | Persistent-state corruption failure injection | **Verified** | `make kind-test` uses isolated bpffs aliases and cloned fault maps to prove partial-pin, malformed active-config, and invalid inactive-stage rejection through the exact deployed agent; every probe exits nonzero with an actionable cause, leaves the primary pin set untouched, and preserves established allow/deny traffic |
 | Physical map-pressure failure injection | **Verified** | `make kind-test` fills the shared real `POLICY_RULES` map with inactive-bank synthetic keys, requires a kernel staging failure plus sync-error telemetry while the applied revision, selected bank, and active allow/deny traffic remain unchanged, then removes only those reserved keys and proves the waiting revision activates on the opposite bank before enforcement is restored |
@@ -117,8 +122,9 @@ gate.
   restart. Linux 6.6+ TCX links are pinned and atomically updated during agent
   replacement; the legacy netlink fallback reserves priority `0x554e` and handles
   `0x554e:1`/`0x554e:2`. Its forced-mode path and scoped migration cleanup are
-  live-verified on Linux 7.1, but native selection and compatibility still require
-  an older kernel and OpenShift. ABI v1 and known stale ABI directories can be
+  live-verified on Linux 7.1. Native legacy selection and compatibility are also
+  live-verified on OpenShift/RHCOS Linux 5.14 with Enforcing SELinux. Broader
+  kernel/platform combinations remain. ABI v1 and known stale ABI directories can be
   removed with the dry-run-first cleanup command after a validated rollout;
   current v2 cleanup remains a separately confirmed, operator-coordinated action.
 - Partial pin sets, malformed active policy config, and invalid inactive-stage
@@ -133,7 +139,9 @@ gate.
   dedicated TLS service plus Pod-bound Kubernetes TokenReview identity. Reports
   older than ten seconds are marked stale, but report storage is current-process
   only. Certificate reload/rotation, durable retention, NetworkPolicy isolation,
-  and OpenShift validation remain.
+  OpenShift Service CA integration is IPv4 live-verified. Certificate hot
+  reload/rotation, durable retention, NetworkPolicy isolation, and OpenShift
+  dual-stack validation remain.
 - Policy simulation currently accepts one native `SecurityPolicy`, uses current
   Pods plus representative policy-derived TCP/UDP/SCTP probes, and rejects matrices
   above 10,000 flows. It separately evaluates retained history and observation
@@ -164,9 +172,11 @@ gate.
 - Dynamic attachment can observe one packet on multiple interfaces; flow
   history aggregates identical logical keys but does not deduplicate one packet's
   interface-level observations.
-- The development DaemonSet is privileged; narrow capabilities and OpenShift SCC/
-  SELinux validation remain required.
-- kind verification is Kubernetes evidence, not an OpenShift support claim.
+- The development DaemonSet is privileged. Its worker-only privileged-SCC runtime
+  and Enforcing SELinux compatibility are OpenShift IPv4 live-verified; a narrower
+  custom SCC/capability profile remains required for production hardening.
+- Dual-stack kind and IPv4 OpenShift are separate verified fixtures; neither is
+  evidence for the still-untested dual-stack OpenShift combination.
 
 ## Phase 3 work breakdown
 

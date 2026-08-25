@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unf-controller
+  namespace: unf-system
+spec:
+  template:
+    spec:
+      securityContext:
+        fsGroup: null
+        fsGroupChangePolicy: null
+      containers:
+        - name: controller
+          imagePullPolicy: Always
+          args:
+            - --listen
+            - 0.0.0.0:9962
+            - --internal-listen
+            - 0.0.0.0:9964
+            - --tls-cert
+            - /var/run/secrets/unf-internal-tls/tls.crt
+            - --tls-key
+            - /var/run/secrets/unf-internal-tls/tls.key
+            - --agent-node-selector
+            - node-role.kubernetes.io/worker
+          securityContext:
+            runAsUser: null
+            runAsGroup: null

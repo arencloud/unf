@@ -3455,7 +3455,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         )
         .status_label(),
         capabilities: state.capabilities.clone(),
-        limitation: "TC policy enforcement uses transactional pinned maps and persistent atomic attachment replacement; acknowledgements use Pod-bound Kubernetes TokenReview authentication over prototype HTTP transport",
+        limitation: "TC policy enforcement uses transactional pinned maps and persistent atomic attachment replacement; internal controller traffic uses dedicated CA-pinned TLS and Pod-bound Kubernetes TokenReview authentication",
     })
 }
 

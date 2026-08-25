@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: unf-qualification-client
+  labels:
+    unf.io/qualification: ipv4
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: unf-qualification-server
+  labels:
+    unf.io/qualification: ipv4
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: unf-qualification-client
+  labels:
+    app.kubernetes.io/name: client
+    unf.io/qualification-pair: ipv4
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/worker: ""
+  imagePullSecrets:
+    - name: unf-quay-pull
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              unf.io/qualification-pair: ipv4
+          namespaceSelector: {}
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: client
+      image: quay.io/arencloud/unf-test-tools-dev:dev
+      imagePullPolicy: Always
+      command: ["sh", "-c", "sleep infinity"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server
+  namespace: unf-qualification-server
+  labels:
+    app.kubernetes.io/name: server
+    unf.io/qualification-pair: ipv4
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/worker: ""
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              unf.io/qualification-pair: ipv4
+          namespaceSelector: {}
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: server
+      image: docker.io/library/busybox:1.37.0
+      command:
+        - sh
+        - -c
+        - mkdir -p /tmp/www && echo unf-openshift-ok > /tmp/www/index.html && httpd -p 9090 -h /tmp/www && httpd -f -p 8080 -h /tmp/www
+      ports:
+        - name: allowed
+          containerPort: 8080
+        - name: denied
+          containerPort: 9090
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+---
+apiVersion: network.unf.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: qualification-ipv4
+  namespace: unf-qualification-server
+spec:
+  target:
+    application: server
+  priority: 100
+  ingress:
+    - from:
+        namespace: unf-qualification-client
+        application: client
+      protocols:
+        - protocol: Tcp
+          port: 8080
+      action: Allow
+  defaultAction: Deny
+  enforcementMode: Enforce

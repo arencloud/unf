@@ -78,6 +78,13 @@ struct Args {
         default_value = "/var/run/secrets/unf-internal-tls/tls.key"
     )]
     tls_key: PathBuf,
+    /// Count agents only on Nodes matching this exact label key or key=value pair.
+    #[arg(
+        long,
+        env = "UNF_CONTROLLER_AGENT_NODE_SELECTOR",
+        value_parser = validate_agent_node_selector
+    )]
+    agent_node_selector: Option<String>,
     /// Run the API server without connecting to Kubernetes (development only).
     #[arg(long)]
     offline: bool,
@@ -97,6 +104,7 @@ struct ControllerState {
     ready: AtomicBool,
     identity_epoch: u64,
     offline: bool,
+    agent_node_selector: Option<String>,
     pods: RwLock<BTreeMap<String, PodRecord>>,
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
     services: RwLock<BTreeMap<String, ServiceRecord>>,
@@ -342,7 +350,11 @@ async fn main() -> Result<()> {
                 .context("create Kubernetes client from in-cluster or kubeconfig settings")?,
         )
     };
-    let state = Arc::new(new_state_with_client(args.offline, client.clone()));
+    let state = Arc::new(new_state_with_client_and_selector(
+        args.offline,
+        client.clone(),
+        args.agent_node_selector.clone(),
+    ));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
 
@@ -456,10 +468,14 @@ fn install_crypto_provider() -> Result<()> {
 
 #[cfg(test)]
 fn new_state(offline: bool) -> ControllerState {
-    new_state_with_client(offline, None)
+    new_state_with_client_and_selector(offline, None, None)
 }
 
-fn new_state_with_client(offline: bool, token_review_client: Option<Client>) -> ControllerState {
+fn new_state_with_client_and_selector(
+    offline: bool,
+    token_review_client: Option<Client>,
+    agent_node_selector: Option<String>,
+) -> ControllerState {
     let metrics = ControllerMetrics::default();
     let mut registry = Registry::default();
     registry.register(
@@ -496,6 +512,7 @@ fn new_state_with_client(offline: bool, token_review_client: Option<Client>) -> 
         ready: AtomicBool::new(offline),
         identity_epoch: controller_epoch(),
         offline,
+        agent_node_selector,
         pods: RwLock::new(BTreeMap::new()),
         nodes: RwLock::new(BTreeMap::new()),
         services: RwLock::new(BTreeMap::new()),
@@ -1701,7 +1718,11 @@ fn agent_convergence_snapshot(
     policy_revision: Revision,
     now_unix_ms: u64,
 ) -> AgentConvergenceSnapshot {
-    let expected_nodes: BTreeSet<_> = read_lock(&state.nodes).keys().cloned().collect();
+    let expected_nodes: BTreeSet<_> = read_lock(&state.nodes)
+        .values()
+        .filter(|node| agent_node_matches(node, state.agent_node_selector.as_deref()))
+        .map(|node| node.name.clone())
+        .collect();
     let reports = read_lock(&state.agent_reports);
     let unexpected_agents = reports
         .iter()
@@ -1762,6 +1783,32 @@ fn agent_convergence_snapshot(
             && converged_agents == expected_agents
             && unexpected_agents == 0,
         nodes,
+    }
+}
+
+fn validate_agent_node_selector(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    let (key, expected_value) = value
+        .split_once('=')
+        .map_or((value, None), |(key, expected)| (key, Some(expected)));
+    if key.is_empty()
+        || expected_value.is_some_and(str::is_empty)
+        || value.chars().any(char::is_whitespace)
+        || expected_value.is_some_and(|expected| expected.contains('='))
+    {
+        return Err("agent Node selector must be an exact label key or key=value pair".to_owned());
+    }
+    Ok(value.to_owned())
+}
+
+fn agent_node_matches(node: &TopologyNode, selector: Option<&str>) -> bool {
+    let Some(selector) = selector else {
+        return true;
+    };
+    if let Some((key, expected)) = selector.split_once('=') {
+        node.labels.get(key).is_some_and(|value| value == expected)
+    } else {
+        node.labels.contains_key(selector)
     }
 }
 
@@ -3340,6 +3387,73 @@ mod tests {
         let mut invalid = report;
         invalid.active_policy_bank = 2;
         assert!(validate_agent_status(&invalid).is_err());
+    }
+
+    #[test]
+    fn agent_status_aggregation_honors_the_configured_node_selector() {
+        let state = new_state_with_client_and_selector(
+            true,
+            None,
+            Some("node-role.kubernetes.io/worker".to_owned()),
+        );
+        let mut worker = node(true);
+        worker
+            .metadata
+            .labels
+            .get_or_insert_default()
+            .insert("node-role.kubernetes.io/worker".to_owned(), String::new());
+        let mut control_plane = node(true);
+        control_plane.metadata.name = Some("control-plane-a".to_owned());
+        control_plane
+            .metadata
+            .labels
+            .get_or_insert_default()
+            .insert(
+                "node-role.kubernetes.io/control-plane".to_owned(),
+                String::new(),
+            );
+        apply_node_event(&state, Event::Apply(worker));
+        apply_node_event(&state, Event::Apply(control_plane));
+
+        let report = converged_agent_report(state.identity_epoch);
+        write_lock(&state.agent_reports).insert(
+            report.node_name.clone(),
+            StoredAgentReport {
+                report,
+                last_received_unix_ms: 100,
+            },
+        );
+        let snapshot =
+            agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100);
+        assert_eq!(snapshot.expected_agents, 1);
+        assert_eq!(snapshot.reporting_agents, 1);
+        assert_eq!(snapshot.nodes[0].node_name, "worker-a");
+        assert!(snapshot.all_converged);
+    }
+
+    #[test]
+    fn agent_node_selector_accepts_presence_and_exact_value_forms() {
+        let mut candidate = topology_node(&node(true));
+        candidate
+            .labels
+            .insert("node-role.kubernetes.io/worker".to_owned(), String::new());
+        candidate
+            .labels
+            .insert("unf.io/pool".to_owned(), "qualification".to_owned());
+
+        assert!(agent_node_matches(&candidate, None));
+        assert!(agent_node_matches(
+            &candidate,
+            Some("node-role.kubernetes.io/worker")
+        ));
+        assert!(agent_node_matches(
+            &candidate,
+            Some("unf.io/pool=qualification")
+        ));
+        assert!(!agent_node_matches(&candidate, Some("unf.io/pool=other")));
+        assert!(validate_agent_node_selector("unf.io/pool=qualification").is_ok());
+        assert!(validate_agent_node_selector("unf.io/pool=").is_err());
+        assert!(validate_agent_node_selector("unf.io/pool = qualification").is_err());
     }
 
     #[test]

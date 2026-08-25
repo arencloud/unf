@@ -45,7 +45,10 @@ both deployed agents, rejects an anonymous request, rejects an invalid token,
 accepts the actual projected Pod token, rejects that valid token with a forged
 Node claim, and checks rejection accounting. Later offline-controller agent
 replacement also obtains a new Pod-bound credential and reconverges after the
-controller returns.
+controller returns. The OpenShift IPv4 qualification gate repeats the anonymous,
+invalid-token, real projected-token, and forged-Node paths against the OpenShift
+TokenReview implementation while requiring exactly the selected worker agents to
+converge.
 
 ## Consequences
 
@@ -56,6 +59,7 @@ revocation follow Kubernetes service-account behavior.
 This decision established acknowledgement identity but did not originally provide
 transport confidentiality. ADR 0024 now places snapshots, acknowledgements, and
 flow telemetry on a dedicated TLS listener and applies the same Pod-bound
-TokenReview identity to every internal request. Native OpenShift validation must
-still confirm projected audience tokens, TokenReview extras/RBAC, SCC behavior,
-certificate integration, and the encrypted service path.
+TokenReview identity to every internal request. Native OpenShift IPv4 validation
+confirms projected audience tokens, TokenReview extras/RBAC, SCC behavior,
+Service CA integration, and the encrypted service path. Dual-stack OpenShift and
+certificate rotation remain separate validation work.

@@ -48,7 +48,9 @@ matrix and reproducible evidence.
   while an offline-controller agent is replaced. The same gate explicitly selects
   the stable-priority/handle legacy netlink path, removes TCX coverage, proves
   in-place replacement with continuous deny enforcement, and safely restores TCX
-  before scoped legacy cleanup. Native pre-6.6 and OpenShift validation remain;
+  before scoped legacy cleanup. Native automatic legacy selection, reserved
+  filters, BTF/bpffs access, SCC admission, enforcing SELinux, and IPv4
+  enforcement are also verified on OpenShift 4.22/RHCOS 9.8 kernel 5.14;
 - Implemented and two-node kind verified: isolated live-kernel fault sets prove
   eight-of-nine pins, malformed active policy config, and corrupt inactive-bank
   debris are rejected with actionable errors while primary allow/deny state
@@ -72,8 +74,13 @@ matrix and reproducible evidence.
   telemetry routes use a separate TLS Service port, agents trust only the mounted
   UNF CA, and every request uses Pod-bound TokenReview identity. Plaintext route
   isolation, CA failure, credential failure, and live convergence/export are gated;
-- Next: legacy-kernel/OpenShift handoff, certificate/token validation and rotation,
-  and durable agent acknowledgement retention.
+- Implemented and OpenShift IPv4 verified: a worker-scoped overlay uses
+  `restricted-v2` for the controller, an explicit privileged agent SCC binding,
+  OpenShift Service CA certificate/bundle injection, exact worker convergence,
+  Pod-bound TokenReview, and cross-worker policy provenance;
+- Next: automated certificate/trust rotation, durable agent acknowledgement
+  retention, a narrower production SCC/capability profile, and OpenShift
+  dual-stack qualification.
 
 ## Phase 3 — compatibility and simulation
 
@@ -110,7 +117,7 @@ matrix and reproducible evidence.
   with time-window queries;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
-- failure, scale, and OpenShift validation.
+- failure and scale validation, plus remaining OpenShift dual-stack coverage.
 
 Full CNI/IPAM, routing, service load balancing, egress, encryption, L7, and
 multi-cluster transport remain research/planned work after these foundations.

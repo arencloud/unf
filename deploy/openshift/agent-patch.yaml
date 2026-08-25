@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: unf-agent
+  namespace: unf-system
+spec:
+  template:
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/worker: ""
+      containers:
+        - name: agent
+          imagePullPolicy: Always
+      volumes:
+        - name: internal-ca
+          configMap:
+            name: unf-internal-ca
+            defaultMode: 0444
+            items:
+              - key: service-ca.crt
+                path: ca.crt

@@ -54,9 +54,10 @@ the TCX-capable development host, and `make kind-test` exercises both attachment
 implementations. The mode override is also available for controlled compatibility
 diagnostics, but `auto` remains the deployment default.
 
-This is not evidence that a pre-6.6 distribution kernel exposes every required
-BPF/netlink capability, nor that OpenShift SCC, SELinux, CRI-O, or host networking
-permits the design. Native older-kernel and OpenShift runs remain required before
-making those platform-support claims. Production rollout and uninstall
-orchestration remain separate operator-facing work; the scoped node cleanup
-primitive is defined by ADR 0022.
+The separate OpenShift IPv4 gate now verifies automatic selection and reserved
+filters on RHCOS 9.8 kernel 5.14, plus SCC, enforcing SELinux, CRI-O, BTF/bpffs,
+Service CA, and cross-worker policy enforcement. That evidence applies to the
+recorded OpenShift environment only; broader versions and OpenShift dual stack
+remain unqualified. Production rollout and uninstall orchestration remain
+separate operator-facing work; the scoped node cleanup primitive is defined by
+ADR 0022.

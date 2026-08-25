@@ -55,5 +55,7 @@ legacy filters are absent.
 ABI retirement and uninstall now have a reviewable, idempotent ownership boundary
 instead of requiring ad hoc recursive deletion. The command intentionally favors
 refusal over cleanup when state is unfamiliar. Production orchestration, native
-pre-6.6 validation, and OpenShift privilege/SELinux compatibility remain separate
-work.
+pre-6.6 validation beyond the qualified OpenShift/RHCOS Linux 5.14 environment,
+and a coordinated OpenShift uninstall/cleanup drill remain separate work. The
+runtime qualification already verifies the reserved legacy filters under the
+privileged SCC with SELinux Enforcing.

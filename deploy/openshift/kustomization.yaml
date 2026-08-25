@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../crds
+  - ../kubernetes
+  - agent-scc.yaml
+  - internal-ca.yaml
+images:
+  - name: localhost/unf-controller
+    newName: quay.io/arencloud/unf-controller-dev
+    newTag: dev
+  - name: localhost/unf-agent
+    newName: quay.io/arencloud/unf-agent-dev
+    newTag: dev
+patches:
+  - path: service-ca-patch.yaml
+  - path: controller-patch.yaml
+  - path: agent-patch.yaml
+  - path: service-account-patch.yaml
+  - target:
+      group: apps
+      version: v1
+      kind: DaemonSet
+      name: unf-agent
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/tolerations
+        value: []
