@@ -15,8 +15,11 @@ UNF supports both deployment models through the same runtime paths:
   agent maps the injected `service-ca.crt` key to its portable `ca.crt` path.
 
 The controller and agent do not contain OpenShift-specific certificate code.
-Certificates are still loaded at process startup, so rotation requires a
-controller rollout and, when trust changes, an agent rollout.
+The controller polls the mounted serving certificate/key and atomically swaps a
+validated Rustls configuration. Agents compare CA-bundle contents before every
+internal request and replace their CA-only client when valid content changes.
+Malformed or incomplete updates are rejected while the last-known-good serving
+or trust configuration remains active.
 
 ## Development images and credentials
 
@@ -55,6 +58,7 @@ logged.
 make openshift-images
 make openshift-deploy
 make openshift-test
+make openshift-tls-rotation-test
 ```
 
 Select a non-default qualification cluster explicitly:
@@ -62,6 +66,7 @@ Select a non-default qualification cluster explicitly:
 ```bash
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-deploy
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-test
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-tls-rotation-test
 ```
 
 Override `OPENSHIFT_KUBECONFIG` or `QUAY_AUTH_FILE` when qualifying another
@@ -69,7 +74,7 @@ environment. The image publishing variables may also be overridden, but a
 different repository or tag must be reflected in the overlay before deployment.
 `openshift-deploy` applies the CRD, RBAC, `unf-system` workloads, Service CA
 objects, and pull Secret, then rolls both components so mutable development tags
-and certificate changes are picked up.
+are picked up. Certificate changes after startup do not require that rollout.
 
 The overlay:
 
@@ -108,6 +113,15 @@ dual-stack OpenShift 4.22/RHCOS 9.8 clusters. One family does not silently satis
 the other: IPv4 is always required and a configured IPv6 cluster CIDR requires
 IPv6 Pod assignment, state distribution, enforcement, and history evidence.
 
+`make openshift-tls-rotation-test` is a disruptive-but-reversible lab gate for
+the `unf-system` certificate objects. It records the original OpenShift-managed
+keypair and CA, transitions through an overlapping external CA, switches the
+serving leaf, contracts trust, injects malformed CA and leaf updates, and then
+restores Service CA ownership. It requires authenticated traffic under the new
+issuer, last-known-good continuity, agent convergence, reload/error metrics,
+exact projected bundles, unchanged Pod UIDs, and a final platform-issued chain.
+An exit trap restores the original certificate contract on failure.
+
 ## Operational boundary
 
 The agent attaches to every non-loopback worker interface, including OVN and
@@ -120,6 +134,7 @@ The SCC still permits root, `spc_t`, host networking/ports, and the `hostPath`
 volume class. Its RBAC is limited to the agent service account and the workload
 mounts only `/sys/fs/bpf` plus read-only `/sys/kernel/btf`, but SCC itself cannot
 restrict hostPath prefixes. Admission policy for those exact paths, immutable
-digest-pinned release images, automated certificate rotation, and complete
+digest-pinned release images, issuer-specific production automation, and complete
 uninstall orchestration remain production-hardening requirements. See
-[ADR 0025](../adr/0025-constrained-openshift-agent-scc.md).
+[ADR 0025](../adr/0025-constrained-openshift-agent-scc.md) and
+[ADR 0026](../adr/0026-hot-certificate-and-trust-rotation.md).

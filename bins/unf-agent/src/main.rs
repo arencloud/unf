@@ -207,6 +207,8 @@ struct AgentMetrics {
     telemetry_dropped_events: Counter,
     telemetry_export_errors: Counter,
     telemetry_exported_events: Counter,
+    controller_trust_reloads: Counter,
+    controller_trust_reload_errors: Counter,
 }
 
 struct AgentState {
@@ -248,7 +250,7 @@ struct IdentitySynchronizer {
     applied_epoch: u64,
     controller_url: Option<String>,
     controller_management_port: Option<u16>,
-    client: reqwest::Client,
+    client: ReloadingControllerClient,
     agent_token_path: PathBuf,
     interval: Duration,
 }
@@ -264,7 +266,7 @@ struct PolicySynchronizer {
     active_bank: u8,
     applied_epoch: u64,
     controller_url: Option<String>,
-    client: reqwest::Client,
+    client: ReloadingControllerClient,
     agent_token_path: PathBuf,
     interval: Duration,
 }
@@ -305,10 +307,23 @@ struct DataplaneConfig {
 
 struct FlowExporterConfig {
     controller_url: String,
-    client: reqwest::Client,
+    client: ReloadingControllerClient,
     node_name: String,
     token_path: PathBuf,
     interval: Duration,
+}
+
+#[derive(Clone)]
+struct ReloadingControllerClient {
+    ca_path: PathBuf,
+    state: Arc<Mutex<ControllerClientState>>,
+    reloads: Counter,
+    reload_errors: Counter,
+}
+
+struct ControllerClientState {
+    observed_ca_pem: Vec<u8>,
+    client: reqwest::Client,
 }
 
 struct RecoveredDataplane {
@@ -814,6 +829,8 @@ fn new_state(
         telemetry_dropped_events: Counter::default(),
         telemetry_export_errors: Counter::default(),
         telemetry_exported_events: Counter::default(),
+        controller_trust_reloads: Counter::default(),
+        controller_trust_reload_errors: Counter::default(),
     };
     let mut registry = Registry::default();
     register_agent_metrics(&mut registry, &metrics);
@@ -933,6 +950,16 @@ fn register_agent_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         "Aggregated flow-event observations accepted by the controller",
         metrics.telemetry_exported_events.clone(),
     );
+    registry.register(
+        "unf_agent_controller_trust_reloads",
+        "Controller CA bundle reloads accepted without an agent restart",
+        metrics.controller_trust_reloads.clone(),
+    );
+    registry.register(
+        "unf_agent_controller_trust_reload_errors",
+        "Controller CA bundle updates rejected while retaining last-known-good trust",
+        metrics.controller_trust_reload_errors.clone(),
+    );
 }
 
 async fn run_dataplane(
@@ -953,10 +980,11 @@ async fn run_dataplane(
         .controller_url
         .as_deref()
         .map(|url| url.trim_end_matches('/').to_owned());
-    let controller_client = match controller_url.as_deref() {
-        Some(url) => build_controller_client(url, &config.controller_ca_path)?,
-        None => reqwest::Client::new(),
-    };
+    let controller_client = dataplane_controller_client(
+        controller_url.as_deref(),
+        &config.controller_ca_path,
+        &state,
+    )?;
     let controller_management_port = controller_url.as_deref().map(controller_port).transpose()?;
     let (mut identities, mut policies) = new_synchronizers(
         identity_maps,
@@ -1094,7 +1122,7 @@ fn new_synchronizers(
     policy_maps: PolicyMaps,
     controller_url: Option<String>,
     controller_management_port: Option<u16>,
-    client: reqwest::Client,
+    client: ReloadingControllerClient,
     agent_token_path: PathBuf,
     interval: Duration,
 ) -> (IdentitySynchronizer, PolicySynchronizer) {
@@ -1133,18 +1161,111 @@ fn new_synchronizers(
     )
 }
 
-fn build_controller_client(controller_url: &str, ca_path: &Path) -> Result<reqwest::Client> {
-    if !controller_url.starts_with("https://") {
-        bail!("controller URL must use https:// when the dataplane is connected");
+fn dataplane_controller_client(
+    controller_url: Option<&str>,
+    ca_path: &Path,
+    state: &AgentState,
+) -> Result<ReloadingControllerClient> {
+    let reloads = state.metrics.controller_trust_reloads.clone();
+    let reload_errors = state.metrics.controller_trust_reload_errors.clone();
+    match controller_url {
+        Some(url) => {
+            ReloadingControllerClient::new(url, ca_path.to_path_buf(), reloads, reload_errors)
+        }
+        None => Ok(ReloadingControllerClient::without_custom_trust(
+            reloads,
+            reload_errors,
+        )),
     }
-    let ca_pem = fs::read(ca_path)
-        .with_context(|| format!("read controller CA certificate {}", ca_path.display()))?;
-    let ca = reqwest::Certificate::from_pem(&ca_pem)
-        .with_context(|| format!("parse controller CA certificate {}", ca_path.display()))?;
+}
+
+impl ReloadingControllerClient {
+    fn new(
+        controller_url: &str,
+        ca_path: PathBuf,
+        reloads: Counter,
+        reload_errors: Counter,
+    ) -> Result<Self> {
+        if !controller_url.starts_with("https://") {
+            bail!("controller URL must use https:// when the dataplane is connected");
+        }
+        let ca_pem = fs::read(&ca_path)
+            .with_context(|| format!("read controller CA certificate {}", ca_path.display()))?;
+        let client = build_controller_client(&ca_pem, &ca_path)?;
+        Ok(Self {
+            ca_path,
+            state: Arc::new(Mutex::new(ControllerClientState {
+                observed_ca_pem: ca_pem,
+                client,
+            })),
+            reloads,
+            reload_errors,
+        })
+    }
+
+    fn without_custom_trust(reloads: Counter, reload_errors: Counter) -> Self {
+        Self {
+            ca_path: PathBuf::new(),
+            state: Arc::new(Mutex::new(ControllerClientState {
+                observed_ca_pem: Vec::new(),
+                client: reqwest::Client::new(),
+            })),
+            reloads,
+            reload_errors,
+        }
+    }
+
+    fn current(&self) -> reqwest::Client {
+        if !self.ca_path.as_os_str().is_empty() {
+            match self.reload_if_changed() {
+                Ok(true) => {
+                    self.reloads.inc();
+                    info!(path = %self.ca_path.display(), "reloaded controller CA trust bundle");
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.reload_errors.inc();
+                    warn!(%error, path = %self.ca_path.display(), "rejected controller CA trust update; retaining last-known-good bundle");
+                }
+            }
+        }
+        self.lock_state().client.clone()
+    }
+
+    fn reload_if_changed(&self) -> Result<bool> {
+        let ca_pem = fs::read(&self.ca_path).with_context(|| {
+            format!(
+                "read updated controller CA certificate {}",
+                self.ca_path.display()
+            )
+        })?;
+        let mut state = self.lock_state();
+        if ca_pem == state.observed_ca_pem {
+            return Ok(false);
+        }
+        state.observed_ca_pem.clone_from(&ca_pem);
+        let client = build_controller_client(&ca_pem, &self.ca_path)?;
+        state.client = client;
+        Ok(true)
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ControllerClientState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn build_controller_client(ca_pem: &[u8], ca_path: &Path) -> Result<reqwest::Client> {
+    let certificates = reqwest::Certificate::from_pem_bundle(ca_pem)
+        .with_context(|| format!("parse controller CA bundle {}", ca_path.display()))?;
+    if certificates.is_empty() {
+        bail!("controller CA bundle {} is empty", ca_path.display());
+    }
     reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .https_only(true)
-        .tls_certs_only([ca])
+        .tls_certs_only(certificates)
         .build()
         .context("construct CA-pinned controller HTTPS client")
 }
@@ -1167,11 +1288,14 @@ fn read_agent_token(path: &Path) -> Result<String> {
 }
 
 fn authenticated_get(
-    client: &reqwest::Client,
+    client: &ReloadingControllerClient,
     url: String,
     token_path: &Path,
 ) -> Result<reqwest::RequestBuilder> {
-    Ok(client.get(url).bearer_auth(read_agent_token(token_path)?))
+    Ok(client
+        .current()
+        .get(url)
+        .bearer_auth(read_agent_token(token_path)?))
 }
 
 async fn await_background_task(task: Option<tokio::task::JoinHandle<()>>, name: &'static str) {
@@ -1606,7 +1730,7 @@ fn take_identity_maps(ebpf: &mut Ebpf) -> Result<IdentityMaps> {
 
 fn spawn_flow_exporter(
     controller_url: Option<String>,
-    client: reqwest::Client,
+    client: ReloadingControllerClient,
     config: &DataplaneConfig,
     state: &Arc<AgentState>,
     cancellation: &CancellationToken,
@@ -1638,7 +1762,7 @@ fn spawn_flow_exporter(
 
 fn spawn_agent_status_reporter(
     controller_url: Option<String>,
-    client: reqwest::Client,
+    client: ReloadingControllerClient,
     config: &DataplaneConfig,
     state: &Arc<AgentState>,
     cancellation: &CancellationToken,
@@ -1913,7 +2037,7 @@ async fn export_flow_batches(
                         continue;
                     }
                 };
-                let result = config.client
+                let result = config.client.current()
                     .post(format!("{}/v1/telemetry/flows", config.controller_url))
                     .bearer_auth(token)
                     .json(&batch)
@@ -1945,7 +2069,7 @@ async fn export_flow_batches(
 
 async fn report_agent_status(
     controller_url: String,
-    client: reqwest::Client,
+    client: ReloadingControllerClient,
     token_path: PathBuf,
     state: Arc<AgentState>,
     cancellation: CancellationToken,
@@ -1964,7 +2088,7 @@ async fn report_agent_status(
                         continue;
                     }
                 };
-                let result = client
+                let result = client.current()
                     .post(format!("{controller_url}/v1/state/agents"))
                     .bearer_auth(token)
                     .json(&agent_state_report(&state))
@@ -3478,6 +3602,71 @@ fn init_tracing() {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn malformed_ca_update_retains_last_known_good_client_without_retry_storm() {
+        let temporary = tempdir().expect("temporary directory is created");
+        let ca_path = temporary.path().join("ca.crt");
+        fs::write(&ca_path, b"not a certificate").expect("candidate CA is written");
+        let reloads = Counter::default();
+        let reload_errors = Counter::default();
+        let client = ReloadingControllerClient {
+            ca_path,
+            state: Arc::new(Mutex::new(ControllerClientState {
+                observed_ca_pem: b"previous valid CA".to_vec(),
+                client: reqwest::Client::new(),
+            })),
+            reloads: reloads.clone(),
+            reload_errors: reload_errors.clone(),
+        };
+
+        drop(client.current());
+        assert_eq!(reloads.get(), 0);
+        assert_eq!(reload_errors.get(), 1);
+        assert_eq!(client.lock_state().observed_ca_pem, b"not a certificate");
+
+        drop(client.current());
+        assert_eq!(reload_errors.get(), 1);
+    }
+
+    #[test]
+    fn valid_ca_bundle_update_replaces_trust_without_restart() {
+        let temporary = tempdir().expect("temporary directory is created");
+        let ca_path = temporary.path().join("ca.crt");
+        let ca_pem = include_bytes!("../testdata/ca.crt");
+        fs::write(&ca_path, ca_pem).expect("initial CA is written");
+        let reloads = Counter::default();
+        let reload_errors = Counter::default();
+        let client = ReloadingControllerClient::new(
+            "https://controller.example",
+            ca_path.clone(),
+            reloads.clone(),
+            reload_errors.clone(),
+        )
+        .expect("initial CA bundle is valid");
+        let mut updated_ca_pem = ca_pem.to_vec();
+        updated_ca_pem.push(b'\n');
+        fs::write(&ca_path, &updated_ca_pem).expect("updated CA bundle is written");
+
+        drop(client.current());
+
+        assert_eq!(reloads.get(), 1);
+        assert_eq!(reload_errors.get(), 0);
+        assert_eq!(client.lock_state().observed_ca_pem, updated_ca_pem);
+    }
+
+    #[test]
+    fn connected_controller_client_refuses_plaintext_before_loading_trust() {
+        let error = ReloadingControllerClient::new(
+            "http://controller.example",
+            PathBuf::from("missing-ca.crt"),
+            Counter::default(),
+            Counter::default(),
+        )
+        .err()
+        .expect("plaintext controller URL is rejected");
+        assert!(error.to_string().contains("must use https://"));
+    }
 
     #[test]
     fn cleanup_cli_is_dry_run_by_default() {

@@ -77,14 +77,15 @@ in transit and authenticated without introducing static client secrets. Server
 TLS plus Pod-bound TokenReview is the selected equivalent encrypted boundary;
 client-certificate mTLS is not required for this phase.
 
-Certificate files are loaded at process startup. Leaf or CA rotation therefore
-requires a coordinated controller and, when trust changes, agent rollout. Durable
-acknowledgement/history retention, automated production certificate rotation,
-and NetworkPolicy isolation of the internal port remain separate work. A
+ADR 0026 extends this boundary with validated in-place serving-keypair and
+CA-bundle reload. Issuer changes use an overlapping trust bundle; malformed
+updates retain the last-known-good configuration without a process restart.
+Durable acknowledgement/history retention, issuer-specific production
+automation, and NetworkPolicy isolation of the internal port remain separate work. A
 successfully reviewed token may remain accepted for up
 to 30 seconds while its Pod still exists at the same authoritative placement.
 Applications intentionally using the reserved controller TCP port are outside the
 workload telemetry surface for that agent configuration. OpenShift Service CA
 issuance, projected tokens/TokenReview, SCC/SELinux admission, and the encrypted
-Service path are IPv4 and dual-stack live-verified. Trust rotation still requires
-a separate gate because certificate files are loaded at startup.
+Service path are IPv4 and dual-stack live-verified. The separate rotation gate
+proves external-PKI handoff and Service CA restoration without Pod replacement.

@@ -48,7 +48,10 @@ SCC with a non-privileged container, runtime-default seccomp, read-only root
 filesystem, and exactly `BPF`, `NET_ADMIN`, and `PERFMON`. Native automatic
 selection installs legacy netlink filters, OpenShift Service CA secures the
 internal Service, and cross-worker IPv4/IPv6 allow/drop scenarios retain
-authenticated provenance.
+authenticated provenance. Controller leaf certificates and agent CA bundles now
+reload in place with last-known-good fallback. A separate OpenShift gate rotates
+through overlapping external-PKI trust, rejects malformed updates, restores the
+platform Service CA, and proves that no controller or agent Pod is replaced.
 The agent also provides a dry-run-first cleanup command for known ABI v1/v2 pins,
 TCX link pins, and UNF-named legacy filters; current ABI removal requires an
 additional explicit confirmation and unknown directory content is refused.
@@ -85,6 +88,8 @@ Implemented in the repository:
   Pod-bound Kubernetes TokenReview identity and authoritative Node placement;
 - a split controller surface with public operator HTTP and CA-pinned,
   TokenReview-authenticated internal HTTPS for agent snapshots and writes;
+- in-place server-certificate and CA-bundle reload with overlapping-root support,
+  last-known-good fallback, reload/error metrics, and an OpenShift rotation gate;
 - revision-fenced, read-only native policy simulation through the shared evaluator;
 - bounded non-blocking agent telemetry export and a 4,096-flow controller history
   with explicit drop/eviction accounting;

@@ -78,6 +78,8 @@ struct Args {
         default_value = "/var/run/secrets/unf-internal-tls/tls.key"
     )]
     tls_key: PathBuf,
+    #[arg(long, env = "UNF_CONTROLLER_TLS_RELOAD_SECONDS", default_value_t = 5)]
+    tls_reload_seconds: u64,
     /// Count agents only on Nodes matching this exact label key or key=value pair.
     #[arg(
         long,
@@ -98,6 +100,14 @@ struct ControllerMetrics {
     telemetry_observations: Counter,
     agent_status_reports: Counter,
     agent_authentication_failures: Counter,
+    tls_reloads: Counter,
+    tls_reload_errors: Counter,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TlsMaterial {
+    certificate: Vec<u8>,
+    private_key: Vec<u8>,
 }
 
 struct ControllerState {
@@ -414,15 +424,29 @@ async fn spawn_internal_api(
     cancellation: CancellationToken,
     tasks: &mut JoinSet<()>,
 ) -> Result<()> {
-    let tls_config = RustlsConfig::from_pem_file(&args.tls_cert, &args.tls_key)
-        .await
-        .with_context(|| {
-            format!(
-                "load controller internal TLS certificate {} and key {}",
-                args.tls_cert.display(),
-                args.tls_key.display()
-            )
-        })?;
+    let tls_material = read_tls_material(&args.tls_cert, &args.tls_key)?;
+    let tls_config = RustlsConfig::from_pem(
+        tls_material.certificate.clone(),
+        tls_material.private_key.clone(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "load controller internal TLS certificate {} and key {}",
+            args.tls_cert.display(),
+            args.tls_key.display()
+        )
+    })?;
+    spawn_tls_reloader(
+        tls_config.clone(),
+        args.tls_cert.clone(),
+        args.tls_key.clone(),
+        Duration::from_secs(args.tls_reload_seconds.max(1)),
+        tls_material,
+        Arc::clone(&state),
+        cancellation.clone(),
+        tasks,
+    );
     let internal_app = Router::new()
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
@@ -458,6 +482,75 @@ async fn spawn_internal_api(
         }
     });
     Ok(())
+}
+
+fn read_tls_material(
+    certificate_path: &PathBuf,
+    private_key_path: &PathBuf,
+) -> Result<TlsMaterial> {
+    Ok(TlsMaterial {
+        certificate: std::fs::read(certificate_path).with_context(|| {
+            format!(
+                "read controller internal TLS certificate {}",
+                certificate_path.display()
+            )
+        })?,
+        private_key: std::fs::read(private_key_path).with_context(|| {
+            format!(
+                "read controller internal TLS private key {}",
+                private_key_path.display()
+            )
+        })?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_tls_reloader(
+    tls_config: RustlsConfig,
+    certificate_path: PathBuf,
+    private_key_path: PathBuf,
+    reload_interval: Duration,
+    mut observed_material: TlsMaterial,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+    tasks: &mut JoinSet<()>,
+) {
+    tasks.spawn(async move {
+        let mut interval = tokio::time::interval(reload_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => break,
+                _ = interval.tick() => {
+                    let candidate = match read_tls_material(&certificate_path, &private_key_path) {
+                        Ok(candidate) => candidate,
+                        Err(error) => {
+                            state.metrics.tls_reload_errors.inc();
+                            warn!(%error, "could not read updated internal TLS material; retaining last-known-good certificate");
+                            continue;
+                        }
+                    };
+                    if candidate == observed_material {
+                        continue;
+                    }
+                    observed_material = candidate.clone();
+                    match tls_config
+                        .reload_from_pem(candidate.certificate, candidate.private_key)
+                        .await
+                    {
+                        Ok(()) => {
+                            state.metrics.tls_reloads.inc();
+                            info!("reloaded controller internal TLS certificate");
+                        }
+                        Err(error) => {
+                            state.metrics.tls_reload_errors.inc();
+                            warn!(%error, "rejected updated internal TLS material; retaining last-known-good certificate");
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn install_crypto_provider() -> Result<()> {
@@ -507,6 +600,16 @@ fn new_state_with_client_and_selector(
         "unf_agent_authentication_failures",
         "Node-agent internal API requests rejected by authentication or identity binding",
         metrics.agent_authentication_failures.clone(),
+    );
+    registry.register(
+        "unf_controller_tls_reloads",
+        "Internal TLS certificate reloads accepted without a process restart",
+        metrics.tls_reloads.clone(),
+    );
+    registry.register(
+        "unf_controller_tls_reload_errors",
+        "Internal TLS certificate updates rejected while retaining last-known-good material",
+        metrics.tls_reload_errors.clone(),
     );
     ControllerState {
         ready: AtomicBool::new(offline),

@@ -79,7 +79,8 @@ command recognizes only the v1/v2 map names, numeric UNF TCX link-pin names, and
 UNF legacy program names. It refuses unknown ABI content and requires explicit
 confirmation for current v2 removal. ADRs 0023 and 0024 place snapshots,
 acknowledgements, and telemetry behind dedicated TLS plus Pod-bound TokenReview;
-durable report retention and automated certificate rotation remain hardening work.
+serving certificates and CA bundles reload with last-known-good fallback and an
+overlapping-trust rotation gate. Durable report retention remains hardening work.
 
 Isolated live-kernel probes verify that partial pin sets,
 invalid active config, and corrupt inactive-stage debris are rejected before

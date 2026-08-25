@@ -128,8 +128,9 @@ make kind-test
 workloads. The script keeps its private CA and leaf key below ignored `.tools/`,
 publishes only the serving Secret and CA ConfigMap to the disposable cluster, and
 reuses an unexpired leaf on later deploys. Removing `.tools/kind-internal-tls`
-rotates the development trust on the next deploy and requires the controller and
-agents to roll together.
+rotates the development trust on the next deploy. Running processes accept
+validated leaf and trust changes in place; use an overlapping CA bundle when the
+issuer changes so clients trust both the old and new leaf during the handoff.
 
 `kind-up` mounts bpffs at `/sys/fs/bpf` inside every disposable kind node,
 matching the agent DaemonSet's host prerequisite. It also selects the nftables
@@ -227,14 +228,15 @@ requires zero successful requests before the replacement is Ready.
 The projected credential is never written to logs or checked into the repository.
 Agent snapshots, acknowledgements, and flow telemetry use the controller's
 dedicated HTTPS port and a client trust store containing only `unf-internal-ca`;
-the public operator API remains HTTP. Certificate changes currently require a
-coordinated workload rollout. The
+the public operator API remains HTTP. Serving keypairs and CA bundles reload in
+place with last-known-good fallback and dedicated success/error metrics. The
 [OpenShift qualification workflow](openshift-qualification.md) uses the platform
 Service CA while preserving the external-PKI Secret/ConfigMap contract. Its IPv4
 and dual-stack gates verify projected custom-audience tokens, TokenReview Pod
 extras, controller RBAC, Service CA TLS, SCC admission, enforcing SELinux, native
 legacy attachment, the encrypted Service path, and per-family cross-worker
-enforcement/history. Automated certificate rotation remains a separate gate.
+enforcement/history. Its dedicated rotation gate also proves an overlapping
+external-PKI issuer handoff and restoration without Pod replacement.
 
 After the primary gate, `hack/verify-kind-legacy-netlink.sh` explicitly selects
 legacy mode when the host would normally choose TCX, confirms the reserved

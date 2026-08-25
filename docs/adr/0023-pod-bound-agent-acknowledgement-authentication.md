@@ -62,4 +62,4 @@ flow telemetry on a dedicated TLS listener and applies the same Pod-bound
 TokenReview identity to every internal request. Native OpenShift IPv4 and
 dual-stack validations confirm projected audience tokens, TokenReview
 extras/RBAC, SCC behavior, Service CA integration, and the encrypted service
-path. Certificate rotation remains separate validation work.
+path. Certificate and trust rotation is separately verified by ADR 0026.

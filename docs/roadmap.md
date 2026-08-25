@@ -81,8 +81,14 @@ matrix and reproducible evidence.
   `NoNewPrivs`, and a read-only root filesystem. Service CA injection, exact
   worker convergence, Pod-bound TokenReview, populated per-family identities,
   and cross-worker IPv4/IPv6 policy provenance are gated;
-- Next: automated certificate/trust rotation, durable agent acknowledgement
-  retention, path-specific host-mount admission policy, and coordinated uninstall.
+- Implemented and OpenShift verified: controller serving keypairs and agent CA
+  bundles reload without Pod replacement. Content-based detection handles atomic
+  projected-volume swaps; malformed updates retain last-known-good material. A
+  repeatable gate proves overlapping-root external-PKI rotation, authenticated
+  traffic under the new issuer, malformed leaf/CA rejection, and restoration to
+  OpenShift Service CA ownership with unchanged Pod UIDs;
+- Next: durable agent acknowledgement retention, path-specific host-mount
+  admission policy, and coordinated uninstall.
 
 ## Phase 3 — compatibility and simulation
 
