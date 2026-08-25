@@ -14,7 +14,7 @@ RUN gcc -std=c11 -O2 -Wall -Wextra -Werror \
 FROM docker.io/library/debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends bpftool socat wget \
+    && apt-get install --yes --no-install-recommends bpftool iproute2 socat wget \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=probe-builder /usr/local/bin/unf-ipv6-extension-probe \

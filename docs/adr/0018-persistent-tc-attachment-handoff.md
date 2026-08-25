@@ -40,6 +40,8 @@ TCX link is an attachment error; the agent does not silently replace it.
 
 The public agent status includes `tc_attachment_mode` with `none`, `tcx_pinned`,
 or `legacy_netlink`, making kernel-specific behavior visible to operators.
+ADR 0021 adds an explicit mode preference for compatibility testing while
+retaining automatic kernel-based selection as the default.
 
 ## Consequences
 
@@ -49,12 +51,19 @@ agent with the controller offline, runs parallel requests continuously against a
 explicitly denied TCP/9090 flow, requires zero successes, and then requires the
 replacement to report pinned TCX mode and atomic-update evidence.
 
+The same host now also live-verifies the legacy implementation by explicitly
+selecting it, confirming its reserved kernel filter, removing UNF's TCX pins, and
+repeating the offline-controller replacement under the continuous deny probe.
+The gate restores TCX before deleting the legacy filters, so cleanup never removes
+the only active UNF attachment.
+
 The fixed legacy tuple avoids accumulating filters and gives restart replacement
 a stable identity, but can conflict with an independently configured filter using
-that reserved tuple. Its implementation and selection boundary have unit/static
-coverage; this development host cannot live-test the pre-6.6 path. Older RHEL,
-OpenShift, and other supported kernels must validate that fallback before it can
-carry the same live-verification claim as TCX.
+that reserved tuple. Its implementation, selection boundary, and in-place
+replacement path now have unit and live-kernel coverage on Linux 7.1. Older RHEL,
+OpenShift, and other pre-6.6 supported kernels must still validate native fallback
+selection and host compatibility before receiving the same platform-support
+claim.
 
 Pinned links and persistent legacy filters need explicit operator cleanup during
 uninstall or ABI retirement. Automated production cleanup is separate work

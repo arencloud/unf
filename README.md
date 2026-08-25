@@ -76,6 +76,9 @@ Implemented in the repository:
 - persistent TC attachment handoff using pinned, atomically updated TCX links on
   Linux 6.6+ and stable legacy netlink filters on older kernels, with the active
   attachment mode exposed by each agent;
+- explicit `auto`, `tcx-pinned`, and `legacy-netlink` attachment selection, with
+  kind verification that removes TCX coverage, continuously probes enforcement
+  through legacy in-place replacement, then restores TCX before scoped cleanup;
 - isolated kind fault injection proving partial pin sets, malformed active
   configuration, and corrupt inactive-stage values are rejected without
   disturbing the live last-known-good dataplane;

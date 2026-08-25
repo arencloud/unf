@@ -64,6 +64,10 @@ per-interface TCX links pinned below `/sys/fs/bpf/unf/v2/links` so a replacement
 can update them atomically. On older kernels it leaves the clsact qdisc and its
 stable legacy filters in place for in-place replacement. Use a disposable
 environment for testing; explicit production cleanup tooling is not implemented.
+Selection defaults to `auto`; `--tc-attachment-mode tcx-pinned` and
+`--tc-attachment-mode legacy-netlink` are explicit compatibility-test or
+controlled-migration overrides. An explicit mode that the host cannot support
+fails during attachment rather than silently changing modes.
 
 ## kind
 
@@ -84,8 +88,8 @@ become ready. This keeps the dual-stack fixture
 reproducible on development kernels without the legacy IPv6 NAT table.
 
 `kind-deploy` builds the userspace images, eBPF object, and test-tools image with
-SCTP `socat` plus the IPv6 extension-header probe, loads them into the nodes, and
-applies the CRD and workloads. `kind-test`
+SCTP `socat`, the IPv6 extension-header probe, BPF fault utilities, and `tc`,
+loads them into the nodes, and applies the CRD and workloads. `kind-test`
 installs the demo, proves cross-node IPv4/IPv6 port 8080 allow and open-port 9090
 deny,
 switches the same policy through shadow pass-through and back, and validates
@@ -162,6 +166,15 @@ has a fresh matching acknowledgement. Each agent also reports
 `tc_attachment_mode` as `tcx_pinned` or `legacy_netlink`. During offline
 replacement, the verifier continuously probes the denied TCP/9090 path and
 requires zero successful requests before the replacement is Ready.
+
+After the primary gate, `hack/verify-kind-legacy-netlink.sh` explicitly selects
+legacy mode when the host would normally choose TCX, confirms the reserved
+priority/handle filters, removes every UNF ingress TCX pin, and repeats the
+offline-controller replacement under a continuous deny probe. It requires the
+replacement to report in-place netlink replacement, then rolls back to automatic
+TCX mode and confirms pins exist before deleting only the reserved legacy
+filters. On a pre-6.6 host already using legacy mode, the same script exercises
+the native selection without the transition or cleanup step.
 
 Before that replacement, `make kind-test` temporarily deploys the privileged
 [BPF fault helper](../../deploy/examples/bpf-fault-helper.yaml) fixture. It builds

@@ -15,6 +15,7 @@ spec:
         app.kubernetes.io/name: unf-bpf-fault-helper
     spec:
       automountServiceAccountToken: false
+      hostNetwork: true
       nodeSelector:
         kubernetes.io/os: linux
       tolerations:

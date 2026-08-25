@@ -45,10 +45,10 @@ matrix and reproducible evidence.
   offline-controller restart recovery through the ABI v2 nine-map pin set;
 - Implemented and two-node kind verified on Linux 7.1: per-interface pinned TCX
   links, atomic replacement-program handoff, and continuous deny enforcement
-  while an offline-controller agent is replaced. Direction-scoped stale owned-
-  link cleanup and the stable-priority/handle legacy netlink fallback are
-  implemented and locally tested; the fallback still needs live validation on
-  an older kernel;
+  while an offline-controller agent is replaced. The same gate explicitly selects
+  the stable-priority/handle legacy netlink path, removes TCX coverage, proves
+  in-place replacement with continuous deny enforcement, and safely restores TCX
+  before scoped legacy cleanup. Native pre-6.6 and OpenShift validation remain;
 - Implemented and two-node kind verified: isolated live-kernel fault sets prove
   eight-of-nine pins, malformed active policy config, and corrupt inactive-bank
   debris are rejected with actionable errors while primary allow/deny state

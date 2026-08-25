@@ -68,15 +68,18 @@ userspace caches after restart. Fresh startup readiness is fenced until identity
 and policy both reconcile, while a complete validated last-known-good set may
 restore service without the controller. On Linux 6.6+, per-interface TCX links
 are pinned and atomically updated to the replacement program; older kernels use
-stable legacy netlink filter identities for in-place replacement. Explicit
-ABI-directory cleanup operations and acknowledgement authentication/durability
-remain hardening work. Isolated live-kernel probes verify that partial pin sets,
+stable legacy netlink filter identities for in-place replacement. Automatic mode
+selection has an explicit compatibility-test override; kind removes TCX coverage,
+proves the legacy filter alone survives offline-controller agent replacement,
+then restores TCX before scoped legacy cleanup. Explicit ABI-directory cleanup
+operations and acknowledgement authentication/durability remain hardening work.
+Isolated live-kernel probes verify that partial pin sets,
 invalid active config, and corrupt inactive-stage debris are rejected before
 adoption without mutating the primary pin set. A separate live pressure probe
 fills only the inactive identity-keyed policy bank, proves a staging insertion
 failure cannot advance applied state or alter active traffic, and verifies retry
 after scoped cleanup. Permanent startup validation failures terminate for
-orchestrator retry. See ADRs 0016 through 0020.
+orchestrator retry. See ADRs 0016 through 0021.
 
 Kubernetes watches remain the controller input. Internal HTTP snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

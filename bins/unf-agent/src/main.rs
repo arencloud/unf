@@ -87,12 +87,26 @@ struct Args {
     flow_export_seconds: u64,
     #[arg(long, env = "UNF_BPF_PIN_PATH", default_value = DEFAULT_BPF_PIN_PATH)]
     bpf_pin_path: PathBuf,
+    #[arg(
+        long,
+        env = "UNF_TC_ATTACHMENT_MODE",
+        value_enum,
+        default_value = "auto"
+    )]
+    tc_attachment_mode: TcAttachmentPreference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Direction {
     Ingress,
     Egress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TcAttachmentPreference {
+    Auto,
+    TcxPinned,
+    LegacyNetlink,
 }
 
 struct AgentMetrics {
@@ -198,6 +212,7 @@ struct DataplaneConfig {
     node_name: String,
     flow_export_interval: Duration,
     bpf_pin_path: PathBuf,
+    tc_attachment_preference: TcAttachmentPreference,
 }
 
 struct RecoveredDataplane {
@@ -304,6 +319,7 @@ async fn main() -> Result<()> {
             let node_name = args.node_name.clone();
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
             let bpf_pin_path = args.bpf_pin_path.clone();
+            let tc_attachment_preference = args.tc_attachment_mode;
             tasks.spawn(async move {
                 let config = DataplaneConfig {
                     object,
@@ -315,6 +331,7 @@ async fn main() -> Result<()> {
                     node_name,
                     flow_export_interval,
                     bpf_pin_path,
+                    tc_attachment_preference,
                 };
                 if let Err(error) = run_dataplane(config, Arc::clone(&state), cancellation).await {
                     error!(?error, "eBPF dataplane stopped");
@@ -537,7 +554,10 @@ async fn run_dataplane(
     let mut attachments = attach_dataplane_program(
         &mut ebpf,
         &config,
-        kernel_supports_tcx(&state.capabilities.kernel_release),
+        select_tc_attachment_mode(
+            config.tc_attachment_preference,
+            kernel_supports_tcx(&state.capabilities.kernel_release),
+        ),
     )?;
     state
         .tc_attachment_mode
@@ -588,7 +608,7 @@ async fn run_dataplane(
 fn attach_dataplane_program<'ebpf>(
     ebpf: &'ebpf mut Ebpf,
     config: &DataplaneConfig,
-    tcx_supported: bool,
+    mode: TcAttachmentMode,
 ) -> Result<InterfaceAttachments<'ebpf>> {
     let program_name = match config.direction {
         Direction::Ingress => "unf_observe_ingress",
@@ -603,11 +623,6 @@ fn attach_dataplane_program<'ebpf>(
     let attach_type = match config.direction {
         Direction::Ingress => TcAttachType::Ingress,
         Direction::Egress => TcAttachType::Egress,
-    };
-    let mode = if tcx_supported {
-        TcAttachmentMode::TcxPinned
-    } else {
-        TcAttachmentMode::LegacyNetlink
     };
     let mut attachments = InterfaceAttachments {
         program,
@@ -2884,6 +2899,19 @@ fn kernel_supports_tcx(release: &str) -> bool {
     (major, minor) >= (6, 6)
 }
 
+const fn select_tc_attachment_mode(
+    preference: TcAttachmentPreference,
+    tcx_supported: bool,
+) -> TcAttachmentMode {
+    match preference {
+        TcAttachmentPreference::Auto if tcx_supported => TcAttachmentMode::TcxPinned,
+        TcAttachmentPreference::Auto | TcAttachmentPreference::LegacyNetlink => {
+            TcAttachmentMode::LegacyNetlink
+        }
+        TcAttachmentPreference::TcxPinned => TcAttachmentMode::TcxPinned,
+    }
+}
+
 async fn health() -> &'static str {
     "ok\n"
 }
@@ -2973,6 +3001,26 @@ mod tests {
         assert!(kernel_supports_tcx("6.6.0"));
         assert!(kernel_supports_tcx("7.1.4-204.fc44.x86_64"));
         assert!(!kernel_supports_tcx("unknown"));
+    }
+
+    #[test]
+    fn attachment_preference_defaults_by_capability_and_allows_explicit_modes() {
+        assert_eq!(
+            select_tc_attachment_mode(TcAttachmentPreference::Auto, true),
+            TcAttachmentMode::TcxPinned
+        );
+        assert_eq!(
+            select_tc_attachment_mode(TcAttachmentPreference::Auto, false),
+            TcAttachmentMode::LegacyNetlink
+        );
+        assert_eq!(
+            select_tc_attachment_mode(TcAttachmentPreference::LegacyNetlink, true),
+            TcAttachmentMode::LegacyNetlink
+        );
+        assert_eq!(
+            select_tc_attachment_mode(TcAttachmentPreference::TcxPinned, false),
+            TcAttachmentMode::TcxPinned
+        );
     }
 
     #[test]

@@ -99,13 +99,18 @@ ABI v2 link directory and atomically updates that link to the newly loaded
 program. On older kernels, it owns a fixed priority/handle tuple per direction
 and replaces the legacy netlink filter in place. The old program therefore
 remains attached until the replacement program is loaded and handed over.
+Automatic selection can be overridden explicitly with `--tc-attachment-mode`
+for compatibility validation and controlled migration. The kind gate selects
+legacy mode on the TCX-capable development kernel, removes the old UNF TCX pins,
+and proves that the reserved netlink filter alone preserves enforcement through
+replacement before restoring TCX and removing the legacy tuple.
 Invalid map state never becomes a deny by accident. The kind gate also fills the
 shared physical `POLICY_RULES` map using reserved keys tagged for the inactive
 bank, requires the staging failure to preserve the selected bank and applied
 revision, then removes only those keys and verifies that the waiting revision
 activates.
 ABI v1 pin directories are not removed automatically; operators may delete them
-only after validating an ABI v2 rollout. See ADRs 0008 and 0016 through 0020.
+only after validating an ABI v2 rollout. See ADRs 0008 and 0016 through 0021.
 Permanent startup validation failures terminate the agent after readiness is
 fenced so the orchestrator can retry after repair.
 
