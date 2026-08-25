@@ -23,6 +23,21 @@ kc=(oc --kubeconfig "${kubeconfig}" --context "${context}")
     --from-file=.dockerconfigjson="${auth_file}" \
     --type=kubernetes.io/dockerconfigjson \
     --dry-run=client -o yaml | "${kc[@]}" apply -f -
+"${kc[@]}" apply -f "${project_root}/deploy/openshift/agent-scc.yaml"
+
+legacy_scc_binding=unf-agent-scc
+if "${kc[@]}" get clusterrolebinding "${legacy_scc_binding}" >/dev/null 2>&1; then
+    legacy_role_kind=$("${kc[@]}" get clusterrolebinding "${legacy_scc_binding}" \
+        -o jsonpath='{.roleRef.kind}')
+    legacy_role_name=$("${kc[@]}" get clusterrolebinding "${legacy_scc_binding}" \
+        -o jsonpath='{.roleRef.name}')
+    if [[ ${legacy_role_kind} != ClusterRole \
+        || ${legacy_role_name} != system:openshift:scc:privileged ]]; then
+        echo "refusing to remove unexpected ClusterRoleBinding ${legacy_scc_binding}" >&2
+        exit 1
+    fi
+    "${kc[@]}" delete clusterrolebinding "${legacy_scc_binding}"
+fi
 "${kc[@]}" apply -k "${project_root}/deploy/openshift"
 
 for _ in {1..60}; do

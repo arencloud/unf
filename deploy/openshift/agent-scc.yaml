@@ -1,11 +1,64 @@
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: unf-agent
+  annotations:
+    kubernetes.io/description: >-
+      Constrained SCC for the UNF worker agent: host networking, two scoped
+      host paths, and only the capabilities required for eBPF and TC lifecycle.
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: true
+allowHostPID: false
+allowHostPorts: true
+allowPrivilegeEscalation: false
+allowPrivilegedContainer: false
+allowedCapabilities:
+  - BPF
+  - NET_ADMIN
+  - PERFMON
+defaultAddCapabilities: null
+readOnlyRootFilesystem: true
+requiredDropCapabilities:
+  - ALL
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+seccompProfiles:
+  - runtime/default
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+userNamespaceLevel: AllowHostLevel
+volumes:
+  - configMap
+  - hostPath
+  - projected
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unf-agent-scc-use
+rules:
+  - apiGroups:
+      - security.openshift.io
+    resourceNames:
+      - unf-agent
+    resources:
+      - securitycontextconstraints
+    verbs:
+      - use
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: unf-agent-scc
+  name: unf-agent-scc-use
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: system:openshift:scc:privileged
+  name: unf-agent-scc-use
 subjects:
   - kind: ServiceAccount
     name: unf-agent

@@ -80,6 +80,27 @@ mapfile -t agents < <("${kc[@]}" -n unf-system get pods \
 [[ ${#agents[@]} -eq ${#workers[@]} ]]
 [[ $("${kc[@]}" -n unf-system get pod "${controller}" \
     -o jsonpath='{.metadata.annotations.openshift\.io/scc}') == restricted-v2 ]]
+agent_service_account=system:serviceaccount:unf-system:unf-agent
+[[ $("${kc[@]}" auth can-i use scc/unf-agent \
+    --as="${agent_service_account}" 2>/dev/null) == yes ]]
+[[ $("${kc[@]}" auth can-i use scc/privileged \
+    --as="${agent_service_account}" 2>/dev/null) == no ]]
+"${kc[@]}" get scc unf-agent -o json | jq -e '
+    .allowHostDirVolumePlugin == true
+    and .allowHostNetwork == true
+    and .allowHostPorts == true
+    and .allowHostIPC == false
+    and .allowHostPID == false
+    and .allowPrivilegeEscalation == false
+    and .allowPrivilegedContainer == false
+    and .readOnlyRootFilesystem == true
+    and (.allowedCapabilities | sort == ["BPF", "NET_ADMIN", "PERFMON"])
+    and .requiredDropCapabilities == ["ALL"]
+    and .runAsUser.type == "RunAsAny"
+    and .seLinuxContext.type == "RunAsAny"
+    and .seccompProfiles == ["runtime/default"]
+    and (.volumes | sort == ["configMap", "hostPath", "projected"])
+' >/dev/null
 
 uid_allocation=$("${kc[@]}" get namespace unf-system \
     -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.uid-range}')
@@ -91,7 +112,22 @@ controller_uid=$("${kc[@]}" -n unf-system get pod "${controller}" \
 
 for agent in "${agents[@]}"; do
     [[ $("${kc[@]}" -n unf-system get pod "${agent}" \
-        -o jsonpath='{.metadata.annotations.openshift\.io/scc}') == privileged ]]
+        -o jsonpath='{.metadata.annotations.openshift\.io/scc}') == unf-agent ]]
+    "${kc[@]}" -n unf-system get pod "${agent}" -o json | jq -e '
+        .spec.hostNetwork == true
+        and (.spec.hostPID // false) == false
+        and (.spec.hostIPC // false) == false
+        and .spec.containers[0].securityContext.privileged == false
+        and .spec.containers[0].securityContext.allowPrivilegeEscalation == false
+        and .spec.containers[0].securityContext.readOnlyRootFilesystem == true
+        and .spec.containers[0].securityContext.runAsUser == 0
+        and .spec.containers[0].securityContext.runAsGroup == 0
+        and .spec.containers[0].securityContext.seLinuxOptions.type == "spc_t"
+        and .spec.containers[0].securityContext.seccompProfile.type == "RuntimeDefault"
+        and (.spec.containers[0].securityContext.capabilities.add | sort
+            == ["BPF", "NET_ADMIN", "PERFMON"])
+        and .spec.containers[0].securityContext.capabilities.drop == ["ALL"]
+    ' >/dev/null
     node=$("${kc[@]}" -n unf-system get pod "${agent}" -o jsonpath='{.spec.nodeName}')
     "${kc[@]}" get node "${node}" -o json \
         | jq -e '.metadata.labels | has("node-role.kubernetes.io/worker")' >/dev/null
@@ -114,6 +150,11 @@ for agent in "${agents[@]}"; do
     "${kc[@]}" -n unf-system exec "${agent}" -- sh -eu -c '
         test -r /sys/kernel/btf/vmlinux
         test "$(stat -f -c %T /sys/fs/bpf)" = bpf_fs
+        test "$(awk "/^Uid:/ { print \$2 }" /proc/1/status)" = 0
+        test "$(awk "/^CapEff:/ { print \$2 }" /proc/1/status)" = 000000c000001000
+        test "$(awk "/^NoNewPrivs:/ { print \$2 }" /proc/1/status)" = 1
+        test "$(awk "/^Seccomp:/ { print \$2 }" /proc/1/status)" = 2
+        grep -q ":spc_t:" /proc/1/attr/current
     '
 done
 
@@ -259,10 +300,23 @@ for namespace in "${client_namespace}" "${server_namespace}"; do
 done
 yq eval-all 'select(.kind != "Namespace")' "${qualification_manifest}" \
     | "${kc[@]}" apply -f - >/dev/null
-"${kc[@]}" -n "${client_namespace}" wait --for=condition=Ready \
-    pod/client --timeout=180s >/dev/null
-"${kc[@]}" -n "${server_namespace}" wait --for=condition=Ready \
-    pod/server --timeout=180s >/dev/null
+wait_for_pod_ready() {
+    local namespace=$1
+    local pod=$2
+    if ! "${kc[@]}" -n "${namespace}" wait --for=condition=Ready \
+        "pod/${pod}" --timeout=180s >/dev/null; then
+        "${kc[@]}" -n "${namespace}" get "pod/${pod}" -o wide >&2 || true
+        "${kc[@]}" -n "${namespace}" describe "pod/${pod}" >&2 || true
+        return 1
+    fi
+}
+
+wait_for_pod_ready "${client_namespace}" client
+wait_for_pod_ready "${server_namespace}" server
+[[ $("${kc[@]}" -n "${client_namespace}" get pod client \
+    -o jsonpath='{.metadata.annotations.openshift\.io/scc}') == restricted-v2 ]]
+[[ $("${kc[@]}" -n "${server_namespace}" get pod server \
+    -o jsonpath='{.metadata.annotations.openshift\.io/scc}') == restricted-v2 ]]
 
 client_node=$("${kc[@]}" -n "${client_namespace}" get pod client \
     -o jsonpath='{.spec.nodeName}')
@@ -394,4 +448,4 @@ unhealthy_operators=$("${kc[@]}" get clusteroperators -o json | jq '[
 ] | length')
 [[ ${unhealthy_operators} -eq 0 ]]
 
-echo "OpenShift ${qualification_mode} qualification passed: restricted-v2 controller, privileged worker-only agents, enforcing SELinux, BTF/bpffs, native legacy netlink filters, Service CA TLS, Pod-bound TokenReview, two-worker convergence, ${qualification_mode} allow/drop provenance, and healthy cluster operators"
+echo "OpenShift ${qualification_mode} qualification passed: restricted-v2 controller, dedicated constrained worker-agent SCC, enforcing SELinux, BTF/bpffs, native legacy netlink filters, Service CA TLS, Pod-bound TokenReview, two-worker convergence, ${qualification_mode} allow/drop provenance, and healthy cluster operators"

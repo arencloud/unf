@@ -75,8 +75,11 @@ The overlay:
 
 - schedules agents only on Nodes carrying `node-role.kubernetes.io/worker`;
 - configures controller convergence with the same exact Node-label selector;
-- grants the agent service account the built-in privileged SCC for this
-  development gate;
+- grants the agent service account only the dedicated `unf-agent` SCC, not the
+  built-in privileged SCC;
+- runs the agent as a non-privileged root process in `spc_t`, with runtime-default
+  seccomp, `NoNewPrivs`, a read-only root filesystem, and only `BPF`,
+  `NET_ADMIN`, and `PERFMON`;
 - lets `restricted-v2` assign the controller UID, GID, fsGroup, and SELinux
   context; and
 - uses the OpenShift Service CA instead of the disposable kind CA.
@@ -86,7 +89,9 @@ temporary qualification Namespaces, and removes them on success or failure. It
 requires IPv4 plus at least two Ready workers; when IPv6 is configured, every
 IPv6 assertion becomes mandatory rather than optional. The gate proves:
 
-- restricted controller and privileged worker-agent SCC admission;
+- restricted controller and dedicated constrained worker-agent SCC admission;
+- exact SCC/RBAC, Pod security context, effective capability mask, seccomp,
+  `NoNewPrivs`, UID/GID, and SELinux-domain assertions on every worker;
 - enforcing host SELinux, readable BTF, bpffs, cgroup v2, and the reserved
   legacy netlink filter on every worker;
 - Service CA certificate validity and DNS identity;
@@ -111,7 +116,10 @@ design. Do not remove the DaemonSet as an uninstall procedure. A coordinated
 uninstall must first use the agent's dry-run-first cleanup command and verify the
 exact owned filters and bpffs paths before deleting workloads.
 
-The built-in privileged SCC is intentionally limited to the lab qualification
-overlay. A narrower custom SCC/capability profile, immutable digest-pinned release
-images, automated certificate rotation, and complete uninstall orchestration
-remain production-hardening requirements.
+The SCC still permits root, `spc_t`, host networking/ports, and the `hostPath`
+volume class. Its RBAC is limited to the agent service account and the workload
+mounts only `/sys/fs/bpf` plus read-only `/sys/kernel/btf`, but SCC itself cannot
+restrict hostPath prefixes. Admission policy for those exact paths, immutable
+digest-pinned release images, automated certificate rotation, and complete
+uninstall orchestration remain production-hardening requirements. See
+[ADR 0025](../adr/0025-constrained-openshift-agent-scc.md).

@@ -31,12 +31,13 @@ credentials are not a production certificate mechanism.
 - BTF at `/sys/kernel/btf/vmlinux` for future portable kernel types;
 - bpffs mounted at `/sys/fs/bpf`;
 - cgroup v2 recommended;
-- `CAP_BPF`, `CAP_NET_ADMIN`, and possibly `CAP_PERFMON`/`CAP_SYS_RESOURCE`
-  depending on kernel policy.
+- `CAP_BPF` and `CAP_NET_ADMIN`, plus any verifier capability required by the
+  compiled program. The qualified RHCOS 9.8 Linux 5.14 path additionally requires
+  `CAP_PERFMON` but not `CAP_SYS_RESOURCE`.
 
 Check the local machine with `unf-agent` capability-only mode and its `/v1/status`
-endpoint. Do not disable SELinux. OpenShift deployment must eventually supply the
-required SCC/SELinux policy and host mounts explicitly.
+endpoint. Do not disable SELinux. The OpenShift overlay supplies and verifies the
+dedicated SCC, explicit `spc_t` domain, and exact host mounts.
 
 ## Build the eBPF object
 
@@ -270,6 +271,8 @@ deduplication and durable history remain later telemetry work.
 Do not assume Ubuntu paths or AppArmor. `make openshift-test` now provides
 separate RHEL CoreOS/CRI-O IPv4-only and dual-stack evidence for SELinux, SCC,
 BTF, bpffs, Service CA, TokenReview, native legacy attachment, and enforcement.
-The kind gate remains separate dual-stack/TCX evidence; broader versions, scale,
-upgrade behavior, and production SCC hardening are not inferred from these
-fixtures.
+Agents use a non-privileged, runtime-default-seccomp, read-only-root profile with
+only `BPF`, `NET_ADMIN`, and `PERFMON`; their service account cannot use the
+built-in privileged SCC. The kind gate remains separate dual-stack/TCX evidence;
+broader versions, scale, upgrade behavior, and path-specific host-mount policy
+are not inferred from these fixtures.

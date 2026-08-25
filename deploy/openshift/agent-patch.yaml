@@ -11,6 +11,23 @@ spec:
       containers:
         - name: agent
           imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - BPF
+                - NET_ADMIN
+                - PERFMON
+              drop:
+                - ALL
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsGroup: 0
+            runAsUser: 0
+            seLinuxOptions:
+              type: spc_t
+            seccompProfile:
+              type: RuntimeDefault
       volumes:
         - name: internal-ca
           configMap:

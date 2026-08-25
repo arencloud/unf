@@ -75,12 +75,14 @@ matrix and reproducible evidence.
   UNF CA, and every request uses Pod-bound TokenReview identity. Plaintext route
   isolation, CA failure, credential failure, and live convergence/export are gated;
 - Implemented and OpenShift IPv4/dual-stack verified: a worker-scoped overlay uses
-  `restricted-v2` for the controller, an explicit privileged agent SCC binding,
-  OpenShift Service CA certificate/bundle injection, exact worker convergence,
-  Pod-bound TokenReview, populated per-family identities, and cross-worker
-  IPv4/IPv6 policy provenance;
+  `restricted-v2` for the controller and a dedicated constrained agent SCC. The
+  agent is non-privileged, cannot use the built-in privileged SCC, drops all but
+  `BPF`, `NET_ADMIN`, and `PERFMON`, and requires runtime-default seccomp,
+  `NoNewPrivs`, and a read-only root filesystem. Service CA injection, exact
+  worker convergence, Pod-bound TokenReview, populated per-family identities,
+  and cross-worker IPv4/IPv6 policy provenance are gated;
 - Next: automated certificate/trust rotation, durable agent acknowledgement
-  retention, and a narrower production SCC/capability profile.
+  retention, path-specific host-mount admission policy, and coordinated uninstall.
 
 ## Phase 3 — compatibility and simulation
 

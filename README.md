@@ -43,10 +43,12 @@ stable legacy netlink filter tuple for in-place replacement. The two-node kind
 gate continuously probes an explicitly denied flow through TCX agent handoff.
 Additional IPv4-only and dual-stack OpenShift gates are live-verified on
 OpenShift 4.22/RHCOS 9.8 with enforcing SELinux and a 5.14 kernel: the controller
-runs under `restricted-v2`, worker-only agents use the explicitly bound privileged
-SCC, native automatic selection installs legacy netlink filters, OpenShift
-Service CA secures the internal Service, and cross-worker IPv4/IPv6 allow/drop
-scenarios retain authenticated provenance.
+runs under `restricted-v2`, while worker-only agents use a dedicated constrained
+SCC with a non-privileged container, runtime-default seccomp, read-only root
+filesystem, and exactly `BPF`, `NET_ADMIN`, and `PERFMON`. Native automatic
+selection installs legacy netlink filters, OpenShift Service CA secures the
+internal Service, and cross-worker IPv4/IPv6 allow/drop scenarios retain
+authenticated provenance.
 The agent also provides a dry-run-first cleanup command for known ABI v1/v2 pins,
 TCX link pins, and UNF-named legacy filters; current ABI removal requires an
 additional explicit confirmation and unknown directory content is refused.

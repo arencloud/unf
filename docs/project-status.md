@@ -1,6 +1,6 @@
 # Project status and requirements traceability
 
-Last verified: **2026-08-25**
+Last verified: **2026-08-26**
 
 This document is the authoritative implementation tracker. The roadmap describes
 direction; this file records phase gates, evidence, limitations, and the next
@@ -33,7 +33,7 @@ completed by Phase 1's observation-only shadow evaluation.
 
 ## Latest verification record
 
-| Check | Result on 2026-08-25 |
+| Check | Result on 2026-08-26 |
 |---|---|
 | Stable userspace formatting, lint, and tests | Passed: `make fmt-check lint test` |
 | eBPF target build and manifest rendering | Passed: `make ebpf` and `kubectl kustomize deploy` |
@@ -51,8 +51,9 @@ completed by Phase 1's observation-only shadow evaluation.
 | Scoped host-state cleanup | The deployed agent refused current v2 removal without confirmation and rejected unknown content injected into recognized v1 state without removing six known pins. Its dry run preserved those pins; execution removed v1 on both nodes while all nine v2 maps remained. After TCX restoration, the legacy gate proved another dry run preserved the reserved filters before the command removed only UNF-named ingress filters |
 | Agent acknowledgement authentication | Both agents converged with schema v2 Pod name/UID reports and dedicated-audience projected tokens accepted through Kubernetes TokenReview. The live gate rejected missing and invalid credentials with 401, accepted the real Pod token with 204, rejected the same valid token carrying a forged Node claim with 403, and required three authentication failures to be accounted without creating an unexpected agent |
 | Internal transport security | Agent-only routes were absent from public HTTP, the dedicated HTTPS port rejected the development CA when it was not explicitly trusted, and the real CA plus projected Pod token read a snapshot and submitted an acknowledgement. Both agents converged and exported retained flow history through the same CA-pinned, TokenReview-authenticated transport; management-port filtering prevented recursive telemetry from displacing workload provenance |
-| OpenShift IPv4 qualification | Passed: `make openshift-test` on OpenShift 4.22.9 / Kubernetes 1.35.6 with two RHCOS 9.8 workers on Linux 5.14. The controller ran under `restricted-v2`, agents ran only on workers under the privileged SCC, SELinux remained Enforcing, BTF/bpffs/cgroup v2 and native `legacy_netlink` filters were verified, OpenShift Service CA TLS and Pod-bound TokenReview positive/negative paths passed, exactly two selected agents converged, cross-worker TCP/8080 allowed while TCP/9090 dropped with retained provenance, and all 34 cluster operators remained healthy |
+| OpenShift IPv4 qualification | Passed: `make openshift-test` on OpenShift 4.22.9 / Kubernetes 1.35.6 with two RHCOS 9.8 workers on Linux 5.14. The controller ran under `restricted-v2`; worker-only agents used the dedicated `unf-agent` SCC and a non-privileged three-capability container. SELinux remained Enforcing, BTF/bpffs/cgroup v2 and native `legacy_netlink` filters were verified, OpenShift Service CA TLS and Pod-bound TokenReview positive/negative paths passed, exactly two selected agents converged, cross-worker TCP/8080 allowed while TCP/9090 dropped with retained provenance, and all 34 cluster operators remained healthy |
 | OpenShift dual-stack qualification | Passed: the adaptive `make openshift-test` gate on a separate OpenShift 4.22.9 / Kubernetes 1.35.6 cluster with two RHCOS 9.8 Linux 5.14 workers. Both agents converged with populated IPv4 and IPv6 identity maps, the authenticated snapshot contained both families, cross-worker IPv4 and IPv6 TCP/8080 allowed while TCP/9090 dropped, retained history carried allow/deny policy provenance for each family, and the same SCC, SELinux, native legacy-filter, Service CA, TokenReview, selected-worker, and 34-operator health assertions passed |
+| OpenShift agent security boundary | Passed on both OpenShift fixtures: the service account can use only the dedicated `unf-agent` SCC, not `privileged`; agents run root in `spc_t` but are non-privileged with host PID/IPC disabled, runtime-default seccomp, `NoNewPrivs`, read-only root filesystems, and exact effective capabilities `BPF`, `NET_ADMIN`, and `PERFMON`. Removing `SYS_RESOURCE` succeeded; removing `PERFMON` produced a kernel verifier rejection and disabling host-port admission rejected the host-network health port, documenting both retained requirements |
 | Persistent-state fault rejection | A short-lived bpffs helper built isolated map sets for eight-of-nine pins, malformed `POLICY_CONFIG`, and corrupt inactive-bank `POLICY_RULES` debris. The exact deployed agent exited nonzero with each expected cause, the primary pins were untouched, established allow/deny traffic remained correct, and the later offline replacement still recovered |
 | Physical map-pressure rollback | The helper filled the shared real `POLICY_RULES` map to its 262,144-entry physical limit with reserved synthetic keys tagged for the inactive bank. A Shadow update advanced desired state but the pressured agent retained its applied revision and bank, incremented `unf_policy_sync_errors_total`, logged the staging failure, and preserved active TCP/8080 allow plus TCP/9090 deny. Releasing pressure let the same waiting revision activate on the opposite bank; Shadow traffic passed and restored Enforce traffic denied again |
 | Dataplane provenance | ABI v2 TCP and SCTP events matched the applied revision and carried nonzero identities plus actual/shadow policy and explicit-deny rule provenance |
@@ -96,7 +97,8 @@ release gate.
 | Controller-to-agent revisioned distribution | **Verified** | Both node agents report desired/applied epoch and revision convergence; controller-restart recovery exercised live |
 | Controller-aggregated node acknowledgements | **Verified** | Schema v2 reports carry Node and Pod identity. A dedicated-audience projected token is authenticated through TokenReview, then bound to the `unf-agent` service account, watched Pod UID, and authoritative Node placement before storage. Controller/CLI status distinguishes expected, missing, stale, unexpected, and converged agents; an optional exact label selector defines the expected agent population. Unit, kind, and OpenShift tests reject missing/invalid credentials and cross-Node claims while all selected agents converge |
 | Encrypted authenticated internal transport | **Verified** | Public HTTP exposes no snapshot or agent-write routes. Dedicated HTTPS serves identity/policy snapshots, acknowledgements, and telemetry; agents trust only `unf-internal-ca` and reread their projected token for every request. The controller bounds Kubernetes API load with a 64-entry/30-second successful-review cache while rechecking authoritative Pod identity and placement on every request; invalid credentials are not cached. Agent userspace counts but excludes the configured management TCP port from logs/export to prevent telemetry recursion. `make kind-test` covers the supplied-Secret CA mode; `make openshift-test` covers OpenShift Service CA injection. Both gates cover plaintext isolation, missing CA, missing/invalid/valid credentials, forged Node claims, convergence, workload provenance, and flow export |
-| OpenShift IPv4 and dual-stack platform qualification | **Verified** | `make openshift-test` detects the cluster families and repeatably verifies restricted controller execution, worker-only privileged agents, native Linux 5.14 legacy TC attachment under Enforcing SELinux, OpenShift Service CA and TokenReview transport, selected-node convergence, required-family identity state, cross-worker allow/drop provenance, and healthy cluster operators on separate IPv4-only and dual-stack OpenShift fixtures |
+| OpenShift IPv4 and dual-stack platform qualification | **Verified** | `make openshift-test` detects the cluster families and repeatably verifies restricted controller execution, worker-only agents under the dedicated constrained SCC, the exact three-capability process boundary, native Linux 5.14 legacy TC attachment under Enforcing SELinux, OpenShift Service CA and TokenReview transport, selected-node convergence, required-family identity state, cross-worker allow/drop provenance, and healthy cluster operators on separate IPv4-only and dual-stack OpenShift fixtures |
+| Constrained OpenShift agent SCC | **Verified** | ADR 0025 defines the explicit SCC/RBAC and safe legacy-binding migration. `make openshift-test` requires no built-in privileged-SCC authorization, non-privileged execution, host PID/IPC disabled, read-only root, runtime-default seccomp, `NoNewPrivs`, `spc_t`, and only `BPF`, `NET_ADMIN`, and `PERFMON` effective on every worker before enforcement checks |
 | Transactional identity map set | **Verified** | Identity ABI v2 stages separate inactive IPv4/IPv6 maps, validates both, and selects them with one `IDENTITY_CONFIG` write; ABI/agent tests cover the fixed config and recovery rules, while `make kind-test` exercises repeated identity changes, dual-stack enforcement, and offline restart recovery |
 | Selector-to-identity policy lowering | **Verified** | Unit tests cover exact/default, shadow provenance, conflicts, and deterministic ordering; `make kind-test` requires nonzero resolved entries |
 | Transactional policy map set | **Verified** | `make kind-test` stages a changed policy on the opposite bank, verifies a higher applied revision, restores it, and verifies reconvergence |
@@ -172,10 +174,11 @@ release gate.
 - Dynamic attachment can observe one packet on multiple interfaces; flow
   history aggregates identical logical keys but does not deduplicate one packet's
   interface-level observations.
-- The development DaemonSet is privileged. Its worker-only privileged-SCC runtime
-  and Enforcing SELinux compatibility are OpenShift IPv4 and dual-stack
-  live-verified; a narrower custom SCC/capability profile remains required for
-  production hardening.
+- The portable Kubernetes DaemonSet remains privileged. The OpenShift overlay is
+  non-privileged and constrained to `BPF`, `NET_ADMIN`, and `PERFMON`, but still
+  requires root, `spc_t`, host networking/ports, and hostPath permission. SCC
+  cannot restrict hostPath prefixes; exact bpffs/BTF mounts remain a manifest and
+  admission-policy boundary.
 - Dual-stack kind and dual-stack OpenShift are separate verified fixtures for
   Linux 7.1 TCX and RHCOS Linux 5.14 legacy attachment respectively. Broader
   kernel, platform, scale, and upgrade combinations remain unqualified.
