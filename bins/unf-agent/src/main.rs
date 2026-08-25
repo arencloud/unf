@@ -48,6 +48,7 @@ use unf_state::{
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
 const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v2";
+const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const CURRENT_BPF_ABI_VERSION: u16 = 2;
 const ABI_V1_MAP_NAMES: [&str; 6] = [
     "IDENTITY_V4",
@@ -94,6 +95,16 @@ struct Args {
     identity_sync_seconds: u64,
     #[arg(long, env = "UNF_NODE_NAME", default_value = "unknown")]
     node_name: String,
+    #[arg(long, env = "UNF_POD_NAME", default_value = "unknown")]
+    pod_name: String,
+    #[arg(long, env = "UNF_POD_UID", default_value = "unknown")]
+    pod_uid: String,
+    #[arg(
+        long,
+        env = "UNF_AGENT_TOKEN_PATH",
+        default_value = DEFAULT_AGENT_TOKEN_PATH
+    )]
+    agent_token_path: PathBuf,
     #[arg(long, env = "UNF_FLOW_EXPORT_SECONDS", default_value_t = 1)]
     flow_export_seconds: u64,
     #[arg(long, env = "UNF_BPF_PIN_PATH", default_value = DEFAULT_BPF_PIN_PATH)]
@@ -192,6 +203,8 @@ struct AgentMetrics {
 
 struct AgentState {
     node_name: String,
+    pod_name: String,
+    pod_uid: String,
     ready: AtomicBool,
     bpf_loaded: AtomicBool,
     observed_flows: AtomicU64,
@@ -272,6 +285,7 @@ struct DataplaneConfig {
     controller_url: Option<String>,
     identity_sync_interval: Duration,
     node_name: String,
+    agent_token_path: PathBuf,
     flow_export_interval: Duration,
     bpf_pin_path: PathBuf,
     tc_attachment_preference: TcAttachmentPreference,
@@ -381,7 +395,12 @@ async fn main() -> Result<()> {
     if let Some(AgentCommand::Cleanup(cleanup)) = &args.command {
         return run_cleanup(cleanup);
     }
-    let state = Arc::new(new_state(detect_capabilities(), args.node_name.clone()));
+    let state = Arc::new(new_state(
+        detect_capabilities(),
+        args.node_name.clone(),
+        args.pod_name.clone(),
+        args.pod_uid.clone(),
+    ));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
     let (dataplane_failure_tx, mut dataplane_failure_rx) = mpsc::channel(1);
@@ -399,6 +418,7 @@ async fn main() -> Result<()> {
             let controller_url = args.controller_url.clone();
             let identity_sync_interval = Duration::from_secs(args.identity_sync_seconds.max(1));
             let node_name = args.node_name.clone();
+            let agent_token_path = args.agent_token_path.clone();
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
             let bpf_pin_path = args.bpf_pin_path.clone();
             let tc_attachment_preference = args.tc_attachment_mode;
@@ -411,6 +431,7 @@ async fn main() -> Result<()> {
                     controller_url,
                     identity_sync_interval,
                     node_name,
+                    agent_token_path,
                     flow_export_interval,
                     bpf_pin_path,
                     tc_attachment_preference,
@@ -747,7 +768,12 @@ fn install_crypto_provider() -> Result<()> {
         .map_err(|_| anyhow!("install process-wide Rustls crypto provider"))
 }
 
-fn new_state(capabilities: KernelCapabilities, node_name: String) -> AgentState {
+fn new_state(
+    capabilities: KernelCapabilities,
+    node_name: String,
+    pod_name: String,
+    pod_uid: String,
+) -> AgentState {
     let metrics = AgentMetrics {
         flow_events: Counter::default(),
         invalid_events: Counter::default(),
@@ -770,6 +796,8 @@ fn new_state(capabilities: KernelCapabilities, node_name: String) -> AgentState 
     register_agent_metrics(&mut registry, &metrics);
     AgentState {
         node_name,
+        pod_name,
+        pod_uid,
         ready: AtomicBool::new(false),
         bpf_loaded: AtomicBool::new(false),
         observed_flows: AtomicU64::new(0),
@@ -1524,8 +1552,16 @@ fn spawn_agent_status_reporter(
     let reporter_state = Arc::clone(state);
     let reporter_cancel = cancellation.clone();
     let interval = config.identity_sync_interval;
+    let token_path = config.agent_token_path.clone();
     Some(tokio::spawn(async move {
-        report_agent_status(controller_url, reporter_state, reporter_cancel, interval).await;
+        report_agent_status(
+            controller_url,
+            token_path,
+            reporter_state,
+            reporter_cancel,
+            interval,
+        )
+        .await;
     }))
 }
 
@@ -1805,6 +1841,7 @@ async fn export_flow_batches(
 
 async fn report_agent_status(
     controller_url: String,
+    token_path: PathBuf,
     state: Arc<AgentState>,
     cancellation: CancellationToken,
     report_interval: Duration,
@@ -1825,8 +1862,20 @@ async fn report_agent_status(
         tokio::select! {
             () = cancellation.cancelled() => break,
             _ = interval.tick() => {
+                let token = match fs::read_to_string(&token_path) {
+                    Ok(token) if !token.trim().is_empty() => token,
+                    Ok(_) => {
+                        warn!(path = %token_path.display(), "agent authentication token is empty");
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(%error, path = %token_path.display(), "could not read agent authentication token");
+                        continue;
+                    }
+                };
                 let result = client
                     .post(format!("{controller_url}/v1/state/agents"))
+                    .bearer_auth(token.trim())
                     .json(&agent_state_report(&state))
                     .send()
                     .await
@@ -1843,6 +1892,8 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
     AgentStateReport {
         schema_version: AGENT_STATUS_SCHEMA_VERSION,
         node_name: state.node_name.clone(),
+        pod_name: state.pod_name.clone(),
+        pod_uid: state.pod_uid.clone(),
         ready: state.ready.load(Ordering::Acquire),
         bpf_loaded: state.bpf_loaded.load(Ordering::Acquire),
         desired_identity_revision: state.desired_identity_revision.load(Ordering::Acquire),
@@ -3303,7 +3354,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         )
         .status_label(),
         capabilities: state.capabilities.clone(),
-        limitation: "TC policy enforcement uses transactional pinned maps and persistent atomic attachment replacement; acknowledgements use unauthenticated prototype transport",
+        limitation: "TC policy enforcement uses transactional pinned maps and persistent atomic attachment replacement; acknowledgements use Pod-bound Kubernetes TokenReview authentication over prototype HTTP transport",
     })
 }
 
@@ -3497,6 +3548,8 @@ mod tests {
                 cgroup_v2: true,
             },
             "worker-a".to_owned(),
+            "unf-agent-test".to_owned(),
+            "test-pod-uid".to_owned(),
         )
     }
 
@@ -3517,6 +3570,8 @@ mod tests {
         let report = agent_state_report(&state);
         assert_eq!(report.schema_version, AGENT_STATUS_SCHEMA_VERSION);
         assert_eq!(report.node_name, "worker-a");
+        assert_eq!(report.pod_name, "unf-agent-test");
+        assert_eq!(report.pod_uid, "test-pod-uid");
         assert!(report.ready);
         assert!(report.bpf_loaded);
         assert_eq!(report.applied_identity_epoch, 7);

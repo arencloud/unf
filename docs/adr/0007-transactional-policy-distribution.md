@@ -57,6 +57,11 @@ unpinned and transport is unauthenticated inside the prototype cluster. ADR 0008
 connects TC enforcement to the active bank without changing this distribution
 protocol.
 
+ADRs 0016–0018 subsequently pinned last-known-good state and attachment identity.
+ADR 0023 authenticates agent acknowledgement writes with Pod-bound Kubernetes
+TokenReview identity; snapshot reads and transport encryption remain outside this
+original distribution decision.
+
 ## Open questions
 
 - measured entry count, update latency, and memory limits at production scale;

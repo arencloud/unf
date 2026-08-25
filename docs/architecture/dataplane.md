@@ -130,4 +130,5 @@ tests still run on stable in the host workspace. See ADR 0002.
 ## Next dataplane milestone
 
 Validate the legacy netlink handoff path on an older supported kernel and an
-OpenShift host, then define authenticated agent acknowledgements.
+OpenShift host, then add encrypted internal transport and durable agent
+acknowledgement retention.

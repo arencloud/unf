@@ -64,8 +64,12 @@ matrix and reproducible evidence.
   unknown ABI content is refused, current v2 requires explicit confirmation, and
   live cleanup preserves the active v2 map set and restores TCX before removing
   legacy filters;
-- Next: legacy-kernel/OpenShift handoff validation and authenticated/durable
-  agent acknowledgements.
+- Implemented and two-node kind verified: acknowledgement schema v2 uses a
+  dedicated-audience projected service-account token, Kubernetes TokenReview,
+  Pod name/UID binding, and watched Node placement. Anonymous, invalid-token, and
+  valid-token/cross-Node claims fail closed without changing convergence state;
+- Next: legacy-kernel/OpenShift handoff and TokenReview validation, encrypted
+  internal transport, and durable agent acknowledgement retention.
 
 ## Phase 3 — compatibility and simulation
 

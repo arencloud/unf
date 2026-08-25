@@ -198,10 +198,24 @@ revisioned, 4,096-key in-memory history. `make kind-test` verifies the predicted
 8080 denial in both inputs, unchanged policy revision, and continued live 8080
 allow after simulation. Status reports per-node desired/applied identity and
 policy revisions and marks the watched Node set converged only while every agent
-has a fresh matching acknowledgement. Each agent also reports
+has a fresh matching acknowledgement. Agent acknowledgement schema v2 includes
+the reporting Pod name/UID. The DaemonSet disables the general API token mount and
+projects only an automatically rotated one-hour token for audience
+`unf-controller.unf-system.svc`; the controller uses its narrowly added
+`tokenreviews.create` permission to bind that credential to the `unf-agent`
+service account, watched Pod UID, and Node placement. Missing, invalid, or
+cross-Node credentials fail closed and are counted by
+`unf_agent_authentication_failures_total`. Each agent also reports
 `tc_attachment_mode` as `tcx_pinned` or `legacy_netlink`. During offline
 replacement, the verifier continuously probes the denied TCP/9090 path and
 requires zero successful requests before the replacement is Ready.
+
+The projected credential is never written to logs or checked into the repository,
+but the prototype controller Service is still HTTP. Do not treat TokenReview as
+transport encryption; production deployment requires mTLS or an equivalent
+encrypted boundary. An OpenShift qualification run must additionally verify
+projected custom-audience tokens, TokenReview Pod extras, controller RBAC, SCC
+admission, and the selected encrypted service path.
 
 After the primary gate, `hack/verify-kind-legacy-netlink.sh` explicitly selects
 legacy mode when the host would normally choose TCX, confirms the reserved

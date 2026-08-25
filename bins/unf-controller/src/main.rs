@@ -6,16 +6,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, TryStreamExt};
+use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kube::api::PostParams;
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, ResourceExt};
 use prometheus_client::encoding::text::encode;
@@ -43,6 +45,10 @@ use unf_state::{
 };
 
 const AGENT_STATUS_FRESHNESS_MILLIS: u64 = 10_000;
+const AGENT_TOKEN_AUDIENCE: &str = "unf-controller.unf-system.svc";
+const AGENT_SERVICE_ACCOUNT_USERNAME: &str = "system:serviceaccount:unf-system:unf-agent";
+const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
+const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF Kubernetes desired-state controller")]
@@ -61,6 +67,7 @@ struct ControllerMetrics {
     telemetry_batches: Counter,
     telemetry_observations: Counter,
     agent_status_reports: Counter,
+    agent_authentication_failures: Counter,
 }
 
 struct ControllerState {
@@ -81,6 +88,7 @@ struct ControllerState {
     identities: Mutex<IdentityRegistry>,
     flow_history: Mutex<FlowHistoryStore>,
     agent_reports: RwLock<BTreeMap<String, StoredAgentReport>>,
+    token_review_client: Option<Client>,
     revisions: Mutex<RevisionSet>,
     registry: Mutex<Registry>,
     metrics: ControllerMetrics,
@@ -96,6 +104,7 @@ struct StoredAgentReport {
 struct PodRecord {
     namespace: String,
     name: String,
+    uid: String,
     node_name: Option<String>,
     endpoint: Endpoint,
     ipv4_addresses: BTreeSet<std::net::Ipv4Addr>,
@@ -287,16 +296,23 @@ async fn main() -> Result<()> {
     install_crypto_provider()?;
     init_tracing();
     let args = Args::parse();
-    let state = Arc::new(new_state(args.offline));
+    let client = if args.offline {
+        None
+    } else {
+        Some(
+            Client::try_default()
+                .await
+                .context("create Kubernetes client from in-cluster or kubeconfig settings")?,
+        )
+    };
+    let state = Arc::new(new_state_with_client(args.offline, client.clone()));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
 
     if args.offline {
         warn!("running without Kubernetes watchers");
     } else {
-        let client = Client::try_default()
-            .await
-            .context("create Kubernetes client from in-cluster or kubeconfig settings")?;
+        let client = client.context("Kubernetes client is required in connected mode")?;
         spawn_watchers(&mut tasks, client, Arc::clone(&state), cancellation.clone());
         state.ready.store(true, Ordering::Release);
     }
@@ -351,7 +367,12 @@ fn install_crypto_provider() -> Result<()> {
         .map_err(|_| anyhow!("install process-wide Rustls crypto provider"))
 }
 
+#[cfg(test)]
 fn new_state(offline: bool) -> ControllerState {
+    new_state_with_client(offline, None)
+}
+
+fn new_state_with_client(offline: bool, token_review_client: Option<Client>) -> ControllerState {
     let metrics = ControllerMetrics::default();
     let mut registry = Registry::default();
     registry.register(
@@ -376,8 +397,13 @@ fn new_state(offline: bool) -> ControllerState {
     );
     registry.register(
         "unf_agent_status_reports",
-        "Node-agent status acknowledgements accepted by the controller",
+        "Authenticated node-agent status acknowledgements accepted by the controller",
         metrics.agent_status_reports.clone(),
+    );
+    registry.register(
+        "unf_agent_authentication_failures",
+        "Node-agent status acknowledgements rejected by authentication",
+        metrics.agent_authentication_failures.clone(),
     );
     ControllerState {
         ready: AtomicBool::new(offline),
@@ -397,6 +423,7 @@ fn new_state(offline: bool) -> ControllerState {
         identities: Mutex::new(IdentityRegistry::default()),
         flow_history: Mutex::new(FlowHistoryStore::default()),
         agent_reports: RwLock::new(BTreeMap::new()),
+        token_review_client,
         revisions: Mutex::new(RevisionSet::default()),
         registry: Mutex::new(registry),
         metrics,
@@ -587,6 +614,7 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
     let record = PodRecord {
         namespace,
         name,
+        uid: pod.metadata.uid.clone().unwrap_or_default(),
         node_name: pod.spec.as_ref().and_then(|spec| spec.node_name.clone()),
         endpoint,
         ipv4_addresses: addresses
@@ -1306,7 +1334,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         agents,
         limitations: [
             "desired state and identity allocations are currently in-memory only",
-            "agent acknowledgements use unauthenticated prototype transport; attachment replacement mode is reported by each agent",
+            "agent acknowledgements use Pod-bound Kubernetes TokenReview authentication; internal HTTP transport is not yet encrypted and attachment replacement mode is reported by each agent",
         ],
     }))
 }
@@ -1324,8 +1352,13 @@ async fn agent_state(State(state): State<Arc<ControllerState>>) -> Json<AgentCon
 
 async fn ingest_agent_status(
     State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
     Json(report): Json<AgentStateReport>,
 ) -> Result<StatusCode, ApiError> {
+    if let Err(error) = authenticate_agent_status(&state, &headers, &report).await {
+        state.metrics.agent_authentication_failures.inc();
+        return Err(error);
+    }
     validate_agent_status(&report)?;
     write_lock(&state.agent_reports).insert(
         report.node_name.clone(),
@@ -1336,6 +1369,106 @@ async fn ingest_agent_status(
     );
     state.metrics.agent_status_reports.inc();
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn authenticate_agent_status(
+    state: &ControllerState,
+    headers: &HeaderMap,
+    report: &AgentStateReport,
+) -> Result<(), ApiError> {
+    let token = bearer_token(headers)?;
+    let client = state.token_review_client.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable("agent authentication requires Kubernetes TokenReview")
+    })?;
+    let review = TokenReview {
+        spec: TokenReviewSpec {
+            audiences: Some(vec![AGENT_TOKEN_AUDIENCE.to_owned()]),
+            token: Some(token.to_owned()),
+        },
+        ..TokenReview::default()
+    };
+    let reviewed = Api::<TokenReview>::all(client.clone())
+        .create(&PostParams::default(), &review)
+        .await
+        .map_err(|_| ApiError::service_unavailable("Kubernetes TokenReview failed"))?;
+    let status = reviewed
+        .status
+        .as_ref()
+        .ok_or_else(|| ApiError::unauthorized("agent token was not authenticated"))?;
+    validate_agent_token_identity(status, report, &read_lock(&state.pods))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
+    let authorization = headers
+        .get(AUTHORIZATION)
+        .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?
+        .to_str()
+        .map_err(|_| ApiError::unauthorized("invalid authorization header"))?;
+    let token = authorization
+        .strip_prefix("Bearer ")
+        .filter(|token| !token.is_empty() && !token.chars().any(char::is_whitespace))
+        .ok_or_else(|| ApiError::unauthorized("invalid bearer token"))?;
+    Ok(token)
+}
+
+fn validate_agent_token_identity(
+    status: &TokenReviewStatus,
+    report: &AgentStateReport,
+    pods: &BTreeMap<String, PodRecord>,
+) -> Result<(), ApiError> {
+    if status.authenticated != Some(true) || status.error.is_some() {
+        return Err(ApiError::unauthorized("agent token was not authenticated"));
+    }
+    if !status
+        .audiences
+        .as_ref()
+        .is_some_and(|audiences| audiences.iter().any(|value| value == AGENT_TOKEN_AUDIENCE))
+    {
+        return Err(ApiError::unauthorized(
+            "agent token has an incompatible audience",
+        ));
+    }
+    let user = status
+        .user
+        .as_ref()
+        .ok_or_else(|| ApiError::unauthorized("agent token has no user identity"))?;
+    if user.username.as_deref() != Some(AGENT_SERVICE_ACCOUNT_USERNAME) {
+        return Err(ApiError::forbidden(
+            "agent token does not identify the UNF agent service account",
+        ));
+    }
+    let extra = user
+        .extra
+        .as_ref()
+        .ok_or_else(|| ApiError::forbidden("agent token is not bound to a Pod"))?;
+    if exact_extra_value(extra, POD_NAME_EXTRA) != Some(report.pod_name.as_str())
+        || exact_extra_value(extra, POD_UID_EXTRA) != Some(report.pod_uid.as_str())
+    {
+        return Err(ApiError::forbidden(
+            "agent report does not match its Pod-bound token",
+        ));
+    }
+    let pod_key = format!("unf-system/{}", report.pod_name);
+    let pod = pods
+        .get(&pod_key)
+        .ok_or_else(|| ApiError::forbidden("agent Pod is not present in watched state"))?;
+    if pod.uid != report.pod_uid
+        || pod.endpoint.service_account != "unf-agent"
+        || pod.node_name.as_deref() != Some(report.node_name.as_str())
+    {
+        return Err(ApiError::forbidden(
+            "agent report does not match its authoritative Pod placement",
+        ));
+    }
+    Ok(())
+}
+
+fn exact_extra_value<'value>(
+    extra: &'value BTreeMap<String, Vec<String>>,
+    key: &str,
+) -> Option<&'value str> {
+    let values = extra.get(key)?;
+    (values.len() == 1).then(|| values[0].as_str())
 }
 
 fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
@@ -1364,6 +1497,16 @@ fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
     if !valid_node_name {
         return Err(ApiError::bad_request(
             "node_name must be a valid 1 to 253 character Kubernetes node name",
+        ));
+    }
+    if report.pod_name.is_empty() || report.pod_name.len() > 253 {
+        return Err(ApiError::bad_request(
+            "pod_name must be a valid 1 to 253 character Kubernetes Pod name",
+        ));
+    }
+    if report.pod_uid.is_empty() || report.pod_uid.len() > 128 {
+        return Err(ApiError::bad_request(
+            "pod_uid must identify the reporting Kubernetes Pod",
         ));
     }
     if report.active_policy_bank > 1 {
@@ -2251,6 +2394,20 @@ struct ApiError {
 }
 
 impl ApiError {
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -2275,6 +2432,13 @@ impl ApiError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
         }
     }
@@ -2428,6 +2592,7 @@ mod tests {
         PodRecord {
             namespace: namespace.to_owned(),
             name: name.to_owned(),
+            uid: format!("{namespace}-{name}-uid"),
             node_name: Some("worker-a".to_owned()),
             endpoint: Endpoint {
                 identity: unf_common::IdentityId::new(id),
@@ -2789,29 +2954,120 @@ mod tests {
         assert_eq!(mutex_lock(&state.revisions).identity, Revision::default());
     }
 
-    #[test]
-    fn agent_status_aggregation_requires_fresh_matching_acknowledgements() {
-        let state = new_state(true);
-        apply_node_event(&state, Event::Apply(node(true)));
-        let report = AgentStateReport {
+    fn converged_agent_report(epoch: u64) -> AgentStateReport {
+        AgentStateReport {
             schema_version: AGENT_STATUS_SCHEMA_VERSION,
             node_name: "worker-a".to_owned(),
+            pod_name: "unf-agent-test".to_owned(),
+            pod_uid: "unf-agent-test-uid".to_owned(),
             ready: true,
             bpf_loaded: true,
             desired_identity_revision: 0,
             applied_identity_revision: 0,
-            desired_identity_epoch: state.identity_epoch,
-            applied_identity_epoch: state.identity_epoch,
+            desired_identity_epoch: epoch,
+            applied_identity_epoch: epoch,
             identity_map_entries: 2,
             ipv4_identity_map_entries: 1,
             ipv6_identity_map_entries: 1,
             desired_policy_revision: 0,
             applied_policy_revision: 0,
-            desired_policy_epoch: state.identity_epoch,
-            applied_policy_epoch: state.identity_epoch,
+            desired_policy_epoch: epoch,
+            applied_policy_epoch: epoch,
             policy_map_entries: 1,
             active_policy_bank: 0,
-        };
+        }
+    }
+
+    fn successful_agent_token_review(report: &AgentStateReport) -> TokenReviewStatus {
+        TokenReviewStatus {
+            audiences: Some(vec![AGENT_TOKEN_AUDIENCE.to_owned()]),
+            authenticated: Some(true),
+            error: None,
+            user: Some(k8s_openapi::api::authentication::v1::UserInfo {
+                username: Some(AGENT_SERVICE_ACCOUNT_USERNAME.to_owned()),
+                extra: Some(BTreeMap::from([
+                    (POD_NAME_EXTRA.to_owned(), vec![report.pod_name.clone()]),
+                    (POD_UID_EXTRA.to_owned(), vec![report.pod_uid.clone()]),
+                ])),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn agent_status_authentication_binds_service_account_pod_and_node() {
+        let report = converged_agent_report(7);
+        let mut pod = pod_record(1, "unf-system", &report.pod_name, "unf-agent");
+        pod.uid.clone_from(&report.pod_uid);
+        pod.endpoint.service_account = "unf-agent".to_owned();
+        let pods = BTreeMap::from([(format!("unf-system/{}", report.pod_name), pod)]);
+        let status = successful_agent_token_review(&report);
+        validate_agent_token_identity(&status, &report, &pods)
+            .expect("Pod-bound UNF agent identity is accepted");
+
+        let mut wrong_node = report.clone();
+        wrong_node.node_name = "worker-b".to_owned();
+        assert_eq!(
+            validate_agent_token_identity(&status, &wrong_node, &pods)
+                .expect_err("cross-node claim is rejected")
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let mut wrong_pod = report.clone();
+        wrong_pod.pod_uid = "another-pod-uid".to_owned();
+        assert_eq!(
+            validate_agent_token_identity(&status, &wrong_pod, &pods)
+                .expect_err("another Pod identity is rejected")
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let mut wrong_service_account = status.clone();
+        wrong_service_account
+            .user
+            .as_mut()
+            .expect("review has user")
+            .username = Some("system:serviceaccount:default:default".to_owned());
+        assert_eq!(
+            validate_agent_token_identity(&wrong_service_account, &report, &pods)
+                .expect_err("another service account is rejected")
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let mut wrong_audience = status;
+        wrong_audience.audiences = Some(vec!["another-service".to_owned()]);
+        assert_eq!(
+            validate_agent_token_identity(&wrong_audience, &report, &pods)
+                .expect_err("another audience is rejected")
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn agent_status_bearer_header_is_strict() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            bearer_token(&headers)
+                .expect_err("missing credentials are rejected")
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+        headers.insert(AUTHORIZATION, "Basic credential".parse().unwrap());
+        assert!(bearer_token(&headers).is_err());
+        headers.insert(AUTHORIZATION, "Bearer token-value".parse().unwrap());
+        assert_eq!(bearer_token(&headers).unwrap(), "token-value");
+        headers.insert(AUTHORIZATION, "Bearer token value".parse().unwrap());
+        assert!(bearer_token(&headers).is_err());
+    }
+
+    #[test]
+    fn agent_status_aggregation_requires_fresh_matching_acknowledgements() {
+        let state = new_state(true);
+        apply_node_event(&state, Event::Apply(node(true)));
+        let report = converged_agent_report(state.identity_epoch);
         validate_agent_status(&report).expect("valid agent report is accepted");
         let missing =
             agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100);

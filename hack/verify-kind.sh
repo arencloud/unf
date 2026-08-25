@@ -143,6 +143,16 @@ agent_metric() {
         | awk -v metric="${metric}" '$1 == metric { print $2; exit }'
 }
 
+post_agent_status_with_token() {
+    local token=$1 report=$2 response_path=$3
+    printf 'Authorization: Bearer %s\n' "${token}" | curl \
+        --silent --show-error --max-time 5 \
+        --output "${response_path}" --write-out '%{http_code}' \
+        --request POST --header @- --header 'Content-Type: application/json' \
+        --data-binary "${report}" \
+        "http://127.0.0.1:${controller_port}/v1/state/agents"
+}
+
 json_number() {
     local field=$1
     sed -nE "s/.*\"${field}\":([0-9]+).*/\1/p"
@@ -583,11 +593,74 @@ if ! wait_for_aggregated_agent_convergence "${#agent_pods[@]}"; then
     echo "controller did not aggregate converged status from every node agent" >&2
     exit 1
 fi
-grep -q '"schema_version": 1' <<<"${agent_convergence_status}"
+grep -q '"schema_version": 2' <<<"${agent_convergence_status}"
 grep -q '"node_name": "unf-dev-control-plane"' <<<"${agent_convergence_status}"
 grep -q '"node_name": "unf-dev-worker"' <<<"${agent_convergence_status}"
 if [[ $(grep -c '"converged": true' <<<"${agent_convergence_status}") -ne 2 ]]; then
     echo "controller did not expose two converged per-node acknowledgements" >&2
+    exit 1
+fi
+
+authentication_agent=${agent_pods[0]}
+authentication_report=$(agent_status "${authentication_agent}")
+if ! grep -q '"schema_version":2' <<<"${authentication_report}" \
+    || ! grep -Eq '"pod_name":"unf-agent-[^"]+"' <<<"${authentication_report}" \
+    || ! grep -Eq '"pod_uid":"[^"]+"' <<<"${authentication_report}"; then
+    echo "agent did not expose its schema v2 Pod-bound acknowledgement identity" >&2
+    exit 1
+fi
+unauthenticated_code=$(curl --silent --show-error --max-time 5 \
+    --output "${temporary_dir}/unauthenticated-agent-report.json" \
+    --write-out '%{http_code}' --request POST \
+    --header 'Content-Type: application/json' --data-binary "${authentication_report}" \
+    "http://127.0.0.1:${controller_port}/v1/state/agents")
+if [[ ${unauthenticated_code} != 401 ]] \
+    || ! grep -q 'missing bearer token' \
+        "${temporary_dir}/unauthenticated-agent-report.json"; then
+    echo "controller did not reject an unauthenticated agent report" >&2
+    exit 1
+fi
+invalid_token_code=$(post_agent_status_with_token \
+    invalid-token "${authentication_report}" \
+    "${temporary_dir}/invalid-token-agent-report.json")
+if [[ ${invalid_token_code} != 401 ]] \
+    || ! grep -q 'agent token was not authenticated' \
+        "${temporary_dir}/invalid-token-agent-report.json"; then
+    echo "controller did not reject an invalid agent token" >&2
+    exit 1
+fi
+authentication_token=$("${kc[@]}" -n unf-system exec "${authentication_agent}" -- \
+    sh -eu -c 'cat /var/run/secrets/unf-agent/token')
+if [[ -z ${authentication_token} ]]; then
+    echo "agent projected authentication token is empty" >&2
+    exit 1
+fi
+authenticated_code=$(post_agent_status_with_token \
+    "${authentication_token}" "${authentication_report}" \
+    "${temporary_dir}/authenticated-agent-report.json")
+if [[ ${authenticated_code} != 204 ]]; then
+    cat "${temporary_dir}/authenticated-agent-report.json" >&2
+    echo "controller rejected a valid Pod-bound agent token" >&2
+    exit 1
+fi
+forged_report=$(sed -E \
+    's/"node_name":"[^"]+"/"node_name":"forged-node"/' \
+    <<<"${authentication_report}")
+forged_code=$(post_agent_status_with_token \
+    "${authentication_token}" "${forged_report}" \
+    "${temporary_dir}/forged-agent-report.json")
+unset authentication_token
+if [[ ${forged_code} != 403 ]] \
+    || ! grep -q 'authoritative Pod placement' \
+        "${temporary_dir}/forged-agent-report.json"; then
+    echo "controller did not reject a valid token with a forged Node claim" >&2
+    exit 1
+fi
+authentication_failures=$(curl --fail --silent \
+    "http://127.0.0.1:${controller_port}/metrics" \
+    | awk '$1 == "unf_agent_authentication_failures_total" { print $2; exit }')
+if [[ -z ${authentication_failures} || ${authentication_failures} -lt 3 ]]; then
+    echo "controller did not account for rejected agent credentials" >&2
     exit 1
 fi
 controller_status_table=$("${unfctl}" \
@@ -2026,4 +2099,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: scoped dry-run/refusal/execution cleanup of stale v1 state with v2 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: Pod-bound TokenReview authentication with anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v2 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

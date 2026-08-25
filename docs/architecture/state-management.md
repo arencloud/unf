@@ -44,10 +44,13 @@ physical IPv4/IPv6 maps, read back, and activated together by one
 identity-keyed, IPv4-keyed, and IPv6-prefix banks before one `POLICY_CONFIG` write
 selects all three. See ADRs 0006, 0007, and 0017.
 
-Each agent also posts a schema v1 acknowledgement containing its Node name,
-readiness, BPF load state, desired/applied identity and policy epoch/revisions,
-active policy bank, and map counts. The controller timestamps reports on receipt
-and compares them with its watched Node set and current desired revisions.
+Each agent also posts a schema v2 acknowledgement containing its Node and Pod
+identity, readiness, BPF load state, desired/applied identity and policy
+epoch/revisions, active policy bank, and map counts. A dedicated-audience,
+short-lived projected service-account token authenticates the request through
+Kubernetes TokenReview. The controller binds its service account and Pod name/UID
+to watched Pod placement before accepting the reported Node. It timestamps reports
+on receipt and compares them with its watched Node set and current desired revisions.
 Controller and CLI status classify expected agents as missing, stale after ten
 seconds, or converged; fresh reports from unknown Nodes remain visible as
 unexpected without permanently degrading status after Node removal.
@@ -74,15 +77,17 @@ proves the legacy filter alone survives offline-controller agent replacement,
 then restores TCX before scoped legacy cleanup. A separate dry-run-first cleanup
 command recognizes only the v1/v2 map names, numeric UNF TCX link-pin names, and
 UNF legacy program names. It refuses unknown ABI content and requires explicit
-confirmation for current v2 removal. Acknowledgement authentication/durability
-remain hardening work.
+confirmation for current v2 removal. Acknowledgement authentication uses the
+Pod-bound TokenReview design in ADR 0023; durable report retention and encrypted
+internal transport remain hardening work.
+
 Isolated live-kernel probes verify that partial pin sets,
 invalid active config, and corrupt inactive-stage debris are rejected before
 adoption without mutating the primary pin set. A separate live pressure probe
 fills only the inactive identity-keyed policy bank, proves a staging insertion
 failure cannot advance applied state or alter active traffic, and verifies retry
 after scoped cleanup. Permanent startup validation failures terminate for
-orchestrator retry. See ADRs 0016 through 0022.
+orchestrator retry. See ADRs 0016 through 0023.
 
 Kubernetes watches remain the controller input. Internal HTTP snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

@@ -20,8 +20,10 @@ Services, selector intent, and EndpointSlice-derived runtime backend readiness.
 Node agents also export
 destination-resolved flow observations into bounded, revisioned in-memory history
 for operator queries and policy impact analysis. Agents publish revisioned status
-acknowledgements, allowing controller and CLI status to report freshness-aware
-cluster convergence for every watched Node. The resolved-identity fast path
+acknowledgements using Pod-bound, audience-scoped Kubernetes tokens; TokenReview
+and authoritative Pod placement prevent anonymous or cross-Node claims. Controller
+and CLI status report freshness-aware cluster convergence for every watched Node.
+The resolved-identity fast path
 is now dual-stack for IPv4/IPv6 TCP/UDP/SCTP, including verifier-bounded IPv6
 extension-header traversal; native policy and selector-based NetworkPolicy IPv6
 decisions are live-verified.
@@ -63,6 +65,8 @@ Implemented in the repository:
   status;
 - controller health, readiness, metrics, status, and userspace explanation APIs;
 - controller-aggregated per-node desired/applied identity and policy convergence;
+- schema v2 agent acknowledgements authenticated through audience-scoped,
+  Pod-bound Kubernetes TokenReview identity and authoritative Node placement;
 - revision-fenced, read-only native policy simulation through the shared evaluator;
 - bounded non-blocking agent telemetry export and a 4,096-flow controller history
   with explicit drop/eviction accounting;

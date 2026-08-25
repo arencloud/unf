@@ -11,7 +11,7 @@ pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 2;
-pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 1;
+pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 2;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
 /// One half of the dual-bank eBPF policy map's 262,144-entry capacity.
@@ -31,6 +31,8 @@ pub struct RevisionSet {
 pub struct AgentStateReport {
     pub schema_version: u16,
     pub node_name: String,
+    pub pod_name: String,
+    pub pod_uid: String,
     pub ready: bool,
     pub bpf_loaded: bool,
     pub desired_identity_revision: u64,
