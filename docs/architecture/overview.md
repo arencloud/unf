@@ -41,7 +41,7 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    resolve two Pods and evaluate the IR.
    `unfctl policy simulate` compiles a candidate without applying it and compares
    current/proposed decisions over a probe matrix fenced to the reported topology
-   revision.
+   revision plus an independently windowed, revision-fenced retained-history set.
 5. The agent loads the Aya object, attaches TC, applies the controller's revisioned
    dual-stack identity snapshot to separate IPv4/IPv6 maps, consumes compact
    events, and exposes health and per-family map metrics.

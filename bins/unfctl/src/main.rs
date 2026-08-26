@@ -71,6 +71,18 @@ enum PolicyCommand {
     Simulate {
         /// `SecurityPolicy` YAML file to evaluate without applying.
         policy_file: PathBuf,
+        /// Restrict historical impact to flows last received within this duration.
+        #[arg(long, value_parser = parse_duration_millis, conflicts_with = "since_unix_ms")]
+        last: Option<u64>,
+        /// Inclusive historical lower bound for the last-received timestamp.
+        #[arg(long)]
+        since_unix_ms: Option<u64>,
+        /// Inclusive historical upper bound for the last-received timestamp.
+        #[arg(long)]
+        until_unix_ms: Option<u64>,
+        /// Maximum number of newest matching historical flows to evaluate.
+        #[arg(long)]
+        limit: Option<usize>,
     },
 }
 
@@ -100,6 +112,15 @@ struct ExplainRequest<'a> {
 #[derive(Debug, Serialize)]
 struct PolicySimulationRequest<'a> {
     policy: &'a SecurityPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flow_history: Option<PolicySimulationFlowHistoryQuery>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct PolicySimulationFlowHistoryQuery {
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
 }
 
 #[tokio::main]
@@ -157,16 +178,33 @@ async fn run() -> Result<()> {
             .await?
         }
         Command::Policy {
-            command: PolicyCommand::Simulate { policy_file },
+            command:
+                PolicyCommand::Simulate {
+                    policy_file,
+                    last,
+                    since_unix_ms,
+                    until_unix_ms,
+                    limit,
+                },
         } => {
             let contents = std::fs::read_to_string(policy_file)
                 .with_context(|| format!("read policy file {}", policy_file.display()))?;
             let policy: SecurityPolicy = serde_yaml::from_str(&contents)
                 .with_context(|| format!("parse SecurityPolicy YAML {}", policy_file.display()))?;
+            let flow_history = policy_simulation_flow_history(
+                *last,
+                *since_unix_ms,
+                *until_unix_ms,
+                *limit,
+                unix_time_millis()?,
+            )?;
             post_json(
                 &client,
                 &format!("{}/v1/policy/simulate", cli.controller_url),
-                &PolicySimulationRequest { policy: &policy },
+                &PolicySimulationRequest {
+                    policy: &policy,
+                    flow_history,
+                },
             )
             .await?
         }
@@ -450,6 +488,25 @@ fn resolve_flow_window(
     Ok((since, until))
 }
 
+fn policy_simulation_flow_history(
+    last_millis: Option<u64>,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+    now_unix_ms: u64,
+) -> Result<Option<PolicySimulationFlowHistoryQuery>> {
+    let (since_unix_ms, until_unix_ms) =
+        resolve_flow_window(last_millis, since_unix_ms, until_unix_ms, now_unix_ms)?;
+    if since_unix_ms.is_none() && until_unix_ms.is_none() && limit.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(PolicySimulationFlowHistoryQuery {
+        since_unix_ms,
+        until_unix_ms,
+        limit,
+    }))
+}
+
 fn flow_history_url(
     controller_url: &str,
     since_unix_ms: Option<u64>,
@@ -647,19 +704,7 @@ fn print_simulation_table(value: &Value) {
         "affected services        {}",
         joined_strings(&value["affected_services"])
     );
-    let historical = &value["historical_summary"];
-    println!(
-        "historical flows         evaluated={}/{} observations={}/{} skipped={}",
-        number_field(historical, "evaluated_flows"),
-        number_field(historical, "retained_flows"),
-        number_field(historical, "evaluated_observations"),
-        number_field(historical, "retained_observations"),
-        number_field(historical, "skipped_unresolved_flows")
-    );
-    println!(
-        "historical would deny    {} observations",
-        number_field(historical, "would_be_denied_observations")
-    );
+    print_historical_simulation_table(value);
     if let Some(changes) = value.get("changes").and_then(Value::as_array) {
         for change in changes.iter().take(20) {
             println!(
@@ -677,6 +722,38 @@ fn print_simulation_table(value: &Value) {
         }
     }
     println!("note                     {}", text_field(value, "note"));
+}
+
+fn print_historical_simulation_table(value: &Value) {
+    let historical = &value["historical_summary"];
+    let historical_query = &value["historical_query"];
+    println!(
+        "historical retained      flows={} observations={}",
+        number_field(historical, "retained_flows"),
+        number_field(historical, "retained_observations")
+    );
+    println!(
+        "historical selection     since={} until={} matched={} observations={} returned={} truncated={}",
+        optional_number_field(historical_query, "since_unix_ms"),
+        optional_number_field(historical_query, "until_unix_ms"),
+        number_field(historical_query, "matched_flows"),
+        number_field(historical_query, "matched_observations"),
+        number_field(historical_query, "returned_flows"),
+        historical_query
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    println!(
+        "historical evaluation    flows={} observations={} skipped={}",
+        number_field(historical, "evaluated_flows"),
+        number_field(historical, "evaluated_observations"),
+        number_field(historical, "skipped_unresolved_flows")
+    );
+    println!(
+        "historical would deny    {} observations",
+        number_field(historical, "would_be_denied_observations")
+    );
 }
 
 fn text_field<'a>(value: &'a Value, field: &str) -> &'a str {
@@ -698,6 +775,10 @@ mod tests {
             "policy",
             "simulate",
             "deploy/examples/simulation-deny.yaml",
+            "--last",
+            "15m",
+            "--limit",
+            "25",
             "--output",
             "json",
         ])
@@ -705,7 +786,13 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Policy {
-                command: PolicyCommand::Simulate { .. }
+                command: PolicyCommand::Simulate {
+                    last: Some(900_000),
+                    since_unix_ms: None,
+                    until_unix_ms: None,
+                    limit: Some(25),
+                    ..
+                }
             }
         ));
         let policy: SecurityPolicy = serde_yaml::from_str(include_str!(
@@ -713,6 +800,20 @@ mod tests {
         ))
         .expect("checked-in simulation fixture is valid");
         assert_eq!(policy.metadata.name.as_deref(), Some("frontend-to-backend"));
+        assert_eq!(
+            policy_simulation_flow_history(Some(900_000), None, None, Some(25), 2_000_000)
+                .expect("relative simulation window resolves"),
+            Some(PolicySimulationFlowHistoryQuery {
+                since_unix_ms: Some(1_100_000),
+                until_unix_ms: Some(2_000_000),
+                limit: Some(25),
+            })
+        );
+        assert_eq!(
+            policy_simulation_flow_history(None, None, None, None, 2_000_000)
+                .expect("omitted simulation window remains backward compatible"),
+            None
+        );
     }
 
     #[test]

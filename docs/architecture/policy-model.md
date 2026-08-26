@@ -103,6 +103,8 @@ snapshots, or BPF maps. The matrix is capped at 10,000 flows. A separate result
 evaluates the controller's bounded retained history, reports unique logical flows
 and observation-weighted impact, skips identities no longer resolvable in current
 topology, and reports Services affected through selectors or ready EndpointSlice
-Pod backends. External sources that lack a
+Pod backends. Optional inclusive last-received bounds and a newest-first limit
+select the historical set without changing the topology matrix; query metadata
+makes partial results explicit. External sources that lack a
 current source identity and user-supplied flow sets remain excluded. See
 [ADR 0010](../adr/0010-read-only-policy-simulation.md).

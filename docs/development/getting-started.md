@@ -226,6 +226,8 @@ To inspect the checked-in deny proposal without applying it:
 ```bash
 target/debug/unfctl --controller-url http://127.0.0.1:9962 \
   policy simulate deploy/examples/simulation-deny.yaml
+target/debug/unfctl --controller-url http://127.0.0.1:9962 \
+  policy simulate deploy/examples/simulation-deny.yaml --last 15m --limit 100
 ```
 
 The result is fenced to the reported identity epoch/revision, policy revision,
@@ -247,9 +249,13 @@ newest bounded checkpoint survives controller restart. Run its focused gate with
 `make kind-flow-history-retention-test`.
 
 Simulation reports its bounded current-topology probe matrix separately from the
-revisioned, 4,096-key retained history. `make kind-test` verifies the predicted
-8080 denial in both inputs, unchanged policy revision, and continued live 8080
-allow after simulation. Status reports per-node desired/applied identity and
+revisioned, 4,096-key retained history. Its `--last`, `--since-unix-ms`,
+`--until-unix-ms`, and `--limit` options apply only to historical impact; topology
+evaluation is unchanged. The response exposes the applied bounds, matched and
+returned flows, observations, and truncation state. `make kind-test` verifies a
+recent 8080 denial impact, an empty future history window, unchanged policy
+revision, and continued live 8080 allow after simulation. Status reports
+per-node desired/applied identity and
 policy revisions and marks the watched Node set converged only while every agent
 has a fresh matching acknowledgement. Agent acknowledgement schema v2 includes
 the reporting Pod name/UID. The DaemonSet disables the general API token mount and

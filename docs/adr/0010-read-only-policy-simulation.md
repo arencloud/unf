@@ -28,14 +28,19 @@ proposed policy, resolved named ports, bounded range members, and one unmatched 
 and UDP port for wildcard/default behavior. The complete matrix is limited to
 10,000 flows; larger requests fail explicitly instead of returning partial counts.
 
-Response schema v2 reports
+Response schema v3 reports
 remain-allowed, remain-denied, would-be-allowed, and would-be-denied counts;
 verdict and full-decision change counts; affected workloads; and each changed
 flow with current/proposed provenance. `unfctl policy simulate <file>` exposes the
 API in table, JSON, or YAML form. It also evaluates the bounded ADR 0012 history,
 reports observation-weighted impact and unresolved-flow skips separately, and
 identifies Services affected through selector intent or ready EndpointSlice Pod
-backends. Schema v1 was the representative-matrix-only foundation.
+backends. An optional nested `flow_history` request selects aggregate entries by
+inclusive `since_unix_ms`/`until_unix_ms` bounds and a newest-first limit from 1
+through 4,096. The response includes matched and returned flows, matched
+observations, applied bounds, and truncation state. Omitting the selector preserves
+the schema-v2 behavior of evaluating the complete retained set; schema v1 was the
+representative-matrix-only foundation.
 
 ## Alternatives
 
@@ -51,7 +56,8 @@ Simulation provides deterministic, read-only what-if evaluation against identifi
 live topology and history snapshots and uses exactly the same IR/evaluator as
 enforcement. The topology matrix is representative for wildcard/default ports
 rather than an enumeration of all 65,535 ports. ADR 0030 makes the newest bounded
-history restart-durable and gives the flow-query API last-received-time windows,
-but simulation still evaluates the complete retained history and accepts no
-window. External sources without a current identity and user-supplied flow sets
-cannot yet be evaluated.
+history restart-durable; schema v3 applies its exact last-received-time query
+contract to historical impact without changing topology evaluation. Because flow
+entries aggregate observations, a matching entry can include observations older
+than the window. External sources without a current identity and user-supplied
+flow sets cannot yet be evaluated.

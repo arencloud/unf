@@ -40,11 +40,12 @@ use unf_policy::{
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
     FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FLOW_HISTORY_CAPACITY, FlowExportBatch,
-    FlowExportRecord, FlowHistoryCheckpoint, FlowHistorySnapshot, FlowHistoryStore,
-    IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
-    PolicyStateSnapshot, RevisionSet, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode,
-    TopologyService, TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort,
-    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
+    FlowExportRecord, FlowHistoryCheckpoint, FlowHistoryQuerySummary, FlowHistorySnapshot,
+    FlowHistoryStore, IdentityRegistry, IdentityStateSnapshot, NetworkIdentity,
+    POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyStateSnapshot, RevisionSet,
+    TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode, TopologyService, TopologyServiceBackend,
+    TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
+    provisional_identity_id,
 };
 
 const AGENT_STATUS_FRESHNESS_MILLIS: u64 = 10_000;
@@ -273,12 +274,14 @@ struct ExplainResponse {
     note: &'static str,
 }
 
-const POLICY_SIMULATION_SCHEMA_VERSION: u16 = 2;
+const POLICY_SIMULATION_SCHEMA_VERSION: u16 = 3;
 const POLICY_SIMULATION_FLOW_LIMIT: usize = 10_000;
 
 #[derive(Debug, Deserialize)]
 struct PolicySimulationRequest {
     policy: SecurityPolicy,
+    #[serde(default)]
+    flow_history: Option<FlowHistoryQuery>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -363,6 +366,7 @@ struct PolicySimulationResponse {
     affected_services: Vec<String>,
     summary: PolicySimulationSummary,
     changes: Vec<PolicySimulationChange>,
+    historical_query: FlowHistoryQuerySummary,
     historical_summary: PolicySimulationHistoricalSummary,
     historical_changes: Vec<PolicySimulationHistoricalChange>,
     note: &'static str,
@@ -2704,6 +2708,7 @@ async fn simulate_policy(
     State(state): State<Arc<ControllerState>>,
     Json(request): Json<PolicySimulationRequest>,
 ) -> Result<Json<PolicySimulationResponse>, ApiError> {
+    let history_query = request.flow_history.unwrap_or_default();
     let key = object_key(&request.policy);
     let policy_id = stable_policy_id(&key);
     let candidate = PolicyCompiler::compile(policy_id, request.policy)
@@ -2711,7 +2716,7 @@ async fn simulate_policy(
 
     let _policy_state_guard = read_lock(&state.policy_state_guard);
     let pod_records: Vec<_> = read_lock(&state.pods).values().cloned().collect();
-    let flow_history = mutex_lock(&state.flow_history).snapshot(state.identity_epoch);
+    let flow_history = simulation_flow_history_snapshot(&state, &history_query)?;
     let namespaces = read_lock(&state.namespaces).clone();
     let current_policies = compiled_policies(&state);
     let current_candidate = read_lock(&state.compiled_security_policies)
@@ -2796,10 +2801,24 @@ async fn simulate_policy(
         affected_services,
         summary,
         changes,
+        historical_query: flow_history.query,
         historical_summary,
         historical_changes,
-        note: "read-only what-if result; the candidate was not applied and retained history is bounded in-memory telemetry",
+        note: "read-only what-if result; the candidate was not applied and historical impact uses bounded last-received-time telemetry",
     }))
+}
+
+fn simulation_flow_history_snapshot(
+    state: &ControllerState,
+    query: &FlowHistoryQuery,
+) -> Result<FlowHistorySnapshot, ApiError> {
+    let limit = validate_flow_history_query(query)?;
+    Ok(mutex_lock(&state.flow_history).snapshot_window(
+        state.identity_epoch,
+        query.since_unix_ms,
+        query.until_unix_ms,
+        limit,
+    ))
 }
 
 fn simulation_proposed_policies(
@@ -4424,6 +4443,11 @@ mod tests {
             State(Arc::clone(&state)),
             Json(PolicySimulationRequest {
                 policy: security_policy("frontend-to-backend", "Deny"),
+                flow_history: Some(FlowHistoryQuery {
+                    since_unix_ms: Some(100),
+                    until_unix_ms: Some(100),
+                    limit: Some(1),
+                }),
             }),
         )
         .await
@@ -4451,16 +4475,48 @@ mod tests {
         assert_eq!(response.changes[0].current.verdict, Verdict::Allow);
         assert_eq!(response.changes[0].proposed.verdict, Verdict::Deny);
         assert_eq!(response.historical_summary.retained_flows, 1);
+        assert_eq!(response.historical_query.since_unix_ms, Some(100));
+        assert_eq!(response.historical_query.until_unix_ms, Some(100));
+        assert_eq!(response.historical_query.limit, 1);
+        assert_eq!(response.historical_query.matched_flows, 1);
+        assert_eq!(response.historical_query.matched_observations, 12);
+        assert_eq!(response.historical_query.returned_flows, 1);
+        assert!(!response.historical_query.truncated);
         assert_eq!(response.historical_summary.evaluated_flows, 1);
         assert_eq!(response.historical_summary.would_be_denied_observations, 12);
         assert_eq!(response.historical_changes.len(), 1);
         assert_eq!(response.historical_changes[0].observed_events, 12);
+
+        assert_future_simulation_window_is_empty(&state).await;
 
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(7));
         assert_eq!(
             read_lock(&state.compiled_security_policies).get(key),
             Some(&current)
         );
+    }
+
+    async fn assert_future_simulation_window_is_empty(state: &Arc<ControllerState>) {
+        let future = simulate_policy(
+            State(Arc::clone(state)),
+            Json(PolicySimulationRequest {
+                policy: security_policy("frontend-to-backend", "Deny"),
+                flow_history: Some(FlowHistoryQuery {
+                    since_unix_ms: Some(101),
+                    until_unix_ms: None,
+                    limit: None,
+                }),
+            }),
+        )
+        .await
+        .expect("empty historical window still simulates topology")
+        .0;
+        assert_eq!(future.schema_version, 3);
+        assert_eq!(future.summary.would_be_denied, 1);
+        assert_eq!(future.historical_query.matched_flows, 0);
+        assert_eq!(future.historical_query.returned_flows, 0);
+        assert_eq!(future.historical_summary.evaluated_flows, 0);
+        assert!(future.historical_changes.is_empty());
     }
 
     #[tokio::test]
@@ -4479,6 +4535,7 @@ mod tests {
             State(Arc::clone(&state)),
             Json(PolicySimulationRequest {
                 policy: security_policy("candidate-deny", "Deny"),
+                flow_history: None,
             }),
         )
         .await
@@ -4486,6 +4543,10 @@ mod tests {
         .0;
 
         assert!(matches!(response.operation, PolicySimulationOperation::Add));
+        assert_eq!(response.schema_version, 3);
+        assert_eq!(response.historical_query.since_unix_ms, None);
+        assert_eq!(response.historical_query.until_unix_ms, None);
+        assert_eq!(response.historical_query.limit, FLOW_HISTORY_CAPACITY);
         assert_eq!(response.summary.evaluated_flows, 8);
         assert_eq!(response.summary.would_be_denied, 8);
         assert!(read_lock(&state.compiled_security_policies).is_empty());
@@ -4511,6 +4572,7 @@ mod tests {
             State(Arc::clone(&state)),
             Json(PolicySimulationRequest {
                 policy: security_policy("candidate-deny", "Deny"),
+                flow_history: None,
             }),
         )
         .await

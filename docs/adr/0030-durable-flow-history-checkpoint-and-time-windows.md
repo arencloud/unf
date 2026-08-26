@@ -61,5 +61,6 @@ database. Telemetry remains advisory and cannot block forwarding.
 These queries are not event-time buckets: all observations attached to a matching
 logical entry are returned even if some occurred before the requested window.
 The ConfigMap is a bounded single-controller checkpoint, not a high-availability
-database. Interface-level deduplication, sampling, simulation-window input,
-topology history, pagination, and external flow backends remain future work.
+database. Policy simulation schema v3 now consumes the same window contract.
+Interface-level deduplication, sampling, topology history, pagination, and
+external flow backends remain future work.

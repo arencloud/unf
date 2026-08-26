@@ -142,7 +142,8 @@ Implemented in the repository:
 - `unfctl status`, `unfctl topology`, `unfctl flows`, and `unfctl explain` against live
   controller state;
 - `unfctl policy simulate <security-policy.yaml>` with table/JSON/YAML
-  representative and historical impact summaries plus current/proposed provenance;
+  representative and historical impact summaries, optional last-received-time
+  windows and newest-first limits, plus current/proposed provenance;
 - a reproducible dual-stack two-node kind demo covering native and NetworkPolicy
   cross-node IPv4/IPv6 allow/drop, bounded IPv6 extension-header allow/drop,
   namespace-selector convergence,

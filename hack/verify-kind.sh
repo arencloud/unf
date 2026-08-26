@@ -817,7 +817,7 @@ grep -q "\"destination_ipv6\": \"${server_ipv6}\"" <<<"${ipv6_flow_history}"
 policy_simulation=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json \
     policy simulate "${project_root}/deploy/examples/simulation-deny.yaml")
-grep -q '"schema_version": 2' <<<"${policy_simulation}"
+grep -q '"schema_version": 3' <<<"${policy_simulation}"
 grep -q '"operation": "replace"' <<<"${policy_simulation}"
 grep -q '"flow_source": "current-topology representative matrix"' <<<"${policy_simulation}"
 grep -Eq '"would_be_denied": [1-9][0-9]*' <<<"${policy_simulation}"
@@ -834,6 +834,81 @@ grep -q '"verdict": "Allow"' <<<"${policy_simulation}"
 grep -q '"verdict": "Deny"' <<<"${policy_simulation}"
 grep -q "\"policy_revision\": ${initial_policy_revision}" <<<"${policy_simulation}"
 grep -q "\"topology_revision\": ${restored_topology_revision}" <<<"${policy_simulation}"
+jq -e '
+    .historical_query.since_unix_ms == null
+    and .historical_query.until_unix_ms == null
+    and .historical_query.limit == 4096
+    and .historical_query.returned_flows == .historical_query.matched_flows
+    and (.historical_query.truncated | not)
+' <<<"${policy_simulation}" >/dev/null
+
+simulation_window_start=$(date +%s%3N)
+"${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080 \
+    | grep -q '^unf-demo-ok$'
+for _ in {1..45}; do
+    recent_flows=$("${unfctl}" \
+        --controller-url "http://127.0.0.1:${controller_port}" --output json \
+        flows --since-unix-ms "${simulation_window_start}" 2>/dev/null || true)
+    if jq -e '
+        any(.entries[];
+            (.source_workloads | index("frontend/client"))
+            and (.destination_workloads | index("backend/server"))
+            and .key.destination_port == 8080)
+    ' <<<"${recent_flows}" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+jq -e '
+    any(.entries[];
+        (.source_workloads | index("frontend/client"))
+        and (.destination_workloads | index("backend/server"))
+        and .key.destination_port == 8080)
+' <<<"${recent_flows}" >/dev/null
+
+windowed_policy_simulation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    policy simulate "${project_root}/deploy/examples/simulation-deny.yaml" \
+    --since-unix-ms "${simulation_window_start}")
+jq -e --argjson start "${simulation_window_start}" '
+    .schema_version == 3
+    and .historical_query.since_unix_ms == $start
+    and .historical_query.matched_flows > 0
+    and .historical_query.returned_flows > 0
+    and .historical_summary.evaluated_observations > 0
+    and .historical_summary.would_be_denied_observations > 0
+    and any(.historical_changes[];
+        .source.reference == "frontend/client"
+        and .destination.reference == "backend/server"
+        and .destination_port == 8080)
+' <<<"${windowed_policy_simulation}" >/dev/null
+
+bounded_policy_simulation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    policy simulate "${project_root}/deploy/examples/simulation-deny.yaml" \
+    --last 10m --limit 1)
+jq -e '
+    .historical_query.limit == 1
+    and .historical_query.returned_flows <= 1
+    and (.historical_query.truncated == (.historical_query.matched_flows > 1))
+' <<<"${bounded_policy_simulation}" >/dev/null
+
+future_simulation_start=$(( $(date +%s%3N) + 60000 ))
+future_policy_simulation=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    policy simulate "${project_root}/deploy/examples/simulation-deny.yaml" \
+    --since-unix-ms "${future_simulation_start}")
+jq -e --argjson start "${future_simulation_start}" '
+    .historical_query.since_unix_ms == $start
+    and .historical_query.matched_flows == 0
+    and .historical_query.matched_observations == 0
+    and .historical_query.returned_flows == 0
+    and .historical_summary.evaluated_flows == 0
+    and .historical_summary.evaluated_observations == 0
+    and (.historical_changes | length) == 0
+    and .summary.would_be_denied > 0
+' <<<"${future_policy_simulation}" >/dev/null
 policy_revision_after_simulation=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json status \
     | sed -nE 's/.*"policy": ([0-9]+).*/\1/p')
