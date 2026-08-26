@@ -137,14 +137,14 @@ matrix and reproducible evidence.
   EndpointSlice-backed runtime relationships with readiness, serving,
   termination, Node/zone, Pod target, address, and port provenance;
   destination-resolved agent flow export through bounded non-blocking queues,
-  revisioned 4,096-key controller history, `unfctl flows`, and
+  revisioned 4,096-key controller history, bounded ConfigMap restart recovery,
+  last-received-time queries and newest-first limits through `unfctl flows`, and
   observation-weighted historical simulation impact; resolved-identity IPv6
   distribution, enforcement, provenance, topology schema v3, and flow-export
   schema v2; bounded IPv6 extension-header traversal with real packet fixtures;
   separate dual-stack OpenShift cross-worker enforcement and history evidence on
   RHCOS Linux 5.14 under Enforcing SELinux;
-- Next: remaining upstream ingress conformance, plus durable telemetry retention
-  with time-window queries;
+- Next: remaining upstream ingress conformance and simulation-window input;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.

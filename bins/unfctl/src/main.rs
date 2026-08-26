@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -30,7 +31,20 @@ enum Command {
     /// Show the current versioned Node, workload, and Service topology.
     Topology,
     /// Show bounded flow history exported by node agents.
-    Flows,
+    Flows {
+        /// Restrict to flows last received within this duration (for example 15m or 2h).
+        #[arg(long, value_parser = parse_duration_millis, conflicts_with = "since_unix_ms")]
+        last: Option<u64>,
+        /// Inclusive lower bound for the last-received timestamp.
+        #[arg(long)]
+        since_unix_ms: Option<u64>,
+        /// Inclusive upper bound for the last-received timestamp.
+        #[arg(long)]
+        until_unix_ms: Option<u64>,
+        /// Maximum number of newest matching flows to return.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Explain a policy decision using live controller state.
     Explain {
         /// Source pod as namespace/name.
@@ -107,7 +121,20 @@ async fn run() -> Result<()> {
         Command::Topology => {
             get_json(&client, &format!("{}/v1/topology", cli.controller_url)).await?
         }
-        Command::Flows => get_json(&client, &format!("{}/v1/flows", cli.controller_url)).await?,
+        Command::Flows {
+            last,
+            since_unix_ms,
+            until_unix_ms,
+            limit,
+        } => {
+            let (since_unix_ms, until_unix_ms) =
+                resolve_flow_window(*last, *since_unix_ms, *until_unix_ms, unix_time_millis()?)?;
+            get_json(
+                &client,
+                &flow_history_url(&cli.controller_url, since_unix_ms, until_unix_ms, *limit),
+            )
+            .await?
+        }
         Command::Explain {
             from,
             to,
@@ -202,7 +229,7 @@ fn print_table(value: &Value) {
     }
     if matches!(
         value.get("schema_version").and_then(Value::as_u64),
-        Some(1 | 2)
+        Some(1..=3)
     ) && value.get("retained_flows").is_some()
         && value.get("entries").is_some()
     {
@@ -308,6 +335,26 @@ fn print_flow_history_table(value: &Value) {
         number_field(value, "evicted_observations"),
         number_field(value, "agent_dropped_events")
     );
+    println!(
+        "durability               checkpointed={} omitted_flows={} omitted_observations={}",
+        number_field(value, "durable_checkpointed_flows"),
+        number_field(value, "durable_omitted_flows"),
+        number_field(value, "durable_omitted_observations")
+    );
+    if let Some(query) = value.get("query") {
+        println!(
+            "query                    since={} until={} matched={} observations={} returned={} truncated={}",
+            optional_number_field(query, "since_unix_ms"),
+            optional_number_field(query, "until_unix_ms"),
+            number_field(query, "matched_flows"),
+            number_field(query, "matched_observations"),
+            number_field(query, "returned_flows"),
+            query
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        );
+    }
     if let Some(entries) = value.get("entries").and_then(Value::as_array) {
         for entry in entries.iter().take(50) {
             let key = &entry["key"];
@@ -335,6 +382,95 @@ fn print_flow_history_table(value: &Value) {
         if entries.len() > 50 {
             println!("flows omitted            {}", entries.len() - 50);
         }
+    }
+}
+
+fn optional_number_field(value: &Value, field: &str) -> String {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .map_or_else(|| "-".to_owned(), |number| number.to_string())
+}
+
+fn parse_duration_millis(value: &str) -> Result<u64, String> {
+    let (digits, multiplier) = if let Some(digits) = value.strip_suffix("ms") {
+        (digits, 1_u64)
+    } else if let Some(digits) = value.strip_suffix('s') {
+        (digits, 1_000)
+    } else if let Some(digits) = value.strip_suffix('m') {
+        (digits, 60_000)
+    } else if let Some(digits) = value.strip_suffix('h') {
+        (digits, 3_600_000)
+    } else if let Some(digits) = value.strip_suffix('d') {
+        (digits, 86_400_000)
+    } else {
+        return Err("duration must use ms, s, m, h, or d suffix".to_owned());
+    };
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|_| "duration must start with a positive integer".to_owned())?;
+    if amount == 0 {
+        return Err("duration must be greater than zero".to_owned());
+    }
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration is too large".to_owned())
+}
+
+fn unix_time_millis() -> Result<u64> {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_millis(),
+    )
+    .context("Unix time does not fit in u64 milliseconds")
+}
+
+fn resolve_flow_window(
+    last_millis: Option<u64>,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    now_unix_ms: u64,
+) -> Result<(Option<u64>, Option<u64>)> {
+    let until = until_unix_ms.or(last_millis.map(|_| now_unix_ms));
+    let since = if let Some(duration) = last_millis {
+        Some(
+            until
+                .unwrap_or(now_unix_ms)
+                .checked_sub(duration)
+                .context("flow-history duration starts before the Unix epoch")?,
+        )
+    } else {
+        since_unix_ms
+    };
+    if since.zip(until).is_some_and(|(start, end)| start > end) {
+        bail!("flow-history start must not exceed its end");
+    }
+    Ok((since, until))
+}
+
+fn flow_history_url(
+    controller_url: &str,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+) -> String {
+    let mut parameters = Vec::new();
+    if let Some(value) = since_unix_ms {
+        parameters.push(format!("since_unix_ms={value}"));
+    }
+    if let Some(value) = until_unix_ms {
+        parameters.push(format!("until_unix_ms={value}"));
+    }
+    if let Some(value) = limit {
+        parameters.push(format!("limit={value}"));
+    }
+    let base = format!("{controller_url}/v1/flows");
+    if parameters.is_empty() {
+        base
+    } else {
+        format!("{base}?{}", parameters.join("&"))
     }
 }
 
@@ -589,10 +725,34 @@ mod tests {
 
     #[test]
     fn flows_command_parses() {
-        let cli = Cli::try_parse_from(["unfctl", "flows", "--output", "json"])
-            .expect("flows command parses");
-        assert!(matches!(cli.command, Command::Flows));
+        let cli = Cli::try_parse_from([
+            "unfctl", "flows", "--last", "15m", "--limit", "25", "--output", "json",
+        ])
+        .expect("flows command parses");
+        assert!(matches!(
+            cli.command,
+            Command::Flows {
+                last: Some(900_000),
+                since_unix_ms: None,
+                until_unix_ms: None,
+                limit: Some(25)
+            }
+        ));
         assert!(matches!(cli.output, Output::Json));
+        assert_eq!(
+            resolve_flow_window(Some(900_000), None, None, 2_000_000)
+                .expect("relative flow window resolves"),
+            (Some(1_100_000), Some(2_000_000))
+        );
+        assert_eq!(
+            flow_history_url(
+                "http://controller",
+                Some(1_100_000),
+                Some(2_000_000),
+                Some(25)
+            ),
+            "http://controller/v1/flows?since_unix_ms=1100000&until_unix_ms=2000000&limit=25"
+        );
     }
 
     #[test]

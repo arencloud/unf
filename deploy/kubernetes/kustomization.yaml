@@ -5,6 +5,7 @@ resources:
   - service-account.yaml
   - rbac.yaml
   - agent-report-store.yaml
+  - flow-history-store.yaml
   - controller.yaml
   - service.yaml
   - agent.yaml

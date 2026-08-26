@@ -23,7 +23,7 @@ repeatable test are both present in this repository.
 |---|---|---|---|
 | Phase 1 — observation foundation | **Verified** | Master prompt §101: controller, identity state, policy compiler, agent/Aya/TC flow events, and successful `unfctl status` | `make fmt-check lint test`, `make ebpf`, `make kind-test` |
 | Phase 2 — identity and policy enforcement | **Verified** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | `make fmt-check lint test`, `make ebpf`, and `make kind-test` verify the complete gate; `make openshift-test` qualifies both IPv4-only and dual-stack platform slices, while focused rotation, acknowledgement-retention, admission, and uninstall/redeploy gates cover the planned OpenShift hardening |
-| Phase 3 — compatibility and simulation | **In progress** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | The supported ingress adapter, resolved-identity IPv6 dataplane, history-aware read-only policy simulation, EndpointSlice-aware topology schema v3, and bounded dual-stack historical export are live verified; broader compatibility remains open |
+| Phase 3 — compatibility and simulation | **In progress** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | The supported ingress adapter, resolved-identity IPv6 dataplane, history-aware read-only policy simulation, EndpointSlice-aware topology schema v3, and bounded dual-stack historical export with restart recovery and last-received-time queries are live verified; broader compatibility remains open |
 | Full CNI and later fabric capabilities | **Planned** | §104 and later roadmap gates | Explicitly out of current scope |
 
 Sections 98–99 describe the richer first enforcement and enriched-observability
@@ -43,7 +43,7 @@ completed by Phase 1's observation-only shadow evaluation.
 | Agent state | Two ready agents with BPF loaded; both converged on the same controller epoch and identity/policy revisions with 14 identity entries each (7 IPv4 + 7 IPv6), 151 active policy entries, zero queued/dropped exports at capture, and `tcx_pinned` attachment mode on the Linux 7.1 kind host |
 | Controller state | Ready with 2 watched Nodes, 17 watched Pods, 8 watched Namespaces, 5 watched Services, 5 watched EndpointSlices, 15 admitted identities, 14 indexed non-host-network Pod IPs, one native policy, one accepted NetworkPolicy, zero rejected NetworkPolicies, 151 resolved identity/IPv4/IPv6 entries, zero reported telemetry drops, and Pod-bound TokenReview-authenticated acknowledgements proving both expected agents converged |
 | Topology state | Schema v3 returned 2 ready Nodes, 17 placed workloads, 5 Services, and 7 dual-stack non-host-network workloads; the EndpointSlice readiness/deletion lifecycle passed without policy-revision mutation |
-| Flow history | Schema v2 retained bounded IPv4, IPv6, and SCTP logical flows; direct IPv6 `frontend/client` → `backend/server` TCP/8080 was enriched with both workload references and exact addresses, while both agents reported zero export drops |
+| Flow history | Snapshot schema v3 retained bounded IPv4, IPv6, and SCTP logical flows; the newest bounded subset survived controller replacement through checkpoint schema v1 with its original first-received time, absolute/relative last-received windows and newest-first limits passed, persistence errors stayed zero, and neither agent was replaced. Direct IPv6 `frontend/client` → `backend/server` TCP/8080 was enriched with both workload references and exact addresses, while agent export remained schema v2 |
 | Transactional policy update | The verifier switched enforce → shadow → enforce and exercised TCP/SCTP protocol-wildcard plus IPv4/IPv6 block mutations, requiring a higher revision and opposite bank on every agent for single-resource transitions; snapshot schema v3 stages all three policy maps before one activation write |
 | Transactional identity update | Identity ABI v2 staged IPv4 and IPv6 in inactive physical maps and activated both with one `IDENTITY_CONFIG` write; repeated Pod/label lifecycle mutations remained dual-stack enforced, and both nodes exposed the complete nine-pin `/sys/fs/bpf/unf/v2` set after the suite |
 | Interruption recovery | With the controller scaled to zero, the server-node agent was deleted and its replacement became Ready from 14 pinned identity entries plus validated identity epoch/revision/active bank and active policy revision; parallel TCP/9090 probes ran continuously through deletion and replacement with zero successful requests, then both agents accepted the restarted controller epoch and reconverged |
@@ -157,13 +157,15 @@ release gate.
 - Policy simulation currently accepts one native `SecurityPolicy`, uses current
   Pods plus representative policy-derived TCP/UDP/SCTP probes, and rejects matrices
   above 10,000 flows. It separately evaluates retained history and observation
-  frequency, but has no time-window filtering, cannot evaluate external sources
-  without a current identity, and accepts no user-supplied flow sets.
-- Flow history is advisory, destination-resolved, current-process telemetry. Agent
-  export uses the authenticated internal TLS boundary, and channels/pending state
-  plus controller retention are bounded with explicit drop and eviction counters,
-  but history is not durable, sampled, or deduplicated across interface-level
-  observations.
+  frequency, but does not yet accept the flow API's time-window parameters, cannot
+  evaluate external sources without a current identity, and accepts no
+  user-supplied flow sets.
+- Flow history is advisory and destination-resolved. Agent export uses the
+  authenticated internal TLS boundary; channels, pending state, controller
+  retention, and a newest-1,024/900,000-byte ConfigMap checkpoint are bounded with
+  explicit drop, eviction, and omission counters. Query windows select aggregate
+  entries by last-received time rather than bucketing observations. History is not
+  an HA database, sampled, or deduplicated across interface-level observations.
 - Topology schema v3 reports current in-memory Node, dual-stack Pod workload,
   Service intent, and EndpointSlice runtime relationships. Conditions are
   Kubernetes-reported state rather than active traffic health; topology history,
@@ -212,7 +214,7 @@ release gate.
 | Egress NetworkPolicy compatibility | **Planned** | Direction-aware IR and dataplane enforcement evidence |
 | Policy simulation foundation | **Verified** | Versioned read-only add/replace API and `unfctl policy simulate` compare current/proposed provenance over a bounded topology-derived matrix and retained flow history; unit tests prove no state mutation and historical weighting, while `make kind-test` proves predicted deny, revision stability, and unchanged live forwarding |
 | Better topology state | **Verified** | Topology schema v3 preserves selector intent, adds per-workload IPv6 addresses, and retains EndpointSlice-derived address/port, Pod target, Node/zone, and ready/serving/terminating backend state; unit tests prove normalization, idempotence, stale-state removal, and revision isolation, while `make kind-test` exercises dual-stack state and not-ready → ready → deleted backend transitions without policy-revision mutation |
-| Historical flow export | **Verified** | Schema v2, non-blocking 4,096-record agent channel, 2,048-key pending aggregation, 512-entry authenticated HTTPS batches, 4,096-key revisioned controller retention, dual-stack address validation, drop/eviction metrics, `unfctl flows`, and history-aware simulation; unit tests cover bounds/aggregation/eviction and `make kind-test` requires enriched IPv4 and IPv6 cross-node flows |
+| Historical flow export | **Verified** | Agent export schema v2, non-blocking 4,096-record channel, 2,048-key pending aggregation, 512-entry authenticated HTTPS batches, 4,096-key revisioned controller retention, dual-stack validation, and explicit drop/eviction accounting. Snapshot schema v3 adds inclusive last-received bounds, newest-first limits, query metadata, and bounded checkpoint/restoration metadata; checkpoint schema v1 preserves the newest 1,024 keys within 900,000 bytes. Unit tests cover query, restoration, validation, and drop baselines; `make kind-flow-history-retention-test` proves exact RBAC and restart continuity without agent replacement, and is included in `make kind-test` |
 
 ## Updating this tracker
 

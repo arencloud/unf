@@ -796,7 +796,7 @@ if ! wait_for_historical_demo_flow; then
     echo "controller did not retain the exported frontend-to-backend flow" >&2
     exit 1
 fi
-grep -q '"schema_version": 2' <<<"${flow_history}"
+grep -q '"schema_version": 3' <<<"${flow_history}"
 grep -Eq '"revision": [1-9][0-9]*' <<<"${flow_history}"
 grep -q '"capacity": 4096' <<<"${flow_history}"
 grep -Eq '"retained_flows": [1-9][0-9]*' <<<"${flow_history}"

@@ -50,6 +50,8 @@ would overstate evidence; schema v2 keeps the two sources separate.
 Simulation provides deterministic, read-only what-if evaluation against identified
 live topology and history snapshots and uses exactly the same IR/evaluator as
 enforcement. The topology matrix is representative for wildcard/default ports
-rather than an enumeration of all 65,535 ports. History remains bounded,
-process-local, and without time-window filtering; external sources without a
-current identity and user-supplied flow sets cannot yet be evaluated.
+rather than an enumeration of all 65,535 ports. ADR 0030 makes the newest bounded
+history restart-durable and gives the flow-query API last-received-time windows,
+but simulation still evaluates the complete retained history and accepts no
+window. External sources without a current identity and user-supplied flow sets
+cannot yet be evaluated.

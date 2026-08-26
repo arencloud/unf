@@ -34,8 +34,12 @@ Telemetry revision advances when the controller accepts a changed node export.
 Flow export schema v2 requires exactly one complete IPv4 or IPv6 address pair.
 The current flow-history store retains 4,096 deterministic logical keys and
 tracks observation totals, controller evictions, and cumulative agent-side drops.
-It is a bounded current-process analysis window, not durable storage. See
-[ADR 0012](../adr/0012-bounded-flow-history-export.md).
+Flow snapshot schema v3 supports inclusive `last_received_unix_ms` bounds and
+newest-first limits. A separate schema-v1 ConfigMap checkpoint preserves the
+newest 1,024 keys within a 900,000-byte payload across controller restart and
+reports every capacity omission. See
+[ADR 0012](../adr/0012-bounded-flow-history-export.md) and
+[ADR 0030](../adr/0030-durable-flow-history-checkpoint-and-time-windows.md).
 
 Agents poll internal identity and policy snapshot endpoints and publish each
 desired/applied epoch and revision. Identity schema v2 is written to inactive
@@ -90,8 +94,9 @@ UNF legacy program names. It refuses unknown ABI content and requires explicit
 confirmation for current v2 removal. ADRs 0023 and 0024 place snapshots,
 acknowledgements, and telemetry behind dedicated TLS plus Pod-bound TokenReview;
 serving certificates and CA bundles reload with last-known-good fallback and an
-overlapping-trust rotation gate. Agent reports survive controller replacement;
-flow history and desired-state/identity allocation remain current-process state.
+overlapping-trust rotation gate. Agent reports and the newest bounded flow
+history survive controller replacement; desired-state and identity allocation
+remain current-process state.
 
 Isolated live-kernel probes verify that partial pin sets,
 invalid active config, and corrupt inactive-stage debris are rejected before
@@ -99,7 +104,7 @@ adoption without mutating the primary pin set. A separate live pressure probe
 fills only the inactive identity-keyed policy bank, proves a staging insertion
 failure cannot advance applied state or alter active traffic, and verifies retry
 after scoped cleanup. Permanent startup validation failures terminate for
-orchestrator retry. See ADRs 0016 through 0029.
+orchestrator retry. See ADRs 0016 through 0030.
 
 Kubernetes watches remain the controller input. Internal HTTPS snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

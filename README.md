@@ -17,9 +17,10 @@ controller, policy engine, and dataplane. A read-only policy simulation foundati
 now compares candidate native policy against revision-fenced live topology without
 applying it. Versioned topology snapshots expose Nodes, workload placement,
 Services, selector intent, and EndpointSlice-derived runtime backend readiness.
-Node agents also export
-destination-resolved flow observations into bounded, revisioned in-memory history
-for operator queries and policy impact analysis. Agents publish revisioned status
+Node agents also export destination-resolved flow observations into bounded,
+revisioned history for operator queries and policy impact analysis. The controller
+checkpoints the newest bounded subset across restarts, and `unfctl flows` supports
+inclusive last-received-time windows and newest-first limits. Agents publish revisioned status
 acknowledgements using Pod-bound, audience-scoped Kubernetes tokens; TokenReview
 and authoritative Pod placement prevent anonymous or cross-Node claims. Controller
 and CLI status report freshness-aware cluster convergence for every watched Node.
@@ -107,7 +108,8 @@ Implemented in the repository:
   paths, mount modes, and single-container ownership;
 - revision-fenced, read-only native policy simulation through the shared evaluator;
 - bounded non-blocking agent telemetry export and a 4,096-flow controller history
-  with explicit drop/eviction accounting;
+  with explicit drop/eviction accounting, schema-validated ConfigMap restart
+  recovery, and last-received-time queries;
 - an Aya agent capable of loading and attaching the TC observation program;
 - IPv4/IPv6 TCP/UDP/SCTP TC parsing, including bounded IPv6 extension-header
   traversal, with counters, bounded ring-buffer events, and active-bank L3/L4

@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unf-flow-history
+  namespace: unf-system
+  labels:
+    app.kubernetes.io/name: unf-controller
+    app.kubernetes.io/component: durable-flow-history

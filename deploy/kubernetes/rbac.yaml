@@ -8,7 +8,7 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["unf-agent-acknowledgements"]
+    resourceNames: ["unf-agent-acknowledgements", "unf-flow-history"]
     verbs: ["get", "patch"]
   - apiGroups: ["network.unf.io"]
     resources: ["securitypolicies"]

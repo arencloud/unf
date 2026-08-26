@@ -11,6 +11,8 @@ pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 2;
+pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
+pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 2;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
@@ -134,7 +136,51 @@ pub struct FlowHistorySnapshot {
     pub evicted_flows: u64,
     pub evicted_observations: u64,
     pub agent_dropped_events: u64,
+    pub durable_checkpointed_flows: usize,
+    pub durable_omitted_flows: usize,
+    pub durable_omitted_observations: u64,
+    pub query: FlowHistoryQuerySummary,
     pub entries: Vec<FlowHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowHistoryQuerySummary {
+    pub since_unix_ms: Option<u64>,
+    pub until_unix_ms: Option<u64>,
+    pub limit: usize,
+    pub matched_flows: usize,
+    pub matched_observations: u64,
+    pub returned_flows: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowHistoryCheckpoint {
+    pub schema_version: u16,
+    pub revision: Revision,
+    pub evicted_flows: u64,
+    pub evicted_observations: u64,
+    pub agent_dropped_events: u64,
+    pub agent_last_dropped_events: BTreeMap<String, u64>,
+    pub omitted_flows: usize,
+    pub omitted_observations: u64,
+    pub entries: Vec<FlowHistoryEntry>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum FlowHistoryCheckpointError {
+    #[error("unsupported flow-history checkpoint schema {actual}; expected {expected}")]
+    UnsupportedSchema { actual: u16, expected: u16 },
+    #[error("flow-history checkpoint contains {actual} entries; capacity is {capacity}")]
+    CapacityExceeded { actual: usize, capacity: usize },
+    #[error("flow-history checkpoint contains duplicate key")]
+    DuplicateKey,
+    #[error("flow-history checkpoint entry has invalid receive timestamps")]
+    InvalidTimestamps,
+    #[error("flow-history checkpoint entry has zero observations")]
+    ZeroObservations,
+    #[error("flow-history checkpoint entry has no reporting nodes")]
+    MissingReportingNode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +200,8 @@ pub struct FlowHistoryStore {
     evicted_observations: u64,
     agent_dropped_events: u64,
     agent_last_dropped_events: BTreeMap<String, u64>,
+    durable_omitted_flows: usize,
+    durable_omitted_observations: u64,
 }
 
 impl Default for FlowHistoryStore {
@@ -173,6 +221,8 @@ impl FlowHistoryStore {
             evicted_observations: 0,
             agent_dropped_events: 0,
             agent_last_dropped_events: BTreeMap::new(),
+            durable_omitted_flows: 0,
+            durable_omitted_observations: 0,
         }
     }
 
@@ -246,9 +296,44 @@ impl FlowHistoryStore {
 
     #[must_use]
     pub fn snapshot(&self, source_epoch: u64) -> FlowHistorySnapshot {
-        let entries: Vec<_> = self
+        self.snapshot_window(source_epoch, None, None, self.capacity)
+    }
+
+    #[must_use]
+    pub fn snapshot_window(
+        &self,
+        source_epoch: u64,
+        since_unix_ms: Option<u64>,
+        until_unix_ms: Option<u64>,
+        limit: usize,
+    ) -> FlowHistorySnapshot {
+        let retained_observations = self
             .entries
             .values()
+            .map(|retained| retained.record.observed_events)
+            .fold(0_u64, u64::saturating_add);
+        let mut matched: Vec<_> = self
+            .entries
+            .values()
+            .filter(|retained| {
+                since_unix_ms.is_none_or(|since| retained.last_received_unix_ms >= since)
+                    && until_unix_ms.is_none_or(|until| retained.last_received_unix_ms <= until)
+            })
+            .collect();
+        matched.sort_by(|left, right| {
+            right
+                .last_received_unix_ms
+                .cmp(&left.last_received_unix_ms)
+                .then_with(|| left.record.key.cmp(&right.record.key))
+        });
+        let matched_flows = matched.len();
+        let matched_observations = matched
+            .iter()
+            .map(|retained| retained.record.observed_events)
+            .fold(0_u64, u64::saturating_add);
+        let entries: Vec<_> = matched
+            .into_iter()
+            .take(limit)
             .map(|retained| FlowHistoryEntry {
                 key: retained.record.key.clone(),
                 source_workloads: Vec::new(),
@@ -263,20 +348,120 @@ impl FlowHistoryStore {
             })
             .collect();
         FlowHistorySnapshot {
-            schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+            schema_version: FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION,
             source_epoch,
             revision: self.revision,
             capacity: self.capacity,
-            retained_flows: entries.len(),
-            retained_observations: entries
-                .iter()
-                .map(|entry| entry.observed_events)
-                .fold(0_u64, u64::saturating_add),
+            retained_flows: self.entries.len(),
+            retained_observations,
             evicted_flows: self.evicted_flows,
             evicted_observations: self.evicted_observations,
             agent_dropped_events: self.agent_dropped_events,
+            durable_checkpointed_flows: 0,
+            durable_omitted_flows: self.durable_omitted_flows,
+            durable_omitted_observations: self.durable_omitted_observations,
+            query: FlowHistoryQuerySummary {
+                since_unix_ms,
+                until_unix_ms,
+                limit,
+                matched_flows,
+                matched_observations,
+                returned_flows: entries.len(),
+                truncated: entries.len() < matched_flows,
+            },
             entries,
         }
+    }
+
+    #[must_use]
+    pub fn checkpoint(&self, entry_limit: usize) -> FlowHistoryCheckpoint {
+        let snapshot = self.snapshot_window(0, None, None, entry_limit);
+        let checkpointed_observations = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.observed_events)
+            .fold(0_u64, u64::saturating_add);
+        FlowHistoryCheckpoint {
+            schema_version: FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION,
+            revision: self.revision,
+            evicted_flows: self.evicted_flows,
+            evicted_observations: self.evicted_observations,
+            agent_dropped_events: self.agent_dropped_events,
+            agent_last_dropped_events: self.agent_last_dropped_events.clone(),
+            omitted_flows: self
+                .durable_omitted_flows
+                .saturating_add(self.entries.len().saturating_sub(snapshot.entries.len())),
+            omitted_observations: self.durable_omitted_observations.saturating_add(
+                snapshot
+                    .retained_observations
+                    .saturating_sub(checkpointed_observations),
+            ),
+            entries: snapshot.entries,
+        }
+    }
+
+    /// Reconstructs bounded flow history from a validated persistence checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlowHistoryCheckpointError`] when the schema, entry count,
+    /// timestamps, observation counts, reporting nodes, or logical keys are invalid.
+    pub fn from_checkpoint(
+        checkpoint: FlowHistoryCheckpoint,
+        capacity: usize,
+    ) -> Result<Self, FlowHistoryCheckpointError> {
+        if checkpoint.schema_version != FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION {
+            return Err(FlowHistoryCheckpointError::UnsupportedSchema {
+                actual: checkpoint.schema_version,
+                expected: FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION,
+            });
+        }
+        if checkpoint.entries.len() > capacity {
+            return Err(FlowHistoryCheckpointError::CapacityExceeded {
+                actual: checkpoint.entries.len(),
+                capacity,
+            });
+        }
+        let mut entries = BTreeMap::new();
+        for entry in checkpoint.entries {
+            if entry.first_received_unix_ms == 0
+                || entry.last_received_unix_ms < entry.first_received_unix_ms
+            {
+                return Err(FlowHistoryCheckpointError::InvalidTimestamps);
+            }
+            if entry.observed_events == 0 {
+                return Err(FlowHistoryCheckpointError::ZeroObservations);
+            }
+            if entry.reporting_nodes.is_empty() {
+                return Err(FlowHistoryCheckpointError::MissingReportingNode);
+            }
+            let retained = RetainedFlow {
+                record: FlowExportRecord {
+                    key: entry.key.clone(),
+                    policy_revision: entry.policy_revision,
+                    decision: entry.decision,
+                    shadow: entry.shadow,
+                    observed_events: entry.observed_events,
+                },
+                first_received_unix_ms: entry.first_received_unix_ms,
+                last_received_unix_ms: entry.last_received_unix_ms,
+                reporting_nodes: entry.reporting_nodes.into_iter().collect(),
+            };
+            if entries.insert(entry.key, retained).is_some() {
+                return Err(FlowHistoryCheckpointError::DuplicateKey);
+            }
+        }
+        Ok(Self {
+            capacity,
+            revision: checkpoint.revision,
+            entries,
+            evicted_flows: checkpoint.evicted_flows,
+            evicted_observations: checkpoint.evicted_observations,
+            agent_dropped_events: checkpoint.agent_dropped_events,
+            agent_last_dropped_events: checkpoint.agent_last_dropped_events,
+            durable_omitted_flows: checkpoint.omitted_flows,
+            durable_omitted_observations: checkpoint.omitted_observations,
+        })
     }
 
     #[must_use]
@@ -999,8 +1184,78 @@ mod tests {
         assert_eq!(snapshot.retained_flows, 2);
         assert_eq!(snapshot.evicted_flows, 1);
         assert_eq!(snapshot.evicted_observations, 1);
-        assert_eq!(snapshot.entries[0].key.destination_port, 8081);
-        assert_eq!(snapshot.entries[1].key.destination_port, 8082);
+        assert_eq!(snapshot.entries[0].key.destination_port, 8082);
+        assert_eq!(snapshot.entries[1].key.destination_port, 8081);
+    }
+
+    #[test]
+    fn flow_history_time_windows_use_last_received_time_and_bound_results() {
+        let mut store = FlowHistoryStore::with_capacity(3);
+        for (port, received) in [(8080, 100), (8081, 200), (8082, 300)] {
+            store.ingest(
+                FlowExportBatch {
+                    schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                    node_name: "worker-a".to_owned(),
+                    dropped_events: 0,
+                    entries: vec![flow_record(1, 2, port, u64::from(port - 8079))],
+                },
+                received,
+            );
+        }
+
+        let window = store.snapshot_window(17, Some(150), Some(250), 3);
+        assert_eq!(window.retained_flows, 3);
+        assert_eq!(window.query.matched_flows, 1);
+        assert_eq!(window.query.matched_observations, 2);
+        assert_eq!(window.query.returned_flows, 1);
+        assert!(!window.query.truncated);
+        assert_eq!(window.entries[0].key.destination_port, 8081);
+
+        let limited = store.snapshot_window(17, None, None, 1);
+        assert_eq!(limited.query.matched_flows, 3);
+        assert_eq!(limited.query.returned_flows, 1);
+        assert!(limited.query.truncated);
+        assert_eq!(limited.entries[0].key.destination_port, 8082);
+    }
+
+    #[test]
+    fn flow_history_checkpoint_restores_newest_entries_and_drop_baselines() {
+        let mut store = FlowHistoryStore::with_capacity(3);
+        for (port, received) in [(8080, 100), (8081, 200), (8082, 300)] {
+            store.ingest(
+                FlowExportBatch {
+                    schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                    node_name: "worker-a".to_owned(),
+                    dropped_events: 3,
+                    entries: vec![flow_record(1, 2, port, u64::from(port - 8079))],
+                },
+                received,
+            );
+        }
+        let checkpoint = store.checkpoint(2);
+        assert_eq!(checkpoint.omitted_flows, 1);
+        assert_eq!(checkpoint.omitted_observations, 1);
+
+        let mut restored = FlowHistoryStore::from_checkpoint(checkpoint, 3)
+            .expect("valid flow-history checkpoint restores");
+        let restored_snapshot = restored.snapshot(99);
+        assert_eq!(restored_snapshot.revision, Revision::new(3));
+        assert_eq!(restored_snapshot.retained_flows, 2);
+        assert_eq!(restored_snapshot.durable_omitted_flows, 1);
+        assert_eq!(restored_snapshot.durable_omitted_observations, 1);
+        assert_eq!(restored_snapshot.entries[0].key.destination_port, 8082);
+        assert_eq!(restored_snapshot.entries[1].key.destination_port, 8081);
+
+        restored.ingest(
+            FlowExportBatch {
+                schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                node_name: "worker-a".to_owned(),
+                dropped_events: 4,
+                entries: Vec::new(),
+            },
+            400,
+        );
+        assert_eq!(restored.snapshot(99).agent_dropped_events, 4);
     }
 
     #[test]

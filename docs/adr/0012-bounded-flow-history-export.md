@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted and implemented for flow export schema v2.
+Accepted and implemented for flow export schema v2. Extended by
+[ADR 0030](0030-durable-flow-history-checkpoint-and-time-windows.md).
 
 ## Context
 
@@ -46,12 +47,13 @@ Networking correctness does not depend on telemetry delivery, and open-source UN
 requires no external database. The HTTP schema is the clean exporter boundary;
 generic plugins are deferred until multiple real transports exist.
 
-History is process-local, bounded, advisory telemetry. It is lost on controller
-restart, has no time-range filtering, and can contain duplicate interface-level
-observations. The ingestion endpoint is not yet mutually authenticated, so
-history must not become authoritative enforcement input. Durable backends,
-authenticated node transport, deduplication, sampling, and wall-clock windows are
-future work.
+History remains bounded advisory telemetry and can contain duplicate
+interface-level observations. ADR 0024 subsequently moved ingestion behind the
+CA-pinned, Pod-bound authenticated internal transport. ADR 0030 adds a bounded
+ConfigMap checkpoint plus inclusive last-received-time windows while retaining
+the failure-priority contract. External durable backends, event-time buckets,
+deduplication, and sampling remain future work; history must not become
+authoritative enforcement input.
 
 Schema v1 was the IPv4-only predecessor. The queueing, aggregation, retention,
 and failure-priority contracts are unchanged in schema v2.

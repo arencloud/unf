@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -39,12 +39,12 @@ use unf_policy::{
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
-    FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowHistorySnapshot,
-    FlowHistoryStore, IdentityRegistry, IdentityStateSnapshot, NetworkIdentity,
-    POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyStateSnapshot, RevisionSet,
-    TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode, TopologyService, TopologyServiceBackend,
-    TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
-    provisional_identity_id,
+    FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FLOW_HISTORY_CAPACITY, FlowExportBatch,
+    FlowExportRecord, FlowHistoryCheckpoint, FlowHistorySnapshot, FlowHistoryStore,
+    IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
+    PolicyStateSnapshot, RevisionSet, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode,
+    TopologyService, TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort,
+    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
 };
 
 const AGENT_STATUS_FRESHNESS_MILLIS: u64 = 10_000;
@@ -60,6 +60,12 @@ const AGENT_REPORT_STORE_SCHEMA_VERSION: u16 = 1;
 const AGENT_REPORT_STORE_CAPACITY: usize = 1_024;
 const AGENT_REPORT_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_REPORT_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
+const FLOW_HISTORY_STORE_NAME: &str = "unf-flow-history";
+const FLOW_HISTORY_STORE_KEY: &str = "flows.json";
+const FLOW_HISTORY_DURABLE_ENTRY_LIMIT: usize = 1_024;
+const FLOW_HISTORY_CONFIG_MAP_DATA_LIMIT: usize = 900_000;
+const FLOW_HISTORY_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
+const FLOW_HISTORY_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF Kubernetes desired-state controller")]
@@ -111,6 +117,9 @@ struct ControllerMetrics {
     agent_report_persistence_writes: Counter,
     agent_report_persistence_errors: Counter,
     agent_reports_restored: Counter,
+    flow_history_persistence_writes: Counter,
+    flow_history_persistence_errors: Counter,
+    flow_history_entries_restored: Counter,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -137,6 +146,11 @@ struct ControllerState {
     policy_state_guard: RwLock<()>,
     identities: Mutex<IdentityRegistry>,
     flow_history: Mutex<FlowHistoryStore>,
+    flow_history_dirty: AtomicBool,
+    flow_history_store: Option<Api<ConfigMap>>,
+    flow_history_checkpointed_flows: AtomicU64,
+    flow_history_checkpoint_omitted_flows: AtomicU64,
+    flow_history_checkpoint_omitted_observations: AtomicU64,
     agent_reports: RwLock<BTreeMap<String, StoredAgentReport>>,
     agent_reports_dirty: AtomicBool,
     agent_report_store: Option<Api<ConfigMap>>,
@@ -363,6 +377,13 @@ struct ResolvedEndpoint {
     application: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct FlowHistoryQuery {
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     install_crypto_provider()?;
@@ -391,7 +412,11 @@ async fn main() -> Result<()> {
         restore_agent_reports(&state)
             .await
             .context("restore durable agent acknowledgements")?;
+        restore_flow_history(&state)
+            .await
+            .context("restore durable flow history")?;
         spawn_agent_report_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
+        spawn_flow_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         let client = client.context("Kubernetes client is required in connected mode")?;
         spawn_watchers(&mut tasks, client, Arc::clone(&state), cancellation.clone());
         state.ready.store(true, Ordering::Release);
@@ -585,6 +610,24 @@ fn new_state(offline: bool) -> ControllerState {
     new_state_with_client_and_selector(offline, None, None)
 }
 
+fn register_flow_history_metrics(registry: &mut Registry, metrics: &ControllerMetrics) {
+    registry.register(
+        "unf_flow_history_persistence_writes",
+        "Durable flow-history checkpoints written by the controller",
+        metrics.flow_history_persistence_writes.clone(),
+    );
+    registry.register(
+        "unf_flow_history_persistence_errors",
+        "Durable flow-history checkpoint reads or writes that failed",
+        metrics.flow_history_persistence_errors.clone(),
+    );
+    registry.register(
+        "unf_flow_history_entries_restored",
+        "Flow-history entries restored from the durable checkpoint at controller startup",
+        metrics.flow_history_entries_restored.clone(),
+    );
+}
+
 fn new_state_with_client_and_selector(
     offline: bool,
     token_review_client: Option<Client>,
@@ -647,7 +690,8 @@ fn new_state_with_client_and_selector(
         "Agent reports restored from the durable checkpoint at controller startup",
         metrics.agent_reports_restored.clone(),
     );
-    let agent_report_store = token_review_client
+    register_flow_history_metrics(&mut registry, &metrics);
+    let config_map_store = token_review_client
         .clone()
         .map(|client| Api::<ConfigMap>::namespaced(client, "unf-system"));
     ControllerState {
@@ -668,9 +712,14 @@ fn new_state_with_client_and_selector(
         policy_state_guard: RwLock::new(()),
         identities: Mutex::new(IdentityRegistry::default()),
         flow_history: Mutex::new(FlowHistoryStore::default()),
+        flow_history_dirty: AtomicBool::new(false),
+        flow_history_store: config_map_store.clone(),
+        flow_history_checkpointed_flows: AtomicU64::new(0),
+        flow_history_checkpoint_omitted_flows: AtomicU64::new(0),
+        flow_history_checkpoint_omitted_observations: AtomicU64::new(0),
         agent_reports: RwLock::new(BTreeMap::new()),
         agent_reports_dirty: AtomicBool::new(false),
-        agent_report_store,
+        agent_report_store: config_map_store,
         agent_authentication_cache: Mutex::new(BTreeMap::new()),
         token_review_client,
         revisions: Mutex::new(RevisionSet::default()),
@@ -810,6 +859,171 @@ async fn persist_agent_reports(state: &ControllerState) -> Result<()> {
     .await
     .with_context(|| format!("patch ConfigMap unf-system/{AGENT_REPORT_STORE_NAME}"))?;
     state.metrics.agent_report_persistence_writes.inc();
+    Ok(())
+}
+
+async fn restore_flow_history(state: &ControllerState) -> Result<()> {
+    let api = state
+        .flow_history_store
+        .as_ref()
+        .context("durable flow-history API is unavailable")?;
+    let config_map = api
+        .get(FLOW_HISTORY_STORE_NAME)
+        .await
+        .with_context(|| format!("read ConfigMap unf-system/{FLOW_HISTORY_STORE_NAME}"))?;
+    let Some(encoded) = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(FLOW_HISTORY_STORE_KEY))
+    else {
+        info!("durable flow-history store is empty");
+        return Ok(());
+    };
+    let checkpoint: FlowHistoryCheckpoint =
+        serde_json::from_str(encoded).context("decode durable flow-history checkpoint")?;
+    validate_flow_history_checkpoint(&checkpoint, unix_time_millis())?;
+    let restored = checkpoint.entries.len();
+    let omitted_flows = checkpoint.omitted_flows;
+    let omitted_observations = checkpoint.omitted_observations;
+    let history = FlowHistoryStore::from_checkpoint(checkpoint, FLOW_HISTORY_CAPACITY)
+        .context("validate durable flow-history checkpoint")?;
+    let revision = history.revision();
+    *mutex_lock(&state.flow_history) = history;
+    mutex_lock(&state.revisions).telemetry = revision;
+    state
+        .flow_history_checkpointed_flows
+        .store(restored as u64, Ordering::Release);
+    state
+        .flow_history_checkpoint_omitted_flows
+        .store(omitted_flows as u64, Ordering::Release);
+    state
+        .flow_history_checkpoint_omitted_observations
+        .store(omitted_observations, Ordering::Release);
+    state
+        .metrics
+        .flow_history_entries_restored
+        .inc_by(restored as u64);
+    info!(restored, omitted_flows, "restored durable flow history");
+    Ok(())
+}
+
+fn validate_flow_history_checkpoint(
+    checkpoint: &FlowHistoryCheckpoint,
+    now_unix_ms: u64,
+) -> Result<()> {
+    for entry in &checkpoint.entries {
+        if entry.last_received_unix_ms
+            > now_unix_ms.saturating_add(FLOW_HISTORY_MAX_FUTURE_SKEW_MILLIS)
+        {
+            return Err(anyhow!(
+                "durable flow-history entry for port {} is unreasonably far in the future",
+                entry.key.destination_port
+            ));
+        }
+        let node_name = entry.reporting_nodes.first().cloned().unwrap_or_default();
+        let batch = FlowExportBatch {
+            schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+            node_name,
+            dropped_events: 0,
+            entries: vec![FlowExportRecord {
+                key: entry.key.clone(),
+                policy_revision: entry.policy_revision,
+                decision: entry.decision,
+                shadow: entry.shadow,
+                observed_events: entry.observed_events,
+            }],
+        };
+        validate_flow_export_batch(&batch)
+            .map_err(|error| anyhow!("invalid durable flow-history entry: {}", error.message))?;
+    }
+    Ok(())
+}
+
+fn spawn_flow_history_persistence(
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+    tasks: &mut JoinSet<()>,
+) {
+    tasks.spawn(async move {
+        let mut interval = tokio::time::interval(FLOW_HISTORY_PERSISTENCE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    persist_flow_history_if_dirty(&state).await;
+                    break;
+                }
+                _ = interval.tick() => persist_flow_history_if_dirty(&state).await,
+            }
+        }
+    });
+}
+
+async fn persist_flow_history_if_dirty(state: &ControllerState) {
+    if !state.flow_history_dirty.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if let Err(error) = persist_flow_history(state).await {
+        state.flow_history_dirty.store(true, Ordering::Release);
+        state.metrics.flow_history_persistence_errors.inc();
+        warn!(%error, "could not persist flow history; retrying");
+    }
+}
+
+async fn persist_flow_history(state: &ControllerState) -> Result<()> {
+    let api = state
+        .flow_history_store
+        .as_ref()
+        .context("durable flow-history API is unavailable")?;
+    let mut entry_limit = FLOW_HISTORY_DURABLE_ENTRY_LIMIT;
+    let (checkpoint, encoded) = loop {
+        let checkpoint = mutex_lock(&state.flow_history).checkpoint(entry_limit);
+        let encoded =
+            serde_json::to_string(&checkpoint).context("encode durable flow-history checkpoint")?;
+        if encoded.len() <= FLOW_HISTORY_CONFIG_MAP_DATA_LIMIT {
+            break (checkpoint, encoded);
+        }
+        if entry_limit == 0 {
+            return Err(anyhow!(
+                "empty durable flow-history checkpoint exceeds ConfigMap data limit"
+            ));
+        }
+        entry_limit /= 2;
+    };
+    let data = BTreeMap::from([(FLOW_HISTORY_STORE_KEY.to_owned(), encoded)]);
+    let patch = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": FLOW_HISTORY_STORE_NAME,
+            "namespace": "unf-system",
+        },
+        "data": data,
+    });
+    api.patch(
+        FLOW_HISTORY_STORE_NAME,
+        &PatchParams::apply("unf-controller-flow-history").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch ConfigMap unf-system/{FLOW_HISTORY_STORE_NAME}"))?;
+    state
+        .flow_history_checkpointed_flows
+        .store(checkpoint.entries.len() as u64, Ordering::Release);
+    state
+        .flow_history_checkpoint_omitted_flows
+        .store(checkpoint.omitted_flows as u64, Ordering::Release);
+    state
+        .flow_history_checkpoint_omitted_observations
+        .store(checkpoint.omitted_observations, Ordering::Release);
+    state.metrics.flow_history_persistence_writes.inc();
+    if checkpoint.omitted_flows != 0 {
+        warn!(
+            checkpointed_flows = checkpoint.entries.len(),
+            omitted_flows = checkpoint.omitted_flows,
+            "durable flow-history checkpoint retained only the newest bounded entries"
+        );
+    }
     Ok(())
 }
 
@@ -1732,7 +1946,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         agents,
         limitations: [
             "desired state and identity allocations are currently in-memory only",
-            "agent acknowledgements use a bounded single-controller ConfigMap checkpoint; telemetry history remains current-process only",
+            "agent acknowledgements and the newest bounded flow history use separate single-controller ConfigMap checkpoints",
         ],
     }))
 }
@@ -2234,13 +2448,71 @@ fn topology_snapshot(state: &ControllerState) -> TopologyStateSnapshot {
     }
 }
 
-async fn flow_history(State(state): State<Arc<ControllerState>>) -> Json<FlowHistorySnapshot> {
+async fn flow_history(
+    State(state): State<Arc<ControllerState>>,
+    Query(query): Query<FlowHistoryQuery>,
+) -> Result<Json<FlowHistorySnapshot>, ApiError> {
+    let limit = validate_flow_history_query(&query)?;
     let _policy_state_guard = read_lock(&state.policy_state_guard);
-    Json(flow_history_snapshot(&state))
+    Ok(Json(flow_history_snapshot_window(
+        &state,
+        query.since_unix_ms,
+        query.until_unix_ms,
+        limit,
+    )))
 }
 
+fn validate_flow_history_query(query: &FlowHistoryQuery) -> Result<usize, ApiError> {
+    let limit = query.limit.unwrap_or(FLOW_HISTORY_CAPACITY);
+    if limit == 0 || limit > FLOW_HISTORY_CAPACITY {
+        return Err(ApiError::bad_request(format!(
+            "flow-history limit must be between 1 and {FLOW_HISTORY_CAPACITY}"
+        )));
+    }
+    if query
+        .since_unix_ms
+        .zip(query.until_unix_ms)
+        .is_some_and(|(since, until)| since > until)
+    {
+        return Err(ApiError::bad_request(
+            "flow-history since_unix_ms must not exceed until_unix_ms",
+        ));
+    }
+    Ok(limit)
+}
+
+#[cfg(test)]
 fn flow_history_snapshot(state: &ControllerState) -> FlowHistorySnapshot {
-    let mut snapshot = mutex_lock(&state.flow_history).snapshot(state.identity_epoch);
+    flow_history_snapshot_window(state, None, None, FLOW_HISTORY_CAPACITY)
+}
+
+fn flow_history_snapshot_window(
+    state: &ControllerState,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: usize,
+) -> FlowHistorySnapshot {
+    let mut snapshot = mutex_lock(&state.flow_history).snapshot_window(
+        state.identity_epoch,
+        since_unix_ms,
+        until_unix_ms,
+        limit,
+    );
+    snapshot.durable_checkpointed_flows = usize::try_from(
+        state
+            .flow_history_checkpointed_flows
+            .load(Ordering::Acquire),
+    )
+    .unwrap_or(usize::MAX);
+    snapshot.durable_omitted_flows = usize::try_from(
+        state
+            .flow_history_checkpoint_omitted_flows
+            .load(Ordering::Acquire),
+    )
+    .unwrap_or(usize::MAX);
+    snapshot.durable_omitted_observations = state
+        .flow_history_checkpoint_omitted_observations
+        .load(Ordering::Acquire);
     let pods = read_lock(&state.pods);
     for entry in &mut snapshot.entries {
         entry.source_workloads = pods
@@ -2282,11 +2554,14 @@ fn ingest_flow_batch(
         .iter()
         .map(|entry| entry.observed_events)
         .fold(0_u64, u64::saturating_add);
-    let revision = {
+    let (revision, changed) = {
         let mut history = mutex_lock(&state.flow_history);
-        history.ingest(batch, unix_time_millis());
-        history.revision()
+        let changed = history.ingest(batch, unix_time_millis());
+        (history.revision(), changed)
     };
+    if changed {
+        state.flow_history_dirty.store(true, Ordering::Release);
+    }
     mutex_lock(&state.revisions).telemetry = revision;
     state.metrics.telemetry_batches.inc();
     state.metrics.telemetry_observations.inc_by(observations);
@@ -4038,6 +4313,61 @@ mod tests {
         let error =
             ingest_flow_batch(&state, invalid).expect_err("unknown flow schema is rejected");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn flow_history_windows_and_durable_checkpoint_validation_are_bounded() {
+        let state = new_state(true);
+        write_lock(&state.pods).insert(
+            "frontend/client".to_owned(),
+            pod_record(1, "frontend", "client", "client"),
+        );
+        write_lock(&state.pods).insert(
+            "backend/server".to_owned(),
+            pod_record(2, "backend", "server", "server"),
+        );
+        mutex_lock(&state.flow_history).ingest(flow_batch(5), 1_000);
+
+        let snapshot = flow_history_snapshot_window(&state, Some(1_000), Some(1_000), 1);
+        assert_eq!(snapshot.schema_version, 3);
+        assert_eq!(snapshot.query.matched_flows, 1);
+        assert_eq!(snapshot.query.matched_observations, 5);
+        assert_eq!(snapshot.query.returned_flows, 1);
+        assert_eq!(snapshot.entries[0].source_workloads, ["frontend/client"]);
+        assert_eq!(
+            snapshot.entries[0].destination_workloads,
+            ["backend/server"]
+        );
+        assert_eq!(
+            flow_history_snapshot_window(&state, Some(1_001), None, 1)
+                .query
+                .matched_flows,
+            0
+        );
+
+        assert!(validate_flow_history_query(&FlowHistoryQuery::default()).is_ok());
+        assert!(
+            validate_flow_history_query(&FlowHistoryQuery {
+                since_unix_ms: Some(2),
+                until_unix_ms: Some(1),
+                limit: None,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_flow_history_query(&FlowHistoryQuery {
+                limit: Some(FLOW_HISTORY_CAPACITY + 1),
+                ..FlowHistoryQuery::default()
+            })
+            .is_err()
+        );
+
+        let mut checkpoint = mutex_lock(&state.flow_history).checkpoint(1);
+        validate_flow_history_checkpoint(&checkpoint, 1_000)
+            .expect("current durable flow history validates");
+        checkpoint.entries[0].last_received_unix_ms =
+            1_000 + FLOW_HISTORY_MAX_FUTURE_SKEW_MILLIS + 1;
+        assert!(validate_flow_history_checkpoint(&checkpoint, 1_000).is_err());
     }
 
     #[tokio::test]

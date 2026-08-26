@@ -216,8 +216,8 @@ not ready to ready, verifies deletion removes runtime state while selector inten
 stays empty, and proves the independent topology/service revisions advance without
 changing policy revision. It also requires agents to export the live
 frontend-to-backend flow, queries bounded history, and verifies
-observation-weighted historical policy impact. Flow history schema v2 must retain
-an enriched direct-address IPv6 flow.
+observation-weighted historical policy impact. Flow snapshot schema v3 must retain
+an enriched direct-address IPv6 flow; agent export remains schema v2.
 The host kernel is shared with kind nodes. `make kind-down`
 deletes only the named `unf-dev` cluster.
 
@@ -235,11 +235,19 @@ backend relationships with:
 ```bash
 target/debug/unfctl --controller-url http://127.0.0.1:9962 topology
 target/debug/unfctl --controller-url http://127.0.0.1:9962 flows
+target/debug/unfctl --controller-url http://127.0.0.1:9962 flows --last 15m --limit 100
+target/debug/unfctl --controller-url http://127.0.0.1:9962 flows \
+  --since-unix-ms 1787688000000 --until-unix-ms 1787688900000
 target/debug/unfctl --controller-url http://127.0.0.1:9962 status
 ```
 
+Flow bounds are inclusive and select aggregate entries by their exact
+`last_received_unix_ms`; they do not bucket each observation by event time. The
+newest bounded checkpoint survives controller restart. Run its focused gate with
+`make kind-flow-history-retention-test`.
+
 Simulation reports its bounded current-topology probe matrix separately from the
-revisioned, 4,096-key in-memory history. `make kind-test` verifies the predicted
+revisioned, 4,096-key retained history. `make kind-test` verifies the predicted
 8080 denial in both inputs, unchanged policy revision, and continued live 8080
 allow after simulation. Status reports per-node desired/applied identity and
 policy revisions and marks the watched Node set converged only while every agent
