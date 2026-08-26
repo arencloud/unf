@@ -126,7 +126,8 @@ matrix and reproducible evidence.
   revisioned provenance, and historical export; an upstream-aligned live ingress
   matrix for default deny, same/all/exact-Namespace peers, Namespace `NotIn`
   exclusion, all four Pod/Namespace selector operators, selector AND,
-  homogeneous multiple-PodSelector and heterogeneous peer OR,
+  multi-value Pod `In` with Namespace-name `NotIn`, homogeneous
+  multiple-PodSelector and heterogeneous peer OR,
   explicit empty source/port lists, multi-port OR,
   multiple ingress-rule source/port pairing,
   exact/protocol-only UDP isolation, destination-specific named ports and

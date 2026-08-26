@@ -1809,6 +1809,90 @@ mod tests {
     }
 
     #[test]
+    fn multiple_pod_values_and_namespace_exclusion_are_anded() {
+        let mut same_namespace_b = endpoint(1, "backend", "client-b");
+        same_namespace_b.labels.extend(labels(&[("pod", "b")]));
+        let mut remote_a = endpoint(2, "frontend", "client-a");
+        remote_a.labels.extend(labels(&[("pod", "a")]));
+        let mut remote_b = endpoint(3, "frontend", "client-b");
+        remote_b.labels.extend(labels(&[("pod", "b")]));
+        let mut remote_c = endpoint(4, "edge", "client-c");
+        remote_c.labels.extend(labels(&[("pod", "c")]));
+        let destination = endpoint(5, "backend", "server");
+
+        let compiled = NetworkPolicyCompiler::compile(
+            PolicyId::new(16),
+            policy(vec![NetworkPolicyIngressRule {
+                from: Some(vec![NetworkPolicyPeer {
+                    namespace_selector: Some(LabelSelector {
+                        match_expressions: Some(vec![expression(
+                            NAMESPACE_NAME_LABEL,
+                            "NotIn",
+                            &["backend"],
+                        )]),
+                        ..LabelSelector::default()
+                    }),
+                    pod_selector: Some(LabelSelector {
+                        match_expressions: Some(vec![expression("pod", "In", &["b", "c"])]),
+                        ..LabelSelector::default()
+                    }),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: Some(vec![NetworkPolicyPort {
+                    port: Some(IntOrString::Int(8087)),
+                    protocol: Some("TCP".to_owned()),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }]),
+        )
+        .expect("multi-value Pod and Namespace selectors compile together");
+        let decision = |source: &Endpoint, port| {
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: port,
+                    source_ipv4: None,
+                    source_ipv6: None,
+                },
+            )
+        };
+
+        for source in [&remote_b, &remote_c] {
+            let allowed = decision(source, 8087);
+            assert_eq!(allowed.verdict, Verdict::Allow);
+            assert_eq!(allowed.reason, PolicyReason::ExplicitRule);
+            assert_eq!(decision(source, 8088).verdict, Verdict::Deny);
+        }
+        for source in [&same_namespace_b, &remote_a] {
+            let denied = decision(source, 8087);
+            assert_eq!(denied.verdict, Verdict::Deny);
+            assert_eq!(denied.reason, PolicyReason::DefaultAction);
+        }
+
+        let entries = compile_dataplane_entries(
+            std::slice::from_ref(&compiled),
+            &[same_namespace_b, remote_a, remote_b, remote_c, destination],
+        )
+        .expect("only the remote b and c alternatives lower into allow entries");
+        let exact_allow = |source_identity| {
+            entries.iter().any(|entry| {
+                entry.key.source_identity == IdentityId::new(source_identity)
+                    && entry.key.destination_identity == IdentityId::new(5)
+                    && entry.key.protocol == Protocol::Tcp as u8
+                    && entry.key.destination_port == 8087
+                    && entry.decision.verdict == Verdict::Allow
+            })
+        };
+        assert!(!exact_allow(1));
+        assert!(!exact_allow(2));
+        assert!(exact_allow(3));
+        assert!(exact_allow(4));
+    }
+
+    #[test]
     fn upstream_expression_rules_preserve_source_port_pairing() {
         let mut same_namespace = endpoint(1, "backend", "same-client");
         same_namespace

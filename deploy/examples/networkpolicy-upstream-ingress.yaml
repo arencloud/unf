@@ -136,6 +136,7 @@ metadata:
   name: same-client
   namespace: unf-np-target
   labels:
+    conformance-pod: b
     conformance-source: same
 spec:
   nodeSelector:
@@ -156,7 +157,29 @@ metadata:
   name: client
   namespace: unf-np-source-a
   labels:
+    conformance-pod: b
     conformance-source: selected
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-control-plane
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: client
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
+      command: ["sh", "-c", "sleep infinity"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: alternate-client
+  namespace: unf-np-source-a
+  labels:
+    conformance-pod: c
+    conformance-source: alternate
 spec:
   nodeSelector:
     kubernetes.io/hostname: unf-dev-control-plane
@@ -176,6 +199,7 @@ metadata:
   name: client
   namespace: unf-np-source-b
   labels:
+    conformance-pod: a
     conformance-source: selected
 spec:
   nodeSelector:
