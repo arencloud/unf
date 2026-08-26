@@ -158,7 +158,13 @@ matrix and reproducible evidence.
   scenarios as 35 verified, 13 unsupported pending egress, and one intentionally
   excluded pending stateful return-flow tracking. With no unclassified stateless
   ingress form, bounded full ingress peer/port compatibility is verified;
-- Next: direction-aware NetworkPolicy egress IR, translation, and enforcement;
+- Implemented and unit verified: ABI-stable direction-aware policy IR and
+  decisions, destination-selected ingress/source-selected egress evaluation,
+  cross-direction isolation, backward-compatible ingress deserialization, and
+  fail-closed rejection of egress IR by the existing ingress-only dataplane
+  lowerers;
+- Next: `spec.egress` translation and `policyTypes` defaulting, followed by
+  source-side lowering and enforcement;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.

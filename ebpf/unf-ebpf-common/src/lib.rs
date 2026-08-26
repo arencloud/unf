@@ -4,6 +4,8 @@
 
 use unf_common::{IdentityId, PolicyId, RuleId, Verdict};
 
+pub use unf_common::PolicyDirection as Direction;
+
 pub const FLOW_ABI_VERSION: u16 = 2;
 pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
@@ -73,13 +75,6 @@ pub const fn ipv6_extension_step(next_header: u8, header: [u8; 8]) -> Ipv6Extens
 pub enum AddressFamily {
     Ipv4 = 4,
     Ipv6 = 6,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Direction {
-    Ingress = 1,
-    Egress = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

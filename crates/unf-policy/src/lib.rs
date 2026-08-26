@@ -24,7 +24,7 @@ use unf_state::{
     POLICY_MAP_BANK_ENTRY_LIMIT, PolicyDecisionRecord, PolicyMapEntry, PolicyMapKey,
 };
 
-pub use unf_common::PolicyReason as DecisionReason;
+pub use unf_common::{PolicyDirection, PolicyReason as DecisionReason};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentitySelector {
@@ -327,6 +327,8 @@ pub struct PolicyIr {
     pub namespace: String,
     pub priority: u32,
     pub origin: PolicyOrigin,
+    #[serde(default)]
+    pub direction: PolicyDirection,
     pub target: IdentitySelector,
     pub default_action: PolicyAction,
     pub enforcement_mode: PolicyEnforcementMode,
@@ -357,6 +359,8 @@ pub struct Flow<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyDecision {
+    #[serde(default, skip_serializing_if = "policy_direction_is_ingress")]
+    pub direction: PolicyDirection,
     pub verdict: Verdict,
     pub shadow_verdict: Option<Verdict>,
     pub shadow_reason: Option<DecisionReason>,
@@ -366,6 +370,14 @@ pub struct PolicyDecision {
     pub policy_id: Option<PolicyId>,
     pub rule_id: Option<RuleId>,
     pub audits: Vec<RuleProvenance>,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a predicate accepting a reference"
+)]
+fn policy_direction_is_ingress(direction: &PolicyDirection) -> bool {
+    *direction == PolicyDirection::Ingress
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -392,6 +404,8 @@ pub enum DataplaneCompileError {
     Ipv4BlockTooLarge { address_count: u64, limit: u64 },
     #[error("source IPv6 address {address} has conflicting endpoint metadata")]
     Ipv6MetadataConflict { address: Ipv6Addr },
+    #[error("{direction:?} policy IR cannot be lowered by the ingress dataplane compiler")]
+    UnsupportedPolicyDirection { direction: PolicyDirection },
 }
 
 pub struct PolicyCompiler;
@@ -471,6 +485,7 @@ impl PolicyCompiler {
             namespace,
             priority: spec.priority,
             origin: PolicyOrigin::Native,
+            direction: PolicyDirection::Ingress,
             target,
             default_action: convert_action(spec.default_action),
             enforcement_mode: match spec.enforcement_mode {
@@ -524,12 +539,32 @@ const fn convert_action(action: Action) -> PolicyAction {
     }
 }
 
-/// Evaluates policy without depending on insertion or controller watch order.
+/// Evaluates ingress policy without depending on insertion or controller watch order.
+///
+/// This compatibility wrapper preserves the original ingress-only API. New
+/// direction-aware callers should use [`evaluate_for_direction`].
 #[must_use]
 pub fn evaluate(policies: &[PolicyIr], flow: Flow<'_>) -> PolicyDecision {
+    evaluate_for_direction(policies, PolicyDirection::Ingress, flow)
+}
+
+/// Evaluates policy for one explicit isolation direction.
+///
+/// Ingress policies select the destination workload. Egress policies select the
+/// source workload. Policies in the opposite direction never affect the result.
+#[must_use]
+pub fn evaluate_for_direction(
+    policies: &[PolicyIr],
+    direction: PolicyDirection,
+    flow: Flow<'_>,
+) -> PolicyDecision {
+    let selected_endpoint = match direction {
+        PolicyDirection::Ingress => flow.destination,
+        PolicyDirection::Egress => flow.source,
+    };
     let applicable: Vec<&PolicyIr> = policies
         .iter()
-        .filter(|policy| policy.target.matches(flow.destination))
+        .filter(|policy| policy.direction == direction && policy.target.matches(selected_endpoint))
         .collect();
 
     let mut audits = matching_audits(&applicable, flow);
@@ -554,6 +589,7 @@ pub fn evaluate(policies: &[PolicyIr], flow: Flow<'_>) -> PolicyDecision {
     );
 
     PolicyDecision {
+        direction,
         verdict,
         shadow_verdict,
         shadow_reason,
@@ -582,6 +618,7 @@ pub fn compile_dataplane_entries(
     policies: &[PolicyIr],
     endpoints: &[Endpoint],
 ) -> Result<Vec<PolicyMapEntry>, DataplaneCompileError> {
+    ensure_ingress_dataplane_policies(policies)?;
     let global_policies = global_fallback_policies(policies);
     let mut unique_endpoints = BTreeMap::<IdentityId, &Endpoint>::new();
     for endpoint in endpoints {
@@ -698,6 +735,7 @@ pub fn compile_ipv4_dataplane_entries(
     endpoints: &[Endpoint],
     ipv4_endpoints: &[Ipv4Endpoint],
 ) -> Result<Vec<Ipv4PolicyMapEntry>, DataplaneCompileError> {
+    ensure_ingress_dataplane_policies(policies)?;
     let global_policies = global_fallback_policies(policies);
     let mut destinations = BTreeMap::<IdentityId, &Endpoint>::new();
     for endpoint in endpoints {
@@ -801,6 +839,7 @@ pub fn compile_ipv6_dataplane_entries(
     endpoints: &[Endpoint],
     ipv6_endpoints: &[Ipv6Endpoint],
 ) -> Result<Vec<Ipv6PolicyMapEntry>, DataplaneCompileError> {
+    ensure_ingress_dataplane_policies(policies)?;
     let global_policies = global_fallback_policies(policies);
     let mut destinations = BTreeMap::<IdentityId, &Endpoint>::new();
     for endpoint in endpoints {
@@ -1090,6 +1129,18 @@ fn global_fallback_policies(policies: &[PolicyIr]) -> Vec<PolicyIr> {
             policy
         })
         .collect()
+}
+
+fn ensure_ingress_dataplane_policies(policies: &[PolicyIr]) -> Result<(), DataplaneCompileError> {
+    if let Some(policy) = policies
+        .iter()
+        .find(|policy| policy.direction != PolicyDirection::Ingress)
+    {
+        return Err(DataplaneCompileError::UnsupportedPolicyDirection {
+            direction: policy.direction,
+        });
+    }
+    Ok(())
 }
 
 fn external_endpoint() -> Endpoint {
@@ -1475,6 +1526,161 @@ mod tests {
             source_ipv4: None,
             source_ipv6: None,
         }
+    }
+
+    fn egress_policy() -> PolicyIr {
+        let target = IdentitySelector {
+            namespace: Some("frontend".to_owned()),
+            application: Some("client".to_owned()),
+            ..IdentitySelector::default()
+        };
+        PolicyIr {
+            id: PolicyId::new(2),
+            name: "allow-client-to-server".to_owned(),
+            namespace: "frontend".to_owned(),
+            priority: 100,
+            origin: PolicyOrigin::Native,
+            direction: PolicyDirection::Egress,
+            target: target.clone(),
+            default_action: PolicyAction::Deny,
+            enforcement_mode: PolicyEnforcementMode::Enforce,
+            rules: vec![PolicyRule {
+                id: RuleId::new(0),
+                source: target,
+                destination: IdentitySelector {
+                    namespace: Some("backend".to_owned()),
+                    application: Some("server".to_owned()),
+                    ..IdentitySelector::default()
+                },
+                protocol: Some(Protocol::Tcp),
+                destination_port: DestinationPort::Number(8080),
+                action: PolicyAction::Allow,
+                provenance: RuleProvenance {
+                    policy_id: PolicyId::new(2),
+                    policy_name: "allow-client-to-server".to_owned(),
+                    namespace: "frontend".to_owned(),
+                    rule_index: 0,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn evaluation_is_direction_aware_and_isolated() {
+        let source = endpoint("frontend", "client");
+        let destination = endpoint("backend", "server");
+        let alternate_destination = endpoint("backend", "database");
+        let alternate_source = endpoint("operations", "job");
+        let ingress = policy(
+            1,
+            100,
+            Action::Allow,
+            Action::Deny,
+            EnforcementMode::Enforce,
+            Some(8080),
+        );
+        let egress = egress_policy();
+        let policies = [ingress, egress];
+
+        let ingress_decision = evaluate(&policies, test_flow(&source, &destination, 8080));
+        assert_eq!(ingress_decision.direction, PolicyDirection::Ingress);
+        assert_eq!(ingress_decision.verdict, Verdict::Allow);
+        assert_eq!(ingress_decision.policy_id, Some(PolicyId::new(1)));
+
+        let egress_decision = evaluate_for_direction(
+            &policies,
+            PolicyDirection::Egress,
+            test_flow(&source, &destination, 8080),
+        );
+        assert_eq!(egress_decision.direction, PolicyDirection::Egress);
+        assert_eq!(egress_decision.verdict, Verdict::Allow);
+        assert_eq!(egress_decision.policy_id, Some(PolicyId::new(2)));
+
+        let denied = evaluate_for_direction(
+            &policies,
+            PolicyDirection::Egress,
+            test_flow(&source, &alternate_destination, 8080),
+        );
+        assert_eq!(denied.verdict, Verdict::Deny);
+        assert_eq!(denied.reason, DecisionReason::DefaultAction);
+
+        let unisolated = evaluate_for_direction(
+            &policies,
+            PolicyDirection::Egress,
+            test_flow(&alternate_source, &destination, 8080),
+        );
+        assert_eq!(unisolated.verdict, Verdict::Allow);
+        assert_eq!(unisolated.reason, DecisionReason::NoApplicablePolicy);
+    }
+
+    #[test]
+    fn direction_serialization_is_explicit_and_backward_compatible() {
+        let egress = egress_policy();
+        let mut serialized = serde_json::to_value(&egress).expect("policy IR serializes");
+        assert_eq!(serialized["direction"], "Egress");
+
+        serialized
+            .as_object_mut()
+            .expect("policy IR is an object")
+            .remove("direction");
+        let legacy: PolicyIr =
+            serde_json::from_value(serialized).expect("legacy policy IR deserializes");
+        assert_eq!(legacy.direction, PolicyDirection::Ingress);
+
+        let source = endpoint("frontend", "client");
+        let destination = endpoint("backend", "server");
+        let ingress_decision = evaluate(
+            &[policy(
+                1,
+                100,
+                Action::Allow,
+                Action::Deny,
+                EnforcementMode::Enforce,
+                Some(8080),
+            )],
+            test_flow(&source, &destination, 8080),
+        );
+        assert!(
+            serde_json::to_value(ingress_decision)
+                .expect("ingress decision serializes")
+                .get("direction")
+                .is_none(),
+            "the established ingress response shape remains unchanged"
+        );
+
+        let decision = evaluate_for_direction(
+            &[egress],
+            PolicyDirection::Egress,
+            test_flow(&source, &destination, 8080),
+        );
+        assert_eq!(
+            serde_json::to_value(decision).expect("decision serializes")["direction"],
+            "Egress"
+        );
+    }
+
+    #[test]
+    fn ingress_dataplane_compilers_reject_egress_policy_ir() {
+        let egress = egress_policy();
+        let expected = DataplaneCompileError::UnsupportedPolicyDirection {
+            direction: PolicyDirection::Egress,
+        };
+
+        assert_eq!(
+            compile_dataplane_entries(std::slice::from_ref(&egress), &[])
+                .expect_err("egress IR must not reach the ingress dataplane"),
+            expected
+        );
+        assert_eq!(
+            compile_ipv4_dataplane_entries(std::slice::from_ref(&egress), &[], &[])
+                .expect_err("egress IR must not reach the IPv4 ingress dataplane"),
+            expected
+        );
+        assert_eq!(
+            compile_ipv6_dataplane_entries(&[egress], &[], &[])
+                .expect_err("egress IR must not reach the IPv6 ingress dataplane"),
+            expected
+        );
     }
 
     #[test]

@@ -61,6 +61,19 @@ pub enum Protocol {
     Sctp = 132,
 }
 
+/// Direction in which policy selects and isolates a workload.
+///
+/// The numeric values intentionally match the flow-event ABI used by the TC
+/// programs so later direction-aware policy maps do not need another enum.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(u8)]
+pub enum PolicyDirection {
+    #[default]
+    Ingress = 1,
+    Egress = 2,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
@@ -105,5 +118,12 @@ mod tests {
     fn revision_is_monotonic_and_saturating() {
         assert_eq!(Revision::INITIAL.next(), Revision::new(1));
         assert_eq!(Revision::new(u64::MAX).next(), Revision::new(u64::MAX));
+    }
+
+    #[test]
+    fn policy_direction_values_match_the_flow_abi() {
+        assert_eq!(PolicyDirection::Ingress as u8, 1);
+        assert_eq!(PolicyDirection::Egress as u8, 2);
+        assert_eq!(PolicyDirection::default(), PolicyDirection::Ingress);
     }
 }

@@ -2873,6 +2873,7 @@ dependencies = [
  "k8s-openapi",
  "proptest",
  "serde",
+ "serde_json",
  "thiserror",
  "unf-api",
  "unf-common",

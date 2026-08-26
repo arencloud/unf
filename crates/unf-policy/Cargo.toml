@@ -16,6 +16,7 @@ unf-state = { path = "../unf-state" }
 
 [dev-dependencies]
 proptest.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

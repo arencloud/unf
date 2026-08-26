@@ -4,6 +4,14 @@
 Each compiled rule retains policy ID/name/namespace and source rule index. CRD
 objects are never interpreted in eBPF.
 
+`PolicyIr` and every userspace `PolicyDecision` carry an explicit ingress or
+egress direction. The direction-aware evaluator selects the destination workload
+for ingress and the source workload for egress, and policies in the opposite
+direction cannot contribute to a decision. The original evaluator entry point is
+an ingress compatibility wrapper. Older serialized records without a direction
+remain ingress, matching the only semantics they could previously represent.
+See [ADR 0031](../adr/0031-direction-aware-policy-ir.md).
+
 ## Phase 1 semantics
 
 - Policies are namespaced; an omitted target namespace means the policy namespace.
@@ -72,6 +80,13 @@ rejects egress and named ports combined with `endPort`. These errors
 prevent a policy from being accepted with weaker or different semantics. Native
 policy has the higher default precedence; the compatibility baseline uses
 reserved priority `1_000_000`.
+
+The shared IR and evaluator now have an explicit egress direction, but the
+current NetworkPolicy translator and identity/IP dataplane compilers remain
+ingress-only. All ingress lowerers reject egress IR before emitting map entries.
+`spec.egress` translation, egress defaulting, destination-IP matching, named-port
+semantics, and source-side dataplane enforcement are the active compatibility
+milestone rather than behavior implied by this foundation.
 
 The controller watches these objects cluster-wide, keeps accepted and rejected
 compatibility state separate, and combines accepted IR with native policy in each

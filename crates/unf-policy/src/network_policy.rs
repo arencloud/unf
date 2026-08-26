@@ -9,7 +9,8 @@ use unf_common::{PolicyAction, PolicyId, Protocol};
 
 use crate::{
     DestinationPort, IdentitySelector, Ipv4Block, Ipv4Cidr, Ipv6Block, Ipv6Cidr, LabelExpression,
-    LabelExpressionOperator, PolicyEnforcementMode, PolicyIr, PolicyOrigin, PolicyRule, push_rule,
+    LabelExpressionOperator, PolicyDirection, PolicyEnforcementMode, PolicyIr, PolicyOrigin,
+    PolicyRule, push_rule,
 };
 
 /// Compatibility policies sit below the native policy priority range by
@@ -195,6 +196,7 @@ impl NetworkPolicyCompiler {
             namespace,
             priority: KUBERNETES_NETWORK_POLICY_PRIORITY,
             origin: PolicyOrigin::KubernetesNetworkPolicy,
+            direction: PolicyDirection::Ingress,
             target,
             default_action: PolicyAction::Deny,
             enforcement_mode: PolicyEnforcementMode::Enforce,
