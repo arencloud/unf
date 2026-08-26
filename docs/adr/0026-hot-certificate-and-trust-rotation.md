@@ -72,6 +72,7 @@ remain excluded.
 The mechanism does not choose renewal times, request certificates, or define a
 production issuer policy. Operators must provide an overlap window long enough
 for every node to project and accept the bundle before switching the leaf, and
-must monitor reload-error counters. Durable acknowledgement/history retention,
+must monitor reload-error counters. ADR 0027 provides bounded durable
+acknowledgement checkpointing; durable flow-history retention,
 internal-port NetworkPolicy, and issuer-specific production automation remain
 separate work.

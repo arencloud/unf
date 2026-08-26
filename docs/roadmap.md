@@ -87,8 +87,13 @@ matrix and reproducible evidence.
   repeatable gate proves overlapping-root external-PKI rotation, authenticated
   traffic under the new issuer, malformed leaf/CA rejection, and restoration to
   OpenShift Service CA ownership with unchanged Pod UIDs;
-- Next: durable agent acknowledgement retention, path-specific host-mount
-  admission policy, and coordinated uninstall.
+- Implemented and OpenShift verified: authenticated agent reports are retained in
+  a schema-versioned, 1,024-entry ConfigMap checkpoint with exact-name RBAC and
+  coalesced two-second writes. Startup validates and restores the checkpoint
+  before watchers begin, but the new controller epoch keeps restored reports
+  non-converged until agents acknowledge current desired state. A restart gate
+  proves both reports restore, reconverge, and advance without agent replacement;
+- Next: path-specific host-mount admission policy and coordinated uninstall.
 
 ## Phase 3 — compatibility and simulation
 

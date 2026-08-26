@@ -23,6 +23,10 @@ for operator queries and policy impact analysis. Agents publish revisioned statu
 acknowledgements using Pod-bound, audience-scoped Kubernetes tokens; TokenReview
 and authoritative Pod placement prevent anonymous or cross-Node claims. Controller
 and CLI status report freshness-aware cluster convergence for every watched Node.
+The controller checkpoints the bounded authenticated report set to a dedicated
+ConfigMap every two seconds and restores it before watchers start, so a restart
+preserves last-known status while the new epoch still requires fresh agent
+acknowledgements before convergence can become true.
 Identity/policy snapshots, acknowledgements, and flow telemetry use a separate
 TLS-only controller port; agents trust only the mounted UNF CA and authenticate
 every internal request with their rotating Pod credential. The reserved internal
@@ -84,6 +88,8 @@ Implemented in the repository:
   status;
 - controller health, readiness, metrics, status, and userspace explanation APIs;
 - controller-aggregated per-node desired/applied identity and policy convergence;
+- bounded, schema-validated ConfigMap persistence for authenticated agent reports,
+  with startup recovery that cannot satisfy a new controller epoch by itself;
 - schema v2 agent acknowledgements authenticated through audience-scoped,
   Pod-bound Kubernetes TokenReview identity and authoritative Node placement;
 - a split controller surface with public operator HTTP and CA-pinned,

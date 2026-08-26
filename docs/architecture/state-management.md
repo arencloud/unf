@@ -55,6 +55,16 @@ Controller and CLI status classify expected agents as missing, stale after ten
 seconds, or converged; fresh reports from unknown Nodes remain visible as
 unexpected without permanently degrading status after Node removal.
 
+The controller coalesces accepted reports into one schema-versioned ConfigMap
+checkpoint at most every two seconds. The store is capped at 1,024 node keys and
+the controller has only exact-name `get`/`patch` access. Startup rejects an
+unsupported schema, malformed report, mismatched node key, zero timestamp, or an
+unreasonable future timestamp before restoring any entry. Restored reports keep
+their original receive time and prior controller epoch: they preserve last-known
+status but cannot report convergence for the new process until fresh authenticated
+agent reports arrive. Node deletion removes its checkpoint entry, and initial
+Node-list reconciliation removes entries deleted while the controller was down.
+
 The identity and policy node update lifecycle is now implemented as:
 
 ```text
@@ -80,7 +90,8 @@ UNF legacy program names. It refuses unknown ABI content and requires explicit
 confirmation for current v2 removal. ADRs 0023 and 0024 place snapshots,
 acknowledgements, and telemetry behind dedicated TLS plus Pod-bound TokenReview;
 serving certificates and CA bundles reload with last-known-good fallback and an
-overlapping-trust rotation gate. Durable report retention remains hardening work.
+overlapping-trust rotation gate. Agent reports survive controller replacement;
+flow history and desired-state/identity allocation remain current-process state.
 
 Isolated live-kernel probes verify that partial pin sets,
 invalid active config, and corrupt inactive-stage debris are rejected before
@@ -88,7 +99,7 @@ adoption without mutating the primary pin set. A separate live pressure probe
 fills only the inactive identity-keyed policy bank, proves a staging insertion
 failure cannot advance applied state or alter active traffic, and verifies retry
 after scoped cleanup. Permanent startup validation failures terminate for
-orchestrator retry. See ADRs 0016 through 0024.
+orchestrator retry. See ADRs 0016 through 0027.
 
 Kubernetes watches remain the controller input. Internal HTTPS snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

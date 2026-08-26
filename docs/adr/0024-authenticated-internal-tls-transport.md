@@ -80,10 +80,11 @@ client-certificate mTLS is not required for this phase.
 ADR 0026 extends this boundary with validated in-place serving-keypair and
 CA-bundle reload. Issuer changes use an overlapping trust bundle; malformed
 updates retain the last-known-good configuration without a process restart.
-Durable acknowledgement/history retention, issuer-specific production
-automation, and NetworkPolicy isolation of the internal port remain separate work. A
-successfully reviewed token may remain accepted for up
-to 30 seconds while its Pod still exists at the same authoritative placement.
+ADR 0027 provides bounded durable acknowledgement checkpointing. Durable flow
+history retention, issuer-specific production automation, and NetworkPolicy
+isolation of the internal port remain separate work. A successfully reviewed
+token may remain accepted for up to 30 seconds while its Pod still exists at the
+same authoritative placement.
 Applications intentionally using the reserved controller TCP port are outside the
 workload telemetry surface for that agent configuration. OpenShift Service CA
 issuance, projected tokens/TokenReview, SCC/SELinux admission, and the encrypted

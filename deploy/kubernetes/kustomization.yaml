@@ -4,6 +4,7 @@ resources:
   - namespace.yaml
   - service-account.yaml
   - rbac.yaml
+  - agent-report-store.yaml
   - controller.yaml
   - service.yaml
   - agent.yaml

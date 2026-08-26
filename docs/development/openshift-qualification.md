@@ -59,6 +59,7 @@ make openshift-images
 make openshift-deploy
 make openshift-test
 make openshift-tls-rotation-test
+make openshift-agent-report-retention-test
 ```
 
 Select a non-default qualification cluster explicitly:
@@ -67,6 +68,7 @@ Select a non-default qualification cluster explicitly:
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-deploy
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-test
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-tls-rotation-test
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-agent-report-retention-test
 ```
 
 Override `OPENSHIFT_KUBECONFIG` or `QUAY_AUTH_FILE` when qualifying another
@@ -122,6 +124,13 @@ issuer, last-known-good continuity, agent convergence, reload/error metrics,
 exact projected bundles, unchanged Pod UIDs, and a final platform-issued chain.
 An exit trap restores the original certificate contract on failure.
 
+`make openshift-agent-report-retention-test` verifies the controller service
+account can only get/patch the exact `unf-agent-acknowledgements` ConfigMap, waits
+for one validated report per selected worker, replaces only the controller, and
+requires the new process to expose the exact restored count. It then requires a
+new controller epoch to converge, the checkpoint receive time to advance, zero
+persistence errors, and unchanged agent Pod UIDs and restart counts.
+
 ## Operational boundary
 
 The agent attaches to every non-loopback worker interface, including OVN and
@@ -135,6 +144,8 @@ volume class. Its RBAC is limited to the agent service account and the workload
 mounts only `/sys/fs/bpf` plus read-only `/sys/kernel/btf`, but SCC itself cannot
 restrict hostPath prefixes. Admission policy for those exact paths, immutable
 digest-pinned release images, issuer-specific production automation, and complete
-uninstall orchestration remain production-hardening requirements. See
+uninstall orchestration remain production-hardening requirements. The report
+checkpoint is deliberately single-controller and is not an HA database. See
 [ADR 0025](../adr/0025-constrained-openshift-agent-scc.md) and
-[ADR 0026](../adr/0026-hot-certificate-and-trust-rotation.md).
+[ADR 0026](../adr/0026-hot-certificate-and-trust-rotation.md), and
+[ADR 0027](../adr/0027-durable-agent-acknowledgement-checkpoint.md).

@@ -63,3 +63,5 @@ TokenReview identity to every internal request. Native OpenShift IPv4 and
 dual-stack validations confirm projected audience tokens, TokenReview
 extras/RBAC, SCC behavior, Service CA integration, and the encrypted service
 path. Certificate and trust rotation is separately verified by ADR 0026.
+ADR 0027 durably checkpoints only reports that have passed this authentication
+and claim-binding path.

@@ -154,6 +154,14 @@ named-port resolution, protocol-only TCP activation/removal without UDP
 broadening, bounded `endPort` boundary enforcement and oversized-range rejection,
 bounded IPv4/IPv6 `ipBlock` allow/exception behavior and oversized-block rejection,
 Namespace relabel, and deletion/recreation convergence.
+
+The base deployment also creates `unf-agent-acknowledgements`. The controller
+owns only its `reports.json` data field and checkpoints authenticated reports at
+most once every two seconds; later `kubectl apply -k deploy` operations do not
+claim or clear that field. If an administrator corrupts the checkpoint, startup
+fails instead of trusting partial state. Repair or recreate that ConfigMap, then
+restart the controller; agents repopulate it through the authenticated path.
+
 It then applies `deploy/examples/networkpolicy-conformance.yaml`, whose policy
 deliberately omits `podSelector`, `policyTypes`, and port protocol. The verifier
 requires the namespace-wide target to isolate the probe's non-allowed port while

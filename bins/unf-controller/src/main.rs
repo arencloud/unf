@@ -16,11 +16,11 @@ use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
-use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::PostParams;
+use kube::api::{Patch, PatchParams, PostParams};
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, ResourceExt};
 use prometheus_client::encoding::text::encode;
@@ -54,6 +54,12 @@ const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
 const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
 const AGENT_AUTHENTICATION_CACHE_TTL: Duration = Duration::from_secs(30);
 const AGENT_AUTHENTICATION_CACHE_CAPACITY: usize = 64;
+const AGENT_REPORT_STORE_NAME: &str = "unf-agent-acknowledgements";
+const AGENT_REPORT_STORE_KEY: &str = "reports.json";
+const AGENT_REPORT_STORE_SCHEMA_VERSION: u16 = 1;
+const AGENT_REPORT_STORE_CAPACITY: usize = 1_024;
+const AGENT_REPORT_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
+const AGENT_REPORT_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF Kubernetes desired-state controller")]
@@ -102,6 +108,9 @@ struct ControllerMetrics {
     agent_authentication_failures: Counter,
     tls_reloads: Counter,
     tls_reload_errors: Counter,
+    agent_report_persistence_writes: Counter,
+    agent_report_persistence_errors: Counter,
+    agent_reports_restored: Counter,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -129,6 +138,8 @@ struct ControllerState {
     identities: Mutex<IdentityRegistry>,
     flow_history: Mutex<FlowHistoryStore>,
     agent_reports: RwLock<BTreeMap<String, StoredAgentReport>>,
+    agent_reports_dirty: AtomicBool,
+    agent_report_store: Option<Api<ConfigMap>>,
     agent_authentication_cache: Mutex<BTreeMap<String, CachedAgentAuthentication>>,
     token_review_client: Option<Client>,
     revisions: Mutex<RevisionSet>,
@@ -136,10 +147,16 @@ struct ControllerState {
     metrics: ControllerMetrics,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct StoredAgentReport {
     report: AgentStateReport,
     last_received_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct DurableAgentReportStore {
+    schema_version: u16,
+    reports: BTreeMap<String, StoredAgentReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +388,10 @@ async fn main() -> Result<()> {
     if args.offline {
         warn!("running without Kubernetes watchers");
     } else {
+        restore_agent_reports(&state)
+            .await
+            .context("restore durable agent acknowledgements")?;
+        spawn_agent_report_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         let client = client.context("Kubernetes client is required in connected mode")?;
         spawn_watchers(&mut tasks, client, Arc::clone(&state), cancellation.clone());
         state.ready.store(true, Ordering::Release);
@@ -611,6 +632,24 @@ fn new_state_with_client_and_selector(
         "Internal TLS certificate updates rejected while retaining last-known-good material",
         metrics.tls_reload_errors.clone(),
     );
+    registry.register(
+        "unf_agent_report_persistence_writes",
+        "Durable agent-report checkpoints written by the controller",
+        metrics.agent_report_persistence_writes.clone(),
+    );
+    registry.register(
+        "unf_agent_report_persistence_errors",
+        "Durable agent-report checkpoint reads or writes that failed",
+        metrics.agent_report_persistence_errors.clone(),
+    );
+    registry.register(
+        "unf_agent_reports_restored",
+        "Agent reports restored from the durable checkpoint at controller startup",
+        metrics.agent_reports_restored.clone(),
+    );
+    let agent_report_store = token_review_client
+        .clone()
+        .map(|client| Api::<ConfigMap>::namespaced(client, "unf-system"));
     ControllerState {
         ready: AtomicBool::new(offline),
         identity_epoch: controller_epoch(),
@@ -630,12 +669,148 @@ fn new_state_with_client_and_selector(
         identities: Mutex::new(IdentityRegistry::default()),
         flow_history: Mutex::new(FlowHistoryStore::default()),
         agent_reports: RwLock::new(BTreeMap::new()),
+        agent_reports_dirty: AtomicBool::new(false),
+        agent_report_store,
         agent_authentication_cache: Mutex::new(BTreeMap::new()),
         token_review_client,
         revisions: Mutex::new(RevisionSet::default()),
         registry: Mutex::new(registry),
         metrics,
     }
+}
+
+async fn restore_agent_reports(state: &ControllerState) -> Result<()> {
+    let api = state
+        .agent_report_store
+        .as_ref()
+        .context("durable agent-report API is unavailable")?;
+    let config_map = api
+        .get(AGENT_REPORT_STORE_NAME)
+        .await
+        .with_context(|| format!("read ConfigMap unf-system/{AGENT_REPORT_STORE_NAME}"))?;
+    let Some(encoded) = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(AGENT_REPORT_STORE_KEY))
+    else {
+        info!("durable agent acknowledgement store is empty");
+        return Ok(());
+    };
+    let reports = decode_agent_report_store(encoded, unix_time_millis())?;
+    let restored = reports.len() as u64;
+    *write_lock(&state.agent_reports) = reports;
+    state.metrics.agent_reports_restored.inc_by(restored);
+    info!(restored, "restored durable agent acknowledgements");
+    Ok(())
+}
+
+fn decode_agent_report_store(
+    encoded: &str,
+    now_unix_ms: u64,
+) -> Result<BTreeMap<String, StoredAgentReport>> {
+    let store: DurableAgentReportStore =
+        serde_json::from_str(encoded).context("decode durable agent-report checkpoint")?;
+    if store.schema_version != AGENT_REPORT_STORE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "unsupported durable agent-report schema {}; expected {}",
+            store.schema_version,
+            AGENT_REPORT_STORE_SCHEMA_VERSION
+        ));
+    }
+    if store.reports.len() > AGENT_REPORT_STORE_CAPACITY {
+        return Err(anyhow!(
+            "durable agent-report checkpoint contains {} entries; limit is {}",
+            store.reports.len(),
+            AGENT_REPORT_STORE_CAPACITY
+        ));
+    }
+    for (node_name, stored) in &store.reports {
+        if node_name != &stored.report.node_name {
+            return Err(anyhow!(
+                "durable agent-report key {node_name:?} does not match report node {:?}",
+                stored.report.node_name
+            ));
+        }
+        validate_agent_status(&stored.report).map_err(|error| {
+            anyhow!("invalid durable report for {node_name}: {}", error.message)
+        })?;
+        if stored.last_received_unix_ms == 0 {
+            return Err(anyhow!(
+                "durable agent report for {node_name} has no receive timestamp"
+            ));
+        }
+        if stored.last_received_unix_ms
+            > now_unix_ms.saturating_add(AGENT_REPORT_MAX_FUTURE_SKEW_MILLIS)
+        {
+            return Err(anyhow!(
+                "durable agent report for {node_name} is unreasonably far in the future"
+            ));
+        }
+    }
+    Ok(store.reports)
+}
+
+fn spawn_agent_report_persistence(
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+    tasks: &mut JoinSet<()>,
+) {
+    tasks.spawn(async move {
+        let mut interval = tokio::time::interval(AGENT_REPORT_PERSISTENCE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    persist_agent_reports_if_dirty(&state).await;
+                    break;
+                }
+                _ = interval.tick() => persist_agent_reports_if_dirty(&state).await,
+            }
+        }
+    });
+}
+
+async fn persist_agent_reports_if_dirty(state: &ControllerState) {
+    if !state.agent_reports_dirty.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if let Err(error) = persist_agent_reports(state).await {
+        state.agent_reports_dirty.store(true, Ordering::Release);
+        state.metrics.agent_report_persistence_errors.inc();
+        warn!(%error, "could not persist agent acknowledgements; retrying");
+    }
+}
+
+async fn persist_agent_reports(state: &ControllerState) -> Result<()> {
+    let api = state
+        .agent_report_store
+        .as_ref()
+        .context("durable agent-report API is unavailable")?;
+    let store = DurableAgentReportStore {
+        schema_version: AGENT_REPORT_STORE_SCHEMA_VERSION,
+        reports: read_lock(&state.agent_reports).clone(),
+    };
+    let encoded =
+        serde_json::to_string(&store).context("encode durable agent-report checkpoint")?;
+    let data = BTreeMap::from([(AGENT_REPORT_STORE_KEY.to_owned(), encoded)]);
+    let patch = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": AGENT_REPORT_STORE_NAME,
+            "namespace": "unf-system",
+        },
+        "data": data,
+    });
+    api.patch(
+        AGENT_REPORT_STORE_NAME,
+        &PatchParams::apply("unf-controller-agent-reports").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch ConfigMap unf-system/{AGENT_REPORT_STORE_NAME}"))?;
+    state.metrics.agent_report_persistence_writes.inc();
+    Ok(())
 }
 
 fn spawn_watchers(
@@ -1009,8 +1184,15 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             }
         }
         Event::Delete(node) => {
-            if write_lock(&state.nodes).remove(&node.name_any()).is_some() {
+            let node_name = node.name_any();
+            if write_lock(&state.nodes).remove(&node_name).is_some() {
                 bump_topology_revision(state);
+            }
+            if write_lock(&state.agent_reports)
+                .remove(&node_name)
+                .is_some()
+            {
+                state.agent_reports_dirty.store(true, Ordering::Release);
             }
         }
         Event::Init => {
@@ -1020,7 +1202,15 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
                 bump_topology_revision(state);
             }
         }
-        Event::InitDone => {}
+        Event::InitDone => {
+            let nodes = read_lock(&state.nodes);
+            let mut reports = write_lock(&state.agent_reports);
+            let previous_len = reports.len();
+            reports.retain(|node_name, _| nodes.contains_key(node_name));
+            if reports.len() != previous_len {
+                state.agent_reports_dirty.store(true, Ordering::Release);
+            }
+        }
     }
 }
 
@@ -1542,7 +1732,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         agents,
         limitations: [
             "desired state and identity allocations are currently in-memory only",
-            "agent snapshots, telemetry, and acknowledgements use a dedicated TLS service plus Pod-bound Kubernetes TokenReview authentication; certificate rotation currently requires a coordinated workload rollout",
+            "agent acknowledgements use a bounded single-controller ConfigMap checkpoint; telemetry history remains current-process only",
         ],
     }))
 }
@@ -1571,13 +1761,21 @@ async fn ingest_agent_status(
         return Err(error);
     }
     validate_agent_status(&report)?;
-    write_lock(&state.agent_reports).insert(
+    let mut reports = write_lock(&state.agent_reports);
+    if !reports.contains_key(&report.node_name) && reports.len() >= AGENT_REPORT_STORE_CAPACITY {
+        return Err(ApiError::service_unavailable(
+            "durable agent-report capacity is exhausted",
+        ));
+    }
+    reports.insert(
         report.node_name.clone(),
         StoredAgentReport {
             report,
             last_received_unix_ms: unix_time_millis(),
         },
     );
+    drop(reports);
+    state.agent_reports_dirty.store(true, Ordering::Release);
     state.metrics.agent_status_reports.inc();
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3325,6 +3523,115 @@ mod tests {
             policy_map_entries: 1,
             active_policy_bank: 0,
         }
+    }
+
+    #[test]
+    fn durable_agent_report_store_round_trips_validated_state() {
+        let stored = StoredAgentReport {
+            report: converged_agent_report(7),
+            last_received_unix_ms: 10_000,
+        };
+        let store = DurableAgentReportStore {
+            schema_version: AGENT_REPORT_STORE_SCHEMA_VERSION,
+            reports: BTreeMap::from([("worker-a".to_owned(), stored.clone())]),
+        };
+        let encoded = serde_json::to_string(&store).expect("durable store encodes");
+
+        let decoded = decode_agent_report_store(&encoded, 10_001)
+            .expect("valid durable acknowledgement is restored");
+
+        assert_eq!(decoded, BTreeMap::from([("worker-a".to_owned(), stored)]));
+    }
+
+    #[test]
+    fn durable_agent_report_store_rejects_untrusted_shape_and_time() {
+        let stored = StoredAgentReport {
+            report: converged_agent_report(7),
+            last_received_unix_ms: 100_000,
+        };
+        let mismatched = DurableAgentReportStore {
+            schema_version: AGENT_REPORT_STORE_SCHEMA_VERSION,
+            reports: BTreeMap::from([("worker-b".to_owned(), stored.clone())]),
+        };
+        assert!(
+            decode_agent_report_store(
+                &serde_json::to_string(&mismatched).expect("store encodes"),
+                100_000,
+            )
+            .is_err()
+        );
+
+        let future = DurableAgentReportStore {
+            schema_version: AGENT_REPORT_STORE_SCHEMA_VERSION,
+            reports: BTreeMap::from([("worker-a".to_owned(), stored)]),
+        };
+        assert!(
+            decode_agent_report_store(&serde_json::to_string(&future).expect("store encodes"), 1,)
+                .is_err()
+        );
+
+        let wrong_schema = DurableAgentReportStore {
+            schema_version: AGENT_REPORT_STORE_SCHEMA_VERSION + 1,
+            reports: BTreeMap::new(),
+        };
+        assert!(
+            decode_agent_report_store(
+                &serde_json::to_string(&wrong_schema).expect("store encodes"),
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn node_deletion_retires_its_durable_agent_report() {
+        let state = new_state(true);
+        let mut node = Node::default();
+        node.metadata.name = Some("worker-a".to_owned());
+        apply_node_event(&state, Event::Apply(node.clone()));
+        write_lock(&state.agent_reports).insert(
+            "worker-a".to_owned(),
+            StoredAgentReport {
+                report: converged_agent_report(state.identity_epoch),
+                last_received_unix_ms: 10_000,
+            },
+        );
+
+        apply_node_event(&state, Event::Delete(node));
+
+        assert!(read_lock(&state.agent_reports).is_empty());
+        assert!(state.agent_reports_dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn node_initialization_retires_reports_deleted_while_controller_was_offline() {
+        let state = new_state(true);
+        for node_name in ["worker-a", "departed-worker"] {
+            let mut report = converged_agent_report(state.identity_epoch);
+            report.node_name = node_name.to_owned();
+            write_lock(&state.agent_reports).insert(
+                node_name.to_owned(),
+                StoredAgentReport {
+                    report,
+                    last_received_unix_ms: 10_000,
+                },
+            );
+        }
+        let mut active_node = Node::default();
+        active_node.metadata.name = Some("worker-a".to_owned());
+
+        apply_node_event(&state, Event::Init);
+        apply_node_event(&state, Event::InitApply(active_node));
+        apply_node_event(&state, Event::InitDone);
+
+        assert_eq!(
+            read_lock(&state.agent_reports)
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["worker-a"]
+        );
+        assert!(state.agent_reports_dirty.load(Ordering::Acquire));
     }
 
     fn successful_agent_token_review(report: &AgentStateReport) -> TokenReviewStatus {

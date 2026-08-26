@@ -67,5 +67,6 @@ original distribution decision.
 - measured entry count, update latency, and memory limits at production scale;
 - map-in-map compatibility and migration from the bank-in-key representation;
 - map pinning, agent restart recovery, and last-known-good persistence;
-- authenticated node-specific state distribution and durable acknowledgements;
+- highly available acknowledgement coordination beyond ADR 0027's bounded
+  single-controller checkpoint;
 - compact unbounded-CIDR, port-range, and external-identity representations.

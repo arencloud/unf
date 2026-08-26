@@ -131,10 +131,9 @@ tests still run on stable in the host workspace. See ADR 0002.
 
 The legacy netlink path, encrypted internal transport, and IPv4/IPv6 policy
 provenance now have repeatable evidence on separate OpenShift 4.22 IPv4-only and
-dual-stack clusters running RHCOS 9.8 kernel 5.14. Next, automate
 dual-stack clusters running RHCOS 9.8 kernel 5.14. Next, add path-specific
-host-mount admission policy and durable agent acknowledgement
-retention. Certificate/trust hot rotation is now live-verified across an
-overlapping external-PKI handoff and OpenShift Service CA restoration. The
-OpenShift agent already uses the constrained three-capability boundary defined by
-ADR 0025.
+host-mount admission policy. Durable agent acknowledgement retention and
+certificate/trust hot rotation are now live-verified across controller
+replacement, an overlapping external-PKI handoff, and OpenShift Service CA
+restoration. The OpenShift agent already uses the constrained three-capability
+boundary defined by ADR 0025.
