@@ -942,6 +942,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_empty_sources_and_ports_are_wildcards() {
+        let compiled = NetworkPolicyCompiler::compile(
+            PolicyId::new(7),
+            policy(vec![NetworkPolicyIngressRule {
+                from: Some(Vec::new()),
+                ports: Some(Vec::new()),
+            }]),
+        )
+        .expect("explicit empty source and port lists compile");
+        assert_eq!(compiled.rules.len(), 1);
+        assert_eq!(compiled.rules[0].source, IdentitySelector::default());
+        assert_eq!(compiled.rules[0].protocol, None);
+        assert_eq!(compiled.rules[0].destination_port, DestinationPort::Any);
+    }
+
+    #[test]
     fn protocol_only_ports_lower_without_broadening_other_protocols() {
         let compiled = NetworkPolicyCompiler::compile(
             PolicyId::new(7),

@@ -1064,9 +1064,16 @@ if "${kc[@]}" exec -n frontend client -- \
     echo "NetworkPolicy compatibility deny failed after policy reconvergence" >&2
     exit 1
 fi
-sleep 1
-
-flow_logs=$(all_agent_logs)
+for _ in {1..10}; do
+    flow_logs=$(all_agent_logs)
+    current_ipv6_deny=$(grep '"destination_port":9090' <<<"${flow_logs}" \
+        | grep '"address_family":6' | grep '"verdict":"Deny"' | grep '"reason":2' \
+        | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
+    if [[ -n ${current_ipv6_deny} ]]; then
+        break
+    fi
+    sleep 1
+done
 allow_line=$(grep '"destination_port":8080' <<<"${flow_logs}" \
     | grep '"verdict":"Allow"' | grep "\"policy_revision\":${enforced_policy_revision}" \
     | tail -n 1 || true)

@@ -114,6 +114,8 @@ matrix and reproducible evidence.
 - Implemented and two-node kind verified: supported ingress `NetworkPolicy`
   translation, additive semantics, controller reconciliation/status, shared
   dataplane enforcement/provenance, pod/Namespace label-expression selectors,
+  explicit empty `from`/`ports` wildcard semantics, multi-port OR without
+  protocol broadening, empty same-Namespace peer PodSelectors,
   destination-aware named-port lowering, namespace relabel convergence without
   identity churn, protocol-only TCP/UDP/SCTP wildcard lowering, bounded numeric
   `endPort` ranges with map-capacity guards, bounded IPv4 exact-source and IPv6
@@ -123,7 +125,8 @@ matrix and reproducible evidence.
   rejection/deletion recovery; IPv4 SCTP parsing/enforcement, live explanation,
   revisioned provenance, and historical export; an upstream-aligned live ingress
   matrix for default deny, same/all/exact-Namespace peers, Namespace `NotIn`
-  exclusion, selector AND, peer OR, Pod/Namespace `matchExpressions`,
+  exclusion, all four Pod/Namespace selector operators, selector AND, peer OR,
+  explicit empty source/port lists, multi-port OR,
   multiple ingress-rule source/port pairing,
   exact/protocol-only UDP isolation, destination-specific named ports,
   destination selection lifecycle, source-label recovery, stacked additive

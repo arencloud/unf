@@ -318,6 +318,16 @@ expect_deny "${source_b_namespace}" client 8087
 
 previous_revision=${policy_revision}
 "${kc[@]}" patch networkpolicy -n "${target_namespace}" ingress-matrix --type=merge \
+    -p '{"spec":{"ingress":[{"from":[{"podSelector":{}}],"ports":[{"protocol":"TCP","port":8087}]}]}}' \
+    >/dev/null
+require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
+    "${previous_revision}" "empty same-Namespace PodSelector policy did not converge"
+expect_allow "${target_namespace}" same-client 8087
+expect_deny "${source_a_namespace}" client 8087
+expect_deny "${source_b_namespace}" client 8087
+
+previous_revision=${policy_revision}
+"${kc[@]}" patch networkpolicy -n "${target_namespace}" ingress-matrix --type=merge \
     -p '{"spec":{"ingress":[{"from":[{"namespaceSelector":{}}],"ports":[{"protocol":"TCP","port":8087}]}]}}' \
     >/dev/null
 require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
@@ -398,6 +408,30 @@ previous_revision=${policy_revision}
 require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
     "${previous_revision}" "DoesNotExist source-label recovery did not converge"
 expect_allow "${source_b_namespace}" client 8088
+
+previous_revision=${policy_revision}
+"${kc[@]}" patch networkpolicy -n "${target_namespace}" ingress-matrix --type=merge \
+    -p '{"spec":{"ingress":[{"from":[{"namespaceSelector":{"matchExpressions":[{"key":"conformance-group","operator":"Exists"},{"key":"conformance-excluded","operator":"DoesNotExist"}]},"podSelector":{"matchExpressions":[{"key":"conformance-source","operator":"NotIn","values":["same"]}]}}],"ports":[{"protocol":"TCP","port":8087}]}]}}' \
+    >/dev/null
+require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
+    "${previous_revision}" "remaining selector operators did not converge"
+expect_allow "${source_a_namespace}" client 8087
+expect_allow "${source_b_namespace}" client 8087
+expect_deny "${target_namespace}" same-client 8087
+
+previous_revision=${policy_revision}
+"${kc[@]}" label namespace "${source_b_namespace}" \
+    conformance-excluded=true --overwrite >/dev/null
+require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
+    "${previous_revision}" "Namespace DoesNotExist transition did not converge"
+expect_allow "${source_a_namespace}" client 8087
+expect_deny "${source_b_namespace}" client 8087
+
+previous_revision=${policy_revision}
+"${kc[@]}" label namespace "${source_b_namespace}" conformance-excluded- >/dev/null
+require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
+    "${previous_revision}" "Namespace DoesNotExist recovery did not converge"
+expect_allow "${source_b_namespace}" client 8087
 
 previous_revision=${policy_revision}
 "${kc[@]}" patch networkpolicy -n "${target_namespace}" ingress-matrix --type=merge \
@@ -599,6 +633,74 @@ expect_protocol_allow \
     "${source_a_namespace}" client tcp "${protocol_server_ip}" 8090
 
 previous_revision=${policy_revision}
+"${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: empty-list-semantics
+  namespace: ${target_namespace}
+spec:
+  podSelector:
+    matchLabels:
+      protocol-target: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from: []
+      ports:
+        - protocol: UDP
+          port: 8090
+        - protocol: TCP
+          port: 8091
+EOF
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "explicit empty source and multi-port policy did not converge"
+for source in \
+    "${target_namespace} same-client" \
+    "${source_a_namespace} client" \
+    "${source_b_namespace} client"; do
+    read -r namespace pod <<<"${source}"
+    expect_protocol_allow "${namespace}" "${pod}" udp "${protocol_server_ip}" 8090
+    expect_protocol_allow "${namespace}" "${pod}" tcp "${protocol_server_ip}" 8091
+    expect_protocol_deny "${namespace}" "${pod}" tcp "${protocol_server_ip}" 8090
+    expect_protocol_deny "${namespace}" "${pod}" udp "${protocol_server_ip}" 8091
+done
+expect_protocol_explanation_to \
+    "${source_b_namespace}/client" protocol-server udp 8090 Allow ExplicitRule
+expect_protocol_explanation_to \
+    "${source_b_namespace}/client" protocol-server tcp 8090 Deny DefaultAction
+
+previous_revision=${policy_revision}
+"${kc[@]}" patch networkpolicy -n "${target_namespace}" \
+    empty-list-semantics --type=merge \
+    -p '{"spec":{"ingress":[{"from":[{"namespaceSelector":{"matchLabels":{"conformance-group":"a"}}}],"ports":[]}]}}' \
+    >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "explicit empty port policy did not converge"
+for protocol in tcp udp; do
+    for port in 8090 8091; do
+        expect_protocol_allow \
+            "${source_a_namespace}" client "${protocol}" "${protocol_server_ip}" "${port}"
+        expect_protocol_deny \
+            "${source_b_namespace}" client "${protocol}" "${protocol_server_ip}" "${port}"
+    done
+done
+expect_protocol_explanation_to \
+    "${source_a_namespace}/client" protocol-server udp 8091 Allow ExplicitRule
+expect_protocol_explanation_to \
+    "${source_b_namespace}/client" protocol-server tcp 8091 Deny DefaultAction
+
+previous_revision=${policy_revision}
+"${kc[@]}" delete networkpolicy -n "${target_namespace}" \
+    empty-list-semantics >/dev/null
+require_policy_state "$((baseline_count + 2))" "${baseline_rejected}" \
+    "${previous_revision}" "empty-list policy deletion did not reconverge"
+expect_protocol_allow \
+    "${source_b_namespace}" client udp "${protocol_server_ip}" 8091
+expect_protocol_allow \
+    "${source_b_namespace}" client tcp "${protocol_server_ip}" 8090
+
+previous_revision=${policy_revision}
 cleanup
 for namespace in "${target_namespace}" "${source_a_namespace}" "${source_b_namespace}"; do
     if ! "${kc[@]}" wait --for=delete namespace/"${namespace}" --timeout=120s >/dev/null; then
@@ -611,4 +713,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned ingress conformance passed: exact/protocol-only UDP isolation, destination-specific named ports, target Pod label isolation/recovery, default deny, same-namespace PodSelector, empty/exact-name/NotIn NamespaceSelector, selector AND, peer OR, matchExpressions with label recovery, multiple ingress rules, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned ingress conformance passed: explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific named ports, target Pod label isolation/recovery, default deny, same-namespace empty/labeled PodSelector, empty/exact-name NamespaceSelector, all selector operators with Pod/Namespace label recovery, selector AND, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"

@@ -149,12 +149,14 @@ Implemented in the repository:
   IPv4/IPv6 `ipBlock`
   enforcement and rejection recovery, named/protocol-only SCTP enforcement,
   namespace-wide target isolation/defaulting, same-Namespace and all-Namespace
-  peers, exact Namespace-name and Namespace `NotIn` selection, peer OR/selector
-  AND semantics, Pod/Namespace expressions, multiple ingress rules,
+  peers, explicit empty source/port wildcards, multi-port OR, empty/labeled
+  same-Namespace PodSelectors, exact Namespace-name selection, all four
+  Pod/Namespace selector operators, peer OR/selector AND semantics, multiple
+  ingress rules,
   exact/protocol-only UDP isolation, per-destination named-port
-  resolution, source and destination label-driven recovery, stacked additive
-  allows and allow-all recovery, revisioned eBPF provenance, and live policy
-  explanations, plus a
+  resolution, source, destination, and Namespace label-driven recovery, stacked
+  additive allows and allow-all recovery, revisioned eBPF provenance, and live
+  policy explanations, plus a
   versioned EndpointSlice backend-readiness lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, workload/data-plane encryption,

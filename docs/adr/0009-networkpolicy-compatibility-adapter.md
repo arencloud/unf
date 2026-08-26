@@ -48,9 +48,11 @@ Kubernetes API defaults are resolved at the compatibility boundary. An omitted
 `spec.podSelector` is the empty selector and therefore selects every Pod in the
 policy Namespace. For the supported ingress-only shape with `egress` omitted,
 omitted `policyTypes` implies ingress, and an omitted port protocol means TCP. A
-Pod not selected by any ingress policy remains non-isolated. These defaults
-compile into ordinary shared IR selectors and rules; they are not special cases
-in the evaluator or dataplane.
+Pod not selected by any ingress policy remains non-isolated. Omitted and
+explicitly empty ingress `from` or `ports` lists compile to source and
+protocol/port wildcards respectively; non-empty list entries retain Kubernetes
+OR semantics. These defaults compile into ordinary shared IR selectors and
+rules; they are not special cases in the evaluator or dataplane.
 
 The controller watches `NetworkPolicy` objects cluster-wide and assigns each a
 stable compatibility policy ID. Accepted IR joins native policy in the revisioned
@@ -87,5 +89,7 @@ separate cross-node fixture proves named SCTP allow/default isolation,
 protocol-only SCTP wildcard activation/removal, revisioned dataplane provenance,
 and enriched historical export. An upstream-aligned three-Namespace matrix proves
 same-Namespace PodSelector scope, empty NamespaceSelector behavior, selector AND,
-peer OR, stacked additive allows, and allow-all deletion recovery. These remain
-bounded compatibility claims rather than full upstream conformance.
+peer OR, explicit empty-list wildcards, multi-port OR, all selector operators,
+Pod/Namespace label recovery, stacked additive allows, and allow-all deletion
+recovery. These remain bounded compatibility claims rather than full upstream
+conformance.
