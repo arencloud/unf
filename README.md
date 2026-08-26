@@ -37,8 +37,9 @@ The resolved-identity fast path
 is now dual-stack for IPv4/IPv6 TCP/UDP/SCTP, including verifier-bounded IPv6
 extension-header traversal; native policy and selector-based NetworkPolicy IPv6
 decisions are live-verified. The upstream-aligned three-Namespace ingress matrix
-now runs every supported selector, additive-policy, named-port, and TCP/UDP
-protocol-isolation transition against direct IPv4 and IPv6 Pod addresses.
+now runs every supported selector—including homogeneous multi-`podSelector`
+peer OR—additive-policy, named-port, and TCP/UDP protocol-isolation transition
+against direct IPv4 and IPv6 Pod addresses.
 Identity and policy updates now use independent transactional banks selected by
 atomic configuration-map writes. All nine enforcement maps persist in an
 ABI-versioned bpffs directory; replacement agents validate and adopt
@@ -155,8 +156,9 @@ Implemented in the repository:
   enforcement and rejection recovery, named/protocol-only SCTP enforcement,
   namespace-wide target isolation/defaulting, same-Namespace and all-Namespace
   peers, explicit empty source/port wildcards, multi-port OR, empty/labeled
-  same-Namespace PodSelectors, exact Namespace-name selection, all four
-  Pod/Namespace selector operators, peer OR/selector AND semantics, multiple
+  same-Namespace PodSelectors, multiple same-Namespace PodSelector peer OR,
+  exact Namespace-name selection, all four Pod/Namespace selector operators,
+  peer OR/selector AND semantics, multiple
   ingress rules,
   exact/protocol-only UDP isolation, per-destination named-port resolution and
   nonexistent named-port fail-closed behavior, all four destination-selector

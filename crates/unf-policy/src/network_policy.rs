@@ -1722,6 +1722,93 @@ mod tests {
     }
 
     #[test]
+    fn multiple_pod_selector_peers_are_ored_within_the_policy_namespace() {
+        let mut first_local_source = endpoint(1, "backend", "client-a");
+        first_local_source
+            .labels
+            .extend(labels(&[("conformance-source", "same")]));
+        let second_local_source = endpoint(2, "backend", "alternate-server");
+        let third_local_source = endpoint(3, "backend", "client-c");
+        let mut remote_matching_source = endpoint(4, "frontend", "client-a");
+        remote_matching_source
+            .labels
+            .extend(labels(&[("conformance-source", "same")]));
+        let destination = endpoint(5, "backend", "server");
+
+        let compiled = NetworkPolicyCompiler::compile(
+            PolicyId::new(15),
+            policy(vec![NetworkPolicyIngressRule {
+                from: Some(vec![
+                    NetworkPolicyPeer {
+                        pod_selector: Some(selector(&[("conformance-source", "same")])),
+                        ..NetworkPolicyPeer::default()
+                    },
+                    NetworkPolicyPeer {
+                        pod_selector: Some(selector(&[("app", "alternate-server")])),
+                        ..NetworkPolicyPeer::default()
+                    },
+                ]),
+                ports: Some(vec![NetworkPolicyPort {
+                    port: Some(IntOrString::Int(8087)),
+                    protocol: Some("TCP".to_owned()),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }]),
+        )
+        .expect("multiple PodSelector peers compile as same-Namespace alternatives");
+        let decision = |source: &Endpoint, port| {
+            evaluate(
+                std::slice::from_ref(&compiled),
+                Flow {
+                    source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: port,
+                    source_ipv4: None,
+                    source_ipv6: None,
+                },
+            )
+        };
+
+        for source in [&first_local_source, &second_local_source] {
+            let allowed = decision(source, 8087);
+            assert_eq!(allowed.verdict, Verdict::Allow);
+            assert_eq!(allowed.reason, PolicyReason::ExplicitRule);
+            assert_eq!(decision(source, 8088).verdict, Verdict::Deny);
+        }
+        for source in [&third_local_source, &remote_matching_source] {
+            let denied = decision(source, 8087);
+            assert_eq!(denied.verdict, Verdict::Deny);
+            assert_eq!(denied.reason, PolicyReason::DefaultAction);
+        }
+
+        let entries = compile_dataplane_entries(
+            std::slice::from_ref(&compiled),
+            &[
+                first_local_source,
+                second_local_source,
+                third_local_source,
+                remote_matching_source,
+                destination,
+            ],
+        )
+        .expect("both same-Namespace peer alternatives lower into dataplane entries");
+        let exact_allow = |source_identity| {
+            entries.iter().any(|entry| {
+                entry.key.source_identity == IdentityId::new(source_identity)
+                    && entry.key.destination_identity == IdentityId::new(5)
+                    && entry.key.protocol == Protocol::Tcp as u8
+                    && entry.key.destination_port == 8087
+                    && entry.decision.verdict == Verdict::Allow
+            })
+        };
+        assert!(exact_allow(1));
+        assert!(exact_allow(2));
+        assert!(!exact_allow(3));
+        assert!(!exact_allow(4));
+    }
+
+    #[test]
     fn upstream_expression_rules_preserve_source_port_pairing() {
         let mut same_namespace = endpoint(1, "backend", "same-client");
         same_namespace

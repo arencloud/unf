@@ -89,7 +89,8 @@ separate cross-node fixture proves named SCTP allow/default isolation,
 protocol-only SCTP wildcard activation/removal, revisioned dataplane provenance,
 and enriched historical export. An upstream-aligned three-Namespace matrix proves
 same-Namespace PodSelector scope, empty NamespaceSelector behavior, selector AND,
-peer OR, explicit empty-list wildcards, multi-port OR, all selector operators,
+homogeneous multiple-PodSelector and heterogeneous peer OR, explicit empty-list
+wildcards, multi-port OR, all selector operators,
 Pod/Namespace label recovery, stacked additive allows, and allow-all deletion
 recovery. Direct IPv4 and IPv6 Pod traffic now exercises every transition,
 including destination-specific named ports, nonexistent-port fail-closed
