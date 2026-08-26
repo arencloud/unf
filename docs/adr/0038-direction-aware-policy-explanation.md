@@ -46,3 +46,6 @@ must share the chosen family.
 
 This does not yet add NetworkPolicy what-if simulation or retain policy direction
 in historical flow keys. Those are separate schema and API changes.
+
+ADR 0039 subsequently retained direction in flow export/history and made
+historical evaluation direction-aware. NetworkPolicy what-if input remains open.

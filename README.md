@@ -17,8 +17,10 @@ controller, policy engine, and dataplane. A read-only policy simulation foundati
 now compares candidate native policy against revision-fenced live topology without
 applying it. Versioned topology snapshots expose Nodes, workload placement,
 Services, selector intent, and EndpointSlice-derived runtime backend readiness.
-Node agents also export destination-resolved flow observations into bounded,
-revisioned history for operator queries and policy impact analysis. The controller
+Node agents also export direction-selected flow observations into bounded,
+revisioned history for operator queries and policy impact analysis. Ingress and
+egress decisions remain distinct logical keys, including external egress from a
+resolved source. The controller
 checkpoints the newest bounded subset across restarts, and `unfctl flows` supports
 inclusive last-received-time windows and newest-first limits. Agents publish revisioned status
 acknowledgements using Pod-bound, audience-scoped Kubernetes tokens; TokenReview

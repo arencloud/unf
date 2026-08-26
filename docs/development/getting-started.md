@@ -229,8 +229,9 @@ not ready to ready, verifies deletion removes runtime state while selector inten
 stays empty, and proves the independent topology/service revisions advance without
 changing policy revision. It also requires agents to export the live
 frontend-to-backend flow, queries bounded history, and verifies
-observation-weighted historical policy impact. Flow snapshot schema v3 must retain
-an enriched direct-address IPv6 flow; agent export remains schema v2.
+observation-weighted historical policy impact. Flow snapshot schema v4 must retain
+direction-separated IPv4/IPv6 flow keys; agent export uses schema v3 and the
+durable checkpoint migrates schema-v1 records to ingress before writing schema v2.
 The host kernel is shared with kind nodes. `make kind-down`
 deletes only the named `unf-dev` cluster.
 

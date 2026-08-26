@@ -234,6 +234,35 @@ expect_egress_explanation() {
     fi
 }
 
+expect_egress_history() {
+    local family=$1 source_address=$2 destination_address=$3 port=$4 verdict=$5 revision=$6
+    local history
+    for _ in {1..30}; do
+        history=$("${unfctl}" --controller-url "${controller_url}" --output json flows)
+        if jq -e --arg family "${family}" --arg source "${source_address}" \
+            --arg destination "${destination_address}" --arg verdict "${verdict}" \
+            --argjson port "${port}" --argjson revision "${revision}" '
+                .schema_version == 4
+                and any(.entries[];
+                    .key.direction == "Egress"
+                    and .key.destination_port == $port
+                    and .policy_revision == $revision
+                    and .decision.verdict == $verdict
+                    and (if $family == "ipv4" then
+                        .key.source_ipv4 == $source and .key.destination_ipv4 == $destination
+                    else
+                        .key.source_ipv6 == $source and .key.destination_ipv6 == $destination
+                    end))
+            ' <<<"${history}" >/dev/null; then
+            return 0
+        fi
+        tcp_exchange client "${destination_address}" "${port}" >/dev/null 2>&1 || true
+        sleep 1
+    done
+    echo "egress ${family} ${verdict} flow was not retained with direction" >&2
+    exit 1
+}
+
 cleanup
 for namespace in "${source_namespace}" "${allowed_namespace}" "${denied_namespace}"; do
     "${kc[@]}" wait --for=delete namespace/"${namespace}" --timeout=60s \
@@ -361,6 +390,12 @@ if ! expect_direction_provenance "${selector_revision}" 8081 Deny 3 false; then
     echo "egress default deny did not emit direction-correct provenance" >&2
     exit 1
 fi
+expect_egress_history ipv4 "${source_ipv4}" "${allowed_ipv4}" \
+    8080 Allow "${selector_revision}"
+expect_egress_history ipv6 "${source_ipv6}" "${allowed_ipv6}" \
+    8080 Allow "${selector_revision}"
+expect_egress_history ipv4 "${source_ipv4}" "${allowed_ipv4}" \
+    8081 Deny "${selector_revision}"
 
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: networking.k8s.io/v1
@@ -472,4 +507,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" \
     exit 1
 fi
 
-echo "dual-stack NetworkPolicy egress qualification passed: selected-source default isolation, non-selected pass-through, Namespace/Pod selector AND, named TCP and UDP ports, protocol-only SCTP, IPv4/IPv6 ipBlock exceptions, direction-correct explanation and allow/deny provenance, deletion recovery, and exact fixture cleanup"
+echo "dual-stack NetworkPolicy egress qualification passed: selected-source default isolation, non-selected pass-through, Namespace/Pod selector AND, named TCP and UDP ports, protocol-only SCTP, IPv4/IPv6 ipBlock exceptions, direction-correct explanation, retained history, and allow/deny provenance, deletion recovery, and exact fixture cleanup"

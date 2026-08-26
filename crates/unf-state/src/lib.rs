@@ -5,14 +5,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
+use unf_common::{IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
-pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 2;
-pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
-pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
+pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 3;
+pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
+pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 2;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
@@ -76,6 +76,8 @@ pub struct AgentConvergenceSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FlowHistoryKey {
+    #[serde(default)]
+    pub direction: PolicyDirection,
     pub source_identity: IdentityId,
     pub destination_identity: IdentityId,
     pub source_ipv4: Option<Ipv4Addr>,
@@ -410,7 +412,9 @@ impl FlowHistoryStore {
         checkpoint: FlowHistoryCheckpoint,
         capacity: usize,
     ) -> Result<Self, FlowHistoryCheckpointError> {
-        if checkpoint.schema_version != FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION {
+        if checkpoint.schema_version != 1
+            && checkpoint.schema_version != FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION
+        {
             return Err(FlowHistoryCheckpointError::UnsupportedSchema {
                 actual: checkpoint.schema_version,
                 expected: FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION,
@@ -1151,6 +1155,7 @@ mod tests {
     ) -> FlowExportRecord {
         FlowExportRecord {
             key: FlowHistoryKey {
+                direction: PolicyDirection::Ingress,
                 source_identity: IdentityId::new(source),
                 destination_identity: IdentityId::new(destination),
                 source_ipv4: None,
@@ -1204,6 +1209,40 @@ mod tests {
         );
         assert_eq!(snapshot.entries[0].first_received_unix_ms, 100);
         assert_eq!(snapshot.entries[0].last_received_unix_ms, 200);
+    }
+
+    #[test]
+    fn flow_history_keeps_ingress_and_egress_decisions_separate() {
+        let ingress = flow_record(1, 2, 8080, 2);
+        let mut egress = ingress.clone();
+        egress.key.direction = PolicyDirection::Egress;
+        egress.observed_events = 3;
+        let mut store = FlowHistoryStore::with_capacity(2);
+        store.ingest(
+            FlowExportBatch {
+                schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                node_name: "worker-a".to_owned(),
+                dropped_events: 0,
+                entries: vec![ingress, egress],
+            },
+            100,
+        );
+
+        let snapshot = store.snapshot(17);
+        assert_eq!(snapshot.retained_flows, 2);
+        assert_eq!(snapshot.retained_observations, 5);
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.key.direction == PolicyDirection::Ingress)
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.key.direction == PolicyDirection::Egress)
+        );
     }
 
     #[test]
@@ -1296,6 +1335,20 @@ mod tests {
             400,
         );
         assert_eq!(restored.snapshot(99).agent_dropped_events, 4);
+
+        let mut legacy = serde_json::to_value(store.checkpoint(1)).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        legacy["entries"][0]["key"]
+            .as_object_mut()
+            .expect("legacy key is an object")
+            .remove("direction");
+        let legacy: FlowHistoryCheckpoint = serde_json::from_value(legacy).unwrap();
+        let migrated = FlowHistoryStore::from_checkpoint(legacy, 3)
+            .expect("schema-v1 checkpoint defaults to ingress");
+        assert_eq!(
+            migrated.snapshot(99).entries[0].key.direction,
+            PolicyDirection::Ingress
+        );
     }
 
     #[test]

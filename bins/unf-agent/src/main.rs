@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
+use unf_common::{IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 use unf_ebpf_common::{
     FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey,
     Ipv6IdentityKey, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
@@ -1933,7 +1933,7 @@ async fn consume_events(
                     state.metrics.flow_events.inc();
                     state.observed_flows.fetch_add(1, Ordering::Relaxed);
                     if let Some(sender) = flow_export_sender
-                        && event.flow.destination_identity.get() != 0
+                        && event_has_selected_identity(&event)
                     {
                         enqueue_flow_export(sender, state, flow_export_record(&event));
                     }
@@ -2004,6 +2004,7 @@ fn record_telemetry_drop(state: &AgentState, count: u64) {
 fn flow_export_record(event: &FlowEvent) -> FlowExportRecord {
     FlowExportRecord {
         key: FlowHistoryKey {
+            direction: policy_direction(event.direction).unwrap_or_default(),
             source_identity: event.flow.source_identity,
             destination_identity: event.flow.destination_identity,
             source_ipv4: event_ipv4(event.flow.address_family, event.flow.source_address),
@@ -2027,6 +2028,22 @@ fn flow_export_record(event: &FlowEvent) -> FlowExportRecord {
             rule_id: rule_id_for_reason(event.shadow_rule_id, event.shadow_reason),
         }),
         observed_events: 1,
+    }
+}
+
+const fn policy_direction(direction: u8) -> Option<PolicyDirection> {
+    match direction {
+        1 => Some(PolicyDirection::Ingress),
+        2 => Some(PolicyDirection::Egress),
+        _ => None,
+    }
+}
+
+fn event_has_selected_identity(event: &FlowEvent) -> bool {
+    match policy_direction(event.direction) {
+        Some(PolicyDirection::Ingress) => event.flow.destination_identity.get() != 0,
+        Some(PolicyDirection::Egress) => event.flow.source_identity.get() != 0,
+        None => false,
     }
 }
 
@@ -3756,7 +3773,7 @@ fn decode_event(bytes: &[u8]) -> Option<FlowEvent> {
         3 => Verdict::Audit,
         _ => return None,
     };
-    if bytes[91] > Verdict::Audit as u8 {
+    if policy_direction(bytes[89]).is_none() || bytes[91] > Verdict::Audit as u8 {
         return None;
     }
     Some(FlowEvent {
@@ -4071,6 +4088,7 @@ mod tests {
         bytes[84..86].copy_from_slice(&FLOW_ABI_VERSION.to_ne_bytes());
         let event_size = u16::try_from(size_of::<FlowEvent>()).expect("event ABI fits in u16");
         bytes[86..88].copy_from_slice(&event_size.to_ne_bytes());
+        bytes[89] = PolicyDirection::Ingress as u8;
         let event = decode_event(&bytes).expect("versioned event is valid");
         assert_eq!(event.timestamp_ns, 0);
         assert_eq!(event.flow.source_port, [0, 0]);
@@ -4174,6 +4192,7 @@ mod tests {
     fn test_flow_record(port: u16) -> FlowExportRecord {
         FlowExportRecord {
             key: FlowHistoryKey {
+                direction: PolicyDirection::Ingress,
                 source_identity: IdentityId::new(1),
                 destination_identity: IdentityId::new(2),
                 source_ipv4: Some(Ipv4Addr::new(10, 42, 0, 1)),
@@ -4257,6 +4276,7 @@ mod tests {
             reserved: [0; 3],
         };
         let record = flow_export_record(&event);
+        assert_eq!(record.key.direction, PolicyDirection::Ingress);
         assert_eq!(record.key.source_ipv4, Some(Ipv4Addr::new(10, 42, 0, 1)));
         assert_eq!(record.key.destination_port, 8080);
         assert_eq!(record.decision.rule_id, Some(RuleId::new(0)));
@@ -4268,6 +4288,16 @@ mod tests {
         event.flow.destination_port = 9964_u16.to_be_bytes();
         assert!(is_controller_management_flow(&event, 9964));
         event.flow.destination_port = 8080_u16.to_be_bytes();
+
+        event.direction = PolicyDirection::Egress as u8;
+        event.flow.destination_identity = IdentityId::default();
+        let external_egress = flow_export_record(&event);
+        assert_eq!(external_egress.key.direction, PolicyDirection::Egress);
+        assert!(event_has_selected_identity(&event));
+        event.flow.source_identity = IdentityId::default();
+        assert!(!event_has_selected_identity(&event));
+        event.flow.source_identity = IdentityId::new(1);
+        event.flow.destination_identity = IdentityId::new(2);
 
         let source_ipv6: Ipv6Addr = "fd00:10:42::1".parse().unwrap();
         let destination_ipv6: Ipv6Addr = "fd00:10:42:1::2".parse().unwrap();

@@ -374,6 +374,7 @@ struct PolicySimulationHistoricalSummary {
 struct PolicySimulationHistoricalChange {
     source: ResolvedEndpoint,
     destination: ResolvedEndpoint,
+    direction: PolicyDirection,
     protocol: &'static str,
     destination_port: u16,
     observed_events: u64,
@@ -2650,10 +2651,15 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
                 "flow export must contain exactly one complete IPv4 or IPv6 address pair",
             ));
         }
-        if entry.key.destination_identity.get() == 0 {
-            return Err(ApiError::bad_request(
-                "flow export destination_identity must be resolved",
-            ));
+        let selected_identity = match entry.key.direction {
+            PolicyDirection::Ingress => entry.key.destination_identity,
+            PolicyDirection::Egress => entry.key.source_identity,
+        };
+        if selected_identity.get() == 0 {
+            return Err(ApiError::bad_request(format!(
+                "flow export selected {:?} identity must be resolved",
+                entry.key.direction
+            )));
         }
         if entry.observed_events == 0 {
             return Err(ApiError::bad_request(
@@ -3052,21 +3058,15 @@ fn evaluate_historical_simulation(
             summary.skipped_unresolved_flows += 1;
             continue;
         };
-        let (source_ipv4, source_ipv6) = source_addresses(
+        let (current, proposed) = evaluate_historical_flow(
+            entry,
             &pod_records[source_index],
-            entry.key.source_ipv4,
-            entry.key.source_ipv6,
-        );
-        let flow = Flow {
-            source: &endpoints[source_index],
-            destination: &endpoints[destination_index],
+            &endpoints[source_index],
+            &endpoints[destination_index],
             protocol,
-            destination_port: entry.key.destination_port,
-            source_ipv4,
-            source_ipv6,
-        };
-        let current = evaluate(current_policies, flow);
-        let proposed = evaluate(proposed_policies, flow);
+            current_policies,
+            proposed_policies,
+        );
         summary.evaluated_flows += 1;
         summary.evaluated_observations = summary
             .evaluated_observations
@@ -3107,6 +3107,7 @@ fn evaluate_historical_simulation(
             changes.push(PolicySimulationHistoricalChange {
                 source: resolved(&pod_records[source_index]),
                 destination: resolved(&pod_records[destination_index]),
+                direction: entry.key.direction,
                 protocol: protocol_name(protocol),
                 destination_port: entry.key.destination_port,
                 observed_events: entry.observed_events,
@@ -3120,6 +3121,45 @@ fn evaluate_historical_simulation(
     }
     summary.affected_workloads = affected_workloads.len();
     (summary, changes)
+}
+
+fn evaluate_historical_flow(
+    entry: &unf_state::FlowHistoryEntry,
+    source_pod: &PodRecord,
+    source: &Endpoint,
+    destination: &Endpoint,
+    protocol: Protocol,
+    current_policies: &[PolicyIr],
+    proposed_policies: &[PolicyIr],
+) -> (unf_policy::PolicyDecision, unf_policy::PolicyDecision) {
+    let (source_ipv4, source_ipv6) =
+        source_addresses(source_pod, entry.key.source_ipv4, entry.key.source_ipv6);
+    let flow = Flow {
+        source,
+        destination,
+        protocol,
+        destination_port: entry.key.destination_port,
+        source_ipv4,
+        source_ipv6,
+    };
+    let destination_addresses = DestinationAddresses {
+        ipv4: entry.key.destination_ipv4,
+        ipv6: entry.key.destination_ipv6,
+    };
+    (
+        evaluate_for_direction_with_addresses(
+            current_policies,
+            entry.key.direction,
+            flow,
+            destination_addresses,
+        ),
+        evaluate_for_direction_with_addresses(
+            proposed_policies,
+            entry.key.direction,
+            flow,
+            destination_addresses,
+        ),
+    )
 }
 
 fn source_addresses(
@@ -3789,6 +3829,7 @@ mod tests {
             dropped_events: 2,
             entries: vec![unf_state::FlowExportRecord {
                 key: unf_state::FlowHistoryKey {
+                    direction: PolicyDirection::Ingress,
                     source_identity: IdentityId::new(1),
                     destination_identity: IdentityId::new(2),
                     source_ipv4: Some("10.42.0.10".parse().expect("valid test address")),
@@ -4592,6 +4633,18 @@ mod tests {
         incomplete_ipv6.entries[0].key.destination_ipv6 = None;
         assert!(validate_flow_export_batch(&incomplete_ipv6).is_err());
 
+        let mut external_egress = flow_batch(1);
+        external_egress.entries[0].key.direction = PolicyDirection::Egress;
+        external_egress.entries[0].key.destination_identity = IdentityId::default();
+        validate_flow_export_batch(&external_egress)
+            .expect("egress export requires only its selected source identity");
+        external_egress.entries[0].key.source_identity = IdentityId::default();
+        assert!(validate_flow_export_batch(&external_egress).is_err());
+
+        let mut unresolved_ingress = flow_batch(1);
+        unresolved_ingress.entries[0].key.destination_identity = IdentityId::default();
+        assert!(validate_flow_export_batch(&unresolved_ingress).is_err());
+
         let mut invalid = flow_batch(1);
         invalid.schema_version = FLOW_EXPORT_SCHEMA_VERSION + 1;
         let error =
@@ -4613,7 +4666,10 @@ mod tests {
         mutex_lock(&state.flow_history).ingest(flow_batch(5), 1_000);
 
         let snapshot = flow_history_snapshot_window(&state, Some(1_000), Some(1_000), 1);
-        assert_eq!(snapshot.schema_version, 3);
+        assert_eq!(
+            snapshot.schema_version,
+            unf_state::FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION
+        );
         assert_eq!(snapshot.query.matched_flows, 1);
         assert_eq!(snapshot.query.matched_observations, 5);
         assert_eq!(snapshot.query.returned_flows, 1);

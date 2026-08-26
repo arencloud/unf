@@ -50,7 +50,7 @@ wait_for_target_flow() {
     for _ in {1..45}; do
         snapshot=$(controller_raw "${controller}" /v1/flows 2>/dev/null || true)
         if jq -e '
-            .schema_version == 3
+            .schema_version == 4
             and any(.entries[];
                 (.source_workloads | index("frontend/client"))
                 and (.destination_workloads | index("backend/server"))
@@ -75,7 +75,7 @@ wait_for_checkpoint() {
         if jq -e \
             --argjson source "${source_identity}" \
             --argjson destination "${destination_identity}" '
-            .schema_version == 1
+            .schema_version == 2
             and .revision > 0
             and any(.entries[];
                 .key.source_identity == $source

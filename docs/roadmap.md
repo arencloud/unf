@@ -189,7 +189,11 @@ matrix and reproducible evidence.
 - Implemented and two-node kind verified: direction- and address-family-aware
   `unfctl explain` for egress selector/default/`ipBlock` decisions, plus separate
   resolved ingress/egress entry counts in controller status;
-- Next: NetworkPolicy simulation/history integration,
+- Implemented and two-node kind verified: direction-aware flow export schema v3,
+  history schema v4, legacy-ingress checkpoint migration to schema v2, external
+  egress selected-identity validation, and direction-correct historical
+  evaluation;
+- Next: NetworkPolicy what-if simulation,
   populated-map controller-offline replacement recovery, stateful replies, and
   dual-stack OpenShift qualification;
 - shadow rollout and offline impact analysis;

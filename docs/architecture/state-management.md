@@ -31,15 +31,21 @@ traffic probe or load-balancing implementation. Historical snapshot persistence,
 pagination, and routing relationships remain future state domains.
 
 Telemetry revision advances when the controller accepts a changed node export.
-Flow export schema v2 requires exactly one complete IPv4 or IPv6 address pair.
+Flow export schema v3 requires exactly one complete IPv4 or IPv6 address pair and
+retains the decisive policy direction as part of its logical key. Directional
+validation requires the selected destination identity for ingress or selected
+source identity for egress, permitting external egress without a fabricated
+destination identity.
 The current flow-history store retains 4,096 deterministic logical keys and
 tracks observation totals, controller evictions, and cumulative agent-side drops.
-Flow snapshot schema v3 supports inclusive `last_received_unix_ms` bounds and
-newest-first limits. A separate schema-v1 ConfigMap checkpoint preserves the
-newest 1,024 keys within a 900,000-byte payload across controller restart and
-reports every capacity omission. See
+Flow snapshot schema v4 supports inclusive `last_received_unix_ms` bounds,
+newest-first limits, and distinct ingress/egress keys. A separate schema-v2
+ConfigMap checkpoint preserves the newest 1,024 keys within a 900,000-byte
+payload across controller restart and reports every capacity omission. The
+reader migrates schema-v1 records to ingress. See
 [ADR 0012](../adr/0012-bounded-flow-history-export.md) and
-[ADR 0030](../adr/0030-durable-flow-history-checkpoint-and-time-windows.md).
+[ADR 0030](../adr/0030-durable-flow-history-checkpoint-and-time-windows.md), and
+[ADR 0039](../adr/0039-direction-aware-flow-history.md).
 
 Agents poll internal identity and policy snapshot endpoints and publish each
 desired/applied epoch and revision. Identity schema v2 is written to inactive

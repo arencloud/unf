@@ -52,13 +52,16 @@ identical nonzero revision.
 Event and map ABIs use fixed C layouts, explicit schema/version fields, and
 compile-time size assertions.
 
-Userspace flow export preserves forwarding priority. Destination-resolved events
+Userspace flow export preserves forwarding priority. Direction-selected events
 enter a 4,096-record non-blocking channel and a 2,048-key pending aggregator. A
 full bound increments `unf_telemetry_dropped_events_total` and discards telemetry
 immediately; it never blocks TC consumption or changes the verdict already
 returned by eBPF. HTTP batches contain at most 512 logical flows. Controller
 retention is independently capped at 4,096 keys with eviction accounting. Flow
-export schema v2 carries exactly one complete IPv4 or IPv6 address pair per key;
+export schema v3 carries the decisive policy direction and exactly one complete
+IPv4 or IPv6 address pair per key; ingress requires a resolved destination while
+egress requires a resolved source, so external egress can be retained. Flow
+history snapshot schema v4 aggregates direction as part of the logical key;
 topology schema v3 exposes both address families for each workload.
 
 Bounded NetworkPolicy `endPort` ranges are expanded into exact keys before
