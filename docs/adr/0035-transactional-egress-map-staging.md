@@ -58,6 +58,7 @@ revision without weakening existing ingress. The separate ABI directory makes
 the upgrade boundary explicit and leaves v2 state available for deliberate
 retirement rather than mutating it in place.
 
-The next slice adds egress map lookup and policy-direction provenance in TC,
-then admits translated egress IR into controller snapshots. Simulation/status
-integration and live egress lifecycle qualification remain later steps.
+ADR 0036 subsequently added source-selected egress map lookup, deny composition,
+and policy-direction provenance in TC. The controller still emits empty egress
+lists. Simulation/status integration and live egress lifecycle qualification
+remain later steps.

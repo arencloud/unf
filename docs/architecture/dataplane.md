@@ -15,6 +15,11 @@ non-initial fragments, malformed or over-limit chains, and unsupported protocols
 fail open. The parser reads the flow tuple with bounded helpers, increments a
 per-CPU counter, reads the active identity configuration once per packet, resolves
 both endpoints from that bank, and reads the atomically active policy bank.
+Ingress and egress policy direction is derived from the selected workload and
+map family, not from the TC attachment direction. Both directions are evaluated;
+either deny drops the packet. A selected policy decision carries its direction
+in the flow event, while an event with no applicable policy retains the observed
+hook direction.
 An actual deny returns `TC_ACT_SHOT`; allow and shadow-only deny return
 `TC_ACT_PIPE`.
 SCTP's common header exposes source and destination ports in the same first four
@@ -33,8 +38,8 @@ key layout without an ABI change.
 | `POLICY_RULES` | source/destination identity, protocol, destination port, bank | actual/shadow verdict and policy/rule/reason provenance, schema, revision | controller compiler; agent transactional writer | stale inactive keys are removed, then populated and validated before activation; pinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries, and the active bank remains selected when staging fails |
 | `POLICY_IPV4` | exact/fallback source IPv4, destination identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller IPv4-aware compiler; agent transactional writer | staged and validated alongside `POLICY_RULES`; pinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
 | `POLICY_IPV6` | destination identity, port, protocol, bank, and source IPv6 prefix | same policy decision/provenance value as `POLICY_RULES` | controller IPv6-aware compiler; agent transactional writer; TC LPM reader | staged and validated alongside the other policy maps; pinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
-| `EGRESS_IPV4` | exact/fallback destination IPv4, source identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller egress compiler; agent transactional writer | staged and validated with the ingress maps; TC lookup remains gated | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
-| `EGRESS_IPV6` | source identity, port, protocol, bank, and destination IPv6 prefix | same policy decision/provenance value as `POLICY_RULES` | controller egress compiler; agent transactional writer | staged and validated with the ingress maps; TC lookup remains gated | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
+| `EGRESS_IPV4` | exact/fallback destination IPv4, source identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller egress compiler; agent transactional writer; TC reader | exact destination then arbitrary-destination fallbacks in the active bank; staged and validated with ingress | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
+| `EGRESS_IPV6` | source identity, port, protocol, bank, and destination IPv6 prefix | same policy decision/provenance value as `POLICY_RULES` | controller egress compiler; agent transactional writer; TC LPM reader | longest-prefix destination lookup for exact, protocol-wildcard, then global-wildcard dimensions; staged and validated with ingress | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
 | `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks; pinned | one entry; failed activation preserves the previous pointer |
 
 `FlowEvent` carries no Kubernetes strings. ABI v2 records the applied policy
@@ -69,17 +74,18 @@ port-zero, and global protocol/port-zero entries before consulting
 bounded block addresses, preserving the shared evaluator's native/compatibility
 precedence.
 
-IPv6 `ipBlock` peers use `POLICY_IPV6`, an LPM trie whose fixed destination,
+IPv6 ingress `ipBlock` peers use `POLICY_IPV6`, an LPM trie whose fixed destination,
 port, protocol, and bank dimensions precede the source address. Snapshot schema
-v3 carries identity, exact IPv4, and IPv6 prefix decisions; the agent stages and
-validates all three inactive banks before the single `POLICY_CONFIG` activation
-write. More-specific exception decisions and known-Pod `/128` decisions override
-broader external prefixes. See ADR 0014.
+v4 carries ingress identity, exact IPv4/source-prefix IPv6, and egress exact
+IPv4/destination-prefix IPv6 decisions; the agent stages and validates all five
+inactive policy banks before the single `POLICY_CONFIG` activation write.
+More-specific exception decisions and known-Pod `/128` decisions override
+broader external prefixes in their respective direction. See ADRs 0014 and 0036.
 
 ## Failure behavior
 
 An interrupted identity or policy stage cannot replace its active bank, and
-controller interruption leaves both last activated revisions in use. The nine
+controller interruption leaves both last activated revisions in use. The eleven
 enforcement maps are an all-or-none pinned set in an ABI-versioned bpffs
 directory. On startup the agent checks map capacities, reconstructs both banks'
 rollback caches, validates each config-selected bank's count and uniform
@@ -90,14 +96,15 @@ snapshots apply; a complete validated last-known-good set may restore readiness
 while the controller is unavailable.
 
 This overlay prototype deliberately
-fails open when the destination identity is unknown, config is absent or
+fails open when the selected workload identity is unknown, config is absent or
 incompatible, an IPv6 extension chain is unsupported, malformed, or exceeds its
-bounds, or no valid identity/IP entry exists. A source without an identity
-can still be enforced when a valid IPv4 exact/fallback or IPv6 prefix entry exists.
+bounds, or no valid direction-specific entry exists. An ingress source without
+an identity can still be enforced when a valid IPv4 exact/fallback or IPv6
+source-prefix entry exists; egress requires the selected source identity.
 Fail-open events are marked observed/identity-unknown with revision zero. TC
 attachments use persistent replacement identities. On Linux 6.6 and newer, the
 agent pins one TCX link per interface index in the configured direction below the
-ABI v2 link directory and atomically updates that link to the newly loaded
+ABI v3 link directory and atomically updates that link to the newly loaded
 program. On older kernels, it owns a fixed priority/handle tuple per direction
 and replaces the legacy netlink filter in place. The old program therefore
 remains attached until the replacement program is loaded and handed over.
@@ -118,7 +125,7 @@ bank, requires the staging failure to preserve the selected bank and applied
 revision, then removes only those keys and verifies that the waiting revision
 activates.
 ABI v1 pin directories are not removed automatically; operators may use the
-scoped cleanup command only after validating an ABI v2 rollout. See ADRs 0008
+scoped cleanup command only after validating an ABI v3 rollout. See ADRs 0008
 and 0016 through 0022.
 Permanent startup validation failures terminate the agent after readiness is
 fenced so the orchestrator can retry after repair.

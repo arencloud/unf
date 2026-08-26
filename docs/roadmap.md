@@ -177,7 +177,10 @@ matrix and reproducible evidence.
 - Implemented and rebuilt-kind verified: snapshot schema v4 and
   policy ABI v3 stage dedicated IPv4/IPv6 egress maps in the same validated,
   rollback-safe inactive-bank transaction as ingress;
-- Next: TC egress lookup and controller egress distribution;
+- Implemented and rebuilt-kind verifier-qualified: source-selected IPv4/IPv6 TC
+  egress lookup, ingress/egress deny composition, and policy-direction event
+  provenance with empty controller egress maps;
+- Next: controller egress distribution and populated-map lifecycle verification;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.

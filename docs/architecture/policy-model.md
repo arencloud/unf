@@ -93,13 +93,15 @@ mixed-family, outside-CIDR, and excepted addresses fail closed to compatibility
 isolation. Source-side egress lowering emits exact IPv4 destination keys and
 IPv6 destination-prefix keys under the selected source identity; known Pod
 addresses retain selector and named-port metadata, while arbitrary destinations
-inherit an isolation fallback. Snapshot schema v4 and policy ABI v3 can stage
-these entries in dedicated maps under the same atomic revision as ingress, but
-controller distribution and TC lookup remain gated. See
+inherit an isolation fallback. Snapshot schema v4 and policy ABI v3 stage these
+entries in dedicated maps under the same atomic revision as ingress. TC performs
+direction-specific lookup and combines the two isolation directions so either
+deny wins; controller distribution remains gated. See
 [ADR 0032](../adr/0032-networkpolicy-multi-direction-translation.md) and
 [ADR 0033](../adr/0033-egress-destination-address-evaluation.md), and
 [ADR 0034](../adr/0034-egress-source-side-lowering.md), and
-[ADR 0035](../adr/0035-transactional-egress-map-staging.md).
+[ADR 0035](../adr/0035-transactional-egress-map-staging.md), and
+[ADR 0036](../adr/0036-source-selected-egress-tc-lookup.md).
 
 The controller watches these objects cluster-wide, keeps accepted and rejected
 compatibility state separate, and combines accepted IR with native policy in each

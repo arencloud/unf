@@ -162,6 +162,8 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction) -> i32 {
         lookup_identity_v4(source_ipv4, identity_config),
         lookup_identity_v4(destination_ipv4, identity_config),
         Some(source_ipv4),
+        Some(destination_ipv4),
+        None,
         None,
     )
 }
@@ -201,7 +203,9 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction) -> i32 {
         lookup_identity_v6(source_address, identity_config),
         lookup_identity_v6(destination_address, identity_config),
         None,
+        None,
         Some(source_address),
+        Some(destination_address),
     )
 }
 
@@ -268,7 +272,9 @@ fn emit_flow(
     source_identity: IdentityId,
     destination_identity: IdentityId,
     source_ipv4: Option<[u8; 4]>,
+    destination_ipv4: Option<[u8; 4]>,
     source_ipv6: Option<[u8; 16]>,
+    destination_ipv6: Option<[u8; 16]>,
 ) -> i32 {
     if let Some(counter) = FLOW_COUNTERS.get_ptr_mut(0) {
         // SAFETY: get_ptr_mut returned a non-null pointer to the current CPU's
@@ -283,8 +289,11 @@ fn emit_flow(
     #[allow(unsafe_code)]
     let timestamp_ns = unsafe { bpf_ktime_get_ns() };
     let decision = lookup_policy(
+        direction,
         source_ipv4,
+        destination_ipv4,
         source_ipv6,
+        destination_ipv6,
         source_identity,
         destination_identity,
         destination_port,
@@ -312,7 +321,7 @@ fn emit_flow(
         version: FLOW_ABI_VERSION,
         size: core::mem::size_of::<FlowEvent>() as u16,
         verdict: decision.verdict,
-        direction: direction as u8,
+        direction: decision.direction as u8,
         reason: decision.reason,
         shadow_verdict: decision.shadow_verdict,
         shadow_reason: decision.shadow_reason,
@@ -342,11 +351,12 @@ struct DataplaneDecision {
     reason: u8,
     shadow_verdict: u8,
     shadow_reason: u8,
+    direction: Direction,
 }
 
 impl DataplaneDecision {
     #[inline(always)]
-    const fn observed(reason: ReasonCode) -> Self {
+    const fn observed(direction: Direction, reason: ReasonCode) -> Self {
         Self {
             policy_revision: 0,
             policy_id: PolicyId::new(0),
@@ -357,30 +367,74 @@ impl DataplaneDecision {
             reason: reason as u8,
             shadow_verdict: Verdict::Unknown as u8,
             shadow_reason: ReasonCode::Observed as u8,
+            direction,
         }
     }
 }
 
 #[inline(always)]
 fn lookup_policy(
+    observed_direction: Direction,
+    source_ipv4: Option<[u8; 4]>,
+    destination_ipv4: Option<[u8; 4]>,
+    source_ipv6: Option<[u8; 16]>,
+    destination_ipv6: Option<[u8; 16]>,
+    source_identity: IdentityId,
+    destination_identity: IdentityId,
+    destination_port: [u8; 2],
+    protocol: u8,
+) -> DataplaneDecision {
+    let Some(config) = POLICY_CONFIG.get(0).copied() else {
+        return DataplaneDecision::observed(observed_direction, ReasonCode::Observed);
+    };
+    if config.schema_version != POLICY_MAP_ABI_VERSION
+        || config.active_bank >= POLICY_BANK_COUNT
+        || config.revision == 0
+    {
+        return DataplaneDecision::observed(observed_direction, ReasonCode::Observed);
+    }
+
+    let ingress = lookup_ingress_policy(
+        source_ipv4,
+        source_ipv6,
+        source_identity,
+        destination_identity,
+        destination_port,
+        protocol,
+        config,
+    );
+    let egress = lookup_egress_policy(
+        destination_ipv4,
+        destination_ipv6,
+        source_identity,
+        destination_port,
+        protocol,
+        config,
+    );
+    let reason = if source_identity.get() == 0 || destination_identity.get() == 0 {
+        ReasonCode::IdentityUnknown
+    } else {
+        ReasonCode::Observed
+    };
+    decisive_directional_policy(
+        ingress,
+        egress,
+        DataplaneDecision::observed(observed_direction, reason),
+    )
+}
+
+#[inline(always)]
+fn lookup_ingress_policy(
     source_ipv4: Option<[u8; 4]>,
     source_ipv6: Option<[u8; 16]>,
     source_identity: IdentityId,
     destination_identity: IdentityId,
     destination_port: [u8; 2],
     protocol: u8,
+    config: PolicyMapConfig,
 ) -> DataplaneDecision {
     if destination_identity.get() == 0 {
-        return DataplaneDecision::observed(ReasonCode::IdentityUnknown);
-    }
-    let Some(config) = POLICY_CONFIG.get(0).copied() else {
-        return DataplaneDecision::observed(ReasonCode::Observed);
-    };
-    if config.schema_version != POLICY_MAP_ABI_VERSION
-        || config.active_bank >= POLICY_BANK_COUNT
-        || config.revision == 0
-    {
-        return DataplaneDecision::observed(ReasonCode::Observed);
+        return DataplaneDecision::observed(Direction::Ingress, ReasonCode::IdentityUnknown);
     }
 
     if let Some(source_ipv4) = source_ipv4 {
@@ -435,7 +489,7 @@ fn lookup_policy(
             })
             .or_else(|| lookup_ipv4_policy_value(&ipv4_external_fallback, config.revision))
         {
-            return decode_policy_value(value, config.revision);
+            return decode_policy_value(value, config.revision, Direction::Ingress);
         }
     }
     if let Some(source_ipv6) = source_ipv6 {
@@ -464,11 +518,11 @@ fn lookup_policy(
             .or_else(|| lookup_ipv6_policy_value(&protocol_fallback, config.revision))
             .or_else(|| lookup_ipv6_policy_value(&global_fallback, config.revision))
         {
-            return decode_policy_value(value, config.revision);
+            return decode_policy_value(value, config.revision, Direction::Ingress);
         }
     }
     if source_identity.get() == 0 {
-        return DataplaneDecision::observed(ReasonCode::IdentityUnknown);
+        return DataplaneDecision::observed(Direction::Ingress, ReasonCode::IdentityUnknown);
     }
 
     let exact = PolicyMapKey {
@@ -496,9 +550,131 @@ fn lookup_policy(
         .or_else(|| lookup_policy_value(&protocol_fallback, config.revision))
         .or_else(|| lookup_policy_value(&fallback, config.revision));
     let Some(value) = value else {
-        return DataplaneDecision::observed(ReasonCode::Observed);
+        return DataplaneDecision::observed(Direction::Ingress, ReasonCode::Observed);
     };
-    decode_policy_value(value, config.revision)
+    decode_policy_value(value, config.revision, Direction::Ingress)
+}
+
+#[inline(always)]
+fn lookup_egress_policy(
+    destination_ipv4: Option<[u8; 4]>,
+    destination_ipv6: Option<[u8; 16]>,
+    source_identity: IdentityId,
+    destination_port: [u8; 2],
+    protocol: u8,
+    config: PolicyMapConfig,
+) -> DataplaneDecision {
+    if source_identity.get() == 0 {
+        return DataplaneDecision::observed(Direction::Egress, ReasonCode::IdentityUnknown);
+    }
+    if let Some(destination_ipv4) = destination_ipv4 {
+        let exact = EgressIpv4PolicyMapKey {
+            destination_address: destination_ipv4,
+            source_identity,
+            destination_port,
+            protocol,
+            bank: config.active_bank,
+        };
+        let protocol_fallback = EgressIpv4PolicyMapKey {
+            destination_address: destination_ipv4,
+            source_identity,
+            destination_port: [0; 2],
+            protocol,
+            bank: config.active_bank,
+        };
+        let global_fallback = EgressIpv4PolicyMapKey {
+            destination_address: destination_ipv4,
+            source_identity,
+            destination_port: [0; 2],
+            protocol: 0,
+            bank: config.active_bank,
+        };
+        let external_exact = EgressIpv4PolicyMapKey {
+            destination_address: [0; 4],
+            source_identity,
+            destination_port,
+            protocol,
+            bank: config.active_bank,
+        };
+        let external_protocol_fallback = EgressIpv4PolicyMapKey {
+            destination_address: [0; 4],
+            source_identity,
+            destination_port: [0; 2],
+            protocol,
+            bank: config.active_bank,
+        };
+        let external_global_fallback = EgressIpv4PolicyMapKey {
+            destination_address: [0; 4],
+            source_identity,
+            destination_port: [0; 2],
+            protocol: 0,
+            bank: config.active_bank,
+        };
+        if let Some(value) = lookup_egress_ipv4_policy_value(&exact, config.revision)
+            .or_else(|| lookup_egress_ipv4_policy_value(&protocol_fallback, config.revision))
+            .or_else(|| lookup_egress_ipv4_policy_value(&global_fallback, config.revision))
+            .or_else(|| lookup_egress_ipv4_policy_value(&external_exact, config.revision))
+            .or_else(|| {
+                lookup_egress_ipv4_policy_value(&external_protocol_fallback, config.revision)
+            })
+            .or_else(|| {
+                lookup_egress_ipv4_policy_value(&external_global_fallback, config.revision)
+            })
+        {
+            return decode_policy_value(value, config.revision, Direction::Egress);
+        }
+    }
+    if let Some(destination_ipv6) = destination_ipv6 {
+        let exact = EgressIpv6PolicyMapData {
+            source_identity,
+            destination_port,
+            protocol,
+            bank: config.active_bank,
+            destination_address: destination_ipv6,
+        };
+        let protocol_fallback = EgressIpv6PolicyMapData {
+            source_identity,
+            destination_port: [0; 2],
+            protocol,
+            bank: config.active_bank,
+            destination_address: destination_ipv6,
+        };
+        let global_fallback = EgressIpv6PolicyMapData {
+            source_identity,
+            destination_port: [0; 2],
+            protocol: 0,
+            bank: config.active_bank,
+            destination_address: destination_ipv6,
+        };
+        if let Some(value) = lookup_egress_ipv6_policy_value(&exact, config.revision)
+            .or_else(|| lookup_egress_ipv6_policy_value(&protocol_fallback, config.revision))
+            .or_else(|| lookup_egress_ipv6_policy_value(&global_fallback, config.revision))
+        {
+            return decode_policy_value(value, config.revision, Direction::Egress);
+        }
+    }
+    DataplaneDecision::observed(Direction::Egress, ReasonCode::Observed)
+}
+
+#[inline(always)]
+fn decisive_directional_policy(
+    ingress: DataplaneDecision,
+    egress: DataplaneDecision,
+    observed: DataplaneDecision,
+) -> DataplaneDecision {
+    let has_ingress = ingress.policy_revision != 0;
+    let has_egress = egress.policy_revision != 0;
+    if has_ingress && ingress.verdict == Verdict::Deny {
+        ingress
+    } else if has_egress && egress.verdict == Verdict::Deny {
+        egress
+    } else if has_ingress {
+        ingress
+    } else if has_egress {
+        egress
+    } else {
+        observed
+    }
 }
 
 #[inline(always)]
@@ -526,6 +702,36 @@ fn lookup_ipv6_policy_value(key: &Ipv6PolicyMapData, revision: u64) -> Option<Po
 }
 
 #[inline(always)]
+fn lookup_egress_ipv4_policy_value(
+    key: &EgressIpv4PolicyMapKey,
+    revision: u64,
+) -> Option<PolicyMapValue> {
+    // SAFETY: EGRESS_IPV4 uses BPF_F_NO_PREALLOC, values have a fixed Copy ABI,
+    // and the reference is copied immediately without escaping this lookup.
+    #[allow(unsafe_code)]
+    let value = unsafe { EGRESS_IPV4.get(key).copied() }?;
+    if value.schema_version == POLICY_MAP_ABI_VERSION && value.revision == revision {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn lookup_egress_ipv6_policy_value(
+    key: &EgressIpv6PolicyMapData,
+    revision: u64,
+) -> Option<PolicyMapValue> {
+    let lookup = LpmKey::new(192, *key);
+    let value = EGRESS_IPV6.get(&lookup).copied()?;
+    if value.schema_version == POLICY_MAP_ABI_VERSION && value.revision == revision {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
 fn lookup_policy_value(key: &PolicyMapKey, revision: u64) -> Option<PolicyMapValue> {
     // SAFETY: POLICY_RULES uses BPF_F_NO_PREALLOC, values have a fixed Copy ABI,
     // and the reference is copied immediately without escaping this lookup.
@@ -539,27 +745,31 @@ fn lookup_policy_value(key: &PolicyMapKey, revision: u64) -> Option<PolicyMapVal
 }
 
 #[inline(always)]
-fn decode_policy_value(value: PolicyMapValue, revision: u64) -> DataplaneDecision {
+fn decode_policy_value(
+    value: PolicyMapValue,
+    revision: u64,
+    direction: Direction,
+) -> DataplaneDecision {
     let Some(verdict) = decode_verdict(value.verdict) else {
-        return DataplaneDecision::observed(ReasonCode::Observed);
+        return DataplaneDecision::observed(direction, ReasonCode::Observed);
     };
     let Some(reason) = decode_reason(value.reason, verdict) else {
-        return DataplaneDecision::observed(ReasonCode::Observed);
+        return DataplaneDecision::observed(direction, ReasonCode::Observed);
     };
     if !valid_provenance(value.flags, value.reason, false) {
-        return DataplaneDecision::observed(ReasonCode::Observed);
+        return DataplaneDecision::observed(direction, ReasonCode::Observed);
     }
 
     let has_shadow = value.flags & POLICY_FLAG_HAS_SHADOW != 0;
     let (shadow_verdict, shadow_reason) = if has_shadow {
         let Some(shadow_verdict) = decode_verdict(value.shadow_verdict) else {
-            return DataplaneDecision::observed(ReasonCode::Observed);
+            return DataplaneDecision::observed(direction, ReasonCode::Observed);
         };
         let Some(shadow_reason) = decode_reason(value.shadow_reason, shadow_verdict) else {
-            return DataplaneDecision::observed(ReasonCode::Observed);
+            return DataplaneDecision::observed(direction, ReasonCode::Observed);
         };
         if !valid_provenance(value.flags, value.shadow_reason, true) {
-            return DataplaneDecision::observed(ReasonCode::Observed);
+            return DataplaneDecision::observed(direction, ReasonCode::Observed);
         }
         (shadow_verdict as u8, shadow_reason)
     } else {
@@ -592,6 +802,7 @@ fn decode_policy_value(value: PolicyMapValue, revision: u64) -> DataplaneDecisio
         reason,
         shadow_verdict,
         shadow_reason,
+        direction,
     }
 }
 

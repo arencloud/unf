@@ -95,15 +95,16 @@ Implemented in the repository:
 - deterministic L3/L4 policy compiler, shadow decisions, and property tests;
 - direction-aware policy IR and userspace decisions with destination-selected
   ingress, source-selected egress, cross-direction isolation, and explicit
-  rejection at the still-ingress-only dataplane boundary;
+  direction provenance at the TC decision boundary;
 - multi-direction Kubernetes NetworkPolicy translation with exact `policyTypes`
   defaulting and source-targeted egress peer/port IR, retained behind the
   ingress-only controller enforcement gate;
 - addressed userspace egress evaluation for bounded IPv4/IPv6 `ipBlock`
-  destinations and exceptions, still excluded from ingress-only snapshots;
+  destinations and exceptions, still excluded from controller snapshots;
 - source-selected IPv4 exact-destination and IPv6 destination-LPM egress
   lowering, including selector metadata, named ports, and isolation fallbacks,
-  retained outside controller snapshots until the egress map ABI is staged;
+  with transactional agent staging and verifier-qualified TC lookup retained
+  behind the controller distribution gate;
 - a supported ingress `NetworkPolicy` adapter that reuses the same IR, additive
   evaluator semantics, controller snapshots, and dataplane lowering as native
   policy, including pod/Namespace expressions, named and protocol-only
