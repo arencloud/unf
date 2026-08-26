@@ -101,6 +101,9 @@ Implemented in the repository:
   ingress-only controller enforcement gate;
 - addressed userspace egress evaluation for bounded IPv4/IPv6 `ipBlock`
   destinations and exceptions, still excluded from ingress-only snapshots;
+- source-selected IPv4 exact-destination and IPv6 destination-LPM egress
+  lowering, including selector metadata, named ports, and isolation fallbacks,
+  retained outside controller snapshots until the egress map ABI is staged;
 - a supported ingress `NetworkPolicy` adapter that reuses the same IR, additive
   evaluator semantics, controller snapshots, and dataplane lowering as native
   policy, including pod/Namespace expressions, named and protocol-only

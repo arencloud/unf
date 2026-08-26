@@ -90,10 +90,15 @@ rejects any effective egress direction. All ingress lowerers also reject egress
 IR before emitting map entries. A separate addressed-evaluation entry point
 matches bounded IPv4/IPv6 egress `ipBlock` destinations and exceptions; absent,
 mixed-family, outside-CIDR, and excepted addresses fail closed to compatibility
-isolation. Source-side dataplane enforcement and controller integration remain
-the active compatibility milestone. See
+isolation. Source-side egress lowering emits exact IPv4 destination keys and
+IPv6 destination-prefix keys under the selected source identity; known Pod
+addresses retain selector and named-port metadata, while arbitrary destinations
+inherit an isolation fallback. These egress entries are not yet present in the
+snapshot schema or kernel maps, so controller distribution and enforcement
+remain gated. See
 [ADR 0032](../adr/0032-networkpolicy-multi-direction-translation.md) and
-[ADR 0033](../adr/0033-egress-destination-address-evaluation.md).
+[ADR 0033](../adr/0033-egress-destination-address-evaluation.md), and
+[ADR 0034](../adr/0034-egress-source-side-lowering.md).
 
 The controller watches these objects cluster-wide, keeps accepted and rejected
 compatibility state separate, and combines accepted IR with native policy in each

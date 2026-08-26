@@ -662,6 +662,42 @@ pub struct Ipv6PolicyMapEntry {
     pub shadow: Option<PolicyDecisionRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EgressIpv4PolicyMapKey {
+    pub source_identity: IdentityId,
+    /// Exact destination address, or `0.0.0.0` for an arbitrary-destination fallback.
+    pub destination_address: Ipv4Addr,
+    /// IP protocol number, or zero for a global wildcard fallback.
+    pub protocol: u8,
+    /// Destination port, or zero for a protocol-specific or global wildcard.
+    pub destination_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressIpv4PolicyMapEntry {
+    pub key: EgressIpv4PolicyMapKey,
+    pub decision: PolicyDecisionRecord,
+    pub shadow: Option<PolicyDecisionRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EgressIpv6PolicyMapKey {
+    pub source_identity: IdentityId,
+    pub destination_network: Ipv6Addr,
+    pub destination_prefix_len: u8,
+    /// IP protocol number, or zero for a global wildcard fallback.
+    pub protocol: u8,
+    /// Destination port, or zero for a protocol-specific or global wildcard.
+    pub destination_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressIpv6PolicyMapEntry {
+    pub key: EgressIpv6PolicyMapKey,
+    pub decision: PolicyDecisionRecord,
+    pub shadow: Option<PolicyDecisionRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyStateSnapshot {
     pub schema_version: u16,

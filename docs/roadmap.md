@@ -170,8 +170,12 @@ matrix and reproducible evidence.
 - Implemented and unit verified: bounded IPv4/IPv6 egress `ipBlock` translation
   and destination-address evaluation, including exceptions and fail-closed
   absent/mixed-family input;
-- Next: source-side lowering, transactional distribution, and TC egress
-  enforcement;
+- Implemented and unit verified: source-selected exact-destination IPv4 and
+  destination-prefix IPv6 lowering, including selector/named-port metadata,
+  isolation fallbacks, exception behavior, capacity limits, and strict
+  direction separation;
+- Next: snapshot/map ABI staging and transactional agent distribution, then TC
+  egress enforcement;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.

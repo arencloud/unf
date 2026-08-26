@@ -59,6 +59,7 @@ can consume the destination addresses already present in retained flow records.
 This removes the final evaluator-level `ipBlock` gap without pretending that an
 ingress-oriented BPF map can enforce it.
 
-Source-side map keys/lowering, snapshot and policy-map ABI design, TC egress
+ADR 0034 subsequently added source-selected IPv4 exact-destination and IPv6
+destination-prefix lowering. Snapshot and policy-map ABI staging, TC egress
 lookups, controller distribution, direction-aware explanation/simulation, and
 live dual-stack egress qualification remain subsequent slices.

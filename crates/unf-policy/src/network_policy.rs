@@ -732,7 +732,8 @@ mod tests {
     use super::*;
     use crate::{
         DestinationAddresses, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort,
-        PolicyDecision, compile_dataplane_entries, compile_ipv4_dataplane_entries,
+        PolicyDecision, compile_dataplane_entries, compile_egress_ipv4_dataplane_entries,
+        compile_egress_ipv6_dataplane_entries, compile_ipv4_dataplane_entries,
         compile_ipv6_dataplane_entries, evaluate, evaluate_for_direction,
         evaluate_for_direction_with_addresses,
     };
@@ -1106,6 +1107,150 @@ mod tests {
             .verdict,
             Verdict::Deny
         );
+    }
+
+    #[test]
+    fn egress_ipv4_lowering_is_source_selected_and_preserves_exceptions() {
+        let policy = egress_policy(
+            Some(vec![NetworkPolicyEgressRule {
+                to: Some(vec![NetworkPolicyPeer {
+                    ip_block: Some(IPBlock {
+                        cidr: "10.0.0.0/30".to_owned(),
+                        except: Some(vec!["10.0.0.2/32".to_owned()]),
+                    }),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: Some(vec![NetworkPolicyPort {
+                    protocol: Some("TCP".to_owned()),
+                    port: Some(IntOrString::Int(443)),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }]),
+            Some(vec!["Egress"]),
+        );
+        let policies = NetworkPolicyCompiler::compile_directions(PolicyId::new(55), policy)
+            .expect("egress IPv4 policy translates");
+        let source = endpoint(1, "frontend", "client");
+        let unselected = endpoint(2, "frontend", "job");
+        let entries = compile_egress_ipv4_dataplane_entries(&policies, &[source, unselected], &[])
+            .expect("egress IPv4 policy lowers");
+
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.key.source_identity == IdentityId::new(1))
+        );
+        assert!(entries.iter().any(|entry| {
+            entry.key.destination_address == "10.0.0.1".parse::<Ipv4Addr>().expect("valid IPv4")
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 443
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.key.destination_address == Ipv4Addr::UNSPECIFIED
+                && entry.key.protocol == 0
+                && entry.key.destination_port == 0
+                && entry.decision.verdict == Verdict::Deny
+                && entry.decision.reason == PolicyReason::DefaultAction
+        }));
+        assert!(entries.iter().all(|entry| {
+            entry.key.destination_address != "10.0.0.2".parse::<Ipv4Addr>().expect("valid IPv4")
+                || entry.decision.verdict != Verdict::Allow
+        }));
+    }
+
+    #[test]
+    fn egress_named_port_lowering_uses_destination_metadata() {
+        let policy = egress_policy(
+            Some(vec![NetworkPolicyEgressRule {
+                to: Some(vec![NetworkPolicyPeer {
+                    namespace_selector: Some(selector(&[(NAMESPACE_NAME_LABEL, "backend")])),
+                    pod_selector: Some(selector(&[("app", "server")])),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: Some(vec![NetworkPolicyPort {
+                    protocol: Some("TCP".to_owned()),
+                    port: Some(IntOrString::String("https".to_owned())),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }]),
+            Some(vec!["Egress"]),
+        );
+        let policies = NetworkPolicyCompiler::compile_directions(PolicyId::new(56), policy)
+            .expect("named-port egress policy translates");
+        let source = endpoint(1, "frontend", "client");
+        let mut destination = endpoint(2, "backend", "server");
+        destination.named_ports.insert(
+            NamedPort {
+                name: "https".to_owned(),
+                protocol: Protocol::Tcp,
+            },
+            8443,
+        );
+        let entries = compile_egress_ipv4_dataplane_entries(
+            &policies,
+            &[source.clone(), destination.clone()],
+            &[Ipv4Endpoint {
+                address: "10.244.1.10".parse().expect("valid Pod IPv4"),
+                endpoint: destination,
+            }],
+        )
+        .expect("named-port egress policy lowers");
+
+        assert!(entries.iter().any(|entry| {
+            entry.key.source_identity == source.identity
+                && entry.key.destination_address
+                    == "10.244.1.10".parse::<Ipv4Addr>().expect("valid Pod IPv4")
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 8443
+                && entry.decision.verdict == Verdict::Allow
+        }));
+    }
+
+    #[test]
+    fn egress_ipv6_lowering_uses_destination_prefixes_and_exceptions() {
+        let policy = egress_policy(
+            Some(vec![NetworkPolicyEgressRule {
+                to: Some(vec![NetworkPolicyPeer {
+                    ip_block: Some(IPBlock {
+                        cidr: "2001:db8::/126".to_owned(),
+                        except: Some(vec!["2001:db8::2/128".to_owned()]),
+                    }),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: Some(vec![NetworkPolicyPort {
+                    protocol: Some("TCP".to_owned()),
+                    port: Some(IntOrString::Int(443)),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }]),
+            Some(vec!["Egress"]),
+        );
+        let policies = NetworkPolicyCompiler::compile_directions(PolicyId::new(57), policy)
+            .expect("egress IPv6 policy translates");
+        let source = endpoint(1, "frontend", "client");
+        let entries = compile_egress_ipv6_dataplane_entries(&policies, &[source], &[])
+            .expect("egress IPv6 policy lowers");
+
+        assert!(entries.iter().any(|entry| {
+            entry.key.destination_network == "2001:db8::".parse::<Ipv6Addr>().expect("valid IPv6")
+                && entry.key.destination_prefix_len == 126
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 443
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.key.destination_network == "2001:db8::2".parse::<Ipv6Addr>().expect("valid IPv6")
+                && entry.key.destination_prefix_len == 128
+                && entry.key.protocol == 0
+                && entry.key.destination_port == 0
+                && entry.decision.verdict == Verdict::Deny
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.key.destination_network == Ipv6Addr::UNSPECIFIED
+                && entry.key.destination_prefix_len == 0
+                && entry.decision.verdict == Verdict::Deny
+        }));
     }
 
     #[test]

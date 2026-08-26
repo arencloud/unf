@@ -20,8 +20,10 @@ use unf_api::{
 };
 use unf_common::{IdentityId, PolicyAction, PolicyId, Protocol, RuleId, Verdict};
 use unf_state::{
-    Ipv4PolicyMapEntry, Ipv4PolicyMapKey, Ipv6PolicyMapEntry, Ipv6PolicyMapKey,
-    POLICY_MAP_BANK_ENTRY_LIMIT, PolicyDecisionRecord, PolicyMapEntry, PolicyMapKey,
+    EgressIpv4PolicyMapEntry, EgressIpv4PolicyMapKey, EgressIpv6PolicyMapEntry,
+    EgressIpv6PolicyMapKey, Ipv4PolicyMapEntry, Ipv4PolicyMapKey, Ipv6PolicyMapEntry,
+    Ipv6PolicyMapKey, POLICY_MAP_BANK_ENTRY_LIMIT, PolicyDecisionRecord, PolicyMapEntry,
+    PolicyMapKey,
 };
 
 pub use unf_common::{PolicyDirection, PolicyReason as DecisionReason};
@@ -431,11 +433,17 @@ pub enum DataplaneCompileError {
     EntryLimitExceeded { limit: usize },
     #[error("source IPv4 address {address} has conflicting endpoint metadata")]
     Ipv4MetadataConflict { address: Ipv4Addr },
+    #[error("destination IPv4 address {address} has conflicting endpoint metadata")]
+    EgressIpv4MetadataConflict { address: Ipv4Addr },
     #[error("IPv4 policy block contains {address_count} addresses, exceeding limit {limit}")]
     Ipv4BlockTooLarge { address_count: u64, limit: u64 },
     #[error("source IPv6 address {address} has conflicting endpoint metadata")]
     Ipv6MetadataConflict { address: Ipv6Addr },
-    #[error("{direction:?} policy IR cannot be lowered by the ingress dataplane compiler")]
+    #[error("destination IPv6 address {address} has conflicting endpoint metadata")]
+    EgressIpv6MetadataConflict { address: Ipv6Addr },
+    #[error(
+        "{direction:?} policy IR cannot be lowered by the opposite-direction dataplane compiler"
+    )]
     UnsupportedPolicyDirection { direction: PolicyDirection },
 }
 
@@ -975,6 +983,187 @@ pub fn compile_ipv6_dataplane_entries(
     Ok(entries)
 }
 
+/// Resolves source-selected egress policy into exact destination IPv4 entries.
+///
+/// Known Pod addresses retain destination selector metadata. Addresses referenced
+/// only by an `ipBlock` use an external endpoint, while destination address zero
+/// is the arbitrary-destination fallback for each isolated source identity.
+///
+/// # Errors
+///
+/// Returns an error for mixed policy directions, conflicting endpoint metadata,
+/// or expansion beyond one dataplane bank.
+pub fn compile_egress_ipv4_dataplane_entries(
+    policies: &[PolicyIr],
+    endpoints: &[Endpoint],
+    ipv4_endpoints: &[Ipv4Endpoint],
+) -> Result<Vec<EgressIpv4PolicyMapEntry>, DataplaneCompileError> {
+    ensure_egress_dataplane_policies(policies)?;
+    let global_policies = global_fallback_policies(policies);
+    let sources = unique_endpoints(endpoints)?;
+    let mut known_destinations = BTreeMap::<Ipv4Addr, &Endpoint>::new();
+    for destination in ipv4_endpoints {
+        if let Some(existing) =
+            known_destinations.insert(destination.address, &destination.endpoint)
+            && existing != &destination.endpoint
+        {
+            return Err(DataplaneCompileError::EgressIpv4MetadataConflict {
+                address: destination.address,
+            });
+        }
+    }
+
+    let ipv4_blocks: Vec<_> = policies
+        .iter()
+        .flat_map(|policy| &policy.rules)
+        .flat_map(|rule| &rule.destination.ipv4_blocks)
+        .collect();
+    for block in &ipv4_blocks {
+        let address_count = block.cidr.address_count();
+        if address_count > KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES {
+            return Err(DataplaneCompileError::Ipv4BlockTooLarge {
+                address_count,
+                limit: KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES,
+            });
+        }
+    }
+    let mut destination_addresses: BTreeSet<_> = known_destinations.keys().copied().collect();
+    if destination_addresses.len() > POLICY_MAP_BANK_ENTRY_LIMIT {
+        return Err(DataplaneCompileError::EntryLimitExceeded {
+            limit: POLICY_MAP_BANK_ENTRY_LIMIT,
+        });
+    }
+    for address in ipv4_blocks.into_iter().flat_map(Ipv4Block::addresses) {
+        if address != Ipv4Addr::UNSPECIFIED
+            && destination_addresses.insert(address)
+            && destination_addresses.len() > POLICY_MAP_BANK_ENTRY_LIMIT
+        {
+            return Err(DataplaneCompileError::EntryLimitExceeded {
+                limit: POLICY_MAP_BANK_ENTRY_LIMIT,
+            });
+        }
+    }
+
+    let external = external_endpoint();
+    let mut entries = Vec::new();
+    for source in sources.values() {
+        for address in &destination_addresses {
+            let destination = known_destinations
+                .get(address)
+                .copied()
+                .unwrap_or(&external);
+            compile_egress_ipv4_pair(
+                policies,
+                &global_policies,
+                source,
+                destination,
+                Some(*address),
+                *address,
+                &mut entries,
+            )?;
+        }
+        if policies.iter().any(|policy| policy.target.matches(source)) {
+            compile_egress_ipv4_pair(
+                policies,
+                &global_policies,
+                source,
+                &external,
+                None,
+                Ipv4Addr::UNSPECIFIED,
+                &mut entries,
+            )?;
+        }
+    }
+    entries.sort_by_key(|entry| entry.key);
+    Ok(entries)
+}
+
+/// Resolves source-selected egress policy into destination IPv6 LPM entries.
+///
+/// Policy boundaries, exceptions, known Pod destinations, and the arbitrary
+/// destination `/0` fallback share one deterministic prefix representation.
+///
+/// # Errors
+///
+/// Returns an error for mixed policy directions, conflicting endpoint metadata,
+/// or expansion beyond one dataplane bank.
+pub fn compile_egress_ipv6_dataplane_entries(
+    policies: &[PolicyIr],
+    endpoints: &[Endpoint],
+    ipv6_endpoints: &[Ipv6Endpoint],
+) -> Result<Vec<EgressIpv6PolicyMapEntry>, DataplaneCompileError> {
+    ensure_egress_dataplane_policies(policies)?;
+    let global_policies = global_fallback_policies(policies);
+    let sources = unique_endpoints(endpoints)?;
+    let mut known_destinations = BTreeMap::<Ipv6Addr, &Endpoint>::new();
+    for destination in ipv6_endpoints {
+        if let Some(existing) =
+            known_destinations.insert(destination.address, &destination.endpoint)
+            && existing != &destination.endpoint
+        {
+            return Err(DataplaneCompileError::EgressIpv6MetadataConflict {
+                address: destination.address,
+            });
+        }
+    }
+
+    let mut boundaries = BTreeSet::from([Ipv6Cidr {
+        network: Ipv6Addr::UNSPECIFIED,
+        prefix_len: 0,
+    }]);
+    for block in policies
+        .iter()
+        .flat_map(|policy| &policy.rules)
+        .flat_map(|rule| &rule.destination.ipv6_blocks)
+    {
+        boundaries.insert(block.cidr.clone());
+        boundaries.extend(block.except.iter().cloned());
+    }
+    boundaries.extend(known_destinations.keys().copied().map(|network| Ipv6Cidr {
+        network,
+        prefix_len: 128,
+    }));
+    if boundaries.len() > POLICY_MAP_BANK_ENTRY_LIMIT {
+        return Err(DataplaneCompileError::EntryLimitExceeded {
+            limit: POLICY_MAP_BANK_ENTRY_LIMIT,
+        });
+    }
+    let boundaries: Vec<_> = boundaries.into_iter().collect();
+    let external = external_endpoint();
+    let mut entries = Vec::new();
+    for source in sources.values() {
+        if !policies.iter().any(|policy| policy.target.matches(source)) {
+            continue;
+        }
+        for boundary in &boundaries {
+            let excluded: Vec<_> = boundaries
+                .iter()
+                .filter(|candidate| {
+                    candidate.prefix_len > boundary.prefix_len && boundary.contains_cidr(candidate)
+                })
+                .collect();
+            let Some(address) = uncovered_ipv6_address(boundary, &excluded) else {
+                continue;
+            };
+            let destination = known_destinations
+                .get(&address)
+                .copied()
+                .unwrap_or(&external);
+            compile_egress_ipv6_pair(
+                policies,
+                &global_policies,
+                source,
+                destination,
+                address,
+                boundary,
+                &mut entries,
+            )?;
+        }
+    }
+    entries.sort_by_key(|entry| entry.key);
+    Ok(entries)
+}
+
 fn uncovered_ipv6_address(cidr: &Ipv6Cidr, excluded: &[&Ipv6Cidr]) -> Option<Ipv6Addr> {
     if excluded.contains(&cidr) {
         return None;
@@ -1005,6 +1194,218 @@ fn uncovered_ipv6_address(cidr: &Ipv6Cidr, excluded: &[&Ipv6Cidr]) -> Option<Ipv
         }
     }
     None
+}
+
+fn unique_endpoints(
+    endpoints: &[Endpoint],
+) -> Result<BTreeMap<IdentityId, &Endpoint>, DataplaneCompileError> {
+    let mut unique = BTreeMap::new();
+    for endpoint in endpoints {
+        if let Some(existing) = unique.insert(endpoint.identity, endpoint)
+            && existing != endpoint
+        {
+            return Err(DataplaneCompileError::IdentityMetadataConflict {
+                identity_id: endpoint.identity,
+            });
+        }
+    }
+    Ok(unique)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_egress_ipv4_pair(
+    policies: &[PolicyIr],
+    global_policies: &[PolicyIr],
+    source: &Endpoint,
+    destination: &Endpoint,
+    destination_ipv4: Option<Ipv4Addr>,
+    key_address: Ipv4Addr,
+    entries: &mut Vec<EgressIpv4PolicyMapEntry>,
+) -> Result<(), DataplaneCompileError> {
+    let destination_addresses = DestinationAddresses {
+        ipv4: destination_ipv4,
+        ipv6: None,
+    };
+    let global_fallback = evaluate_for_direction_with_addresses(
+        global_policies,
+        PolicyDirection::Egress,
+        dataplane_flow(source, destination, Protocol::Tcp, 0),
+        destination_addresses,
+    );
+    let global_entry = egress_ipv4_policy_map_entry(source, key_address, 0, 0, &global_fallback);
+    if has_policy_provenance(&global_fallback) {
+        push_egress_ipv4_dataplane_entry(entries, global_entry)?;
+    }
+
+    let wildcard_protocols =
+        egress_wildcard_protocols(policies, source, destination, destination_addresses);
+    let mut protocol_entries = BTreeMap::new();
+    for protocol in wildcard_protocols {
+        let decision = evaluate_for_direction_with_addresses(
+            policies,
+            PolicyDirection::Egress,
+            dataplane_flow(source, destination, protocol, 0),
+            destination_addresses,
+        );
+        let entry = egress_ipv4_policy_map_entry(source, key_address, protocol as u8, 0, &decision);
+        if has_policy_provenance(&decision)
+            && (entry.decision != global_entry.decision || entry.shadow != global_entry.shadow)
+        {
+            push_egress_ipv4_dataplane_entry(entries, entry)?;
+        }
+        protocol_entries.insert(protocol, entry);
+    }
+
+    for (protocol, port) in
+        egress_exact_tuples(policies, source, destination, destination_addresses)
+    {
+        let decision = evaluate_for_direction_with_addresses(
+            policies,
+            PolicyDirection::Egress,
+            dataplane_flow(source, destination, protocol, port),
+            destination_addresses,
+        );
+        let entry =
+            egress_ipv4_policy_map_entry(source, key_address, protocol as u8, port, &decision);
+        let inherited = protocol_entries.get(&protocol).unwrap_or(&global_entry);
+        if has_policy_provenance(&decision)
+            && (entry.decision != inherited.decision || entry.shadow != inherited.shadow)
+        {
+            push_egress_ipv4_dataplane_entry(entries, entry)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_egress_ipv6_pair(
+    policies: &[PolicyIr],
+    global_policies: &[PolicyIr],
+    source: &Endpoint,
+    destination: &Endpoint,
+    destination_address: Ipv6Addr,
+    destination_cidr: &Ipv6Cidr,
+    entries: &mut Vec<EgressIpv6PolicyMapEntry>,
+) -> Result<(), DataplaneCompileError> {
+    let destination_addresses = DestinationAddresses {
+        ipv4: None,
+        ipv6: Some(destination_address),
+    };
+    let global_fallback = evaluate_for_direction_with_addresses(
+        global_policies,
+        PolicyDirection::Egress,
+        dataplane_flow(source, destination, Protocol::Tcp, 0),
+        destination_addresses,
+    );
+    if has_policy_provenance(&global_fallback) {
+        push_egress_ipv6_dataplane_entry(
+            entries,
+            egress_ipv6_policy_map_entry(source, destination_cidr, 0, 0, &global_fallback),
+        )?;
+    }
+
+    for protocol in egress_wildcard_protocols(policies, source, destination, destination_addresses)
+    {
+        let decision = evaluate_for_direction_with_addresses(
+            policies,
+            PolicyDirection::Egress,
+            dataplane_flow(source, destination, protocol, 0),
+            destination_addresses,
+        );
+        if has_policy_provenance(&decision) {
+            push_egress_ipv6_dataplane_entry(
+                entries,
+                egress_ipv6_policy_map_entry(
+                    source,
+                    destination_cidr,
+                    protocol as u8,
+                    0,
+                    &decision,
+                ),
+            )?;
+        }
+    }
+
+    for (protocol, port) in
+        egress_exact_tuples(policies, source, destination, destination_addresses)
+    {
+        let decision = evaluate_for_direction_with_addresses(
+            policies,
+            PolicyDirection::Egress,
+            dataplane_flow(source, destination, protocol, port),
+            destination_addresses,
+        );
+        if has_policy_provenance(&decision) {
+            push_egress_ipv6_dataplane_entry(
+                entries,
+                egress_ipv6_policy_map_entry(
+                    source,
+                    destination_cidr,
+                    protocol as u8,
+                    port,
+                    &decision,
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn dataplane_flow<'a>(
+    source: &'a Endpoint,
+    destination: &'a Endpoint,
+    protocol: Protocol,
+    destination_port: u16,
+) -> Flow<'a> {
+    Flow {
+        source,
+        destination,
+        protocol,
+        destination_port,
+        source_ipv4: None,
+        source_ipv6: None,
+    }
+}
+
+fn egress_wildcard_protocols(
+    policies: &[PolicyIr],
+    source: &Endpoint,
+    destination: &Endpoint,
+    destination_addresses: DestinationAddresses,
+) -> BTreeSet<Protocol> {
+    policies
+        .iter()
+        .filter(|policy| policy.target.matches(source))
+        .flat_map(|policy| &policy.rules)
+        .filter(|rule| {
+            rule.source.matches_source(source, None, None)
+                && rule
+                    .destination
+                    .matches_destination(destination, destination_addresses)
+                && rule.destination_port == DestinationPort::Any
+        })
+        .filter_map(|rule| rule.protocol)
+        .collect()
+}
+
+fn egress_exact_tuples(
+    policies: &[PolicyIr],
+    source: &Endpoint,
+    destination: &Endpoint,
+    destination_addresses: DestinationAddresses,
+) -> BTreeSet<(Protocol, u16)> {
+    policies
+        .iter()
+        .filter(|policy| policy.target.matches(source))
+        .flat_map(|policy| &policy.rules)
+        .filter(|rule| {
+            rule.source.matches_source(source, None, None)
+                && rule
+                    .destination
+                    .matches_destination(destination, destination_addresses)
+        })
+        .flat_map(|rule| exact_rule_ports(rule, destination))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1204,6 +1605,18 @@ fn ensure_ingress_dataplane_policies(policies: &[PolicyIr]) -> Result<(), Datapl
     Ok(())
 }
 
+fn ensure_egress_dataplane_policies(policies: &[PolicyIr]) -> Result<(), DataplaneCompileError> {
+    if let Some(policy) = policies
+        .iter()
+        .find(|policy| policy.direction != PolicyDirection::Egress)
+    {
+        return Err(DataplaneCompileError::UnsupportedPolicyDirection {
+            direction: policy.direction,
+        });
+    }
+    Ok(())
+}
+
 fn external_endpoint() -> Endpoint {
     Endpoint {
         identity: IdentityId::new(0),
@@ -1253,6 +1666,24 @@ fn push_ipv4_dataplane_entry(
 fn push_ipv6_dataplane_entry(
     entries: &mut Vec<Ipv6PolicyMapEntry>,
     entry: Ipv6PolicyMapEntry,
+) -> Result<(), DataplaneCompileError> {
+    ensure_dataplane_capacity(entries.len())?;
+    entries.push(entry);
+    Ok(())
+}
+
+fn push_egress_ipv4_dataplane_entry(
+    entries: &mut Vec<EgressIpv4PolicyMapEntry>,
+    entry: EgressIpv4PolicyMapEntry,
+) -> Result<(), DataplaneCompileError> {
+    ensure_dataplane_capacity(entries.len())?;
+    entries.push(entry);
+    Ok(())
+}
+
+fn push_egress_ipv6_dataplane_entry(
+    entries: &mut Vec<EgressIpv6PolicyMapEntry>,
+    entry: EgressIpv6PolicyMapEntry,
 ) -> Result<(), DataplaneCompileError> {
     ensure_dataplane_capacity(entries.len())?;
     entries.push(entry);
@@ -1334,6 +1765,68 @@ fn ipv4_policy_map_entry(
                 rule_id: decision.shadow_rule_id,
             }),
     }
+}
+
+fn egress_ipv4_policy_map_entry(
+    source: &Endpoint,
+    destination_address: Ipv4Addr,
+    protocol: u8,
+    destination_port: u16,
+    decision: &PolicyDecision,
+) -> EgressIpv4PolicyMapEntry {
+    let dataplane_tuple = EgressIpv4PolicyMapKey {
+        source_identity: source.identity,
+        destination_address,
+        protocol,
+        destination_port,
+    };
+    EgressIpv4PolicyMapEntry {
+        key: dataplane_tuple,
+        decision: policy_decision_record(decision),
+        shadow: shadow_policy_decision_record(decision),
+    }
+}
+
+fn egress_ipv6_policy_map_entry(
+    source: &Endpoint,
+    destination: &Ipv6Cidr,
+    protocol: u8,
+    destination_port: u16,
+    decision: &PolicyDecision,
+) -> EgressIpv6PolicyMapEntry {
+    let dataplane_tuple = EgressIpv6PolicyMapKey {
+        source_identity: source.identity,
+        destination_network: destination.network,
+        destination_prefix_len: destination.prefix_len,
+        protocol,
+        destination_port,
+    };
+    EgressIpv6PolicyMapEntry {
+        key: dataplane_tuple,
+        decision: policy_decision_record(decision),
+        shadow: shadow_policy_decision_record(decision),
+    }
+}
+
+fn policy_decision_record(decision: &PolicyDecision) -> PolicyDecisionRecord {
+    PolicyDecisionRecord {
+        verdict: decision.verdict,
+        reason: decision.reason,
+        policy_id: decision.policy_id,
+        rule_id: decision.rule_id,
+    }
+}
+
+fn shadow_policy_decision_record(decision: &PolicyDecision) -> Option<PolicyDecisionRecord> {
+    decision
+        .shadow_verdict
+        .zip(decision.shadow_reason)
+        .map(|(verdict, reason)| PolicyDecisionRecord {
+            verdict,
+            reason,
+            policy_id: decision.shadow_policy_id,
+            rule_id: decision.shadow_rule_id,
+        })
 }
 
 fn ipv6_policy_map_entry(
@@ -1737,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn ingress_dataplane_compilers_reject_egress_policy_ir() {
+    fn dataplane_compilers_reject_opposite_direction_policy_ir() {
         let egress = egress_policy();
         let expected = DataplaneCompileError::UnsupportedPolicyDirection {
             direction: PolicyDirection::Egress,
@@ -1756,6 +2249,28 @@ mod tests {
         assert_eq!(
             compile_ipv6_dataplane_entries(&[egress], &[], &[])
                 .expect_err("egress IR must not reach the IPv6 ingress dataplane"),
+            expected
+        );
+
+        let ingress = policy(
+            1,
+            100,
+            Action::Allow,
+            Action::Deny,
+            EnforcementMode::Enforce,
+            Some(8080),
+        );
+        let expected = DataplaneCompileError::UnsupportedPolicyDirection {
+            direction: PolicyDirection::Ingress,
+        };
+        assert_eq!(
+            compile_egress_ipv4_dataplane_entries(std::slice::from_ref(&ingress), &[], &[],)
+                .expect_err("ingress IR must not reach the IPv4 egress dataplane"),
+            expected
+        );
+        assert_eq!(
+            compile_egress_ipv6_dataplane_entries(&[ingress], &[], &[])
+                .expect_err("ingress IR must not reach the IPv6 egress dataplane"),
             expected
         );
     }
