@@ -32,6 +32,7 @@ and the upstream
 | UDP rules preserve protocol and peer isolation | An exact UDP/8090 rule allows source Namespace A while UDP/8091, TCP/8090, and Namespace B remain denied; removing the numeric port activates protocol-only UDP/8091 without allowing TCP/8091, and policy deletion restores both protocols | Compiler test, dual-protocol echo fixture, revision-converged explanations, cross-node request/response traffic, and deletion recovery |
 | Selecting policies combine allows additively | One policy allows Namespace A on TCP/8087 and another allows Namespace B on TCP/8088 | Existing additive evaluator test plus two-node traffic |
 | Stacked policies with overlapping destination selectors combine only on their intersection | A broad policy allows Namespace A on TCP/8087 to both servers; a narrow policy additionally allows Namespace B on TCP/8088 only to the worker-node server. Deleting narrow then broad restores the intermediate isolation and final non-isolated state | Destination-specific evaluator/lowering test, revision-converged explanations, ordered deletion, and IPv4/IPv6 traffic |
+| A target-specific allow is additive over namespace-wide default deny for remote sources | A broad policy isolates the target Namespace, while a second policy selects only the worker-node server and allows every Pod through one peer containing both empty Pod and Namespace selectors. Remote sources reach only that server; deleting narrow then broad restores broad isolation and final non-isolated traffic | Destination-specific evaluator/lowering test, both remote source scopes, revision-converged explanations, ordered deletion, and IPv4/IPv6 traffic |
 | An allow-all policy takes precedence over other isolation policies | A temporary `ingress: [{}]` permits both ports from every source; deletion restores the stacked rules | Two-node mutation and recovery traffic |
 | Updating one policy replaces its ingress rules | One accepted policy changes from `ingress: [{}]` to `ingress: []`, switching both selected servers from allow-all to default deny without changing the accepted-policy count; restoring the rule and deleting the policy recover allow-all and non-isolated traffic | Same-identity compiler/evaluator test, exact revision convergence, explanations, and direct IPv4/IPv6 traffic from all source scopes |
 
@@ -69,7 +70,10 @@ The matrix covers only behavior already represented faithfully by the current
 ingress IR and probes direct Pod addresses rather than Service-family selection.
 The main kind verifier separately proves bounded IPv4/IPv6 `ipBlock`
 allow/default-deny/exception recovery and bounded extension-header traversal.
-Egress, non-initial fragments, IPv6 jumbograms/ESP/reassembly, malformed or
-over-limit extension chains, unbounded compiler output, and complete upstream
-suite execution remain outside this claim. Those gaps stay visible in the authoritative
-[project tracker](../project-status.md).
+Egress, established/related return-flow tracking when both endpoints are selected
+by ingress policies, non-initial fragments, IPv6 jumbograms/ESP/reassembly,
+malformed or over-limit extension chains, unbounded compiler output, and complete
+upstream suite execution remain outside this claim. In particular, the same-Namespace
+source leg of upstream's namespace-wide default-deny plus target-exception scenario
+requires stateful return handling and is not claimed here. Those gaps stay visible
+in the authoritative [project tracker](../project-status.md).

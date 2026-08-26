@@ -132,6 +132,8 @@ matrix and reproducible evidence.
   nonexistent named-port fail-closed behavior,
   destination match-label and all-four-expression-operator selection lifecycle,
   broad/narrow overlapping destination-selector additivity and ordered recovery,
+  remote target-specific allow over namespace-wide default deny with combined empty
+  peer selectors, while stateful same-Namespace return traffic remains explicit work,
   same-object allow-all/default-deny policy replacement and rollback,
   source-label recovery, stacked additive policies, and allow-all precedence/recovery,
   all against direct IPv4 and IPv6 Pod addresses;

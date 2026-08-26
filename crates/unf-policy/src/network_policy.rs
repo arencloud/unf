@@ -975,6 +975,79 @@ mod tests {
     }
 
     #[test]
+    fn target_specific_allow_overrides_broad_default_deny_only_for_its_target() {
+        let mut broad_policy = policy(Vec::new());
+        broad_policy.metadata.name = Some("broad-default-deny".to_owned());
+        broad_policy
+            .spec
+            .as_mut()
+            .expect("broad policy has spec")
+            .pod_selector = Some(LabelSelector::default());
+        let broad = NetworkPolicyCompiler::compile(PolicyId::new(9), broad_policy)
+            .expect("broad default-deny policy compiles");
+
+        let mut narrow_policy = policy(vec![NetworkPolicyIngressRule {
+            from: Some(vec![NetworkPolicyPeer {
+                pod_selector: Some(LabelSelector::default()),
+                namespace_selector: Some(LabelSelector::default()),
+                ..NetworkPolicyPeer::default()
+            }]),
+            ports: None,
+        }]);
+        narrow_policy.metadata.name = Some("target-specific-allow".to_owned());
+        let narrow = NetworkPolicyCompiler::compile(PolicyId::new(10), narrow_policy)
+            .expect("target-specific allow policy compiles");
+
+        let remote_source = endpoint(1, "frontend", "client");
+        let same_namespace_source = endpoint(4, "backend", "client");
+        let server = endpoint(2, "backend", "server");
+        let alternate = endpoint(3, "backend", "alternate");
+        let policies = [broad, narrow];
+        let decision = |source: &Endpoint, destination: &Endpoint| {
+            evaluate(
+                &policies,
+                Flow {
+                    source,
+                    destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8080,
+                    source_ipv4: None,
+                    source_ipv6: None,
+                },
+            )
+        };
+
+        for source in [&remote_source, &same_namespace_source] {
+            let allowed = decision(source, &server);
+            assert_eq!(allowed.verdict, Verdict::Allow);
+            assert_eq!(allowed.reason, PolicyReason::ExplicitRule);
+            let denied = decision(source, &alternate);
+            assert_eq!(denied.verdict, Verdict::Deny);
+            assert_eq!(denied.reason, PolicyReason::DefaultAction);
+        }
+
+        let entries = compile_dataplane_entries(
+            &policies,
+            &[remote_source, same_namespace_source, server, alternate],
+        )
+        .expect("target-specific exception lowers into destination-specific entries");
+        assert!(entries.iter().any(|entry| {
+            entry.key.source_identity == IdentityId::new(1)
+                && entry.key.destination_identity == IdentityId::new(2)
+                && entry.key.protocol == 0
+                && entry.key.destination_port == 0
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.key.source_identity == IdentityId::new(1)
+                && entry.key.destination_identity == IdentityId::new(3)
+                && entry.key.protocol == 0
+                && entry.key.destination_port == 0
+                && entry.decision.verdict == Verdict::Deny
+        }));
+    }
+
+    #[test]
     fn overlapping_target_selectors_combine_only_on_their_intersection() {
         let rule = |port| NetworkPolicyIngressRule {
             from: None,

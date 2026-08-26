@@ -162,13 +162,14 @@ Implemented in the repository:
   nonexistent named-port fail-closed behavior, all four destination-selector
   expression operators, overlapping destination-selector additivity, source,
   destination, and Namespace label-driven recovery, stacked additive allows and
-  same-object allow-all/default-deny replacement, allow-all recovery, revisioned
-  eBPF provenance, and live policy explanations, plus a versioned EndpointSlice
+  remote target-specific exceptions over namespace-wide isolation, same-object
+  allow-all/default-deny replacement, allow-all recovery, revisioned eBPF
+  provenance, and live policy explanations, plus a versioned EndpointSlice
   backend-readiness lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, workload/data-plane encryption,
-multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production
-fail-closed recovery.
+stateful established/related flow tracking, multi-cluster transport, IPv6
+jumbograms/ESP/reassembly, or production fail-closed recovery.
 
 ## Repository layout
 

@@ -94,6 +94,10 @@ Pod/Namespace label recovery, stacked additive allows, and allow-all deletion
 recovery. Direct IPv4 and IPv6 Pod traffic now exercises every transition,
 including destination-specific named ports, nonexistent-port fail-closed
 isolation, all four destination match-expression operators, overlapping
-destination-selector additivity, same-object allow-all/default-deny replacement,
-and TCP/UDP protocol isolation. These
-remain bounded compatibility claims rather than full upstream conformance.
+destination-selector additivity, remote target-specific exceptions over
+namespace-wide isolation, same-object allow-all/default-deny replacement, and
+TCP/UDP protocol isolation. Enforcement remains stateless: if the source Pod is
+also selected by ingress isolation, established/related return packets are not
+implicitly allowed. That same-Namespace upstream leg remains excluded pending the
+connection-tracking architecture required by the project prompt. These remain
+bounded compatibility claims rather than full upstream conformance.
