@@ -92,5 +92,6 @@ same-Namespace PodSelector scope, empty NamespaceSelector behavior, selector AND
 peer OR, explicit empty-list wildcards, multi-port OR, all selector operators,
 Pod/Namespace label recovery, stacked additive allows, and allow-all deletion
 recovery. Direct IPv4 and IPv6 Pod traffic now exercises every transition,
-including destination-specific named ports and TCP/UDP protocol isolation. These
+including destination-specific named ports, nonexistent-port fail-closed
+isolation, and TCP/UDP protocol isolation. These
 remain bounded compatibility claims rather than full upstream conformance.

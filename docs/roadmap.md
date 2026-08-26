@@ -128,7 +128,8 @@ matrix and reproducible evidence.
   exclusion, all four Pod/Namespace selector operators, selector AND, peer OR,
   explicit empty source/port lists, multi-port OR,
   multiple ingress-rule source/port pairing,
-  exact/protocol-only UDP isolation, destination-specific named ports,
+  exact/protocol-only UDP isolation, destination-specific named ports and
+  nonexistent named-port fail-closed behavior,
   destination selection lifecycle, source-label recovery, stacked additive
   policies, and allow-all precedence/recovery, all against direct IPv4 and IPv6
   Pod addresses;

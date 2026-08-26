@@ -158,10 +158,10 @@ Implemented in the repository:
   same-Namespace PodSelectors, exact Namespace-name selection, all four
   Pod/Namespace selector operators, peer OR/selector AND semantics, multiple
   ingress rules,
-  exact/protocol-only UDP isolation, per-destination named-port
-  resolution, source, destination, and Namespace label-driven recovery, stacked
-  additive allows and allow-all recovery, revisioned eBPF provenance, and live
-  policy explanations, plus a
+  exact/protocol-only UDP isolation, per-destination named-port resolution and
+  nonexistent named-port fail-closed behavior, source, destination, and
+  Namespace label-driven recovery, stacked additive allows and allow-all
+  recovery, revisioned eBPF provenance, and live policy explanations, plus a
   versioned EndpointSlice backend-readiness lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, workload/data-plane encryption,

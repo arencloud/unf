@@ -614,6 +614,53 @@ expect_address_allow "${source_a_namespace}" client "${server_ipv6}" 8088
 expect_address_allow "${source_a_namespace}" client "${alternate_server_ipv6}" 8087
 
 previous_revision=${policy_revision}
+"${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nonexistent-named-port
+  namespace: ${target_namespace}
+spec:
+  podSelector:
+    matchLabels:
+      named-port-target: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: no-such-port
+EOF
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "nonexistent named-port policy did not converge"
+for destination in \
+    "server ${server_ip} ${server_ipv6}" \
+    "alternate-server ${alternate_server_ip} ${alternate_server_ipv6}"; do
+    read -r pod ipv4 ipv6 <<<"${destination}"
+    for port in 8087 8088; do
+        expect_address_deny "${source_a_namespace}" client "${ipv4}" "${port}"
+        expect_address_deny "${source_a_namespace}" client "${ipv6}" "${port}"
+    done
+    expect_explanation_to \
+        "${source_a_namespace}/client" "${pod}" 8087 Deny DefaultAction
+done
+
+previous_revision=${policy_revision}
+"${kc[@]}" delete networkpolicy -n "${target_namespace}" \
+    nonexistent-named-port >/dev/null
+require_policy_state "$((baseline_count + 2))" "${baseline_rejected}" \
+    "${previous_revision}" "nonexistent named-port deletion did not reconverge"
+for destination in \
+    "${server_ip} ${server_ipv6}" \
+    "${alternate_server_ip} ${alternate_server_ipv6}"; do
+    read -r ipv4 ipv6 <<<"${destination}"
+    for port in 8087 8088; do
+        expect_address_allow "${source_a_namespace}" client "${ipv4}" "${port}"
+        expect_address_allow "${source_a_namespace}" client "${ipv6}" "${port}"
+    done
+done
+
+previous_revision=${policy_revision}
 for protocol in tcp udp; do
     for port in 8090 8091; do
         expect_protocol_allow \
@@ -764,4 +811,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned dual-stack ingress conformance passed: IPv4/IPv6 explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific named ports, target Pod label isolation/recovery, default deny, same-namespace empty/labeled PodSelector, empty/exact-name NamespaceSelector, all selector operators with Pod/Namespace label recovery, selector AND, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned dual-stack ingress conformance passed: IPv4/IPv6 explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific and nonexistent named ports, target Pod label isolation/recovery, default deny, same-namespace empty/labeled PodSelector, empty/exact-name NamespaceSelector, all selector operators with Pod/Namespace label recovery, selector AND, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"

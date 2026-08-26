@@ -172,7 +172,8 @@ expected native allow/explicit-deny decisions and provenance. It also exercises
 a supported ingress `NetworkPolicy`: cross-node IPv4/IPv6 allow and
 default-isolation drop,
 unsupported-update rejection and recovery, and
-named-port resolution, protocol-only TCP activation/removal without UDP
+per-destination named-port resolution and nonexistent-port fail-closed isolation,
+protocol-only TCP activation/removal without UDP
 broadening, bounded `endPort` boundary enforcement and oversized-range rejection,
 bounded IPv4/IPv6 `ipBlock` allow/exception behavior and oversized-block rejection,
 Namespace relabel, and deletion/recreation convergence.

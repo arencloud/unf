@@ -1704,6 +1704,51 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_named_port_fails_closed() {
+        let compiled = NetworkPolicyCompiler::compile(
+            PolicyId::new(7),
+            policy(vec![NetworkPolicyIngressRule {
+                from: None,
+                ports: Some(vec![NetworkPolicyPort {
+                    port: Some(IntOrString::String("no-such-port".to_owned())),
+                    protocol: Some("TCP".to_owned()),
+                    ..NetworkPolicyPort::default()
+                }]),
+            }]),
+        )
+        .expect("unresolved named port policy compiles");
+        let source = endpoint(1, "frontend", "client");
+        let destination = endpoint(2, "backend", "server");
+
+        let decision = evaluate(
+            std::slice::from_ref(&compiled),
+            Flow {
+                source: &source,
+                destination: &destination,
+                protocol: Protocol::Tcp,
+                destination_port: 8081,
+                source_ipv4: None,
+                source_ipv6: None,
+            },
+        );
+        assert_eq!(decision.verdict, Verdict::Deny);
+        assert_eq!(decision.reason, PolicyReason::DefaultAction);
+
+        let entries = compile_dataplane_entries(&[compiled], &[source, destination])
+            .expect("unresolved named port lowers to isolation without an allow");
+        assert!(entries.iter().any(|entry| {
+            entry.key.destination_identity == IdentityId::new(2)
+                && entry.key.protocol == 0
+                && entry.key.destination_port == 0
+                && entry.decision.verdict == Verdict::Deny
+        }));
+        assert!(!entries.iter().any(|entry| {
+            entry.key.destination_identity == IdentityId::new(2)
+                && entry.decision.verdict == Verdict::Allow
+        }));
+    }
+
+    #[test]
     fn bounded_port_ranges_evaluate_and_lower_to_exact_entries() {
         let compiled = NetworkPolicyCompiler::compile(
             PolicyId::new(7),

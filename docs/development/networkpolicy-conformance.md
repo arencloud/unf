@@ -27,6 +27,7 @@ and the upstream
 | An explicitly empty `from` list matches every source, and port entries are ORed | Every source reaches UDP/8090 and TCP/8091, while TCP/8090 and UDP/8091 remain denied | Unit wildcard assertion, revision-converged dual-protocol traffic, and explanations |
 | An explicitly empty `ports` list matches every supported port and protocol | Namespace A reaches TCP and UDP on 8090 and 8091 while Namespace B remains denied by the peer selector | Unit wildcard assertion, revision-converged dual-protocol traffic, and explanations |
 | A named port resolves independently for every selected destination Pod | One `web` rule allows TCP/8087 on the worker-node server and TCP/8088 on the control-plane server; each opposite open port and the non-matching source remain denied, and policy deletion restores both | Destination-aware lowering test, revision-converged explanations, cross-node/same-node traffic, and deletion recovery |
+| A nonexistent named port fails closed | A `no-such-port` rule isolates both selected destinations without allowing either open TCP port; default-deny explanations remain truthful and deletion restores forwarding | Dedicated evaluator/lowering test plus revision-converged IPv4/IPv6 traffic against both Nodes |
 | UDP rules preserve protocol and peer isolation | An exact UDP/8090 rule allows source Namespace A while UDP/8091, TCP/8090, and Namespace B remain denied; removing the numeric port activates protocol-only UDP/8091 without allowing TCP/8091, and policy deletion restores both protocols | Compiler test, dual-protocol echo fixture, revision-converged explanations, cross-node request/response traffic, and deletion recovery |
 | Selecting policies combine allows additively | One policy allows Namespace A on TCP/8087 and another allows Namespace B on TCP/8088 | Existing additive evaluator test plus two-node traffic |
 | An allow-all policy takes precedence over other isolation policies | A temporary `ingress: [{}]` permits both ports from every source; deletion restores the stacked rules | Two-node mutation and recovery traffic |
@@ -39,12 +40,12 @@ convergence after each policy change, validates live forwarding and explanation,
 and requires cleanup back to the pre-test accepted/rejected policy counts.
 
 Every HTTP allow/deny transition above is sent directly to both IPv4 and IPv6 Pod
-addresses. The multi-destination named-port checks cover both families on both
-Nodes. The dual-protocol target binds separate IPv4/IPv6 TCP and UDP sockets, so
-exact ports, protocol-only rules, explicit empty lists, peer isolation, and
-cross-protocol denial are also exercised over both families. Explanations remain
-family-neutral because both paths resolve to the same workload identities and
-shared policy IR.
+addresses. The valid and nonexistent multi-destination named-port checks cover
+both families on both Nodes. The dual-protocol target binds separate IPv4/IPv6
+TCP and UDP sockets, so exact ports, protocol-only rules, explicit empty lists,
+peer isolation, and cross-protocol denial are also exercised over both families.
+Explanations remain family-neutral because both paths resolve to the same
+workload identities and shared policy IR.
 
 ## Running the evidence
 
