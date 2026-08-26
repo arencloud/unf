@@ -193,9 +193,11 @@ matrix and reproducible evidence.
   history schema v4, legacy-ingress checkpoint migration to schema v2, external
   egress selected-identity validation, and direction-correct historical
   evaluation;
-- Next: NetworkPolicy what-if simulation,
-  populated-map controller-offline replacement recovery, stateful replies, and
-  dual-stack OpenShift qualification;
+- Implemented and two-node kind verified: read-only `NetworkPolicy` add/replace
+  simulation with source-selected dual-stack egress topology, retained-history
+  impact, direction/address reporting, and revision/forwarding immutability;
+- Next: populated-map controller-offline replacement recovery, stateful replies,
+  and dual-stack OpenShift qualification;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.

@@ -36,7 +36,7 @@ use unf_policy::{
     DestinationAddresses, DestinationPort, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort,
     NetworkPolicyCompiler, PolicyCompiler, PolicyIr, compile_dataplane_entries,
     compile_egress_ipv4_dataplane_entries, compile_egress_ipv6_dataplane_entries,
-    compile_ipv4_dataplane_entries, compile_ipv6_dataplane_entries, evaluate,
+    compile_ipv4_dataplane_entries, compile_ipv6_dataplane_entries,
     evaluate_for_direction_with_addresses,
 };
 use unf_state::{
@@ -303,12 +303,12 @@ struct ExplainResponse {
     note: &'static str,
 }
 
-const POLICY_SIMULATION_SCHEMA_VERSION: u16 = 3;
+const POLICY_SIMULATION_SCHEMA_VERSION: u16 = 4;
 const POLICY_SIMULATION_FLOW_LIMIT: usize = 10_000;
 
 #[derive(Debug, Deserialize)]
 struct PolicySimulationRequest {
-    policy: SecurityPolicy,
+    policy: serde_json::Value,
     #[serde(default)]
     flow_history: Option<FlowHistoryQuery>,
 }
@@ -318,6 +318,12 @@ struct PolicySimulationRequest {
 enum PolicySimulationOperation {
     Add,
     Replace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+enum PolicySimulationResourceKind {
+    SecurityPolicy,
+    NetworkPolicy,
 }
 
 #[derive(Debug, Serialize)]
@@ -347,6 +353,10 @@ struct PolicySimulationSummary {
 struct PolicySimulationChange {
     source: ResolvedEndpoint,
     destination: ResolvedEndpoint,
+    direction: PolicyDirection,
+    ip_family: Option<RequestIpFamily>,
+    source_address: Option<IpAddr>,
+    destination_address: Option<IpAddr>,
     protocol: &'static str,
     destination_port: u16,
     current: unf_policy::PolicyDecision,
@@ -388,10 +398,12 @@ struct PolicySimulationHistoricalChange {
 #[derive(Debug, Serialize)]
 struct PolicySimulationResponse {
     schema_version: u16,
+    resource_kind: PolicySimulationResourceKind,
     policy: String,
     policy_id: PolicyId,
     operation: PolicySimulationOperation,
     snapshot: PolicySimulationSnapshot,
+    affected_sources: usize,
     affected_destinations: usize,
     affected_services: Vec<String>,
     summary: PolicySimulationSummary,
@@ -416,6 +428,32 @@ struct FlowHistoryQuery {
     since_unix_ms: Option<u64>,
     until_unix_ms: Option<u64>,
     limit: Option<usize>,
+}
+
+#[derive(Debug)]
+struct CompiledSimulationCandidate {
+    resource_kind: PolicySimulationResourceKind,
+    key: String,
+    policy_id: PolicyId,
+    policies: Vec<PolicyIr>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SimulationAddresses {
+    ip_family: Option<RequestIpFamily>,
+    source_ipv4: Option<std::net::Ipv4Addr>,
+    source_ipv6: Option<Ipv6Addr>,
+    destination: DestinationAddresses,
+}
+
+#[derive(Debug)]
+struct SimulationMatrixFlow {
+    direction: PolicyDirection,
+    source_index: usize,
+    destination_index: usize,
+    protocol: Protocol,
+    destination_port: u16,
+    addresses: SimulationAddresses,
 }
 
 #[tokio::main]
@@ -2847,67 +2885,60 @@ async fn simulate_policy(
     Json(request): Json<PolicySimulationRequest>,
 ) -> Result<Json<PolicySimulationResponse>, ApiError> {
     let history_query = request.flow_history.unwrap_or_default();
-    let key = object_key(&request.policy);
-    let policy_id = stable_policy_id(&key);
-    let candidate = PolicyCompiler::compile(policy_id, request.policy)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let candidate = compile_simulation_candidate(request.policy)?;
 
     let _policy_state_guard = read_lock(&state.policy_state_guard);
     let pod_records: Vec<_> = read_lock(&state.pods).values().cloned().collect();
     let flow_history = simulation_flow_history_snapshot(&state, &history_query)?;
     let namespaces = read_lock(&state.namespaces).clone();
     let current_policies = compiled_policies(&state);
-    let current_candidate = read_lock(&state.compiled_security_policies)
-        .get(&key)
-        .cloned();
-    let operation = if current_candidate.is_some() {
+    let (current_candidate, candidate_exists) =
+        simulation_current_candidate(&state, candidate.resource_kind, &candidate.key);
+    let operation = if candidate_exists {
         PolicySimulationOperation::Replace
     } else {
         PolicySimulationOperation::Add
     };
-    let proposed_policies = simulation_proposed_policies(&state, &key, candidate.clone());
+    let proposed_policies = simulation_proposed_policies(
+        &state,
+        candidate.resource_kind,
+        &candidate.key,
+        &candidate.policies,
+    );
 
     let endpoints: Vec<_> = pod_records
         .iter()
         .map(|pod| endpoint_with_namespace_labels(&pod.endpoint, &namespaces))
         .collect();
-    let affected_destinations: BTreeSet<_> = endpoints
-        .iter()
-        .enumerate()
-        .filter(|(_, endpoint)| {
-            candidate.target.matches(endpoint)
-                || current_candidate
-                    .as_ref()
-                    .is_some_and(|policy| policy.target.matches(endpoint))
-        })
-        .map(|(index, _)| index)
-        .collect();
+    let affected_sources = simulation_selected_endpoints(
+        &endpoints,
+        &candidate.policies,
+        &current_candidate,
+        PolicyDirection::Egress,
+    );
+    let affected_destinations = simulation_selected_endpoints(
+        &endpoints,
+        &candidate.policies,
+        &current_candidate,
+        PolicyDirection::Ingress,
+    );
+    let matrix = simulation_matrix(
+        &pod_records,
+        &endpoints,
+        &affected_sources,
+        &affected_destinations,
+        &current_policies,
+        &proposed_policies,
+    )?;
+    let service_destinations: BTreeSet<_> =
+        matrix.iter().map(|flow| flow.destination_index).collect();
     let affected_services =
-        simulation_affected_services(&state, &pod_records, &affected_destinations);
-
-    let mut flow_count = 0_usize;
-    let mut destination_tuples = BTreeMap::new();
-    for destination_index in &affected_destinations {
-        let tuples = simulation_protocol_ports(
-            &current_policies,
-            &proposed_policies,
-            &endpoints[*destination_index],
-        );
-        flow_count = flow_count
-            .checked_add(pod_records.len().saturating_mul(tuples.len()))
-            .ok_or_else(|| ApiError::bad_request("policy simulation flow count overflow"))?;
-        if flow_count > POLICY_SIMULATION_FLOW_LIMIT {
-            return Err(ApiError::unprocessable(format!(
-                "policy simulation requires {flow_count} topology-derived flows; limit is {POLICY_SIMULATION_FLOW_LIMIT}"
-            )));
-        }
-        destination_tuples.insert(*destination_index, tuples);
-    }
+        simulation_affected_services(&state, &pod_records, &service_destinations);
 
     let (summary, changes) = evaluate_simulation_matrix(
         &pod_records,
         &endpoints,
-        &destination_tuples,
+        &matrix,
         &current_policies,
         &proposed_policies,
     );
@@ -2923,8 +2954,9 @@ async fn simulate_policy(
     let revisions = mutex_lock(&state.revisions).clone();
     Ok(Json(PolicySimulationResponse {
         schema_version: POLICY_SIMULATION_SCHEMA_VERSION,
-        policy: key,
-        policy_id,
+        resource_kind: candidate.resource_kind,
+        policy: candidate.key,
+        policy_id: candidate.policy_id,
         operation,
         snapshot: PolicySimulationSnapshot {
             identity_epoch: state.identity_epoch,
@@ -2935,6 +2967,7 @@ async fn simulate_policy(
             pods: pod_records.len(),
             flow_source: "current-topology representative matrix",
         },
+        affected_sources: affected_sources.len(),
         affected_destinations: affected_destinations.len(),
         affected_services,
         summary,
@@ -2944,6 +2977,50 @@ async fn simulate_policy(
         historical_changes,
         note: "read-only what-if result; the candidate was not applied and historical impact uses bounded last-received-time telemetry",
     }))
+}
+
+fn compile_simulation_candidate(
+    value: serde_json::Value,
+) -> Result<CompiledSimulationCandidate, ApiError> {
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("policy kind is required"))?;
+    match kind {
+        "SecurityPolicy" => {
+            let policy: SecurityPolicy = serde_json::from_value(value).map_err(|error| {
+                ApiError::bad_request(format!("invalid SecurityPolicy: {error}"))
+            })?;
+            let key = object_key(&policy);
+            let policy_id = stable_policy_id(&key);
+            let compiled = PolicyCompiler::compile(policy_id, policy)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            Ok(CompiledSimulationCandidate {
+                resource_kind: PolicySimulationResourceKind::SecurityPolicy,
+                key,
+                policy_id,
+                policies: vec![compiled],
+            })
+        }
+        "NetworkPolicy" => {
+            let policy: NetworkPolicy = serde_json::from_value(value).map_err(|error| {
+                ApiError::bad_request(format!("invalid NetworkPolicy: {error}"))
+            })?;
+            let key = object_key(&policy);
+            let policy_id = stable_policy_id(&format!("networkpolicy:{key}"));
+            let policies = NetworkPolicyCompiler::compile_directions(policy_id, policy)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            Ok(CompiledSimulationCandidate {
+                resource_kind: PolicySimulationResourceKind::NetworkPolicy,
+                key,
+                policy_id,
+                policies,
+            })
+        }
+        _ => Err(ApiError::bad_request(format!(
+            "unsupported policy kind {kind:?}; expected SecurityPolicy or NetworkPolicy"
+        ))),
+    }
 }
 
 fn simulation_flow_history_snapshot(
@@ -2959,24 +3036,73 @@ fn simulation_flow_history_snapshot(
     ))
 }
 
+fn simulation_current_candidate(
+    state: &ControllerState,
+    resource_kind: PolicySimulationResourceKind,
+    candidate_key: &str,
+) -> (Vec<PolicyIr>, bool) {
+    match resource_kind {
+        PolicySimulationResourceKind::SecurityPolicy => {
+            let policies = read_lock(&state.compiled_security_policies);
+            let current = policies.get(candidate_key).cloned().into_iter().collect();
+            (current, policies.contains_key(candidate_key))
+        }
+        PolicySimulationResourceKind::NetworkPolicy => {
+            let current = read_lock(&state.compiled_network_policies)
+                .get(candidate_key)
+                .cloned()
+                .unwrap_or_default();
+            let exists = !current.is_empty()
+                || read_lock(&state.rejected_network_policies).contains_key(candidate_key);
+            (current, exists)
+        }
+    }
+}
+
 fn simulation_proposed_policies(
     state: &ControllerState,
+    resource_kind: PolicySimulationResourceKind,
     candidate_key: &str,
-    candidate: PolicyIr,
+    candidate: &[PolicyIr],
 ) -> Vec<PolicyIr> {
     let mut policies: Vec<_> = read_lock(&state.compiled_security_policies)
         .iter()
-        .filter(|(existing_key, _)| existing_key.as_str() != candidate_key)
+        .filter(|(existing_key, _)| {
+            resource_kind != PolicySimulationResourceKind::SecurityPolicy
+                || existing_key.as_str() != candidate_key
+        })
         .map(|(_, policy)| policy.clone())
         .collect();
     policies.extend(
         read_lock(&state.compiled_network_policies)
-            .values()
-            .flatten()
-            .cloned(),
+            .iter()
+            .filter(|(existing_key, _)| {
+                resource_kind != PolicySimulationResourceKind::NetworkPolicy
+                    || existing_key.as_str() != candidate_key
+            })
+            .flat_map(|(_, policies)| policies.iter().cloned()),
     );
-    policies.push(candidate);
+    policies.extend(candidate.iter().cloned());
     policies
+}
+
+fn simulation_selected_endpoints(
+    endpoints: &[Endpoint],
+    candidate: &[PolicyIr],
+    current_candidate: &[PolicyIr],
+    direction: PolicyDirection,
+) -> BTreeSet<usize> {
+    endpoints
+        .iter()
+        .enumerate()
+        .filter(|(_, endpoint)| {
+            candidate
+                .iter()
+                .chain(current_candidate)
+                .any(|policy| policy.direction == direction && policy.target.matches(endpoint))
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 fn simulation_affected_services(
@@ -3184,80 +3310,161 @@ fn source_addresses(
 fn evaluate_simulation_matrix(
     pod_records: &[PodRecord],
     endpoints: &[Endpoint],
-    destination_tuples: &BTreeMap<usize, BTreeSet<(Protocol, u16)>>,
+    matrix: &[SimulationMatrixFlow],
     current_policies: &[PolicyIr],
     proposed_policies: &[PolicyIr],
 ) -> (PolicySimulationSummary, Vec<PolicySimulationChange>) {
     let mut summary = PolicySimulationSummary::default();
     let mut changes = Vec::new();
     let mut affected_workloads = BTreeSet::new();
-    for (source_index, source) in endpoints.iter().enumerate() {
-        for (destination_index, tuples) in destination_tuples {
-            let destination = &endpoints[*destination_index];
-            for (protocol, destination_port) in tuples {
-                let flow = Flow {
-                    source,
-                    destination,
-                    protocol: *protocol,
-                    destination_port: *destination_port,
-                    source_ipv4: pod_records[source_index]
-                        .ipv4_addresses
-                        .iter()
-                        .next()
-                        .copied(),
-                    source_ipv6: pod_records[source_index]
-                        .ipv4_addresses
-                        .is_empty()
-                        .then(|| {
-                            pod_records[source_index]
-                                .ipv6_addresses
-                                .iter()
-                                .next()
-                                .copied()
-                        })
-                        .flatten(),
-                };
-                let current = evaluate(current_policies, flow);
-                let proposed = evaluate(proposed_policies, flow);
-                summary.evaluated_flows += 1;
-                match (current.verdict, proposed.verdict) {
-                    (Verdict::Allow, Verdict::Deny) => summary.would_be_denied += 1,
-                    (Verdict::Deny, Verdict::Allow) => summary.would_be_allowed += 1,
-                    (_, Verdict::Allow) => summary.remain_allowed += 1,
-                    (_, Verdict::Deny) => summary.remain_denied += 1,
-                    _ => {}
-                }
-                if current.verdict != proposed.verdict {
-                    summary.verdict_changes += 1;
-                }
-                if current != proposed {
-                    summary.decision_changes += 1;
-                    affected_workloads.insert(source_index);
-                    affected_workloads.insert(*destination_index);
-                    changes.push(PolicySimulationChange {
-                        source: resolved(&pod_records[source_index]),
-                        destination: resolved(&pod_records[*destination_index]),
-                        protocol: protocol_name(*protocol),
-                        destination_port: *destination_port,
-                        current,
-                        proposed,
-                    });
-                }
-            }
+    for candidate_flow in matrix {
+        let flow = Flow {
+            source: &endpoints[candidate_flow.source_index],
+            destination: &endpoints[candidate_flow.destination_index],
+            protocol: candidate_flow.protocol,
+            destination_port: candidate_flow.destination_port,
+            source_ipv4: candidate_flow.addresses.source_ipv4,
+            source_ipv6: candidate_flow.addresses.source_ipv6,
+        };
+        let current = evaluate_for_direction_with_addresses(
+            current_policies,
+            candidate_flow.direction,
+            flow,
+            candidate_flow.addresses.destination,
+        );
+        let proposed = evaluate_for_direction_with_addresses(
+            proposed_policies,
+            candidate_flow.direction,
+            flow,
+            candidate_flow.addresses.destination,
+        );
+        summary.evaluated_flows += 1;
+        match (current.verdict, proposed.verdict) {
+            (Verdict::Allow, Verdict::Deny) => summary.would_be_denied += 1,
+            (Verdict::Deny, Verdict::Allow) => summary.would_be_allowed += 1,
+            (_, Verdict::Allow) => summary.remain_allowed += 1,
+            (_, Verdict::Deny) => summary.remain_denied += 1,
+            _ => {}
+        }
+        if current.verdict != proposed.verdict {
+            summary.verdict_changes += 1;
+        }
+        if current != proposed {
+            summary.decision_changes += 1;
+            affected_workloads.insert(candidate_flow.source_index);
+            affected_workloads.insert(candidate_flow.destination_index);
+            changes.push(PolicySimulationChange {
+                source: resolved(&pod_records[candidate_flow.source_index]),
+                destination: resolved(&pod_records[candidate_flow.destination_index]),
+                direction: candidate_flow.direction,
+                ip_family: candidate_flow.addresses.ip_family,
+                source_address: simulation_source_address(candidate_flow.addresses),
+                destination_address: simulation_destination_address(candidate_flow.addresses),
+                protocol: protocol_name(candidate_flow.protocol),
+                destination_port: candidate_flow.destination_port,
+                current,
+                proposed,
+            });
         }
     }
     summary.affected_workloads = affected_workloads.len();
     (summary, changes)
 }
 
+fn simulation_matrix(
+    pod_records: &[PodRecord],
+    endpoints: &[Endpoint],
+    affected_sources: &BTreeSet<usize>,
+    affected_destinations: &BTreeSet<usize>,
+    current_policies: &[PolicyIr],
+    proposed_policies: &[PolicyIr],
+) -> Result<Vec<SimulationMatrixFlow>, ApiError> {
+    let mut matrix = Vec::new();
+    for destination_index in affected_destinations {
+        for source_index in 0..endpoints.len() {
+            append_simulation_flows(
+                &mut matrix,
+                pod_records,
+                endpoints,
+                PolicyDirection::Ingress,
+                source_index,
+                *destination_index,
+                current_policies,
+                proposed_policies,
+            )?;
+        }
+    }
+    for source_index in affected_sources {
+        for destination_index in 0..endpoints.len() {
+            append_simulation_flows(
+                &mut matrix,
+                pod_records,
+                endpoints,
+                PolicyDirection::Egress,
+                *source_index,
+                destination_index,
+                current_policies,
+                proposed_policies,
+            )?;
+        }
+    }
+    Ok(matrix)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_simulation_flows(
+    matrix: &mut Vec<SimulationMatrixFlow>,
+    pod_records: &[PodRecord],
+    endpoints: &[Endpoint],
+    direction: PolicyDirection,
+    source_index: usize,
+    destination_index: usize,
+    current_policies: &[PolicyIr],
+    proposed_policies: &[PolicyIr],
+) -> Result<(), ApiError> {
+    let tuples = simulation_protocol_ports(
+        current_policies,
+        proposed_policies,
+        direction,
+        &endpoints[source_index],
+        &endpoints[destination_index],
+    );
+    let addresses =
+        simulation_address_pairs(&pod_records[source_index], &pod_records[destination_index]);
+    for (protocol, destination_port) in tuples {
+        for addresses in &addresses {
+            matrix.push(SimulationMatrixFlow {
+                direction,
+                source_index,
+                destination_index,
+                protocol,
+                destination_port,
+                addresses: *addresses,
+            });
+            if matrix.len() > POLICY_SIMULATION_FLOW_LIMIT {
+                return Err(ApiError::unprocessable(format!(
+                    "policy simulation requires more than {POLICY_SIMULATION_FLOW_LIMIT} topology-derived flows; limit is {POLICY_SIMULATION_FLOW_LIMIT}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn simulation_protocol_ports(
     current_policies: &[PolicyIr],
     proposed_policies: &[PolicyIr],
+    direction: PolicyDirection,
+    source: &Endpoint,
     destination: &Endpoint,
 ) -> BTreeSet<(Protocol, u16)> {
     let mut tuples = BTreeSet::new();
     for policy in current_policies.iter().chain(proposed_policies) {
-        if !policy.target.matches(destination) {
+        let selected = match direction {
+            PolicyDirection::Ingress => destination,
+            PolicyDirection::Egress => source,
+        };
+        if policy.direction != direction || !policy.target.matches(selected) {
             continue;
         }
         for rule in &policy.rules {
@@ -3299,6 +3506,65 @@ fn simulation_protocol_ports(
         }
     }
     tuples
+}
+
+fn simulation_address_pairs(
+    source: &PodRecord,
+    destination: &PodRecord,
+) -> Vec<SimulationAddresses> {
+    let mut pairs = Vec::with_capacity(2);
+    if let (Some(source), Some(destination)) = (
+        source.ipv4_addresses.iter().next().copied(),
+        destination.ipv4_addresses.iter().next().copied(),
+    ) {
+        pairs.push(SimulationAddresses {
+            ip_family: Some(RequestIpFamily::Ipv4),
+            source_ipv4: Some(source),
+            source_ipv6: None,
+            destination: DestinationAddresses {
+                ipv4: Some(destination),
+                ipv6: None,
+            },
+        });
+    }
+    if let (Some(source), Some(destination)) = (
+        source.ipv6_addresses.iter().next().copied(),
+        destination.ipv6_addresses.iter().next().copied(),
+    ) {
+        pairs.push(SimulationAddresses {
+            ip_family: Some(RequestIpFamily::Ipv6),
+            source_ipv4: None,
+            source_ipv6: Some(source),
+            destination: DestinationAddresses {
+                ipv4: None,
+                ipv6: Some(destination),
+            },
+        });
+    }
+    if pairs.is_empty() {
+        pairs.push(SimulationAddresses {
+            ip_family: None,
+            source_ipv4: None,
+            source_ipv6: None,
+            destination: DestinationAddresses::default(),
+        });
+    }
+    pairs
+}
+
+fn simulation_source_address(addresses: SimulationAddresses) -> Option<IpAddr> {
+    addresses
+        .source_ipv4
+        .map(IpAddr::V4)
+        .or_else(|| addresses.source_ipv6.map(IpAddr::V6))
+}
+
+fn simulation_destination_address(addresses: SimulationAddresses) -> Option<IpAddr> {
+    addresses
+        .destination
+        .ipv4
+        .map(IpAddr::V4)
+        .or_else(|| addresses.destination.ipv6.map(IpAddr::V6))
 }
 
 const fn protocol_name(protocol: Protocol) -> &'static str {
@@ -4763,7 +5029,8 @@ mod tests {
         let response = simulate_policy(
             State(Arc::clone(&state)),
             Json(PolicySimulationRequest {
-                policy: security_policy("frontend-to-backend", "Deny"),
+                policy: serde_json::to_value(security_policy("frontend-to-backend", "Deny"))
+                    .expect("candidate serializes"),
                 flow_history: Some(FlowHistoryQuery {
                     since_unix_ms: Some(100),
                     until_unix_ms: Some(100),
@@ -4821,7 +5088,8 @@ mod tests {
         let future = simulate_policy(
             State(Arc::clone(state)),
             Json(PolicySimulationRequest {
-                policy: security_policy("frontend-to-backend", "Deny"),
+                policy: serde_json::to_value(security_policy("frontend-to-backend", "Deny"))
+                    .expect("candidate serializes"),
                 flow_history: Some(FlowHistoryQuery {
                     since_unix_ms: Some(101),
                     until_unix_ms: None,
@@ -4832,7 +5100,7 @@ mod tests {
         .await
         .expect("empty historical window still simulates topology")
         .0;
-        assert_eq!(future.schema_version, 3);
+        assert_eq!(future.schema_version, 4);
         assert_eq!(future.summary.would_be_denied, 1);
         assert_eq!(future.historical_query.matched_flows, 0);
         assert_eq!(future.historical_query.returned_flows, 0);
@@ -4855,7 +5123,8 @@ mod tests {
         let response = simulate_policy(
             State(Arc::clone(&state)),
             Json(PolicySimulationRequest {
-                policy: security_policy("candidate-deny", "Deny"),
+                policy: serde_json::to_value(security_policy("candidate-deny", "Deny"))
+                    .expect("candidate serializes"),
                 flow_history: None,
             }),
         )
@@ -4864,7 +5133,8 @@ mod tests {
         .0;
 
         assert!(matches!(response.operation, PolicySimulationOperation::Add));
-        assert_eq!(response.schema_version, 3);
+        assert_eq!(response.schema_version, 4);
+        assert_eq!(response.affected_sources, 0);
         assert_eq!(response.historical_query.since_unix_ms, None);
         assert_eq!(response.historical_query.until_unix_ms, None);
         assert_eq!(response.historical_query.limit, FLOW_HISTORY_CAPACITY);
@@ -4872,6 +5142,81 @@ mod tests {
         assert_eq!(response.summary.would_be_denied, 8);
         assert!(read_lock(&state.compiled_security_policies).is_empty());
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::default());
+    }
+
+    #[tokio::test]
+    async fn network_policy_simulation_is_direction_aware_and_read_only() {
+        let state = Arc::new(egress_policy_state());
+        let key = "frontend/allow-server-egress";
+        let current = read_lock(&state.compiled_network_policies)
+            .get(key)
+            .cloned()
+            .expect("live egress policy exists");
+        let revision = mutex_lock(&state.revisions).policy;
+        let candidate = serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": "allow-server-egress",
+                "namespace": "frontend"
+            },
+            "spec": {
+                "podSelector": {"matchLabels": {"app": "client"}},
+                "policyTypes": ["Egress"],
+                "egress": []
+            }
+        });
+
+        let response = simulate_policy(
+            State(Arc::clone(&state)),
+            Json(PolicySimulationRequest {
+                policy: candidate,
+                flow_history: None,
+            }),
+        )
+        .await
+        .expect("egress NetworkPolicy candidate simulates")
+        .0;
+
+        assert_eq!(response.schema_version, 4);
+        assert_eq!(
+            response.resource_kind,
+            PolicySimulationResourceKind::NetworkPolicy
+        );
+        assert!(matches!(
+            response.operation,
+            PolicySimulationOperation::Replace
+        ));
+        assert_eq!(response.policy, key);
+        assert_eq!(response.affected_sources, 1);
+        assert_eq!(response.affected_destinations, 0);
+        assert_eq!(response.summary.evaluated_flows, 14);
+        assert_eq!(response.summary.would_be_denied, 2);
+        assert_eq!(response.summary.verdict_changes, 2);
+        assert_eq!(response.changes.len(), 2);
+        assert!(response.changes.iter().all(|change| {
+            change.direction == PolicyDirection::Egress
+                && change.destination_port == 8080
+                && change.current.verdict == Verdict::Allow
+                && change.proposed.verdict == Verdict::Deny
+        }));
+        assert!(
+            response
+                .changes
+                .iter()
+                .any(|change| matches!(change.ip_family, Some(RequestIpFamily::Ipv4)))
+        );
+        assert!(
+            response
+                .changes
+                .iter()
+                .any(|change| matches!(change.ip_family, Some(RequestIpFamily::Ipv6)))
+        );
+        assert_eq!(mutex_lock(&state.revisions).policy, revision);
+        assert_eq!(
+            read_lock(&state.compiled_network_policies).get(key),
+            Some(&current)
+        );
     }
 
     #[tokio::test]
@@ -4892,7 +5237,8 @@ mod tests {
         let error = simulate_policy(
             State(Arc::clone(&state)),
             Json(PolicySimulationRequest {
-                policy: security_policy("candidate-deny", "Deny"),
+                policy: serde_json::to_value(security_policy("candidate-deny", "Deny"))
+                    .expect("candidate serializes"),
                 flow_history: None,
             }),
         )

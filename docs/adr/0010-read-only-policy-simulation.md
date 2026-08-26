@@ -61,3 +61,7 @@ contract to historical impact without changing topology evaluation. Because flow
 entries aggregate observations, a matching entry can include observations older
 than the window. External sources without a current identity and user-supplied
 flow sets cannot yet be evaluated.
+
+ADR 0040 subsequently extends request/response schema v4 to Kubernetes
+`NetworkPolicy`, adds source-selected dual-stack egress matrix evaluation, and
+retains the same read-only revision fence.

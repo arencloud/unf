@@ -944,7 +944,7 @@ grep -q "\"destination_ipv6\": \"${server_ipv6}\"" <<<"${ipv6_flow_history}"
 policy_simulation=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json \
     policy simulate "${project_root}/deploy/examples/simulation-deny.yaml")
-grep -q '"schema_version": 3' <<<"${policy_simulation}"
+grep -q '"schema_version": 4' <<<"${policy_simulation}"
 grep -q '"operation": "replace"' <<<"${policy_simulation}"
 grep -q '"flow_source": "current-topology representative matrix"' <<<"${policy_simulation}"
 grep -Eq '"would_be_denied": [1-9][0-9]*' <<<"${policy_simulation}"
@@ -999,7 +999,7 @@ windowed_policy_simulation=$("${unfctl}" \
     policy simulate "${project_root}/deploy/examples/simulation-deny.yaml" \
     --since-unix-ms "${simulation_window_start}")
 jq -e --argjson start "${simulation_window_start}" '
-    .schema_version == 3
+    .schema_version == 4
     and .historical_query.since_unix_ms == $start
     and .historical_query.matched_flows > 0
     and .historical_query.returned_flows > 0
@@ -2319,4 +2319,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: split public/internal TLS routing with dedicated CA trust and Pod-bound TokenReview authentication, anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v3 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, dual-stack upstream exact/protocol-only UDP isolation, multi-destination and nonexistent named ports, target match-label/expression lifecycle, overlapping selectors, remote target-specific exceptions, same-object update recovery, multi-value Pod/Namespace selector AND, homogeneous PodSelector peer OR, source-label lifecycle, exact-name/NotIn Namespace selection, and peer-selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned dual-stack ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, authenticated direction-aware flow export v3, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: split public/internal TLS routing with dedicated CA trust and Pod-bound TokenReview authentication, anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v3 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, dual-stack upstream exact/protocol-only UDP isolation, multi-destination and nonexistent named ports, target match-label/expression lifecycle, overlapping selectors, remote target-specific exceptions, same-object update recovery, multi-value Pod/Namespace selector AND, homogeneous PodSelector peer OR, source-label lifecycle, exact-name/NotIn Namespace selection, and peer-selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned dual-stack ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, direction-aware native/NetworkPolicy what-if simulation, topology v3, authenticated direction-aware flow export v3, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

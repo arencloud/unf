@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::Value;
-use unf_api::SecurityPolicy;
 
 #[derive(Debug, Parser)]
 #[command(about = "Inspect, explain, and simulate the UNF network fabric")]
@@ -73,9 +72,9 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum PolicyCommand {
-    /// Compare a candidate `SecurityPolicy` with current topology and policy state.
+    /// Compare a candidate `SecurityPolicy` or `NetworkPolicy` with live state.
     Simulate {
-        /// `SecurityPolicy` YAML file to evaluate without applying.
+        /// Policy YAML file to evaluate without applying.
         policy_file: PathBuf,
         /// Restrict historical impact to flows last received within this duration.
         #[arg(long, value_parser = parse_duration_millis, conflicts_with = "since_unix_ms")]
@@ -134,7 +133,7 @@ struct ExplainRequest<'a> {
 
 #[derive(Debug, Serialize)]
 struct PolicySimulationRequest<'a> {
-    policy: &'a SecurityPolicy,
+    policy: &'a Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     flow_history: Option<PolicySimulationFlowHistoryQuery>,
 }
@@ -216,8 +215,8 @@ async fn run() -> Result<()> {
         } => {
             let contents = std::fs::read_to_string(policy_file)
                 .with_context(|| format!("read policy file {}", policy_file.display()))?;
-            let policy: SecurityPolicy = serde_yaml::from_str(&contents)
-                .with_context(|| format!("parse SecurityPolicy YAML {}", policy_file.display()))?;
+            let policy: Value = serde_yaml::from_str(&contents)
+                .with_context(|| format!("parse policy YAML {}", policy_file.display()))?;
             let flow_history = policy_simulation_flow_history(
                 *last,
                 *since_unix_ms,
@@ -679,7 +678,8 @@ fn print_simulation_table(value: &Value) {
     let snapshot = &value["snapshot"];
     println!("Policy Simulation");
     println!(
-        "policy                   {} ({})",
+        "policy                   {} {} ({})",
+        text_field(value, "resource_kind"),
         text_field(value, "policy"),
         text_field(value, "operation")
     );
@@ -728,6 +728,11 @@ fn print_simulation_table(value: &Value) {
         number_field(summary, "affected_workloads")
     );
     println!(
+        "selected endpoints       sources={} destinations={}",
+        number_field(value, "affected_sources"),
+        number_field(value, "affected_destinations")
+    );
+    println!(
         "affected services        {}",
         joined_strings(&value["affected_services"])
     );
@@ -735,11 +740,15 @@ fn print_simulation_table(value: &Value) {
     if let Some(changes) = value.get("changes").and_then(Value::as_array) {
         for change in changes.iter().take(20) {
             println!(
-                "change                   {} -> {} {}/{}: {} -> {}",
+                "change                   {} {} -> {} {}/{} family={} addresses={}->{}: {} -> {}",
+                change["direction"].as_str().unwrap_or("Ingress"),
                 change["source"]["reference"].as_str().unwrap_or("?"),
                 change["destination"]["reference"].as_str().unwrap_or("?"),
                 change["protocol"].as_str().unwrap_or("?"),
                 change["destination_port"],
+                change["ip_family"].as_str().unwrap_or("-"),
+                change["source_address"].as_str().unwrap_or("-"),
+                change["destination_address"].as_str().unwrap_or("-"),
                 change["current"]["verdict"].as_str().unwrap_or("?"),
                 change["proposed"]["verdict"].as_str().unwrap_or("?"),
             );
@@ -822,11 +831,17 @@ mod tests {
                 }
             }
         ));
-        let policy: SecurityPolicy = serde_yaml::from_str(include_str!(
+        let policy: Value = serde_yaml::from_str(include_str!(
             "../../../deploy/examples/simulation-deny.yaml"
         ))
         .expect("checked-in simulation fixture is valid");
-        assert_eq!(policy.metadata.name.as_deref(), Some("frontend-to-backend"));
+        assert_eq!(policy["metadata"]["name"], "frontend-to-backend");
+        let network_policy: Value = serde_yaml::from_str(include_str!(
+            "../../../deploy/examples/simulation-networkpolicy-egress-deny.yaml"
+        ))
+        .expect("checked-in NetworkPolicy simulation fixture is valid");
+        assert_eq!(network_policy["kind"], "NetworkPolicy");
+        assert_eq!(network_policy["spec"]["policyTypes"][0], "Egress");
         assert_eq!(
             policy_simulation_flow_history(Some(900_000), None, None, Some(25), 2_000_000)
                 .expect("relative simulation window resolves"),

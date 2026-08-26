@@ -7,6 +7,7 @@ context=${KUBE_CONTEXT:-kind-unf-dev}
 controller_url=${UNF_CONTROLLER_URL:-http://127.0.0.1:19962}
 unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 fixture="${project_root}/deploy/examples/networkpolicy-egress.yaml"
+simulation_fixture="${project_root}/deploy/examples/simulation-networkpolicy-egress-deny.yaml"
 source_namespace=unf-egress-source
 allowed_namespace=unf-egress-allowed
 denied_namespace=unf-egress-denied
@@ -263,6 +264,55 @@ expect_egress_history() {
     exit 1
 }
 
+expect_egress_simulation() {
+    local revision=$1 simulation after_revision
+    simulation=$("${unfctl}" --controller-url "${controller_url}" --output json \
+        policy simulate "${simulation_fixture}")
+    if ! jq -e --arg source4 "${source_ipv4}" --arg destination4 "${allowed_ipv4}" \
+        --arg source6 "${source_ipv6}" --arg destination6 "${allowed_ipv6}" \
+        --argjson revision "${revision}" '
+        .schema_version == 4
+        and .resource_kind == "NetworkPolicy"
+        and .policy == "unf-egress-source/selected-egress"
+        and .operation == "replace"
+        and .snapshot.policy_revision == $revision
+        and .affected_sources == 1
+        and .affected_destinations == 0
+        and .summary.would_be_denied >= 2
+        and .summary.verdict_changes >= 2
+        and .historical_summary.would_be_denied_observations > 0
+        and any(.historical_changes[];
+            .direction == "Egress"
+            and .destination_port == 8080
+            and .current.verdict == "Allow"
+            and .proposed.verdict == "Deny")
+        and any(.changes[];
+            .direction == "Egress"
+            and .ip_family == "ipv4"
+            and .source_address == $source4
+            and .destination_address == $destination4
+            and .destination_port == 8080
+            and .current.verdict == "Allow"
+            and .proposed.verdict == "Deny")
+        and any(.changes[];
+            .direction == "Egress"
+            and .ip_family == "ipv6"
+            and .source_address == $source6
+            and .destination_address == $destination6
+            and .destination_port == 8080
+            and .current.verdict == "Allow"
+            and .proposed.verdict == "Deny")
+    ' <<<"${simulation}" >/dev/null; then
+        echo "direction-aware egress NetworkPolicy simulation was incomplete" >&2
+        exit 1
+    fi
+    after_revision=$(status_field policy <<<"$(controller_status)")
+    if [[ ${after_revision} != "${revision}" ]]; then
+        echo "read-only NetworkPolicy simulation changed policy revision" >&2
+        exit 1
+    fi
+}
+
 cleanup
 for namespace in "${source_namespace}" "${allowed_namespace}" "${denied_namespace}"; do
     "${kc[@]}" wait --for=delete namespace/"${namespace}" --timeout=60s \
@@ -396,6 +446,9 @@ expect_egress_history ipv6 "${source_ipv6}" "${allowed_ipv6}" \
     8080 Allow "${selector_revision}"
 expect_egress_history ipv4 "${source_ipv4}" "${allowed_ipv4}" \
     8081 Deny "${selector_revision}"
+expect_egress_simulation "${selector_revision}"
+expect_tcp_allow client "${allowed_ipv4}" 8080 unf-egress-ok
+expect_tcp_allow client "${allowed_ipv6}" 8080 unf-egress-ok
 
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: networking.k8s.io/v1
@@ -507,4 +560,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" \
     exit 1
 fi
 
-echo "dual-stack NetworkPolicy egress qualification passed: selected-source default isolation, non-selected pass-through, Namespace/Pod selector AND, named TCP and UDP ports, protocol-only SCTP, IPv4/IPv6 ipBlock exceptions, direction-correct explanation, retained history, and allow/deny provenance, deletion recovery, and exact fixture cleanup"
+echo "dual-stack NetworkPolicy egress qualification passed: selected-source default isolation, non-selected pass-through, Namespace/Pod selector AND, named TCP and UDP ports, protocol-only SCTP, IPv4/IPv6 ipBlock exceptions, direction-correct explanation, retained history, read-only what-if simulation, allow/deny provenance, deletion recovery, and exact fixture cleanup"

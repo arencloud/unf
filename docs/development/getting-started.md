@@ -242,8 +242,13 @@ target/debug/unfctl --controller-url http://127.0.0.1:9962 \
   policy simulate deploy/examples/simulation-deny.yaml
 target/debug/unfctl --controller-url http://127.0.0.1:9962 \
   policy simulate deploy/examples/simulation-deny.yaml --last 15m --limit 100
+target/debug/unfctl --controller-url http://127.0.0.1:9962 \
+  policy simulate deploy/examples/simulation-networkpolicy-egress-deny.yaml
 ```
 
+Both native `SecurityPolicy` and Kubernetes `NetworkPolicy` manifests use the
+same read-only command. Schema v4 reports the resource kind and expands
+NetworkPolicy impact by ingress/egress direction and each shared IPv4/IPv6 family.
 The result is fenced to the reported identity epoch/revision, policy revision,
 and topology revision. Inspect the same current Node/workload/Service and runtime
 backend relationships with:

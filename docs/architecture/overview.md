@@ -40,7 +40,8 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    readiness/serving/termination state. `unfctl explain` asks the controller to
    resolve two Pods and evaluate one explicit policy direction against a concrete
    IPv4 or IPv6 address pair.
-   `unfctl policy simulate` compiles a candidate without applying it and compares
+   `unfctl policy simulate` compiles a native or Kubernetes policy candidate
+   without applying it and compares
    current/proposed decisions over a probe matrix fenced to the reported topology
    revision plus an independently windowed, revision-fenced retained-history set.
 5. The agent loads the Aya object, attaches TC, applies the controller's revisioned

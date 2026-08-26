@@ -13,9 +13,10 @@ Phase 1's observation gate and Phase 2's first enforcement gate are verified in
 a two-node kind cluster. Collision-checked identities and transactional policy
 revisions now drive TC allow/drop decisions with actual and shadow provenance.
 The supported ingress `NetworkPolicy` slices are live-verified through the same
-controller, policy engine, and dataplane. A read-only policy simulation foundation
-now compares candidate native policy against revision-fenced live topology without
-applying it. Versioned topology snapshots expose Nodes, workload placement,
+controller, policy engine, and dataplane. Read-only what-if simulation compares
+candidate native or Kubernetes NetworkPolicy resources against revision-fenced,
+direction-aware dual-stack topology and retained history without applying them.
+Versioned topology snapshots expose Nodes, workload placement,
 Services, selector intent, and EndpointSlice-derived runtime backend readiness.
 Node agents also export direction-selected flow observations into bounded,
 revisioned history for operator queries and policy impact analysis. Ingress and
@@ -170,7 +171,8 @@ Implemented in the repository:
 - `unfctl status`, `unfctl topology`, `unfctl flows`, and direction-/family-aware
   `unfctl explain` against live controller state, including separate resolved
   ingress/egress status counts;
-- `unfctl policy simulate <security-policy.yaml>` with table/JSON/YAML
+- `unfctl policy simulate <policy.yaml>` for `SecurityPolicy` or `NetworkPolicy`,
+  with table/JSON/YAML output
   representative and historical impact summaries, optional last-received-time
   windows and newest-first limits, plus current/proposed provenance;
 - a reproducible dual-stack two-node kind demo covering native and NetworkPolicy

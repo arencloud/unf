@@ -1,0 +1,12 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: selected-egress
+  namespace: unf-egress-source
+spec:
+  podSelector:
+    matchLabels:
+      app: egress-client
+  policyTypes:
+    - Egress
+  egress: []

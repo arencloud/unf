@@ -120,13 +120,15 @@ policy state rather than widening an allow across both workloads.
 
 ## Read-only policy simulation
 
-The Phase 3 simulation foundation compiles a candidate native `SecurityPolicy`
-through the same `PolicyCompiler` and compares the current policy set with an
-in-memory add-or-replace proposal. The controller captures the identity epoch,
+The Phase 3 simulation API compiles a candidate native `SecurityPolicy` or
+Kubernetes `NetworkPolicy` through the same resource-specific compiler used by
+enforcement and compares the current policy set with an in-memory add-or-replace
+proposal. The controller captures the identity epoch,
 identity revision, policy revision, topology revision, and Pod topology under one
 read fence. It
-evaluates current and proposed policy over all Pod sources, affected destinations,
-every referenced concrete port, and representative TCP/UDP/SCTP fallback ports.
+evaluates current and proposed policy over destination-selected ingress and
+source-selected egress Pod pairs, every referenced concrete port, representative
+TCP/UDP/SCTP fallback ports, and each IPv4/IPv6 family shared by the pair.
 
 The versioned response retains both decisions and provenance, separates verdict
 changes from provenance-only changes, and reports affected workloads. Simulation
@@ -139,4 +141,5 @@ Pod backends. Optional inclusive last-received bounds and a newest-first limit
 select the historical set without changing the topology matrix; query metadata
 makes partial results explicit. External sources that lack a
 current source identity and user-supplied flow sets remain excluded. See
-[ADR 0010](../adr/0010-read-only-policy-simulation.md).
+[ADR 0010](../adr/0010-read-only-policy-simulation.md) and
+[ADR 0040](../adr/0040-networkpolicy-what-if-simulation.md).
