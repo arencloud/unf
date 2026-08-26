@@ -32,6 +32,18 @@ controller_status() {
     "${unfctl}" --controller-url "${controller_url}" --output json status
 }
 
+pod_ipv4() {
+    "${kc[@]}" get pod -n "$1" "$2" \
+        -o jsonpath='{range .status.podIPs[*]}{.ip}{"\n"}{end}' \
+        | awk 'index($0, ".") > 0 && index($0, ":") == 0 { print; exit }'
+}
+
+pod_ipv6() {
+    "${kc[@]}" get pod -n "$1" "$2" \
+        -o jsonpath='{range .status.podIPs[*]}{.ip}{"\n"}{end}' \
+        | awk 'index($0, ":") > 0 { print; exit }'
+}
+
 agent_status() {
     "${kc[@]}" get --raw \
         "/api/v1/namespaces/unf-system/pods/${1}/proxy/v1/status"
@@ -126,9 +138,10 @@ expect_address_allow() {
     local pod=$2
     local address=$3
     local port=$4
-    local response
+    local response url_host=${address}
+    [[ ${address} != *:* ]] || url_host="[${address}]"
     response=$("${kc[@]}" exec -n "${namespace}" "${pod}" -- \
-        wget -T 2 -t 1 -qO- "http://${address}:${port}")
+        wget -T 2 -t 1 -qO- "http://${url_host}:${port}")
     if [[ ${response} != "unf-upstream-ok" ]]; then
         echo "expected ${namespace}/${pod} to reach ${address} TCP/${port}" >&2
         exit 1
@@ -140,8 +153,10 @@ expect_address_deny() {
     local pod=$2
     local address=$3
     local port=$4
+    local url_host=${address}
+    [[ ${address} != *:* ]] || url_host="[${address}]"
     if "${kc[@]}" exec -n "${namespace}" "${pod}" -- \
-        wget -T 2 -t 1 -qO- "http://${address}:${port}" >/dev/null 2>&1; then
+        wget -T 2 -t 1 -qO- "http://${url_host}:${port}" >/dev/null 2>&1; then
         echo "expected ${namespace}/${pod} to be denied to ${address} TCP/${port}" >&2
         exit 1
     fi
@@ -149,10 +164,12 @@ expect_address_deny() {
 
 expect_allow() {
     expect_address_allow "$1" "$2" "${server_ip}" "$3"
+    expect_address_allow "$1" "$2" "${server_ipv6}" "$3"
 }
 
 expect_deny() {
     expect_address_deny "$1" "$2" "${server_ip}" "$3"
+    expect_address_deny "$1" "$2" "${server_ipv6}" "$3"
 }
 
 protocol_exchange() {
@@ -162,9 +179,11 @@ protocol_exchange() {
     local address=$4
     local port=$5
     local endpoint
-    case ${protocol} in
-        tcp) endpoint="TCP4:${address}:${port}" ;;
-        udp) endpoint="UDP4-DATAGRAM:${address}:${port}" ;;
+    case "${protocol}:$([[ ${address} == *:* ]] && echo 6 || echo 4)" in
+        tcp:4) endpoint="TCP4:${address}:${port}" ;;
+        udp:4) endpoint="UDP4-DATAGRAM:${address}:${port}" ;;
+        tcp:6) endpoint="TCP6:[${address}]:${port}" ;;
+        udp:6) endpoint="UDP6-DATAGRAM:[${address}]:${port}" ;;
         *) echo "unsupported echo protocol ${protocol}" >&2; return 2 ;;
     esac
     {
@@ -181,6 +200,13 @@ expect_protocol_allow() {
         echo "expected $1/$2 $3 to reach $4 port $5" >&2
         exit 1
     fi
+    if [[ $4 == "${protocol_server_ip:-}" && -n ${protocol_server_ipv6:-} ]]; then
+        response=$(protocol_exchange "$1" "$2" "$3" "${protocol_server_ipv6}" "$5" || true)
+        if [[ ${response} != "unf-protocol-ok" ]]; then
+            echo "expected $1/$2 $3 to reach ${protocol_server_ipv6} port $5" >&2
+            exit 1
+        fi
+    fi
 }
 
 expect_protocol_deny() {
@@ -189,6 +215,13 @@ expect_protocol_deny() {
     if [[ ${response} == "unf-protocol-ok" ]]; then
         echo "expected $1/$2 $3 to be denied to $4 port $5" >&2
         exit 1
+    fi
+    if [[ $4 == "${protocol_server_ip:-}" && -n ${protocol_server_ipv6:-} ]]; then
+        response=$(protocol_exchange "$1" "$2" "$3" "${protocol_server_ipv6}" "$5" || true)
+        if [[ ${response} == "unf-protocol-ok" ]]; then
+            echo "expected $1/$2 $3 to be denied to ${protocol_server_ipv6} port $5" >&2
+            exit 1
+        fi
     fi
 }
 
@@ -244,12 +277,12 @@ fi
     --timeout=120s
 "${kc[@]}" wait --for=condition=Ready pod/client -n "${source_a_namespace}" --timeout=120s
 "${kc[@]}" wait --for=condition=Ready pod/client -n "${source_b_namespace}" --timeout=120s
-server_ip=$("${kc[@]}" get pod -n "${target_namespace}" server \
-    -o jsonpath='{.status.podIP}')
-alternate_server_ip=$("${kc[@]}" get pod -n "${target_namespace}" alternate-server \
-    -o jsonpath='{.status.podIP}')
-protocol_server_ip=$("${kc[@]}" get pod -n "${target_namespace}" protocol-server \
-    -o jsonpath='{.status.podIP}')
+server_ip=$(pod_ipv4 "${target_namespace}" server)
+server_ipv6=$(pod_ipv6 "${target_namespace}" server)
+alternate_server_ip=$(pod_ipv4 "${target_namespace}" alternate-server)
+alternate_server_ipv6=$(pod_ipv6 "${target_namespace}" alternate-server)
+protocol_server_ip=$(pod_ipv4 "${target_namespace}" protocol-server)
+protocol_server_ipv6=$(pod_ipv6 "${target_namespace}" protocol-server)
 if [[ ! ${server_ip} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "upstream conformance server has no IPv4 Pod address" >&2
     exit 1
@@ -262,6 +295,16 @@ if [[ ! ${protocol_server_ip} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "upstream conformance protocol server has no IPv4 Pod address" >&2
     exit 1
 fi
+for address_record in \
+    "server ${server_ipv6}" \
+    "alternate-server ${alternate_server_ipv6}" \
+    "protocol-server ${protocol_server_ipv6}"; do
+    read -r pod address <<<"${address_record}"
+    if [[ ${address} != *:* ]]; then
+        echo "upstream conformance ${pod} has no IPv6 Pod address" >&2
+        exit 1
+    fi
+done
 for port in 8087 8088; do
     response=$("${kc[@]}" exec -n "${target_namespace}" server -- \
         wget -T 2 -t 1 -qO- "http://127.0.0.1:${port}")
@@ -547,6 +590,12 @@ expect_address_allow "${source_a_namespace}" client "${alternate_server_ip}" 808
 expect_address_deny "${source_a_namespace}" client "${alternate_server_ip}" 8087
 expect_address_deny "${source_b_namespace}" client "${server_ip}" 8087
 expect_address_deny "${source_b_namespace}" client "${alternate_server_ip}" 8088
+expect_address_allow "${source_a_namespace}" client "${server_ipv6}" 8087
+expect_address_deny "${source_a_namespace}" client "${server_ipv6}" 8088
+expect_address_allow "${source_a_namespace}" client "${alternate_server_ipv6}" 8088
+expect_address_deny "${source_a_namespace}" client "${alternate_server_ipv6}" 8087
+expect_address_deny "${source_b_namespace}" client "${server_ipv6}" 8087
+expect_address_deny "${source_b_namespace}" client "${alternate_server_ipv6}" 8088
 expect_explanation_to "${source_a_namespace}/client" server 8087 Allow ExplicitRule
 expect_explanation_to \
     "${source_a_namespace}/client" alternate-server 8088 Allow ExplicitRule
@@ -561,6 +610,8 @@ require_policy_state "$((baseline_count + 2))" "${baseline_rejected}" \
     "${previous_revision}" "multi-destination named-port deletion did not reconverge"
 expect_address_allow "${source_a_namespace}" client "${server_ip}" 8088
 expect_address_allow "${source_a_namespace}" client "${alternate_server_ip}" 8087
+expect_address_allow "${source_a_namespace}" client "${server_ipv6}" 8088
+expect_address_allow "${source_a_namespace}" client "${alternate_server_ipv6}" 8087
 
 previous_revision=${policy_revision}
 for protocol in tcp udp; do
@@ -713,4 +764,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned ingress conformance passed: explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific named ports, target Pod label isolation/recovery, default deny, same-namespace empty/labeled PodSelector, empty/exact-name NamespaceSelector, all selector operators with Pod/Namespace label recovery, selector AND, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned dual-stack ingress conformance passed: IPv4/IPv6 explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific named ports, target Pod label isolation/recovery, default deny, same-namespace empty/labeled PodSelector, empty/exact-name NamespaceSelector, all selector operators with Pod/Namespace label recovery, selector AND, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"

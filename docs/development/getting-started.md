@@ -204,7 +204,9 @@ temporary allow-all precedence across three source contexts and two ports. Its
 two selected servers also map one `web` port name to different numeric ports;
 the verifier requires destination-specific allow/deny and deletion recovery.
 A dual-protocol echo target proves exact and protocol-only UDP rules do not
-broaden TCP or non-matching peers and recover after deletion. The verifier also
+broaden TCP or non-matching peers and recover after deletion. Every selector and
+additive-policy transition targets direct IPv4 and IPv6 Pod addresses; the named
+port and dual-protocol targets also bind and verify both families. The verifier
 requires every mutation to converge on both agents and deletes its three test
 Namespaces before returning.
 The exact scope and upstream mapping are tracked

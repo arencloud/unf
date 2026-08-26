@@ -130,7 +130,8 @@ matrix and reproducible evidence.
   multiple ingress-rule source/port pairing,
   exact/protocol-only UDP isolation, destination-specific named ports,
   destination selection lifecycle, source-label recovery, stacked additive
-  policies, and allow-all precedence/recovery;
+  policies, and allow-all precedence/recovery, all against direct IPv4 and IPv6
+  Pod addresses;
   revision-fenced, read-only native policy simulation over a bounded
   current-topology probe matrix; versioned Node,
   workload-placement, Service, and selector-membership topology snapshots;

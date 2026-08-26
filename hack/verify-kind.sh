@@ -139,6 +139,27 @@ start_controller_forward() {
     return 1
 }
 
+wait_for_controller_baseline() {
+    local status
+    for _ in {1..30}; do
+        status=$("${unfctl}" \
+            --controller-url "http://127.0.0.1:${controller_port}" --output json status \
+            2>/dev/null || true)
+        if grep -Eq '"identities": [1-9][0-9]*' <<<"${status}" \
+            && grep -Eq '"indexed_pod_ips": [1-9][0-9]*' <<<"${status}" \
+            && grep -Eq '"resolved_policy_entries": [1-9][0-9]*' <<<"${status}" \
+            && grep -Eq '"network_policies": [1-9][0-9]*' <<<"${status}" \
+            && grep -Eq '"endpoint_slices": [1-9][0-9]*' <<<"${status}" \
+            && grep -q '"rejected_network_policies": 0' <<<"${status}" \
+            && grep -q '"all_converged": true' <<<"${status}"; then
+            controller_status=${status}
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 agent_status() {
     "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${1}/proxy/v1/status"
 }
@@ -428,16 +449,21 @@ wait_for_historical_demo_flow() {
 }
 
 wait_for_historical_ipv6_demo_flow() {
-    local snapshot compact
+    local snapshot
     for _ in {1..30}; do
         snapshot=$("${unfctl}" \
             --controller-url "http://127.0.0.1:${controller_port}" --output json flows)
-        compact=$(tr -d '\n' <<<"${snapshot}")
-        if grep -q '"source_ipv6": "' <<<"${compact}" \
-            && grep -q '"destination_ipv6": "' <<<"${compact}" \
-            && grep -q '"destination_port": 8080' <<<"${compact}" \
-            && grep -q '"frontend/client"' <<<"${compact}" \
-            && grep -q '"backend/server"' <<<"${compact}"; then
+        if jq -e \
+            --arg source_ipv6 "${client_ipv6}" \
+            --arg destination_ipv6 "${server_ipv6}" '
+                any(.entries[];
+                    .key.source_ipv6 == $source_ipv6
+                    and .key.destination_ipv6 == $destination_ipv6
+                    and .key.destination_port == 8080
+                    and (.source_workloads | index("frontend/client")) != null
+                    and (.destination_workloads | index("backend/server")) != null
+                )
+            ' <<<"${snapshot}" >/dev/null; then
             ipv6_flow_history=${snapshot}
             return 0
         fi
@@ -477,14 +503,10 @@ if ! start_controller_forward; then
     exit 1
 fi
 
-controller_status=$("${unfctl}" \
-    --controller-url "http://127.0.0.1:${controller_port}" --output json status)
-grep -Eq '"identities": [1-9][0-9]*' <<<"${controller_status}"
-grep -Eq '"indexed_pod_ips": [1-9][0-9]*' <<<"${controller_status}"
-grep -Eq '"resolved_policy_entries": [1-9][0-9]*' <<<"${controller_status}"
-grep -Eq '"network_policies": [1-9][0-9]*' <<<"${controller_status}"
-grep -Eq '"endpoint_slices": [1-9][0-9]*' <<<"${controller_status}"
-grep -q '"rejected_network_policies": 0' <<<"${controller_status}"
+if ! wait_for_controller_baseline; then
+    echo "controller did not reconcile the demo baseline after Pod updates" >&2
+    exit 1
+fi
 
 allow_explanation=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json \
@@ -2230,4 +2252,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: split public/internal TLS routing with dedicated CA trust and Pod-bound TokenReview authentication, anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v2 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, authenticated flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: split public/internal TLS routing with dedicated CA trust and Pod-bound TokenReview authentication, anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v2 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, dual-stack upstream exact/protocol-only UDP isolation, multi-destination named ports, target/source label lifecycle, exact-name/NotIn Namespace selection, and selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned dual-stack ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, authenticated flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

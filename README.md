@@ -36,7 +36,9 @@ recursive telemetry loop.
 The resolved-identity fast path
 is now dual-stack for IPv4/IPv6 TCP/UDP/SCTP, including verifier-bounded IPv6
 extension-header traversal; native policy and selector-based NetworkPolicy IPv6
-decisions are live-verified.
+decisions are live-verified. The upstream-aligned three-Namespace ingress matrix
+now runs every supported selector, additive-policy, named-port, and TCP/UDP
+protocol-isolation transition against direct IPv4 and IPv6 Pod addresses.
 Identity and policy updates now use independent transactional banks selected by
 atomic configuration-map writes. All nine enforcement maps persist in an
 ABI-versioned bpffs directory; replacement agents validate and adopt

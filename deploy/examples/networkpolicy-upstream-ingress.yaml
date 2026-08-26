@@ -105,7 +105,11 @@ spec:
           socat TCP4-LISTEN:8090,reuseaddr,fork EXEC:/bin/cat &
           socat TCP4-LISTEN:8091,reuseaddr,fork EXEC:/bin/cat &
           socat UDP4-RECVFROM:8091,reuseaddr,fork EXEC:/bin/cat &
-          exec socat UDP4-RECVFROM:8090,reuseaddr,fork EXEC:/bin/cat
+          socat UDP4-RECVFROM:8090,reuseaddr,fork EXEC:/bin/cat &
+          socat TCP6-LISTEN:8090,reuseaddr,fork,ipv6-v6only=1 EXEC:/bin/cat &
+          socat TCP6-LISTEN:8091,reuseaddr,fork,ipv6-v6only=1 EXEC:/bin/cat &
+          socat UDP6-RECVFROM:8091,reuseaddr,fork,ipv6-v6only=1 EXEC:/bin/cat &
+          exec socat UDP6-RECVFROM:8090,reuseaddr,fork,ipv6-v6only=1 EXEC:/bin/cat
       ports:
         - name: exact-udp
           containerPort: 8090

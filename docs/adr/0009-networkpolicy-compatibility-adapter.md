@@ -80,8 +80,8 @@ through the same Phase 2 dataplane compiler in a two-node cluster. Rejection
 details do not yet have a dedicated API endpoint. Exact-key range expansion is
 simple and matches the existing fast path, but intentionally trades map entries
 for range support; per-range and per-bank limits make that cost explicit and
-fail compilation instead of weakening policy. Unbounded and IPv6 IP blocks still
-need a compact prefix representation, and egress needs a direction-aware IR and
+fail compilation instead of weakening policy. ADR 0014 subsequently added compact
+bounded IPv6 prefix representation; egress still needs a direction-aware IR and
 hook. The live verifier also creates a policy with omitted target selector,
 policy types, and port protocol, proves namespace-wide TCP isolation, then
 narrows the target and proves the no-longer-selected Pod is non-isolated. A
@@ -91,5 +91,6 @@ and enriched historical export. An upstream-aligned three-Namespace matrix prove
 same-Namespace PodSelector scope, empty NamespaceSelector behavior, selector AND,
 peer OR, explicit empty-list wildcards, multi-port OR, all selector operators,
 Pod/Namespace label recovery, stacked additive allows, and allow-all deletion
-recovery. These remain bounded compatibility claims rather than full upstream
-conformance.
+recovery. Direct IPv4 and IPv6 Pod traffic now exercises every transition,
+including destination-specific named ports and TCP/UDP protocol isolation. These
+remain bounded compatibility claims rather than full upstream conformance.

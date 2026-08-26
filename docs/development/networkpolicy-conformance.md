@@ -38,6 +38,14 @@ owns its exact three test Namespaces, waits for controller/agent revision
 convergence after each policy change, validates live forwarding and explanation,
 and requires cleanup back to the pre-test accepted/rejected policy counts.
 
+Every HTTP allow/deny transition above is sent directly to both IPv4 and IPv6 Pod
+addresses. The multi-destination named-port checks cover both families on both
+Nodes. The dual-protocol target binds separate IPv4/IPv6 TCP and UDP sockets, so
+exact ports, protocol-only rules, explicit empty lists, peer isolation, and
+cross-protocol denial are also exercised over both families. Explanations remain
+family-neutral because both paths resolve to the same workload identities and
+shared policy IR.
+
 ## Running the evidence
 
 The supported entry point is:
@@ -54,9 +62,9 @@ against an existing connection by setting `KUBECONFIG`, `KUBE_CONTEXT`,
 ## Deliberate exclusions
 
 The matrix covers only behavior already represented faithfully by the current
-ingress IR; its DNS-based traffic assertions currently select IPv4. The main kind
-verifier separately proves direct-address IPv6 selector, bounded `ipBlock`
-allow/default-deny/exception recovery, and bounded extension-header traversal.
+ingress IR and probes direct Pod addresses rather than Service-family selection.
+The main kind verifier separately proves bounded IPv4/IPv6 `ipBlock`
+allow/default-deny/exception recovery and bounded extension-header traversal.
 Egress, non-initial fragments, IPv6 jumbograms/ESP/reassembly, malformed or
 over-limit extension chains, unbounded compiler output, and complete upstream
 suite execution remain outside this claim. Those gaps stay visible in the authoritative
