@@ -55,7 +55,6 @@ and map ABI design without overloading ingress key meaning. IPv4 deliberately
 trades bounded exact entries for a simple hash lookup; IPv6 remains compact in
 an LPM trie.
 
-The next slice must version the snapshot/map set, stage egress maps in the same
-inactive bank as ingress, validate their capacity and provenance in the agent,
-and flip one revision only after every direction is complete. TC lookup and
-live enforcement follow that transactional foundation.
+ADR 0035 subsequently versioned the snapshot/map set and stages both egress maps
+in the same inactive-bank transaction as ingress. TC lookup, controller egress
+distribution, and live enforcement follow that transactional foundation.

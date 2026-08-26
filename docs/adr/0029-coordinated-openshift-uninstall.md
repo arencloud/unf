@@ -23,7 +23,7 @@ non-mutating dry run by default and requires both `--execute` and an exact
 unless every selected agent is Ready.
 
 The preflight executes `unf-agent cleanup` without `--execute` in every current
-agent Pod. Each node must expose a valid current-ABI plan containing all nine v2
+agent Pod. Each node must expose a valid current-ABI plan containing all eleven v3
 map pins. The plan covers UNF ingress and egress legacy program names on all
 current non-loopback interfaces and describes the exact Kubernetes and
 cluster-scoped resource disposition.
@@ -38,7 +38,7 @@ Execution uses this order:
    `unf-agent` service account, constrained SCC, three-capability security
    context, and ADR 0028 admission-protected host mounts;
 4. require every Job to report an execute plan and completion;
-5. inspect each host and require `/sys/fs/bpf/unf/v2`, UNF program names, and the
+5. inspect each host and require `/sys/fs/bpf/unf/v3`, UNF program names, and the
    reserved legacy handles to be absent in both directions;
 6. remove cleanup Jobs and either delete the dedicated `unf-system` Namespace or
    only the exact UNF namespaced objects; and

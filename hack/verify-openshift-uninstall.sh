@@ -59,8 +59,8 @@ grep -q 'stop DaemonSet unf-system/unf-agent before host mutation' \
 grep -q 'delete dedicated Namespace unf-system' "${temporary_dir}/plan.txt"
 grep -q 'preserve SecurityPolicy CRD' "${temporary_dir}/plan.txt"
 grep -q 'dry run only' "${temporary_dir}/plan.txt"
-[[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v2/' \
-    "${temporary_dir}/plan.txt") -eq $((agent_count * 9)) ]]
+[[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v3/' \
+    "${temporary_dir}/plan.txt") -eq $((agent_count * 11)) ]]
 [[ $("${kc[@]}" -n unf-system get deployment unf-controller \
     -o jsonpath='{.metadata.uid}') == "${before_controller}" ]]
 [[ $("${kc[@]}" -n unf-system get pod \
@@ -111,7 +111,7 @@ mapfile -t nodes < <(cut -f1 <<<"${before_agents}")
 for node in "${nodes[@]}"; do
     verification=$("${kc[@]}" debug "node/${node}" --quiet -- \
         chroot /host sh -eu -c '
-            test ! -e /sys/fs/bpf/unf/v2
+            test ! -e /sys/fs/bpf/unf/v3
             for path in /sys/class/net/*; do
                 interface=${path##*/}
                 [ "${interface}" = lo ] && continue

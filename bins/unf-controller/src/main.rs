@@ -2372,6 +2372,8 @@ async fn policy_snapshot(
         entries,
         ipv4_entries,
         ipv6_entries,
+        egress_ipv4_entries: Vec::new(),
+        egress_ipv6_entries: Vec::new(),
     }))
 }
 

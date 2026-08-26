@@ -78,7 +78,7 @@ cleanup() {
             if [[ -n ${pressure_inactive_bank} ]]; then
                 "${kc[@]}" -n unf-system exec "${helper}" -- \
                     /usr/local/bin/unf-bpf-map-pressure clear \
-                    /sys/fs/bpf/unf/v2/POLICY_RULES "${pressure_inactive_bank}" \
+                    /sys/fs/bpf/unf/v3/POLICY_RULES "${pressure_inactive_bank}" \
                     >/dev/null 2>&1 || true
             fi
         done < <("${kc[@]}" -n unf-system get pods \
@@ -205,14 +205,15 @@ expected_attachment_mode() {
 prepare_fault_map_set() {
     local helper=$1 target=$2 omitted=$3
     "${kc[@]}" -n unf-system exec "${helper}" -- sh -eu -c '
-        source=/sys/fs/bpf/unf/v2
+        source=/sys/fs/bpf/unf/v3
         target=$1
         omitted=$2
         rm -rf "${target}"
         mkdir -p "${target}"
         for map in \
             IDENTITY_V4 IDENTITY_V4_B IDENTITY_V6 IDENTITY_V6_B \
-            IDENTITY_CONFIG POLICY_RULES POLICY_IPV4 POLICY_IPV6 POLICY_CONFIG
+            IDENTITY_CONFIG POLICY_RULES POLICY_IPV4 POLICY_IPV6 \
+            EGRESS_IPV4 EGRESS_IPV6 POLICY_CONFIG
         do
             if [ "${map}" = "${omitted}" ]; then
                 continue
@@ -697,7 +698,7 @@ for _ in {1..30}; do
         fi
         if [[ ${attachment_mode} == tcx_pinned ]] \
             && ! "${kc[@]}" -n unf-system exec "${pod}" -- sh -c \
-                'find /sys/fs/bpf/unf/v2/links -maxdepth 1 -type f -name "tcx-ingress-*" | grep -q .' \
+                'find /sys/fs/bpf/unf/v3/links -maxdepth 1 -type f -name "tcx-ingress-*" | grep -q .' \
                 >/dev/null 2>&1; then
             initial_synced=false
             break
@@ -1982,7 +1983,7 @@ map_pressure_helper=${fault_helper}
     rm -f /run/unf-test/pressure-ready /run/unf-test/pressure-stop
 "${kc[@]}" -n unf-system exec "${fault_helper}" -- \
     /usr/local/bin/unf-bpf-map-pressure hold \
-    /sys/fs/bpf/unf/v2/POLICY_RULES "${pressure_inactive_bank}" \
+    /sys/fs/bpf/unf/v3/POLICY_RULES "${pressure_inactive_bank}" \
     /run/unf-test/pressure-ready /run/unf-test/pressure-stop \
     >"${temporary_dir}/map-pressure.log" 2>&1 &
 map_pressure_pid=$!
@@ -2098,11 +2099,11 @@ pressure_inactive_bank=
 map_pressure_helper=
 
 if current_abi_refusal=$("${kc[@]}" -n unf-system exec "${restart_agent}" -- \
-    /usr/local/bin/unf-component cleanup --abi-version 2 --execute 2>&1); then
+    /usr/local/bin/unf-component cleanup --abi-version 3 --execute 2>&1); then
     echo "cleanup accepted current ABI removal without explicit confirmation" >&2
     exit 1
 fi
-if ! grep -q 'refusing to clean current ABI v2 without --allow-current-abi' \
+if ! grep -q 'refusing to clean current ABI v3 without --allow-current-abi' \
     <<<"${current_abi_refusal}"; then
     printf '%s\n' "${current_abi_refusal}" >&2
     echo "cleanup did not report the current-ABI confirmation requirement" >&2
@@ -2117,7 +2118,7 @@ fi
 if "${kc[@]}" -n unf-system exec "${fault_helper}" -- \
     test ! -e /sys/fs/bpf/unf/v1; then
     "${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
-        source=/sys/fs/bpf/unf/v2
+        source=/sys/fs/bpf/unf/v3
         target=/sys/fs/bpf/unf/v1
         mkdir "${target}"
         for map in \
@@ -2171,7 +2172,7 @@ if ! grep -q 'UNF cleanup completed' <<<"${cleanup_execution}"; then
 fi
 "${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
     test ! -e /sys/fs/bpf/unf/v1
-    test "$(find /sys/fs/bpf/unf/v2 -maxdepth 1 -type f | wc -l)" -eq 9
+    test "$(find /sys/fs/bpf/unf/v3 -maxdepth 1 -type f | wc -l)" -eq 11
 '
 stale_abi_fixture_helper=
 
@@ -2191,7 +2192,7 @@ while read -r cleanup_helper; do
     [[ -n ${cleanup_helper} ]] || continue
     "${kc[@]}" -n unf-system exec "${cleanup_helper}" -- sh -eu -c '
         test ! -e /sys/fs/bpf/unf/v1
-        test "$(find /sys/fs/bpf/unf/v2 -maxdepth 1 -type f | wc -l)" -eq 9
+        test "$(find /sys/fs/bpf/unf/v3 -maxdepth 1 -type f | wc -l)" -eq 11
     '
 done < <("${kc[@]}" -n unf-system get pods \
     -l app.kubernetes.io/name=unf-bpf-fault-helper \
@@ -2314,4 +2315,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: split public/internal TLS routing with dedicated CA trust and Pod-bound TokenReview authentication, anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v2 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, dual-stack upstream exact/protocol-only UDP isolation, multi-destination and nonexistent named ports, target match-label/expression lifecycle, overlapping selectors, remote target-specific exceptions, same-object update recovery, multi-value Pod/Namespace selector AND, homogeneous PodSelector peer OR, source-label lifecycle, exact-name/NotIn Namespace selection, and peer-selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned dual-stack ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, authenticated flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: split public/internal TLS routing with dedicated CA trust and Pod-bound TokenReview authentication, anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v3 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, dual-stack upstream exact/protocol-only UDP isolation, multi-destination and nonexistent named ports, target match-label/expression lifecycle, overlapping selectors, remote target-specific exceptions, same-object update recovery, multi-value Pod/Namespace selector AND, homogeneous PodSelector peer OR, source-label lifecycle, exact-name/NotIn Namespace selection, and peer-selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned dual-stack ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, authenticated flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

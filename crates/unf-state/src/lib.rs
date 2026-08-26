@@ -8,7 +8,7 @@ use thiserror::Error;
 use unf_common::{IdentityId, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
-pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
+pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 2;
 pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
@@ -706,6 +706,10 @@ pub struct PolicyStateSnapshot {
     pub entries: Vec<PolicyMapEntry>,
     pub ipv4_entries: Vec<Ipv4PolicyMapEntry>,
     pub ipv6_entries: Vec<Ipv6PolicyMapEntry>,
+    #[serde(default)]
+    pub egress_ipv4_entries: Vec<EgressIpv4PolicyMapEntry>,
+    #[serde(default)]
+    pub egress_ipv6_entries: Vec<EgressIpv6PolicyMapEntry>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

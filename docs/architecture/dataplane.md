@@ -27,12 +27,14 @@ key layout without an ABI change.
 |---|---|---|---|---|---|
 | `FLOW_COUNTERS` | constant `u32` slot 0 | per-CPU `u64` | eBPF program | increment per parsed flow; program lifetime | one entry; forwarding continues if lookup fails |
 | `FLOW_EVENTS` | none (ring) | `FlowEvent` ABI v2 | eBPF producer, agent consumer | ephemeral, unpinned | 256 KiB; events drop under pressure without changing the already-computed forwarding decision |
-| `IDENTITY_V4`, `IDENTITY_V4_B` | IPv4 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent transactional writer; TC reader | physical banks 0/1; inactive map is replaced and validated before activation; pinned under `/sys/fs/bpf/unf/v2` | 65,536 entries per bank; unknown/mismatched identity resolves to ID zero and forwarding continues |
+| `IDENTITY_V4`, `IDENTITY_V4_B` | IPv4 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent transactional writer; TC reader | physical banks 0/1; inactive map is replaced and validated before activation; pinned under `/sys/fs/bpf/unf/v3` | 65,536 entries per bank; unknown/mismatched identity resolves to ID zero and forwarding continues |
 | `IDENTITY_V6`, `IDENTITY_V6_B` | 16 IPv6 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent transactional writer; TC reader | physical banks 0/1 stage with their IPv4 counterpart; pinned under the same ABI directory | 65,536 entries per bank; unknown/mismatched identity resolves to ID zero and forwarding continues |
 | `IDENTITY_CONFIG` | constant `u32` slot 0 | controller epoch, identity revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates both address-family maps; pinned | one entry; failed activation preserves the previous pointer |
 | `POLICY_RULES` | source/destination identity, protocol, destination port, bank | actual/shadow verdict and policy/rule/reason provenance, schema, revision | controller compiler; agent transactional writer | stale inactive keys are removed, then populated and validated before activation; pinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries, and the active bank remains selected when staging fails |
 | `POLICY_IPV4` | exact/fallback source IPv4, destination identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller IPv4-aware compiler; agent transactional writer | staged and validated alongside `POLICY_RULES`; pinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
 | `POLICY_IPV6` | destination identity, port, protocol, bank, and source IPv6 prefix | same policy decision/provenance value as `POLICY_RULES` | controller IPv6-aware compiler; agent transactional writer; TC LPM reader | staged and validated alongside the other policy maps; pinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
+| `EGRESS_IPV4` | exact/fallback destination IPv4, source identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller egress compiler; agent transactional writer | staged and validated with the ingress maps; TC lookup remains gated | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
+| `EGRESS_IPV6` | source identity, port, protocol, bank, and destination IPv6 prefix | same policy decision/provenance value as `POLICY_RULES` | controller egress compiler; agent transactional writer | staged and validated with the ingress maps; TC lookup remains gated | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
 | `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks; pinned | one entry; failed activation preserves the previous pointer |
 
 `FlowEvent` carries no Kubernetes strings. ABI v2 records the applied policy
@@ -106,8 +108,8 @@ and proves that the reserved netlink filter alone preserves enforcement through
 replacement before restoring TCX and removing the legacy tuple.
 Operators can inspect and remove recognized persistent state with `unf-agent
 cleanup`. Planning is the default; `--execute` applies the plan. ABI cleanup
-accepts only the known v1/v2 map names and numeric UNF TCX link-pin names, refuses
-unknown directory content, and requires `--allow-current-abi` for v2. Legacy
+accepts only the known v1/v2/v3 map names and numeric UNF TCX link-pin names,
+refuses unknown directory content, and requires `--allow-current-abi` for v3. Legacy
 cleanup matches only UNF program names and leaves clsact and unrelated filters
 untouched.
 Invalid map state never becomes a deny by accident. The kind gate also fills the

@@ -9,8 +9,8 @@ use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, RingBuf};
 use aya_ebpf::programs::TcContext;
 use unf_common::{IdentityId, PolicyId, PolicyReason, RuleId, Verdict};
 use unf_ebpf_common::{
-    AddressFamily, Direction, FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT,
-    IDENTITY_MAP_ABI_VERSION,
+    AddressFamily, Direction, EgressIpv4PolicyMapKey, EgressIpv6PolicyMapData, FLOW_ABI_VERSION,
+    FlowEvent, FlowKey, IDENTITY_BANK_COUNT, IDENTITY_MAP_ABI_VERSION,
     IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT, IPV6_NEXT_HEADER_HOP_BY_HOP,
     IdentityMapConfig, IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, Ipv6ExtensionStep,
     Ipv6IdentityKey, Ipv6PolicyMapData, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
@@ -67,6 +67,16 @@ static POLICY_IPV4: HashMap<Ipv4PolicyMapKey, PolicyMapValue> =
 /// Prefix-based IPv6 compatibility decisions share the dual-bank revision.
 #[map]
 static POLICY_IPV6: LpmTrie<Ipv6PolicyMapData, PolicyMapValue> =
+    LpmTrie::with_max_entries(262_144, 0);
+
+/// Exact-destination IPv4 egress decisions share the active policy bank.
+#[map]
+static EGRESS_IPV4: HashMap<EgressIpv4PolicyMapKey, PolicyMapValue> =
+    HashMap::with_max_entries(262_144, BPF_F_NO_PREALLOC);
+
+/// Destination-prefix IPv6 egress decisions share the active policy bank.
+#[map]
+static EGRESS_IPV6: LpmTrie<EgressIpv6PolicyMapData, PolicyMapValue> =
     LpmTrie::with_max_entries(262_144, 0);
 
 #[map]

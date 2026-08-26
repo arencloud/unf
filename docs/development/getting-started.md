@@ -67,7 +67,7 @@ sudo target/debug/unf-agent \
 ```
 
 TC attachment changes host network state. On Linux 6.6+, the agent leaves its
-per-interface TCX links pinned below `/sys/fs/bpf/unf/v2/links` so a replacement
+per-interface TCX links pinned below `/sys/fs/bpf/unf/v3/links` so a replacement
 can update them atomically. On older kernels it leaves the clsact qdisc and its
 stable legacy filters in place for in-place replacement. Use a disposable
 environment for testing.
@@ -92,16 +92,16 @@ names. It refuses symbolic links, non-directory targets, and any unknown direct
 content instead of recursively deleting it. A missing target is an idempotent
 no-op.
 
-Removing current v2 state is an uninstall or controlled-reset operation. First
+Removing current v3 state is an uninstall or controlled-reset operation. First
 stop every agent using that node so no process is reading or recreating the maps
 or attachments, inspect the dry run, and provide the additional confirmation:
 
 ```bash
 sudo target/debug/unf-agent cleanup \
-  --abi-version 2 --allow-current-abi \
+  --abi-version 3 --allow-current-abi \
   --legacy-attachments --all-interfaces --legacy-direction both
 sudo target/debug/unf-agent cleanup \
-  --abi-version 2 --allow-current-abi \
+  --abi-version 3 --allow-current-abi \
   --legacy-attachments --all-interfaces --legacy-direction both --execute
 ```
 
@@ -316,8 +316,8 @@ fixed, rechecks the established allow/deny flows, releases pressure, and require
 that waiting revision to activate before restoring enforcement. Cleanup removes
 only the scoped synthetic keys and fault aliases. It also adds unknown content to
 a recognized v1 directory to prove refusal, verifies dry-run preservation, then
-uses the deployed agent command to remove v1 state on both nodes while all nine
-v2 pins remain. The helper is removed before offline replacement and is not part
+uses the deployed agent command to remove v1 state on both nodes while all eleven
+v3 pins remain. The helper is removed before offline replacement and is not part
 of the production kustomization.
 
 The DaemonSet attaches ingress classification to every non-loopback node interface

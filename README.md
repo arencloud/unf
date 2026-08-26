@@ -47,7 +47,7 @@ UDP, and SCTP scenarios with no unclassified case; the verified bounded ingress
 peer/port slice and its explicit egress/stateful boundaries are tracked in the
 [conformance matrix](docs/development/networkpolicy-conformance.md).
 Identity and policy updates now use independent transactional banks selected by
-atomic configuration-map writes. All nine enforcement maps persist in an
+atomic configuration-map writes. All eleven enforcement maps persist in an
 ABI-versioned bpffs directory; replacement agents validate and adopt
 last-known-good identity/policy state, while fresh or incompatible startup
 remains fenced from readiness until reconciliation.
@@ -137,7 +137,7 @@ Implemented in the repository:
 - revisioned controller-to-agent dual-stack identity snapshots and transactional
   dual-bank IPv4/IPv6 BPF maps selected by one atomic configuration write;
 - selector-resolved policy snapshots and dual-bank transactional BPF policy maps;
-- nine pinned enforcement maps with all-or-none validation, active-bank and
+- eleven pinned enforcement maps with all-or-none validation, active-bank and
   revision checks, userspace cache recovery, and controller-independent
   replacement-agent readiness;
 - persistent TC attachment handoff using pinned, atomically updated TCX links on
@@ -146,7 +146,7 @@ Implemented in the repository:
 - explicit `auto`, `tcx-pinned`, and `legacy-netlink` attachment selection, with
   kind verification that removes TCX coverage, continuously probes enforcement
   through legacy in-place replacement, then restores TCX before scoped cleanup;
-- dry-run-first `unf-agent cleanup` planning for recognized ABI v1/v2 map and
+- dry-run-first `unf-agent cleanup` planning for recognized ABI v1/v2/v3 map and
   TCX pins plus UNF-named legacy filters, with unknown-content refusal and an
   explicit current-ABI confirmation gate;
 - coordinated dry-run-first OpenShift uninstall with all-agent shutdown,

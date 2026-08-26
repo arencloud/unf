@@ -42,7 +42,7 @@ matrix and reproducible evidence.
   node agent with the controller offline before checking allow/deny state;
 - Implemented and two-node kind verified: transactional dual-bank IPv4/IPv6
   identity staging, read-back validation, single-write activation, rollback, and
-  offline-controller restart recovery through the ABI v2 nine-map pin set;
+  offline-controller restart recovery through the ABI v3 eleven-map pin set;
 - Implemented and two-node kind verified on Linux 7.1: per-interface pinned TCX
   links, atomic replacement-program handoff, and continuous deny enforcement
   while an offline-controller agent is replaced. The same gate explicitly selects
@@ -52,7 +52,7 @@ matrix and reproducible evidence.
   filters, BTF/bpffs access, SCC admission, enforcing SELinux, and IPv4
   enforcement are also verified on OpenShift 4.22/RHCOS 9.8 kernel 5.14;
 - Implemented and two-node kind verified: isolated live-kernel fault sets prove
-  eight-of-nine pins, malformed active policy config, and corrupt inactive-bank
+  ten-of-eleven pins, malformed active policy config, and corrupt inactive-bank
   debris are rejected with actionable errors while primary allow/deny state
   remains unchanged; permanent dataplane startup failure exits for orchestrator
   retry;
@@ -62,9 +62,9 @@ matrix and reproducible evidence.
   revision/bank and traffic; after scoped cleanup, the waiting revision activates
   and enforcement restores;
 - Implemented and two-node kind verified: dry-run-first host-state cleanup removes
-  only recognized ABI v1/v2 map pins, TCX link pins, and UNF-named legacy filters;
-  unknown ABI content is refused, current v2 requires explicit confirmation, and
-  live cleanup preserves the active v2 map set and restores TCX before removing
+  only recognized ABI v1/v2/v3 map pins, TCX link pins, and UNF-named legacy filters;
+  unknown ABI content is refused, current v3 requires explicit confirmation, and
+  live cleanup preserves the active v3 map set and restores TCX before removing
   legacy filters;
 - Implemented and two-node kind verified: acknowledgement schema v2 uses a
   dedicated-audience projected service-account token, Kubernetes TokenReview,
@@ -174,8 +174,10 @@ matrix and reproducible evidence.
   destination-prefix IPv6 lowering, including selector/named-port metadata,
   isolation fallbacks, exception behavior, capacity limits, and strict
   direction separation;
-- Next: snapshot/map ABI staging and transactional agent distribution, then TC
-  egress enforcement;
+- Implemented and rebuilt-kind verified: snapshot schema v4 and
+  policy ABI v3 stage dedicated IPv4/IPv6 egress maps in the same validated,
+  rollback-safe inactive-bank transaction as ingress;
+- Next: TC egress lookup and controller egress distribution;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.

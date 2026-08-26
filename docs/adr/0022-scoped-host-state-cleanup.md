@@ -42,10 +42,10 @@ Unit tests cover dry-run CLI defaults, exact TCX-name matching, current and
 unsupported ABI refusal, root/target symlink refusal, unknown-content refusal
 without mutation, and exact planned removal while preserving a sibling entry.
 
-The two-node kind gate uses the deployed agent binary to reject current v2
+The two-node kind gate uses the deployed agent binary to reject current v3
 without confirmation, inject unknown content into recognized v1 state and prove
 non-mutation, remove that content, prove a dry run retains all v1 pins, then
-execute cleanup on both nodes. It requires v1 to be absent and all nine v2 map
+execute cleanup on both nodes. It requires v1 to be absent and all eleven v3 map
 pins to remain. The legacy gate restores and verifies TCX first, proves legacy
 cleanup dry-run non-mutation, executes the same command, and confirms the reserved
 legacy filters are absent.
@@ -60,3 +60,7 @@ Native pre-6.6 validation beyond the qualified OpenShift/RHCOS Linux 5.14
 environment remains separate work. Runtime and uninstall qualification verify
 the reserved legacy filters and their removal under the constrained ADR 0025 SCC
 with SELinux Enforcing.
+
+ADR 0035 subsequently added ownership recognition for the historical v2 set and
+the current eleven-map v3 set; current-v3 removal retains the same explicit
+confirmation boundary.

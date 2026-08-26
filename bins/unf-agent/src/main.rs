@@ -38,19 +38,20 @@ use unf_ebpf_common::{
     POLICY_MAP_ABI_VERSION,
 };
 use unf_state::{
-    AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, FLOW_EXPORT_BATCH_LIMIT,
-    FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowExportDecision, FlowExportRecord,
-    FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
-    Ipv4PolicyMapEntry, Ipv6IdentityMapping, Ipv6PolicyMapEntry, POLICY_MAP_BANK_ENTRY_LIMIT,
-    POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord, PolicyMapEntry, PolicyStateSnapshot,
+    AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, EgressIpv4PolicyMapEntry,
+    EgressIpv6PolicyMapEntry, FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch,
+    FlowExportDecision, FlowExportRecord, FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION,
+    IdentityStateSnapshot, Ipv4IdentityMapping, Ipv4PolicyMapEntry, Ipv6IdentityMapping,
+    Ipv6PolicyMapEntry, POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION,
+    PolicyDecisionRecord, PolicyMapEntry, PolicyStateSnapshot,
 };
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v2";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v3";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
-const CURRENT_BPF_ABI_VERSION: u16 = 2;
+const CURRENT_BPF_ABI_VERSION: u16 = 3;
 const ABI_V1_MAP_NAMES: [&str; 6] = [
     "IDENTITY_V4",
     "IDENTITY_V6",
@@ -59,7 +60,7 @@ const ABI_V1_MAP_NAMES: [&str; 6] = [
     "POLICY_IPV6",
     "POLICY_CONFIG",
 ];
-const PERSISTENT_MAP_NAMES: [&str; 9] = [
+const ABI_V2_MAP_NAMES: [&str; 9] = [
     "IDENTITY_V4",
     "IDENTITY_V4_B",
     "IDENTITY_V6",
@@ -68,6 +69,19 @@ const PERSISTENT_MAP_NAMES: [&str; 9] = [
     "POLICY_RULES",
     "POLICY_IPV4",
     "POLICY_IPV6",
+    "POLICY_CONFIG",
+];
+const PERSISTENT_MAP_NAMES: [&str; 11] = [
+    "IDENTITY_V4",
+    "IDENTITY_V4_B",
+    "IDENTITY_V6",
+    "IDENTITY_V6_B",
+    "IDENTITY_CONFIG",
+    "POLICY_RULES",
+    "POLICY_IPV4",
+    "POLICY_IPV6",
+    "EGRESS_IPV4",
+    "EGRESS_IPV6",
     "POLICY_CONFIG",
 ];
 const IDENTITY_MAP_CAPACITY: u32 = 65_536;
@@ -259,10 +273,14 @@ struct PolicySynchronizer {
     identity_map: AyaHashMap<MapData, [u8; 12], [u8; 32]>,
     ipv4_map: AyaHashMap<MapData, [u8; 12], [u8; 32]>,
     ipv6_map: AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
+    egress_ipv4_map: AyaHashMap<MapData, [u8; 12], [u8; 32]>,
+    egress_ipv6_map: AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
     config: AyaArray<MapData, [u8; 24]>,
     identity_banks: [BTreeMap<[u8; 12], [u8; 32]>; POLICY_BANK_COUNT as usize],
     ipv4_banks: [BTreeMap<[u8; 12], [u8; 32]>; POLICY_BANK_COUNT as usize],
     ipv6_banks: [EncodedIpv6PolicyBank; POLICY_BANK_COUNT as usize],
+    egress_ipv4_banks: [BTreeMap<[u8; 12], [u8; 32]>; POLICY_BANK_COUNT as usize],
+    egress_ipv6_banks: [EncodedIpv6PolicyBank; POLICY_BANK_COUNT as usize],
     active_bank: u8,
     applied_epoch: u64,
     controller_url: Option<String>,
@@ -280,6 +298,8 @@ type EncodedIpv6PolicyKey = (u32, [u8; 24]);
 type EncodedIpv6PolicyBank = BTreeMap<EncodedIpv6PolicyKey, [u8; 32]>;
 type PolicyMaps = (
     EncodedPolicyMap,
+    EncodedPolicyMap,
+    AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
     EncodedPolicyMap,
     AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
     AyaArray<MapData, [u8; 24]>,
@@ -532,7 +552,7 @@ fn run_cleanup(args: &CleanupArgs) -> Result<()> {
         bail!("cleanup requires --abi-version or --legacy-attachments");
     }
     if args.allow_current_abi && args.abi_version != Some(CURRENT_BPF_ABI_VERSION) {
-        bail!("--allow-current-abi is valid only with --abi-version 2");
+        bail!("--allow-current-abi is valid only with --abi-version {CURRENT_BPF_ABI_VERSION}");
     }
 
     let abi_plan = args
@@ -606,8 +626,8 @@ fn plan_abi_cleanup(
     abi_version: u16,
     allow_current_abi: bool,
 ) -> Result<AbiCleanupPlan> {
-    if !matches!(abi_version, 1 | CURRENT_BPF_ABI_VERSION) {
-        bail!("unsupported ABI version {abi_version}; this binary recognizes only v1 and v2");
+    if !matches!(abi_version, 1 | 2 | CURRENT_BPF_ABI_VERSION) {
+        bail!("unsupported ABI version {abi_version}; this binary recognizes only v1, v2, and v3");
     }
     if abi_version == CURRENT_BPF_ABI_VERSION && !allow_current_abi {
         bail!(
@@ -635,10 +655,10 @@ fn plan_abi_cleanup(
         );
     }
     plan.directory_exists = true;
-    let recognized_maps: &[&str] = if abi_version == 1 {
-        &ABI_V1_MAP_NAMES
-    } else {
-        &PERSISTENT_MAP_NAMES
+    let recognized_maps: &[&str] = match abi_version {
+        1 => &ABI_V1_MAP_NAMES,
+        2 => &ABI_V2_MAP_NAMES,
+        _ => &PERSISTENT_MAP_NAMES,
     };
     let mut unknown = Vec::new();
     for entry in fs::read_dir(&abi_directory)
@@ -974,8 +994,7 @@ async fn run_dataplane(
     )
     .context("open FLOW_EVENTS ring buffer")?;
     let identity_maps = take_identity_maps(&mut ebpf)?;
-    let (policy_map, ipv4_policy_map, ipv6_policy_map, policy_config) =
-        take_policy_maps(&mut ebpf)?;
+    let policy_maps = take_policy_maps(&mut ebpf)?;
     let controller_url = config
         .controller_url
         .as_deref()
@@ -988,7 +1007,7 @@ async fn run_dataplane(
     let controller_management_port = controller_url.as_deref().map(controller_port).transpose()?;
     let (mut identities, mut policies) = new_synchronizers(
         identity_maps,
-        (policy_map, ipv4_policy_map, ipv6_policy_map, policy_config),
+        policy_maps,
         controller_url.clone(),
         controller_management_port,
         controller_client.clone(),
@@ -1127,7 +1146,8 @@ fn new_synchronizers(
     interval: Duration,
 ) -> (IdentitySynchronizer, PolicySynchronizer) {
     let (ipv4_maps, ipv6_maps, identity_config) = identity_maps;
-    let (identity_map, ipv4_policy_map, ipv6_policy_map, config) = policy_maps;
+    let (identity_map, ipv4_policy_map, ipv6_policy_map, egress_ipv4_map, egress_ipv6_map, config) =
+        policy_maps;
     (
         IdentitySynchronizer {
             ipv4_maps,
@@ -1147,10 +1167,14 @@ fn new_synchronizers(
             identity_map,
             ipv4_map: ipv4_policy_map,
             ipv6_map: ipv6_policy_map,
+            egress_ipv4_map,
+            egress_ipv6_map,
             config,
             identity_banks: [BTreeMap::new(), BTreeMap::new()],
             ipv4_banks: [BTreeMap::new(), BTreeMap::new()],
             ipv6_banks: [BTreeMap::new(), BTreeMap::new()],
+            egress_ipv4_banks: [BTreeMap::new(), BTreeMap::new()],
+            egress_ipv6_banks: [BTreeMap::new(), BTreeMap::new()],
             active_bank: 0,
             applied_epoch: 0,
             controller_url,
@@ -1362,6 +1386,16 @@ fn recover_persistent_dataplane(
     )?;
     validate_map_capacity("POLICY_IPV4", policies.ipv4_map.map(), POLICY_MAP_CAPACITY)?;
     validate_map_capacity("POLICY_IPV6", policies.ipv6_map.map(), POLICY_MAP_CAPACITY)?;
+    validate_map_capacity(
+        "EGRESS_IPV4",
+        policies.egress_ipv4_map.map(),
+        POLICY_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "EGRESS_IPV6",
+        policies.egress_ipv6_map.map(),
+        POLICY_MAP_CAPACITY,
+    )?;
     validate_map_capacity("POLICY_CONFIG", policies.config.map(), 1)?;
 
     recover_identity_entries(identities)?;
@@ -1526,6 +1560,19 @@ fn recover_policy_entries(policies: &mut PolicySynchronizer) -> Result<()> {
         validate_recovered_policy_value(&value)?;
         policies.ipv6_banks[bank].insert((key.prefix_len(), data), value);
     }
+    for entry in &policies.egress_ipv4_map {
+        let (key, value) = entry.context("iterate persistent IPv4 egress policies")?;
+        let bank = policy_bank(key[11])?;
+        validate_recovered_policy_value(&value)?;
+        policies.egress_ipv4_banks[bank].insert(key, value);
+    }
+    for entry in &policies.egress_ipv6_map {
+        let (key, value) = entry.context("iterate persistent IPv6 egress policies")?;
+        let data = key.data();
+        let bank = policy_bank(data[7])?;
+        validate_recovered_policy_value(&value)?;
+        policies.egress_ipv6_banks[bank].insert((key.prefix_len(), data), value);
+    }
     Ok(())
 }
 
@@ -1619,7 +1666,9 @@ fn policy_entry_count_for_bank(policies: &PolicySynchronizer, bank: u8) -> u64 {
     let bank = usize::from(bank);
     (policies.identity_banks[bank].len()
         + policies.ipv4_banks[bank].len()
-        + policies.ipv6_banks[bank].len()) as u64
+        + policies.ipv6_banks[bank].len()
+        + policies.egress_ipv4_banks[bank].len()
+        + policies.egress_ipv6_banks[bank].len()) as u64
 }
 
 fn validate_active_policy_revision(
@@ -1632,6 +1681,8 @@ fn validate_active_policy_revision(
         .values()
         .chain(policies.ipv4_banks[bank].values())
         .chain(policies.ipv6_banks[bank].values())
+        .chain(policies.egress_ipv4_banks[bank].values())
+        .chain(policies.egress_ipv6_banks[bank].values())
     {
         let entry_revision =
             u64::from_ne_bytes(value[16..24].try_into().expect("fixed policy revision"));
@@ -1801,12 +1852,29 @@ fn take_policy_maps(ebpf: &mut Ebpf) -> Result<PolicyMaps> {
             .context("eBPF object does not contain POLICY_IPV6 map")?,
     )
     .context("open POLICY_IPV6 map")?;
+    let egress_ipv4_map = AyaHashMap::<_, [u8; 12], [u8; 32]>::try_from(
+        ebpf.take_map("EGRESS_IPV4")
+            .context("eBPF object does not contain EGRESS_IPV4 map")?,
+    )
+    .context("open EGRESS_IPV4 map")?;
+    let egress_ipv6_map = AyaLpmTrie::<_, [u8; 24], [u8; 32]>::try_from(
+        ebpf.take_map("EGRESS_IPV6")
+            .context("eBPF object does not contain EGRESS_IPV6 map")?,
+    )
+    .context("open EGRESS_IPV6 map")?;
     let policy_config = AyaArray::<_, [u8; 24]>::try_from(
         ebpf.take_map("POLICY_CONFIG")
             .context("eBPF object does not contain POLICY_CONFIG map")?,
     )
     .context("open POLICY_CONFIG map")?;
-    Ok((policy_map, ipv4_policy_map, ipv6_policy_map, policy_config))
+    Ok((
+        policy_map,
+        ipv4_policy_map,
+        ipv6_policy_map,
+        egress_ipv4_map,
+        egress_ipv6_map,
+        policy_config,
+    ))
 }
 
 async fn consume_events(
@@ -2533,6 +2601,7 @@ fn restore_ipv6_identity_entries(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn synchronize_policies(
     synchronizer: &mut PolicySynchronizer,
     state: &AgentState,
@@ -2593,11 +2662,23 @@ async fn synchronize_policies(
         desired_ipv4_policy_entries(&snapshot.ipv4_entries, desired_revision, staging_bank)?;
     let desired_ipv6 =
         desired_ipv6_policy_entries(&snapshot.ipv6_entries, desired_revision, staging_bank)?;
+    let desired_egress_ipv4 = desired_egress_ipv4_policy_entries(
+        &snapshot.egress_ipv4_entries,
+        desired_revision,
+        staging_bank,
+    )?;
+    let desired_egress_ipv6 = desired_egress_ipv6_policy_entries(
+        &snapshot.egress_ipv6_entries,
+        desired_revision,
+        staging_bank,
+    )?;
     apply_policy_entries(
         synchronizer,
         desired,
         desired_ipv4,
         desired_ipv6,
+        desired_egress_ipv4,
+        desired_egress_ipv6,
         snapshot.source_epoch,
         desired_revision,
         staging_bank,
@@ -2637,7 +2718,9 @@ fn active_policy_entry_count(synchronizer: &PolicySynchronizer) -> u64 {
     let active = usize::from(synchronizer.active_bank);
     (synchronizer.identity_banks[active].len()
         + synchronizer.ipv4_banks[active].len()
-        + synchronizer.ipv6_banks[active].len()) as u64
+        + synchronizer.ipv6_banks[active].len()
+        + synchronizer.egress_ipv4_banks[active].len()
+        + synchronizer.egress_ipv6_banks[active].len()) as u64
 }
 
 fn desired_policy_entries(
@@ -2698,6 +2781,48 @@ fn desired_ipv6_policy_entries(
         let value = encode_policy_decisions(&entry.decision, entry.shadow.as_ref(), revision);
         if desired.insert(key, value).is_some() {
             bail!("controller snapshot contains a duplicate IPv6 policy key");
+        }
+    }
+    Ok(desired)
+}
+
+fn desired_egress_ipv4_policy_entries(
+    entries: &[EgressIpv4PolicyMapEntry],
+    revision: u64,
+    bank: u8,
+) -> Result<BTreeMap<[u8; 12], [u8; 32]>> {
+    if bank >= POLICY_BANK_COUNT {
+        bail!("invalid policy bank {bank}");
+    }
+    validate_policy_bank_capacity(entries.len())?;
+    let mut desired = BTreeMap::new();
+    for entry in entries {
+        validate_egress_ipv4_policy_entry(entry)?;
+        let key = encode_egress_ipv4_policy_key(entry, bank);
+        let value = encode_policy_decisions(&entry.decision, entry.shadow.as_ref(), revision);
+        if desired.insert(key, value).is_some() {
+            bail!("controller snapshot contains a duplicate IPv4 egress policy key");
+        }
+    }
+    Ok(desired)
+}
+
+fn desired_egress_ipv6_policy_entries(
+    entries: &[EgressIpv6PolicyMapEntry],
+    revision: u64,
+    bank: u8,
+) -> Result<EncodedIpv6PolicyBank> {
+    if bank >= POLICY_BANK_COUNT {
+        bail!("invalid policy bank {bank}");
+    }
+    validate_policy_bank_capacity(entries.len())?;
+    let mut desired = BTreeMap::new();
+    for entry in entries {
+        validate_egress_ipv6_policy_entry(entry)?;
+        let key = encode_egress_ipv6_policy_key(entry, bank);
+        let value = encode_policy_decisions(&entry.decision, entry.shadow.as_ref(), revision);
+        if desired.insert(key, value).is_some() {
+            bail!("controller snapshot contains a duplicate IPv6 egress policy key");
         }
     }
     Ok(desired)
@@ -2769,6 +2894,58 @@ fn validate_ipv6_policy_entry(entry: &Ipv6PolicyMapEntry) -> Result<()> {
     Ok(())
 }
 
+fn validate_egress_ipv4_policy_entry(entry: &EgressIpv4PolicyMapEntry) -> Result<()> {
+    if entry.key.source_identity.get() == 0 {
+        bail!("IPv4 egress policy entry contains reserved source identity ID zero");
+    }
+    validate_policy_transport(
+        entry.key.protocol,
+        entry.key.destination_port,
+        "IPv4 egress",
+    )?;
+    validate_policy_decision(&entry.decision)?;
+    if let Some(shadow) = &entry.shadow {
+        validate_policy_decision(shadow)?;
+    }
+    Ok(())
+}
+
+fn validate_egress_ipv6_policy_entry(entry: &EgressIpv6PolicyMapEntry) -> Result<()> {
+    if entry.key.source_identity.get() == 0 {
+        bail!("IPv6 egress policy entry contains reserved source identity ID zero");
+    }
+    if entry.key.destination_prefix_len > 128 {
+        bail!("IPv6 egress policy entry contains an invalid destination prefix length");
+    }
+    let prefix = entry.key.destination_prefix_len;
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    if u128::from(entry.key.destination_network) & mask != u128::from(entry.key.destination_network)
+    {
+        bail!("IPv6 egress policy entry destination network is not canonical");
+    }
+    validate_policy_transport(
+        entry.key.protocol,
+        entry.key.destination_port,
+        "IPv6 egress",
+    )?;
+    validate_policy_decision(&entry.decision)?;
+    if let Some(shadow) = &entry.shadow {
+        validate_policy_decision(shadow)?;
+    }
+    Ok(())
+}
+
+fn validate_policy_transport(protocol: u8, destination_port: u16, label: &str) -> Result<()> {
+    match (protocol, destination_port) {
+        (0, 0) | (6 | 17 | 132, 0..=u16::MAX) => Ok(()),
+        _ => bail!("{label} policy entry contains an invalid protocol/port wildcard combination"),
+    }
+}
+
 fn validate_policy_decision(decision: &PolicyDecisionRecord) -> Result<()> {
     if !matches!(decision.verdict, Verdict::Allow | Verdict::Deny) {
         bail!("policy map decision must be allow or deny");
@@ -2824,6 +3001,26 @@ fn encode_ipv6_policy_key(entry: &Ipv6PolicyMapEntry, bank: u8) -> (u32, [u8; 24
     encoded[7] = bank;
     encoded[8..24].copy_from_slice(&entry.key.source_network.octets());
     (64 + u32::from(entry.key.source_prefix_len), encoded)
+}
+
+fn encode_egress_ipv4_policy_key(entry: &EgressIpv4PolicyMapEntry, bank: u8) -> [u8; 12] {
+    let mut encoded = [0_u8; 12];
+    encoded[0..4].copy_from_slice(&entry.key.destination_address.octets());
+    encoded[4..8].copy_from_slice(&entry.key.source_identity.get().to_ne_bytes());
+    encoded[8..10].copy_from_slice(&entry.key.destination_port.to_be_bytes());
+    encoded[10] = entry.key.protocol;
+    encoded[11] = bank;
+    encoded
+}
+
+fn encode_egress_ipv6_policy_key(entry: &EgressIpv6PolicyMapEntry, bank: u8) -> (u32, [u8; 24]) {
+    let mut encoded = [0_u8; 24];
+    encoded[0..4].copy_from_slice(&entry.key.source_identity.get().to_ne_bytes());
+    encoded[4..6].copy_from_slice(&entry.key.destination_port.to_be_bytes());
+    encoded[6] = entry.key.protocol;
+    encoded[7] = bank;
+    encoded[8..24].copy_from_slice(&entry.key.destination_network.octets());
+    (64 + u32::from(entry.key.destination_prefix_len), encoded)
 }
 
 fn encode_policy_value(entry: &PolicyMapEntry, revision: u64) -> [u8; 32] {
@@ -2906,12 +3103,14 @@ fn encode_map_config(
     Ok(encoded)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn apply_policy_entries(
     synchronizer: &mut PolicySynchronizer,
     desired: BTreeMap<[u8; 12], [u8; 32]>,
     desired_ipv4: BTreeMap<[u8; 12], [u8; 32]>,
     desired_ipv6: EncodedIpv6PolicyBank,
+    desired_egress_ipv4: BTreeMap<[u8; 12], [u8; 32]>,
+    desired_egress_ipv6: EncodedIpv6PolicyBank,
     source_epoch: u64,
     revision: u64,
     staging_bank: u8,
@@ -2920,6 +3119,8 @@ fn apply_policy_entries(
     let previous_identity = synchronizer.identity_banks[staging_index].clone();
     let previous_ipv4 = synchronizer.ipv4_banks[staging_index].clone();
     let previous_ipv6 = synchronizer.ipv6_banks[staging_index].clone();
+    let previous_egress_ipv4 = synchronizer.egress_ipv4_banks[staging_index].clone();
+    let previous_egress_ipv6 = synchronizer.egress_ipv6_banks[staging_index].clone();
     if let Err(error) =
         replace_policy_entries(&mut synchronizer.identity_map, &previous_identity, &desired)
     {
@@ -2928,6 +3129,8 @@ fn apply_policy_entries(
             &previous_identity,
             &previous_ipv4,
             &previous_ipv6,
+            &previous_egress_ipv4,
+            &previous_egress_ipv6,
             staging_bank,
             &error.context("stage identity policy map bank"),
         ));
@@ -2940,6 +3143,8 @@ fn apply_policy_entries(
             &previous_identity,
             &previous_ipv4,
             &previous_ipv6,
+            &previous_egress_ipv4,
+            &previous_egress_ipv6,
             staging_bank,
             &error.context("stage IPv4 policy map bank"),
         ));
@@ -2952,24 +3157,70 @@ fn apply_policy_entries(
             &previous_identity,
             &previous_ipv4,
             &previous_ipv6,
+            &previous_egress_ipv4,
+            &previous_egress_ipv6,
             staging_bank,
             &error.context("stage IPv6 policy map bank"),
         ));
     }
+    if let Err(error) = replace_policy_entries(
+        &mut synchronizer.egress_ipv4_map,
+        &previous_egress_ipv4,
+        &desired_egress_ipv4,
+    ) {
+        return Err(rollback_policy_stages(
+            synchronizer,
+            &previous_identity,
+            &previous_ipv4,
+            &previous_ipv6,
+            &previous_egress_ipv4,
+            &previous_egress_ipv6,
+            staging_bank,
+            &error.context("stage IPv4 egress policy map bank"),
+        ));
+    }
+    if let Err(error) = replace_ipv6_policy_entries(
+        &mut synchronizer.egress_ipv6_map,
+        &previous_egress_ipv6,
+        &desired_egress_ipv6,
+    ) {
+        return Err(rollback_policy_stages(
+            synchronizer,
+            &previous_identity,
+            &previous_ipv4,
+            &previous_ipv6,
+            &previous_egress_ipv4,
+            &previous_egress_ipv6,
+            staging_bank,
+            &error.context("stage IPv6 egress policy map bank"),
+        ));
+    }
     let validation = validate_staged_policy_entries(&synchronizer.identity_map, &desired)
         .and_then(|()| validate_staged_policy_entries(&synchronizer.ipv4_map, &desired_ipv4))
-        .and_then(|()| validate_staged_ipv6_policy_entries(&synchronizer.ipv6_map, &desired_ipv6));
+        .and_then(|()| validate_staged_ipv6_policy_entries(&synchronizer.ipv6_map, &desired_ipv6))
+        .and_then(|()| {
+            validate_staged_policy_entries(&synchronizer.egress_ipv4_map, &desired_egress_ipv4)
+        })
+        .and_then(|()| {
+            validate_staged_ipv6_policy_entries(&synchronizer.egress_ipv6_map, &desired_egress_ipv6)
+        });
     if let Err(error) = validation {
         return Err(rollback_policy_stages(
             synchronizer,
             &previous_identity,
             &previous_ipv4,
             &previous_ipv6,
+            &previous_egress_ipv4,
+            &previous_egress_ipv6,
             staging_bank,
             &error,
         ));
     }
-    let entry_count = desired.len() + desired_ipv4.len() + desired_ipv6.len();
+    let entry_count = desired.len()
+        + desired_ipv4.len()
+        + desired_ipv6.len()
+        + desired_egress_ipv4.len()
+        + desired_egress_ipv6.len();
     let config = match encode_policy_config(source_epoch, revision, entry_count, staging_bank) {
         Ok(config) => config,
         Err(error) => {
@@ -2978,6 +3229,8 @@ fn apply_policy_entries(
                 &previous_identity,
                 &previous_ipv4,
                 &previous_ipv6,
+                &previous_egress_ipv4,
+                &previous_egress_ipv6,
                 staging_bank,
                 &error,
             ));
@@ -2989,6 +3242,8 @@ fn apply_policy_entries(
             &previous_identity,
             &previous_ipv4,
             &previous_ipv6,
+            &previous_egress_ipv4,
+            &previous_egress_ipv6,
             staging_bank,
             &anyhow!(error).context("atomically activate staged policy bank"),
         ));
@@ -2998,6 +3253,8 @@ fn apply_policy_entries(
     synchronizer.identity_banks[staging_index] = desired;
     synchronizer.ipv4_banks[staging_index] = desired_ipv4;
     synchronizer.ipv6_banks[staging_index] = desired_ipv6;
+    synchronizer.egress_ipv4_banks[staging_index] = desired_egress_ipv4;
+    synchronizer.egress_ipv6_banks[staging_index] = desired_egress_ipv6;
     synchronizer.active_bank = staging_bank;
     let previous_index = usize::from(previous_active);
     if previous_active != staging_bank {
@@ -3037,6 +3294,30 @@ fn apply_policy_entries(
         } else {
             synchronizer.ipv6_banks[previous_index].clear();
         }
+        if let Err(error) = clear_policy_bank(
+            &mut synchronizer.egress_ipv4_map,
+            &synchronizer.egress_ipv4_banks[previous_index],
+        ) {
+            warn!(
+                ?error,
+                bank = previous_active,
+                "could not garbage-collect old IPv4 egress policy bank"
+            );
+        } else {
+            synchronizer.egress_ipv4_banks[previous_index].clear();
+        }
+        if let Err(error) = clear_ipv6_policy_bank(
+            &mut synchronizer.egress_ipv6_map,
+            &synchronizer.egress_ipv6_banks[previous_index],
+        ) {
+            warn!(
+                ?error,
+                bank = previous_active,
+                "could not garbage-collect old IPv6 egress policy bank"
+            );
+        } else {
+            synchronizer.egress_ipv6_banks[previous_index].clear();
+        }
     }
     Ok(())
 }
@@ -3072,11 +3353,14 @@ fn validate_staged_ipv6_policy_entries(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rollback_policy_stages(
     synchronizer: &mut PolicySynchronizer,
     previous_identity: &BTreeMap<[u8; 12], [u8; 32]>,
     previous_ipv4: &BTreeMap<[u8; 12], [u8; 32]>,
     previous_ipv6: &EncodedIpv6PolicyBank,
+    previous_egress_ipv4: &BTreeMap<[u8; 12], [u8; 32]>,
+    previous_egress_ipv6: &EncodedIpv6PolicyBank,
     bank: u8,
     cause: &anyhow::Error,
 ) -> anyhow::Error {
@@ -3085,12 +3369,28 @@ fn rollback_policy_stages(
     let ipv4_rollback = restore_policy_entries(&mut synchronizer.ipv4_map, previous_ipv4, bank);
     let ipv6_rollback =
         restore_ipv6_policy_entries(&mut synchronizer.ipv6_map, previous_ipv6, bank);
-    match (identity_rollback, ipv4_rollback, ipv6_rollback) {
-        (Ok(()), Ok(()), Ok(())) => {
+    let egress_ipv4_rollback = restore_policy_entries(
+        &mut synchronizer.egress_ipv4_map,
+        previous_egress_ipv4,
+        bank,
+    );
+    let egress_ipv6_rollback = restore_ipv6_policy_entries(
+        &mut synchronizer.egress_ipv6_map,
+        previous_egress_ipv6,
+        bank,
+    );
+    match (
+        identity_rollback,
+        ipv4_rollback,
+        ipv6_rollback,
+        egress_ipv4_rollback,
+        egress_ipv6_rollback,
+    ) {
+        (Ok(()), Ok(()), Ok(()), Ok(()), Ok(())) => {
             anyhow!("policy update failed and staging banks were rolled back: {cause:#}")
         }
-        (identity, ipv4, ipv6) => anyhow!(
-            "policy update failed: {cause:#}; identity rollback: {identity:?}; IPv4 rollback: {ipv4:?}; IPv6 rollback: {ipv6:?}"
+        (identity, ipv4, ipv6, egress_ipv4, egress_ipv6) => anyhow!(
+            "policy update failed: {cause:#}; identity rollback: {identity:?}; IPv4 rollback: {ipv4:?}; IPv6 rollback: {ipv6:?}; IPv4 egress rollback: {egress_ipv4:?}; IPv6 egress rollback: {egress_ipv6:?}"
         ),
     }
 }
@@ -3705,7 +4005,8 @@ mod tests {
         let temporary = tempdir().expect("temporary directory is created");
         let root = temporary.path().join("unf");
         assert!(plan_abi_cleanup(&root, CURRENT_BPF_ABI_VERSION, false).is_err());
-        assert!(plan_abi_cleanup(&root, 3, true).is_err());
+        assert!(plan_abi_cleanup(&root, 4, true).is_err());
+        assert!(plan_abi_cleanup(&root, 2, false).is_ok());
         assert!(plan_abi_cleanup(Path::new("relative"), 1, false).is_err());
         assert!(plan_abi_cleanup(Path::new("/"), 1, false).is_err());
     }
@@ -3819,11 +4120,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v2/links"),
+                Path::new("/sys/fs/bpf/unf/v3/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v2/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v3/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -4147,6 +4448,55 @@ mod tests {
         assert_eq!(key[7], 1);
         assert_eq!(&key[8..24], &source_network.octets());
         assert_eq!(u32::from_ne_bytes(value[0..4].try_into().unwrap()), 7);
+        assert_eq!(u64::from_ne_bytes(value[16..24].try_into().unwrap()), 17);
+    }
+
+    #[test]
+    fn egress_policy_snapshot_encoding_matches_source_selected_abi_layout() {
+        let policy = policy_entry();
+        let ipv4_tuple = unf_state::EgressIpv4PolicyMapKey {
+            source_identity: policy.key.source_identity,
+            destination_address: "10.244.1.3".parse().unwrap(),
+            protocol: policy.key.protocol,
+            destination_port: policy.key.destination_port,
+        };
+        let ipv4_entry = EgressIpv4PolicyMapEntry {
+            key: ipv4_tuple,
+            decision: policy.decision,
+            shadow: policy.shadow,
+        };
+        let desired = desired_egress_ipv4_policy_entries(&[ipv4_entry], 17, 1)
+            .expect("IPv4 egress policy is valid");
+        let (key, value) = desired.first_key_value().expect("one encoded entry");
+        assert_eq!(&key[0..4], &[10, 244, 1, 3]);
+        assert_eq!(u32::from_ne_bytes(key[4..8].try_into().unwrap()), 11);
+        assert_eq!(u16::from_be_bytes(key[8..10].try_into().unwrap()), 8080);
+        assert_eq!(key[10], 6);
+        assert_eq!(key[11], 1);
+        assert_eq!(u64::from_ne_bytes(value[16..24].try_into().unwrap()), 17);
+
+        let destination_network: Ipv6Addr = "2001:db8:2::".parse().unwrap();
+        let ipv6_tuple = unf_state::EgressIpv6PolicyMapKey {
+            source_identity: policy.key.source_identity,
+            destination_network,
+            destination_prefix_len: 64,
+            protocol: policy.key.protocol,
+            destination_port: policy.key.destination_port,
+        };
+        let ipv6_entry = EgressIpv6PolicyMapEntry {
+            key: ipv6_tuple,
+            decision: policy.decision,
+            shadow: policy.shadow,
+        };
+        let desired = desired_egress_ipv6_policy_entries(&[ipv6_entry], 17, 1)
+            .expect("IPv6 egress policy is valid");
+        let ((prefix_len, key), value) = desired.first_key_value().expect("one encoded entry");
+        assert_eq!(*prefix_len, 128);
+        assert_eq!(u32::from_ne_bytes(key[0..4].try_into().unwrap()), 11);
+        assert_eq!(u16::from_be_bytes(key[4..6].try_into().unwrap()), 8080);
+        assert_eq!(key[6], 6);
+        assert_eq!(key[7], 1);
+        assert_eq!(&key[8..24], &destination_network.octets());
         assert_eq!(u64::from_ne_bytes(value[16..24].try_into().unwrap()), 17);
     }
 
