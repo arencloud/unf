@@ -28,7 +28,8 @@ and service-account binding. The SCC:
 
 The workload manifest mounts only `/sys/fs/bpf` read/write and
 `/sys/kernel/btf` read-only. The SCC API cannot constrain `hostPath` prefixes,
-so those exact paths remain a workload-manifest and admission-policy boundary.
+so ADR 0028 adds a native path-specific admission boundary around those exact
+volumes and mount modes.
 
 The deployment migration applies the new SCC/RBAC before changing workloads. It
 removes the old
@@ -58,8 +59,9 @@ retained provenance, and cluster-operator health.
 The OpenShift agent is no longer a privileged container and its service account
 cannot request the built-in privileged SCC. Root, `spc_t`, host networking,
 host-port admission, and hostPath volume permission remain powerful but explicit
-requirements. Broader OpenShift/kernel versions, path-specific admission policy,
-and coordinated uninstall remain separate hardening and portability work.
+requirements. ADR 0028 now constrains the exact host paths and mount semantics;
+broader OpenShift/kernel versions and coordinated uninstall remain separate
+hardening and portability work.
 
 The portable Kubernetes manifest remains privileged because upstream Kubernetes
 does not provide SCC. Installers for other platforms must supply an equivalent

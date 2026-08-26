@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test kind-tool kind-up kind-load kind-deploy kind-demo kind-test kind-down
+.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test kind-tool kind-up kind-load kind-deploy kind-demo kind-test kind-down
 
 KIND := .tools/bin/kind
 KIND_PROVIDER ?= podman
@@ -66,6 +66,9 @@ openshift-tls-rotation-test:
 
 openshift-agent-report-retention-test:
 	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/verify-openshift-agent-report-retention.sh
+
+openshift-host-mount-policy-test:
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/verify-openshift-host-mount-policy.sh
 
 kind-tool:
 	mkdir -p .tools/bin

@@ -93,7 +93,13 @@ matrix and reproducible evidence.
   before watchers begin, but the new controller epoch keeps restored reports
   non-converged until agents acknowledge current desired state. A restart gate
   proves both reports restore, reconverge, and advance without agent replacement;
-- Next: path-specific host-mount admission policy and coordinated uninstall.
+- Implemented and OpenShift verified: native fail-closed admission validates the
+  agent DaemonSet before rollout plus direct/generated Pods and ephemeral updates.
+  Only the exact existing `/sys/fs/bpf` and `/sys/kernel/btf` directories are
+  admitted, with writable bpffs, read-only BTF, no subpaths/propagation, and no
+  sidecar/init/ephemeral access. The focused negative gate is also part of the
+  complete dual-stack qualification;
+- Next: coordinated uninstall.
 
 ## Phase 3 — compatibility and simulation
 

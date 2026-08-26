@@ -60,6 +60,7 @@ make openshift-deploy
 make openshift-test
 make openshift-tls-rotation-test
 make openshift-agent-report-retention-test
+make openshift-host-mount-policy-test
 ```
 
 Select a non-default qualification cluster explicitly:
@@ -69,6 +70,7 @@ OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-deploy
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-test
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-tls-rotation-test
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-agent-report-retention-test
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-host-mount-policy-test
 ```
 
 Override `OPENSHIFT_KUBECONFIG` or `QUAY_AUTH_FILE` when qualifying another
@@ -84,6 +86,8 @@ The overlay:
 - configures controller convergence with the same exact Node-label selector;
 - grants the agent service account only the dedicated `unf-agent` SCC, not the
   built-in privileged SCC;
+- installs fail-closed native admission for the exact bpffs/BTF source paths,
+  mount modes, and container ownership;
 - runs the agent as a non-privileged root process in `spc_t`, with runtime-default
   seccomp, `NoNewPrivs`, a read-only root filesystem, and only `BPF`,
   `NET_ADMIN`, and `PERFMON`;
@@ -131,6 +135,14 @@ requires the new process to expose the exact restored count. It then requires a
 new controller epoch to converge, the checkpoint receive time to advance, zero
 persistence errors, and unchanged agent Pod UIDs and restart counts.
 
+`make openshift-host-mount-policy-test` verifies both native policies and their
+deny bindings are type-checked and active. It admits the current DaemonSet and an
+unrelated Pod, then uses non-mutating server dry runs to reject alternate paths,
+service-account replacement, host-path creation, incorrect read/write modes,
+subPath, mount propagation, sidecar/init, direct-agent-Pod, and
+ephemeral-container host-volume access.
+`make openshift-test` invokes this gate before its dataplane qualification.
+
 ## Operational boundary
 
 The agent attaches to every non-loopback worker interface, including OVN and
@@ -140,12 +152,12 @@ uninstall must first use the agent's dry-run-first cleanup command and verify th
 exact owned filters and bpffs paths before deleting workloads.
 
 The SCC still permits root, `spc_t`, host networking/ports, and the `hostPath`
-volume class. Its RBAC is limited to the agent service account and the workload
-mounts only `/sys/fs/bpf` plus read-only `/sys/kernel/btf`, but SCC itself cannot
-restrict hostPath prefixes. Admission policy for those exact paths, immutable
-digest-pinned release images, issuer-specific production automation, and complete
-uninstall orchestration remain production-hardening requirements. The report
-checkpoint is deliberately single-controller and is not an HA database. See
-[ADR 0025](../adr/0025-constrained-openshift-agent-scc.md) and
-[ADR 0026](../adr/0026-hot-certificate-and-trust-rotation.md), and
-[ADR 0027](../adr/0027-durable-agent-acknowledgement-checkpoint.md).
+volume class. Its RBAC is limited to the agent service account; ADR 0028's native
+admission policy closes SCC's path-prefix gap for the exact bpffs/BTF contract.
+Immutable digest-pinned release images, issuer-specific production automation,
+and complete uninstall orchestration remain production-hardening requirements.
+The report checkpoint is deliberately single-controller and is not an HA
+database. See [ADR 0025](../adr/0025-constrained-openshift-agent-scc.md),
+[ADR 0026](../adr/0026-hot-certificate-and-trust-rotation.md),
+[ADR 0027](../adr/0027-durable-agent-acknowledgement-checkpoint.md), and
+[ADR 0028](../adr/0028-path-specific-openshift-host-mount-admission.md).

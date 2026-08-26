@@ -64,6 +64,9 @@ if [[ ${ipv6_cluster_networks} -gt 0 ]]; then
     qualification_mode=dual-stack
 fi
 
+KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
+    "${project_root}/hack/verify-openshift-host-mount-policy.sh"
+
 mapfile -t workers < <("${kc[@]}" get nodes -l node-role.kubernetes.io/worker \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 [[ ${#workers[@]} -ge 2 ]]
@@ -448,4 +451,4 @@ unhealthy_operators=$("${kc[@]}" get clusteroperators -o json | jq '[
 ] | length')
 [[ ${unhealthy_operators} -eq 0 ]]
 
-echo "OpenShift ${qualification_mode} qualification passed: restricted-v2 controller, dedicated constrained worker-agent SCC, enforcing SELinux, BTF/bpffs, native legacy netlink filters, Service CA TLS, Pod-bound TokenReview, two-worker convergence, ${qualification_mode} allow/drop provenance, and healthy cluster operators"
+echo "OpenShift ${qualification_mode} qualification passed: restricted-v2 controller, dedicated constrained worker-agent SCC, exact host-mount admission, enforcing SELinux, BTF/bpffs, native legacy netlink filters, Service CA TLS, Pod-bound TokenReview, two-worker convergence, ${qualification_mode} allow/drop provenance, and healthy cluster operators"

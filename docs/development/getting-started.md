@@ -283,6 +283,9 @@ separate RHEL CoreOS/CRI-O IPv4-only and dual-stack evidence for SELinux, SCC,
 BTF, bpffs, Service CA, TokenReview, native legacy attachment, and enforcement.
 Agents use a non-privileged, runtime-default-seccomp, read-only-root profile with
 only `BPF`, `NET_ADMIN`, and `PERFMON`; their service account cannot use the
-built-in privileged SCC. The kind gate remains separate dual-stack/TCX evidence;
-broader versions, scale, upgrade behavior, and path-specific host-mount policy
-are not inferred from these fixtures.
+built-in privileged SCC. Native validating admission additionally restricts that
+service account to the exact writable `/sys/fs/bpf` and read-only
+`/sys/kernel/btf` mounts and rejects host-volume access from sidecars, init
+containers, or ephemeral containers. The kind gate remains separate
+dual-stack/TCX evidence; broader versions, scale, and upgrade behavior are not
+inferred from these fixtures.

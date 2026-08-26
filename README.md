@@ -49,7 +49,10 @@ Additional IPv4-only and dual-stack OpenShift gates are live-verified on
 OpenShift 4.22/RHCOS 9.8 with enforcing SELinux and a 5.14 kernel: the controller
 runs under `restricted-v2`, while worker-only agents use a dedicated constrained
 SCC with a non-privileged container, runtime-default seccomp, read-only root
-filesystem, and exactly `BPF`, `NET_ADMIN`, and `PERFMON`. Native automatic
+filesystem, and exactly `BPF`, `NET_ADMIN`, and `PERFMON`. Native validating
+admission policies additionally restrict the agent to writable `/sys/fs/bpf` and
+read-only `/sys/kernel/btf`, rejecting alternate paths, unsafe mount modes, and
+sidecar/init/ephemeral access before Pod admission. Native automatic
 selection installs legacy netlink filters, OpenShift Service CA secures the
 internal Service, and cross-worker IPv4/IPv6 allow/drop scenarios retain
 authenticated provenance. Controller leaf certificates and agent CA bundles now
@@ -96,6 +99,8 @@ Implemented in the repository:
   TokenReview-authenticated internal HTTPS for agent snapshots and writes;
 - in-place server-certificate and CA-bundle reload with overlapping-root support,
   last-known-good fallback, reload/error metrics, and an OpenShift rotation gate;
+- OpenShift-native fail-closed admission for the agent's exact bpffs/BTF host
+  paths, mount modes, and single-container ownership;
 - revision-fenced, read-only native policy simulation through the shared evaluator;
 - bounded non-blocking agent telemetry export and a 4,096-flow controller history
   with explicit drop/eviction accounting;

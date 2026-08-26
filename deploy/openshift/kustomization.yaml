@@ -4,6 +4,7 @@ resources:
   - ../crds
   - ../kubernetes
   - agent-scc.yaml
+  - agent-host-mount-policy.yaml
   - internal-ca.yaml
 images:
   - name: localhost/unf-controller
