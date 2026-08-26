@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use k8s_openapi::api::networking::v1::{NetworkPolicy, NetworkPolicyPeer, NetworkPolicyPort};
+use k8s_openapi::api::networking::v1::{
+    NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyPeer, NetworkPolicyPort,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use thiserror::Error;
@@ -32,12 +34,17 @@ pub enum NetworkPolicyCompileError {
     MissingNamespace,
     #[error("NetworkPolicy spec is required")]
     MissingSpec,
-    #[error("NetworkPolicy egress semantics are not supported yet")]
+    #[error("NetworkPolicy egress enforcement is not supported yet")]
     UnsupportedEgress,
+    #[error(
+        "egress rule {rule_index} peer {peer_index} uses ipBlock, which requires destination-address evaluation"
+    )]
+    UnsupportedEgressIpBlock {
+        rule_index: usize,
+        peer_index: usize,
+    },
     #[error("NetworkPolicy policyType {policy_type:?} is not supported")]
     UnsupportedPolicyType { policy_type: String },
-    #[error("NetworkPolicy policyTypes must include Ingress")]
-    MissingIngressPolicyType,
     #[error("{field} matchExpression for key {key:?} uses invalid operator {operator:?}")]
     InvalidMatchExpressionOperator {
         field: &'static str,
@@ -53,20 +60,20 @@ pub enum NetworkPolicyCompileError {
         operator: String,
     },
     #[error(
-        "ingress rule {rule_index} peer {peer_index} combines ipBlock with pod/namespace selectors"
+        "policy rule {rule_index} peer {peer_index} combines ipBlock with pod/namespace selectors"
     )]
     InvalidIpBlockPeerCombination {
         rule_index: usize,
         peer_index: usize,
     },
-    #[error("ingress rule {rule_index} peer {peer_index} contains invalid IP CIDR {cidr:?}")]
+    #[error("policy rule {rule_index} peer {peer_index} contains invalid IP CIDR {cidr:?}")]
     InvalidIpBlockCidr {
         rule_index: usize,
         peer_index: usize,
         cidr: String,
     },
     #[error(
-        "ingress rule {rule_index} peer {peer_index} except CIDR {except:?} is outside {cidr:?}"
+        "policy rule {rule_index} peer {peer_index} except CIDR {except:?} is outside {cidr:?}"
     )]
     IpBlockExceptOutsideCidr {
         rule_index: usize,
@@ -75,7 +82,7 @@ pub enum NetworkPolicyCompileError {
         except: String,
     },
     #[error(
-        "ingress rule {rule_index} peer {peer_index} ipBlock contains {address_count} addresses, exceeding limit {limit}"
+        "policy rule {rule_index} peer {peer_index} ipBlock contains {address_count} addresses, exceeding limit {limit}"
     )]
     IpBlockTooLarge {
         rule_index: usize,
@@ -84,7 +91,7 @@ pub enum NetworkPolicyCompileError {
         limit: u64,
     },
     #[error(
-        "ingress rule {rule_index} peer {peer_index} IPv6 ipBlock contains {prefix_count} CIDR boundaries, exceeding limit {limit}"
+        "policy rule {rule_index} peer {peer_index} IPv6 ipBlock contains {prefix_count} CIDR boundaries, exceeding limit {limit}"
     )]
     Ipv6IpBlockTooManyPrefixes {
         rule_index: usize,
@@ -93,45 +100,43 @@ pub enum NetworkPolicyCompileError {
         limit: usize,
     },
     #[error(
-        "ingress rule {rule_index} peer {peer_index} ipBlock contains reserved source address 0.0.0.0"
+        "policy rule {rule_index} peer {peer_index} ipBlock contains reserved source address 0.0.0.0"
     )]
     IpBlockContainsReservedAddress {
         rule_index: usize,
         peer_index: usize,
     },
-    #[error("ingress rule {rule_index} port {port_index} contains an empty named port")]
+    #[error("policy rule {rule_index} port {port_index} contains an empty named port")]
     InvalidNamedPort {
         rule_index: usize,
         port_index: usize,
     },
-    #[error("ingress rule {rule_index} port {port_index} combines a named port with endPort")]
+    #[error("policy rule {rule_index} port {port_index} combines a named port with endPort")]
     InvalidNamedPortRange {
         rule_index: usize,
         port_index: usize,
     },
-    #[error("ingress rule {rule_index} port {port_index} contains invalid range {start}..={end}")]
+    #[error("policy rule {rule_index} port {port_index} contains invalid range {start}..={end}")]
     InvalidPortRange {
         rule_index: usize,
         port_index: usize,
         start: i32,
         end: i32,
     },
-    #[error(
-        "ingress rule {rule_index} port {port_index} range width {width} exceeds limit {limit}"
-    )]
+    #[error("policy rule {rule_index} port {port_index} range width {width} exceeds limit {limit}")]
     PortRangeTooLarge {
         rule_index: usize,
         port_index: usize,
         width: u32,
         limit: u32,
     },
-    #[error("ingress rule {rule_index} port {port_index} uses unsupported protocol {protocol:?}")]
+    #[error("policy rule {rule_index} port {port_index} uses unsupported protocol {protocol:?}")]
     UnsupportedProtocol {
         rule_index: usize,
         port_index: usize,
         protocol: String,
     },
-    #[error("ingress rule {rule_index} port {port_index} contains invalid port {port}")]
+    #[error("policy rule {rule_index} port {port_index} contains invalid port {port}")]
     InvalidPort {
         rule_index: usize,
         port_index: usize,
@@ -141,11 +146,17 @@ pub enum NetworkPolicyCompileError {
     TooManyRules,
 }
 
-/// Translates the supported ingress subset of Kubernetes `NetworkPolicy` into the
-/// same Kubernetes-independent IR used by native UNF policy.
+/// Translates supported Kubernetes `NetworkPolicy` directions into the same
+/// Kubernetes-independent IR used by native UNF policy.
 pub struct NetworkPolicyCompiler;
 
 impl NetworkPolicyCompiler {
+    /// Translates the ingress-only shape currently admitted by the controller.
+    ///
+    /// Use [`Self::compile_directions`] for userspace translation of effective
+    /// ingress and egress directions. This enforcement entry point rejects every
+    /// object whose effective directions include egress.
+    ///
     /// # Errors
     ///
     /// Returns an explicit error for missing metadata or semantics that cannot
@@ -154,6 +165,28 @@ impl NetworkPolicyCompiler {
         policy_id: PolicyId,
         policy: NetworkPolicy,
     ) -> Result<PolicyIr, NetworkPolicyCompileError> {
+        let mut policies = Self::compile_directions(policy_id, policy)?;
+        if policies.len() == 1 && policies[0].direction == PolicyDirection::Ingress {
+            return Ok(policies.remove(0));
+        }
+        Err(NetworkPolicyCompileError::UnsupportedEgress)
+    }
+
+    /// Translates every effective policy direction into one independent IR.
+    ///
+    /// Omitted or empty `policyTypes` follows Kubernetes API defaulting: ingress
+    /// is always selected, and egress is additionally selected when at least one
+    /// egress rule exists. Explicit policy types select only the named directions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an explicit error for missing metadata, invalid selectors and
+    /// ports, unknown policy types, or egress `ipBlock`, whose destination-address
+    /// semantics require the next evaluator/dataplane slice.
+    pub fn compile_directions(
+        policy_id: PolicyId,
+        policy: NetworkPolicy,
+    ) -> Result<Vec<PolicyIr>, NetworkPolicyCompileError> {
         let name = policy
             .metadata
             .name
@@ -163,63 +196,108 @@ impl NetworkPolicyCompiler {
             .namespace
             .ok_or(NetworkPolicyCompileError::MissingNamespace)?;
         let spec = policy.spec.ok_or(NetworkPolicyCompileError::MissingSpec)?;
-        validate_policy_types(spec.policy_types.as_deref(), spec.egress.as_deref())?;
+        let directions = policy_directions(spec.policy_types.as_deref(), spec.egress.as_deref())?;
 
         let pod_selector = spec.pod_selector.unwrap_or_default();
         let target = pod_identity_selector(pod_selector, Some(namespace.clone()), "podSelector")?;
-        let mut rules = Vec::<PolicyRule>::new();
-        for (rule_index, ingress) in spec.ingress.unwrap_or_default().into_iter().enumerate() {
-            let sources = sources(ingress.from, &namespace, rule_index)?;
-            let ports = ports(ingress.ports, rule_index)?;
-            for source in sources {
-                for (protocol, port) in &ports {
-                    push_rule(
-                        &mut rules,
-                        policy_id,
-                        &name,
-                        &namespace,
-                        source.clone(),
-                        target.clone(),
-                        *protocol,
-                        port.clone(),
-                        PolicyAction::Allow,
-                        rule_index,
-                    )
-                    .map_err(|_| NetworkPolicyCompileError::TooManyRules)?;
+        let mut policies = Vec::with_capacity(2);
+
+        if directions.ingress {
+            let mut rules = Vec::<PolicyRule>::new();
+            for (rule_index, ingress) in spec.ingress.unwrap_or_default().into_iter().enumerate() {
+                let sources = sources(ingress.from, &namespace, rule_index)?;
+                let ports = ports(ingress.ports, rule_index)?;
+                for source in sources {
+                    for (protocol, port) in &ports {
+                        push_rule(
+                            &mut rules,
+                            policy_id,
+                            &name,
+                            &namespace,
+                            source.clone(),
+                            target.clone(),
+                            *protocol,
+                            port.clone(),
+                            PolicyAction::Allow,
+                            rule_index,
+                        )
+                        .map_err(|_| NetworkPolicyCompileError::TooManyRules)?;
+                    }
                 }
             }
+            policies.push(compatibility_policy_ir(
+                policy_id,
+                &name,
+                &namespace,
+                PolicyDirection::Ingress,
+                target.clone(),
+                rules,
+            ));
         }
 
-        Ok(PolicyIr {
-            id: policy_id,
-            name,
-            namespace,
-            priority: KUBERNETES_NETWORK_POLICY_PRIORITY,
-            origin: PolicyOrigin::KubernetesNetworkPolicy,
-            direction: PolicyDirection::Ingress,
-            target,
-            default_action: PolicyAction::Deny,
-            enforcement_mode: PolicyEnforcementMode::Enforce,
-            rules,
-        })
+        if directions.egress {
+            let mut rules = Vec::<PolicyRule>::new();
+            for (rule_index, egress) in spec.egress.unwrap_or_default().into_iter().enumerate() {
+                let destinations = destinations(egress.to, &namespace, rule_index)?;
+                let ports = ports(egress.ports, rule_index)?;
+                for destination in destinations {
+                    for (protocol, port) in &ports {
+                        push_rule(
+                            &mut rules,
+                            policy_id,
+                            &name,
+                            &namespace,
+                            target.clone(),
+                            destination.clone(),
+                            *protocol,
+                            port.clone(),
+                            PolicyAction::Allow,
+                            rule_index,
+                        )
+                        .map_err(|_| NetworkPolicyCompileError::TooManyRules)?;
+                    }
+                }
+            }
+            policies.push(compatibility_policy_ir(
+                policy_id,
+                &name,
+                &namespace,
+                PolicyDirection::Egress,
+                target,
+                rules,
+            ));
+        }
+
+        Ok(policies)
     }
 }
 
-fn validate_policy_types(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PolicyDirections {
+    ingress: bool,
+    egress: bool,
+}
+
+fn policy_directions(
     policy_types: Option<&[String]>,
-    egress: Option<&[k8s_openapi::api::networking::v1::NetworkPolicyEgressRule]>,
-) -> Result<(), NetworkPolicyCompileError> {
-    if egress.is_some() {
-        return Err(NetworkPolicyCompileError::UnsupportedEgress);
+    egress: Option<&[NetworkPolicyEgressRule]>,
+) -> Result<PolicyDirections, NetworkPolicyCompileError> {
+    if policy_types.is_none_or(<[String]>::is_empty) {
+        return Ok(PolicyDirections {
+            ingress: true,
+            egress: egress.is_some_and(|rules| !rules.is_empty()),
+        });
     }
+
+    let mut directions = PolicyDirections {
+        ingress: false,
+        egress: false,
+    };
     if let Some(policy_types) = policy_types {
-        if policy_types.is_empty() {
-            return Err(NetworkPolicyCompileError::MissingIngressPolicyType);
-        }
         for policy_type in policy_types {
             match policy_type.as_str() {
-                "Ingress" => {}
-                "Egress" => return Err(NetworkPolicyCompileError::UnsupportedEgress),
+                "Ingress" => directions.ingress = true,
+                "Egress" => directions.egress = true,
                 _ => {
                     return Err(NetworkPolicyCompileError::UnsupportedPolicyType {
                         policy_type: policy_type.clone(),
@@ -228,7 +306,29 @@ fn validate_policy_types(
             }
         }
     }
-    Ok(())
+    Ok(directions)
+}
+
+fn compatibility_policy_ir(
+    policy_id: PolicyId,
+    name: &str,
+    namespace: &str,
+    direction: PolicyDirection,
+    target: IdentitySelector,
+    rules: Vec<PolicyRule>,
+) -> PolicyIr {
+    PolicyIr {
+        id: policy_id,
+        name: name.to_owned(),
+        namespace: namespace.to_owned(),
+        priority: KUBERNETES_NETWORK_POLICY_PRIORITY,
+        origin: PolicyOrigin::KubernetesNetworkPolicy,
+        direction,
+        target,
+        default_action: PolicyAction::Deny,
+        enforcement_mode: PolicyEnforcementMode::Enforce,
+        rules,
+    }
 }
 
 fn sources(
@@ -244,6 +344,30 @@ fn sources(
         .into_iter()
         .enumerate()
         .map(|(peer_index, peer)| peer_selector(peer, policy_namespace, rule_index, peer_index))
+        .collect()
+}
+
+fn destinations(
+    peers: Option<Vec<NetworkPolicyPeer>>,
+    policy_namespace: &str,
+    rule_index: usize,
+) -> Result<Vec<IdentitySelector>, NetworkPolicyCompileError> {
+    let peers = peers.unwrap_or_default();
+    if peers.is_empty() {
+        return Ok(vec![IdentitySelector::default()]);
+    }
+    peers
+        .into_iter()
+        .enumerate()
+        .map(|(peer_index, peer)| {
+            if peer.ip_block.is_some() {
+                return Err(NetworkPolicyCompileError::UnsupportedEgressIpBlock {
+                    rule_index,
+                    peer_index,
+                });
+            }
+            peer_selector(peer, policy_namespace, rule_index, peer_index)
+        })
         .collect()
 }
 
@@ -617,7 +741,9 @@ fn port_tuple(
 mod tests {
     use std::collections::BTreeMap;
 
-    use k8s_openapi::api::networking::v1::{IPBlock, NetworkPolicyIngressRule, NetworkPolicySpec};
+    use k8s_openapi::api::networking::v1::{
+        IPBlock, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicySpec,
+    };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelectorRequirement, ObjectMeta};
     use unf_common::{IdentityId, PolicyReason, Verdict};
 
@@ -625,6 +751,7 @@ mod tests {
     use crate::{
         Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort, compile_dataplane_entries,
         compile_ipv4_dataplane_entries, compile_ipv6_dataplane_entries, evaluate,
+        evaluate_for_direction,
     };
 
     fn labels(values: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -665,6 +792,26 @@ mod tests {
         }
     }
 
+    fn egress_policy(
+        egress: Option<Vec<NetworkPolicyEgressRule>>,
+        policy_types: Option<Vec<&str>>,
+    ) -> NetworkPolicy {
+        NetworkPolicy {
+            metadata: ObjectMeta {
+                name: Some("allow-server".to_owned()),
+                namespace: Some("frontend".to_owned()),
+                ..ObjectMeta::default()
+            },
+            spec: Some(NetworkPolicySpec {
+                pod_selector: Some(selector(&[("app", "client")])),
+                egress,
+                policy_types: policy_types
+                    .map(|types| types.into_iter().map(str::to_owned).collect::<Vec<_>>()),
+                ..NetworkPolicySpec::default()
+            }),
+        }
+    }
+
     fn endpoint(id: u32, namespace: &str, app: &str) -> Endpoint {
         Endpoint {
             identity: IdentityId::new(id),
@@ -675,6 +822,197 @@ mod tests {
             labels: labels(&[("app", app)]),
             named_ports: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn egress_translation_selects_source_and_preserves_peer_port_pairing() {
+        let peer = NetworkPolicyPeer {
+            namespace_selector: Some(selector(&[(NAMESPACE_NAME_LABEL, "backend")])),
+            pod_selector: Some(selector(&[("app", "server")])),
+            ..NetworkPolicyPeer::default()
+        };
+        let translated = NetworkPolicyCompiler::compile_directions(
+            PolicyId::new(51),
+            egress_policy(
+                Some(vec![NetworkPolicyEgressRule {
+                    to: Some(vec![peer]),
+                    ports: Some(vec![NetworkPolicyPort {
+                        port: Some(IntOrString::Int(8080)),
+                        protocol: Some("TCP".to_owned()),
+                        ..NetworkPolicyPort::default()
+                    }]),
+                }]),
+                Some(vec!["Egress"]),
+            ),
+        )
+        .expect("supported egress policy translates");
+        assert_eq!(translated.len(), 1);
+        let compiled = &translated[0];
+        assert_eq!(compiled.direction, PolicyDirection::Egress);
+        assert_eq!(compiled.target.namespace.as_deref(), Some("frontend"));
+        assert_eq!(compiled.target.match_labels, labels(&[("app", "client")]));
+        assert_eq!(compiled.rules.len(), 1);
+        assert_eq!(
+            compiled.rules[0].destination.namespace.as_deref(),
+            Some("backend")
+        );
+        assert_eq!(
+            compiled.rules[0].destination.match_labels,
+            labels(&[("app", "server")])
+        );
+
+        let source = endpoint(1, "frontend", "client");
+        let destination = endpoint(2, "backend", "server");
+        let database = endpoint(3, "backend", "database");
+        let allowed = evaluate_for_direction(
+            &translated,
+            PolicyDirection::Egress,
+            Flow {
+                source: &source,
+                destination: &destination,
+                protocol: Protocol::Tcp,
+                destination_port: 8080,
+                source_ipv4: None,
+                source_ipv6: None,
+            },
+        );
+        assert_eq!(allowed.verdict, Verdict::Allow);
+        assert_eq!(allowed.policy_id, Some(PolicyId::new(51)));
+        let denied = evaluate_for_direction(
+            &translated,
+            PolicyDirection::Egress,
+            Flow {
+                source: &source,
+                destination: &database,
+                protocol: Protocol::Tcp,
+                destination_port: 8080,
+                source_ipv4: None,
+                source_ipv6: None,
+            },
+        );
+        assert_eq!(denied.verdict, Verdict::Deny);
+        assert_eq!(denied.reason, PolicyReason::DefaultAction);
+    }
+
+    #[test]
+    fn policy_type_defaulting_matches_kubernetes_api_behavior() {
+        let no_egress =
+            NetworkPolicyCompiler::compile_directions(PolicyId::new(52), egress_policy(None, None))
+                .expect("omitted types default to ingress");
+        assert_eq!(
+            no_egress
+                .iter()
+                .map(|policy| policy.direction)
+                .collect::<Vec<_>>(),
+            vec![PolicyDirection::Ingress]
+        );
+
+        let empty_types = NetworkPolicyCompiler::compile_directions(
+            PolicyId::new(52),
+            egress_policy(None, Some(Vec::new())),
+        )
+        .expect("empty types receive API defaults");
+        assert_eq!(empty_types[0].direction, PolicyDirection::Ingress);
+
+        let empty_egress = NetworkPolicyCompiler::compile_directions(
+            PolicyId::new(52),
+            egress_policy(Some(Vec::new()), None),
+        )
+        .expect("empty egress list does not imply egress");
+        assert_eq!(empty_egress.len(), 1);
+        assert_eq!(empty_egress[0].direction, PolicyDirection::Ingress);
+
+        let defaulted_both = NetworkPolicyCompiler::compile_directions(
+            PolicyId::new(52),
+            egress_policy(Some(vec![NetworkPolicyEgressRule::default()]), None),
+        )
+        .expect("non-empty egress defaults both directions");
+        assert_eq!(
+            defaulted_both
+                .iter()
+                .map(|policy| policy.direction)
+                .collect::<Vec<_>>(),
+            vec![PolicyDirection::Ingress, PolicyDirection::Egress]
+        );
+        assert!(defaulted_both[0].rules.is_empty());
+        assert_eq!(defaulted_both[1].rules.len(), 1);
+        assert_eq!(
+            defaulted_both[1].rules[0].destination,
+            IdentitySelector::default()
+        );
+        assert_eq!(defaulted_both[1].rules[0].protocol, None);
+        assert_eq!(
+            defaulted_both[1].rules[0].destination_port,
+            DestinationPort::Any
+        );
+
+        let explicit_egress_deny = NetworkPolicyCompiler::compile_directions(
+            PolicyId::new(52),
+            egress_policy(None, Some(vec!["Egress"])),
+        )
+        .expect("explicit egress with no rules is default deny");
+        assert_eq!(explicit_egress_deny.len(), 1);
+        assert_eq!(explicit_egress_deny[0].direction, PolicyDirection::Egress);
+        assert!(explicit_egress_deny[0].rules.is_empty());
+
+        let explicit_both = NetworkPolicyCompiler::compile_directions(
+            PolicyId::new(52),
+            egress_policy(None, Some(vec!["Ingress", "Egress"])),
+        )
+        .expect("explicit types isolate both directions without rules");
+        assert_eq!(
+            explicit_both
+                .iter()
+                .map(|policy| policy.direction)
+                .collect::<Vec<_>>(),
+            vec![PolicyDirection::Ingress, PolicyDirection::Egress]
+        );
+        assert!(explicit_both.iter().all(|policy| policy.rules.is_empty()));
+
+        let ingress_only = NetworkPolicyCompiler::compile_directions(
+            PolicyId::new(52),
+            egress_policy(
+                Some(vec![NetworkPolicyEgressRule::default()]),
+                Some(vec!["Ingress"]),
+            ),
+        )
+        .expect("explicit ingress ignores egress rules");
+        assert_eq!(ingress_only.len(), 1);
+        assert_eq!(ingress_only[0].direction, PolicyDirection::Ingress);
+
+        assert_eq!(
+            NetworkPolicyCompiler::compile_directions(
+                PolicyId::new(52),
+                egress_policy(None, Some(vec!["Audit"])),
+            ),
+            Err(NetworkPolicyCompileError::UnsupportedPolicyType {
+                policy_type: "Audit".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn egress_ipblock_waits_for_destination_address_evaluation() {
+        let policy = egress_policy(
+            Some(vec![NetworkPolicyEgressRule {
+                to: Some(vec![NetworkPolicyPeer {
+                    ip_block: Some(IPBlock {
+                        cidr: "10.0.0.0/24".to_owned(),
+                        except: None,
+                    }),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: None,
+            }]),
+            Some(vec!["Egress"]),
+        );
+        assert_eq!(
+            NetworkPolicyCompiler::compile_directions(PolicyId::new(53), policy),
+            Err(NetworkPolicyCompileError::UnsupportedEgressIpBlock {
+                rule_index: 0,
+                peer_index: 0,
+            })
+        );
     }
 
     #[test]

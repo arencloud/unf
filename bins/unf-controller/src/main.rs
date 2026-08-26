@@ -3775,6 +3775,46 @@ mod tests {
     }
 
     #[test]
+    fn network_policy_reconciliation_keeps_translated_egress_out_of_ingress_dataplane() {
+        let state = new_state(true);
+        let policy: NetworkPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": "allow-server-egress",
+                "namespace": "frontend"
+            },
+            "spec": {
+                "podSelector": {"matchLabels": {"app": "client"}},
+                "policyTypes": ["Egress"],
+                "egress": [{
+                    "to": [{
+                        "namespaceSelector": {
+                            "matchLabels": {"kubernetes.io/metadata.name": "backend"}
+                        },
+                        "podSelector": {"matchLabels": {"app": "server"}}
+                    }],
+                    "ports": [{"protocol": "TCP", "port": 8080}]
+                }]
+            }
+        }))
+        .expect("test egress NetworkPolicy is valid Kubernetes JSON");
+
+        apply_network_policy_event(&state, Event::Apply(policy));
+
+        assert!(read_lock(&state.network_policies).is_empty());
+        assert!(read_lock(&state.compiled_network_policies).is_empty());
+        let rejected = read_lock(&state.rejected_network_policies);
+        assert_eq!(rejected.len(), 1);
+        assert!(
+            rejected
+                .values()
+                .all(|reason| reason.contains("egress enforcement is not supported yet"))
+        );
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::default());
+    }
+
+    #[test]
     fn namespace_label_changes_advance_policy_revision_without_identity_churn() {
         let state = new_state(true);
         apply_namespace_event(&state, Event::Apply(namespace("production")));

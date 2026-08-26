@@ -96,6 +96,9 @@ Implemented in the repository:
 - direction-aware policy IR and userspace decisions with destination-selected
   ingress, source-selected egress, cross-direction isolation, and explicit
   rejection at the still-ingress-only dataplane boundary;
+- multi-direction Kubernetes NetworkPolicy translation with exact `policyTypes`
+  defaulting and source-targeted egress peer/port IR, retained behind the
+  ingress-only controller enforcement gate;
 - a supported ingress `NetworkPolicy` adapter that reuses the same IR, additive
   evaluator semantics, controller snapshots, and dataplane lowering as native
   policy, including pod/Namespace expressions, named and protocol-only

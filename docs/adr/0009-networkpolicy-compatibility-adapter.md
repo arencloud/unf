@@ -35,8 +35,10 @@ all-protocol global fallback. SCTP uses its IANA protocol number 132 and the sam
 source/destination port positions as the other supported transports. A range may
 span at most 1,024 ports, and the shared compiler refuses more than 131,072
 entries in either transactional bank;
-the agent validates that bank limit again before staging a snapshot. It returns
-typed errors for egress, IP blocks wider than 1,024 IPv4 addresses, IPv6 blocks
+the agent validates that bank limit again before staging a snapshot. The
+controller's enforceable entry point rejects every effective egress direction
+until source-side dataplane support exists. Translation returns typed errors for
+egress `ipBlock`, IP blocks wider than 1,024 IPv4 addresses, IPv6 blocks
 with more than 1,024 CIDR boundaries, reserved IPv4 blocks, out-of-block exceptions, oversized/reversed port
 ranges, named ports combined with `endPort`, and malformed metadata/ports or
 selector requirements. Bounded
@@ -46,9 +48,10 @@ ADR 0014 extends the same IR with bounded IPv6 prefix boundaries and LPM lowerin
 
 Kubernetes API defaults are resolved at the compatibility boundary. An omitted
 `spec.podSelector` is the empty selector and therefore selects every Pod in the
-policy Namespace. For the supported ingress-only shape with `egress` omitted,
-omitted `policyTypes` implies ingress, and an omitted port protocol means TCP. A
-Pod not selected by any ingress policy remains non-isolated. Omitted and
+policy Namespace. Missing or empty `policyTypes` always implies ingress and also
+implies egress when the egress rule list is non-empty; explicit types select only
+their named directions. An omitted port protocol means TCP. A Pod not selected
+by any policy remains non-isolated in that direction. Omitted and
 explicitly empty ingress `from` or `ports` lists compile to source and
 protocol/port wildcards respectively; non-empty list entries retain Kubernetes
 OR semantics. These defaults compile into ordinary shared IR selectors and
@@ -75,14 +78,17 @@ priority policies would give isolation defaults incorrect precedence.
 
 ## Consequences
 
-The supported compatibility slice is deterministic, explainable, and verified
+The supported enforced ingress slice is deterministic, explainable, and verified
 through the same Phase 2 dataplane compiler in a two-node cluster. Rejection
 details do not yet have a dedicated API endpoint. Exact-key range expansion is
 simple and matches the existing fast path, but intentionally trades map entries
 for range support; per-range and per-bank limits make that cost explicit and
 fail compilation instead of weakening policy. ADR 0014 subsequently added compact
-bounded IPv6 prefix representation; egress still needs a direction-aware IR and
-hook. The live verifier also creates a policy with omitted target selector,
+bounded IPv6 prefix representation. ADRs 0031 and 0032 subsequently added
+direction-aware policy IR, evaluation, multi-direction translation, and
+Kubernetes direction defaulting behind the ingress-only controller admission
+gate; egress still needs destination-address evaluation and a source-side hook.
+The live verifier also creates a policy with omitted target selector,
 policy types, and port protocol, proves namespace-wide TCP isolation, then
 narrows the target and proves the no-longer-selected Pod is non-isolated. A
 separate cross-node fixture proves named SCTP allow/default isolation,

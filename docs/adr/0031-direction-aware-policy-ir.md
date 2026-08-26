@@ -56,8 +56,9 @@ Userspace can now represent and evaluate policy isolation in either direction
 without duplicating the policy engine, while all existing ingress callers keep
 their behavior. Unsupported egress lowering fails closed at an explicit boundary.
 
-This ADR does not claim Kubernetes `spec.egress` translation, `policyTypes`
-egress defaulting, destination `ipBlock` evaluation, named-port resolution for
-egress, source-side BPF maps or hook enforcement, direction-bearing retained flow
-history, simulation integration, or live kind/OpenShift egress qualification.
-Those remain the next egress milestone slices.
+ADR 0032 subsequently added userspace `spec.egress` translation and Kubernetes
+`policyTypes` defaulting behind the ingress-only controller admission boundary.
+This ADR does not claim destination `ipBlock` evaluation, source-side BPF maps or
+hook enforcement, direction-bearing retained flow history, simulation/status
+integration, or live kind/OpenShift egress qualification. Those remain the next
+egress milestone slices.

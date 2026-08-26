@@ -62,11 +62,11 @@ identity pairs. The shared compiler also rejects a snapshot that would exceed
 one bank's 131,072-entry allocation, and the agent independently validates the
 same bound.
 At the translation boundary, an omitted target `podSelector` becomes the empty
-selector for all Pods in the policy Namespace. For the supported ingress-only
-shape with `egress` omitted, omitted `policyTypes` defaults to ingress, and an
-omitted port protocol defaults to TCP. The evaluator's existing
-no-applicable-policy behavior keeps Pods outside every ingress policy target
-non-isolated.
+selector for all Pods in the policy Namespace. Missing or empty `policyTypes`
+always defaults to ingress and additionally defaults to egress when the egress
+rule list is non-empty; explicit types select their named directions. An omitted
+port protocol defaults to TCP. The evaluator's existing no-applicable-policy
+behavior keeps Pods outside every policy target non-isolated in that direction.
 IPv4 `ipBlock` peers and nested `except` CIDRs are preserved in IR and expanded
 into an exact-source IPv4 policy map. One block may contain at most 1,024
 addresses. IPv6 blocks remain compact CIDR boundaries in an LPM policy map,
@@ -75,18 +75,23 @@ Pod addresses become `/128` overrides and `/0` represents arbitrary external
 sources. `0.0.0.0`, wider IPv4 blocks, out-of-block or mixed-family exceptions,
 and peers that combine `ipBlock` with selectors are rejected. A source-IP fallback represents
 arbitrary external sources, so compatibility isolation does not silently fail
-open merely because the source has no workload identity. The adapter deliberately
-rejects egress and named ports combined with `endPort`. These errors
+open merely because the source has no workload identity. The enforceable
+controller entry point deliberately rejects effective egress, the
+multi-direction translator rejects egress `ipBlock`, and both directions reject
+named ports combined with `endPort`. These errors
 prevent a policy from being accepted with weaker or different semantics. Native
 policy has the higher default precedence; the compatibility baseline uses
 reserved priority `1_000_000`.
 
-The shared IR and evaluator now have an explicit egress direction, but the
-current NetworkPolicy translator and identity/IP dataplane compilers remain
-ingress-only. All ingress lowerers reject egress IR before emitting map entries.
-`spec.egress` translation, egress defaulting, destination-IP matching, named-port
-semantics, and source-side dataplane enforcement are the active compatibility
-milestone rather than behavior implied by this foundation.
+The multi-direction NetworkPolicy entry point now emits independent ingress and
+egress IR, including Kubernetes `policyTypes` defaulting, source-selected egress
+targets, `to` peer destinations, and the shared port/protocol forms. The
+controller continues to call the enforceable ingress-only entry point, which
+rejects any effective egress direction. All ingress lowerers also reject egress
+IR before emitting map entries. Egress `ipBlock`, destination-IP evaluation,
+source-side dataplane enforcement, and controller integration remain the active
+compatibility milestone. See
+[ADR 0032](../adr/0032-networkpolicy-multi-direction-translation.md).
 
 The controller watches these objects cluster-wide, keeps accepted and rejected
 compatibility state separate, and combines accepted IR with native policy in each
