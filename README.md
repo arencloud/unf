@@ -99,6 +99,8 @@ Implemented in the repository:
 - multi-direction Kubernetes NetworkPolicy translation with exact `policyTypes`
   defaulting and source-targeted egress peer/port IR, retained behind the
   ingress-only controller enforcement gate;
+- addressed userspace egress evaluation for bounded IPv4/IPv6 `ipBlock`
+  destinations and exceptions, still excluded from ingress-only snapshots;
 - a supported ingress `NetworkPolicy` adapter that reuses the same IR, additive
   evaluator semantics, controller snapshots, and dataplane lowering as native
   policy, including pod/Namespace expressions, named and protocol-only

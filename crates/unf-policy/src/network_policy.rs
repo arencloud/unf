@@ -36,13 +36,6 @@ pub enum NetworkPolicyCompileError {
     MissingSpec,
     #[error("NetworkPolicy egress enforcement is not supported yet")]
     UnsupportedEgress,
-    #[error(
-        "egress rule {rule_index} peer {peer_index} uses ipBlock, which requires destination-address evaluation"
-    )]
-    UnsupportedEgressIpBlock {
-        rule_index: usize,
-        peer_index: usize,
-    },
     #[error("NetworkPolicy policyType {policy_type:?} is not supported")]
     UnsupportedPolicyType { policy_type: String },
     #[error("{field} matchExpression for key {key:?} uses invalid operator {operator:?}")]
@@ -99,9 +92,7 @@ pub enum NetworkPolicyCompileError {
         prefix_count: usize,
         limit: usize,
     },
-    #[error(
-        "policy rule {rule_index} peer {peer_index} ipBlock contains reserved source address 0.0.0.0"
-    )]
+    #[error("policy rule {rule_index} peer {peer_index} ipBlock contains reserved address 0.0.0.0")]
     IpBlockContainsReservedAddress {
         rule_index: usize,
         peer_index: usize,
@@ -181,8 +172,7 @@ impl NetworkPolicyCompiler {
     /// # Errors
     ///
     /// Returns an explicit error for missing metadata, invalid selectors and
-    /// ports, unknown policy types, or egress `ipBlock`, whose destination-address
-    /// semantics require the next evaluator/dataplane slice.
+    /// ports, unknown policy types, or invalid/beyond-limit address blocks.
     pub fn compile_directions(
         policy_id: PolicyId,
         policy: NetworkPolicy,
@@ -359,15 +349,7 @@ fn destinations(
     peers
         .into_iter()
         .enumerate()
-        .map(|(peer_index, peer)| {
-            if peer.ip_block.is_some() {
-                return Err(NetworkPolicyCompileError::UnsupportedEgressIpBlock {
-                    rule_index,
-                    peer_index,
-                });
-            }
-            peer_selector(peer, policy_namespace, rule_index, peer_index)
-        })
+        .map(|(peer_index, peer)| peer_selector(peer, policy_namespace, rule_index, peer_index))
         .collect()
 }
 
@@ -749,9 +731,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort, compile_dataplane_entries,
-        compile_ipv4_dataplane_entries, compile_ipv6_dataplane_entries, evaluate,
-        evaluate_for_direction,
+        DestinationAddresses, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort,
+        PolicyDecision, compile_dataplane_entries, compile_ipv4_dataplane_entries,
+        compile_ipv6_dataplane_entries, evaluate, evaluate_for_direction,
+        evaluate_for_direction_with_addresses,
     };
 
     fn labels(values: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -822,6 +805,27 @@ mod tests {
             labels: labels(&[("app", app)]),
             named_ports: BTreeMap::new(),
         }
+    }
+
+    fn evaluate_egress_with_addresses(
+        policies: &[PolicyIr],
+        source: &Endpoint,
+        destination: &Endpoint,
+        destination_addresses: DestinationAddresses,
+    ) -> PolicyDecision {
+        evaluate_for_direction_with_addresses(
+            policies,
+            PolicyDirection::Egress,
+            Flow {
+                source,
+                destination,
+                protocol: Protocol::Tcp,
+                destination_port: 443,
+                source_ipv4: None,
+                source_ipv6: None,
+            },
+            destination_addresses,
+        )
     }
 
     #[test]
@@ -992,13 +996,13 @@ mod tests {
     }
 
     #[test]
-    fn egress_ipblock_waits_for_destination_address_evaluation() {
-        let policy = egress_policy(
+    fn egress_ipv4_ipblock_applies_destination_exceptions_and_address_invariants() {
+        let ipv4_policy = egress_policy(
             Some(vec![NetworkPolicyEgressRule {
                 to: Some(vec![NetworkPolicyPeer {
                     ip_block: Some(IPBlock {
-                        cidr: "10.0.0.0/24".to_owned(),
-                        except: None,
+                        cidr: "10.0.0.0/29".to_owned(),
+                        except: Some(vec!["10.0.0.4/32".to_owned()]),
                     }),
                     ..NetworkPolicyPeer::default()
                 }]),
@@ -1006,12 +1010,101 @@ mod tests {
             }]),
             Some(vec!["Egress"]),
         );
+        let ipv4 = NetworkPolicyCompiler::compile_directions(PolicyId::new(53), ipv4_policy)
+            .expect("bounded IPv4 destination block translates");
+        let source = endpoint(1, "frontend", "client");
+        let destination = endpoint(0, "external", "external");
+
         assert_eq!(
-            NetworkPolicyCompiler::compile_directions(PolicyId::new(53), policy),
-            Err(NetworkPolicyCompileError::UnsupportedEgressIpBlock {
-                rule_index: 0,
-                peer_index: 0,
-            })
+            evaluate_egress_with_addresses(
+                &ipv4,
+                &source,
+                &destination,
+                DestinationAddresses {
+                    ipv4: Some("10.0.0.3".parse().expect("valid IPv4 address")),
+                    ipv6: None,
+                },
+            )
+            .verdict,
+            Verdict::Allow
+        );
+        for address in ["10.0.0.4", "10.0.1.1"] {
+            let decision = evaluate_egress_with_addresses(
+                &ipv4,
+                &source,
+                &destination,
+                DestinationAddresses {
+                    ipv4: Some(address.parse().expect("valid IPv4 address")),
+                    ipv6: None,
+                },
+            );
+            assert_eq!(decision.verdict, Verdict::Deny);
+            assert_eq!(decision.reason, PolicyReason::DefaultAction);
+        }
+        for destination_addresses in [
+            DestinationAddresses::default(),
+            DestinationAddresses {
+                ipv4: Some("10.0.0.3".parse().expect("valid IPv4 address")),
+                ipv6: Some("2001:db8::3".parse().expect("valid IPv6 address")),
+            },
+        ] {
+            assert_eq!(
+                evaluate_egress_with_addresses(
+                    &ipv4,
+                    &source,
+                    &destination,
+                    destination_addresses,
+                )
+                .verdict,
+                Verdict::Deny
+            );
+        }
+    }
+
+    #[test]
+    fn egress_ipv6_ipblock_applies_destination_exceptions() {
+        let ipv6_policy = egress_policy(
+            Some(vec![NetworkPolicyEgressRule {
+                to: Some(vec![NetworkPolicyPeer {
+                    ip_block: Some(IPBlock {
+                        cidr: "2001:db8::/64".to_owned(),
+                        except: Some(vec!["2001:db8::5/128".to_owned()]),
+                    }),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: None,
+            }]),
+            Some(vec!["Egress"]),
+        );
+        let ipv6 = NetworkPolicyCompiler::compile_directions(PolicyId::new(54), ipv6_policy)
+            .expect("bounded IPv6 destination block translates");
+        let source = endpoint(1, "frontend", "client");
+        let destination = endpoint(0, "external", "external");
+        assert_eq!(
+            evaluate_egress_with_addresses(
+                &ipv6,
+                &source,
+                &destination,
+                DestinationAddresses {
+                    ipv4: None,
+                    ipv6: Some("2001:db8::4".parse().expect("valid IPv6 address")),
+                },
+            )
+            .verdict,
+            Verdict::Allow
+        );
+        assert_eq!(
+            evaluate_egress_with_addresses(
+                &ipv6,
+                &source,
+                &destination,
+                DestinationAddresses {
+                    ipv4: None,
+                    ipv6: Some("2001:db8::5".parse().expect("valid IPv6 address")),
+                },
+            )
+            .verdict,
+            Verdict::Deny
         );
     }
 

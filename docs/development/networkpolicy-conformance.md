@@ -37,7 +37,7 @@ This audit does not claim that the upstream test binary itself was executed.
 | # | Upstream context and scenario | Classification | UNF evidence or boundary |
 |---:|---|---|---|
 | 1 | TCP — should support a `default-deny-ingress` policy | **Verified** | M + U: selecting empty ingress rules deny all tested source scopes |
-| 2 | TCP — should support a `default-deny-all` policy | **Unsupported** | The exact scenario includes egress isolation; `spec.egress` fails closed as unsupported |
+| 2 | TCP — should support a `default-deny-all` policy | **Unsupported** | The exact scenario includes egress isolation; userspace translation/evaluation exists but enforcement remains gated |
 | 3 | TCP — should allow same-Namespace traffic based on PodSelector | **Verified** | M + U: policy-local PodSelector scope and non-matching remote denial |
 | 4 | TCP — should allow ingress traffic for a target | **Intentionally excluded** | M + U verify the target-specific exception, combined empty Pod/Namespace peer, both remote scopes, and ordered recovery. The same-Namespace live leg needs established/related return-flow tracking because the broad policy also ingress-isolates the source |
 | 5 | TCP — should allow ingress from Pods in all Namespaces | **Verified** | M + U: empty NamespaceSelector across all source scopes |
@@ -54,26 +54,26 @@ This audit does not claim that the upstream test binary itself was executed.
 | 16 | TCP — should support allow-all policy | **Verified** | M: `ingress: [{}]`, precedence, and deletion recovery |
 | 17 | TCP — should allow ingress on one named port | **Verified** | M + U: destination-resolved named port and opposite-port denial |
 | 18 | TCP — should allow ingress from a Namespace on one named port | **Verified** | M + U: peer-restricted, per-destination named-port lowering |
-| 19 | TCP — should allow egress on one named port | **Unsupported** | Egress NetworkPolicy translation and enforcement are not implemented |
+| 19 | TCP — should allow egress on one named port | **Unsupported** | Named-port egress IR translates through the shared parser, but source-side enforcement is not implemented |
 | 20 | TCP — should not allow all ports for a nonexistent named port | **Verified** | M + U: fail-closed isolation on both selected destinations |
 | 21 | TCP — should enforce updated policy | **Verified** | M + U: same-object allow-all/default-deny replacement and rollback |
 | 22 | TCP — should allow ingress from an updated Namespace | **Verified** | M: Namespace-label deny/recovery with revision convergence |
 | 23 | TCP — should allow ingress from an updated Pod | **Verified** | M: source-label deny/recovery with revision convergence |
 | 24 | TCP — should deny ingress from Pods in other Namespaces | **Verified** | M + U: empty PodSelector remains policy-Namespace-local |
 | 25 | TCP — should deny ingress access to an updated target Pod | **Verified** | M + U: destination-label selection, isolation, and recovery |
-| 26 | TCP — should deny egress from Pods based on PodSelector | **Unsupported** | Egress source isolation is not implemented |
-| 27 | TCP — should deny egress from all Pods in a Namespace | **Unsupported** | Egress source isolation is not implemented |
+| 26 | TCP — should deny egress from Pods based on PodSelector | **Unsupported** | Source-selected userspace isolation exists, but egress dataplane enforcement is not implemented |
+| 27 | TCP — should deny egress from all Pods in a Namespace | **Unsupported** | Source-selected userspace isolation exists, but egress dataplane enforcement is not implemented |
 | 28 | TCP — should work with Ingress and Egress together | **Unsupported** | The exact scenario requires direction-aware policy composition |
 | 29 | TCP — should deny client-side egress even when the server allows ingress | **Unsupported** | Egress enforcement is not implemented |
-| 30 | TCP — should allow egress to a selected Pod in a selected Namespace | **Unsupported** | Egress peer translation is not implemented |
+| 30 | TCP — should allow egress to a selected Pod in a selected Namespace | **Unsupported** | Egress peer translation/evaluation exists, but source-side enforcement is not implemented |
 | 31 | TCP/UDP — should allow any port on one ingress protocol | **Verified** | K + U: protocol-only TCP wildcard without UDP broadening |
 | 32 | TCP — should let an ingress allow-all policy take precedence | **Verified** | M + U: additive allow-all over selecting policies |
-| 33 | TCP — should let an egress allow-all policy take precedence | **Unsupported** | Egress additive semantics are not implemented |
+| 33 | TCP — should let an egress allow-all policy take precedence | **Unsupported** | The shared additive evaluator is direction-aware, but egress dataplane enforcement is not implemented |
 | 34 | TCP — should stop enforcing policies after deletion | **Unsupported** | The exact upstream object contains ingress and egress. M/K verify ingress deletion and recreation independently |
-| 35 | TCP — should allow egress to a server in a CIDR block | **Unsupported** | Egress `ipBlock` is not implemented |
-| 36 | TCP — should enforce an egress `ipBlock` exception | **Unsupported** | Egress `ipBlock` is not implemented |
-| 37 | TCP — should allow an IP covered by overlapping egress CIDR policies | **Unsupported** | Egress `ipBlock` and additive egress policy are not implemented |
-| 38 | TCP — should control ingress and egress independently by PodSelector | **Unsupported** | Direction-aware isolation and egress enforcement are not implemented |
+| 35 | TCP — should allow egress to a server in a CIDR block | **Unsupported** | Bounded destination-CIDR evaluation exists, but egress dataplane enforcement is not implemented |
+| 36 | TCP — should enforce an egress `ipBlock` exception | **Unsupported** | Destination exceptions evaluate correctly in userspace, but egress dataplane enforcement is not implemented |
+| 37 | TCP — should allow an IP covered by overlapping egress CIDR policies | **Unsupported** | Addressed/additive userspace semantics exist, but egress dataplane enforcement is not implemented |
+| 38 | TCP — should control ingress and egress independently by PodSelector | **Unsupported** | Cross-direction userspace isolation exists, but egress dataplane enforcement is not implemented |
 | 39 | TCP/SCTP — should not treat SCTP policy as TCP | **Verified** | K + U: SCTP keys and TCP isolation |
 | 40 | TCP/SCTP — should isolate Pods selected by an SCTP policy | **Verified** | K + U: named SCTP allow with default-isolated open port |
 | 41 | TCP/UDP — should not allow TCP when policy specifies only UDP | **Verified** | M + U: exact and protocol-only UDP with same-port TCP denial |

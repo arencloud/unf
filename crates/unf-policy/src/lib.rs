@@ -116,13 +116,34 @@ impl IdentitySelector {
         source_ipv4: Option<Ipv4Addr>,
         source_ipv6: Option<Ipv6Addr>,
     ) -> bool {
-        let external_source_matches = endpoint.identity.get() != 0
+        self.matches_addressed(endpoint, source_ipv4, source_ipv6)
+    }
+
+    fn matches_destination(
+        &self,
+        endpoint: &Endpoint,
+        destination_addresses: DestinationAddresses,
+    ) -> bool {
+        self.matches_addressed(
+            endpoint,
+            destination_addresses.ipv4,
+            destination_addresses.ipv6,
+        )
+    }
+
+    fn matches_addressed(
+        &self,
+        endpoint: &Endpoint,
+        ipv4: Option<Ipv4Addr>,
+        ipv6: Option<Ipv6Addr>,
+    ) -> bool {
+        let external_endpoint_matches = endpoint.identity.get() != 0
             || !self.ipv4_blocks.is_empty()
             || !self.ipv6_blocks.is_empty()
             || self.is_unconstrained();
-        external_source_matches
+        external_endpoint_matches
             && self.matches(endpoint)
-            && match (source_ipv4, source_ipv6) {
+            && match (ipv4, ipv6) {
                 (Some(address), None) => {
                     self.ipv6_blocks.is_empty()
                         && (self.ipv4_blocks.is_empty()
@@ -357,6 +378,16 @@ pub struct Flow<'a> {
     pub source_ipv6: Option<Ipv6Addr>,
 }
 
+/// Destination addresses available to userspace policy evaluation.
+///
+/// At most one family should be populated for one concrete flow. Both absent
+/// preserves the historical endpoint-only behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DestinationAddresses {
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyDecision {
     #[serde(default, skip_serializing_if = "policy_direction_is_ingress")]
@@ -558,6 +589,26 @@ pub fn evaluate_for_direction(
     direction: PolicyDirection,
     flow: Flow<'_>,
 ) -> PolicyDecision {
+    evaluate_for_direction_with_addresses(
+        policies,
+        direction,
+        flow,
+        DestinationAddresses::default(),
+    )
+}
+
+/// Evaluates one isolation direction with concrete destination addresses.
+///
+/// Destination addresses are required for egress `ipBlock` matching. Supplying
+/// neither address preserves endpoint-selector behavior; supplying both families
+/// cannot match an address block.
+#[must_use]
+pub fn evaluate_for_direction_with_addresses(
+    policies: &[PolicyIr],
+    direction: PolicyDirection,
+    flow: Flow<'_>,
+    destination_addresses: DestinationAddresses,
+) -> PolicyDecision {
     let selected_endpoint = match direction {
         PolicyDirection::Ingress => flow.destination,
         PolicyDirection::Egress => flow.source,
@@ -567,15 +618,25 @@ pub fn evaluate_for_direction(
         .filter(|policy| policy.direction == direction && policy.target.matches(selected_endpoint))
         .collect();
 
-    let mut audits = matching_audits(&applicable, flow);
+    let mut audits = matching_audits(&applicable, flow, destination_addresses);
     audits.sort_by(|left, right| {
         left.policy_id
             .cmp(&right.policy_id)
             .then(left.rule_index.cmp(&right.rule_index))
     });
 
-    let enforced = decide_for_mode(&applicable, flow, PolicyEnforcementMode::Enforce);
-    let shadow = decide_for_mode(&applicable, flow, PolicyEnforcementMode::Shadow);
+    let enforced = decide_for_mode(
+        &applicable,
+        flow,
+        destination_addresses,
+        PolicyEnforcementMode::Enforce,
+    );
+    let shadow = decide_for_mode(
+        &applicable,
+        flow,
+        destination_addresses,
+        PolicyEnforcementMode::Shadow,
+    );
 
     let (verdict, reason, policy_id, rule_id) = enforced.unwrap_or((
         Verdict::Allow,
@@ -1313,6 +1374,7 @@ type RankedDecision = (u32, PolicyAction, PolicyId, Option<RuleId>, DecisionReas
 fn decide_for_mode(
     policies: &[&PolicyIr],
     flow: Flow<'_>,
+    destination_addresses: DestinationAddresses,
     mode: PolicyEnforcementMode,
 ) -> Option<(Verdict, DecisionReason, Option<PolicyId>, Option<RuleId>)> {
     let mut candidates = Vec::new();
@@ -1326,7 +1388,10 @@ fn decide_for_mode(
         .copied()
         .filter(|policy| policy.origin == PolicyOrigin::Native)
     {
-        let matched = policy.rules.iter().filter(|rule| rule_matches(rule, flow));
+        let matched = policy
+            .rules
+            .iter()
+            .filter(|rule| rule_matches(rule, flow, destination_addresses));
         let mut enforcing_rules = matched
             .filter(|rule| rule.action != PolicyAction::Audit)
             .peekable();
@@ -1359,7 +1424,7 @@ fn decide_for_mode(
     let compatibility_rules: Vec<_> = compatibility_policies
         .iter()
         .flat_map(|policy| &policy.rules)
-        .filter(|rule| rule_matches(rule, flow))
+        .filter(|rule| rule_matches(rule, flow, destination_addresses))
         .collect();
     if compatibility_rules.is_empty() {
         let mut defaults: Vec<_> = compatibility_policies
@@ -1426,19 +1491,31 @@ const fn action_verdict(action: PolicyAction) -> Verdict {
     }
 }
 
-fn matching_audits(policies: &[&PolicyIr], flow: Flow<'_>) -> Vec<RuleProvenance> {
+fn matching_audits(
+    policies: &[&PolicyIr],
+    flow: Flow<'_>,
+    destination_addresses: DestinationAddresses,
+) -> Vec<RuleProvenance> {
     policies
         .iter()
         .flat_map(|policy| &policy.rules)
-        .filter(|rule| rule.action == PolicyAction::Audit && rule_matches(rule, flow))
+        .filter(|rule| {
+            rule.action == PolicyAction::Audit && rule_matches(rule, flow, destination_addresses)
+        })
         .map(|rule| rule.provenance.clone())
         .collect()
 }
 
-fn rule_matches(rule: &PolicyRule, flow: Flow<'_>) -> bool {
+fn rule_matches(
+    rule: &PolicyRule,
+    flow: Flow<'_>,
+    destination_addresses: DestinationAddresses,
+) -> bool {
     rule.source
         .matches_source(flow.source, flow.source_ipv4, flow.source_ipv6)
-        && rule.destination.matches(flow.destination)
+        && rule
+            .destination
+            .matches_destination(flow.destination, destination_addresses)
         && rule.protocol.is_none_or(|value| value == flow.protocol)
         && match &rule.destination_port {
             DestinationPort::Any => true,

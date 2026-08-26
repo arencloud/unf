@@ -58,7 +58,8 @@ their behavior. Unsupported egress lowering fails closed at an explicit boundary
 
 ADR 0032 subsequently added userspace `spec.egress` translation and Kubernetes
 `policyTypes` defaulting behind the ingress-only controller admission boundary.
-This ADR does not claim destination `ipBlock` evaluation, source-side BPF maps or
-hook enforcement, direction-bearing retained flow history, simulation/status
-integration, or live kind/OpenShift egress qualification. Those remain the next
-egress milestone slices.
+ADR 0033 subsequently added destination-address and egress `ipBlock` evaluation.
+This ADR does not claim source-side BPF maps or hook enforcement,
+direction-bearing retained flow history, simulation/status integration, or live
+kind/OpenShift egress qualification. Those remain the next egress milestone
+slices.

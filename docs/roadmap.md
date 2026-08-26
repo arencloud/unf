@@ -167,8 +167,11 @@ matrix and reproducible evidence.
   implicit/explicit `policyTypes` defaulting, source-targeted `to` peer/port
   translation, and a controller admission test proving egress remains outside
   ingress-only snapshots;
-- Next: destination-address/`ipBlock` evaluation, then source-side lowering and
-  TC egress enforcement;
+- Implemented and unit verified: bounded IPv4/IPv6 egress `ipBlock` translation
+  and destination-address evaluation, including exceptions and fail-closed
+  absent/mixed-family input;
+- Next: source-side lowering, transactional distribution, and TC egress
+  enforcement;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.

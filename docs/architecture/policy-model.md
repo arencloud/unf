@@ -76,9 +76,8 @@ sources. `0.0.0.0`, wider IPv4 blocks, out-of-block or mixed-family exceptions,
 and peers that combine `ipBlock` with selectors are rejected. A source-IP fallback represents
 arbitrary external sources, so compatibility isolation does not silently fail
 open merely because the source has no workload identity. The enforceable
-controller entry point deliberately rejects effective egress, the
-multi-direction translator rejects egress `ipBlock`, and both directions reject
-named ports combined with `endPort`. These errors
+controller entry point deliberately rejects effective egress, and both
+directions reject named ports combined with `endPort`. These errors
 prevent a policy from being accepted with weaker or different semantics. Native
 policy has the higher default precedence; the compatibility baseline uses
 reserved priority `1_000_000`.
@@ -88,10 +87,13 @@ egress IR, including Kubernetes `policyTypes` defaulting, source-selected egress
 targets, `to` peer destinations, and the shared port/protocol forms. The
 controller continues to call the enforceable ingress-only entry point, which
 rejects any effective egress direction. All ingress lowerers also reject egress
-IR before emitting map entries. Egress `ipBlock`, destination-IP evaluation,
-source-side dataplane enforcement, and controller integration remain the active
-compatibility milestone. See
-[ADR 0032](../adr/0032-networkpolicy-multi-direction-translation.md).
+IR before emitting map entries. A separate addressed-evaluation entry point
+matches bounded IPv4/IPv6 egress `ipBlock` destinations and exceptions; absent,
+mixed-family, outside-CIDR, and excepted addresses fail closed to compatibility
+isolation. Source-side dataplane enforcement and controller integration remain
+the active compatibility milestone. See
+[ADR 0032](../adr/0032-networkpolicy-multi-direction-translation.md) and
+[ADR 0033](../adr/0033-egress-destination-address-evaluation.md).
 
 The controller watches these objects cluster-wide, keeps accepted and rejected
 compatibility state separate, and combines accepted IR with native policy in each

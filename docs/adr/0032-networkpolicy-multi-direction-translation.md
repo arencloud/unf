@@ -29,8 +29,8 @@ The policy Pod selector targets the destination for ingress and the source for
 egress. Ingress `from` peers become rule sources; egress `to` peers become rule
 destinations. Omitted or empty peer and port lists retain wildcard semantics.
 Both directions share selector, protocol, numeric/named port, and bounded range
-parsing. Egress `ipBlock` is rejected explicitly because faithful evaluation
-requires destination addresses in the flow model.
+parsing. ADR 0033 subsequently added bounded egress `ipBlock` translation and
+destination-address evaluation.
 
 The established `NetworkPolicyCompiler::compile` entry point remains the
 controller's enforcement admission boundary. It delegates to the complete
@@ -59,7 +59,6 @@ semantics and feed the already direction-aware evaluator without redesigning the
 ingress API. Existing ingress reconciliation and dataplane snapshots remain
 unchanged and fail closed for egress.
 
-This ADR does not claim egress `ipBlock`, destination-address evaluation,
-source-side lowering/maps, TC egress enforcement, retained-flow direction,
-simulation/status integration, lifecycle/provenance recovery, or kind/OpenShift
-egress qualification.
+This ADR does not claim source-side lowering/maps, TC egress enforcement,
+retained-flow direction, simulation/status integration, lifecycle/provenance
+recovery, or kind/OpenShift egress qualification.

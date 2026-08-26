@@ -38,7 +38,7 @@ entries in either transactional bank;
 the agent validates that bank limit again before staging a snapshot. The
 controller's enforceable entry point rejects every effective egress direction
 until source-side dataplane support exists. Translation returns typed errors for
-egress `ipBlock`, IP blocks wider than 1,024 IPv4 addresses, IPv6 blocks
+IP blocks wider than 1,024 IPv4 addresses, IPv6 blocks
 with more than 1,024 CIDR boundaries, reserved IPv4 blocks, out-of-block exceptions, oversized/reversed port
 ranges, named ports combined with `endPort`, and malformed metadata/ports or
 selector requirements. Bounded
@@ -87,7 +87,8 @@ fail compilation instead of weakening policy. ADR 0014 subsequently added compac
 bounded IPv6 prefix representation. ADRs 0031 and 0032 subsequently added
 direction-aware policy IR, evaluation, multi-direction translation, and
 Kubernetes direction defaulting behind the ingress-only controller admission
-gate; egress still needs destination-address evaluation and a source-side hook.
+gate. ADR 0033 subsequently added destination-address and egress `ipBlock`
+evaluation; egress still needs source-side lowering and a hook.
 The live verifier also creates a policy with omitted target selector,
 policy types, and port protocol, proves namespace-wide TCP isolation, then
 narrows the target and proves the no-longer-selected Pod is non-isolated. A
