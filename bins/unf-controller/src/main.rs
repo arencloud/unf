@@ -33,10 +33,11 @@ use tracing::{error, info, warn};
 use unf_api::SecurityPolicy;
 use unf_common::{IdentityId, PolicyDirection, PolicyId, Protocol, Revision, Verdict};
 use unf_policy::{
-    DestinationPort, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort, NetworkPolicyCompiler,
-    PolicyCompiler, PolicyIr, compile_dataplane_entries, compile_egress_ipv4_dataplane_entries,
-    compile_egress_ipv6_dataplane_entries, compile_ipv4_dataplane_entries,
-    compile_ipv6_dataplane_entries, evaluate,
+    DestinationAddresses, DestinationPort, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort,
+    NetworkPolicyCompiler, PolicyCompiler, PolicyIr, compile_dataplane_entries,
+    compile_egress_ipv4_dataplane_entries, compile_egress_ipv6_dataplane_entries,
+    compile_ipv4_dataplane_entries, compile_ipv6_dataplane_entries, evaluate,
+    evaluate_for_direction_with_addresses,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
@@ -240,6 +241,8 @@ struct StatusBody {
     rejected_network_policies: usize,
     compiled_policies: usize,
     resolved_policy_entries: usize,
+    resolved_ingress_policy_entries: usize,
+    resolved_egress_policy_entries: usize,
     identities: usize,
     indexed_pod_ips: usize,
     retained_flows: usize,
@@ -255,6 +258,10 @@ struct StatusBody {
 struct ExplainRequest {
     from: String,
     to: String,
+    #[serde(default)]
+    direction: RequestPolicyDirection,
+    #[serde(default)]
+    ip_family: Option<RequestIpFamily>,
     protocol: RequestProtocol,
     port: u16,
 }
@@ -267,10 +274,29 @@ enum RequestProtocol {
     Sctp,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RequestPolicyDirection {
+    #[default]
+    Ingress,
+    Egress,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RequestIpFamily {
+    Ipv4,
+    Ipv6,
+}
+
 #[derive(Debug, Serialize)]
 struct ExplainResponse {
     source: ResolvedEndpoint,
     destination: ResolvedEndpoint,
+    direction: PolicyDirection,
+    ip_family: RequestIpFamily,
+    source_address: IpAddr,
+    destination_address: IpAddr,
     decision: unf_policy::PolicyDecision,
     policy_revision: Revision,
     dataplane_enforcement: bool,
@@ -1907,11 +1933,11 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         egress_ipv4_policy_entries,
         egress_ipv6_policy_entries,
     ) = dataplane_policy_state(&state)?;
-    let resolved_policy_entries = policy_entries.len()
-        + ipv4_policy_entries.len()
-        + ipv6_policy_entries.len()
-        + egress_ipv4_policy_entries.len()
-        + egress_ipv6_policy_entries.len();
+    let resolved_ingress_policy_entries =
+        policy_entries.len() + ipv4_policy_entries.len() + ipv6_policy_entries.len();
+    let resolved_egress_policy_entries =
+        egress_ipv4_policy_entries.len() + egress_ipv6_policy_entries.len();
+    let resolved_policy_entries = resolved_ingress_policy_entries + resolved_egress_policy_entries;
     let (identity_revision, identity_count, indexed_pod_ips) = {
         let identities = mutex_lock(&state.identities);
         (
@@ -1953,6 +1979,8 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
                 .map(Vec::len)
                 .sum::<usize>(),
         resolved_policy_entries,
+        resolved_ingress_policy_entries,
+        resolved_egress_policy_entries,
         identities: identity_count,
         indexed_pod_ips,
         retained_flows: history.retained_flows,
@@ -2689,6 +2717,13 @@ async fn explain(
     State(state): State<Arc<ControllerState>>,
     Json(request): Json<ExplainRequest>,
 ) -> Result<Json<ExplainResponse>, ApiError> {
+    explain_response(&state, &request).map(Json)
+}
+
+fn explain_response(
+    state: &ControllerState,
+    request: &ExplainRequest,
+) -> Result<ExplainResponse, ApiError> {
     if request.port == 0 {
         return Err(ApiError::bad_request("port must be between 1 and 65535"));
     }
@@ -2708,31 +2743,97 @@ async fn explain(
         RequestProtocol::Udp => Protocol::Udp,
         RequestProtocol::Sctp => Protocol::Sctp,
     };
-    let policies = compiled_policies(&state);
-    let decision = evaluate(
+    let direction = match request.direction {
+        RequestPolicyDirection::Ingress => PolicyDirection::Ingress,
+        RequestPolicyDirection::Egress => PolicyDirection::Egress,
+    };
+    let (ip_family, source_address, destination_address) =
+        explain_addresses(source, destination, request.ip_family)?;
+    let (source_ipv4, source_ipv6) = match source_address {
+        IpAddr::V4(address) => (Some(address), None),
+        IpAddr::V6(address) => (None, Some(address)),
+    };
+    let destination_addresses = match destination_address {
+        IpAddr::V4(address) => DestinationAddresses {
+            ipv4: Some(address),
+            ipv6: None,
+        },
+        IpAddr::V6(address) => DestinationAddresses {
+            ipv4: None,
+            ipv6: Some(address),
+        },
+    };
+    let policies = compiled_policies(state);
+    let decision = evaluate_for_direction_with_addresses(
         &policies,
+        direction,
         Flow {
             source: &source_endpoint,
             destination: &destination_endpoint,
             protocol,
             destination_port: request.port,
-            source_ipv4: source.ipv4_addresses.iter().next().copied(),
-            source_ipv6: source
-                .ipv4_addresses
-                .is_empty()
-                .then(|| source.ipv6_addresses.iter().next().copied())
-                .flatten(),
+            source_ipv4,
+            source_ipv6,
         },
+        destination_addresses,
     );
     let revision = mutex_lock(&state.revisions).policy;
-    Ok(Json(ExplainResponse {
+    Ok(ExplainResponse {
         source: resolved(source),
         destination: resolved(destination),
+        direction,
+        ip_family,
+        source_address,
+        destination_address,
         decision,
         policy_revision: revision,
         dataplane_enforcement: true,
         note: "decision is enforceable after traffic-path nodes report this policy revision as applied",
-    }))
+    })
+}
+
+fn explain_addresses(
+    source: &PodRecord,
+    destination: &PodRecord,
+    requested_family: Option<RequestIpFamily>,
+) -> Result<(RequestIpFamily, IpAddr, IpAddr), ApiError> {
+    let family = requested_family.unwrap_or({
+        if !source.ipv4_addresses.is_empty() && !destination.ipv4_addresses.is_empty() {
+            RequestIpFamily::Ipv4
+        } else {
+            RequestIpFamily::Ipv6
+        }
+    });
+    match family {
+        RequestIpFamily::Ipv4 => {
+            let source_address = source.ipv4_addresses.iter().next().copied();
+            let destination_address = destination.ipv4_addresses.iter().next().copied();
+            match (source_address, destination_address) {
+                (Some(source_address), Some(destination_address)) => Ok((
+                    family,
+                    IpAddr::V4(source_address),
+                    IpAddr::V4(destination_address),
+                )),
+                _ => Err(ApiError::unprocessable(
+                    "source and destination Pods must both have an IPv4 address",
+                )),
+            }
+        }
+        RequestIpFamily::Ipv6 => {
+            let source_address = source.ipv6_addresses.iter().next().copied();
+            let destination_address = destination.ipv6_addresses.iter().next().copied();
+            match (source_address, destination_address) {
+                (Some(source_address), Some(destination_address)) => Ok((
+                    family,
+                    IpAddr::V6(source_address),
+                    IpAddr::V6(destination_address),
+                )),
+                _ => Err(ApiError::unprocessable(
+                    "source and destination Pods must both have an IPv6 address",
+                )),
+            }
+        }
+    }
 }
 
 async fn simulate_policy(
@@ -3507,6 +3608,50 @@ mod tests {
         .expect("test NetworkPolicy is valid Kubernetes JSON")
     }
 
+    fn egress_policy_state() -> ControllerState {
+        let state = new_state(true);
+        let mut source = pod_record(10, "frontend", "client", "client");
+        source
+            .ipv4_addresses
+            .insert("10.244.0.10".parse().expect("valid source IPv4"));
+        source
+            .ipv6_addresses
+            .insert("fd00:10:244::10".parse().expect("valid source IPv6"));
+        let mut destination = pod_record(20, "backend", "server", "server");
+        destination
+            .ipv4_addresses
+            .insert("10.244.1.20".parse().expect("valid destination IPv4"));
+        destination
+            .ipv6_addresses
+            .insert("fd00:10:244::20".parse().expect("valid destination IPv6"));
+        write_lock(&state.pods).insert("frontend/client".to_owned(), source);
+        write_lock(&state.pods).insert("backend/server".to_owned(), destination);
+        let policy: NetworkPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": "allow-server-egress",
+                "namespace": "frontend"
+            },
+            "spec": {
+                "podSelector": {"matchLabels": {"app": "client"}},
+                "policyTypes": ["Egress"],
+                "egress": [{
+                    "to": [{
+                        "namespaceSelector": {
+                            "matchLabels": {"kubernetes.io/metadata.name": "backend"}
+                        },
+                        "podSelector": {"matchLabels": {"app": "server"}}
+                    }],
+                    "ports": [{"protocol": "TCP", "port": 8080}]
+                }]
+            }
+        }))
+        .expect("test egress NetworkPolicy is valid Kubernetes JSON");
+        apply_network_policy_event(&state, Event::Apply(policy));
+        state
+    }
+
     fn namespace(environment: &str) -> Namespace {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "v1",
@@ -3809,47 +3954,7 @@ mod tests {
 
     #[test]
     fn network_policy_reconciliation_distributes_egress_without_ingress_cross_contamination() {
-        let state = new_state(true);
-        let mut source = pod_record(10, "frontend", "client", "client");
-        source
-            .ipv4_addresses
-            .insert("10.244.0.10".parse().expect("valid source IPv4"));
-        source
-            .ipv6_addresses
-            .insert("fd00:10:244::10".parse().expect("valid source IPv6"));
-        let mut destination = pod_record(20, "backend", "server", "server");
-        destination
-            .ipv4_addresses
-            .insert("10.244.1.20".parse().expect("valid destination IPv4"));
-        destination
-            .ipv6_addresses
-            .insert("fd00:10:244::20".parse().expect("valid destination IPv6"));
-        write_lock(&state.pods).insert("frontend/client".to_owned(), source);
-        write_lock(&state.pods).insert("backend/server".to_owned(), destination);
-        let policy: NetworkPolicy = serde_json::from_value(serde_json::json!({
-            "apiVersion": "networking.k8s.io/v1",
-            "kind": "NetworkPolicy",
-            "metadata": {
-                "name": "allow-server-egress",
-                "namespace": "frontend"
-            },
-            "spec": {
-                "podSelector": {"matchLabels": {"app": "client"}},
-                "policyTypes": ["Egress"],
-                "egress": [{
-                    "to": [{
-                        "namespaceSelector": {
-                            "matchLabels": {"kubernetes.io/metadata.name": "backend"}
-                        },
-                        "podSelector": {"matchLabels": {"app": "server"}}
-                    }],
-                    "ports": [{"protocol": "TCP", "port": 8080}]
-                }]
-            }
-        }))
-        .expect("test egress NetworkPolicy is valid Kubernetes JSON");
-
-        apply_network_policy_event(&state, Event::Apply(policy));
+        let state = egress_policy_state();
 
         assert_eq!(read_lock(&state.network_policies).len(), 1);
         let compiled = read_lock(&state.compiled_network_policies);
@@ -3889,6 +3994,49 @@ mod tests {
                 && entry.key.destination_port == 8080
                 && entry.decision.verdict == Verdict::Allow
         }));
+    }
+
+    #[test]
+    fn direction_aware_explanation_uses_the_requested_address_family() {
+        let state = egress_policy_state();
+        let allowed = explain_response(
+            &state,
+            &ExplainRequest {
+                from: "frontend/client".to_owned(),
+                to: "backend/server".to_owned(),
+                direction: RequestPolicyDirection::Egress,
+                ip_family: Some(RequestIpFamily::Ipv6),
+                protocol: RequestProtocol::Tcp,
+                port: 8080,
+            },
+        )
+        .expect("IPv6 egress allow is explainable");
+        assert_eq!(allowed.direction, PolicyDirection::Egress);
+        assert_eq!(
+            allowed.source_address,
+            "fd00:10:244::10".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            allowed.destination_address,
+            "fd00:10:244::20".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(allowed.decision.direction, PolicyDirection::Egress);
+        assert_eq!(allowed.decision.verdict, Verdict::Allow);
+
+        let denied = explain_response(
+            &state,
+            &ExplainRequest {
+                from: "frontend/client".to_owned(),
+                to: "backend/server".to_owned(),
+                direction: RequestPolicyDirection::Egress,
+                ip_family: Some(RequestIpFamily::Ipv4),
+                protocol: RequestProtocol::Tcp,
+                port: 8081,
+            },
+        )
+        .expect("IPv4 egress default isolation is explainable");
+        assert_eq!(denied.decision.direction, PolicyDirection::Egress);
+        assert_eq!(denied.decision.verdict, Verdict::Deny);
     }
 
     #[test]

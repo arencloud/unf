@@ -186,7 +186,10 @@ matrix and reproducible evidence.
   non-selected pass-through, Namespace/Pod selector AND, named TCP/UDP,
   protocol-only SCTP, bounded IPv4/IPv6 `ipBlock` exceptions, direction-correct
   provenance, policy deletion recovery, and baseline reconvergence;
-- Next: direction-aware explanation, simulation/status/history integration,
+- Implemented and two-node kind verified: direction- and address-family-aware
+  `unfctl explain` for egress selector/default/`ipBlock` decisions, plus separate
+  resolved ingress/egress entry counts in controller status;
+- Next: NetworkPolicy simulation/history integration,
   populated-map controller-offline replacement recovery, stateful replies, and
   dual-stack OpenShift qualification;
 - shadow rollout and offline impact analysis;

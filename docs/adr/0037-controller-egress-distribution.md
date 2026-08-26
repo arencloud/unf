@@ -59,3 +59,6 @@ This slice does not claim direction-aware operator explanation or simulation,
 direction retention in historical export, controller-offline replacement with a
 populated egress bank, stateful established/related reply handling, or OpenShift
 egress qualification. Those remain explicit Phase 3 work.
+
+ADR 0038 subsequently added direction- and address-family-aware live explanation
+and separate resolved ingress/egress controller status counts.

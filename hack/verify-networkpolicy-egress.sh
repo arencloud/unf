@@ -216,6 +216,24 @@ expect_direction_provenance() {
     return 1
 }
 
+expect_egress_explanation() {
+    local destination=$1 family=$2 source_address=$3 destination_address=$4
+    local port=$5 verdict=$6 reason=$7 explanation
+    explanation=$("${unfctl}" --controller-url "${controller_url}" --output json \
+        explain --from "${source_namespace}/client" --to "${destination}" \
+        --direction egress --ip-family "${family}" --protocol tcp --port "${port}")
+    if ! grep -q '"direction": "Egress"' <<<"${explanation}" \
+        || ! grep -q "\"ip_family\": \"${family}\"" <<<"${explanation}" \
+        || ! grep -q "\"source_address\": \"${source_address}\"" <<<"${explanation}" \
+        || ! grep -q "\"destination_address\": \"${destination_address}\"" \
+            <<<"${explanation}" \
+        || ! grep -q "\"verdict\": \"${verdict}\"" <<<"${explanation}" \
+        || ! grep -q "\"reason\": \"${reason}\"" <<<"${explanation}"; then
+        echo "unexpected egress ${family} explanation to ${destination} TCP/${port}" >&2
+        exit 1
+    fi
+}
+
 cleanup
 for namespace in "${source_namespace}" "${allowed_namespace}" "${denied_namespace}"; do
     "${kc[@]}" wait --for=delete namespace/"${namespace}" --timeout=60s \
@@ -247,11 +265,14 @@ done
 
 allowed_ipv4=$(pod_address "${allowed_namespace}" server 4)
 allowed_ipv6=$(pod_address "${allowed_namespace}" server 6)
+source_ipv4=$(pod_address "${source_namespace}" client 4)
+source_ipv6=$(pod_address "${source_namespace}" client 6)
 denied_ipv4=$(pod_address "${denied_namespace}" server 4)
 denied_ipv6=$(pod_address "${denied_namespace}" server 6)
 protocol_ipv4=$(pod_address "${allowed_namespace}" protocol-server 4)
 protocol_ipv6=$(pod_address "${allowed_namespace}" protocol-server 6)
-for address in "${allowed_ipv4}" "${allowed_ipv6}" "${denied_ipv4}" \
+for address in "${source_ipv4}" "${source_ipv6}" "${allowed_ipv4}" \
+    "${allowed_ipv6}" "${denied_ipv4}" \
     "${denied_ipv6}" "${protocol_ipv4}" "${protocol_ipv6}"; do
     if [[ -z ${address} ]]; then
         echo "egress qualification requires dual-stack Pod addresses" >&2
@@ -314,12 +335,24 @@ EOF
 require_policy_state "$((baseline_count + 1))" "${baseline_rejected}" \
     "${default_deny_revision}" "selector/named-port egress allow did not converge"
 selector_revision=${policy_revision}
+selector_status=$(controller_status)
+selector_egress_entries=$(status_field resolved_egress_policy_entries <<<"${selector_status}")
+if [[ -z ${selector_egress_entries} || ${selector_egress_entries} -eq 0 ]]; then
+    echo "controller status did not expose populated egress policy entries" >&2
+    exit 1
+fi
 expect_tcp_allow client "${allowed_ipv4}" 8080 unf-egress-ok
 expect_tcp_allow client "${allowed_ipv6}" 8080 unf-egress-ok
 expect_tcp_deny client "${allowed_ipv4}" 8081
 expect_tcp_deny client "${allowed_ipv6}" 8081
 expect_tcp_deny client "${denied_ipv4}" 8080
 expect_tcp_deny client "${denied_ipv6}" 8080
+expect_egress_explanation "${allowed_namespace}/server" ipv4 \
+    "${source_ipv4}" "${allowed_ipv4}" 8080 Allow ExplicitRule
+expect_egress_explanation "${allowed_namespace}/server" ipv6 \
+    "${source_ipv6}" "${allowed_ipv6}" 8080 Allow ExplicitRule
+expect_egress_explanation "${allowed_namespace}/server" ipv4 \
+    "${source_ipv4}" "${allowed_ipv4}" 8081 Deny DefaultAction
 if ! expect_direction_provenance "${selector_revision}" 8080 Allow 1 true; then
     echo "egress explicit allow did not emit direction-correct provenance" >&2
     exit 1
@@ -406,6 +439,14 @@ expect_tcp_allow client "${allowed_ipv4}" 8080 unf-egress-ok
 expect_tcp_allow client "${allowed_ipv6}" 8080 unf-egress-ok
 expect_tcp_deny client "${denied_ipv4}" 8080
 expect_tcp_deny client "${denied_ipv6}" 8080
+expect_egress_explanation "${allowed_namespace}/server" ipv4 \
+    "${source_ipv4}" "${allowed_ipv4}" 8080 Allow ExplicitRule
+expect_egress_explanation "${allowed_namespace}/server" ipv6 \
+    "${source_ipv6}" "${allowed_ipv6}" 8080 Allow ExplicitRule
+expect_egress_explanation "${denied_namespace}/server" ipv4 \
+    "${source_ipv4}" "${denied_ipv4}" 8080 Deny DefaultAction
+expect_egress_explanation "${denied_namespace}/server" ipv6 \
+    "${source_ipv6}" "${denied_ipv6}" 8080 Deny DefaultAction
 
 "${kc[@]}" delete networkpolicy -n "${source_namespace}" \
     selected-egress selected-egress-protocols >/dev/null
@@ -431,4 +472,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" \
     exit 1
 fi
 
-echo "dual-stack NetworkPolicy egress qualification passed: selected-source default isolation, non-selected pass-through, Namespace/Pod selector AND, named TCP and UDP ports, protocol-only SCTP, IPv4/IPv6 ipBlock exceptions, direction-correct allow/deny provenance, deletion recovery, and exact fixture cleanup"
+echo "dual-stack NetworkPolicy egress qualification passed: selected-source default isolation, non-selected pass-through, Namespace/Pod selector AND, named TCP and UDP ports, protocol-only SCTP, IPv4/IPv6 ipBlock exceptions, direction-correct explanation and allow/deny provenance, deletion recovery, and exact fixture cleanup"

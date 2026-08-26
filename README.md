@@ -165,8 +165,9 @@ Implemented in the repository:
   to fill the shared physical policy map, proving capacity failure cannot advance
   the applied revision or disturb active traffic and that retry succeeds after
   scoped cleanup;
-- `unfctl status`, `unfctl topology`, `unfctl flows`, and `unfctl explain` against live
-  controller state;
+- `unfctl status`, `unfctl topology`, `unfctl flows`, and direction-/family-aware
+  `unfctl explain` against live controller state, including separate resolved
+  ingress/egress status counts;
 - `unfctl policy simulate <security-policy.yaml>` with table/JSON/YAML
   representative and historical impact summaries, optional last-received-time
   windows and newest-first limits, plus current/proposed provenance;

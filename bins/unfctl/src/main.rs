@@ -53,6 +53,12 @@ enum Command {
         /// Destination pod as namespace/name.
         #[arg(long)]
         to: String,
+        /// Policy isolation direction to evaluate.
+        #[arg(long, value_enum, default_value = "ingress")]
+        direction: Direction,
+        /// Concrete Pod address family to use; defaults to IPv4 when both Pods have it.
+        #[arg(long, value_enum)]
+        ip_family: Option<IpFamily>,
         #[arg(long, value_enum, default_value = "tcp")]
         protocol: Protocol,
         #[arg(long)]
@@ -101,10 +107,27 @@ enum Protocol {
     Sctp,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum Direction {
+    Ingress,
+    Egress,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum IpFamily {
+    Ipv4,
+    Ipv6,
+}
+
 #[derive(Debug, Serialize)]
 struct ExplainRequest<'a> {
     from: &'a str,
     to: &'a str,
+    direction: Direction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip_family: Option<IpFamily>,
     protocol: Protocol,
     port: u16,
 }
@@ -159,6 +182,8 @@ async fn run() -> Result<()> {
         Command::Explain {
             from,
             to,
+            direction,
+            ip_family,
             protocol,
             port,
         } => {
@@ -171,6 +196,8 @@ async fn run() -> Result<()> {
                 &ExplainRequest {
                     from,
                     to,
+                    direction: *direction,
+                    ip_family: *ip_family,
                     protocol: *protocol,
                     port: *port,
                 },
@@ -875,6 +902,35 @@ mod tests {
             cli.command,
             Command::Explain {
                 protocol: Protocol::Sctp,
+                direction: Direction::Ingress,
+                ip_family: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn egress_ipv6_explain_command_parses() {
+        let cli = Cli::try_parse_from([
+            "unfctl",
+            "explain",
+            "--from",
+            "frontend/client",
+            "--to",
+            "backend/server",
+            "--direction",
+            "egress",
+            "--ip-family",
+            "ipv6",
+            "--port",
+            "8080",
+        ])
+        .expect("egress IPv6 explain command parses");
+        assert!(matches!(
+            cli.command,
+            Command::Explain {
+                direction: Direction::Egress,
+                ip_family: Some(IpFamily::Ipv6),
                 ..
             }
         ));

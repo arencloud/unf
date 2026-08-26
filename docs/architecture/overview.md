@@ -32,13 +32,14 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
 2. Pod metadata becomes provisional network identities. Namespace labels remain
    separate selector metadata, while policy-relevant named-port mappings join the
    canonical identity key so incompatible destinations cannot alias.
-3. SecurityPolicies and the supported NetworkPolicy ingress subset compile into
-   the same provenance-preserving IR; unsupported compatibility objects are
-   rejected without retaining stale compiled state.
+3. SecurityPolicies and the supported NetworkPolicy ingress/egress subset compile
+   into the same provenance-preserving direction-aware IR; unsupported
+   compatibility objects are rejected without retaining stale compiled state.
 4. `unfctl topology` queries a versioned snapshot of Nodes, Pod placement,
    Services, selector-derived intent, and EndpointSlice runtime backends with
    readiness/serving/termination state. `unfctl explain` asks the controller to
-   resolve two Pods and evaluate the IR.
+   resolve two Pods and evaluate one explicit policy direction against a concrete
+   IPv4 or IPv6 address pair.
    `unfctl policy simulate` compiles a candidate without applying it and compares
    current/proposed decisions over a probe matrix fenced to the reported topology
    revision plus an independently windowed, revision-fenced retained-history set.
@@ -48,10 +49,11 @@ fixed-size numeric state and does no selector or Kubernetes interpretation.
    Destination-resolved events enter a bounded non-blocking queue, aggregate by
    logical L3/L4 flow, and export in capped batches. Queue pressure drops telemetry
    while forwarding continues.
-6. The controller resolves policy selectors to identity tuples, bounded exact
-   IPv4-source tuples, and bounded IPv6 prefixes; each agent stages all three
-   dual-bank maps and atomically activates the resulting policy revision with one
-   configuration write.
+6. The controller resolves ingress selectors to identity tuples, bounded exact
+   IPv4-source tuples, and bounded IPv6 source prefixes, and egress selectors to
+   exact IPv4 destinations and IPv6 destination prefixes. Each agent stages all
+   five dual-bank maps and atomically activates the resulting policy revision
+   with one configuration write.
    Namespace label changes advance this policy revision when selector results can
    change.
 7. TC parses IPv4/IPv6 TCP, UDP, and SCTP, including verifier-bounded traversal

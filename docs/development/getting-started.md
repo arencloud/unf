@@ -254,7 +254,15 @@ target/debug/unfctl --controller-url http://127.0.0.1:9962 flows --last 15m --li
 target/debug/unfctl --controller-url http://127.0.0.1:9962 flows \
   --since-unix-ms 1787688000000 --until-unix-ms 1787688900000
 target/debug/unfctl --controller-url http://127.0.0.1:9962 status
+target/debug/unfctl --controller-url http://127.0.0.1:9962 explain \
+  --from frontend/client --to backend/server --direction ingress \
+  --ip-family ipv6 --protocol tcp --port 8080
 ```
+
+Ingress is the backward-compatible explanation default. For egress policy, pass
+`--direction egress`; on dual-stack Pods, pass `--ip-family ipv4` or `ipv6` so
+the reported `ipBlock` result is tied to the concrete address pair shown in the
+response.
 
 Flow bounds are inclusive and select aggregate entries by their exact
 `last_received_unix_ms`; they do not bucket each observation by event time. The
