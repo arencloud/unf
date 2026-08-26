@@ -751,6 +751,52 @@ mod tests {
     }
 
     #[test]
+    fn policy_update_replaces_allow_all_with_default_deny_and_recovers() {
+        let source = endpoint(1, "frontend", "client");
+        let destination = endpoint(2, "backend", "server");
+        let decision = |compiled: &PolicyIr| {
+            evaluate(
+                std::slice::from_ref(compiled),
+                Flow {
+                    source: &source,
+                    destination: &destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: 8080,
+                    source_ipv4: None,
+                    source_ipv6: None,
+                },
+            )
+        };
+        let mut updated_policy = policy(vec![NetworkPolicyIngressRule::default()]);
+        updated_policy.metadata.name = Some("allow-all-mutate-to-deny-all".to_owned());
+
+        let allow_all = NetworkPolicyCompiler::compile(PolicyId::new(8), updated_policy.clone())
+            .expect("allow-all policy compiles");
+        assert_eq!(decision(&allow_all).verdict, Verdict::Allow);
+        assert_eq!(decision(&allow_all).reason, PolicyReason::ExplicitRule);
+
+        updated_policy
+            .spec
+            .as_mut()
+            .expect("updated policy has spec")
+            .ingress = Some(Vec::new());
+        let default_deny = NetworkPolicyCompiler::compile(PolicyId::new(8), updated_policy.clone())
+            .expect("updated default-deny policy compiles");
+        assert_eq!(decision(&default_deny).verdict, Verdict::Deny);
+        assert_eq!(decision(&default_deny).reason, PolicyReason::DefaultAction);
+
+        updated_policy
+            .spec
+            .as_mut()
+            .expect("updated policy has spec")
+            .ingress = Some(vec![NetworkPolicyIngressRule::default()]);
+        let recovered = NetworkPolicyCompiler::compile(PolicyId::new(8), updated_policy)
+            .expect("restored allow-all policy compiles");
+        assert_eq!(decision(&recovered).verdict, Verdict::Allow);
+        assert_eq!(decision(&recovered).policy_id, Some(PolicyId::new(8)));
+    }
+
+    #[test]
     fn target_label_lifecycle_changes_policy_applicability() {
         let mut lifecycle_policy = policy(Vec::new());
         lifecycle_policy

@@ -33,6 +33,7 @@ and the upstream
 | Selecting policies combine allows additively | One policy allows Namespace A on TCP/8087 and another allows Namespace B on TCP/8088 | Existing additive evaluator test plus two-node traffic |
 | Stacked policies with overlapping destination selectors combine only on their intersection | A broad policy allows Namespace A on TCP/8087 to both servers; a narrow policy additionally allows Namespace B on TCP/8088 only to the worker-node server. Deleting narrow then broad restores the intermediate isolation and final non-isolated state | Destination-specific evaluator/lowering test, revision-converged explanations, ordered deletion, and IPv4/IPv6 traffic |
 | An allow-all policy takes precedence over other isolation policies | A temporary `ingress: [{}]` permits both ports from every source; deletion restores the stacked rules | Two-node mutation and recovery traffic |
+| Updating one policy replaces its ingress rules | One accepted policy changes from `ingress: [{}]` to `ingress: []`, switching both selected servers from allow-all to default deny without changing the accepted-policy count; restoring the rule and deleting the policy recover allow-all and non-isolated traffic | Same-identity compiler/evaluator test, exact revision convergence, explanations, and direct IPv4/IPv6 traffic from all source scopes |
 
 The disposable fixture is
 [`deploy/examples/networkpolicy-upstream-ingress.yaml`](../../deploy/examples/networkpolicy-upstream-ingress.yaml).

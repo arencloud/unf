@@ -1003,6 +1003,94 @@ for destination in \
 done
 
 previous_revision=${policy_revision}
+"${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-all-mutate-to-deny-all
+  namespace: ${target_namespace}
+spec:
+  podSelector:
+    matchLabels:
+      named-port-target: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - {}
+EOF
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "mutable allow-all policy did not converge"
+for source in \
+    "${target_namespace} same-client" \
+    "${source_a_namespace} client" \
+    "${source_b_namespace} client"; do
+    read -r namespace pod <<<"${source}"
+    for destination in \
+        "${server_ip} ${server_ipv6}" \
+        "${alternate_server_ip} ${alternate_server_ipv6}"; do
+        read -r ipv4 ipv6 <<<"${destination}"
+        for port in 8087 8088; do
+            expect_address_allow "${namespace}" "${pod}" "${ipv4}" "${port}"
+            expect_address_allow "${namespace}" "${pod}" "${ipv6}" "${port}"
+        done
+    done
+done
+expect_explanation "${source_b_namespace}/client" 8087 Allow ExplicitRule
+
+previous_revision=${policy_revision}
+"${kc[@]}" patch networkpolicy -n "${target_namespace}" \
+    allow-all-mutate-to-deny-all --type=json \
+    -p '[{"op":"replace","path":"/spec/ingress","value":[]}]' >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "allow-all to default-deny policy update did not converge"
+for source in \
+    "${target_namespace} same-client" \
+    "${source_a_namespace} client" \
+    "${source_b_namespace} client"; do
+    read -r namespace pod <<<"${source}"
+    for destination in \
+        "${server_ip} ${server_ipv6}" \
+        "${alternate_server_ip} ${alternate_server_ipv6}"; do
+        read -r ipv4 ipv6 <<<"${destination}"
+        for port in 8087 8088; do
+            expect_address_deny "${namespace}" "${pod}" "${ipv4}" "${port}"
+            expect_address_deny "${namespace}" "${pod}" "${ipv6}" "${port}"
+        done
+    done
+done
+expect_explanation "${source_b_namespace}/client" 8087 Deny DefaultAction
+expect_explanation_to \
+    "${source_b_namespace}/client" alternate-server 8088 Deny DefaultAction
+
+previous_revision=${policy_revision}
+"${kc[@]}" patch networkpolicy -n "${target_namespace}" \
+    allow-all-mutate-to-deny-all --type=json \
+    -p '[{"op":"replace","path":"/spec/ingress","value":[{}]}]' >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "default-deny to allow-all policy recovery did not converge"
+for destination in \
+    "${server_ip} ${server_ipv6}" \
+    "${alternate_server_ip} ${alternate_server_ipv6}"; do
+    read -r ipv4 ipv6 <<<"${destination}"
+    for port in 8087 8088; do
+        expect_address_allow "${source_b_namespace}" client "${ipv4}" "${port}"
+        expect_address_allow "${source_b_namespace}" client "${ipv6}" "${port}"
+    done
+done
+expect_explanation "${source_b_namespace}/client" 8087 Allow ExplicitRule
+
+previous_revision=${policy_revision}
+"${kc[@]}" delete networkpolicy -n "${target_namespace}" \
+    allow-all-mutate-to-deny-all >/dev/null
+require_policy_state "$((baseline_count + 2))" "${baseline_rejected}" \
+    "${previous_revision}" "mutable policy deletion did not reconverge"
+expect_allow "${source_b_namespace}" client 8087
+expect_address_allow \
+    "${source_b_namespace}" client "${alternate_server_ip}" 8088
+expect_address_allow \
+    "${source_b_namespace}" client "${alternate_server_ipv6}" 8088
+
+previous_revision=${policy_revision}
 cleanup
 for namespace in "${target_namespace}" "${source_a_namespace}" "${source_b_namespace}"; do
     if ! "${kc[@]}" wait --for=delete namespace/"${namespace}" --timeout=120s >/dev/null; then
@@ -1015,4 +1103,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned dual-stack ingress conformance passed: IPv4/IPv6 explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific and nonexistent named ports, target Pod match-label/expression isolation and recovery, overlapping destination selectors, default deny, same-namespace empty/labeled PodSelector, empty/exact-name NamespaceSelector, all peer selector operators with Pod/Namespace label recovery, selector AND, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned dual-stack ingress conformance passed: IPv4/IPv6 explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific and nonexistent named ports, target Pod match-label/expression isolation and recovery, overlapping destination selectors, same-object allow-all/default-deny update recovery, default deny, same-namespace empty/labeled PodSelector, empty/exact-name NamespaceSelector, all peer selector operators with Pod/Namespace label recovery, selector AND, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"
