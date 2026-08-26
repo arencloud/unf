@@ -1205,55 +1205,63 @@ mod tests {
         destination
             .labels
             .insert("managed".to_owned(), "true".to_owned());
-        assert_eq!(
+        let decision = |source: &Endpoint, destination: &Endpoint| {
             evaluate(
                 std::slice::from_ref(&compiled),
                 Flow {
-                    source: &source,
-                    destination: &destination,
+                    source,
+                    destination,
                     protocol: Protocol::Tcp,
                     destination_port: 8080,
                     source_ipv4: None,
                     source_ipv6: None,
-                }
+                },
             )
-            .verdict,
-            Verdict::Allow
-        );
+        };
+        assert_eq!(decision(&source, &destination).verdict, Verdict::Allow);
 
-        source.labels.insert("blocked".to_owned(), "yes".to_owned());
+        destination
+            .labels
+            .insert("app".to_owned(), "database".to_owned());
         assert_eq!(
-            evaluate(
-                std::slice::from_ref(&compiled),
-                Flow {
-                    source: &source,
-                    destination: &destination,
-                    protocol: Protocol::Tcp,
-                    destination_port: 8080,
-                    source_ipv4: None,
-                    source_ipv6: None,
-                }
-            )
-            .verdict,
-            Verdict::Deny
+            decision(&source, &destination).reason,
+            PolicyReason::NoApplicablePolicy
         );
+        destination
+            .labels
+            .insert("app".to_owned(), "server".to_owned());
+
+        destination
+            .labels
+            .insert("tier".to_owned(), "edge".to_owned());
+        assert_eq!(
+            decision(&source, &destination).reason,
+            PolicyReason::NoApplicablePolicy
+        );
+        destination
+            .labels
+            .insert("tier".to_owned(), "core".to_owned());
 
         destination.labels.remove("managed");
         assert_eq!(
-            evaluate(
-                &[compiled],
-                Flow {
-                    source: &source,
-                    destination: &destination,
-                    protocol: Protocol::Tcp,
-                    destination_port: 8080,
-                    source_ipv4: None,
-                    source_ipv6: None,
-                }
-            )
-            .reason,
+            decision(&source, &destination).reason,
             PolicyReason::NoApplicablePolicy
         );
+        destination
+            .labels
+            .insert("managed".to_owned(), "true".to_owned());
+
+        destination
+            .labels
+            .insert("skip".to_owned(), "true".to_owned());
+        assert_eq!(
+            decision(&source, &destination).reason,
+            PolicyReason::NoApplicablePolicy
+        );
+        destination.labels.remove("skip");
+
+        source.labels.insert("blocked".to_owned(), "yes".to_owned());
+        assert_eq!(decision(&source, &destination).verdict, Verdict::Deny);
     }
 
     #[test]

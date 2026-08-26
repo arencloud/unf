@@ -93,5 +93,6 @@ peer OR, explicit empty-list wildcards, multi-port OR, all selector operators,
 Pod/Namespace label recovery, stacked additive allows, and allow-all deletion
 recovery. Direct IPv4 and IPv6 Pod traffic now exercises every transition,
 including destination-specific named ports, nonexistent-port fail-closed
-isolation, and TCP/UDP protocol isolation. These
+isolation, all four destination match-expression operators, and TCP/UDP protocol
+isolation. These
 remain bounded compatibility claims rather than full upstream conformance.

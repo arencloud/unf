@@ -26,6 +26,9 @@ metadata:
   namespace: unf-np-target
   labels:
     app: upstream-server
+    expression-present: "true"
+    expression-target: selected
+    expression-track: stable
     named-port-target: "true"
 spec:
   nodeSelector:
@@ -56,6 +59,9 @@ metadata:
   namespace: unf-np-target
   labels:
     app: upstream-alternate-server
+    expression-present: "true"
+    expression-target: alternate
+    expression-track: stable
     named-port-target: "true"
 spec:
   nodeSelector:

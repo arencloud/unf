@@ -176,7 +176,8 @@ per-destination named-port resolution and nonexistent-port fail-closed isolation
 protocol-only TCP activation/removal without UDP
 broadening, bounded `endPort` boundary enforcement and oversized-range rejection,
 bounded IPv4/IPv6 `ipBlock` allow/exception behavior and oversized-block rejection,
-Namespace relabel, and deletion/recreation convergence.
+all four destination `podSelector` expression operators, Namespace relabel, and
+deletion/recreation convergence.
 
 The base deployment also creates `unf-agent-acknowledgements`. The controller
 owns only its `reports.json` data field and checkpoints authenticated reports at

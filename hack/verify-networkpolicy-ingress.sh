@@ -251,6 +251,17 @@ expect_explanation() {
     expect_explanation_to "$1" server "$2" "$3" "$4"
 }
 
+expect_expression_target_selected() {
+    expect_deny "${source_b_namespace}" client 8087
+    expect_explanation "${source_b_namespace}/client" 8087 Deny DefaultAction
+}
+
+expect_expression_target_unselected() {
+    expect_allow "${source_b_namespace}" client 8087
+    expect_allow "${source_b_namespace}" client 8088
+    expect_explanation "${source_b_namespace}/client" 8087 Allow NoApplicablePolicy
+}
+
 mapfile -t agent_pods < <("${kc[@]}" -n unf-system get pods \
     -l app.kubernetes.io/name=unf-agent \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
@@ -799,6 +810,114 @@ expect_protocol_allow \
     "${source_b_namespace}" client tcp "${protocol_server_ip}" 8090
 
 previous_revision=${policy_revision}
+"${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: target-match-expressions
+  namespace: ${target_namespace}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: expression-target
+        operator: In
+        values:
+          - selected
+      - key: expression-track
+        operator: NotIn
+        values:
+          - excluded
+      - key: expression-present
+        operator: Exists
+      - key: expression-blocked
+        operator: DoesNotExist
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              conformance-group: a
+      ports:
+        - protocol: TCP
+          port: 8087
+EOF
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "target match-expression policy did not converge"
+expect_allow "${source_a_namespace}" client 8087
+expect_deny "${source_a_namespace}" client 8088
+expect_expression_target_selected
+for port in 8087 8088; do
+    expect_address_allow \
+        "${source_b_namespace}" client "${alternate_server_ip}" "${port}"
+    expect_address_allow \
+        "${source_b_namespace}" client "${alternate_server_ipv6}" "${port}"
+done
+expect_explanation_to \
+    "${source_b_namespace}/client" alternate-server 8087 Allow NoApplicablePolicy
+
+previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${target_namespace}" server \
+    expression-target=alternate --overwrite >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "target In transition did not converge"
+expect_expression_target_unselected
+
+previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${target_namespace}" server \
+    expression-target=selected --overwrite >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "target In recovery did not converge"
+expect_expression_target_selected
+
+previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${target_namespace}" server \
+    expression-track=excluded --overwrite >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "target NotIn transition did not converge"
+expect_expression_target_unselected
+
+previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${target_namespace}" server \
+    expression-track=stable --overwrite >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "target NotIn recovery did not converge"
+expect_expression_target_selected
+
+previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${target_namespace}" server expression-present- >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "target Exists transition did not converge"
+expect_expression_target_unselected
+
+previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${target_namespace}" server \
+    expression-present=true --overwrite >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "target Exists recovery did not converge"
+expect_expression_target_selected
+
+previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${target_namespace}" server \
+    expression-blocked=true --overwrite >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "target DoesNotExist transition did not converge"
+expect_expression_target_unselected
+
+previous_revision=${policy_revision}
+"${kc[@]}" label pod -n "${target_namespace}" server expression-blocked- >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "target DoesNotExist recovery did not converge"
+expect_expression_target_selected
+
+previous_revision=${policy_revision}
+"${kc[@]}" delete networkpolicy -n "${target_namespace}" \
+    target-match-expressions >/dev/null
+require_policy_state "$((baseline_count + 2))" "${baseline_rejected}" \
+    "${previous_revision}" "target match-expression deletion did not reconverge"
+expect_expression_target_unselected
+
+previous_revision=${policy_revision}
 cleanup
 for namespace in "${target_namespace}" "${source_a_namespace}" "${source_b_namespace}"; do
     if ! "${kc[@]}" wait --for=delete namespace/"${namespace}" --timeout=120s >/dev/null; then
@@ -811,4 +930,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned dual-stack ingress conformance passed: IPv4/IPv6 explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific and nonexistent named ports, target Pod label isolation/recovery, default deny, same-namespace empty/labeled PodSelector, empty/exact-name NamespaceSelector, all selector operators with Pod/Namespace label recovery, selector AND, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned dual-stack ingress conformance passed: IPv4/IPv6 explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific and nonexistent named ports, target Pod match-label/expression isolation and recovery, default deny, same-namespace empty/labeled PodSelector, empty/exact-name NamespaceSelector, all peer selector operators with Pod/Namespace label recovery, selector AND, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"
