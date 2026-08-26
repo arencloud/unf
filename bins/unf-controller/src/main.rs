@@ -31,10 +31,11 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_api::SecurityPolicy;
-use unf_common::{IdentityId, PolicyId, Protocol, Revision, Verdict};
+use unf_common::{IdentityId, PolicyDirection, PolicyId, Protocol, Revision, Verdict};
 use unf_policy::{
     DestinationPort, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort, NetworkPolicyCompiler,
-    PolicyCompiler, PolicyIr, compile_dataplane_entries, compile_ipv4_dataplane_entries,
+    PolicyCompiler, PolicyIr, compile_dataplane_entries, compile_egress_ipv4_dataplane_entries,
+    compile_egress_ipv6_dataplane_entries, compile_ipv4_dataplane_entries,
     compile_ipv6_dataplane_entries, evaluate,
 };
 use unf_state::{
@@ -142,7 +143,7 @@ struct ControllerState {
     security_policies: RwLock<BTreeMap<String, SecurityPolicy>>,
     compiled_security_policies: RwLock<BTreeMap<String, PolicyIr>>,
     network_policies: RwLock<BTreeMap<String, NetworkPolicy>>,
-    compiled_network_policies: RwLock<BTreeMap<String, PolicyIr>>,
+    compiled_network_policies: RwLock<BTreeMap<String, Vec<PolicyIr>>>,
     rejected_network_policies: RwLock<BTreeMap<String, String>>,
     policy_state_guard: RwLock<()>,
     identities: Mutex<IdentityRegistry>,
@@ -203,6 +204,8 @@ type DataplanePolicyState = (
     Vec<unf_state::PolicyMapEntry>,
     Vec<unf_state::Ipv4PolicyMapEntry>,
     Vec<unf_state::Ipv6PolicyMapEntry>,
+    Vec<unf_state::EgressIpv4PolicyMapEntry>,
+    Vec<unf_state::EgressIpv6PolicyMapEntry>,
 );
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1822,14 +1825,14 @@ fn apply_network_policy_event(state: &ControllerState, event: Event<NetworkPolic
         Event::Apply(policy) | Event::InitApply(policy) => {
             let key = object_key(&policy);
             let id = stable_policy_id(&format!("networkpolicy:{key}"));
-            match NetworkPolicyCompiler::compile(id, policy.clone()) {
-                Ok(ir) => {
+            match NetworkPolicyCompiler::compile_directions(id, policy.clone()) {
+                Ok(policies) => {
                     let previous = write_lock(&state.compiled_network_policies)
-                        .insert(key.clone(), ir.clone());
+                        .insert(key.clone(), policies.clone());
                     write_lock(&state.network_policies).insert(key.clone(), policy);
                     write_lock(&state.rejected_network_policies).remove(&key);
                     state.metrics.reconciles.inc();
-                    if previous.as_ref() != Some(&ir) {
+                    if previous.as_ref() != Some(&policies) {
                         bump_policy_revision(state);
                     }
                 }
@@ -1896,10 +1899,19 @@ async fn metrics(State(state): State<Arc<ControllerState>>) -> Response {
 }
 
 async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<StatusBody>, ApiError> {
-    let (_, policy_entries, ipv4_policy_entries, ipv6_policy_entries) =
-        dataplane_policy_state(&state)?;
-    let resolved_policy_entries =
-        policy_entries.len() + ipv4_policy_entries.len() + ipv6_policy_entries.len();
+    let (
+        _,
+        policy_entries,
+        ipv4_policy_entries,
+        ipv6_policy_entries,
+        egress_ipv4_policy_entries,
+        egress_ipv6_policy_entries,
+    ) = dataplane_policy_state(&state)?;
+    let resolved_policy_entries = policy_entries.len()
+        + ipv4_policy_entries.len()
+        + ipv6_policy_entries.len()
+        + egress_ipv4_policy_entries.len()
+        + egress_ipv6_policy_entries.len();
     let (identity_revision, identity_count, indexed_pod_ips) = {
         let identities = mutex_lock(&state.identities);
         (
@@ -1936,7 +1948,10 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         network_policies: read_lock(&state.network_policies).len(),
         rejected_network_policies: read_lock(&state.rejected_network_policies).len(),
         compiled_policies: read_lock(&state.compiled_security_policies).len()
-            + read_lock(&state.compiled_network_policies).len(),
+            + read_lock(&state.compiled_network_policies)
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
         resolved_policy_entries,
         identities: identity_count,
         indexed_pod_ips,
@@ -2364,7 +2379,8 @@ async fn policy_snapshot(
     headers: HeaderMap,
 ) -> Result<Json<PolicyStateSnapshot>, ApiError> {
     authenticate_internal_agent(&state, &headers).await?;
-    let (revision, entries, ipv4_entries, ipv6_entries) = dataplane_policy_state(&state)?;
+    let (revision, entries, ipv4_entries, ipv6_entries, egress_ipv4_entries, egress_ipv6_entries) =
+        dataplane_policy_state(&state)?;
     Ok(Json(PolicyStateSnapshot {
         schema_version: POLICY_SNAPSHOT_SCHEMA_VERSION,
         source_epoch: state.identity_epoch,
@@ -2372,8 +2388,8 @@ async fn policy_snapshot(
         entries,
         ipv4_entries,
         ipv6_entries,
-        egress_ipv4_entries: Vec::new(),
-        egress_ipv6_entries: Vec::new(),
+        egress_ipv4_entries,
+        egress_ipv6_entries,
     }))
 }
 
@@ -2639,20 +2655,33 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
 fn dataplane_policy_state(state: &ControllerState) -> Result<DataplanePolicyState, ApiError> {
     let _policy_state_guard = read_lock(&state.policy_state_guard);
     let policies = compiled_policies(state);
+    let (ingress_policies, egress_policies): (Vec<_>, Vec<_>) = policies
+        .into_iter()
+        .partition(|policy| policy.direction == PolicyDirection::Ingress);
     let endpoints = endpoints_with_namespace_labels(state);
-    let entries = compile_dataplane_entries(&policies, &endpoints)
+    let entries = compile_dataplane_entries(&ingress_policies, &endpoints)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let ipv4_endpoints = ipv4_endpoints_with_namespace_labels(state);
-    let ipv4_entries = compile_ipv4_dataplane_entries(&policies, &endpoints, &ipv4_endpoints)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let ipv4_entries =
+        compile_ipv4_dataplane_entries(&ingress_policies, &endpoints, &ipv4_endpoints)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
     let ipv6_endpoints = ipv6_endpoints_with_namespace_labels(state);
-    let ipv6_entries = compile_ipv6_dataplane_entries(&policies, &endpoints, &ipv6_endpoints)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let ipv6_entries =
+        compile_ipv6_dataplane_entries(&ingress_policies, &endpoints, &ipv6_endpoints)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    let egress_ipv4_entries =
+        compile_egress_ipv4_dataplane_entries(&egress_policies, &endpoints, &ipv4_endpoints)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    let egress_ipv6_entries =
+        compile_egress_ipv6_dataplane_entries(&egress_policies, &endpoints, &ipv6_endpoints)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok((
         mutex_lock(&state.revisions).policy,
         entries,
         ipv4_entries,
         ipv6_entries,
+        egress_ipv4_entries,
+        egress_ipv6_entries,
     ))
 }
 
@@ -2836,6 +2865,7 @@ fn simulation_proposed_policies(
     policies.extend(
         read_lock(&state.compiled_network_policies)
             .values()
+            .flatten()
             .cloned(),
     );
     policies.push(candidate);
@@ -3215,6 +3245,7 @@ fn compiled_policies(state: &ControllerState) -> Vec<PolicyIr> {
     policies.extend(
         read_lock(&state.compiled_network_policies)
             .values()
+            .flatten()
             .cloned(),
     );
     policies
@@ -3777,8 +3808,24 @@ mod tests {
     }
 
     #[test]
-    fn network_policy_reconciliation_keeps_translated_egress_out_of_ingress_dataplane() {
+    fn network_policy_reconciliation_distributes_egress_without_ingress_cross_contamination() {
         let state = new_state(true);
+        let mut source = pod_record(10, "frontend", "client", "client");
+        source
+            .ipv4_addresses
+            .insert("10.244.0.10".parse().expect("valid source IPv4"));
+        source
+            .ipv6_addresses
+            .insert("fd00:10:244::10".parse().expect("valid source IPv6"));
+        let mut destination = pod_record(20, "backend", "server", "server");
+        destination
+            .ipv4_addresses
+            .insert("10.244.1.20".parse().expect("valid destination IPv4"));
+        destination
+            .ipv6_addresses
+            .insert("fd00:10:244::20".parse().expect("valid destination IPv6"));
+        write_lock(&state.pods).insert("frontend/client".to_owned(), source);
+        write_lock(&state.pods).insert("backend/server".to_owned(), destination);
         let policy: NetworkPolicy = serde_json::from_value(serde_json::json!({
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
@@ -3804,16 +3851,44 @@ mod tests {
 
         apply_network_policy_event(&state, Event::Apply(policy));
 
-        assert!(read_lock(&state.network_policies).is_empty());
-        assert!(read_lock(&state.compiled_network_policies).is_empty());
-        let rejected = read_lock(&state.rejected_network_policies);
-        assert_eq!(rejected.len(), 1);
-        assert!(
-            rejected
-                .values()
-                .all(|reason| reason.contains("egress enforcement is not supported yet"))
+        assert_eq!(read_lock(&state.network_policies).len(), 1);
+        let compiled = read_lock(&state.compiled_network_policies);
+        assert_eq!(compiled.len(), 1);
+        assert_eq!(compiled["frontend/allow-server-egress"].len(), 1);
+        assert_eq!(
+            compiled["frontend/allow-server-egress"][0].direction,
+            PolicyDirection::Egress
         );
-        assert_eq!(mutex_lock(&state.revisions).policy, Revision::default());
+        drop(compiled);
+        assert!(read_lock(&state.rejected_network_policies).is_empty());
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(1));
+
+        let (_, ingress, ingress_ipv4, ingress_ipv6, egress_ipv4, egress_ipv6) =
+            dataplane_policy_state(&state).expect("egress policy lowers into one snapshot");
+        assert!(ingress.is_empty());
+        assert!(ingress_ipv4.is_empty());
+        assert!(ingress_ipv6.is_empty());
+        assert!(egress_ipv4.iter().any(|entry| {
+            entry.key.source_identity == IdentityId::new(10)
+                && entry.key.destination_address
+                    == "10.244.1.20"
+                        .parse::<std::net::Ipv4Addr>()
+                        .expect("valid expected IPv4")
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 8080
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(egress_ipv6.iter().any(|entry| {
+            entry.key.source_identity == IdentityId::new(10)
+                && entry.key.destination_network
+                    == "fd00:10:244::20"
+                        .parse::<Ipv6Addr>()
+                        .expect("valid expected IPv6")
+                && entry.key.destination_prefix_len == 128
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 8080
+                && entry.decision.verdict == Verdict::Allow
+        }));
     }
 
     #[test]

@@ -75,9 +75,8 @@ Pod addresses become `/128` overrides and `/0` represents arbitrary external
 sources. `0.0.0.0`, wider IPv4 blocks, out-of-block or mixed-family exceptions,
 and peers that combine `ipBlock` with selectors are rejected. A source-IP fallback represents
 arbitrary external sources, so compatibility isolation does not silently fail
-open merely because the source has no workload identity. The enforceable
-controller entry point deliberately rejects effective egress, and both
-directions reject named ports combined with `endPort`. These errors
+open merely because the source has no workload identity. Both directions reject
+named ports combined with `endPort`. These errors
 prevent a policy from being accepted with weaker or different semantics. Native
 policy has the higher default precedence; the compatibility baseline uses
 reserved priority `1_000_000`.
@@ -85,9 +84,10 @@ reserved priority `1_000_000`.
 The multi-direction NetworkPolicy entry point now emits independent ingress and
 egress IR, including Kubernetes `policyTypes` defaulting, source-selected egress
 targets, `to` peer destinations, and the shared port/protocol forms. The
-controller continues to call the enforceable ingress-only entry point, which
-rejects any effective egress direction. All ingress lowerers also reject egress
-IR before emitting map entries. A separate addressed-evaluation entry point
+controller stores every effective direction under the source object and
+partitions IR before lowering, so ingress and egress cannot enter the other's map
+families. Direction-specific lowerers also reject opposite-direction IR before
+emitting entries. A separate addressed-evaluation entry point
 matches bounded IPv4/IPv6 egress `ipBlock` destinations and exceptions; absent,
 mixed-family, outside-CIDR, and excepted addresses fail closed to compatibility
 isolation. Source-side egress lowering emits exact IPv4 destination keys and
@@ -96,12 +96,14 @@ addresses retain selector and named-port metadata, while arbitrary destinations
 inherit an isolation fallback. Snapshot schema v4 and policy ABI v3 stage these
 entries in dedicated maps under the same atomic revision as ingress. TC performs
 direction-specific lookup and combines the two isolation directions so either
-deny wins; controller distribution remains gated. See
+deny wins. Controller snapshots populate both egress lists in the same revision,
+and object deletion removes all directions together. See
 [ADR 0032](../adr/0032-networkpolicy-multi-direction-translation.md) and
 [ADR 0033](../adr/0033-egress-destination-address-evaluation.md), and
 [ADR 0034](../adr/0034-egress-source-side-lowering.md), and
-[ADR 0035](../adr/0035-transactional-egress-map-staging.md), and
-[ADR 0036](../adr/0036-source-selected-egress-tc-lookup.md).
+[ADR 0035](../adr/0035-transactional-egress-map-staging.md),
+[ADR 0036](../adr/0036-source-selected-egress-tc-lookup.md), and
+[ADR 0037](../adr/0037-controller-egress-distribution.md).
 
 The controller watches these objects cluster-wide, keeps accepted and rejected
 compatibility state separate, and combines accepted IR with native policy in each

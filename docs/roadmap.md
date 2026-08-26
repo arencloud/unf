@@ -179,8 +179,16 @@ matrix and reproducible evidence.
   rollback-safe inactive-bank transaction as ingress;
 - Implemented and rebuilt-kind verifier-qualified: source-selected IPv4/IPv6 TC
   egress lookup, ingress/egress deny composition, and policy-direction event
-  provenance with empty controller egress maps;
-- Next: controller egress distribution and populated-map lifecycle verification;
+  provenance;
+- Implemented and two-node kind verified: controller distribution of independent
+  ingress/egress IR into one transactional snapshot plus a self-cleaning
+  dual-stack egress matrix covering selected-source default isolation,
+  non-selected pass-through, Namespace/Pod selector AND, named TCP/UDP,
+  protocol-only SCTP, bounded IPv4/IPv6 `ipBlock` exceptions, direction-correct
+  provenance, policy deletion recovery, and baseline reconvergence;
+- Next: direction-aware explanation, simulation/status/history integration,
+  populated-map controller-offline replacement recovery, stateful replies, and
+  dual-stack OpenShift qualification;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.

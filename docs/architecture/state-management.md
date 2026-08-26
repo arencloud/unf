@@ -45,8 +45,9 @@ Agents poll internal identity and policy snapshot endpoints and publish each
 desired/applied epoch and revision. Identity schema v2 is written to inactive
 physical IPv4/IPv6 maps, read back, and activated together by one
 `IDENTITY_CONFIG` write. Policy reconciliation similarly populates inactive
-identity-keyed, IPv4-keyed, and IPv6-prefix banks before one `POLICY_CONFIG` write
-selects all three. See ADRs 0006, 0007, and 0017.
+ingress identity-keyed, IPv4-source, IPv6-source, egress IPv4-destination, and
+egress IPv6-destination banks before one `POLICY_CONFIG` write selects all five.
+See ADRs 0006, 0007, 0017, 0035, and 0037.
 
 Each agent also posts a schema v2 acknowledgement containing its Node and Pod
 identity, readiness, BPF load state, desired/applied identity and policy

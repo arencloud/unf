@@ -1878,6 +1878,10 @@ KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
     UNF_CONTROLLER_URL="http://127.0.0.1:${controller_port}" UNFCTL="${unfctl}" \
     "${project_root}/hack/verify-networkpolicy-ingress.sh"
 
+KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
+    UNF_CONTROLLER_URL="http://127.0.0.1:${controller_port}" UNFCTL="${unfctl}" \
+    "${project_root}/hack/verify-networkpolicy-egress.sh"
+
 if ! wait_for_aggregated_agent_convergence "${#agent_pods[@]}"; then
     echo "controller did not retain cluster-wide agent convergence after the full matrix" >&2
     exit 1

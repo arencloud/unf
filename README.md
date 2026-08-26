@@ -41,6 +41,11 @@ now runs its supported selector, additive-policy, named-port, and TCP/UDP
 protocol-isolation transitions against direct IPv4 and IPv6 Pod addresses. The
 selector coverage includes multi-value Pod `In` combined with Namespace `NotIn`
 and homogeneous multi-`podSelector` peer OR.
+A separate self-cleaning egress matrix now live-verifies source-selected default
+isolation, non-selected pass-through, Namespace/Pod destination selector AND,
+named TCP/UDP ports, protocol-only SCTP, bounded dual-stack `ipBlock` exceptions,
+direction-correct dataplane provenance, deletion recovery, and final state
+reconvergence.
 A one-to-one audit pinned to Kubernetes commit
 `9aac5f741fa6095594cdfed4756a52cf0bf4b191` now classifies all 49 primary TCP,
 UDP, and SCTP scenarios with no unclassified case; the verified bounded ingress
@@ -97,14 +102,14 @@ Implemented in the repository:
   ingress, source-selected egress, cross-direction isolation, and explicit
   direction provenance at the TC decision boundary;
 - multi-direction Kubernetes NetworkPolicy translation with exact `policyTypes`
-  defaulting and source-targeted egress peer/port IR, retained behind the
-  ingress-only controller enforcement gate;
+  defaulting and source-targeted egress peer/port IR, distributed as independent
+  ingress/egress records by the controller;
 - addressed userspace egress evaluation for bounded IPv4/IPv6 `ipBlock`
-  destinations and exceptions, still excluded from controller snapshots;
+  destinations and exceptions;
 - source-selected IPv4 exact-destination and IPv6 destination-LPM egress
   lowering, including selector metadata, named ports, and isolation fallbacks,
-  with transactional agent staging and verifier-qualified TC lookup retained
-  behind the controller distribution gate;
+  with transactional agent staging, populated controller snapshots, and
+  verifier-qualified TC lookup;
 - a supported ingress `NetworkPolicy` adapter that reuses the same IR, additive
   evaluator semantics, controller snapshots, and dataplane lowering as native
   policy, including pod/Namespace expressions, named and protocol-only
@@ -186,7 +191,9 @@ Implemented in the repository:
   remote target-specific exceptions over namespace-wide isolation, same-object
   allow-all/default-deny replacement, allow-all recovery, revisioned eBPF
   provenance, and live policy explanations, plus a versioned EndpointSlice
-  backend-readiness lifecycle.
+  backend-readiness lifecycle; a separate egress fixture covers selected-source
+  isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
+  direction-correct provenance, deletion recovery, and exact cleanup.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, workload/data-plane encryption,
 stateful established/related flow tracking, multi-cluster transport, IPv6

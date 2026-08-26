@@ -1,0 +1,156 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: unf-egress-source
+  labels:
+    unf-egress-zone: source
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: unf-egress-allowed
+  labels:
+    unf-egress-zone: allowed
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: unf-egress-denied
+  labels:
+    unf-egress-zone: denied
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: unf-egress-source
+  labels:
+    app: egress-client
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-control-plane
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: client
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
+      command: ["sh", "-c", "sleep infinity"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unselected-client
+  namespace: unf-egress-source
+  labels:
+    app: egress-unselected
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-control-plane
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: client
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
+      command: ["sh", "-c", "sleep infinity"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server
+  namespace: unf-egress-allowed
+  labels:
+    app: egress-server
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-worker
+  containers:
+    - name: server
+      image: docker.io/library/busybox:1.37.0
+      command:
+        - sh
+        - -c
+        - |
+          mkdir -p /www
+          echo unf-egress-ok > /www/index.html
+          httpd -p 8081 -h /www
+          exec httpd -f -p 8080 -h /www
+      ports:
+        - name: web
+          containerPort: 8080
+          protocol: TCP
+        - name: other
+          containerPort: 8081
+          protocol: TCP
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server
+  namespace: unf-egress-denied
+  labels:
+    app: egress-server
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-worker
+  containers:
+    - name: server
+      image: docker.io/library/busybox:1.37.0
+      command:
+        - sh
+        - -c
+        - |
+          mkdir -p /www
+          echo unf-egress-denied-ok > /www/index.html
+          exec httpd -f -p 8080 -h /www
+      ports:
+        - name: web
+          containerPort: 8080
+          protocol: TCP
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: protocol-server
+  namespace: unf-egress-allowed
+  labels:
+    app: egress-protocol-server
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: unf-dev-worker
+  containers:
+    - name: server
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
+      command:
+        - sh
+        - -c
+        - |
+          socat TCP4-LISTEN:8090,reuseaddr,fork EXEC:/bin/cat &
+          socat TCP4-LISTEN:8091,reuseaddr,fork EXEC:/bin/cat &
+          socat UDP4-RECVFROM:8090,reuseaddr,fork EXEC:/bin/cat &
+          socat UDP4-RECVFROM:8091,reuseaddr,fork EXEC:/bin/cat &
+          socat TCP6-LISTEN:8090,reuseaddr,fork,ipv6-v6only=1 EXEC:/bin/cat &
+          socat TCP6-LISTEN:8091,reuseaddr,fork,ipv6-v6only=1 EXEC:/bin/cat &
+          socat UDP6-RECVFROM:8090,reuseaddr,fork,ipv6-v6only=1 EXEC:/bin/cat &
+          socat UDP6-RECVFROM:8091,reuseaddr,fork,ipv6-v6only=1 EXEC:/bin/cat &
+          socat SCTP-LISTEN:8092,reuseaddr,fork EXEC:/bin/cat &
+          exec socat SCTP-LISTEN:8093,reuseaddr,fork EXEC:/bin/cat
+      ports:
+        - name: allowed-udp
+          containerPort: 8090
+          protocol: UDP
+        - name: denied-udp
+          containerPort: 8091
+          protocol: UDP
+        - name: allowed-sctp
+          containerPort: 8092
+          protocol: SCTP
+        - name: wildcard-sctp
+          containerPort: 8093
+          protocol: SCTP
