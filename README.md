@@ -160,9 +160,9 @@ Implemented in the repository:
   ingress rules,
   exact/protocol-only UDP isolation, per-destination named-port resolution and
   nonexistent named-port fail-closed behavior, all four destination-selector
-  expression operators, source, destination, and Namespace label-driven
-  recovery, stacked additive allows and allow-all recovery, revisioned eBPF
-  provenance, and live policy explanations, plus a
+  expression operators, overlapping destination-selector additivity, source,
+  destination, and Namespace label-driven recovery, stacked additive allows and
+  allow-all recovery, revisioned eBPF provenance, and live policy explanations, plus a
   versioned EndpointSlice backend-readiness lifecycle.
 
 Not implemented yet: service load balancing, routing, IPAM/CNI, workload/data-plane encryption,

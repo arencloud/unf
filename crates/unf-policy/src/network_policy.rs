@@ -929,6 +929,71 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_target_selectors_combine_only_on_their_intersection() {
+        let rule = |port| NetworkPolicyIngressRule {
+            from: None,
+            ports: Some(vec![NetworkPolicyPort {
+                port: Some(IntOrString::Int(port)),
+                ..NetworkPolicyPort::default()
+            }]),
+        };
+        let mut broad_policy = policy(vec![rule(8080)]);
+        broad_policy.metadata.name = Some("broad-target".to_owned());
+        broad_policy
+            .spec
+            .as_mut()
+            .expect("broad policy has spec")
+            .pod_selector = Some(LabelSelector {
+            match_expressions: Some(vec![expression("app", "Exists", &[])]),
+            ..LabelSelector::default()
+        });
+        let broad = NetworkPolicyCompiler::compile(PolicyId::new(9), broad_policy)
+            .expect("broad target policy compiles");
+
+        let mut narrow_policy = policy(vec![rule(8081)]);
+        narrow_policy.metadata.name = Some("narrow-target".to_owned());
+        let narrow = NetworkPolicyCompiler::compile(PolicyId::new(10), narrow_policy)
+            .expect("narrow target policy compiles");
+
+        let source = endpoint(1, "frontend", "client");
+        let server = endpoint(2, "backend", "server");
+        let alternate = endpoint(3, "backend", "alternate");
+        let policies = [broad, narrow];
+        let verdict = |destination: &Endpoint, port| {
+            evaluate(
+                &policies,
+                Flow {
+                    source: &source,
+                    destination,
+                    protocol: Protocol::Tcp,
+                    destination_port: port,
+                    source_ipv4: None,
+                    source_ipv6: None,
+                },
+            )
+            .verdict
+        };
+
+        assert_eq!(verdict(&server, 8080), Verdict::Allow);
+        assert_eq!(verdict(&server, 8081), Verdict::Allow);
+        assert_eq!(verdict(&alternate, 8080), Verdict::Allow);
+        assert_eq!(verdict(&alternate, 8081), Verdict::Deny);
+
+        let entries = compile_dataplane_entries(&policies, &[source, server, alternate])
+            .expect("overlapping target policies lower into destination-specific entries");
+        assert!(entries.iter().any(|entry| {
+            entry.key.destination_identity == IdentityId::new(2)
+                && entry.key.destination_port == 8081
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(!entries.iter().any(|entry| {
+            entry.key.destination_identity == IdentityId::new(3)
+                && entry.key.destination_port == 8081
+                && entry.decision.verdict == Verdict::Allow
+        }));
+    }
+
+    #[test]
     fn omitted_sources_and_ports_are_wildcards() {
         let compiled = NetworkPolicyCompiler::compile(
             PolicyId::new(7),

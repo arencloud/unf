@@ -918,6 +918,91 @@ require_policy_state "$((baseline_count + 2))" "${baseline_rejected}" \
 expect_expression_target_unselected
 
 previous_revision=${policy_revision}
+"${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: overlap-broad-target
+  namespace: ${target_namespace}
+spec:
+  podSelector:
+    matchLabels:
+      named-port-target: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              conformance-group: a
+      ports:
+        - protocol: TCP
+          port: 8087
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: overlap-narrow-target
+  namespace: ${target_namespace}
+spec:
+  podSelector:
+    matchLabels:
+      expression-target: selected
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              conformance-group: b
+      ports:
+        - protocol: TCP
+          port: 8088
+EOF
+require_policy_state "$((baseline_count + 4))" "${baseline_rejected}" \
+    "${previous_revision}" "overlapping target policies did not converge"
+expect_allow "${source_a_namespace}" client 8087
+expect_deny "${source_a_namespace}" client 8088
+expect_deny "${source_b_namespace}" client 8087
+expect_allow "${source_b_namespace}" client 8088
+for address in "${alternate_server_ip}" "${alternate_server_ipv6}"; do
+    expect_address_allow "${source_a_namespace}" client "${address}" 8087
+    expect_address_deny "${source_a_namespace}" client "${address}" 8088
+    expect_address_deny "${source_b_namespace}" client "${address}" 8087
+    expect_address_deny "${source_b_namespace}" client "${address}" 8088
+done
+expect_explanation "${source_b_namespace}/client" 8088 Allow ExplicitRule
+expect_explanation_to \
+    "${source_b_namespace}/client" alternate-server 8088 Deny DefaultAction
+
+previous_revision=${policy_revision}
+"${kc[@]}" delete networkpolicy -n "${target_namespace}" \
+    overlap-narrow-target >/dev/null
+require_policy_state "$((baseline_count + 3))" "${baseline_rejected}" \
+    "${previous_revision}" "narrow overlapping target policy deletion did not converge"
+expect_deny "${source_b_namespace}" client 8088
+expect_allow "${source_a_namespace}" client 8087
+expect_address_allow \
+    "${source_a_namespace}" client "${alternate_server_ip}" 8087
+expect_address_allow \
+    "${source_a_namespace}" client "${alternate_server_ipv6}" 8087
+
+previous_revision=${policy_revision}
+"${kc[@]}" delete networkpolicy -n "${target_namespace}" \
+    overlap-broad-target >/dev/null
+require_policy_state "$((baseline_count + 2))" "${baseline_rejected}" \
+    "${previous_revision}" "broad overlapping target policy deletion did not converge"
+for destination in \
+    "${server_ip} ${server_ipv6}" \
+    "${alternate_server_ip} ${alternate_server_ipv6}"; do
+    read -r ipv4 ipv6 <<<"${destination}"
+    for port in 8087 8088; do
+        expect_address_allow "${source_b_namespace}" client "${ipv4}" "${port}"
+        expect_address_allow "${source_b_namespace}" client "${ipv6}" "${port}"
+    done
+done
+
+previous_revision=${policy_revision}
 cleanup
 for namespace in "${target_namespace}" "${source_a_namespace}" "${source_b_namespace}"; do
     if ! "${kc[@]}" wait --for=delete namespace/"${namespace}" --timeout=120s >/dev/null; then
@@ -930,4 +1015,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned dual-stack ingress conformance passed: IPv4/IPv6 explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific and nonexistent named ports, target Pod match-label/expression isolation and recovery, default deny, same-namespace empty/labeled PodSelector, empty/exact-name NamespaceSelector, all peer selector operators with Pod/Namespace label recovery, selector AND, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned dual-stack ingress conformance passed: IPv4/IPv6 explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific and nonexistent named ports, target Pod match-label/expression isolation and recovery, overlapping destination selectors, default deny, same-namespace empty/labeled PodSelector, empty/exact-name NamespaceSelector, all peer selector operators with Pod/Namespace label recovery, selector AND, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"

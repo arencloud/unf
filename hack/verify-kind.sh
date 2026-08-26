@@ -349,6 +349,106 @@ all_agent_logs() {
         --all-containers=true --prefix=true --since=30s --tail=-1
 }
 
+wait_for_shadow_deny_provenance() {
+    local revision=$1 logs line
+    for _ in {1..20}; do
+        logs=$(all_agent_logs)
+        line=$(grep '"destination_port":9090' <<<"${logs}" \
+            | grep '"shadow_verdict":2' | grep "\"policy_revision\":${revision}" \
+            | tail -n 1 || true)
+        if grep -q '"verdict":"Allow"' <<<"${line}" \
+            && grep -Eq '"shadow_policy_id":[1-9][0-9]*' <<<"${line}" \
+            && grep -Eq '"shadow_rule_id":[1-9][0-9]*' <<<"${line}"; then
+            return 0
+        fi
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:9090 \
+            >/dev/null
+        sleep 1
+    done
+    return 1
+}
+
+has_policy_provenance() {
+    local line=$1
+    grep -Eq '"source_identity":[1-9][0-9]*' <<<"${line}" \
+        && grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${line}" \
+        && grep -Eq '"policy_id":[1-9][0-9]*' <<<"${line}"
+}
+
+has_rule_provenance() {
+    local line=$1
+    has_policy_provenance "${line}" \
+        && grep -Eq '"rule_id":[1-9][0-9]*' <<<"${line}"
+}
+
+wait_for_enforced_provenance() {
+    local revision=$1 logs
+    for _ in {1..20}; do
+        logs=$(all_agent_logs)
+        allow_line=$(grep '"destination_port":8080' <<<"${logs}" \
+            | grep '"address_family":4' | grep '"verdict":"Allow"' \
+            | grep "\"policy_revision\":${revision}" | tail -n 1 || true)
+        deny_line=$(grep '"destination_port":9090' <<<"${logs}" \
+            | grep '"address_family":4' | grep '"verdict":"Deny"' | grep '"reason":2' \
+            | grep "\"policy_revision\":${revision}" | tail -n 1 || true)
+        network_policy_allow_line=$(grep '"destination_port":8081' <<<"${logs}" \
+            | grep '"address_family":4' | grep '"verdict":"Allow"' | grep '"reason":1' \
+            | grep "\"policy_revision\":${revision}" | tail -n 1 || true)
+        network_policy_deny_line=$(grep '"destination_port":9091' <<<"${logs}" \
+            | grep '"address_family":4' | grep '"verdict":"Deny"' | grep '"reason":3' \
+            | grep "\"policy_revision\":${revision}" | tail -n 1 || true)
+        network_policy_range_line=$(grep '"destination_port":8083' <<<"${logs}" \
+            | grep '"address_family":4' | grep '"verdict":"Allow"' | grep '"reason":1' \
+            | grep "\"policy_revision\":${revision}" | tail -n 1 || true)
+        ipv6_allow_line=$(grep '"destination_port":8080' <<<"${logs}" \
+            | grep '"address_family":6' | grep '"verdict":"Allow"' \
+            | grep "\"policy_revision\":${revision}" | tail -n 1 || true)
+        ipv6_deny_line=$(grep '"destination_port":9090' <<<"${logs}" \
+            | grep '"address_family":6' | grep '"verdict":"Deny"' | grep '"reason":2' \
+            | grep "\"policy_revision\":${revision}" | tail -n 1 || true)
+        ipv6_network_policy_allow_line=$(grep '"destination_port":8081' <<<"${logs}" \
+            | grep '"address_family":6' | grep '"verdict":"Allow"' | grep '"reason":1' \
+            | grep "\"policy_revision\":${revision}" | tail -n 1 || true)
+        ipv6_network_policy_deny_line=$(grep '"destination_port":9091' <<<"${logs}" \
+            | grep '"address_family":6' | grep '"verdict":"Deny"' | grep '"reason":3' \
+            | grep "\"policy_revision\":${revision}" | tail -n 1 || true)
+        if has_policy_provenance "${allow_line}" \
+            && has_rule_provenance "${deny_line}" \
+            && has_policy_provenance "${network_policy_allow_line}" \
+            && has_policy_provenance "${network_policy_deny_line}" \
+            && has_policy_provenance "${network_policy_range_line}" \
+            && has_policy_provenance "${ipv6_allow_line}" \
+            && has_rule_provenance "${ipv6_deny_line}" \
+            && has_policy_provenance "${ipv6_network_policy_allow_line}" \
+            && has_policy_provenance "${ipv6_network_policy_deny_line}"; then
+            return 0
+        fi
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- "http://${server_ipv4}:8080" >/dev/null
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- "http://${server_ipv4}:9090" >/dev/null 2>&1 || true
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- "http://${network_policy_server_ipv4}:8081" >/dev/null
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- "http://${network_policy_server_ipv4}:8083" >/dev/null
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- "http://${network_policy_server_ipv4}:9091" \
+            >/dev/null 2>&1 || true
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- "http://[${server_ipv6}]:8080" >/dev/null
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- "http://[${server_ipv6}]:9090" >/dev/null 2>&1 || true
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- "http://[${network_policy_server_ipv6}]:8081" >/dev/null
+        "${kc[@]}" exec -n frontend client -- \
+            wget -T 2 -t 1 -qO- "http://[${network_policy_server_ipv6}]:9091" \
+            >/dev/null 2>&1 || true
+        sleep 1
+    done
+    return 1
+}
+
 wait_for_controller_policy_counts() {
     local accepted=$1
     local rejected=$2
@@ -806,11 +906,15 @@ if [[ ${policy_revision_after_topology} != "${initial_policy_revision}" ]]; then
     exit 1
 fi
 
+client_ipv4=$(pod_ipv4 frontend client)
+server_ipv4=$(pod_ipv4 backend server)
+network_policy_server_ipv4=$(pod_ipv4 backend np-server)
 client_ipv6=$(pod_ipv6 frontend client)
 server_ipv6=$(pod_ipv6 backend server)
 network_policy_server_ipv6=$(pod_ipv6 backend np-server)
-if [[ -z ${client_ipv6} || -z ${server_ipv6} || -z ${network_policy_server_ipv6} ]]; then
-    echo "demo Pods do not all have IPv6 addresses" >&2
+if [[ -z ${client_ipv4} || -z ${server_ipv4} || -z ${network_policy_server_ipv4} \
+    || -z ${client_ipv6} || -z ${server_ipv6} || -z ${network_policy_server_ipv6} ]]; then
+    echo "demo Pods do not all have dual-stack addresses" >&2
     exit 1
 fi
 
@@ -1084,13 +1188,7 @@ if "${kc[@]}" exec -n frontend client -- \
     echo "NetworkPolicy compatibility default deny did not drop the open port" >&2
     exit 1
 fi
-sleep 1
-shadow_line=$(all_agent_logs | grep '"destination_port":9090' \
-    | grep '"shadow_verdict":2' | grep "\"policy_revision\":${shadow_policy_revision}" \
-    | tail -n 1 || true)
-if ! grep -q '"verdict":"Allow"' <<<"${shadow_line}" \
-    || ! grep -Eq '"shadow_policy_id":[1-9][0-9]*' <<<"${shadow_line}" \
-    || ! grep -Eq '"shadow_rule_id":[1-9][0-9]*' <<<"${shadow_line}"; then
+if ! wait_for_shadow_deny_provenance "${shadow_policy_revision}"; then
     echo "UNF did not emit allow-plus-shadow-deny provenance" >&2
     exit 1
 fi
@@ -1161,43 +1259,7 @@ if "${kc[@]}" exec -n frontend client -- \
     echo "NetworkPolicy compatibility deny failed after policy reconvergence" >&2
     exit 1
 fi
-for _ in {1..10}; do
-    flow_logs=$(all_agent_logs)
-    current_ipv6_deny=$(grep '"destination_port":9090' <<<"${flow_logs}" \
-        | grep '"address_family":6' | grep '"verdict":"Deny"' | grep '"reason":2' \
-        | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
-    if [[ -n ${current_ipv6_deny} ]]; then
-        break
-    fi
-    sleep 1
-done
-allow_line=$(grep '"destination_port":8080' <<<"${flow_logs}" \
-    | grep '"verdict":"Allow"' | grep "\"policy_revision\":${enforced_policy_revision}" \
-    | tail -n 1 || true)
-deny_line=$(grep '"destination_port":9090' <<<"${flow_logs}" \
-    | grep '"verdict":"Deny"' | grep '"reason":2' \
-    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
-network_policy_allow_line=$(grep '"destination_port":8081' <<<"${flow_logs}" \
-    | grep '"verdict":"Allow"' | grep '"reason":1' \
-    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
-network_policy_deny_line=$(grep '"destination_port":9091' <<<"${flow_logs}" \
-    | grep '"verdict":"Deny"' | grep '"reason":3' \
-    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
-network_policy_range_line=$(grep '"destination_port":8083' <<<"${flow_logs}" \
-    | grep '"verdict":"Allow"' | grep '"reason":1' \
-    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
-ipv6_allow_line=$(grep '"destination_port":8080' <<<"${flow_logs}" \
-    | grep '"address_family":6' | grep '"verdict":"Allow"' \
-    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
-ipv6_deny_line=$(grep '"destination_port":9090' <<<"${flow_logs}" \
-    | grep '"address_family":6' | grep '"verdict":"Deny"' | grep '"reason":2' \
-    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
-ipv6_network_policy_allow_line=$(grep '"destination_port":8081' <<<"${flow_logs}" \
-    | grep '"address_family":6' | grep '"verdict":"Allow"' | grep '"reason":1' \
-    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
-ipv6_network_policy_deny_line=$(grep '"destination_port":9091' <<<"${flow_logs}" \
-    | grep '"address_family":6' | grep '"verdict":"Deny"' | grep '"reason":3' \
-    | grep "\"policy_revision\":${enforced_policy_revision}" | tail -n 1 || true)
+wait_for_enforced_provenance "${enforced_policy_revision}" || true
 if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${allow_line}" \
     || ! grep -Eq '"destination_identity":[1-9][0-9]*' <<<"${allow_line}" \
     || ! grep -Eq '"policy_id":[1-9][0-9]*' <<<"${allow_line}"; then
@@ -2252,4 +2314,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: split public/internal TLS routing with dedicated CA trust and Pod-bound TokenReview authentication, anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v2 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, dual-stack upstream exact/protocol-only UDP isolation, multi-destination and nonexistent named ports, target match-label/expression and source-label lifecycle, exact-name/NotIn Namespace selection, and peer-selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned dual-stack ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, authenticated flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: split public/internal TLS routing with dedicated CA trust and Pod-bound TokenReview authentication, anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v2 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, dual-stack upstream exact/protocol-only UDP isolation, multi-destination and nonexistent named ports, target match-label/expression lifecycle and overlapping selectors, source-label lifecycle, exact-name/NotIn Namespace selection, and peer-selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned dual-stack ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, history-aware simulation, topology v3, authenticated flow export v2, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
