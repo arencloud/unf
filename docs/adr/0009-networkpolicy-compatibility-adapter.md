@@ -102,3 +102,12 @@ also selected by ingress isolation, established/related return packets are not
 implicitly allowed. That same-Namespace upstream leg remains excluded pending the
 connection-tracking architecture required by the project prompt. These remain
 bounded compatibility claims rather than full upstream conformance.
+
+A one-to-one audit against Kubernetes commit
+`9aac5f741fa6095594cdfed4756a52cf0bf4b191` closes the bounded ingress peer/port
+scope: all 49 primary TCP, UDP, and SCTP scenarios are classified as 35 verified,
+13 unsupported because they require egress, and one intentionally excluded in
+full because of the stateful same-Namespace return path. This supports marking
+bounded full ingress peer/port compatibility verified without claiming execution
+of the upstream suite or silently absorbing the egress and connection-tracking
+milestones.

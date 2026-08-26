@@ -153,10 +153,16 @@ matrix and reproducible evidence.
   schema v2; bounded IPv6 extension-header traversal with real packet fixtures;
   separate dual-stack OpenShift cross-worker enforcement and history evidence on
   RHCOS Linux 5.14 under Enforcing SELinux;
-- Next: remaining upstream ingress conformance;
+- Completed: a one-to-one audit pinned to Kubernetes commit
+  `9aac5f741fa6095594cdfed4756a52cf0bf4b191` classifies all 49 primary/UDP/SCTP
+  scenarios as 35 verified, 13 unsupported pending egress, and one intentionally
+  excluded pending stateful return-flow tracking. With no unclassified stateless
+  ingress form, bounded full ingress peer/port compatibility is verified;
+- Next: direction-aware NetworkPolicy egress IR, translation, and enforcement;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.
 
-Full CNI/IPAM, routing, service load balancing, egress, encryption, L7, and
-multi-cluster transport remain research/planned work after these foundations.
+Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
+transport remain research/planned work after these foundations. Egress is the
+next active compatibility milestone.

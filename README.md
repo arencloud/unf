@@ -41,6 +41,11 @@ now runs its supported selector, additive-policy, named-port, and TCP/UDP
 protocol-isolation transitions against direct IPv4 and IPv6 Pod addresses. The
 selector coverage includes multi-value Pod `In` combined with Namespace `NotIn`
 and homogeneous multi-`podSelector` peer OR.
+A one-to-one audit pinned to Kubernetes commit
+`9aac5f741fa6095594cdfed4756a52cf0bf4b191` now classifies all 49 primary TCP,
+UDP, and SCTP scenarios with no unclassified case; the verified bounded ingress
+peer/port slice and its explicit egress/stateful boundaries are tracked in the
+[conformance matrix](docs/development/networkpolicy-conformance.md).
 Identity and policy updates now use independent transactional banks selected by
 atomic configuration-map writes. All nine enforcement maps persist in an
 ABI-versioned bpffs directory; replacement agents validate and adopt

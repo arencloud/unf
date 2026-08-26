@@ -218,6 +218,10 @@ requires every mutation to converge on both agents and deletes its three test
 Namespaces before returning.
 The exact scope and upstream mapping are tracked
 in [networkpolicy-conformance.md](networkpolicy-conformance.md).
+That document also pins a one-to-one 49-scenario audit to upstream Kubernetes
+commit `9aac5f741fa6095594cdfed4756a52cf0bf4b191`, with every scenario classified
+as verified, unsupported pending egress, or intentionally excluded pending
+stateful return-flow tracking.
 The verifier also queries topology schema v3, requires dual-stack workload
 addresses and populated per-family identity maps, and creates a selectorless Service
 with a manually managed EndpointSlice. It requires the backend to transition from
