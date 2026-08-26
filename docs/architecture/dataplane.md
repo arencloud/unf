@@ -132,9 +132,12 @@ tests still run on stable in the host workspace. See ADR 0002.
 The legacy netlink path, encrypted internal transport, and IPv4/IPv6 policy
 provenance now have repeatable evidence on separate OpenShift 4.22 IPv4-only and
 dual-stack clusters running RHCOS 9.8 kernel 5.14. Path-specific admission,
-durable agent acknowledgement retention, and certificate/trust hot rotation are now
-live-verified across rejected unsafe workload changes, controller replacement,
-an overlapping external-PKI handoff, and OpenShift Service CA restoration. Next,
-implement coordinated uninstall. The OpenShift agent uses the constrained
-three-capability boundary defined by ADR 0025 and the exact mount boundary in ADR
-0028.
+durable agent acknowledgement retention, and certificate/trust hot rotation are
+now live-verified across rejected unsafe workload changes, controller
+replacement, an overlapping external-PKI handoff, and OpenShift Service CA
+restoration.
+Coordinated uninstall now stops agents, cleans and verifies each worker, removes
+the exact cluster resources, and proves full redeploy recovery. The OpenShift
+agent uses the constrained three-capability boundary defined by ADR 0025, the
+exact mount boundary in ADR 0028, and the uninstall ordering in ADR 0029. The
+next dataplane work is the remaining Phase 3 NetworkPolicy compatibility scope.

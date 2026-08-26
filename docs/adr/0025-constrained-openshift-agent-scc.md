@@ -60,8 +60,8 @@ The OpenShift agent is no longer a privileged container and its service account
 cannot request the built-in privileged SCC. Root, `spc_t`, host networking,
 host-port admission, and hostPath volume permission remain powerful but explicit
 requirements. ADR 0028 now constrains the exact host paths and mount semantics;
-broader OpenShift/kernel versions and coordinated uninstall remain separate
-hardening and portability work.
+ADR 0029 uses the same boundary for per-node uninstall Jobs before removing the
+SCC. Broader OpenShift/kernel versions remain separate portability work.
 
 The portable Kubernetes manifest remains privileged because upstream Kubernetes
 does not provide SCC. Installers for other platforms must supply an equivalent

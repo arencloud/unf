@@ -81,5 +81,6 @@ The policy uses the cluster-scoped `admissionregistration.k8s.io/v1` API and is
 live-qualified on OpenShift 4.22 / Kubernetes 1.35. Installers targeting clusters
 without stable `ValidatingAdmissionPolicy` must provide an equivalent fail-closed
 path policy. Cluster administrators remain capable of changing this boundary;
-immutable release images and coordinated host-state cleanup/uninstall remain
-separate work.
+immutable release images remain separate work. ADR 0029 coordinates host cleanup
+and removes these admission objects only after every selected node is verified
+clean.

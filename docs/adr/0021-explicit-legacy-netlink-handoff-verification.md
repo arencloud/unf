@@ -59,5 +59,6 @@ selection and reserved filters on RHCOS 9.8 kernel 5.14, plus SCC, enforcing
 SELinux, CRI-O, BTF/bpffs, Service CA, and cross-worker policy enforcement for
 every configured family. That evidence applies to the recorded OpenShift 4.22
 environments only; broader versions remain unqualified. Production rollout and
-uninstall orchestration remain separate operator-facing work; the scoped node
-cleanup primitive is defined by ADR 0022.
+broader installer integration remain separate work. The scoped node cleanup
+primitive is defined by ADR 0022, and ADR 0029 now provides the coordinated
+OpenShift uninstall orchestration.

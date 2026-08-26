@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test kind-tool kind-up kind-load kind-deploy kind-demo kind-test kind-down
+.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-deploy kind-demo kind-test kind-down
 
 KIND := .tools/bin/kind
 KIND_PROVIDER ?= podman
@@ -10,6 +10,7 @@ UNF_CONTROLLER_DEV_IMAGE ?= quay.io/arencloud/unf-controller-dev:$(UNF_DEV_IMAGE
 UNF_AGENT_DEV_IMAGE ?= quay.io/arencloud/unf-agent-dev:$(UNF_DEV_IMAGE_TAG)
 UNF_TEST_TOOLS_DEV_IMAGE ?= quay.io/arencloud/unf-test-tools-dev:$(UNF_DEV_IMAGE_TAG)
 OPENSHIFT_KUBECONFIG ?= $(CURDIR)/.tools/cl01-audit.kubeconfig
+OPENSHIFT_UNINSTALL_ARGS ?=
 
 build:
 	cargo build --workspace
@@ -69,6 +70,12 @@ openshift-agent-report-retention-test:
 
 openshift-host-mount-policy-test:
 	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/verify-openshift-host-mount-policy.sh
+
+openshift-uninstall:
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/uninstall-openshift.sh $(OPENSHIFT_UNINSTALL_ARGS)
+
+openshift-uninstall-test:
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) hack/verify-openshift-uninstall.sh
 
 kind-tool:
 	mkdir -p .tools/bin

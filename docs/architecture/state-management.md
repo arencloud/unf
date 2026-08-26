@@ -99,7 +99,7 @@ adoption without mutating the primary pin set. A separate live pressure probe
 fills only the inactive identity-keyed policy bank, proves a staging insertion
 failure cannot advance applied state or alter active traffic, and verifies retry
 after scoped cleanup. Permanent startup validation failures terminate for
-orchestrator retry. See ADRs 0016 through 0027.
+orchestrator retry. See ADRs 0016 through 0029.
 
 Kubernetes watches remain the controller input. Internal HTTPS snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured

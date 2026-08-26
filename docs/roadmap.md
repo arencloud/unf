@@ -18,7 +18,7 @@ matrix and reproducible evidence.
 
 ## Phase 2 — identity and policy enforcement
 
-**Initial enforcement gate: verified.** Production hardening remains in progress.
+**Gate: verified.** The planned OpenShift hardening slice is complete.
 
 - Implemented foundation: collision-checked identity admission, Pod-IP desired-
   state index, update/removal garbage collection, and controller status counts.
@@ -99,7 +99,13 @@ matrix and reproducible evidence.
   admitted, with writable bpffs, read-only BTF, no subpaths/propagation, and no
   sidecar/init/ephemeral access. The focused negative gate is also part of the
   complete dual-stack qualification;
-- Next: coordinated uninstall.
+- Implemented and OpenShift verified: coordinated uninstall is dry-run-first,
+  requires exact context confirmation, stops every agent before host mutation,
+  runs one SCC/admission-constrained cleanup Job per selected worker, verifies
+  v2 pins and UNF filters are absent, then removes namespaced and exact
+  cluster-scoped resources. The CRD is preserved by default. A disruptive gate
+  proves clean two-node uninstall, CRD UID preservation, redeploy, and complete
+  dual-stack recovery.
 
 ## Phase 3 — compatibility and simulation
 

@@ -61,7 +61,11 @@ through overlapping external-PKI trust, rejects malformed updates, restores the
 platform Service CA, and proves that no controller or agent Pod is replaced.
 The agent also provides a dry-run-first cleanup command for known ABI v1/v2 pins,
 TCX link pins, and UNF-named legacy filters; current ABI removal requires an
-additional explicit confirmation and unknown directory content is refused.
+additional explicit confirmation and unknown directory content is refused. The
+OpenShift uninstall orchestrator reviews that plan on every selected worker,
+requires exact cluster-context confirmation, stops agents before mutation,
+verifies host cleanup, preserves the CRD by default, and removes its temporary
+cleanup authority only after the hosts are clean.
 See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
 gates, evidence, limitations, and current work. The shorter
@@ -123,6 +127,9 @@ Implemented in the repository:
 - dry-run-first `unf-agent cleanup` planning for recognized ABI v1/v2 map and
   TCX pins plus UNF-named legacy filters, with unknown-content refusal and an
   explicit current-ABI confirmation gate;
+- coordinated dry-run-first OpenShift uninstall with all-agent shutdown,
+  admission-constrained per-node cleanup Jobs, post-cleanup host verification,
+  exact resource removal, CRD preservation, and full redeploy qualification;
 - isolated kind fault injection proving partial pin sets, malformed active
   configuration, and corrupt inactive-stage values are rejected without
   disturbing the live last-known-good dataplane;

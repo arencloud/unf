@@ -54,8 +54,9 @@ legacy filters are absent.
 
 ABI retirement and uninstall now have a reviewable, idempotent ownership boundary
 instead of requiring ad hoc recursive deletion. The command intentionally favors
-refusal over cleanup when state is unfamiliar. Production orchestration, native
-pre-6.6 validation beyond the qualified OpenShift/RHCOS Linux 5.14 environment,
-and a coordinated OpenShift uninstall/cleanup drill remain separate work. The
-  runtime qualification already verifies the reserved legacy filters under the
-  constrained ADR 0025 SCC with SELinux Enforcing.
+refusal over cleanup when state is unfamiliar. ADR 0029 now provides
+production-style OpenShift orchestration and a complete uninstall/redeploy drill.
+Native pre-6.6 validation beyond the qualified OpenShift/RHCOS Linux 5.14
+environment remains separate work. Runtime and uninstall qualification verify
+the reserved legacy filters and their removal under the constrained ADR 0025 SCC
+with SELinux Enforcing.

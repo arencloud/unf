@@ -61,6 +61,8 @@ make openshift-test
 make openshift-tls-rotation-test
 make openshift-agent-report-retention-test
 make openshift-host-mount-policy-test
+make openshift-uninstall
+make openshift-uninstall-test
 ```
 
 Select a non-default qualification cluster explicitly:
@@ -71,6 +73,8 @@ OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-test
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-tls-rotation-test
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-agent-report-retention-test
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-host-mount-policy-test
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-uninstall
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-uninstall-test
 ```
 
 Override `OPENSHIFT_KUBECONFIG` or `QUAY_AUTH_FILE` when qualifying another
@@ -141,23 +145,48 @@ unrelated Pod, then uses non-mutating server dry runs to reject alternate paths,
 service-account replacement, host-path creation, incorrect read/write modes,
 subPath, mount propagation, sidecar/init, direct-agent-Pod, and
 ephemeral-container host-volume access.
+
 `make openshift-test` invokes this gate before its dataplane qualification.
+
+`make openshift-uninstall` is always a non-mutating plan unless explicit
+execution arguments are supplied. It inventories all Ready agents, runs the
+ownership-checked current-ABI/legacy cleanup planner on each node, and reports
+the host plus resource disposition. Execution requires `--execute` and the exact
+current context. Agents stop before constrained cleanup Jobs run; hosts must be
+free of v2 pins and UNF ingress/egress filters before namespaced, admission, SCC,
+and RBAC resources are removed. Namespace and CRD deletion are separate flags;
+the CRD is preserved by default and existing custom resources add another
+data-loss confirmation.
+
+An execution failure after agent shutdown leaves the cleanup Jobs and remaining
+authority in place for inspection; it does not silently restart enforcement
+against partially cleaned state. Repair the reported node or ownership issue and
+rerun the reviewed plan. The self-restoring qualification wrapper is a lab gate,
+not the production failure policy.
+
+`make openshift-uninstall-test` is destructive but self-restoring. It proves
+dry-run non-mutation and wrong-context refusal, removes the dedicated Namespace
+and exact cluster resources only after two-node host cleanup, preserves the CRD
+UID, redeploys, and runs the complete dual-stack qualification. Once destructive
+execution starts, its exit trap attempts redeployment after any failure.
 
 ## Operational boundary
 
 The agent attaches to every non-loopback worker interface, including OVN and
 workload interfaces, and persistent legacy filters survive Pod deletion by
-design. Do not remove the DaemonSet as an uninstall procedure. A coordinated
-uninstall must first use the agent's dry-run-first cleanup command and verify the
-exact owned filters and bpffs paths before deleting workloads.
+design. Do not remove the DaemonSet as an uninstall procedure; use the
+dry-run-first coordinated uninstall so every agent stops before per-node cleanup
+and host verification.
 
 The SCC still permits root, `spc_t`, host networking/ports, and the `hostPath`
 volume class. Its RBAC is limited to the agent service account; ADR 0028's native
 admission policy closes SCC's path-prefix gap for the exact bpffs/BTF contract.
-Immutable digest-pinned release images, issuer-specific production automation,
-and complete uninstall orchestration remain production-hardening requirements.
+Immutable digest-pinned release images and issuer-specific production automation
+remain production-hardening requirements.
+
 The report checkpoint is deliberately single-controller and is not an HA
 database. See [ADR 0025](../adr/0025-constrained-openshift-agent-scc.md),
 [ADR 0026](../adr/0026-hot-certificate-and-trust-rotation.md),
-[ADR 0027](../adr/0027-durable-agent-acknowledgement-checkpoint.md), and
-[ADR 0028](../adr/0028-path-specific-openshift-host-mount-admission.md).
+[ADR 0027](../adr/0027-durable-agent-acknowledgement-checkpoint.md),
+[ADR 0028](../adr/0028-path-specific-openshift-host-mount-admission.md), and
+[ADR 0029](../adr/0029-coordinated-openshift-uninstall.md).

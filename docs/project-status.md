@@ -22,7 +22,7 @@ repeatable test are both present in this repository.
 | Phase | State | Gate | Evidence |
 |---|---|---|---|
 | Phase 1 — observation foundation | **Verified** | Master prompt §101: controller, identity state, policy compiler, agent/Aya/TC flow events, and successful `unfctl status` | `make fmt-check lint test`, `make ebpf`, `make kind-test` |
-| Phase 2 — identity and policy enforcement | **Verified** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | `make fmt-check lint test`, `make ebpf`, and `make kind-test` verify the complete gate; `make openshift-test` qualifies both IPv4-only and dual-stack OpenShift platform slices |
+| Phase 2 — identity and policy enforcement | **Verified** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | `make fmt-check lint test`, `make ebpf`, and `make kind-test` verify the complete gate; `make openshift-test` qualifies both IPv4-only and dual-stack platform slices, while focused rotation, acknowledgement-retention, admission, and uninstall/redeploy gates cover the planned OpenShift hardening |
 | Phase 3 — compatibility and simulation | **In progress** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | The supported ingress adapter, resolved-identity IPv6 dataplane, history-aware read-only policy simulation, EndpointSlice-aware topology schema v3, and bounded dual-stack historical export are live verified; broader compatibility remains open |
 | Full CNI and later fabric capabilities | **Planned** | §104 and later roadmap gates | Explicitly out of current scope |
 
@@ -57,6 +57,7 @@ completed by Phase 1's observation-only shadow evaluation.
 | OpenShift host-mount admission | Passed on dual-stack OpenShift with `make openshift-host-mount-policy-test`: both native policies were observed without type warnings, the deployed DaemonSet and an unrelated Pod were admitted, all live agents exposed only the exact bpffs/BTF mounts, and service-account replacement, alternate paths/types/modes, subPath/propagation, sidecar/init, direct-agent-Pod, and ephemeral-container access were denied by server dry run |
 | Certificate and trust rotation | Passed on dual-stack OpenShift with `make openshift-tls-rotation-test`: an overlapping CA bundle was projected to both agents, the controller switched to an external-PKI leaf, authenticated snapshots succeeded under the new issuer, trust contracted to the new CA, malformed CA and leaf updates were rejected while last-known-good transport and convergence remained active, and the original Service CA contract was restored. Controller/agent reload and error metrics advanced as expected and every Pod UID/restart count remained unchanged |
 | Durable agent acknowledgement retention | Passed on dual-stack OpenShift with `make openshift-agent-report-retention-test`: two authenticated reports were schema-versioned in the exact-name ConfigMap checkpoint, the controller Pod was replaced, the new process reported exactly two restored entries before agents reconverged to its new epoch, checkpoint receive times advanced, persistence errors stayed zero, and both agent Pod UID/restart tuples remained unchanged |
+| Coordinated OpenShift uninstall | Passed on dual-stack OpenShift with `make openshift-uninstall-test`: a two-node dry run planned exactly 18 current-v2 map pins without Pod mutation, incorrect context confirmation was refused, all agents stopped before constrained cleanup Jobs removed host pins and UNF ingress/egress filters, the dedicated Namespace and exact cluster resources disappeared, the CRD UID was preserved, and a clean redeploy passed the complete dual-stack qualification |
 | Persistent-state fault rejection | A short-lived bpffs helper built isolated map sets for eight-of-nine pins, malformed `POLICY_CONFIG`, and corrupt inactive-bank `POLICY_RULES` debris. The exact deployed agent exited nonzero with each expected cause, the primary pins were untouched, established allow/deny traffic remained correct, and the later offline replacement still recovered |
 | Physical map-pressure rollback | The helper filled the shared real `POLICY_RULES` map to its 262,144-entry physical limit with reserved synthetic keys tagged for the inactive bank. A Shadow update advanced desired state but the pressured agent retained its applied revision and bank, incremented `unf_policy_sync_errors_total`, logged the staging failure, and preserved active TCP/8080 allow plus TCP/9090 deny. Releasing pressure let the same waiting revision activate on the opposite bank; Shadow traffic passed and restored Enforce traffic denied again |
 | Dataplane provenance | ABI v2 TCP and SCTP events matched the applied revision and carried nonzero identities plus actual/shadow policy and explicit-deny rule provenance |
@@ -68,8 +69,8 @@ completed by Phase 1's observation-only shadow evaluation.
 The kind fixture and the two temporary OpenShift qualification Namespaces are
 disposable, and object counts can change as system Pods roll. The OpenShift
 product deployment intentionally remains in `unf-system`; its host filters must
-be removed with the coordinated cleanup procedure before uninstalling the
-DaemonSet. The repeatable commands, rather than these snapshot counts, are the
+be removed with `hack/uninstall-openshift.sh` before its cluster resources are
+deleted. The repeatable commands, rather than these snapshot counts, are the
 release gate.
 
 ## Phase 1 acceptance matrix
@@ -105,6 +106,7 @@ release gate.
 | OpenShift IPv4 and dual-stack platform qualification | **Verified** | `make openshift-test` detects the cluster families and repeatably verifies restricted controller execution, worker-only agents under the dedicated constrained SCC, the exact three-capability process boundary, native Linux 5.14 legacy TC attachment under Enforcing SELinux, OpenShift Service CA and TokenReview transport, selected-node convergence, required-family identity state, cross-worker allow/drop provenance, and healthy cluster operators on separate IPv4-only and dual-stack OpenShift fixtures |
 | Constrained OpenShift agent SCC | **Verified** | ADR 0025 defines the explicit SCC/RBAC and safe legacy-binding migration. `make openshift-test` requires no built-in privileged-SCC authorization, non-privileged execution, host PID/IPC disabled, read-only root, runtime-default seccomp, `NoNewPrivs`, `spc_t`, and only `BPF`, `NET_ADMIN`, and `PERFMON` effective on every worker before enforcement checks |
 | Path-specific OpenShift host-mount admission | **Verified** | ADR 0028 defines fail-closed native DaemonSet and Pod/ephemeral policies scoped to `unf-system`, the named DaemonSet, and the `unf-agent` service account. The focused gate proves exact writable bpffs and read-only BTF admission, rejects service-account/path/type/mode/subPath/container-ownership violations, and is invoked by the full dual-stack OpenShift gate |
+| Coordinated OpenShift uninstall | **Verified** | ADR 0029 defines dry-run-first planning, Ready-node coverage, exact context confirmation, agent shutdown, constrained per-node cleanup Jobs, post-cleanup host inspection, ordered exact resource removal, default CRD preservation, and explicit CRD data-loss authority. The disruptive cl02 gate proves complete uninstall and full dual-stack redeploy recovery |
 | Transactional identity map set | **Verified** | Identity ABI v2 stages separate inactive IPv4/IPv6 maps, validates both, and selects them with one `IDENTITY_CONFIG` write; ABI/agent tests cover the fixed config and recovery rules, while `make kind-test` exercises repeated identity changes, dual-stack enforcement, and offline restart recovery |
 | Selector-to-identity policy lowering | **Verified** | Unit tests cover exact/default, shadow provenance, conflicts, and deterministic ordering; `make kind-test` requires nonzero resolved entries |
 | Transactional policy map set | **Verified** | `make kind-test` stages a changed policy on the opposite bank, verifies a higher applied revision, restores it, and verifies reconvergence |
@@ -133,9 +135,10 @@ release gate.
   `0x554e:1`/`0x554e:2`. Its forced-mode path and scoped migration cleanup are
   live-verified on Linux 7.1. Native legacy selection and compatibility are also
   live-verified on OpenShift/RHCOS Linux 5.14 with Enforcing SELinux. Broader
-  kernel/platform combinations remain. ABI v1 and known stale ABI directories can be
-  removed with the dry-run-first cleanup command after a validated rollout;
-  current v2 cleanup remains a separately confirmed, operator-coordinated action.
+  kernel/platform combinations remain. ABI v1 and known stale ABI directories
+  can be removed with the dry-run-first cleanup command after a validated
+  rollout. Standalone current-v2 cleanup still requires explicit confirmation;
+  ADR 0029 now coordinates and live-verifies it for OpenShift uninstall.
 - Partial pin sets, malformed active policy config, and invalid inactive-stage
   values are live-verified as rejected using isolated bpffs fault sets. Physical
   inactive-bank exhaustion, rollback, active-traffic preservation, scoped

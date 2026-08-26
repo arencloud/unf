@@ -112,6 +112,28 @@ operation; the command does not coordinate a DaemonSet rollout or validate that
 replacement enforcement is active. During migration, restore and verify the new
 attachment mode before removing the old one.
 
+For OpenShift uninstall, do not invoke current-ABI cleanup independently. Review
+the coordinated plan on every selected worker first:
+
+```bash
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-uninstall
+```
+
+After reviewing the reported context, nodes, pins, interfaces, and resource
+scope, execution requires that exact context. Namespace deletion is separately
+explicit; the CRD and `SecurityPolicy` objects remain by default:
+
+```bash
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" \
+OPENSHIFT_UNINSTALL_ARGS="--execute --confirm-context 'CURRENT_CONTEXT' --delete-namespace" \
+make openshift-uninstall
+```
+
+The orchestrator stops every agent, uses constrained per-node Jobs for cleanup,
+verifies host state is absent, and only then removes SCC, admission, and RBAC
+authority. CRD deletion additionally needs `--delete-crd`; if custom resources
+exist it also needs `--confirm-crd-data-loss`.
+
 ## kind
 
 The local workflow currently uses Podman, `sudo`, Go, and `kubectl`. It installs a
