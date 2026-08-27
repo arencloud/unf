@@ -96,7 +96,9 @@ revision, and refuses partial or malformed persistent state. Debris from an
 interrupted inactive-bank stage is structurally validated but need not share one
 revision. A controller-managed fresh process stays NotReady until both initial
 snapshots apply; a complete validated last-known-good set may restore readiness
-while the controller is unavailable.
+while the controller is unavailable. Recovery logs expose active-bank counts for
+all five policy maps; the Kind gate requires populated IPv4 and IPv6 egress maps
+plus preserved direct-Pod allow/deny forwarding after source-node replacement.
 
 This overlay prototype deliberately
 fails open when the selected workload identity is unknown, config is absent or

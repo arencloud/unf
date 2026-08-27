@@ -46,15 +46,17 @@ controller_raw() {
 
 wait_for_target_flow() {
     local controller=$1
+    local since_unix_ms=$2
     local snapshot
     for _ in {1..45}; do
         snapshot=$(controller_raw "${controller}" /v1/flows 2>/dev/null || true)
-        if jq -e '
+        if jq -e --argjson since "${since_unix_ms}" '
             .schema_version == 4
             and any(.entries[];
                 (.source_workloads | index("frontend/client"))
                 and (.destination_workloads | index("backend/server"))
                 and .key.destination_port == 8080
+                and .last_received_unix_ms >= $since
                 and .decision.verdict == "Allow")
         ' <<<"${snapshot}" >/dev/null 2>&1; then
             printf '%s' "${snapshot}"
@@ -122,7 +124,7 @@ window_start=$(date +%s%3N)
 response=$("${kc[@]}" exec -n frontend client -- \
     wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080)
 [[ ${response} == unf-demo-ok ]]
-before=$(wait_for_target_flow "${controller}")
+before=$(wait_for_target_flow "${controller}" "${window_start}")
 target=$(jq -c '[
     .entries[]
     | select((.source_workloads | index("frontend/client"))
@@ -206,7 +208,7 @@ new_controller_uid=$("${kc[@]}" -n unf-system get pod "${controller}" \
 [[ ${new_controller_uid} != "${old_controller_uid}" ]]
 [[ $(agent_runtime_state) == "${agent_state}" ]]
 
-after=$(wait_for_target_flow "${controller}")
+after=$(wait_for_target_flow "${controller}" "${window_start}")
 restored_first=$(jq \
     --argjson source "${source_identity}" \
     --argjson destination "${destination_identity}" '[

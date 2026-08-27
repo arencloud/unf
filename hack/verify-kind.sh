@@ -26,6 +26,7 @@ network_policy_sctp_created=false
 namespace_mutated=false
 topology_service_created=false
 bpf_fault_helper_created=false
+egress_recovery_policy_created=false
 stale_abi_fixture_helper=
 stale_abi_unknown_helper=
 network_policy_selector_peer='[{"namespaceSelector":{"matchLabels":{"environment":"production"},"matchExpressions":[{"key":"team","operator":"In","values":["checkout"]}]},"podSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["client"]}]}}]'
@@ -86,6 +87,10 @@ cleanup() {
             -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
         "${kc[@]}" delete -f \
             "${project_root}/deploy/examples/bpf-fault-helper.yaml" \
+            --ignore-not-found >/dev/null 2>&1 || true
+    fi
+    if [[ ${egress_recovery_policy_created} == true ]]; then
+        "${kc[@]}" -n frontend delete networkpolicy offline-egress-recovery \
             --ignore-not-found >/dev/null 2>&1 || true
     fi
     if [[ ${policy_mutated} == true ]]; then
@@ -2311,6 +2316,145 @@ if ! wait_for_aggregated_agent_convergence "${#agent_pods[@]}"; then
     exit 1
 fi
 
+egress_recovery_floor=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json status \
+    | sed -nE 's/.*"policy": ([0-9]+).*/\1/p')
+"${kc[@]}" apply -f - >/dev/null <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: offline-egress-recovery
+  namespace: frontend
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: client
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: backend
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: server
+      ports:
+        - protocol: TCP
+          port: 8080
+EOF
+egress_recovery_policy_created=true
+if ! wait_for_policy_batch_convergence "${egress_recovery_floor}"; then
+    echo "populated egress recovery policy did not converge" >&2
+    exit 1
+fi
+egress_recovery_revision=${transition_revision}
+egress_recovery_status=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json status)
+if ! grep -Eq '"resolved_egress_policy_entries": [1-9][0-9]*' \
+    <<<"${egress_recovery_status}"; then
+    echo "controller did not expose populated egress maps before offline recovery" >&2
+    exit 1
+fi
+for endpoint in \
+    "http://${server_ipv4}:8080" \
+    "http://[${server_ipv6}]:8080"; do
+    if [[ $("${kc[@]}" exec -n frontend client -- \
+        wget -T 2 -t 1 -qO- "${endpoint}") != unf-demo-ok ]]; then
+        echo "egress recovery allow baseline failed for ${endpoint}" >&2
+        exit 1
+    fi
+done
+
+source_node=$("${kc[@]}" -n frontend get pod client -o jsonpath='{.spec.nodeName}')
+source_agent=$("${kc[@]}" -n unf-system get pods \
+    -l app.kubernetes.io/name=unf-agent \
+    -o jsonpath="{range .items[?(@.spec.nodeName=='${source_node}')]}{.metadata.name}{'\n'}{end}" \
+    | head -n 1)
+if [[ -z ${source_agent} ]]; then
+    echo "could not identify the source-node agent for egress recovery" >&2
+    exit 1
+fi
+"${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=0 >/dev/null
+controller_scaled_down=true
+"${kc[@]}" -n unf-system wait --for=delete pod \
+    -l app.kubernetes.io/name=unf-controller --timeout=120s
+"${kc[@]}" -n unf-system delete pod "${source_agent}" --wait=true >/dev/null
+
+recovered_egress_agent=
+for _ in {1..60}; do
+    recovered_egress_agent=$("${kc[@]}" -n unf-system get pods \
+        -l app.kubernetes.io/name=unf-agent \
+        -o jsonpath="{range .items[?(@.spec.nodeName=='${source_node}')]}{.metadata.name}{'\n'}{end}" \
+        | grep -v "^${source_agent}$" | head -n 1 || true)
+    if [[ -n ${recovered_egress_agent} ]] && "${kc[@]}" -n unf-system wait \
+        --for=condition=Ready "pod/${recovered_egress_agent}" --timeout=2s \
+        >/dev/null 2>&1; then
+        break
+    fi
+    recovered_egress_agent=
+    sleep 1
+done
+if [[ -z ${recovered_egress_agent} ]]; then
+    echo "source-node agent did not recover populated egress maps offline" >&2
+    exit 1
+fi
+recovered_egress_status=$(agent_status "${recovered_egress_agent}")
+if [[ $(json_number applied_policy_revision <<<"${recovered_egress_status}") \
+        != "${egress_recovery_revision}" ]]; then
+    echo "source-node agent recovered the wrong egress policy revision" >&2
+    exit 1
+fi
+recovered_egress_logs=$("${kc[@]}" -n unf-system logs "${recovered_egress_agent}")
+if ! grep -q 'validated pinned last-known-good dataplane' <<<"${recovered_egress_logs}" \
+    || ! grep -Eq '"egress_ipv4_entries":[1-9][0-9]*' \
+        <<<"${recovered_egress_logs}" \
+    || ! grep -Eq '"egress_ipv6_entries":[1-9][0-9]*' \
+        <<<"${recovered_egress_logs}"; then
+    echo "source-node agent did not validate populated dual-stack egress maps" >&2
+    exit 1
+fi
+for endpoint in \
+    "http://${server_ipv4}:8080" \
+    "http://[${server_ipv6}]:8080"; do
+    if [[ $("${kc[@]}" exec -n frontend client -- \
+        wget -T 2 -t 1 -qO- "${endpoint}") != unf-demo-ok ]]; then
+        echo "offline egress recovery lost allow forwarding for ${endpoint}" >&2
+        exit 1
+    fi
+done
+if "${kc[@]}" exec -n frontend client -- \
+    wget -T 2 -t 1 -qO- "http://${server_ipv4}:9090" \
+    >/dev/null 2>&1; then
+    echo "offline egress recovery opened a denied destination port" >&2
+    exit 1
+fi
+
+"${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 >/dev/null
+controller_scaled_down=false
+"${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=120s
+if [[ -n ${controller_forward_pid} ]]; then
+    kill "${controller_forward_pid}" 2>/dev/null || true
+    wait "${controller_forward_pid}" 2>/dev/null || true
+    controller_forward_pid=
+fi
+if ! start_controller_forward; then
+    echo "controller port-forward did not recover after egress restart test" >&2
+    exit 1
+fi
+mapfile -t agent_pods < <("${kc[@]}" -n unf-system get pods \
+    -l app.kubernetes.io/name=unf-agent -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+if ! wait_for_aggregated_agent_convergence "${#agent_pods[@]}"; then
+    echo "agents did not reconverge after populated egress recovery" >&2
+    exit 1
+fi
+"${kc[@]}" -n frontend delete networkpolicy offline-egress-recovery >/dev/null
+egress_recovery_policy_created=false
+if ! wait_for_policy_batch_convergence "${egress_recovery_revision}"; then
+    echo "egress recovery policy cleanup did not converge" >&2
+    exit 1
+fi
+
 "${kc[@]}" -n kube-system rollout status daemonset/kindnet --timeout=120s
 if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' \
@@ -2319,4 +2463,4 @@ if "${kc[@]}" -n kube-system get pods -l app=kindnet \
     exit 1
 fi
 
-echo "kind verification passed: split public/internal TLS routing with dedicated CA trust and Pod-bound TokenReview authentication, anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v3 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline, dual-stack upstream exact/protocol-only UDP isolation, multi-destination and nonexistent named ports, target match-label/expression lifecycle, overlapping selectors, remote target-specific exceptions, same-object update recovery, multi-value Pod/Namespace selector AND, homogeneous PodSelector peer OR, source-label lifecycle, exact-name/NotIn Namespace selection, and peer-selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned dual-stack ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, direction-aware native/NetworkPolicy what-if simulation, topology v3, authenticated direction-aware flow export v3, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"
+echo "kind verification passed: split public/internal TLS routing with dedicated CA trust and Pod-bound TokenReview authentication, anonymous/invalid/cross-Node rejection, scoped dry-run/refusal/execution cleanup of stale v1 state with v3 preservation, isolated partial-pin/active-config/inactive-stage fault rejection, physical inactive-bank pressure rollback and retry, continuous deny enforcement across atomic TC attachment handoff, controller-aggregated two-node agent convergence, pinned last-known-good agent restart recovery with the controller offline including populated dual-stack source-selected egress maps, dual-stack upstream exact/protocol-only UDP isolation, multi-destination and nonexistent named ports, target match-label/expression lifecycle, overlapping selectors, remote target-specific exceptions, same-object update recovery, multi-value Pod/Namespace selector AND, homogeneous PodSelector peer OR, source-label lifecycle, exact-name/NotIn Namespace selection, and peer-selector-expression/multi-rule recovery, bounded IPv6 extension-header allow/deny, dual-stack identity maps, native/NetworkPolicy IPv6 enforcement and history, IPv4/IPv6 ipBlock exceptions, upstream-aligned dual-stack ingress matrix, named/protocol-only SCTP and namespace-wide/default-TCP conformance, EndpointSlice readiness, direction-aware native/NetworkPolicy what-if simulation, topology v3, authenticated direction-aware flow export v3, bounded ranges, lifecycle recovery, shadow mode, transactional activation, and provenance"

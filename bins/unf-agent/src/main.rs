@@ -1035,6 +1035,7 @@ async fn run_dataplane(
         Ordering::Release,
     );
     if recovered_ready {
+        let active_policy_bank = usize::from(policies.active_bank);
         info!(
             identity_epoch = recovered.identity_epoch,
             identity_revision = recovered.identity_revision,
@@ -1042,6 +1043,11 @@ async fn run_dataplane(
             policy_revision = recovered.policy_revision,
             active_identity_bank = identities.active_bank,
             active_policy_bank = policies.active_bank,
+            identity_policy_entries = policies.identity_banks[active_policy_bank].len(),
+            ipv4_policy_entries = policies.ipv4_banks[active_policy_bank].len(),
+            ipv6_policy_entries = policies.ipv6_banks[active_policy_bank].len(),
+            egress_ipv4_entries = policies.egress_ipv4_banks[active_policy_bank].len(),
+            egress_ipv6_entries = policies.egress_ipv6_banks[active_policy_bank].len(),
             "validated pinned last-known-good dataplane"
         );
     } else if controller_url.is_some() {

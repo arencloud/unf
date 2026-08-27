@@ -196,8 +196,10 @@ matrix and reproducible evidence.
 - Implemented and two-node kind verified: read-only `NetworkPolicy` add/replace
   simulation with source-selected dual-stack egress topology, retained-history
   impact, direction/address reporting, and revision/forwarding immutability;
-- Next: populated-map controller-offline replacement recovery, stateful replies,
-  and dual-stack OpenShift qualification;
+- Implemented and two-node kind verified: source-node agent replacement with the
+  controller offline retains populated IPv4/IPv6 egress maps, the exact policy
+  revision, and direct-Pod allow/deny forwarding before clean reconvergence;
+- Next: stateful replies and dual-stack OpenShift qualification;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.

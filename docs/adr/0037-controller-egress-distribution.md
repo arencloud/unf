@@ -62,3 +62,8 @@ egress qualification. Those remain explicit Phase 3 work.
 
 ADR 0038 subsequently added direction- and address-family-aware live explanation
 and separate resolved ingress/egress controller status counts.
+
+ADRs 0039–0041 subsequently added direction-aware retained history,
+NetworkPolicy what-if simulation, and controller-offline source-agent replacement
+with populated dual-stack egress maps. Stateful reply handling and OpenShift
+egress qualification remain open.

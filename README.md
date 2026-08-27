@@ -57,8 +57,9 @@ peer/port slice and its explicit egress/stateful boundaries are tracked in the
 Identity and policy updates now use independent transactional banks selected by
 atomic configuration-map writes. All eleven enforcement maps persist in an
 ABI-versioned bpffs directory; replacement agents validate and adopt
-last-known-good identity/policy state, while fresh or incompatible startup
-remains fenced from readiness until reconciliation.
+last-known-good identity/policy state—including populated dual-stack egress banks
+on the source Node—while fresh or incompatible startup remains fenced from
+readiness until reconciliation.
 TC attachments now survive agent replacement: kernels supporting TCX use
 per-interface pinned links and atomic link updates, while older kernels use a
 stable legacy netlink filter tuple for in-place replacement. The two-node kind

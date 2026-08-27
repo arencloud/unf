@@ -319,6 +319,13 @@ filters through the production dry-run-first cleanup command. On a pre-6.6 host
 already using legacy mode, the same script exercises
 the native selection without the transition or cleanup step.
 
+The primary Kind gate also performs a second offline replacement with a populated
+dual-stack egress policy. It replaces the source-node agent, requires nonzero
+recovered IPv4/IPv6 egress-bank counts and the exact policy revision, and proves
+direct Pod-address allow/deny continuity before controller restoration and policy
+cleanup. Service ClusterIPs are intentionally not used for this proof because
+UNF does not own CNI service-NAT behavior.
+
 Before that replacement, `make kind-test` temporarily deploys the privileged
 [BPF fault helper](../../deploy/examples/bpf-fault-helper.yaml) fixture. It builds
 isolated bpffs alias sets and requires the exact agent binary to reject partial
