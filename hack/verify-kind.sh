@@ -1465,6 +1465,12 @@ for _ in {1..20}; do
     if [[ -n ${protocol_wildcard_line} ]]; then
         break
     fi
+    # Flow export is intentionally sampled and bounded. Regenerate the exact
+    # allowed tuple while waiting so this provenance assertion does not depend
+    # on a single successful request surviving the sampling boundary.
+    "${kc[@]}" exec -n frontend client -- \
+        wget -T 2 -t 1 -qO- http://np-server.backend.svc.cluster.local:9091 \
+        >/dev/null 2>&1 || true
     sleep 1
 done
 if ! grep -Eq '"source_identity":[1-9][0-9]*' <<<"${protocol_wildcard_line}" \
