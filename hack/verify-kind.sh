@@ -10,6 +10,9 @@ controller_internal_host=unf-controller.unf-system.svc.cluster.local
 controller_internal_url=https://${controller_internal_host}:${controller_internal_port}
 unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 temporary_dir=$(mktemp -d)
+control_plane_node=${UNF_KIND_CONTROL_PLANE_NODE:-unf-dev-control-plane}
+worker_node=${UNF_KIND_WORKER_NODE:-unf-dev-worker}
+topology_probe_manifest=${temporary_dir}/topology-probe.yaml
 controller_forward_pid=
 handoff_probe_pid=
 map_pressure_pid=
@@ -30,6 +33,17 @@ egress_recovery_policy_created=false
 stale_abi_fixture_helper=
 stale_abi_unknown_helper=
 network_policy_selector_peer='[{"namespaceSelector":{"matchLabels":{"environment":"production"},"matchExpressions":[{"key":"team","operator":"In","values":["checkout"]}]},"podSelector":{"matchExpressions":[{"key":"app.kubernetes.io/name","operator":"In","values":["client"]}]}}]'
+
+[[ ${control_plane_node} =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || {
+    echo "invalid Kind control-plane Node name: ${control_plane_node}" >&2
+    exit 1
+}
+[[ ${worker_node} =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || {
+    echo "invalid Kind worker Node name: ${worker_node}" >&2
+    exit 1
+}
+sed "s/nodeName: unf-dev-control-plane/nodeName: ${control_plane_node}/" \
+    "${project_root}/deploy/examples/topology-probe.yaml" >"${topology_probe_manifest}"
 
 cleanup() {
     if [[ -n ${handoff_probe_pid} ]]; then
@@ -740,8 +754,8 @@ if ! wait_for_aggregated_agent_convergence "${#agent_pods[@]}"; then
     exit 1
 fi
 grep -q '"schema_version": 2' <<<"${agent_convergence_status}"
-grep -q '"node_name": "unf-dev-control-plane"' <<<"${agent_convergence_status}"
-grep -q '"node_name": "unf-dev-worker"' <<<"${agent_convergence_status}"
+grep -Fq "\"node_name\": \"${control_plane_node}\"" <<<"${agent_convergence_status}"
+grep -Fq "\"node_name\": \"${worker_node}\"" <<<"${agent_convergence_status}"
 if [[ $(grep -c '"converged": true' <<<"${agent_convergence_status}") -ne 2 ]]; then
     echo "controller did not expose two converged per-node acknowledgements" >&2
     exit 1
@@ -840,8 +854,8 @@ controller_status_table=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" status)
 grep -q '^Controller Status$' <<<"${controller_status_table}"
 grep -q 'agents.*converged=2/2.*all_converged=true' <<<"${controller_status_table}"
-grep -q 'agent.*unf-dev-control-plane.*converged=true' <<<"${controller_status_table}"
-grep -q 'agent.*unf-dev-worker.*converged=true' <<<"${controller_status_table}"
+grep -Eq "agent.*${control_plane_node}.*converged=true" <<<"${controller_status_table}"
+grep -Eq "agent.*${worker_node}.*converged=true" <<<"${controller_status_table}"
 
 initial_topology=$("${unfctl}" \
     --controller-url "http://127.0.0.1:${controller_port}" --output json topology)
@@ -849,20 +863,20 @@ compact_initial_topology=$(tr -d '\n' <<<"${initial_topology}")
 grep -q '"schema_version": 3' <<<"${initial_topology}"
 grep -Eq '"revision": [1-9][0-9]*' <<<"${initial_topology}"
 grep -Eq '"identity_revision": [1-9][0-9]*' <<<"${initial_topology}"
-grep -q '"name": "unf-dev-control-plane"' <<<"${initial_topology}"
-grep -q '"name": "unf-dev-worker"' <<<"${initial_topology}"
+grep -Fq "\"name\": \"${control_plane_node}\"" <<<"${initial_topology}"
+grep -Fq "\"name\": \"${worker_node}\"" <<<"${initial_topology}"
 grep -q '"reference": "frontend/client"' <<<"${initial_topology}"
 grep -q '"reference": "backend/server"' <<<"${initial_topology}"
 grep -q '"reference": "backend/np-server"' <<<"${initial_topology}"
-grep -q '"node_name": "unf-dev-control-plane"' <<<"${initial_topology}"
-grep -q '"node_name": "unf-dev-worker"' <<<"${initial_topology}"
+grep -Fq "\"node_name\": \"${control_plane_node}\"" <<<"${initial_topology}"
+grep -Fq "\"node_name\": \"${worker_node}\"" <<<"${initial_topology}"
 grep -Eq '"ipv6_addresses": \[[[:space:]]*"[^" ]*:[^" ]*"' \
     <<<"${compact_initial_topology}"
 grep -q '"selected_workloads": \[' <<<"${initial_topology}"
 initial_topology_revision=$(sed -nE 's/.*"revision": ([0-9]+).*/\1/p' \
     <<<"${initial_topology}")
 
-"${kc[@]}" apply -f "${project_root}/deploy/examples/topology-probe.yaml" >/dev/null
+"${kc[@]}" apply -f "${topology_probe_manifest}" >/dev/null
 topology_service_created=true
 if ! wait_for_topology_probe_backend "${initial_topology_revision}" false; then
     echo "controller did not expose the not-ready EndpointSlice backend" >&2
@@ -933,7 +947,7 @@ grep -Eq '"revision": [1-9][0-9]*' <<<"${flow_history}"
 grep -q '"capacity": 4096' <<<"${flow_history}"
 grep -Eq '"retained_flows": [1-9][0-9]*' <<<"${flow_history}"
 grep -Eq '"retained_observations": [1-9][0-9]*' <<<"${flow_history}"
-grep -q '"unf-dev-worker"' <<<"${flow_history}"
+grep -Fq "\"${worker_node}\"" <<<"${flow_history}"
 if grep -q '"destination_port": 9964' <<<"${flow_history}"; then
     echo "controller management traffic recursively entered flow history" >&2
     exit 1

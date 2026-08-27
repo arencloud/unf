@@ -7,6 +7,8 @@ KIND_NAME ?= unf-dev
 KIND_CONFIG ?= $(CURDIR)/hack/kind-config.yaml
 KIND_KUBECONFIG ?= $(CURDIR)/.tools/kind-$(KIND_NAME).kubeconfig
 KUBE_CONTEXT ?= kind-$(KIND_NAME)
+UNF_KIND_CONTROL_PLANE_NODE ?= $(KIND_NAME)-control-plane
+UNF_KIND_WORKER_NODE ?= $(KIND_NAME)-worker
 TEST_TOOLS_IMAGE := localhost/unf-test-tools:ipv6-ext-v1
 UNF_BUILD_REVISION ?= $(shell git describe --always --dirty --abbrev=40 2>/dev/null || echo unknown)
 UNF_UPGRADE_BASELINE_REF ?= HEAD^
@@ -207,7 +209,7 @@ kind-scale-failure-test: kind-deploy kind-demo
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-kind-scale-failure.sh
 
 kind-test: cli kind-demo
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-kind.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) UNF_KIND_CONTROL_PLANE_NODE=$(UNF_KIND_CONTROL_PLANE_NODE) UNF_KIND_WORKER_NODE=$(UNF_KIND_WORKER_NODE) hack/verify-kind.sh
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-topology-history.sh
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-flow-history-retention.sh
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-external-flow-export.sh

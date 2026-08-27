@@ -5,6 +5,8 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cluster_name=${UNF_MATRIX_KIND_NAME:-unf-matrix-134}
 kubeconfig=${UNF_MATRIX_KIND_KUBECONFIG:-"${project_root}/.tools/kind-${cluster_name}.kubeconfig"}
 context=kind-${cluster_name}
+control_plane_node=${cluster_name}-control-plane
+worker_node=${cluster_name}-worker
 config=${UNF_MATRIX_KIND_CONFIG:-"${project_root}/hack/kind-config-1.34.yaml"}
 result_record=${UNF_MATRIX_KIND_RESULT_RECORD:-"${project_root}/.artifacts/phase3-kind-kubernetes-1.34-result.json"}
 attempt_history=${UNF_MATRIX_KIND_ATTEMPT_HISTORY:-"${project_root}/.artifacts/phase3-kind-kubernetes-1.34-attempts.jsonl"}
@@ -166,6 +168,16 @@ KUBECONFIG="${kubeconfig}" kubectl --context "${context}" get nodes -o json | jq
     }]
 }' >"${environment_file}"
 
+# The portable test manifests retain stable placement labels so their traffic
+# topology stays comparable across clusters. Node identity assertions continue
+# to use the actual isolated-cluster Node names.
+KUBECONFIG="${kubeconfig}" kubectl --context "${context}" label node \
+    "${control_plane_node}" kubernetes.io/hostname=unf-dev-control-plane \
+    --overwrite >/dev/null
+KUBECONFIG="${kubeconfig}" kubectl --context "${context}" label node \
+    "${worker_node}" kubernetes.io/hostname=unf-dev-worker \
+    --overwrite >/dev/null
+
 stage=endpoint-enforcement-recovery
 make -C "${project_root}" kind-deploy \
     KIND_NAME="${cluster_name}" \
@@ -174,7 +186,9 @@ make -C "${project_root}" kind-deploy \
 make -C "${project_root}" kind-test \
     KIND_NAME="${cluster_name}" \
     KIND_KUBECONFIG="${kubeconfig}" \
-    KUBE_CONTEXT="${context}"
+    KUBE_CONTEXT="${context}" \
+    UNF_KIND_CONTROL_PLANE_NODE="${control_plane_node}" \
+    UNF_KIND_WORKER_NODE="${worker_node}"
 
 stage=adjacent-upgrade-rollback
 make -C "${project_root}" kind-upgrade-test \
