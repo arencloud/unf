@@ -40,8 +40,11 @@ An optional external HTTP backend forwards only authenticated and validated flow
 batches in a versioned epoch/sequence/topology envelope. Its bounded non-blocking
 queue, at-least-once retry, dedicated delivery/loss metrics, HTTPS/private-CA
 trust, and rotating token-file authentication keep receiver outages independent
-from local history and agent ingestion. The focused Kind gate removes and
-restores the receiver to prove that boundary.
+from local history and agent ingestion. Capacity, current-depth, and lifetime
+high-water gauges make saturation directly observable. The focused Kind gate
+removes and restores the receiver, then applies sustained receiver latency to
+prove the queue bound, monotonic delivery sequence, explicit loss accounting,
+and uninterrupted internal ingestion.
 The resolved-identity fast path
 is now dual-stack for IPv4/IPv6 TCP/UDP/SCTP, including verifier-bounded IPv6
 extension-header traversal; native policy and selector-based NetworkPolicy IPv6

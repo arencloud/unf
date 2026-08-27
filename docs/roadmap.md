@@ -215,8 +215,10 @@ matrix and reproducible evidence.
 - Implemented and two-node Kind verified: optional external HTTP flow export
   with a versioned epoch/sequence/topology envelope, HTTPS and private-CA trust,
   rotating token-file authentication, bounded non-blocking queue, at-least-once
-  retry, explicit delivery/loss metrics, and receiver-outage recovery without
-  interrupting authenticated ingestion or local history;
+  retry, exact queue capacity/depth/high-water telemetry, explicit delivery/loss
+  metrics, concurrent publication ordering, receiver-outage recovery, and
+  sustained slow-receiver saturation without interrupting authenticated
+  ingestion or local history;
 - failure, scale, upgrade, and broader OpenShift version validation.
 
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster

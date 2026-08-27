@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::gauge::Gauge;
 use reqwest::{StatusCode, Url, redirect};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -37,6 +40,9 @@ impl ExternalFlowExportEnvelope {
 
 #[derive(Clone, Default)]
 pub struct ExternalFlowExportMetrics {
+    pub queue_capacity: Gauge<u64, AtomicU64>,
+    pub queue_depth: Gauge<u64, AtomicU64>,
+    pub queue_high_watermark: Gauge<u64, AtomicU64>,
     pub enqueued_batches: Counter,
     pub delivery_attempts: Counter,
     pub delivered_batches: Counter,
@@ -127,24 +133,40 @@ impl ExternalFlowExportConfig {
 pub struct ExternalFlowExporter {
     sender: mpsc::Sender<ExternalFlowExportEnvelope>,
     metrics: ExternalFlowExportMetrics,
+    sequence: Arc<AtomicU64>,
+    enqueue_guard: Arc<Mutex<()>>,
 }
 
 impl ExternalFlowExporter {
-    pub fn enqueue(&self, envelope: ExternalFlowExportEnvelope) {
+    pub fn enqueue(&self, mut envelope: ExternalFlowExportEnvelope) {
         let observations = envelope.observations();
-        match self.sender.try_send(envelope) {
-            Ok(()) => {
+        let _guard = self
+            .enqueue_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.sender.try_reserve() {
+            Ok(permit) => {
+                envelope.export_sequence = self
+                    .sequence
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1);
+                let depth = self.metrics.queue_depth.inc().saturating_add(1);
+                self.metrics
+                    .queue_high_watermark
+                    .inner()
+                    .fetch_max(depth, Ordering::AcqRel);
+                permit.send(envelope);
                 self.metrics.enqueued_batches.inc();
             }
             Err(error) => {
                 self.metrics.dropped_batches.inc();
                 self.metrics.dropped_observations.inc_by(observations);
                 match error {
-                    mpsc::error::TrySendError::Full(_) => warn!(
+                    mpsc::error::TrySendError::Full(()) => warn!(
                         observations,
                         "external flow-export queue is full; dropping validated batch"
                     ),
-                    mpsc::error::TrySendError::Closed(_) => warn!(
+                    mpsc::error::TrySendError::Closed(()) => warn!(
                         observations,
                         "external flow-export worker is unavailable; dropping validated batch"
                     ),
@@ -189,10 +211,16 @@ pub fn build_external_flow_export(
         .build()
         .context("construct external flow-export HTTP client")?;
     let (sender, receiver) = mpsc::channel(config.queue_capacity);
+    metrics.queue_capacity.set(
+        u64::try_from(config.queue_capacity)
+            .context("external flow-export queue capacity does not fit metric representation")?,
+    );
     Ok((
         ExternalFlowExporter {
             sender,
             metrics: metrics.clone(),
+            sequence: Arc::new(AtomicU64::new(0)),
+            enqueue_guard: Arc::new(Mutex::new(())),
         },
         ExternalFlowExportWorker {
             config,
@@ -218,7 +246,10 @@ impl ExternalFlowExportWorker {
                     break;
                 }
                 envelope = self.receiver.recv() => match envelope {
-                    Some(envelope) => envelope,
+                    Some(envelope) => {
+                        self.metrics.queue_depth.dec();
+                        envelope
+                    },
                     None => break,
                 },
             };
@@ -334,8 +365,10 @@ impl ExternalFlowExportWorker {
     fn drop_pending(&mut self) {
         self.receiver.close();
         while let Ok(envelope) = self.receiver.try_recv() {
+            self.metrics.queue_depth.dec();
             self.drop_envelope(&envelope);
         }
+        self.metrics.queue_depth.set(0);
     }
 }
 
@@ -579,6 +612,9 @@ mod tests {
         exporter.enqueue(envelope(3));
         exporter.enqueue(envelope(5));
         assert_eq!(metrics.enqueued_batches.get(), 1);
+        assert_eq!(metrics.queue_capacity.get(), 1);
+        assert_eq!(metrics.queue_depth.get(), 1);
+        assert_eq!(metrics.queue_high_watermark.get(), 1);
         assert_eq!(metrics.dropped_batches.get(), 1);
         assert_eq!(metrics.dropped_observations.get(), 5);
     }
@@ -608,6 +644,8 @@ mod tests {
         assert_eq!(metrics.delivery_attempts.get(), 2);
         assert_eq!(metrics.delivery_errors.get(), 1);
         assert_eq!(metrics.delivered_observations.get(), 7);
+        assert_eq!(metrics.queue_depth.get(), 0);
+        assert!(metrics.queue_high_watermark.get() <= metrics.queue_capacity.get());
         assert_eq!(metrics.dropped_batches.get(), 0);
         assert_eq!(receiver_state.attempts.load(Ordering::Acquire), 2);
         {
@@ -622,5 +660,61 @@ mod tests {
         worker_task.await.expect("join test flow-export worker");
         receiver_task.abort();
         std::fs::remove_file(token_path).expect("remove test bearer token");
+    }
+
+    #[tokio::test]
+    async fn concurrent_enqueue_preserves_published_sequence_order() {
+        let (endpoint, receiver_state, receiver_task) = spawn_receiver(0, None).await;
+        let metrics = ExternalFlowExportMetrics::default();
+        let configuration = ExternalFlowExportConfig::new(
+            &endpoint,
+            true,
+            None,
+            None,
+            64,
+            1,
+            Duration::from_secs(1),
+        )
+        .expect("valid concurrent queue test config")
+        .with_retry_initial_delay(Duration::from_millis(1));
+        let (exporter, worker) =
+            build_external_flow_export(configuration, metrics.clone()).expect("build exporter");
+        let cancellation = CancellationToken::new();
+        let worker_task = tokio::spawn(worker.run(cancellation.clone()));
+
+        let mut enqueue_tasks = Vec::new();
+        for observed_events in 1..=32 {
+            let exporter = exporter.clone();
+            enqueue_tasks.push(tokio::spawn(async move {
+                exporter.enqueue(envelope(observed_events));
+            }));
+        }
+        for task in enqueue_tasks {
+            task.await.expect("join concurrent enqueue task");
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while metrics.delivered_batches.get() != 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all concurrently enqueued flow exports delivered");
+
+        let sequences = receiver_state
+            .envelopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|received| received.export_sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, (1..=32).collect::<Vec<_>>());
+        assert_eq!(metrics.enqueued_batches.get(), 32);
+        assert_eq!(metrics.dropped_batches.get(), 0);
+        assert_eq!(metrics.queue_depth.get(), 0);
+        assert!(metrics.queue_high_watermark.get() <= metrics.queue_capacity.get());
+
+        cancellation.cancel();
+        worker_task.await.expect("join test flow-export worker");
+        receiver_task.abort();
     }
 }

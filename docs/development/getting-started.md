@@ -342,9 +342,11 @@ flow-export schema-v3 `batch`. Receivers should deduplicate on
 `(controller_epoch, export_sequence)`. Delivery is at least once, redirects are
 disabled, and 408, 429, 5xx, or network failures retry with bounded backoff.
 Queue pressure and exhausted delivery affect only the external copy; the seven
-`unf_external_flow_export_*` counters report enqueue, attempt, success, error,
-and batch/observation loss. No endpoint is configured by default. Use
-`make kind-external-flow-export-test` for the focused outage/recovery gate.
+delivery/loss counters report enqueue, attempt, success, error, and
+batch/observation loss. Three gauges report configured queue capacity, current
+depth, and the process-lifetime high-water mark. No endpoint is configured by
+default. Use `make kind-external-flow-export-test` for the focused retry,
+outage/recovery, sustained-pressure, and ordering gate.
 
 Simulation reports its bounded current-topology probe matrix separately from the
 revisioned, 4,096-key retained history. Its `--last`, `--since-unix-ms`,

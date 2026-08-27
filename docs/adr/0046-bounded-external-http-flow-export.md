@@ -36,26 +36,38 @@ are rejected, redirects are disabled, and an optional bearer-token file is
 validated at startup and reread for every attempt so token rotation does not
 require a controller restart. The token value is never logged.
 
-Seven Prometheus counters expose enqueued batches, delivery attempts, delivered
-batches/observations, delivery errors, and dropped batches/observations.
+Ten Prometheus metrics expose configured queue capacity, current queue depth,
+process-lifetime queue high-water mark, enqueued batches, delivery attempts,
+delivered batches/observations, delivery errors, and dropped
+batches/observations. Accepted queue items receive their sequence while holding
+the same small publication fence used to reserve their slot, so concurrent
+ingestion cannot publish a lower sequence after a higher one. Retries retain the
+same sequence.
 
 ## Verification
 
 Unit tests reject unsafe configuration, prove a full queue drops synchronously
-without waiting, exercise bearer-authenticated retry after 503, and verify the
-wire envelope. The controller ingestion test proves only validated batches enter
-the external queue. `make kind-external-flow-export-test`, included in
-`make kind-test`, deploys a non-root receiver, validates the complete schema-v1
-envelope and bearer token, requires retry after an injected 503, removes the
+without waiting, exercise bearer-authenticated retry after 503, verify the wire
+envelope, and concurrently enqueue batches to prove published sequence order.
+The controller ingestion test proves only validated batches enter the external
+queue. `make kind-external-flow-export-test`, included in `make kind-test`,
+deploys a non-root receiver, validates the complete schema-v1 envelope and
+bearer token, requires a same-sequence retry after an injected 503, removes the
 receiver, and proves authenticated telemetry plus durable local history continue
-while external drops become visible. It restores the receiver and requires
-delivery recovery without replacing or restarting the controller.
+while external drops become visible. After recovery, a three-second receiver
+delay saturates a one-item queue under sustained traffic. The gate requires
+capacity and high-water gauges of one, depth never above one, increasing
+delivery and explicit batch/observation loss, strictly non-regressing receiver
+sequences, continued local telemetry/history growth, and no controller
+replacement or restart.
 
 ## Consequences
 
 UNF now has a stable, bounded external flow handoff suitable for webhook
 collectors and adapters. Receivers must use the epoch/sequence fence for
 idempotence. Controller restart and queue overflow can lose external-only data;
-the bounded local history remains the recovery window. A persistent spool,
+the bounded local history remains the recovery window. The publication fence is
+held only around non-blocking slot reservation, sequence assignment, and send;
+network I/O remains isolated in the worker. A persistent spool,
 multiple simultaneous sinks, Kafka/OTLP-native transports, receiver-side
 backpressure negotiation, and CA-client hot reload remain future work.

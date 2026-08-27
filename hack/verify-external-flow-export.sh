@@ -67,6 +67,23 @@ metric() {
         | awk -v metric_name="${name}" '$1 == metric_name { print int($2); found=1 } END { if (!found) print 0 }'
 }
 
+wait_for_metric_equals() {
+    local controller=$1
+    local name=$2
+    local expected=$3
+    local value=0
+    for _ in {1..60}; do
+        value=$(metric "${controller}" "${name}" 2>/dev/null || true)
+        if [[ ${value:-0} -eq ${expected} ]]; then
+            printf '%s' "${value}"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "metric ${name} did not equal ${expected}; last value ${value:-unavailable}" >&2
+    return 1
+}
+
 wait_for_metric_at_least() {
     local controller=$1
     local name=$2
@@ -87,9 +104,25 @@ wait_for_metric_at_least() {
 emit_flows() {
     for _ in {1..12}; do
         "${kc[@]}" -n frontend exec client -- \
-            wget -qO- --timeout=2 http://server.backend.svc.cluster.local:8080 >/dev/null
+            wget -qO- --timeout=2 "${server_url}" >/dev/null
     done
 }
+
+
+emit_pressure_flows() {
+    for _ in {1..15}; do
+        "${kc[@]}" -n frontend exec client -- sh -c \
+            'for request in 1 2 3 4; do wget -qO- --timeout=2 "$1" >/dev/null; done' \
+            sh "${server_url}"
+        sleep 1
+    done
+}
+
+server_ipv4=$("${kc[@]}" -n backend get pod server -o json \
+    | jq -r '.status.podIPs[]?.ip | select(contains(":") | not)' \
+    | head -n 1)
+[[ -n ${server_ipv4} ]]
+server_url="http://${server_ipv4}:8080"
 
 "${kc[@]}" -n unf-system create secret generic "${token_secret}" \
     --from-literal=token=kind-flow-export-token >/dev/null
@@ -129,6 +162,7 @@ spec:
             httpGet:
               path: /health
               port: http
+            timeoutSeconds: 5
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -171,11 +205,11 @@ spec:
             - name: UNF_CONTROLLER_FLOW_EXPORT_HTTP_BEARER_TOKEN_FILE
               value: /var/run/secrets/unf-flow-export/token
             - name: UNF_CONTROLLER_FLOW_EXPORT_HTTP_QUEUE_CAPACITY
-              value: "4"
+              value: "1"
             - name: UNF_CONTROLLER_FLOW_EXPORT_HTTP_MAX_ATTEMPTS
               value: "3"
             - name: UNF_CONTROLLER_FLOW_EXPORT_HTTP_TIMEOUT_SECONDS
-              value: "1"
+              value: "5"
           volumeMounts:
             - name: external-flow-export-token
               mountPath: /var/run/secrets/unf-flow-export
@@ -205,7 +239,15 @@ wait_for_metric_at_least "${controller}" \
     unf_external_flow_export_delivery_attempts_total 2 >/dev/null
 
 receiver_stats=$(receiver_raw /stats)
-jq -e '.attempts >= 2 and .accepted >= 1' <<<"${receiver_stats}" >/dev/null
+jq -e '
+  .attempts >= 2
+  and .accepted >= 1
+  and .last_sequence > 0
+  and .sequence_duplicates >= 1
+  and .sequence_regressions == 0
+  and .max_body_bytes > 0
+  and .max_body_bytes <= 2097152
+' <<<"${receiver_stats}" >/dev/null
 last_envelope=$(receiver_raw /last)
 jq -e '
   .schema_version == 1
@@ -252,4 +294,63 @@ emit_flows
 wait_for_metric_at_least "${controller}" unf_external_flow_export_delivered_batches_total \
     "$((baseline_delivered + 1))" >/dev/null
 
-echo "external flow-export qualification passed: schema-v1 provenance envelope, bearer authentication, retry after 503, bounded non-blocking loss accounting, receiver-outage history continuity, recovery, and zero controller restarts"
+"${kc[@]}" -n unf-system patch deployment "${receiver_name}" --type=strategic -p '
+spec:
+  template:
+    spec:
+      containers:
+        - name: receiver
+          env:
+            - name: UNF_FLOW_RECEIVER_FAIL_FIRST
+              value: "0"
+            - name: UNF_FLOW_RECEIVER_DELAY_MILLIS
+              value: "3000"
+' >/dev/null
+"${kc[@]}" -n unf-system rollout status deployment/"${receiver_name}" \
+    --timeout=120s >/dev/null
+
+baseline_telemetry=$(metric "${controller}" unf_telemetry_observations_total)
+baseline_history=$(controller_raw "${controller}" /v1/flows | jq '.retained_observations')
+baseline_enqueued=$(metric "${controller}" unf_external_flow_export_enqueued_batches_total)
+baseline_delivered=$(metric "${controller}" unf_external_flow_export_delivered_batches_total)
+baseline_dropped=$(metric "${controller}" unf_external_flow_export_dropped_batches_total)
+baseline_dropped_observations=$(metric "${controller}" \
+    unf_external_flow_export_dropped_observations_total)
+emit_pressure_flows
+wait_for_metric_at_least "${controller}" unf_telemetry_observations_total \
+    "$((baseline_telemetry + 1))" >/dev/null
+wait_for_metric_at_least "${controller}" unf_external_flow_export_enqueued_batches_total \
+    "$((baseline_enqueued + 2))" >/dev/null
+wait_for_metric_at_least "${controller}" unf_external_flow_export_delivered_batches_total \
+    "$((baseline_delivered + 1))" >/dev/null
+wait_for_metric_at_least "${controller}" unf_external_flow_export_dropped_batches_total \
+    "$((baseline_dropped + 1))" >/dev/null
+wait_for_metric_at_least "${controller}" unf_external_flow_export_dropped_observations_total \
+    "$((baseline_dropped_observations + 1))" >/dev/null
+wait_for_metric_equals "${controller}" unf_external_flow_export_queue_capacity 1 >/dev/null
+wait_for_metric_equals "${controller}" unf_external_flow_export_queue_high_watermark 1 >/dev/null
+[[ $(metric "${controller}" unf_external_flow_export_queue_depth) -le 1 ]]
+for _ in {1..30}; do
+    current_history=$(controller_raw "${controller}" /v1/flows | jq '.retained_observations')
+    if [[ ${current_history} -gt ${baseline_history} ]]; then
+        break
+    fi
+    sleep 1
+done
+[[ ${current_history:-0} -gt ${baseline_history} ]]
+
+receiver_stats=$(receiver_raw /stats)
+jq -e '
+  .attempts >= 2
+  and .accepted == .attempts
+  and .last_sequence > 0
+  and .sequence_duplicates == 0
+  and .sequence_regressions == 0
+  and .max_body_bytes > 0
+  and .max_body_bytes <= 2097152
+' <<<"${receiver_stats}" >/dev/null
+[[ $("${kc[@]}" -n unf-system get pod "${controller}" -o jsonpath='{.metadata.uid}') == "${controller_uid}" ]]
+[[ $("${kc[@]}" -n unf-system get pod "${controller}" \
+    -o jsonpath='{.status.containerStatuses[0].restartCount}') == "${controller_restarts}" ]]
+
+echo "external flow-export qualification passed: schema-v1 provenance envelope, bearer authentication, retry sequencing, exact queue bounds and high-water telemetry, sustained slow-receiver loss accounting, receiver-outage history continuity, recovery, and zero controller restarts"

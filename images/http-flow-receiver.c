@@ -10,6 +10,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
@@ -23,9 +24,51 @@ struct receiver_state {
     uint64_t fail_first;
     uint64_t attempts;
     uint64_t accepted;
+    uint64_t delay_millis;
+    uint64_t last_sequence;
+    uint64_t sequence_duplicates;
+    uint64_t sequence_regressions;
+    uint64_t max_body_bytes;
+    bool has_sequence;
     char *last_body;
     size_t last_body_length;
 };
+
+static void delay_response(uint64_t delay_millis)
+{
+    struct timespec delay = {
+        .tv_sec = (time_t)(delay_millis / 1000),
+        .tv_nsec = (long)((delay_millis % 1000) * 1000000),
+    };
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    }
+}
+
+static void record_export_sequence(struct receiver_state *state, const char *body)
+{
+    const char marker[] = "\"export_sequence\":";
+    const char *value = strstr(body, marker);
+    if (value == NULL) {
+        return;
+    }
+    value += sizeof(marker) - 1;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || parsed == 0) {
+        return;
+    }
+    uint64_t sequence = (uint64_t)parsed;
+    if (state->has_sequence) {
+        if (sequence == state->last_sequence) {
+            state->sequence_duplicates++;
+        } else if (sequence < state->last_sequence) {
+            state->sequence_regressions++;
+        }
+    }
+    state->last_sequence = sequence;
+    state->has_sequence = true;
+}
 
 static int send_all(int socket_fd, const char *data, size_t length)
 {
@@ -202,11 +245,17 @@ static void handle_connection(int socket_fd, struct receiver_state *state)
                           state->last_body_length);
         }
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/stats") == 0) {
-        char stats[160];
+        char stats[384];
         int length = snprintf(stats, sizeof(stats),
-                              "{\"attempts\":%llu,\"accepted\":%llu}\n",
+                              "{\"attempts\":%llu,\"accepted\":%llu,"
+                              "\"last_sequence\":%llu,\"sequence_duplicates\":%llu,"
+                              "\"sequence_regressions\":%llu,\"max_body_bytes\":%llu}\n",
                               (unsigned long long)state->attempts,
-                              (unsigned long long)state->accepted);
+                              (unsigned long long)state->accepted,
+                              (unsigned long long)state->last_sequence,
+                              (unsigned long long)state->sequence_duplicates,
+                              (unsigned long long)state->sequence_regressions,
+                              (unsigned long long)state->max_body_bytes);
         if (length > 0 && (size_t)length < sizeof(stats)) {
             (void)respond(socket_fd, 200, "OK", "application/json", stats, (size_t)length);
         }
@@ -224,7 +273,12 @@ static void handle_connection(int socket_fd, struct receiver_state *state)
                 free(state->last_body);
                 state->last_body = saved;
                 state->last_body_length = body_length;
+                if (body_length > state->max_body_bytes) {
+                    state->max_body_bytes = body_length;
+                }
+                record_export_sequence(state, saved);
                 state->attempts++;
+                delay_response(state->delay_millis);
                 if (state->attempts <= state->fail_first) {
                     (void)respond(socket_fd, 503, "Service Unavailable", "text/plain",
                                   "retry\n", 6);
@@ -254,6 +308,12 @@ int main(int argc, char **argv)
     const char *fail_first = getenv("UNF_FLOW_RECEIVER_FAIL_FIRST");
     if (fail_first != NULL && parse_unsigned(fail_first, UINT32_MAX, &state.fail_first) != 0) {
         fprintf(stderr, "UNF_FLOW_RECEIVER_FAIL_FIRST must be a nonnegative integer\n");
+        return 2;
+    }
+    const char *delay_millis = getenv("UNF_FLOW_RECEIVER_DELAY_MILLIS");
+    if (delay_millis != NULL
+        && parse_unsigned(delay_millis, 60000, &state.delay_millis) != 0) {
+        fprintf(stderr, "UNF_FLOW_RECEIVER_DELAY_MILLIS must be between 0 and 60000\n");
         return 2;
     }
 

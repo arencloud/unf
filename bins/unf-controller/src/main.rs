@@ -214,7 +214,6 @@ struct ControllerState {
     flow_history_checkpoint_omitted_flows: AtomicU64,
     flow_history_checkpoint_omitted_observations: AtomicU64,
     external_flow_export: RwLock<Option<ExternalFlowExporter>>,
-    external_flow_export_sequence: AtomicU64,
     topology_history: Mutex<TopologyHistoryStore>,
     topology_history_dirty: AtomicBool,
     topology_history_store: Option<Api<ConfigMap>>,
@@ -807,6 +806,21 @@ fn register_flow_history_metrics(registry: &mut Registry, metrics: &ControllerMe
 fn register_external_flow_export_metrics(registry: &mut Registry, metrics: &ControllerMetrics) {
     let external = &metrics.external_flow_export;
     registry.register(
+        "unf_external_flow_export_queue_capacity",
+        "Configured capacity of the bounded external flow-export queue",
+        external.queue_capacity.clone(),
+    );
+    registry.register(
+        "unf_external_flow_export_queue_depth",
+        "Current number of batches reserved in the external flow-export queue",
+        external.queue_depth.clone(),
+    );
+    registry.register(
+        "unf_external_flow_export_queue_high_watermark",
+        "Highest external flow-export queue depth observed in this controller process",
+        external.queue_high_watermark.clone(),
+    );
+    registry.register(
         "unf_external_flow_export_enqueued_batches",
         "Validated flow batches accepted by the bounded external-export queue",
         external.enqueued_batches.clone(),
@@ -956,7 +970,6 @@ fn new_state_with_client_and_selector(
         flow_history_checkpoint_omitted_flows: AtomicU64::new(0),
         flow_history_checkpoint_omitted_observations: AtomicU64::new(0),
         external_flow_export: RwLock::new(None),
-        external_flow_export_sequence: AtomicU64::new(0),
         topology_history: Mutex::new(TopologyHistoryStore::default()),
         topology_history_dirty: AtomicBool::new(false),
         topology_history_store: config_map_store.clone(),
@@ -3140,10 +3153,7 @@ fn ingest_flow_batch(
         exporter.enqueue(ExternalFlowExportEnvelope {
             schema_version: external_flow_export::EXTERNAL_FLOW_EXPORT_SCHEMA_VERSION,
             controller_epoch: state.identity_epoch,
-            export_sequence: state
-                .external_flow_export_sequence
-                .fetch_add(1, Ordering::AcqRel)
-                .saturating_add(1),
+            export_sequence: 0,
             topology_revision,
             received_unix_ms,
             batch,
