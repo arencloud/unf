@@ -52,10 +52,11 @@ the policy revision remains unchanged.
 
 Operators and simulation clients now have a deterministic, queryable topology
 fence without introducing a custom query language. Simulation can attribute an
-affected selectorless Service through a ready Pod backend. The snapshot is still
-in-memory/current-state only: EndpointSlice conditions are Kubernetes-reported
-state, not active health probes. Topology history, pagination, filtering, routing
-relationships, and durable storage require later schema or endpoint additions.
+affected selectorless Service through a ready Pod backend. EndpointSlice
+conditions are Kubernetes-reported state, not active health probes. ADR 0045
+adds bounded durable history and time/revision filtering without changing this
+current-snapshot schema; pagination, routing relationships, and current-snapshot
+filtering require later endpoint additions.
 
 Schema v3 is the dual-stack extension of schema v2; all Node, Service, and
 EndpointSlice semantics are unchanged.

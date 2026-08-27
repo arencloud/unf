@@ -182,12 +182,14 @@ namespace-wide isolation, same-object allow-all/default-deny replacement and rol
 Namespace relabel, and deletion/recreation convergence. Stateful same-Namespace
 return traffic when both endpoints are ingress-isolated remains outside this claim.
 
-The base deployment also creates `unf-agent-acknowledgements`. The controller
-owns only its `reports.json` data field and checkpoints authenticated reports at
-most once every two seconds; later `kubectl apply -k deploy` operations do not
-claim or clear that field. If an administrator corrupts the checkpoint, startup
-fails instead of trusting partial state. Repair or recreate that ConfigMap, then
-restart the controller; agents repopulate it through the authenticated path.
+The base deployment also pre-creates `unf-agent-acknowledgements`,
+`unf-flow-history`, and `unf-topology-history`. Exact-name RBAC allows the
+controller to get and patch these stores but not create or delete ConfigMaps. It
+owns their `reports.json`, `flows.json`, and `history.json` data fields and
+checkpoints at most once every two seconds; later `kubectl apply -k deploy`
+operations do not claim or clear those fields. If an administrator corrupts a
+checkpoint, startup fails instead of trusting partial state. Repair or recreate
+the affected ConfigMap, then restart the controller.
 
 It then applies `deploy/examples/networkpolicy-conformance.yaml`, whose policy
 deliberately omits `podSelector`, `policyTypes`, and port protocol. The verifier
@@ -281,6 +283,10 @@ Inspect the current Node/workload/Service and runtime backend relationships with
 
 ```bash
 target/debug/unfctl --controller-url http://127.0.0.1:9962 topology
+target/debug/unfctl --controller-url http://127.0.0.1:9962 \
+  topology-history --last 15m --limit 10
+target/debug/unfctl --controller-url http://127.0.0.1:9962 \
+  topology-history --since-revision 100 --until-revision 120 --output json
 target/debug/unfctl --controller-url http://127.0.0.1:9962 flows
 target/debug/unfctl --controller-url http://127.0.0.1:9962 flows --last 15m --limit 100
 target/debug/unfctl --controller-url http://127.0.0.1:9962 flows \
@@ -295,6 +301,14 @@ Ingress is the backward-compatible explanation default. For egress policy, pass
 `--direction egress`; on dual-stack Pods, pass `--ip-family ipv4` or `ipv6` so
 the reported `ipBlock` result is tied to the concrete address pair shown in the
 response.
+
+Topology history contains complete topology schema-v3 snapshots rather than
+object-level patches. The controller retains the newest 32 semantic revisions,
+coalesces Kubernetes watcher initialization into one snapshot, and checkpoints
+the newest subset that fits below the ConfigMap data ceiling. Query bounds are
+inclusive, results are newest first, and the response reports memory eviction,
+durable omission, matching, and truncation explicitly. A restored entry keeps
+its original controller epoch and capture timestamp.
 
 Flow bounds are inclusive and select aggregate entries by their exact
 `last_received_unix_ms`; they do not bucket each observation by event time. The

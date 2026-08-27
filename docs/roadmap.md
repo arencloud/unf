@@ -209,9 +209,12 @@ matrix and reproducible evidence.
   rollout reporting plus schema-validated offline analysis of saved bounded flow
   history, including controller-independent JSON/YAML/table output, affected
   workloads, shadow policy IDs, and per-flow provenance;
-- topology history and external flow-export backends;
+- Implemented and two-node Kind verified: bounded, durable full-snapshot
+  topology history with inclusive time/revision queries, newest-first limits,
+  watcher-replay coalescing, exact ConfigMap RBAC, and restart fencing;
+- external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.
 
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
 transport remain research/planned work after these foundations. The next active
-Phase 3 work now moves to topology history and external flow-export backends.
+Phase 3 work now moves to external flow-export backends.

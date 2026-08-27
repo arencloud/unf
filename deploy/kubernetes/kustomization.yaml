@@ -6,6 +6,7 @@ resources:
   - rbac.yaml
   - agent-report-store.yaml
   - flow-history-store.yaml
+  - topology-history-store.yaml
   - controller.yaml
   - service.yaml
   - agent.yaml

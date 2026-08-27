@@ -48,7 +48,8 @@ use unf_state::{
     FLOW_HISTORY_CAPACITY, FlowExportBatch, FlowExportRecord, FlowHistoryCheckpoint,
     FlowHistoryQuerySummary, FlowHistorySnapshot, FlowHistoryStore, IdentityRegistry,
     IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord,
-    PolicyStateSnapshot, RevisionSet, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode,
+    PolicyStateSnapshot, RevisionSet, TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION,
+    TopologyHistoryCheckpoint, TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode,
     TopologyService, TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort,
     TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
 };
@@ -72,6 +73,11 @@ const FLOW_HISTORY_DURABLE_ENTRY_LIMIT: usize = 1_024;
 const FLOW_HISTORY_CONFIG_MAP_DATA_LIMIT: usize = 900_000;
 const FLOW_HISTORY_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const FLOW_HISTORY_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
+const TOPOLOGY_HISTORY_STORE_NAME: &str = "unf-topology-history";
+const TOPOLOGY_HISTORY_STORE_KEY: &str = "history.json";
+const TOPOLOGY_HISTORY_CONFIG_MAP_DATA_LIMIT: usize = 900_000;
+const TOPOLOGY_HISTORY_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
+const TOPOLOGY_HISTORY_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF Kubernetes desired-state controller")]
@@ -126,6 +132,9 @@ struct ControllerMetrics {
     flow_history_persistence_writes: Counter,
     flow_history_persistence_errors: Counter,
     flow_history_entries_restored: Counter,
+    topology_history_persistence_writes: Counter,
+    topology_history_persistence_errors: Counter,
+    topology_history_entries_restored: Counter,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -159,6 +168,12 @@ struct ControllerState {
     flow_history_checkpointed_flows: AtomicU64,
     flow_history_checkpoint_omitted_flows: AtomicU64,
     flow_history_checkpoint_omitted_observations: AtomicU64,
+    topology_history: Mutex<TopologyHistoryStore>,
+    topology_history_dirty: AtomicBool,
+    topology_history_store: Option<Api<ConfigMap>>,
+    topology_history_checkpointed_snapshots: AtomicU64,
+    topology_history_checkpoint_omitted_snapshots: AtomicU64,
+    topology_initializations: AtomicU64,
     agent_reports: RwLock<BTreeMap<String, StoredAgentReport>>,
     agent_reports_dirty: AtomicBool,
     agent_report_store: Option<Api<ConfigMap>>,
@@ -441,6 +456,15 @@ struct FlowHistoryQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct TopologyHistoryQuery {
+    since_revision: Option<u64>,
+    until_revision: Option<u64>,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+}
+
 #[derive(Debug)]
 struct CompiledSimulationCandidate {
     resource_kind: PolicySimulationResourceKind,
@@ -498,8 +522,12 @@ async fn main() -> Result<()> {
         restore_flow_history(&state)
             .await
             .context("restore durable flow history")?;
+        restore_topology_history(&state)
+            .await
+            .context("restore durable topology history")?;
         spawn_agent_report_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_flow_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
+        spawn_topology_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         let client = client.context("Kubernetes client is required in connected mode")?;
         spawn_watchers(&mut tasks, client, Arc::clone(&state), cancellation.clone());
         state.ready.store(true, Ordering::Release);
@@ -512,6 +540,7 @@ async fn main() -> Result<()> {
         .route("/v1/status", get(status))
         .route("/v1/state/agents", get(agent_state))
         .route("/v1/topology", get(topology))
+        .route("/v1/topology/history", get(topology_history))
         .route("/v1/flows", get(flow_history))
         .route("/v1/explain", post(explain))
         .route("/v1/policy/simulate", post(simulate_policy))
@@ -711,6 +740,25 @@ fn register_flow_history_metrics(registry: &mut Registry, metrics: &ControllerMe
     );
 }
 
+fn register_topology_history_metrics(registry: &mut Registry, metrics: &ControllerMetrics) {
+    registry.register(
+        "unf_topology_history_persistence_writes",
+        "Durable topology-history checkpoints written by the controller",
+        metrics.topology_history_persistence_writes.clone(),
+    );
+    registry.register(
+        "unf_topology_history_persistence_errors",
+        "Durable topology-history checkpoint reads or writes that failed",
+        metrics.topology_history_persistence_errors.clone(),
+    );
+    registry.register(
+        "unf_topology_history_entries_restored",
+        "Topology-history snapshots restored at controller startup",
+        metrics.topology_history_entries_restored.clone(),
+    );
+}
+
+#[allow(clippy::too_many_lines)]
 fn new_state_with_client_and_selector(
     offline: bool,
     token_review_client: Option<Client>,
@@ -774,6 +822,7 @@ fn new_state_with_client_and_selector(
         metrics.agent_reports_restored.clone(),
     );
     register_flow_history_metrics(&mut registry, &metrics);
+    register_topology_history_metrics(&mut registry, &metrics);
     let config_map_store = token_review_client
         .clone()
         .map(|client| Api::<ConfigMap>::namespaced(client, "unf-system"));
@@ -802,6 +851,12 @@ fn new_state_with_client_and_selector(
         flow_history_checkpointed_flows: AtomicU64::new(0),
         flow_history_checkpoint_omitted_flows: AtomicU64::new(0),
         flow_history_checkpoint_omitted_observations: AtomicU64::new(0),
+        topology_history: Mutex::new(TopologyHistoryStore::default()),
+        topology_history_dirty: AtomicBool::new(false),
+        topology_history_store: config_map_store.clone(),
+        topology_history_checkpointed_snapshots: AtomicU64::new(0),
+        topology_history_checkpoint_omitted_snapshots: AtomicU64::new(0),
+        topology_initializations: AtomicU64::new(0),
         agent_reports: RwLock::new(BTreeMap::new()),
         agent_reports_dirty: AtomicBool::new(false),
         agent_report_store: config_map_store,
@@ -1112,6 +1167,142 @@ async fn persist_flow_history(state: &ControllerState) -> Result<()> {
     Ok(())
 }
 
+async fn restore_topology_history(state: &ControllerState) -> Result<()> {
+    let api = state
+        .topology_history_store
+        .as_ref()
+        .context("durable topology-history API is unavailable")?;
+    let config_map = api
+        .get(TOPOLOGY_HISTORY_STORE_NAME)
+        .await
+        .with_context(|| format!("read ConfigMap unf-system/{TOPOLOGY_HISTORY_STORE_NAME}"))?;
+    let Some(encoded) = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(TOPOLOGY_HISTORY_STORE_KEY))
+    else {
+        info!("durable topology-history store is empty");
+        return Ok(());
+    };
+    let checkpoint: TopologyHistoryCheckpoint =
+        serde_json::from_str(encoded).context("decode durable topology-history checkpoint")?;
+    let now_unix_ms = unix_time_millis();
+    for entry in &checkpoint.entries {
+        if entry.captured_at_unix_ms
+            > now_unix_ms.saturating_add(TOPOLOGY_HISTORY_MAX_FUTURE_SKEW_MILLIS)
+        {
+            return Err(anyhow!(
+                "durable topology-history revision {} is unreasonably far in the future",
+                entry.snapshot.revision.get()
+            ));
+        }
+    }
+    let restored = checkpoint.entries.len();
+    let omitted = checkpoint.omitted_snapshots;
+    let history = TopologyHistoryStore::from_checkpoint(checkpoint, TOPOLOGY_HISTORY_CAPACITY)
+        .context("validate durable topology-history checkpoint")?;
+    let latest_revision = history.latest_revision();
+    *mutex_lock(&state.topology_history) = history;
+    mutex_lock(&state.revisions).topology = latest_revision;
+    state
+        .topology_history_checkpointed_snapshots
+        .store(restored as u64, Ordering::Release);
+    state
+        .topology_history_checkpoint_omitted_snapshots
+        .store(omitted, Ordering::Release);
+    state
+        .metrics
+        .topology_history_entries_restored
+        .inc_by(restored as u64);
+    info!(restored, "restored durable topology history");
+    Ok(())
+}
+
+fn spawn_topology_history_persistence(
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+    tasks: &mut JoinSet<()>,
+) {
+    tasks.spawn(async move {
+        let mut interval = tokio::time::interval(TOPOLOGY_HISTORY_PERSISTENCE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    persist_topology_history_if_dirty(&state).await;
+                    break;
+                }
+                _ = interval.tick() => persist_topology_history_if_dirty(&state).await,
+            }
+        }
+    });
+}
+
+async fn persist_topology_history_if_dirty(state: &ControllerState) {
+    if !state.topology_history_dirty.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if let Err(error) = persist_topology_history(state).await {
+        state.topology_history_dirty.store(true, Ordering::Release);
+        state.metrics.topology_history_persistence_errors.inc();
+        warn!(%error, "could not persist topology history; retrying");
+    }
+}
+
+async fn persist_topology_history(state: &ControllerState) -> Result<()> {
+    let api = state
+        .topology_history_store
+        .as_ref()
+        .context("durable topology-history API is unavailable")?;
+    let mut entry_limit = TOPOLOGY_HISTORY_CAPACITY;
+    let (checkpoint, encoded) = loop {
+        let checkpoint = mutex_lock(&state.topology_history).checkpoint(entry_limit);
+        let encoded = serde_json::to_string(&checkpoint)
+            .context("encode durable topology-history checkpoint")?;
+        if encoded.len() <= TOPOLOGY_HISTORY_CONFIG_MAP_DATA_LIMIT {
+            break (checkpoint, encoded);
+        }
+        if entry_limit == 0 {
+            return Err(anyhow!(
+                "empty durable topology-history checkpoint exceeds ConfigMap data limit"
+            ));
+        }
+        entry_limit /= 2;
+    };
+    let data = BTreeMap::from([(TOPOLOGY_HISTORY_STORE_KEY.to_owned(), encoded)]);
+    let patch = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": TOPOLOGY_HISTORY_STORE_NAME,
+            "namespace": "unf-system",
+        },
+        "data": data,
+    });
+    api.patch(
+        TOPOLOGY_HISTORY_STORE_NAME,
+        &PatchParams::apply("unf-controller-topology-history").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch ConfigMap unf-system/{TOPOLOGY_HISTORY_STORE_NAME}"))?;
+    state
+        .topology_history_checkpointed_snapshots
+        .store(checkpoint.entries.len() as u64, Ordering::Release);
+    state
+        .topology_history_checkpoint_omitted_snapshots
+        .store(checkpoint.omitted_snapshots, Ordering::Release);
+    state.metrics.topology_history_persistence_writes.inc();
+    if checkpoint.omitted_snapshots != 0 {
+        warn!(
+            checkpointed_snapshots = checkpoint.entries.len(),
+            omitted_snapshots = checkpoint.omitted_snapshots,
+            "durable topology-history checkpoint retained only the newest bounded snapshots"
+        );
+    }
+    Ok(())
+}
+
 fn spawn_watchers(
     tasks: &mut JoinSet<()>,
     client: Client,
@@ -1214,6 +1405,7 @@ fn apply_pod_event(state: &ControllerState, event: Event<Pod>) {
             }
         }
         Event::Init => {
+            begin_topology_initialization(state);
             let had_pods = !read_lock(&state.pods).is_empty();
             write_lock(&state.pods).clear();
             mutex_lock(&state.identities).clear();
@@ -1222,7 +1414,7 @@ fn apply_pod_event(state: &ControllerState, event: Event<Pod>) {
                 bump_topology_revision(state);
             }
         }
-        Event::InitDone => {}
+        Event::InitDone => finish_topology_initialization(state),
     }
 }
 
@@ -1515,6 +1707,7 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             }
         }
         Event::Init => {
+            begin_topology_initialization(state);
             let had_nodes = !read_lock(&state.nodes).is_empty();
             write_lock(&state.nodes).clear();
             let had_gateways = !read_lock(&state.host_network_gateways).is_empty();
@@ -1534,6 +1727,9 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             if reports.len() != previous_len {
                 state.agent_reports_dirty.store(true, Ordering::Release);
             }
+            drop(reports);
+            drop(nodes);
+            finish_topology_initialization(state);
         }
     }
 }
@@ -1656,13 +1852,14 @@ fn apply_service_event(state: &ControllerState, event: Event<Service>) {
             }
         }
         Event::Init => {
+            begin_topology_initialization(state);
             let had_services = !read_lock(&state.services).is_empty();
             write_lock(&state.services).clear();
             if had_services {
                 bump_service_and_topology_revision(state);
             }
         }
-        Event::InitDone => {}
+        Event::InitDone => finish_topology_initialization(state),
     }
 }
 
@@ -1782,13 +1979,14 @@ fn apply_endpoint_slice_event(state: &ControllerState, event: Event<EndpointSlic
             }
         }
         Event::Init => {
+            begin_topology_initialization(state);
             let had_endpoint_slices = !read_lock(&state.endpoint_slices).is_empty();
             write_lock(&state.endpoint_slices).clear();
             if had_endpoint_slices {
                 bump_service_and_topology_revision(state);
             }
         }
-        Event::InitDone => {}
+        Event::InitDone => finish_topology_initialization(state),
     }
 }
 
@@ -2550,6 +2748,60 @@ async fn policy_snapshot(
 async fn topology(State(state): State<Arc<ControllerState>>) -> Json<TopologyStateSnapshot> {
     let _policy_state_guard = read_lock(&state.policy_state_guard);
     Json(topology_snapshot(&state))
+}
+
+async fn topology_history(
+    State(state): State<Arc<ControllerState>>,
+    Query(query): Query<TopologyHistoryQuery>,
+) -> Result<Json<TopologyHistorySnapshot>, ApiError> {
+    let limit = validate_topology_history_query(&query)?;
+    let _policy_state_guard = read_lock(&state.policy_state_guard);
+    let checkpointed = usize::try_from(
+        state
+            .topology_history_checkpointed_snapshots
+            .load(Ordering::Acquire),
+    )
+    .unwrap_or(usize::MAX);
+    let mut snapshot = mutex_lock(&state.topology_history).snapshot_window(
+        query.since_revision,
+        query.until_revision,
+        query.since_unix_ms,
+        query.until_unix_ms,
+        limit,
+        checkpointed,
+    );
+    snapshot.durable_omitted_snapshots = state
+        .topology_history_checkpoint_omitted_snapshots
+        .load(Ordering::Acquire);
+    Ok(Json(snapshot))
+}
+
+fn validate_topology_history_query(query: &TopologyHistoryQuery) -> Result<usize, ApiError> {
+    let limit = query.limit.unwrap_or(TOPOLOGY_HISTORY_CAPACITY);
+    if limit == 0 || limit > TOPOLOGY_HISTORY_CAPACITY {
+        return Err(ApiError::bad_request(format!(
+            "topology-history limit must be between 1 and {TOPOLOGY_HISTORY_CAPACITY}"
+        )));
+    }
+    if query
+        .since_revision
+        .zip(query.until_revision)
+        .is_some_and(|(since, until)| since > until)
+    {
+        return Err(ApiError::bad_request(
+            "topology-history since_revision must not exceed until_revision",
+        ));
+    }
+    if query
+        .since_unix_ms
+        .zip(query.until_unix_ms)
+        .is_some_and(|(since, until)| since > until)
+    {
+        return Err(ApiError::bad_request(
+            "topology-history since_unix_ms must not exceed until_unix_ms",
+        ));
+    }
+    Ok(limit)
 }
 
 fn topology_snapshot(state: &ControllerState) -> TopologyStateSnapshot {
@@ -4055,14 +4307,58 @@ fn bump_policy_revision(state: &ControllerState) {
 }
 
 fn bump_topology_revision(state: &ControllerState) {
-    let mut revisions = mutex_lock(&state.revisions);
-    revisions.topology = revisions.topology.next();
+    {
+        let mut revisions = mutex_lock(&state.revisions);
+        revisions.topology = revisions.topology.next();
+    }
+    capture_topology_history(state);
 }
 
 fn bump_service_and_topology_revision(state: &ControllerState) {
-    let mut revisions = mutex_lock(&state.revisions);
-    revisions.service = revisions.service.next();
-    revisions.topology = revisions.topology.next();
+    {
+        let mut revisions = mutex_lock(&state.revisions);
+        revisions.service = revisions.service.next();
+        revisions.topology = revisions.topology.next();
+    }
+    capture_topology_history(state);
+}
+
+fn capture_topology_history(state: &ControllerState) {
+    if state.topology_initializations.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let snapshot = topology_snapshot(state);
+    mutex_lock(&state.topology_history).record(snapshot, unix_time_millis());
+    state.topology_history_dirty.store(true, Ordering::Release);
+}
+
+fn begin_topology_initialization(state: &ControllerState) {
+    state
+        .topology_initializations
+        .fetch_add(1, Ordering::AcqRel);
+}
+
+fn finish_topology_initialization(state: &ControllerState) {
+    let mut current = state.topology_initializations.load(Ordering::Acquire);
+    loop {
+        if current == 0 {
+            return;
+        }
+        match state.topology_initializations.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                if current == 1 {
+                    capture_topology_history(state);
+                }
+                return;
+            }
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 fn controller_epoch() -> u64 {
@@ -4891,6 +5187,18 @@ mod tests {
             vec!["worker-a"]
         );
         assert!(state.agent_reports_dirty.load(Ordering::Acquire));
+        let history = mutex_lock(&state.topology_history).snapshot_window(
+            None,
+            None,
+            None,
+            None,
+            TOPOLOGY_HISTORY_CAPACITY,
+            0,
+        );
+        assert_eq!(history.retained_snapshots, 1);
+        assert_eq!(history.entries[0].snapshot.revision, Revision::new(1));
+        assert_eq!(history.entries[0].snapshot.nodes.len(), 1);
+        assert_eq!(state.topology_initializations.load(Ordering::Acquire), 0);
     }
 
     fn successful_agent_token_review(report: &AgentStateReport) -> TokenReviewStatus {
@@ -5193,6 +5501,33 @@ mod tests {
         assert_eq!(mutex_lock(&state.revisions).service, Revision::new(2));
         assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(3));
         assert!(topology_snapshot(&state).services.is_empty());
+
+        let history =
+            mutex_lock(&state.topology_history).snapshot_window(Some(2), Some(3), None, None, 1, 0);
+        assert_eq!(history.retained_snapshots, 3);
+        assert_eq!(history.query.matched_snapshots, 2);
+        assert_eq!(history.query.returned_snapshots, 1);
+        assert!(history.query.truncated);
+        assert_eq!(history.entries[0].snapshot.revision, Revision::new(3));
+        assert!(history.entries[0].snapshot.services.is_empty());
+        assert!(state.topology_history_dirty.load(Ordering::Acquire));
+
+        assert!(validate_topology_history_query(&TopologyHistoryQuery::default()).is_ok());
+        assert!(
+            validate_topology_history_query(&TopologyHistoryQuery {
+                since_revision: Some(4),
+                until_revision: Some(3),
+                ..TopologyHistoryQuery::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_topology_history_query(&TopologyHistoryQuery {
+                limit: Some(TOPOLOGY_HISTORY_CAPACITY + 1),
+                ..TopologyHistoryQuery::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]

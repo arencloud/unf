@@ -287,7 +287,7 @@ else
     "${kc[@]}" -n unf-system delete service unf-controller \
         --ignore-not-found >/dev/null
     "${kc[@]}" -n unf-system delete configmap \
-        unf-agent-acknowledgements unf-flow-history unf-internal-ca \
+        unf-agent-acknowledgements unf-flow-history unf-topology-history unf-internal-ca \
         --ignore-not-found >/dev/null
     "${kc[@]}" -n unf-system delete secret \
         unf-internal-tls unf-quay-pull --ignore-not-found >/dev/null

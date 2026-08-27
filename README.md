@@ -181,6 +181,9 @@ Implemented in the repository:
 - `unfctl policy shadow-impact` for observation-weighted live rollout evidence,
   or `--flows-file <snapshot>` for schema-validated analysis that performs no
   controller request and can run after the snapshot is moved off-cluster;
+- `unfctl topology-history` for bounded, revision- and time-filtered topology
+  schema-v3 snapshots with restart-safe checkpoint fencing and explicit
+  eviction/omission accounting;
 - a reproducible dual-stack two-node kind demo covering native and NetworkPolicy
   cross-node IPv4/IPv6 allow/drop, bounded IPv6 extension-header allow/drop,
   namespace-selector convergence,

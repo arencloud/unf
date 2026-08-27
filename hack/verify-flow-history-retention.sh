@@ -48,7 +48,15 @@ wait_for_target_flow() {
     local controller=$1
     local since_unix_ms=$2
     local snapshot
-    for _ in {1..45}; do
+    local response
+    for attempt in {1..45}; do
+        if (( (attempt - 1) % 5 == 0 )); then
+            for _ in {1..4}; do
+                response=$("${kc[@]}" exec -n frontend client -- \
+                    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080)
+                [[ ${response} == unf-demo-ok ]]
+            done
+        fi
         snapshot=$(controller_raw "${controller}" /v1/flows 2>/dev/null || true)
         if jq -e --argjson since "${since_unix_ms}" '
             .schema_version == 4

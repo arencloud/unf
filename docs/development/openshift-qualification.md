@@ -133,8 +133,9 @@ exact projected bundles, unchanged Pod UIDs, and a final platform-issued chain.
 An exit trap restores the original certificate contract on failure.
 
 `make openshift-agent-report-retention-test` verifies the controller service
-account can only get/patch the exact `unf-agent-acknowledgements` ConfigMap, waits
-for one validated report per selected worker, replaces only the controller, and
+account can get/patch the exact `unf-agent-acknowledgements` ConfigMap but cannot
+create or delete ConfigMaps, waits for one validated report per selected worker,
+replaces only the controller, and
 requires the new process to expose the exact restored count. It then requires a
 new controller epoch to converge, the checkpoint receive time to advance, zero
 persistence errors, and unchanged agent Pod UIDs and restart counts.

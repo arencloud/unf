@@ -30,6 +30,27 @@ enum Command {
     Status,
     /// Show the current versioned Node, workload, and Service topology.
     Topology,
+    /// Show bounded historical topology revisions.
+    TopologyHistory {
+        /// Restrict to snapshots captured within this duration.
+        #[arg(long, value_parser = parse_duration_millis, conflicts_with = "since_unix_ms")]
+        last: Option<u64>,
+        /// Inclusive lower topology revision bound.
+        #[arg(long)]
+        since_revision: Option<u64>,
+        /// Inclusive upper topology revision bound.
+        #[arg(long)]
+        until_revision: Option<u64>,
+        /// Inclusive lower snapshot-capture timestamp bound.
+        #[arg(long)]
+        since_unix_ms: Option<u64>,
+        /// Inclusive upper snapshot-capture timestamp bound.
+        #[arg(long)]
+        until_unix_ms: Option<u64>,
+        /// Maximum number of newest matching snapshots to return.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Show bounded flow history exported by node agents.
     Flows {
         /// Restrict to flows last received within this duration (for example 15m or 2h).
@@ -178,6 +199,7 @@ async fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let client = reqwest::Client::new();
@@ -186,17 +208,39 @@ async fn run() -> Result<()> {
         Command::Topology => {
             get_json(&client, &format!("{}/v1/topology", cli.controller_url)).await?
         }
+        Command::TopologyHistory {
+            last,
+            since_revision,
+            until_revision,
+            since_unix_ms,
+            until_unix_ms,
+            limit,
+        } => {
+            topology_history_value(
+                &client,
+                &cli.controller_url,
+                *last,
+                *since_revision,
+                *until_revision,
+                *since_unix_ms,
+                *until_unix_ms,
+                *limit,
+            )
+            .await?
+        }
         Command::Flows {
             last,
             since_unix_ms,
             until_unix_ms,
             limit,
         } => {
-            let (since_unix_ms, until_unix_ms) =
-                resolve_flow_window(*last, *since_unix_ms, *until_unix_ms, unix_time_millis()?)?;
-            get_json(
+            flow_history_value(
                 &client,
-                &flow_history_url(&cli.controller_url, since_unix_ms, until_unix_ms, *limit),
+                &cli.controller_url,
+                *last,
+                *since_unix_ms,
+                *until_unix_ms,
+                *limit,
             )
             .await?
         }
@@ -208,20 +252,15 @@ async fn run() -> Result<()> {
             protocol,
             port,
         } => {
-            if *port == 0 {
-                bail!("port must be between 1 and 65535");
-            }
-            post_json(
+            explanation_value(
                 &client,
-                &format!("{}/v1/explain", cli.controller_url),
-                &ExplainRequest {
-                    from,
-                    to,
-                    direction: *direction,
-                    ip_family: *ip_family,
-                    protocol: *protocol,
-                    port: *port,
-                },
+                &cli.controller_url,
+                from,
+                to,
+                *direction,
+                *ip_family,
+                *protocol,
+                *port,
             )
             .await?
         }
@@ -269,6 +308,79 @@ async fn run() -> Result<()> {
         }
     };
     print_value(&value, cli.output)
+}
+
+async fn flow_history_value(
+    client: &reqwest::Client,
+    controller_url: &str,
+    last: Option<u64>,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+) -> Result<Value> {
+    let (since_unix_ms, until_unix_ms) =
+        resolve_time_window(last, since_unix_ms, until_unix_ms, unix_time_millis()?)?;
+    get_json(
+        client,
+        &flow_history_url(controller_url, since_unix_ms, until_unix_ms, limit),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn explanation_value(
+    client: &reqwest::Client,
+    controller_url: &str,
+    from: &str,
+    to: &str,
+    direction: Direction,
+    ip_family: Option<IpFamily>,
+    protocol: Protocol,
+    port: u16,
+) -> Result<Value> {
+    if port == 0 {
+        bail!("port must be between 1 and 65535");
+    }
+    post_json(
+        client,
+        &format!("{controller_url}/v1/explain"),
+        &ExplainRequest {
+            from,
+            to,
+            direction,
+            ip_family,
+            protocol,
+            port,
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn topology_history_value(
+    client: &reqwest::Client,
+    controller_url: &str,
+    last: Option<u64>,
+    since_revision: Option<u64>,
+    until_revision: Option<u64>,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+) -> Result<Value> {
+    let (since_unix_ms, until_unix_ms) =
+        resolve_time_window(last, since_unix_ms, until_unix_ms, unix_time_millis()?)?;
+    get_json(
+        client,
+        &topology_history_url(
+            controller_url,
+            since_revision,
+            until_revision,
+            since_unix_ms,
+            until_unix_ms,
+            limit,
+        ),
+    )
+    .await
 }
 
 async fn policy_simulation_value(
@@ -319,7 +431,7 @@ async fn shadow_impact_value(
         (snapshot, format!("offline:{}", path.display()))
     } else {
         let (since_unix_ms, until_unix_ms) =
-            resolve_flow_window(last, since_unix_ms, until_unix_ms, unix_time_millis()?)?;
+            resolve_time_window(last, since_unix_ms, until_unix_ms, unix_time_millis()?)?;
         let value = get_json(
             client,
             &flow_history_url(controller_url, since_unix_ms, until_unix_ms, limit),
@@ -395,6 +507,13 @@ fn print_table(value: &Value) {
         && value.get("entries").is_some()
     {
         print_flow_history_table(value);
+        return;
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && value.get("retained_snapshots").is_some()
+        && value.get("entries").is_some()
+    {
+        print_topology_history_table(value);
         return;
     }
     if matches!(
@@ -620,6 +739,50 @@ fn print_flow_history_table(value: &Value) {
     }
 }
 
+fn print_topology_history_table(value: &Value) {
+    println!("Topology History");
+    println!(
+        "retention                snapshots={}/{} evicted={} checkpointed={} omitted={}",
+        number_field(value, "retained_snapshots"),
+        number_field(value, "capacity"),
+        number_field(value, "evicted_snapshots"),
+        number_field(value, "durable_checkpointed_snapshots"),
+        number_field(value, "durable_omitted_snapshots")
+    );
+    let query = &value["query"];
+    println!(
+        "query                    revisions={}..{} time={}..{} matched={} returned={} truncated={}",
+        optional_number_field(query, "since_revision"),
+        optional_number_field(query, "until_revision"),
+        optional_number_field(query, "since_unix_ms"),
+        optional_number_field(query, "until_unix_ms"),
+        number_field(query, "matched_snapshots"),
+        number_field(query, "returned_snapshots"),
+        query
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    if let Some(entries) = value.get("entries").and_then(Value::as_array) {
+        for entry in entries.iter().take(50) {
+            let snapshot = &entry["snapshot"];
+            println!(
+                "snapshot                 revision={} captured={} epoch={} identity={} nodes={} workloads={} services={}",
+                number_field(snapshot, "revision"),
+                number_field(entry, "captured_at_unix_ms"),
+                number_field(snapshot, "source_epoch"),
+                number_field(snapshot, "identity_revision"),
+                snapshot["nodes"].as_array().map_or(0, Vec::len),
+                snapshot["workloads"].as_array().map_or(0, Vec::len),
+                snapshot["services"].as_array().map_or(0, Vec::len)
+            );
+        }
+        if entries.len() > 50 {
+            println!("snapshots omitted        {}", entries.len() - 50);
+        }
+    }
+}
+
 fn optional_number_field(value: &Value, field: &str) -> String {
     value
         .get(field)
@@ -662,7 +825,7 @@ fn unix_time_millis() -> Result<u64> {
     .context("Unix time does not fit in u64 milliseconds")
 }
 
-fn resolve_flow_window(
+fn resolve_time_window(
     last_millis: Option<u64>,
     since_unix_ms: Option<u64>,
     until_unix_ms: Option<u64>,
@@ -693,7 +856,7 @@ fn policy_simulation_flow_history(
     now_unix_ms: u64,
 ) -> Result<Option<PolicySimulationFlowHistoryQuery>> {
     let (since_unix_ms, until_unix_ms) =
-        resolve_flow_window(last_millis, since_unix_ms, until_unix_ms, now_unix_ms)?;
+        resolve_time_window(last_millis, since_unix_ms, until_unix_ms, now_unix_ms)?;
     if since_unix_ms.is_none() && until_unix_ms.is_none() && limit.is_none() {
         return Ok(None);
     }
@@ -721,6 +884,35 @@ fn flow_history_url(
         parameters.push(format!("limit={value}"));
     }
     let base = format!("{controller_url}/v1/flows");
+    if parameters.is_empty() {
+        base
+    } else {
+        format!("{base}?{}", parameters.join("&"))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn topology_history_url(
+    controller_url: &str,
+    since_revision: Option<u64>,
+    until_revision: Option<u64>,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+) -> String {
+    let mut parameters = Vec::new();
+    for (name, value) in [
+        ("since_revision", since_revision),
+        ("until_revision", until_revision),
+        ("since_unix_ms", since_unix_ms),
+        ("until_unix_ms", until_unix_ms),
+        ("limit", limit.map(|value| value as u64)),
+    ] {
+        if let Some(value) = value {
+            parameters.push(format!("{name}={value}"));
+        }
+    }
+    let base = format!("{controller_url}/v1/topology/history");
     if parameters.is_empty() {
         base
     } else {
@@ -1116,6 +1308,47 @@ mod tests {
     }
 
     #[test]
+    fn topology_history_command_builds_bounded_query() {
+        let cli = Cli::try_parse_from([
+            "unfctl",
+            "topology-history",
+            "--since-revision",
+            "12",
+            "--until-revision",
+            "20",
+            "--last",
+            "15m",
+            "--limit",
+            "5",
+            "--output",
+            "json",
+        ])
+        .expect("topology-history command parses");
+        assert!(matches!(
+            cli.command,
+            Command::TopologyHistory {
+                last: Some(900_000),
+                since_revision: Some(12),
+                until_revision: Some(20),
+                since_unix_ms: None,
+                until_unix_ms: None,
+                limit: Some(5),
+            }
+        ));
+        assert_eq!(
+            topology_history_url(
+                "http://controller",
+                Some(12),
+                Some(20),
+                Some(1_100_000),
+                Some(2_000_000),
+                Some(5),
+            ),
+            "http://controller/v1/topology/history?since_revision=12&until_revision=20&since_unix_ms=1100000&until_unix_ms=2000000&limit=5"
+        );
+    }
+
+    #[test]
     fn flows_command_parses() {
         let cli = Cli::try_parse_from([
             "unfctl", "flows", "--last", "15m", "--limit", "25", "--output", "json",
@@ -1132,7 +1365,7 @@ mod tests {
         ));
         assert!(matches!(cli.output, Output::Json));
         assert_eq!(
-            resolve_flow_window(Some(900_000), None, None, 2_000_000)
+            resolve_time_window(Some(900_000), None, None, 2_000_000)
                 .expect("relative flow window resolves"),
             (Some(1_100_000), Some(2_000_000))
         );

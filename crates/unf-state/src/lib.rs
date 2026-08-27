@@ -1,6 +1,6 @@
 //! Revisioned control-plane state and stable identity metadata.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,9 @@ use unf_common::{IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
+pub const TOPOLOGY_HISTORY_SCHEMA_VERSION: u16 = 1;
+pub const TOPOLOGY_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
+pub const TOPOLOGY_HISTORY_CAPACITY: usize = 32;
 pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 3;
 pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
@@ -753,6 +756,232 @@ pub struct TopologyStateSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyHistoryEntry {
+    pub captured_at_unix_ms: u64,
+    pub snapshot: TopologyStateSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyHistoryQuerySummary {
+    pub since_revision: Option<u64>,
+    pub until_revision: Option<u64>,
+    pub since_unix_ms: Option<u64>,
+    pub until_unix_ms: Option<u64>,
+    pub limit: usize,
+    pub matched_snapshots: usize,
+    pub returned_snapshots: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyHistorySnapshot {
+    pub schema_version: u16,
+    pub capacity: usize,
+    pub retained_snapshots: usize,
+    pub evicted_snapshots: u64,
+    pub durable_checkpointed_snapshots: usize,
+    pub durable_omitted_snapshots: u64,
+    pub query: TopologyHistoryQuerySummary,
+    pub entries: Vec<TopologyHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyHistoryCheckpoint {
+    pub schema_version: u16,
+    pub evicted_snapshots: u64,
+    pub omitted_snapshots: u64,
+    pub entries: Vec<TopologyHistoryEntry>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TopologyHistoryCheckpointError {
+    #[error("unsupported topology-history checkpoint schema {actual}; expected {expected}")]
+    UnsupportedSchema { actual: u16, expected: u16 },
+    #[error("topology-history checkpoint contains {actual} entries; capacity is {capacity}")]
+    CapacityExceeded { actual: usize, capacity: usize },
+    #[error("topology-history checkpoint entry has an invalid capture timestamp")]
+    InvalidTimestamp,
+    #[error("topology-history checkpoint contains unsupported topology schema {actual}")]
+    UnsupportedTopologySchema { actual: u16 },
+    #[error("topology-history checkpoint revisions are not strictly increasing")]
+    InvalidRevisionOrder,
+    #[error("topology-history checkpoint contains a duplicate epoch/revision fence")]
+    DuplicateFence,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct TopologyHistoryStore {
+    capacity: usize,
+    entries: VecDeque<TopologyHistoryEntry>,
+    evicted_snapshots: u64,
+    durable_omitted_snapshots: u64,
+}
+
+impl Default for TopologyHistoryStore {
+    fn default() -> Self {
+        Self::with_capacity(TOPOLOGY_HISTORY_CAPACITY)
+    }
+}
+
+impl TopologyHistoryStore {
+    #[must_use]
+    pub const fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: VecDeque::new(),
+            evicted_snapshots: 0,
+            durable_omitted_snapshots: 0,
+        }
+    }
+
+    pub fn record(&mut self, snapshot: TopologyStateSnapshot, captured_at_unix_ms: u64) {
+        if self.capacity == 0 {
+            self.evicted_snapshots = self.evicted_snapshots.saturating_add(1);
+            return;
+        }
+        if let Some(latest) = self.entries.back_mut()
+            && latest.snapshot.source_epoch == snapshot.source_epoch
+            && latest.snapshot.revision == snapshot.revision
+        {
+            *latest = TopologyHistoryEntry {
+                captured_at_unix_ms,
+                snapshot,
+            };
+            return;
+        }
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+            self.evicted_snapshots = self.evicted_snapshots.saturating_add(1);
+        }
+        self.entries.push_back(TopologyHistoryEntry {
+            captured_at_unix_ms,
+            snapshot,
+        });
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapshot_window(
+        &self,
+        since_revision: Option<u64>,
+        until_revision: Option<u64>,
+        since_unix_ms: Option<u64>,
+        until_unix_ms: Option<u64>,
+        limit: usize,
+        durable_checkpointed_snapshots: usize,
+    ) -> TopologyHistorySnapshot {
+        let matched: Vec<_> = self
+            .entries
+            .iter()
+            .rev()
+            .filter(|entry| {
+                let revision = entry.snapshot.revision.get();
+                since_revision.is_none_or(|since| revision >= since)
+                    && until_revision.is_none_or(|until| revision <= until)
+                    && since_unix_ms.is_none_or(|since| entry.captured_at_unix_ms >= since)
+                    && until_unix_ms.is_none_or(|until| entry.captured_at_unix_ms <= until)
+            })
+            .collect();
+        let matched_snapshots = matched.len();
+        let entries = matched.into_iter().take(limit).cloned().collect::<Vec<_>>();
+        TopologyHistorySnapshot {
+            schema_version: TOPOLOGY_HISTORY_SCHEMA_VERSION,
+            capacity: self.capacity,
+            retained_snapshots: self.entries.len(),
+            evicted_snapshots: self.evicted_snapshots,
+            durable_checkpointed_snapshots,
+            durable_omitted_snapshots: self.durable_omitted_snapshots,
+            query: TopologyHistoryQuerySummary {
+                since_revision,
+                until_revision,
+                since_unix_ms,
+                until_unix_ms,
+                limit,
+                matched_snapshots,
+                returned_snapshots: entries.len(),
+                truncated: entries.len() < matched_snapshots,
+            },
+            entries,
+        }
+    }
+
+    #[must_use]
+    pub fn checkpoint(&self, entry_limit: usize) -> TopologyHistoryCheckpoint {
+        let retained = self.entries.len().min(entry_limit);
+        TopologyHistoryCheckpoint {
+            schema_version: TOPOLOGY_HISTORY_CHECKPOINT_SCHEMA_VERSION,
+            evicted_snapshots: self.evicted_snapshots,
+            omitted_snapshots: self
+                .durable_omitted_snapshots
+                .saturating_add(self.entries.len().saturating_sub(retained) as u64),
+            entries: self
+                .entries
+                .iter()
+                .skip(self.entries.len().saturating_sub(retained))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Reconstructs bounded topology history from a validated checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TopologyHistoryCheckpointError`] when the checkpoint schema,
+    /// bounds, timestamps, topology schemas, or revision ordering are invalid.
+    pub fn from_checkpoint(
+        checkpoint: TopologyHistoryCheckpoint,
+        capacity: usize,
+    ) -> Result<Self, TopologyHistoryCheckpointError> {
+        if checkpoint.schema_version != TOPOLOGY_HISTORY_CHECKPOINT_SCHEMA_VERSION {
+            return Err(TopologyHistoryCheckpointError::UnsupportedSchema {
+                actual: checkpoint.schema_version,
+                expected: TOPOLOGY_HISTORY_CHECKPOINT_SCHEMA_VERSION,
+            });
+        }
+        if checkpoint.entries.len() > capacity {
+            return Err(TopologyHistoryCheckpointError::CapacityExceeded {
+                actual: checkpoint.entries.len(),
+                capacity,
+            });
+        }
+        let mut fences = BTreeSet::new();
+        let mut previous_revision = None;
+        for entry in &checkpoint.entries {
+            if entry.captured_at_unix_ms == 0 {
+                return Err(TopologyHistoryCheckpointError::InvalidTimestamp);
+            }
+            if entry.snapshot.schema_version != TOPOLOGY_SNAPSHOT_SCHEMA_VERSION {
+                return Err(TopologyHistoryCheckpointError::UnsupportedTopologySchema {
+                    actual: entry.snapshot.schema_version,
+                });
+            }
+            let revision = entry.snapshot.revision.get();
+            if !fences.insert((entry.snapshot.source_epoch, revision)) {
+                return Err(TopologyHistoryCheckpointError::DuplicateFence);
+            }
+            if revision == 0 || previous_revision.is_some_and(|previous| revision <= previous) {
+                return Err(TopologyHistoryCheckpointError::InvalidRevisionOrder);
+            }
+            previous_revision = Some(revision);
+        }
+        Ok(Self {
+            capacity,
+            entries: checkpoint.entries.into(),
+            evicted_snapshots: checkpoint.evicted_snapshots,
+            durable_omitted_snapshots: checkpoint.omitted_snapshots,
+        })
+    }
+
+    #[must_use]
+    pub fn latest_revision(&self) -> Revision {
+        self.entries
+            .back()
+            .map_or(Revision::INITIAL, |entry| entry.snapshot.revision)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkIdentity {
     pub id: IdentityId,
     pub cluster: String,
@@ -1289,12 +1518,11 @@ mod tests {
         assert_eq!(registry.revision(), Revision::new(1));
     }
 
-    #[test]
-    fn topology_snapshot_schema_round_trips() {
-        let snapshot = TopologyStateSnapshot {
+    fn topology_snapshot(revision: u64) -> TopologyStateSnapshot {
+        TopologyStateSnapshot {
             schema_version: TOPOLOGY_SNAPSHOT_SCHEMA_VERSION,
             source_epoch: 17,
-            revision: Revision::new(4),
+            revision: Revision::new(revision),
             identity_revision: Revision::new(3),
             nodes: vec![TopologyNode {
                 name: "worker-a".to_owned(),
@@ -1344,11 +1572,75 @@ mod tests {
                     }],
                 }],
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn topology_snapshot_schema_round_trips() {
+        let snapshot = topology_snapshot(4);
         let encoded = serde_json::to_vec(&snapshot).expect("topology snapshot serializes");
         let decoded: TopologyStateSnapshot =
             serde_json::from_slice(&encoded).expect("topology snapshot deserializes");
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn topology_history_is_bounded_queryable_and_restart_safe() {
+        let mut store = TopologyHistoryStore::with_capacity(3);
+        for (revision, captured_at) in [(1, 100), (2, 200), (3, 300), (4, 400)] {
+            store.record(topology_snapshot(revision), captured_at);
+        }
+
+        let bounded = store.snapshot_window(Some(2), Some(4), Some(200), None, 2, 0);
+        assert_eq!(bounded.schema_version, TOPOLOGY_HISTORY_SCHEMA_VERSION);
+        assert_eq!(bounded.retained_snapshots, 3);
+        assert_eq!(bounded.evicted_snapshots, 1);
+        assert_eq!(bounded.query.matched_snapshots, 3);
+        assert_eq!(bounded.query.returned_snapshots, 2);
+        assert!(bounded.query.truncated);
+        assert_eq!(bounded.entries[0].snapshot.revision, Revision::new(4));
+        assert_eq!(bounded.entries[1].snapshot.revision, Revision::new(3));
+
+        let checkpoint = store.checkpoint(2);
+        assert_eq!(checkpoint.omitted_snapshots, 1);
+        let restored = TopologyHistoryStore::from_checkpoint(checkpoint, 3)
+            .expect("valid topology history restores");
+        assert_eq!(restored.latest_revision(), Revision::new(4));
+        let restored_snapshot = restored.snapshot_window(None, None, None, None, 3, 2);
+        assert_eq!(restored_snapshot.retained_snapshots, 2);
+        assert_eq!(restored_snapshot.durable_omitted_snapshots, 1);
+        assert_eq!(restored_snapshot.durable_checkpointed_snapshots, 2);
+    }
+
+    #[test]
+    fn topology_history_rejects_untrusted_checkpoints() {
+        let mut store = TopologyHistoryStore::with_capacity(2);
+        store.record(topology_snapshot(1), 100);
+        store.record(topology_snapshot(2), 200);
+
+        let mut checkpoint = store.checkpoint(2);
+        checkpoint.entries[1].snapshot.revision = Revision::new(1);
+        checkpoint.entries[1].snapshot.source_epoch = 18;
+        assert_eq!(
+            TopologyHistoryStore::from_checkpoint(checkpoint, 2),
+            Err(TopologyHistoryCheckpointError::InvalidRevisionOrder)
+        );
+
+        let mut checkpoint = store.checkpoint(2);
+        checkpoint.entries[1].snapshot.revision = Revision::new(1);
+        assert_eq!(
+            TopologyHistoryStore::from_checkpoint(checkpoint, 2),
+            Err(TopologyHistoryCheckpointError::DuplicateFence)
+        );
+
+        let mut checkpoint = store.checkpoint(2);
+        checkpoint.entries[0].snapshot.schema_version = TOPOLOGY_SNAPSHOT_SCHEMA_VERSION - 1;
+        assert_eq!(
+            TopologyHistoryStore::from_checkpoint(checkpoint, 2),
+            Err(TopologyHistoryCheckpointError::UnsupportedTopologySchema {
+                actual: TOPOLOGY_SNAPSHOT_SCHEMA_VERSION - 1,
+            })
+        );
     }
 
     fn flow_record(

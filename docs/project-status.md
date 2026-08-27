@@ -175,10 +175,11 @@ release gate.
   explicit drop, eviction, and omission counters. Query windows select aggregate
   entries by last-received time rather than bucketing observations. History is not
   an HA database, sampled, or deduplicated across interface-level observations.
-- Topology schema v3 reports current in-memory Node, dual-stack Pod workload,
-  Service intent, and EndpointSlice runtime relationships. Conditions are
-  Kubernetes-reported state rather than active traffic health; topology history,
-  filtering,
+- Topology schema v3 reports current Node, dual-stack Pod workload, Service
+  intent, and EndpointSlice runtime relationships. Topology-history schema v1
+  retains 32 complete semantic revisions with inclusive time/revision filtering
+  and bounded ConfigMap restart recovery. Conditions remain Kubernetes-reported
+  state rather than active traffic health; current-snapshot filtering,
   pagination, and routing/load-balancing behavior are not implemented.
 - The NetworkPolicy adapter intentionally accepts only the documented ingress
   subset. Omitted target selectors, policy types, and port protocols follow the
@@ -235,6 +236,7 @@ release gate.
 | Policy simulation foundation | **Verified** | Versioned read-only add/replace API and `unfctl policy simulate` compare current/proposed provenance over a bounded topology-derived matrix and retained flow history. Schema v4 accepts native and Kubernetes policy resources, expands the matrix by direction and shared address family, and retains optional inclusive history bounds, newest-first limits, selection metadata, and explicit truncation. Unit and Kind gates prove exact/empty selection, egress impact, revision stability, and unchanged forwarding |
 | Shadow rollout and offline impact analysis | **Verified** | Shadow-impact schema v1 aggregates schema-v4 history into observation-weighted would-deny/would-allow, same-verdict, provenance-change, affected-workload, and shadow-policy summaries with bounded per-flow evidence. `unfctl policy shadow-impact` supports live history windows/limits, while `--flows-file` accepts a saved JSON/YAML snapshot, validates its schema/query/timestamps/counts, and never contacts the controller. Unit tests cover aggregation and untrusted input; `make kind-test` captures a real allow-plus-shadow-deny TCP/9090 record, verifies the live report, and repeats JSON/table analysis with an intentionally unreachable controller URL. ADR 0044 records the contract |
 | Better topology state | **Verified** | Topology schema v3 preserves selector intent, adds per-workload IPv6 addresses, and retains EndpointSlice-derived address/port, Pod target, Node/zone, and ready/serving/terminating backend state; unit tests prove normalization, idempotence, stale-state removal, and revision isolation, while `make kind-test` exercises dual-stack state and not-ready → ready → deleted backend transitions without policy-revision mutation |
+| Durable topology history | **Verified** | Topology-history schema v1 retains the newest 32 complete schema-v3 snapshots, with original epoch/revision/capture-time fences, inclusive time and revision windows, newest-first limits, and explicit eviction/checkpoint/omission/truncation metadata. Watcher initialization is coalesced so restart reconstruction cannot flood the ring. A pre-created exact-name ConfigMap checkpoint adapts to the 900,000-byte ceiling. Unit tests cover bounds, restore, malformed ordering/schema, and initialization coalescing; `make kind-topology-history-test` proves not-ready/ready/deleted lifecycle evidence, exact RBAC, JSON/table queries, restart restoration, revision continuation, and zero agent replacements. ADR 0045 records the contract |
 | Historical flow export | **Verified** | Agent export schema v3, non-blocking 4,096-record channel, 2,048-key pending aggregation, 512-entry authenticated HTTPS batches, and 4,096-key revisioned controller retention preserve direction-separated dual-stack keys with explicit drop/eviction accounting. Snapshot schema v4 adds inclusive last-received bounds, newest-first limits, query metadata, and bounded checkpoint/restoration metadata; checkpoint schema v2 preserves the newest 1,024 keys within 900,000 bytes and migrates v1 as ingress. Unit tests cover query, restoration, validation, migration, direction separation, and drop baselines; `make kind-flow-history-retention-test` proves exact RBAC and restart continuity without agent replacement, and is included in `make kind-test` |
 
 ## Updating this tracker
