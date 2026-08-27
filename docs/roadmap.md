@@ -223,17 +223,21 @@ matrix and reproducible evidence.
   controller-first upgrades with an explicit persistent-BPF/wire-schema tuple,
   deterministic mixed-agent rollout, authenticated reconvergence, continuous
   forwarding/telemetry, and reversible agent/controller rollback;
+- Implemented and two-node Kind verified for one exact window: a strict
+  two-commit same-tuple skipped upgrade requires version metadata from every N
+  and N+2 component, then repeats controller-first mixed rollout, agent and
+  controller downgrade/forward recovery, forwarding, and telemetry checks;
 - Implemented and bounded two-node Kind verified: deterministic 24-workload
   ingress/egress scale generation, measured Namespace/Pod/policy churn,
   simultaneous two-agent pinned-state recovery with the controller offline,
   continuous dual-stack forwarding, bounded queue/error behavior, exact cleanup,
   and schema-versioned environment/provenance evidence;
-- skipped/incompatible-version, OpenShift upgrade, and platform-version
-  validation.
+- incompatible-version, unsupported downgrade/migration, OpenShift upgrade, and
+  platform-version validation.
 
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
 transport remain research/planned work after these foundations. The next active
-Phase 3 work is skipped/incompatible-version and OpenShift/version-matrix qualification,
+Phase 3 work is incompatible-version/downgrade-migration and OpenShift/version-matrix qualification,
 plus additional external transport adapters where product requirements justify
 them.
 
