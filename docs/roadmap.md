@@ -239,11 +239,15 @@ matrix and reproducible evidence.
 - Completed and two-node Kind verified: status, controller aggregation, metrics,
   and logs classify compatible rollback, blocked rollback, and recovery while a
   bounded fail-closed window preserves rejection visibility before retry;
-- OpenShift upgrade and broader platform-version validation remain.
+- Completed on dual-stack OpenShift cl02: six immutable N/N+1 development
+  artifacts, full endpoint platform gates, controller-first and worker-serial
+  rollout, complete rollback/forward recovery, sustained dual-stack policy
+  enforcement, provenance/telemetry continuity, and healthy operators;
+- Broader platform-version validation remains.
 
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
 transport remain research/planned work after these foundations. The next active
-Phase 3 work is OpenShift upgrade and platform/version-matrix qualification,
+Phase 3 work is broader platform/version-matrix qualification and closure,
 plus additional external transport adapters where product requirements justify
 them.
 

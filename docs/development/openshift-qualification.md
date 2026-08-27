@@ -58,6 +58,8 @@ logged.
 make openshift-images
 make openshift-deploy
 make openshift-test
+make openshift-upgrade-images UNF_OPENSHIFT_UPGRADE_BASELINE_REF=<committed-N>
+make openshift-upgrade-test
 make openshift-tls-rotation-test
 make openshift-agent-report-retention-test
 make openshift-host-mount-policy-test
@@ -70,6 +72,7 @@ Select a non-default qualification cluster explicitly:
 ```bash
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-deploy
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-test
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-upgrade-test
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-tls-rotation-test
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-agent-report-retention-test
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-host-mount-policy-test
@@ -149,6 +152,53 @@ ephemeral-container host-volume access.
 
 `make openshift-test` invokes this gate before its dataplane qualification.
 
+## Digest-pinned upgrade qualification
+
+The upgrade gate is separate from the mutable `:dev` deployment workflow. Run
+it only from a clean committed revision. First publish controller, agent, and
+test-tool images for an ancestor N and the current N+1 revision:
+
+```bash
+make openshift-upgrade-images \
+  UNF_OPENSHIFT_UPGRADE_BASELINE_REF=<committed-N>
+```
+
+The publisher uses unique revision tags but resolves and records immutable
+repository digests in
+`.artifacts/phase3-openshift-upgrade-images.json`. The record includes both
+full Git revisions and their commit distance. The transition gate rejects a
+dirty tree, a record that does not name the current revision, a non-ancestor N,
+or an image that is not addressed by digest.
+
+Qualify the recorded pair against an explicitly selected lab cluster:
+
+```bash
+make openshift-upgrade-test \
+  OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig"
+```
+
+The gate runs the full adaptive endpoint suite at N and N+1. Between those
+endpoints it proves controller-first compatibility, one-worker-at-a-time agent
+rollout, complete agent/controller rollback, and controller-first plus
+worker-serial recovery. Every transition checks exact revisions, authenticated
+convergence, compatibility tuples, dual-stack policy enforcement and
+provenance, advancing telemetry, platform security invariants, and cluster
+operator health.
+
+Direct stage assertions are strict. The background continuity monitor fails
+immediately if a denied flow succeeds and reports an allowed-flow breach after
+three consecutive one-second failures, so an isolated transport loss is
+retained as diagnostic noise rather than misclassified as a sustained
+dataplane gap. Its diagnostics include UTC time and the probed address.
+
+The latest result is written to
+`.artifacts/phase3-openshift-upgrade-result.json`; every attempt is appended to
+`.artifacts/phase3-openshift-upgrade-attempts.jsonl`. A failure trap removes
+qualification fixtures and restores the recorded N+1 Deployment and rolling
+DaemonSet. These local artifacts contain no registry credential, kubeadmin
+password, projected token, or kubeconfig content. ADR 0054 records the exact
+live-verified cl02 window and the non-transitive support boundary.
+
 `make openshift-uninstall` is always a non-mutating plan unless explicit
 execution arguments are supplied. It inventories all Ready agents, runs the
 ownership-checked current-ABI/legacy cleanup planner on each node, and reports
@@ -190,4 +240,6 @@ database. See [ADR 0025](../adr/0025-constrained-openshift-agent-scc.md),
 [ADR 0026](../adr/0026-hot-certificate-and-trust-rotation.md),
 [ADR 0027](../adr/0027-durable-agent-acknowledgement-checkpoint.md),
 [ADR 0028](../adr/0028-path-specific-openshift-host-mount-admission.md), and
-[ADR 0029](../adr/0029-coordinated-openshift-uninstall.md).
+[ADR 0029](../adr/0029-coordinated-openshift-uninstall.md). Digest-pinned
+version-transition qualification is specified by
+[ADR 0054](../adr/0054-digest-pinned-openshift-upgrade-qualification.md).

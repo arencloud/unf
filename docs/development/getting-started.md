@@ -508,6 +508,21 @@ legacy attachment, the encrypted Service path, and per-family cross-worker
 enforcement/history. Its dedicated rotation gate also proves an overlapping
 external-PKI issuer handoff and restoration without Pod replacement.
 
+After Kind compatibility succeeds, publish and qualify an immutable OpenShift
+N/N+1 pair from a clean committed revision:
+
+```bash
+make openshift-upgrade-images UNF_OPENSHIFT_UPGRADE_BASELINE_REF=<committed-N>
+make openshift-upgrade-test \
+  OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig"
+```
+
+The first target records six repository digests. The second runs both complete
+endpoint suites around controller-first and worker-serial rollout, rollback,
+and recovery, preserves an append-only attempt history, and restores N+1 on
+failure. See the OpenShift qualification workflow and ADR 0054 for the artifact
+paths, retry semantics, and exact live-verified platform boundary.
+
 After the primary gate, `hack/verify-kind-legacy-netlink.sh` explicitly selects
 legacy mode when the host would normally choose TCX, confirms the reserved
 priority/handle filters, removes every UNF ingress TCX pin, and repeats the
@@ -560,6 +575,7 @@ only `BPF`, `NET_ADMIN`, and `PERFMON`; their service account cannot use the
 built-in privileged SCC. Native validating admission additionally restricts that
 service account to the exact writable `/sys/fs/bpf` and read-only
 `/sys/kernel/btf` mounts and rejects host-volume access from sidecars, init
-containers, or ephemeral containers. The kind gate remains separate
-dual-stack/TCX evidence; broader versions, scale, and upgrade behavior are not
+containers, or ephemeral containers. The Kind gate remains separate
+dual-stack/TCX evidence. The digest-pinned cl02 gate qualifies one exact
+OpenShift revision window; broader releases and platform combinations are not
 inferred from these fixtures.

@@ -100,6 +100,19 @@ ADR 0052. `make kind-rollback-reporting-test` additionally requires local
 status, controller aggregation, metrics, and logs to distinguish compatible
 rollback, blocked rollback, and recovery, then restore both agents to `normal`;
 ADR 0053 records that observable transition contract.
+The OpenShift compatibility gate publishes separate N/N+1 controller, agent,
+and test-tool images to the development repositories, records immutable digest
+references, and qualifies full dual-stack RHCOS endpoints around a
+controller-first, worker-serial rollout plus complete rollback and recovery:
+
+```bash
+make openshift-upgrade-images UNF_OPENSHIFT_UPGRADE_BASELINE_REF=<committed-N>
+make openshift-upgrade-test \
+  OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig"
+```
+
+ADR 0054 records the exact cl02 window, image digests, platform invariants, and
+append-only attempt history.
 
 A bounded Kind failure/scale gate adds deterministic workload generation,
 measured churn and recovery budgets, simultaneous two-agent last-known-good

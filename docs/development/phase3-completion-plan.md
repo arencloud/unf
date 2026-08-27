@@ -14,7 +14,7 @@ complete its parent milestone.
 |---|---|---|---|---|
 | 1 | Broader failure and scale qualification | **Verified** | Existing two-node dual-stack Kind fixture | `make kind-scale-failure-test` plus a schema-versioned result record; ADR 0048 |
 | 2 | Expanded version compatibility matrix | **Verified** | Milestone 1 budgets and the compatibility tuple from ADR 0047 | Same-tuple skipped upgrade, incompatible-tuple rejection, persistent-state clean rebuild, supported/unsupported downgrade behavior, and transition reporting are Verified; ADRs 0049–0053 |
-| 3 | OpenShift cl02 upgrade qualification | **Planned** | Milestone 2 Kind evidence and development images in Quay | Repeatable dual-stack RHCOS controller/agent rollout and rollback gate |
+| 3 | OpenShift cl02 upgrade qualification | **Verified** | Milestone 2 Kind evidence and development images in Quay | `make openshift-upgrade-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig`; ADR 0054 |
 | 4 | Broader platform/version coverage | **Planned** | Available clusters for each claimed platform | Versioned support matrix with one evidence record per claimed combination |
 | 5 | Phase 3 closure | **Planned** | Milestones 1–4 Verified | Complete release audit and Phase 3 marked **Verified** in `project-status.md` |
 | 6 | Full-CNI foundation entry | **Gated** | Milestone 5 and explicit approval at the architecture gate | Accepted design plus bounded CNI/IPAM/veth/routing/MTU/node-networking slices |
@@ -48,11 +48,11 @@ budgets and retain a separate result record.
 
 | ID | Deliverable | State | Required evidence |
 |---|---|---|---|
-| 3.1 | Immutable development images | **Planned** | N and N+1 controller, agent, and test-tool images published by digest to the development Quay repositories |
-| 3.2 | Controller-first rollout | **Planned** | N+1 controller remains compatible with N agents and every authenticated agent stays observable |
-| 3.3 | Worker-serial agent rollout | **Planned** | One RHCOS worker at a time transitions under dual-stack traffic with no simultaneous dataplane gap |
-| 3.4 | OpenShift rollback | **Planned** | Agent and controller rollback/forward recovery retain policy revision, provenance, and telemetry |
-| 3.5 | Platform invariants | **Planned** | Enforcing SELinux, constrained SCC, Service CA, TokenReview, OVN replies, legacy-netlink attachment, and cluster operators remain healthy |
+| 3.1 | Immutable development images | **Verified** | Clean-revision publisher recorded six Quay digest references for N=`b078f03` and N+1=`9a376ae`, covering controller, agent, and test tools with exact revision/distance provenance |
+| 3.2 | Controller-first rollout | **Verified** | N+1 controller served two N agents with an identical compatibility tuple, two fresh authenticated converged reports, dual-stack enforcement/provenance, and advancing telemetry |
+| 3.3 | Worker-serial agent rollout | **Verified** | Each RHCOS worker transitioned alone through deterministic mixed/full states; continuous IPv4/IPv6 probes reported no sustained allow gap or deny breach |
+| 3.4 | OpenShift rollback | **Verified** | Both agents rolled back serially, the controller returned to exact N/N, then controller-first and worker-serial recovery restored full N+1 with policy state, provenance, and telemetry at every stage |
+| 3.5 | Platform invariants | **Verified** | Full N and N+1 endpoint gates plus every transition retained Enforcing SELinux, constrained SCC, Service CA, TokenReview, OVN/stateful replies, native legacy filters, and 34 healthy operators; ADR 0054 |
 
 cl02 is first required by milestone 3. Milestones 1 and 2 run against Kind.
 
