@@ -65,12 +65,24 @@ pub struct RevisionSet {
     pub telemetry: Revision,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionTransition {
+    #[default]
+    Normal,
+    CompatibleRollback,
+    BlockedRollback,
+    Recovery,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStateReport {
     pub schema_version: u16,
     pub node_name: String,
     pub pod_name: String,
     pub pod_uid: String,
+    #[serde(default)]
+    pub version_transition: VersionTransition,
     pub ready: bool,
     pub bpf_loaded: bool,
     pub desired_identity_revision: u64,
@@ -1429,6 +1441,20 @@ mod tests {
         assert_eq!(
             compatibility.flow_export_schema_version,
             FLOW_EXPORT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn version_transition_uses_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&VersionTransition::CompatibleRollback)
+                .expect("transition serializes"),
+            "\"compatible_rollback\""
+        );
+        assert_eq!(
+            serde_json::from_str::<VersionTransition>("\"blocked_rollback\"")
+                .expect("transition deserializes"),
+            VersionTransition::BlockedRollback
         );
     }
 

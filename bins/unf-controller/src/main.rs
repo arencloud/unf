@@ -5260,6 +5260,7 @@ mod tests {
             node_name: "worker-a".to_owned(),
             pod_name: "unf-agent-test".to_owned(),
             pod_uid: "unf-agent-test-uid".to_owned(),
+            version_transition: unf_state::VersionTransition::Normal,
             ready: true,
             bpf_loaded: true,
             desired_identity_revision: 0,

@@ -32,9 +32,9 @@ patch_controller_image() {
 }
 
 patch_agent_template() {
-    local image=$1 abi=$2 strategy=$3 payload
+    local image=$1 abi=$2 strategy=$3 transition=${4:-normal} payload
     payload=$(jq -nc --arg image "${image}" --arg path "/sys/fs/bpf/unf/v${abi}" \
-        --arg strategy "${strategy}" '{
+        --arg strategy "${strategy}" --arg transition "${transition}" '{
             spec:{
                 updateStrategy:(if $strategy == "OnDelete" then
                     {type:"OnDelete",rollingUpdate:null}
@@ -49,7 +49,8 @@ patch_agent_template() {
                         "--ebpf-object","/opt/unf/ebpf/unf-ebpf-tc",
                         "--bpf-pin-path",$path,
                         "--controller-url","https://unf-controller.unf-system.svc.cluster.local:9964",
-                        "--controller-ca-path","/var/run/secrets/unf-internal-ca/ca.crt"
+                        "--controller-ca-path","/var/run/secrets/unf-internal-ca/ca.crt",
+                        "--version-transition",$transition
                     ]
                 }]}}
             }
@@ -92,6 +93,13 @@ agent_raw() {
     [[ -n ${pod} ]]
     "${kc[@]}" get --raw \
         "/api/v1/namespaces/unf-system/pods/${pod}:9963/proxy${path}"
+}
+
+agent_metric() {
+    local node=$1 metric=$2
+    agent_raw "${node}" /metrics \
+        | awk -v metric_name="${metric}" \
+            '$1 == metric_name { print int($2); found=1 } END { if (!found) print -1 }'
 }
 
 helper_pod_on_node() {
@@ -251,6 +259,34 @@ wait_for_unsupported_downgrade_rejection() {
     done
     echo "unsupported downgrade did not fail at the local ABI boundary on ${node}" >&2
     printf '%s\n' "${logs}" >&2
+    return 1
+}
+
+assert_transition_reporting() {
+    local node=$1 expected=$2 code=$3 counter=$4 pod status snapshot logs=
+    for _ in {1..20}; do
+        status=$(agent_raw "${node}" /v1/status 2>/dev/null || true)
+        snapshot=$(controller_raw /v1/state/agents 2>/dev/null || true)
+        if jq -e --arg expected "${expected}" \
+            '.version_transition == $expected' <<<"${status}" >/dev/null 2>&1 \
+            && [[ $(agent_metric "${node}" unf_version_transition_state) -eq ${code} ]] \
+            && [[ $(agent_metric "${node}" "${counter}") -eq 1 ]] \
+            && jq -e --arg node "${node}" --arg expected "${expected}" '
+                any(.nodes[];
+                    .node_name == $node
+                    and .report != null
+                    and .report.version_transition == $expected)
+            ' <<<"${snapshot}" >/dev/null 2>&1; then
+            pod=$(agent_pod_on_node "${node}")
+            logs=$("${kc[@]}" -n unf-system logs "${pod}" --tail=-1 2>&1 || true)
+            grep -Fq "version transition state changed" <<<"${logs}"
+            grep -Fq "${expected}" <<<"${logs}"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "${expected} transition reporting did not converge on ${node}" >&2
+    printf 'status: %s\ncontroller: %s\n' "${status}" "${snapshot}" >&2
     return 1
 }
 
@@ -459,14 +495,19 @@ if [[ ${require_unsupported_downgrade} == true ]]; then
     replace_agent_on_node "${downgrade_node}" "${current_agent_image}" false
     wait_for_unsupported_downgrade_rejection \
         "${downgrade_node}" "${current_abi}" "${future_abi}"
+    assert_transition_reporting \
+        "${downgrade_node}" blocked_rollback 2 \
+        unf_version_transition_blocked_rollbacks_total
     [[ $(map_digest "${downgrade_node}" "${future_abi}") == "${future_digest_before}" ]]
     assert_abi_present "${downgrade_node}" "${future_abi}"
 
-    patch_agent_template "${future_agent_image}" "${future_abi}" OnDelete
+    patch_agent_template "${future_agent_image}" "${future_abi}" OnDelete recovery
     replace_agent_on_node "${downgrade_node}" "${future_agent_image}"
     wait_for_convergence
     assert_agent_state "${downgrade_node}" "${future_abi}"
-    downgrade_result=", unsupported direct v${future_abi}->v${current_abi} downgrade rejection without v${future_abi} map mutation"
+    assert_transition_reporting \
+        "${downgrade_node}" recovery 3 unf_version_transition_recoveries_total
+    downgrade_result=", status/metrics/log classification of blocked rollback, recovery, and compatible rollback, unsupported direct v${future_abi}->v${current_abi} rejection without v${future_abi} map mutation"
 fi
 
 # Only the fully converged v4 agents are authorized to remove their older v3
@@ -481,11 +522,16 @@ wait_for_convergence
 # Exercise the reverse clean rebuild. Fresh v3 state is populated and attached
 # node-serially before a scoped v4 binary retires future-version state.
 patch_controller_image "${current_controller_image}"
-patch_agent_template "${current_agent_image}" "${current_abi}" OnDelete
+patch_agent_template "${current_agent_image}" "${current_abi}" OnDelete compatible-rollback
 for node in "${nodes[@]}"; do
     replace_agent_on_node "${node}" "${current_agent_image}"
     wait_for_convergence
     assert_agent_state "${node}" "${current_abi}"
+    if [[ ${require_unsupported_downgrade} == true ]]; then
+        assert_transition_reporting \
+            "${node}" compatible_rollback 1 \
+            unf_version_transition_compatible_rollbacks_total
+    fi
     assert_prepopulation_log "${node}"
     assert_abi_present "${node}" "${current_abi}"
     assert_abi_present "${node}" "${future_abi}"

@@ -45,7 +45,7 @@ use unf_state::{
     FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
     Ipv4PolicyMapEntry, Ipv6IdentityMapping, Ipv6PolicyMapEntry, PERSISTENT_BPF_STATE_ABI_VERSION,
     POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord,
-    PolicyMapEntry, PolicyStateSnapshot,
+    PolicyMapEntry, PolicyStateSnapshot, VersionTransition,
 };
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
@@ -54,6 +54,7 @@ const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v3";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
+const BLOCKED_TRANSITION_REPORTING_WINDOW: Duration = Duration::from_secs(30);
 const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
     Some(revision) => revision,
     None => "unknown",
@@ -144,6 +145,13 @@ struct Args {
         default_value = "auto"
     )]
     tc_attachment_mode: TcAttachmentPreference,
+    #[arg(
+        long,
+        env = "UNF_VERSION_TRANSITION",
+        value_enum,
+        default_value = "normal"
+    )]
+    version_transition: VersionTransitionIntent,
 }
 
 #[derive(Debug, Subcommand)]
@@ -210,6 +218,50 @@ enum TcAttachmentPreference {
     LegacyNetlink,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum VersionTransitionIntent {
+    Normal,
+    CompatibleRollback,
+    Recovery,
+}
+
+impl From<VersionTransitionIntent> for VersionTransition {
+    fn from(value: VersionTransitionIntent) -> Self {
+        match value {
+            VersionTransitionIntent::Normal => Self::Normal,
+            VersionTransitionIntent::CompatibleRollback => Self::CompatibleRollback,
+            VersionTransitionIntent::Recovery => Self::Recovery,
+        }
+    }
+}
+
+const fn version_transition_code(value: VersionTransition) -> u64 {
+    match value {
+        VersionTransition::Normal => 0,
+        VersionTransition::CompatibleRollback => 1,
+        VersionTransition::BlockedRollback => 2,
+        VersionTransition::Recovery => 3,
+    }
+}
+
+const fn version_transition_label(value: VersionTransition) -> &'static str {
+    match value {
+        VersionTransition::Normal => "normal",
+        VersionTransition::CompatibleRollback => "compatible_rollback",
+        VersionTransition::BlockedRollback => "blocked_rollback",
+        VersionTransition::Recovery => "recovery",
+    }
+}
+
+const fn version_transition_from_code(value: u64) -> VersionTransition {
+    match value {
+        1 => VersionTransition::CompatibleRollback,
+        2 => VersionTransition::BlockedRollback,
+        3 => VersionTransition::Recovery,
+        _ => VersionTransition::Normal,
+    }
+}
+
 struct AgentMetrics {
     flow_events: Counter,
     management_flow_events_filtered: Counter,
@@ -230,6 +282,10 @@ struct AgentMetrics {
     telemetry_exported_events: Counter,
     controller_trust_reloads: Counter,
     controller_trust_reload_errors: Counter,
+    version_transition_state: Gauge,
+    compatible_rollbacks: Counter,
+    blocked_rollbacks: Counter,
+    transition_recoveries: Counter,
 }
 
 struct AgentState {
@@ -256,6 +312,7 @@ struct AgentState {
     dropped_flow_exports: AtomicU64,
     exported_flow_events: AtomicU64,
     tc_attachment_mode: AtomicU64,
+    version_transition: AtomicU64,
     capabilities: KernelCapabilities,
     registry: Mutex<Registry>,
     metrics: AgentMetrics,
@@ -458,14 +515,10 @@ async fn main() -> Result<()> {
     if let Some(AgentCommand::Cleanup(cleanup)) = &args.command {
         return run_cleanup(cleanup);
     }
-    let state = Arc::new(new_state(
-        detect_capabilities(),
-        args.node_name.clone(),
-        args.pod_name.clone(),
-        args.pod_uid.clone(),
-    ));
+    let state = Arc::new(initial_agent_state(&args));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
+    spawn_startup_agent_status_reporter(&args, &state, &cancellation, &mut tasks)?;
     let (dataplane_failure_tx, mut dataplane_failure_rx) = mpsc::channel(1);
     let mut dataplane_configured = false;
 
@@ -544,6 +597,7 @@ async fn main() -> Result<()> {
         }
         failure = dataplane_failure_rx.recv(), if dataplane_configured => failure,
     };
+    hold_blocked_transition_reporting_window(dataplane_failure.as_ref(), &state).await;
     cancellation.cancel();
     while let Some(result) = tasks.join_next().await {
         if let Err(error) = result {
@@ -554,6 +608,62 @@ async fn main() -> Result<()> {
         return Err(error).context("eBPF dataplane failed");
     }
     Ok(())
+}
+
+fn initial_agent_state(args: &Args) -> AgentState {
+    new_state(
+        detect_capabilities(),
+        args.node_name.clone(),
+        args.pod_name.clone(),
+        args.pod_uid.clone(),
+        args.version_transition.into(),
+    )
+}
+
+fn spawn_startup_agent_status_reporter(
+    args: &Args,
+    state: &Arc<AgentState>,
+    cancellation: &CancellationToken,
+    tasks: &mut JoinSet<()>,
+) -> Result<()> {
+    let Some(controller_url) = args.controller_url.as_deref() else {
+        return Ok(());
+    };
+    let controller_url = controller_url.trim_end_matches('/').to_owned();
+    let client =
+        dataplane_controller_client(Some(&controller_url), &args.controller_ca_path, state)?;
+    let token_path = args.agent_token_path.clone();
+    let reporter_state = Arc::clone(state);
+    let reporter_cancellation = cancellation.clone();
+    let interval = Duration::from_secs(args.identity_sync_seconds.max(1));
+    tasks.spawn(async move {
+        report_agent_status(
+            controller_url,
+            client,
+            token_path,
+            reporter_state,
+            reporter_cancellation,
+            interval,
+        )
+        .await;
+    });
+    Ok(())
+}
+
+async fn hold_blocked_transition_reporting_window(
+    dataplane_failure: Option<&anyhow::Error>,
+    state: &AgentState,
+) {
+    if dataplane_failure.is_none()
+        || current_version_transition(state) != VersionTransition::BlockedRollback
+    {
+        return;
+    }
+    warn!(
+        reporting_seconds = BLOCKED_TRANSITION_REPORTING_WINDOW.as_secs(),
+        "blocked rollback remains fail-closed and observable before orchestrator retry"
+    );
+    tokio::time::sleep(BLOCKED_TRANSITION_REPORTING_WINDOW).await;
 }
 
 fn run_cleanup(args: &CleanupArgs) -> Result<()> {
@@ -841,6 +951,7 @@ fn new_state(
     node_name: String,
     pod_name: String,
     pod_uid: String,
+    version_transition: VersionTransition,
 ) -> AgentState {
     let metrics = AgentMetrics {
         flow_events: Counter::default(),
@@ -862,10 +973,14 @@ fn new_state(
         telemetry_exported_events: Counter::default(),
         controller_trust_reloads: Counter::default(),
         controller_trust_reload_errors: Counter::default(),
+        version_transition_state: Gauge::default(),
+        compatible_rollbacks: Counter::default(),
+        blocked_rollbacks: Counter::default(),
+        transition_recoveries: Counter::default(),
     };
     let mut registry = Registry::default();
     register_agent_metrics(&mut registry, &metrics);
-    AgentState {
+    let state = AgentState {
         node_name,
         pod_name,
         pod_uid,
@@ -889,10 +1004,46 @@ fn new_state(
         dropped_flow_exports: AtomicU64::new(0),
         exported_flow_events: AtomicU64::new(0),
         tc_attachment_mode: AtomicU64::new(TcAttachmentMode::None as u64),
+        version_transition: AtomicU64::new(version_transition_code(VersionTransition::Normal)),
         capabilities,
         registry: Mutex::new(registry),
         metrics,
+    };
+    record_version_transition(&state, version_transition);
+    state
+}
+
+fn record_version_transition(state: &AgentState, transition: VersionTransition) {
+    let code = version_transition_code(transition);
+    let previous = state.version_transition.swap(code, Ordering::AcqRel);
+    state
+        .metrics
+        .version_transition_state
+        .set(i64::try_from(code).expect("transition state fits in i64"));
+    if previous == code {
+        return;
     }
+    match transition {
+        VersionTransition::Normal => {}
+        VersionTransition::CompatibleRollback => {
+            state.metrics.compatible_rollbacks.inc();
+        }
+        VersionTransition::BlockedRollback => {
+            state.metrics.blocked_rollbacks.inc();
+        }
+        VersionTransition::Recovery => {
+            state.metrics.transition_recoveries.inc();
+        }
+    }
+    info!(
+        previous = version_transition_label(version_transition_from_code(previous)),
+        transition = version_transition_label(transition),
+        "version transition state changed"
+    );
+}
+
+fn current_version_transition(state: &AgentState) -> VersionTransition {
+    version_transition_from_code(state.version_transition.load(Ordering::Acquire))
 }
 
 fn register_agent_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
@@ -991,6 +1142,30 @@ fn register_agent_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         "Controller CA bundle updates rejected while retaining last-known-good trust",
         metrics.controller_trust_reload_errors.clone(),
     );
+    register_version_transition_metrics(registry, metrics);
+}
+
+fn register_version_transition_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
+    registry.register(
+        "unf_version_transition_state",
+        "Version transition state: 0 normal, 1 compatible rollback, 2 blocked rollback, 3 recovery",
+        metrics.version_transition_state.clone(),
+    );
+    registry.register(
+        "unf_version_transition_compatible_rollbacks",
+        "Agent processes started for an explicitly compatible rollback",
+        metrics.compatible_rollbacks.clone(),
+    );
+    registry.register(
+        "unf_version_transition_blocked_rollbacks",
+        "Newer persistent-state downgrade attempts blocked before BPF access",
+        metrics.blocked_rollbacks.clone(),
+    );
+    registry.register(
+        "unf_version_transition_recoveries",
+        "Agent processes started to recover a version transition",
+        metrics.transition_recoveries.clone(),
+    );
 }
 
 async fn run_dataplane(
@@ -998,7 +1173,19 @@ async fn run_dataplane(
     state: Arc<AgentState>,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    ensure_bpf_pin_path_abi(&config.bpf_pin_path)?;
+    if let Err(error) = ensure_bpf_pin_path_abi(&config.bpf_pin_path) {
+        if configured_abi_version(&config.bpf_pin_path)
+            .is_some_and(|version| version > CURRENT_BPF_ABI_VERSION)
+        {
+            record_version_transition(&state, VersionTransition::BlockedRollback);
+            error!(
+                configured_path = %config.bpf_pin_path.display(),
+                compiled_abi = CURRENT_BPF_ABI_VERSION,
+                "version transition blocked before persistent BPF access"
+            );
+        }
+        return Err(error);
+    }
     let (controller_url, controller_client) =
         preflight_dataplane_controller(&config, &state).await?;
 
@@ -1060,13 +1247,6 @@ async fn run_dataplane(
         );
     }
     let (flow_export_sender, flow_export_task) = spawn_flow_exporter(
-        controller_url.clone(),
-        controller_client.clone(),
-        &config,
-        &state,
-        &cancellation,
-    );
-    let status_report_task = spawn_agent_status_reporter(
         controller_url,
         controller_client,
         &config,
@@ -1085,7 +1265,6 @@ async fn run_dataplane(
     .await;
     drop(flow_export_sender);
     await_background_task(flow_export_task, "flow exporter").await;
-    await_background_task(status_report_task, "agent status reporter").await;
     state.ready.store(false, Ordering::Release);
     state.bpf_loaded.store(false, Ordering::Release);
     state.metrics.bpf_loaded.set(0);
@@ -1563,6 +1742,14 @@ fn ensure_bpf_pin_path_abi(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn configured_abi_version(path: &Path) -> Option<u16> {
+    path.file_name()
+        .and_then(std::ffi::OsStr::to_str)?
+        .strip_prefix('v')?
+        .parse()
+        .ok()
+}
+
 fn recover_persistent_dataplane(
     identities: &mut IdentitySynchronizer,
     policies: &mut PolicySynchronizer,
@@ -2013,31 +2200,6 @@ fn spawn_flow_exporter(
     (Some(sender), Some(task))
 }
 
-fn spawn_agent_status_reporter(
-    controller_url: Option<String>,
-    client: ReloadingControllerClient,
-    config: &DataplaneConfig,
-    state: &Arc<AgentState>,
-    cancellation: &CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let controller_url = controller_url?;
-    let reporter_state = Arc::clone(state);
-    let reporter_cancel = cancellation.clone();
-    let interval = config.identity_sync_interval;
-    let token_path = config.agent_token_path.clone();
-    Some(tokio::spawn(async move {
-        report_agent_status(
-            controller_url,
-            client,
-            token_path,
-            reporter_state,
-            reporter_cancel,
-            interval,
-        )
-        .await;
-    }))
-}
-
 fn take_policy_maps(ebpf: &mut Ebpf) -> Result<PolicyMaps> {
     let policy_map = AyaHashMap::<_, [u8; 12], [u8; 32]>::try_from(
         ebpf.take_map("POLICY_RULES")
@@ -2430,6 +2592,7 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
         node_name: state.node_name.clone(),
         pod_name: state.pod_name.clone(),
         pod_uid: state.pod_uid.clone(),
+        version_transition: current_version_transition(state),
         ready: state.ready.load(Ordering::Acquire),
         bpf_loaded: state.bpf_loaded.load(Ordering::Acquire),
         desired_identity_revision: state.desired_identity_revision.load(Ordering::Acquire),
@@ -4129,7 +4292,7 @@ fn component_compatibility() -> ComponentCompatibility {
 async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
     Json(AgentStatus {
         component: "unf-agent",
-        healthy: true,
+        healthy: current_version_transition(&state) != VersionTransition::BlockedRollback,
         observed_flows: state.observed_flows.load(Ordering::Relaxed),
         state: agent_state_report(&state),
         queued_flow_exports: state.queued_flow_exports.load(Ordering::Relaxed),
@@ -4439,6 +4602,7 @@ mod tests {
             "worker-a".to_owned(),
             "unf-agent-test".to_owned(),
             "test-pod-uid".to_owned(),
+            VersionTransition::Normal,
         )
     }
 
@@ -4502,6 +4666,10 @@ mod tests {
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v3")).is_ok());
+        assert_eq!(
+            configured_abi_version(Path::new("/sys/fs/bpf/unf/v4")),
+            Some(4)
+        );
         let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
@@ -4510,6 +4678,26 @@ mod tests {
             )
         );
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v3")).is_err());
+        assert_eq!(
+            configured_abi_version(Path::new("/sys/fs/bpf/unf-v3")),
+            None
+        );
+    }
+
+    #[test]
+    fn version_transition_reporting_is_idempotent_and_machine_readable() {
+        let state = test_agent_state();
+        record_version_transition(&state, VersionTransition::BlockedRollback);
+        record_version_transition(&state, VersionTransition::BlockedRollback);
+
+        assert_eq!(
+            agent_state_report(&state).version_transition,
+            VersionTransition::BlockedRollback
+        );
+        assert_eq!(state.metrics.version_transition_state.get(), 2);
+        assert_eq!(state.metrics.blocked_rollbacks.get(), 1);
+        assert_eq!(state.metrics.compatible_rollbacks.get(), 0);
+        assert_eq!(state.metrics.transition_recoveries.get(), 0);
     }
 
     #[test]
