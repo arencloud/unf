@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 kubeconfig=${KUBECONFIG:-"${project_root}/.tools/kind-unf-dev.kubeconfig"}
@@ -9,6 +9,14 @@ unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
 temporary_dir=$(mktemp -d)
 forward_pid=
+qualification_stage=initialization
+
+report_failure() {
+    local status=$?
+    local line=${BASH_LINENO[0]:-unknown}
+    echo "durable flow-history qualification failed during ${qualification_stage} at line ${line}: ${BASH_COMMAND}" >&2
+    return "${status}"
+}
 
 cleanup() {
     if [[ -n ${forward_pid} ]]; then
@@ -17,6 +25,7 @@ cleanup() {
     fi
     rm -rf "${temporary_dir}"
 }
+trap report_failure ERR
 trap cleanup EXIT
 
 active_controller() {
@@ -53,9 +62,14 @@ wait_for_target_flow() {
     for attempt in {1..45}; do
         if (( (attempt - 1) % 5 == 0 )); then
             for _ in {1..4}; do
-                response=$("${kc[@]}" exec -n frontend client -- \
-                    wget -T 2 -t 1 -qO- "${target_url}")
-                [[ ${response} == unf-demo-ok ]]
+                if response=$("${kc[@]}" exec -n frontend client -- \
+                    wget -T 2 -t 1 -qO- "${target_url}" 2>/dev/null) \
+                    && [[ ${response} == unf-demo-ok ]]; then
+                    continue
+                fi
+                # A single sample may race a just-completed dataplane recovery.
+                # Keep the overall wait bounded and require a qualifying flow.
+                break
             done
         fi
         snapshot=$(controller_raw "${controller}" /v1/flows 2>/dev/null || true)
@@ -108,6 +122,7 @@ wait_for_checkpoint() {
 for command in kubectl jq date; do
     command -v "${command}" >/dev/null
 done
+qualification_stage=prerequisites
 [[ -x ${unfctl} ]]
 [[ -s ${kubeconfig} ]]
 "${kc[@]}" -n unf-system wait --for=condition=Available \
@@ -126,14 +141,17 @@ service_account=system:serviceaccount:unf-system:unf-controller
     --as="${service_account}" -n unf-system) == yes ]]
 [[ $("${kc[@]}" auth can-i patch configmap/unf-flow-history \
     --as="${service_account}" -n unf-system) == yes ]]
-[[ $("${kc[@]}" auth can-i create configmaps \
-    --as="${service_account}" -n unf-system) == no ]]
-[[ $("${kc[@]}" auth can-i delete configmap/unf-flow-history \
-    --as="${service_account}" -n unf-system) == no ]]
+can_create_configmaps=$("${kc[@]}" auth can-i create configmaps \
+    --as="${service_account}" -n unf-system || true)
+[[ ${can_create_configmaps} == no ]]
+can_delete_checkpoint=$("${kc[@]}" auth can-i delete configmap/unf-flow-history \
+    --as="${service_account}" -n unf-system || true)
+[[ ${can_delete_checkpoint} == no ]]
 
 controller=$(active_controller)
 [[ $(wc -w <<<"${controller}") -eq 1 ]]
 window_start=$(date +%s%3N)
+qualification_stage=traffic-generation
 # A bounded burst makes the persistence fixture independent of the agent's
 # aggregation sampling boundary after the high-volume conformance matrix.
 for _ in {1..8}; do
@@ -141,6 +159,7 @@ for _ in {1..8}; do
         wget -T 2 -t 1 -qO- "${target_url}")
     [[ ${response} == unf-demo-ok ]]
 done
+qualification_stage=live-flow-observation
 before=$(wait_for_target_flow "${controller}" "${window_start}" "${target_url}")
 target=$(jq -c '[
     .entries[]
@@ -152,6 +171,7 @@ target=$(jq -c '[
 source_identity=$(jq '.key.source_identity' <<<"${target}")
 destination_identity=$(jq '.key.destination_identity' <<<"${target}")
 
+qualification_stage=durable-checkpoint
 checkpoint_before=$(wait_for_checkpoint "${source_identity}" "${destination_identity}")
 first_received=$(jq \
     --argjson source "${source_identity}" \
@@ -167,15 +187,23 @@ first_received=$(jq \
 "${kc[@]}" -n unf-system port-forward service/unf-controller \
     "${controller_port}:9962" >"${temporary_dir}/port-forward.log" 2>&1 &
 forward_pid=$!
+qualification_stage=client-api-readiness
+client_api_ready=false
 for _ in {1..30}; do
     if "${unfctl}" --controller-url "http://127.0.0.1:${controller_port}" \
         --output json status >/dev/null 2>&1; then
+        client_api_ready=true
         break
     fi
     sleep 1
 done
-kill -0 "${forward_pid}"
+if [[ ${client_api_ready} != true ]] || ! kill -0 "${forward_pid}" 2>/dev/null; then
+    echo "controller client API did not become ready; port-forward log follows:" >&2
+    sed -n '1,80p' "${temporary_dir}/port-forward.log" >&2
+    false
+fi
 
+qualification_stage=bounded-history-queries
 recent=$("${unfctl}" --controller-url "http://127.0.0.1:${controller_port}" \
     --output json flows --since-unix-ms "${window_start}")
 jq -e --argjson start "${window_start}" '
@@ -209,6 +237,7 @@ jq -e '
 old_controller_uid=$("${kc[@]}" -n unf-system get pod "${controller}" \
     -o jsonpath='{.metadata.uid}')
 agent_state=$(agent_runtime_state)
+qualification_stage=controller-restart
 "${kc[@]}" -n unf-system rollout restart deployment/unf-controller >/dev/null
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller \
     --timeout=180s >/dev/null
@@ -225,6 +254,7 @@ new_controller_uid=$("${kc[@]}" -n unf-system get pod "${controller}" \
 [[ ${new_controller_uid} != "${old_controller_uid}" ]]
 [[ $(agent_runtime_state) == "${agent_state}" ]]
 
+qualification_stage=checkpoint-restore
 after=$(wait_for_target_flow "${controller}" "${window_start}" "${target_url}")
 restored_first=$(jq \
     --argjson source "${source_identity}" \
@@ -253,4 +283,5 @@ logs=$("${kc[@]}" -n unf-system logs "${controller}")
 grep -q 'restored durable flow history' <<<"${logs}"
 [[ $(agent_runtime_state) == "${agent_state}" ]]
 
+qualification_stage=complete
 echo "durable flow-history qualification passed: bounded checkpoint restore, exact RBAC, last-received absolute/relative windows, newest-first limit, empty future window, preserved first-received time, and zero agent replacements or persistence errors"
