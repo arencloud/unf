@@ -82,6 +82,9 @@ proves controller-first N+1/N operation, deterministic one-Node-at-a-time agent
 rollout, agent and controller rollback, fresh epoch convergence, telemetry
 continuity, and uninterrupted allow/deny enforcement. This support applies only
 while the published compatibility tuple is unchanged.
+A separate skipped-revision gate requires a baseline at least two commits behind
+the current revision and exact tuple equality before repeating the complete
+controller-first, node-serial, rollback, forwarding, and telemetry matrix.
 The remaining Phase 3 production-readiness work is tracked subpoint by subpoint
 in the [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md).
 A bounded Kind failure/scale gate adds deterministic workload generation,

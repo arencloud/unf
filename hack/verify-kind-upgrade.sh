@@ -9,6 +9,8 @@ baseline_agent_image=${UNF_UPGRADE_BASELINE_AGENT_IMAGE:-localhost/unf-agent:upg
 current_controller_image=${UNF_UPGRADE_CURRENT_CONTROLLER_IMAGE:-localhost/unf-controller:dev}
 current_agent_image=${UNF_UPGRADE_CURRENT_AGENT_IMAGE:-localhost/unf-agent:dev}
 current_revision=${UNF_UPGRADE_CURRENT_REVISION:-unknown}
+current_generation=${UNF_UPGRADE_CURRENT_GENERATION:-N+1}
+require_baseline_tuple=${UNF_UPGRADE_REQUIRE_BASELINE_TUPLE:-false}
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
 temporary_dir=$(mktemp -d)
 probe_pid=
@@ -95,6 +97,7 @@ done
 [[ ${baseline_controller_image} != "${current_controller_image}" ]]
 [[ ${baseline_agent_image} != "${current_agent_image}" ]]
 [[ ${current_revision} != unknown ]]
+[[ ${require_baseline_tuple} == true || ${require_baseline_tuple} == false ]]
 
 "${kc[@]}" wait --for=condition=Ready nodes --all --timeout=120s >/dev/null
 [[ $("${kc[@]}" get nodes -o json | jq '.items | length') -eq 2 ]]
@@ -317,6 +320,10 @@ if baseline_version=$(controller_raw /v1/version 2>/dev/null); then
         [[ ${agent_baseline_tuple} == "${baseline_tuple}" ]]
     done
 fi
+if [[ ${require_baseline_tuple} == true && -z ${baseline_tuple} ]]; then
+    echo "baseline generation must publish compatibility schema v1 for this upgrade gate" >&2
+    exit 1
+fi
 
 # Upgrade the controller first: controller N+1 must serve agent N.
 patch_controller_image "${current_controller_image}"
@@ -373,4 +380,4 @@ stop_probe
 trap - EXIT
 rm -rf -- "${temporary_dir}"
 
-echo "Kind upgrade qualification passed: observable schema/ABI build metadata, N/N baseline, controller-first N+1/N compatibility, deterministic one-node mixed agent rollout, full N+1 convergence, agent rollback/forward recovery, controller rollback with N+1 agents, uninterrupted allow/deny enforcement, and telemetry continuity"
+echo "Kind upgrade qualification passed for ${current_generation}: observable schema/ABI build metadata, N/N baseline, controller-first ${current_generation}/N compatibility, deterministic one-node mixed agent rollout, full ${current_generation} convergence, agent rollback/forward recovery, controller rollback with ${current_generation} agents, uninterrupted allow/deny enforcement, and telemetry continuity"

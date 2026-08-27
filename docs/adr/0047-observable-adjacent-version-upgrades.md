@@ -68,6 +68,7 @@ Kind regression gate remain required alongside the focused upgrade test.
 
 UNF has repeatable evidence for an observable, reversible adjacent-version
 window without a simultaneous node transition. The evidence is deliberately
-narrow: it does not claim skips across multiple revisions, incompatible map or
-wire schemas, large clusters, OpenShift/RHCOS rolling upgrades, Kubernetes
-version skew, or HA-controller coordination. Those require separate matrices.
+narrow: it does not claim incompatible map or wire schemas, large clusters,
+OpenShift/RHCOS rolling upgrades, Kubernetes version skew, or HA-controller
+coordination. Skips across multiple same-tuple revisions require the separate
+strict-distance qualification gate; other boundaries require their own matrices.

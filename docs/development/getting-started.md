@@ -387,6 +387,24 @@ pairing. Override `UNF_UPGRADE_BASELINE_REF` to pin a release baseline. The gate
 supports only adjacent revisions with the same published compatibility tuple;
 ABI/schema changes require a dedicated migration plan and qualification.
 
+After at least two committed revisions share the same compatibility tuple, use
+the skipped-revision gate:
+
+```bash
+make kind-skipped-upgrade-test
+```
+
+This target builds `HEAD^^` as N and the current clean commit as N+2, refuses a
+baseline fewer than two commits behind, and requires the baseline controller,
+both baseline agents, the current controller, and current agents to publish the
+exact same schema/ABI tuple. It then repeats the controller-first, deterministic
+mixed-agent, complete rollout, agent rollback/forward, controller rollback, and
+traffic/telemetry checks. `UNF_SKIPPED_UPGRADE_BASELINE_REF` may select an older
+release, but commit distance and exact tuple equality remain mandatory. This
+gate qualifies only skips whose listed persistent-state and wire schemas are
+unchanged; incompatible migration and downgrade rejection are separate
+milestone-2 evidence.
+
 Use the bounded failure/scale profile after deploying the current images:
 
 ```bash

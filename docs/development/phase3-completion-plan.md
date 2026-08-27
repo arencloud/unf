@@ -38,7 +38,7 @@ budgets and retain a separate result record.
 
 | ID | Deliverable | State | Required evidence |
 |---|---|---|---|
-| 2.1 | Skipped revision | **Planned** | N to N+2 controller-first and node-serial rollout under an unchanged compatibility tuple |
+| 2.1 | Skipped revision | **In progress** | `make kind-skipped-upgrade-test` must prove a minimum two-commit N to N+2 controller-first and node-serial rollout under an exactly matching published compatibility tuple |
 | 2.2 | Incompatible tuple rejection | **Planned** | Schema/ABI mismatch is observable, actionable, and cannot mutate active BPF state |
 | 2.3 | Persistent-state migration contract | **Planned** | Versioned migration or deliberate clean-rebuild behavior with atomic failure recovery |
 | 2.4 | Downgrade behavior | **Planned** | Supported downgrade succeeds; unsupported downgrade fails before dataplane mutation |
