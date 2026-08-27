@@ -9,11 +9,13 @@ current_agent_image=${UNF_CURRENT_AGENT_IMAGE:-localhost/unf-agent:dev}
 future_controller_image=${UNF_CLEAN_REBUILD_CONTROLLER_IMAGE:-localhost/unf-controller:clean-rebuild-abi4}
 future_agent_image=${UNF_CLEAN_REBUILD_AGENT_IMAGE:-localhost/unf-agent:clean-rebuild-abi4}
 current_revision=${UNF_CURRENT_REVISION:-unknown}
+require_unsupported_downgrade=${UNF_REQUIRE_UNSUPPORTED_DOWNGRADE:-false}
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
 temporary_dir=$(mktemp -d)
 probe_pid=
 helper_created=false
 cleanup_pods=()
+downgrade_result=
 map_names=(
     IDENTITY_V4 IDENTITY_V4_B IDENTITY_V6 IDENTITY_V6_B IDENTITY_CONFIG
     POLICY_RULES POLICY_IPV4 POLICY_IPV6 EGRESS_IPV4 EGRESS_IPV6 POLICY_CONFIG
@@ -127,17 +129,19 @@ wait_for_convergence() {
 }
 
 wait_for_agent_replacement() {
-    local node=$1 old_uid=$2 image=$3 pod_json=
+    local node=$1 old_uid=$2 image=$3 require_ready=$4 pod_json=
     for _ in {1..180}; do
         pod_json=$("${kc[@]}" -n unf-system get pods \
             -l app.kubernetes.io/name=unf-agent -o json 2>/dev/null || true)
-        if jq -e --arg node "${node}" --arg uid "${old_uid}" --arg image "${image}" '
+        if jq -e --arg node "${node}" --arg uid "${old_uid}" --arg image "${image}" \
+            --argjson ready "${require_ready}" '
             any(.items[];
                 .spec.nodeName == $node
                 and .metadata.uid != $uid
                 and .metadata.deletionTimestamp == null
                 and .spec.containers[0].image == $image
-                and any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+                and (($ready | not) or any(.status.conditions[]?;
+                    .type == "Ready" and .status == "True")))
         ' <<<"${pod_json}" >/dev/null 2>&1; then
             return 0
         fi
@@ -148,11 +152,11 @@ wait_for_agent_replacement() {
 }
 
 replace_agent_on_node() {
-    local node=$1 image=$2 pod old_uid
+    local node=$1 image=$2 require_ready=${3:-true} pod old_uid
     pod=$(agent_pod_on_node "${node}")
     old_uid=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.metadata.uid}')
     "${kc[@]}" -n unf-system delete pod "${pod}" --wait=false >/dev/null
-    wait_for_agent_replacement "${node}" "${old_uid}" "${image}"
+    wait_for_agent_replacement "${node}" "${old_uid}" "${image}" "${require_ready}"
 }
 
 assert_agent_state() {
@@ -201,6 +205,20 @@ assert_abi_absent() {
         test ! -e "/sys/fs/bpf/unf/v${abi}"
 }
 
+map_digest() {
+    local node=$1 abi=$2 helper map
+    helper=$(helper_pod_on_node "${node}")
+    [[ -n ${helper} ]]
+    {
+        for map in "${map_names[@]}"; do
+            printf '%s\n' "${map}"
+            "${kc[@]}" -n unf-system exec "${helper}" -- \
+                bpftool -j map dump pinned "/sys/fs/bpf/unf/v${abi}/${map}" \
+                | jq -Sc 'sort_by(.key | tostring)'
+        done
+    } | sha256sum | awk '{print $1}'
+}
+
 assert_prepopulation_log() {
     local node=$1 pod logs=
     pod=$(agent_pod_on_node "${node}")
@@ -212,6 +230,26 @@ assert_prepopulation_log() {
         sleep 1
     done
     echo "agent on ${node} did not report pre-attachment population" >&2
+    printf '%s\n' "${logs}" >&2
+    return 1
+}
+
+wait_for_unsupported_downgrade_rejection() {
+    local node=$1 current_abi=$2 future_abi=$3 pod logs=
+    for _ in {1..90}; do
+        pod=$(agent_pod_on_node "${node}")
+        if [[ -n ${pod} ]]; then
+            logs=$("${kc[@]}" -n unf-system logs "${pod}" --all-containers=true \
+                --tail=-1 2>&1 || true)
+            if grep -Fq "configured BPF pin path /sys/fs/bpf/unf/v${future_abi}" <<<"${logs}" \
+                && grep -Fq "incompatible with persistent BPF-state ABI v${current_abi}" <<<"${logs}" \
+                && grep -Fq "expected a /v${current_abi} directory" <<<"${logs}"; then
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    echo "unsupported downgrade did not fail at the local ABI boundary on ${node}" >&2
     printf '%s\n' "${logs}" >&2
     return 1
 }
@@ -344,13 +382,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in kubectl jq grep sed tr; do
+for command in kubectl jq grep sed tr awk sha256sum; do
     command -v "${command}" >/dev/null
 done
 [[ -s ${kubeconfig} ]]
 [[ ${current_revision} != unknown ]]
 [[ ${current_controller_image} != "${future_controller_image}" ]]
 [[ ${current_agent_image} != "${future_agent_image}" ]]
+[[ ${require_unsupported_downgrade} == true || ${require_unsupported_downgrade} == false ]]
 
 "${kc[@]}" wait --for=condition=Ready nodes --all --timeout=120s >/dev/null
 [[ $("${kc[@]}" get nodes -o json | jq '.items | length') -eq 2 ]]
@@ -410,6 +449,26 @@ for node in "${nodes[@]}"; do
     assert_abi_present "${node}" "${future_abi}"
 done
 
+# A direct older binary pointed at newer persistent state is unsupported. It
+# must reject the local ABI path before opening the v4 maps; the pinned v4 TCX
+# attachment remains active until the compatible v4 agent recovers.
+if [[ ${require_unsupported_downgrade} == true ]]; then
+    downgrade_node=${nodes[0]}
+    future_digest_before=$(map_digest "${downgrade_node}" "${future_abi}")
+    patch_agent_template "${current_agent_image}" "${future_abi}" OnDelete
+    replace_agent_on_node "${downgrade_node}" "${current_agent_image}" false
+    wait_for_unsupported_downgrade_rejection \
+        "${downgrade_node}" "${current_abi}" "${future_abi}"
+    [[ $(map_digest "${downgrade_node}" "${future_abi}") == "${future_digest_before}" ]]
+    assert_abi_present "${downgrade_node}" "${future_abi}"
+
+    patch_agent_template "${future_agent_image}" "${future_abi}" OnDelete
+    replace_agent_on_node "${downgrade_node}" "${future_agent_image}"
+    wait_for_convergence
+    assert_agent_state "${downgrade_node}" "${future_abi}"
+    downgrade_result=", unsupported direct v${future_abi}->v${current_abi} downgrade rejection without v${future_abi} map mutation"
+fi
+
 # Only the fully converged v4 agents are authorized to remove their older v3
 # pins and links. The v4 attachment continues enforcement during each removal.
 for node in "${nodes[@]}"; do
@@ -445,4 +504,4 @@ helper_created=false
 trap - EXIT
 rm -rf -- "${temporary_dir}"
 
-echo "Kind clean-rebuild qualification passed: controller-first ABI v${current_abi}->v${future_abi}, pre-attachment snapshot population, node-serial mixed-ABI handoff, post-convergence old-state retirement, reverse clean rebuild, scoped future-state cleanup, uninterrupted allow/deny enforcement, and current-version convergence were verified"
+echo "Kind clean-rebuild qualification passed: controller-first ABI v${current_abi}->v${future_abi}, pre-attachment snapshot population, node-serial mixed-ABI handoff${downgrade_result}, post-convergence old-state retirement, reverse clean rebuild, scoped future-state cleanup, uninterrupted allow/deny enforcement, and current-version convergence were verified"

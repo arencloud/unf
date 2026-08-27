@@ -1,5 +1,5 @@
-.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-scale-failure-test kind-test kind-down
-.NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test
+.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-scale-failure-test kind-test kind-down
+.NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test
 
 KIND := .tools/bin/kind
 KIND_PROVIDER ?= podman
@@ -182,6 +182,9 @@ kind-incompatible-version-test: kind-deploy kind-demo kind-incompatible-version-
 
 kind-clean-rebuild-test: kind-deploy kind-demo kind-clean-rebuild-load
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_CLEAN_REBUILD_CONTROLLER_IMAGE=$(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) UNF_CLEAN_REBUILD_AGENT_IMAGE=$(UNF_CLEAN_REBUILD_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-clean-rebuild.sh
+
+kind-unsupported-downgrade-test: kind-deploy kind-demo kind-clean-rebuild-load
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_CLEAN_REBUILD_CONTROLLER_IMAGE=$(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) UNF_CLEAN_REBUILD_AGENT_IMAGE=$(UNF_CLEAN_REBUILD_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) UNF_REQUIRE_UNSUPPORTED_DOWNGRADE=true hack/verify-kind-clean-rebuild.sh
 
 kind-scale-failure-test: kind-deploy kind-demo
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-kind-scale-failure.sh
