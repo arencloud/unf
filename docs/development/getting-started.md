@@ -387,6 +387,30 @@ pairing. Override `UNF_UPGRADE_BASELINE_REF` to pin a release baseline. The gate
 supports only adjacent revisions with the same published compatibility tuple;
 ABI/schema changes require a dedicated migration plan and qualification.
 
+Use the bounded failure/scale profile after deploying the current images:
+
+```bash
+make kind-scale-failure-test
+```
+
+The default profile creates four temporary Namespaces with four clients and two
+servers per Namespace plus paired ingress/egress NetworkPolicies. It records
+initial convergence, repeats Namespace-selector churn, mutates a selected Pod
+and both policy directions, then replaces both node agents while the controller
+is offline. Continuous direct-Pod IPv4 and IPv6 probes require TCP/8080 to remain
+allowed and TCP/9090 to remain denied throughout last-known-good recovery and
+controller reconvergence. The gate rejects stale agents, rejected policies,
+non-empty agent export queues, hidden sync/reconcile errors, or imprecise
+cleanup after their explicit drain/recovery budgets expire. Its schema-v1 result is written to
+`.artifacts/phase3-scale-kind-result.json` with the exact Git revision,
+cardinalities, budgets, timings, node/Kubernetes/CNI details, workload MTU, and
+offload configuration. Every attempt is also appended to
+`.artifacts/phase3-scale-kind-result-attempts.jsonl`, so a successful retry does
+not erase earlier failure evidence. `UNF_SCALE_*` variables can select another bounded
+profile; changed profiles are separate evidence and do not broaden the default
+claim implicitly. The complete ordered checklist is maintained in the
+[Phase 3 completion plan](phase3-completion-plan.md).
+
 The projected credential is never written to logs or checked into the repository.
 Agent snapshots, acknowledgements, and flow telemetry use the controller's
 dedicated HTTPS port and a client trust store containing only `unf-internal-ca`;

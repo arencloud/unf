@@ -223,11 +223,21 @@ matrix and reproducible evidence.
   controller-first upgrades with an explicit persistent-BPF/wire-schema tuple,
   deterministic mixed-agent rollout, authenticated reconvergence, continuous
   forwarding/telemetry, and reversible agent/controller rollback;
-- broader failure, scale, skipped/incompatible-version, OpenShift upgrade, and
-  platform-version validation.
+- Implemented and bounded two-node Kind verified: deterministic 24-workload
+  ingress/egress scale generation, measured Namespace/Pod/policy churn,
+  simultaneous two-agent pinned-state recovery with the controller offline,
+  continuous dual-stack forwarding, bounded queue/error behavior, exact cleanup,
+  and schema-versioned environment/provenance evidence;
+- skipped/incompatible-version, OpenShift upgrade, and platform-version
+  validation.
 
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
 transport remain research/planned work after these foundations. The next active
-Phase 3 work is broader failure/scale and OpenShift/version-matrix qualification,
+Phase 3 work is skipped/incompatible-version and OpenShift/version-matrix qualification,
 plus additional external transport adapters where product requirements justify
 them.
+
+The ordered milestones and their evidence-bearing subpoints are maintained in
+[the Phase 3 completion and full-CNI entry plan](development/phase3-completion-plan.md).
+That matrix is the working checklist; `project-status.md` remains the
+authoritative record of verified results.

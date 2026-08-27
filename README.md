@@ -82,6 +82,12 @@ proves controller-first N+1/N operation, deterministic one-Node-at-a-time agent
 rollout, agent and controller rollback, fresh epoch convergence, telemetry
 continuity, and uninterrupted allow/deny enforcement. This support applies only
 while the published compatibility tuple is unchanged.
+The remaining Phase 3 production-readiness work is tracked subpoint by subpoint
+in the [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md).
+A bounded Kind failure/scale gate adds deterministic workload generation,
+measured churn and recovery budgets, simultaneous two-agent last-known-good
+recovery with the controller offline, continuous dual-stack policy probes, and
+a machine-readable environment/result record.
 Additional IPv4-only and dual-stack OpenShift gates are live-verified on
 OpenShift 4.22/RHCOS 9.8 with enforcing SELinux and a 5.14 kernel: the controller
 runs under `restricted-v2`, while worker-only agents use a dedicated constrained

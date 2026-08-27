@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images upgrade-baseline-images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-test kind-down
+.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images upgrade-baseline-images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-scale-failure-test kind-test kind-down
 .NOTPARALLEL: kind-upgrade-test
 
 KIND := .tools/bin/kind
@@ -136,6 +136,9 @@ kind-external-flow-export-test:
 
 kind-upgrade-test: kind-deploy kind-demo kind-upgrade-load
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE=$(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE) UNF_UPGRADE_BASELINE_AGENT_IMAGE=$(UNF_UPGRADE_BASELINE_AGENT_IMAGE) UNF_UPGRADE_CURRENT_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-upgrade.sh
+
+kind-scale-failure-test: kind-deploy kind-demo
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-kind-scale-failure.sh
 
 kind-test: cli kind-demo
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-kind.sh
