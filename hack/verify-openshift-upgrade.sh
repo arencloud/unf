@@ -326,10 +326,22 @@ start_probe() {
     "${kc[@]}" -n "${client_namespace}" exec client -- sh -c '
         ipv4=$1
         ipv6=$2
+        allow_with_retry() {
+            address=$1
+            for attempt in 1 2 3; do
+                if timeout 3 wget -qO- -T 1 -t 1 "http://${address}:8080" >/dev/null; then
+                    return 0
+                fi
+                sleep 0.2
+            done
+            return 1
+        }
         while [ ! -e /tmp/unf-openshift-upgrade-stop ]; do
             for address in "${ipv4}" "[${ipv6}]"; do
-                if ! timeout 3 wget -qO- -T 1 -t 1 "http://${address}:8080" >/dev/null; then
-                    echo allow-outage >>/tmp/unf-openshift-upgrade-breach
+                if ! allow_with_retry "${address}"; then
+                    printf "%s allow-outage address=%s\n" \
+                        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${address}" \
+                        >>/tmp/unf-openshift-upgrade-breach
                 fi
                 if timeout 3 wget -qO- -T 1 -t 1 "http://${address}:9090" >/dev/null 2>&1; then
                     echo deny-breach >>/tmp/unf-openshift-upgrade-breach
@@ -365,6 +377,8 @@ stop_probe() {
     fi
     if ! wait "${probe_pid}"; then
         cat "${temporary_dir}/traffic-probe.log" >&2
+        "${kc[@]}" -n "${client_namespace}" exec client -- \
+            cat /tmp/unf-openshift-upgrade-breach >&2 || true
         probe_pid=
         return 1
     fi
