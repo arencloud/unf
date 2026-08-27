@@ -1,6 +1,6 @@
 # Project status and requirements traceability
 
-Last verified: **2026-08-27**
+Last verified: **2026-08-28**
 
 This document is the authoritative implementation tracker. The roadmap describes
 direction; this file records phase gates, evidence, limitations, and the next
@@ -23,7 +23,7 @@ repeatable test are both present in this repository.
 |---|---|---|---|
 | Phase 1 — observation foundation | **Verified** | Master prompt §101: controller, identity state, policy compiler, agent/Aya/TC flow events, and successful `unfctl status` | `make fmt-check lint test`, `make ebpf`, `make kind-test` |
 | Phase 2 — identity and policy enforcement | **Verified** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | `make fmt-check lint test`, `make ebpf`, and `make kind-test` verify the complete gate; `make openshift-test` qualifies both IPv4-only and dual-stack platform slices, while focused rotation, acknowledgement-retention, admission, and uninstall/redeploy gates cover the planned OpenShift hardening |
-| Phase 3 — compatibility and simulation | **In progress** | §103: NetworkPolicy adapter, simulation foundation, improved topology, and historical export | The supported ingress/egress adapter with dual-stack upstream-aligned qualification, direction-aware native/NetworkPolicy simulation, EndpointSlice-aware topology plus durable history, bounded dual-stack historical/export handoff, external-export pressure, independently qualified Kubernetes 1.34/1.35 Kind and OpenShift 4.22 tuples, complete version-transition matrices, and bounded combined failure/scale profile are live verified; the closure audit remains open |
+| Phase 3 — compatibility and simulation | **Verified** | §103: NetworkPolicy adapter, shadow policies, simulation foundation, improved topology, and historical export | All 42 Phase 3 deliverables are Verified. The committed-revision closure passed static/eBPF/render, complete Kind endpoint, scale/failure, adjacent upgrade/rollback, and digest-pinned dual-stack cl02 gates; ADR 0056 records the one-to-one requirements/limitations audit, immutable artifacts, retries, and exact boundaries |
 | Full CNI and later fabric capabilities | **Planned** | §104 and later roadmap gates | Explicitly out of current scope |
 
 Sections 98–99 describe the richer first enforcement and enriched-observability
@@ -33,7 +33,7 @@ completed by Phase 1's observation-only shadow evaluation.
 
 ## Latest verification record
 
-| Check | Result on 2026-08-27 |
+| Check | Latest result |
 |---|---|
 | Stable userspace formatting, lint, and tests | Passed: `make fmt-check lint test` |
 | eBPF target build and manifest rendering | Passed: `make ebpf` and `kubectl kustomize deploy` |
@@ -57,8 +57,8 @@ completed by Phase 1's observation-only shadow evaluation.
 | Persistent-state clean rebuild | `make kind-clean-rebuild-test` passed on its first attempt from clean revision `e39ac5c` with a test-only persistent ABI 3→4 boundary and unchanged wire schemas. Fresh v4 and reverse-v3 agents committed identity and policy snapshots before TCX attachment, each node-serial mixed state converged with both ABI pin sets, old state was retired only after full convergence, exact v4 cleanup restored v3, and continuous 8080 allow/9090 deny reported no breach. ADR 0051 records image IDs, environment, ordering, and exclusions |
 | Unsupported downgrade rejection | `make kind-unsupported-downgrade-test` passed on its first attempt from clean revision `cc52ac5`. Against converged v4 state, the v3 binary retained `/v4`, rejected the path before BPF access with the expected v4-path/v3-ABI facts, and left the canonical digest across all eleven v4 maps identical. Pinned enforcement stayed uninterrupted, v4 recovery reconverged, and the qualified reverse rebuild restored current v3 with no v4 state; ADR 0052 records image IDs and boundaries |
 | Version-transition reporting | `make kind-rollback-reporting-test` passed on its first attempt from clean revision `1bf83f7`. Local agent status, controller aggregation, metrics, and logs consistently classified blocked rollback, recovery, and compatible rollback. The blocked v3-on-v4 path remained fail closed and observable before retry, retained an identical eleven-map v4 digest, and preserved continuous enforcement; recovery and reverse rebuild converged, scoped cleanup removed v4, and both final v3 agents reported `normal`. ADR 0053 records image IDs, environment, semantics, and limitations |
-| OpenShift digest-pinned upgrade and rollback | `make openshift-upgrade-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig` passed from clean revision `9a376ae` across N=`b078f03` and six immutable Quay image digests. Full N and N+1 endpoint gates plus controller-first, both worker-serial mixed/full directions, complete rollback, and recovery retained dual-stack enforcement, policy provenance, telemetry, SCC/SELinux/Service CA/TokenReview/OVN/legacy-netlink invariants, and 34 healthy operators. The final N+1 Pods were Ready with zero restarts. ADR 0054 records digests and all four attempts |
-| Bounded failure and scale qualification | `make kind-scale-failure-test` passed a deterministic four-Namespace, 24-workload, eight-NetworkPolicy dual-stack profile producing 62 indexed Pod IPs and 1,355 policy entries. Initial convergence took 11s, three Namespace cycles plus Pod/policy churn 39s, simultaneous two-agent pinned-state recovery with the controller offline 32s, and new-epoch controller reconvergence 7s. Continuous IPv4/IPv6 8080 allow and 9090 deny reported no breach; six bounded outage sync retries, zero export/telemetry drops, drained queues, exact cleanup, and schema-v1 environment/provenance evidence passed. ADR 0048 defines the bounded claim |
+| OpenShift digest-pinned upgrade and rollback | `make openshift-upgrade-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig` passed the closure run from clean N+1 revision `43320db` with adjacent N=`6fcea31` and six immutable Quay image digests. Full N and N+1 endpoint gates plus controller-first, both worker-serial mixed/full directions, complete rollback, and recovery retained dual-stack enforcement, policy provenance, telemetry, SCC/SELinux/Service CA/TokenReview/OVN/legacy-netlink invariants, and 34 healthy operators. The final N+1 Pods were Ready with zero restarts. ADR 0056 records the current digests and five retained attempts; ADR 0054 defines the gate |
+| Bounded failure and scale qualification | `make kind-scale-failure-test` passed from clean closure revision `43320db` with a deterministic four-Namespace, 24-workload, eight-NetworkPolicy dual-stack profile producing 62 indexed Pod IPs and 1,355 policy entries. Initial convergence took 11s, three Namespace cycles plus Pod/policy churn 40s, simultaneous two-agent pinned-state recovery with the controller offline 33s, and new-epoch controller reconvergence 7s. Continuous IPv4/IPv6 8080 allow and 9090 deny reported no breach; six bounded outage sync retries, zero export/telemetry drops, drained queues, exact cleanup, and schema-v1 environment/provenance evidence passed. ADRs 0048 and 0056 define the bounded claim and closure run |
 | Scoped host-state cleanup | The deployed agent refused current v3 removal without confirmation and rejected unknown content injected into recognized v1 state without removing six known pins. Its dry run preserved those pins; execution removed v1 on both nodes while all eleven v3 maps remained. After TCX restoration, the legacy gate proved another dry run preserved the reserved filters before the command removed only UNF-named ingress filters |
 | Agent acknowledgement authentication | Both agents converged with schema v2 Pod name/UID reports and dedicated-audience projected tokens accepted through Kubernetes TokenReview. The live gate rejected missing and invalid credentials with 401, accepted the real Pod token with 204, rejected the same valid token carrying a forged Node claim with 403, and required three authentication failures to be accounted without creating an unexpected agent |
 | Internal transport security | Agent-only routes were absent from public HTTP, the dedicated HTTPS port rejected the development CA when it was not explicitly trusted, and the real CA plus projected Pod token read a snapshot and submitted an acknowledgement. Both agents converged and exported retained flow history through the same CA-pinned, TokenReview-authenticated transport; management-port filtering prevented recursive telemetry from displacing workload provenance |
@@ -197,9 +197,10 @@ release gate.
   and bounded ConfigMap restart recovery. Conditions remain Kubernetes-reported
   state rather than active traffic health; current-snapshot filtering,
   pagination, and routing/load-balancing behavior are not implemented.
-- The NetworkPolicy adapter intentionally accepts only the documented ingress
-  subset. Omitted target selectors, policy types, and port protocols follow the
-  supported Kubernetes namespace-wide/ingress/TCP defaults. Numeric ranges are
+- The NetworkPolicy adapter intentionally accepts only the documented bounded
+  ingress and egress L4 subset. Omitted target selectors, policy types, and port
+  protocols follow the supported Kubernetes namespace-wide/direction/TCP
+  defaults. Numeric ranges are
   limited to 1,024 inclusive ports, and complete
   identity-keyed snapshots to 131,072 entries per bank. IPv4 blocks support
   `except` but are limited to 1,024 addresses each and 131,072 IPv4 entries per
@@ -222,9 +223,10 @@ release gate.
   same-ABI/schema and one exact two-commit skipped Kind window are qualified;
   one deliberate incompatible schema/ABI boundary is qualified for rejection,
   and one ABI v3→v4 boundary is qualified for controller-snapshot clean rebuild
-  and reverse recovery. Byte migration, OpenShift upgrades, and broader
-  kernel/platform/scale combinations beyond the bounded ADR 0048 profile remain
-  unqualified.
+  and reverse recovery. Digest-pinned UNF component upgrade/rollback is qualified
+  for the exact cl02 window. Byte migration, upgrades of the OpenShift platform
+  itself, and broader kernel/platform/scale combinations beyond the bounded ADR
+  0048 profile remain unqualified.
 
 ## Phase 3 work breakdown
 
@@ -271,7 +273,7 @@ release gate.
 | Rollback transition reporting | **Verified** | Agent status schema v2 additively defaults `version_transition` to `normal`; local status, controller aggregation, metrics, and structured logs distinguish compatible rollback, blocked rollback, and recovery. The blocked path reports fail closed for 30 seconds before orchestrator retry, and the complete clean-rebuild lifecycle restores normal convergence. ADR 0053 records the contract and live gate |
 | OpenShift upgrade qualification | **Verified** | The clean-revision publisher creates digest-pinned N/N+1 controller, agent, and test-tool artifacts. The cl02 gate proves both full platform endpoints, controller-first compatibility, deterministic worker-serial rollout, complete rollback/forward recovery, sustained dual-stack enforcement, provenance/telemetry continuity, and healthy RHCOS/SCC/SELinux/Service CA/TokenReview/OVN/legacy-netlink invariants. ADR 0054 records the exact window and attempts |
 | Broader platform/version matrix | **Verified** | Schema-v1 `docs/development/support-matrix.json` retains four independently validated tuples: Kubernetes 1.35.0 Kind, Kubernetes 1.34.8 Kind, cl01 IPv4 OpenShift 4.22, and cl02 dual-stack OpenShift 4.22. The additional 1.34.8 tuple passed full dual-stack enforcement/recovery, TCX and legacy attachment, and adjacent-revision upgrade/rollback from clean revision `da73359`; seven normative boundary dimensions prohibit transitive claims; ADR 0055 |
-| Phase 3 closure | **Planned** | Full committed-revision regression, requirements/limitations audits, and a release-readiness record precede moving the Phase 3 gate to **Verified** |
+| Phase 3 closure | **Verified** | Implementation revision `43320db` passed static/eBPF/render, complete Kind, bounded scale/failure, adjacent upgrade/rollback, and digest-pinned cl02 gates. ADR 0056 maps every §103 requirement, reconciles limitations, records immutable digests and retries, and confirms all 42 Phase 3 rows Verified |
 | Full-CNI foundation entry | **Gated** | CNI ownership, executable/configuration, dual-stack IPAM, link lifecycle, routing/MTU, and node-to-node networking begin only after the Phase 3 gate and explicit architecture approval. See `docs/development/phase3-completion-plan.md` |
 
 ## Updating this tracker

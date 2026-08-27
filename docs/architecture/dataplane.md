@@ -154,4 +154,6 @@ Coordinated uninstall now stops agents, cleans and verifies each worker, removes
 the exact cluster resources, and proves full redeploy recovery. The OpenShift
 agent uses the constrained three-capability boundary defined by ADR 0025, the
 exact mount boundary in ADR 0028, and the uninstall ordering in ADR 0029. The
-next dataplane work is the remaining Phase 3 NetworkPolicy compatibility scope.
+Phase 3 NetworkPolicy compatibility is complete at its documented bounded L4
+scope. Full-CNI dataplane ownership remains behind the separate architecture
+gate in the Phase 3 completion and full-CNI entry plan.

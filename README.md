@@ -2,9 +2,9 @@
 
 UNF is an early-stage, Rust-first network observability and policy project for
 Kubernetes and OpenShift. Its long-term goal is an identity-aware, explainable,
-multi-cluster eBPF network fabric. Phase 1 established observation; Phase 2 added
-the first identity-aware L3/L4 enforcement path, and Phase 3 is adding Kubernetes
-compatibility. UNF is **not production-ready or
+multi-cluster eBPF network fabric. Phase 1 established observation, Phase 2 added
+the first identity-aware L3/L4 enforcement path, and Phase 3 completed its
+bounded Kubernetes compatibility and simulation gate. UNF is **not production-ready or
 a CNI replacement**.
 
 ## Project status
@@ -85,8 +85,10 @@ while the published compatibility tuple is unchanged.
 A separate skipped-revision gate requires a baseline at least two commits behind
 the current revision and exact tuple equality before repeating the complete
 controller-first, node-serial, rollback, forwarding, and telemetry matrix.
-The remaining Phase 3 production-readiness work is tracked subpoint by subpoint
-in the [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md).
+The Phase 3 gate and all 42 deliverables are Verified. Exact closure evidence,
+limits, and the separately gated full-CNI entry are tracked in the
+[Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md)
+and ADR 0056.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

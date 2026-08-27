@@ -1,8 +1,9 @@
 # Phase 3 completion and full-CNI entry plan
 
-Last reviewed: **2026-08-27**
+Last reviewed: **2026-08-28**
 
-This is the execution matrix for the remaining qualification work. The
+This is the execution matrix for Phase 3 closure and the separately gated
+full-CNI entry work. The
 authoritative feature status remains in [project-status.md](../project-status.md).
 A row moves to **Verified** only when its implementation, repeatable command,
 and recorded evidence are all present. Passing a narrower child row does not
@@ -16,7 +17,7 @@ complete its parent milestone.
 | 2 | Expanded version compatibility matrix | **Verified** | Milestone 1 budgets and the compatibility tuple from ADR 0047 | Same-tuple skipped upgrade, incompatible-tuple rejection, persistent-state clean rebuild, supported/unsupported downgrade behavior, and transition reporting are Verified; ADRs 0049–0053 |
 | 3 | OpenShift cl02 upgrade qualification | **Verified** | Milestone 2 Kind evidence and development images in Quay | `make openshift-upgrade-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig`; ADR 0054 |
 | 4 | Broader platform/version coverage | **Verified** | Available clusters for each claimed platform | Four exact qualified tuples, including an isolated Kubernetes 1.34.8 endpoint/recovery/upgrade record; ADR 0055 |
-| 5 | Phase 3 closure | **Planned** | Milestones 1–4 Verified | Complete release audit and Phase 3 marked **Verified** in `project-status.md` |
+| 5 | Phase 3 closure | **Verified** | Milestones 1–4 Verified | Complete release audit and Phase 3 marked **Verified** in `project-status.md`; ADR 0056 |
 | 6 | Full-CNI foundation entry | **Gated** | Milestone 5 and explicit approval at the architecture gate | Accepted design plus bounded CNI/IPAM/veth/routing/MTU/node-networking slices |
 
 ## 1. Broader failure and scale qualification
@@ -24,7 +25,7 @@ complete its parent milestone.
 | ID | Deliverable | State | Required evidence |
 |---|---|---|---|
 | 1.1 | Deterministic scale fixture | **Verified** | The bounded generator creates exact Namespace, workload, and paired ingress/egress policy counts deterministically; client dry-run validation and exact cleanup pass |
-| 1.2 | Measured convergence budgets | **Verified** | Default-profile apply completed in 11s, churn in 39s, simultaneous-agent recovery in 32s, and controller reconvergence in 7s against 180s budgets |
+| 1.2 | Measured convergence budgets | **Verified** | The closure run completed default-profile apply in 11s, churn in 40s, simultaneous-agent recovery in 33s, and controller reconvergence in 7s against 180s budgets |
 | 1.3 | Sustained object churn | **Verified** | Three Namespace selector cycles, Pod selection removal/restoration, and paired ingress/egress policy mutation advanced revisions with 62 indexed IPs, no rejection, and converged agents |
 | 1.4 | Combined controller and agent failure | **Verified** | Both agents recovered the exact nonzero applied revisions and 1,355 policy entries while desired revisions correctly remained zero with the controller offline, then reconverged to its new epoch |
 | 1.5 | Enforcement and queue safety | **Verified** | Continuous dual-stack 8080 allow/9090 deny reported no breach; queues drained within budget, six expected outage sync errors stayed below ten, and flow/telemetry drop deltas were zero |
@@ -48,7 +49,7 @@ budgets and retain a separate result record.
 
 | ID | Deliverable | State | Required evidence |
 |---|---|---|---|
-| 3.1 | Immutable development images | **Verified** | Clean-revision publisher recorded six Quay digest references for N=`b078f03` and N+1=`9a376ae`, covering controller, agent, and test tools with exact revision/distance provenance |
+| 3.1 | Immutable development images | **Verified** | The closure publisher recorded six Quay digest references for adjacent N=`6fcea31` and N+1=`43320db`, covering controller, agent, and test tools with exact revision/distance provenance; ADR 0056 |
 | 3.2 | Controller-first rollout | **Verified** | N+1 controller served two N agents with an identical compatibility tuple, two fresh authenticated converged reports, dual-stack enforcement/provenance, and advancing telemetry |
 | 3.3 | Worker-serial agent rollout | **Verified** | Each RHCOS worker transitioned alone through deterministic mixed/full states; continuous IPv4/IPv6 probes reported no sustained allow gap or deny breach |
 | 3.4 | OpenShift rollback | **Verified** | Both agents rolled back serially, the controller returned to exact N/N, then controller-first and worker-serial recovery restored full N+1 with policy state, provenance, and telemetry at every stage |
@@ -61,7 +62,7 @@ cl02 is first required by milestone 3. Milestones 1 and 2 run against Kind.
 | ID | Deliverable | State | Required evidence |
 |---|---|---|---|
 | 4.1 | Support-matrix schema | **Verified** | Schema-v1 `support-matrix.json` records the exact platform, Kubernetes/OpenShift, OS, kernel, runtime, CNI, address families, attachment modes, architecture, cluster shape, full evidence revision, commands, records, decisions, and scope; `make support-matrix-check` validates structure and references |
-| 4.2 | Existing fixtures | **Verified** | Separate exact rows retain Kind dual-stack TCX/legacy evidence at `9dc6023`, cl01 IPv4 OpenShift legacy evidence at `4f213c7`, and cl02 dual-stack OpenShift legacy plus digest-pinned transitions at `9a376ae` |
+| 4.2 | Existing fixtures | **Verified** | Separate exact rows retain Kind dual-stack TCX/legacy evidence at `9dc6023`, cl01 IPv4 OpenShift legacy evidence at `4f213c7`, and cl02 dual-stack OpenShift legacy plus digest-pinned transitions at `43320db` |
 | 4.3 | Additional release | **Verified** | `make kind-platform-matrix-test` passed on Kubernetes 1.34.8 from clean revision `da73359`, independently of the existing Kubernetes 1.35.0 Kind row; schema-v1 result and append-only attempt history are retained; ADR 0055 |
 | 4.4 | Additional kernel/attachment coverage | **Verified** | The additional Debian 13/containerd 2.3.1/kindnetd tuple passed full dual-stack endpoint and recovery gates in both TCX and legacy-netlink modes plus adjacent-revision upgrade/rollback on its actual Linux 7.1.4 host kernel |
 | 4.5 | Unsupported boundaries | **Verified** | Seven normative dimensions explicitly leave unlisted releases, kernels/OSes, architectures, CNIs, cluster shapes, and production artifact paths unqualified; matrix semantics prohibit transitive claims |
@@ -70,11 +71,11 @@ cl02 is first required by milestone 3. Milestones 1 and 2 run against Kind.
 
 | ID | Deliverable | State | Required evidence |
 |---|---|---|---|
-| 5.1 | Complete regression suite | **Planned** | Formatting, lint, workspace tests, eBPF, render, Kind, scale/failure, upgrade, and OpenShift gates pass from committed revisions |
-| 5.2 | Requirements audit | **Planned** | Master-prompt Phase 3 requirements and every tracker row map one-to-one to evidence or a documented exclusion |
-| 5.3 | Limitation audit | **Planned** | User-facing status, roadmap, ADRs, and support matrix agree on remaining limits |
-| 5.4 | Release-readiness record | **Planned** | Immutable revisions, image digests, cluster versions, commands, results, and retry history are recorded |
-| 5.5 | Gate transition | **Planned** | Phase 3 changes from **In progress** to **Verified** only after 5.1–5.4 pass |
+| 5.1 | Complete regression suite | **Verified** | Formatting, lint, 170 workspace tests, eBPF, base/OpenShift renders, complete Kind, scale/failure, adjacent-upgrade, and digest-pinned cl02 gates passed for implementation revision `43320db`; ADR 0056 |
+| 5.2 | Requirements audit | **Verified** | ADR 0056 maps every master-prompt §103 requirement one-to-one and confirms all 42 Phase 3 tracker rows are Verified |
+| 5.3 | Limitation audit | **Verified** | Status, roadmap, ADR 0056, and support matrix consistently retain bounded L4, exact-platform, development-artifact, OpenShift-platform-upgrade, incompatible-ABI migration, production-scale, and full-CNI limits |
+| 5.4 | Release-readiness record | **Verified** | ADR 0056 records exact revisions, all six current cl02 image digests, cluster/runtime facts, commands, outcomes, and retained retry history |
+| 5.5 | Gate transition | **Verified** | Items 5.1–5.4 passed; Phase 3 is **Verified** in `project-status.md` while full-CNI entry remains separately Gated |
 
 ## 6. Full-CNI foundation entry
 

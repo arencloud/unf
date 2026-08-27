@@ -109,7 +109,7 @@ matrix and reproducible evidence.
 
 ## Phase 3 — compatibility and simulation
 
-**Gate: in progress.**
+**Gate: verified.**
 
 - Implemented and two-node kind verified: supported ingress `NetworkPolicy`
   translation, additive semantics, controller reconciliation/status, shared
@@ -248,10 +248,10 @@ matrix and reproducible evidence.
   TCX and legacy attachment, and adjacent-revision upgrade/rollback, creating a
   fourth exact support-matrix row alongside Kubernetes 1.35 and OpenShift 4.22.
 
+Phase 3 is closed by the committed-revision regression, one-to-one requirements
+and limitations audit, and immutable release-readiness evidence in ADR 0056.
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
-transport remain research/planned work after these foundations. The next active
-The next active Phase 3 work is the closure regression, requirements and
-limitations audit, and immutable release-readiness record. Additional external
+transport remain gated or planned after these foundations. Additional external
 transport adapters remain conditional on product requirements.
 
 The ordered milestones and their evidence-bearing subpoints are maintained in
