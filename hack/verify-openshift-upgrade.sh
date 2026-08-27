@@ -195,6 +195,22 @@ assert_operator_health() {
     [[ ${unhealthy} -eq 0 ]]
 }
 
+reconcile_controller_prerequisites() {
+    local store
+    "${kc[@]}" apply -f "${project_root}/deploy/kubernetes/rbac.yaml" >/dev/null
+    for store in agent-report-store flow-history-store topology-history-store; do
+        if ! "${kc[@]}" -n unf-system get configmap \
+            "$(yq -r .metadata.name "${project_root}/deploy/kubernetes/${store}.yaml")" \
+            >/dev/null 2>&1; then
+            "${kc[@]}" create -f \
+                "${project_root}/deploy/kubernetes/${store}.yaml" >/dev/null
+        fi
+    done
+    [[ $("${kc[@]}" auth can-i get configmap/unf-topology-history \
+        --as=system:serviceaccount:unf-system:unf-controller \
+        -n unf-system 2>/dev/null) == yes ]]
+}
+
 assert_agent_images() {
     local baseline_count=$1 current_count=$2 pods
     pods=$("${kc[@]}" -n unf-system get pods \
@@ -468,6 +484,7 @@ for node in "${workers[@]}"; do
     [[ $("${kc[@]}" get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]
 done
 assert_operator_health
+reconcile_controller_prerequisites
 restoration_enabled=true
 
 completed_stage=baseline-deployment
