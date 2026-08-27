@@ -2018,12 +2018,12 @@ if [[ -z ${fault_helper} ]]; then
 fi
 
 fault_root=/sys/fs/bpf/unf/fault-tests-v2
-partial_pin_path=${fault_root}/partial
+partial_pin_path=${fault_root}/partial/v3
 prepare_fault_map_set "${fault_helper}" "${partial_pin_path}" POLICY_CONFIG
 expect_agent_startup_rejection \
     "${restart_agent}" "${partial_pin_path}" "partial persistent BPF map set"
 
-corrupt_config_path=${fault_root}/active-config
+corrupt_config_path=${fault_root}/active-config/v3
 prepare_fault_map_set "${fault_helper}" "${corrupt_config_path}" POLICY_CONFIG
 "${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
     target=$1
@@ -2047,7 +2047,7 @@ if [[ ${active_policy_bank} != 0 && ${active_policy_bank} != 1 ]]; then
     exit 1
 fi
 inactive_policy_bank=$((1 - active_policy_bank))
-inactive_stage_path=${fault_root}/inactive-stage
+inactive_stage_path=${fault_root}/inactive-stage/v3
 prepare_fault_map_set "${fault_helper}" "${inactive_stage_path}" POLICY_RULES
 "${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
     target=$1
