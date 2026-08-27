@@ -100,6 +100,10 @@ delayed until cluster convergence.
 
 This does not qualify a real map-layout translator, a simultaneous wire-schema
 change, unsupported direct downgrade, OpenShift legacy-netlink migration, or an
-arbitrary multi-version span. Unsupported downgrade classification and rollback
-reporting remain milestones 2.4 and 2.5; OpenShift qualification remains
-milestone 3.
+arbitrary multi-version span. At this ADR's initial acceptance, unsupported
+downgrade classification and rollback reporting remained milestones 2.4 and
+2.5; OpenShift qualification remained milestone 3.
+
+ADR 0052 subsequently verified the direct older-binary/newer-state rejection for
+milestone 2.4. The clean rebuild in this ADR remains the supported ABI-boundary
+rollback path.

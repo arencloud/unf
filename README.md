@@ -94,6 +94,9 @@ staging or active-bank mutation, and keeps a continuous allow/deny probe running
 through compatible recovery. This rejection boundary is verified by ADR 0050;
 the deliberate snapshot-driven ABI clean rebuild and reverse recovery are
 verified separately by `make kind-clean-rebuild-test` and ADR 0051.
+Direct downgrade of an older binary against newer persistent state is rejected
+before BPF access and qualified by `make kind-unsupported-downgrade-test` and
+ADR 0052.
 
 A bounded Kind failure/scale gate adds deterministic workload generation,
 measured churn and recovery budgets, simultaneous two-agent last-known-good

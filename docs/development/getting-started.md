@@ -443,6 +443,19 @@ probe is mandatory throughout. This qualifies snapshot-driven clean rebuild,
 not byte migration or simultaneous wire-schema changes; ADR 0051 defines the
 boundary.
 
+To include the unsupported direct-downgrade boundary in that lifecycle, run:
+
+```bash
+make kind-unsupported-downgrade-test
+```
+
+After v4 convergence, this target starts the current v3 agent with the `/v4`
+path and requires rejection before BPF access plus an identical canonical digest
+across all eleven v4 maps. It then requires compatible-v4 recovery and completes
+the supported clean rebuild back to v3. This distinguishes same-tuple software
+rollback, ABI-boundary clean rebuild, and unsupported direct state adoption;
+ADR 0052 records the evidence.
+
 Use the bounded failure/scale profile after deploying the current images:
 
 ```bash
