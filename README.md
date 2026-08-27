@@ -96,7 +96,10 @@ the deliberate snapshot-driven ABI clean rebuild and reverse recovery are
 verified separately by `make kind-clean-rebuild-test` and ADR 0051.
 Direct downgrade of an older binary against newer persistent state is rejected
 before BPF access and qualified by `make kind-unsupported-downgrade-test` and
-ADR 0052.
+ADR 0052. `make kind-rollback-reporting-test` additionally requires local
+status, controller aggregation, metrics, and logs to distinguish compatible
+rollback, blocked rollback, and recovery, then restore both agents to `normal`;
+ADR 0053 records that observable transition contract.
 
 A bounded Kind failure/scale gate adds deterministic workload generation,
 measured churn and recovery budgets, simultaneous two-agent last-known-good

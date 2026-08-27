@@ -13,7 +13,7 @@ complete its parent milestone.
 | ID | Milestone | State | Dependency | Exit evidence |
 |---|---|---|---|---|
 | 1 | Broader failure and scale qualification | **Verified** | Existing two-node dual-stack Kind fixture | `make kind-scale-failure-test` plus a schema-versioned result record; ADR 0048 |
-| 2 | Expanded version compatibility matrix | **In progress** | Milestone 1 budgets and the compatibility tuple from ADR 0047 | Same-tuple skipped upgrade, incompatible-tuple rejection, persistent-state clean rebuild, and supported/unsupported downgrade behavior are Verified; rollback reporting remains |
+| 2 | Expanded version compatibility matrix | **Verified** | Milestone 1 budgets and the compatibility tuple from ADR 0047 | Same-tuple skipped upgrade, incompatible-tuple rejection, persistent-state clean rebuild, supported/unsupported downgrade behavior, and transition reporting are Verified; ADRs 0049–0053 |
 | 3 | OpenShift cl02 upgrade qualification | **Planned** | Milestone 2 Kind evidence and development images in Quay | Repeatable dual-stack RHCOS controller/agent rollout and rollback gate |
 | 4 | Broader platform/version coverage | **Planned** | Available clusters for each claimed platform | Versioned support matrix with one evidence record per claimed combination |
 | 5 | Phase 3 closure | **Planned** | Milestones 1–4 Verified | Complete release audit and Phase 3 marked **Verified** in `project-status.md` |
@@ -42,7 +42,7 @@ budgets and retain a separate result record.
 | 2.2 | Incompatible tuple rejection | **Verified** | `make kind-incompatible-version-test` passed from clean revision `6d7dd28`: local ABI 4 rejected the configured v3 directory before BPF access, repeated policy-schema 5 snapshots left agent policy state and pinned policy maps unchanged, enforcement stayed continuous, and the current tuple reconverged; ADR 0050 |
 | 2.3 | Persistent-state migration contract | **Verified** | `make kind-clean-rebuild-test` passed from clean revision `e39ac5c`: fresh ABI state committed identity and policy snapshots before attachment, v3→v4 and reverse node-serial handoffs retained continuous enforcement, old state was retired only after convergence, and exact scoped cleanup restored v3; ADR 0051 |
 | 2.4 | Downgrade behavior | **Verified** | Same-tuple N+2→N agent/controller rollback is supported by 2.1; `make kind-unsupported-downgrade-test` passed from clean revision `cc52ac5`, proving a v3 agent rejects `/v4` before BPF access, all eleven v4 maps remain digest-identical, enforcement stays continuous, v4 recovers, and clean-rebuild rollback restores v3; ADR 0052 |
-| 2.5 | Rollback reporting | **Planned** | Status, metrics, and logs distinguish compatible rollback, blocked rollback, and recovery |
+| 2.5 | Rollback reporting | **Verified** | `make kind-rollback-reporting-test` passed on its first attempt from clean revision `1bf83f7`: local status, controller aggregation, metrics, and logs classified blocked rollback, recovery, and compatible rollback; rejection preserved the eleven-map v4 digest and continuous enforcement; final v3 convergence restored `normal`; ADR 0053 |
 
 ## 3. OpenShift cl02 upgrade qualification
 

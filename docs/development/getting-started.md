@@ -456,6 +456,21 @@ the supported clean rebuild back to v3. This distinguishes same-tuple software
 rollback, ABI-boundary clean rebuild, and unsupported direct state adoption;
 ADR 0052 records the evidence.
 
+To verify the operator-visible classification for the complete lifecycle, run:
+
+```bash
+make kind-rollback-reporting-test
+```
+
+The blocked v3-on-v4 attempt must report `blocked_rollback` through local agent
+status, controller aggregation, its transition gauge/counter, and structured
+logs while staying fail closed for a bounded 30-second window before retry. The
+compatible v4 replacement reports `recovery`; each node-serial reverse rebuild
+reports `compatible_rollback`; and final convergence restores `normal`. The
+status field is additive and defaults to normal for older schema-v2 reports, so
+the published compatibility tuple remains unchanged. ADR 0053 records the
+contract and exact evidence.
+
 Use the bounded failure/scale profile after deploying the current images:
 
 ```bash

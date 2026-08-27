@@ -236,11 +236,14 @@ matrix and reproducible evidence.
   simultaneous two-agent pinned-state recovery with the controller offline,
   continuous dual-stack forwarding, bounded queue/error behavior, exact cleanup,
   and schema-versioned environment/provenance evidence;
-- rollback reporting, OpenShift upgrade, and platform-version validation.
+- Completed and two-node Kind verified: status, controller aggregation, metrics,
+  and logs classify compatible rollback, blocked rollback, and recovery while a
+  bounded fail-closed window preserves rejection visibility before retry;
+- OpenShift upgrade and broader platform-version validation remain.
 
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
 transport remain research/planned work after these foundations. The next active
-Phase 3 work is rollback reporting and OpenShift/version-matrix qualification,
+Phase 3 work is OpenShift upgrade and platform/version-matrix qualification,
 plus additional external transport adapters where product requirements justify
 them.
 

@@ -78,6 +78,6 @@ use the qualified software rollback; changed persistent ABIs require the
 qualified clean rebuild; and a direct older-binary/newer-state pairing fails
 before dataplane mutation.
 
-The rejection is currently visible in agent logs and Kubernetes workload state.
-Version-transition status, metrics, and durable classification remain milestone
-2.5 and are not inferred from this gate.
+ADR 0053 subsequently added and live-qualified a shared blocked-rollback
+classification across local status, controller aggregation, metrics, and logs,
+including a bounded fail-closed reporting window before orchestrator retry.

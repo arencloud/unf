@@ -116,6 +116,14 @@ mixed-agent interval and both agent/controller rollback. ABI or listed-schema
 changes require an explicit migration and cannot inherit that claim. ADR 0047
 defines the window and its repeatable Kind gate.
 
+Agent status also carries an additive `version_transition` classification:
+`normal`, `compatible_rollback`, `blocked_rollback`, or `recovery`. The same
+value is visible in controller aggregation, metrics, and structured logs.
+Blocked newer-state adoption is derived by the local ABI preflight, remains not
+Ready and fail closed, and reports for a bounded 30-second window before exit;
+operators explicitly label compatible rollback and recovery rollouts. ADR 0053
+defines and live-qualifies this reporting contract.
+
 Isolated live-kernel probes verify that partial pin sets,
 invalid active config, and corrupt inactive-stage debris are rejected before
 adoption without mutating the primary pin set. A separate live pressure probe
