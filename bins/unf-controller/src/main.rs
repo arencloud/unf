@@ -676,6 +676,7 @@ async fn spawn_internal_api(
         tasks,
     );
     let internal_app = Router::new()
+        .route("/v1/version", get(version))
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
         .route("/v1/state/agents", post(ingest_agent_status))

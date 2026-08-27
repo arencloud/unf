@@ -405,6 +405,25 @@ gate qualifies only skips whose listed persistent-state and wire schemas are
 unchanged; incompatible migration and downgrade rejection are separate
 milestone-2 evidence.
 
+Use the negative compatibility gate to prove that a deliberately changed policy
+schema and persistent BPF ABI fail before active dataplane state can be changed:
+
+```bash
+make kind-incompatible-version-test
+```
+
+The target accepts only a clean committed revision, derives test-only images
+whose policy schema and persistent ABI are each exactly one version newer, and
+loads them alongside the current images. It first replaces one agent and
+requires the compiled persistent ABI to reject the still-configured v3 pin
+directory before any persistent map is opened. It
+then rolls out the incompatible controller and requires each current agent to
+count and log the unsupported policy snapshot while its desired/applied policy
+state, active bank, and direct pinned-policy-map digest remain unchanged. A
+continuous 8080 allow/9090 deny probe and final current-tuple convergence are
+mandatory. These deliberately incompatible images are local test fixtures and
+must never be published as releases.
+
 Use the bounded failure/scale profile after deploying the current images:
 
 ```bash

@@ -996,6 +996,12 @@ async fn run_dataplane(
     state: Arc<AgentState>,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    ensure_bpf_pin_path_abi(&config.bpf_pin_path)?;
+    let (controller_url, controller_client) =
+        preflight_dataplane_controller(&config, &state).await?;
+
+    // Compatibility is checked before this call because opening the persistent
+    // map set may create pins or adopt existing kernel state.
     let (mut ebpf, pins_existed) = load_persistent_ebpf(&config)?;
     let ring = RingBuf::try_from(
         ebpf.take_map("FLOW_EVENTS")
@@ -1004,15 +1010,6 @@ async fn run_dataplane(
     .context("open FLOW_EVENTS ring buffer")?;
     let identity_maps = take_identity_maps(&mut ebpf)?;
     let policy_maps = take_policy_maps(&mut ebpf)?;
-    let controller_url = config
-        .controller_url
-        .as_deref()
-        .map(|url| url.trim_end_matches('/').to_owned());
-    let controller_client = dataplane_controller_client(
-        controller_url.as_deref(),
-        &config.controller_ca_path,
-        &state,
-    )?;
     let controller_management_port = controller_url.as_deref().map(controller_port).transpose()?;
     let (mut identities, mut policies) = new_synchronizers(
         identity_maps,
@@ -1218,6 +1215,23 @@ fn dataplane_controller_client(
     }
 }
 
+async fn preflight_dataplane_controller(
+    config: &DataplaneConfig,
+    state: &AgentState,
+) -> Result<(Option<String>, ReloadingControllerClient)> {
+    let controller_url = config
+        .controller_url
+        .as_deref()
+        .map(|url| url.trim_end_matches('/').to_owned());
+    let client =
+        dataplane_controller_client(controller_url.as_deref(), &config.controller_ca_path, state)?;
+    if let Some(controller_url) = controller_url.as_deref() {
+        preflight_controller_compatibility(&client, controller_url, &config.agent_token_path)
+            .await?;
+    }
+    Ok((controller_url, client))
+}
+
 impl ReloadingControllerClient {
     fn new(
         controller_url: &str,
@@ -1376,6 +1390,97 @@ fn authenticated_get(
         .bearer_auth(read_agent_token(token_path)?))
 }
 
+async fn preflight_controller_compatibility(
+    client: &ReloadingControllerClient,
+    controller_url: &str,
+    token_path: &Path,
+) -> Result<()> {
+    let response = match authenticated_get(
+        client,
+        format!("{controller_url}/v1/version"),
+        token_path,
+    )?
+    .send()
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(
+                %error,
+                "controller compatibility preflight unavailable; retaining offline-start recovery"
+            );
+            return Ok(());
+        }
+    };
+    let compatibility: ComponentCompatibility = response
+        .error_for_status()
+        .context("controller compatibility preflight was rejected")?
+        .json()
+        .await
+        .context("decode controller compatibility preflight")?;
+    ensure_controller_compatibility(&compatibility)?;
+    info!(
+        controller_revision = %compatibility.build_revision,
+        persistent_bpf_state_abi_version = compatibility.persistent_bpf_state_abi_version,
+        policy_snapshot_schema_version = compatibility.policy_snapshot_schema_version,
+        "controller compatibility preflight passed before persistent BPF state access"
+    );
+    Ok(())
+}
+
+fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Result<()> {
+    let local = component_compatibility();
+    let mismatches = [
+        (
+            "compatibility schema",
+            controller.schema_version,
+            local.schema_version,
+        ),
+        (
+            "persistent BPF-state ABI",
+            controller.persistent_bpf_state_abi_version,
+            local.persistent_bpf_state_abi_version,
+        ),
+        (
+            "identity snapshot schema",
+            controller.identity_snapshot_schema_version,
+            local.identity_snapshot_schema_version,
+        ),
+        (
+            "policy snapshot schema",
+            controller.policy_snapshot_schema_version,
+            local.policy_snapshot_schema_version,
+        ),
+        (
+            "agent-status schema",
+            controller.agent_status_schema_version,
+            local.agent_status_schema_version,
+        ),
+        (
+            "flow-export schema",
+            controller.flow_export_schema_version,
+            local.flow_export_schema_version,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, remote, expected)| remote != expected)
+    .map(|(name, remote, expected)| format!("{name} controller={remote} agent={expected}"))
+    .collect::<Vec<_>>();
+    if controller.component != "unf-controller" {
+        bail!(
+            "incompatible controller compatibility response: component={}; expected unf-controller",
+            controller.component
+        );
+    }
+    if !mismatches.is_empty() {
+        bail!(
+            "incompatible controller compatibility tuple: {}",
+            mismatches.join(", ")
+        );
+    }
+    Ok(())
+}
+
 async fn await_background_task(task: Option<tokio::task::JoinHandle<()>>, name: &'static str) {
     if let Some(task) = task
         && let Err(error) = task.await
@@ -1413,6 +1518,17 @@ fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool)> {
         .load_file(&config.object)
         .with_context(|| format!("load eBPF object {}", config.object.display()))?;
     Ok((ebpf, existing == PERSISTENT_MAP_NAMES.len()))
+}
+
+fn ensure_bpf_pin_path_abi(path: &Path) -> Result<()> {
+    let expected = format!("v{CURRENT_BPF_ABI_VERSION}");
+    if path.file_name().and_then(std::ffi::OsStr::to_str) != Some(expected.as_str()) {
+        bail!(
+            "configured BPF pin path {} is incompatible with persistent BPF-state ABI v{CURRENT_BPF_ABI_VERSION}; expected a /{expected} directory",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn recover_persistent_dataplane(
@@ -4273,6 +4389,60 @@ mod tests {
             version.agent_status_schema_version,
             AGENT_STATUS_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn controller_preflight_accepts_only_the_exact_local_tuple() {
+        let mut controller = ComponentCompatibility::current(
+            "unf-controller",
+            env!("CARGO_PKG_VERSION"),
+            "controller-revision",
+        );
+        assert!(ensure_controller_compatibility(&controller).is_ok());
+
+        controller.policy_snapshot_schema_version += 1;
+        let error = ensure_controller_compatibility(&controller)
+            .expect_err("a policy-schema mismatch is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("policy snapshot schema controller=5 agent=4")
+        );
+
+        controller.policy_snapshot_schema_version -= 1;
+        controller.persistent_bpf_state_abi_version += 1;
+        let error = ensure_controller_compatibility(&controller)
+            .expect_err("a persistent-ABI mismatch is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("persistent BPF-state ABI controller=4 agent=3")
+        );
+    }
+
+    #[test]
+    fn controller_preflight_rejects_a_non_controller_response() {
+        let response = component_compatibility();
+        let error = ensure_controller_compatibility(&response)
+            .expect_err("an agent response cannot satisfy controller preflight");
+        assert!(
+            error
+                .to_string()
+                .contains("component=unf-agent; expected unf-controller")
+        );
+    }
+
+    #[test]
+    fn persistent_abi_requires_its_exact_versioned_pin_directory() {
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v3")).is_ok());
+        let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
+            .expect_err("a stale ABI directory is rejected before access");
+        assert!(
+            error.to_string().contains(
+                "incompatible with persistent BPF-state ABI v3; expected a /v3 directory"
+            )
+        );
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v3")).is_err());
     }
 
     #[test]
