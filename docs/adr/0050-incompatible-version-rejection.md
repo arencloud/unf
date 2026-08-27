@@ -78,3 +78,7 @@ does not define a schema translator, dual-read/write window, persistent-state
 migration, or clean rebuild. Those behaviors remain milestone 2.3. Unsupported
 downgrade classification and operator-facing rollback reporting also remain
 separate tracked work.
+
+ADR 0051 subsequently verified the deliberate snapshot-driven clean-rebuild
+choice for milestone 2.3; this ADR's negative rejection boundary remains
+unchanged.

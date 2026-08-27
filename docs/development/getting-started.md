@@ -424,6 +424,25 @@ continuous 8080 allow/9090 deny probe and final current-tuple convergence are
 mandatory. These deliberately incompatible images are local test fixtures and
 must never be published as releases.
 
+Use the persistent-state boundary gate to prove deliberate clean rebuild and
+reverse recovery when the persistent ABI changes but wire schemas remain
+compatible:
+
+```bash
+make kind-clean-rebuild-test
+```
+
+The target accepts only a clean committed revision and derives local ABI-v4
+controller and agent fixtures from it. It upgrades the controller first, then
+replaces one agent at a time. Every fresh ABI directory must commit identity and
+policy snapshots before attachment, report populated state, and converge while
+the prior ABI remains pinned. Only after full convergence does the gate retire
+old state. It repeats the process back to v3 and uses an exact-node cleanup Pod
+from the v4 image to remove only v4 state. A continuous 8080 allow/9090 deny
+probe is mandatory throughout. This qualifies snapshot-driven clean rebuild,
+not byte migration or simultaneous wire-schema changes; ADR 0051 defines the
+boundary.
+
 Use the bounded failure/scale profile after deploying the current images:
 
 ```bash
