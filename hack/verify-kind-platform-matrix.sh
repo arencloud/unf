@@ -13,9 +13,13 @@ revision=$(git -C "${project_root}" rev-parse HEAD)
 stage=preflight
 cluster_created=false
 cluster_removed=true
+inotify_adjusted=false
+inotify_restored=true
 outcome=failed
 kubernetes_version=
 node_image=$(awk '/image: kindest\/node:/ {print $2; exit}' "${config}")
+original_inotify_instances=$(sysctl -n fs.inotify.max_user_instances)
+qualification_inotify_instances=${UNF_MATRIX_INOTIFY_INSTANCES:-512}
 environment_file=$(mktemp)
 
 mkdir -p "$(dirname "${result_record}")" "$(dirname "${attempt_history}")"
@@ -33,6 +37,9 @@ write_result() {
         --arg node_image "${node_image}" \
         --arg kubernetes_version "${kubernetes_version}" \
         --argjson cluster_removed "${cluster_removed}" \
+        --argjson original_inotify_instances "${original_inotify_instances}" \
+        --argjson qualification_inotify_instances "${qualification_inotify_instances}" \
+        --argjson inotify_restored "${inotify_restored}" \
         --slurpfile environment "${environment_file}" \
         '{
             schema_version: 1,
@@ -54,7 +61,10 @@ write_result() {
                 adjacent_revision_upgrade_rollback: ($outcome == "passed")
             },
             cleanup: {
-                dedicated_cluster_removed: $cluster_removed
+                dedicated_cluster_removed: $cluster_removed,
+                original_inotify_instances: $original_inotify_instances,
+                qualification_inotify_instances: $qualification_inotify_instances,
+                original_inotify_instances_restored: $inotify_restored
             }
         }' >"${result_record}"
     jq -c . "${result_record}" >>"${attempt_history}"
@@ -70,6 +80,22 @@ cleanup() {
             KIND_KUBECONFIG="${kubeconfig}" \
             KUBE_CONTEXT="${context}" >/dev/null 2>&1; then
             cluster_removed=true
+        fi
+    fi
+    if [[ ${cluster_removed} != true && ${exit_code} -eq 0 ]]; then
+        exit_code=1
+        outcome=failed
+        stage=dedicated-cluster-cleanup
+    fi
+    if [[ ${inotify_adjusted} == true ]]; then
+        inotify_restored=false
+        if sudo sysctl -q -w \
+            "fs.inotify.max_user_instances=${original_inotify_instances}"; then
+            inotify_restored=true
+        elif [[ ${exit_code} -eq 0 ]]; then
+            exit_code=1
+            outcome=failed
+            stage=host-prerequisite-restore
         fi
     fi
     write_result
@@ -93,6 +119,11 @@ trap cleanup EXIT
     echo "matrix Kind node image must be tag-and-digest pinned" >&2
     exit 1
 }
+[[ ${qualification_inotify_instances} =~ ^[0-9]+$ ]] &&
+    ((qualification_inotify_instances >= original_inotify_instances)) || {
+    echo "matrix inotify instance limit must be an integer at least ${original_inotify_instances}" >&2
+    exit 1
+}
 [[ -z $(git -C "${project_root}" status --porcelain) ]] || {
     echo "platform-matrix qualification requires a clean committed tree" >&2
     exit 1
@@ -100,6 +131,13 @@ trap cleanup EXIT
 if sudo env KIND_EXPERIMENTAL_PROVIDER=podman "${project_root}/.tools/bin/kind" get clusters 2>/dev/null | grep -Fxq "${cluster_name}"; then
     echo "refusing to reuse existing matrix cluster ${cluster_name}" >&2
     exit 1
+fi
+
+stage=host-prerequisite
+if ((original_inotify_instances < qualification_inotify_instances)); then
+    inotify_adjusted=true
+    sudo sysctl -q -w \
+        "fs.inotify.max_user_instances=${qualification_inotify_instances}"
 fi
 
 stage=cluster-create
