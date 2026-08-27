@@ -1,5 +1,5 @@
-.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-scale-failure-test kind-test kind-down
-.NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test
+.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-scale-failure-test kind-test kind-down
+.NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test
 
 KIND := .tools/bin/kind
 KIND_PROVIDER ?= podman
@@ -14,6 +14,8 @@ UNF_SKIPPED_UPGRADE_BASELINE_CONTROLLER_IMAGE ?= localhost/unf-controller:upgrad
 UNF_SKIPPED_UPGRADE_BASELINE_AGENT_IMAGE ?= localhost/unf-agent:upgrade-skip-n
 UNF_INCOMPATIBLE_CONTROLLER_IMAGE ?= localhost/unf-controller:incompatible-tuple
 UNF_INCOMPATIBLE_AGENT_IMAGE ?= localhost/unf-agent:incompatible-tuple
+UNF_CLEAN_REBUILD_CONTROLLER_IMAGE ?= localhost/unf-controller:clean-rebuild-abi4
+UNF_CLEAN_REBUILD_AGENT_IMAGE ?= localhost/unf-agent:clean-rebuild-abi4
 QUAY_AUTH_FILE ?= $(CURDIR)/.tools/quay-auth.json
 UNF_DEV_IMAGE_TAG ?= dev
 UNF_CONTROLLER_DEV_IMAGE ?= quay.io/arencloud/unf-controller-dev:$(UNF_DEV_IMAGE_TAG)
@@ -69,6 +71,9 @@ skipped-upgrade-baseline-images:
 
 incompatible-version-images: images
 	UNF_INCOMPATIBLE_CONTROLLER_IMAGE=$(UNF_INCOMPATIBLE_CONTROLLER_IMAGE) UNF_INCOMPATIBLE_AGENT_IMAGE=$(UNF_INCOMPATIBLE_AGENT_IMAGE) hack/build-incompatible-version-images.sh
+
+clean-rebuild-version-images: images
+	UNF_CLEAN_REBUILD_CONTROLLER_IMAGE=$(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) UNF_CLEAN_REBUILD_AGENT_IMAGE=$(UNF_CLEAN_REBUILD_AGENT_IMAGE) hack/build-clean-rebuild-images.sh
 
 openshift-images: images
 	podman push --authfile $(QUAY_AUTH_FILE) localhost/unf-controller:dev docker://$(UNF_CONTROLLER_DEV_IMAGE)
@@ -135,6 +140,13 @@ kind-incompatible-version-load: incompatible-version-images
 	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_INCOMPATIBLE_CONTROLLER_IMAGE)
 	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_INCOMPATIBLE_AGENT_IMAGE)
 
+kind-clean-rebuild-load: clean-rebuild-version-images
+	ln -sf $$(command -v podman) .tools/bin/docker
+	podman save $(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) | sudo podman load
+	podman save $(UNF_CLEAN_REBUILD_AGENT_IMAGE) | sudo podman load
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE)
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_CLEAN_REBUILD_AGENT_IMAGE)
+
 kind-deploy: kind-load
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/configure-internal-tls.sh
 	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev apply -k deploy
@@ -167,6 +179,9 @@ kind-skipped-upgrade-test: kind-deploy kind-demo kind-skipped-upgrade-load
 
 kind-incompatible-version-test: kind-deploy kind-demo kind-incompatible-version-load
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_INCOMPATIBLE_CONTROLLER_IMAGE=$(UNF_INCOMPATIBLE_CONTROLLER_IMAGE) UNF_INCOMPATIBLE_AGENT_IMAGE=$(UNF_INCOMPATIBLE_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-incompatible-version.sh
+
+kind-clean-rebuild-test: kind-deploy kind-demo kind-clean-rebuild-load
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_CLEAN_REBUILD_CONTROLLER_IMAGE=$(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) UNF_CLEAN_REBUILD_AGENT_IMAGE=$(UNF_CLEAN_REBUILD_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-clean-rebuild.sh
 
 kind-scale-failure-test: kind-deploy kind-demo
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-kind-scale-failure.sh

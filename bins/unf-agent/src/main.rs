@@ -158,10 +158,10 @@ struct CleanupArgs {
     /// Parent directory containing versioned UNF bpffs state.
     #[arg(long, default_value = "/sys/fs/bpf/unf")]
     bpf_root: PathBuf,
-    /// Remove one known ABI directory (supported: 1 or 2).
+    /// Remove one ABI directory recognized by this binary.
     #[arg(long)]
     abi_version: Option<u16>,
-    /// Permit removal of the currently deployed ABI v2 directory.
+    /// Permit removal of this binary's current ABI directory.
     #[arg(long, requires = "abi_version")]
     allow_current_abi: bool,
     /// Remove UNF-named persistent netlink filters.
@@ -635,8 +635,10 @@ fn plan_abi_cleanup(
     abi_version: u16,
     allow_current_abi: bool,
 ) -> Result<AbiCleanupPlan> {
-    if !matches!(abi_version, 1 | 2 | CURRENT_BPF_ABI_VERSION) {
-        bail!("unsupported ABI version {abi_version}; this binary recognizes only v1, v2, and v3");
+    if abi_version == 0 || abi_version > CURRENT_BPF_ABI_VERSION {
+        bail!(
+            "unsupported ABI version {abi_version}; this binary recognizes v1 through v{CURRENT_BPF_ABI_VERSION}"
+        );
     }
     if abi_version == CURRENT_BPF_ABI_VERSION && !allow_current_abi {
         bail!(
@@ -1022,6 +1024,10 @@ async fn run_dataplane(
     );
     let recovered = recover_persistent_dataplane(&mut identities, &mut policies, pins_existed)?;
     apply_recovered_state(&state, &identities, &policies, &recovered);
+    let recovered_ready = recovered_dataplane_is_ready(&recovered);
+    if !recovered_ready {
+        populate_dataplane_before_attachment(&mut identities, &mut policies, &state).await?;
+    }
     let mut attachments = attach_dataplane_program(
         &mut ebpf,
         &config,
@@ -1035,11 +1041,7 @@ async fn run_dataplane(
         .store(attachments.mode as u64, Ordering::Release);
     state.bpf_loaded.store(true, Ordering::Release);
     state.metrics.bpf_loaded.set(1);
-    let recovered_ready = recovered_dataplane_is_ready(&recovered);
-    state.ready.store(
-        controller_url.is_none() || recovered_ready,
-        Ordering::Release,
-    );
+    state.ready.store(true, Ordering::Release);
     if recovered_ready {
         let active_policy_bank = usize::from(policies.active_bank);
         info!(
@@ -1056,8 +1058,6 @@ async fn run_dataplane(
             egress_ipv6_entries = policies.egress_ipv6_banks[active_policy_bank].len(),
             "validated pinned last-known-good dataplane"
         );
-    } else if controller_url.is_some() {
-        info!("waiting for initial identity and policy snapshots before becoming ready");
     }
     let (flow_export_sender, flow_export_task) = spawn_flow_exporter(
         controller_url.clone(),
@@ -1146,6 +1146,38 @@ fn recovered_dataplane_is_ready(recovered: &RecoveredDataplane) -> bool {
         && recovered.identity_revision.is_some()
         && recovered.policy_epoch.is_some()
         && recovered.policy_revision.is_some()
+}
+
+async fn populate_dataplane_before_attachment(
+    identities: &mut IdentitySynchronizer,
+    policies: &mut PolicySynchronizer,
+    state: &AgentState,
+) -> Result<()> {
+    if identities.controller_url.is_none() || policies.controller_url.is_none() {
+        bail!("persistent BPF state is uninitialized and cannot be attached without a controller");
+    }
+    synchronize_identities(identities, state)
+        .await
+        .context("populate identity maps before dataplane attachment")?;
+    synchronize_policies(policies, state)
+        .await
+        .context("populate policy maps before dataplane attachment")?;
+    let active_policy_bank = usize::from(policies.active_bank);
+    info!(
+        identity_epoch = identities.applied_epoch,
+        identity_revision = state.applied_identity_revision.load(Ordering::Acquire),
+        policy_epoch = policies.applied_epoch,
+        policy_revision = state.applied_policy_revision.load(Ordering::Acquire),
+        active_identity_bank = identities.active_bank,
+        active_policy_bank = policies.active_bank,
+        identity_policy_entries = policies.identity_banks[active_policy_bank].len(),
+        ipv4_policy_entries = policies.ipv4_banks[active_policy_bank].len(),
+        ipv6_policy_entries = policies.ipv6_banks[active_policy_bank].len(),
+        egress_ipv4_entries = policies.egress_ipv4_banks[active_policy_bank].len(),
+        egress_ipv6_entries = policies.egress_ipv6_banks[active_policy_bank].len(),
+        "fresh persistent BPF state populated before attachment"
+    );
+    Ok(())
 }
 
 fn new_synchronizers(
@@ -4235,10 +4267,45 @@ mod tests {
         let temporary = tempdir().expect("temporary directory is created");
         let root = temporary.path().join("unf");
         assert!(plan_abi_cleanup(&root, CURRENT_BPF_ABI_VERSION, false).is_err());
-        assert!(plan_abi_cleanup(&root, 4, true).is_err());
+        assert!(plan_abi_cleanup(&root, CURRENT_BPF_ABI_VERSION + 1, true).is_err());
+        assert!(plan_abi_cleanup(&root, 0, false).is_err());
         assert!(plan_abi_cleanup(&root, 2, false).is_ok());
         assert!(plan_abi_cleanup(Path::new("relative"), 1, false).is_err());
         assert!(plan_abi_cleanup(Path::new("/"), 1, false).is_err());
+    }
+
+    #[test]
+    fn only_complete_recovered_state_can_attach_without_initial_population() {
+        let complete = RecoveredDataplane {
+            identity_epoch: Some(7),
+            identity_revision: Some(11),
+            policy_epoch: Some(7),
+            policy_revision: Some(13),
+        };
+        assert!(recovered_dataplane_is_ready(&complete));
+
+        for incomplete in [
+            RecoveredDataplane {
+                identity_epoch: None,
+                identity_revision: None,
+                policy_epoch: None,
+                policy_revision: None,
+            },
+            RecoveredDataplane {
+                identity_epoch: Some(7),
+                identity_revision: Some(11),
+                policy_epoch: None,
+                policy_revision: None,
+            },
+            RecoveredDataplane {
+                identity_epoch: None,
+                identity_revision: None,
+                policy_epoch: Some(7),
+                policy_revision: Some(13),
+            },
+        ] {
+            assert!(!recovered_dataplane_is_ready(&incomplete));
+        }
     }
 
     #[test]

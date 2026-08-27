@@ -88,17 +88,20 @@ temporarily unavailable. New identity and policy state never partially
 overwrites active maps; each prior bank remains selected through any pre-switch
 failure. Eleven enforcement maps are pinned under the `/sys/fs/bpf/unf/v3` ABI
 directory, reopened with strict all-or-none validation, and reconstructed into
-userspace caches after restart. Fresh startup readiness is fenced until identity
-and policy both reconcile, while a complete validated last-known-good set may
-restore service without the controller. On Linux 6.6+, per-interface TCX links
+userspace caches after restart. A fresh or incomplete map set must receive and
+commit both identity and policy snapshots before any TC program is attached;
+failure leaves the new ABI state unattached for safe retry. A complete validated
+last-known-good set may restore service without the controller. On Linux 6.6+,
+per-interface TCX links
 are pinned and atomically updated to the replacement program; older kernels use
 stable legacy netlink filter identities for in-place replacement. Automatic mode
 selection has an explicit compatibility-test override; kind removes TCX coverage,
 proves the legacy filter alone survives offline-controller agent replacement,
 then restores TCX before scoped legacy cleanup. A separate dry-run-first cleanup
-command recognizes only the v1/v2/v3 map names, numeric UNF TCX link-pin names, and
-UNF legacy program names. It refuses unknown ABI content and requires explicit
-confirmation for current v3 removal. ADRs 0023 and 0024 place snapshots,
+command recognizes every ABI from v1 through the binary's compiled current
+version, numeric UNF TCX link-pin names, and UNF legacy program names. It refuses
+unknown ABI content and requires explicit confirmation for current-ABI removal.
+ADRs 0023 and 0024 place snapshots,
 acknowledgements, and telemetry behind dedicated TLS plus Pod-bound TokenReview;
 serving certificates and CA bundles reload with last-known-good fallback and an
 overlapping-trust rotation gate. Agent reports and the newest bounded flow

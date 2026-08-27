@@ -111,9 +111,10 @@ authenticated provenance. Controller leaf certificates and agent CA bundles now
 reload in place with last-known-good fallback. A separate OpenShift gate rotates
 through overlapping external-PKI trust, rejects malformed updates, restores the
 platform Service CA, and proves that no controller or agent Pod is replaced.
-The agent also provides a dry-run-first cleanup command for known ABI v1/v2 pins,
-TCX link pins, and UNF-named legacy filters; current ABI removal requires an
-additional explicit confirmation and unknown directory content is refused. The
+The agent also provides a dry-run-first cleanup command for ABI directories from
+v1 through the binary's compiled current version, TCX link pins, and UNF-named
+legacy filters; current ABI removal requires an additional explicit confirmation
+and unknown directory content is refused. The
 OpenShift uninstall orchestrator reviews that plan on every selected worker,
 requires exact cluster-context confirmation, stops agents before mutation,
 verifies host cleanup, preserves the CRD by default, and removes its temporary
@@ -189,9 +190,9 @@ Implemented in the repository:
 - explicit `auto`, `tcx-pinned`, and `legacy-netlink` attachment selection, with
   kind verification that removes TCX coverage, continuously probes enforcement
   through legacy in-place replacement, then restores TCX before scoped cleanup;
-- dry-run-first `unf-agent cleanup` planning for recognized ABI v1/v2/v3 map and
-  TCX pins plus UNF-named legacy filters, with unknown-content refusal and an
-  explicit current-ABI confirmation gate;
+- dry-run-first `unf-agent cleanup` planning for map and TCX pins from ABI v1
+  through the binary's compiled current version plus UNF-named legacy filters,
+  with unknown-content refusal and an explicit current-ABI confirmation gate;
 - coordinated dry-run-first OpenShift uninstall with all-agent shutdown,
   admission-constrained per-node cleanup Jobs, post-cleanup host verification,
   exact resource removal, CRD preservation, and full redeploy qualification;
