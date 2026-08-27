@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -31,7 +31,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_api::SecurityPolicy;
-use unf_common::{IdentityId, PolicyDirection, PolicyId, Protocol, Revision, Verdict};
+use unf_common::{
+    IdentityId, PolicyAction, PolicyDirection, PolicyId, PolicyReason, Protocol, Revision, Verdict,
+};
 use unf_policy::{
     DestinationAddresses, DestinationPort, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort,
     NetworkPolicyCompiler, PolicyCompiler, PolicyIr, compile_dataplane_entries,
@@ -41,13 +43,14 @@ use unf_policy::{
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
-    FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FLOW_HISTORY_CAPACITY, FlowExportBatch,
-    FlowExportRecord, FlowHistoryCheckpoint, FlowHistoryQuerySummary, FlowHistorySnapshot,
-    FlowHistoryStore, IdentityRegistry, IdentityStateSnapshot, NetworkIdentity,
-    POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyStateSnapshot, RevisionSet,
-    TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode, TopologyService, TopologyServiceBackend,
-    TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
-    provisional_identity_id,
+    EgressIpv4PolicyMapEntry, EgressIpv4PolicyMapKey, EgressIpv6PolicyMapEntry,
+    EgressIpv6PolicyMapKey, FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION,
+    FLOW_HISTORY_CAPACITY, FlowExportBatch, FlowExportRecord, FlowHistoryCheckpoint,
+    FlowHistoryQuerySummary, FlowHistorySnapshot, FlowHistoryStore, IdentityRegistry,
+    IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord,
+    PolicyStateSnapshot, RevisionSet, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyNode,
+    TopologyService, TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort,
+    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
 };
 
 const AGENT_STATUS_FRESHNESS_MILLIS: u64 = 10_000;
@@ -138,6 +141,7 @@ struct ControllerState {
     agent_node_selector: Option<String>,
     pods: RwLock<BTreeMap<String, PodRecord>>,
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
+    host_network_gateways: RwLock<BTreeMap<String, HostNetworkGateways>>,
     services: RwLock<BTreeMap<String, ServiceRecord>>,
     endpoint_slices: RwLock<BTreeMap<String, EndpointSliceRecord>>,
     namespaces: RwLock<BTreeMap<String, BTreeMap<String, String>>>,
@@ -147,6 +151,7 @@ struct ControllerState {
     compiled_network_policies: RwLock<BTreeMap<String, Vec<PolicyIr>>>,
     rejected_network_policies: RwLock<BTreeMap<String, String>>,
     policy_state_guard: RwLock<()>,
+    dataplane_policy_cache: Mutex<Option<DataplanePolicyState>>,
     identities: Mutex<IdentityRegistry>,
     flow_history: Mutex<FlowHistoryStore>,
     flow_history_dirty: AtomicBool,
@@ -162,6 +167,12 @@ struct ControllerState {
     revisions: Mutex<RevisionSet>,
     registry: Mutex<Registry>,
     metrics: ControllerMetrics,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HostNetworkGateways {
+    ipv4: BTreeSet<std::net::Ipv4Addr>,
+    ipv6: BTreeSet<Ipv6Addr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -773,6 +784,7 @@ fn new_state_with_client_and_selector(
         agent_node_selector,
         pods: RwLock::new(BTreeMap::new()),
         nodes: RwLock::new(BTreeMap::new()),
+        host_network_gateways: RwLock::new(BTreeMap::new()),
         services: RwLock::new(BTreeMap::new()),
         endpoint_slices: RwLock::new(BTreeMap::new()),
         namespaces: RwLock::new(BTreeMap::new()),
@@ -782,6 +794,7 @@ fn new_state_with_client_and_selector(
         compiled_network_policies: RwLock::new(BTreeMap::new()),
         rejected_network_policies: RwLock::new(BTreeMap::new()),
         policy_state_guard: RwLock::new(()),
+        dataplane_policy_cache: Mutex::new(None),
         identities: Mutex::new(IdentityRegistry::default()),
         flow_history: Mutex::new(FlowHistoryStore::default()),
         flow_history_dirty: AtomicBool::new(false),
@@ -1462,17 +1475,37 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
     match event {
         Event::Apply(node) | Event::InitApply(node) => {
             let normalized = topology_node(&node);
+            let gateways = ovn_host_network_gateways(&node);
             let previous =
                 write_lock(&state.nodes).insert(normalized.name.clone(), normalized.clone());
+            let previous_gateways = if gateways == HostNetworkGateways::default() {
+                write_lock(&state.host_network_gateways).remove(&normalized.name)
+            } else {
+                write_lock(&state.host_network_gateways)
+                    .insert(normalized.name.clone(), gateways.clone())
+            };
             state.metrics.reconciles.inc();
             if previous.as_ref() != Some(&normalized) {
                 bump_topology_revision(state);
+            }
+            let gateways_changed = previous_gateways.as_ref().map_or(
+                !gateways.ipv4.is_empty() || !gateways.ipv6.is_empty(),
+                |previous| previous != &gateways,
+            );
+            if gateways_changed {
+                bump_policy_revision(state);
             }
         }
         Event::Delete(node) => {
             let node_name = node.name_any();
             if write_lock(&state.nodes).remove(&node_name).is_some() {
                 bump_topology_revision(state);
+            }
+            if write_lock(&state.host_network_gateways)
+                .remove(&node_name)
+                .is_some()
+            {
+                bump_policy_revision(state);
             }
             if write_lock(&state.agent_reports)
                 .remove(&node_name)
@@ -1484,8 +1517,13 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
         Event::Init => {
             let had_nodes = !read_lock(&state.nodes).is_empty();
             write_lock(&state.nodes).clear();
+            let had_gateways = !read_lock(&state.host_network_gateways).is_empty();
+            write_lock(&state.host_network_gateways).clear();
             if had_nodes {
                 bump_topology_revision(state);
+            }
+            if had_gateways {
+                bump_policy_revision(state);
             }
         }
         Event::InitDone => {
@@ -1497,6 +1535,55 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
                 state.agent_reports_dirty.store(true, Ordering::Release);
             }
         }
+    }
+}
+
+fn ovn_host_network_gateways(node: &Node) -> HostNetworkGateways {
+    const NODE_SUBNETS_ANNOTATION: &str = "k8s.ovn.org/node-subnets";
+    let Some(encoded) = node
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(NODE_SUBNETS_ANNOTATION))
+    else {
+        return HostNetworkGateways::default();
+    };
+    let Ok(networks) = serde_json::from_str::<BTreeMap<String, Vec<String>>>(encoded) else {
+        warn!(node = %node.name_any(), "ignored malformed OVN node-subnets annotation");
+        return HostNetworkGateways::default();
+    };
+    let mut gateways = HostNetworkGateways::default();
+    for network in networks.into_values().flatten() {
+        match ovn_gateway_address(&network) {
+            Some(IpAddr::V4(address)) => {
+                gateways.ipv4.insert(address);
+            }
+            Some(IpAddr::V6(address)) => {
+                gateways.ipv6.insert(address);
+            }
+            None => warn!(node = %node.name_any(), network, "ignored invalid OVN node subnet"),
+        }
+    }
+    gateways
+}
+
+fn ovn_gateway_address(network: &str) -> Option<IpAddr> {
+    let (address, prefix_len) = network.split_once('/')?;
+    let prefix_len: u8 = prefix_len.parse().ok()?;
+    match address.parse::<IpAddr>().ok()? {
+        IpAddr::V4(address) if prefix_len <= 30 => {
+            let mask = u32::MAX << (32 - prefix_len);
+            Some(IpAddr::V4(Ipv4Addr::from(
+                (u32::from(address) & mask).checked_add(2)?,
+            )))
+        }
+        IpAddr::V6(address) if prefix_len <= 126 => {
+            let mask = u128::MAX << (128 - prefix_len);
+            Some(IpAddr::V6(Ipv6Addr::from(
+                (u128::from(address) & mask).checked_add(2)?,
+            )))
+        }
+        _ => None,
     }
 }
 
@@ -2715,7 +2802,7 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
                 "TCP/UDP/SCTP flow export destination_port must be greater than zero",
             ));
         }
-        if entry.decision.reason > 5 || entry.shadow.is_some_and(|shadow| shadow.reason > 5) {
+        if entry.decision.reason > 6 || entry.shadow.is_some_and(|shadow| shadow.reason > 6) {
             return Err(ApiError::bad_request(
                 "flow export decision reason must be a known ABI reason code",
             ));
@@ -2726,6 +2813,13 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
 
 fn dataplane_policy_state(state: &ControllerState) -> Result<DataplanePolicyState, ApiError> {
     let _policy_state_guard = read_lock(&state.policy_state_guard);
+    let revision = mutex_lock(&state.revisions).policy;
+    let mut cache = mutex_lock(&state.dataplane_policy_cache);
+    if let Some(snapshot) = cache.as_ref()
+        && snapshot.0 == revision
+    {
+        return Ok(snapshot.clone());
+    }
     let policies = compiled_policies(state);
     let (ingress_policies, egress_policies): (Vec<_>, Vec<_>) = policies
         .into_iter()
@@ -2741,20 +2835,154 @@ fn dataplane_policy_state(state: &ControllerState) -> Result<DataplanePolicyStat
     let ipv6_entries =
         compile_ipv6_dataplane_entries(&ingress_policies, &endpoints, &ipv6_endpoints)
             .map_err(|error| ApiError::internal(error.to_string()))?;
-    let egress_ipv4_entries =
+    let mut egress_ipv4_entries =
         compile_egress_ipv4_dataplane_entries(&egress_policies, &endpoints, &ipv4_endpoints)
             .map_err(|error| ApiError::internal(error.to_string()))?;
-    let egress_ipv6_entries =
+    let mut egress_ipv6_entries =
         compile_egress_ipv6_dataplane_entries(&egress_policies, &endpoints, &ipv6_endpoints)
             .map_err(|error| ApiError::internal(error.to_string()))?;
-    Ok((
-        mutex_lock(&state.revisions).policy,
+    add_ovn_host_network_reply_entries(
+        state,
+        &ingress_policies,
+        &egress_policies,
+        &endpoints,
+        &mut egress_ipv4_entries,
+        &mut egress_ipv6_entries,
+    )?;
+    let snapshot = (
+        revision,
         entries,
         ipv4_entries,
         ipv6_entries,
         egress_ipv4_entries,
         egress_ipv6_entries,
-    ))
+    );
+    *cache = Some(snapshot.clone());
+    Ok(snapshot)
+}
+
+fn add_ovn_host_network_reply_entries(
+    state: &ControllerState,
+    ingress_policies: &[PolicyIr],
+    egress_policies: &[PolicyIr],
+    endpoints: &[Endpoint],
+    ipv4_entries: &mut Vec<EgressIpv4PolicyMapEntry>,
+    ipv6_entries: &mut Vec<EgressIpv6PolicyMapEntry>,
+) -> Result<(), ApiError> {
+    use unf_policy::PolicyOrigin;
+
+    let namespaces = read_lock(&state.namespaces);
+    let gateway_endpoint = host_network_gateway_endpoint(&namespaces);
+    drop(namespaces);
+    let gateways = read_lock(&state.host_network_gateways);
+    if gateways.is_empty() {
+        return Ok(());
+    }
+
+    for endpoint in endpoints {
+        let egress_isolated = egress_policies.iter().any(|policy| {
+            policy.origin == PolicyOrigin::KubernetesNetworkPolicy
+                && policy.target.matches(endpoint)
+        });
+        if !egress_isolated {
+            continue;
+        }
+
+        for policy in ingress_policies.iter().filter(|policy| {
+            policy.origin == PolicyOrigin::KubernetesNetworkPolicy
+                && policy.target.matches(endpoint)
+        }) {
+            for rule in policy.rules.iter().filter(|rule| {
+                rule.action == PolicyAction::Allow && rule.source.matches(&gateway_endpoint)
+            }) {
+                let decision = PolicyDecisionRecord {
+                    verdict: Verdict::Allow,
+                    reason: PolicyReason::ExplicitRule,
+                    policy_id: Some(policy.id),
+                    rule_id: Some(rule.id),
+                };
+                let protocol = rule.protocol.map_or(0, |protocol| protocol as u8);
+                for gateway in gateways.values() {
+                    for destination_address in &gateway.ipv4 {
+                        upsert_egress_ipv4_entry(
+                            ipv4_entries,
+                            EgressIpv4PolicyMapEntry {
+                                key: EgressIpv4PolicyMapKey {
+                                    source_identity: endpoint.identity,
+                                    destination_address: *destination_address,
+                                    protocol,
+                                    destination_port: 0,
+                                },
+                                decision,
+                                shadow: None,
+                            },
+                        )?;
+                    }
+                    for destination_network in &gateway.ipv6 {
+                        upsert_egress_ipv6_entry(
+                            ipv6_entries,
+                            EgressIpv6PolicyMapEntry {
+                                key: EgressIpv6PolicyMapKey {
+                                    source_identity: endpoint.identity,
+                                    destination_network: *destination_network,
+                                    destination_prefix_len: 128,
+                                    protocol,
+                                    destination_port: 0,
+                                },
+                                decision,
+                                shadow: None,
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    ipv4_entries.sort_by_key(|entry| entry.key);
+    ipv6_entries.sort_by_key(|entry| entry.key);
+    Ok(())
+}
+
+fn upsert_egress_ipv4_entry(
+    entries: &mut Vec<EgressIpv4PolicyMapEntry>,
+    entry: EgressIpv4PolicyMapEntry,
+) -> Result<(), ApiError> {
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|existing| existing.key == entry.key)
+    {
+        *existing = entry;
+    } else {
+        if entries.len() >= unf_state::POLICY_MAP_BANK_ENTRY_LIMIT {
+            return Err(ApiError::internal(format!(
+                "egress IPv4 policy entry limit {} exceeded while adding OVN reply state",
+                unf_state::POLICY_MAP_BANK_ENTRY_LIMIT
+            )));
+        }
+        entries.push(entry);
+    }
+    Ok(())
+}
+
+fn upsert_egress_ipv6_entry(
+    entries: &mut Vec<EgressIpv6PolicyMapEntry>,
+    entry: EgressIpv6PolicyMapEntry,
+) -> Result<(), ApiError> {
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|existing| existing.key == entry.key)
+    {
+        *existing = entry;
+    } else {
+        if entries.len() >= unf_state::POLICY_MAP_BANK_ENTRY_LIMIT {
+            return Err(ApiError::internal(format!(
+                "egress IPv6 policy entry limit {} exceeded while adding OVN reply state",
+                unf_state::POLICY_MAP_BANK_ENTRY_LIMIT
+            )));
+        }
+        entries.push(entry);
+    }
+    Ok(())
 }
 
 async fn explain(
@@ -3595,7 +3823,7 @@ fn endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Endpoint> {
 
 fn ipv4_endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Ipv4Endpoint> {
     let namespaces = read_lock(&state.namespaces);
-    read_lock(&state.pods)
+    let mut endpoints: Vec<_> = read_lock(&state.pods)
         .values()
         .flat_map(|pod| {
             let endpoint = endpoint_with_namespace_labels(&pod.endpoint, &namespaces);
@@ -3607,12 +3835,23 @@ fn ipv4_endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Ipv4Endp
                     endpoint: endpoint.clone(),
                 })
         })
-        .collect()
+        .collect();
+    let gateway = host_network_gateway_endpoint(&namespaces);
+    endpoints.extend(
+        read_lock(&state.host_network_gateways)
+            .values()
+            .flat_map(|gateways| gateways.ipv4.iter().copied())
+            .map(|address| Ipv4Endpoint {
+                address,
+                endpoint: gateway.clone(),
+            }),
+    );
+    endpoints
 }
 
 fn ipv6_endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Ipv6Endpoint> {
     let namespaces = read_lock(&state.namespaces);
-    read_lock(&state.pods)
+    let mut endpoints: Vec<_> = read_lock(&state.pods)
         .values()
         .flat_map(|pod| {
             let endpoint = endpoint_with_namespace_labels(&pod.endpoint, &namespaces);
@@ -3624,7 +3863,36 @@ fn ipv6_endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Ipv6Endp
                     endpoint: endpoint.clone(),
                 })
         })
-        .collect()
+        .collect();
+    let gateway = host_network_gateway_endpoint(&namespaces);
+    endpoints.extend(
+        read_lock(&state.host_network_gateways)
+            .values()
+            .flat_map(|gateways| gateways.ipv6.iter().copied())
+            .map(|address| Ipv6Endpoint {
+                address,
+                endpoint: gateway.clone(),
+            }),
+    );
+    endpoints
+}
+
+fn host_network_gateway_endpoint(
+    namespaces: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Endpoint {
+    const HOST_NETWORK_NAMESPACE: &str = "openshift-host-network";
+    endpoint_with_namespace_labels(
+        &Endpoint {
+            identity: IdentityId::new(u32::MAX),
+            namespace: HOST_NETWORK_NAMESPACE.to_owned(),
+            namespace_labels: BTreeMap::new(),
+            service_account: String::new(),
+            application: None,
+            labels: BTreeMap::new(),
+            named_ports: BTreeMap::new(),
+        },
+        namespaces,
+    )
 }
 
 fn endpoint_with_namespace_labels(
@@ -3968,6 +4236,131 @@ mod tests {
             }
         }))
         .expect("test Namespace is valid Kubernetes JSON")
+    }
+
+    #[test]
+    fn ovn_node_subnets_create_virtual_host_network_peers() {
+        let node: Node = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "worker-a",
+                "annotations": {
+                    "k8s.ovn.org/node-subnets":
+                        "{\"default\":[\"10.131.0.0/23\",\"fd01:0:0:4::/64\"]}"
+                }
+            }
+        }))
+        .expect("test Node is valid Kubernetes JSON");
+        let gateways = ovn_host_network_gateways(&node);
+        assert_eq!(
+            gateways.ipv4,
+            BTreeSet::from(["10.131.0.2".parse().expect("valid IPv4 gateway")])
+        );
+        assert_eq!(
+            gateways.ipv6,
+            BTreeSet::from(["fd01:0:0:4::2".parse().expect("valid IPv6 gateway")])
+        );
+
+        let state = new_state(true);
+        write_lock(&state.host_network_gateways).insert("worker-a".to_owned(), gateways);
+        write_lock(&state.namespaces).insert(
+            "openshift-host-network".to_owned(),
+            BTreeMap::from([(
+                "policy-group.network.openshift.io/host-network".to_owned(),
+                String::new(),
+            )]),
+        );
+        let endpoint = ipv4_endpoints_with_namespace_labels(&state)
+            .into_iter()
+            .find(|endpoint| endpoint.address == "10.131.0.2".parse::<Ipv4Addr>().unwrap())
+            .expect("OVN gateway becomes an IPv4 policy peer");
+        assert_eq!(endpoint.endpoint.namespace, "openshift-host-network");
+        assert_eq!(
+            endpoint
+                .endpoint
+                .namespace_labels
+                .get("policy-group.network.openshift.io/host-network"),
+            Some(&String::new())
+        );
+    }
+
+    #[test]
+    fn ovn_host_network_ingress_allow_creates_scoped_egress_reply_entries() {
+        let state = egress_policy_state();
+        write_lock(&state.host_network_gateways).insert(
+            "worker-a".to_owned(),
+            HostNetworkGateways {
+                ipv4: BTreeSet::from(["10.131.0.2".parse().expect("valid IPv4 gateway")]),
+                ipv6: BTreeSet::from(["fd01:0:0:4::2".parse().expect("valid IPv6 gateway")]),
+            },
+        );
+        write_lock(&state.namespaces).insert(
+            "openshift-host-network".to_owned(),
+            BTreeMap::from([(
+                "policy-group.network.openshift.io/host-network".to_owned(),
+                String::new(),
+            )]),
+        );
+        let ingress_policy: NetworkPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": "allow-router-ingress",
+                "namespace": "frontend"
+            },
+            "spec": {
+                "podSelector": {"matchLabels": {"app": "client"}},
+                "policyTypes": ["Ingress"],
+                "ingress": [{
+                    "from": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "policy-group.network.openshift.io/host-network": ""
+                            }
+                        }
+                    }],
+                    "ports": [{"protocol": "TCP", "port": 8443}]
+                }]
+            }
+        }))
+        .expect("test ingress NetworkPolicy is valid Kubernetes JSON");
+        apply_network_policy_event(&state, Event::Apply(ingress_policy));
+
+        let (_, _, _, _, egress_ipv4, egress_ipv6) =
+            dataplane_policy_state(&state).expect("OVN reply entries lower into the snapshot");
+        let ipv4_reply = egress_ipv4
+            .iter()
+            .find(|entry| {
+                entry.key.source_identity == IdentityId::new(10)
+                    && entry.key.destination_address == "10.131.0.2".parse::<Ipv4Addr>().unwrap()
+                    && entry.key.protocol == Protocol::Tcp as u8
+                    && entry.key.destination_port == 0
+            })
+            .expect("isolated target gets a TCP reply allow to the IPv4 gateway");
+        assert_eq!(ipv4_reply.decision.verdict, Verdict::Allow);
+        assert_eq!(ipv4_reply.decision.reason, PolicyReason::ExplicitRule);
+        assert!(ipv4_reply.decision.policy_id.is_some());
+        assert!(ipv4_reply.decision.rule_id.is_some());
+        assert!(egress_ipv6.iter().any(|entry| {
+            entry.key.source_identity == IdentityId::new(10)
+                && entry.key.destination_network == "fd01:0:0:4::2".parse::<Ipv6Addr>().unwrap()
+                && entry.key.destination_prefix_len == 128
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 0
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(!egress_ipv4.iter().any(|entry| {
+            entry.key.source_identity == IdentityId::new(10)
+                && entry.key.destination_address == "10.131.0.2".parse::<Ipv4Addr>().unwrap()
+                && entry.key.protocol == Protocol::Udp as u8
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(!egress_ipv4.iter().any(|entry| {
+            entry.key.source_identity == IdentityId::new(20)
+                && entry.key.destination_address == "10.131.0.2".parse::<Ipv4Addr>().unwrap()
+                && entry.decision.verdict == Verdict::Allow
+        }));
     }
 
     fn pod_with_named_ports() -> Pod {
@@ -4882,6 +5275,13 @@ mod tests {
         sctp.entries[0].key.protocol = Protocol::Sctp as u8;
         sctp.entries[0].key.destination_port = 8086;
         validate_flow_export_batch(&sctp).expect("SCTP flow export is accepted");
+
+        let mut established = flow_batch(1);
+        established.entries[0].decision.reason = 6;
+        validate_flow_export_batch(&established)
+            .expect("established-reply flow provenance is accepted");
+        established.entries[0].decision.reason = 7;
+        assert!(validate_flow_export_batch(&established).is_err());
 
         let mut ipv6 = flow_batch(1);
         ipv6.entries[0].key.source_ipv4 = None;

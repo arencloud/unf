@@ -445,13 +445,13 @@ fn ip_block_selector(
         }
     })?;
     let address_count = cidr.address_count();
-    if cidr.contains(Ipv4Addr::UNSPECIFIED) {
+    if cidr.prefix_len != 0 && cidr.contains(Ipv4Addr::UNSPECIFIED) {
         return Err(NetworkPolicyCompileError::IpBlockContainsReservedAddress {
             rule_index,
             peer_index,
         });
     }
-    if address_count > KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES {
+    if cidr.prefix_len != 0 && address_count > KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES {
         return Err(NetworkPolicyCompileError::IpBlockTooLarge {
             rule_index,
             peer_index,
@@ -484,9 +484,34 @@ fn ip_block_selector(
         .collect::<Result<Vec<_>, _>>()?;
     except.sort();
     except.dedup();
+    validate_global_ipv4_exceptions(&cidr, &except, rule_index, peer_index)?;
     Ok(IdentitySelector {
         ipv4_blocks: vec![Ipv4Block { cidr, except }],
         ..IdentitySelector::default()
+    })
+}
+
+fn validate_global_ipv4_exceptions(
+    cidr: &Ipv4Cidr,
+    except: &[Ipv4Cidr],
+    rule_index: usize,
+    peer_index: usize,
+) -> Result<(), NetworkPolicyCompileError> {
+    if cidr.prefix_len != 0 {
+        return Ok(());
+    }
+    let address_count = except
+        .iter()
+        .try_fold(0_u64, |total, item| total.checked_add(item.address_count()));
+    if address_count.is_some_and(|count| count <= KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES)
+    {
+        return Ok(());
+    }
+    Err(NetworkPolicyCompileError::IpBlockTooLarge {
+        rule_index,
+        peer_index,
+        address_count: address_count.unwrap_or(u64::MAX),
+        limit: KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES,
     })
 }
 
@@ -675,6 +700,9 @@ fn port_tuple(
                         });
                     }
                     let width = u32::from(end) - u32::from(start) + 1;
+                    if start == 1 && end == u16::MAX {
+                        return Ok((Some(protocol), DestinationPort::Any));
+                    }
                     if width > KUBERNETES_NETWORK_POLICY_MAX_PORT_RANGE_WIDTH {
                         return Err(NetworkPolicyCompileError::PortRangeTooLarge {
                             rule_index,
@@ -1110,6 +1138,90 @@ mod tests {
     }
 
     #[test]
+    fn egress_allow_all_and_overlapping_cidrs_are_additive() {
+        let deny = NetworkPolicyCompiler::compile_directions(
+            PolicyId::new(60),
+            egress_policy(None, Some(vec!["Egress"])),
+        )
+        .expect("empty egress policy isolates its selected source");
+        let allow_all = NetworkPolicyCompiler::compile_directions(
+            PolicyId::new(61),
+            egress_policy(
+                Some(vec![NetworkPolicyEgressRule::default()]),
+                Some(vec!["Egress"]),
+            ),
+        )
+        .expect("empty egress rule allows every destination");
+        let source = endpoint(1, "frontend", "client");
+        let destination = endpoint(0, "external", "external");
+        let allow_all_policies = [deny[0].clone(), allow_all[0].clone()];
+        assert_eq!(
+            evaluate_egress_with_addresses(
+                &allow_all_policies,
+                &source,
+                &destination,
+                DestinationAddresses {
+                    ipv4: Some("203.0.113.20".parse().expect("valid IPv4 address")),
+                    ipv6: None,
+                },
+            )
+            .verdict,
+            Verdict::Allow
+        );
+
+        let cidr_policy = |id, cidr: &str| {
+            NetworkPolicyCompiler::compile_directions(
+                PolicyId::new(id),
+                egress_policy(
+                    Some(vec![NetworkPolicyEgressRule {
+                        to: Some(vec![NetworkPolicyPeer {
+                            ip_block: Some(IPBlock {
+                                cidr: cidr.to_owned(),
+                                except: None,
+                            }),
+                            ..NetworkPolicyPeer::default()
+                        }]),
+                        ports: None,
+                    }]),
+                    Some(vec!["Egress"]),
+                ),
+            )
+            .expect("bounded egress CIDR policy translates")
+            .remove(0)
+        };
+        let overlapping = [
+            cidr_policy(62, "10.0.0.0/24"),
+            cidr_policy(63, "10.0.0.0/25"),
+        ];
+        assert_eq!(
+            evaluate_egress_with_addresses(
+                &overlapping,
+                &source,
+                &destination,
+                DestinationAddresses {
+                    ipv4: Some("10.0.0.20".parse().expect("valid IPv4 address")),
+                    ipv6: None,
+                },
+            )
+            .verdict,
+            Verdict::Allow
+        );
+        assert_eq!(
+            evaluate_egress_with_addresses(
+                &overlapping,
+                &source,
+                &destination,
+                DestinationAddresses {
+                    ipv4: Some("10.0.1.20".parse().expect("valid IPv4 address")),
+                    ipv6: None,
+                },
+            )
+            .verdict,
+            Verdict::Deny
+        );
+    }
+
+    #[test]
     fn egress_ipv4_lowering_is_source_selected_and_preserves_exceptions() {
         let policy = egress_policy(
             Some(vec![NetworkPolicyEgressRule {
@@ -1156,6 +1268,47 @@ mod tests {
         assert!(entries.iter().all(|entry| {
             entry.key.destination_address != "10.0.0.2".parse::<Ipv4Addr>().expect("valid IPv4")
                 || entry.decision.verdict != Verdict::Allow
+        }));
+    }
+
+    #[test]
+    fn egress_ipv4_global_block_uses_fallback_and_exact_exceptions() {
+        let policy = egress_policy(
+            Some(vec![NetworkPolicyEgressRule {
+                to: Some(vec![NetworkPolicyPeer {
+                    ip_block: Some(IPBlock {
+                        cidr: "0.0.0.0/0".to_owned(),
+                        except: Some(vec!["203.0.113.7/32".to_owned()]),
+                    }),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: Some(vec![NetworkPolicyPort {
+                    protocol: Some("TCP".to_owned()),
+                    port: Some(IntOrString::Int(1)),
+                    end_port: Some(i32::from(u16::MAX)),
+                }]),
+            }]),
+            Some(vec!["Egress"]),
+        );
+        let policies = NetworkPolicyCompiler::compile_directions(PolicyId::new(58), policy)
+            .expect("global IPv4 block and full transport range translate");
+        assert_eq!(policies[0].rules[0].destination_port, DestinationPort::Any);
+
+        let source = endpoint(1, "frontend", "client");
+        let entries = compile_egress_ipv4_dataplane_entries(&policies, &[source], &[])
+            .expect("global IPv4 block lowers without address expansion");
+        assert!(entries.iter().any(|entry| {
+            entry.key.destination_address == Ipv4Addr::UNSPECIFIED
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 0
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.key.destination_address
+                == "203.0.113.7".parse::<Ipv4Addr>().expect("valid exception")
+                && entry.key.protocol == 0
+                && entry.key.destination_port == 0
+                && entry.decision.verdict == Verdict::Deny
         }));
     }
 

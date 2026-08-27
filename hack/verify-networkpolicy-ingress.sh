@@ -1142,6 +1142,7 @@ EOF
 require_policy_state "$((baseline_count + 4))" "${baseline_rejected}" \
     "${previous_revision}" "target-specific exception policies did not converge"
 for source in \
+    "${target_namespace} same-client" \
     "${source_a_namespace} client" \
     "${source_b_namespace} client"; do
     read -r namespace pod <<<"${source}"
@@ -1152,6 +1153,32 @@ for source in \
         expect_address_deny \
             "${namespace}" "${pod}" "${alternate_server_ipv6}" "${port}"
     done
+done
+for family in 4 6; do
+    found=false
+    for _ in {1..20}; do
+        logs=$("${kc[@]}" logs -n unf-system \
+            -l app.kubernetes.io/name=unf-agent --all-containers=true \
+            --prefix=true --since=2m --tail=-1)
+        line=$(grep 'flow observed' <<<"${logs}" \
+            | grep "\"policy_revision\":${policy_revision}" \
+            | grep -E '"source_port":808(7|8)' \
+            | grep "\"address_family\":${family}" \
+            | grep '"verdict":"Allow"' \
+            | grep '"reason":6' \
+            | grep '"direction":1' \
+            | tail -n 1 || true)
+        if [[ -n ${line} ]]; then
+            found=true
+            break
+        fi
+        expect_allow "${target_namespace}" same-client 8087
+        sleep 1
+    done
+    if [[ ${found} != true ]]; then
+        echo "same-Namespace replies did not emit established IPv${family} provenance" >&2
+        exit 1
+    fi
 done
 expect_explanation "${source_b_namespace}/client" 8087 Allow ExplicitRule
 expect_explanation_to \
@@ -1261,4 +1288,4 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" "${previou
     exit 1
 fi
 
-echo "upstream-aligned dual-stack ingress conformance passed: IPv4/IPv6 explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific and nonexistent named ports, target Pod match-label/expression isolation and recovery, overlapping destination selectors, remote target-specific allow over namespace-wide default deny, same-object allow-all/default-deny update recovery, default deny, same-namespace empty/labeled PodSelector, multiple same-Namespace PodSelector peer OR, empty/exact-name NamespaceSelector, all peer selector operators with Pod/Namespace label recovery, selector AND including multi-value Pod In with Namespace NotIn, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"
+echo "upstream-aligned dual-stack ingress conformance passed: IPv4/IPv6 explicit empty source/port wildcard semantics, multi-port OR, exact/protocol-only UDP isolation, destination-specific and nonexistent named ports, target Pod match-label/expression isolation and recovery, overlapping destination selectors, remote and stateful same-Namespace target-specific allow over namespace-wide default deny, same-object allow-all/default-deny update recovery, default deny, same-namespace empty/labeled PodSelector, multiple same-Namespace PodSelector peer OR, empty/exact-name NamespaceSelector, all peer selector operators with Pod/Namespace label recovery, selector AND including multi-value Pod In with Namespace NotIn, peer OR, multiple ingress rules, stacked additive policies, and allow-all precedence"

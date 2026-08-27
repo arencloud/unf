@@ -31,6 +31,7 @@ cleanup() {
     exit "${result}"
 }
 trap cleanup EXIT
+trap 'echo "OpenShift qualification failed at line ${LINENO}" >&2' ERR
 
 [[ -s ${kubeconfig} ]] || {
     echo "OpenShift kubeconfig not found: ${kubeconfig}" >&2
@@ -159,18 +160,32 @@ for agent in "${agents[@]}"; do
         test "$(awk "/^Seccomp:/ { print \$2 }" /proc/1/status)" = 2
         grep -q ":spc_t:" /proc/1/attr/current
     '
+    if ! "${kc[@]}" -n unf-system exec "${agent}" -- \
+        sh -c 'grep -q "^sctp " /proc/modules'; then
+        echo "SCTP kernel module is not loaded on worker ${node}; load it before qualification (for example, chroot /host modprobe sctp from an authorized node debug session)" >&2
+        exit 1
+    fi
 done
 
-controller_status=$("${kc[@]}" get --raw \
-    "/api/v1/namespaces/unf-system/pods/${controller}:9962/proxy/v1/status")
-jq -e --argjson workers "${#workers[@]}" '
-    .agents.expected_agents == $workers
-    and .agents.reporting_agents == $workers
-    and .agents.converged_agents == $workers
-    and .agents.missing_agents == 0
-    and .agents.unexpected_agents == 0
-    and .agents.all_converged == true
-' <<<"${controller_status}" >/dev/null
+agents_converged=false
+for _ in {1..45}; do
+    controller_status=$("${kc[@]}" get --raw \
+        "/api/v1/namespaces/unf-system/pods/${controller}:9962/proxy/v1/status" \
+        2>/dev/null || true)
+    if jq -e --argjson workers "${#workers[@]}" '
+        .agents.expected_agents == $workers
+        and .agents.reporting_agents == $workers
+        and .agents.converged_agents == $workers
+        and .agents.missing_agents == 0
+        and .agents.unexpected_agents == 0
+        and .agents.all_converged == true
+    ' <<<"${controller_status}" >/dev/null 2>&1; then
+        agents_converged=true
+        break
+    fi
+    sleep 2
+done
+[[ ${agents_converged} == true ]]
 
 for node in "${workers[@]}"; do
     host_probe=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -eu -c '
@@ -436,6 +451,28 @@ for _ in {1..20}; do
 done
 [[ ${history_verified} == true ]]
 
+egress_fixture="${temporary_dir}/networkpolicy-egress.yaml"
+UNF_EGRESS_SOURCE_NODE="${client_node}" \
+UNF_EGRESS_DESTINATION_NODE="${server_node}" \
+UNF_EGRESS_TEST_IMAGE=quay.io/arencloud/unf-test-tools-dev:dev \
+    yq eval '
+        (select(.kind == "Pod" and .metadata.namespace == "unf-egress-source")
+            .spec.nodeSelector."kubernetes.io/hostname") = strenv(UNF_EGRESS_SOURCE_NODE) |
+        (select(.kind == "Pod" and .metadata.namespace != "unf-egress-source")
+            .spec.nodeSelector."kubernetes.io/hostname") = strenv(UNF_EGRESS_DESTINATION_NODE) |
+        (select(.kind == "Pod") | .spec.imagePullSecrets) = [{"name": "unf-egress-registry-pull"}] |
+        (select(.kind == "Pod") | .spec.containers[] |
+            select(.image == "localhost/unf-test-tools:ipv6-ext-v1") | .image)
+            = strenv(UNF_EGRESS_TEST_IMAGE) |
+        (select(.kind == "Pod") | .spec.containers[] |
+            select(.image == strenv(UNF_EGRESS_TEST_IMAGE)) | .imagePullPolicy) = "Always"
+    ' "${project_root}/deploy/examples/networkpolicy-egress.yaml" >"${egress_fixture}"
+KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
+    UNF_CONTROLLER_URL="http://127.0.0.1:${public_port}" \
+    UNF_EGRESS_FIXTURE="${egress_fixture}" \
+    UNF_REGISTRY_AUTH_FILE="${auth_file}" \
+    "${project_root}/hack/verify-networkpolicy-egress.sh"
+
 for agent in "${agents[@]}"; do
     metric=$("${kc[@]}" get --raw \
         "/api/v1/namespaces/unf-system/pods/${agent}:9963/proxy/metrics" \
@@ -451,4 +488,4 @@ unhealthy_operators=$("${kc[@]}" get clusteroperators -o json | jq '[
 ] | length')
 [[ ${unhealthy_operators} -eq 0 ]]
 
-echo "OpenShift ${qualification_mode} qualification passed: restricted-v2 controller, dedicated constrained worker-agent SCC, exact host-mount admission, enforcing SELinux, BTF/bpffs, native legacy netlink filters, Service CA TLS, Pod-bound TokenReview, two-worker convergence, ${qualification_mode} allow/drop provenance, and healthy cluster operators"
+echo "OpenShift ${qualification_mode} qualification passed: restricted-v2 controller, dedicated constrained worker-agent SCC, exact host-mount admission, enforcing SELinux, BTF/bpffs, native legacy netlink filters, Service CA TLS, Pod-bound TokenReview, two-worker convergence, ${qualification_mode} ingress and egress enforcement/provenance, and healthy cluster operators"

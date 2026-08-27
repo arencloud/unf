@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -86,6 +87,7 @@ const PERSISTENT_MAP_NAMES: [&str; 11] = [
 ];
 const IDENTITY_MAP_CAPACITY: u32 = 65_536;
 const POLICY_MAP_CAPACITY: u32 = 262_144;
+const CONTROLLER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const LEGACY_TC_PRIORITY: u16 = 0x554e;
 const LEGACY_TC_HANDLE_MAJOR: u16 = 0x554e;
 
@@ -336,6 +338,7 @@ struct FlowExporterConfig {
 #[derive(Clone)]
 struct ReloadingControllerClient {
     ca_path: PathBuf,
+    controller_resolution: Option<(String, SocketAddr)>,
     state: Arc<Mutex<ControllerClientState>>,
     reloads: Counter,
     reload_errors: Counter,
@@ -1221,9 +1224,14 @@ impl ReloadingControllerClient {
         }
         let ca_pem = fs::read(&ca_path)
             .with_context(|| format!("read controller CA certificate {}", ca_path.display()))?;
-        let client = build_controller_client(&ca_pem, &ca_path)?;
+        let controller_resolution = controller_service_resolution(
+            controller_url,
+            std::env::var("UNF_CONTROLLER_SERVICE_HOST").ok().as_deref(),
+        )?;
+        let client = build_controller_client(&ca_pem, &ca_path, controller_resolution.as_ref())?;
         Ok(Self {
             ca_path,
+            controller_resolution,
             state: Arc::new(Mutex::new(ControllerClientState {
                 observed_ca_pem: ca_pem,
                 client,
@@ -1236,6 +1244,7 @@ impl ReloadingControllerClient {
     fn without_custom_trust(reloads: Counter, reload_errors: Counter) -> Self {
         Self {
             ca_path: PathBuf::new(),
+            controller_resolution: None,
             state: Arc::new(Mutex::new(ControllerClientState {
                 observed_ca_pem: Vec::new(),
                 client: reqwest::Client::new(),
@@ -1274,7 +1283,8 @@ impl ReloadingControllerClient {
             return Ok(false);
         }
         state.observed_ca_pem.clone_from(&ca_pem);
-        let client = build_controller_client(&ca_pem, &self.ca_path)?;
+        let client =
+            build_controller_client(&ca_pem, &self.ca_path, self.controller_resolution.as_ref())?;
         state.client = client;
         Ok(true)
     }
@@ -1286,18 +1296,50 @@ impl ReloadingControllerClient {
     }
 }
 
-fn build_controller_client(ca_pem: &[u8], ca_path: &Path) -> Result<reqwest::Client> {
+fn build_controller_client(
+    ca_pem: &[u8],
+    ca_path: &Path,
+    controller_resolution: Option<&(String, SocketAddr)>,
+) -> Result<reqwest::Client> {
     let certificates = reqwest::Certificate::from_pem_bundle(ca_pem)
         .with_context(|| format!("parse controller CA bundle {}", ca_path.display()))?;
     if certificates.is_empty() {
         bail!("controller CA bundle {} is empty", ca_path.display());
     }
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
+    let mut builder = reqwest::Client::builder()
+        .timeout(CONTROLLER_REQUEST_TIMEOUT)
         .https_only(true)
-        .tls_certs_only(certificates)
+        .tls_certs_only(certificates);
+    if let Some((hostname, address)) = controller_resolution {
+        builder = builder.resolve(hostname, *address);
+    }
+    builder
         .build()
         .context("construct CA-pinned controller HTTPS client")
+}
+
+fn controller_service_resolution(
+    controller_url: &str,
+    service_host: Option<&str>,
+) -> Result<Option<(String, SocketAddr)>> {
+    let url = reqwest::Url::parse(controller_url).context("parse controller URL")?;
+    let hostname = url.host_str().context("controller URL has no hostname")?;
+    if !matches!(
+        hostname,
+        "unf-controller.unf-system.svc" | "unf-controller.unf-system.svc.cluster.local"
+    ) {
+        return Ok(None);
+    }
+    let Some(service_host) = service_host else {
+        return Ok(None);
+    };
+    let address = service_host
+        .parse()
+        .with_context(|| format!("parse injected controller Service address {service_host:?}"))?;
+    let port = url
+        .port_or_known_default()
+        .context("controller URL has no known port")?;
+    Ok(Some((hostname.to_owned(), SocketAddr::new(address, port))))
 }
 
 fn controller_port(controller_url: &str) -> Result<u16> {
@@ -2086,6 +2128,7 @@ async fn export_flow_batches(
 ) {
     let mut interval = tokio::time::interval(config.interval);
     let mut pending = BTreeMap::new();
+    let mut last_exported_key = None;
     let mut last_reported_drops = 0_u64;
     loop {
         tokio::select! {
@@ -2109,11 +2152,11 @@ async fn export_flow_batches(
                 if pending.is_empty() && dropped_events == last_reported_drops {
                     continue;
                 }
-                let entries: Vec<_> = pending
-                    .values()
-                    .take(FLOW_EXPORT_BATCH_LIMIT)
-                    .cloned()
-                    .collect();
+                let entries = pending_flow_batch(
+                    &pending,
+                    last_exported_key.as_ref(),
+                    FLOW_EXPORT_BATCH_LIMIT,
+                );
                 let batch = FlowExportBatch {
                     schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                     node_name: config.node_name.clone(),
@@ -2141,6 +2184,9 @@ async fn export_flow_batches(
                             .iter()
                             .map(|record| record.observed_events)
                             .fold(0_u64, u64::saturating_add);
+                        if let Some(entry) = entries.last() {
+                            last_exported_key = Some(entry.key.clone());
+                        }
                         for entry in entries {
                             pending.remove(&entry.key);
                         }
@@ -2156,6 +2202,36 @@ async fn export_flow_batches(
             }
         }
     }
+}
+
+fn pending_flow_batch(
+    pending: &BTreeMap<FlowHistoryKey, FlowExportRecord>,
+    after: Option<&FlowHistoryKey>,
+    limit: usize,
+) -> Vec<FlowExportRecord> {
+    if limit == 0 || pending.is_empty() {
+        return Vec::new();
+    }
+    let mut entries = Vec::with_capacity(limit.min(pending.len()));
+    if let Some(after) = after {
+        entries.extend(
+            pending
+                .range((Excluded(after), Unbounded))
+                .take(limit)
+                .map(|(_, record)| record.clone()),
+        );
+        if entries.len() < limit {
+            entries.extend(
+                pending
+                    .range(..=after)
+                    .take(limit - entries.len())
+                    .map(|(_, record)| record.clone()),
+            );
+        }
+    } else {
+        entries.extend(pending.values().take(limit).cloned());
+    }
+    entries
 }
 
 async fn report_agent_status(
@@ -3935,6 +4011,7 @@ mod tests {
         let reload_errors = Counter::default();
         let client = ReloadingControllerClient {
             ca_path,
+            controller_resolution: None,
             state: Arc::new(Mutex::new(ControllerClientState {
                 observed_ca_pem: b"previous valid CA".to_vec(),
                 client: reqwest::Client::new(),
@@ -4249,6 +4326,33 @@ mod tests {
             1
         );
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_flow_batches_advance_fairly_and_wrap() {
+        let pending = [8080, 8081, 8082]
+            .into_iter()
+            .map(|port| {
+                let record = test_flow_record(port);
+                (record.key.clone(), record)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let first = pending_flow_batch(&pending, None, 2);
+        assert_eq!(
+            first
+                .iter()
+                .map(|record| record.key.destination_port)
+                .collect::<Vec<_>>(),
+            [8080, 8081]
+        );
+        let next = pending_flow_batch(&pending, Some(&first[1].key), 2);
+        assert_eq!(
+            next.iter()
+                .map(|record| record.key.destination_port)
+                .collect::<Vec<_>>(),
+            [8082, 8080]
+        );
+        assert!(pending_flow_batch(&pending, None, 0).is_empty());
     }
 
     #[test]
@@ -4666,5 +4770,36 @@ mod tests {
         state.applied_policy_epoch.store(7, Ordering::Release);
         refresh_controller_readiness(&state);
         assert!(state.ready.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn in_cluster_controller_resolution_preserves_the_tls_hostname() {
+        let resolution = controller_service_resolution(
+            "https://unf-controller.unf-system.svc.cluster.local:9964",
+            Some("172.30.71.84"),
+        )
+        .expect("injected Service address is valid")
+        .expect("in-cluster controller is resolved directly");
+        assert_eq!(
+            resolution,
+            (
+                "unf-controller.unf-system.svc.cluster.local".to_owned(),
+                "172.30.71.84:9964".parse().expect("valid socket address")
+            )
+        );
+
+        assert!(
+            controller_service_resolution("https://controller.example.com:9964", Some("10.0.0.1"))
+                .expect("external controller URL is valid")
+                .is_none()
+        );
+        assert!(
+            controller_service_resolution(
+                "https://unf-controller.unf-system.svc.cluster.local:9964",
+                None,
+            )
+            .expect("missing injection remains compatible")
+            .is_none()
+        );
     }
 }

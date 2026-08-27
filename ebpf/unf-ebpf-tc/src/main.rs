@@ -5,18 +5,20 @@ use aya_ebpf::bindings::{TC_ACT_PIPE, TC_ACT_SHOT};
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
-use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, RingBuf};
+use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::TcContext;
 use unf_common::{IdentityId, PolicyId, PolicyReason, RuleId, Verdict};
 use unf_ebpf_common::{
-    AddressFamily, Direction, EgressIpv4PolicyMapKey, EgressIpv6PolicyMapData, FLOW_ABI_VERSION,
-    FlowEvent, FlowKey, IDENTITY_BANK_COUNT, IDENTITY_MAP_ABI_VERSION,
+    AddressFamily, ConnectionKey, ConnectionState, Direction, EgressIpv4PolicyMapKey,
+    EgressIpv6PolicyMapData, FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT,
+    IDENTITY_MAP_ABI_VERSION,
     IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT, IPV6_NEXT_HEADER_HOP_BY_HOP,
     IdentityMapConfig, IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, Ipv6ExtensionStep,
     Ipv6IdentityKey, Ipv6PolicyMapData, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
     POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
-    PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, ipv6_extension_step,
+    PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, connection_is_active,
+    ipv6_extension_step, packet_starts_connection,
 };
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -26,12 +28,19 @@ const PROTOCOL_UDP: u8 = 17;
 const PROTOCOL_SCTP: u8 = 132;
 const ETHERNET_HEADER_LEN: usize = 14;
 const BPF_F_NO_PREALLOC: u32 = 1;
+const CONNECTION_CAPACITY: u32 = 65_536;
 
 #[map]
 static FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
 static FLOW_COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// Runtime-only, bounded flow state. Policy maps remain the complete persistent
+/// recovery boundary; replacing the eBPF program intentionally resets flows.
+#[map]
+static CONNECTIONS: LruHashMap<ConnectionKey, ConnectionState> =
+    LruHashMap::with_max_entries(CONNECTION_CAPACITY, 0);
 
 #[map]
 static IDENTITY_V4: HashMap<Ipv4IdentityKey, IdentityMapValue> =
@@ -145,6 +154,14 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction) -> i32 {
     let Ok(destination_port) = ctx.load::<[u8; 2]>(transport_offset + 2) else {
         return TC_ACT_PIPE;
     };
+    let tcp_flags = if protocol == PROTOCOL_TCP {
+        let Ok(flags) = ctx.load::<u8>(transport_offset + 13) else {
+            return TC_ACT_PIPE;
+        };
+        flags
+    } else {
+        0
+    };
 
     let mut source_address = [0_u8; 16];
     source_address[..4].copy_from_slice(&source_ipv4);
@@ -165,6 +182,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction) -> i32 {
         Some(destination_ipv4),
         None,
         None,
+        tcp_flags,
     )
 }
 
@@ -191,6 +209,14 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction) -> i32 {
     let Ok(destination_port) = ctx.load::<[u8; 2]>(transport_offset + 2) else {
         return TC_ACT_PIPE;
     };
+    let tcp_flags = if protocol == PROTOCOL_TCP {
+        let Ok(flags) = ctx.load::<u8>(transport_offset + 13) else {
+            return TC_ACT_PIPE;
+        };
+        flags
+    } else {
+        0
+    };
     let identity_config = active_identity_config();
     emit_flow(
         direction,
@@ -206,6 +232,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction) -> i32 {
         None,
         Some(source_address),
         Some(destination_address),
+        tcp_flags,
     )
 }
 
@@ -275,6 +302,7 @@ fn emit_flow(
     destination_ipv4: Option<[u8; 4]>,
     source_ipv6: Option<[u8; 16]>,
     destination_ipv6: Option<[u8; 16]>,
+    tcp_flags: u8,
 ) -> i32 {
     if let Some(counter) = FLOW_COUNTERS.get_ptr_mut(0) {
         // SAFETY: get_ptr_mut returned a non-null pointer to the current CPU's
@@ -288,7 +316,7 @@ fn emit_flow(
     // SAFETY: this helper has no preconditions and returns monotonic kernel time.
     #[allow(unsafe_code)]
     let timestamp_ns = unsafe { bpf_ktime_get_ns() };
-    let decision = lookup_policy(
+    let mut decision = lookup_policy(
         direction,
         source_ipv4,
         destination_ipv4,
@@ -299,6 +327,30 @@ fn emit_flow(
         destination_port,
         protocol,
     );
+    let connection_key = ConnectionKey {
+        source_address,
+        destination_address,
+        source_port,
+        destination_port,
+        protocol,
+        address_family: address_family as u8,
+        reserved: [0; 2],
+    };
+    let policy_revision = active_policy_revision();
+    if decision.verdict == Verdict::Deny {
+        if refresh_connection(connection_key.reverse(), policy_revision, timestamp_ns) {
+            decision = DataplaneDecision::established(decision);
+        }
+    } else if !refresh_connection(connection_key, policy_revision, timestamp_ns)
+        && packet_starts_connection(protocol, tcp_flags)
+        && policy_revision != 0
+    {
+        let state = ConnectionState {
+            last_seen_ns: timestamp_ns,
+            policy_revision,
+        };
+        let _ = CONNECTIONS.insert(&connection_key, &state, 0);
+    }
     let event = FlowEvent {
         timestamp_ns,
         flow: FlowKey {
@@ -370,6 +422,55 @@ impl DataplaneDecision {
             direction,
         }
     }
+
+
+    #[inline(always)]
+    const fn established(denied: Self) -> Self {
+        Self {
+            policy_revision: denied.policy_revision,
+            policy_id: PolicyId::new(0),
+            rule_id: RuleId::new(0),
+            shadow_policy_id: PolicyId::new(0),
+            shadow_rule_id: RuleId::new(0),
+            verdict: Verdict::Allow,
+            reason: ReasonCode::AllowEstablished as u8,
+            shadow_verdict: Verdict::Unknown as u8,
+            shadow_reason: ReasonCode::Observed as u8,
+            direction: denied.direction,
+        }
+    }
+}
+
+#[inline(always)]
+fn active_policy_revision() -> u64 {
+    let Some(config) = POLICY_CONFIG.get(0).copied() else {
+        return 0;
+    };
+    if config.schema_version == POLICY_MAP_ABI_VERSION
+        && config.active_bank < POLICY_BANK_COUNT
+        && config.revision != 0
+    {
+        config.revision
+    } else {
+        0
+    }
+}
+
+#[inline(always)]
+fn refresh_connection(key: ConnectionKey, policy_revision: u64, now_ns: u64) -> bool {
+    // SAFETY: CONNECTIONS is a fixed-layout LRU map. The value is copied before
+    // the subsequent update, so no map-backed reference escapes the lookup.
+    #[allow(unsafe_code)]
+    let Some(mut state) = (unsafe { CONNECTIONS.get(&key).copied() }) else {
+        return false;
+    };
+    if !connection_is_active(state, policy_revision, now_ns, key.protocol) {
+        let _ = CONNECTIONS.remove(&key);
+        return false;
+    }
+    state.last_seen_ns = now_ns;
+    let _ = CONNECTIONS.insert(&key, &state, 0);
+    true
 }
 
 #[inline(always)]

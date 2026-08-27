@@ -134,8 +134,8 @@ matrix and reproducible evidence.
   nonexistent named-port fail-closed behavior,
   destination match-label and all-four-expression-operator selection lifecycle,
   broad/narrow overlapping destination-selector additivity and ordered recovery,
-  remote target-specific allow over namespace-wide default deny with combined empty
-  peer selectors, while stateful same-Namespace return traffic remains explicit work,
+  remote and stateful same-Namespace target-specific allow over namespace-wide
+  default deny with combined empty peer selectors and established provenance,
   same-object allow-all/default-deny policy replacement and rollback,
   source-label recovery, stacked additive policies, and allow-all precedence/recovery,
   all against direct IPv4 and IPv6 Pod addresses;
@@ -155,9 +155,8 @@ matrix and reproducible evidence.
   RHCOS Linux 5.14 under Enforcing SELinux;
 - Completed: a one-to-one audit pinned to Kubernetes commit
   `9aac5f741fa6095594cdfed4756a52cf0bf4b191` classifies all 49 primary/UDP/SCTP
-  scenarios as 35 verified, 13 unsupported pending egress, and one intentionally
-  excluded pending stateful return-flow tracking. With no unclassified stateless
-  ingress form, bounded full ingress peer/port compatibility is verified;
+  scenarios as verified through shared unit evidence and the complete ingress and
+  focused egress gates, with no unclassified or excluded bounded L4 scenario;
 - Implemented and unit verified: ABI-stable direction-aware policy IR and
   decisions, destination-selected ingress/source-selected egress evaluation,
   cross-direction isolation, backward-compatible ingress deserialization, and
@@ -199,11 +198,18 @@ matrix and reproducible evidence.
 - Implemented and two-node kind verified: source-node agent replacement with the
   controller offline retains populated IPv4/IPv6 egress maps, the exact policy
   revision, and direct-Pod allow/deny forwarding before clean reconvergence;
-- Next: stateful replies and dual-stack OpenShift qualification;
+- Implemented and two-node kind verified: bounded, revision-scoped TCP/UDP/SCTP
+  reply state, including the formerly excluded same-Namespace target-exception
+  path over both address families and explicit established provenance;
+- Completed on dual-stack OpenShift: source-selected egress and stateful replies,
+  including OVN host-network gateway identity, same-node router replies, named
+  TCP/UDP, protocol-only SCTP, bounded IPv4/global IPv6 `ipBlock` exceptions,
+  explanation, history, simulation, deletion recovery, and operator health;
 - shadow rollout and offline impact analysis;
 - topology history and external flow-export backends;
 - failure, scale, upgrade, and broader OpenShift version validation.
 
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
-transport remain research/planned work after these foundations. Egress is the
-next active compatibility milestone.
+transport remain research/planned work after these foundations. The next active
+Phase 3 work is shadow rollout/offline impact analysis followed by topology
+history and external flow-export backends.

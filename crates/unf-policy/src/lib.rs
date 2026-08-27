@@ -207,6 +207,12 @@ impl Ipv4Cidr {
     }
 }
 
+fn arbitrary_ipv4_address(exact_addresses: &BTreeSet<Ipv4Addr>) -> Option<Ipv4Addr> {
+    (1..=u32::MAX)
+        .map(Ipv4Addr::from)
+        .find(|address| !exact_addresses.contains(address))
+}
+
 impl Ipv4Block {
     #[must_use]
     pub fn contains(&self, address: Ipv4Addr) -> bool {
@@ -835,7 +841,9 @@ pub fn compile_ipv4_dataplane_entries(
         .collect();
     for block in &ipv4_blocks {
         let address_count = block.cidr.address_count();
-        if address_count > KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES {
+        if block.cidr.prefix_len != 0
+            && address_count > KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES
+        {
             return Err(DataplaneCompileError::Ipv4BlockTooLarge {
                 address_count,
                 limit: KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES,
@@ -844,7 +852,19 @@ pub fn compile_ipv4_dataplane_entries(
     }
 
     let mut source_addresses: BTreeSet<_> = known_sources.keys().copied().collect();
-    for address in ipv4_blocks.into_iter().flat_map(Ipv4Block::addresses) {
+    let has_global_ipv4_block = ipv4_blocks.iter().any(|block| block.cidr.prefix_len == 0);
+    for address in ipv4_blocks
+        .iter()
+        .filter(|block| block.cidr.prefix_len != 0)
+        .flat_map(|block| block.addresses())
+        .chain(
+            ipv4_blocks
+                .iter()
+                .filter(|block| block.cidr.prefix_len == 0)
+                .flat_map(|block| &block.except)
+                .flat_map(Ipv4Cidr::addresses),
+        )
+    {
         if address != Ipv4Addr::UNSPECIFIED
             && source_addresses.insert(address)
             && source_addresses.len() > POLICY_MAP_BANK_ENTRY_LIMIT
@@ -857,15 +877,15 @@ pub fn compile_ipv4_dataplane_entries(
 
     let external = external_endpoint();
     let mut entries = Vec::new();
-    for address in source_addresses {
-        let source = known_sources.get(&address).copied().unwrap_or(&external);
+    for address in &source_addresses {
+        let source = known_sources.get(address).copied().unwrap_or(&external);
         for destination in destinations.values() {
             compile_ipv4_pair(
                 policies,
                 &global_policies,
                 source,
-                Some(address),
-                address,
+                Some(*address),
+                *address,
                 destination,
                 &mut entries,
             )?;
@@ -878,11 +898,14 @@ pub fn compile_ipv4_dataplane_entries(
                 && policy.target.matches(destination)
         })
     }) {
+        let fallback_address = has_global_ipv4_block
+            .then(|| arbitrary_ipv4_address(&source_addresses))
+            .flatten();
         compile_ipv4_pair(
             policies,
             &global_policies,
             &external,
-            None,
+            fallback_address,
             Ipv4Addr::UNSPECIFIED,
             destination,
             &mut entries,
@@ -1020,7 +1043,9 @@ pub fn compile_egress_ipv4_dataplane_entries(
         .collect();
     for block in &ipv4_blocks {
         let address_count = block.cidr.address_count();
-        if address_count > KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES {
+        if block.cidr.prefix_len != 0
+            && address_count > KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES
+        {
             return Err(DataplaneCompileError::Ipv4BlockTooLarge {
                 address_count,
                 limit: KUBERNETES_NETWORK_POLICY_MAX_IP_BLOCK_ADDRESSES,
@@ -1033,7 +1058,19 @@ pub fn compile_egress_ipv4_dataplane_entries(
             limit: POLICY_MAP_BANK_ENTRY_LIMIT,
         });
     }
-    for address in ipv4_blocks.into_iter().flat_map(Ipv4Block::addresses) {
+    let has_global_ipv4_block = ipv4_blocks.iter().any(|block| block.cidr.prefix_len == 0);
+    for address in ipv4_blocks
+        .iter()
+        .filter(|block| block.cidr.prefix_len != 0)
+        .flat_map(|block| block.addresses())
+        .chain(
+            ipv4_blocks
+                .iter()
+                .filter(|block| block.cidr.prefix_len == 0)
+                .flat_map(|block| &block.except)
+                .flat_map(Ipv4Cidr::addresses),
+        )
+    {
         if address != Ipv4Addr::UNSPECIFIED
             && destination_addresses.insert(address)
             && destination_addresses.len() > POLICY_MAP_BANK_ENTRY_LIMIT
@@ -1063,12 +1100,15 @@ pub fn compile_egress_ipv4_dataplane_entries(
             )?;
         }
         if policies.iter().any(|policy| policy.target.matches(source)) {
+            let fallback_address = has_global_ipv4_block
+                .then(|| arbitrary_ipv4_address(&destination_addresses))
+                .flatten();
             compile_egress_ipv4_pair(
                 policies,
                 &global_policies,
                 source,
                 &external,
-                None,
+                fallback_address,
                 Ipv4Addr::UNSPECIFIED,
                 &mut entries,
             )?;

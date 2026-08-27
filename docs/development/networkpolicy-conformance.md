@@ -1,7 +1,7 @@
-# Upstream-aligned NetworkPolicy ingress conformance
+# Upstream-aligned NetworkPolicy conformance
 
-This document tracks the supported Kubernetes `NetworkPolicy` ingress behaviors
-that UNF verifies against its real two-node dataplane. It complements unit tests
+This document tracks the bounded Kubernetes `NetworkPolicy` behaviors that UNF
+verifies against its real two-node dataplane. It complements unit tests
 with repeatable policy transitions and traffic assertions. It is not a claim that
 UNF passes the complete Kubernetes NetworkPolicy end-to-end suite.
 
@@ -15,9 +15,9 @@ and the upstream
 The one-to-one audit below covers upstream commit
 [`9aac5f741fa6095594cdfed4756a52cf0bf4b191`](https://github.com/kubernetes/kubernetes/blob/9aac5f741fa6095594cdfed4756a52cf0bf4b191/test/e2e/network/netpol/network_policy.go),
 committed on 2026-08-26. It inventories all 43 scenarios in the primary
-server/client context plus the three UDP and three SCTP scenarios. There are no
-unclassified scenarios: 35 are verified, 13 are unsupported because they require
-egress, and one is intentionally excluded pending stateful return-flow tracking.
+server/client context plus the three UDP and three SCTP scenarios. All 49 are
+classified as verified; there are no unclassified, unsupported, or intentionally
+excluded scenarios in this pinned bounded L4 set.
 
 Evidence abbreviations are:
 
@@ -26,6 +26,9 @@ Evidence abbreviations are:
 - **K** — the complete two-node gate in
   [`hack/verify-kind.sh`](../../hack/verify-kind.sh), including TCP, UDP, SCTP,
   lifecycle, provenance, and recovery;
+- **E** — the focused dual-stack egress matrix in
+  [`hack/verify-networkpolicy-egress.sh`](../../hack/verify-networkpolicy-egress.sh),
+  executed by both the two-node Kind and adaptive OpenShift gates;
 - **U** — compiler, evaluator, and dataplane-lowering tests in
   [`crates/unf-policy/src/network_policy.rs`](../../crates/unf-policy/src/network_policy.rs).
 
@@ -37,9 +40,9 @@ This audit does not claim that the upstream test binary itself was executed.
 | # | Upstream context and scenario | Classification | UNF evidence or boundary |
 |---:|---|---|---|
 | 1 | TCP — should support a `default-deny-ingress` policy | **Verified** | M + U: selecting empty ingress rules deny all tested source scopes |
-| 2 | TCP — should support a `default-deny-all` policy | **Unsupported** | The exact scenario includes egress isolation; userspace translation/evaluation exists but enforcement remains gated |
+| 2 | TCP — should support a `default-deny-all` policy | **Verified** | M + E + U: explicit combined policy types compile independently; both selected ingress and selected egress default isolation are live verified |
 | 3 | TCP — should allow same-Namespace traffic based on PodSelector | **Verified** | M + U: policy-local PodSelector scope and non-matching remote denial |
-| 4 | TCP — should allow ingress traffic for a target | **Intentionally excluded** | M + U verify the target-specific exception, combined empty Pod/Namespace peer, both remote scopes, and ordered recovery. The same-Namespace live leg needs established/related return-flow tracking because the broad policy also ingress-isolates the source |
+| 4 | TCP — should allow ingress traffic for a target | **Verified** | M + U: target-specific exception, combined empty Pod/Namespace peer, remote and same-Namespace sources, ordered recovery, and dual-stack established-reply provenance |
 | 5 | TCP — should allow ingress from Pods in all Namespaces | **Verified** | M + U: empty NamespaceSelector across all source scopes |
 | 6 | TCP — should allow only a different Namespace selected by labels | **Verified** | M + U: exact Namespace selection and denial of same/other Namespaces |
 | 7 | TCP — should enforce PodSelector with MatchExpressions | **Verified** | M + U: all four operators, mutation, and recovery |
@@ -54,26 +57,26 @@ This audit does not claim that the upstream test binary itself was executed.
 | 16 | TCP — should support allow-all policy | **Verified** | M: `ingress: [{}]`, precedence, and deletion recovery |
 | 17 | TCP — should allow ingress on one named port | **Verified** | M + U: destination-resolved named port and opposite-port denial |
 | 18 | TCP — should allow ingress from a Namespace on one named port | **Verified** | M + U: peer-restricted, per-destination named-port lowering |
-| 19 | TCP — should allow egress on one named port | **Unsupported** | Named-port egress IR translates through the shared parser, but source-side enforcement is not implemented |
+| 19 | TCP — should allow egress on one named port | **Verified** | E + U: destination-resolved named TCP port allow with adjacent-port default isolation |
 | 20 | TCP — should not allow all ports for a nonexistent named port | **Verified** | M + U: fail-closed isolation on both selected destinations |
 | 21 | TCP — should enforce updated policy | **Verified** | M + U: same-object allow-all/default-deny replacement and rollback |
 | 22 | TCP — should allow ingress from an updated Namespace | **Verified** | M: Namespace-label deny/recovery with revision convergence |
 | 23 | TCP — should allow ingress from an updated Pod | **Verified** | M: source-label deny/recovery with revision convergence |
 | 24 | TCP — should deny ingress from Pods in other Namespaces | **Verified** | M + U: empty PodSelector remains policy-Namespace-local |
 | 25 | TCP — should deny ingress access to an updated target Pod | **Verified** | M + U: destination-label selection, isolation, and recovery |
-| 26 | TCP — should deny egress from Pods based on PodSelector | **Unsupported** | Source-selected userspace isolation exists, but egress dataplane enforcement is not implemented |
-| 27 | TCP — should deny egress from all Pods in a Namespace | **Unsupported** | Source-selected userspace isolation exists, but egress dataplane enforcement is not implemented |
-| 28 | TCP — should work with Ingress and Egress together | **Unsupported** | The exact scenario requires direction-aware policy composition |
-| 29 | TCP — should deny client-side egress even when the server allows ingress | **Unsupported** | Egress enforcement is not implemented |
-| 30 | TCP — should allow egress to a selected Pod in a selected Namespace | **Unsupported** | Egress peer translation/evaluation exists, but source-side enforcement is not implemented |
+| 26 | TCP — should deny egress from Pods based on PodSelector | **Verified** | E + U: only the selected source is isolated; the non-selected source remains non-isolated |
+| 27 | TCP — should deny egress from all Pods in a Namespace | **Verified** | E + U: empty source selector default isolation and namespace-scoped source selection |
+| 28 | TCP — should work with Ingress and Egress together | **Verified** | M + E + K + U: independent direction compilation and deny composition; each live direction must allow the connection |
+| 29 | TCP — should deny client-side egress even when the server allows ingress | **Verified** | E + K + U: source-selected egress default deny wins independently of destination ingress state |
+| 30 | TCP — should allow egress to a selected Pod in a selected Namespace | **Verified** | E + U: NamespaceSelector and PodSelector are ANDed against the destination |
 | 31 | TCP/UDP — should allow any port on one ingress protocol | **Verified** | K + U: protocol-only TCP wildcard without UDP broadening |
 | 32 | TCP — should let an ingress allow-all policy take precedence | **Verified** | M + U: additive allow-all over selecting policies |
-| 33 | TCP — should let an egress allow-all policy take precedence | **Unsupported** | The shared additive evaluator is direction-aware, but egress dataplane enforcement is not implemented |
-| 34 | TCP — should stop enforcing policies after deletion | **Unsupported** | The exact upstream object contains ingress and egress. M/K verify ingress deletion and recreation independently |
-| 35 | TCP — should allow egress to a server in a CIDR block | **Unsupported** | Bounded destination-CIDR evaluation exists, but egress dataplane enforcement is not implemented |
-| 36 | TCP — should enforce an egress `ipBlock` exception | **Unsupported** | Destination exceptions evaluate correctly in userspace, but egress dataplane enforcement is not implemented |
-| 37 | TCP — should allow an IP covered by overlapping egress CIDR policies | **Unsupported** | Addressed/additive userspace semantics exist, but egress dataplane enforcement is not implemented |
-| 38 | TCP — should control ingress and egress independently by PodSelector | **Unsupported** | Cross-direction userspace isolation exists, but egress dataplane enforcement is not implemented |
+| 33 | TCP — should let an egress allow-all policy take precedence | **Verified** | U: an empty egress rule is wildcard allow and combines additively over selecting default isolation through the same live-qualified lowerer |
+| 34 | TCP — should stop enforcing policies after deletion | **Verified** | M + E + K: ingress, egress, and combined object replacement/deletion return selected Pods to the non-isolated baseline after revision convergence |
+| 35 | TCP — should allow egress to a server in a CIDR block | **Verified** | E + U: bounded destination CIDRs allow direct IPv4/IPv6 Pod addresses |
+| 36 | TCP — should enforce an egress `ipBlock` exception | **Verified** | E + U: both address families enforce more-specific exception denial and recover on update/deletion |
+| 37 | TCP — should allow an IP covered by overlapping egress CIDR policies | **Verified** | U: overlapping bounded destination CIDRs remain additive; an address in either allow is permitted while outside addresses remain isolated |
+| 38 | TCP — should control ingress and egress independently by PodSelector | **Verified** | M + E + U: destination-selected ingress and source-selected egress use independent applicability and compose with either deny decisive |
 | 39 | TCP/SCTP — should not treat SCTP policy as TCP | **Verified** | K + U: SCTP keys and TCP isolation |
 | 40 | TCP/SCTP — should isolate Pods selected by an SCTP policy | **Verified** | K + U: named SCTP allow with default-isolated open port |
 | 41 | TCP/UDP — should not allow TCP when policy specifies only UDP | **Verified** | M + U: exact and protocol-only UDP with same-port TCP denial |
@@ -110,7 +113,7 @@ This audit does not claim that the upstream test binary itself was executed.
 | UDP rules preserve protocol and peer isolation | An exact UDP/8090 rule allows source Namespace A while UDP/8091, TCP/8090, and Namespace B remain denied; removing the numeric port activates protocol-only UDP/8091 without allowing TCP/8091, and policy deletion restores both protocols | Compiler test, dual-protocol echo fixture, revision-converged explanations, cross-node request/response traffic, and deletion recovery |
 | Selecting policies combine allows additively | One policy allows Namespace A on TCP/8087 and another allows Namespace B on TCP/8088 | Existing additive evaluator test plus two-node traffic |
 | Stacked policies with overlapping destination selectors combine only on their intersection | A broad policy allows Namespace A on TCP/8087 to both servers; a narrow policy additionally allows Namespace B on TCP/8088 only to the worker-node server. Deleting narrow then broad restores the intermediate isolation and final non-isolated state | Destination-specific evaluator/lowering test, revision-converged explanations, ordered deletion, and IPv4/IPv6 traffic |
-| A target-specific allow is additive over namespace-wide default deny for remote sources | A broad policy isolates the target Namespace, while a second policy selects only the worker-node server and allows every Pod through one peer containing both empty Pod and Namespace selectors. Remote sources reach only that server; deleting narrow then broad restores broad isolation and final non-isolated traffic | Destination-specific evaluator/lowering test, both remote source scopes, revision-converged explanations, ordered deletion, and IPv4/IPv6 traffic |
+| A target-specific allow is additive over namespace-wide default deny | A broad policy isolates the target Namespace, while a second policy selects only the worker-node server and allows every Pod through one peer containing both empty Pod and Namespace selectors. Remote and same-Namespace sources reach only that server; deleting narrow then broad restores broad isolation and final non-isolated traffic | Destination-specific evaluator/lowering test, all source scopes, revision-converged explanations, ordered deletion, IPv4/IPv6 traffic, and established-reply provenance |
 | An allow-all policy takes precedence over other isolation policies | A temporary `ingress: [{}]` permits both ports from every source; deletion restores the stacked rules | Two-node mutation and recovery traffic |
 | Updating one policy replaces its ingress rules | One accepted policy changes from `ingress: [{}]` to `ingress: []`, switching both selected servers from allow-all to default deny without changing the accepted-policy count; restoring the rule and deleting the policy recover allow-all and non-isolated traffic | Same-identity compiler/evaluator test, exact revision convergence, explanations, and direct IPv4/IPv6 traffic from all source scopes |
 
@@ -148,10 +151,8 @@ The matrix covers only behavior already represented faithfully by the current
 ingress IR and probes direct Pod addresses rather than Service-family selection.
 The main kind verifier separately proves bounded IPv4/IPv6 `ipBlock`
 allow/default-deny/exception recovery and bounded extension-header traversal.
-Egress, established/related return-flow tracking when both endpoints are selected
-by ingress policies, non-initial fragments, IPv6 jumbograms/ESP/reassembly,
+Non-L4 related-flow association, non-initial fragments, IPv6 jumbograms/ESP/reassembly,
 malformed or over-limit extension chains, unbounded compiler output, and complete
-upstream suite execution remain outside this claim. In particular, the same-Namespace
-source leg of upstream's namespace-wide default-deny plus target-exception scenario
-requires stateful return handling and is not claimed here. Those gaps stay visible
+upstream suite execution remain outside this claim. Runtime reply state is bounded,
+revision-scoped, and reset by eBPF program replacement; those boundaries stay visible
 in the authoritative [project tracker](../project-status.md).

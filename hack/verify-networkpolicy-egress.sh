@@ -7,6 +7,8 @@ context=${KUBE_CONTEXT:-kind-unf-dev}
 controller_url=${UNF_CONTROLLER_URL:-http://127.0.0.1:19962}
 unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 fixture="${project_root}/deploy/examples/networkpolicy-egress.yaml"
+fixture=${UNF_EGRESS_FIXTURE:-"${fixture}"}
+registry_auth_file=${UNF_REGISTRY_AUTH_FILE:-}
 simulation_fixture="${project_root}/deploy/examples/simulation-networkpolicy-egress-deny.yaml"
 source_namespace=unf-egress-source
 allowed_namespace=unf-egress-allowed
@@ -14,6 +16,8 @@ denied_namespace=unf-egress-denied
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
 
 cleanup() {
+    "${kc[@]}" delete networkpolicies --all -n "${source_namespace}" \
+        --ignore-not-found --wait=false >/dev/null 2>&1 || true
     "${kc[@]}" delete namespaces "${source_namespace}" "${allowed_namespace}" \
         "${denied_namespace}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
@@ -169,11 +173,15 @@ udp_exchange() {
 
 expect_udp_allow() {
     local response
-    response=$(udp_exchange "$1" "$2")
-    if [[ ${response} != "unf-egress-protocol-ok" ]]; then
-        echo "expected selected client to reach $1 UDP/$2" >&2
-        exit 1
-    fi
+    for _ in {1..10}; do
+        response=$(udp_exchange "$1" "$2")
+        if [[ ${response} == "unf-egress-protocol-ok" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "expected selected client to reach $1 UDP/$2" >&2
+    exit 1
 }
 
 expect_udp_deny() {
@@ -191,6 +199,19 @@ sctp_exchange() {
         | "${kc[@]}" exec -i -n "${source_namespace}" client -- \
             timeout 5 socat -T 3 - "SCTP:${protocol_ipv4}:${port}" 2>/dev/null || true)
     printf '%s' "${response}"
+}
+
+expect_sctp_allow() {
+    local port=$1 response
+    for _ in {1..5}; do
+        response=$(sctp_exchange "${port}")
+        if [[ ${response} == "unf-egress-sctp-ok" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "protocol-only egress SCTP/${port} was not allowed" >&2
+    exit 1
 }
 
 expect_direction_provenance() {
@@ -304,6 +325,19 @@ expect_egress_simulation() {
             and .proposed.verdict == "Deny")
     ' <<<"${simulation}" >/dev/null; then
         echo "direction-aware egress NetworkPolicy simulation was incomplete" >&2
+        jq '{
+            schema_version,
+            resource_kind,
+            policy,
+            operation,
+            snapshot,
+            affected_sources,
+            affected_destinations,
+            summary,
+            historical_summary,
+            changes,
+            historical_changes
+        }' <<<"${simulation}" >&2
         exit 1
     fi
     after_revision=$(status_field policy <<<"$(controller_status)")
@@ -331,7 +365,19 @@ if ! wait_for_current_policy_sync; then
     exit 1
 fi
 
-"${kc[@]}" apply -f "${fixture}" >/dev/null
+yq eval-all 'select(.kind == "Namespace")' "${fixture}" \
+    | "${kc[@]}" apply -f - >/dev/null
+if [[ -n ${registry_auth_file} ]]; then
+    [[ -s ${registry_auth_file} ]]
+    for namespace in "${source_namespace}" "${allowed_namespace}" "${denied_namespace}"; do
+        "${kc[@]}" -n "${namespace}" create secret generic unf-egress-registry-pull \
+            --from-file=.dockerconfigjson="${registry_auth_file}" \
+            --type=kubernetes.io/dockerconfigjson \
+            --dry-run=client -o yaml | "${kc[@]}" apply -f - >/dev/null
+    done
+fi
+yq eval-all 'select(.kind != "Namespace")' "${fixture}" \
+    | "${kc[@]}" apply -f - >/dev/null
 for target in \
     "${source_namespace} client" \
     "${source_namespace} unselected-client" \
@@ -366,6 +412,27 @@ for pod in client unselected-client; do
     expect_tcp_allow "${pod}" "${denied_ipv6}" 8080 unf-egress-denied-ok
 done
 
+ipv4_to_u32() {
+    local address=$1 a b c d
+    IFS=. read -r a b c d <<<"${address}"
+    printf '%u' "$(((a << 24) | (b << 16) | (c << 8) | d))"
+}
+
+allowed_ipv4_u32=$(ipv4_to_u32 "${allowed_ipv4}")
+denied_ipv4_u32=$(ipv4_to_u32 "${denied_ipv4}")
+different_bits=$((allowed_ipv4_u32 ^ denied_ipv4_u32))
+ipv4_prefix_length=32
+while (( different_bits > 0 )); do
+    different_bits=$((different_bits >> 1))
+    ipv4_prefix_length=$((ipv4_prefix_length - 1))
+done
+if (( ipv4_prefix_length < 22 )); then
+    echo "IPv4 egress exception fixture Pods require a block larger than the bounded /22 limit" >&2
+    exit 1
+fi
+ipv4_mask=$(((0xffffffff << (32 - ipv4_prefix_length)) & 0xffffffff))
+ipv4_network=$((allowed_ipv4_u32 & ipv4_mask))
+ipv4_prefix="$(((ipv4_network >> 24) & 255)).$(((ipv4_network >> 16) & 255)).$(((ipv4_network >> 8) & 255)).$((ipv4_network & 255))/${ipv4_prefix_length}"
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -482,17 +549,9 @@ for address in "${protocol_ipv4}" "${protocol_ipv6}"; do
     expect_udp_deny "${address}" 8091
 done
 for port in 8092 8093; do
-    if [[ $(sctp_exchange "${port}") != "unf-egress-sctp-ok" ]]; then
-        echo "protocol-only egress SCTP/${port} was not allowed" >&2
-        exit 1
-    fi
+    expect_sctp_allow "${port}"
 done
 
-ipv4_prefix=$(awk -F. '{print $1 "." $2 "." $3 ".0/24"}' <<<"${allowed_ipv4}")
-if [[ ${denied_ipv4%.*} != "${allowed_ipv4%.*}" ]]; then
-    echo "IPv4 egress exception fixture Pods are not in one bounded /24" >&2
-    exit 1
-fi
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

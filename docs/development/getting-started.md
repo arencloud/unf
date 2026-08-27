@@ -219,9 +219,10 @@ Namespaces before returning.
 The exact scope and upstream mapping are tracked
 in [networkpolicy-conformance.md](networkpolicy-conformance.md).
 That document also pins a one-to-one 49-scenario audit to upstream Kubernetes
-commit `9aac5f741fa6095594cdfed4756a52cf0bf4b191`, with every scenario classified
-as verified, unsupported pending egress, or intentionally excluded pending
-stateful return-flow tracking.
+commit `9aac5f741fa6095594cdfed4756a52cf0bf4b191`; all scenarios are verified
+through shared unit evidence and the complete ingress and focused egress gates.
+The same-Namespace target-exception leg additionally requires dual-stack
+established-reply provenance.
 The verifier also queries topology schema v3, requires dual-stack workload
 addresses and populated per-family identity maps, and creates a selectorless Service
 with a manually managed EndpointSlice. It requires the backend to transition from
@@ -351,6 +352,11 @@ deduplication and durable history remain later telemetry work.
 Do not assume Ubuntu paths or AppArmor. `make openshift-test` now provides
 separate RHEL CoreOS/CRI-O IPv4-only and dual-stack evidence for SELinux, SCC,
 BTF, bpffs, Service CA, TokenReview, native legacy attachment, and enforcement.
+The dual-stack gate includes the complete ingress and egress matrices. SCTP must
+be available and loaded on every selected worker; the gate checks `/proc/modules`
+up front and reports the affected Node. On RHCOS where the shipped module is not
+loaded yet, an authorized administrator can load it with `modprobe sctp` from the
+host environment (for example through an approved node-debug workflow).
 Agents use a non-privileged, runtime-default-seccomp, read-only-root profile with
 only `BPF`, `NET_ADMIN`, and `PERFMON`; their service account cannot use the
 built-in privileged SCC. Native validating admission additionally restricts that

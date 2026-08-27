@@ -48,11 +48,13 @@ A separate self-cleaning egress matrix now live-verifies source-selected default
 isolation, non-selected pass-through, Namespace/Pod destination selector AND,
 named TCP/UDP ports, protocol-only SCTP, bounded dual-stack `ipBlock` exceptions,
 direction-correct dataplane provenance, deletion recovery, and final state
-reconvergence.
+reconvergence. The same matrix is part of the dual-stack OpenShift gate, where it
+also verifies RHCOS/SELinux cross-worker behavior, OVN host-network replies,
+explanation, retained history, read-only simulation, and healthy operators.
 A one-to-one audit pinned to Kubernetes commit
 `9aac5f741fa6095594cdfed4756a52cf0bf4b191` now classifies all 49 primary TCP,
-UDP, and SCTP scenarios with no unclassified case; the verified bounded ingress
-peer/port slice and its explicit egress/stateful boundaries are tracked in the
+UDP, and SCTP scenarios as verified with no unclassified or excluded bounded L4
+case; the complete evidence and explicit runtime-state boundaries are tracked in the
 [conformance matrix](docs/development/networkpolicy-conformance.md).
 Identity and policy updates now use independent transactional banks selected by
 atomic configuration-map writes. All eleven enforcement maps persist in an
@@ -201,9 +203,11 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-Not implemented yet: service load balancing, routing, IPAM/CNI, workload/data-plane encryption,
-stateful established/related flow tracking, multi-cluster transport, IPv6
-jumbograms/ESP/reassembly, or production fail-closed recovery.
+Not implemented yet: service load balancing, routing, IPAM/CNI,
+workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
+multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production
+fail-closed recovery. Bounded revision-scoped TCP/UDP/SCTP reply state is
+implemented; it resets when the eBPF program is replaced.
 
 ## Repository layout
 
