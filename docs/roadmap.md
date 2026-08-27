@@ -258,3 +258,19 @@ The ordered milestones and their evidence-bearing subpoints are maintained in
 [the Phase 3 completion and full-CNI entry plan](development/phase3-completion-plan.md).
 That matrix is the working checklist; `project-status.md` remains the
 authoritative record of verified results.
+
+## Full-CNI foundation
+
+**Gate: in progress.**
+
+- Architecture and ownership are accepted in ADR 0057: the current overlay is
+  unchanged, primary ownership is opt-in and Kind-first, durable attachment/IPAM
+  state belongs to the local agent, and cutover/rollback requires node drain.
+- The initial Rust `unf-cni` executable implements bounded CNI 1.0/1.1 request
+  validation and VERSION behavior. ADD/CHECK/STATUS remain explicitly unavailable
+  until the versioned root-authenticated agent transaction API is present.
+- Next: local transaction persistence and idempotence, dual-stack node-block
+  IPAM, veth lifecycle, native routing/MTU, then cross-node Kind qualification.
+- Netkit, OpenShift primary-CNI installation, service load balancing,
+  kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
+  this foundation slice.

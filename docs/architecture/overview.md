@@ -25,6 +25,25 @@ The policy compiler is a pure userspace library. Kubernetes types pass through a
 conversion boundary before they reach domain policy IR. The kernel sees only
 fixed-size numeric state and does no selector or Kubernetes interpretation.
 
+## Full-CNI foundation
+
+The Phase 3 overlay remains the default. Opt-in primary-CNI mode is being built
+behind a separate isolated-cluster gate:
+
+```text
+container runtime -> unf-cni -> root-authenticated local agent socket
+                                  |
+                     durable attachment + IPAM transaction
+                                  |
+                    veth / addresses / routes / BPF
+```
+
+The executable owns bounded CNI parsing and one attachment's namespace/link
+application. The local agent owns durable state and recovery; the controller
+owns pool/node-block intent. Kubernetes watches, policy compilation, service
+logic, routing protocols, and telemetry aggregation never enter the CNI process.
+ADR 0057 defines coexistence, rollback, uninstall, and failure boundaries.
+
 ## Phase 1 through 3 data flows
 
 1. kube-rs watches Nodes, Pods, Namespaces, Services, EndpointSlices,

@@ -2828,6 +2828,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "unf-cni"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "unf-common"
 version = "0.1.0"
 dependencies = [

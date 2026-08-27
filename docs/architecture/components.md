@@ -9,6 +9,7 @@
 | `unf-state` | Revision snapshots, bounded flow-history contract, Service/backend topology schema, and identity metadata | Transport or controller loops |
 | `unf-controller` | Watches, EndpointSlice-aware desired-state/topology reconciliation, bounded durable agent-report and flow-history checkpointing, non-blocking external HTTP flow handoff, time-window flow queries, explanation, and read-only simulation orchestration | Packet parsing |
 | `unf-agent` | Capability detection, Aya lifecycle, events, and non-blocking telemetry export | Kubernetes policy semantics |
+| `unf-cni` | Bounded CNI protocol handling and one attachment's namespace/link transaction application | Kubernetes access, policy compilation, durable IPAM, routing protocols, or telemetry aggregation |
 | `unfctl` | Operator-facing status, topology, flow history, explanation, and simulation | Fabric state ownership |
 | `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, and telemetry | Selectors or enrichment strings |
 

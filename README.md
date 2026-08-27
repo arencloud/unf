@@ -86,9 +86,13 @@ A separate skipped-revision gate requires a baseline at least two commits behind
 the current revision and exact tuple equality before repeating the complete
 controller-first, node-serial, rollback, forwarding, and telemetry matrix.
 The Phase 3 gate and all 42 deliverables are Verified. Exact closure evidence,
-limits, and the separately gated full-CNI entry are tracked in the
+limits, and the separately tracked full-CNI entry are maintained in the
 [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md)
 and ADR 0056.
+The full-CNI foundation is now in progress under ADR 0057. Its first executable
+slice is deliberately fail closed until the local agent transaction, IPAM, link,
+route, and recovery contracts are implemented; existing overlay deployments are
+unchanged.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

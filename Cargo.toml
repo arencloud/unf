@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "bins/unf-agent",
+    "bins/unf-cni",
     "bins/unf-controller",
     "bins/unfctl",
     "crates/unf-api",

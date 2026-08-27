@@ -2,7 +2,7 @@
 
 Last reviewed: **2026-08-28**
 
-This is the execution matrix for Phase 3 closure and the separately gated
+This is the execution matrix for Phase 3 closure and the separately tracked
 full-CNI entry work. The
 authoritative feature status remains in [project-status.md](../project-status.md).
 A row moves to **Verified** only when its implementation, repeatable command,
@@ -18,7 +18,7 @@ complete its parent milestone.
 | 3 | OpenShift cl02 upgrade qualification | **Verified** | Milestone 2 Kind evidence and development images in Quay | `make openshift-upgrade-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig`; ADR 0054 |
 | 4 | Broader platform/version coverage | **Verified** | Available clusters for each claimed platform | Four exact qualified tuples, including an isolated Kubernetes 1.34.8 endpoint/recovery/upgrade record; ADR 0055 |
 | 5 | Phase 3 closure | **Verified** | Milestones 1–4 Verified | Complete release audit and Phase 3 marked **Verified** in `project-status.md`; ADR 0056 |
-| 6 | Full-CNI foundation entry | **Gated** | Milestone 5 and explicit approval at the architecture gate | Accepted design plus bounded CNI/IPAM/veth/routing/MTU/node-networking slices |
+| 6 | Full-CNI foundation entry | **In progress** | Milestone 5 Verified; architecture entry explicitly approved | ADR 0057 plus bounded CNI/IPAM/veth/routing/MTU/node-networking slices |
 
 ## 1. Broader failure and scale qualification
 
@@ -75,21 +75,21 @@ cl02 is first required by milestone 3. Milestones 1 and 2 run against Kind.
 | 5.2 | Requirements audit | **Verified** | ADR 0056 maps every master-prompt §103 requirement one-to-one and confirms all 42 Phase 3 tracker rows are Verified |
 | 5.3 | Limitation audit | **Verified** | Status, roadmap, ADR 0056, and support matrix consistently retain bounded L4, exact-platform, development-artifact, OpenShift-platform-upgrade, incompatible-ABI migration, production-scale, and full-CNI limits |
 | 5.4 | Release-readiness record | **Verified** | ADR 0056 records exact revisions, all six current cl02 image digests, cluster/runtime facts, commands, outcomes, and retained retry history |
-| 5.5 | Gate transition | **Verified** | Items 5.1–5.4 passed; Phase 3 is **Verified** in `project-status.md` while full-CNI entry remains separately Gated |
+| 5.5 | Gate transition | **Verified** | Items 5.1–5.4 passed and Phase 3 is **Verified** in `project-status.md`; later authorization started the separately tracked full-CNI foundation |
 
 ## 6. Full-CNI foundation entry
 
-This milestone starts only after the Phase 3 gate and an explicit architecture
+This milestone started after the Phase 3 gate and explicit architecture entry
 approval. It must not silently change the current overlay deployment into a CNI.
 
 | ID | Deliverable | State | Required evidence |
 |---|---|---|---|
-| 6.1 | CNI architecture and ownership | **Gated** | Accepted API/state, host-ownership, coexistence, upgrade, rollback, and uninstall design |
-| 6.2 | CNI executable/configuration | **Gated** | Versioned ADD/CHECK/DEL behavior with idempotence and actionable errors |
-| 6.3 | IPAM | **Gated** | Dual-stack allocation, persistence, collision prevention, release, exhaustion, and recovery tests |
-| 6.4 | Link lifecycle | **Gated** | veth/netkit creation, namespace movement, naming, cleanup, and crash recovery |
-| 6.5 | Routing and MTU | **Gated** | Per-family routes, neighbor behavior, MTU derivation, fragmentation boundaries, and rollback |
-| 6.6 | Node-to-node networking | **Gated** | Cross-node dual-stack lifecycle, failure recovery, observability, and coexistence qualification |
+| 6.1 | CNI architecture and ownership | **Verified** | ADR 0057 accepts the versioned local transaction/state model, exact host ownership, overlay/primary coexistence, node-drain cutover/rollback, scoped uninstall, and Kind-first qualification boundary |
+| 6.2 | CNI executable/configuration | **In progress** | `make cni-protocol-test` verifies bounded CNI 1.0/1.1 VERSION/ADD/DEL/CHECK/STATUS/GC inputs and structured results; lifecycle creation remains fail closed until the local agent transaction API exists |
+| 6.3 | IPAM | **Planned** | Dual-stack allocation, persistence, collision prevention, release, exhaustion, and recovery tests |
+| 6.4 | Link lifecycle | **Planned** | Portable veth creation, namespace movement, deterministic naming, cleanup, and crash recovery; netkit remains separately gated |
+| 6.5 | Routing and MTU | **Planned** | Per-family routes, neighbor behavior, MTU derivation, fragmentation boundaries, and rollback |
+| 6.6 | Node-to-node networking | **Planned** | Cross-node dual-stack lifecycle, failure recovery, observability, and coexistence qualification |
 
 ## Updating this plan
 

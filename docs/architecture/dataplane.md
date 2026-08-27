@@ -155,5 +155,5 @@ the exact cluster resources, and proves full redeploy recovery. The OpenShift
 agent uses the constrained three-capability boundary defined by ADR 0025, the
 exact mount boundary in ADR 0028, and the uninstall ordering in ADR 0029. The
 Phase 3 NetworkPolicy compatibility is complete at its documented bounded L4
-scope. Full-CNI dataplane ownership remains behind the separate architecture
-gate in the Phase 3 completion and full-CNI entry plan.
+scope. Full-CNI dataplane ownership has entered its separate architecture under
+ADR 0057; link, routing, and cluster lifecycle implementation remain planned.
