@@ -60,11 +60,11 @@ cl02 is first required by milestone 3. Milestones 1 and 2 run against Kind.
 
 | ID | Deliverable | State | Required evidence |
 |---|---|---|---|
-| 4.1 | Support-matrix schema | **Planned** | Each row records Kubernetes/OpenShift, kernel, OS, CNI, address families, attachment mode, architecture, and evidence revision |
-| 4.2 | Existing fixtures | **Planned** | cl01 remains the IPv4 OpenShift row; cl02 remains the dual-stack OpenShift row; Kind remains the dual-stack TCX row |
+| 4.1 | Support-matrix schema | **Verified** | Schema-v1 `support-matrix.json` records the exact platform, Kubernetes/OpenShift, OS, kernel, runtime, CNI, address families, attachment modes, architecture, cluster shape, full evidence revision, commands, records, decisions, and scope; `make support-matrix-check` validates structure and references |
+| 4.2 | Existing fixtures | **Verified** | Separate exact rows retain Kind dual-stack TCX/legacy evidence at `9dc6023`, cl01 IPv4 OpenShift legacy evidence at `4f213c7`, and cl02 dual-stack OpenShift legacy plus digest-pinned transitions at `9a376ae` |
 | 4.3 | Additional release | **Planned** | At least one additional Kubernetes or OpenShift release is qualified before claiming multi-version support |
 | 4.4 | Additional kernel/attachment coverage | **Planned** | Every newly claimed kernel and TCX/legacy combination passes enforcement, recovery, and upgrade gates |
-| 4.5 | Unsupported boundaries | **Planned** | Untested combinations remain explicitly unqualified rather than inferred from nearby rows |
+| 4.5 | Unsupported boundaries | **Verified** | Seven normative dimensions explicitly leave unlisted releases, kernels/OSes, architectures, CNIs, cluster shapes, and production artifact paths unqualified; matrix semantics prohibit transitive claims |
 
 ## 5. Phase 3 closure
 

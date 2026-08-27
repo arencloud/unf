@@ -114,6 +114,14 @@ make openshift-upgrade-test \
 ADR 0054 records the exact cl02 window, image digests, platform invariants, and
 append-only attempt history.
 
+Exact qualified platform tuples and their non-transitive boundaries are tracked
+in `docs/development/support-matrix.json`. Validate its schema, Git evidence,
+and ADR references with:
+
+```bash
+make support-matrix-check
+```
+
 A bounded Kind failure/scale gate adds deterministic workload generation,
 measured churn and recovery budgets, simultaneous two-agent last-known-good
 recovery with the controller offline, continuous dual-stack policy probes, and

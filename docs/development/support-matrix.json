@@ -1,0 +1,230 @@
+{
+  "schema_version": 1,
+  "last_reviewed": "2026-08-27",
+  "qualification_semantics": {
+    "qualified": "The exact row passed every listed gate at the recorded evidence revision.",
+    "non_transitive": true,
+    "freshness": "A recorded pass remains evidence for its exact tuple; current reachability is operational state and does not silently refresh or invalidate the record."
+  },
+  "rows": [
+    {
+      "id": "kind-kubernetes-1.35-dual-tcx-legacy-amd64",
+      "state": "qualified",
+      "platform": {
+        "distribution": "Kubernetes",
+        "environment": "Kind v0.32.0",
+        "kubernetes_version": "v1.35.0",
+        "openshift_version": null
+      },
+      "nodes": {
+        "count": 2,
+        "os": "Debian GNU/Linux 12 (bookworm) Kind node on Fedora host",
+        "kernels": [
+          "7.1.4-204.fc44.x86_64"
+        ],
+        "architecture": "amd64",
+        "container_runtime": "containerd 2.2.0"
+      },
+      "networking": {
+        "cni": "kindnetd v20251212-v0.29.0-alpha-105-g20ccfc88",
+        "address_families": [
+          "ipv4",
+          "ipv6"
+        ]
+      },
+      "dataplane": {
+        "attachment_modes": [
+          "tcx_pinned",
+          "legacy_netlink"
+        ]
+      },
+      "evidence": {
+        "outcome": "passed",
+        "verified_at": "2026-08-27",
+        "revision": "9dc602300e5efe35af113b109753cf9c31b268de",
+        "commands": [
+          "make kind-test",
+          "make kind-scale-failure-test",
+          "make kind-upgrade-test",
+          "make kind-rollback-reporting-test"
+        ],
+        "records": [
+          ".artifacts/phase3-scale-kind-result.json",
+          ".artifacts/phase3-scale-kind-result-attempts.jsonl"
+        ],
+        "decisions": [
+          "docs/adr/0048-bounded-kind-failure-scale-qualification.md",
+          "docs/adr/0053-observable-version-transition-outcomes.md"
+        ]
+      },
+      "qualified_scope": [
+        "dual-stack ingress and egress enforcement",
+        "TCX and native legacy-netlink attachment",
+        "controller and simultaneous-agent recovery",
+        "same-tuple upgrade, rollback, and transition reporting",
+        "bounded scale and object churn"
+      ]
+    },
+    {
+      "id": "cl01-openshift-4.22-ipv4-legacy-amd64",
+      "state": "qualified",
+      "platform": {
+        "distribution": "OpenShift",
+        "environment": "cl01",
+        "kubernetes_version": "v1.35.6",
+        "openshift_version": "4.22.9"
+      },
+      "nodes": {
+        "count": 2,
+        "os": "Red Hat Enterprise Linux CoreOS 9.8",
+        "kernels": [
+          "5.14.0-687.35.1.el9_8.x86_64"
+        ],
+        "architecture": "amd64",
+        "container_runtime": "CRI-O 1.35"
+      },
+      "networking": {
+        "cni": "OVN-Kubernetes",
+        "address_families": [
+          "ipv4"
+        ]
+      },
+      "dataplane": {
+        "attachment_modes": [
+          "legacy_netlink"
+        ]
+      },
+      "evidence": {
+        "outcome": "passed",
+        "verified_at": "2026-08-25",
+        "revision": "4f213c7aed51cac65781d561301edfdf67d40ea0",
+        "commands": [
+          "make openshift-test"
+        ],
+        "records": [
+          "docs/project-status.md#latest-verification-evidence"
+        ],
+        "decisions": [
+          "docs/adr/0025-constrained-openshift-agent-scc.md"
+        ]
+      },
+      "qualified_scope": [
+        "IPv4 cross-worker ingress enforcement and provenance",
+        "RHCOS enforcing-SELinux and constrained-SCC operation",
+        "Service CA and Pod-bound TokenReview transport",
+        "native legacy-netlink attachment",
+        "healthy OpenShift operators before and after qualification"
+      ]
+    },
+    {
+      "id": "cl02-openshift-4.22-dual-legacy-amd64",
+      "state": "qualified",
+      "platform": {
+        "distribution": "OpenShift",
+        "environment": "cl02",
+        "kubernetes_version": "v1.35.6",
+        "openshift_version": "4.22.9"
+      },
+      "nodes": {
+        "count": 2,
+        "os": "Red Hat Enterprise Linux CoreOS 9.8.20260804-2 (Plow)",
+        "kernels": [
+          "5.14.0-687.35.1.el9_8.x86_64"
+        ],
+        "architecture": "amd64",
+        "container_runtime": "CRI-O 1.35.5-3.rhaos4.22.git0adf62b.el9"
+      },
+      "networking": {
+        "cni": "OVN-Kubernetes",
+        "address_families": [
+          "ipv4",
+          "ipv6"
+        ]
+      },
+      "dataplane": {
+        "attachment_modes": [
+          "legacy_netlink"
+        ]
+      },
+      "evidence": {
+        "outcome": "passed",
+        "verified_at": "2026-08-27",
+        "revision": "9a376ae500cd7b4c84672bb77db3d3e7428a785d",
+        "commands": [
+          "make openshift-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig",
+          "make openshift-upgrade-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig"
+        ],
+        "records": [
+          ".artifacts/phase3-openshift-upgrade-result.json",
+          ".artifacts/phase3-openshift-upgrade-attempts.jsonl"
+        ],
+        "decisions": [
+          "docs/adr/0043-openshift-ovn-egress-qualification.md",
+          "docs/adr/0054-digest-pinned-openshift-upgrade-qualification.md"
+        ]
+      },
+      "qualified_scope": [
+        "dual-stack cross-worker ingress and egress enforcement",
+        "RHCOS enforcing-SELinux and constrained-SCC operation",
+        "Service CA, Pod-bound TokenReview, and OVN reply compatibility",
+        "native legacy-netlink attachment",
+        "digest-pinned controller-first and worker-serial upgrade, rollback, and recovery"
+      ]
+    }
+  ],
+  "unsupported_boundaries": [
+    {
+      "dimension": "Kubernetes release",
+      "qualified_values": [
+        "v1.35.0",
+        "v1.35.6 as shipped by OpenShift 4.22.9"
+      ],
+      "boundary": "Other Kubernetes minor releases are unqualified until a separate row passes the required gates."
+    },
+    {
+      "dimension": "OpenShift release",
+      "qualified_values": [
+        "4.22.9"
+      ],
+      "boundary": "Other OpenShift releases and upgrades of the OpenShift platform itself are unqualified."
+    },
+    {
+      "dimension": "Kernel and operating system",
+      "qualified_values": [
+        "Fedora-hosted Linux 7.1.4 Kind nodes",
+        "RHCOS 9.8 Linux 5.14.0-687.35.1.el9_8"
+      ],
+      "boundary": "Adjacent kernels, other distributions, and PREEMPT_RT kernels are not inferred."
+    },
+    {
+      "dimension": "Architecture",
+      "qualified_values": [
+        "amd64"
+      ],
+      "boundary": "arm64, s390x, ppc64le, and mixed-architecture clusters are unqualified."
+    },
+    {
+      "dimension": "CNI",
+      "qualified_values": [
+        "kindnetd",
+        "OVN-Kubernetes"
+      ],
+      "boundary": "Other CNIs and CNI chaining combinations are unqualified."
+    },
+    {
+      "dimension": "Cluster shape",
+      "qualified_values": [
+        "two selected nodes"
+      ],
+      "boundary": "Larger clusters, multiple controller replicas, mixed kernels, and mixed attachment modes are unqualified."
+    },
+    {
+      "dimension": "Release artifacts",
+      "qualified_values": [
+        "local Kind images",
+        "digest-pinned development Quay images for the recorded cl02 window"
+      ],
+      "boundary": "Production repositories, signatures, attestations, and production installer automation are not qualified."
+    }
+  ]
+}
