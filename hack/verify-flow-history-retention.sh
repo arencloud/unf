@@ -57,6 +57,7 @@ wait_for_target_flow() {
     local controller=$1
     local since_unix_ms=$2
     local target_url=$3
+    local expected_key=${4:-null}
     local snapshot
     local response
     for attempt in {1..45}; do
@@ -73,12 +74,17 @@ wait_for_target_flow() {
             done
         fi
         snapshot=$(controller_raw "${controller}" /v1/flows 2>/dev/null || true)
-        if jq -e --argjson since "${since_unix_ms}" '
+        if jq -e --argjson since "${since_unix_ms}" \
+            --argjson expected_key "${expected_key}" '
             .schema_version == 4
             and any(.entries[];
-                (.source_workloads | index("frontend/client"))
-                and (.destination_workloads | index("backend/server"))
-                and .key.destination_port == 8080
+                (if $expected_key == null then
+                    (.source_workloads | index("frontend/client"))
+                    and (.destination_workloads | index("backend/server"))
+                    and .key.destination_port == 8080
+                else
+                    .key == $expected_key
+                end)
                 and .last_received_unix_ms >= $since
                 and .decision.verdict == "Allow")
         ' <<<"${snapshot}" >/dev/null 2>&1; then
@@ -92,20 +98,16 @@ wait_for_target_flow() {
 }
 
 wait_for_checkpoint() {
-    local source_identity=$1
-    local destination_identity=$2
+    local target_key=$1
     local encoded
     for _ in {1..45}; do
         encoded=$(checkpoint 2>/dev/null || true)
         if jq -e \
-            --argjson source "${source_identity}" \
-            --argjson destination "${destination_identity}" '
+            --argjson target_key "${target_key}" '
             .schema_version == 2
             and .revision > 0
             and any(.entries[];
-                .key.source_identity == $source
-                and .key.destination_identity == $destination
-                and .key.destination_port == 8080
+                .key == $target_key
                 and .observed_events > 0
                 and .first_received_unix_ms > 0
                 and .last_received_unix_ms >= .first_received_unix_ms)
@@ -168,18 +170,13 @@ target=$(jq -c '[
         and .key.destination_port == 8080
         and .decision.verdict == "Allow")
     ][0]' <<<"${before}")
-source_identity=$(jq '.key.source_identity' <<<"${target}")
-destination_identity=$(jq '.key.destination_identity' <<<"${target}")
+target_key=$(jq -c '.key' <<<"${target}")
 
 qualification_stage=durable-checkpoint
-checkpoint_before=$(wait_for_checkpoint "${source_identity}" "${destination_identity}")
-first_received=$(jq \
-    --argjson source "${source_identity}" \
-    --argjson destination "${destination_identity}" '[
+checkpoint_before=$(wait_for_checkpoint "${target_key}")
+first_received=$(jq --argjson target_key "${target_key}" '[
     .entries[]
-    | select(.key.source_identity == $source
-        and .key.destination_identity == $destination
-        and .key.destination_port == 8080)
+    | select(.key == $target_key)
     | .first_received_unix_ms
     ][0]' <<<"${checkpoint_before}")
 [[ ${first_received} -gt 0 ]]
@@ -255,14 +252,11 @@ new_controller_uid=$("${kc[@]}" -n unf-system get pod "${controller}" \
 [[ $(agent_runtime_state) == "${agent_state}" ]]
 
 qualification_stage=checkpoint-restore
-after=$(wait_for_target_flow "${controller}" "${window_start}" "${target_url}")
-restored_first=$(jq \
-    --argjson source "${source_identity}" \
-    --argjson destination "${destination_identity}" '[
+after=$(wait_for_target_flow \
+    "${controller}" "${window_start}" "${target_url}" "${target_key}")
+restored_first=$(jq --argjson target_key "${target_key}" '[
     .entries[]
-    | select(.key.source_identity == $source
-        and .key.destination_identity == $destination
-        and .key.destination_port == 8080)
+    | select(.key == $target_key)
     | .first_received_unix_ms
     ][0]' <<<"${after}")
 [[ ${restored_first} -eq "${first_received}" ]]
