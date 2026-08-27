@@ -13,6 +13,7 @@ temporary_dir=$(mktemp -d)
 control_plane_node=${UNF_KIND_CONTROL_PLANE_NODE:-unf-dev-control-plane}
 worker_node=${UNF_KIND_WORKER_NODE:-unf-dev-worker}
 topology_probe_manifest=${temporary_dir}/topology-probe.yaml
+policy_transition_attempts=${UNF_POLICY_TRANSITION_ATTEMPTS:-30}
 controller_forward_pid=
 handoff_probe_pid=
 map_pressure_pid=
@@ -40,6 +41,11 @@ network_policy_selector_peer='[{"namespaceSelector":{"matchLabels":{"environment
 }
 [[ ${worker_node} =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || {
     echo "invalid Kind worker Node name: ${worker_node}" >&2
+    exit 1
+}
+[[ ${policy_transition_attempts} =~ ^[0-9]+$ ]] \
+    && ((policy_transition_attempts >= 30 && policy_transition_attempts <= 180)) || {
+    echo "policy transition attempts must be an integer from 30 through 180" >&2
     exit 1
 }
 sed "s/nodeName: unf-dev-control-plane/nodeName: ${control_plane_node}/" \
@@ -286,7 +292,8 @@ wait_for_aggregated_agent_convergence() {
 wait_for_policy_transition() {
     local floor_revision=$1
     local all_converged status desired applied bank pod candidate_revision controller_revision
-    for _ in {1..30}; do
+    local attempt
+    for ((attempt = 1; attempt <= policy_transition_attempts; attempt++)); do
         all_converged=true
         candidate_revision=
         controller_revision=$("${unfctl}" \
@@ -320,6 +327,14 @@ wait_for_policy_transition() {
             return 0
         fi
         sleep 1
+    done
+    echo "policy transition timed out: floor=${floor_revision} controller=${controller_revision:-unknown} attempts=${policy_transition_attempts}" >&2
+    for pod in "${agent_pods[@]}"; do
+        status=$(agent_status "${pod}" || true)
+        desired=$(json_number desired_policy_revision <<<"${status}")
+        applied=$(json_number applied_policy_revision <<<"${status}")
+        bank=$(json_number active_policy_bank <<<"${status}")
+        echo "policy transition agent=${pod} desired=${desired:-unknown} applied=${applied:-unknown} bank=${bank:-unknown} previous_bank=${policy_banks[${pod}]:-unknown}" >&2
     done
     return 1
 }

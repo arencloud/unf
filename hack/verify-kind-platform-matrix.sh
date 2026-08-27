@@ -188,7 +188,8 @@ make -C "${project_root}" kind-test \
     KIND_KUBECONFIG="${kubeconfig}" \
     KUBE_CONTEXT="${context}" \
     UNF_KIND_CONTROL_PLANE_NODE="${control_plane_node}" \
-    UNF_KIND_WORKER_NODE="${worker_node}"
+    UNF_KIND_WORKER_NODE="${worker_node}" \
+    UNF_POLICY_TRANSITION_ATTEMPTS=90
 
 stage=adjacent-upgrade-rollback
 make -C "${project_root}" kind-upgrade-test \
