@@ -243,13 +243,16 @@ matrix and reproducible evidence.
   artifacts, full endpoint platform gates, controller-first and worker-serial
   rollout, complete rollback/forward recovery, sustained dual-stack policy
   enforcement, provenance/telemetry continuity, and healthy operators;
-- Broader platform-version validation remains.
+- Completed on an isolated two-node Kind fixture: Kubernetes 1.34.8 on Debian
+  13/containerd 2.3.1 independently passed full dual-stack endpoint/recovery,
+  TCX and legacy attachment, and adjacent-revision upgrade/rollback, creating a
+  fourth exact support-matrix row alongside Kubernetes 1.35 and OpenShift 4.22.
 
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
 transport remain research/planned work after these foundations. The next active
-Phase 3 work is broader platform/version-matrix qualification and closure,
-plus additional external transport adapters where product requirements justify
-them.
+The next active Phase 3 work is the closure regression, requirements and
+limitations audit, and immutable release-readiness record. Additional external
+transport adapters remain conditional on product requirements.
 
 The ordered milestones and their evidence-bearing subpoints are maintained in
 [the Phase 3 completion and full-CNI entry plan](development/phase3-completion-plan.md).

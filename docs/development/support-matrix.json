@@ -66,6 +66,60 @@
       ]
     },
     {
+      "id": "kind-kubernetes-1.34-dual-tcx-legacy-amd64",
+      "state": "qualified",
+      "platform": {
+        "distribution": "Kubernetes",
+        "environment": "Kind v0.32.0",
+        "kubernetes_version": "v1.34.8",
+        "openshift_version": null
+      },
+      "nodes": {
+        "count": 2,
+        "os": "Debian GNU/Linux 13 (trixie) Kind node on Fedora host",
+        "kernels": [
+          "7.1.4-204.fc44.x86_64"
+        ],
+        "architecture": "amd64",
+        "container_runtime": "containerd 2.3.1"
+      },
+      "networking": {
+        "cni": "kindnetd v20260528-9350166c",
+        "address_families": [
+          "ipv4",
+          "ipv6"
+        ]
+      },
+      "dataplane": {
+        "attachment_modes": [
+          "tcx_pinned",
+          "legacy_netlink"
+        ]
+      },
+      "evidence": {
+        "outcome": "passed",
+        "verified_at": "2026-08-27",
+        "revision": "da733591b23618bff1001769ae02d30dc1c3e2ce",
+        "commands": [
+          "make kind-platform-matrix-test"
+        ],
+        "records": [
+          ".artifacts/phase3-kind-kubernetes-1.34-result.json",
+          ".artifacts/phase3-kind-kubernetes-1.34-attempts.jsonl"
+        ],
+        "decisions": [
+          "docs/adr/0055-multi-version-kind-platform-qualification.md"
+        ]
+      },
+      "qualified_scope": [
+        "dual-stack ingress and egress enforcement",
+        "TCX and native legacy-netlink attachment",
+        "controller, agent, persistent-state, and export recovery",
+        "adjacent committed-revision upgrade and rollback",
+        "exact platform provenance and bounded host-prerequisite restoration"
+      ]
+    },
+    {
       "id": "cl01-openshift-4.22-ipv4-legacy-amd64",
       "state": "qualified",
       "platform": {
@@ -176,6 +230,7 @@
     {
       "dimension": "Kubernetes release",
       "qualified_values": [
+        "v1.34.8",
         "v1.35.0",
         "v1.35.6 as shipped by OpenShift 4.22.9"
       ],
@@ -191,7 +246,7 @@
     {
       "dimension": "Kernel and operating system",
       "qualified_values": [
-        "Fedora-hosted Linux 7.1.4 Kind nodes",
+        "Debian 12 and Debian 13 Kind nodes on Fedora-hosted Linux 7.1.4",
         "RHCOS 9.8 Linux 5.14.0-687.35.1.el9_8"
       ],
       "boundary": "Adjacent kernels, other distributions, and PREEMPT_RT kernels are not inferred."

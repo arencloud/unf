@@ -122,6 +122,18 @@ and ADR references with:
 make support-matrix-check
 ```
 
+Qualify the pinned additional Kubernetes 1.34.8 tuple in a disposable two-node
+dual-stack Kind cluster with:
+
+```bash
+make kind-platform-matrix-test
+```
+
+The gate requires a clean committed tree, records every attempt, runs complete
+endpoint/recovery and adjacent-revision upgrade/rollback checks, then removes
+only its dedicated cluster and restores its bounded host prerequisite. ADR 0055
+records the verified tuple and retry history.
+
 A bounded Kind failure/scale gate adds deterministic workload generation,
 measured churn and recovery budgets, simultaneous two-agent last-known-good
 recovery with the controller offline, continuous dual-stack policy probes, and

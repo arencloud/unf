@@ -17,6 +17,7 @@ refreshing the old result.
 | Fixture | Platform | OS and kernel | CNI/families | Attachment | Evidence |
 |---|---|---|---|---|---|
 | Kind | Kubernetes 1.35.0 | Debian 12 node / Fedora host, Linux 7.1.4, amd64 | kindnetd, IPv4/IPv6 | TCX and legacy netlink | `9dc6023`, Kind endpoint/scale/recovery/upgrade gates |
+| Kind matrix | Kubernetes 1.34.8 | Debian 13 node / Fedora host, Linux 7.1.4, amd64 | kindnetd, IPv4/IPv6 | TCX and legacy netlink | `da73359`, isolated endpoint/recovery/upgrade gate; ADR 0055 |
 | cl01 | OpenShift 4.22.9 / Kubernetes 1.35.6 | RHCOS 9.8, Linux 5.14, amd64 | OVN-Kubernetes, IPv4 | legacy netlink | `4f213c7`, adaptive OpenShift endpoint gate |
 | cl02 | OpenShift 4.22.9 / Kubernetes 1.35.6 | RHCOS 9.8, Linux 5.14, amd64 | OVN-Kubernetes, IPv4/IPv6 | legacy netlink | `9a376ae`, endpoint and digest-pinned transition gates |
 
@@ -26,6 +27,7 @@ commands, result/ADR references, and scope for every row. Its explicit
 releases, kernels, architectures, CNIs, cluster shapes, and production artifact
 paths remain unqualified.
 
-The next matrix exit requirement is a fourth row for an additional Kubernetes
-or OpenShift release. That row must pass enforcement, recovery, and upgrade on
-its actual kernel/attachment tuple before milestone 4 can be marked Verified.
+The fourth row satisfies the multi-version exit requirement through the
+isolated `make kind-platform-matrix-test` gate. Future rows must independently
+pass enforcement, recovery, and upgrade on their actual kernel/attachment tuple;
+the existing rows do not imply support for adjacent versions.

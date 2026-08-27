@@ -15,7 +15,7 @@ complete its parent milestone.
 | 1 | Broader failure and scale qualification | **Verified** | Existing two-node dual-stack Kind fixture | `make kind-scale-failure-test` plus a schema-versioned result record; ADR 0048 |
 | 2 | Expanded version compatibility matrix | **Verified** | Milestone 1 budgets and the compatibility tuple from ADR 0047 | Same-tuple skipped upgrade, incompatible-tuple rejection, persistent-state clean rebuild, supported/unsupported downgrade behavior, and transition reporting are Verified; ADRs 0049–0053 |
 | 3 | OpenShift cl02 upgrade qualification | **Verified** | Milestone 2 Kind evidence and development images in Quay | `make openshift-upgrade-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig`; ADR 0054 |
-| 4 | Broader platform/version coverage | **Planned** | Available clusters for each claimed platform | Versioned support matrix with one evidence record per claimed combination |
+| 4 | Broader platform/version coverage | **Verified** | Available clusters for each claimed platform | Four exact qualified tuples, including an isolated Kubernetes 1.34.8 endpoint/recovery/upgrade record; ADR 0055 |
 | 5 | Phase 3 closure | **Planned** | Milestones 1–4 Verified | Complete release audit and Phase 3 marked **Verified** in `project-status.md` |
 | 6 | Full-CNI foundation entry | **Gated** | Milestone 5 and explicit approval at the architecture gate | Accepted design plus bounded CNI/IPAM/veth/routing/MTU/node-networking slices |
 
@@ -62,8 +62,8 @@ cl02 is first required by milestone 3. Milestones 1 and 2 run against Kind.
 |---|---|---|---|
 | 4.1 | Support-matrix schema | **Verified** | Schema-v1 `support-matrix.json` records the exact platform, Kubernetes/OpenShift, OS, kernel, runtime, CNI, address families, attachment modes, architecture, cluster shape, full evidence revision, commands, records, decisions, and scope; `make support-matrix-check` validates structure and references |
 | 4.2 | Existing fixtures | **Verified** | Separate exact rows retain Kind dual-stack TCX/legacy evidence at `9dc6023`, cl01 IPv4 OpenShift legacy evidence at `4f213c7`, and cl02 dual-stack OpenShift legacy plus digest-pinned transitions at `9a376ae` |
-| 4.3 | Additional release | **Planned** | At least one additional Kubernetes or OpenShift release is qualified before claiming multi-version support |
-| 4.4 | Additional kernel/attachment coverage | **Planned** | Every newly claimed kernel and TCX/legacy combination passes enforcement, recovery, and upgrade gates |
+| 4.3 | Additional release | **Verified** | `make kind-platform-matrix-test` passed on Kubernetes 1.34.8 from clean revision `da73359`, independently of the existing Kubernetes 1.35.0 Kind row; schema-v1 result and append-only attempt history are retained; ADR 0055 |
+| 4.4 | Additional kernel/attachment coverage | **Verified** | The additional Debian 13/containerd 2.3.1/kindnetd tuple passed full dual-stack endpoint and recovery gates in both TCX and legacy-netlink modes plus adjacent-revision upgrade/rollback on its actual Linux 7.1.4 host kernel |
 | 4.5 | Unsupported boundaries | **Verified** | Seven normative dimensions explicitly leave unlisted releases, kernels/OSes, architectures, CNIs, cluster shapes, and production artifact paths unqualified; matrix semantics prohibit transitive claims |
 
 ## 5. Phase 3 closure

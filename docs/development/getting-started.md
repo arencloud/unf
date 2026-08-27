@@ -495,6 +495,20 @@ profile; changed profiles are separate evidence and do not broaden the default
 claim implicitly. The complete ordered checklist is maintained in the
 [Phase 3 completion plan](phase3-completion-plan.md).
 
+To reproduce the independently qualified Kubernetes 1.34.8 support row, run
+the isolated platform-matrix gate from a clean committed tree:
+
+```bash
+make kind-platform-matrix-test
+```
+
+It uses a dedicated `unf-matrix-134` cluster, preserves `unf-dev`, runs the
+complete dual-stack endpoint/recovery and adjacent-revision transition suites,
+retains a schema-v1 result plus append-only attempt history under `.artifacts/`,
+and restores the original host inotify limit during cleanup. See
+[ADR 0055](../adr/0055-multi-version-kind-platform-qualification.md) for the
+exact node image, qualified environment, and non-transitive boundary.
+
 The projected credential is never written to logs or checked into the repository.
 Agent snapshots, acknowledgements, and flow telemetry use the controller's
 dedicated HTTPS port and a client trust store containing only `unf-internal-ca`;
