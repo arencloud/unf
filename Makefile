@@ -1,9 +1,12 @@
-.PHONY: build test lint fmt fmt-check support-matrix-check ebpf generate-crds controller agent cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-upgrade-images openshift-deploy openshift-test openshift-upgrade-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-down
+.PHONY: build test lint fmt fmt-check support-matrix-check ebpf generate-crds controller agent cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-upgrade-images openshift-deploy openshift-test openshift-upgrade-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-platform-matrix-test kind-down
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
 KIND_PROVIDER ?= podman
-KIND_KUBECONFIG := $(CURDIR)/.tools/kind-unf-dev.kubeconfig
+KIND_NAME ?= unf-dev
+KIND_CONFIG ?= $(CURDIR)/hack/kind-config.yaml
+KIND_KUBECONFIG ?= $(CURDIR)/.tools/kind-$(KIND_NAME).kubeconfig
+KUBE_CONTEXT ?= kind-$(KIND_NAME)
 TEST_TOOLS_IMAGE := localhost/unf-test-tools:ipv6-ext-v1
 UNF_BUILD_REVISION ?= $(shell git describe --always --dirty --abbrev=40 2>/dev/null || echo unknown)
 UNF_UPGRADE_BASELINE_REF ?= HEAD^
@@ -117,98 +120,101 @@ kind-tool:
 	GOBIN=$(CURDIR)/.tools/bin go install sigs.k8s.io/kind@v0.32.0
 
 kind-up: kind-tool
-	sudo env KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) create cluster --name unf-dev --config hack/kind-config.yaml --wait 5m
+	sudo env KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) create cluster --name $(KIND_NAME) --config $(KIND_CONFIG) --wait 5m
 	sudo chown $$(id -u):$$(id -g) $(KIND_KUBECONFIG)
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/configure-kind.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/configure-kind.sh
 
 kind-load: images
 	ln -sf $$(command -v podman) .tools/bin/docker
 	podman save localhost/unf-controller:dev | sudo podman load
 	podman save localhost/unf-agent:dev | sudo podman load
 	podman save $(TEST_TOOLS_IMAGE) | sudo podman load
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev localhost/unf-controller:dev
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev localhost/unf-agent:dev
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(TEST_TOOLS_IMAGE)
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name $(KIND_NAME) localhost/unf-controller:dev
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name $(KIND_NAME) localhost/unf-agent:dev
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name $(KIND_NAME) $(TEST_TOOLS_IMAGE)
 
 kind-upgrade-load: upgrade-baseline-images
 	ln -sf $$(command -v podman) .tools/bin/docker
 	podman save $(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE) | sudo podman load
 	podman save $(UNF_UPGRADE_BASELINE_AGENT_IMAGE) | sudo podman load
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE)
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_UPGRADE_BASELINE_AGENT_IMAGE)
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name $(KIND_NAME) $(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE)
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name $(KIND_NAME) $(UNF_UPGRADE_BASELINE_AGENT_IMAGE)
 
 kind-skipped-upgrade-load: skipped-upgrade-baseline-images
 	ln -sf $$(command -v podman) .tools/bin/docker
 	podman save $(UNF_SKIPPED_UPGRADE_BASELINE_CONTROLLER_IMAGE) | sudo podman load
 	podman save $(UNF_SKIPPED_UPGRADE_BASELINE_AGENT_IMAGE) | sudo podman load
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_SKIPPED_UPGRADE_BASELINE_CONTROLLER_IMAGE)
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_SKIPPED_UPGRADE_BASELINE_AGENT_IMAGE)
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name $(KIND_NAME) $(UNF_SKIPPED_UPGRADE_BASELINE_CONTROLLER_IMAGE)
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name $(KIND_NAME) $(UNF_SKIPPED_UPGRADE_BASELINE_AGENT_IMAGE)
 
 kind-incompatible-version-load: incompatible-version-images
 	ln -sf $$(command -v podman) .tools/bin/docker
 	podman save $(UNF_INCOMPATIBLE_CONTROLLER_IMAGE) | sudo podman load
 	podman save $(UNF_INCOMPATIBLE_AGENT_IMAGE) | sudo podman load
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_INCOMPATIBLE_CONTROLLER_IMAGE)
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_INCOMPATIBLE_AGENT_IMAGE)
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name $(KIND_NAME) $(UNF_INCOMPATIBLE_CONTROLLER_IMAGE)
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name $(KIND_NAME) $(UNF_INCOMPATIBLE_AGENT_IMAGE)
 
 kind-clean-rebuild-load: clean-rebuild-version-images
 	ln -sf $$(command -v podman) .tools/bin/docker
 	podman save $(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) | sudo podman load
 	podman save $(UNF_CLEAN_REBUILD_AGENT_IMAGE) | sudo podman load
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE)
-	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_CLEAN_REBUILD_AGENT_IMAGE)
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name $(KIND_NAME) $(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE)
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name $(KIND_NAME) $(UNF_CLEAN_REBUILD_AGENT_IMAGE)
 
 kind-deploy: kind-load
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/configure-internal-tls.sh
-	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev apply -k deploy
-	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev rollout restart deployment/unf-controller -n unf-system
-	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev rollout restart daemonset/unf-agent -n unf-system
-	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev rollout status deployment/unf-controller -n unf-system --timeout=120s
-	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev rollout status daemonset/unf-agent -n unf-system --timeout=120s
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/configure-internal-tls.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context $(KUBE_CONTEXT) apply -k deploy
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context $(KUBE_CONTEXT) rollout restart deployment/unf-controller -n unf-system
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context $(KUBE_CONTEXT) rollout restart daemonset/unf-agent -n unf-system
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context $(KUBE_CONTEXT) rollout status deployment/unf-controller -n unf-system --timeout=120s
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context $(KUBE_CONTEXT) rollout status daemonset/unf-agent -n unf-system --timeout=120s
 
 kind-demo:
-	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev apply -f deploy/examples/demo.yaml
-	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev wait --for=condition=Ready pod/client -n frontend --timeout=120s
-	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev wait --for=condition=Ready pod/server -n backend --timeout=120s
-	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev wait --for=condition=Ready pod/np-server -n backend --timeout=120s
-	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev exec -n frontend client -- wget -qO- http://server.backend.svc.cluster.local:8080
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context $(KUBE_CONTEXT) apply -f deploy/examples/demo.yaml
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context $(KUBE_CONTEXT) wait --for=condition=Ready pod/client -n frontend --timeout=120s
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context $(KUBE_CONTEXT) wait --for=condition=Ready pod/server -n backend --timeout=120s
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context $(KUBE_CONTEXT) wait --for=condition=Ready pod/np-server -n backend --timeout=120s
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context $(KUBE_CONTEXT) exec -n frontend client -- wget -qO- http://server.backend.svc.cluster.local:8080
 
 kind-flow-history-retention-test: cli
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-flow-history-retention.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-flow-history-retention.sh
 
 kind-topology-history-test: cli
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-topology-history.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-topology-history.sh
 
 kind-external-flow-export-test:
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-external-flow-export.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-external-flow-export.sh
 
 kind-upgrade-test: kind-deploy kind-demo kind-upgrade-load
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE=$(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE) UNF_UPGRADE_BASELINE_AGENT_IMAGE=$(UNF_UPGRADE_BASELINE_AGENT_IMAGE) UNF_UPGRADE_CURRENT_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-upgrade.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE=$(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE) UNF_UPGRADE_BASELINE_AGENT_IMAGE=$(UNF_UPGRADE_BASELINE_AGENT_IMAGE) UNF_UPGRADE_CURRENT_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-upgrade.sh
 
 kind-skipped-upgrade-test: kind-deploy kind-demo kind-skipped-upgrade-load
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE=$(UNF_SKIPPED_UPGRADE_BASELINE_CONTROLLER_IMAGE) UNF_UPGRADE_BASELINE_AGENT_IMAGE=$(UNF_SKIPPED_UPGRADE_BASELINE_AGENT_IMAGE) UNF_UPGRADE_CURRENT_REVISION=$(UNF_BUILD_REVISION) UNF_UPGRADE_CURRENT_GENERATION=N+2 UNF_UPGRADE_REQUIRE_BASELINE_TUPLE=true hack/verify-kind-upgrade.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE=$(UNF_SKIPPED_UPGRADE_BASELINE_CONTROLLER_IMAGE) UNF_UPGRADE_BASELINE_AGENT_IMAGE=$(UNF_SKIPPED_UPGRADE_BASELINE_AGENT_IMAGE) UNF_UPGRADE_CURRENT_REVISION=$(UNF_BUILD_REVISION) UNF_UPGRADE_CURRENT_GENERATION=N+2 UNF_UPGRADE_REQUIRE_BASELINE_TUPLE=true hack/verify-kind-upgrade.sh
 
 kind-incompatible-version-test: kind-deploy kind-demo kind-incompatible-version-load
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_INCOMPATIBLE_CONTROLLER_IMAGE=$(UNF_INCOMPATIBLE_CONTROLLER_IMAGE) UNF_INCOMPATIBLE_AGENT_IMAGE=$(UNF_INCOMPATIBLE_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-incompatible-version.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) UNF_INCOMPATIBLE_CONTROLLER_IMAGE=$(UNF_INCOMPATIBLE_CONTROLLER_IMAGE) UNF_INCOMPATIBLE_AGENT_IMAGE=$(UNF_INCOMPATIBLE_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-incompatible-version.sh
 
 kind-clean-rebuild-test: kind-deploy kind-demo kind-clean-rebuild-load
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_CLEAN_REBUILD_CONTROLLER_IMAGE=$(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) UNF_CLEAN_REBUILD_AGENT_IMAGE=$(UNF_CLEAN_REBUILD_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-clean-rebuild.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) UNF_CLEAN_REBUILD_CONTROLLER_IMAGE=$(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) UNF_CLEAN_REBUILD_AGENT_IMAGE=$(UNF_CLEAN_REBUILD_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-clean-rebuild.sh
 
 kind-unsupported-downgrade-test: kind-deploy kind-demo kind-clean-rebuild-load
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_CLEAN_REBUILD_CONTROLLER_IMAGE=$(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) UNF_CLEAN_REBUILD_AGENT_IMAGE=$(UNF_CLEAN_REBUILD_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) UNF_REQUIRE_UNSUPPORTED_DOWNGRADE=true hack/verify-kind-clean-rebuild.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) UNF_CLEAN_REBUILD_CONTROLLER_IMAGE=$(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) UNF_CLEAN_REBUILD_AGENT_IMAGE=$(UNF_CLEAN_REBUILD_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) UNF_REQUIRE_UNSUPPORTED_DOWNGRADE=true hack/verify-kind-clean-rebuild.sh
 
 kind-rollback-reporting-test: kind-deploy kind-demo kind-clean-rebuild-load
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_CLEAN_REBUILD_CONTROLLER_IMAGE=$(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) UNF_CLEAN_REBUILD_AGENT_IMAGE=$(UNF_CLEAN_REBUILD_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) UNF_REQUIRE_UNSUPPORTED_DOWNGRADE=true hack/verify-kind-clean-rebuild.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) UNF_CLEAN_REBUILD_CONTROLLER_IMAGE=$(UNF_CLEAN_REBUILD_CONTROLLER_IMAGE) UNF_CLEAN_REBUILD_AGENT_IMAGE=$(UNF_CLEAN_REBUILD_AGENT_IMAGE) UNF_CURRENT_REVISION=$(UNF_BUILD_REVISION) UNF_REQUIRE_UNSUPPORTED_DOWNGRADE=true hack/verify-kind-clean-rebuild.sh
 
 kind-scale-failure-test: kind-deploy kind-demo
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-kind-scale-failure.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-kind-scale-failure.sh
 
 kind-test: cli kind-demo
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-kind.sh
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-topology-history.sh
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-flow-history-retention.sh
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-external-flow-export.sh
-	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-kind-legacy-netlink.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-kind.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-topology-history.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-flow-history-retention.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-external-flow-export.sh
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=$(KUBE_CONTEXT) hack/verify-kind-legacy-netlink.sh
+
+kind-platform-matrix-test:
+	hack/verify-kind-platform-matrix.sh
 
 kind-down:
-	sudo env KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) delete cluster --name unf-dev
+	sudo env KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) delete cluster --name $(KIND_NAME)
