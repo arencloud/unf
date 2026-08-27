@@ -251,8 +251,33 @@ Both native `SecurityPolicy` and Kubernetes `NetworkPolicy` manifests use the
 same read-only command. Schema v4 reports the resource kind and expands
 NetworkPolicy impact by ingress/egress direction and each shared IPv4/IPv6 family.
 The result is fenced to the reported identity epoch/revision, policy revision,
-and topology revision. Inspect the same current Node/workload/Service and runtime
-backend relationships with:
+and topology revision.
+
+During a native `SecurityPolicy` shadow rollout, summarize retained
+counterfactual decisions directly from the controller:
+
+```bash
+target/debug/unfctl --controller-url http://127.0.0.1:9962 \
+  policy shadow-impact --last 15m --limit 100
+```
+
+For controller-independent review, first export a bounded schema-v4 snapshot,
+then analyze that file locally. The second command does not use the controller
+URL and accepts JSON or YAML:
+
+```bash
+target/debug/unfctl --controller-url http://127.0.0.1:9962 \
+  --output json flows --last 15m --limit 100 > shadow-flows.json
+target/debug/unfctl --controller-url http://127.0.0.1:1 \
+  policy shadow-impact --flows-file shadow-flows.json
+```
+
+The report is observation-weighted because one retained logical flow can
+aggregate many dataplane events. It distinguishes actual-allow/shadow-deny,
+actual-deny/shadow-allow, equal verdicts, and other verdict changes while
+retaining policy/rule provenance and the snapshot query boundary.
+
+Inspect the current Node/workload/Service and runtime backend relationships with:
 
 ```bash
 target/debug/unfctl --controller-url http://127.0.0.1:9962 topology

@@ -16,6 +16,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
 unf-api = { path = "../../crates/unf-api" }
+unf-state = { path = "../../crates/unf-state" }
 
 [lints]
 workspace = true

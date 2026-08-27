@@ -121,9 +121,13 @@ service_account=system:serviceaccount:unf-system:unf-controller
 controller=$(active_controller)
 [[ $(wc -w <<<"${controller}") -eq 1 ]]
 window_start=$(date +%s%3N)
-response=$("${kc[@]}" exec -n frontend client -- \
-    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080)
-[[ ${response} == unf-demo-ok ]]
+# A bounded burst makes the persistence fixture independent of the agent's
+# aggregation sampling boundary after the high-volume conformance matrix.
+for _ in {1..8}; do
+    response=$("${kc[@]}" exec -n frontend client -- \
+        wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080)
+    [[ ${response} == unf-demo-ok ]]
+done
 before=$(wait_for_target_flow "${controller}" "${window_start}")
 target=$(jq -c '[
     .entries[]

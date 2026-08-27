@@ -618,5 +618,6 @@ if ! wait_for_policy_state "${baseline_count}" "${baseline_rejected}" \
     echo "egress fixture cleanup did not reconverge" >&2
     exit 1
 fi
+trap - EXIT
 
 echo "dual-stack NetworkPolicy egress qualification passed: selected-source default isolation, non-selected pass-through, Namespace/Pod selector AND, named TCP and UDP ports, protocol-only SCTP, IPv4/IPv6 ipBlock exceptions, direction-correct explanation, retained history, read-only what-if simulation, allow/deny provenance, deletion recovery, and exact fixture cleanup"

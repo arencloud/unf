@@ -7,9 +7,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::Value;
+use unf_state::{FlowHistorySnapshot, analyze_shadow_impact};
 
 #[derive(Debug, Parser)]
-#[command(about = "Inspect, explain, and simulate the UNF network fabric")]
+#[command(about = "Inspect, explain, simulate, and analyze the UNF network fabric")]
 struct Cli {
     #[arg(
         long,
@@ -86,6 +87,27 @@ enum PolicyCommand {
         #[arg(long)]
         until_unix_ms: Option<u64>,
         /// Maximum number of newest matching historical flows to evaluate.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Summarize recorded shadow decisions from live or saved flow history.
+    ShadowImpact {
+        /// Analyze a saved JSON/YAML flow-history snapshot without contacting a controller.
+        #[arg(
+            long,
+            conflicts_with_all = ["last", "since_unix_ms", "until_unix_ms", "limit"]
+        )]
+        flows_file: Option<PathBuf>,
+        /// Restrict live history to flows last received within this duration.
+        #[arg(long, value_parser = parse_duration_millis, conflicts_with = "since_unix_ms")]
+        last: Option<u64>,
+        /// Inclusive lower bound for live history's last-received timestamp.
+        #[arg(long)]
+        since_unix_ms: Option<u64>,
+        /// Inclusive upper bound for live history's last-received timestamp.
+        #[arg(long)]
+        until_unix_ms: Option<u64>,
+        /// Maximum number of newest matching live flows to analyze.
         #[arg(long)]
         limit: Option<usize>,
     },
@@ -213,29 +235,104 @@ async fn run() -> Result<()> {
                     limit,
                 },
         } => {
-            let contents = std::fs::read_to_string(policy_file)
-                .with_context(|| format!("read policy file {}", policy_file.display()))?;
-            let policy: Value = serde_yaml::from_str(&contents)
-                .with_context(|| format!("parse policy YAML {}", policy_file.display()))?;
-            let flow_history = policy_simulation_flow_history(
+            policy_simulation_value(
+                &client,
+                &cli.controller_url,
+                policy_file,
                 *last,
                 *since_unix_ms,
                 *until_unix_ms,
                 *limit,
-                unix_time_millis()?,
-            )?;
-            post_json(
-                &client,
-                &format!("{}/v1/policy/simulate", cli.controller_url),
-                &PolicySimulationRequest {
-                    policy: &policy,
-                    flow_history,
+            )
+            .await?
+        }
+        Command::Policy {
+            command:
+                PolicyCommand::ShadowImpact {
+                    flows_file,
+                    last,
+                    since_unix_ms,
+                    until_unix_ms,
+                    limit,
                 },
+        } => {
+            shadow_impact_value(
+                &client,
+                &cli.controller_url,
+                flows_file.as_ref(),
+                *last,
+                *since_unix_ms,
+                *until_unix_ms,
+                *limit,
             )
             .await?
         }
     };
     print_value(&value, cli.output)
+}
+
+async fn policy_simulation_value(
+    client: &reqwest::Client,
+    controller_url: &str,
+    policy_file: &PathBuf,
+    last: Option<u64>,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+) -> Result<Value> {
+    let contents = std::fs::read_to_string(policy_file)
+        .with_context(|| format!("read policy file {}", policy_file.display()))?;
+    let policy: Value = serde_yaml::from_str(&contents)
+        .with_context(|| format!("parse policy YAML {}", policy_file.display()))?;
+    let flow_history = policy_simulation_flow_history(
+        last,
+        since_unix_ms,
+        until_unix_ms,
+        limit,
+        unix_time_millis()?,
+    )?;
+    post_json(
+        client,
+        &format!("{controller_url}/v1/policy/simulate"),
+        &PolicySimulationRequest {
+            policy: &policy,
+            flow_history,
+        },
+    )
+    .await
+}
+
+async fn shadow_impact_value(
+    client: &reqwest::Client,
+    controller_url: &str,
+    flows_file: Option<&PathBuf>,
+    last: Option<u64>,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+) -> Result<Value> {
+    let (snapshot, analysis_source) = if let Some(path) = flows_file {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("read flow-history file {}", path.display()))?;
+        let snapshot = serde_yaml::from_str::<FlowHistorySnapshot>(&contents)
+            .with_context(|| format!("parse flow-history file {}", path.display()))?;
+        (snapshot, format!("offline:{}", path.display()))
+    } else {
+        let (since_unix_ms, until_unix_ms) =
+            resolve_flow_window(last, since_unix_ms, until_unix_ms, unix_time_millis()?)?;
+        let value = get_json(
+            client,
+            &flow_history_url(controller_url, since_unix_ms, until_unix_ms, limit),
+        )
+        .await?;
+        let snapshot = serde_json::from_value::<FlowHistorySnapshot>(value)
+            .context("decode live flow-history snapshot")?;
+        (snapshot, format!("live:{controller_url}"))
+    };
+    serde_json::to_value(
+        analyze_shadow_impact(&snapshot, analysis_source).context("analyze shadow impact")?,
+    )
+    .context("serialize shadow-impact report")
 }
 
 async fn get_json(client: &reqwest::Client, url: &str) -> Result<Value> {
@@ -293,7 +390,7 @@ fn print_table(value: &Value) {
     }
     if matches!(
         value.get("schema_version").and_then(Value::as_u64),
-        Some(1..=3)
+        Some(1..=4)
     ) && value.get("retained_flows").is_some()
         && value.get("entries").is_some()
     {
@@ -314,6 +411,10 @@ fn print_table(value: &Value) {
         print_simulation_table(value);
         return;
     }
+    if value.get("analysis").and_then(Value::as_str) == Some("shadow_impact") {
+        print_shadow_impact_table(value);
+        return;
+    }
     if let Some(object) = value.as_object() {
         for (key, value) in object {
             let rendered = match value {
@@ -325,6 +426,76 @@ fn print_table(value: &Value) {
     } else {
         println!("{value}");
     }
+}
+
+fn print_shadow_impact_table(value: &Value) {
+    let summary = &value["summary"];
+    println!("Shadow Impact");
+    println!(
+        "source                   {} history_schema={} revision={} epoch={}",
+        text_field(value, "analysis_source"),
+        number_field(value, "flow_history_schema_version"),
+        number_field(value, "flow_history_revision"),
+        number_field(value, "source_epoch")
+    );
+    println!(
+        "selected                 flows={} observations={}",
+        number_field(summary, "selected_flows"),
+        number_field(summary, "selected_observations")
+    );
+    println!(
+        "shadowed                 flows={} observations={} policies={}",
+        number_field(summary, "shadowed_flows"),
+        number_field(summary, "shadowed_observations"),
+        joined_numbers(&value["shadow_policy_ids"])
+    );
+    println!(
+        "would deny              flows={} observations={}",
+        number_field(summary, "would_deny_flows"),
+        number_field(summary, "would_deny_observations")
+    );
+    println!(
+        "would allow             flows={} observations={}",
+        number_field(summary, "would_allow_flows"),
+        number_field(summary, "would_allow_observations")
+    );
+    println!(
+        "decision changes        flows={} observations={} workloads={}",
+        number_field(summary, "decision_change_flows"),
+        number_field(summary, "decision_change_observations"),
+        number_field(summary, "affected_workloads")
+    );
+    if let Some(changes) = value.get("changes").and_then(Value::as_array) {
+        for change in changes.iter().take(50) {
+            let flow = &change["flow"];
+            let key = &flow["key"];
+            let sources = joined_strings(&flow["source_workloads"]);
+            let destinations = joined_strings(&flow["destination_workloads"]);
+            println!(
+                "impact                   {} {} -> {} {}/{} actual={} shadow={} observations={}",
+                text_field(change, "classification"),
+                if sources.is_empty() {
+                    identity_label(key, "source_identity")
+                } else {
+                    sources
+                },
+                if destinations.is_empty() {
+                    identity_label(key, "destination_identity")
+                } else {
+                    destinations
+                },
+                protocol_label(number_field(key, "protocol")),
+                number_field(key, "destination_port"),
+                text_field(&flow["decision"], "verdict"),
+                text_field(&flow["shadow"], "verdict"),
+                number_field(flow, "observed_events")
+            );
+        }
+        if changes.len() > 50 {
+            println!("impacts omitted          {}", changes.len() - 50);
+        }
+    }
+    println!("note                     {}", text_field(value, "note"));
 }
 
 fn print_controller_status_table(value: &Value) {
@@ -568,6 +739,21 @@ fn joined_strings(value: &Value) -> String {
                 .join(",")
         })
         .unwrap_or_default()
+}
+
+fn joined_numbers(value: &Value) -> String {
+    value
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| "-".to_owned())
 }
 
 fn identity_label(value: &Value, field: &str) -> String {
@@ -855,6 +1041,69 @@ mod tests {
             policy_simulation_flow_history(None, None, None, None, 2_000_000)
                 .expect("omitted simulation window remains backward compatible"),
             None
+        );
+    }
+
+    #[test]
+    fn shadow_impact_supports_live_and_offline_sources() {
+        let offline = Cli::try_parse_from([
+            "unfctl",
+            "--controller-url",
+            "http://127.0.0.1:1",
+            "policy",
+            "shadow-impact",
+            "--flows-file",
+            "flows.json",
+            "--output",
+            "json",
+        ])
+        .expect("offline shadow-impact command parses");
+        assert!(matches!(
+            offline.command,
+            Command::Policy {
+                command: PolicyCommand::ShadowImpact {
+                    flows_file: Some(_),
+                    last: None,
+                    since_unix_ms: None,
+                    until_unix_ms: None,
+                    limit: None,
+                }
+            }
+        ));
+
+        let live = Cli::try_parse_from([
+            "unfctl",
+            "policy",
+            "shadow-impact",
+            "--last",
+            "15m",
+            "--limit",
+            "25",
+        ])
+        .expect("live shadow-impact command parses");
+        assert!(matches!(
+            live.command,
+            Command::Policy {
+                command: PolicyCommand::ShadowImpact {
+                    flows_file: None,
+                    last: Some(900_000),
+                    limit: Some(25),
+                    ..
+                }
+            }
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "unfctl",
+                "policy",
+                "shadow-impact",
+                "--flows-file",
+                "flows.json",
+                "--last",
+                "15m",
+            ])
+            .is_err()
         );
     }
 

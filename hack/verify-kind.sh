@@ -1199,6 +1199,80 @@ if ! wait_for_shadow_deny_provenance "${shadow_policy_revision}"; then
     exit 1
 fi
 
+shadow_history_file="${temporary_dir}/shadow-flow-history.json"
+shadow_history_verified=false
+for _ in {1..30}; do
+    "${unfctl}" --controller-url "http://127.0.0.1:${controller_port}" \
+        --output json flows --limit 4096 >"${shadow_history_file}"
+    if jq -e --argjson revision "${shadow_policy_revision}" '
+        .schema_version == 4
+        and any(.entries[];
+            .policy_revision == $revision
+            and .key.direction == "Ingress"
+            and .key.destination_port == 9090
+            and .decision.verdict == "Allow"
+            and .shadow.verdict == "Deny"
+            and .observed_events > 0)
+    ' "${shadow_history_file}" >/dev/null; then
+        shadow_history_verified=true
+        break
+    fi
+    "${kc[@]}" exec -n frontend client -- \
+        wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:9090 \
+        >/dev/null
+    sleep 1
+done
+if [[ ${shadow_history_verified} != true ]]; then
+    echo "shadow decision was not retained for impact analysis" >&2
+    exit 1
+fi
+
+shadow_live_report=$("${unfctl}" \
+    --controller-url "http://127.0.0.1:${controller_port}" --output json \
+    policy shadow-impact --limit 4096)
+if ! jq -e --argjson revision "${shadow_policy_revision}" '
+    .schema_version == 1
+    and .analysis == "shadow_impact"
+    and (.analysis_source | startswith("live:"))
+    and .flow_history_schema_version == 4
+    and .summary.shadowed_flows > 0
+    and .summary.would_deny_flows > 0
+    and .summary.would_deny_observations > 0
+    and (.shadow_policy_ids | any(. > 0))
+    and any(.changes[];
+        .classification == "would_deny"
+        and .flow.policy_revision == $revision
+        and .flow.key.destination_port == 9090
+        and .flow.decision.verdict == "Allow"
+        and .flow.shadow.verdict == "Deny")
+' <<<"${shadow_live_report}" >/dev/null; then
+    echo "live shadow-impact analysis was incomplete" >&2
+    exit 1
+fi
+
+shadow_offline_report=$("${unfctl}" --controller-url http://127.0.0.1:1 \
+    --output json policy shadow-impact --flows-file "${shadow_history_file}")
+if ! jq -e --argjson revision "${shadow_policy_revision}" '
+    .schema_version == 1
+    and (.analysis_source | startswith("offline:"))
+    and .summary.would_deny_flows > 0
+    and .summary.would_deny_observations > 0
+    and any(.changes[];
+        .classification == "would_deny"
+        and .flow.policy_revision == $revision
+        and .flow.key.destination_port == 9090)
+' <<<"${shadow_offline_report}" >/dev/null; then
+    echo "controller-independent shadow-impact analysis was incomplete" >&2
+    exit 1
+fi
+if ! "${unfctl}" --controller-url http://127.0.0.1:1 \
+    policy shadow-impact --flows-file "${shadow_history_file}" \
+    | grep -q '^Shadow Impact$'; then
+    echo "offline shadow-impact table rendering failed" >&2
+    exit 1
+fi
+echo "shadow rollout impact qualification passed: retained actual/shadow provenance, observation-weighted live analysis, and controller-independent saved-snapshot JSON/table analysis"
+
 "${kc[@]}" patch securitypolicy -n backend frontend-to-backend \
     --type=merge -p '{"spec":{"enforcementMode":"Enforce"}}' >/dev/null
 if ! wait_for_policy_transition "${shadow_policy_revision}"; then

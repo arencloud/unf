@@ -178,6 +178,9 @@ Implemented in the repository:
   with table/JSON/YAML output
   representative and historical impact summaries, optional last-received-time
   windows and newest-first limits, plus current/proposed provenance;
+- `unfctl policy shadow-impact` for observation-weighted live rollout evidence,
+  or `--flows-file <snapshot>` for schema-validated analysis that performs no
+  controller request and can run after the snapshot is moved off-cluster;
 - a reproducible dual-stack two-node kind demo covering native and NetworkPolicy
   cross-node IPv4/IPv6 allow/drop, bounded IPv6 extension-header allow/drop,
   namespace-selector convergence,

@@ -143,3 +143,19 @@ makes partial results explicit. External sources that lack a
 current source identity and user-supplied flow sets remain excluded. See
 [ADR 0010](../adr/0010-read-only-policy-simulation.md) and
 [ADR 0040](../adr/0040-networkpolicy-what-if-simulation.md).
+
+## Shadow rollout impact
+
+Shadow-impact analysis is distinct from candidate simulation. It consumes the
+actual and shadow decisions already emitted by the dataplane and retained in a
+bounded flow-history snapshot; it does not re-evaluate a proposed policy. Schema
+v1 reports observation-weighted would-deny/would-allow outcomes, equal or other
+verdict changes, decision/provenance changes, affected workloads, shadow policy
+IDs, and the exact flow evidence.
+
+`unfctl policy shadow-impact` fetches a bounded live snapshot using the same
+last-received window and newest-first limit contract as `unfctl flows`.
+`--flows-file` instead validates and analyzes a saved schema-v4 JSON/YAML
+snapshot locally without a controller request. This makes rollout review
+portable while preserving the source epoch, history revision, and query metadata.
+See [ADR 0044](../adr/0044-shadow-rollout-offline-impact.md).

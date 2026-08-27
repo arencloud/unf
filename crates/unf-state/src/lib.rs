@@ -13,6 +13,7 @@ pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 3;
 pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
+pub const SHADOW_IMPACT_SCHEMA_VERSION: u16 = 1;
 pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 2;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
@@ -154,6 +155,209 @@ pub struct FlowHistoryQuerySummary {
     pub matched_observations: u64,
     pub returned_flows: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowImpactClassification {
+    WouldDeny,
+    WouldAllow,
+    SameVerdict,
+    OtherVerdictChange,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowImpactSummary {
+    pub selected_flows: usize,
+    pub selected_observations: u64,
+    pub shadowed_flows: usize,
+    pub shadowed_observations: u64,
+    pub would_deny_flows: usize,
+    pub would_deny_observations: u64,
+    pub would_allow_flows: usize,
+    pub would_allow_observations: u64,
+    pub same_verdict_flows: usize,
+    pub same_verdict_observations: u64,
+    pub other_verdict_change_flows: usize,
+    pub other_verdict_change_observations: u64,
+    pub decision_change_flows: usize,
+    pub decision_change_observations: u64,
+    pub affected_workloads: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowImpactChange {
+    pub classification: ShadowImpactClassification,
+    pub flow: FlowHistoryEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowImpactReport {
+    pub schema_version: u16,
+    pub analysis: String,
+    pub analysis_source: String,
+    pub flow_history_schema_version: u16,
+    pub source_epoch: u64,
+    pub flow_history_revision: Revision,
+    pub query: FlowHistoryQuerySummary,
+    pub retained_flows: usize,
+    pub retained_observations: u64,
+    pub shadow_policy_ids: Vec<u32>,
+    pub summary: ShadowImpactSummary,
+    pub changes: Vec<ShadowImpactChange>,
+    pub note: String,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ShadowImpactError {
+    #[error("unsupported flow-history snapshot schema {actual}; expected {expected}")]
+    UnsupportedSchema { actual: u16, expected: u16 },
+    #[error("flow-history query reports {reported} returned flows but contains {actual} entries")]
+    InconsistentReturnedFlows { reported: usize, actual: usize },
+    #[error("flow-history entry has zero observations")]
+    ZeroObservations,
+    #[error("flow-history entry has invalid receive timestamps")]
+    InvalidTimestamps,
+}
+
+/// Builds a bounded, observation-weighted report from one history snapshot.
+///
+/// # Errors
+///
+/// Returns [`ShadowImpactError`] when the snapshot schema is unsupported, its
+/// query metadata does not match its entries, or an entry has invalid counts or
+/// timestamps.
+pub fn analyze_shadow_impact(
+    snapshot: &FlowHistorySnapshot,
+    analysis_source: impl Into<String>,
+) -> Result<ShadowImpactReport, ShadowImpactError> {
+    if snapshot.schema_version != FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION {
+        return Err(ShadowImpactError::UnsupportedSchema {
+            actual: snapshot.schema_version,
+            expected: FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION,
+        });
+    }
+    if snapshot.query.returned_flows != snapshot.entries.len() {
+        return Err(ShadowImpactError::InconsistentReturnedFlows {
+            reported: snapshot.query.returned_flows,
+            actual: snapshot.entries.len(),
+        });
+    }
+
+    let mut summary = ShadowImpactSummary {
+        selected_flows: snapshot.entries.len(),
+        selected_observations: snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.observed_events)
+            .fold(0_u64, u64::saturating_add),
+        ..ShadowImpactSummary::default()
+    };
+    let mut affected_workloads = BTreeSet::new();
+    let mut shadow_policy_ids = BTreeSet::new();
+    let mut changes = Vec::new();
+    for entry in &snapshot.entries {
+        if entry.observed_events == 0 {
+            return Err(ShadowImpactError::ZeroObservations);
+        }
+        if entry.first_received_unix_ms > entry.last_received_unix_ms {
+            return Err(ShadowImpactError::InvalidTimestamps);
+        }
+        let Some(shadow) = entry.shadow else {
+            continue;
+        };
+        summary.shadowed_flows += 1;
+        summary.shadowed_observations = summary
+            .shadowed_observations
+            .saturating_add(entry.observed_events);
+        if let Some(policy_id) = shadow.policy_id {
+            shadow_policy_ids.insert(policy_id.get());
+        }
+        for workload in entry
+            .source_workloads
+            .iter()
+            .chain(&entry.destination_workloads)
+        {
+            affected_workloads.insert(workload.clone());
+        }
+        if entry.source_workloads.is_empty() {
+            affected_workloads.insert(format!("identity:{}", entry.key.source_identity.get()));
+        }
+        if entry.destination_workloads.is_empty() {
+            affected_workloads.insert(format!("identity:{}", entry.key.destination_identity.get()));
+        }
+
+        let classification = record_shadow_classification(
+            &mut summary,
+            entry.decision.verdict,
+            shadow.verdict,
+            entry.observed_events,
+        );
+        if entry.decision != shadow {
+            summary.decision_change_flows += 1;
+            summary.decision_change_observations = summary
+                .decision_change_observations
+                .saturating_add(entry.observed_events);
+        }
+        changes.push(ShadowImpactChange {
+            classification,
+            flow: entry.clone(),
+        });
+    }
+    summary.affected_workloads = affected_workloads.len();
+
+    Ok(ShadowImpactReport {
+        schema_version: SHADOW_IMPACT_SCHEMA_VERSION,
+        analysis: "shadow_impact".to_owned(),
+        analysis_source: analysis_source.into(),
+        flow_history_schema_version: snapshot.schema_version,
+        source_epoch: snapshot.source_epoch,
+        flow_history_revision: snapshot.revision,
+        query: snapshot.query.clone(),
+        retained_flows: snapshot.retained_flows,
+        retained_observations: snapshot.retained_observations,
+        shadow_policy_ids: shadow_policy_ids.into_iter().collect(),
+        summary,
+        changes,
+        note: "observation-weighted counterfactuals from recorded shadow decisions; no policy or dataplane state was changed".to_owned(),
+    })
+}
+
+fn record_shadow_classification(
+    summary: &mut ShadowImpactSummary,
+    actual: Verdict,
+    shadow: Verdict,
+    observations: u64,
+) -> ShadowImpactClassification {
+    match (actual, shadow) {
+        (Verdict::Allow, Verdict::Deny) => {
+            summary.would_deny_flows += 1;
+            summary.would_deny_observations =
+                summary.would_deny_observations.saturating_add(observations);
+            ShadowImpactClassification::WouldDeny
+        }
+        (Verdict::Deny, Verdict::Allow) => {
+            summary.would_allow_flows += 1;
+            summary.would_allow_observations = summary
+                .would_allow_observations
+                .saturating_add(observations);
+            ShadowImpactClassification::WouldAllow
+        }
+        (actual, proposed) if actual == proposed => {
+            summary.same_verdict_flows += 1;
+            summary.same_verdict_observations = summary
+                .same_verdict_observations
+                .saturating_add(observations);
+            ShadowImpactClassification::SameVerdict
+        }
+        _ => {
+            summary.other_verdict_change_flows += 1;
+            summary.other_verdict_change_observations = summary
+                .other_verdict_change_observations
+                .saturating_add(observations);
+            ShadowImpactClassification::OtherVerdictChange
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1295,6 +1499,71 @@ mod tests {
         assert_eq!(limited.query.returned_flows, 1);
         assert!(limited.query.truncated);
         assert_eq!(limited.entries[0].key.destination_port, 8082);
+    }
+
+    #[test]
+    fn shadow_impact_is_observation_weighted_and_offline_safe() {
+        let mut would_deny = flow_record(1, 2, 9090, 7);
+        would_deny.shadow = Some(FlowExportDecision {
+            verdict: Verdict::Deny,
+            reason: PolicyReason::ExplicitRule as u8,
+            policy_id: Some(PolicyId::new(41)),
+            rule_id: Some(RuleId::new(3)),
+        });
+        let unchanged = flow_record(1, 2, 8080, 5);
+        let mut store = FlowHistoryStore::with_capacity(2);
+        store.ingest(
+            FlowExportBatch {
+                schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                node_name: "worker-a".to_owned(),
+                dropped_events: 0,
+                entries: vec![would_deny, unchanged],
+            },
+            100,
+        );
+
+        let report = analyze_shadow_impact(&store.snapshot(17), "offline:test.json")
+            .expect("valid saved history produces a shadow-impact report");
+        assert_eq!(report.schema_version, SHADOW_IMPACT_SCHEMA_VERSION);
+        assert_eq!(report.analysis_source, "offline:test.json");
+        assert_eq!(report.shadow_policy_ids, [41]);
+        assert_eq!(report.summary.selected_flows, 2);
+        assert_eq!(report.summary.selected_observations, 12);
+        assert_eq!(report.summary.shadowed_flows, 1);
+        assert_eq!(report.summary.shadowed_observations, 7);
+        assert_eq!(report.summary.would_deny_flows, 1);
+        assert_eq!(report.summary.would_deny_observations, 7);
+        assert_eq!(report.summary.decision_change_flows, 1);
+        assert_eq!(report.summary.affected_workloads, 2);
+        assert_eq!(report.changes.len(), 1);
+        assert_eq!(
+            report.changes[0].classification,
+            ShadowImpactClassification::WouldDeny
+        );
+    }
+
+    #[test]
+    fn shadow_impact_rejects_untrusted_snapshot_shape() {
+        let store = FlowHistoryStore::with_capacity(1);
+        let mut snapshot = store.snapshot(17);
+        snapshot.schema_version = FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION - 1;
+        assert_eq!(
+            analyze_shadow_impact(&snapshot, "offline:legacy.json"),
+            Err(ShadowImpactError::UnsupportedSchema {
+                actual: FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION - 1,
+                expected: FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION,
+            })
+        );
+
+        let mut snapshot = store.snapshot(17);
+        snapshot.query.returned_flows = 1;
+        assert_eq!(
+            analyze_shadow_impact(&snapshot, "offline:invalid.json"),
+            Err(ShadowImpactError::InconsistentReturnedFlows {
+                reported: 1,
+                actual: 0,
+            })
+        );
     }
 
     #[test]
