@@ -227,17 +227,22 @@ matrix and reproducible evidence.
   two-commit same-tuple skipped upgrade requires version metadata from every N
   and N+2 component, then repeats controller-first mixed rollout, agent and
   controller downgrade/forward recovery, forwarding, and telemetry checks;
+- Implemented and two-node Kind verified: deliberately incompatible persistent
+  ABI and policy-schema images fail before persistent-map access or policy-bank
+  mutation, retain canonical pinned-state digests and continuous enforcement,
+  expose actionable errors/counters, and recover to the current tuple;
 - Implemented and bounded two-node Kind verified: deterministic 24-workload
   ingress/egress scale generation, measured Namespace/Pod/policy churn,
   simultaneous two-agent pinned-state recovery with the controller offline,
   continuous dual-stack forwarding, bounded queue/error behavior, exact cleanup,
   and schema-versioned environment/provenance evidence;
-- incompatible-version, unsupported downgrade/migration, OpenShift upgrade, and
-  platform-version validation.
+- persistent-state migration/clean rebuild, unsupported downgrade/reporting,
+  OpenShift upgrade, and platform-version validation.
 
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
 transport remain research/planned work after these foundations. The next active
-Phase 3 work is incompatible-version/downgrade-migration and OpenShift/version-matrix qualification,
+Phase 3 work is persistent-state migration, unsupported downgrade/reporting,
+and OpenShift/version-matrix qualification,
 plus additional external transport adapters where product requirements justify
 them.
 

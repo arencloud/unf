@@ -13,7 +13,7 @@ complete its parent milestone.
 | ID | Milestone | State | Dependency | Exit evidence |
 |---|---|---|---|---|
 | 1 | Broader failure and scale qualification | **Verified** | Existing two-node dual-stack Kind fixture | `make kind-scale-failure-test` plus a schema-versioned result record; ADR 0048 |
-| 2 | Expanded version compatibility matrix | **In progress** | Milestone 1 budgets and the compatibility tuple from ADR 0047 | Same-tuple skipped upgrade is Verified; incompatible-tuple, migration/clean rebuild, unsupported downgrade, and rollback-reporting gates remain |
+| 2 | Expanded version compatibility matrix | **In progress** | Milestone 1 budgets and the compatibility tuple from ADR 0047 | Same-tuple skipped upgrade and incompatible-tuple rejection are Verified; migration/clean rebuild, unsupported downgrade, and rollback-reporting gates remain |
 | 3 | OpenShift cl02 upgrade qualification | **Planned** | Milestone 2 Kind evidence and development images in Quay | Repeatable dual-stack RHCOS controller/agent rollout and rollback gate |
 | 4 | Broader platform/version coverage | **Planned** | Available clusters for each claimed platform | Versioned support matrix with one evidence record per claimed combination |
 | 5 | Phase 3 closure | **Planned** | Milestones 1–4 Verified | Complete release audit and Phase 3 marked **Verified** in `project-status.md` |
@@ -39,7 +39,7 @@ budgets and retain a separate result record.
 | ID | Deliverable | State | Required evidence |
 |---|---|---|---|
 | 2.1 | Skipped revision | **Verified** | `make kind-skipped-upgrade-test` passed N=`e6e5ac6`, skipped=`9dc6023`, N+2=`a630ee1` at exact distance two, requiring an identical published tuple before controller-first, mixed, full, downgrade/forward, and recovery checks; ADR 0049 |
-| 2.2 | Incompatible tuple rejection | **In progress** | Agent startup now checks both its local ABI-directory invariant and the reachable controller tuple before persistent BPF access, while live policy sync rejects schema skew before staging; `make kind-incompatible-version-test` must pass from the clean implementation commit before this row becomes Verified |
+| 2.2 | Incompatible tuple rejection | **Verified** | `make kind-incompatible-version-test` passed from clean revision `6d7dd28`: local ABI 4 rejected the configured v3 directory before BPF access, repeated policy-schema 5 snapshots left agent policy state and pinned policy maps unchanged, enforcement stayed continuous, and the current tuple reconverged; ADR 0050 |
 | 2.3 | Persistent-state migration contract | **Planned** | Versioned migration or deliberate clean-rebuild behavior with atomic failure recovery |
 | 2.4 | Downgrade behavior | **In progress** | Same-tuple N+2 agent-to-N and controller-to-N downgrade/forward recovery is verified by 2.1; unsupported downgrade must still fail before dataplane mutation |
 | 2.5 | Rollback reporting | **Planned** | Status, metrics, and logs distinguish compatible rollback, blocked rollback, and recovery |

@@ -89,9 +89,10 @@ The remaining Phase 3 production-readiness work is tracked subpoint by subpoint
 in the [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md).
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
-before persistent BPF access, requires
-live policy-schema rejection before staging or active-bank mutation, and keeps a
-continuous allow/deny probe running through compatible recovery.
+before persistent BPF access, requires live policy-schema rejection before
+staging or active-bank mutation, and keeps a continuous allow/deny probe running
+through compatible recovery. This rejection boundary is verified by ADR 0050;
+state migration remains separate work.
 A bounded Kind failure/scale gate adds deterministic workload generation,
 measured churn and recovery budgets, simultaneous two-agent last-known-good
 recovery with the controller offline, continuous dual-stack policy probes, and
