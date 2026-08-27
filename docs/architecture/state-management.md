@@ -105,6 +105,14 @@ overlapping-trust rotation gate. Agent reports and the newest bounded flow
 history survive controller replacement; desired-state and identity allocation
 remain current-process state.
 
+Controller and agent `GET /v1/version` responses publish compatibility schema
+v1: embedded build revision, persistent BPF-state ABI, identity/policy snapshot
+schemas, agent-status schema, and flow-export schema. Adjacent revisions with an
+unchanged tuple are live-qualified in controller-first order with a deliberate
+mixed-agent interval and both agent/controller rollback. ABI or listed-schema
+changes require an explicit migration and cannot inherit that claim. ADR 0047
+defines the window and its repeatable Kind gate.
+
 Isolated live-kernel probes verify that partial pin sets,
 invalid active config, and corrupt inactive-stage debris are rejected before
 adoption without mutating the primary pin set. A separate live pressure probe

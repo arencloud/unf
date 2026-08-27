@@ -18,10 +18,42 @@ pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 pub const SHADOW_IMPACT_SCHEMA_VERSION: u16 = 1;
 pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 2;
+pub const COMPONENT_COMPATIBILITY_SCHEMA_VERSION: u16 = 1;
+pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 3;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
 /// One half of the dual-bank eBPF policy map's 262,144-entry capacity.
 pub const POLICY_MAP_BANK_ENTRY_LIMIT: usize = 131_072;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentCompatibility {
+    pub schema_version: u16,
+    pub component: String,
+    pub software_version: String,
+    pub build_revision: String,
+    pub persistent_bpf_state_abi_version: u16,
+    pub identity_snapshot_schema_version: u16,
+    pub policy_snapshot_schema_version: u16,
+    pub agent_status_schema_version: u16,
+    pub flow_export_schema_version: u16,
+}
+
+impl ComponentCompatibility {
+    #[must_use]
+    pub fn current(component: &str, software_version: &str, build_revision: &str) -> Self {
+        Self {
+            schema_version: COMPONENT_COMPATIBILITY_SCHEMA_VERSION,
+            component: component.to_owned(),
+            software_version: software_version.to_owned(),
+            build_revision: build_revision.to_owned(),
+            persistent_bpf_state_abi_version: PERSISTENT_BPF_STATE_ABI_VERSION,
+            identity_snapshot_schema_version: IDENTITY_SNAPSHOT_SCHEMA_VERSION,
+            policy_snapshot_schema_version: POLICY_SNAPSHOT_SCHEMA_VERSION,
+            agent_status_schema_version: AGENT_STATUS_SCHEMA_VERSION,
+            flow_export_schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevisionSet {
@@ -1367,6 +1399,38 @@ pub fn provisional_identity_id(identity_key: &str) -> IdentityId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_compatibility_fixes_the_upgrade_contract() {
+        let compatibility = ComponentCompatibility::current("unf-agent", "0.1.0", "revision-a");
+        assert_eq!(
+            compatibility.schema_version,
+            COMPONENT_COMPATIBILITY_SCHEMA_VERSION
+        );
+        assert_eq!(compatibility.component, "unf-agent");
+        assert_eq!(compatibility.software_version, "0.1.0");
+        assert_eq!(compatibility.build_revision, "revision-a");
+        assert_eq!(
+            compatibility.persistent_bpf_state_abi_version,
+            PERSISTENT_BPF_STATE_ABI_VERSION
+        );
+        assert_eq!(
+            compatibility.identity_snapshot_schema_version,
+            IDENTITY_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            compatibility.policy_snapshot_schema_version,
+            POLICY_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            compatibility.agent_status_schema_version,
+            AGENT_STATUS_SCHEMA_VERSION
+        );
+        assert_eq!(
+            compatibility.flow_export_schema_version,
+            FLOW_EXPORT_SCHEMA_VERSION
+        );
+    }
 
     #[test]
     fn provisional_ids_are_deterministic_and_nonzero() {

@@ -43,18 +43,24 @@ use unf_policy::{
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
-    EgressIpv4PolicyMapEntry, EgressIpv4PolicyMapKey, EgressIpv6PolicyMapEntry,
-    EgressIpv6PolicyMapKey, FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION,
-    FLOW_HISTORY_CAPACITY, FlowExportBatch, FlowExportRecord, FlowHistoryCheckpoint,
-    FlowHistoryQuerySummary, FlowHistorySnapshot, FlowHistoryStore, IdentityRegistry,
-    IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord,
-    PolicyStateSnapshot, RevisionSet, TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION,
-    TopologyHistoryCheckpoint, TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode,
-    TopologyService, TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort,
-    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
+    ComponentCompatibility, EgressIpv4PolicyMapEntry, EgressIpv4PolicyMapKey,
+    EgressIpv6PolicyMapEntry, EgressIpv6PolicyMapKey, FLOW_EXPORT_BATCH_LIMIT,
+    FLOW_EXPORT_SCHEMA_VERSION, FLOW_HISTORY_CAPACITY, FlowExportBatch, FlowExportRecord,
+    FlowHistoryCheckpoint, FlowHistoryQuerySummary, FlowHistorySnapshot, FlowHistoryStore,
+    IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
+    PolicyDecisionRecord, PolicyStateSnapshot, RevisionSet, TOPOLOGY_HISTORY_CAPACITY,
+    TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyHistoryCheckpoint, TopologyHistorySnapshot,
+    TopologyHistoryStore, TopologyNode, TopologyService, TopologyServiceBackend,
+    TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
+    provisional_identity_id,
 };
 
 mod external_flow_export;
+
+const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
+    Some(revision) => revision,
+    None => "unknown",
+};
 
 use external_flow_export::{
     ExternalFlowExportConfig, ExternalFlowExportEnvelope, ExternalFlowExportMetrics,
@@ -600,6 +606,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/metrics", get(metrics))
+        .route("/v1/version", get(version))
         .route("/v1/status", get(status))
         .route("/v1/state/agents", get(agent_state))
         .route("/v1/topology", get(topology))
@@ -2365,6 +2372,14 @@ async fn metrics(State(state): State<Arc<ControllerState>>) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn version() -> Json<ComponentCompatibility> {
+    Json(component_compatibility())
+}
+
+fn component_compatibility() -> ComponentCompatibility {
+    ComponentCompatibility::current("unf-controller", env!("CARGO_PKG_VERSION"), BUILD_REVISION)
 }
 
 async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<StatusBody>, ApiError> {
@@ -4572,6 +4587,22 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_version_exposes_the_controller_compatibility_tuple() {
+        let version = component_compatibility();
+        assert_eq!(version.component, "unf-controller");
+        assert_eq!(version.software_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(version.build_revision, BUILD_REVISION);
+        assert_eq!(
+            version.policy_snapshot_schema_version,
+            POLICY_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.agent_status_schema_version,
+            AGENT_STATUS_SCHEMA_VERSION
+        );
+    }
 
     fn security_policy(name: &str, action: &str) -> SecurityPolicy {
         serde_json::from_value(serde_json::json!({

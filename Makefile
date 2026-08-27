@@ -1,9 +1,14 @@
-.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-test kind-down
+.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images upgrade-baseline-images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-test kind-down
+.NOTPARALLEL: kind-upgrade-test
 
 KIND := .tools/bin/kind
 KIND_PROVIDER ?= podman
 KIND_KUBECONFIG := $(CURDIR)/.tools/kind-unf-dev.kubeconfig
 TEST_TOOLS_IMAGE := localhost/unf-test-tools:ipv6-ext-v1
+UNF_BUILD_REVISION ?= $(shell git describe --always --dirty --abbrev=40 2>/dev/null || echo unknown)
+UNF_UPGRADE_BASELINE_REF ?= HEAD^
+UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE ?= localhost/unf-controller:upgrade-n
+UNF_UPGRADE_BASELINE_AGENT_IMAGE ?= localhost/unf-agent:upgrade-n
 QUAY_AUTH_FILE ?= $(CURDIR)/.tools/quay-auth.json
 UNF_DEV_IMAGE_TAG ?= dev
 UNF_CONTROLLER_DEV_IMAGE ?= quay.io/arencloud/unf-controller-dev:$(UNF_DEV_IMAGE_TAG)
@@ -47,9 +52,12 @@ artifacts: ebpf
 	cp ebpf/unf-ebpf-tc/target/bpfel-unknown-none/release/unf-ebpf-tc .artifacts/unf-ebpf-tc
 
 images: artifacts
-	podman build --build-arg UNF_PACKAGE=unf-controller --tag localhost/unf-controller:dev --file images/Containerfile .
-	podman build --build-arg UNF_PACKAGE=unf-agent --tag localhost/unf-agent:dev --file images/Containerfile .
+	podman build --build-arg UNF_BUILD_REVISION=$(UNF_BUILD_REVISION) --build-arg UNF_PACKAGE=unf-controller --tag localhost/unf-controller:dev --file images/Containerfile .
+	podman build --build-arg UNF_BUILD_REVISION=$(UNF_BUILD_REVISION) --build-arg UNF_PACKAGE=unf-agent --tag localhost/unf-agent:dev --file images/Containerfile .
 	podman build --tag $(TEST_TOOLS_IMAGE) --file images/SctpTestContainerfile .
+
+upgrade-baseline-images:
+	UNF_UPGRADE_BASELINE_REF=$(UNF_UPGRADE_BASELINE_REF) UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE=$(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE) UNF_UPGRADE_BASELINE_AGENT_IMAGE=$(UNF_UPGRADE_BASELINE_AGENT_IMAGE) hack/build-upgrade-baseline-images.sh
 
 openshift-images: images
 	podman push --authfile $(QUAY_AUTH_FILE) localhost/unf-controller:dev docker://$(UNF_CONTROLLER_DEV_IMAGE)
@@ -95,6 +103,13 @@ kind-load: images
 	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev localhost/unf-agent:dev
 	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(TEST_TOOLS_IMAGE)
 
+kind-upgrade-load: upgrade-baseline-images
+	ln -sf $$(command -v podman) .tools/bin/docker
+	podman save $(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE) | sudo podman load
+	podman save $(UNF_UPGRADE_BASELINE_AGENT_IMAGE) | sudo podman load
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE)
+	sudo env PATH=$(CURDIR)/.tools/bin:$$PATH KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) load docker-image --name unf-dev $(UNF_UPGRADE_BASELINE_AGENT_IMAGE)
+
 kind-deploy: kind-load
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/configure-internal-tls.sh
 	KUBECONFIG=$(KIND_KUBECONFIG) kubectl --context kind-unf-dev apply -k deploy
@@ -118,6 +133,9 @@ kind-topology-history-test: cli
 
 kind-external-flow-export-test:
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-external-flow-export.sh
+
+kind-upgrade-test: kind-deploy kind-demo kind-upgrade-load
+	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE=$(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE) UNF_UPGRADE_BASELINE_AGENT_IMAGE=$(UNF_UPGRADE_BASELINE_AGENT_IMAGE) UNF_UPGRADE_CURRENT_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-upgrade.sh
 
 kind-test: cli kind-demo
 	KUBECONFIG=$(KIND_KUBECONFIG) KUBE_CONTEXT=kind-unf-dev hack/verify-kind.sh

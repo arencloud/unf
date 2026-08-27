@@ -1,6 +1,9 @@
 ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm
 FROM ${RUST_IMAGE} AS builder
 
+ARG UNF_BUILD_REVISION=unknown
+ENV UNF_BUILD_REVISION=${UNF_BUILD_REVISION}
+
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./

@@ -219,9 +219,15 @@ matrix and reproducible evidence.
   metrics, concurrent publication ordering, receiver-outage recovery, and
   sustained slow-receiver saturation without interrupting authenticated
   ingestion or local history;
-- failure, scale, upgrade, and broader OpenShift version validation.
+- Implemented and two-node Kind verified: observable adjacent-version
+  controller-first upgrades with an explicit persistent-BPF/wire-schema tuple,
+  deterministic mixed-agent rollout, authenticated reconvergence, continuous
+  forwarding/telemetry, and reversible agent/controller rollback;
+- broader failure, scale, skipped/incompatible-version, OpenShift upgrade, and
+  platform-version validation.
 
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
 transport remain research/planned work after these foundations. The next active
-Phase 3 work is failure/scale/upgrade qualification and additional external
-transport adapters where product requirements justify them.
+Phase 3 work is broader failure/scale and OpenShift/version-matrix qualification,
+plus additional external transport adapters where product requirements justify
+them.

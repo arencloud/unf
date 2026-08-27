@@ -75,6 +75,13 @@ TC attachments now survive agent replacement: kernels supporting TCX use
 per-interface pinned links and atomic link updates, while older kernels use a
 stable legacy netlink filter tuple for in-place replacement. The two-node kind
 gate continuously probes an explicitly denied flow through TCX agent handoff.
+Both components now expose a versioned compatibility endpoint containing their
+embedded Git revision, persistent BPF-state ABI, and controller-agent wire
+schemas. A focused two-node Kind gate builds adjacent committed revisions and
+proves controller-first N+1/N operation, deterministic one-Node-at-a-time agent
+rollout, agent and controller rollback, fresh epoch convergence, telemetry
+continuity, and uninterrupted allow/deny enforcement. This support applies only
+while the published compatibility tuple is unchanged.
 Additional IPv4-only and dual-stack OpenShift gates are live-verified on
 OpenShift 4.22/RHCOS 9.8 with enforcing SELinux and a 5.14 kernel: the controller
 runs under `restricted-v2`, while worker-only agents use a dedicated constrained

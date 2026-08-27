@@ -369,6 +369,24 @@ cross-Node credentials fail closed and are counted by
 replacement, the verifier continuously probes the denied TCP/9090 path and
 requires zero successful requests before the replacement is Ready.
 
+Both controller and agent expose `GET /v1/version`. Compatibility schema v1
+reports the embedded Git revision and the persistent-BPF, identity snapshot,
+policy snapshot, agent-status, and flow-export schema versions. Use the focused
+adjacent-version gate after the normal Kind deployment:
+
+```bash
+make kind-upgrade-test
+```
+
+The target archives and builds `HEAD^` as N, builds the working tree as N+1,
+loads both generations, and proves N/N, controller N+1 with agents N, a
+one-Node-at-a-time mixed agent state, all N+1, agent rollback, controller
+rollback with N+1 agents, and final recovery. It continuously requires 8080
+allow plus 9090 deny and checks authenticated convergence and telemetry in every
+pairing. Override `UNF_UPGRADE_BASELINE_REF` to pin a release baseline. The gate
+supports only adjacent revisions with the same published compatibility tuple;
+ABI/schema changes require a dedicated migration plan and qualification.
+
 The projected credential is never written to logs or checked into the repository.
 Agent snapshots, acknowledgements, and flow telemetry use the controller's
 dedicated HTTPS port and a client trust store containing only `unf-internal-ca`;

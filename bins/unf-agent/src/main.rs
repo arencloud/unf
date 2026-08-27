@@ -39,12 +39,13 @@ use unf_ebpf_common::{
     POLICY_MAP_ABI_VERSION,
 };
 use unf_state::{
-    AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, EgressIpv4PolicyMapEntry,
-    EgressIpv6PolicyMapEntry, FLOW_EXPORT_BATCH_LIMIT, FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch,
-    FlowExportDecision, FlowExportRecord, FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION,
-    IdentityStateSnapshot, Ipv4IdentityMapping, Ipv4PolicyMapEntry, Ipv6IdentityMapping,
-    Ipv6PolicyMapEntry, POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION,
-    PolicyDecisionRecord, PolicyMapEntry, PolicyStateSnapshot,
+    AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
+    EgressIpv4PolicyMapEntry, EgressIpv6PolicyMapEntry, FLOW_EXPORT_BATCH_LIMIT,
+    FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowExportDecision, FlowExportRecord,
+    FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
+    Ipv4PolicyMapEntry, Ipv6IdentityMapping, Ipv6PolicyMapEntry, PERSISTENT_BPF_STATE_ABI_VERSION,
+    POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord,
+    PolicyMapEntry, PolicyStateSnapshot,
 };
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
@@ -52,7 +53,11 @@ const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
 const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v3";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
-const CURRENT_BPF_ABI_VERSION: u16 = 3;
+const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
+const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
+    Some(revision) => revision,
+    None => "unknown",
+};
 const ABI_V1_MAP_NAMES: [&str; 6] = [
     "IDENTITY_V4",
     "IDENTITY_V6",
@@ -515,6 +520,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/metrics", get(metrics))
+        .route("/v1/version", get(version))
         .route("/v1/status", get(status))
         .with_state(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind(args.listen)
@@ -3964,6 +3970,14 @@ async fn metrics(State(state): State<Arc<AgentState>>) -> Response {
     }
 }
 
+async fn version() -> Json<ComponentCompatibility> {
+    Json(component_compatibility())
+}
+
+fn component_compatibility() -> ComponentCompatibility {
+    ComponentCompatibility::current("unf-agent", env!("CARGO_PKG_VERSION"), BUILD_REVISION)
+}
+
 async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
     Json(AgentStatus {
         component: "unf-agent",
@@ -4243,6 +4257,22 @@ mod tests {
             "unf-agent-test".to_owned(),
             "test-pod-uid".to_owned(),
         )
+    }
+
+    #[test]
+    fn component_version_exposes_the_agent_compatibility_tuple() {
+        let version = component_compatibility();
+        assert_eq!(version.component, "unf-agent");
+        assert_eq!(version.software_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(version.build_revision, BUILD_REVISION);
+        assert_eq!(
+            version.persistent_bpf_state_abi_version,
+            CURRENT_BPF_ABI_VERSION
+        );
+        assert_eq!(
+            version.agent_status_schema_version,
+            AGENT_STATUS_SCHEMA_VERSION
+        );
     }
 
     #[test]
