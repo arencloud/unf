@@ -13,6 +13,7 @@ internal_port=${UNF_OPENSHIFT_INTERNAL_PORT:-29964}
 client_namespace=unf-qualification-client
 server_namespace=unf-qualification-server
 qualification_manifest=${project_root}/deploy/openshift/qualification.yaml
+test_tools_image=${UNF_TEST_TOOLS_IMAGE:-quay.io/arencloud/unf-test-tools-dev:dev}
 kc=(oc --kubeconfig "${kubeconfig}" --context "${context}")
 temporary_dir=$(mktemp -d)
 port_forward_pid=
@@ -308,7 +309,12 @@ for _ in {1..60}; do
     sleep 1
 done
 [[ -n ${baseline_security_policies} ]]
-yq eval-all 'select(.kind == "Namespace")' "${qualification_manifest}" \
+qualification_fixture=${temporary_dir}/qualification.yaml
+UNF_TEST_TOOLS_IMAGE="${test_tools_image}" yq eval '
+    (select(.kind == "Pod" and .metadata.namespace == "unf-qualification-client")
+        .spec.containers[0].image) = strenv(UNF_TEST_TOOLS_IMAGE)
+' "${qualification_manifest}" >"${qualification_fixture}"
+yq eval-all 'select(.kind == "Namespace")' "${qualification_fixture}" \
     | "${kc[@]}" apply -f - >/dev/null
 for namespace in "${client_namespace}" "${server_namespace}"; do
     "${kc[@]}" -n "${namespace}" create secret generic unf-quay-pull \
@@ -316,7 +322,7 @@ for namespace in "${client_namespace}" "${server_namespace}"; do
         --type=kubernetes.io/dockerconfigjson \
         --dry-run=client -o yaml | "${kc[@]}" apply -f - >/dev/null
 done
-yq eval-all 'select(.kind != "Namespace")' "${qualification_manifest}" \
+yq eval-all 'select(.kind != "Namespace")' "${qualification_fixture}" \
     | "${kc[@]}" apply -f - >/dev/null
 wait_for_pod_ready() {
     local namespace=$1
@@ -454,7 +460,7 @@ done
 egress_fixture="${temporary_dir}/networkpolicy-egress.yaml"
 UNF_EGRESS_SOURCE_NODE="${client_node}" \
 UNF_EGRESS_DESTINATION_NODE="${server_node}" \
-UNF_EGRESS_TEST_IMAGE=quay.io/arencloud/unf-test-tools-dev:dev \
+UNF_EGRESS_TEST_IMAGE="${test_tools_image}" \
     yq eval '
         (select(.kind == "Pod" and .metadata.namespace == "unf-egress-source")
             .spec.nodeSelector."kubernetes.io/hostname") = strenv(UNF_EGRESS_SOURCE_NODE) |

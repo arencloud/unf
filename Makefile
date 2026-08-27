@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-deploy openshift-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-down
+.PHONY: build test lint fmt fmt-check ebpf generate-crds controller agent cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-upgrade-images openshift-deploy openshift-test openshift-upgrade-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-down
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -21,6 +21,8 @@ UNF_DEV_IMAGE_TAG ?= dev
 UNF_CONTROLLER_DEV_IMAGE ?= quay.io/arencloud/unf-controller-dev:$(UNF_DEV_IMAGE_TAG)
 UNF_AGENT_DEV_IMAGE ?= quay.io/arencloud/unf-agent-dev:$(UNF_DEV_IMAGE_TAG)
 UNF_TEST_TOOLS_DEV_IMAGE ?= quay.io/arencloud/unf-test-tools-dev:$(UNF_DEV_IMAGE_TAG)
+UNF_OPENSHIFT_UPGRADE_BASELINE_REF ?= HEAD^
+UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD ?= $(CURDIR)/.artifacts/phase3-openshift-upgrade-images.json
 OPENSHIFT_KUBECONFIG ?= $(CURDIR)/.tools/cl01-audit.kubeconfig
 OPENSHIFT_UNINSTALL_ARGS ?=
 
@@ -80,11 +82,17 @@ openshift-images: images
 	podman push --authfile $(QUAY_AUTH_FILE) localhost/unf-agent:dev docker://$(UNF_AGENT_DEV_IMAGE)
 	podman push --authfile $(QUAY_AUTH_FILE) $(TEST_TOOLS_IMAGE) docker://$(UNF_TEST_TOOLS_DEV_IMAGE)
 
+openshift-upgrade-images:
+	UNF_OPENSHIFT_UPGRADE_BASELINE_REF=$(UNF_OPENSHIFT_UPGRADE_BASELINE_REF) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD=$(UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD) hack/build-openshift-upgrade-images.sh
+
 openshift-deploy:
 	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) hack/deploy-openshift.sh
 
 openshift-test:
 	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) hack/verify-openshift.sh
+
+openshift-upgrade-test:
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD=$(UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD) hack/verify-openshift-upgrade.sh
 
 openshift-tls-rotation-test:
 	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/verify-openshift-tls-rotation.sh
