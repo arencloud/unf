@@ -212,9 +212,14 @@ matrix and reproducible evidence.
 - Implemented and two-node Kind verified: bounded, durable full-snapshot
   topology history with inclusive time/revision queries, newest-first limits,
   watcher-replay coalescing, exact ConfigMap RBAC, and restart fencing;
-- external flow-export backends;
+- Implemented and two-node Kind verified: optional external HTTP flow export
+  with a versioned epoch/sequence/topology envelope, HTTPS and private-CA trust,
+  rotating token-file authentication, bounded non-blocking queue, at-least-once
+  retry, explicit delivery/loss metrics, and receiver-outage recovery without
+  interrupting authenticated ingestion or local history;
 - failure, scale, upgrade, and broader OpenShift version validation.
 
 Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
 transport remain research/planned work after these foundations. The next active
-Phase 3 work now moves to external flow-export backends.
+Phase 3 work is failure/scale/upgrade qualification and additional external
+transport adapters where product requirements justify them.

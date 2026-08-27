@@ -47,13 +47,14 @@ controller_raw() {
 wait_for_target_flow() {
     local controller=$1
     local since_unix_ms=$2
+    local target_url=$3
     local snapshot
     local response
     for attempt in {1..45}; do
         if (( (attempt - 1) % 5 == 0 )); then
             for _ in {1..4}; do
                 response=$("${kc[@]}" exec -n frontend client -- \
-                    wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080)
+                    wget -T 2 -t 1 -qO- "${target_url}")
                 [[ ${response} == unf-demo-ok ]]
             done
         fi
@@ -115,6 +116,10 @@ done
     --timeout=120s >/dev/null
 "${kc[@]}" -n frontend wait --for=condition=Ready pod/client --timeout=120s >/dev/null
 "${kc[@]}" -n backend wait --for=condition=Ready pod/server --timeout=120s >/dev/null
+server_ipv4=$("${kc[@]}" -n backend get pod server -o json \
+    | jq -r '[.status.podIPs[].ip | select(contains("."))][0] // empty')
+[[ -n ${server_ipv4} ]]
+target_url="http://${server_ipv4}:8080"
 
 service_account=system:serviceaccount:unf-system:unf-controller
 [[ $("${kc[@]}" auth can-i get configmap/unf-flow-history \
@@ -133,10 +138,10 @@ window_start=$(date +%s%3N)
 # aggregation sampling boundary after the high-volume conformance matrix.
 for _ in {1..8}; do
     response=$("${kc[@]}" exec -n frontend client -- \
-        wget -T 2 -t 1 -qO- http://server.backend.svc.cluster.local:8080)
+        wget -T 2 -t 1 -qO- "${target_url}")
     [[ ${response} == unf-demo-ok ]]
 done
-before=$(wait_for_target_flow "${controller}" "${window_start}")
+before=$(wait_for_target_flow "${controller}" "${window_start}" "${target_url}")
 target=$(jq -c '[
     .entries[]
     | select((.source_workloads | index("frontend/client"))
@@ -220,7 +225,7 @@ new_controller_uid=$("${kc[@]}" -n unf-system get pod "${controller}" \
 [[ ${new_controller_uid} != "${old_controller_uid}" ]]
 [[ $(agent_runtime_state) == "${agent_state}" ]]
 
-after=$(wait_for_target_flow "${controller}" "${window_start}")
+after=$(wait_for_target_flow "${controller}" "${window_start}" "${target_url}")
 restored_first=$(jq \
     --argjson source "${source_identity}" \
     --argjson destination "${destination_identity}" '[

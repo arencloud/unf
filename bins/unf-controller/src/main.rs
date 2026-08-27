@@ -54,6 +54,13 @@ use unf_state::{
     TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
 };
 
+mod external_flow_export;
+
+use external_flow_export::{
+    ExternalFlowExportConfig, ExternalFlowExportEnvelope, ExternalFlowExportMetrics,
+    ExternalFlowExporter, build_external_flow_export,
+};
+
 const AGENT_STATUS_FRESHNESS_MILLIS: u64 = 10_000;
 const AGENT_TOKEN_AUDIENCE: &str = "unf-controller.unf-system.svc";
 const AGENT_SERVICE_ACCOUNT_USERNAME: &str = "system:serviceaccount:unf-system:unf-agent";
@@ -111,6 +118,43 @@ struct Args {
         value_parser = validate_agent_node_selector
     )]
     agent_node_selector: Option<String>,
+    /// Optional HTTP endpoint that receives validated, schema-versioned flow batches.
+    #[arg(long, env = "UNF_CONTROLLER_FLOW_EXPORT_HTTP_URL")]
+    flow_export_http_url: Option<String>,
+    /// Permit a plaintext HTTP flow-export endpoint (development only).
+    #[arg(
+        long,
+        env = "UNF_CONTROLLER_FLOW_EXPORT_HTTP_ALLOW_PLAINTEXT",
+        default_value_t = false
+    )]
+    flow_export_http_allow_plaintext: bool,
+    /// Additional PEM CA bundle used with the platform trust roots.
+    #[arg(long, env = "UNF_CONTROLLER_FLOW_EXPORT_HTTP_CA")]
+    flow_export_http_ca: Option<PathBuf>,
+    /// File containing a bearer token, reread for every delivery attempt.
+    #[arg(long, env = "UNF_CONTROLLER_FLOW_EXPORT_HTTP_BEARER_TOKEN_FILE")]
+    flow_export_http_bearer_token_file: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "UNF_CONTROLLER_FLOW_EXPORT_HTTP_QUEUE_CAPACITY",
+        default_value_t = 256,
+        value_parser = parse_flow_export_queue_capacity
+    )]
+    flow_export_http_queue_capacity: usize,
+    #[arg(
+        long,
+        env = "UNF_CONTROLLER_FLOW_EXPORT_HTTP_MAX_ATTEMPTS",
+        default_value_t = 3,
+        value_parser = parse_flow_export_max_attempts
+    )]
+    flow_export_http_max_attempts: u8,
+    #[arg(
+        long,
+        env = "UNF_CONTROLLER_FLOW_EXPORT_HTTP_TIMEOUT_SECONDS",
+        default_value_t = 10,
+        value_parser = parse_flow_export_timeout_seconds
+    )]
+    flow_export_http_timeout_seconds: u64,
     /// Run the API server without connecting to Kubernetes (development only).
     #[arg(long)]
     offline: bool,
@@ -135,6 +179,7 @@ struct ControllerMetrics {
     topology_history_persistence_writes: Counter,
     topology_history_persistence_errors: Counter,
     topology_history_entries_restored: Counter,
+    external_flow_export: ExternalFlowExportMetrics,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -168,6 +213,8 @@ struct ControllerState {
     flow_history_checkpointed_flows: AtomicU64,
     flow_history_checkpoint_omitted_flows: AtomicU64,
     flow_history_checkpoint_omitted_observations: AtomicU64,
+    external_flow_export: RwLock<Option<ExternalFlowExporter>>,
+    external_flow_export_sequence: AtomicU64,
     topology_history: Mutex<TopologyHistoryStore>,
     topology_history_dirty: AtomicBool,
     topology_history_store: Option<Api<ConfigMap>>,
@@ -513,6 +560,23 @@ async fn main() -> Result<()> {
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
 
+    if let Some(endpoint) = args.flow_export_http_url.as_deref() {
+        let config = ExternalFlowExportConfig::new(
+            endpoint,
+            args.flow_export_http_allow_plaintext,
+            args.flow_export_http_ca.clone(),
+            args.flow_export_http_bearer_token_file.clone(),
+            args.flow_export_http_queue_capacity,
+            args.flow_export_http_max_attempts,
+            Duration::from_secs(args.flow_export_http_timeout_seconds),
+        )?;
+        let (exporter, worker) =
+            build_external_flow_export(config, state.metrics.external_flow_export.clone())?;
+        *write_lock(&state.external_flow_export) = Some(exporter);
+        let worker_cancellation = cancellation.clone();
+        tasks.spawn(worker.run(worker_cancellation));
+    }
+
     if args.offline {
         warn!("running without Kubernetes watchers");
     } else {
@@ -740,6 +804,45 @@ fn register_flow_history_metrics(registry: &mut Registry, metrics: &ControllerMe
     );
 }
 
+fn register_external_flow_export_metrics(registry: &mut Registry, metrics: &ControllerMetrics) {
+    let external = &metrics.external_flow_export;
+    registry.register(
+        "unf_external_flow_export_enqueued_batches",
+        "Validated flow batches accepted by the bounded external-export queue",
+        external.enqueued_batches.clone(),
+    );
+    registry.register(
+        "unf_external_flow_export_delivery_attempts",
+        "HTTP delivery attempts made by the external flow-export worker",
+        external.delivery_attempts.clone(),
+    );
+    registry.register(
+        "unf_external_flow_export_delivered_batches",
+        "Flow batches successfully delivered to the external HTTP receiver",
+        external.delivered_batches.clone(),
+    );
+    registry.register(
+        "unf_external_flow_export_delivered_observations",
+        "Flow observations successfully delivered to the external HTTP receiver",
+        external.delivered_observations.clone(),
+    );
+    registry.register(
+        "unf_external_flow_export_delivery_errors",
+        "Failed external HTTP flow-export attempts, including receiver rejections",
+        external.delivery_errors.clone(),
+    );
+    registry.register(
+        "unf_external_flow_export_dropped_batches",
+        "External flow-export batches dropped after queue pressure or delivery exhaustion",
+        external.dropped_batches.clone(),
+    );
+    registry.register(
+        "unf_external_flow_export_dropped_observations",
+        "External flow observations dropped after queue pressure or delivery exhaustion",
+        external.dropped_observations.clone(),
+    );
+}
+
 fn register_topology_history_metrics(registry: &mut Registry, metrics: &ControllerMetrics) {
     registry.register(
         "unf_topology_history_persistence_writes",
@@ -822,6 +925,7 @@ fn new_state_with_client_and_selector(
         metrics.agent_reports_restored.clone(),
     );
     register_flow_history_metrics(&mut registry, &metrics);
+    register_external_flow_export_metrics(&mut registry, &metrics);
     register_topology_history_metrics(&mut registry, &metrics);
     let config_map_store = token_review_client
         .clone()
@@ -851,6 +955,8 @@ fn new_state_with_client_and_selector(
         flow_history_checkpointed_flows: AtomicU64::new(0),
         flow_history_checkpoint_omitted_flows: AtomicU64::new(0),
         flow_history_checkpoint_omitted_observations: AtomicU64::new(0),
+        external_flow_export: RwLock::new(None),
+        external_flow_export_sequence: AtomicU64::new(0),
         topology_history: Mutex::new(TopologyHistoryStore::default()),
         topology_history_dirty: AtomicBool::new(false),
         topology_history_store: config_map_store.clone(),
@@ -2687,6 +2793,36 @@ fn validate_agent_node_selector(value: &str) -> std::result::Result<String, Stri
     Ok(value.to_owned())
 }
 
+fn parse_flow_export_queue_capacity(value: &str) -> std::result::Result<usize, String> {
+    let capacity = value
+        .parse::<usize>()
+        .map_err(|_| "flow-export queue capacity must be an integer".to_owned())?;
+    (1..=4_096)
+        .contains(&capacity)
+        .then_some(capacity)
+        .ok_or_else(|| "flow-export queue capacity must be between 1 and 4096".to_owned())
+}
+
+fn parse_flow_export_max_attempts(value: &str) -> std::result::Result<u8, String> {
+    let attempts = value
+        .parse::<u8>()
+        .map_err(|_| "flow-export max attempts must be an integer".to_owned())?;
+    (1..=10)
+        .contains(&attempts)
+        .then_some(attempts)
+        .ok_or_else(|| "flow-export max attempts must be between 1 and 10".to_owned())
+}
+
+fn parse_flow_export_timeout_seconds(value: &str) -> std::result::Result<u64, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "flow-export timeout must be an integer".to_owned())?;
+    (1..=300)
+        .contains(&seconds)
+        .then_some(seconds)
+        .ok_or_else(|| "flow-export timeout must be between 1 and 300 seconds".to_owned())
+}
+
 fn agent_node_matches(node: &TopologyNode, selector: Option<&str>) -> bool {
     let Some(selector) = selector else {
         return true;
@@ -2977,6 +3113,9 @@ fn ingest_flow_batch(
     batch: FlowExportBatch,
 ) -> Result<StatusCode, ApiError> {
     validate_flow_export_batch(&batch)?;
+    let received_unix_ms = unix_time_millis();
+    let external_exporter = read_lock(&state.external_flow_export).clone();
+    let external_batch = external_exporter.as_ref().map(|_| batch.clone());
     let observations = batch
         .entries
         .iter()
@@ -2984,15 +3123,32 @@ fn ingest_flow_batch(
         .fold(0_u64, u64::saturating_add);
     let (revision, changed) = {
         let mut history = mutex_lock(&state.flow_history);
-        let changed = history.ingest(batch, unix_time_millis());
+        let changed = history.ingest(batch, received_unix_ms);
         (history.revision(), changed)
     };
     if changed {
         state.flow_history_dirty.store(true, Ordering::Release);
     }
-    mutex_lock(&state.revisions).telemetry = revision;
+    let topology_revision = {
+        let mut revisions = mutex_lock(&state.revisions);
+        revisions.telemetry = revision;
+        revisions.topology
+    };
     state.metrics.telemetry_batches.inc();
     state.metrics.telemetry_observations.inc_by(observations);
+    if let (Some(exporter), Some(batch)) = (external_exporter, external_batch) {
+        exporter.enqueue(ExternalFlowExportEnvelope {
+            schema_version: external_flow_export::EXTERNAL_FLOW_EXPORT_SCHEMA_VERSION,
+            controller_epoch: state.identity_epoch,
+            export_sequence: state
+                .external_flow_export_sequence
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1),
+            topology_revision,
+            received_unix_ms,
+            batch,
+        });
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5582,6 +5738,22 @@ mod tests {
     #[tokio::test]
     async fn flow_ingestion_is_validated_revisioned_and_enriched() {
         let state = Arc::new(new_state(true));
+        let external_metrics = state.metrics.external_flow_export.clone();
+        let (external_exporter, _external_worker) = build_external_flow_export(
+            ExternalFlowExportConfig::new(
+                "http://127.0.0.1:9/flows",
+                true,
+                None,
+                None,
+                1,
+                1,
+                Duration::from_secs(1),
+            )
+            .expect("valid flow-ingestion exporter config"),
+            external_metrics.clone(),
+        )
+        .expect("build flow-ingestion exporter");
+        *write_lock(&state.external_flow_export) = Some(external_exporter);
         write_lock(&state.pods).insert(
             "frontend/client".to_owned(),
             pod_record(1, "frontend", "client", "client"),
@@ -5605,6 +5777,8 @@ mod tests {
             ["backend/server"]
         );
         assert_eq!(mutex_lock(&state.revisions).telemetry, Revision::new(1));
+        assert_eq!(external_metrics.enqueued_batches.get(), 1);
+        assert_eq!(external_metrics.dropped_batches.get(), 0);
 
         let mut sctp = flow_batch(1);
         sctp.entries[0].key.protocol = Protocol::Sctp as u8;
@@ -5651,6 +5825,7 @@ mod tests {
         let error =
             ingest_flow_batch(&state, invalid).expect_err("unknown flow schema is rejected");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(external_metrics.enqueued_batches.get(), 1);
     }
 
     #[test]

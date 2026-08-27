@@ -2846,6 +2846,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "prometheus-client",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",

@@ -315,6 +315,37 @@ Flow bounds are inclusive and select aggregate entries by their exact
 newest bounded checkpoint survives controller restart. Run its focused gate with
 `make kind-flow-history-retention-test`.
 
+The controller can also forward each validated agent batch to one external HTTP
+receiver. HTTPS is mandatory unless the explicit development-only plaintext flag
+is enabled. A private CA augments normal platform trust, and a bearer token is
+reread from its mounted file for every attempt:
+
+```yaml
+env:
+  - name: UNF_CONTROLLER_FLOW_EXPORT_HTTP_URL
+    value: https://collector.example/v1/unf/flows
+  - name: UNF_CONTROLLER_FLOW_EXPORT_HTTP_CA
+    value: /var/run/secrets/collector/ca.crt
+  - name: UNF_CONTROLLER_FLOW_EXPORT_HTTP_BEARER_TOKEN_FILE
+    value: /var/run/secrets/collector/token
+  - name: UNF_CONTROLLER_FLOW_EXPORT_HTTP_QUEUE_CAPACITY
+    value: "256"
+  - name: UNF_CONTROLLER_FLOW_EXPORT_HTTP_MAX_ATTEMPTS
+    value: "3"
+  - name: UNF_CONTROLLER_FLOW_EXPORT_HTTP_TIMEOUT_SECONDS
+    value: "10"
+```
+
+Envelope schema v1 contains `controller_epoch`, epoch-scoped
+`export_sequence`, `topology_revision`, `received_unix_ms`, and the complete
+flow-export schema-v3 `batch`. Receivers should deduplicate on
+`(controller_epoch, export_sequence)`. Delivery is at least once, redirects are
+disabled, and 408, 429, 5xx, or network failures retry with bounded backoff.
+Queue pressure and exhausted delivery affect only the external copy; the seven
+`unf_external_flow_export_*` counters report enqueue, attempt, success, error,
+and batch/observation loss. No endpoint is configured by default. Use
+`make kind-external-flow-export-test` for the focused outage/recovery gate.
+
 Simulation reports its bounded current-topology probe matrix separately from the
 revisioned, 4,096-key retained history. Its `--last`, `--since-unix-ms`,
 `--until-unix-ms`, and `--limit` options apply only to historical impact; topology

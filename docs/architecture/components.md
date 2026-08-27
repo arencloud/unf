@@ -7,7 +7,7 @@
 | `unf-api` | CRD schema and serialization | Policy evaluation |
 | `unf-policy` | Native and NetworkPolicy conversion, shared IR, deterministic evaluation, identity-tuple lowering | Kubernetes watches or BPF map mutation |
 | `unf-state` | Revision snapshots, bounded flow-history contract, Service/backend topology schema, and identity metadata | Transport or controller loops |
-| `unf-controller` | Watches, EndpointSlice-aware desired-state/topology reconciliation, bounded durable agent-report and flow-history checkpointing, time-window flow queries, explanation, and read-only simulation orchestration | Packet parsing |
+| `unf-controller` | Watches, EndpointSlice-aware desired-state/topology reconciliation, bounded durable agent-report and flow-history checkpointing, non-blocking external HTTP flow handoff, time-window flow queries, explanation, and read-only simulation orchestration | Packet parsing |
 | `unf-agent` | Capability detection, Aya lifecycle, events, and non-blocking telemetry export | Kubernetes policy semantics |
 | `unfctl` | Operator-facing status, topology, flow history, explanation, and simulation | Fabric state ownership |
 | `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, and telemetry | Selectors or enrichment strings |

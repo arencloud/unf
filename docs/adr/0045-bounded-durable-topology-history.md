@@ -59,5 +59,5 @@ revisions without running an external database. Complete snapshots make each
 entry independently portable and avoid patch-chain corruption, at the cost of a
 small 32-revision window and potentially fewer durable entries for large
 clusters. This is not an audit log or HA store. External topology databases,
-pagination, topology diffs, and external flow-export backends remain separate
-work.
+pagination, topology diffs, and additional external export transports remain
+separate work.

@@ -36,6 +36,12 @@ TLS-only controller port; agents trust only the mounted UNF CA and authenticate
 every internal request with their rotating Pod credential. The reserved internal
 port is filtered from workload logs/export so management traffic cannot create a
 recursive telemetry loop.
+An optional external HTTP backend forwards only authenticated and validated flow
+batches in a versioned epoch/sequence/topology envelope. Its bounded non-blocking
+queue, at-least-once retry, dedicated delivery/loss metrics, HTTPS/private-CA
+trust, and rotating token-file authentication keep receiver outages independent
+from local history and agent ingestion. The focused Kind gate removes and
+restores the receiver to prove that boundary.
 The resolved-identity fast path
 is now dual-stack for IPv4/IPv6 TCP/UDP/SCTP, including verifier-bounded IPv6
 extension-header traversal; native policy and selector-based NetworkPolicy IPv6
