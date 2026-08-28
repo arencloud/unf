@@ -76,6 +76,15 @@ refusal with the published agent image. OpenShift 4.22 server-side dry runs
 accepted the SCCs, admission policies, and MachineConfigs without mutating
 cl02.
 
+The Agent-based alternative is also bounded. Its versioned inputs retain the
+audited three-master/two-worker identity, `/dev/sda`, VLAN 600, exact dual-stack
+addresses and VIPs, and create `br-ex` directly because OVN will no longer exist
+to synthesize that uplink. OpenShift Installer 4.22.10 accepted the inputs and
+produced a 1.42 GB agent ISO. Before image creation, the generated
+AgentClusterInstall is explicitly changed from its visible OVN default to
+`None`, and the custom Network manifest is embedded as an extra manifest. The
+package check prevents the installer host set and Node-block map from drifting.
+
 ## Consequences
 
 The reinstall configuration and activation workflow are ready for a new cl02

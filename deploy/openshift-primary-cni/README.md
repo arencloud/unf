@@ -22,6 +22,12 @@ For an Assisted Installer deployment:
 5. Start installation and obtain the administrative kubeconfig when the API is
    available. The cluster is expected to wait for a CNI at this boundary.
 
+For an Agent-based Installer deployment, use the exact five-host inputs and the
+generated-manifest/custom-manifest sequence in `agent-based/README.md`. Do not
+run `agent create image` directly from only the two input files: OpenShift
+4.22.10 must have the generated AgentClusterInstall field set explicitly to
+`None` and the custom Network manifest embedded first.
+
 The versioned Node-block map is deliberately bound to the current five physical
 Node names. If any Node name changes during reinstall, stop before activation
 and update `node-blocks.json`; the deployer rejects a partial or different Node

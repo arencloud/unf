@@ -1,0 +1,291 @@
+apiVersion: v1beta1
+kind: AgentConfig
+metadata:
+  name: cl02
+rendezvousIP: 10.50.60.200
+hosts:
+  - hostname: bc-24-11-47-5e-1b
+    role: master
+    interfaces:
+      - name: ens18
+        macAddress: bc:24:11:47:5e:1b
+    rootDeviceHints:
+      deviceName: /dev/sda
+    networkConfig:
+      interfaces:
+        - name: ens18
+          type: ethernet
+          state: up
+          mac-address: bc:24:11:47:5e:1b
+          ipv4:
+            enabled: true
+            dhcp: true
+            auto-dns: false
+          ipv6:
+            enabled: false
+        - name: br-ex
+          type: vlan
+          state: up
+          vlan:
+            base-iface: ens18
+            id: 600
+          ipv4:
+            enabled: true
+            dhcp: false
+            address:
+              - ip: 10.50.60.200
+                prefix-length: 24
+          ipv6:
+            enabled: true
+            dhcp: false
+            autoconf: false
+            address:
+              - ip: 2a02:abcd:1234:5600::2001
+                prefix-length: 64
+      dns-resolver:
+        config:
+          search:
+            - arencloud.com
+          server:
+            - 8.8.8.8
+            - 8.8.4.4
+            - 2001:4860:4860::8888
+            - 2001:4860:4860::8844
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: 10.50.60.1
+            next-hop-interface: br-ex
+            metric: 50
+          - destination: ::/0
+            next-hop-address: 2a02:abcd:1234:5600::1
+            next-hop-interface: br-ex
+            metric: 50
+  - hostname: bc-24-11-89-00-a5
+    role: master
+    interfaces:
+      - name: ens18
+        macAddress: bc:24:11:89:00:a5
+    rootDeviceHints:
+      deviceName: /dev/sda
+    networkConfig:
+      interfaces:
+        - name: ens18
+          type: ethernet
+          state: up
+          mac-address: bc:24:11:89:00:a5
+          ipv4:
+            enabled: true
+            dhcp: true
+            auto-dns: false
+          ipv6:
+            enabled: false
+        - name: br-ex
+          type: vlan
+          state: up
+          vlan:
+            base-iface: ens18
+            id: 600
+          ipv4:
+            enabled: true
+            dhcp: false
+            address:
+              - ip: 10.50.60.201
+                prefix-length: 24
+          ipv6:
+            enabled: true
+            dhcp: false
+            autoconf: false
+            address:
+              - ip: 2a02:abcd:1234:5600::2002
+                prefix-length: 64
+      dns-resolver:
+        config:
+          search:
+            - arencloud.com
+          server:
+            - 8.8.8.8
+            - 8.8.4.4
+            - 2001:4860:4860::8888
+            - 2001:4860:4860::8844
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: 10.50.60.1
+            next-hop-interface: br-ex
+            metric: 50
+          - destination: ::/0
+            next-hop-address: 2a02:abcd:1234:5600::1
+            next-hop-interface: br-ex
+            metric: 50
+  - hostname: bc-24-11-7f-81-3f
+    role: master
+    interfaces:
+      - name: ens18
+        macAddress: bc:24:11:7f:81:3f
+    rootDeviceHints:
+      deviceName: /dev/sda
+    networkConfig:
+      interfaces:
+        - name: ens18
+          type: ethernet
+          state: up
+          mac-address: bc:24:11:7f:81:3f
+          ipv4:
+            enabled: true
+            dhcp: true
+            auto-dns: false
+          ipv6:
+            enabled: false
+        - name: br-ex
+          type: vlan
+          state: up
+          vlan:
+            base-iface: ens18
+            id: 600
+          ipv4:
+            enabled: true
+            dhcp: false
+            address:
+              - ip: 10.50.60.203
+                prefix-length: 24
+          ipv6:
+            enabled: true
+            dhcp: false
+            autoconf: false
+            address:
+              - ip: 2a02:abcd:1234:5600::2004
+                prefix-length: 64
+      dns-resolver:
+        config:
+          search:
+            - arencloud.com
+          server:
+            - 8.8.8.8
+            - 8.8.4.4
+            - 2001:4860:4860::8888
+            - 2001:4860:4860::8844
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: 10.50.60.1
+            next-hop-interface: br-ex
+            metric: 50
+          - destination: ::/0
+            next-hop-address: 2a02:abcd:1234:5600::1
+            next-hop-interface: br-ex
+            metric: 50
+  - hostname: bc-24-11-27-b6-49
+    role: worker
+    interfaces:
+      - name: ens18
+        macAddress: bc:24:11:27:b6:49
+    rootDeviceHints:
+      deviceName: /dev/sda
+    networkConfig:
+      interfaces:
+        - name: ens18
+          type: ethernet
+          state: up
+          mac-address: bc:24:11:27:b6:49
+          ipv4:
+            enabled: true
+            dhcp: true
+            auto-dns: false
+          ipv6:
+            enabled: false
+        - name: br-ex
+          type: vlan
+          state: up
+          vlan:
+            base-iface: ens18
+            id: 600
+          ipv4:
+            enabled: true
+            dhcp: false
+            address:
+              - ip: 10.50.60.202
+                prefix-length: 24
+          ipv6:
+            enabled: true
+            dhcp: false
+            autoconf: false
+            address:
+              - ip: 2a02:abcd:1234:5600::2003
+                prefix-length: 64
+      dns-resolver:
+        config:
+          search:
+            - arencloud.com
+          server:
+            - 8.8.8.8
+            - 8.8.4.4
+            - 2001:4860:4860::8888
+            - 2001:4860:4860::8844
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: 10.50.60.1
+            next-hop-interface: br-ex
+            metric: 50
+          - destination: ::/0
+            next-hop-address: 2a02:abcd:1234:5600::1
+            next-hop-interface: br-ex
+            metric: 50
+  - hostname: bc-24-11-74-2b-8d
+    role: worker
+    interfaces:
+      - name: ens18
+        macAddress: bc:24:11:74:2b:8d
+    rootDeviceHints:
+      deviceName: /dev/sda
+    networkConfig:
+      interfaces:
+        - name: ens18
+          type: ethernet
+          state: up
+          mac-address: bc:24:11:74:2b:8d
+          ipv4:
+            enabled: true
+            dhcp: true
+            auto-dns: false
+          ipv6:
+            enabled: false
+        - name: br-ex
+          type: vlan
+          state: up
+          vlan:
+            base-iface: ens18
+            id: 600
+          ipv4:
+            enabled: true
+            dhcp: false
+            address:
+              - ip: 10.50.60.204
+                prefix-length: 24
+          ipv6:
+            enabled: true
+            dhcp: false
+            autoconf: false
+            address:
+              - ip: 2a02:abcd:1234:5600::2005
+                prefix-length: 64
+      dns-resolver:
+        config:
+          search:
+            - arencloud.com
+          server:
+            - 8.8.8.8
+            - 8.8.4.4
+            - 2001:4860:4860::8888
+            - 2001:4860:4860::8844
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: 10.50.60.1
+            next-hop-interface: br-ex
+            metric: 50
+          - destination: ::/0
+            next-hop-address: 2a02:abcd:1234:5600::1
+            next-hop-interface: br-ex
+            metric: 50

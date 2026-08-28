@@ -1,0 +1,40 @@
+apiVersion: v1
+baseDomain: arencloud.com
+metadata:
+  name: cl02
+controlPlane:
+  name: master
+  architecture: amd64
+  hyperthreading: Enabled
+  replicas: 3
+compute:
+  - name: worker
+    architecture: amd64
+    hyperthreading: Enabled
+    replicas: 2
+networking:
+  networkType: None
+  machineNetwork:
+    - cidr: 10.50.60.0/24
+    - cidr: 2a02:abcd:1234:5600::/64
+  clusterNetwork:
+    - cidr: 10.128.0.0/14
+      hostPrefix: 23
+    - cidr: fd01::/48
+      hostPrefix: 64
+  serviceNetwork:
+    - 172.30.0.0/16
+    - fd02::/112
+platform:
+  baremetal:
+    provisioningNetwork: Disabled
+    apiVIPs:
+      - 10.50.60.5
+      - 2a02:abcd:1234:5600::5
+    ingressVIPs:
+      - 10.50.60.6
+      - 2a02:abcd:1234:5600::6
+publish: External
+fips: false
+pullSecret: '<inject a valid OpenShift pull secret>'
+sshKey: '<inject an SSH public key for the core user>'
