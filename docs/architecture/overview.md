@@ -81,6 +81,10 @@ exact rollback in the isolated Kind fixture. ADR 0068 adds the OpenShift
 installation-time boundary: an existing OVN cluster is not converted in place,
 and live qualification requires a new custom-CNI/`None` cluster with explicit
 CNO, CRI-O, RHCOS, MachineConfig, SELinux, and teardown ownership.
+ADR 0069 defines the corresponding bootstrap package: explicit five-Node
+dual-stack block assignment, direct-underlay controller discovery before DNS,
+digest-pinned host-network operands, MachineConfig forwarding, exact SCC and
+admission boundaries, and socket-fenced fingerprinted CNI publication.
 
 IPAM stays below a provider interface and above routing. The first provider
 accepts one canonical IPv4 and IPv6 node block, reserves network/gateway and IPv4

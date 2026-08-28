@@ -201,11 +201,16 @@ The audit always writes a mode-0600 schema-v1 record to
 `.artifacts/phase3-openshift-primary-cni-audit.json`; preflight additionally
 fails unless the cluster was installed through the custom-CNI/`None` path, has
 dual-stack Node PodCIDRs, standalone kube-proxy, no Multus or OVN ownership, and
-no foreign CNI files. ADR 0068 records why an existing OVN installation must be
-reprovisioned rather than force-converted. Installer inputs live under
-`deploy/openshift-primary-cni/`, but must not be used until the remaining
-digest-pinned bootstrap, MachineConfig, teardown, and recovery gates are
-implemented.
+no foreign CNI files. A new custom-CNI cluster may initially lack PodCIDRs; the
+deployer allows only that single audit reason, applies the exact versioned
+five-Node map, then requires strict preflight before continuing. ADR 0068
+records why an existing OVN installation must be
+reprovisioned rather than force-converted. The bounded reinstall instructions,
+installer inputs, digest-pinned runtime, and MachineConfigs live under
+`deploy/openshift-primary-cni/`. Validate them with
+`make openshift-primary-cni-package-check`. ADR 0069 records the bootstrap
+contract. Live teardown and recovery remain qualification work on the newly
+installed disposable cluster.
 
 `kind-deploy` builds the userspace images, eBPF object, and test-tools image with
 SCTP `socat`, the IPv6 extension-header probe, BPF fault utilities, and `tc`,

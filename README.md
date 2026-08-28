@@ -89,7 +89,7 @@ The Phase 3 gate and all 42 deliverables are Verified. Exact closure evidence,
 limits, and the separately tracked full-CNI entry are maintained in the
 [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md)
 and ADR 0056.
-The full-CNI foundation is now in progress under ADRs 0057–0068. The `unf-cni`
+The full-CNI foundation is now in progress under ADRs 0057–0069. The `unf-cni`
 executable now composes dual-stack IPAM, exact veth, and native routing through
 atomic ADD/CHECK/DEL transactions. An explicitly enabled local-agent Unix service
 provides the root-authenticated, bounded schema-v2 transaction boundary and
@@ -266,6 +266,9 @@ Implemented in the repository:
 - a fail-closed OpenShift primary-CNI candidate audit that records the real
   RHCOS/CRI-O/CNO ownership boundary and rejects post-install conversion of an
   OVN cluster; installer-time `networkType: None` inputs are tracked separately;
+- a statically verified OpenShift reinstall package with immutable images,
+  DNS-independent host-network bootstrap, forwarding MachineConfigs, exact
+  SCC/admission/host ownership, and socket-fenced fingerprinted CNI publication;
 - coordinated dry-run-first OpenShift uninstall with all-agent shutdown,
   admission-constrained per-node cleanup Jobs, post-cleanup host verification,
   exact resource removal, CRD preservation, and full redeploy qualification;

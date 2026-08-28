@@ -1,0 +1,94 @@
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: unf-primary-controller
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: true
+allowHostPID: false
+allowHostPorts: true
+allowPrivilegeEscalation: false
+allowPrivilegedContainer: false
+allowedCapabilities: null
+defaultAddCapabilities: null
+readOnlyRootFilesystem: true
+requiredDropCapabilities:
+  - ALL
+runAsUser:
+  type: MustRunAsRange
+  uidRangeMin: 65532
+  uidRangeMax: 65532
+seLinuxContext:
+  type: MustRunAs
+seccompProfiles:
+  - runtime/default
+fsGroup:
+  type: MustRunAs
+  ranges:
+    - min: 65532
+      max: 65532
+supplementalGroups:
+  type: RunAsAny
+volumes:
+  - projected
+  - secret
+---
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: unf-primary-agent
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: true
+allowHostPID: true
+allowHostPorts: true
+allowPrivilegeEscalation: true
+allowPrivilegedContainer: true
+allowedCapabilities:
+  - BPF
+  - NET_ADMIN
+  - PERFMON
+defaultAddCapabilities: null
+readOnlyRootFilesystem: true
+requiredDropCapabilities: null
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+seccompProfiles:
+  - runtime/default
+  - unconfined
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+volumes:
+  - configMap
+  - hostPath
+  - projected
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unf-primary-scc-use
+rules:
+  - apiGroups: ["security.openshift.io"]
+    resources: ["securitycontextconstraints"]
+    resourceNames: ["unf-primary-controller", "unf-primary-agent"]
+    verbs: ["use"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: unf-primary-scc-use
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: unf-primary-scc-use
+subjects:
+  - kind: ServiceAccount
+    name: unf-controller
+    namespace: unf-system
+  - kind: ServiceAccount
+    name: unf-agent
+    namespace: unf-system

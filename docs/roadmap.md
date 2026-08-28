@@ -318,9 +318,11 @@ authoritative record of verified results.
   0068. The audited cl02 is a healthy OVN installation and is intentionally
   rejected: OpenShift custom-CNI qualification requires a new disposable
   `networkType: None` cluster, not an unsafe post-install provider conversion.
-- Next: implement digest-pinned host-network bootstrap, exact MachineConfig/host
-  ownership, no-CNI teardown, and recovery gates; then qualify those mechanics
-  on a reprovisioned dual-stack cl02 or an equivalent disposable cluster.
+- ADR 0069 now verifies the reinstall and activation package: DNS-independent
+  controller bootstrap, immutable development images, forwarding
+  MachineConfigs, exact SCC/admission/host paths, socket-fenced installation,
+  and replay/foreign/drift fixtures. The next action is the cl02 reinstall and
+  live CRI-O/recovery/teardown gate; no live OpenShift primary-CNI claim exists.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

@@ -26,7 +26,9 @@ fi
 
 if [[ ! -s ${server_key} || ! -s ${server_cert} ]] \
     || ! openssl x509 -checkend 86400 -noout -in "${server_cert}" >/dev/null 2>&1 \
-    || ! openssl verify -CAfile "${ca_cert}" "${server_cert}" >/dev/null 2>&1; then
+    || ! openssl verify -CAfile "${ca_cert}" "${server_cert}" >/dev/null 2>&1 \
+    || ! openssl x509 -checkhost unf-primary-controller.internal \
+        -noout -in "${server_cert}" >/dev/null 2>&1; then
     openssl req -new -newkey rsa:2048 -nodes -sha256 \
         -subj '/CN=unf-controller.unf-system.svc.cluster.local' \
         -keyout "${server_key}" -out "${server_csr}" >/dev/null 2>&1
@@ -34,7 +36,7 @@ if [[ ! -s ${server_key} || ! -s ${server_cert} ]] \
         'basicConstraints=critical,CA:FALSE' \
         'keyUsage=critical,digitalSignature,keyEncipherment' \
         'extendedKeyUsage=serverAuth' \
-        'subjectAltName=DNS:unf-controller,DNS:unf-controller.unf-system,DNS:unf-controller.unf-system.svc,DNS:unf-controller.unf-system.svc.cluster.local' \
+        'subjectAltName=DNS:unf-controller,DNS:unf-controller.unf-system,DNS:unf-controller.unf-system.svc,DNS:unf-controller.unf-system.svc.cluster.local,DNS:unf-primary-controller.internal' \
         >"${server_extensions}"
     openssl x509 -req -sha256 -days 365 \
         -in "${server_csr}" -CA "${ca_cert}" -CAkey "${ca_key}" \

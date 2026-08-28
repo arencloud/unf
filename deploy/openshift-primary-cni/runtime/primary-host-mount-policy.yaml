@@ -1,0 +1,120 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unf-primary-agent-daemonset
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    matchPolicy: Equivalent
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: unf-system
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["daemonsets"]
+        scope: Namespaced
+  matchConditions:
+    - name: primary-agent
+      expression: >-
+        object.metadata.name == 'unf-agent' ||
+        object.spec.template.spec.serviceAccountName == 'unf-agent'
+  variables:
+    - name: podSpec
+      expression: object.spec.template.spec
+    - name: hostPaths
+      expression: variables.podSpec.volumes.filter(volume, has(volume.hostPath))
+  validations:
+    - expression: >-
+        object.metadata.name == 'unf-agent' &&
+        variables.podSpec.serviceAccountName == 'unf-agent' &&
+        variables.podSpec.hostNetwork && variables.podSpec.hostPID &&
+        variables.podSpec.nodeSelector['network.unf.io/primary-cni'] == 'enabled'
+      message: the primary agent must retain its exact identity, host namespaces, and opt-in selector
+    - expression: >-
+        variables.hostPaths.size() == 7 &&
+        variables.hostPaths.exists(v, v.name == 'bpffs' && v.hostPath.path == '/sys/fs/bpf' && v.hostPath.type == 'Directory') &&
+        variables.hostPaths.exists(v, v.name == 'btf' && v.hostPath.path == '/sys/kernel/btf' && v.hostPath.type == 'Directory') &&
+        variables.hostPaths.exists(v, v.name == 'cni-bin' && v.hostPath.path == '/var/lib/cni/bin' && v.hostPath.type == 'Directory') &&
+        variables.hostPaths.exists(v, v.name == 'cni-config' && v.hostPath.path == '/etc/kubernetes/cni/net.d' && v.hostPath.type == 'Directory') &&
+        variables.hostPaths.exists(v, v.name == 'cni-state' && v.hostPath.path == '/var/lib/unf/cni' && v.hostPath.type == 'DirectoryOrCreate') &&
+        variables.hostPaths.exists(v, v.name == 'cni-run' && v.hostPath.path == '/run/unf' && v.hostPath.type == 'DirectoryOrCreate') &&
+        variables.hostPaths.exists(v, v.name == 'host-netns' && v.hostPath.path == '/var/run/netns' && v.hostPath.type == 'DirectoryOrCreate')
+      message: the primary agent must retain exactly seven recognized host paths
+    - expression: >-
+        variables.podSpec.containers.size() == 2 &&
+        variables.podSpec.containers.exists(c,
+          c.name == 'agent' && !c.securityContext.privileged &&
+          c.securityContext.readOnlyRootFilesystem &&
+          c.securityContext.seLinuxOptions.type == 'spc_t') &&
+        variables.podSpec.containers.exists(c,
+          c.name == 'install-primary-cni' && c.securityContext.privileged &&
+          c.securityContext.readOnlyRootFilesystem &&
+          c.securityContext.seLinuxOptions.type == 'spc_t') &&
+        (!has(variables.podSpec.initContainers) || variables.podSpec.initContainers.size() == 0)
+      message: only the exact non-privileged agent and privileged installer containers are allowed
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unf-primary-agent-daemonset
+spec:
+  policyName: unf-primary-agent-daemonset
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: unf-primary-agent-pod
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    matchPolicy: Equivalent
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: unf-system
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods", "pods/ephemeralcontainers"]
+        scope: Namespaced
+  matchConditions:
+    - name: primary-agent-service-account
+      expression: object.spec.serviceAccountName == 'unf-agent'
+  variables:
+    - name: podSpec
+      expression: object.spec
+    - name: hostPaths
+      expression: variables.podSpec.volumes.filter(volume, has(volume.hostPath))
+  validations:
+    - expression: >-
+        variables.podSpec.hostNetwork && variables.podSpec.hostPID &&
+        variables.podSpec.nodeSelector['network.unf.io/primary-cni'] == 'enabled'
+      message: a primary-agent Pod must retain host namespaces and its opt-in selector
+    - expression: >-
+        variables.hostPaths.size() == 7 &&
+        variables.hostPaths.exists(v, v.name == 'bpffs' && v.hostPath.path == '/sys/fs/bpf' && v.hostPath.type == 'Directory') &&
+        variables.hostPaths.exists(v, v.name == 'btf' && v.hostPath.path == '/sys/kernel/btf' && v.hostPath.type == 'Directory') &&
+        variables.hostPaths.exists(v, v.name == 'cni-bin' && v.hostPath.path == '/var/lib/cni/bin' && v.hostPath.type == 'Directory') &&
+        variables.hostPaths.exists(v, v.name == 'cni-config' && v.hostPath.path == '/etc/kubernetes/cni/net.d' && v.hostPath.type == 'Directory') &&
+        variables.hostPaths.exists(v, v.name == 'cni-state' && v.hostPath.path == '/var/lib/unf/cni' && v.hostPath.type == 'DirectoryOrCreate') &&
+        variables.hostPaths.exists(v, v.name == 'cni-run' && v.hostPath.path == '/run/unf' && v.hostPath.type == 'DirectoryOrCreate') &&
+        variables.hostPaths.exists(v, v.name == 'host-netns' && v.hostPath.path == '/var/run/netns' && v.hostPath.type == 'DirectoryOrCreate')
+      message: a primary-agent Pod must retain exactly seven recognized host paths
+    - expression: >-
+        variables.podSpec.containers.size() == 2 &&
+        variables.podSpec.containers.exists(c, c.name == 'agent' && !c.securityContext.privileged) &&
+        variables.podSpec.containers.exists(c, c.name == 'install-primary-cni' && c.securityContext.privileged) &&
+        (!has(variables.podSpec.initContainers) || variables.podSpec.initContainers.size() == 0) &&
+        (!has(variables.podSpec.ephemeralContainers) || variables.podSpec.ephemeralContainers.size() == 0)
+      message: direct, initialized, or ephemeral primary-agent Pod variants are forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: unf-primary-agent-pod
+spec:
+  policyName: unf-primary-agent-pod
+  validationActions: [Deny]

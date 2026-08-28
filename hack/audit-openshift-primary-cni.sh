@@ -38,13 +38,14 @@ machine_pools=$("${kc[@]}" get machineconfigpools -o json)
 operators=$("${kc[@]}" get clusteroperators -o json)
 
 mapfile -t workers < <(jq -r '.items[] | select(.metadata.labels["node-role.kubernetes.io/worker"] != null) | .metadata.name' <<<"${nodes}" | sort)
+mapfile -t primary_nodes < <(jq -r '.items[] | select(.metadata.labels["kubernetes.io/os"] == "linux") | .metadata.name' <<<"${nodes}" | sort)
 if (( ${#workers[@]} == 0 )); then
     echo "OpenShift primary-CNI audit requires at least one worker" >&2
     exit 1
 fi
 
 host_rows='[]'
-for node in "${workers[@]}"; do
+for node in "${primary_nodes[@]}"; do
     row=''
     for attempt in 1 2 3; do
         output=$("${oc_cli[@]}" debug "node/${node}" --quiet -- chroot /host sh -uc '
@@ -123,10 +124,10 @@ if [[ ${all_nodes_have_dual_pod_cidrs} != true ]]; then
     add_reason "every opted-in primary-CNI Node requires exactly one IPv4 and one IPv6 spec.podCIDR"
 fi
 if jq -e 'any(.[]; .inspectionError != null)' >/dev/null <<<"${host_rows}"; then
-    add_reason "one or more worker host inspections failed"
+    add_reason "one or more primary-CNI Node host inspections failed"
 fi
 if jq -e 'any(.[]; (.configs // []) | any(. != "10-unf.conflist"))' >/dev/null <<<"${host_rows}"; then
-    add_reason "worker CNI directories contain foreign configuration"
+    add_reason "Node CNI directories contain foreign configuration"
 fi
 
 eligible=$(jq -n --argjson reasons "${reasons}" '$reasons | length == 0')

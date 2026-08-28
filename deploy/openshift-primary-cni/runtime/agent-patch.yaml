@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: unf-agent
+  namespace: unf-system
+spec:
+  template:
+    metadata:
+      annotations:
+        openshift.io/required-scc: unf-primary-agent
+    spec:
+      hostPID: true
+      dnsPolicy: Default
+      hostAliases:
+        - ip: 192.0.2.1
+          hostnames:
+            - unf-primary-controller.internal
+      nodeSelector:
+        network.unf.io/primary-cni: enabled
+      containers:
+        - name: agent
+          imagePullPolicy: IfNotPresent
+          args:
+            - --listen
+            - 0.0.0.0:9963
+            - --all-interfaces
+            - --ebpf-object
+            - /opt/unf/ebpf/unf-ebpf-tc
+            - --bpf-pin-path
+            - /sys/fs/bpf/unf/v3
+            - --controller-url
+            - https://unf-primary-controller.internal:9964
+            - --controller-ca-path
+            - /var/run/secrets/unf-internal-ca/ca.crt
+            - --cni-socket
+            - /run/unf/cni.sock
+            - --cni-native-ipv4-uplink
+            - br-ex
+            - --cni-native-ipv6-uplink
+            - br-ex
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsUser: 0
+            runAsGroup: 0
+            seLinuxOptions:
+              type: spc_t
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+              add: ["BPF", "NET_ADMIN", "PERFMON"]
+          volumeMounts:
+            - name: cni-state
+              mountPath: /var/lib/unf/cni
+            - name: cni-run
+              mountPath: /run/unf
+            - name: host-netns
+              mountPath: /var/run/netns
+              mountPropagation: HostToContainer
+        - name: install-primary-cni
+          image: localhost/unf-agent:dev
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, /opt/unf/install/install.sh]
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+            seLinuxOptions:
+              type: spc_t
+          volumeMounts:
+            - name: cni-install
+              mountPath: /opt/unf/install
+              readOnly: true
+            - name: cni-bin
+              mountPath: /host/var/lib/cni/bin
+            - name: cni-config
+              mountPath: /host/etc/kubernetes/cni/net.d
+            - name: cni-state
+              mountPath: /host/var/lib/unf/cni
+            - name: cni-run
+              mountPath: /host/run/unf
+      volumes:
+        - name: cni-install
+          configMap:
+            name: unf-cni-install
+            defaultMode: 0555
+        - name: cni-bin
+          hostPath:
+            path: /var/lib/cni/bin
+            type: Directory
+        - name: cni-config
+          hostPath:
+            path: /etc/kubernetes/cni/net.d
+            type: Directory
+        - name: cni-state
+          hostPath:
+            path: /var/lib/unf/cni
+            type: DirectoryOrCreate
+        - name: cni-run
+          hostPath:
+            path: /run/unf
+            type: DirectoryOrCreate
+        - name: host-netns
+          hostPath:
+            path: /var/run/netns
+            type: DirectoryOrCreate

@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unf-controller
+  namespace: unf-system
+spec:
+  template:
+    metadata:
+      annotations:
+        openshift.io/required-scc: unf-primary-controller
+    spec:
+      hostNetwork: true
+      dnsPolicy: Default
+      nodeName: unf-primary-controller-node.invalid
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: controller
+          imagePullPolicy: IfNotPresent

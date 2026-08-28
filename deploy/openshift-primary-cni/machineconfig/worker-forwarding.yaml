@@ -1,0 +1,17 @@
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-unf-primary-worker-forwarding
+  labels:
+    machineconfiguration.openshift.io/role: worker
+spec:
+  config:
+    ignition:
+      version: 3.4.0
+    storage:
+      files:
+        - path: /etc/sysctl.d/90-unf-primary-cni.conf
+          mode: 420
+          overwrite: true
+          contents:
+            source: data:text/plain;charset=utf-8,net.ipv4.ip_forward%3D1%0Anet.ipv6.conf.all.forwarding%3D1%0Anet.ipv6.conf.default.forwarding%3D1%0A
