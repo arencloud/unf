@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Bound::{Excluded, Unbounded};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use unf_cni_state::AttachmentJournal;
 use unf_common::{IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 use unf_ebpf_common::{
     FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey,
@@ -38,7 +40,10 @@ use unf_ebpf_common::{
     POLICY_FLAG_HAS_SHADOW, POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE,
     POLICY_MAP_ABI_VERSION,
 };
-use unf_ipam::{Ipv4NodeBlock, Ipv6NodeBlock, NodeBlockProvider};
+use unf_ipam::{
+    Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
+    NodeBlockSnapshot,
+};
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
     EgressIpv4PolicyMapEntry, EgressIpv6PolicyMapEntry, FLOW_EXPORT_BATCH_LIMIT,
@@ -59,6 +64,7 @@ const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v3";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
+const DEFAULT_CNI_NODE_BLOCK_STATE_PATH: &str = "/var/lib/unf/cni/v1/node-block.json";
 const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
 const BLOCKED_TRANSITION_REPORTING_WINDOW: Duration = Duration::from_secs(30);
 const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
@@ -145,11 +151,7 @@ struct Args {
     #[arg(long, env = "UNF_BPF_PIN_PATH", default_value = DEFAULT_BPF_PIN_PATH)]
     bpf_pin_path: PathBuf,
     /// Enable the root-only local CNI transaction API at this Unix socket.
-    #[arg(
-        long,
-        env = "UNF_CNI_SOCKET",
-        requires_all = ["cni_ipv4_block", "cni_ipv6_block"]
-    )]
+    #[arg(long, env = "UNF_CNI_SOCKET")]
     cni_socket: Option<PathBuf>,
     /// Durable attachment journal used only when --cni-socket is enabled.
     #[arg(
@@ -158,6 +160,13 @@ struct Args {
         default_value = DEFAULT_CNI_STATE_PATH
     )]
     cni_state_path: PathBuf,
+    /// Durable controller-issued node-block snapshot used by the CNI service.
+    #[arg(
+        long,
+        env = "UNF_CNI_NODE_BLOCK_STATE_PATH",
+        default_value = DEFAULT_CNI_NODE_BLOCK_STATE_PATH
+    )]
+    cni_node_block_state_path: PathBuf,
     /// Controller-assigned IPv4 node block for the opt-in CNI service.
     #[arg(
         long,
@@ -344,6 +353,8 @@ struct AgentState {
     applied_policy_epoch: AtomicU64,
     policy_map_entries: AtomicU64,
     active_policy_bank: AtomicU64,
+    desired_node_block_revision: AtomicU64,
+    applied_node_block_revision: AtomicU64,
     queued_flow_exports: AtomicU64,
     dropped_flow_exports: AtomicU64,
     exported_flow_events: AtomicU64,
@@ -431,6 +442,11 @@ struct FlowExporterConfig {
     node_name: String,
     token_path: PathBuf,
     interval: Duration,
+}
+
+struct ResolvedCniProvider {
+    provider: NodeBlockProvider,
+    snapshot: Option<NodeBlockSnapshot>,
 }
 
 #[derive(Clone)]
@@ -563,8 +579,15 @@ async fn main() -> Result<()> {
     let (service_failure_tx, mut service_failure_rx) = mpsc::channel(1);
     let mut supervised_service_configured = false;
 
-    supervised_service_configured |=
-        spawn_cni_transaction_server(&args, &cancellation, &mut tasks, &service_failure_tx)?;
+    let cni_provider = resolve_cni_provider(&args, &state).await?;
+    supervised_service_configured |= spawn_cni_transaction_server(
+        &args,
+        cni_provider,
+        &state,
+        &cancellation,
+        &mut tasks,
+        &service_failure_tx,
+    )?;
 
     match (&args.ebpf_object, &args.interface, args.all_interfaces) {
         (Some(object), interface, all_interfaces) if interface.is_some() || all_interfaces => {
@@ -680,8 +703,150 @@ async fn finish_agent_tasks(
     }
 }
 
+async fn resolve_cni_provider(
+    args: &Args,
+    state: &AgentState,
+) -> Result<Option<ResolvedCniProvider>> {
+    if args.cni_socket.is_none() {
+        if args.cni_ipv4_block.is_some() || args.cni_ipv6_block.is_some() {
+            bail!("CNI node blocks require --cni-socket");
+        }
+        return Ok(None);
+    }
+    match (args.cni_ipv4_block, args.cni_ipv6_block) {
+        (Some(ipv4), Some(ipv6)) => Ok(Some(ResolvedCniProvider {
+            provider: NodeBlockProvider::new(ipv4, ipv6),
+            snapshot: None,
+        })),
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("manual CNI node blocks require both IPv4 and IPv6 values")
+        }
+        (None, None) => {
+            let controller_url = args
+                .controller_url
+                .as_deref()
+                .context("controller-distributed CNI blocks require --controller-url")?
+                .trim_end_matches('/');
+            let client =
+                dataplane_controller_client(Some(controller_url), &args.controller_ca_path, state)?;
+            let snapshot: NodeBlockSnapshot = authenticated_get(
+                &client,
+                format!("{controller_url}/v1/state/node-block"),
+                &args.agent_token_path,
+            )?
+            .send()
+            .await
+            .context("request controller node-block snapshot")?
+            .error_for_status()
+            .context("controller rejected node-block snapshot request")?
+            .json()
+            .await
+            .context("decode controller node-block snapshot")?;
+            validate_node_block_snapshot(&snapshot, &args.node_name)?;
+            state
+                .desired_node_block_revision
+                .store(snapshot.revision, Ordering::Release);
+            AttachmentJournal::open(&args.cni_state_path, snapshot.provider)
+                .context("validate controller node blocks against durable attachments")?;
+            Ok(Some(ResolvedCniProvider {
+                provider: snapshot.provider,
+                snapshot: Some(snapshot),
+            }))
+        }
+    }
+}
+
+fn validate_node_block_snapshot(snapshot: &NodeBlockSnapshot, node_name: &str) -> Result<()> {
+    if snapshot.schema_version != NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION {
+        bail!(
+            "unsupported node-block snapshot schema {}; expected {}",
+            snapshot.schema_version,
+            NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION
+        );
+    }
+    if snapshot.revision == 0 {
+        bail!("node-block snapshot revision must be nonzero");
+    }
+    if snapshot.node_name != node_name {
+        bail!(
+            "node-block snapshot targets {:?}, local node is {:?}",
+            snapshot.node_name,
+            node_name
+        );
+    }
+    if snapshot.node_uid.is_empty() {
+        bail!("node-block snapshot has no authoritative Node UID");
+    }
+    Ok(())
+}
+
+fn persist_node_block_snapshot(path: &Path, snapshot: &NodeBlockSnapshot) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("node-block state path must be absolute");
+    }
+    let parent = path
+        .parent()
+        .context("node-block state path must have a parent directory")?;
+    reject_node_block_symlinks(path)?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create node-block state directory {}", parent.display()))?;
+    reject_node_block_symlinks(path)?;
+    let file_name = path
+        .file_name()
+        .context("node-block state path must name a file")?
+        .to_string_lossy();
+    let temporary = path.with_file_name(format!(".{file_name}.tmp"));
+    if temporary.exists() {
+        bail!(
+            "temporary node-block state {} already exists",
+            temporary.display()
+        );
+    }
+    let bytes = serde_json::to_vec_pretty(snapshot).context("encode node-block state")?;
+    let write_result = (|| -> Result<()> {
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .with_context(|| format!("create node-block state {}", temporary.display()))?;
+        output.write_all(&bytes)?;
+        output.write_all(b"\n")?;
+        output.sync_all()?;
+        fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn reject_node_block_symlinks(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "node-block state path cannot contain symlink {}",
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn spawn_cni_transaction_server(
     args: &Args,
+    resolved: Option<ResolvedCniProvider>,
+    state: &AgentState,
     cancellation: &CancellationToken,
     tasks: &mut JoinSet<()>,
     failure_tx: &mpsc::Sender<SupervisedFailure>,
@@ -689,12 +854,14 @@ fn spawn_cni_transaction_server(
     let Some(socket_path) = &args.cni_socket else {
         return Ok(false);
     };
-    let provider = NodeBlockProvider::new(
-        args.cni_ipv4_block
-            .context("--cni-socket requires --cni-ipv4-block")?,
-        args.cni_ipv6_block
-            .context("--cni-socket requires --cni-ipv6-block")?,
-    );
+    let resolved = resolved.context("CNI node-block provider was not resolved")?;
+    let provider = resolved.provider;
+    if let Some(snapshot) = resolved.snapshot {
+        persist_node_block_snapshot(&args.cni_node_block_state_path, &snapshot)?;
+        state
+            .applied_node_block_revision
+            .store(snapshot.revision, Ordering::Release);
+    }
     let server = CniTransactionServer::bind(socket_path.clone(), &args.cni_state_path, provider)?;
     let server_cancellation = cancellation.clone();
     let failure_tx = failure_tx.clone();
@@ -1096,6 +1263,8 @@ fn new_state(
         applied_policy_epoch: AtomicU64::new(0),
         policy_map_entries: AtomicU64::new(0),
         active_policy_bank: AtomicU64::new(0),
+        desired_node_block_revision: AtomicU64::new(0),
+        applied_node_block_revision: AtomicU64::new(0),
         queued_flow_exports: AtomicU64::new(0),
         dropped_flow_exports: AtomicU64::new(0),
         exported_flow_events: AtomicU64::new(0),
@@ -2704,6 +2873,8 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
         applied_policy_epoch: state.applied_policy_epoch.load(Ordering::Acquire),
         policy_map_entries: state.policy_map_entries.load(Ordering::Acquire),
         active_policy_bank: state.active_policy_bank.load(Ordering::Acquire),
+        desired_node_block_revision: state.desired_node_block_revision.load(Ordering::Acquire),
+        applied_node_block_revision: state.applied_node_block_revision.load(Ordering::Acquire),
     }
 }
 
@@ -4424,14 +4595,27 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn cni_transaction_api_is_disabled_by_default_and_explicitly_opt_in() {
+    fn cni_node_block_arguments_support_manual_or_controller_distribution() {
         let defaults = Args::try_parse_from(["unf-agent"]).expect("default arguments parse");
         assert_eq!(defaults.cni_socket, None);
         assert_eq!(
             defaults.cni_state_path,
             Path::new("/var/lib/unf/cni/v1/attachments.json")
         );
-        assert!(Args::try_parse_from(["unf-agent", "--cni-socket", "/run/unf/cni.sock"]).is_err());
+        let distributed = Args::try_parse_from(["unf-agent", "--cni-socket", "/run/unf/cni.sock"])
+            .expect("controller-distributed block mode parses");
+        assert!(distributed.cni_ipv4_block.is_none());
+        assert!(distributed.cni_ipv6_block.is_none());
+        assert!(
+            Args::try_parse_from([
+                "unf-agent",
+                "--cni-socket",
+                "/run/unf/cni.sock",
+                "--cni-ipv4-block",
+                "10.42.0.0/24",
+            ])
+            .is_err()
+        );
 
         let enabled = Args::try_parse_from([
             "unf-agent",
@@ -4453,6 +4637,45 @@ mod tests {
             enabled.cni_ipv4_block.expect("IPv4 block").to_string(),
             "10.42.0.0/24"
         );
+    }
+
+    #[test]
+    fn controller_node_block_snapshot_is_validated_and_persisted_atomically() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("node-block.json");
+        let snapshot = NodeBlockSnapshot {
+            schema_version: NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION,
+            revision: 4,
+            node_name: "worker-a".to_owned(),
+            node_uid: "worker-a-uid".to_owned(),
+            provider: NodeBlockProvider::new(
+                "10.42.0.0/24".parse().unwrap(),
+                "fd00:42::/64".parse().unwrap(),
+            ),
+        };
+        validate_node_block_snapshot(&snapshot, "worker-a").unwrap();
+        persist_node_block_snapshot(&path, &snapshot).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            serde_json::from_slice::<NodeBlockSnapshot>(&fs::read(&path).unwrap()).unwrap(),
+            snapshot
+        );
+
+        let mut wrong = snapshot.clone();
+        wrong.node_name = "worker-b".to_owned();
+        assert!(validate_node_block_snapshot(&wrong, "worker-a").is_err());
+        wrong = snapshot.clone();
+        wrong.schema_version += 1;
+        assert!(validate_node_block_snapshot(&wrong, "worker-a").is_err());
+
+        let target = directory.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(persist_node_block_snapshot(&link.join("state.json"), &snapshot).is_err());
     }
 
     #[test]

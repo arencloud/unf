@@ -25,6 +25,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 unf-api = { path = "../../crates/unf-api" }
 unf-common = { path = "../../crates/unf-common" }
+unf-ipam = { path = "../../crates/unf-ipam" }
 unf-policy = { path = "../../crates/unf-policy" }
 unf-state = { path = "../../crates/unf-state" }
 

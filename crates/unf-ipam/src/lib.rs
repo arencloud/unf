@@ -8,6 +8,7 @@ use thiserror::Error;
 
 /// Bounds deterministic allocation work and retained leases for one node.
 pub const MAX_NODE_LEASES: usize = 65_536;
+pub const NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressFamily {
@@ -124,6 +125,13 @@ impl Ipv4NodeBlock {
         usize::try_from((addresses - 3).min(MAX_NODE_LEASES as u64)).unwrap_or(MAX_NODE_LEASES)
     }
 
+    #[must_use]
+    pub fn overlaps(self, other: Self) -> bool {
+        let prefix = self.prefix_len.min(other.prefix_len);
+        let mask = prefix_mask_v4(prefix);
+        u32::from(self.network) & mask == u32::from(other.network) & mask
+    }
+
     fn candidate(self, index: usize) -> Ipv4Addr {
         let offset = u32::try_from(index).expect("bounded index fits u32") + 2;
         Ipv4Addr::from(u32::from(self.network) + offset)
@@ -237,6 +245,13 @@ impl Ipv6NodeBlock {
         }
         let addresses = 1_u32 << (128 - self.prefix_len);
         usize::try_from(addresses - 2).unwrap_or(MAX_NODE_LEASES)
+    }
+
+    #[must_use]
+    pub fn overlaps(self, other: Self) -> bool {
+        let prefix = self.prefix_len.min(other.prefix_len);
+        let mask = prefix_mask_v6(prefix);
+        u128::from(self.network) & mask == u128::from(other.network) & mask
     }
 
     fn candidate(self, index: usize) -> Ipv6Addr {
@@ -394,6 +409,16 @@ pub struct NodeBlockProvider {
     pub ipv6_block: Ipv6NodeBlock,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NodeBlockSnapshot {
+    pub schema_version: u16,
+    pub revision: u64,
+    pub node_name: String,
+    pub node_uid: String,
+    pub provider: NodeBlockProvider,
+}
+
 impl NodeBlockProvider {
     #[must_use]
     pub const fn new(ipv4_block: Ipv4NodeBlock, ipv6_block: Ipv6NodeBlock) -> Self {
@@ -527,6 +552,31 @@ mod tests {
         for invalid in ["fd00:42::1/64", "fd00:42::/127", "fd00:42::", "bad/64"] {
             assert!(invalid.parse::<Ipv6NodeBlock>().is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn block_overlap_and_snapshot_wire_shape_are_exact() {
+        let ipv4: Ipv4NodeBlock = "10.42.0.0/24".parse().unwrap();
+        assert!(ipv4.overlaps("10.42.0.128/25".parse().unwrap()));
+        assert!(!ipv4.overlaps("10.42.1.0/24".parse().unwrap()));
+        let ipv6: Ipv6NodeBlock = "fd00:42::/64".parse().unwrap();
+        assert!(ipv6.overlaps("fd00:42::/80".parse().unwrap()));
+        assert!(!ipv6.overlaps("fd00:43::/64".parse().unwrap()));
+
+        let snapshot = NodeBlockSnapshot {
+            schema_version: NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION,
+            revision: 7,
+            node_name: "worker-a".to_owned(),
+            node_uid: "worker-a-uid".to_owned(),
+            provider: provider("10.42.0.0/24", "fd00:42::/64"),
+        };
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(encoded["schemaVersion"], 1);
+        assert_eq!(encoded["provider"]["ipv4Block"], "10.42.0.0/24");
+        assert_eq!(
+            serde_json::from_value::<NodeBlockSnapshot>(encoded).unwrap(),
+            snapshot
+        );
     }
 
     #[test]

@@ -2961,6 +2961,7 @@ dependencies = [
  "tracing-subscriber",
  "unf-api",
  "unf-common",
+ "unf-ipam",
  "unf-policy",
  "unf-state",
 ]

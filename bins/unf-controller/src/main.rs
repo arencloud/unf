@@ -34,6 +34,10 @@ use unf_api::SecurityPolicy;
 use unf_common::{
     IdentityId, PolicyAction, PolicyDirection, PolicyId, PolicyReason, Protocol, Revision, Verdict,
 };
+use unf_ipam::{
+    Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
+    NodeBlockSnapshot,
+};
 use unf_policy::{
     DestinationAddresses, DestinationPort, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort,
     NetworkPolicyCompiler, PolicyCompiler, PolicyIr, compile_dataplane_entries,
@@ -91,6 +95,8 @@ const TOPOLOGY_HISTORY_STORE_KEY: &str = "history.json";
 const TOPOLOGY_HISTORY_CONFIG_MAP_DATA_LIMIT: usize = 900_000;
 const TOPOLOGY_HISTORY_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const TOPOLOGY_HISTORY_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
+const PRIMARY_CNI_NODE_LABEL: &str = "network.unf.io/primary-cni";
+const PRIMARY_CNI_NODE_LABEL_VALUE: &str = "enabled";
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF Kubernetes desired-state controller")]
@@ -201,6 +207,10 @@ struct ControllerState {
     agent_node_selector: Option<String>,
     pods: RwLock<BTreeMap<String, PodRecord>>,
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
+    node_block_inputs: RwLock<BTreeMap<String, NodeBlockInput>>,
+    node_block_initialization: Mutex<Option<BTreeMap<String, NodeBlockInput>>>,
+    node_blocks: RwLock<BTreeMap<String, AssignedNodeBlock>>,
+    rejected_node_blocks: RwLock<BTreeMap<String, String>>,
     host_network_gateways: RwLock<BTreeMap<String, HostNetworkGateways>>,
     services: RwLock<BTreeMap<String, ServiceRecord>>,
     endpoint_slices: RwLock<BTreeMap<String, EndpointSliceRecord>>,
@@ -240,6 +250,19 @@ struct ControllerState {
 struct HostNetworkGateways {
     ipv4: BTreeSet<std::net::Ipv4Addr>,
     ipv6: BTreeSet<Ipv6Addr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeBlockInput {
+    node_uid: String,
+    provider: Result<NodeBlockProvider, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignedNodeBlock {
+    node_uid: String,
+    provider: NodeBlockProvider,
+    revision: Revision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -311,6 +334,8 @@ struct StatusBody {
     mode: &'static str,
     pods: usize,
     nodes: usize,
+    assigned_node_blocks: usize,
+    rejected_node_blocks: usize,
     services: usize,
     endpoint_slices: usize,
     namespaces: usize,
@@ -679,6 +704,7 @@ async fn spawn_internal_api(
         .route("/v1/version", get(version))
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
+        .route("/v1/state/node-block", get(node_block_snapshot))
         .route("/v1/state/agents", post(ingest_agent_status))
         .route("/v1/telemetry/flows", post(ingest_flows))
         .with_state(state);
@@ -959,6 +985,10 @@ fn new_state_with_client_and_selector(
         agent_node_selector,
         pods: RwLock::new(BTreeMap::new()),
         nodes: RwLock::new(BTreeMap::new()),
+        node_block_inputs: RwLock::new(BTreeMap::new()),
+        node_block_initialization: Mutex::new(None),
+        node_blocks: RwLock::new(BTreeMap::new()),
+        rejected_node_blocks: RwLock::new(BTreeMap::new()),
         host_network_gateways: RwLock::new(BTreeMap::new()),
         services: RwLock::new(BTreeMap::new()),
         endpoint_slices: RwLock::new(BTreeMap::new()),
@@ -1792,31 +1822,16 @@ async fn watch_nodes(api: Api<Node>, state: Arc<ControllerState>, cancellation: 
 fn apply_node_event(state: &ControllerState, event: Event<Node>) {
     let _policy_state_guard = write_lock(&state.policy_state_guard);
     match event {
-        Event::Apply(node) | Event::InitApply(node) => {
-            let normalized = topology_node(&node);
-            let gateways = ovn_host_network_gateways(&node);
-            let previous =
-                write_lock(&state.nodes).insert(normalized.name.clone(), normalized.clone());
-            let previous_gateways = if gateways == HostNetworkGateways::default() {
-                write_lock(&state.host_network_gateways).remove(&normalized.name)
-            } else {
-                write_lock(&state.host_network_gateways)
-                    .insert(normalized.name.clone(), gateways.clone())
-            };
-            state.metrics.reconciles.inc();
-            if previous.as_ref() != Some(&normalized) {
-                bump_topology_revision(state);
-            }
-            let gateways_changed = previous_gateways.as_ref().map_or(
-                !gateways.ipv4.is_empty() || !gateways.ipv6.is_empty(),
-                |previous| previous != &gateways,
-            );
-            if gateways_changed {
-                bump_policy_revision(state);
-            }
-        }
+        Event::Apply(node) => reconcile_node(state, &node, false),
+        Event::InitApply(node) => reconcile_node(state, &node, true),
         Event::Delete(node) => {
             let node_name = node.name_any();
+            if write_lock(&state.node_block_inputs)
+                .remove(&node_name)
+                .is_some()
+            {
+                recompute_node_blocks(state);
+            }
             if write_lock(&state.nodes).remove(&node_name).is_some() {
                 bump_topology_revision(state);
             }
@@ -1835,6 +1850,7 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
         }
         Event::Init => {
             begin_topology_initialization(state);
+            *mutex_lock(&state.node_block_initialization) = Some(BTreeMap::new());
             let had_nodes = !read_lock(&state.nodes).is_empty();
             write_lock(&state.nodes).clear();
             let had_gateways = !read_lock(&state.host_network_gateways).is_empty();
@@ -1847,6 +1863,13 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             }
         }
         Event::InitDone => {
+            if let Some(initialized) = mutex_lock(&state.node_block_initialization).take() {
+                let changed = *read_lock(&state.node_block_inputs) != initialized;
+                if changed {
+                    *write_lock(&state.node_block_inputs) = initialized;
+                    recompute_node_blocks(state);
+                }
+            }
             let nodes = read_lock(&state.nodes);
             let mut reports = write_lock(&state.agent_reports);
             let previous_len = reports.len();
@@ -1858,6 +1881,189 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             drop(nodes);
             finish_topology_initialization(state);
         }
+    }
+}
+
+fn reconcile_node(state: &ControllerState, node: &Node, initializing: bool) {
+    let normalized = topology_node(node);
+    let gateways = ovn_host_network_gateways(node);
+    if initializing {
+        stage_node_block_input(state, node);
+    } else {
+        update_node_block_input(state, node);
+    }
+    let previous = write_lock(&state.nodes).insert(normalized.name.clone(), normalized.clone());
+    let previous_gateways = if gateways == HostNetworkGateways::default() {
+        write_lock(&state.host_network_gateways).remove(&normalized.name)
+    } else {
+        write_lock(&state.host_network_gateways).insert(normalized.name.clone(), gateways.clone())
+    };
+    state.metrics.reconciles.inc();
+    if previous.as_ref() != Some(&normalized) {
+        bump_topology_revision(state);
+    }
+    let gateways_changed = previous_gateways.as_ref().map_or(
+        !gateways.ipv4.is_empty() || !gateways.ipv6.is_empty(),
+        |previous| previous != &gateways,
+    );
+    if gateways_changed {
+        bump_policy_revision(state);
+    }
+}
+
+fn update_node_block_input(state: &ControllerState, node: &Node) {
+    let node_name = node.name_any();
+    let input = node_block_input(node);
+    let changed = if let Some(input) = input {
+        write_lock(&state.node_block_inputs)
+            .insert(node_name, input.clone())
+            .as_ref()
+            != Some(&input)
+    } else {
+        write_lock(&state.node_block_inputs)
+            .remove(&node_name)
+            .is_some()
+    };
+    if changed {
+        recompute_node_blocks(state);
+    }
+}
+
+fn stage_node_block_input(state: &ControllerState, node: &Node) {
+    let Some(input) = node_block_input(node) else {
+        return;
+    };
+    let mut initialization = mutex_lock(&state.node_block_initialization);
+    if let Some(inputs) = initialization.as_mut() {
+        inputs.insert(node.name_any(), input);
+    } else {
+        drop(initialization);
+        update_node_block_input(state, node);
+    }
+}
+
+fn node_block_input(node: &Node) -> Option<NodeBlockInput> {
+    let enabled = node
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(PRIMARY_CNI_NODE_LABEL))
+        .is_some_and(|value| value == PRIMARY_CNI_NODE_LABEL_VALUE);
+    if !enabled {
+        return None;
+    }
+    Some(NodeBlockInput {
+        node_uid: node.metadata.uid.clone().unwrap_or_default(),
+        provider: node_block_provider(node),
+    })
+}
+
+fn node_block_provider(node: &Node) -> Result<NodeBlockProvider, String> {
+    let cidrs = node
+        .spec
+        .as_ref()
+        .and_then(|spec| {
+            spec.pod_cidrs
+                .clone()
+                .filter(|cidrs| !cidrs.is_empty())
+                .or_else(|| spec.pod_cidr.clone().map(|cidr| vec![cidr]))
+        })
+        .ok_or_else(|| "Node spec has no Pod CIDRs".to_owned())?;
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    for cidr in cidrs {
+        if cidr.contains(':') {
+            ipv6.push(
+                cidr.parse::<Ipv6NodeBlock>()
+                    .map_err(|error| error.to_string())?,
+            );
+        } else {
+            ipv4.push(
+                cidr.parse::<Ipv4NodeBlock>()
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    if ipv4.len() != 1 || ipv6.len() != 1 {
+        return Err(format!(
+            "Node spec must contain exactly one IPv4 and one IPv6 Pod CIDR; found {} and {}",
+            ipv4.len(),
+            ipv6.len()
+        ));
+    }
+    Ok(NodeBlockProvider::new(ipv4[0], ipv6[0]))
+}
+
+fn recompute_node_blocks(state: &ControllerState) {
+    let inputs = read_lock(&state.node_block_inputs).clone();
+    let previous_assignments = read_lock(&state.node_blocks).clone();
+    let mut candidates = BTreeMap::new();
+    let mut rejected = BTreeMap::new();
+    for (node_name, input) in &inputs {
+        match input.provider {
+            Ok(provider) if !input.node_uid.is_empty() => {
+                candidates.insert(node_name.clone(), (input.node_uid.clone(), provider));
+            }
+            Ok(_) => {
+                rejected.insert(node_name.clone(), "Node UID is missing".to_owned());
+            }
+            Err(ref error) => {
+                rejected.insert(node_name.clone(), error.clone());
+            }
+        }
+    }
+
+    let overlap_candidates: Vec<_> = candidates
+        .iter()
+        .map(|(name, (_, provider))| (name.clone(), *provider))
+        .collect();
+    for (index, (left_name, left)) in overlap_candidates.iter().enumerate() {
+        for (right_name, right) in overlap_candidates.iter().skip(index + 1) {
+            if left.ipv4_block.overlaps(right.ipv4_block)
+                || left.ipv6_block.overlaps(right.ipv6_block)
+            {
+                let message = format!("node blocks overlap assignment for {right_name}");
+                rejected.insert(left_name.clone(), message);
+                let message = format!("node blocks overlap assignment for {left_name}");
+                rejected.insert(right_name.clone(), message);
+            }
+        }
+    }
+    for node_name in rejected.keys() {
+        candidates.remove(node_name);
+    }
+
+    let assignments_changed = previous_assignments.len() != candidates.len()
+        || candidates.iter().any(|(node_name, (node_uid, provider))| {
+            previous_assignments.get(node_name).is_none_or(|previous| {
+                previous.node_uid != *node_uid || previous.provider != *provider
+            })
+        });
+    let changed = assignments_changed || *read_lock(&state.rejected_node_blocks) != rejected;
+    if changed {
+        bump_routing_revision(state);
+        let routing_revision = mutex_lock(&state.revisions).routing;
+        let assignments = candidates
+            .into_iter()
+            .map(|(node_name, (node_uid, provider))| {
+                let revision = previous_assignments
+                    .get(&node_name)
+                    .filter(|previous| {
+                        previous.node_uid == node_uid && previous.provider == provider
+                    })
+                    .map_or(routing_revision, |previous| previous.revision);
+                (
+                    node_name,
+                    AssignedNodeBlock {
+                        node_uid,
+                        provider,
+                        revision,
+                    },
+                )
+            })
+            .collect();
+        *write_lock(&state.node_blocks) = assignments;
+        *write_lock(&state.rejected_node_blocks) = rejected;
     }
 }
 
@@ -2426,6 +2632,8 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         },
         pods: read_lock(&state.pods).len(),
         nodes: read_lock(&state.nodes).len(),
+        assigned_node_blocks: read_lock(&state.node_blocks).len(),
+        rejected_node_blocks: read_lock(&state.rejected_node_blocks).len(),
         services: read_lock(&state.services).len(),
         endpoint_slices: read_lock(&state.endpoint_slices).len(),
         namespaces: read_lock(&state.namespaces).len(),
@@ -2745,6 +2953,10 @@ fn agent_convergence_snapshot(
         .map(|node| node.name.clone())
         .collect();
     let reports = read_lock(&state.agent_reports);
+    let node_block_revisions: BTreeMap<_, _> = read_lock(&state.node_blocks)
+        .iter()
+        .map(|(node_name, assignment)| (node_name.clone(), assignment.revision))
+        .collect();
     let unexpected_agents = reports
         .iter()
         .filter(|(node_name, stored)| {
@@ -2777,6 +2989,10 @@ fn agent_convergence_snapshot(
                         state.identity_epoch,
                         identity_revision,
                         policy_revision,
+                        node_block_revisions
+                            .get(node_name)
+                            .copied()
+                            .unwrap_or_default(),
                     )
             });
             if converged {
@@ -2868,6 +3084,7 @@ fn agent_report_matches(
     expected_epoch: u64,
     identity_revision: Revision,
     policy_revision: Revision,
+    node_block_revision: Revision,
 ) -> bool {
     report.ready
         && report.bpf_loaded
@@ -2879,6 +3096,8 @@ fn agent_report_matches(
         && report.applied_policy_epoch == expected_epoch
         && report.desired_policy_revision == policy_revision.get()
         && report.applied_policy_revision == policy_revision.get()
+        && report.desired_node_block_revision == node_block_revision.get()
+        && report.applied_node_block_revision == node_block_revision.get()
 }
 
 async fn identity_snapshot(
@@ -2908,6 +3127,35 @@ async fn policy_snapshot(
         egress_ipv4_entries,
         egress_ipv6_entries,
     }))
+}
+
+async fn node_block_snapshot(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<NodeBlockSnapshot>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    Ok(Json(node_block_snapshot_for(&state, &agent.node_name)?))
+}
+
+fn node_block_snapshot_for(
+    state: &ControllerState,
+    node_name: &str,
+) -> Result<NodeBlockSnapshot, ApiError> {
+    let assignment = read_lock(&state.node_blocks)
+        .get(node_name)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::service_unavailable(format!(
+                "node {node_name} has no valid opt-in dual-stack block assignment"
+            ))
+        })?;
+    Ok(NodeBlockSnapshot {
+        schema_version: NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION,
+        revision: assignment.revision.get(),
+        node_name: node_name.to_owned(),
+        node_uid: assignment.node_uid,
+        provider: assignment.provider,
+    })
 }
 
 async fn topology(State(state): State<Arc<ControllerState>>) -> Json<TopologyStateSnapshot> {
@@ -4496,6 +4744,11 @@ fn bump_topology_revision(state: &ControllerState) {
     capture_topology_history(state);
 }
 
+fn bump_routing_revision(state: &ControllerState) {
+    let mut revisions = mutex_lock(&state.revisions);
+    revisions.routing = revisions.routing.next();
+}
+
 fn bump_service_and_topology_revision(state: &ControllerState) {
     {
         let mut revisions = mutex_lock(&state.revisions);
@@ -4923,6 +5176,23 @@ mod tests {
         .expect("test Node is valid Kubernetes JSON")
     }
 
+    fn primary_node(name: &str, ipv4: &str, ipv6: &str) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": name,
+                "uid": format!("{name}-uid"),
+                "labels": {
+                    "kubernetes.io/hostname": name,
+                    (PRIMARY_CNI_NODE_LABEL): PRIMARY_CNI_NODE_LABEL_VALUE
+                }
+            },
+            "spec": {"podCIDRs": [ipv4, ipv6]}
+        }))
+        .expect("primary-CNI test Node is valid Kubernetes JSON")
+    }
+
     fn service() -> Service {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "v1",
@@ -5276,6 +5546,8 @@ mod tests {
             applied_policy_epoch: epoch,
             policy_map_entries: 1,
             active_policy_bank: 0,
+            desired_node_block_revision: 0,
+            applied_node_block_revision: 0,
         }
     }
 
@@ -5355,6 +5627,120 @@ mod tests {
 
         assert!(read_lock(&state.agent_reports).is_empty());
         assert!(state.agent_reports_dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn opt_in_node_blocks_are_dual_stack_non_overlapping_and_revisioned() {
+        let state = new_state(true);
+        let worker_a = primary_node("worker-a", "10.42.0.0/24", "fd00:42::/64");
+        apply_node_event(&state, Event::Apply(worker_a.clone()));
+        let first = node_block_snapshot_for(&state, "worker-a").unwrap();
+        assert_eq!(first.schema_version, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(first.revision, 1);
+        assert_eq!(first.node_uid, "worker-a-uid");
+        assert_eq!(first.provider.ipv4_block.to_string(), "10.42.0.0/24");
+
+        apply_node_event(&state, Event::Apply(worker_a));
+        assert_eq!(mutex_lock(&state.revisions).routing, Revision::new(1));
+
+        let mut report = converged_agent_report(state.identity_epoch);
+        write_lock(&state.agent_reports).insert(
+            "worker-a".to_owned(),
+            StoredAgentReport {
+                report: report.clone(),
+                last_received_unix_ms: 100,
+            },
+        );
+        assert!(
+            !agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100,)
+                .all_converged
+        );
+        report.desired_node_block_revision = first.revision;
+        report.applied_node_block_revision = first.revision;
+        write_lock(&state.agent_reports).insert(
+            "worker-a".to_owned(),
+            StoredAgentReport {
+                report,
+                last_received_unix_ms: 100,
+            },
+        );
+        assert!(
+            agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100,)
+                .all_converged
+        );
+
+        apply_node_event(
+            &state,
+            Event::Apply(primary_node("worker-b", "10.43.0.0/24", "fd00:43::/64")),
+        );
+        assert_eq!(
+            node_block_snapshot_for(&state, "worker-a")
+                .unwrap()
+                .revision,
+            1
+        );
+        assert_eq!(
+            node_block_snapshot_for(&state, "worker-b")
+                .unwrap()
+                .revision,
+            2
+        );
+
+        let overlapping = primary_node("worker-b", "10.42.0.128/25", "fd00:43::/64");
+        apply_node_event(&state, Event::Apply(overlapping.clone()));
+        assert!(read_lock(&state.node_blocks).is_empty());
+        assert_eq!(read_lock(&state.rejected_node_blocks).len(), 2);
+        assert!(node_block_snapshot_for(&state, "worker-a").is_err());
+
+        apply_node_event(&state, Event::Delete(overlapping));
+        assert_eq!(
+            node_block_snapshot_for(&state, "worker-a")
+                .unwrap()
+                .revision,
+            4
+        );
+        assert_eq!(read_lock(&state.rejected_node_blocks).len(), 0);
+        assert_eq!(mutex_lock(&state.revisions).routing, Revision::new(4));
+
+        apply_node_event(&state, Event::Init);
+        assert_eq!(
+            node_block_snapshot_for(&state, "worker-a")
+                .unwrap()
+                .revision,
+            4
+        );
+        apply_node_event(
+            &state,
+            Event::InitApply(primary_node("worker-a", "10.42.0.0/24", "fd00:42::/64")),
+        );
+        apply_node_event(&state, Event::InitDone);
+        assert_eq!(
+            node_block_snapshot_for(&state, "worker-a")
+                .unwrap()
+                .revision,
+            4
+        );
+        assert_eq!(mutex_lock(&state.revisions).routing, Revision::new(4));
+
+        apply_node_event(&state, Event::Init);
+        assert!(node_block_snapshot_for(&state, "worker-a").is_ok());
+        apply_node_event(&state, Event::InitDone);
+        assert!(node_block_snapshot_for(&state, "worker-a").is_err());
+        assert_eq!(mutex_lock(&state.revisions).routing, Revision::new(5));
+    }
+
+    #[test]
+    fn node_block_distribution_requires_explicit_label_and_exact_family_pair() {
+        let state = new_state(true);
+        apply_node_event(&state, Event::Apply(node(true)));
+        assert!(read_lock(&state.node_block_inputs).is_empty());
+        assert_eq!(mutex_lock(&state.revisions).routing, Revision::default());
+
+        let mut invalid = primary_node("worker-a", "10.42.0.0/24", "fd00:42::/64");
+        invalid.spec.as_mut().unwrap().pod_cidrs = Some(vec!["10.42.0.0/24".to_owned()]);
+        apply_node_event(&state, Event::Apply(invalid));
+        assert!(read_lock(&state.node_blocks).is_empty());
+        assert!(read_lock(&state.rejected_node_blocks)["worker-a"].contains("exactly one"));
     }
 
     #[test]

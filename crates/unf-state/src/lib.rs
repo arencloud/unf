@@ -98,6 +98,10 @@ pub struct AgentStateReport {
     pub applied_policy_epoch: u64,
     pub policy_map_entries: u64,
     pub active_policy_bank: u64,
+    #[serde(default)]
+    pub desired_node_block_revision: u64,
+    #[serde(default)]
+    pub applied_node_block_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

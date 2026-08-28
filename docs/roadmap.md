@@ -294,8 +294,13 @@ authoritative record of verified results.
   scoped rollback, conflict preservation, isolated IPv4/IPv6 forwarding, exact
   MTU boundaries, source-fragment behavior, and MTU drift rejection are
   Verified.
-- Next: implement controller node-block distribution and cross-node native
-  routing/recovery before isolated primary-CNI Kind installation.
+- Controller node-block distribution is now Verified by ADR 0064. Only Nodes
+  explicitly labeled `network.unf.io/primary-cni=enabled` receive their own
+  authenticated, revisioned IPv4+IPv6 `spec.podCIDRs` snapshot. Overlaps and
+  malformed assignments fail closed; agents validate durable provenance,
+  persist mode-0600 state, and acknowledge desired/applied revisions.
+- Next: implement cross-node native route intent, typed kernel lifecycle, and
+  reconciliation/recovery before isolated primary-CNI Kind installation.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

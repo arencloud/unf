@@ -51,8 +51,15 @@ restart recovery. `unf-cni` now composes that state with exact veth and native
 route lifecycle: commit follows kernel readback, CHECK compares the prior result
 and live state, and cleanup intent remains durable until route-first DEL or abort
 finishes. ADRs 0058 and 0063 record the wire and atomic resource contracts. The
-overlay remains the only deployed mode until controller block distribution,
-cross-node networking, and isolated primary-CNI qualification pass.
+controller now validates exactly one canonical IPv4 and IPv6 `spec.podCIDRs`
+assignment for each explicitly labeled primary-CNI Node, rejects overlaps, and
+serves only that Node's strict revisioned snapshot over the authenticated
+internal TLS API. Before binding its CNI socket, the agent validates the
+assignment against the durable attachment journal, atomically persists
+owner-only provenance, and reports desired/applied acknowledgement. Assignment
+rotation requires drain and restart. The overlay remains the only deployed mode
+until cross-node networking and isolated primary-CNI qualification pass. ADR
+0064 records this distribution boundary.
 
 IPAM stays below a provider interface and above routing. The first provider
 accepts one canonical IPv4 and IPv6 node block, reserves network/gateway and IPv4
