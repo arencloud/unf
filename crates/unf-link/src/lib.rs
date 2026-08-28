@@ -48,6 +48,8 @@ pub struct LinkReadback {
     pub peer_index: u32,
     pub host_name: String,
     pub peer_name: String,
+    pub host_address: [u8; 6],
+    pub peer_address: [u8; 6],
     pub mtu: u32,
     pub addresses: BTreeSet<AssignedAddress>,
 }
@@ -112,11 +114,11 @@ impl VethPlan {
             [
                 AssignedAddress {
                     address: IpAddr::V4(record.lease.ipv4.address),
-                    prefix_len: record.lease.ipv4.prefix_len,
+                    prefix_len: 32,
                 },
                 AssignedAddress {
                     address: IpAddr::V6(record.lease.ipv6.address),
-                    prefix_len: record.lease.ipv6.prefix_len,
+                    prefix_len: 128,
                 },
             ],
         )
@@ -231,6 +233,8 @@ impl VethPlan {
             peer_index: peer.index,
             host_name: self.host_name.clone(),
             peer_name: self.container_name.clone(),
+            host_address: self.host_address,
+            peer_address: self.peer_address,
             mtu: self.mtu,
             addresses: peer.addresses,
         })
@@ -375,6 +379,8 @@ impl VethPlan {
             peer_index: peer.index,
             host_name: self.host_name.clone(),
             peer_name: self.container_name.clone(),
+            host_address: self.host_address,
+            peer_address: self.peer_address,
             mtu: self.mtu,
             addresses: peer.addresses,
         })
@@ -852,6 +858,9 @@ fn validate_addresses(addresses: [AssignedAddress; 2]) -> Result<(), LinkError> 
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
+    use unf_cni_state::{AttachmentKey, AttachmentPhase, AttachmentSpec};
+    use unf_ipam::{DualStackLease, Ipv4Lease, Ipv6Lease};
+
     use super::*;
 
     fn plan() -> VethPlan {
@@ -946,5 +955,37 @@ mod tests {
             ),
             Err(LinkError::InvalidPlan(_))
         ));
+    }
+
+    #[test]
+    fn durable_node_block_lease_becomes_routed_host_prefixes() {
+        let record = AttachmentRecord {
+            spec: AttachmentSpec {
+                key: AttachmentKey {
+                    network: "unf-test".to_string(),
+                    container_id: "container-1".to_string(),
+                    ifname: "eth0".to_string(),
+                },
+                netns: "/run/netns/pod-1".to_string(),
+                mtu: 1_400,
+            },
+            host_interface: "unf01234567890".to_string(),
+            lease: DualStackLease {
+                ipv4: Ipv4Lease {
+                    address: Ipv4Addr::new(10, 44, 0, 2),
+                    gateway: Ipv4Addr::new(10, 44, 0, 1),
+                    prefix_len: 24,
+                },
+                ipv6: Ipv6Lease {
+                    address: Ipv6Addr::new(0xfd44, 0, 0, 1, 0, 0, 0, 2),
+                    gateway: Ipv6Addr::new(0xfd44, 0, 0, 1, 0, 0, 0, 1),
+                    prefix_len: 64,
+                },
+            },
+            phase: AttachmentPhase::Preparing,
+        };
+        let plan = VethPlan::from_attachment(&record).expect("durable record is valid");
+        assert_eq!(plan.addresses[0].prefix_len, 32);
+        assert_eq!(plan.addresses[1].prefix_len, 128);
     }
 }

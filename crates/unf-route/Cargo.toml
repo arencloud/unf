@@ -1,5 +1,5 @@
 [package]
-name = "unf-link"
+name = "unf-route"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,12 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-futures.workspace = true
-rtnetlink.workspace = true
-rustix.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 unf-cni-state = { path = "../unf-cni-state" }
+unf-link = { path = "../unf-link" }
 
 [dev-dependencies]
 unf-ipam = { path = "../unf-ipam" }

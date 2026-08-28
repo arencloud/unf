@@ -2985,6 +2985,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "unf-cni-state",
+ "unf-ipam",
 ]
 
 [[package]]
@@ -2999,6 +3000,16 @@ dependencies = [
  "unf-api",
  "unf-common",
  "unf-state",
+]
+
+[[package]]
+name = "unf-route"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "unf-cni-state",
+ "unf-ipam",
+ "unf-link",
 ]
 
 [[package]]

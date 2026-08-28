@@ -285,9 +285,14 @@ authoritative record of verified results.
   uses typed netlink plus a disposable namespace thread to create, move,
   configure, recover, read back, and exactly delete a dual-stack veth. The real
   namespace gate also proves foreign-link preservation; ADR 0061.
-- Next: add native per-family routes and rollback, then connect ADD/DEL/CHECK to
-  the complete link-plus-route transaction before controller block distribution
-  and cross-node Kind qualification.
+- Native routing now has a provider boundary and deterministic dual-stack IR:
+  routed `/32` and `/128` workload addresses, exact host endpoint routes,
+  explicit container gateway/default routes, permanent MAC-bound neighbors, and
+  zero-overhead MTU derivation; ADR 0062. Typed kernel apply/readback/delete,
+  rollback, forwarding, and fragmentation qualification are in progress.
+- After those gates, connect ADD/DEL/CHECK to the complete link-plus-route
+  transaction before controller block distribution and cross-node Kind
+  qualification.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

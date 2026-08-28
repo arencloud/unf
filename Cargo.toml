@@ -10,6 +10,7 @@ members = [
     "crates/unf-cni-state",
     "crates/unf-ipam",
     "crates/unf-link",
+    "crates/unf-route",
     "crates/unf-policy",
     "crates/unf-state",
     "ebpf/unf-ebpf-common",

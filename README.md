@@ -89,7 +89,7 @@ The Phase 3 gate and all 42 deliverables are Verified. Exact closure evidence,
 limits, and the separately tracked full-CNI entry are maintained in the
 [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md)
 and ADR 0056.
-The full-CNI foundation is now in progress under ADRs 0057–0061. The initial
+The full-CNI foundation is now in progress under ADRs 0057–0062. The initial
 `unf-cni` protocol executable remains deliberately fail closed for Pod lifecycle
 operations. An explicitly enabled local-agent Unix service now provides the
 root-authenticated, bounded schema-v2 transaction boundary and atomic durable

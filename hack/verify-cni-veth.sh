@@ -30,8 +30,8 @@ sudo -n ip -n "${namespace}" link set dev eth0 alias ""
 sudo -n "${example}" delete "${host_interface}" "${namespace_path}"
 
 sudo -n "${example}" apply "${host_interface}" "${namespace_path}"
-sudo -n ip -n "${namespace}" address del 10.244.44.2/24 dev eth0
-sudo -n ip -n "${namespace}" address del fd44:0:0:44::2/64 dev eth0
+sudo -n ip -n "${namespace}" address del 10.244.44.2/32 dev eth0
+sudo -n ip -n "${namespace}" address del fd44:0:0:44::2/128 dev eth0
 sudo -n ip link set dev "${host_interface}" down alias ""
 sudo -n ip -n "${namespace}" link set dev eth0 down alias ""
 sudo -n "${example}" apply "${host_interface}" "${namespace_path}"

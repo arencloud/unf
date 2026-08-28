@@ -13,11 +13,11 @@ fn plan(host_name: String, netns: PathBuf) -> Result<VethPlan, unf_link::LinkErr
         [
             AssignedAddress {
                 address: IpAddr::V4(Ipv4Addr::new(10, 244, 44, 2)),
-                prefix_len: 24,
+                prefix_len: 32,
             },
             AssignedAddress {
                 address: IpAddr::V6(Ipv6Addr::new(0xfd44, 0, 0, 0x44, 0, 0, 0, 2)),
-                prefix_len: 64,
+                prefix_len: 128,
             },
         ],
     )
