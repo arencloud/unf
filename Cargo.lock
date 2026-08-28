@@ -2892,6 +2892,7 @@ dependencies = [
  "unf-common",
  "unf-ebpf-common",
  "unf-ipam",
+ "unf-route",
  "unf-state",
 ]
 
@@ -2963,6 +2964,7 @@ dependencies = [
  "unf-common",
  "unf-ipam",
  "unf-policy",
+ "unf-route",
  "unf-state",
 ]
 

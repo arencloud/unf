@@ -304,8 +304,15 @@ authoritative record of verified results.
   deterministic bounded planning, replay/readback/repair, scoped rollback,
   exact cleanup, and foreign-route preservation. The current-product design
   inputs are tracked in the [competitive routing evaluation](development/competitive-routing-evaluation.md).
-- Next: distribute the complete remote-route snapshot and implement long-lived
-  agent reconciliation/recovery before isolated primary-CNI Kind installation.
+- Complete cross-node reconciliation is Verified by ADR 0066. The authenticated
+  schema-v1 snapshot binds controller epoch/global routing revision to local and
+  remote Node/block provenance plus exact dual-stack `InternalIP` transports.
+  Explicit per-family native uplinks, owner-only last-known-good restore,
+  atomic route-set replacement, stale retirement, persistence rollback, and
+  desired/applied/error acknowledgement are covered by
+  `make cni-route-reconciliation-test`.
+- Next: install the complete primary-CNI path only in a disposable dual-stack
+  Kind cluster and qualify cross-worker lifecycle, coexistence, and rollback.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

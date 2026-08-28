@@ -45,6 +45,10 @@ use unf_policy::{
     compile_ipv4_dataplane_entries, compile_ipv6_dataplane_entries,
     evaluate_for_direction_with_addresses,
 };
+use unf_route::{
+    MAX_REMOTE_NODES, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION, RemoteNodeIntent, RemoteRouteSnapshot,
+    RemoteRouteSnapshotNode,
+};
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
     ComponentCompatibility, EgressIpv4PolicyMapEntry, EgressIpv4PolicyMapKey,
@@ -256,6 +260,7 @@ struct HostNetworkGateways {
 struct NodeBlockInput {
     node_uid: String,
     provider: Result<NodeBlockProvider, String>,
+    transport: Result<NodeTransport, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +268,13 @@ struct AssignedNodeBlock {
     node_uid: String,
     provider: NodeBlockProvider,
     revision: Revision,
+    transport: Result<NodeTransport, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeTransport {
+    ipv4: Ipv4Addr,
+    ipv6: Ipv6Addr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -336,6 +348,7 @@ struct StatusBody {
     nodes: usize,
     assigned_node_blocks: usize,
     rejected_node_blocks: usize,
+    unroutable_node_transports: usize,
     services: usize,
     endpoint_slices: usize,
     namespaces: usize,
@@ -705,6 +718,7 @@ async fn spawn_internal_api(
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
         .route("/v1/state/node-block", get(node_block_snapshot))
+        .route("/v1/state/remote-routes", get(remote_route_snapshot))
         .route("/v1/state/agents", post(ingest_agent_status))
         .route("/v1/telemetry/flows", post(ingest_flows))
         .with_state(state);
@@ -1955,7 +1969,63 @@ fn node_block_input(node: &Node) -> Option<NodeBlockInput> {
     Some(NodeBlockInput {
         node_uid: node.metadata.uid.clone().unwrap_or_default(),
         provider: node_block_provider(node),
+        transport: node_transport(node),
     })
+}
+
+fn node_transport(node: &Node) -> Result<NodeTransport, String> {
+    let mut ipv4 = BTreeSet::new();
+    let mut ipv6 = BTreeSet::new();
+    for entry in node
+        .status
+        .as_ref()
+        .and_then(|status| status.addresses.as_ref())
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.type_ == "InternalIP")
+    {
+        match entry.address.parse::<IpAddr>() {
+            Ok(IpAddr::V4(address)) if usable_ipv4_transport(address) => {
+                ipv4.insert(address);
+            }
+            Ok(IpAddr::V6(address)) if usable_ipv6_transport(address) => {
+                ipv6.insert(address);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Node InternalIP {:?} is not an IP address: {error}",
+                    entry.address
+                ));
+            }
+        }
+    }
+    if ipv4.len() != 1 || ipv6.len() != 1 {
+        return Err(format!(
+            "Node status must contain exactly one usable IPv4 and one IPv6 InternalIP; found {} and {}",
+            ipv4.len(),
+            ipv6.len()
+        ));
+    }
+    Ok(NodeTransport {
+        ipv4: *ipv4.first().expect("one IPv4 transport exists"),
+        ipv6: *ipv6.first().expect("one IPv6 transport exists"),
+    })
+}
+
+const fn usable_ipv4_transport(address: Ipv4Addr) -> bool {
+    !address.is_unspecified()
+        && !address.is_loopback()
+        && !address.is_multicast()
+        && !address.is_broadcast()
+        && !address.is_link_local()
+}
+
+const fn usable_ipv6_transport(address: Ipv6Addr) -> bool {
+    !address.is_unspecified()
+        && !address.is_loopback()
+        && !address.is_multicast()
+        && !address.is_unicast_link_local()
 }
 
 fn node_block_provider(node: &Node) -> Result<NodeBlockProvider, String> {
@@ -2002,7 +2072,10 @@ fn recompute_node_blocks(state: &ControllerState) {
     for (node_name, input) in &inputs {
         match input.provider {
             Ok(provider) if !input.node_uid.is_empty() => {
-                candidates.insert(node_name.clone(), (input.node_uid.clone(), provider));
+                candidates.insert(
+                    node_name.clone(),
+                    (input.node_uid.clone(), provider, input.transport.clone()),
+                );
             }
             Ok(_) => {
                 rejected.insert(node_name.clone(), "Node UID is missing".to_owned());
@@ -2015,7 +2088,7 @@ fn recompute_node_blocks(state: &ControllerState) {
 
     let overlap_candidates: Vec<_> = candidates
         .iter()
-        .map(|(name, (_, provider))| (name.clone(), *provider))
+        .map(|(name, (_, provider, _))| (name.clone(), *provider))
         .collect();
     for (index, (left_name, left)) in overlap_candidates.iter().enumerate() {
         for (right_name, right) in overlap_candidates.iter().skip(index + 1) {
@@ -2034,18 +2107,22 @@ fn recompute_node_blocks(state: &ControllerState) {
     }
 
     let assignments_changed = previous_assignments.len() != candidates.len()
-        || candidates.iter().any(|(node_name, (node_uid, provider))| {
-            previous_assignments.get(node_name).is_none_or(|previous| {
-                previous.node_uid != *node_uid || previous.provider != *provider
-            })
-        });
+        || candidates
+            .iter()
+            .any(|(node_name, (node_uid, provider, transport))| {
+                previous_assignments.get(node_name).is_none_or(|previous| {
+                    previous.node_uid != *node_uid
+                        || previous.provider != *provider
+                        || previous.transport != *transport
+                })
+            });
     let changed = assignments_changed || *read_lock(&state.rejected_node_blocks) != rejected;
     if changed {
         bump_routing_revision(state);
         let routing_revision = mutex_lock(&state.revisions).routing;
         let assignments = candidates
             .into_iter()
-            .map(|(node_name, (node_uid, provider))| {
+            .map(|(node_name, (node_uid, provider, transport))| {
                 let revision = previous_assignments
                     .get(&node_name)
                     .filter(|previous| {
@@ -2058,6 +2135,7 @@ fn recompute_node_blocks(state: &ControllerState) {
                         node_uid,
                         provider,
                         revision,
+                        transport,
                     },
                 )
             })
@@ -2634,6 +2712,10 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         nodes: read_lock(&state.nodes).len(),
         assigned_node_blocks: read_lock(&state.node_blocks).len(),
         rejected_node_blocks: read_lock(&state.rejected_node_blocks).len(),
+        unroutable_node_transports: read_lock(&state.node_blocks)
+            .values()
+            .filter(|assignment| assignment.transport.is_err())
+            .count(),
         services: read_lock(&state.services).len(),
         endpoint_slices: read_lock(&state.endpoint_slices).len(),
         namespaces: read_lock(&state.namespaces).len(),
@@ -2957,6 +3039,7 @@ fn agent_convergence_snapshot(
         .iter()
         .map(|(node_name, assignment)| (node_name.clone(), assignment.revision))
         .collect();
+    let routing_revision = mutex_lock(&state.revisions).routing;
     let unexpected_agents = reports
         .iter()
         .filter(|(node_name, stored)| {
@@ -2993,6 +3076,11 @@ fn agent_convergence_snapshot(
                             .get(node_name)
                             .copied()
                             .unwrap_or_default(),
+                        if node_block_revisions.contains_key(node_name) {
+                            (state.identity_epoch, routing_revision)
+                        } else {
+                            Default::default()
+                        },
                     )
             });
             if converged {
@@ -3085,6 +3173,7 @@ fn agent_report_matches(
     identity_revision: Revision,
     policy_revision: Revision,
     node_block_revision: Revision,
+    remote_route_revision: (u64, Revision),
 ) -> bool {
     report.ready
         && report.bpf_loaded
@@ -3098,6 +3187,10 @@ fn agent_report_matches(
         && report.applied_policy_revision == policy_revision.get()
         && report.desired_node_block_revision == node_block_revision.get()
         && report.applied_node_block_revision == node_block_revision.get()
+        && report.desired_remote_route_epoch == remote_route_revision.0
+        && report.applied_remote_route_epoch == remote_route_revision.0
+        && report.desired_remote_route_revision == remote_route_revision.1.get()
+        && report.applied_remote_route_revision == remote_route_revision.1.get()
 }
 
 async fn identity_snapshot(
@@ -3137,6 +3230,14 @@ async fn node_block_snapshot(
     Ok(Json(node_block_snapshot_for(&state, &agent.node_name)?))
 }
 
+async fn remote_route_snapshot(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<RemoteRouteSnapshot>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    Ok(Json(remote_route_snapshot_for(&state, &agent.node_name)?))
+}
+
 fn node_block_snapshot_for(
     state: &ControllerState,
     node_name: &str,
@@ -3155,6 +3256,67 @@ fn node_block_snapshot_for(
         node_name: node_name.to_owned(),
         node_uid: assignment.node_uid,
         provider: assignment.provider,
+    })
+}
+
+fn remote_route_snapshot_for(
+    state: &ControllerState,
+    node_name: &str,
+) -> Result<RemoteRouteSnapshot, ApiError> {
+    let assignments = read_lock(&state.node_blocks);
+    let local = assignments.get(node_name).ok_or_else(|| {
+        ApiError::service_unavailable(format!(
+            "node {node_name} has no valid opt-in dual-stack block assignment"
+        ))
+    })?;
+    if assignments.len().saturating_sub(1) > MAX_REMOTE_NODES {
+        return Err(ApiError::service_unavailable(format!(
+            "remote route snapshot exceeds the {MAX_REMOTE_NODES}-node safety bound"
+        )));
+    }
+    let mut remote_nodes = Vec::with_capacity(assignments.len().saturating_sub(1));
+    let mut ipv4_transports = BTreeSet::new();
+    let mut ipv6_transports = BTreeSet::new();
+    for (remote_name, assignment) in assignments.iter() {
+        let transport = assignment.transport.as_ref().map_err(|error| {
+            ApiError::service_unavailable(format!(
+                "remote route snapshot is incomplete because node {remote_name} has invalid transport addresses: {error}"
+            ))
+        })?;
+        if !ipv4_transports.insert(transport.ipv4) || !ipv6_transports.insert(transport.ipv6) {
+            return Err(ApiError::service_unavailable(format!(
+                "remote route snapshot has duplicate Node transport addresses at node {remote_name}"
+            )));
+        }
+        if remote_name == node_name {
+            continue;
+        }
+        remote_nodes.push(RemoteRouteSnapshotNode {
+            intent: RemoteNodeIntent {
+                node_name: remote_name.clone(),
+                node_uid: assignment.node_uid.clone(),
+                assignment_revision: assignment.revision.get(),
+                blocks: assignment.provider,
+            },
+            ipv4_transport: transport.ipv4,
+            ipv6_transport: transport.ipv6,
+        });
+    }
+    let revision = mutex_lock(&state.revisions).routing.get();
+    if revision == 0 {
+        return Err(ApiError::service_unavailable(
+            "remote route state has no authoritative revision",
+        ));
+    }
+    Ok(RemoteRouteSnapshot {
+        schema_version: REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+        source_epoch: state.identity_epoch,
+        revision,
+        node_name: node_name.to_owned(),
+        node_uid: local.node_uid.clone(),
+        local_assignment_revision: local.revision.get(),
+        local_blocks: local.provider,
+        remote_nodes,
     })
 }
 
@@ -5177,6 +5339,7 @@ mod tests {
     }
 
     fn primary_node(name: &str, ipv4: &str, ipv6: &str) -> Node {
+        let suffix = if name.ends_with('b') { 2 } else { 1 };
         serde_json::from_value(serde_json::json!({
             "apiVersion": "v1",
             "kind": "Node",
@@ -5188,7 +5351,11 @@ mod tests {
                     (PRIMARY_CNI_NODE_LABEL): PRIMARY_CNI_NODE_LABEL_VALUE
                 }
             },
-            "spec": {"podCIDRs": [ipv4, ipv6]}
+            "spec": {"podCIDRs": [ipv4, ipv6]},
+            "status": {"addresses": [
+                {"type": "InternalIP", "address": format!("192.0.2.{suffix}")},
+                {"type": "InternalIP", "address": format!("fdff::{suffix}")}
+            ]}
         }))
         .expect("primary-CNI test Node is valid Kubernetes JSON")
     }
@@ -5548,6 +5715,12 @@ mod tests {
             active_policy_bank: 0,
             desired_node_block_revision: 0,
             applied_node_block_revision: 0,
+            desired_remote_route_epoch: 0,
+            applied_remote_route_epoch: 0,
+            desired_remote_route_revision: 0,
+            applied_remote_route_revision: 0,
+            remote_route_entries: 0,
+            remote_route_reconcile_errors: 0,
         }
     }
 
@@ -5657,6 +5830,10 @@ mod tests {
         );
         report.desired_node_block_revision = first.revision;
         report.applied_node_block_revision = first.revision;
+        report.desired_remote_route_epoch = state.identity_epoch;
+        report.applied_remote_route_epoch = state.identity_epoch;
+        report.desired_remote_route_revision = 1;
+        report.applied_remote_route_revision = 1;
         write_lock(&state.agent_reports).insert(
             "worker-a".to_owned(),
             StoredAgentReport {
@@ -5741,6 +5918,84 @@ mod tests {
         apply_node_event(&state, Event::Apply(invalid));
         assert!(read_lock(&state.node_blocks).is_empty());
         assert!(read_lock(&state.rejected_node_blocks)["worker-a"].contains("exactly one"));
+    }
+
+    #[test]
+    fn remote_route_snapshots_are_complete_revisioned_and_transport_strict() {
+        let state = new_state(true);
+        apply_node_event(
+            &state,
+            Event::Apply(primary_node("worker-a", "10.42.0.0/24", "fd00:42::/64")),
+        );
+        apply_node_event(
+            &state,
+            Event::Apply(primary_node("worker-b", "10.43.0.0/24", "fd00:43::/64")),
+        );
+
+        let snapshot = remote_route_snapshot_for(&state, "worker-a").unwrap();
+        assert_eq!(
+            snapshot.schema_version,
+            REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(snapshot.source_epoch, state.identity_epoch);
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.local_assignment_revision, 1);
+        assert_eq!(snapshot.remote_nodes.len(), 1);
+        assert_eq!(snapshot.remote_nodes[0].intent.node_name, "worker-b");
+        assert_eq!(snapshot.remote_nodes[0].intent.assignment_revision, 2);
+        assert_eq!(
+            snapshot.remote_nodes[0].ipv4_transport,
+            "192.0.2.2".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            snapshot.remote_nodes[0].ipv6_transport,
+            "fdff::2".parse::<Ipv6Addr>().unwrap()
+        );
+
+        let mut moved = primary_node("worker-b", "10.43.0.0/24", "fd00:43::/64");
+        moved.status.as_mut().unwrap().addresses.as_mut().unwrap()[0].address =
+            "192.0.2.22".to_owned();
+        apply_node_event(&state, Event::Apply(moved));
+        let moved = remote_route_snapshot_for(&state, "worker-a").unwrap();
+        assert_eq!(moved.revision, 3);
+        assert_eq!(moved.remote_nodes[0].intent.assignment_revision, 2);
+        assert_eq!(
+            moved.remote_nodes[0].ipv4_transport,
+            "192.0.2.22".parse::<Ipv4Addr>().unwrap()
+        );
+
+        let mut invalid = primary_node("worker-b", "10.43.0.0/24", "fd00:43::/64");
+        invalid
+            .status
+            .as_mut()
+            .unwrap()
+            .addresses
+            .as_mut()
+            .unwrap()
+            .pop();
+        apply_node_event(&state, Event::Apply(invalid));
+        assert!(remote_route_snapshot_for(&state, "worker-a").is_err());
+        assert_eq!(
+            read_lock(&state.node_blocks)
+                .values()
+                .filter(|assignment| assignment.transport.is_err())
+                .count(),
+            1
+        );
+
+        apply_node_event(
+            &state,
+            Event::Delete(primary_node("worker-b", "10.43.0.0/24", "fd00:43::/64")),
+        );
+        let retired = remote_route_snapshot_for(&state, "worker-a").unwrap();
+        assert_eq!(retired.revision, 5);
+        assert!(retired.remote_nodes.is_empty());
+
+        apply_node_event(
+            &state,
+            Event::Apply(primary_node("worker-c", "10.44.0.0/24", "fd00:44::/64")),
+        );
+        assert!(remote_route_snapshot_for(&state, "worker-a").is_err());
     }
 
     #[test]

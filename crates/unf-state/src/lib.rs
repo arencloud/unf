@@ -102,6 +102,18 @@ pub struct AgentStateReport {
     pub desired_node_block_revision: u64,
     #[serde(default)]
     pub applied_node_block_revision: u64,
+    #[serde(default)]
+    pub desired_remote_route_epoch: u64,
+    #[serde(default)]
+    pub applied_remote_route_epoch: u64,
+    #[serde(default)]
+    pub desired_remote_route_revision: u64,
+    #[serde(default)]
+    pub applied_remote_route_revision: u64,
+    #[serde(default)]
+    pub remote_route_entries: u64,
+    #[serde(default)]
+    pub remote_route_reconcile_errors: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

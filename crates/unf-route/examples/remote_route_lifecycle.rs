@@ -35,6 +35,65 @@ fn plan(
     )
 }
 
+fn replacement_plan(
+    ipv4_output_interface: u32,
+    ipv6_output_interface: u32,
+) -> Result<unf_route::NativeRemoteRoutePlan, Box<dyn std::error::Error>> {
+    let local_blocks = NodeBlockProvider::new("10.42.0.0/24".parse()?, "fd00:42::/64".parse()?);
+    let remotes = [
+        (
+            "worker-b",
+            "worker-b-uid",
+            "10.43.0.0/24",
+            "fd00:43::/64",
+            "192.0.2.3",
+            "fdff::3",
+        ),
+        (
+            "worker-c",
+            "worker-c-uid",
+            "10.44.0.0/24",
+            "fd00:44::/64",
+            "192.0.2.2",
+            "fdff::2",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, uid, ipv4, ipv6, ipv4_gateway, ipv6_gateway)| {
+        Ok(NativeRemoteNode {
+            intent: RemoteNodeIntent {
+                node_name: name.to_owned(),
+                node_uid: uid.to_owned(),
+                assignment_revision: 3,
+                blocks: NodeBlockProvider::new(ipv4.parse()?, ipv6.parse()?),
+            },
+            ipv4_next_hop: NativeIpv4NextHop {
+                gateway: ipv4_gateway.parse()?,
+                output_interface: ipv4_output_interface,
+                onlink: false,
+            },
+            ipv6_next_hop: NativeIpv6NextHop {
+                gateway: ipv6_gateway.parse()?,
+                output_interface: ipv6_output_interface,
+                onlink: false,
+            },
+        })
+    })
+    .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    Ok(
+        NativeRemoteRoutingProvider::new("worker-a", "worker-a-uid", local_blocks)?
+            .plan(remotes)?,
+    )
+}
+
+fn empty_plan() -> Result<unf_route::NativeRemoteRoutePlan, Box<dyn std::error::Error>> {
+    let local_blocks = NodeBlockProvider::new("10.42.0.0/24".parse()?, "fd00:42::/64".parse()?);
+    Ok(
+        NativeRemoteRoutingProvider::new("worker-a", "worker-a-uid", local_blocks)?
+            .plan(Vec::new())?,
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(1);
@@ -80,6 +139,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 return Err("remote route deletion is not idempotent".into());
             }
+        }
+        "reconcile" => {
+            let previous = plan(output_interface, output_interface)?;
+            previous.apply().await?;
+            let desired = replacement_plan(output_interface, output_interface)?;
+            desired.reconcile_from(&previous).await?;
+            desired.readback().await?;
+        }
+        "retire" => {
+            let previous = replacement_plan(output_interface, output_interface)?;
+            let desired = empty_plan()?;
+            desired.reconcile_from(&previous).await?;
+            desired.readback().await?;
+        }
+        "reconcile-rollback" => {
+            let previous = plan(output_interface, output_interface)?;
+            previous.apply().await?;
+            let desired = replacement_plan(output_interface, u32::MAX)?;
+            if desired.reconcile_from(&previous).await.is_ok() {
+                return Err("invalid replacement unexpectedly applied".into());
+            }
+            previous.readback().await?;
         }
         _ => return Err(format!("unsupported operation {operation:?}").into()),
     }

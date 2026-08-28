@@ -627,9 +627,10 @@ fn print_controller_status_table(value: &Value) {
     );
     let revisions = &value["revisions"];
     println!(
-        "revisions                identity={} policy={} topology={} telemetry={}",
+        "revisions                identity={} policy={} routing={} topology={} telemetry={}",
         number_field(revisions, "identity"),
         number_field(revisions, "policy"),
+        number_field(revisions, "routing"),
         number_field(revisions, "topology"),
         number_field(revisions, "telemetry")
     );
@@ -639,6 +640,12 @@ fn print_controller_status_table(value: &Value) {
         number_field(value, "pods"),
         number_field(value, "identities"),
         number_field(value, "compiled_policies")
+    );
+    println!(
+        "primary CNI              assigned_nodes={} invalid_blocks={} invalid_transports={}",
+        number_field(value, "assigned_node_blocks"),
+        number_field(value, "rejected_node_blocks"),
+        number_field(value, "unroutable_node_transports")
     );
     let agents = &value["agents"];
     println!(
@@ -658,7 +665,7 @@ fn print_controller_status_table(value: &Value) {
         for node in nodes {
             let report = &node["report"];
             println!(
-                "agent                    {} fresh={} converged={} identity={}/{} policy={}/{} bank={}",
+                "agent                    {} fresh={} converged={} identity={}/{} policy={}/{} bank={} block={}/{} routes={}:{} / {}:{} entries={} errors={}",
                 text_field(node, "node_name"),
                 node.get("fresh").and_then(Value::as_bool).unwrap_or(false),
                 node.get("converged")
@@ -668,7 +675,15 @@ fn print_controller_status_table(value: &Value) {
                 number_field(report, "desired_identity_revision"),
                 number_field(report, "applied_policy_revision"),
                 number_field(report, "desired_policy_revision"),
-                number_field(report, "active_policy_bank")
+                number_field(report, "active_policy_bank"),
+                number_field(report, "applied_node_block_revision"),
+                number_field(report, "desired_node_block_revision"),
+                number_field(report, "applied_remote_route_epoch"),
+                number_field(report, "applied_remote_route_revision"),
+                number_field(report, "desired_remote_route_epoch"),
+                number_field(report, "desired_remote_route_revision"),
+                number_field(report, "remote_route_entries"),
+                number_field(report, "remote_route_reconcile_errors")
             );
         }
     }

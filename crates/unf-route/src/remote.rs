@@ -11,6 +11,33 @@ use super::{
 /// Prevents an untrusted desired-state snapshot from causing unbounded memory
 /// or kernel reconciliation work. Validation remains O(n log n).
 pub const MAX_REMOTE_NODES: usize = 65_536;
+pub const REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+
+/// Complete, authenticated routing input for one local Node. The controller
+/// emits one atomic snapshot so agents never infer remote ownership from
+/// independently observed Kubernetes objects.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RemoteRouteSnapshot {
+    pub schema_version: u16,
+    pub source_epoch: u64,
+    pub revision: u64,
+    pub node_name: String,
+    pub node_uid: String,
+    pub local_assignment_revision: u64,
+    pub local_blocks: NodeBlockProvider,
+    pub remote_nodes: Vec<RemoteRouteSnapshotNode>,
+}
+
+/// Provider-neutral remote ownership plus the authoritative Node transport
+/// addresses that a concrete routing backend may lower into paths.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RemoteRouteSnapshotNode {
+    pub intent: RemoteNodeIntent,
+    pub ipv4_transport: Ipv4Addr,
+    pub ipv6_transport: Ipv6Addr,
+}
 
 /// Provider-neutral remote Node intent. Routing backends may lower the same
 /// identity and block provenance into native, overlay, BGP, or hybrid state.

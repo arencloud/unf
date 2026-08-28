@@ -12,7 +12,8 @@ mod remote;
 
 pub use remote::{
     MAX_REMOTE_NODES, NativeIpv4NextHop, NativeIpv6NextHop, NativeRemoteNode,
-    NativeRemoteRoutePlan, NativeRemoteRoutingProvider, RemoteNodeIntent,
+    NativeRemoteRoutePlan, NativeRemoteRoutingProvider, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+    RemoteNodeIntent, RemoteRouteSnapshot, RemoteRouteSnapshotNode,
 };
 
 pub const MIN_DUAL_STACK_MTU: u32 = 1_280;

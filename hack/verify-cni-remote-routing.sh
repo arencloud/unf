@@ -37,6 +37,8 @@ sudo -n ip -n "${local_namespace}" address add 192.0.2.1/24 dev "${local_uplink}
 sudo -n ip -n "${local_namespace}" -6 address add fdff::1/64 dev "${local_uplink}"
 sudo -n ip -n "${remote_namespace}" address add 192.0.2.2/24 dev "${remote_uplink}"
 sudo -n ip -n "${remote_namespace}" -6 address add fdff::2/64 dev "${remote_uplink}"
+sudo -n ip -n "${remote_namespace}" address add 192.0.2.3/24 dev "${remote_uplink}"
+sudo -n ip -n "${remote_namespace}" -6 address add fdff::3/64 dev "${remote_uplink}"
 sudo -n ip -n "${local_namespace}" link set "${local_uplink}" up
 sudo -n ip -n "${remote_namespace}" link set "${remote_uplink}" up
 sudo -n ip -n "${remote_namespace}" link add "${remote_pod}" type dummy
@@ -55,6 +57,26 @@ run_example() {
 run_example rollback
 [[ -z $(sudo -n ip -n "${local_namespace}" route show protocol "${route_protocol}") ]]
 [[ -z $(sudo -n ip -n "${local_namespace}" -6 route show protocol "${route_protocol}") ]]
+
+run_example reconcile
+sudo -n ip -n "${local_namespace}" route show protocol "${route_protocol}" \
+    | grep -q '^10.43.0.0/24 via 192.0.2.3'
+sudo -n ip -n "${local_namespace}" route show protocol "${route_protocol}" \
+    | grep -q '^10.44.0.0/24 via 192.0.2.2'
+sudo -n ip -n "${local_namespace}" -6 route show protocol "${route_protocol}" \
+    | grep -q '^fd00:43::/64 via fdff::3'
+sudo -n ip -n "${local_namespace}" -6 route show protocol "${route_protocol}" \
+    | grep -q '^fd00:44::/64 via fdff::2'
+run_example retire
+[[ -z $(sudo -n ip -n "${local_namespace}" route show protocol "${route_protocol}") ]]
+[[ -z $(sudo -n ip -n "${local_namespace}" -6 route show protocol "${route_protocol}") ]]
+
+run_example reconcile-rollback
+sudo -n ip -n "${local_namespace}" route show protocol "${route_protocol}" \
+    | grep -q '^10.43.0.0/24 via 192.0.2.2'
+sudo -n ip -n "${local_namespace}" -6 route show protocol "${route_protocol}" \
+    | grep -q '^fd00:43::/64 via fdff::2'
+run_example delete
 
 sudo -n ip -n "${local_namespace}" route add 10.43.0.0/24 \
     via 192.0.2.2 dev "${local_uplink}" protocol "${route_protocol}"
@@ -108,4 +130,4 @@ sudo -n ip -n "${local_namespace}" route show 10.43.0.0/24 \
     | grep -q 'metric 777'
 [[ -z $(sudo -n ip -n "${local_namespace}" -6 route show protocol "${route_protocol}") ]]
 
-echo "UNF remote native routing passed: deterministic dual-stack block routes, forwarding, replay/readback/repair, scoped rollback, exact cleanup, and foreign-route preservation"
+echo "UNF remote native routing passed: deterministic dual-stack block routes, forwarding, replay/readback/repair, atomic snapshot replacement, stale retirement, scoped rollback, exact cleanup, and foreign-route preservation"

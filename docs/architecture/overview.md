@@ -68,8 +68,14 @@ behavior, then lowers one exact route per remote block. Complete typed-netlink
 preflight precedes mutation; replay, readback, missing-route repair, scoped
 rollback, foreign-state preservation, and exact deletion share one lifecycle.
 This IR is the boundary for later overlay, BGP, hybrid and multi-cluster
-providers. Controller-to-agent remote-state distribution and continuous
-reconciliation remain in 6.6c; ADR 0065 records the implemented primitive.
+providers. The authenticated controller now emits one complete node-scoped
+snapshot containing its epoch, global routing revision, stable assignment
+provenance, and exact dual-stack Node transports. With explicit per-family
+uplinks, the agent restores and repairs owner-only last-known-good state, applies
+complete replacements before retiring stale routes, rolls back kernel or
+persistence failure, and reports desired/applied/error state. ADRs 0065 and 0066
+record the primitive and runtime contracts. Primary-CNI cluster installation
+remains isolated milestone 6.6d.
 
 IPAM stays below a provider interface and above routing. The first provider
 accepts one canonical IPv4 and IPv6 node block, reserves network/gateway and IPv4

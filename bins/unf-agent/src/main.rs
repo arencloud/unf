@@ -28,6 +28,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -43,6 +44,10 @@ use unf_ebpf_common::{
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
     NodeBlockSnapshot,
+};
+use unf_route::{
+    NativeIpv4NextHop, NativeIpv6NextHop, NativeRemoteNode, NativeRemoteRoutePlan,
+    NativeRemoteRoutingProvider, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION, RemoteRouteSnapshot,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
@@ -65,6 +70,7 @@ const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
 const DEFAULT_CNI_NODE_BLOCK_STATE_PATH: &str = "/var/lib/unf/cni/v1/node-block.json";
+const DEFAULT_CNI_REMOTE_ROUTE_STATE_PATH: &str = "/var/lib/unf/cni/v1/remote-routes.json";
 const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
 const BLOCKED_TRANSITION_REPORTING_WINDOW: Duration = Duration::from_secs(30);
 const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
@@ -167,6 +173,13 @@ struct Args {
         default_value = DEFAULT_CNI_NODE_BLOCK_STATE_PATH
     )]
     cni_node_block_state_path: PathBuf,
+    /// Durable last-known-good complete remote-route snapshot.
+    #[arg(
+        long,
+        env = "UNF_CNI_REMOTE_ROUTE_STATE_PATH",
+        default_value = DEFAULT_CNI_REMOTE_ROUTE_STATE_PATH
+    )]
+    cni_remote_route_state_path: PathBuf,
     /// Controller-assigned IPv4 node block for the opt-in CNI service.
     #[arg(
         long,
@@ -183,6 +196,41 @@ struct Args {
         requires = "cni_ipv4_block"
     )]
     cni_ipv6_block: Option<Ipv6NodeBlock>,
+    /// Host uplink used to reach remote Node IPv4 `InternalIP` addresses.
+    #[arg(
+        long,
+        env = "UNF_CNI_NATIVE_IPV4_UPLINK",
+        requires = "cni_socket",
+        requires = "cni_native_ipv6_uplink"
+    )]
+    cni_native_ipv4_uplink: Option<String>,
+    /// Host uplink used to reach remote Node IPv6 `InternalIP` addresses.
+    #[arg(
+        long,
+        env = "UNF_CNI_NATIVE_IPV6_UPLINK",
+        requires = "cni_socket",
+        requires = "cni_native_ipv4_uplink"
+    )]
+    cni_native_ipv6_uplink: Option<String>,
+    /// Force native IPv4 remote next hops on-link.
+    #[arg(
+        long,
+        env = "UNF_CNI_NATIVE_IPV4_ONLINK",
+        requires = "cni_native_ipv4_uplink",
+        default_value_t = false
+    )]
+    cni_native_ipv4_onlink: bool,
+    /// Force native IPv6 remote next hops on-link.
+    #[arg(
+        long,
+        env = "UNF_CNI_NATIVE_IPV6_ONLINK",
+        requires = "cni_native_ipv6_uplink",
+        default_value_t = false
+    )]
+    cni_native_ipv6_onlink: bool,
+    /// Poll interval for complete remote-route snapshots.
+    #[arg(long, env = "UNF_CNI_ROUTE_SYNC_SECONDS", default_value_t = 2)]
+    cni_route_sync_seconds: u64,
     #[arg(
         long,
         env = "UNF_TC_ATTACHMENT_MODE",
@@ -322,6 +370,10 @@ struct AgentMetrics {
     desired_policy_revision: Gauge,
     applied_policy_revision: Gauge,
     policy_map_entries: Gauge,
+    remote_route_sync_errors: Counter,
+    desired_remote_route_revision: Gauge,
+    applied_remote_route_revision: Gauge,
+    remote_route_entries: Gauge,
     telemetry_dropped_events: Counter,
     telemetry_export_errors: Counter,
     telemetry_exported_events: Counter,
@@ -355,6 +407,12 @@ struct AgentState {
     active_policy_bank: AtomicU64,
     desired_node_block_revision: AtomicU64,
     applied_node_block_revision: AtomicU64,
+    desired_remote_route_epoch: AtomicU64,
+    applied_remote_route_epoch: AtomicU64,
+    desired_remote_route_revision: AtomicU64,
+    applied_remote_route_revision: AtomicU64,
+    remote_route_entries: AtomicU64,
+    remote_route_reconcile_errors: AtomicU64,
     queued_flow_exports: AtomicU64,
     dropped_flow_exports: AtomicU64,
     exported_flow_events: AtomicU64,
@@ -447,6 +505,35 @@ struct FlowExporterConfig {
 struct ResolvedCniProvider {
     provider: NodeBlockProvider,
     snapshot: Option<NodeBlockSnapshot>,
+}
+
+struct RemoteRouteRuntime {
+    controller_url: String,
+    client: ReloadingControllerClient,
+    token_path: PathBuf,
+    state_path: PathBuf,
+    local: NodeBlockSnapshot,
+    ipv4_output_interface: u32,
+    ipv6_output_interface: u32,
+    ipv4_onlink: bool,
+    ipv6_onlink: bool,
+    interval: Duration,
+    applied: AppliedRemoteRoutes,
+}
+
+struct AppliedRemoteRoutes {
+    snapshot: RemoteRouteSnapshot,
+    plan: NativeRemoteRoutePlan,
+}
+
+#[derive(Clone, Copy)]
+struct RemoteRouteApplyContext<'a> {
+    local: &'a NodeBlockSnapshot,
+    ipv4_output_interface: u32,
+    ipv6_output_interface: u32,
+    ipv4_onlink: bool,
+    ipv6_onlink: bool,
+    state_path: &'a Path,
 }
 
 #[derive(Clone)]
@@ -580,14 +667,17 @@ async fn main() -> Result<()> {
     let mut supervised_service_configured = false;
 
     let cni_provider = resolve_cni_provider(&args, &state).await?;
+    let remote_routes = initialize_remote_routes(&args, cni_provider.as_ref(), &state).await?;
     supervised_service_configured |= spawn_cni_transaction_server(
         &args,
         cni_provider,
-        &state,
         &cancellation,
         &mut tasks,
         &service_failure_tx,
     )?;
+    if let Some(runtime) = remote_routes {
+        spawn_remote_route_task(runtime, &state, &cancellation, &mut tasks);
+    }
 
     match (&args.ebpf_object, &args.interface, args.all_interfaces) {
         (Some(object), interface, all_interfaces) if interface.is_some() || all_interfaces => {
@@ -667,6 +757,19 @@ async fn main() -> Result<()> {
     finish_agent_tasks(cancellation, tasks, service_failure, &state).await
 }
 
+fn spawn_remote_route_task(
+    runtime: RemoteRouteRuntime,
+    state: &Arc<AgentState>,
+    cancellation: &CancellationToken,
+    tasks: &mut JoinSet<()>,
+) {
+    let route_state = Arc::clone(state);
+    let route_cancellation = cancellation.clone();
+    tasks.spawn(async move {
+        run_remote_route_reconciler(runtime, route_state, route_cancellation).await;
+    });
+}
+
 fn initial_agent_state(args: &Args) -> AgentState {
     new_state(
         detect_capabilities(),
@@ -729,25 +832,47 @@ async fn resolve_cni_provider(
                 .trim_end_matches('/');
             let client =
                 dataplane_controller_client(Some(controller_url), &args.controller_ca_path, state)?;
-            let snapshot: NodeBlockSnapshot = authenticated_get(
+            let request = authenticated_get(
                 &client,
                 format!("{controller_url}/v1/state/node-block"),
                 &args.agent_token_path,
-            )?
-            .send()
-            .await
-            .context("request controller node-block snapshot")?
-            .error_for_status()
-            .context("controller rejected node-block snapshot request")?
-            .json()
-            .await
-            .context("decode controller node-block snapshot")?;
+            )?;
+            let snapshot = match request.send().await {
+                Ok(response) => response
+                    .error_for_status()
+                    .context("controller rejected node-block snapshot request")?
+                    .json::<NodeBlockSnapshot>()
+                    .await
+                    .context("decode controller node-block snapshot")?,
+                Err(transport_error) => {
+                    let snapshot: NodeBlockSnapshot =
+                        load_secure_json(&args.cni_node_block_state_path, "node-block")
+                            .with_context(|| {
+                                format!(
+                                    "controller node-block transport failed ({transport_error}); no usable last-known-good snapshot"
+                                )
+                            })?;
+                    warn!(
+                        %transport_error,
+                        path = %args.cni_node_block_state_path.display(),
+                        "restored last-known-good node-block snapshot during controller outage"
+                    );
+                    state
+                        .applied_node_block_revision
+                        .store(snapshot.revision, Ordering::Release);
+                    snapshot
+                }
+            };
             validate_node_block_snapshot(&snapshot, &args.node_name)?;
             state
                 .desired_node_block_revision
                 .store(snapshot.revision, Ordering::Release);
             AttachmentJournal::open(&args.cni_state_path, snapshot.provider)
                 .context("validate controller node blocks against durable attachments")?;
+            persist_node_block_snapshot(&args.cni_node_block_state_path, &snapshot)?;
+            state
+                .applied_node_block_revision
+                .store(snapshot.revision, Ordering::Release);
             Ok(Some(ResolvedCniProvider {
                 provider: snapshot.provider,
                 snapshot: Some(snapshot),
@@ -781,35 +906,40 @@ fn validate_node_block_snapshot(snapshot: &NodeBlockSnapshot, node_name: &str) -
 }
 
 fn persist_node_block_snapshot(path: &Path, snapshot: &NodeBlockSnapshot) -> Result<()> {
+    persist_secure_json(path, snapshot, "node-block")
+}
+
+fn persist_secure_json<T: Serialize>(path: &Path, value: &T, description: &str) -> Result<()> {
     if !path.is_absolute() {
-        bail!("node-block state path must be absolute");
+        bail!("{description} state path must be absolute");
     }
     let parent = path
         .parent()
-        .context("node-block state path must have a parent directory")?;
+        .with_context(|| format!("{description} state path must have a parent directory"))?;
     reject_node_block_symlinks(path)?;
     fs::create_dir_all(parent)
-        .with_context(|| format!("create node-block state directory {}", parent.display()))?;
+        .with_context(|| format!("create {description} state directory {}", parent.display()))?;
     reject_node_block_symlinks(path)?;
     let file_name = path
         .file_name()
-        .context("node-block state path must name a file")?
+        .with_context(|| format!("{description} state path must name a file"))?
         .to_string_lossy();
     let temporary = path.with_file_name(format!(".{file_name}.tmp"));
     if temporary.exists() {
         bail!(
-            "temporary node-block state {} already exists",
+            "temporary {description} state {} already exists",
             temporary.display()
         );
     }
-    let bytes = serde_json::to_vec_pretty(snapshot).context("encode node-block state")?;
+    let bytes =
+        serde_json::to_vec_pretty(value).with_context(|| format!("encode {description} state"))?;
     let write_result = (|| -> Result<()> {
         let mut output = OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
             .open(&temporary)
-            .with_context(|| format!("create node-block state {}", temporary.display()))?;
+            .with_context(|| format!("create {description} state {}", temporary.display()))?;
         output.write_all(&bytes)?;
         output.write_all(b"\n")?;
         output.sync_all()?;
@@ -822,6 +952,26 @@ fn persist_node_block_snapshot(path: &Path, snapshot: &NodeBlockSnapshot) -> Res
         let _ = fs::remove_file(&temporary);
     }
     write_result
+}
+
+fn load_secure_json<T: DeserializeOwned>(path: &Path, description: &str) -> Result<T> {
+    if !path.is_absolute() {
+        bail!("{description} state path must be absolute");
+    }
+    reject_node_block_symlinks(path)?;
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("inspect {description} state {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
+        bail!("{description} state must be a regular file no larger than 64 MiB");
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        bail!(
+            "{description} state {} is accessible outside its owner",
+            path.display()
+        );
+    }
+    serde_json::from_slice(&fs::read(path)?)
+        .with_context(|| format!("decode {description} state {}", path.display()))
 }
 
 fn reject_node_block_symlinks(path: &Path) -> Result<()> {
@@ -843,10 +993,448 @@ fn reject_node_block_symlinks(path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn initialize_remote_routes(
+    args: &Args,
+    resolved: Option<&ResolvedCniProvider>,
+    state: &Arc<AgentState>,
+) -> Result<Option<RemoteRouteRuntime>> {
+    let (Some(ipv4_uplink), Some(ipv6_uplink)) = (
+        args.cni_native_ipv4_uplink.as_deref(),
+        args.cni_native_ipv6_uplink.as_deref(),
+    ) else {
+        if args.cni_native_ipv4_uplink.is_some() || args.cni_native_ipv6_uplink.is_some() {
+            bail!("native remote routing requires both IPv4 and IPv6 uplinks");
+        }
+        return Ok(None);
+    };
+    validate_cleanup_interface_name(ipv4_uplink)?;
+    validate_cleanup_interface_name(ipv6_uplink)?;
+    let local = resolved
+        .and_then(|resolved| resolved.snapshot.clone())
+        .context("native remote routing requires a controller-issued node-block snapshot")?;
+    let controller_url = args
+        .controller_url
+        .as_deref()
+        .context("native remote routing requires --controller-url")?
+        .trim_end_matches('/')
+        .to_owned();
+    let client =
+        dataplane_controller_client(Some(&controller_url), &args.controller_ca_path, state)?;
+    let ipv4_output_interface = interface_index(ipv4_uplink)?;
+    let ipv6_output_interface = interface_index(ipv6_uplink)?;
+    let apply_context = RemoteRouteApplyContext {
+        local: &local,
+        ipv4_output_interface,
+        ipv6_output_interface,
+        ipv4_onlink: args.cni_native_ipv4_onlink,
+        ipv6_onlink: args.cni_native_ipv6_onlink,
+        state_path: &args.cni_remote_route_state_path,
+    };
+    let (mut applied, restored_is_current) = restore_remote_routes(apply_context, state).await?;
+
+    let fetched =
+        fetch_remote_route_snapshot(&controller_url, &client, &args.agent_token_path).await;
+    match fetched {
+        Ok(snapshot) => {
+            applied = Some(
+                apply_remote_route_snapshot(snapshot, apply_context, applied.as_ref(), state)
+                    .await?,
+            );
+        }
+        Err(error) if restored_is_current => {
+            record_remote_route_error(state);
+            warn!(%error, "controller unavailable; retaining last-known-good remote routes");
+        }
+        Err(error) => return Err(error).context("initial remote-route snapshot is unavailable"),
+    }
+
+    Ok(Some(RemoteRouteRuntime {
+        controller_url,
+        client,
+        token_path: args.agent_token_path.clone(),
+        state_path: args.cni_remote_route_state_path.clone(),
+        local,
+        ipv4_output_interface,
+        ipv6_output_interface,
+        ipv4_onlink: args.cni_native_ipv4_onlink,
+        ipv6_onlink: args.cni_native_ipv6_onlink,
+        interval: Duration::from_secs(args.cni_route_sync_seconds.max(1)),
+        applied: applied.expect("remote routing initialization establishes desired state"),
+    }))
+}
+
+async fn restore_remote_routes(
+    context: RemoteRouteApplyContext<'_>,
+    state: &AgentState,
+) -> Result<(Option<AppliedRemoteRoutes>, bool)> {
+    let restored = load_remote_route_snapshot_for_startup(
+        context.state_path,
+        context.local,
+        context.ipv4_output_interface,
+        context.ipv6_output_interface,
+        context.ipv4_onlink,
+        context.ipv6_onlink,
+    )?;
+    let current = restored.as_ref().is_some_and(|(_, current)| *current);
+    let applied = match restored {
+        Some((restored, true)) => {
+            restored
+                .plan
+                .apply()
+                .await
+                .context("repair last-known-good remote routes")?;
+            publish_desired_remote_routes(state, &restored.snapshot);
+            publish_applied_remote_routes(state, &restored.snapshot, &restored.plan);
+            info!(
+                epoch = restored.snapshot.source_epoch,
+                revision = restored.snapshot.revision,
+                routes = restored.plan.routes().len(),
+                path = %context.state_path.display(),
+                "restored last-known-good remote routes"
+            );
+            Some(restored)
+        }
+        Some((historic_routes, false)) => {
+            warn!(
+                epoch = historic_routes.snapshot.source_epoch,
+                revision = historic_routes.snapshot.revision,
+                path = %context.state_path.display(),
+                "durable remote routes predate the drained local block assignment; controller replacement is required"
+            );
+            Some(historic_routes)
+        }
+        None => None,
+    };
+    Ok((applied, current))
+}
+
+async fn run_remote_route_reconciler(
+    mut runtime: RemoteRouteRuntime,
+    state: Arc<AgentState>,
+    cancellation: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(runtime.interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            _ = interval.tick() => {
+                match fetch_remote_route_snapshot(
+                    &runtime.controller_url,
+                    &runtime.client,
+                    &runtime.token_path,
+                ).await {
+                    Ok(snapshot) => {
+                        match apply_remote_route_snapshot(
+                            snapshot,
+                            RemoteRouteApplyContext {
+                                local: &runtime.local,
+                                ipv4_output_interface: runtime.ipv4_output_interface,
+                                ipv6_output_interface: runtime.ipv6_output_interface,
+                                ipv4_onlink: runtime.ipv4_onlink,
+                                ipv6_onlink: runtime.ipv6_onlink,
+                                state_path: &runtime.state_path,
+                            },
+                            Some(&runtime.applied),
+                            &state,
+                        ).await {
+                            Ok(applied) => runtime.applied = applied,
+                            Err(error) => {
+                                record_remote_route_error(&state);
+                                warn!(%error, "remote-route snapshot rejected; retaining last-known-good routes");
+                                repair_last_known_good_routes(&runtime.applied, &state).await;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        record_remote_route_error(&state);
+                        warn!(%error, "remote-route sync failed; retaining last-known-good routes");
+                        repair_last_known_good_routes(&runtime.applied, &state).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn repair_last_known_good_routes(applied: &AppliedRemoteRoutes, state: &AgentState) {
+    match applied.plan.apply().await {
+        Ok(_) => publish_applied_remote_routes(state, &applied.snapshot, &applied.plan),
+        Err(error) => {
+            state.applied_remote_route_epoch.store(0, Ordering::Release);
+            state
+                .applied_remote_route_revision
+                .store(0, Ordering::Release);
+            state.remote_route_entries.store(0, Ordering::Release);
+            state.metrics.applied_remote_route_revision.set(0);
+            state.metrics.remote_route_entries.set(0);
+            error!(%error, "last-known-good remote routes could not be repaired");
+        }
+    }
+}
+
+async fn fetch_remote_route_snapshot(
+    controller_url: &str,
+    client: &ReloadingControllerClient,
+    token_path: &Path,
+) -> Result<RemoteRouteSnapshot> {
+    authenticated_get(
+        client,
+        format!("{controller_url}/v1/state/remote-routes"),
+        token_path,
+    )?
+    .send()
+    .await
+    .context("request controller remote-route snapshot")?
+    .error_for_status()
+    .context("controller rejected remote-route snapshot request")?
+    .json()
+    .await
+    .context("decode controller remote-route snapshot")
+}
+
+fn load_optional_remote_route_snapshot(
+    path: &Path,
+    local: &NodeBlockSnapshot,
+    ipv4_output_interface: u32,
+    ipv6_output_interface: u32,
+    ipv4_onlink: bool,
+    ipv6_onlink: bool,
+) -> Result<Option<AppliedRemoteRoutes>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let snapshot: RemoteRouteSnapshot = load_secure_json(path, "remote-route")?;
+    let plan = lower_remote_route_snapshot(
+        &snapshot,
+        local,
+        ipv4_output_interface,
+        ipv6_output_interface,
+        ipv4_onlink,
+        ipv6_onlink,
+    )?;
+    Ok(Some(AppliedRemoteRoutes { snapshot, plan }))
+}
+
+fn load_remote_route_snapshot_for_startup(
+    path: &Path,
+    local: &NodeBlockSnapshot,
+    ipv4_output_interface: u32,
+    ipv6_output_interface: u32,
+    ipv4_onlink: bool,
+    ipv6_onlink: bool,
+) -> Result<Option<(AppliedRemoteRoutes, bool)>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    match load_optional_remote_route_snapshot(
+        path,
+        local,
+        ipv4_output_interface,
+        ipv6_output_interface,
+        ipv4_onlink,
+        ipv6_onlink,
+    ) {
+        Ok(Some(applied)) => Ok(Some((applied, true))),
+        Ok(None) => Ok(None),
+        Err(current_error) => {
+            let snapshot: RemoteRouteSnapshot = load_secure_json(path, "remote-route")
+                .with_context(|| {
+                    format!("current route snapshot validation failed: {current_error}")
+                })?;
+            if snapshot.node_name != local.node_name || snapshot.node_uid != local.node_uid {
+                return Err(current_error)
+                    .context("durable remote routes belong to another local Node identity");
+            }
+            let historic_local = NodeBlockSnapshot {
+                schema_version: NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION,
+                revision: snapshot.local_assignment_revision,
+                node_name: snapshot.node_name.clone(),
+                node_uid: snapshot.node_uid.clone(),
+                provider: snapshot.local_blocks,
+            };
+            let plan = lower_remote_route_snapshot(
+                &snapshot,
+                &historic_local,
+                ipv4_output_interface,
+                ipv6_output_interface,
+                ipv4_onlink,
+                ipv6_onlink,
+            )
+            .with_context(|| {
+                format!("current route snapshot validation failed: {current_error}")
+            })?;
+            Ok(Some((AppliedRemoteRoutes { snapshot, plan }, false)))
+        }
+    }
+}
+
+async fn apply_remote_route_snapshot(
+    snapshot: RemoteRouteSnapshot,
+    context: RemoteRouteApplyContext<'_>,
+    previous: Option<&AppliedRemoteRoutes>,
+    state: &AgentState,
+) -> Result<AppliedRemoteRoutes> {
+    validate_remote_route_snapshot(&snapshot, context.local)?;
+    publish_desired_remote_routes(state, &snapshot);
+    validate_remote_route_transition(&snapshot, previous.map(|value| &value.snapshot))?;
+    let plan = lower_remote_route_snapshot(
+        &snapshot,
+        context.local,
+        context.ipv4_output_interface,
+        context.ipv6_output_interface,
+        context.ipv4_onlink,
+        context.ipv6_onlink,
+    )?;
+    match previous {
+        Some(previous) => plan.reconcile_from(&previous.plan).await?,
+        None => plan.apply().await?,
+    };
+    if let Err(cause) = persist_secure_json(context.state_path, &snapshot, "remote-route") {
+        let rollback = match previous {
+            Some(previous) => previous.plan.reconcile_from(&plan).await.map(|_| ()),
+            None => plan.delete().await.map(|_| ()),
+        };
+        return match rollback {
+            Ok(()) => Err(cause).context("persist applied remote-route snapshot"),
+            Err(rollback) => Err(anyhow!(
+                "persist applied remote-route snapshot failed ({cause}); kernel rollback also failed ({rollback})"
+            )),
+        };
+    }
+    publish_applied_remote_routes(state, &snapshot, &plan);
+    Ok(AppliedRemoteRoutes { snapshot, plan })
+}
+
+fn validate_remote_route_snapshot(
+    snapshot: &RemoteRouteSnapshot,
+    local: &NodeBlockSnapshot,
+) -> Result<()> {
+    if snapshot.schema_version != REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION {
+        bail!(
+            "unsupported remote-route snapshot schema {}; expected {}",
+            snapshot.schema_version,
+            REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION
+        );
+    }
+    if snapshot.source_epoch == 0 || snapshot.revision == 0 {
+        bail!("remote-route snapshot epoch and revision must be nonzero");
+    }
+    if snapshot.node_name != local.node_name
+        || snapshot.node_uid != local.node_uid
+        || snapshot.local_assignment_revision != local.revision
+        || snapshot.local_blocks != local.provider
+    {
+        bail!("remote-route snapshot does not match the durable local Node-block assignment");
+    }
+    Ok(())
+}
+
+fn validate_remote_route_transition(
+    snapshot: &RemoteRouteSnapshot,
+    previous: Option<&RemoteRouteSnapshot>,
+) -> Result<()> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    if previous.source_epoch != snapshot.source_epoch {
+        return Ok(());
+    }
+    if snapshot.revision < previous.revision {
+        bail!(
+            "remote-route revision regressed from {} to {} in controller epoch {}",
+            previous.revision,
+            snapshot.revision,
+            snapshot.source_epoch
+        );
+    }
+    if snapshot.revision == previous.revision && snapshot != previous {
+        bail!("remote-route snapshot content changed without a revision change");
+    }
+    Ok(())
+}
+
+fn lower_remote_route_snapshot(
+    snapshot: &RemoteRouteSnapshot,
+    local: &NodeBlockSnapshot,
+    ipv4_output_interface: u32,
+    ipv6_output_interface: u32,
+    ipv4_onlink: bool,
+    ipv6_onlink: bool,
+) -> Result<NativeRemoteRoutePlan> {
+    validate_remote_route_snapshot(snapshot, local)?;
+    let provider = NativeRemoteRoutingProvider::new(
+        local.node_name.clone(),
+        local.node_uid.clone(),
+        local.provider,
+    )?;
+    let remotes = snapshot
+        .remote_nodes
+        .iter()
+        .map(|remote| NativeRemoteNode {
+            intent: remote.intent.clone(),
+            ipv4_next_hop: NativeIpv4NextHop {
+                gateway: remote.ipv4_transport,
+                output_interface: ipv4_output_interface,
+                onlink: ipv4_onlink,
+            },
+            ipv6_next_hop: NativeIpv6NextHop {
+                gateway: remote.ipv6_transport,
+                output_interface: ipv6_output_interface,
+                onlink: ipv6_onlink,
+            },
+        })
+        .collect();
+    provider.plan(remotes).map_err(Into::into)
+}
+
+fn publish_applied_remote_routes(
+    state: &AgentState,
+    snapshot: &RemoteRouteSnapshot,
+    plan: &NativeRemoteRoutePlan,
+) {
+    let entries = u64::try_from(plan.routes().len()).unwrap_or(u64::MAX);
+    state
+        .applied_remote_route_epoch
+        .store(snapshot.source_epoch, Ordering::Release);
+    state
+        .applied_remote_route_revision
+        .store(snapshot.revision, Ordering::Release);
+    state.remote_route_entries.store(entries, Ordering::Release);
+    state
+        .metrics
+        .applied_remote_route_revision
+        .set(i64::try_from(snapshot.revision).unwrap_or(i64::MAX));
+    state
+        .metrics
+        .remote_route_entries
+        .set(i64::try_from(entries).unwrap_or(i64::MAX));
+}
+
+fn publish_desired_remote_routes(state: &AgentState, snapshot: &RemoteRouteSnapshot) {
+    state
+        .desired_remote_route_epoch
+        .store(snapshot.source_epoch, Ordering::Release);
+    state
+        .desired_remote_route_revision
+        .store(snapshot.revision, Ordering::Release);
+    state
+        .metrics
+        .desired_remote_route_revision
+        .set(i64::try_from(snapshot.revision).unwrap_or(i64::MAX));
+}
+
+fn record_remote_route_error(state: &AgentState) {
+    state
+        .remote_route_reconcile_errors
+        .fetch_add(1, Ordering::AcqRel);
+    state.metrics.remote_route_sync_errors.inc();
+}
+
 fn spawn_cni_transaction_server(
     args: &Args,
     resolved: Option<ResolvedCniProvider>,
-    state: &AgentState,
     cancellation: &CancellationToken,
     tasks: &mut JoinSet<()>,
     failure_tx: &mpsc::Sender<SupervisedFailure>,
@@ -856,12 +1444,6 @@ fn spawn_cni_transaction_server(
     };
     let resolved = resolved.context("CNI node-block provider was not resolved")?;
     let provider = resolved.provider;
-    if let Some(snapshot) = resolved.snapshot {
-        persist_node_block_snapshot(&args.cni_node_block_state_path, &snapshot)?;
-        state
-            .applied_node_block_revision
-            .store(snapshot.revision, Ordering::Release);
-    }
     let server = CniTransactionServer::bind(socket_path.clone(), &args.cni_state_path, provider)?;
     let server_cancellation = cancellation.clone();
     let failure_tx = failure_tx.clone();
@@ -1231,6 +1813,10 @@ fn new_state(
         desired_policy_revision: Gauge::default(),
         applied_policy_revision: Gauge::default(),
         policy_map_entries: Gauge::default(),
+        remote_route_sync_errors: Counter::default(),
+        desired_remote_route_revision: Gauge::default(),
+        applied_remote_route_revision: Gauge::default(),
+        remote_route_entries: Gauge::default(),
         telemetry_dropped_events: Counter::default(),
         telemetry_export_errors: Counter::default(),
         telemetry_exported_events: Counter::default(),
@@ -1265,6 +1851,12 @@ fn new_state(
         active_policy_bank: AtomicU64::new(0),
         desired_node_block_revision: AtomicU64::new(0),
         applied_node_block_revision: AtomicU64::new(0),
+        desired_remote_route_epoch: AtomicU64::new(0),
+        applied_remote_route_epoch: AtomicU64::new(0),
+        desired_remote_route_revision: AtomicU64::new(0),
+        applied_remote_route_revision: AtomicU64::new(0),
+        remote_route_entries: AtomicU64::new(0),
+        remote_route_reconcile_errors: AtomicU64::new(0),
         queued_flow_exports: AtomicU64::new(0),
         dropped_flow_exports: AtomicU64::new(0),
         exported_flow_events: AtomicU64::new(0),
@@ -1382,6 +1974,7 @@ fn register_agent_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         "Policy entries in the active BPF map bank",
         metrics.policy_map_entries.clone(),
     );
+    register_remote_route_metrics(registry, metrics);
     registry.register(
         "unf_telemetry_dropped_events",
         "Flow events dropped by bounded userspace export buffering",
@@ -1408,6 +2001,29 @@ fn register_agent_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         metrics.controller_trust_reload_errors.clone(),
     );
     register_version_transition_metrics(registry, metrics);
+}
+
+fn register_remote_route_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
+    registry.register(
+        "unf_remote_route_sync_errors",
+        "Complete remote-route snapshots rejected or not applied",
+        metrics.remote_route_sync_errors.clone(),
+    );
+    registry.register(
+        "unf_remote_route_revision_desired",
+        "Latest complete remote-route revision observed from the controller",
+        metrics.desired_remote_route_revision.clone(),
+    );
+    registry.register(
+        "unf_remote_route_revision_applied",
+        "Remote-route revision applied and durably committed",
+        metrics.applied_remote_route_revision.clone(),
+    );
+    registry.register(
+        "unf_remote_route_entries",
+        "Exact remote Pod-block routes in the applied snapshot",
+        metrics.remote_route_entries.clone(),
+    );
 }
 
 fn register_version_transition_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
@@ -2875,6 +3491,12 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
         active_policy_bank: state.active_policy_bank.load(Ordering::Acquire),
         desired_node_block_revision: state.desired_node_block_revision.load(Ordering::Acquire),
         applied_node_block_revision: state.applied_node_block_revision.load(Ordering::Acquire),
+        desired_remote_route_epoch: state.desired_remote_route_epoch.load(Ordering::Acquire),
+        applied_remote_route_epoch: state.applied_remote_route_epoch.load(Ordering::Acquire),
+        desired_remote_route_revision: state.desired_remote_route_revision.load(Ordering::Acquire),
+        applied_remote_route_revision: state.applied_remote_route_revision.load(Ordering::Acquire),
+        remote_route_entries: state.remote_route_entries.load(Ordering::Acquire),
+        remote_route_reconcile_errors: state.remote_route_reconcile_errors.load(Ordering::Acquire),
     }
 }
 
@@ -4593,6 +5215,7 @@ fn init_tracing() {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use unf_route::{RemoteNodeIntent, RemoteRouteSnapshotNode};
 
     #[test]
     fn cni_node_block_arguments_support_manual_or_controller_distribution() {
@@ -4637,6 +5260,32 @@ mod tests {
             enabled.cni_ipv4_block.expect("IPv4 block").to_string(),
             "10.42.0.0/24"
         );
+
+        assert!(
+            Args::try_parse_from([
+                "unf-agent",
+                "--cni-socket",
+                "/run/unf/cni.sock",
+                "--cni-native-ipv4-uplink",
+                "eth0",
+            ])
+            .is_err()
+        );
+        let native = Args::try_parse_from([
+            "unf-agent",
+            "--cni-socket",
+            "/run/unf/cni.sock",
+            "--cni-native-ipv4-uplink",
+            "eth0",
+            "--cni-native-ipv6-uplink",
+            "eth1",
+            "--cni-native-ipv4-onlink",
+        ])
+        .expect("dual-stack native route arguments parse");
+        assert_eq!(native.cni_native_ipv4_uplink.as_deref(), Some("eth0"));
+        assert_eq!(native.cni_native_ipv6_uplink.as_deref(), Some("eth1"));
+        assert!(native.cni_native_ipv4_onlink);
+        assert!(!native.cni_native_ipv6_onlink);
     }
 
     #[test]
@@ -4676,6 +5325,137 @@ mod tests {
         let link = directory.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(persist_node_block_snapshot(&link.join("state.json"), &snapshot).is_err());
+    }
+
+    fn route_test_snapshots() -> (NodeBlockSnapshot, RemoteRouteSnapshot) {
+        let local = NodeBlockSnapshot {
+            schema_version: NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION,
+            revision: 4,
+            node_name: "worker-a".to_owned(),
+            node_uid: "worker-a-uid".to_owned(),
+            provider: NodeBlockProvider::new(
+                "10.42.0.0/24".parse().unwrap(),
+                "fd00:42::/64".parse().unwrap(),
+            ),
+        };
+        let snapshot = RemoteRouteSnapshot {
+            schema_version: REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+            source_epoch: 9,
+            revision: 7,
+            node_name: local.node_name.clone(),
+            node_uid: local.node_uid.clone(),
+            local_assignment_revision: local.revision,
+            local_blocks: local.provider,
+            remote_nodes: vec![RemoteRouteSnapshotNode {
+                intent: RemoteNodeIntent {
+                    node_name: "worker-b".to_owned(),
+                    node_uid: "worker-b-uid".to_owned(),
+                    assignment_revision: 6,
+                    blocks: NodeBlockProvider::new(
+                        "10.43.0.0/24".parse().unwrap(),
+                        "fd00:43::/64".parse().unwrap(),
+                    ),
+                },
+                ipv4_transport: "192.0.2.2".parse().unwrap(),
+                ipv6_transport: "fdff::2".parse().unwrap(),
+            }],
+        };
+        (local, snapshot)
+    }
+
+    #[test]
+    fn remote_route_snapshot_is_strict_lowerable_and_durable() {
+        let (local, snapshot) = route_test_snapshots();
+        let plan = lower_remote_route_snapshot(&snapshot, &local, 3, 4, true, false).unwrap();
+        assert_eq!(plan.local_node_name(), "worker-a");
+        assert_eq!(plan.remote_nodes().len(), 1);
+        assert_eq!(plan.routes().len(), 2);
+        assert!(plan.routes().iter().any(|route| route.onlink));
+        assert!(plan.routes().iter().any(|route| !route.onlink));
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("remote-routes.json");
+        persist_secure_json(&path, &snapshot, "remote-route").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let restored = load_optional_remote_route_snapshot(&path, &local, 3, 4, true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.snapshot, snapshot);
+        assert_eq!(restored.plan.routes(), plan.routes());
+
+        let mut wrong = snapshot.clone();
+        wrong.node_uid = "another-uid".to_owned();
+        assert!(validate_remote_route_snapshot(&wrong, &local).is_err());
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        let mut encoded = encoded.as_object().unwrap().clone();
+        encoded.insert("unexpected".to_owned(), serde_json::json!(true));
+        assert!(serde_json::from_value::<RemoteRouteSnapshot>(encoded.into()).is_err());
+
+        let mut rotated = local.clone();
+        rotated.revision += 1;
+        rotated.provider = NodeBlockProvider::new(
+            "10.45.0.0/24".parse().unwrap(),
+            "fd00:45::/64".parse().unwrap(),
+        );
+        let (_, current) =
+            load_remote_route_snapshot_for_startup(&path, &rotated, 3, 4, true, false)
+                .unwrap()
+                .unwrap();
+        assert!(!current);
+        rotated.node_uid = "replacement-node-uid".to_owned();
+        assert!(
+            load_remote_route_snapshot_for_startup(&path, &rotated, 3, 4, true, false).is_err()
+        );
+    }
+
+    #[test]
+    fn remote_route_revision_replay_rejects_regression_and_mutation() {
+        let (_, snapshot) = route_test_snapshots();
+        assert!(validate_remote_route_transition(&snapshot, Some(&snapshot)).is_ok());
+
+        let mut regressed = snapshot.clone();
+        regressed.revision -= 1;
+        assert!(validate_remote_route_transition(&regressed, Some(&snapshot)).is_err());
+
+        let mut mutated = snapshot.clone();
+        mutated.remote_nodes[0].ipv4_transport = "192.0.2.22".parse().unwrap();
+        assert!(validate_remote_route_transition(&mutated, Some(&snapshot)).is_err());
+
+        mutated.source_epoch += 1;
+        assert!(validate_remote_route_transition(&mutated, Some(&snapshot)).is_ok());
+    }
+
+    #[test]
+    fn remote_route_status_distinguishes_desired_applied_and_errors() {
+        let capabilities = KernelCapabilities {
+            kernel_release: "test".to_owned(),
+            btf: true,
+            bpffs: true,
+            cgroup_v2: true,
+        };
+        let state = new_state(
+            capabilities,
+            "worker-a".to_owned(),
+            "agent-a".to_owned(),
+            "agent-a-uid".to_owned(),
+            VersionTransition::Normal,
+        );
+        let (local, snapshot) = route_test_snapshots();
+        let plan = lower_remote_route_snapshot(&snapshot, &local, 3, 4, false, false).unwrap();
+        publish_desired_remote_routes(&state, &snapshot);
+        publish_applied_remote_routes(&state, &snapshot, &plan);
+        record_remote_route_error(&state);
+
+        let report = agent_state_report(&state);
+        assert_eq!(report.desired_remote_route_epoch, 9);
+        assert_eq!(report.applied_remote_route_epoch, 9);
+        assert_eq!(report.desired_remote_route_revision, 7);
+        assert_eq!(report.applied_remote_route_revision, 7);
+        assert_eq!(report.remote_route_entries, 2);
+        assert_eq!(report.remote_route_reconcile_errors, 1);
     }
 
     #[test]

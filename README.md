@@ -89,7 +89,7 @@ The Phase 3 gate and all 42 deliverables are Verified. Exact closure evidence,
 limits, and the separately tracked full-CNI entry are maintained in the
 [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md)
 and ADR 0056.
-The full-CNI foundation is now in progress under ADRs 0057–0065. The `unf-cni`
+The full-CNI foundation is now in progress under ADRs 0057–0066. The `unf-cni`
 executable now composes dual-stack IPAM, exact veth, and native routing through
 atomic ADD/CHECK/DEL transactions. An explicitly enabled local-agent Unix service
 provides the root-authenticated, bounded schema-v2 transaction boundary and
@@ -106,9 +106,13 @@ the agent validates durable provider provenance, persists owner-only state, and
 acknowledges application before convergence. Provider-neutral remote Node/block
 intent now lowers into deterministic, exact native IPv4/IPv6 block routes with
 independent family paths, typed-netlink replay/readback/repair/delete, scoped
-rollback, and foreign-state preservation. Runtime route distribution and
-reconciliation, cluster CNI installation, and cross-worker primary-mode
-qualification are not implemented; existing overlay deployments are unchanged.
+rollback, and foreign-state preservation. The controller now distributes complete,
+authenticated epoch/revision-fenced remote-route snapshots, and an explicitly
+configured agent reconciler restores owner-only last-known-good state, applies
+atomic route-set replacements, retires stale routes after replacement, and
+reports desired/applied/error state. Cluster CNI installation and cross-worker
+primary-mode qualification are not implemented; existing overlay deployments
+are unchanged.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -331,7 +335,14 @@ make build
 make test
 make lint
 make fmt-check
+make cni-route-reconciliation-test
 ```
+
+The reconciliation gate requires passwordless `sudo` and Linux network
+namespaces. Native remote routing remains disabled unless the agent receives both
+`--cni-native-ipv4-uplink` and `--cni-native-ipv6-uplink`; the default overlay
+manifests do not set them. IPv4 and IPv6 on-link behavior is independently
+selectable and never inferred from one family.
 
 The eBPF program has a separate target build because it cannot be compiled as a
 normal host test binary:

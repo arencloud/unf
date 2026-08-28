@@ -34,7 +34,9 @@ Every routing provider must preserve these common contracts:
   endpoint allocation, durable CNI transactions, policy identity, or telemetry
   provenance.
 
-Milestone 6.6b verifies the provider-neutral remote intent and native static
-lowering/lifecycle only. It does not yet claim BGP, overlay, VRF, ECMP,
-multi-cluster, service advertisement, or comparative superiority. Those claims
-require their own implementations and repeatable qualification gates.
+Milestone 6.6b verifies provider-neutral intent and the native static lifecycle;
+6.6c verifies complete snapshot distribution, durable last-known-good recovery,
+atomic replacement, stale retirement, and acknowledgements for that native
+backend. UNF does not yet claim BGP, overlay, VRF, ECMP, multi-cluster, service
+advertisement, or comparative superiority. Those capabilities require their own
+implementations and repeatable qualification gates.

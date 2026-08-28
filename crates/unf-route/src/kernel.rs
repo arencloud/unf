@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsFd;
@@ -243,6 +244,77 @@ impl NativeRemoteRoutePlan {
         }
     }
 
+    /// Atomically reconciles this complete desired snapshot from a previously
+    /// applied plan. New distinct routes are installed before stale routes are
+    /// retired; changed same-key routes are replaced under rollback protection.
+    ///
+    /// # Errors
+    ///
+    /// Fails before mutation if either plan targets another local Node or any
+    /// union key contains state matching neither the previous nor desired plan.
+    /// A later failure removes newly installed state and restores every prior
+    /// route deleted by this transaction.
+    pub async fn reconcile_from(
+        &self,
+        previous: &NativeRemoteRoutePlan,
+    ) -> Result<RouteReadback, RouteError> {
+        if self.local_node_name != previous.local_node_name
+            || self.local_node_uid != previous.local_node_uid
+        {
+            return Err(RouteError::Readback(
+                "remote route replacement changes local Node provenance".to_owned(),
+            ));
+        }
+        let host = connect("open remote route reconciliation connection")?;
+        let transitions = preflight_remote_reconciliation(&host, previous, self).await?;
+
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        for transition in transitions.values() {
+            let Some(desired) = transition.desired else {
+                continue;
+            };
+            if transition
+                .observed
+                .as_ref()
+                .is_some_and(|message| route_exact(message, &desired))
+            {
+                continue;
+            }
+            if let (Some(prior), Some(message)) = (transition.prior, &transition.observed) {
+                if let Err(error) = host.route().del(message.clone()).execute().await {
+                    let cause = netlink("replace previous remote route", &error);
+                    return Err(with_reconcile_rollback(&host, cause, added, removed).await);
+                }
+                removed.push(prior);
+            }
+            if let Err(error) = host.route().add(build_route(desired)).execute().await {
+                let cause = netlink("add desired remote route", &error);
+                return Err(with_reconcile_rollback(&host, cause, added, removed).await);
+            }
+            added.push(desired);
+        }
+
+        for transition in transitions.values() {
+            let (Some(prior), None) = (transition.prior, transition.desired) else {
+                continue;
+            };
+            if let Some(message) = &transition.observed {
+                if let Err(error) = host.route().del(message.clone()).execute().await {
+                    let cause = netlink("retire stale remote route", &error);
+                    return Err(with_reconcile_rollback(&host, cause, added, removed).await);
+                }
+                removed.push(prior);
+            }
+        }
+
+        let result = readback_remote_reconciliation(&host, previous, self).await;
+        match result {
+            Ok(readback) => Ok(readback),
+            Err(cause) => Err(with_reconcile_rollback(&host, cause, added, removed).await),
+        }
+    }
+
     /// Strictly reads the complete remote Pod-block route set.
     ///
     /// # Errors
@@ -275,6 +347,119 @@ impl NativeRemoteRoutePlan {
             RouteDeleteOutcome::AlreadyAbsent
         })
     }
+}
+
+type RouteKey = (IpAddr, u8, u32);
+
+struct RouteTransition {
+    prior: Option<RouteSpec>,
+    desired: Option<RouteSpec>,
+    observed: Option<RouteMessage>,
+}
+
+async fn preflight_remote_reconciliation(
+    handle: &Handle,
+    previous: &NativeRemoteRoutePlan,
+    desired: &NativeRemoteRoutePlan,
+) -> Result<BTreeMap<RouteKey, RouteTransition>, RouteError> {
+    let route_messages = list_routes(handle).await?;
+    let mut routes = BTreeMap::new();
+    for route in &previous.routes {
+        routes.entry(route_key(route)).or_insert((None, None)).0 = Some(*route);
+    }
+    for route in &desired.routes {
+        routes.entry(route_key(route)).or_insert((None, None)).1 = Some(*route);
+    }
+    let mut transitions = BTreeMap::new();
+    for (key, (prior, desired)) in routes {
+        let matching: Vec<&RouteMessage> = route_messages
+            .iter()
+            .filter(|message| route_message_key(message) == key)
+            .collect();
+        let observed = match matching.as_slice() {
+            [] => None,
+            [message]
+                if desired.is_some_and(|route| route_exact(message, &route))
+                    || prior.is_some_and(|route| route_exact(message, &route)) =>
+            {
+                Some((*message).clone())
+            }
+            _ => {
+                let route = desired.or(prior).ok_or_else(|| {
+                    RouteError::Readback("remote route union contains an empty key".to_owned())
+                })?;
+                return Err(RouteError::Conflict {
+                    namespace: route.namespace,
+                    resource: "route",
+                    message: format!(
+                        "key {}/{} in table {} has state owned by neither route snapshot",
+                        route.destination, route.prefix_len, route.table
+                    ),
+                });
+            }
+        };
+        transitions.insert(
+            key,
+            RouteTransition {
+                prior,
+                desired,
+                observed,
+            },
+        );
+    }
+    Ok(transitions)
+}
+
+async fn readback_remote_reconciliation(
+    handle: &Handle,
+    previous: &NativeRemoteRoutePlan,
+    desired: &NativeRemoteRoutePlan,
+) -> Result<RouteReadback, RouteError> {
+    let desired_state = inspect_local(handle, &desired.routes, &[]).await?;
+    require_complete(&desired_state, NetworkNamespace::Host)?;
+    let stale: Vec<_> = previous
+        .routes
+        .iter()
+        .filter(|route| {
+            !desired
+                .routes
+                .iter()
+                .any(|desired| route_key(desired) == route_key(route))
+        })
+        .copied()
+        .collect();
+    if !inspect_local(handle, &stale, &[]).await?.is_absent() {
+        return Err(RouteError::Readback(
+            "stale remote routes remain after snapshot replacement".to_owned(),
+        ));
+    }
+    Ok(RouteReadback {
+        routes: desired.routes.iter().copied().collect(),
+        neighbors: std::collections::BTreeSet::new(),
+    })
+}
+
+fn route_key(route: &RouteSpec) -> RouteKey {
+    (route.destination, route.prefix_len, route.table)
+}
+
+fn route_message_key(message: &RouteMessage) -> RouteKey {
+    (
+        route_destination(message),
+        message.header.destination_prefix_length,
+        route_table(message),
+    )
+}
+
+async fn with_reconcile_rollback(
+    handle: &Handle,
+    cause: RouteError,
+    added: Vec<RouteSpec>,
+    removed: Vec<RouteSpec>,
+) -> RouteError {
+    let remove_new = delete_local(handle, &added, &[]).await;
+    let restore_prior = apply_local(handle, &removed, &[]).await.map(|_| true);
+    with_rollback(cause, [remove_new, restore_prior])
 }
 
 fn require_complete(state: &ObservedState, namespace: NetworkNamespace) -> Result<(), RouteError> {

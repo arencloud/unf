@@ -55,9 +55,19 @@ ingress identity-keyed, IPv4-source, IPv6-source, egress IPv4-destination, and
 egress IPv6-destination banks before one `POLICY_CONFIG` write selects all five.
 See ADRs 0006, 0007, 0017, 0035, and 0037.
 
+Opted-in primary-CNI agents additionally poll one authenticated complete
+remote-route snapshot. Schema v1 binds the controller epoch and global routing
+revision to local Node/block provenance and every remote Node's stable assignment,
+blocks, and exact dual-stack transport. The agent repairs its owner-only durable
+last-known-good snapshot before polling, rejects same-epoch regression or silent
+mutation, applies complete route replacements before stale retirement, and
+commits persistence only after kernel readback. ADR 0066 defines this recovery
+transaction.
+
 Each agent also posts a schema v2 acknowledgement containing its Node and Pod
 identity, readiness, BPF load state, desired/applied identity and policy
-epoch/revisions, active policy bank, and map counts. A dedicated-audience,
+epoch/revisions, optional primary-CNI Node-block revision, desired/applied remote
+route epoch/revision, route/error counts, active policy bank, and map counts. A dedicated-audience,
 short-lived projected service-account token authenticates the request through
 Kubernetes TokenReview. The controller binds its service account and Pod name/UID
 to watched Pod placement before accepting the reported Node. It timestamps reports
@@ -105,8 +115,9 @@ ADRs 0023 and 0024 place snapshots,
 acknowledgements, and telemetry behind dedicated TLS plus Pod-bound TokenReview;
 serving certificates and CA bundles reload with last-known-good fallback and an
 overlapping-trust rotation gate. Agent reports and the newest bounded flow
-history survive controller replacement; desired-state and identity allocation
-remain current-process state.
+history survive controller replacement. The agent's applied primary-CNI
+Node-block and remote-route provenance also survives locally; other desired state
+and identity allocation remain current-process state.
 
 Controller and agent `GET /v1/version` responses publish compatibility schema
 v1: embedded build revision, persistent BPF-state ABI, identity/policy snapshot

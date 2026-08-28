@@ -82,7 +82,7 @@ exact pre-existing IPv4 route proves scoped rollback preserves it.
 
 ## Consequences
 
-Milestone 6.6b is Verified. Native remote route intent and typed kernel ownership
-are ready for the controller-to-agent snapshot and long-lived reconciliation in
-6.6c. No cluster networking support is claimed until that reconciliation,
-failure recovery and isolated primary-CNI qualification pass.
+Milestone 6.6b is Verified. ADR 0066 subsequently implements and verifies the
+controller-to-agent snapshot plus long-lived reconciliation and recovery in
+6.6c. No deployed cluster-networking support is claimed until isolated
+primary-CNI qualification passes.
