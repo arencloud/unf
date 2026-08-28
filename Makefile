@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt fmt-check support-matrix-check ebpf generate-crds controller agent cni cni-protocol-test cni-transaction-test cni-ipam-test cni-veth-test cni-routing-test cni-lifecycle-test cni-node-block-test cni-remote-routing-test cni-route-reconciliation-test cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-upgrade-images openshift-deploy openshift-test openshift-upgrade-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-platform-matrix-test kind-down
+.PHONY: build test lint fmt fmt-check support-matrix-check ebpf generate-crds controller agent cni cni-protocol-test cni-transaction-test cni-ipam-test cni-veth-test cni-routing-test cni-lifecycle-test cni-node-block-test cni-remote-routing-test cni-route-reconciliation-test cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-upgrade-images openshift-deploy openshift-test openshift-upgrade-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-platform-matrix-test kind-down primary-cni-kind-up primary-cni-kind-load primary-cni-kind-deploy primary-cni-kind-test primary-cni-kind-rollback primary-cni-kind-down
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -31,6 +31,10 @@ UNF_OPENSHIFT_UPGRADE_BASELINE_REF ?= HEAD^
 UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD ?= $(CURDIR)/.artifacts/phase3-openshift-upgrade-images.json
 OPENSHIFT_KUBECONFIG ?= $(CURDIR)/.tools/cl01-audit.kubeconfig
 OPENSHIFT_UNINSTALL_ARGS ?=
+PRIMARY_CNI_KIND_NAME ?= unf-cni-dev
+PRIMARY_CNI_KIND_CONFIG ?= $(CURDIR)/hack/kind-primary-cni-config.yaml
+PRIMARY_CNI_KIND_KUBECONFIG ?= $(CURDIR)/.tools/kind-$(PRIMARY_CNI_KIND_NAME).kubeconfig
+PRIMARY_CNI_KUBE_CONTEXT ?= kind-$(PRIMARY_CNI_KIND_NAME)
 
 build:
 	cargo build --workspace
@@ -271,3 +275,32 @@ kind-platform-matrix-test:
 
 kind-down:
 	sudo env KUBECONFIG=$(KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) delete cluster --name $(KIND_NAME)
+
+# This fixture is intentionally separate from the overlay-development cluster.
+# It owns primary CNI state and is disposable by contract.
+primary-cni-kind-up: kind-tool
+	hack/verify-kind-host-prerequisites.sh
+	sudo env KUBECONFIG=$(PRIMARY_CNI_KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) create cluster --name $(PRIMARY_CNI_KIND_NAME) --config $(PRIMARY_CNI_KIND_CONFIG)
+	sudo chown $$(id -u):$$(id -g) $(PRIMARY_CNI_KIND_KUBECONFIG)
+	KUBECONFIG=$(PRIMARY_CNI_KIND_KUBECONFIG) KUBE_CONTEXT=$(PRIMARY_CNI_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) hack/configure-kind-primary-cni.sh
+
+primary-cni-kind-load: KIND_NAME = $(PRIMARY_CNI_KIND_NAME)
+primary-cni-kind-load: KIND_KUBECONFIG = $(PRIMARY_CNI_KIND_KUBECONFIG)
+primary-cni-kind-load: KUBE_CONTEXT = $(PRIMARY_CNI_KUBE_CONTEXT)
+primary-cni-kind-load: kind-load
+
+primary-cni-kind-deploy: primary-cni-kind-load
+	KUBECONFIG=$(PRIMARY_CNI_KIND_KUBECONFIG) KUBE_CONTEXT=$(PRIMARY_CNI_KUBE_CONTEXT) UNF_INTERNAL_TLS_DIR=$(CURDIR)/.tools/kind-primary-cni-internal-tls hack/configure-internal-tls.sh
+	KUBECONFIG=$(PRIMARY_CNI_KIND_KUBECONFIG) kubectl --context $(PRIMARY_CNI_KUBE_CONTEXT) apply -k deploy/kind-primary-cni
+	KUBECONFIG=$(PRIMARY_CNI_KIND_KUBECONFIG) kubectl --context $(PRIMARY_CNI_KUBE_CONTEXT) rollout status deployment/unf-controller -n unf-system --timeout=180s
+	KUBECONFIG=$(PRIMARY_CNI_KIND_KUBECONFIG) kubectl --context $(PRIMARY_CNI_KUBE_CONTEXT) rollout status daemonset/unf-agent -n unf-system --timeout=180s
+	KUBECONFIG=$(PRIMARY_CNI_KIND_KUBECONFIG) kubectl --context $(PRIMARY_CNI_KUBE_CONTEXT) wait --for=condition=Ready nodes --all --timeout=180s
+
+primary-cni-kind-test: cli
+	KUBECONFIG=$(PRIMARY_CNI_KIND_KUBECONFIG) KUBE_CONTEXT=$(PRIMARY_CNI_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) hack/verify-kind-primary-cni.sh
+
+primary-cni-kind-rollback:
+	KUBECONFIG=$(PRIMARY_CNI_KIND_KUBECONFIG) KUBE_CONTEXT=$(PRIMARY_CNI_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) hack/rollback-kind-primary-cni.sh
+
+primary-cni-kind-down:
+	sudo env KUBECONFIG=$(PRIMARY_CNI_KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) delete cluster --name $(PRIMARY_CNI_KIND_NAME)

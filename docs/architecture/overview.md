@@ -57,9 +57,10 @@ serves only that Node's strict revisioned snapshot over the authenticated
 internal TLS API. Before binding its CNI socket, the agent validates the
 assignment against the durable attachment journal, atomically persists
 owner-only provenance, and reports desired/applied acknowledgement. Assignment
-rotation requires drain and restart. The overlay remains the only deployed mode
-until cross-node networking and isolated primary-CNI qualification pass. ADR
-0064 records this distribution boundary.
+rotation requires drain and restart. The overlay remains the default deployment;
+primary ownership is qualified only in its separate default-CNI-disabled Kind
+fixture and is not installed by the portable or OpenShift overlays. ADR 0064
+records the distribution boundary.
 
 Cross-node desired state begins with strict provider-neutral remote Node intent:
 Node name/UID, assignment revision, and canonical IPv4/IPv6 blocks. The native
@@ -74,8 +75,10 @@ provenance, and exact dual-stack Node transports. With explicit per-family
 uplinks, the agent restores and repairs owner-only last-known-good state, applies
 complete replacements before retiring stale routes, rolls back kernel or
 persistence failure, and reports desired/applied/error state. ADRs 0065 and 0066
-record the primitive and runtime contracts. Primary-CNI cluster installation
-remains isolated milestone 6.6d.
+record the primitive and runtime contracts. ADR 0067 verifies fingerprinted
+installation, two-worker dual-stack lifecycle/recovery, coexistence refusal, and
+exact rollback in the isolated Kind fixture. OpenShift installation remains a
+separate design and cl02 qualification milestone.
 
 IPAM stays below a provider interface and above routing. The first provider
 accepts one canonical IPv4 and IPv6 node block, reserves network/gateway and IPv4

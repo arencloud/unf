@@ -4,6 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use serde_json::Value;
 use unf_cni_state::{
     AttachmentKey, AttachmentPhase, AttachmentRecord, AttachmentSpec,
     CNI_TRANSACTION_SCHEMA_VERSION, MAX_TRANSACTION_MESSAGE_BYTES, TransactionErrorCode,
@@ -271,18 +272,38 @@ async fn check<T: TransactionApi>(
         "check",
     )?;
     let actual = verify_ready(config, &record).await?;
-    let expected = serde_json::to_value(&actual).map_err(|error| {
+    let mut expected = serde_json::to_value(&actual).map_err(|error| {
         CniError::io(format!(
             "encode expected CHECK result for comparison: {error}"
         ))
     })?;
-    if config.prev_result.as_ref() != Some(&expected) {
+    let mut supplied = config.prev_result.clone().ok_or_else(|| {
+        CniError::invalid_config(&config.cni_version, "CHECK requires prevResult")
+    })?;
+    normalize_empty_dns(&mut expected);
+    normalize_empty_dns(&mut supplied);
+    if supplied != expected {
         return Err(CniError::retry_with_details(
             &config.cni_version,
             "CHECK prevResult differs from the durable and kernel attachment result",
         ));
     }
     Ok(())
+}
+
+// CNI runtimes are permitted to normalize an empty DNS result while caching
+// ADD output. containerd removes `dns: {}` before constructing CHECK's
+// prevResult, so treat those two representations as the same semantic result.
+fn normalize_empty_dns(result: &mut Value) {
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    if object
+        .get("dns")
+        .is_some_and(|dns| dns.as_object().is_some_and(serde_json::Map::is_empty))
+    {
+        object.remove("dns");
+    }
 }
 
 async fn delete<T: TransactionApi>(
@@ -731,6 +752,28 @@ mod tests {
         assert!(result.ips.iter().all(|ip| ip.interface == 1));
         assert_eq!(result.routes[1].dst, "::/0");
         assert_eq!(result.interfaces[0].mac, "02:00:00:00:00:01");
+    }
+
+    #[test]
+    fn check_result_normalizes_runtime_omission_of_empty_dns() {
+        let mut emitted = serde_json::json!({
+            "cniVersion": "1.1.0",
+            "interfaces": [],
+            "ips": [],
+            "routes": [],
+            "dns": {}
+        });
+        let mut cached = serde_json::json!({
+            "cniVersion": "1.1.0",
+            "interfaces": [],
+            "ips": [],
+            "routes": []
+        });
+
+        normalize_empty_dns(&mut emitted);
+        normalize_empty_dns(&mut cached);
+
+        assert_eq!(emitted, cached);
     }
 
     #[test]

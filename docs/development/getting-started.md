@@ -160,6 +160,31 @@ IPv6 frontend inside the pinned kindnet image and waits for that DaemonSet to
 become ready. This keeps the dual-stack fixture
 reproducible on development kernels without the legacy IPv6 NAT table.
 
+### Isolated primary-CNI Kind gate
+
+Primary-CNI work never uses or mutates the overlay `unf-dev` fixture. Its own
+three-Node dual-stack cluster disables kindnet and starts from an empty CNI
+configuration directory:
+
+```bash
+sudo sysctl -w fs.inotify.max_user_instances=1024
+make primary-cni-kind-up
+make primary-cni-kind-deploy
+make primary-cni-kind-test
+```
+
+The host prerequisite check requires at least 512 inotify instances before Kind
+creation. `primary-cni-kind-deploy` installs the fingerprinted UNF binary and
+configuration through the dedicated overlay. `primary-cni-kind-test` verifies
+two-worker ADD/CHECK/DEL, direct IPv4/IPv6 forwarding, outage recovery,
+coexistence refusal, and exact rollback. It restores the saved CoreDNS bootstrap
+template, removes only recognized UNF routes/files/BPF state, returns the Nodes
+to the default-CNI-disabled NotReady baseline, and writes schema-v1 evidence to
+`.artifacts/phase3-primary-cni-kind.json`. Use `make primary-cni-kind-rollback`
+to run the same scoped rollback independently and `make primary-cni-kind-down`
+to delete the disposable cluster. These commands do not install a CNI on
+OpenShift; that requires the separately tracked 6.6e design and cl02 gate.
+
 `kind-deploy` builds the userspace images, eBPF object, and test-tools image with
 SCTP `socat`, the IPv6 extension-header probe, BPF fault utilities, and `tc`,
 loads them into the nodes, and applies the CRD and workloads. `kind-test`

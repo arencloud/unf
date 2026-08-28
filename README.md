@@ -260,6 +260,9 @@ Implemented in the repository:
 - dry-run-first `unf-agent cleanup` planning for map and TCX pins from ABI v1
   through the binary's compiled current version plus UNF-named legacy filters,
   with unknown-content refusal and an explicit current-ABI confirmation gate;
+- an isolated, default-CNI-disabled three-Node dual-stack Kind gate for
+  fingerprinted UNF primary-CNI installation, two-worker ADD/CHECK/DEL and
+  direct forwarding, outage recovery, coexistence refusal, and exact rollback;
 - coordinated dry-run-first OpenShift uninstall with all-agent shutdown,
   admission-constrained per-node cleanup Jobs, post-cleanup host verification,
   exact resource removal, CRD preservation, and full redeploy qualification;

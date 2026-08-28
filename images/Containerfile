@@ -11,7 +11,7 @@ COPY crates ./crates
 COPY bins ./bins
 COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
 
-RUN cargo build --locked --release --package unf-controller --package unf-agent
+RUN cargo build --locked --release --package unf-controller --package unf-agent --package unf-cni
 
 FROM docker.io/library/debian:bookworm-slim
 
@@ -21,6 +21,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder "/src/target/release/${UNF_PACKAGE}" /usr/local/bin/unf-component
+COPY --from=builder /src/target/release/unf-cni /opt/unf/cni/unf-cni
 COPY .artifacts/unf-ebpf-tc /opt/unf/ebpf/unf-ebpf-tc
 
 ENTRYPOINT ["/usr/local/bin/unf-component"]

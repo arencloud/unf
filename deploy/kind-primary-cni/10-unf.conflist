@@ -1,0 +1,16 @@
+{
+  "cniVersion": "1.1.0",
+  "name": "unf-primary",
+  "plugins": [
+    {
+      "type": "unf",
+      "mode": "primary",
+      "dataplane": "veth",
+      "agentSocket": "/run/unf/cni.sock",
+      "mtu": 1500,
+      "ipam": {
+        "type": "unf"
+      }
+    }
+  ]
+}

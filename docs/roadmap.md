@@ -311,8 +311,12 @@ authoritative record of verified results.
   atomic route-set replacement, stale retirement, persistence rollback, and
   desired/applied/error acknowledgement are covered by
   `make cni-route-reconciliation-test`.
-- Next: install the complete primary-CNI path only in a disposable dual-stack
-  Kind cluster and qualify cross-worker lifecycle, coexistence, and rollback.
+- The complete primary-CNI path is now Verified in a separate disposable
+  three-Node dual-stack Kind cluster, including two-worker lifecycle,
+  coexistence refusal/recovery, outage restart, and exact rollback; ADR 0067.
+- Next: accept an OpenShift Network Operator/MachineConfig ownership and
+  recovery design, then qualify that bounded design on dual-stack cl02 without
+  treating Kind mechanics as an in-place OpenShift takeover procedure.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.
