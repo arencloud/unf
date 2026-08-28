@@ -185,7 +185,7 @@ impl CniError {
             11,
             "Try again later",
             format!(
-                "{operation:?} requires IPAM and link lifecycle through the local unf-agent CNI transaction API, which are not implemented yet"
+                "{operation:?} requires the local unf-agent IPAM transaction plus link lifecycle; link application is not implemented yet"
             ),
         )
     }

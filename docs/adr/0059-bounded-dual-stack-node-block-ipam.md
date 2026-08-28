@@ -1,6 +1,6 @@
 # ADR 0059: Node-block IPAM is modular, dual-stack, and bounded
 
-Status: Accepted and implemented for the IPAM allocation-core slice
+Status: Accepted; durable integration completed by ADR 0060
 
 ## Context
 
@@ -64,7 +64,8 @@ complete workspace suite contains 199 tests after this slice.
 
 ## Consequences
 
-The node-block allocation core is Verified, while milestone 6.3 remains In
-progress. No address is yet written to the attachment journal or configured on a
-link, no node block is distributed by the controller, and `unf-cni` remains
-fail-closed for ADD/CHECK/STATUS. Existing overlay deployments are unchanged.
+At this allocation-core checkpoint, milestone 6.3 remained In progress and no
+address was written to the attachment journal. ADR 0060 subsequently verifies
+durable lease integration and closes 6.3. No address is configured on a link, no
+node block is distributed by the controller, and `unf-cni` remains fail-closed
+for ADD/CHECK/STATUS. Existing overlay deployments are unchanged.

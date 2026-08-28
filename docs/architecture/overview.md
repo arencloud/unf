@@ -44,7 +44,7 @@ owns pool/node-block intent. Kubernetes watches, policy compilation, service
 logic, routing protocols, and telemetry aggregation never enter the CNI process.
 ADR 0057 defines coexistence, rollback, uninstall, and failure boundaries. The
 first agent-side slice is opt-in through `--cni-socket`; it authenticates UID 0
-with kernel Unix peer credentials and serializes bounded schema-v1 transactions
+with kernel Unix peer credentials and serializes bounded schema-v2 transactions
 into a mode-0600, atomically replaced journal. Its durable phases are
 `preparing`, `ready`, `aborting`, and `deleting`. No link or address is created
 yet, so the overlay remains the only deployable mode. ADR 0058 records the wire,
@@ -54,8 +54,10 @@ IPAM stays below a provider interface and above routing. The first provider
 accepts one canonical IPv4 and IPv6 node block, reserves network/gateway and IPv4
 broadcast boundaries, and deterministically selects the lowest free address in
 each family as one atomic lease. Search and node usage are capped at 65,536
-leases. The provider validates reconstructed leases but owns no persistence;
-ADR 0059 keeps durable attachment integration as the remaining 6.3 gate.
+leases. The provider validates reconstructed leases but owns no persistence.
+ADR 0060 integrates each lease into the same atomic attachment record, migrates
+schema-v1 journals, stores exact block provenance, retains leases through cleanup
+intent, and releases only with completed abort/delete.
 
 ## Phase 1 through 3 data flows
 

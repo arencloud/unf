@@ -6,9 +6,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use unf_ipam::{DualStackLease, IpamError, IpamProvider, NodeBlockProvider, UsedAddresses};
 
-pub const CNI_TRANSACTION_SCHEMA_VERSION: u16 = 1;
+pub const CNI_TRANSACTION_SCHEMA_VERSION: u16 = 2;
 pub const MAX_TRANSACTION_MESSAGE_BYTES: usize = 65_536;
+
+const ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 2;
+const LEGACY_ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 1;
 
 const MIN_DUAL_STACK_MTU: u32 = 1_280;
 const MAX_MTU: u32 = 65_535;
@@ -45,6 +49,7 @@ pub enum AttachmentPhase {
 pub struct AttachmentRecord {
     pub spec: AttachmentSpec,
     pub host_interface: String,
+    pub lease: DualStackLease,
     pub phase: AttachmentPhase,
 }
 
@@ -174,6 +179,7 @@ pub enum TransactionErrorCode {
     Conflict,
     InvalidTransition,
     PersistenceFailure,
+    Exhausted,
     Unauthorized,
 }
 
@@ -229,17 +235,36 @@ pub enum JournalError {
     Io(#[from] io::Error),
     #[error("attachment journal JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("attachment IPAM failed: {0}")]
+    Ipam(#[from] IpamError),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct JournalDocument {
     schema_version: u16,
+    provider: NodeBlockProvider,
     attachments: Vec<AttachmentRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacyJournalDocument {
+    schema_version: u16,
+    attachments: Vec<LegacyAttachmentRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LegacyAttachmentRecord {
+    spec: AttachmentSpec,
+    host_interface: String,
+    phase: AttachmentPhase,
 }
 
 pub struct AttachmentJournal {
     path: PathBuf,
+    provider: NodeBlockProvider,
     attachments: BTreeMap<AttachmentKey, AttachmentRecord>,
 }
 
@@ -250,7 +275,10 @@ impl AttachmentJournal {
     ///
     /// Returns an error for unsafe paths, malformed or incompatible state, and
     /// filesystem failures.
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self, JournalError> {
+    pub fn open(
+        path: impl Into<PathBuf>,
+        provider: NodeBlockProvider,
+    ) -> Result<Self, JournalError> {
         let path = path.into();
         if !path.is_absolute() {
             return Err(JournalError::Invalid(
@@ -265,21 +293,28 @@ impl AttachmentJournal {
         reject_symlink_components(&path)?;
         remove_stale_temporary(&path)?;
 
-        let attachments = if path.exists() {
+        let (attachments, migrated) = if path.exists() {
             let metadata = fs::metadata(&path)?;
             if !metadata.file_type().is_file() {
                 return Err(JournalError::Invalid(
                     "journal path must be a regular file".to_owned(),
                 ));
             }
-            let document: JournalDocument = serde_json::from_reader(File::open(&path)?)?;
-            let attachments = validate_document(document)?;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-            attachments
+            load_document(&path, provider)?
         } else {
-            BTreeMap::new()
+            (BTreeMap::new(), false)
         };
-        Ok(Self { path, attachments })
+        let journal = Self {
+            path,
+            provider,
+            attachments,
+        };
+        if migrated {
+            journal.persist()?;
+        } else if journal.path.exists() {
+            fs::set_permissions(&journal.path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(journal)
     }
 
     #[must_use]
@@ -393,9 +428,13 @@ impl AttachmentJournal {
                 "derived host interface {host_interface} is already owned"
             )));
         }
+        let used =
+            UsedAddresses::from_leases(self.attachments.values().map(|record| record.lease))?;
+        let lease = self.provider.allocate(&used)?;
         let record = AttachmentRecord {
             spec: spec.clone(),
             host_interface,
+            lease,
             phase: AttachmentPhase::Preparing,
         };
         self.attachments.insert(spec.key, record.clone());
@@ -522,7 +561,8 @@ impl AttachmentJournal {
             )));
         }
         let document = JournalDocument {
-            schema_version: CNI_TRANSACTION_SCHEMA_VERSION,
+            schema_version: ATTACHMENT_JOURNAL_SCHEMA_VERSION,
+            provider: self.provider,
             attachments: self.attachments.values().cloned().collect(),
         };
         let bytes = serde_json::to_vec_pretty(&document)?;
@@ -547,42 +587,126 @@ impl AttachmentJournal {
     }
 }
 
+fn load_document(
+    path: &Path,
+    provider: NodeBlockProvider,
+) -> Result<(BTreeMap<AttachmentKey, AttachmentRecord>, bool), JournalError> {
+    let bytes = fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let actual = value
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+        .ok_or_else(|| JournalError::Invalid("journal schemaVersion is missing".to_owned()))?;
+    match actual {
+        ATTACHMENT_JOURNAL_SCHEMA_VERSION => {
+            let document: JournalDocument = serde_json::from_value(value)?;
+            if document.provider != provider {
+                return Err(JournalError::Conflict(format!(
+                    "configured node blocks {provider:?} do not match durable provenance {:?}",
+                    document.provider
+                )));
+            }
+            Ok((validate_document(document, provider)?, false))
+        }
+        LEGACY_ATTACHMENT_JOURNAL_SCHEMA_VERSION => {
+            let document: LegacyJournalDocument = serde_json::from_value(value)?;
+            Ok((migrate_legacy_document(document, provider)?, true))
+        }
+        _ => Err(JournalError::IncompatibleSchema {
+            actual,
+            expected: ATTACHMENT_JOURNAL_SCHEMA_VERSION,
+        }),
+    }
+}
+
 fn validate_document(
     document: JournalDocument,
+    provider: NodeBlockProvider,
 ) -> Result<BTreeMap<AttachmentKey, AttachmentRecord>, JournalError> {
-    if document.schema_version != CNI_TRANSACTION_SCHEMA_VERSION {
+    if document.schema_version != ATTACHMENT_JOURNAL_SCHEMA_VERSION {
         return Err(JournalError::IncompatibleSchema {
             actual: document.schema_version,
-            expected: CNI_TRANSACTION_SCHEMA_VERSION,
+            expected: ATTACHMENT_JOURNAL_SCHEMA_VERSION,
         });
     }
     let mut attachments = BTreeMap::new();
     let mut interfaces = BTreeSet::new();
+    let mut used = UsedAddresses::default();
     let mut previous_key: Option<AttachmentKey> = None;
     for record in document.attachments {
-        validate_spec(&record.spec)?;
-        if record.host_interface != deterministic_host_interface(&record.spec.key) {
-            return Err(JournalError::Invalid(
-                "journal contains a non-deterministic host interface".to_owned(),
-            ));
-        }
-        if previous_key
-            .as_ref()
-            .is_some_and(|key| key >= &record.spec.key)
-        {
-            return Err(JournalError::Invalid(
-                "journal attachments must be uniquely sorted by key".to_owned(),
-            ));
-        }
-        if !interfaces.insert(record.host_interface.clone()) {
-            return Err(JournalError::Conflict(
-                "journal contains duplicate host-interface ownership".to_owned(),
-            ));
-        }
+        validate_record_identity(
+            &record.spec,
+            &record.host_interface,
+            previous_key.as_ref(),
+            &mut interfaces,
+        )?;
+        provider.validate(&record.lease)?;
+        used.insert(record.lease)?;
         previous_key = Some(record.spec.key.clone());
         attachments.insert(record.spec.key.clone(), record);
     }
     Ok(attachments)
+}
+
+fn migrate_legacy_document(
+    document: LegacyJournalDocument,
+    provider: NodeBlockProvider,
+) -> Result<BTreeMap<AttachmentKey, AttachmentRecord>, JournalError> {
+    if document.schema_version != LEGACY_ATTACHMENT_JOURNAL_SCHEMA_VERSION {
+        return Err(JournalError::IncompatibleSchema {
+            actual: document.schema_version,
+            expected: ATTACHMENT_JOURNAL_SCHEMA_VERSION,
+        });
+    }
+    let mut attachments = BTreeMap::new();
+    let mut interfaces = BTreeSet::new();
+    let mut used = UsedAddresses::default();
+    let mut previous_key: Option<AttachmentKey> = None;
+    for legacy in document.attachments {
+        validate_record_identity(
+            &legacy.spec,
+            &legacy.host_interface,
+            previous_key.as_ref(),
+            &mut interfaces,
+        )?;
+        let lease = provider.allocate(&used)?;
+        used.insert(lease)?;
+        previous_key = Some(legacy.spec.key.clone());
+        let record = AttachmentRecord {
+            spec: legacy.spec,
+            host_interface: legacy.host_interface,
+            lease,
+            phase: legacy.phase,
+        };
+        attachments.insert(record.spec.key.clone(), record);
+    }
+    Ok(attachments)
+}
+
+fn validate_record_identity(
+    spec: &AttachmentSpec,
+    host_interface: &str,
+    previous_key: Option<&AttachmentKey>,
+    interfaces: &mut BTreeSet<String>,
+) -> Result<(), JournalError> {
+    validate_spec(spec)?;
+    if host_interface != deterministic_host_interface(&spec.key) {
+        return Err(JournalError::Invalid(
+            "journal contains a non-deterministic host interface".to_owned(),
+        ));
+    }
+    if previous_key.is_some_and(|key| key >= &spec.key) {
+        return Err(JournalError::Invalid(
+            "journal attachments must be uniquely sorted by key".to_owned(),
+        ));
+    }
+    if !interfaces.insert(host_interface.to_owned()) {
+        return Err(JournalError::Conflict(
+            "journal contains duplicate host-interface ownership".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_spec(spec: &AttachmentSpec) -> Result<(), JournalError> {
@@ -685,6 +809,13 @@ mod tests {
 
     use super::*;
 
+    fn provider() -> NodeBlockProvider {
+        NodeBlockProvider::new(
+            "10.42.0.0/24".parse().expect("IPv4 node block"),
+            "fd00:42::/120".parse().expect("IPv6 node block"),
+        )
+    }
+
     fn key(container_id: &str) -> AttachmentKey {
         AttachmentKey {
             network: "unf-test".to_owned(),
@@ -709,7 +840,7 @@ mod tests {
     fn prepare_commit_check_and_restart_are_durable_and_idempotent() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("attachments.json");
-        let mut journal = AttachmentJournal::open(&path).expect("open journal");
+        let mut journal = AttachmentJournal::open(&path, provider()).expect("open journal");
         let prepare = request(TransactionOperation::Prepare {
             attachment: spec("container-1"),
         });
@@ -723,7 +854,7 @@ mod tests {
         });
         journal.apply(commit.clone()).expect("commit");
         journal.apply(commit).expect("replay commit");
-        let reopened = AttachmentJournal::open(&path).expect("restart journal");
+        let reopened = AttachmentJournal::open(&path, provider()).expect("restart journal");
         assert_eq!(reopened.len(), 1);
         assert_eq!(
             reopened.get(&key("container-1")).expect("record").phase,
@@ -742,12 +873,16 @@ mod tests {
     fn abort_and_delete_are_repeatable_and_do_not_release_early() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("attachments.json");
-        let mut journal = AttachmentJournal::open(&path).expect("open journal");
+        let mut journal = AttachmentJournal::open(&path, provider()).expect("open journal");
         journal
             .apply(request(TransactionOperation::Prepare {
                 attachment: spec("abort-me"),
             }))
             .expect("prepare abort");
+        let released_lease = journal
+            .get(&key("abort-me"))
+            .expect("prepared abort record")
+            .lease;
         let begin_abort = request(TransactionOperation::BeginAbort {
             key: key("abort-me"),
         });
@@ -758,7 +893,7 @@ mod tests {
             AttachmentPhase::Aborting
         );
         assert_eq!(
-            AttachmentJournal::open(&path)
+            AttachmentJournal::open(&path, provider())
                 .expect("restart while aborting")
                 .get(&key("abort-me"))
                 .expect("durable aborting record")
@@ -780,6 +915,10 @@ mod tests {
                 attachment: spec("delete-me"),
             }))
             .expect("prepare delete");
+        assert_eq!(
+            journal.get(&key("delete-me")).expect("reused lease").lease,
+            released_lease
+        );
         journal
             .apply(request(TransactionOperation::Commit {
                 key: key("delete-me"),
@@ -795,7 +934,7 @@ mod tests {
             AttachmentPhase::Deleting
         );
         assert_eq!(
-            AttachmentJournal::open(&path)
+            AttachmentJournal::open(&path, provider())
                 .expect("restart while deleting")
                 .get(&key("delete-me"))
                 .expect("durable deleting record")
@@ -811,10 +950,42 @@ mod tests {
     }
 
     #[test]
+    fn exhaustion_is_atomic_and_preserves_the_durable_first_lease() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("attachments.json");
+        let limited = NodeBlockProvider::new(
+            "10.42.0.0/30".parse().unwrap(),
+            "fd00:42::/120".parse().unwrap(),
+        );
+        let mut journal = AttachmentJournal::open(&path, limited).expect("open journal");
+        journal
+            .apply(request(TransactionOperation::Prepare {
+                attachment: spec("container-1"),
+            }))
+            .expect("first lease");
+        assert!(matches!(
+            journal.apply(request(TransactionOperation::Prepare {
+                attachment: spec("container-2")
+            })),
+            Err(JournalError::Ipam(IpamError::Exhausted {
+                family: unf_ipam::AddressFamily::Ipv4,
+                ..
+            }))
+        ));
+        assert_eq!(journal.len(), 1);
+        assert_eq!(
+            AttachmentJournal::open(path, limited)
+                .expect("restart after exhaustion")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn conflicts_and_invalid_transitions_do_not_change_state() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let mut journal =
-            AttachmentJournal::open(directory.path().join("state.json")).expect("open journal");
+        let mut journal = AttachmentJournal::open(directory.path().join("state.json"), provider())
+            .expect("open journal");
         journal
             .apply(request(TransactionOperation::Prepare {
                 attachment: spec("container-1"),
@@ -841,31 +1012,30 @@ mod tests {
     fn incompatible_malformed_unsorted_and_symlinked_journals_are_rejected() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let incompatible = directory.path().join("incompatible.json");
-        fs::write(&incompatible, r#"{"schemaVersion":2,"attachments":[]}"#)
-            .expect("write incompatible state");
+        fs::write(&incompatible, r#"{"schemaVersion":3}"#).expect("write incompatible state");
         assert!(matches!(
-            AttachmentJournal::open(incompatible),
+            AttachmentJournal::open(incompatible, provider()),
             Err(JournalError::IncompatibleSchema { .. })
         ));
 
         let malformed = directory.path().join("malformed.json");
         fs::write(&malformed, b"not-json").expect("write malformed state");
         assert!(matches!(
-            AttachmentJournal::open(malformed),
+            AttachmentJournal::open(malformed, provider()),
             Err(JournalError::Json(_))
         ));
 
         let sorted = directory.path().join("sorted.json");
         let records = [spec("container-b"), spec("container-a")]
             .into_iter()
-            .map(|spec| AttachmentRecord {
+            .map(|spec| LegacyAttachmentRecord {
                 host_interface: deterministic_host_interface(&spec.key),
                 spec,
                 phase: AttachmentPhase::Preparing,
             })
             .collect();
-        let document = JournalDocument {
-            schema_version: CNI_TRANSACTION_SCHEMA_VERSION,
+        let document = LegacyJournalDocument {
+            schema_version: LEGACY_ATTACHMENT_JOURNAL_SCHEMA_VERSION,
             attachments: records,
         };
         fs::write(
@@ -874,7 +1044,7 @@ mod tests {
         )
         .expect("write unsorted state");
         assert!(matches!(
-            AttachmentJournal::open(sorted),
+            AttachmentJournal::open(sorted, provider()),
             Err(JournalError::Invalid(_))
         ));
 
@@ -883,7 +1053,7 @@ mod tests {
         let link = directory.path().join("link.json");
         symlink(real, &link).expect("create journal symlink");
         assert!(matches!(
-            AttachmentJournal::open(link),
+            AttachmentJournal::open(link, provider()),
             Err(JournalError::Invalid(_))
         ));
 
@@ -891,7 +1061,7 @@ mod tests {
         fs::write(temporary_path(&recoverable), b"interrupted write")
             .expect("write stale temporary journal");
         assert!(
-            AttachmentJournal::open(&recoverable)
+            AttachmentJournal::open(&recoverable, provider())
                 .expect("stale temporary state is recovered")
                 .is_empty()
         );
@@ -902,18 +1072,136 @@ mod tests {
     fn requests_and_results_have_a_stable_versioned_wire_shape() {
         let encoded =
             serde_json::to_value(request(TransactionOperation::Status)).expect("encode request");
-        assert_eq!(encoded["schemaVersion"], 1);
+        assert_eq!(encoded["schemaVersion"], 2);
         assert_eq!(encoded["operation"], "status");
         let response = TransactionResponse::error(
             TransactionErrorCode::Unauthorized,
             "root credentials required",
         );
         let encoded = serde_json::to_value(response).expect("encode response");
-        assert_eq!(encoded["schemaVersion"], 1);
+        assert_eq!(encoded["schemaVersion"], 2);
         assert_eq!(encoded["status"], "error");
         assert_eq!(encoded["code"], "unauthorized");
 
-        let unknown = br#"{"schemaVersion":1,"operation":"status","unexpected":true}"#;
+        let unknown = br#"{"schemaVersion":2,"operation":"status","unexpected":true}"#;
         assert!(serde_json::from_slice::<TransactionRequest>(unknown).is_err());
+    }
+
+    #[test]
+    fn schema_one_journal_migrates_deterministically_with_provider_provenance() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("attachments.json");
+        let records = [spec("container-a"), spec("container-b")]
+            .into_iter()
+            .map(|spec| LegacyAttachmentRecord {
+                host_interface: deterministic_host_interface(&spec.key),
+                spec,
+                phase: AttachmentPhase::Preparing,
+            })
+            .collect();
+        fs::write(
+            &path,
+            serde_json::to_vec(&LegacyJournalDocument {
+                schema_version: LEGACY_ATTACHMENT_JOURNAL_SCHEMA_VERSION,
+                attachments: records,
+            })
+            .expect("encode legacy state"),
+        )
+        .expect("write legacy state");
+
+        let journal = AttachmentJournal::open(&path, provider()).expect("migrate legacy journal");
+        assert_eq!(
+            journal
+                .get(&key("container-a"))
+                .expect("first migrated lease")
+                .lease
+                .ipv4
+                .address,
+            "10.42.0.2".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            journal
+                .get(&key("container-b"))
+                .expect("second migrated lease")
+                .lease
+                .ipv6
+                .address,
+            "fd00:42::3".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read migrated state"))
+                .expect("decode migrated state");
+        assert_eq!(encoded["schemaVersion"], 2);
+        assert_eq!(encoded["provider"]["ipv4Block"], "10.42.0.0/24");
+        AttachmentJournal::open(&path, provider()).expect("reopen migrated journal");
+
+        let changed = NodeBlockProvider::new(
+            "10.43.0.0/24".parse().unwrap(),
+            "fd00:43::/120".parse().unwrap(),
+        );
+        assert!(matches!(
+            AttachmentJournal::open(path, changed),
+            Err(JournalError::Conflict(_))
+        ));
+
+        let exhausted_path = directory.path().join("exhausted-legacy.json");
+        let records = [spec("container-a"), spec("container-b")]
+            .into_iter()
+            .map(|spec| LegacyAttachmentRecord {
+                host_interface: deterministic_host_interface(&spec.key),
+                spec,
+                phase: AttachmentPhase::Preparing,
+            })
+            .collect();
+        let original = serde_json::to_vec(&LegacyJournalDocument {
+            schema_version: LEGACY_ATTACHMENT_JOURNAL_SCHEMA_VERSION,
+            attachments: records,
+        })
+        .expect("encode exhausted legacy state");
+        fs::write(&exhausted_path, &original).expect("write exhausted legacy state");
+        let limited = NodeBlockProvider::new(
+            "10.44.0.0/30".parse().unwrap(),
+            "fd00:44::/120".parse().unwrap(),
+        );
+        assert!(matches!(
+            AttachmentJournal::open(&exhausted_path, limited),
+            Err(JournalError::Ipam(IpamError::Exhausted { .. }))
+        ));
+        assert_eq!(
+            fs::read(exhausted_path).expect("failed migration keeps original"),
+            original
+        );
+    }
+
+    #[test]
+    fn duplicate_durable_lease_is_rejected_before_state_is_served() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("attachments.json");
+        let mut journal = AttachmentJournal::open(&path, provider()).expect("open journal");
+        for container_id in ["container-a", "container-b"] {
+            journal
+                .apply(request(TransactionOperation::Prepare {
+                    attachment: spec(container_id),
+                }))
+                .expect("prepare lease");
+        }
+        drop(journal);
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read journal"))
+                .expect("decode journal");
+        let first_ipv4 = document["attachments"][0]["lease"]["ipv4"]["address"].clone();
+        document["attachments"][1]["lease"]["ipv4"]["address"] = first_ipv4;
+        fs::write(
+            &path,
+            serde_json::to_vec(&document).expect("encode corrupt journal"),
+        )
+        .expect("write corrupt journal");
+        assert!(matches!(
+            AttachmentJournal::open(path, provider()),
+            Err(JournalError::Ipam(IpamError::DuplicateLease {
+                family: unf_ipam::AddressFamily::Ipv4,
+                ..
+            }))
+        ));
     }
 }

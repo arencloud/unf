@@ -1,6 +1,6 @@
 # ADR 0058: Local CNI attachment transactions are durable and root-authenticated
 
-Status: Accepted and implemented for the full-CNI foundation
+Status: Accepted; schema v1 superseded by the migration-compatible schema v2 in ADR 0060
 
 ## Context
 

@@ -38,6 +38,7 @@ use unf_ebpf_common::{
     POLICY_FLAG_HAS_SHADOW, POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE,
     POLICY_MAP_ABI_VERSION,
 };
+use unf_ipam::{Ipv4NodeBlock, Ipv6NodeBlock, NodeBlockProvider};
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
     EgressIpv4PolicyMapEntry, EgressIpv6PolicyMapEntry, FLOW_EXPORT_BATCH_LIMIT,
@@ -144,7 +145,11 @@ struct Args {
     #[arg(long, env = "UNF_BPF_PIN_PATH", default_value = DEFAULT_BPF_PIN_PATH)]
     bpf_pin_path: PathBuf,
     /// Enable the root-only local CNI transaction API at this Unix socket.
-    #[arg(long, env = "UNF_CNI_SOCKET")]
+    #[arg(
+        long,
+        env = "UNF_CNI_SOCKET",
+        requires_all = ["cni_ipv4_block", "cni_ipv6_block"]
+    )]
     cni_socket: Option<PathBuf>,
     /// Durable attachment journal used only when --cni-socket is enabled.
     #[arg(
@@ -153,6 +158,22 @@ struct Args {
         default_value = DEFAULT_CNI_STATE_PATH
     )]
     cni_state_path: PathBuf,
+    /// Controller-assigned IPv4 node block for the opt-in CNI service.
+    #[arg(
+        long,
+        env = "UNF_CNI_IPV4_BLOCK",
+        requires = "cni_socket",
+        requires = "cni_ipv6_block"
+    )]
+    cni_ipv4_block: Option<Ipv4NodeBlock>,
+    /// Controller-assigned IPv6 node block for the opt-in CNI service.
+    #[arg(
+        long,
+        env = "UNF_CNI_IPV6_BLOCK",
+        requires = "cni_socket",
+        requires = "cni_ipv4_block"
+    )]
+    cni_ipv6_block: Option<Ipv6NodeBlock>,
     #[arg(
         long,
         env = "UNF_TC_ATTACHMENT_MODE",
@@ -668,12 +689,20 @@ fn spawn_cni_transaction_server(
     let Some(socket_path) = &args.cni_socket else {
         return Ok(false);
     };
-    let server = CniTransactionServer::bind(socket_path.clone(), &args.cni_state_path)?;
+    let provider = NodeBlockProvider::new(
+        args.cni_ipv4_block
+            .context("--cni-socket requires --cni-ipv4-block")?,
+        args.cni_ipv6_block
+            .context("--cni-socket requires --cni-ipv6-block")?,
+    );
+    let server = CniTransactionServer::bind(socket_path.clone(), &args.cni_state_path, provider)?;
     let server_cancellation = cancellation.clone();
     let failure_tx = failure_tx.clone();
     info!(
         socket = %socket_path.display(),
         state = %args.cni_state_path.display(),
+        ipv4_block = %provider.ipv4_block,
+        ipv6_block = %provider.ipv6_block,
         "root-authenticated CNI transaction API enabled"
     );
     tasks.spawn(async move {
@@ -4402,6 +4431,7 @@ mod tests {
             defaults.cni_state_path,
             Path::new("/var/lib/unf/cni/v1/attachments.json")
         );
+        assert!(Args::try_parse_from(["unf-agent", "--cni-socket", "/run/unf/cni.sock"]).is_err());
 
         let enabled = Args::try_parse_from([
             "unf-agent",
@@ -4409,11 +4439,19 @@ mod tests {
             "/run/unf/cni.sock",
             "--cni-state-path",
             "/var/lib/unf/cni/v1/test.json",
+            "--cni-ipv4-block",
+            "10.42.0.0/24",
+            "--cni-ipv6-block",
+            "fd00:42::/64",
         ])
         .expect("CNI transaction arguments parse");
         assert_eq!(
             enabled.cni_socket.as_deref(),
             Some(Path::new("/run/unf/cni.sock"))
+        );
+        assert_eq!(
+            enabled.cni_ipv4_block.expect("IPv4 block").to_string(),
+            "10.42.0.0/24"
         );
     }
 

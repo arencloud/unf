@@ -2814,6 +2814,7 @@ dependencies = [
  "unf-cni-state",
  "unf-common",
  "unf-ebpf-common",
+ "unf-ipam",
  "unf-state",
 ]
 
@@ -2845,6 +2846,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "unf-ipam",
 ]
 
 [[package]]

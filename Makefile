@@ -75,7 +75,9 @@ cni-transaction-test:
 
 cni-ipam-test:
 	cargo test -p unf-ipam
-	cargo clippy -p unf-ipam --all-targets --all-features -- -D warnings
+	cargo test -p unf-cni-state
+	cargo test -p unf-agent cni_server
+	cargo clippy -p unf-ipam -p unf-cni-state -p unf-agent --all-targets --all-features -- -D warnings
 
 cli:
 	cargo build -p unfctl

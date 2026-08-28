@@ -14,6 +14,7 @@ use unf_cni_state::{
     AttachmentJournal, JournalError, MAX_TRANSACTION_MESSAGE_BYTES, TransactionErrorCode,
     TransactionRequest, TransactionResponse,
 };
+use unf_ipam::{IpamError, NodeBlockProvider};
 
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
@@ -33,9 +34,13 @@ impl CniTransactionServer {
     ///
     /// Returns an error when the paths are unsafe, durable state is invalid, or
     /// the socket cannot be bound with owner-only permissions.
-    pub fn bind(socket_path: PathBuf, state_path: &Path) -> Result<Self> {
+    pub fn bind(
+        socket_path: PathBuf,
+        state_path: &Path,
+        provider: NodeBlockProvider,
+    ) -> Result<Self> {
         validate_socket_path(&socket_path)?;
-        let journal = AttachmentJournal::open(state_path)
+        let journal = AttachmentJournal::open(state_path, provider)
             .with_context(|| format!("open CNI attachment journal {}", state_path.display()))?;
         prepare_socket_path(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)
@@ -143,10 +148,11 @@ fn journal_error_response(error: &JournalError) -> TransactionResponse {
     let code = match error {
         JournalError::Invalid(_) | JournalError::Json(_) => TransactionErrorCode::InvalidRequest,
         JournalError::NotFound => TransactionErrorCode::NotFound,
-        JournalError::Conflict(_) => TransactionErrorCode::Conflict,
         JournalError::InvalidTransition(_) => TransactionErrorCode::InvalidTransition,
         JournalError::IncompatibleSchema { .. } => TransactionErrorCode::IncompatibleSchema,
         JournalError::Io(_) => TransactionErrorCode::PersistenceFailure,
+        JournalError::Ipam(IpamError::Exhausted { .. }) => TransactionErrorCode::Exhausted,
+        JournalError::Conflict(_) | JournalError::Ipam(_) => TransactionErrorCode::Conflict,
     };
     TransactionResponse::error(code, error.to_string())
 }
@@ -264,6 +270,13 @@ mod tests {
 
     use super::*;
 
+    fn provider() -> NodeBlockProvider {
+        NodeBlockProvider::new(
+            "10.42.0.0/24".parse().expect("IPv4 node block"),
+            "fd00:42::/120".parse().expect("IPv6 node block"),
+        )
+    }
+
     fn request(operation: TransactionOperation) -> Vec<u8> {
         serde_json::to_vec(&TransactionRequest::new(
             CNI_TRANSACTION_SCHEMA_VERSION,
@@ -288,7 +301,7 @@ mod tests {
     async fn handler_persists_versioned_state_transitions() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("attachments.json");
-        let journal = Mutex::new(AttachmentJournal::open(&path).expect("open journal"));
+        let journal = Mutex::new(AttachmentJournal::open(&path, provider()).expect("open journal"));
         let prepare = handle_request(
             &request(TransactionOperation::Prepare { attachment: spec() }),
             &journal,
@@ -316,14 +329,19 @@ mod tests {
             panic!("commit must return one attachment");
         };
         assert_eq!(ready.phase, AttachmentPhase::Ready);
-        assert_eq!(AttachmentJournal::open(path).expect("restart").len(), 1);
+        assert_eq!(
+            AttachmentJournal::open(path, provider())
+                .expect("restart")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn malformed_and_incompatible_requests_have_machine_readable_errors() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let journal = Mutex::new(
-            AttachmentJournal::open(directory.path().join("attachments.json"))
+            AttachmentJournal::open(directory.path().join("attachments.json"), provider())
                 .expect("open journal"),
         );
         let malformed = handle_request(b"not-json", &journal).await;
@@ -335,7 +353,7 @@ mod tests {
             }
         ));
         let incompatible = handle_request(
-            &serde_json::to_vec(&TransactionRequest::new(2, TransactionOperation::Status))
+            &serde_json::to_vec(&TransactionRequest::new(1, TransactionOperation::Status))
                 .expect("encode incompatible request"),
             &journal,
         )
@@ -347,6 +365,35 @@ mod tests {
                 ..
             }
         ));
+
+        let limited = NodeBlockProvider::new(
+            "10.43.0.0/30".parse().unwrap(),
+            "fd00:43::/120".parse().unwrap(),
+        );
+        let limited_journal = Mutex::new(
+            AttachmentJournal::open(directory.path().join("limited.json"), limited)
+                .expect("open limited journal"),
+        );
+        handle_request(
+            &request(TransactionOperation::Prepare { attachment: spec() }),
+            &limited_journal,
+        )
+        .await;
+        let mut second = spec();
+        second.key.container_id = "container-2".to_owned();
+        second.netns = "/run/netns/container-2".to_owned();
+        let exhausted = handle_request(
+            &request(TransactionOperation::Prepare { attachment: second }),
+            &limited_journal,
+        )
+        .await;
+        assert!(matches!(
+            exhausted.outcome,
+            TransactionOutcome::Error {
+                code: TransactionErrorCode::Exhausted,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -354,7 +401,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let socket = directory.path().join("cni.sock");
         let state = directory.path().join("attachments.json");
-        let server = CniTransactionServer::bind(socket.clone(), &state).expect("bind server");
+        let server =
+            CniTransactionServer::bind(socket.clone(), &state, provider()).expect("bind server");
         let mode = fs::metadata(&socket)
             .expect("socket metadata")
             .permissions()
@@ -372,7 +420,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let socket = directory.path().join("cni.sock");
         let state = directory.path().join("attachments.json");
-        let server = CniTransactionServer::bind(socket.clone(), &state).expect("bind server");
+        let server =
+            CniTransactionServer::bind(socket.clone(), &state, provider()).expect("bind server");
         let cancellation = CancellationToken::new();
         let shutdown = cancellation.clone();
         let task = tokio::spawn(server.run(shutdown));
@@ -414,7 +463,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let socket = directory.path().join("cni.sock");
         let state = directory.path().join("attachments.json");
-        let server = CniTransactionServer::bind(socket.clone(), &state).expect("bind server");
+        let server =
+            CniTransactionServer::bind(socket.clone(), &state, provider()).expect("bind server");
         fs::remove_file(&socket).expect("unlink original socket name");
         fs::write(&socket, b"replacement").expect("create replacement path");
         let cancellation = CancellationToken::new();

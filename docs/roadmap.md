@@ -270,16 +270,19 @@ authoritative record of verified results.
   validation and VERSION behavior. ADD/CHECK/STATUS remain explicitly unavailable
   until IPAM and link operations are connected through the versioned local API.
 - The opt-in local agent transaction service now enforces kernel UID-0 peer
-  authentication and schema-v1 64-KiB messages. Its atomic mode-0600 journal
-  durably reloads deterministic preparing/ready/aborting/deleting attachment
-  records and rejects conflicting or invalid replays; ADR 0058.
+  authentication and schema-v2 64-KiB messages. Its atomic mode-0600 journal
+  durably reloads deterministic preparing/ready/aborting/deleting attachment and
+  lease records and rejects conflicting or invalid replays; ADRs 0058 and 0060.
 - The first `unf-ipam` provider now validates canonical dual-stack node blocks
   and returns one deterministic, bounded, collision-checked lease without owning
   routing or Kubernetes state. Exhaustion and release/reuse are verified; ADR
   0059.
-- Next: integrate leases into a migration-tested schema-v2 attachment journal,
-  then connect ADD/DEL/CHECK to veth lifecycle, native routing/MTU, and cross-node
-  Kind qualification.
+- Schema-v2 attachment records now allocate a complete lease on prepare, retain
+  it through cleanup intent and restart, and release it only on completed cleanup.
+  Schema-v1 state migrates atomically and exact node-block provenance prevents
+  silent configuration drift; ADR 0060.
+- Next: connect ADD/DEL/CHECK to a portable veth lifecycle, then native
+  routing/MTU, controller block distribution, and cross-node Kind qualification.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.
