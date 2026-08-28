@@ -299,8 +299,13 @@ authoritative record of verified results.
   authenticated, revisioned IPv4+IPv6 `spec.podCIDRs` snapshot. Overlaps and
   malformed assignments fail closed; agents validate durable provenance,
   persist mode-0600 state, and acknowledge desired/applied revisions.
-- Next: implement cross-node native route intent, typed kernel lifecycle, and
-  reconciliation/recovery before isolated primary-CNI Kind installation.
+- Provider-neutral remote Node/block intent and native lowering are Verified by
+  ADR 0065. The typed kernel lifecycle supports independent IPv4/IPv6 next hops,
+  deterministic bounded planning, replay/readback/repair, scoped rollback,
+  exact cleanup, and foreign-route preservation. The current-product design
+  inputs are tracked in the [competitive routing evaluation](development/competitive-routing-evaluation.md).
+- Next: distribute the complete remote-route snapshot and implement long-lived
+  agent reconciliation/recovery before isolated primary-CNI Kind installation.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

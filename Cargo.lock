@@ -3016,6 +3016,8 @@ dependencies = [
  "futures",
  "rtnetlink",
  "rustix",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "unf-cni-state",

@@ -61,6 +61,16 @@ rotation requires drain and restart. The overlay remains the only deployed mode
 until cross-node networking and isolated primary-CNI qualification pass. ADR
 0064 records this distribution boundary.
 
+Cross-node desired state begins with strict provider-neutral remote Node intent:
+Node name/UID, assignment revision, and canonical IPv4/IPv6 blocks. The native
+provider independently supplies each family's next hop, interface, and on-link
+behavior, then lowers one exact route per remote block. Complete typed-netlink
+preflight precedes mutation; replay, readback, missing-route repair, scoped
+rollback, foreign-state preservation, and exact deletion share one lifecycle.
+This IR is the boundary for later overlay, BGP, hybrid and multi-cluster
+providers. Controller-to-agent remote-state distribution and continuous
+reconciliation remain in 6.6c; ADR 0065 records the implemented primitive.
+
 IPAM stays below a provider interface and above routing. The first provider
 accepts one canonical IPv4 and IPv6 node block, reserves network/gateway and IPv4
 broadcast boundaries, and deterministically selects the lowest free address in

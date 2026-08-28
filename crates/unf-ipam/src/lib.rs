@@ -132,6 +132,11 @@ impl Ipv4NodeBlock {
         u32::from(self.network) & mask == u32::from(other.network) & mask
     }
 
+    #[must_use]
+    pub fn contains(self, address: Ipv4Addr) -> bool {
+        u32::from(address) & prefix_mask_v4(self.prefix_len) == u32::from(self.network)
+    }
+
     fn candidate(self, index: usize) -> Ipv4Addr {
         let offset = u32::try_from(index).expect("bounded index fits u32") + 2;
         Ipv4Addr::from(u32::from(self.network) + offset)
@@ -142,7 +147,7 @@ impl Ipv4NodeBlock {
         let network = u32::from(self.network);
         let total = 1_u64 << (32 - self.prefix_len);
         let offset = u64::from(value.saturating_sub(network));
-        value >= network && offset >= 2 && offset < total - 1
+        self.contains(address) && value >= network && offset >= 2 && offset < total - 1
     }
 }
 
@@ -254,6 +259,11 @@ impl Ipv6NodeBlock {
         u128::from(self.network) & mask == u128::from(other.network) & mask
     }
 
+    #[must_use]
+    pub fn contains(self, address: Ipv6Addr) -> bool {
+        u128::from(address) & prefix_mask_v6(self.prefix_len) == u128::from(self.network)
+    }
+
     fn candidate(self, index: usize) -> Ipv6Addr {
         let offset = u128::try_from(index).expect("bounded index fits u128") + 2;
         Ipv6Addr::from(u128::from(self.network) + offset)
@@ -262,9 +272,7 @@ impl Ipv6NodeBlock {
     fn contains_workload(self, address: Ipv6Addr) -> bool {
         let value = u128::from(address);
         let network = u128::from(self.network);
-        value >= network
-            && value & prefix_mask_v6(self.prefix_len) == network
-            && value.saturating_sub(network) >= 2
+        value >= network && self.contains(address) && value.saturating_sub(network) >= 2
     }
 }
 
@@ -559,9 +567,13 @@ mod tests {
         let ipv4: Ipv4NodeBlock = "10.42.0.0/24".parse().unwrap();
         assert!(ipv4.overlaps("10.42.0.128/25".parse().unwrap()));
         assert!(!ipv4.overlaps("10.42.1.0/24".parse().unwrap()));
+        assert!(ipv4.contains("10.42.0.255".parse().unwrap()));
+        assert!(!ipv4.contains("10.42.1.0".parse().unwrap()));
         let ipv6: Ipv6NodeBlock = "fd00:42::/64".parse().unwrap();
         assert!(ipv6.overlaps("fd00:42::/80".parse().unwrap()));
         assert!(!ipv6.overlaps("fd00:43::/64".parse().unwrap()));
+        assert!(ipv6.contains("fd00:42::ffff".parse().unwrap()));
+        assert!(!ipv6.contains("fd00:43::".parse().unwrap()));
 
         let snapshot = NodeBlockSnapshot {
             schema_version: NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION,

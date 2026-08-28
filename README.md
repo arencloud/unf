@@ -89,7 +89,7 @@ The Phase 3 gate and all 42 deliverables are Verified. Exact closure evidence,
 limits, and the separately tracked full-CNI entry are maintained in the
 [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md)
 and ADR 0056.
-The full-CNI foundation is now in progress under ADRs 0057–0064. The `unf-cni`
+The full-CNI foundation is now in progress under ADRs 0057–0065. The `unf-cni`
 executable now composes dual-stack IPAM, exact veth, and native routing through
 atomic ADD/CHECK/DEL transactions. An explicitly enabled local-agent Unix service
 provides the root-authenticated, bounded schema-v2 transaction boundary and
@@ -103,8 +103,12 @@ endpoint routing with scoped rollback, conflict preservation, and verified
 MTU/fragmentation boundaries. An explicitly opted-in Node now receives its own
 authenticated, revisioned dual-stack `spec.podCIDRs` snapshot from the controller;
 the agent validates durable provider provenance, persists owner-only state, and
-acknowledges application before convergence. Cross-node networking and cluster
-CNI installation are not implemented; existing overlay deployments are unchanged.
+acknowledges application before convergence. Provider-neutral remote Node/block
+intent now lowers into deterministic, exact native IPv4/IPv6 block routes with
+independent family paths, typed-netlink replay/readback/repair/delete, scoped
+rollback, and foreign-state preservation. Runtime route distribution and
+reconciliation, cluster CNI installation, and cross-worker primary-mode
+qualification are not implemented; existing overlay deployments are unchanged.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

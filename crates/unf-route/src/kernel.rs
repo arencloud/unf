@@ -17,14 +17,20 @@ use rustix::fs::{Mode, OFlags, open};
 use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
 
 use super::{
-    NativeRoutePlan, NeighborSpec, NetworkNamespace, RouteDeleteOutcome, RouteError, RouteReadback,
-    RouteScope, RouteSpec,
+    NativeRemoteRoutePlan, NativeRoutePlan, NeighborSpec, NetworkNamespace, RouteDeleteOutcome,
+    RouteError, RouteReadback, RouteScope, RouteSpec,
 };
 
 #[derive(Debug)]
 struct ObservedState {
     routes: Vec<Option<RouteMessage>>,
     neighbors: Vec<Option<NeighbourMessage>>,
+}
+
+#[derive(Debug, Default)]
+struct AppliedState {
+    routes: Vec<RouteSpec>,
+    neighbors: Vec<NeighborSpec>,
 }
 
 impl ObservedState {
@@ -71,31 +77,42 @@ impl NativeRoutePlan {
         .await?;
 
         let plan = self.clone();
-        let container_apply = run_in_namespace(
+        let container_changes = run_in_namespace(
             clone_namespace(&namespace, &self.netns)?,
             move || async move {
                 let handle = connect("open container route connection")?;
                 apply_local(&handle, &plan.container_routes, &plan.container_neighbors).await
             },
         )
-        .await;
-        if let Err(cause) = container_apply {
-            let rollback = self.rollback_container(&namespace).await;
-            return Err(with_rollback(cause, [rollback]));
-        }
+        .await?;
 
         if let Err(cause) = after_container() {
-            let rollback = self.rollback_container(&namespace).await;
+            let rollback = self
+                .rollback_container_changes(&namespace, container_changes)
+                .await;
             return Err(with_rollback(cause, [rollback]));
         }
 
-        if let Err(cause) = apply_local(&host, &self.host_routes, &self.host_neighbors).await {
-            let host_rollback = delete_local(&host, &self.host_routes, &self.host_neighbors).await;
-            let container_rollback = self.rollback_container(&namespace).await;
-            return Err(with_rollback(cause, [host_rollback, container_rollback]));
-        }
+        let host_changes = match apply_local(&host, &self.host_routes, &self.host_neighbors).await {
+            Ok(changes) => changes,
+            Err(cause) => {
+                let container_rollback = self
+                    .rollback_container_changes(&namespace, container_changes)
+                    .await;
+                return Err(with_rollback(cause, [container_rollback]));
+            }
+        };
 
-        self.readback().await
+        match self.readback().await {
+            Ok(readback) => Ok(readback),
+            Err(cause) => {
+                let host_rollback = rollback_local(&host, host_changes).await;
+                let container_rollback = self
+                    .rollback_container_changes(&namespace, container_changes)
+                    .await;
+                Err(with_rollback(cause, [host_rollback, container_rollback]))
+            }
+        }
     }
 
     /// Strictly reads both namespace roles and returns the planned state.
@@ -190,16 +207,73 @@ impl NativeRoutePlan {
         })
     }
 
-    async fn rollback_container(&self, namespace: &File) -> Result<bool, RouteError> {
-        let plan = self.clone();
+    async fn rollback_container_changes(
+        &self,
+        namespace: &File,
+        changes: AppliedState,
+    ) -> Result<bool, RouteError> {
         run_in_namespace(
             clone_namespace(namespace, &self.netns)?,
             move || async move {
                 let handle = connect("open container rollback connection")?;
-                delete_local(&handle, &plan.container_routes, &plan.container_neighbors).await
+                rollback_local(&handle, changes).await
             },
         )
         .await
+    }
+}
+
+impl NativeRemoteRoutePlan {
+    /// Applies or exactly replays all remote Pod-block routes on the host.
+    ///
+    /// # Errors
+    ///
+    /// Preflights the complete desired set before mutation, rejects foreign
+    /// destination/table keys, and rolls back only routes created by this call
+    /// after a partial netlink or readback failure.
+    pub async fn apply(&self) -> Result<RouteReadback, RouteError> {
+        let host = connect("open remote route connection")?;
+        let changes = apply_local(&host, &self.routes, &[]).await?;
+        match self.readback().await {
+            Ok(readback) => Ok(readback),
+            Err(cause) => {
+                let rollback = rollback_local(&host, changes).await;
+                Err(with_rollback(cause, [rollback]))
+            }
+        }
+    }
+
+    /// Strictly reads the complete remote Pod-block route set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing, duplicate, or foreign route state.
+    pub async fn readback(&self) -> Result<RouteReadback, RouteError> {
+        let host = connect("open remote route readback connection")?;
+        let observed = inspect_local(&host, &self.routes, &[]).await?;
+        require_complete(&observed, NetworkNamespace::Host)?;
+        Ok(RouteReadback {
+            routes: self.routes.iter().copied().collect(),
+            neighbors: std::collections::BTreeSet::new(),
+        })
+    }
+
+    /// Removes only the exact owned remote Pod-block route set.
+    ///
+    /// # Errors
+    ///
+    /// Preflights the complete set and refuses mutation when any destination
+    /// key contains foreign state.
+    pub async fn delete(&self) -> Result<RouteDeleteOutcome, RouteError> {
+        let host = connect("open remote route deletion connection")?;
+        let observed = inspect_local(&host, &self.routes, &[]).await?;
+        let existed = !observed.is_absent();
+        delete_local(&host, &self.routes, &[]).await?;
+        Ok(if existed {
+            RouteDeleteOutcome::Deleted
+        } else {
+            RouteDeleteOutcome::AlreadyAbsent
+        })
     }
 }
 
@@ -244,30 +318,45 @@ async fn apply_local(
     handle: &Handle,
     routes: &[RouteSpec],
     neighbors: &[NeighborSpec],
-) -> Result<(), RouteError> {
+) -> Result<AppliedState, RouteError> {
     let observed = inspect_local(handle, routes, neighbors).await?;
+    let mut changes = AppliedState::default();
     for (spec, message) in neighbors.iter().zip(observed.neighbors) {
         if message.is_none() {
-            handle
+            let result = handle
                 .neighbours()
                 .add(spec.output_interface, spec.destination)
                 .link_layer_address(&spec.link_address)
                 .execute()
-                .await
-                .map_err(|error| netlink("add permanent neighbor", &error))?;
+                .await;
+            if let Err(error) = result {
+                let cause = netlink("add permanent neighbor", &error);
+                return Err(with_rollback(
+                    cause,
+                    [rollback_local(handle, changes).await],
+                ));
+            }
+            changes.neighbors.push(*spec);
         }
     }
     for (spec, message) in routes.iter().zip(observed.routes) {
         if message.is_none() {
-            handle
-                .route()
-                .add(build_route(*spec))
-                .execute()
-                .await
-                .map_err(|error| netlink("add route", &error))?;
+            let result = handle.route().add(build_route(*spec)).execute().await;
+            if let Err(error) = result {
+                let cause = netlink("add route", &error);
+                return Err(with_rollback(
+                    cause,
+                    [rollback_local(handle, changes).await],
+                ));
+            }
+            changes.routes.push(*spec);
         }
     }
-    Ok(())
+    Ok(changes)
+}
+
+async fn rollback_local(handle: &Handle, changes: AppliedState) -> Result<bool, RouteError> {
+    delete_local(handle, &changes.routes, &changes.neighbors).await
 }
 
 async fn delete_local(

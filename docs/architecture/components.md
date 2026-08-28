@@ -6,7 +6,7 @@
 | `unf-cni-state` | Versioned local CNI transaction schema, inspectable attachment/lease state machine, schema migration, and atomic durable journal | Kubernetes access, namespace/link mutation, IPAM allocation policy, or remote transport |
 | `unf-ipam` | Modular, bounded dual-stack lease types, collision-safe node-block allocation, overlap validation, and strict distribution snapshot schema | Kubernetes watches, routing policy, durable attachment storage, or namespace/link mutation |
 | `unf-link` | Deterministic, ownership-safe veth planning, namespace movement, dual-stack address application, readback, recovery, and exact cleanup | Kubernetes access, durable transactions, route policy, controller state, or shell-command mutation |
-| `unf-route` | Routing-provider abstraction, native endpoint route/neighbor IR and typed kernel lifecycle, scoped rollback, and provider-declared MTU derivation | IP allocation, link mutation, durable transactions, Kubernetes access, or policy enforcement |
+| `unf-route` | Routing-provider abstraction, strict remote Node/block intent, native endpoint and cross-node route IR, typed kernel lifecycle/repair, scoped rollback, and provider-declared MTU derivation | IP allocation, link mutation, durable transactions, Kubernetes access, or policy enforcement |
 | `unf-ebpf-common` | Versioned fixed-layout flow and BPF map ABIs | Variable strings or allocation |
 | `unf-api` | CRD schema and serialization | Policy evaluation |
 | `unf-policy` | Native and NetworkPolicy conversion, shared IR, deterministic evaluation, identity-tuple lowering | Kubernetes watches or BPF map mutation |

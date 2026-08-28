@@ -10,13 +10,15 @@ repository.workspace = true
 futures.workspace = true
 rtnetlink.workspace = true
 rustix.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 unf-cni-state = { path = "../unf-cni-state" }
+unf-ipam = { path = "../unf-ipam" }
 unf-link = { path = "../unf-link" }
 
 [dev-dependencies]
-unf-ipam = { path = "../unf-ipam" }
+serde_json.workspace = true
 
 [lints]
 workspace = true

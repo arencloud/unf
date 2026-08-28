@@ -8,6 +8,12 @@ use unf_cni_state::AttachmentRecord;
 use unf_link::{AssignedAddress, LinkReadback};
 
 mod kernel;
+mod remote;
+
+pub use remote::{
+    MAX_REMOTE_NODES, NativeIpv4NextHop, NativeIpv6NextHop, NativeRemoteNode,
+    NativeRemoteRoutePlan, NativeRemoteRoutingProvider, RemoteNodeIntent,
+};
 
 pub const MIN_DUAL_STACK_MTU: u32 = 1_280;
 pub const MAX_WORKLOAD_MTU: u32 = 65_535;
@@ -322,6 +328,16 @@ pub enum RouteError {
     NamespaceRuntime(String),
     #[error("native route application failed ({cause}); rollback also failed ({rollback})")]
     Rollback { cause: String, rollback: String },
+    #[error("remote route plan exceeds the {limit}-node safety bound: {actual}")]
+    TooManyRemoteNodes { actual: usize, limit: usize },
+    #[error("invalid remote routing input for node {node:?}: {reason}")]
+    InvalidRemoteNode { node: String, reason: String },
+    #[error("{family} blocks for nodes {left:?} and {right:?} overlap")]
+    RemoteBlockOverlap {
+        family: &'static str,
+        left: String,
+        right: String,
+    },
 }
 
 impl RoutingProvider for NativeRoutingProvider {
