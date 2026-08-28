@@ -183,7 +183,29 @@ to the default-CNI-disabled NotReady baseline, and writes schema-v1 evidence to
 `.artifacts/phase3-primary-cni-kind.json`. Use `make primary-cni-kind-rollback`
 to run the same scoped rollback independently and `make primary-cni-kind-down`
 to delete the disposable cluster. These commands do not install a CNI on
-OpenShift; that requires the separately tracked 6.6e design and cl02 gate.
+OpenShift.
+
+### OpenShift primary-CNI candidate gate
+
+OpenShift primary-CNI qualification is installation-time only. Audit a candidate
+without changing its Network Operator configuration:
+
+```bash
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" \
+  make openshift-primary-cni-audit
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" \
+  make openshift-primary-cni-preflight
+```
+
+The audit always writes a mode-0600 schema-v1 record to
+`.artifacts/phase3-openshift-primary-cni-audit.json`; preflight additionally
+fails unless the cluster was installed through the custom-CNI/`None` path, has
+dual-stack Node PodCIDRs, standalone kube-proxy, no Multus or OVN ownership, and
+no foreign CNI files. ADR 0068 records why an existing OVN installation must be
+reprovisioned rather than force-converted. Installer inputs live under
+`deploy/openshift-primary-cni/`, but must not be used until the remaining
+digest-pinned bootstrap, MachineConfig, teardown, and recovery gates are
+implemented.
 
 `kind-deploy` builds the userspace images, eBPF object, and test-tools image with
 SCTP `socat`, the IPv6 extension-header probe, BPF fault utilities, and `tc`,

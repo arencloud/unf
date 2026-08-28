@@ -77,8 +77,10 @@ complete replacements before retiring stale routes, rolls back kernel or
 persistence failure, and reports desired/applied/error state. ADRs 0065 and 0066
 record the primitive and runtime contracts. ADR 0067 verifies fingerprinted
 installation, two-worker dual-stack lifecycle/recovery, coexistence refusal, and
-exact rollback in the isolated Kind fixture. OpenShift installation remains a
-separate design and cl02 qualification milestone.
+exact rollback in the isolated Kind fixture. ADR 0068 adds the OpenShift
+installation-time boundary: an existing OVN cluster is not converted in place,
+and live qualification requires a new custom-CNI/`None` cluster with explicit
+CNO, CRI-O, RHCOS, MachineConfig, SELinux, and teardown ownership.
 
 IPAM stays below a provider interface and above routing. The first provider
 accepts one canonical IPv4 and IPv6 node block, reserves network/gateway and IPv4

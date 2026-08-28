@@ -314,9 +314,13 @@ authoritative record of verified results.
 - The complete primary-CNI path is now Verified in a separate disposable
   three-Node dual-stack Kind cluster, including two-worker lifecycle,
   coexistence refusal/recovery, outage restart, and exact rollback; ADR 0067.
-- Next: accept an OpenShift Network Operator/MachineConfig ownership and
-  recovery design, then qualify that bounded design on dual-stack cl02 without
-  treating Kind mechanics as an in-place OpenShift takeover procedure.
+- The OpenShift installation boundary and candidate audit are Verified by ADR
+  0068. The audited cl02 is a healthy OVN installation and is intentionally
+  rejected: OpenShift custom-CNI qualification requires a new disposable
+  `networkType: None` cluster, not an unsafe post-install provider conversion.
+- Next: implement digest-pinned host-network bootstrap, exact MachineConfig/host
+  ownership, no-CNI teardown, and recovery gates; then qualify those mechanics
+  on a reprovisioned dual-stack cl02 or an equivalent disposable cluster.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

@@ -1,0 +1,19 @@
+# Installer manifest for a new disposable custom-CNI cluster. Never apply this
+# resource to an existing OVN cluster.
+apiVersion: operator.openshift.io/v1
+kind: Network
+metadata:
+  name: cluster
+spec:
+  clusterNetwork:
+    - cidr: 10.128.0.0/14
+      hostPrefix: 23
+    - cidr: fd01::/48
+      hostPrefix: 64
+  defaultNetwork:
+    type: None
+  deployKubeProxy: true
+  disableMultiNetwork: true
+  serviceNetwork:
+    - 172.30.0.0/16
+    - fd02::/112
