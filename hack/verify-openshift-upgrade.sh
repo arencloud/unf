@@ -3,7 +3,6 @@ set -euo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 kubeconfig=${KUBECONFIG:-"${project_root}/.tools/cl02-audit.kubeconfig"}
-auth_file=${QUAY_AUTH_FILE:-"${project_root}/.tools/quay-auth.json"}
 image_record=${UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD:-"${project_root}/.artifacts/phase3-openshift-upgrade-images.json"}
 result_record=${UNF_OPENSHIFT_UPGRADE_RESULT_RECORD:-"${project_root}/.artifacts/phase3-openshift-upgrade-result.json"}
 attempt_history=${UNF_OPENSHIFT_UPGRADE_ATTEMPT_HISTORY:-"${project_root}/.artifacts/phase3-openshift-upgrade-attempts.jsonl"}
@@ -20,7 +19,7 @@ restoration_enabled=false
 for command in git jq oc openssl timeout yq; do
     command -v "${command}" >/dev/null
 done
-[[ -s ${kubeconfig} && -s ${auth_file} && -s ${image_record} ]]
+[[ -s ${kubeconfig} && -s ${image_record} ]]
 [[ -z $(git -C "${project_root}" status --porcelain) ]] || {
     echo "OpenShift upgrade qualification requires a clean committed tree" >&2
     exit 2
@@ -398,10 +397,6 @@ create_fixture() {
             .spec.containers[0].image) = strenv(UNF_TEST_TOOLS_IMAGE)
     ' "${project_root}/deploy/openshift/qualification.yaml" >"${fixture}"
     yq eval-all 'select(.kind == "Namespace")' "${fixture}" | "${kc[@]}" apply -f - >/dev/null
-    "${kc[@]}" -n "${client_namespace}" create secret generic unf-quay-pull \
-        --from-file=.dockerconfigjson="${auth_file}" \
-        --type=kubernetes.io/dockerconfigjson --dry-run=client -o yaml \
-        | "${kc[@]}" apply -f - >/dev/null
     yq eval-all 'select(.kind != "Namespace")' "${fixture}" | "${kc[@]}" apply -f - >/dev/null
     "${kc[@]}" -n "${client_namespace}" wait --for=condition=Ready pod/client --timeout=240s >/dev/null
     "${kc[@]}" -n "${server_namespace}" wait --for=condition=Ready pod/server --timeout=240s >/dev/null
@@ -504,7 +499,7 @@ restoration_enabled=true
 completed_stage=baseline-deployment
 patch_controller_image "${baseline_controller_image}"
 patch_agent_image "${baseline_agent_image}" RollingUpdate
-KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" QUAY_AUTH_FILE="${auth_file}" \
+KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
     UNF_TEST_TOOLS_IMAGE="${baseline_test_tools_image}" \
     "${project_root}/hack/verify-openshift.sh"
 
@@ -546,7 +541,7 @@ stop_probe
 delete_fixture
 
 completed_stage=final-platform-qualification
-KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" QUAY_AUTH_FILE="${auth_file}" \
+KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
     UNF_TEST_TOOLS_IMAGE="${current_test_tools_image}" \
     "${project_root}/hack/verify-openshift.sh"
 assert_operator_health

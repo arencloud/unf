@@ -33,6 +33,7 @@ yq -o=json '.' "${agent_based}/agent-config.yaml" \
 [[ $(grep -c 'quay.io/arencloud/unf-controller-dev@sha256:' "${temporary_dir}/runtime.yaml") -eq 1 ]]
 [[ $(grep -c 'quay.io/arencloud/unf-agent-dev@sha256:' "${temporary_dir}/runtime.yaml") -eq 2 ]]
 ! grep -Eq 'image: .*:dev([[:space:]]|$)' "${temporary_dir}/runtime.yaml"
+! grep -Eq 'imagePullSecrets:|unf-quay-pull' "${temporary_dir}/runtime.yaml"
 grep -q 'nodeName: unf-primary-controller-node.invalid' "${temporary_dir}/runtime.yaml"
 grep -q 'ip: 192.0.2.1' "${temporary_dir}/runtime.yaml"
 grep -q 'https://unf-primary-controller.internal:9964' "${temporary_dir}/runtime.yaml"

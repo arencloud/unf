@@ -3,7 +3,6 @@ set -euo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 kubeconfig=${KUBECONFIG:-"${project_root}/.tools/cl02-audit.kubeconfig"}
-auth_file=${QUAY_AUTH_FILE:-"${project_root}/.tools/quay-auth.json"}
 expected_infrastructure=${UNF_OPENSHIFT_PRIMARY_EXPECTED_INFRASTRUCTURE:-}
 acknowledgement=${UNF_OPENSHIFT_PRIMARY_ACKNOWLEDGE_DISPOSABLE:-}
 artifact=${UNF_OPENSHIFT_PRIMARY_DEPLOY_ARTIFACT:-"${project_root}/.artifacts/phase3-openshift-primary-cni-deploy.json"}
@@ -14,12 +13,10 @@ for command in jq kubectl oc openssl; do
         exit 1
     }
 done
-for protected_file in "${kubeconfig}" "${auth_file}"; do
-    if [[ ! -s ${protected_file} || $(stat -c '%a' "${protected_file}") != 600 ]]; then
-        echo "OpenShift primary-CNI deployment requires a non-empty mode-0600 file: ${protected_file}" >&2
-        exit 1
-    fi
-done
+if [[ ! -s ${kubeconfig} || $(stat -c '%a' "${kubeconfig}") != 600 ]]; then
+    echo "OpenShift primary-CNI deployment requires a non-empty mode-0600 kubeconfig: ${kubeconfig}" >&2
+    exit 1
+fi
 
 context=$(kubectl --kubeconfig "${kubeconfig}" config current-context)
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
@@ -163,11 +160,6 @@ done
 KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
     UNF_INTERNAL_TLS_DIR="${project_root}/.tools/openshift-primary-cni-internal-tls" \
     "${project_root}/hack/configure-internal-tls.sh"
-"${kc[@]}" -n unf-system create secret generic unf-quay-pull \
-    --from-file=.dockerconfigjson="${auth_file}" \
-    --type=kubernetes.io/dockerconfigjson \
-    --dry-run=client -o yaml | "${kc[@]}" apply -f -
-
 "${kc[@]}" label nodes --all network.unf.io/primary-cni=enabled --overwrite
 "${kc[@]}" apply -f "${rendered}"
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=10m

@@ -33,8 +33,7 @@ Node names. If any Node name changes during reinstall, stop before activation
 and update `node-blocks.json`; the deployer rejects a partial or different Node
 set instead of guessing an allocation.
 
-Before activating UNF, protect the kubeconfig and Quay auth file with mode 0600,
-then run:
+Before activating UNF, protect the kubeconfig with mode 0600, then run:
 
 ```bash
 make openshift-primary-cni-package-check
@@ -53,8 +52,8 @@ The deployment's candidate audit first allows only a missing-PodCIDR condition,
 then validates and assigns the exact five-Node dual-stack map in
 `node-blocks.json`. It applies
 the forwarding MachineConfigs and waits for both pools, verifies the pinned
-uplinks and SELinux, creates disposable TLS and the namespaced pull Secret,
-labels the exact Nodes, and applies the digest-pinned
+uplinks and SELinux, creates disposable TLS, labels the exact Nodes, and applies
+the anonymously pullable digest-pinned
 host-network controller and agent. The installer sidecar waits for the local
 root-authenticated agent socket before atomically publishing the sole CRI-O CNI
 configuration. It then verifies exact fingerprints and waits for every Node to

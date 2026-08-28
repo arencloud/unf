@@ -17,7 +17,6 @@ patches:
   - path: service-ca-patch.yaml
   - path: controller-patch.yaml
   - path: agent-patch.yaml
-  - path: service-account-patch.yaml
   - target:
       group: apps
       version: v1

@@ -4,7 +4,6 @@ set -euo pipefail
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 command -v oc >/dev/null
 kubeconfig=${KUBECONFIG:-"${project_root}/.tools/cl01-audit.kubeconfig"}
-auth_file=${QUAY_AUTH_FILE:-"${project_root}/.tools/quay-auth.json"}
 context=${KUBE_CONTEXT:-$(oc --kubeconfig "${kubeconfig}" config current-context)}
 kc=(oc --kubeconfig "${kubeconfig}" --context "${context}")
 
@@ -12,17 +11,8 @@ kc=(oc --kubeconfig "${kubeconfig}" --context "${context}")
     echo "OpenShift kubeconfig not found: ${kubeconfig}" >&2
     exit 1
 }
-[[ -s ${auth_file} ]] || {
-    echo "Quay authentication file not found: ${auth_file}" >&2
-    exit 1
-}
-
 "${kc[@]}" get clusterversion version >/dev/null
 "${kc[@]}" apply -f "${project_root}/deploy/kubernetes/namespace.yaml"
-"${kc[@]}" -n unf-system create secret generic unf-quay-pull \
-    --from-file=.dockerconfigjson="${auth_file}" \
-    --type=kubernetes.io/dockerconfigjson \
-    --dry-run=client -o yaml | "${kc[@]}" apply -f -
 "${kc[@]}" apply -f "${project_root}/deploy/openshift/agent-scc.yaml"
 
 legacy_scc_binding=unf-agent-scc

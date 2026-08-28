@@ -3,7 +3,6 @@ set -euo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 kubeconfig=${KUBECONFIG:-"${project_root}/.tools/cl02-audit.kubeconfig"}
-auth_file=${QUAY_AUTH_FILE:-"${project_root}/.tools/quay-auth.json"}
 context=${KUBE_CONTEXT:-$(oc --kubeconfig "${kubeconfig}" config current-context)}
 kc=(oc --kubeconfig "${kubeconfig}" --context "${context}")
 temporary_dir=$(mktemp -d)
@@ -20,7 +19,6 @@ cleanup() {
                 --ignore-not-found --wait=true >/dev/null 2>&1
         fi
         KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
-            QUAY_AUTH_FILE="${auth_file}" \
             "${project_root}/hack/deploy-openshift.sh" >/dev/null 2>&1
     fi
     rm -rf "${temporary_dir}"
@@ -32,7 +30,6 @@ for command in oc jq; do
     command -v "${command}" >/dev/null
 done
 [[ -s ${kubeconfig} ]]
-[[ -s ${auth_file} ]]
 "${kc[@]}" get clusterversion version >/dev/null
 "${kc[@]}" -n unf-system wait --for=condition=Available \
     deployment/unf-controller --timeout=120s >/dev/null
@@ -129,12 +126,12 @@ for node in "${nodes[@]}"; do
 done
 
 KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
-    QUAY_AUTH_FILE="${auth_file}" "${project_root}/hack/deploy-openshift.sh" \
+    "${project_root}/hack/deploy-openshift.sh" \
     >"${temporary_dir}/redeploy.txt"
 [[ $("${kc[@]}" get customresourcedefinition \
     securitypolicies.network.unf.io -o jsonpath='{.metadata.uid}') == "${crd_uid}" ]]
 KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
-    QUAY_AUTH_FILE="${auth_file}" "${project_root}/hack/verify-openshift.sh" \
+    "${project_root}/hack/verify-openshift.sh" \
     >"${temporary_dir}/qualification.txt"
 qualification_mode=$(sed -n \
     's/^OpenShift \(IPv4\|dual-stack\) qualification passed:.*/\1/p' \

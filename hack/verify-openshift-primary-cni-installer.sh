@@ -2,9 +2,9 @@
 set -euo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-auth_file=${QUAY_AUTH_FILE:-"${project_root}/.tools/quay-auth.json"}
 agent_image=${UNF_OPENSHIFT_PRIMARY_AGENT_IMAGE:-quay.io/arencloud/unf-agent-dev@sha256:e94e58150d3bb8756ab3c298db7d36dd0b9a1bd7bec1ffc6bb03f6e986a60fb9}
 fixture=$(mktemp -d /tmp/unf-primary-installer.XXXXXX)
+anonymous_auth=${fixture}/anonymous-auth.json
 socket_pid=
 cleanup() {
     if [[ -n ${socket_pid} ]]; then
@@ -14,17 +14,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in podman socat; do
+for command in podman skopeo socat; do
     command -v "${command}" >/dev/null || {
         echo "OpenShift primary-CNI installer test prerequisite is missing: ${command}" >&2
         exit 1
     }
 done
-if [[ ! -s ${auth_file} || $(stat -c '%a' "${auth_file}") != 600 ]]; then
-    echo "OpenShift primary-CNI installer test requires a mode-0600 Quay auth file" >&2
-    exit 1
-fi
-podman pull --authfile "${auth_file}" "${agent_image}" >/dev/null
+printf '%s\n' '{"auths":{}}' >"${anonymous_auth}"
+chmod 0600 "${anonymous_auth}"
+skopeo inspect --authfile "${anonymous_auth}" "docker://${agent_image}" >/dev/null
+podman pull --authfile "${anonymous_auth}" "${agent_image}" >/dev/null
 
 mkdir -p \
     "${fixture}/host/var/lib/cni/bin" \

@@ -52,6 +52,8 @@ The dedicated runtime overlay:
 
 - uses immutable controller and agent image digests built from revision
   `a521b45e48df3b6be2090c1ff6e59579bcebe273`;
+- pulls those public development images anonymously; the Quay robot credential
+  is reserved for publication and is never installed in the cluster;
 - runs the controller and agent on host networking, with every opted-in Node
   receiving a local agent;
 - grants separate required SCCs to the controller and agent service accounts;

@@ -31,7 +31,8 @@ quay.io/arencloud/unf-agent-dev:dev
 quay.io/arencloud/unf-test-tools-dev:dev
 ```
 
-Authenticate without placing credentials in the repository:
+Authenticate only before publishing images, without placing credentials in the
+repository:
 
 ```bash
 mkdir -p .tools
@@ -48,9 +49,10 @@ chmod 600 .tools/cl01-audit.kubeconfig
 chmod 600 .tools/cl02-audit.kubeconfig
 ```
 
-The deploy workflow creates only a namespaced pull Secret from the dedicated
-auth file. Robot credentials and projected Pod tokens are never rendered or
-logged.
+The Quay robot credential is used only by image publication targets. All three
+development repositories are public, so deploy and qualification workflows pull
+anonymously and create no Quay pull Secret. Robot credentials and projected Pod
+tokens are never rendered or logged.
 
 ## Deploy and verify
 
@@ -80,12 +82,14 @@ OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-uninstal
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-uninstall-test
 ```
 
-Override `OPENSHIFT_KUBECONFIG` or `QUAY_AUTH_FILE` when qualifying another
-environment. The image publishing variables may also be overridden, but a
-different repository or tag must be reflected in the overlay before deployment.
-`openshift-deploy` applies the CRD, RBAC, `unf-system` workloads, Service CA
-objects, and pull Secret, then rolls both components so mutable development tags
-are picked up. Certificate changes after startup do not require that rollout.
+Override `OPENSHIFT_KUBECONFIG` when qualifying another environment.
+`QUAY_AUTH_FILE` is required only by `openshift-images` and
+`openshift-upgrade-images`. The image publishing variables may also be
+overridden, but a different repository or tag must be reflected in the overlay
+before deployment. `openshift-deploy` applies the CRD, RBAC, `unf-system`
+workloads, and Service CA objects, then rolls both components so mutable
+development tags are picked up. Certificate changes after startup do not
+require that rollout.
 
 The overlay:
 

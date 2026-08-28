@@ -149,13 +149,13 @@ openshift-upgrade-images:
 	UNF_OPENSHIFT_UPGRADE_BASELINE_REF=$(UNF_OPENSHIFT_UPGRADE_BASELINE_REF) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD=$(UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD) hack/build-openshift-upgrade-images.sh
 
 openshift-deploy:
-	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) hack/deploy-openshift.sh
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/deploy-openshift.sh
 
 openshift-test:
-	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) hack/verify-openshift.sh
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/verify-openshift.sh
 
 openshift-upgrade-test:
-	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD=$(UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD) hack/verify-openshift-upgrade.sh
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD=$(UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD) hack/verify-openshift-upgrade.sh
 
 openshift-tls-rotation-test:
 	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/verify-openshift-tls-rotation.sh
@@ -170,7 +170,7 @@ openshift-uninstall:
 	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/uninstall-openshift.sh $(OPENSHIFT_UNINSTALL_ARGS)
 
 openshift-uninstall-test:
-	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) hack/verify-openshift-uninstall.sh
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/verify-openshift-uninstall.sh
 
 # This audit is read-only apart from short-lived oc debug Pods. It records why
 # a cluster is or is not eligible for the installation-time custom-CNI gate.
@@ -186,7 +186,7 @@ openshift-primary-cni-package-check:
 	hack/verify-openshift-primary-cni-package.sh
 
 openshift-primary-cni-deploy:
-	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) QUAY_AUTH_FILE=$(QUAY_AUTH_FILE) hack/deploy-openshift-primary-cni.sh
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/deploy-openshift-primary-cni.sh
 
 kind-tool:
 	mkdir -p .tools/bin

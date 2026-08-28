@@ -21,6 +21,5 @@ images:
     newName: quay.io/arencloud/unf-agent-dev
     digest: sha256:e94e58150d3bb8756ab3c298db7d36dd0b9a1bd7bec1ffc6bb03f6e986a60fb9
 patches:
-  - path: service-account-patch.yaml
   - path: controller-patch.yaml
   - path: agent-patch.yaml

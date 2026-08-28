@@ -6,7 +6,6 @@ for command in oc yq jq curl openssl timeout; do
     command -v "${command}" >/dev/null
 done
 kubeconfig=${KUBECONFIG:-"${project_root}/.tools/cl01-audit.kubeconfig"}
-auth_file=${QUAY_AUTH_FILE:-"${project_root}/.tools/quay-auth.json"}
 context=${KUBE_CONTEXT:-$(oc --kubeconfig "${kubeconfig}" config current-context)}
 public_port=${UNF_OPENSHIFT_PUBLIC_PORT:-29962}
 internal_port=${UNF_OPENSHIFT_INTERNAL_PORT:-29964}
@@ -38,11 +37,6 @@ trap 'echo "OpenShift qualification failed at line ${LINENO}" >&2' ERR
     echo "OpenShift kubeconfig not found: ${kubeconfig}" >&2
     exit 1
 }
-[[ -s ${auth_file} ]] || {
-    echo "Quay authentication file not found: ${auth_file}" >&2
-    exit 1
-}
-
 "${kc[@]}" get clusterversion version >/dev/null
 unhealthy_operators=$("${kc[@]}" get clusteroperators -o json | jq '[
     .items[] | select(
@@ -316,12 +310,6 @@ UNF_TEST_TOOLS_IMAGE="${test_tools_image}" yq eval '
 ' "${qualification_manifest}" >"${qualification_fixture}"
 yq eval-all 'select(.kind == "Namespace")' "${qualification_fixture}" \
     | "${kc[@]}" apply -f - >/dev/null
-for namespace in "${client_namespace}" "${server_namespace}"; do
-    "${kc[@]}" -n "${namespace}" create secret generic unf-quay-pull \
-        --from-file=.dockerconfigjson="${auth_file}" \
-        --type=kubernetes.io/dockerconfigjson \
-        --dry-run=client -o yaml | "${kc[@]}" apply -f - >/dev/null
-done
 yq eval-all 'select(.kind != "Namespace")' "${qualification_fixture}" \
     | "${kc[@]}" apply -f - >/dev/null
 wait_for_pod_ready() {
@@ -466,7 +454,6 @@ UNF_EGRESS_TEST_IMAGE="${test_tools_image}" \
             .spec.nodeSelector."kubernetes.io/hostname") = strenv(UNF_EGRESS_SOURCE_NODE) |
         (select(.kind == "Pod" and .metadata.namespace != "unf-egress-source")
             .spec.nodeSelector."kubernetes.io/hostname") = strenv(UNF_EGRESS_DESTINATION_NODE) |
-        (select(.kind == "Pod") | .spec.imagePullSecrets) = [{"name": "unf-egress-registry-pull"}] |
         (select(.kind == "Pod") | .spec.containers[] |
             select(.image == "localhost/unf-test-tools:ipv6-ext-v1") | .image)
             = strenv(UNF_EGRESS_TEST_IMAGE) |
@@ -476,7 +463,6 @@ UNF_EGRESS_TEST_IMAGE="${test_tools_image}" \
 KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" \
     UNF_CONTROLLER_URL="http://127.0.0.1:${public_port}" \
     UNF_EGRESS_FIXTURE="${egress_fixture}" \
-    UNF_REGISTRY_AUTH_FILE="${auth_file}" \
     "${project_root}/hack/verify-networkpolicy-egress.sh"
 
 for agent in "${agents[@]}"; do
