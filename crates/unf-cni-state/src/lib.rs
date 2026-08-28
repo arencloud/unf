@@ -57,6 +57,7 @@ pub struct AttachmentRecord {
 #[serde(deny_unknown_fields, tag = "operation", rename_all = "snake_case")]
 pub enum TransactionOperation {
     Status,
+    Inspect { key: AttachmentKey },
     Prepare { attachment: AttachmentSpec },
     Commit { key: AttachmentKey },
     BeginAbort { key: AttachmentKey },
@@ -76,6 +77,10 @@ pub enum TransactionOperation {
 pub enum TransactionRequest {
     Status {
         schema_version: u16,
+    },
+    Inspect {
+        schema_version: u16,
+        key: AttachmentKey,
     },
     Prepare {
         schema_version: u16,
@@ -112,6 +117,10 @@ impl TransactionRequest {
     pub fn new(schema_version: u16, operation: TransactionOperation) -> Self {
         match operation {
             TransactionOperation::Status => Self::Status { schema_version },
+            TransactionOperation::Inspect { key } => Self::Inspect {
+                schema_version,
+                key,
+            },
             TransactionOperation::Prepare { attachment } => Self::Prepare {
                 schema_version,
                 attachment,
@@ -146,6 +155,7 @@ impl TransactionRequest {
     const fn schema_version(&self) -> u16 {
         match self {
             Self::Status { schema_version }
+            | Self::Inspect { schema_version, .. }
             | Self::Prepare { schema_version, .. }
             | Self::Commit { schema_version, .. }
             | Self::BeginAbort { schema_version, .. }
@@ -159,6 +169,7 @@ impl TransactionRequest {
     fn into_operation(self) -> TransactionOperation {
         match self {
             Self::Status { .. } => TransactionOperation::Status,
+            Self::Inspect { key, .. } => TransactionOperation::Inspect { key },
             Self::Prepare { attachment, .. } => TransactionOperation::Prepare { attachment },
             Self::Commit { key, .. } => TransactionOperation::Commit { key },
             Self::BeginAbort { key, .. } => TransactionOperation::BeginAbort { key },
@@ -357,6 +368,10 @@ impl AttachmentJournal {
         let previous = self.attachments.clone();
         let attachment = match request.into_operation() {
             TransactionOperation::Status => None,
+            TransactionOperation::Inspect { key } => {
+                validate_key(&key)?;
+                self.attachments.get(&key).cloned()
+            }
             TransactionOperation::Prepare { attachment } => {
                 validate_spec(&attachment)?;
                 Some(self.prepare(attachment)?)
@@ -847,6 +862,21 @@ mod tests {
         let first = journal.apply(prepare.clone()).expect("prepare");
         let replay = journal.apply(prepare).expect("replay prepare");
         assert_eq!(first, replay);
+        let inspected = journal
+            .apply(request(TransactionOperation::Inspect {
+                key: key("container-1"),
+            }))
+            .expect("inspect preparing attachment");
+        assert!(matches!(
+            inspected.outcome,
+            TransactionOutcome::Ok {
+                attachment: Some(AttachmentRecord {
+                    phase: AttachmentPhase::Preparing,
+                    ..
+                }),
+                ..
+            }
+        ));
         assert_eq!(journal.len(), 1);
 
         let commit = request(TransactionOperation::Commit {
@@ -1074,6 +1104,12 @@ mod tests {
             serde_json::to_value(request(TransactionOperation::Status)).expect("encode request");
         assert_eq!(encoded["schemaVersion"], 2);
         assert_eq!(encoded["operation"], "status");
+        let inspect = serde_json::to_value(request(TransactionOperation::Inspect {
+            key: key("container-1"),
+        }))
+        .expect("encode inspect request");
+        assert_eq!(inspect["operation"], "inspect");
+        assert_eq!(inspect["key"]["containerId"], "container-1");
         let response = TransactionResponse::error(
             TransactionErrorCode::Unauthorized,
             "root credentials required",

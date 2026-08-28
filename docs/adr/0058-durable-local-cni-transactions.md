@@ -16,8 +16,9 @@ enables it.
 `unf-cni-state` defines local transaction schema v1. Every JSON request and
 response carries `schemaVersion: 1` and is bounded to 65,536 bytes. One Unix
 connection carries one request and one response. Operations are `status`,
-`prepare`, `commit`, `begin_abort`, `complete_abort`, `check`, `begin_delete`,
-and `complete_delete`. Errors have stable codes for invalid input, incompatible
+`inspect`, `prepare`, `commit`, `begin_abort`, `complete_abort`, `check`,
+`begin_delete`, and `complete_delete`. Inspect is non-mutating and returns the
+current phase for exact restart recovery. Errors have stable codes for invalid input, incompatible
 schema, absence, conflict, invalid transition, persistence failure, and failed
 authentication.
 
@@ -48,10 +49,10 @@ times out each connection after five seconds, removes only its owned socket on
 clean shutdown, and replaces a stale socket only after proving that it is a Unix
 socket with no active listener. Symlinks and non-socket collisions are refused.
 
-This slice records lifecycle intent only. It does not allocate an address, enter
-a network namespace, create or delete a link, install a route, attach BPF, or make
-`unf-cni` ADD/CHECK return success. Existing overlay deployments do not set the
-new option and therefore retain identical startup and dataplane behavior.
+The initial slice recorded lifecycle intent only. ADRs 0060 and 0063 subsequently
+integrated allocation and atomic link/route ADD/CHECK/DEL orchestration without
+changing the opt-in service boundary. Existing overlay deployments do not set
+the option and therefore retain identical startup and dataplane behavior.
 
 ## Alternatives
 
@@ -70,12 +71,11 @@ restart reload in every cleanup phase, socket collision and cleanup behavior,
 kernel peer-credential enforcement over a live Unix connection, bounded errors,
 and strict Clippy. The complete workspace suite contains 191 tests after this
 slice. CNI protocol, eBPF, and deployment-render gates remain independently
-required before commit.
+required before commit. `make cni-lifecycle-test` later verifies that the
+non-mutating inspect path drives preparing and aborting restart recovery.
 
 ## Consequences
 
-The local transaction state/API deliverable is Verified. Milestone 6 and CNI
-executable/configuration remain In progress because no CNI lifecycle operation
-owns resources yet. The next slice can add collision-safe dual-stack node-block
-leases to these same prepare/abort/delete durability boundaries before any veth
-creation begins.
+The local transaction state/API deliverable is Verified. ADRs 0060 and 0063 build
+on these same durability boundaries for dual-stack leases and exact kernel
+resource ownership.

@@ -66,8 +66,7 @@ requirements, and strict lint. The complete workspace suite contains 202 tests.
 
 ## Consequences
 
-Milestone 6.3 IPAM is Verified. No link, address, route, neighbor entry, BPF
-attachment, controller block assignment, or CNI result is created yet. Milestone
-6.4 portable veth lifecycle is next; existing overlay deployment remains
-unchanged and OpenShift is not required for its initial namespace/link unit and
-isolated Kind work.
+Milestone 6.3 IPAM is Verified. ADRs 0061–0063 subsequently add portable links,
+native routes, and the atomic local CNI result/lifecycle. Controller block
+assignment, cluster installation, and cross-node networking remain; the existing
+overlay deployment is unchanged.

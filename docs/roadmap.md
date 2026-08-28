@@ -266,9 +266,11 @@ authoritative record of verified results.
 - Architecture and ownership are accepted in ADR 0057: the current overlay is
   unchanged, primary ownership is opt-in and Kind-first, durable attachment/IPAM
   state belongs to the local agent, and cutover/rollback requires node drain.
-- The initial Rust `unf-cni` executable implements bounded CNI 1.0/1.1 request
-  validation and VERSION behavior. ADD/CHECK/STATUS remain explicitly unavailable
-  until IPAM and link operations are connected through the versioned local API.
+- The Rust `unf-cni` executable implements bounded CNI 1.0/1.1 request handling
+  and a one-request local-agent client. Atomic ADD prepares durable allocation,
+  applies and reads back links/routes, then commits; CHECK validates prevResult
+  and exact durable/kernel state; route-first DEL retains its lease until cleanup
+  completes. Restart and conflict recovery are Verified by ADR 0063.
 - The opt-in local agent transaction service now enforces kernel UID-0 peer
   authentication and schema-v2 64-KiB messages. Its atomic mode-0600 journal
   durably reloads deterministic preparing/ready/aborting/deleting attachment and
@@ -292,8 +294,8 @@ authoritative record of verified results.
   scoped rollback, conflict preservation, isolated IPv4/IPv6 forwarding, exact
   MTU boundaries, source-fragment behavior, and MTU drift rejection are
   Verified.
-- Next: connect ADD/DEL/CHECK to the complete link-plus-route transaction before
-  controller block distribution and cross-node Kind qualification.
+- Next: implement controller node-block distribution and cross-node native
+  routing/recovery before isolated primary-CNI Kind installation.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

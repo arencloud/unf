@@ -73,8 +73,7 @@ the dummy remains intact. Exact temporary resources are removed by a trap.
 
 ## Consequences
 
-Milestone 6.4 is Verified as a portable local link primitive. Milestone 6.5
-native routing and MTU/rollback behavior is next. `unf-cni` continues to return
-structured unavailable/retry errors and existing overlay installations remain
-unchanged until the full link-plus-route transaction and isolated CNI
-qualification pass.
+Milestone 6.4 is Verified as a portable local link primitive. ADR 0063 now
+composes it with native routing and durable allocation in the atomic CNI
+lifecycle. Existing overlay installations remain unchanged until isolated
+primary-CNI cluster qualification passes.

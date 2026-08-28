@@ -3,6 +3,10 @@ use std::env;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod lifecycle;
+
+pub use lifecycle::{SocketTransactionApi, TransactionApi};
+
 pub const MAX_CONFIG_BYTES: usize = 1_048_576;
 pub const CURRENT_CNI_VERSION: &str = "1.1.0";
 pub const SUPPORTED_CNI_VERSIONS: [&str; 2] = ["1.0.0", CURRENT_CNI_VERSION];
@@ -179,32 +183,54 @@ impl CniError {
         )
     }
 
-    fn retry(version: &str, operation: Command) -> Self {
-        Self::new(
-            version,
-            11,
-            "Try again later",
-            format!(
-                "{operation:?} requires the local unf-agent IPAM transaction plus link lifecycle; link application is not implemented yet"
-            ),
-        )
-    }
-
-    fn unavailable(version: &str) -> Self {
-        Self::new(
-            version,
-            50,
-            "Plugin not available",
-            "plugin readiness is not connected to the local unf-agent CNI transaction API yet",
-        )
+    fn retry_with_details(version: &str, details: impl Into<String>) -> Self {
+        Self::new(version, 11, "Try again later", details)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Success {
     Empty,
+    Add(AddResult),
     Version(VersionResponse),
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddResult {
+    pub cni_version: String,
+    pub interfaces: Vec<ResultInterface>,
+    pub ips: Vec<ResultIp>,
+    pub routes: Vec<ResultRoute>,
+    pub dns: ResultDns,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultInterface {
+    pub name: String,
+    pub mac: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultIp {
+    pub interface: usize,
+    pub address: String,
+    pub gateway: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultRoute {
+    pub dst: String,
+    pub gw: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ResultDns {}
 
 /// Validates and executes one bounded CNI invocation.
 ///
@@ -235,12 +261,56 @@ pub fn execute(environment: &InvocationEnvironment, input: &[u8]) -> Result<Succ
     validate_config(&config, command)?;
     validate_environment(environment, command, &config.cni_version)?;
 
-    match command {
-        Command::Delete | Command::GarbageCollect => Ok(Success::Empty),
-        Command::Status => Err(CniError::unavailable(&config.cni_version)),
-        Command::Add | Command::Check => Err(CniError::retry(&config.cni_version, command)),
-        Command::Version => unreachable!("VERSION returns before network config parsing"),
+    let socket = config
+        .agent_socket
+        .as_deref()
+        .unwrap_or(DEFAULT_AGENT_SOCKET);
+    let mut transaction = SocketTransactionApi::new(socket.into());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| CniError::io(format!("create CNI lifecycle runtime: {error}")))?;
+    runtime.block_on(lifecycle::execute_validated(
+        environment,
+        &config,
+        command,
+        &mut transaction,
+    ))
+}
+
+/// Validates and runs one invocation through a supplied durable transaction API.
+///
+/// The privileged integration harness uses this boundary with a disposable
+/// journal; the production executable uses the root-authenticated Unix client.
+///
+/// # Errors
+///
+/// Returns the same structured CNI errors as [`execute`].
+pub async fn execute_with_transaction<T: TransactionApi>(
+    environment: &InvocationEnvironment,
+    input: &[u8],
+    transaction: &mut T,
+) -> Result<Success, CniError> {
+    if input.len() > MAX_CONFIG_BYTES {
+        return Err(CniError::oversized_config(input.len()));
     }
+    let command = Command::parse(environment.command.as_deref())?;
+    if command == Command::Version {
+        let request: VersionRequest = serde_json::from_slice(input)
+            .map_err(|error| CniError::decode(format!("invalid VERSION input: {error}")))?;
+        return Ok(Success::Version(VersionResponse {
+            cni_version: request.cni_version,
+            supported_versions: SUPPORTED_CNI_VERSIONS
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        }));
+    }
+    let config: NetworkConfig = serde_json::from_slice(input)
+        .map_err(|error| CniError::decode(format!("invalid network config JSON: {error}")))?;
+    validate_config(&config, command)?;
+    validate_environment(environment, command, &config.cni_version)?;
+    lifecycle::execute_validated(environment, &config, command, transaction).await
 }
 
 fn validate_config(config: &NetworkConfig, command: Command) -> Result<(), CniError> {
@@ -434,17 +504,19 @@ mod tests {
     }
 
     #[test]
-    fn add_is_validated_then_fails_closed_until_ipam_and_links_exist() {
+    fn add_is_validated_then_fails_closed_until_agent_is_available() {
         let error = execute(&environment("ADD"), &config("")).expect_err("ADD is gated");
         assert_eq!(error.code, 11);
         assert!(error.details.contains("unf-agent"));
     }
 
     #[test]
-    fn delete_is_idempotent_before_the_plugin_owns_resources() {
+    fn delete_fails_retryably_when_durable_ownership_is_unavailable() {
         let mut invocation = environment("DEL");
         invocation.netns = None;
-        assert_eq!(execute(&invocation, &config("")), Ok(Success::Empty));
+        let error = execute(&invocation, &config(""))
+            .expect_err("DEL cannot release ownership while its journal is unavailable");
+        assert_eq!(error.code, 11);
     }
 
     #[test]

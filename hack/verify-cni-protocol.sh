@@ -43,12 +43,17 @@ set -e
 jq -e '.cniVersion == "1.1.0" and .code == 50' \
     <<<"${status_output}" >/dev/null
 
+set +e
 delete_output=$(printf '%s' "${config}" | env \
     CNI_COMMAND=DEL \
     CNI_CONTAINERID=container-1 \
     CNI_IFNAME=eth0 \
     "${binary}")
-[[ -z ${delete_output} ]]
+delete_exit=$?
+set -e
+[[ ${delete_exit} -ne 0 ]]
+jq -e '.cniVersion == "1.1.0" and .code == 11' \
+    <<<"${delete_output}" >/dev/null
 
 gc_output=$(printf '%s' "${config}" | env \
     CNI_COMMAND=GC \
@@ -56,4 +61,4 @@ gc_output=$(printf '%s' "${config}" | env \
     "${binary}")
 [[ -z ${gc_output} ]]
 
-echo "UNF CNI protocol foundation passed: VERSION, fail-closed ADD/STATUS, and idempotent pre-ownership DEL/GC"
+echo "UNF CNI protocol passed: VERSION, bounded fail-closed ADD/STATUS/DEL, and pre-ownership GC"

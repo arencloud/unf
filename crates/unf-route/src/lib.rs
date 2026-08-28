@@ -122,6 +122,91 @@ impl NativeRoutingProvider {
     pub const fn profile(self) -> MtuProfile {
         self.profile
     }
+
+    /// Builds a route-deletion plan from exact link ownership readback.
+    ///
+    /// Zero interface indexes represent endpoints that are already absent.
+    /// Route-key preflight still detects foreign destination/table state before
+    /// link cleanup proceeds.
+    ///
+    /// # Errors
+    ///
+    /// Rejects durable identity, MTU, address, or provider drift.
+    pub fn cleanup_plan(
+        &self,
+        attachment: &AttachmentRecord,
+        links: &LinkReadback,
+    ) -> Result<NativeRoutePlan, RouteError> {
+        (*self).build_plan(attachment, links, true)
+    }
+
+    fn build_plan(
+        self,
+        attachment: &AttachmentRecord,
+        links: &LinkReadback,
+        allow_absent_indexes: bool,
+    ) -> Result<NativeRoutePlan, RouteError> {
+        let mtu = self.workload_mtu()?;
+        if attachment.spec.mtu != mtu {
+            return Err(RouteError::AttachmentMtuMismatch {
+                attachment: attachment.spec.mtu,
+                provider: mtu,
+            });
+        }
+        validate_links(attachment, links, mtu, allow_absent_indexes)?;
+
+        let workload_v4 = attachment.lease.ipv4.address;
+        let gateway_v4 = attachment.lease.ipv4.gateway;
+        let workload_v6 = attachment.lease.ipv6.address;
+        let gateway_v6 = attachment.lease.ipv6.gateway;
+        validate_family(workload_v4, gateway_v4, "IPv4")?;
+        validate_family(workload_v6, gateway_v6, "IPv6")?;
+
+        Ok(NativeRoutePlan {
+            host_name: attachment.host_interface.clone(),
+            container_name: attachment.spec.key.ifname.clone(),
+            netns: PathBuf::from(&attachment.spec.netns),
+            mtu,
+            host_routes: [
+                host_route(workload_v4, links.host_index),
+                host_route(workload_v6, links.host_index),
+            ],
+            container_routes: [
+                gateway_route(gateway_v4, links.peer_index),
+                default_route(gateway_v4, links.peer_index),
+                gateway_route(gateway_v6, links.peer_index),
+                default_route(gateway_v6, links.peer_index),
+            ],
+            host_neighbors: [
+                neighbor(
+                    NetworkNamespace::Host,
+                    workload_v4,
+                    links.host_index,
+                    links.peer_address,
+                ),
+                neighbor(
+                    NetworkNamespace::Host,
+                    workload_v6,
+                    links.host_index,
+                    links.peer_address,
+                ),
+            ],
+            container_neighbors: [
+                neighbor(
+                    NetworkNamespace::Container,
+                    gateway_v4,
+                    links.peer_index,
+                    links.host_address,
+                ),
+                neighbor(
+                    NetworkNamespace::Container,
+                    gateway_v6,
+                    links.peer_index,
+                    links.host_address,
+                ),
+            ],
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,66 +336,7 @@ impl RoutingProvider for NativeRoutingProvider {
         attachment: &AttachmentRecord,
         links: &LinkReadback,
     ) -> Result<Self::Plan, RouteError> {
-        let mtu = self.workload_mtu()?;
-        if attachment.spec.mtu != mtu {
-            return Err(RouteError::AttachmentMtuMismatch {
-                attachment: attachment.spec.mtu,
-                provider: mtu,
-            });
-        }
-        validate_links(attachment, links, mtu)?;
-
-        let workload_v4 = attachment.lease.ipv4.address;
-        let gateway_v4 = attachment.lease.ipv4.gateway;
-        let workload_v6 = attachment.lease.ipv6.address;
-        let gateway_v6 = attachment.lease.ipv6.gateway;
-        validate_family(workload_v4, gateway_v4, "IPv4")?;
-        validate_family(workload_v6, gateway_v6, "IPv6")?;
-
-        Ok(NativeRoutePlan {
-            host_name: attachment.host_interface.clone(),
-            container_name: attachment.spec.key.ifname.clone(),
-            netns: PathBuf::from(&attachment.spec.netns),
-            mtu,
-            host_routes: [
-                host_route(workload_v4, links.host_index),
-                host_route(workload_v6, links.host_index),
-            ],
-            container_routes: [
-                gateway_route(gateway_v4, links.peer_index),
-                default_route(gateway_v4, links.peer_index),
-                gateway_route(gateway_v6, links.peer_index),
-                default_route(gateway_v6, links.peer_index),
-            ],
-            host_neighbors: [
-                neighbor(
-                    NetworkNamespace::Host,
-                    workload_v4,
-                    links.host_index,
-                    links.peer_address,
-                ),
-                neighbor(
-                    NetworkNamespace::Host,
-                    workload_v6,
-                    links.host_index,
-                    links.peer_address,
-                ),
-            ],
-            container_neighbors: [
-                neighbor(
-                    NetworkNamespace::Container,
-                    gateway_v4,
-                    links.peer_index,
-                    links.host_address,
-                ),
-                neighbor(
-                    NetworkNamespace::Container,
-                    gateway_v6,
-                    links.peer_index,
-                    links.host_address,
-                ),
-            ],
-        })
+        (*self).build_plan(attachment, links, false)
     }
 }
 
@@ -318,6 +344,7 @@ fn validate_links(
     attachment: &AttachmentRecord,
     links: &LinkReadback,
     mtu: u32,
+    allow_absent_indexes: bool,
 ) -> Result<(), RouteError> {
     if links.host_name != attachment.host_interface {
         return Err(RouteError::LinkMismatch(
@@ -335,7 +362,7 @@ fn validate_links(
             links.mtu
         )));
     }
-    if links.host_index == 0 || links.peer_index == 0 {
+    if !allow_absent_indexes && (links.host_index == 0 || links.peer_index == 0) {
         return Err(RouteError::LinkMismatch(
             "kernel interface indexes must be nonzero".to_string(),
         ));
@@ -596,5 +623,31 @@ mod tests {
             NativeRoutingProvider::new(1_400).plan(&attachment, &links()),
             Err(RouteError::AttachmentMtuMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn cleanup_plan_accepts_only_explicitly_absent_interface_indexes() {
+        let mut absent = links();
+        absent.host_index = 0;
+        absent.peer_index = 0;
+        assert!(matches!(
+            NativeRoutingProvider::new(1_400).plan(&attachment(), &absent),
+            Err(RouteError::LinkMismatch(_))
+        ));
+        let cleanup = NativeRoutingProvider::new(1_400)
+            .cleanup_plan(&attachment(), &absent)
+            .expect("cleanup may represent already absent links");
+        assert!(
+            cleanup
+                .host_routes()
+                .iter()
+                .all(|route| route.output_interface == 0)
+        );
+        assert!(
+            cleanup
+                .container_routes()
+                .iter()
+                .all(|route| route.output_interface == 0)
+        );
     }
 }

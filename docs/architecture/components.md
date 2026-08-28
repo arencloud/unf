@@ -3,7 +3,7 @@
 | Component | Responsibility | Must not own |
 |---|---|---|
 | `unf-common` | IDs, revisions, protocols, verdicts, policy reasons | Kubernetes or Aya clients |
-| `unf-cni-state` | Versioned local CNI transaction schema, validated attachment/lease state machine, schema migration, and atomic durable journal | Kubernetes access, namespace/link mutation, IPAM allocation policy, or remote transport |
+| `unf-cni-state` | Versioned local CNI transaction schema, inspectable attachment/lease state machine, schema migration, and atomic durable journal | Kubernetes access, namespace/link mutation, IPAM allocation policy, or remote transport |
 | `unf-ipam` | Modular, bounded dual-stack lease types and collision-safe node-block allocation | Kubernetes watches, routing policy, durable attachment storage, or namespace/link mutation |
 | `unf-link` | Deterministic, ownership-safe veth planning, namespace movement, dual-stack address application, readback, recovery, and exact cleanup | Kubernetes access, durable transactions, route policy, controller state, or shell-command mutation |
 | `unf-route` | Routing-provider abstraction, native endpoint route/neighbor IR and typed kernel lifecycle, scoped rollback, and provider-declared MTU derivation | IP allocation, link mutation, durable transactions, Kubernetes access, or policy enforcement |
@@ -13,7 +13,7 @@
 | `unf-state` | Revision snapshots, bounded flow-history contract, Service/backend topology schema, and identity metadata | Transport or controller loops |
 | `unf-controller` | Watches, EndpointSlice-aware desired-state/topology reconciliation, bounded durable agent-report and flow-history checkpointing, non-blocking external HTTP flow handoff, time-window flow queries, explanation, and read-only simulation orchestration | Packet parsing |
 | `unf-agent` | Capability detection, Aya lifecycle, events, non-blocking telemetry export, and opt-in root-authenticated local CNI transaction service | Kubernetes policy semantics or CNI namespace mutation |
-| `unf-cni` | Bounded CNI protocol handling and one attachment's namespace/link transaction application | Kubernetes access, policy compilation, durable IPAM, routing protocols, or telemetry aggregation |
+| `unf-cni` | Bounded CNI protocol/socket handling and atomic durable-IPAM plus link/route ADD/CHECK/DEL orchestration | Kubernetes access, policy compilation, durable IPAM storage, routing protocols, or telemetry aggregation |
 | `unfctl` | Operator-facing status, topology, flow history, explanation, and simulation | Fabric state ownership |
 | `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, and telemetry | Selectors or enrichment strings |
 

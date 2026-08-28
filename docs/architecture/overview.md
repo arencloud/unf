@@ -46,9 +46,13 @@ ADR 0057 defines coexistence, rollback, uninstall, and failure boundaries. The
 first agent-side slice is opt-in through `--cni-socket`; it authenticates UID 0
 with kernel Unix peer credentials and serializes bounded schema-v2 transactions
 into a mode-0600, atomically replaced journal. Its durable phases are
-`preparing`, `ready`, `aborting`, and `deleting`. No link or address is created
-yet, so the overlay remains the only deployable mode. ADR 0058 records the wire,
-persistence, replay, and restart contracts.
+`preparing`, `ready`, `aborting`, and `deleting`, plus non-mutating inspection for
+restart recovery. `unf-cni` now composes that state with exact veth and native
+route lifecycle: commit follows kernel readback, CHECK compares the prior result
+and live state, and cleanup intent remains durable until route-first DEL or abort
+finishes. ADRs 0058 and 0063 record the wire and atomic resource contracts. The
+overlay remains the only deployed mode until controller block distribution,
+cross-node networking, and isolated primary-CNI qualification pass.
 
 IPAM stays below a provider interface and above routing. The first provider
 accepts one canonical IPv4 and IPv6 node block, reserves network/gateway and IPv4

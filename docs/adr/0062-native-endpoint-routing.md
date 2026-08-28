@@ -81,7 +81,7 @@ drift, subtraction underflow, and results below the IPv6 minimum.
 
 ## Consequences
 
-Milestone 6.5 and sub-items 6.5a through 6.5c are Verified. Production CNI
-ADD/CHECK/DEL remains fail closed until link plus route operations share the
-durable attachment transaction. Controller block distribution and cross-node
-node-networking qualification remain later full-CNI slices.
+Milestone 6.5 and sub-items 6.5a through 6.5c are Verified. ADR 0063 now composes
+link and route operations with the durable ADD/CHECK/DEL attachment transaction.
+Controller block distribution and cross-node node-networking qualification
+remain later full-CNI slices.

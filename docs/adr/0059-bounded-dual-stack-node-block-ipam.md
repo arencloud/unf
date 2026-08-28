@@ -66,6 +66,6 @@ complete workspace suite contains 199 tests after this slice.
 
 At this allocation-core checkpoint, milestone 6.3 remained In progress and no
 address was written to the attachment journal. ADR 0060 subsequently verifies
-durable lease integration and closes 6.3. No address is configured on a link, no
-node block is distributed by the controller, and `unf-cni` remains fail-closed
-for ADD/CHECK/STATUS. Existing overlay deployments are unchanged.
+durable lease integration and closes 6.3; ADRs 0061–0063 subsequently verify
+link, route, and atomic CNI integration. Controller node-block distribution and
+cluster primary-CNI installation remain. Existing overlay deployments are unchanged.

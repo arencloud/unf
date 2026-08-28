@@ -11,6 +11,7 @@ fn main() -> ExitCode {
     };
     match execute(&InvocationEnvironment::from_process(), &input) {
         Ok(Success::Empty) => ExitCode::SUCCESS,
+        Ok(Success::Add(response)) => emit_success(&response),
         Ok(Success::Version(response)) => emit_success(&response),
         Err(error) => emit_error(&error),
     }

@@ -386,6 +386,80 @@ impl VethPlan {
         })
     }
 
+    /// Reads ownership and interface indexes for exact route-first cleanup.
+    ///
+    /// Unlike strict CHECK readback, this accepts absent endpoints and missing
+    /// managed addresses. It still rejects same-named foreign links, MAC/alias
+    /// drift, and MTU drift before returning indexes (zero means absent).
+    ///
+    /// # Errors
+    ///
+    /// Returns an ownership conflict or netlink error when cleanup cannot
+    /// safely distinguish managed from foreign link state.
+    pub async fn cleanup_readback(&self) -> Result<LinkReadback, LinkError> {
+        let (connection, handle, _) =
+            new_connection().map_err(|source| LinkError::OpenNetlink {
+                operation: "open host cleanup connection",
+                source,
+            })?;
+        tokio::spawn(connection);
+        let host_index = if let Some(host) = find_link(&handle, &self.host_name).await? {
+            validate_recoverable_link(
+                &host,
+                &self.host_name,
+                &self.host_alias,
+                self.mtu,
+                self.host_address,
+            )?;
+            host.header.index
+        } else {
+            0
+        };
+
+        let peer_index = match open_namespace(&self.netns) {
+            Ok(namespace) => {
+                let plan = self.clone();
+                run_in_namespace(namespace, move || async move {
+                    let (connection, handle, _) =
+                        new_connection().map_err(|source| LinkError::OpenNetlink {
+                            operation: "open container cleanup connection",
+                            source,
+                        })?;
+                    tokio::spawn(connection);
+                    let Some(peer) = find_link(&handle, &plan.container_name).await? else {
+                        return Ok(0);
+                    };
+                    validate_recoverable_link(
+                        &peer,
+                        &plan.container_name,
+                        &plan.peer_alias,
+                        plan.mtu,
+                        plan.peer_address,
+                    )?;
+                    Ok(peer.header.index)
+                })
+                .await?
+            }
+            Err(LinkError::OpenNamespace { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                0
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(LinkReadback {
+            host_index,
+            peer_index,
+            host_name: self.host_name.clone(),
+            peer_name: self.container_name.clone(),
+            host_address: self.host_address,
+            peer_address: self.peer_address,
+            mtu: self.mtu,
+            addresses: BTreeSet::from(self.addresses),
+        })
+    }
+
     /// Deletes only the endpoint pair bearing this plan's ownership aliases.
     ///
     /// # Errors
