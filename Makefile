@@ -87,6 +87,7 @@ cni-veth-test:
 cni-routing-test: cni-veth-test
 	cargo test -p unf-route
 	cargo clippy -p unf-route --all-targets --all-features -- -D warnings
+	hack/verify-cni-routing.sh
 
 cli:
 	cargo build -p unfctl

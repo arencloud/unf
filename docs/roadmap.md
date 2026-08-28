@@ -289,10 +289,11 @@ authoritative record of verified results.
   routed `/32` and `/128` workload addresses, exact host endpoint routes,
   explicit container gateway/default routes, permanent MAC-bound neighbors, and
   zero-overhead MTU derivation; ADR 0062. Typed kernel apply/readback/delete,
-  rollback, forwarding, and fragmentation qualification are in progress.
-- After those gates, connect ADD/DEL/CHECK to the complete link-plus-route
-  transaction before controller block distribution and cross-node Kind
-  qualification.
+  scoped rollback, conflict preservation, isolated IPv4/IPv6 forwarding, exact
+  MTU boundaries, source-fragment behavior, and MTU drift rejection are
+  Verified.
+- Next: connect ADD/DEL/CHECK to the complete link-plus-route transaction before
+  controller block distribution and cross-node Kind qualification.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

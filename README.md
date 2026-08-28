@@ -98,9 +98,11 @@ IPAM provider allocates deterministically from explicit node blocks, migrates
 schema-v1 attachment state, and releases leases only after abort/delete
 completion. A typed-netlink `unf-link` primitive now creates, moves, configures,
 recovers, reads back, and exactly removes dual-stack veth pairs from those durable
-records. Native routes, controller block distribution, CNI transaction wiring,
-and cluster CNI installation are not implemented; existing overlay deployments
-are unchanged.
+records. A typed native route/neighbor primitive now adds exact dual-stack
+endpoint routing with scoped rollback, conflict preservation, and verified
+MTU/fragmentation boundaries. Controller block distribution, CNI transaction
+wiring, and cluster CNI installation are not implemented; existing overlay
+deployments are unchanged.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

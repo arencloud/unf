@@ -7,12 +7,14 @@ use thiserror::Error;
 use unf_cni_state::AttachmentRecord;
 use unf_link::{AssignedAddress, LinkReadback};
 
+mod kernel;
+
 pub const MIN_DUAL_STACK_MTU: u32 = 1_280;
 pub const MAX_WORKLOAD_MTU: u32 = 65_535;
 pub const MAIN_ROUTE_TABLE: u32 = 254;
-/// Private route-protocol marker used to distinguish UNF-owned native routes.
-/// Standard Linux protocol assignments, including BGP at 186, are not reused.
-pub const UNF_ROUTE_PROTOCOL: u8 = 99;
+/// UNF's node-local route-protocol convention. Value 196 is unassigned in the
+/// current Linux UAPI; exact-key preflight still treats other state as foreign.
+pub const UNF_ROUTE_PROTOCOL: u8 = 196;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum NetworkNamespace {
@@ -134,6 +136,18 @@ pub struct NativeRoutePlan {
     container_neighbors: [NeighborSpec; 2],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteReadback {
+    pub routes: std::collections::BTreeSet<RouteSpec>,
+    pub neighbors: std::collections::BTreeSet<NeighborSpec>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteDeleteOutcome {
+    Deleted,
+    AlreadyAbsent,
+}
+
 impl NativeRoutePlan {
     #[must_use]
     pub fn host_name(&self) -> &str {
@@ -192,6 +206,37 @@ pub enum RouteError {
         workload: IpAddr,
         gateway: IpAddr,
     },
+    #[error("network namespace {path:?} is unavailable: {message}")]
+    OpenNamespace {
+        path: PathBuf,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    #[error("refusing network namespace path {0:?}: the final component is a symbolic link")]
+    SymbolicLinkNamespace(PathBuf),
+    #[error("netlink {operation} failed: {message}")]
+    Netlink {
+        operation: &'static str,
+        message: String,
+    },
+    #[error("{namespace:?} {resource} conflicts with the native routing plan: {message}")]
+    Conflict {
+        namespace: NetworkNamespace,
+        resource: &'static str,
+        message: String,
+    },
+    #[error("native route readback failed: {0}")]
+    Readback(String),
+    #[error("could not enter network namespace: {0}")]
+    EnterNamespace(String),
+    #[error("network namespace worker panicked")]
+    NamespaceWorkerPanicked,
+    #[error("network namespace worker could not be joined: {0}")]
+    NamespaceJoin(String),
+    #[error("could not construct the namespace-local Tokio runtime: {0}")]
+    NamespaceRuntime(String),
+    #[error("native route application failed ({cause}); rollback also failed ({rollback})")]
+    Rollback { cause: String, rollback: String },
 }
 
 impl RoutingProvider for NativeRoutingProvider {
@@ -344,7 +389,7 @@ where
         onlink: false,
         protocol: UNF_ROUTE_PROTOCOL,
         table: MAIN_ROUTE_TABLE,
-        scope: RouteScope::Link,
+        scope: direct_scope(destination),
     }
 }
 
@@ -362,7 +407,7 @@ where
         onlink: false,
         protocol: UNF_ROUTE_PROTOCOL,
         table: MAIN_ROUTE_TABLE,
-        scope: RouteScope::Link,
+        scope: direct_scope(destination),
     }
 }
 
@@ -408,6 +453,13 @@ const fn full_prefix(address: IpAddr) -> u8 {
     match address {
         IpAddr::V4(_) => 32,
         IpAddr::V6(_) => 128,
+    }
+}
+
+const fn direct_scope(address: IpAddr) -> RouteScope {
+    match address {
+        IpAddr::V4(_) => RouteScope::Link,
+        IpAddr::V6(_) => RouteScope::Universe,
     }
 }
 
@@ -487,7 +539,7 @@ mod tests {
                 && matches!(route.prefix_len, 32 | 128)
                 && route.protocol == UNF_ROUTE_PROTOCOL
                 && route.table == MAIN_ROUTE_TABLE
-                && route.scope == RouteScope::Link
+                && route.scope == direct_scope(route.destination)
         }));
         assert!(
             plan.container_routes()

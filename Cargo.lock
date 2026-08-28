@@ -3006,7 +3006,11 @@ dependencies = [
 name = "unf-route"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "rtnetlink",
+ "rustix",
  "thiserror",
+ "tokio",
  "unf-cni-state",
  "unf-ipam",
  "unf-link",
