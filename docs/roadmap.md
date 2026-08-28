@@ -273,8 +273,13 @@ authoritative record of verified results.
   authentication and schema-v1 64-KiB messages. Its atomic mode-0600 journal
   durably reloads deterministic preparing/ready/aborting/deleting attachment
   records and rejects conflicting or invalid replays; ADR 0058.
-- Next: dual-stack node-block IPAM, then connect ADD/DEL/CHECK to veth lifecycle,
-  native routing/MTU, and cross-node Kind qualification.
+- The first `unf-ipam` provider now validates canonical dual-stack node blocks
+  and returns one deterministic, bounded, collision-checked lease without owning
+  routing or Kubernetes state. Exhaustion and release/reuse are verified; ADR
+  0059.
+- Next: integrate leases into a migration-tested schema-v2 attachment journal,
+  then connect ADD/DEL/CHECK to veth lifecycle, native routing/MTU, and cross-node
+  Kind qualification.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

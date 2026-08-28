@@ -4,6 +4,7 @@
 |---|---|---|
 | `unf-common` | IDs, revisions, protocols, verdicts, policy reasons | Kubernetes or Aya clients |
 | `unf-cni-state` | Versioned local CNI transaction schema, validated attachment state machine, and atomic durable journal | Kubernetes access, namespace/link mutation, IPAM policy, or remote transport |
+| `unf-ipam` | Modular, bounded dual-stack lease types and collision-safe node-block allocation | Kubernetes watches, routing policy, durable attachment storage, or namespace/link mutation |
 | `unf-ebpf-common` | Versioned fixed-layout flow and BPF map ABIs | Variable strings or allocation |
 | `unf-api` | CRD schema and serialization | Policy evaluation |
 | `unf-policy` | Native and NetworkPolicy conversion, shared IR, deterministic evaluation, identity-tuple lowering | Kubernetes watches or BPF map mutation |

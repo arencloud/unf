@@ -8,6 +8,7 @@ members = [
     "crates/unf-api",
     "crates/unf-common",
     "crates/unf-cni-state",
+    "crates/unf-ipam",
     "crates/unf-policy",
     "crates/unf-state",
     "ebpf/unf-ebpf-common",

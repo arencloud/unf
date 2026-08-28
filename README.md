@@ -94,8 +94,11 @@ The full-CNI foundation is now in progress under ADRs 0057 and 0058. The initial
 operations. An explicitly enabled local-agent Unix service now provides the
 root-authenticated, bounded schema-v1 transaction boundary and atomic durable
 attachment journal beneath that future lifecycle. IPAM, link creation, routes,
-and cluster CNI installation are not implemented; existing overlay deployments
-are unchanged.
+and cluster CNI installation are not complete; existing overlay deployments are
+unchanged. The first IPAM core now provides bounded, deterministic dual-stack
+allocation from controller-assigned node blocks behind a routing-independent
+provider trait. Durable attachment/lease integration remains the next gate and
+the CNI executable still cannot create networking.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

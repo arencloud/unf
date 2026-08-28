@@ -50,6 +50,13 @@ into a mode-0600, atomically replaced journal. Its durable phases are
 yet, so the overlay remains the only deployable mode. ADR 0058 records the wire,
 persistence, replay, and restart contracts.
 
+IPAM stays below a provider interface and above routing. The first provider
+accepts one canonical IPv4 and IPv6 node block, reserves network/gateway and IPv4
+broadcast boundaries, and deterministically selects the lowest free address in
+each family as one atomic lease. Search and node usage are capped at 65,536
+leases. The provider validates reconstructed leases but owns no persistence;
+ADR 0059 keeps durable attachment integration as the remaining 6.3 gate.
+
 ## Phase 1 through 3 data flows
 
 1. kube-rs watches Nodes, Pods, Namespaces, Services, EndpointSlices,
