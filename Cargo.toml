@@ -9,6 +9,7 @@ members = [
     "crates/unf-common",
     "crates/unf-cni-state",
     "crates/unf-ipam",
+    "crates/unf-link",
     "crates/unf-policy",
     "crates/unf-state",
     "ebpf/unf-ebpf-common",
@@ -34,6 +35,8 @@ kube = { version = "4.2.0", features = ["client", "derive", "runtime", "rustls-t
 prometheus-client = "0.25.0"
 proptest = "1.9.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+rtnetlink = "0.23.0"
+rustix = { version = "1.1.4", features = ["fs", "thread"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
 schemars = "1.2.2"
 serde = { version = "1.0.228", features = ["derive"] }

@@ -281,8 +281,13 @@ authoritative record of verified results.
   it through cleanup intent and restart, and release it only on completed cleanup.
   Schema-v1 state migrates atomically and exact node-block provenance prevents
   silent configuration drift; ADR 0060.
-- Next: connect ADD/DEL/CHECK to a portable veth lifecycle, then native
-  routing/MTU, controller block distribution, and cross-node Kind qualification.
+- The `unf-link` primitive derives exact ownership from the durable record and
+  uses typed netlink plus a disposable namespace thread to create, move,
+  configure, recover, read back, and exactly delete a dual-stack veth. The real
+  namespace gate also proves foreign-link preservation; ADR 0061.
+- Next: add native per-family routes and rollback, then connect ADD/DEL/CHECK to
+  the complete link-plus-route transaction before controller block distribution
+  and cross-node Kind qualification.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

@@ -89,16 +89,18 @@ The Phase 3 gate and all 42 deliverables are Verified. Exact closure evidence,
 limits, and the separately tracked full-CNI entry are maintained in the
 [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md)
 and ADR 0056.
-The full-CNI foundation is now in progress under ADRs 0057–0060. The initial
+The full-CNI foundation is now in progress under ADRs 0057–0061. The initial
 `unf-cni` protocol executable remains deliberately fail closed for Pod lifecycle
 operations. An explicitly enabled local-agent Unix service now provides the
 root-authenticated, bounded schema-v2 transaction boundary and atomic durable
 attachment/dual-stack lease journal beneath that future lifecycle. Its modular
 IPAM provider allocates deterministically from explicit node blocks, migrates
 schema-v1 attachment state, and releases leases only after abort/delete
-completion. Link creation, routes, controller block distribution, and cluster
-CNI installation are not implemented; existing overlay deployments are
-unchanged.
+completion. A typed-netlink `unf-link` primitive now creates, moves, configures,
+recovers, reads back, and exactly removes dual-stack veth pairs from those durable
+records. Native routes, controller block distribution, CNI transaction wiring,
+and cluster CNI installation are not implemented; existing overlay deployments
+are unchanged.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -294,7 +296,7 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-Not implemented yet: service load balancing, routing, IPAM/CNI,
+Not implemented yet: service load balancing, production routing/CNI integration,
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
 multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production
 fail-closed recovery. Bounded revision-scoped TCP/UDP/SCTP reply state is
