@@ -2805,11 +2805,13 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "unf-cni-state",
  "unf-common",
  "unf-ebpf-common",
  "unf-state",
@@ -2833,6 +2835,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "unf-cni-state"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

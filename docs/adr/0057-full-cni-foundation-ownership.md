@@ -53,9 +53,10 @@ routes, files, or CNI configurations.
 initially accepts only `mode: primary`, `dataplane: veth`, `ipam.type: unf`, an
 absolute local agent socket, and MTU values valid for dual stack. VERSION is
 functional immediately. ADD and CHECK return a structured retry error, and
-STATUS reports unavailable, until the local agent transaction API exists. DEL
-and GC are idempotent no-ops while this binary cannot create resources. This
-prevents a partially implemented plugin from returning false success.
+STATUS reports unavailable, until the local agent transaction API exists and
+completed IPAM/link lifecycle operations are connected through it. DEL and GC
+are idempotent no-ops while this binary cannot create resources. This prevents a
+partially implemented plugin from returning false success.
 
 The executable never calls Kubernetes, compiles policy, manages services, runs a
 routing protocol, or aggregates telemetry. Structured CNI results are the only

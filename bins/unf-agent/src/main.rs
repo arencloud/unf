@@ -48,11 +48,16 @@ use unf_state::{
     PolicyMapEntry, PolicyStateSnapshot, VersionTransition,
 };
 
+mod cni_server;
+
+use cni_server::CniTransactionServer;
+
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
 const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v3";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
+const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
 const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
 const BLOCKED_TRANSITION_REPORTING_WINDOW: Duration = Duration::from_secs(30);
 const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
@@ -138,6 +143,16 @@ struct Args {
     flow_export_seconds: u64,
     #[arg(long, env = "UNF_BPF_PIN_PATH", default_value = DEFAULT_BPF_PIN_PATH)]
     bpf_pin_path: PathBuf,
+    /// Enable the root-only local CNI transaction API at this Unix socket.
+    #[arg(long, env = "UNF_CNI_SOCKET")]
+    cni_socket: Option<PathBuf>,
+    /// Durable attachment journal used only when --cni-socket is enabled.
+    #[arg(
+        long,
+        env = "UNF_CNI_STATE_PATH",
+        default_value = DEFAULT_CNI_STATE_PATH
+    )]
+    cni_state_path: PathBuf,
     #[arg(
         long,
         env = "UNF_TC_ATTACHMENT_MODE",
@@ -507,6 +522,11 @@ struct AgentStatus {
     limitation: &'static str,
 }
 
+enum SupervisedFailure {
+    Dataplane(anyhow::Error),
+    CniTransaction(anyhow::Error),
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     install_crypto_provider()?;
@@ -519,15 +539,18 @@ async fn main() -> Result<()> {
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
     spawn_startup_agent_status_reporter(&args, &state, &cancellation, &mut tasks)?;
-    let (dataplane_failure_tx, mut dataplane_failure_rx) = mpsc::channel(1);
-    let mut dataplane_configured = false;
+    let (service_failure_tx, mut service_failure_rx) = mpsc::channel(1);
+    let mut supervised_service_configured = false;
+
+    supervised_service_configured |=
+        spawn_cni_transaction_server(&args, &cancellation, &mut tasks, &service_failure_tx)?;
 
     match (&args.ebpf_object, &args.interface, args.all_interfaces) {
         (Some(object), interface, all_interfaces) if interface.is_some() || all_interfaces => {
-            dataplane_configured = true;
+            supervised_service_configured = true;
             let state = Arc::clone(&state);
             let cancellation = cancellation.clone();
-            let dataplane_failure_tx = dataplane_failure_tx.clone();
+            let failure_tx = service_failure_tx.clone();
             let object = object.clone();
             let interface = interface.clone();
             let direction = args.direction;
@@ -557,7 +580,7 @@ async fn main() -> Result<()> {
                 if let Err(error) = run_dataplane(config, Arc::clone(&state), cancellation).await {
                     error!(?error, "eBPF dataplane stopped");
                     state.ready.store(false, Ordering::Release);
-                    let _ = dataplane_failure_tx.send(error).await;
+                    let _ = failure_tx.send(SupervisedFailure::Dataplane(error)).await;
                 }
             });
         }
@@ -567,7 +590,7 @@ async fn main() -> Result<()> {
         }
         _ => bail!("--ebpf-object must be paired with either --interface or --all-interfaces"),
     }
-    drop(dataplane_failure_tx);
+    drop(service_failure_tx);
 
     let app = Router::new()
         .route("/healthz", get(health))
@@ -590,24 +613,14 @@ async fn main() -> Result<()> {
         }
     });
 
-    let dataplane_failure = tokio::select! {
+    let service_failure = tokio::select! {
         result = tokio::signal::ctrl_c() => {
             result.context("listen for shutdown signal")?;
             None
         }
-        failure = dataplane_failure_rx.recv(), if dataplane_configured => failure,
+        failure = service_failure_rx.recv(), if supervised_service_configured => failure,
     };
-    hold_blocked_transition_reporting_window(dataplane_failure.as_ref(), &state).await;
-    cancellation.cancel();
-    while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result {
-            error!(%error, "agent task failed");
-        }
-    }
-    if let Some(error) = dataplane_failure {
-        return Err(error).context("eBPF dataplane failed");
-    }
-    Ok(())
+    finish_agent_tasks(cancellation, tasks, service_failure, &state).await
 }
 
 fn initial_agent_state(args: &Args) -> AgentState {
@@ -618,6 +631,60 @@ fn initial_agent_state(args: &Args) -> AgentState {
         args.pod_uid.clone(),
         args.version_transition.into(),
     )
+}
+
+async fn finish_agent_tasks(
+    cancellation: CancellationToken,
+    mut tasks: JoinSet<()>,
+    service_failure: Option<SupervisedFailure>,
+    state: &AgentState,
+) -> Result<()> {
+    let dataplane_failure = match service_failure.as_ref() {
+        Some(SupervisedFailure::Dataplane(error)) => Some(error),
+        _ => None,
+    };
+    hold_blocked_transition_reporting_window(dataplane_failure, state).await;
+    cancellation.cancel();
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            error!(%error, "agent task failed");
+        }
+    }
+    match service_failure {
+        Some(SupervisedFailure::Dataplane(error)) => Err(error).context("eBPF dataplane failed"),
+        Some(SupervisedFailure::CniTransaction(error)) => {
+            Err(error).context("CNI transaction API failed")
+        }
+        None => Ok(()),
+    }
+}
+
+fn spawn_cni_transaction_server(
+    args: &Args,
+    cancellation: &CancellationToken,
+    tasks: &mut JoinSet<()>,
+    failure_tx: &mpsc::Sender<SupervisedFailure>,
+) -> Result<bool> {
+    let Some(socket_path) = &args.cni_socket else {
+        return Ok(false);
+    };
+    let server = CniTransactionServer::bind(socket_path.clone(), &args.cni_state_path)?;
+    let server_cancellation = cancellation.clone();
+    let failure_tx = failure_tx.clone();
+    info!(
+        socket = %socket_path.display(),
+        state = %args.cni_state_path.display(),
+        "root-authenticated CNI transaction API enabled"
+    );
+    tasks.spawn(async move {
+        if let Err(error) = server.run(server_cancellation).await {
+            error!(?error, "CNI transaction API stopped");
+            let _ = failure_tx
+                .send(SupervisedFailure::CniTransaction(error))
+                .await;
+        }
+    });
+    Ok(true)
 }
 
 fn spawn_startup_agent_status_reporter(
@@ -4326,6 +4393,29 @@ fn init_tracing() {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn cni_transaction_api_is_disabled_by_default_and_explicitly_opt_in() {
+        let defaults = Args::try_parse_from(["unf-agent"]).expect("default arguments parse");
+        assert_eq!(defaults.cni_socket, None);
+        assert_eq!(
+            defaults.cni_state_path,
+            Path::new("/var/lib/unf/cni/v1/attachments.json")
+        );
+
+        let enabled = Args::try_parse_from([
+            "unf-agent",
+            "--cni-socket",
+            "/run/unf/cni.sock",
+            "--cni-state-path",
+            "/var/lib/unf/cni/v1/test.json",
+        ])
+        .expect("CNI transaction arguments parse");
+        assert_eq!(
+            enabled.cni_socket.as_deref(),
+            Some(Path::new("/run/unf/cni.sock"))
+        );
+    }
 
     #[test]
     fn malformed_ca_update_retains_last_known_good_client_without_retry_storm() {

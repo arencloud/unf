@@ -268,9 +268,13 @@ authoritative record of verified results.
   state belongs to the local agent, and cutover/rollback requires node drain.
 - The initial Rust `unf-cni` executable implements bounded CNI 1.0/1.1 request
   validation and VERSION behavior. ADD/CHECK/STATUS remain explicitly unavailable
-  until the versioned root-authenticated agent transaction API is present.
-- Next: local transaction persistence and idempotence, dual-stack node-block
-  IPAM, veth lifecycle, native routing/MTU, then cross-node Kind qualification.
+  until IPAM and link operations are connected through the versioned local API.
+- The opt-in local agent transaction service now enforces kernel UID-0 peer
+  authentication and schema-v1 64-KiB messages. Its atomic mode-0600 journal
+  durably reloads deterministic preparing/ready/aborting/deleting attachment
+  records and rejects conflicting or invalid replays; ADR 0058.
+- Next: dual-stack node-block IPAM, then connect ADD/DEL/CHECK to veth lifecycle,
+  native routing/MTU, and cross-node Kind qualification.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

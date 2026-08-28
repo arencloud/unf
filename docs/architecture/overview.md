@@ -42,7 +42,13 @@ The executable owns bounded CNI parsing and one attachment's namespace/link
 application. The local agent owns durable state and recovery; the controller
 owns pool/node-block intent. Kubernetes watches, policy compilation, service
 logic, routing protocols, and telemetry aggregation never enter the CNI process.
-ADR 0057 defines coexistence, rollback, uninstall, and failure boundaries.
+ADR 0057 defines coexistence, rollback, uninstall, and failure boundaries. The
+first agent-side slice is opt-in through `--cni-socket`; it authenticates UID 0
+with kernel Unix peer credentials and serializes bounded schema-v1 transactions
+into a mode-0600, atomically replaced journal. Its durable phases are
+`preparing`, `ready`, `aborting`, and `deleting`. No link or address is created
+yet, so the overlay remains the only deployable mode. ADR 0058 records the wire,
+persistence, replay, and restart contracts.
 
 ## Phase 1 through 3 data flows
 

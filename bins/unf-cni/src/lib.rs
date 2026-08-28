@@ -185,7 +185,7 @@ impl CniError {
             11,
             "Try again later",
             format!(
-                "{operation:?} requires the versioned local unf-agent CNI transaction API, which is not implemented yet"
+                "{operation:?} requires IPAM and link lifecycle through the local unf-agent CNI transaction API, which are not implemented yet"
             ),
         )
     }
@@ -195,7 +195,7 @@ impl CniError {
             version,
             50,
             "Plugin not available",
-            "the local unf-agent CNI transaction API is not implemented yet",
+            "plugin readiness is not connected to the local unf-agent CNI transaction API yet",
         )
     }
 }
@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn add_is_validated_then_fails_closed_until_agent_transactions_exist() {
+    fn add_is_validated_then_fails_closed_until_ipam_and_links_exist() {
         let error = execute(&environment("ADD"), &config("")).expect_err("ADD is gated");
         assert_eq!(error.code, 11);
         assert!(error.details.contains("unf-agent"));
@@ -456,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_not_available_until_the_agent_api_exists() {
+    fn status_reports_not_available_until_agent_readiness_is_connected() {
         let error = execute(&environment("STATUS"), &config(""))
             .expect_err("STATUS must not claim readiness");
         assert_eq!(error.code, 50);
