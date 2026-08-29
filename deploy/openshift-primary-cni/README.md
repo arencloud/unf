@@ -65,9 +65,14 @@ available.
 Pinned development images:
 
 ```text
-quay.io/arencloud/unf-controller-dev@sha256:b4df5645ac3a2ea9552f7a21d2d0d81c7d7c4aa1ea8355e2c6f304c2f2be3d56
-quay.io/arencloud/unf-agent-dev@sha256:e94e58150d3bb8756ab3c298db7d36dd0b9a1bd7bec1ffc6bb03f6e986a60fb9
+quay.io/arencloud/unf-controller-dev@sha256:02a719b79c7e6f9c27e7ae7a63ee70fa2d02a17734a765d9cf41e5576d0a6e0c
+quay.io/arencloud/unf-agent-dev@sha256:d958d99fbdc09fb1f72c9949f3cc9ce533dedb0dfab0ce4a7634c34aa7b059bf
 ```
+
+The host-network controller uses a `Recreate` strategy. Its fixed ports and
+single pinned control-plane placement make overlapping old and new Pods
+invalid; updates therefore trade a short bounded controller outage for a
+deterministic replacement while agents retain last-known-good state.
 
 Run the read-only eligibility check against any candidate API:
 

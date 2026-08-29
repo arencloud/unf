@@ -119,6 +119,28 @@ Ready. The live temporary-policy count is therefore 25. The rejected image tag
 and digest will not be reused; the next attempt requires a new committed
 revision and new immutable digests.
 
+### Corrected remediation rollout
+
+Revision `be501c0` passed the expanded isolated Kind gate and was published as
+controller digest
+`sha256:02a719b79c7e6f9c27e7ae7a63ee70fa2d02a17734a765d9cf41e5576d0a6e0c`
+and agent digest
+`sha256:d958d99fbdc09fb1f72c9949f3cc9ce533dedb0dfab0ce4a7634c34aa7b059bf`.
+The five corrected agents converged during a 75-second old-controller hold with
+zero restarts and all five DNS Pods Ready. After the corrected controller
+started, its state endpoint reported five expected, reporting, fresh, and
+converged agents with one shared epoch and exact desired/applied identity,
+policy, Node-block, and route revisions.
+
+The controller update retained one failed packaging attempt. The host-network
+singleton inherited `RollingUpdate`; its replacement could not share fixed
+ports on the pinned control-plane Node, and OpenShift retained 340 failed Pods
+with reason `NodePorts`. Patching the Deployment to `Recreate` stopped the old
+revision before starting the corrected controller. The healthy replacement was
+not manually altered, and only the 340 terminal failed-Pod records were then
+deleted. The runtime package and package check now require `Recreate`. This
+retry remains part of the qualification record.
+
 ## Remaining exit criteria
 
 The live primary-CNI lifecycle remains **In progress** until repository changes

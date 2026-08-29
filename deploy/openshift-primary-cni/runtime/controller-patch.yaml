@@ -4,6 +4,10 @@ metadata:
   name: unf-controller
   namespace: unf-system
 spec:
+  # A host-network singleton with fixed ports cannot overlap its replacement on
+  # the pinned control-plane Node. Stop it before starting the next revision.
+  strategy:
+    type: Recreate
   template:
     metadata:
       annotations:

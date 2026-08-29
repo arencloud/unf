@@ -1,7 +1,7 @@
 # ADR 0070: Primary-CNI bootstrap recovery is identity-, NAT-, and epoch-aware
 
 Status: Accepted and implemented; expanded isolated dual-stack Kind verified,
-live OpenShift rerun pending
+corrected OpenShift rollout converged; workaround-removal gate in progress
 
 ## Context
 
@@ -87,9 +87,23 @@ only the residual UNF egress filters. Authentication, console, and DNS recovered
 Insights retained its pre-existing external upload timeout. This failed attempt
 is retained as evidence rather than credited as qualification.
 
-Live OpenShift verification still requires immutable images, a staged cl02
-rollout, deletion of every annotated temporary policy, operator/canary closure,
-and explicit outage and Node reboot evidence.
+The corrected rollout uses source revision `be501c0`, controller digest
+`sha256:02a719b79c7e6f9c27e7ae7a63ee70fa2d02a17734a765d9cf41e5576d0a6e0c`,
+and agent digest
+`sha256:d958d99fbdc09fb1f72c9949f3cc9ce533dedb0dfab0ce4a7634c34aa7b059bf`.
+All five agents first converged during a 75-second mixed-version hold with zero
+restarts and stable DNS. The controller update then exposed a packaging error:
+the host-network singleton inherited `RollingUpdate`, so its fixed ports on the
+pinned Node caused 340 replacement Pods to be rejected with `NodePorts`. The
+live Deployment was corrected to `Recreate`, the old controller stopped, and
+one corrected replacement became Ready. All five agents reconverged to its new
+epoch and the 340 terminal retry artifacts were removed. The package now
+requires `Recreate` so an update has one bounded controller outage while agents
+continue from last-known-good state.
+
+Live OpenShift verification still requires deletion of every annotated
+temporary policy, operator/canary closure, and explicit outage and Node reboot
+evidence.
 
 ## Consequences
 
