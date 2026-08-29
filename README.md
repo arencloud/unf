@@ -110,9 +110,14 @@ rollback, and foreign-state preservation. The controller now distributes complet
 authenticated epoch/revision-fenced remote-route snapshots, and an explicitly
 configured agent reconciler restores owner-only last-known-good state, applies
 atomic route-set replacements, retires stale routes after replacement, and
-reports desired/applied/error state. Cluster CNI installation and cross-worker
-primary-mode qualification are not implemented; existing overlay deployments
-are unchanged.
+reports desired/applied/error state. A five-Node dual-stack OpenShift 4.22.10
+Agent-based installation now reaches installer completion with UNF as the
+primary Pod network, healthy operators, converged agents, and cross-worker
+IPv4/IPv6 forwarding. That checkpoint still depends on annotated bootstrap
+NetworkPolicies and exposes identity/reply/recovery gaps, so workaround-free
+primary-mode qualification and production support are not claimed. Existing
+overlay deployments are unchanged. See the
+[cl02 installation checkpoint](docs/development/openshift-primary-cni-cl02-install.md).
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
