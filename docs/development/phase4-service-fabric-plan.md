@@ -18,7 +18,7 @@ cluster support.
 | 4.1 | Service domain contract | **Verified** | `make service-ir-test`; explicit per-frontend same-family backend references; ADR 0074 |
 | 4.2 | Kubernetes service compiler | **Verified** | `make service-compiler-test`; deterministic exact dual-stack translation, stable collision rejection, lifecycle provenance, retained-last-valid status and topology non-regression; ADR 0075 |
 | 4.3 | Revisioned agent distribution | **Verified** | `make service-distribution-test`; authenticated snapshot, compatibility fencing, desired/applied/failed status, durable mode-0600 LKG persistence and outage recovery; ADR 0076 |
-| 4.4 | Transactional eBPF service state | **Planned** | Accepted map/connection-state ADR, verifier build, staging/readback/atomic activation/rollback and capacity fault gate |
+| 4.4 | Transactional eBPF service state | **Verified** | `make service-dataplane-test`; fixed dual-stack ABI, v4/eighteen-pin clean boundary, real-map staging/readback/atomic activation/rollback/capacity fault; ADR 0077 |
 | 4.5 | Dual-stack ClusterIP dataplane | **Planned** | TCP/UDP translation, deterministic backend persistence, reverse path, endpoint churn, no-backend behavior and provenance |
 | 4.6 | Service operations | **Planned** | Metrics, status, flow history, explanation, cleanup and actionable failure reasons |
 | 4.7 | Kube-proxy-free Kind qualification | **Planned** | Dedicated primary-CNI dual-stack lifecycle/failure/recovery artifact |
@@ -48,8 +48,9 @@ first gate. They receive separate rows after the ClusterIP foundation closes.
 
 ## Immediate next slice
 
-Before implementing Phase 4.4, accept the service dataplane hook and connection
-state ADR. Define fixed-layout frontend/backend/config capacity, transactional
-staging and atomic activation, readback, last-known-good recovery, rollback on
-partial or capacity failure, and exact ownership/cleanup semantics. Then build
-and test those maps without yet claiming packet translation or ClusterIP support.
+Implement Phase 4.5 against ADR 0077's accepted source-side Pod-veth TC hook and
+connection-state ABI. Start with exact IPv4 TCP/UDP frontend lookup, eligible
+backend selection, forward DNAT/checksum repair, reverse-key insertion and SNAT,
+then add the identical IPv6 path. Preserve a selected BackendId across service
+revision churn, make pair-insertion and no-backend failures explicit, and prove
+verifier-safe parsing/mutation before adding cluster claims.

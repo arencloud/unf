@@ -2901,7 +2901,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         limitations: [
             "desired state and identity allocations are currently in-memory only",
             "agent acknowledgements and the newest bounded flow history use separate single-controller ConfigMap checkpoints",
-            "service snapshots are distributed and durable userspace intent only; no service BPF map or ClusterIP forwarding is active",
+            "agents can transactionally activate distributed service BPF state; packet NAT, backend selection, and ClusterIP forwarding are not active before Phase 4.5",
         ],
     }))
 }

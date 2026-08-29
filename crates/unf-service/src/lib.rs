@@ -10,15 +10,23 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{BackendId, Protocol, Revision, ServiceId};
+use unf_ebpf_common::{
+    SERVICE_BACKEND_FLAG_READY, SERVICE_BACKEND_FLAG_SERVING, SERVICE_BACKEND_FLAG_TERMINATING,
+    SERVICE_BANK_COUNT, SERVICE_MAP_ABI_VERSION,
+};
 
 pub use unf_common::SERVICE_SNAPSHOT_SCHEMA_VERSION;
 
 pub const MAX_SERVICES: usize = 65_536;
 pub const MAX_SERVICE_FRONTENDS: usize = 131_072;
 pub const MAX_SERVICE_BACKENDS: usize = 262_144;
+pub const MAX_SERVICE_BACKEND_REFERENCES: usize = 524_288;
 pub const MAX_BACKENDS_PER_SERVICE: usize = 4_096;
 pub const MAX_PROVENANCE_COMPONENT_BYTES: usize = 253;
 pub const MAX_ENDPOINT_SLICE_PROVENANCE: usize = 128;
+pub const SERVICE_FRONTEND_BANK_CAPACITY: usize = MAX_SERVICE_FRONTENDS;
+pub const SERVICE_BACKEND_BANK_CAPACITY: usize = MAX_SERVICE_BACKENDS;
+pub const SERVICE_BACKEND_SLOT_BANK_CAPACITY: usize = MAX_SERVICE_BACKEND_REFERENCES;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -133,6 +141,8 @@ pub enum ServiceIrError {
     TooManyFrontends { actual: usize, limit: usize },
     #[error("service snapshot has {actual} backends; limit is {limit}")]
     TooManyBackends { actual: usize, limit: usize },
+    #[error("service snapshot has {actual} frontend/backend references; limit is {limit}")]
+    TooManyBackendReferences { actual: usize, limit: usize },
     #[error("service {service:?} has {actual} backends; per-service limit is {limit}")]
     TooManyServiceBackends {
         service: ServiceId,
@@ -237,6 +247,34 @@ pub enum ServiceCompileError {
     },
     #[error(transparent)]
     InvalidIr(#[from] ServiceIrError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ServiceDataplaneError {
+    #[error(transparent)]
+    InvalidIr(#[from] ServiceIrError),
+    #[error("invalid service map bank {0}; expected 0 or 1")]
+    InvalidBank(u8),
+    #[error("service map {map} requires {actual} entries; per-bank limit is {limit}")]
+    Capacity {
+        map: &'static str,
+        actual: usize,
+        limit: usize,
+    },
+}
+
+/// Canonical fixed-width bytes written to one logical service bank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceDataplaneState {
+    pub source_epoch: u64,
+    pub revision: u64,
+    pub bank: u8,
+    pub ipv4_frontends: BTreeMap<[u8; 8], [u8; 32]>,
+    pub ipv6_frontends: BTreeMap<[u8; 20], [u8; 32]>,
+    pub ipv4_backends: BTreeMap<[u8; 12], [u8; 24]>,
+    pub ipv6_backends: BTreeMap<[u8; 12], [u8; 32]>,
+    pub backend_slots: BTreeMap<[u8; 16], [u8; 16]>,
+    pub config: [u8; 32],
 }
 
 #[derive(Default)]
@@ -550,6 +588,7 @@ impl ServiceSnapshot {
         let mut frontend_owners = BTreeMap::new();
         let mut total_frontends = 0_usize;
         let mut total_backends = 0_usize;
+        let mut total_backend_references = 0_usize;
 
         for service in &mut self.services {
             validate_service_identity(service, &mut service_ids, &mut service_names)?;
@@ -567,6 +606,12 @@ impl ServiceSnapshot {
             }
             total_frontends = total_frontends.saturating_add(service.frontends.len());
             total_backends = total_backends.saturating_add(service.backends.len());
+            total_backend_references = service
+                .frontends
+                .iter()
+                .fold(total_backend_references, |count, frontend| {
+                    count.saturating_add(frontend.backend_ids.len())
+                });
 
             for frontend in &mut service.frontends {
                 validate_frontend(service.id, frontend)?;
@@ -596,6 +641,12 @@ impl ServiceSnapshot {
             return Err(ServiceIrError::TooManyBackends {
                 actual: total_backends,
                 limit: MAX_SERVICE_BACKENDS,
+            });
+        }
+        if total_backend_references > MAX_SERVICE_BACKEND_REFERENCES {
+            return Err(ServiceIrError::TooManyBackendReferences {
+                actual: total_backend_references,
+                limit: MAX_SERVICE_BACKEND_REFERENCES,
             });
         }
         self.services.sort_by(|left, right| {
@@ -811,6 +862,296 @@ const fn is_service_protocol(protocol: Protocol) -> bool {
     matches!(protocol, Protocol::Tcp | Protocol::Udp | Protocol::Sctp)
 }
 
+/// Lowers one validated service snapshot into the exact bytes for an inactive
+/// logical BPF bank. This function has no map side effects.
+///
+/// # Errors
+///
+/// Rejects invalid IR, a bank outside the two-bank ABI, or any per-map capacity
+/// violation before a kernel map can be mutated.
+#[allow(clippy::too_many_lines)]
+pub fn compile_service_dataplane(
+    snapshot: &ServiceSnapshot,
+    bank: u8,
+) -> Result<ServiceDataplaneState, ServiceDataplaneError> {
+    if bank >= SERVICE_BANK_COUNT {
+        return Err(ServiceDataplaneError::InvalidBank(bank));
+    }
+    let snapshot = snapshot.clone().validate_and_normalize()?;
+    let mut ipv4_frontends = BTreeMap::new();
+    let mut ipv6_frontends = BTreeMap::new();
+    let mut ipv4_backends = BTreeMap::new();
+    let mut ipv6_backends = BTreeMap::new();
+    let mut backend_slots = BTreeMap::new();
+
+    for service in &snapshot.services {
+        for backend in &service.backends {
+            let key = encode_service_backend_key(service.id, backend.id, bank);
+            let flags = encode_backend_flags(backend);
+            match backend.address {
+                IpAddr::V4(address) => {
+                    ipv4_backends.insert(
+                        key,
+                        encode_ipv4_service_backend(
+                            address.octets(),
+                            backend.port,
+                            backend.protocol,
+                            flags,
+                            snapshot.revision.get(),
+                        ),
+                    );
+                }
+                IpAddr::V6(address) => {
+                    ipv6_backends.insert(
+                        key,
+                        encode_ipv6_service_backend(
+                            address.octets(),
+                            backend.port,
+                            backend.protocol,
+                            flags,
+                            snapshot.revision.get(),
+                        ),
+                    );
+                }
+            }
+        }
+        for (frontend_index, frontend) in service.frontends.iter().enumerate() {
+            let frontend_index = bounded_u32(frontend_index);
+            let value = encode_service_frontend_value(
+                service.id,
+                frontend_index,
+                frontend.backend_ids.len(),
+                snapshot.revision.get(),
+            );
+            match frontend.address {
+                IpAddr::V4(address) => {
+                    ipv4_frontends.insert(
+                        encode_ipv4_service_frontend_key(
+                            address.octets(),
+                            frontend.port,
+                            frontend.protocol,
+                            bank,
+                        ),
+                        value,
+                    );
+                }
+                IpAddr::V6(address) => {
+                    ipv6_frontends.insert(
+                        encode_ipv6_service_frontend_key(
+                            address.octets(),
+                            frontend.port,
+                            frontend.protocol,
+                            bank,
+                        ),
+                        value,
+                    );
+                }
+            }
+            for (slot, backend_id) in frontend.backend_ids.iter().enumerate() {
+                let slot = bounded_u32(slot);
+                backend_slots.insert(
+                    encode_service_backend_slot_key(service.id, frontend_index, slot, bank),
+                    encode_service_backend_slot_value(*backend_id, snapshot.revision.get()),
+                );
+            }
+        }
+    }
+
+    validate_dataplane_capacity(
+        "SERVICE_FRONTENDS_V4",
+        ipv4_frontends.len(),
+        SERVICE_FRONTEND_BANK_CAPACITY,
+    )?;
+    validate_dataplane_capacity(
+        "SERVICE_FRONTENDS_V6",
+        ipv6_frontends.len(),
+        SERVICE_FRONTEND_BANK_CAPACITY,
+    )?;
+    validate_dataplane_capacity(
+        "SERVICE_BACKENDS_V4",
+        ipv4_backends.len(),
+        SERVICE_BACKEND_BANK_CAPACITY,
+    )?;
+    validate_dataplane_capacity(
+        "SERVICE_BACKENDS_V6",
+        ipv6_backends.len(),
+        SERVICE_BACKEND_BANK_CAPACITY,
+    )?;
+    validate_dataplane_capacity(
+        "SERVICE_BACKEND_SLOTS",
+        backend_slots.len(),
+        SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+    )?;
+    let frontend_count = ipv4_frontends.len() + ipv6_frontends.len();
+    let backend_count = ipv4_backends.len() + ipv6_backends.len();
+    let config = encode_service_config(
+        snapshot.source_epoch,
+        snapshot.revision.get(),
+        frontend_count,
+        backend_count,
+        backend_slots.len(),
+        bank,
+    );
+    Ok(ServiceDataplaneState {
+        source_epoch: snapshot.source_epoch,
+        revision: snapshot.revision.get(),
+        bank,
+        ipv4_frontends,
+        ipv6_frontends,
+        ipv4_backends,
+        ipv6_backends,
+        backend_slots,
+        config,
+    })
+}
+
+fn validate_dataplane_capacity(
+    map: &'static str,
+    actual: usize,
+    limit: usize,
+) -> Result<(), ServiceDataplaneError> {
+    if actual > limit {
+        return Err(ServiceDataplaneError::Capacity { map, actual, limit });
+    }
+    Ok(())
+}
+
+fn encode_ipv4_service_frontend_key(
+    address: [u8; 4],
+    port: u16,
+    protocol: Protocol,
+    bank: u8,
+) -> [u8; 8] {
+    let mut key = [0_u8; 8];
+    key[0..4].copy_from_slice(&address);
+    key[4..6].copy_from_slice(&port.to_be_bytes());
+    key[6] = protocol as u8;
+    key[7] = bank;
+    key
+}
+
+fn encode_ipv6_service_frontend_key(
+    address: [u8; 16],
+    port: u16,
+    protocol: Protocol,
+    bank: u8,
+) -> [u8; 20] {
+    let mut key = [0_u8; 20];
+    key[0..16].copy_from_slice(&address);
+    key[16..18].copy_from_slice(&port.to_be_bytes());
+    key[18] = protocol as u8;
+    key[19] = bank;
+    key
+}
+
+fn encode_service_frontend_value(
+    service_id: ServiceId,
+    frontend_index: u32,
+    backend_count: usize,
+    revision: u64,
+) -> [u8; 32] {
+    let mut value = [0_u8; 32];
+    value[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
+    value[4..8].copy_from_slice(&frontend_index.to_ne_bytes());
+    value[8..12].copy_from_slice(&bounded_u32(backend_count).to_ne_bytes());
+    value[12..14].copy_from_slice(&SERVICE_MAP_ABI_VERSION.to_ne_bytes());
+    value[16..24].copy_from_slice(&revision.to_ne_bytes());
+    value
+}
+
+fn encode_service_backend_key(service_id: ServiceId, backend_id: BackendId, bank: u8) -> [u8; 12] {
+    let mut key = [0_u8; 12];
+    key[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
+    key[4..8].copy_from_slice(&backend_id.get().to_ne_bytes());
+    key[8] = bank;
+    key
+}
+
+fn encode_ipv4_service_backend(
+    address: [u8; 4],
+    port: u16,
+    protocol: Protocol,
+    flags: u8,
+    revision: u64,
+) -> [u8; 24] {
+    let mut value = [0_u8; 24];
+    value[0..8].copy_from_slice(&revision.to_ne_bytes());
+    value[8..12].copy_from_slice(&address);
+    value[12..14].copy_from_slice(&port.to_be_bytes());
+    value[14..16].copy_from_slice(&SERVICE_MAP_ABI_VERSION.to_ne_bytes());
+    value[16] = protocol as u8;
+    value[17] = flags;
+    value
+}
+
+fn encode_ipv6_service_backend(
+    address: [u8; 16],
+    port: u16,
+    protocol: Protocol,
+    flags: u8,
+    revision: u64,
+) -> [u8; 32] {
+    let mut value = [0_u8; 32];
+    value[0..8].copy_from_slice(&revision.to_ne_bytes());
+    value[8..24].copy_from_slice(&address);
+    value[24..26].copy_from_slice(&port.to_be_bytes());
+    value[26..28].copy_from_slice(&SERVICE_MAP_ABI_VERSION.to_ne_bytes());
+    value[28] = protocol as u8;
+    value[29] = flags;
+    value
+}
+
+fn encode_backend_flags(backend: &ServiceBackend) -> u8 {
+    (u8::from(backend.ready) * SERVICE_BACKEND_FLAG_READY)
+        | (u8::from(backend.serving) * SERVICE_BACKEND_FLAG_SERVING)
+        | (u8::from(backend.terminating) * SERVICE_BACKEND_FLAG_TERMINATING)
+}
+
+fn encode_service_backend_slot_key(
+    service_id: ServiceId,
+    frontend_index: u32,
+    slot: u32,
+    bank: u8,
+) -> [u8; 16] {
+    let mut key = [0_u8; 16];
+    key[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
+    key[4..8].copy_from_slice(&frontend_index.to_ne_bytes());
+    key[8..12].copy_from_slice(&slot.to_ne_bytes());
+    key[12] = bank;
+    key
+}
+
+fn encode_service_backend_slot_value(backend_id: BackendId, revision: u64) -> [u8; 16] {
+    let mut value = [0_u8; 16];
+    value[0..4].copy_from_slice(&backend_id.get().to_ne_bytes());
+    value[4..6].copy_from_slice(&SERVICE_MAP_ABI_VERSION.to_ne_bytes());
+    value[8..16].copy_from_slice(&revision.to_ne_bytes());
+    value
+}
+
+fn encode_service_config(
+    source_epoch: u64,
+    revision: u64,
+    frontend_count: usize,
+    backend_count: usize,
+    backend_slot_count: usize,
+    bank: u8,
+) -> [u8; 32] {
+    let mut config = [0_u8; 32];
+    config[0..8].copy_from_slice(&source_epoch.to_ne_bytes());
+    config[8..16].copy_from_slice(&revision.to_ne_bytes());
+    config[16..20].copy_from_slice(&bounded_u32(frontend_count).to_ne_bytes());
+    config[20..24].copy_from_slice(&bounded_u32(backend_count).to_ne_bytes());
+    config[24..28].copy_from_slice(&bounded_u32(backend_slot_count).to_ne_bytes());
+    config[28..30].copy_from_slice(&SERVICE_MAP_ABI_VERSION.to_ne_bytes());
+    config[30] = bank;
+    config
+}
+
+fn bounded_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +1244,70 @@ mod tests {
         assert_eq!(left, right);
         assert!(!left.services[0].backends[1].ready);
         assert!(left.services[0].backends[1].terminating);
+    }
+
+    #[test]
+    fn service_dataplane_encoding_is_fixed_width_network_order_and_banked() {
+        let state = compile_service_dataplane(&snapshot(vec![service(2, "ipv4")]), 1)
+            .expect("valid service dataplane state");
+        assert_eq!(state.source_epoch, 7);
+        assert_eq!(state.revision, 11);
+        assert_eq!(state.bank, 1);
+        assert_eq!(state.ipv4_frontends.len(), 1);
+        assert_eq!(state.ipv4_backends.len(), 1);
+        assert_eq!(state.backend_slots.len(), 1);
+        let (frontend_key, frontend_value) = state.ipv4_frontends.first_key_value().unwrap();
+        assert_eq!(&frontend_key[0..4], &[10, 96, 0, 10]);
+        assert_eq!(&frontend_key[4..6], &443_u16.to_be_bytes());
+        assert_eq!(frontend_key[6], Protocol::Tcp as u8);
+        assert_eq!(frontend_key[7], 1);
+        assert_eq!(
+            u32::from_ne_bytes(frontend_value[0..4].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            u32::from_ne_bytes(frontend_value[8..12].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u64::from_ne_bytes(frontend_value[16..24].try_into().unwrap()),
+            11
+        );
+        let (backend_key, backend_value) = state.ipv4_backends.first_key_value().unwrap();
+        assert_eq!(backend_key[8], 1);
+        assert_eq!(&backend_value[8..12], &[10, 244, 0, 10]);
+        assert_eq!(&backend_value[12..14], &8443_u16.to_be_bytes());
+        assert_eq!(
+            backend_value[17],
+            SERVICE_BACKEND_FLAG_READY | SERVICE_BACKEND_FLAG_SERVING
+        );
+        let slot_key = state.backend_slots.first_key_value().unwrap().0;
+        assert_eq!(slot_key[12], 1);
+        assert_eq!(state.config[30], 1);
+    }
+
+    #[test]
+    fn service_dataplane_rejects_unknown_bank_before_encoding() {
+        assert_eq!(
+            compile_service_dataplane(&snapshot(vec![service(1, "ipv6")]), 2),
+            Err(ServiceDataplaneError::InvalidBank(2))
+        );
+    }
+
+    #[test]
+    fn service_dataplane_capacity_fault_is_rejected_before_map_mutation() {
+        assert_eq!(
+            validate_dataplane_capacity(
+                "SERVICE_BACKEND_SLOTS",
+                SERVICE_BACKEND_SLOT_BANK_CAPACITY + 1,
+                SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+            ),
+            Err(ServiceDataplaneError::Capacity {
+                map: "SERVICE_BACKEND_SLOTS",
+                actual: SERVICE_BACKEND_SLOT_BANK_CAPACITY + 1,
+                limit: SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+            })
+        );
     }
 
     #[test]

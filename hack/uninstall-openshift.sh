@@ -128,19 +128,19 @@ for index in "${!nodes[@]}"; do
     echo "node cleanup: ${node} via ${pod}"
     cleanup_plan=$("${kc[@]}" -n unf-system exec "${pod}" -- \
         /usr/local/bin/unf-component cleanup \
-        --abi-version 3 --allow-current-abi \
+        --abi-version 4 --allow-current-abi \
         --legacy-attachments --all-interfaces --legacy-direction both)
     grep -q 'UNF cleanup plan (dry-run)' <<<"${cleanup_plan}"
     grep -q 'dry run only' <<<"${cleanup_plan}"
-    grep -q 'ABI directory: /sys/fs/bpf/unf/v3' <<<"${cleanup_plan}"
-    [[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v3/' <<<"${cleanup_plan}") -eq 11 ]]
+    grep -q 'ABI directory: /sys/fs/bpf/unf/v4' <<<"${cleanup_plan}"
+    [[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v4/' <<<"${cleanup_plan}") -eq 18 ]]
     sed 's/^/  /' <<<"${cleanup_plan}"
 done
 
 echo "cluster cleanup:"
 echo "  stop DaemonSet unf-system/unf-agent before host mutation"
 echo "  run one constrained cleanup Job on each selected node"
-echo "  verify /sys/fs/bpf/unf/v3 and UNF legacy filters are absent"
+echo "  verify /sys/fs/bpf/unf/v4 and UNF legacy filters are absent"
 if ${delete_namespace}; then
     echo "  delete dedicated Namespace unf-system"
 else
@@ -259,7 +259,7 @@ done
 for node in "${nodes[@]}"; do
     verification=$("${kc[@]}" debug "node/${node}" --quiet -- \
         chroot /host sh -eu -c '
-            test ! -e /sys/fs/bpf/unf/v3
+            test ! -e /sys/fs/bpf/unf/v4
             for path in /sys/class/net/*; do
                 interface=${path##*/}
                 [ "${interface}" = lo ] && continue

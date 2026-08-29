@@ -175,7 +175,9 @@ map_digest() {
     local node=$1 scope=$2 helper map
     local -a maps=(POLICY_RULES POLICY_IPV4 POLICY_IPV6 EGRESS_IPV4 EGRESS_IPV6 POLICY_CONFIG)
     if [[ ${scope} == persistent ]]; then
-        maps=(IDENTITY_V4 IDENTITY_V4_B IDENTITY_V6 IDENTITY_V6_B IDENTITY_CONFIG "${maps[@]}")
+        maps=(IDENTITY_V4 IDENTITY_V4_B IDENTITY_V6 IDENTITY_V6_B IDENTITY_CONFIG "${maps[@]}"
+            SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 SERVICE_BACKENDS_V4
+            SERVICE_BACKENDS_V6 SERVICE_BACKEND_SLOTS SERVICE_CONFIG SERVICE_CONNECTIONS)
     fi
     helper=$(helper_pod_on_node "${node}")
     [[ -n ${helper} ]]
@@ -183,7 +185,7 @@ map_digest() {
         for map in "${maps[@]}"; do
             printf '%s\n' "${map}"
             "${kc[@]}" -n unf-system exec "${helper}" -- \
-                bpftool -j map dump pinned "/sys/fs/bpf/unf/v3/${map}" \
+                bpftool -j map dump pinned "/sys/fs/bpf/unf/v4/${map}" \
                 | jq -Sc 'sort_by(.key | tostring)'
         done
     } | sha256sum | awk '{print $1}'

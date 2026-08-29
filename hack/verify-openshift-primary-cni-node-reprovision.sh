@@ -83,7 +83,7 @@ host_snapshot() {
         caches=$(sudo find /var/lib/cni/results -maxdepth 1 -type f -name "unf-primary-*-eth0" | wc -l)
         links=$(sudo ip -o link show | grep -Ec "^[0-9]+: unf[0-9a-f]+")
         pending=$(sudo find /var/lib/unf/cni/v1/pending-deletes -type f -name "*.json" 2>/dev/null | wc -l)
-        maps=$(sudo find /sys/fs/bpf/unf/v3 -maxdepth 1 -type f 2>/dev/null | wc -l)
+        maps=$(sudo find /sys/fs/bpf/unf/v4 -maxdepth 1 -type f 2>/dev/null | wc -l)
         routes4=$(sudo ip -4 route show proto 196 | wc -l)
         routes6=$(sudo ip -6 route show proto 196 | wc -l)
         printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
@@ -198,7 +198,7 @@ IFS=$'\t' read -r baseline_attachments baseline_caches baseline_links \
 [[ ${baseline_pods} -eq ${baseline_attachments} ]]
 [[ ${baseline_attachments} -eq ${baseline_caches} ]]
 [[ ${baseline_attachments} -eq ${baseline_links} ]]
-[[ ${baseline_pending} -eq 0 && ${baseline_maps} -eq 11 ]]
+[[ ${baseline_pending} -eq 0 && ${baseline_maps} -eq 18 ]]
 [[ ${baseline_routes4} -eq $((baseline_attachments + expected_agents - 1)) ]]
 [[ ${baseline_routes6} -eq ${baseline_routes4} ]]
 "${ssh_node[@]}" '
@@ -248,10 +248,10 @@ agent_sandbox=$(crictl ps -o json | jq -r --arg id "$agent_container" '
     .containers[] | select(.id == $id) | .podSandboxId')
 test -n "$agent_container" && test -n "$agent_sandbox"
 crictl exec "$agent_container" /usr/local/bin/unf-component cleanup \
-    --abi-version 3 --allow-current-abi --legacy-attachments --all-interfaces \
+    --abi-version 4 --allow-current-abi --legacy-attachments --all-interfaces \
     --legacy-direction both --execute >/run/unf/node-reprovision-cleanup.log
 grep -q 'UNF cleanup completed' /run/unf/node-reprovision-cleanup.log
-test ! -e /sys/fs/bpf/unf/v3
+test ! -e /sys/fs/bpf/unf/v4
 crictl stopp "$agent_sandbox" >/dev/null
 crictl rmp "$agent_sandbox" >/dev/null
 
@@ -399,7 +399,7 @@ for _ in $(seq 1 180); do
     if [[ ${recovered_pods} -gt 0 && ${recovered_pods} -eq ${recovered_attachments} \
         && ${recovered_attachments} -eq ${recovered_caches} \
         && ${recovered_attachments} -eq ${recovered_links} \
-        && ${recovered_pending} -eq 0 && ${recovered_maps} -eq 11 \
+        && ${recovered_pending} -eq 0 && ${recovered_maps} -eq 18 \
         && ${recovered_routes4} -eq $((recovered_attachments + expected_agents - 1)) \
         && ${recovered_routes6} -eq ${recovered_routes4} ]]; then
         break
@@ -409,7 +409,7 @@ done
 [[ ${recovered_pods} -gt 0 && ${recovered_pods} -eq ${recovered_attachments} ]]
 [[ ${recovered_attachments} -eq ${recovered_caches} \
     && ${recovered_attachments} -eq ${recovered_links} ]]
-[[ ${recovered_pending} -eq 0 && ${recovered_maps} -eq 11 ]]
+[[ ${recovered_pending} -eq 0 && ${recovered_maps} -eq 18 ]]
 [[ ${recovered_routes4} -eq $((recovered_attachments + expected_agents - 1)) \
     && ${recovered_routes6} -eq ${recovered_routes4} ]]
 

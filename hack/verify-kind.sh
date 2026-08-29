@@ -99,7 +99,7 @@ cleanup() {
             if [[ -n ${pressure_inactive_bank} ]]; then
                 "${kc[@]}" -n unf-system exec "${helper}" -- \
                     /usr/local/bin/unf-bpf-map-pressure clear \
-                    /sys/fs/bpf/unf/v3/POLICY_RULES "${pressure_inactive_bank}" \
+                    /sys/fs/bpf/unf/v4/POLICY_RULES "${pressure_inactive_bank}" \
                     >/dev/null 2>&1 || true
             fi
         done < <("${kc[@]}" -n unf-system get pods \
@@ -230,7 +230,7 @@ expected_attachment_mode() {
 prepare_fault_map_set() {
     local helper=$1 target=$2 omitted=$3
     "${kc[@]}" -n unf-system exec "${helper}" -- sh -eu -c '
-        source=/sys/fs/bpf/unf/v3
+        source=/sys/fs/bpf/unf/v4
         target=$1
         omitted=$2
         rm -rf "${target}"
@@ -238,7 +238,9 @@ prepare_fault_map_set() {
         for map in \
             IDENTITY_V4 IDENTITY_V4_B IDENTITY_V6 IDENTITY_V6_B \
             IDENTITY_CONFIG POLICY_RULES POLICY_IPV4 POLICY_IPV6 \
-            EGRESS_IPV4 EGRESS_IPV6 POLICY_CONFIG
+            EGRESS_IPV4 EGRESS_IPV6 POLICY_CONFIG \
+            SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 SERVICE_BACKENDS_V4 \
+            SERVICE_BACKENDS_V6 SERVICE_BACKEND_SLOTS SERVICE_CONFIG SERVICE_CONNECTIONS
         do
             if [ "${map}" = "${omitted}" ]; then
                 continue
@@ -732,7 +734,7 @@ for _ in {1..30}; do
         fi
         if [[ ${attachment_mode} == tcx_pinned ]] \
             && ! "${kc[@]}" -n unf-system exec "${pod}" -- sh -c \
-                'find /sys/fs/bpf/unf/v3/links -maxdepth 1 -type f -name "tcx-ingress-*" | grep -q .' \
+                'find /sys/fs/bpf/unf/v4/links -maxdepth 1 -type f -name "tcx-ingress-*" | grep -q .' \
                 >/dev/null 2>&1; then
             initial_synced=false
             break
@@ -2101,7 +2103,7 @@ map_pressure_helper=${fault_helper}
     rm -f /run/unf-test/pressure-ready /run/unf-test/pressure-stop
 "${kc[@]}" -n unf-system exec "${fault_helper}" -- \
     /usr/local/bin/unf-bpf-map-pressure hold \
-    /sys/fs/bpf/unf/v3/POLICY_RULES "${pressure_inactive_bank}" \
+    /sys/fs/bpf/unf/v4/POLICY_RULES "${pressure_inactive_bank}" \
     /run/unf-test/pressure-ready /run/unf-test/pressure-stop \
     >"${temporary_dir}/map-pressure.log" 2>&1 &
 map_pressure_pid=$!
@@ -2217,7 +2219,7 @@ pressure_inactive_bank=
 map_pressure_helper=
 
 if current_abi_refusal=$("${kc[@]}" -n unf-system exec "${restart_agent}" -- \
-    /usr/local/bin/unf-component cleanup --abi-version 3 --execute 2>&1); then
+    /usr/local/bin/unf-component cleanup --abi-version 4 --execute 2>&1); then
     echo "cleanup accepted current ABI removal without explicit confirmation" >&2
     exit 1
 fi
@@ -2236,7 +2238,7 @@ fi
 if "${kc[@]}" -n unf-system exec "${fault_helper}" -- \
     test ! -e /sys/fs/bpf/unf/v1; then
     "${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
-        source=/sys/fs/bpf/unf/v3
+        source=/sys/fs/bpf/unf/v4
         target=/sys/fs/bpf/unf/v1
         mkdir "${target}"
         for map in \
@@ -2290,7 +2292,7 @@ if ! grep -q 'UNF cleanup completed' <<<"${cleanup_execution}"; then
 fi
 "${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
     test ! -e /sys/fs/bpf/unf/v1
-    test "$(find /sys/fs/bpf/unf/v3 -maxdepth 1 -type f | wc -l)" -eq 11
+    test "$(find /sys/fs/bpf/unf/v4 -maxdepth 1 -type f | wc -l)" -eq 18
 '
 stale_abi_fixture_helper=
 
@@ -2310,7 +2312,7 @@ while read -r cleanup_helper; do
     [[ -n ${cleanup_helper} ]] || continue
     "${kc[@]}" -n unf-system exec "${cleanup_helper}" -- sh -eu -c '
         test ! -e /sys/fs/bpf/unf/v1
-        test "$(find /sys/fs/bpf/unf/v3 -maxdepth 1 -type f | wc -l)" -eq 11
+        test "$(find /sys/fs/bpf/unf/v4 -maxdepth 1 -type f | wc -l)" -eq 18
     '
 done < <("${kc[@]}" -n unf-system get pods \
     -l app.kubernetes.io/name=unf-bpf-fault-helper \

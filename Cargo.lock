@@ -3038,6 +3038,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "unf-common",
+ "unf-ebpf-common",
 ]
 
 [[package]]

@@ -6,8 +6,8 @@ kubeconfig=${KUBECONFIG:-"${project_root}/.tools/kind-unf-dev.kubeconfig"}
 context=${KUBE_CONTEXT:-kind-unf-dev}
 current_controller_image=${UNF_CURRENT_CONTROLLER_IMAGE:-localhost/unf-controller:dev}
 current_agent_image=${UNF_CURRENT_AGENT_IMAGE:-localhost/unf-agent:dev}
-future_controller_image=${UNF_CLEAN_REBUILD_CONTROLLER_IMAGE:-localhost/unf-controller:clean-rebuild-abi4}
-future_agent_image=${UNF_CLEAN_REBUILD_AGENT_IMAGE:-localhost/unf-agent:clean-rebuild-abi4}
+future_controller_image=${UNF_CLEAN_REBUILD_CONTROLLER_IMAGE:-localhost/unf-controller:clean-rebuild-abi5}
+future_agent_image=${UNF_CLEAN_REBUILD_AGENT_IMAGE:-localhost/unf-agent:clean-rebuild-abi5}
 current_revision=${UNF_CURRENT_REVISION:-unknown}
 require_unsupported_downgrade=${UNF_REQUIRE_UNSUPPORTED_DOWNGRADE:-false}
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
@@ -19,6 +19,8 @@ downgrade_result=
 map_names=(
     IDENTITY_V4 IDENTITY_V4_B IDENTITY_V6 IDENTITY_V6_B IDENTITY_CONFIG
     POLICY_RULES POLICY_IPV4 POLICY_IPV6 EGRESS_IPV4 EGRESS_IPV6 POLICY_CONFIG
+    SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 SERVICE_BACKENDS_V4
+    SERVICE_BACKENDS_V6 SERVICE_BACKEND_SLOTS SERVICE_CONFIG SERVICE_CONNECTIONS
 )
 
 patch_controller_image() {
@@ -436,7 +438,7 @@ wait_for_convergence
 current_version=$(controller_raw /v1/version)
 current_abi=$(jq '.persistent_bpf_state_abi_version' <<<"${current_version}")
 future_abi=$((current_abi + 1))
-[[ ${current_abi} -eq 3 ]]
+[[ ${current_abi} -eq 4 ]]
 jq -e --arg revision "${current_revision}" '
     .schema_version == 1
     and .component == "unf-controller"

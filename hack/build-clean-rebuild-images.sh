@@ -2,8 +2,8 @@
 set -euo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-controller_image=${UNF_CLEAN_REBUILD_CONTROLLER_IMAGE:-localhost/unf-controller:clean-rebuild-abi4}
-agent_image=${UNF_CLEAN_REBUILD_AGENT_IMAGE:-localhost/unf-agent:clean-rebuild-abi4}
+controller_image=${UNF_CLEAN_REBUILD_CONTROLLER_IMAGE:-localhost/unf-controller:clean-rebuild-abi5}
+agent_image=${UNF_CLEAN_REBUILD_AGENT_IMAGE:-localhost/unf-agent:clean-rebuild-abi5}
 
 for command in git podman sed tar; do
     command -v "${command}" >/dev/null

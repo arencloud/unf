@@ -10,13 +10,13 @@
 | `unf-ebpf-common` | Versioned fixed-layout flow and BPF map ABIs | Variable strings or allocation |
 | `unf-api` | CRD schema and serialization | Policy evaluation |
 | `unf-policy` | Native and NetworkPolicy conversion, shared IR, deterministic evaluation, identity-tuple lowering | Kubernetes watches or BPF map mutation |
-| `unf-service` | Bounded revisioned service IR, typed frontend/backend intent, provider-neutral Service/EndpointSlice compiler inputs, stable collision-checked provisional IDs, deterministic normalization, and validation | Kubernetes watches, backend selection, connection tracking, or BPF map mutation |
+| `unf-service` | Bounded revisioned service IR, typed frontend/backend intent, provider-neutral Service/EndpointSlice compiler inputs, stable collision-checked provisional IDs, deterministic normalization, validation, and fixed dual-stack service-map lowering | Kubernetes watches, runtime backend selection, connection tracking, or BPF map mutation |
 | `unf-state` | Revision snapshots, bounded flow-history contract, Service/backend topology schema, and identity metadata | Transport or controller loops |
 | `unf-controller` | Watches, EndpointSlice-aware desired-state/topology reconciliation, retained-last-valid service compilation and authenticated snapshot distribution, explicit Node block and complete remote-route distribution, bounded durable agent-report and flow-history checkpointing, non-blocking external HTTP flow handoff, time-window flow queries, explanation, and read-only simulation orchestration | Packet parsing |
-| `unf-agent` | Capability detection, Aya lifecycle, events, non-blocking telemetry export, authenticated durable service/node-block adoption, last-known-good service and remote-route reconciliation, and opt-in root-authenticated local CNI transaction service | Kubernetes policy semantics or CNI namespace mutation |
+| `unf-agent` | Capability detection, Aya lifecycle, events, non-blocking telemetry export, authenticated transactional service-map and durable node-block adoption, exact service/identity/policy recovery, remote-route reconciliation, and opt-in root-authenticated local CNI transaction service | Kubernetes policy semantics or CNI namespace mutation |
 | `unf-cni` | Bounded CNI protocol/socket handling and atomic durable-IPAM plus link/route ADD/CHECK/DEL orchestration | Kubernetes access, policy compilation, durable IPAM storage, routing protocols, or telemetry aggregation |
 | `unfctl` | Operator-facing status, topology, flow history, explanation, and simulation | Fabric state ownership |
-| `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, and telemetry | Selectors or enrichment strings |
+| `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, telemetry, and verifier-built fixed service/connection maps | Selectors, enrichment strings, or service translation before Phase 4.5 |
 
 The allowed dependency direction is from binaries toward libraries and from API
 conversion toward domain types. Kernel ABI types depend only on `no_std`

@@ -72,12 +72,13 @@ A one-to-one audit pinned to Kubernetes commit
 UDP, and SCTP scenarios as verified with no unclassified or excluded bounded L4
 case; the complete evidence and explicit runtime-state boundaries are tracked in the
 [conformance matrix](docs/development/networkpolicy-conformance.md).
-Identity and policy updates now use independent transactional banks selected by
-atomic configuration-map writes. All eleven enforcement maps persist in an
-ABI-versioned bpffs directory; replacement agents validate and adopt
-last-known-good identity/policy state—including populated dual-stack egress banks
-on the source Node—while fresh or incompatible startup remains fenced from
-readiness until reconciliation.
+Identity, policy, and service updates use independent transactional banks
+selected by atomic configuration-map writes. All eighteen desired-state and
+reserved service-connection maps persist in the ABI-v4 bpffs directory;
+replacement agents validate and adopt last-known-good identity/policy/service
+state—including populated dual-stack egress banks on the source Node—while
+fresh or incompatible startup remains fenced from readiness until
+reconciliation.
 TC attachments now survive agent replacement: kernels supporting TCX use
 per-interface pinned links and atomic link updates, while older kernels use a
 stable legacy netlink filter tuple for in-place replacement. The two-node kind
@@ -136,16 +137,18 @@ reprovision from zero all pass committed gates. Qualification remains limited
 to the exact recorded development tuple; production repositories and other
 platform versions are not inferred. Existing overlay deployments are unchanged.
 See the [cl02 installation checkpoint](docs/development/openshift-primary-cni-cl02-install.md).
-Phase 4 is now in progress. Its first three verified slices add strongly typed
+Phase 4 is now in progress. Its first four verified slices add strongly typed
 `ServiceId`/`BackendId` values and a bounded, schema-versioned,
 Kubernetes-independent dual-stack service IR, plus deterministic Kubernetes
 Service/EndpointSlice compilation with collision-checked IDs, exact family and
 port matching, lifecycle provenance, last-valid retention, and explicit status.
-Agents now retrieve that snapshot over the authenticated internal TLS channel,
-reject compatibility or epoch/revision violations, persist a mode-0600
-last-known-good copy before acknowledging it, and expose desired/applied/failed
-service state. eBPF service maps, connection persistence, and kube-proxy-free
-forwarding remain explicitly gated by the
+Agents retrieve that snapshot over the authenticated internal TLS channel and
+reject compatibility or epoch/revision violations. Dataplane agents compile
+fixed dual-stack frontend/backend/slot tables, read back an inactive bank,
+atomically activate it, couple the mode-0600 last-known-good checkpoint to
+rollback, and expose desired/applied/failed state. ABI v4 also reserves the
+bounded persistent service-flow layout accepted by ADR 0077. Packet translation,
+connection insertion/expiry, and kube-proxy-free forwarding remain gated by the
 [Phase 4 service-fabric plan](docs/development/phase4-service-fabric-plan.md).
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
@@ -287,9 +290,10 @@ Implemented in the repository:
 - revisioned controller-to-agent dual-stack identity snapshots and transactional
   dual-bank IPv4/IPv6 BPF maps selected by one atomic configuration write;
 - selector-resolved policy snapshots and dual-bank transactional BPF policy maps;
-- eleven pinned enforcement maps with all-or-none validation, active-bank and
-  revision checks, userspace cache recovery, and controller-independent
-  replacement-agent readiness;
+- eighteen pinned identity/policy/service maps with all-or-none validation,
+  active-bank and revision checks, exact durable service recompilation,
+  userspace cache recovery, and controller-independent replacement-agent
+  readiness;
 - persistent TC attachment handoff using pinned, atomically updated TCX links on
   Linux 6.6+ and stable legacy netlink filters on older kernels, with the active
   attachment mode exposed by each agent;

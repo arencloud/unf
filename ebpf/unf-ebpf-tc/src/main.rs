@@ -14,11 +14,14 @@ use unf_ebpf_common::{
     IDENTITY_MAP_ABI_VERSION,
     IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT, IPV6_NEXT_HEADER_HOP_BY_HOP,
     IdentityMapConfig, IdentityMapValue, Ipv4IdentityKey, Ipv4PolicyMapKey, Ipv6ExtensionStep,
-    Ipv6IdentityKey, Ipv6PolicyMapData, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
-    POLICY_FLAG_HAS_SHADOW,
+    Ipv4ServiceBackendValue, Ipv4ServiceFrontendKey, Ipv6IdentityKey, Ipv6PolicyMapData,
+    Ipv6ServiceBackendValue, Ipv6ServiceFrontendKey, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY,
+    POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
-    PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, connection_is_active,
-    ipv6_extension_step, packet_starts_connection,
+    PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, ServiceBackendKey,
+    ServiceBackendSlotKey, ServiceBackendSlotValue, ServiceFrontendValue, ServiceMapConfig,
+    ServiceConnectionKey, ServiceConnectionValue, connection_is_active, ipv6_extension_step,
+    packet_starts_connection,
 };
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -29,6 +32,10 @@ const PROTOCOL_SCTP: u8 = 132;
 const ETHERNET_HEADER_LEN: usize = 14;
 const BPF_F_NO_PREALLOC: u32 = 1;
 const CONNECTION_CAPACITY: u32 = 65_536;
+const SERVICE_FRONTEND_CAPACITY: u32 = 262_144;
+const SERVICE_BACKEND_CAPACITY: u32 = 524_288;
+const SERVICE_BACKEND_SLOT_CAPACITY: u32 = 1_048_576;
+const SERVICE_CONNECTION_CAPACITY: u32 = 262_144;
 
 #[map]
 static FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -90,6 +97,38 @@ static EGRESS_IPV6: LpmTrie<EgressIpv6PolicyMapData, PolicyMapValue> =
 
 #[map]
 static POLICY_CONFIG: Array<PolicyMapConfig> = Array::with_max_entries(1, 0);
+
+/// Service state is staged in the inactive logical bank and becomes visible
+/// only through one SERVICE_CONFIG write. Phase 4.4 declares the verifier-safe
+/// ABI; packet translation begins in Phase 4.5.
+#[map]
+static SERVICE_FRONTENDS_V4: HashMap<Ipv4ServiceFrontendKey, ServiceFrontendValue> =
+    HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static SERVICE_FRONTENDS_V6: HashMap<Ipv6ServiceFrontendKey, ServiceFrontendValue> =
+    HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static SERVICE_BACKENDS_V4: HashMap<ServiceBackendKey, Ipv4ServiceBackendValue> =
+    HashMap::with_max_entries(SERVICE_BACKEND_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static SERVICE_BACKENDS_V6: HashMap<ServiceBackendKey, Ipv6ServiceBackendValue> =
+    HashMap::with_max_entries(SERVICE_BACKEND_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static SERVICE_BACKEND_SLOTS: HashMap<ServiceBackendSlotKey, ServiceBackendSlotValue> =
+    HashMap::with_max_entries(SERVICE_BACKEND_SLOT_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static SERVICE_CONFIG: Array<ServiceMapConfig> = Array::with_max_entries(1, 0);
+
+/// Bounded persistent flow translations reserved by the accepted Phase 4
+/// connection-state contract. Phase 4.5 adds packet-path reads and writes.
+#[map]
+static SERVICE_CONNECTIONS: LruHashMap<ServiceConnectionKey, ServiceConnectionValue> =
+    LruHashMap::with_max_entries(SERVICE_CONNECTION_CAPACITY, 0);
 
 #[classifier]
 pub fn unf_observe_ingress(ctx: TcContext) -> i32 {

@@ -2,7 +2,7 @@
 
 //! Versioned, fixed-layout data shared by eBPF programs and userspace.
 
-use unf_common::{IdentityId, PolicyId, RuleId, Verdict};
+use unf_common::{BackendId, IdentityId, PolicyId, RuleId, ServiceId, Verdict};
 
 pub use unf_common::PolicyDirection as Direction;
 
@@ -11,6 +11,11 @@ pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
 pub const POLICY_BANK_COUNT: u8 = 2;
+pub const SERVICE_MAP_ABI_VERSION: u16 = 1;
+pub const SERVICE_BANK_COUNT: u8 = 2;
+pub const SERVICE_BACKEND_FLAG_READY: u8 = 1 << 0;
+pub const SERVICE_BACKEND_FLAG_SERVING: u8 = 1 << 1;
+pub const SERVICE_BACKEND_FLAG_TERMINATING: u8 = 1 << 2;
 pub const POLICY_FLAG_HAS_POLICY: u16 = 1 << 0;
 pub const POLICY_FLAG_HAS_RULE: u16 = 1 << 1;
 pub const POLICY_FLAG_HAS_SHADOW: u16 = 1 << 2;
@@ -350,6 +355,144 @@ pub struct PolicyMapConfig {
     pub flags: u8,
 }
 
+/// Exact IPv4 `ClusterIP` frontend. Ports are stored in network byte order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv4ServiceFrontendKey {
+    pub address: [u8; 4],
+    pub port: [u8; 2],
+    pub protocol: u8,
+    pub bank: u8,
+}
+
+/// Exact IPv6 `ClusterIP` frontend. Ports are stored in network byte order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv6ServiceFrontendKey {
+    pub address: [u8; 16],
+    pub port: [u8; 2],
+    pub protocol: u8,
+    pub bank: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ServiceFrontendValue {
+    pub service_id: ServiceId,
+    pub frontend_index: u32,
+    pub backend_count: u32,
+    pub schema_version: u16,
+    pub flags: u16,
+    pub revision: u64,
+    pub reserved: [u8; 8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ServiceBackendKey {
+    pub service_id: ServiceId,
+    pub backend_id: BackendId,
+    pub bank: u8,
+    pub reserved: [u8; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv4ServiceBackendValue {
+    pub revision: u64,
+    pub address: [u8; 4],
+    pub port: [u8; 2],
+    pub schema_version: u16,
+    pub protocol: u8,
+    pub flags: u8,
+    pub reserved: [u8; 6],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv6ServiceBackendValue {
+    pub revision: u64,
+    pub address: [u8; 16],
+    pub port: [u8; 2],
+    pub schema_version: u16,
+    pub protocol: u8,
+    pub flags: u8,
+    pub reserved: [u8; 2],
+}
+
+/// Ordered backend membership for one frontend. The index is deterministic
+/// only within a revision; connection state persists the stable `BackendId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ServiceBackendSlotKey {
+    pub service_id: ServiceId,
+    pub frontend_index: u32,
+    pub slot: u32,
+    pub bank: u8,
+    pub reserved: [u8; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ServiceBackendSlotValue {
+    pub backend_id: BackendId,
+    pub schema_version: u16,
+    pub flags: u16,
+    pub revision: u64,
+}
+
+/// The sole activation pointer for the complete service map family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ServiceMapConfig {
+    pub source_epoch: u64,
+    pub revision: u64,
+    pub frontend_count: u32,
+    pub backend_count: u32,
+    pub backend_slot_count: u32,
+    pub schema_version: u16,
+    pub active_bank: u8,
+    pub flags: u8,
+}
+
+/// Forward or reverse service-flow key. The role disambiguates identical
+/// tuples admitted in opposite translation directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ServiceConnectionKey {
+    pub source_address: [u8; 16],
+    pub destination_address: [u8; 16],
+    pub source_port: [u8; 2],
+    pub destination_port: [u8; 2],
+    pub protocol: u8,
+    pub address_family: u8,
+    pub role: u8,
+    pub reserved: u8,
+}
+
+/// Stable translation selected for one service flow. Both forward and reverse
+/// keys point at the same semantic value so backend selection survives service
+/// revision churn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ServiceConnectionValue {
+    pub last_seen_ns: u64,
+    pub service_revision: u64,
+    pub client_address: [u8; 16],
+    pub frontend_address: [u8; 16],
+    pub backend_address: [u8; 16],
+    pub service_id: ServiceId,
+    pub backend_id: BackendId,
+    pub client_port: [u8; 2],
+    pub frontend_port: [u8; 2],
+    pub backend_port: [u8; 2],
+    pub schema_version: u16,
+    pub protocol: u8,
+    pub address_family: u8,
+    pub flags: u16,
+    pub reserved: [u8; 4],
+}
+
 const _: () = assert!(core::mem::size_of::<FlowKey>() == 48);
 const _: () = assert!(core::mem::size_of::<FlowEvent>() == 96);
 const _: () = assert!(core::mem::size_of::<ConnectionKey>() == 40);
@@ -365,6 +508,17 @@ const _: () = assert!(core::mem::size_of::<EgressIpv4PolicyMapKey>() == 12);
 const _: () = assert!(core::mem::size_of::<EgressIpv6PolicyMapData>() == 24);
 const _: () = assert!(core::mem::size_of::<PolicyMapValue>() == 32);
 const _: () = assert!(core::mem::size_of::<PolicyMapConfig>() == 24);
+const _: () = assert!(core::mem::size_of::<Ipv4ServiceFrontendKey>() == 8);
+const _: () = assert!(core::mem::size_of::<Ipv6ServiceFrontendKey>() == 20);
+const _: () = assert!(core::mem::size_of::<ServiceFrontendValue>() == 32);
+const _: () = assert!(core::mem::size_of::<ServiceBackendKey>() == 12);
+const _: () = assert!(core::mem::size_of::<Ipv4ServiceBackendValue>() == 24);
+const _: () = assert!(core::mem::size_of::<Ipv6ServiceBackendValue>() == 32);
+const _: () = assert!(core::mem::size_of::<ServiceBackendSlotKey>() == 16);
+const _: () = assert!(core::mem::size_of::<ServiceBackendSlotValue>() == 16);
+const _: () = assert!(core::mem::size_of::<ServiceMapConfig>() == 32);
+const _: () = assert!(core::mem::size_of::<ServiceConnectionKey>() == 40);
+const _: () = assert!(core::mem::size_of::<ServiceConnectionValue>() == 88);
 
 #[cfg(test)]
 mod tests {
@@ -399,6 +553,28 @@ mod tests {
         assert_eq!(core::mem::size_of::<PolicyMapValue>(), 32);
         assert_eq!(core::mem::align_of::<PolicyMapConfig>(), 8);
         assert_eq!(core::mem::size_of::<PolicyMapConfig>(), 24);
+        assert_eq!(core::mem::align_of::<Ipv4ServiceFrontendKey>(), 1);
+        assert_eq!(core::mem::size_of::<Ipv4ServiceFrontendKey>(), 8);
+        assert_eq!(core::mem::align_of::<Ipv6ServiceFrontendKey>(), 1);
+        assert_eq!(core::mem::size_of::<Ipv6ServiceFrontendKey>(), 20);
+        assert_eq!(core::mem::align_of::<ServiceFrontendValue>(), 8);
+        assert_eq!(core::mem::size_of::<ServiceFrontendValue>(), 32);
+        assert_eq!(core::mem::align_of::<ServiceBackendKey>(), 4);
+        assert_eq!(core::mem::size_of::<ServiceBackendKey>(), 12);
+        assert_eq!(core::mem::align_of::<Ipv4ServiceBackendValue>(), 8);
+        assert_eq!(core::mem::size_of::<Ipv4ServiceBackendValue>(), 24);
+        assert_eq!(core::mem::align_of::<Ipv6ServiceBackendValue>(), 8);
+        assert_eq!(core::mem::size_of::<Ipv6ServiceBackendValue>(), 32);
+        assert_eq!(core::mem::align_of::<ServiceBackendSlotKey>(), 4);
+        assert_eq!(core::mem::size_of::<ServiceBackendSlotKey>(), 16);
+        assert_eq!(core::mem::align_of::<ServiceBackendSlotValue>(), 8);
+        assert_eq!(core::mem::size_of::<ServiceBackendSlotValue>(), 16);
+        assert_eq!(core::mem::align_of::<ServiceMapConfig>(), 8);
+        assert_eq!(core::mem::size_of::<ServiceMapConfig>(), 32);
+        assert_eq!(core::mem::align_of::<ServiceConnectionKey>(), 1);
+        assert_eq!(core::mem::size_of::<ServiceConnectionKey>(), 40);
+        assert_eq!(core::mem::align_of::<ServiceConnectionValue>(), 8);
+        assert_eq!(core::mem::size_of::<ServiceConnectionValue>(), 88);
     }
 
     #[test]

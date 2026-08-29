@@ -94,12 +94,13 @@ compile N+1 -> populate all staging maps -> read back and validate
 ```
 
 Existing applied state must remain usable if the controller or Kubernetes API is
-temporarily unavailable. New identity and policy state never partially
+temporarily unavailable. New identity, policy, and service state never partially
 overwrites active maps; each prior bank remains selected through any pre-switch
-failure. Eleven enforcement maps are pinned under the `/sys/fs/bpf/unf/v3` ABI
-directory, reopened with strict all-or-none validation, and reconstructed into
-userspace caches after restart. A fresh or incomplete map set must receive and
-commit both identity and policy snapshots before any TC program is attached;
+failure. Eighteen maps are pinned under the `/sys/fs/bpf/unf/v4` ABI directory,
+reopened with strict all-or-none validation, and reconstructed into userspace
+caches after restart. The active service bank must exactly recompile from its
+owner-only durable snapshot. A fresh or incomplete map set must receive and
+commit identity, policy, and available service snapshots before any TC program is attached;
 failure leaves the new ABI state unattached for safe retry. A complete validated
 last-known-good set may restore service without the controller. On Linux 6.6+,
 per-interface TCX links

@@ -39,7 +39,7 @@ use unf_ebpf_common::{
     FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey,
     Ipv6IdentityKey, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
     POLICY_FLAG_HAS_SHADOW, POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE,
-    POLICY_MAP_ABI_VERSION,
+    POLICY_MAP_ABI_VERSION, SERVICE_BANK_COUNT, SERVICE_MAP_ABI_VERSION,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -49,7 +49,11 @@ use unf_route::{
     NativeIpv4NextHop, NativeIpv6NextHop, NativeRemoteNode, NativeRemoteRoutePlan,
     NativeRemoteRoutingProvider, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION, RemoteRouteSnapshot,
 };
-use unf_service::ServiceSnapshot;
+use unf_service::{
+    MAX_BACKENDS_PER_SERVICE, SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+    SERVICE_FRONTEND_BANK_CAPACITY, ServiceDataplaneState, ServiceSnapshot,
+    compile_service_dataplane,
+};
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
     EgressIpv4PolicyMapEntry, EgressIpv6PolicyMapEntry, FLOW_EXPORT_BATCH_LIMIT,
@@ -66,7 +70,7 @@ use cni_server::CniTransactionServer;
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v3";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v4";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
@@ -100,7 +104,7 @@ const ABI_V2_MAP_NAMES: [&str; 9] = [
     "POLICY_IPV6",
     "POLICY_CONFIG",
 ];
-const PERSISTENT_MAP_NAMES: [&str; 11] = [
+const ABI_V3_MAP_NAMES: [&str; 11] = [
     "IDENTITY_V4",
     "IDENTITY_V4_B",
     "IDENTITY_V6",
@@ -113,8 +117,32 @@ const PERSISTENT_MAP_NAMES: [&str; 11] = [
     "EGRESS_IPV6",
     "POLICY_CONFIG",
 ];
+const PERSISTENT_MAP_NAMES: [&str; 18] = [
+    "IDENTITY_V4",
+    "IDENTITY_V4_B",
+    "IDENTITY_V6",
+    "IDENTITY_V6_B",
+    "IDENTITY_CONFIG",
+    "POLICY_RULES",
+    "POLICY_IPV4",
+    "POLICY_IPV6",
+    "EGRESS_IPV4",
+    "EGRESS_IPV6",
+    "POLICY_CONFIG",
+    "SERVICE_FRONTENDS_V4",
+    "SERVICE_FRONTENDS_V6",
+    "SERVICE_BACKENDS_V4",
+    "SERVICE_BACKENDS_V6",
+    "SERVICE_BACKEND_SLOTS",
+    "SERVICE_CONFIG",
+    "SERVICE_CONNECTIONS",
+];
 const IDENTITY_MAP_CAPACITY: u32 = 65_536;
 const POLICY_MAP_CAPACITY: u32 = 262_144;
+const SERVICE_FRONTEND_MAP_CAPACITY: u32 = 262_144;
+const SERVICE_BACKEND_MAP_CAPACITY: u32 = 524_288;
+const SERVICE_BACKEND_SLOT_MAP_CAPACITY: u32 = 1_048_576;
+const SERVICE_CONNECTION_MAP_CAPACITY: u32 = 262_144;
 const CONTROLLER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const LEGACY_TC_PRIORITY: u16 = 0x554e;
 const LEGACY_TC_HANDLE_MAJOR: u16 = 0x554e;
@@ -148,7 +176,7 @@ struct Args {
     controller_ca_path: PathBuf,
     #[arg(long, env = "UNF_IDENTITY_SYNC_SECONDS", default_value_t = 2)]
     identity_sync_seconds: u64,
-    /// Poll interval for validated userspace service snapshots.
+    /// Poll interval for validated transactional service snapshots.
     #[arg(long, env = "UNF_SERVICE_SYNC_SECONDS", default_value_t = 2)]
     service_sync_seconds: u64,
     /// Durable owner-only last-known-good service snapshot.
@@ -499,6 +527,24 @@ struct PolicySynchronizer {
     interval: Duration,
 }
 
+struct ServiceSynchronizer {
+    ipv4_frontends: AyaHashMap<MapData, [u8; 8], [u8; 32]>,
+    ipv6_frontends: AyaHashMap<MapData, [u8; 20], [u8; 32]>,
+    ipv4_backends: AyaHashMap<MapData, [u8; 12], [u8; 24]>,
+    ipv6_backends: AyaHashMap<MapData, [u8; 12], [u8; 32]>,
+    backend_slots: AyaHashMap<MapData, [u8; 16], [u8; 16]>,
+    config: AyaArray<MapData, [u8; 32]>,
+    connections: AyaHashMap<MapData, [u8; 40], [u8; 88]>,
+    banks: [Option<ServiceDataplaneState>; SERVICE_BANK_COUNT as usize],
+    active_bank: u8,
+    applied: Option<ServiceSnapshot>,
+    controller_url: Option<String>,
+    client: ReloadingControllerClient,
+    agent_token_path: PathBuf,
+    state_path: PathBuf,
+    interval: Duration,
+}
+
 type EncodedPolicyMap = AyaHashMap<MapData, [u8; 12], [u8; 32]>;
 type EncodedIpv4IdentityMap = AyaHashMap<MapData, [u8; 4], [u8; 16]>;
 type EncodedIpv6IdentityMap = AyaHashMap<MapData, [u8; 16], [u8; 16]>;
@@ -519,6 +565,16 @@ type IdentityMaps = (
     [EncodedIpv6IdentityMap; IDENTITY_BANK_COUNT as usize],
     AyaArray<MapData, [u8; 24]>,
 );
+type ServiceMaps = (
+    AyaHashMap<MapData, [u8; 8], [u8; 32]>,
+    AyaHashMap<MapData, [u8; 20], [u8; 32]>,
+    AyaHashMap<MapData, [u8; 12], [u8; 24]>,
+    AyaHashMap<MapData, [u8; 12], [u8; 32]>,
+    AyaHashMap<MapData, [u8; 16], [u8; 16]>,
+    AyaArray<MapData, [u8; 32]>,
+    AyaHashMap<MapData, [u8; 40], [u8; 88]>,
+);
+type RecoveredServiceConfig = (u64, u64, u32, u32, u32, u8);
 
 struct DataplaneConfig {
     object: PathBuf,
@@ -529,6 +585,8 @@ struct DataplaneConfig {
     controller_url: Option<String>,
     controller_ca_path: PathBuf,
     identity_sync_interval: Duration,
+    service_sync_interval: Duration,
+    service_state_path: PathBuf,
     node_name: String,
     agent_token_path: PathBuf,
     flow_export_interval: Duration,
@@ -598,6 +656,8 @@ struct RecoveredDataplane {
     identity_revision: Option<u64>,
     policy_epoch: Option<u64>,
     policy_revision: Option<u64>,
+    service_epoch: Option<u64>,
+    service_revision: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -721,6 +781,7 @@ enum SupervisedFailure {
     CniTransaction(anyhow::Error),
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
     install_crypto_provider()?;
@@ -732,7 +793,9 @@ async fn main() -> Result<()> {
     let state = Arc::new(initial_agent_state(&args));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
-    spawn_control_plane_tasks(&args, &state, &cancellation, &mut tasks)?;
+    let service_dataplane =
+        args.ebpf_object.is_some() && (args.interface.is_some() || args.all_interfaces);
+    spawn_control_plane_tasks(&args, &state, &cancellation, &mut tasks, service_dataplane)?;
     let (service_failure_tx, mut service_failure_rx) = mpsc::channel(1);
     let mut supervised_service_configured = false;
 
@@ -762,6 +825,8 @@ async fn main() -> Result<()> {
             let controller_url = args.controller_url.clone();
             let controller_ca_path = args.controller_ca_path.clone();
             let identity_sync_interval = Duration::from_secs(args.identity_sync_seconds.max(1));
+            let service_sync_interval = Duration::from_secs(args.service_sync_seconds.max(1));
+            let service_state_path = args.service_state_path.clone();
             let node_name = args.node_name.clone();
             let agent_token_path = args.agent_token_path.clone();
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
@@ -777,6 +842,8 @@ async fn main() -> Result<()> {
                     controller_url,
                     controller_ca_path,
                     identity_sync_interval,
+                    service_sync_interval,
+                    service_state_path,
                     node_name,
                     agent_token_path,
                     flow_export_interval,
@@ -1659,9 +1726,14 @@ fn spawn_control_plane_tasks(
     state: &Arc<AgentState>,
     cancellation: &CancellationToken,
     tasks: &mut JoinSet<()>,
+    service_dataplane: bool,
 ) -> Result<()> {
     spawn_startup_agent_status_reporter(args, state, cancellation, tasks)?;
-    spawn_service_snapshot_reconciler(args, state, cancellation, tasks)
+    if service_dataplane {
+        Ok(())
+    } else {
+        spawn_service_snapshot_reconciler(args, state, cancellation, tasks)
+    }
 }
 
 fn spawn_service_snapshot_reconciler(
@@ -1810,6 +1882,96 @@ fn load_optional_service_snapshot(path: &Path) -> Result<Option<ServiceSnapshot>
     }
 }
 
+fn service_pending_state_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .context("service state path must name a file")?
+        .to_string_lossy();
+    Ok(path.with_file_name(format!("{file_name}.pending")))
+}
+
+fn discard_service_pending_state(path: &Path) -> Result<()> {
+    let pending = service_pending_state_path(path)?;
+    match fs::symlink_metadata(&pending) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect pending service snapshot {}", pending.display())),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!(
+                "pending service snapshot must be a regular file: {}",
+                pending.display()
+            )
+        }
+        Ok(_) => fs::remove_file(&pending)
+            .with_context(|| format!("remove pending service snapshot {}", pending.display())),
+    }
+}
+
+fn prepare_service_snapshot(path: &Path, snapshot: &ServiceSnapshot) -> Result<PathBuf> {
+    discard_service_pending_state(path)?;
+    let pending = service_pending_state_path(path)?;
+    persist_secure_json(&pending, snapshot, "pending service")?;
+    Ok(pending)
+}
+
+fn commit_prepared_service_snapshot(path: &Path, pending: &Path) -> Result<()> {
+    reject_node_block_symlinks(path)?;
+    reject_node_block_symlinks(pending)?;
+    let parent = path.parent().context("service state path has no parent")?;
+    fs::rename(pending, path).with_context(|| {
+        format!(
+            "commit pending service snapshot {} to {}",
+            pending.display(),
+            path.display()
+        )
+    })?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn restore_service_checkpoint(path: &Path, previous: Option<&ServiceSnapshot>) -> Result<()> {
+    if let Some(previous) = previous {
+        return persist_secure_json(path, previous, "service rollback");
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect service checkpoint during rollback"),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!("service checkpoint rollback target is not a regular file")
+        }
+        Ok(_) => {
+            fs::remove_file(path).context("remove first service checkpoint during rollback")?;
+        }
+    }
+    File::open(path.parent().context("service state path has no parent")?)?.sync_all()?;
+    Ok(())
+}
+
+fn load_service_snapshot_for_active(
+    path: &Path,
+    epoch: u64,
+    revision: u64,
+) -> Result<ServiceSnapshot> {
+    let current = load_optional_service_snapshot(path)?;
+    if let Some(snapshot) = current
+        .filter(|snapshot| snapshot.source_epoch == epoch && snapshot.revision.get() == revision)
+    {
+        discard_service_pending_state(path)?;
+        return Ok(snapshot);
+    }
+    let pending_path = service_pending_state_path(path)?;
+    let pending = load_optional_service_snapshot(&pending_path)?;
+    if let Some(snapshot) = pending
+        .filter(|snapshot| snapshot.source_epoch == epoch && snapshot.revision.get() == revision)
+    {
+        commit_prepared_service_snapshot(path, &pending_path)?;
+        return Ok(snapshot);
+    }
+    bail!(
+        "persistent active service tuple {epoch}/{revision} has no matching durable or prepared snapshot"
+    )
+}
+
 fn adopt_service_snapshot(
     candidate: ServiceSnapshot,
     applied: &mut Option<ServiceSnapshot>,
@@ -1860,6 +2022,358 @@ fn validate_service_snapshot_transition(
         return Ok(false);
     }
     Ok(true)
+}
+
+async fn restore_or_populate_service_state(
+    synchronizer: &mut ServiceSynchronizer,
+    state: &AgentState,
+) -> Result<()> {
+    if synchronizer.applied.is_some() {
+        return Ok(());
+    }
+    if let Some(snapshot) = load_optional_service_snapshot(&synchronizer.state_path)? {
+        publish_desired_service_snapshot(state, &snapshot);
+        activate_service_snapshot(synchronizer, &snapshot, false, state)?;
+        return Ok(());
+    }
+    if synchronizer.controller_url.is_some() {
+        synchronize_services(synchronizer, state).await?;
+    }
+    Ok(())
+}
+
+async fn synchronize_services(
+    synchronizer: &mut ServiceSynchronizer,
+    state: &AgentState,
+) -> Result<()> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("service synchronization requires a controller URL")?;
+    let candidate = fetch_service_snapshot(
+        controller_url,
+        &synchronizer.client,
+        &synchronizer.agent_token_path,
+    )
+    .await?
+    .validate_and_normalize()?;
+    publish_desired_service_snapshot(state, &candidate);
+    if !validate_service_snapshot_transition(&candidate, synchronizer.applied.as_ref())? {
+        return Ok(());
+    }
+    activate_service_snapshot(synchronizer, &candidate, true, state)
+}
+
+#[allow(clippy::too_many_lines)]
+fn activate_service_snapshot(
+    synchronizer: &mut ServiceSynchronizer,
+    candidate: &ServiceSnapshot,
+    persist: bool,
+    state: &AgentState,
+) -> Result<()> {
+    let staging_bank = (synchronizer.active_bank + 1) % SERVICE_BANK_COUNT;
+    let staging_index = usize::from(staging_bank);
+    let desired = compile_service_dataplane(candidate, staging_bank)?;
+    let previous = synchronizer.banks[staging_index]
+        .clone()
+        .unwrap_or_else(|| empty_service_bank(staging_bank));
+
+    macro_rules! stage {
+        ($map:expr, $current:expr, $desired:expr, $label:literal) => {
+            if let Err(error) = replace_encoded_entries($map, $current, $desired) {
+                return Err(rollback_service_stages(
+                    synchronizer,
+                    &previous,
+                    &error.context(concat!("stage ", $label)),
+                ));
+            }
+        };
+    }
+    stage!(
+        &mut synchronizer.ipv4_frontends,
+        &previous.ipv4_frontends,
+        &desired.ipv4_frontends,
+        "IPv4 service frontends"
+    );
+    stage!(
+        &mut synchronizer.ipv6_frontends,
+        &previous.ipv6_frontends,
+        &desired.ipv6_frontends,
+        "IPv6 service frontends"
+    );
+    stage!(
+        &mut synchronizer.ipv4_backends,
+        &previous.ipv4_backends,
+        &desired.ipv4_backends,
+        "IPv4 service backends"
+    );
+    stage!(
+        &mut synchronizer.ipv6_backends,
+        &previous.ipv6_backends,
+        &desired.ipv6_backends,
+        "IPv6 service backends"
+    );
+    stage!(
+        &mut synchronizer.backend_slots,
+        &previous.backend_slots,
+        &desired.backend_slots,
+        "service backend slots"
+    );
+
+    let validation = validate_encoded_entries(
+        &synchronizer.ipv4_frontends,
+        &desired.ipv4_frontends,
+        "IPv4 service frontend",
+    )
+    .and_then(|()| {
+        validate_encoded_entries(
+            &synchronizer.ipv6_frontends,
+            &desired.ipv6_frontends,
+            "IPv6 service frontend",
+        )
+    })
+    .and_then(|()| {
+        validate_encoded_entries(
+            &synchronizer.ipv4_backends,
+            &desired.ipv4_backends,
+            "IPv4 service backend",
+        )
+    })
+    .and_then(|()| {
+        validate_encoded_entries(
+            &synchronizer.ipv6_backends,
+            &desired.ipv6_backends,
+            "IPv6 service backend",
+        )
+    })
+    .and_then(|()| {
+        validate_encoded_entries(
+            &synchronizer.backend_slots,
+            &desired.backend_slots,
+            "service backend slot",
+        )
+    });
+    if let Err(error) = validation {
+        return Err(rollback_service_stages(synchronizer, &previous, &error));
+    }
+
+    let previous_config = synchronizer
+        .config
+        .get(&0, 0)
+        .context("read service activation pointer before update")?;
+    let prepared = if persist {
+        match prepare_service_snapshot(&synchronizer.state_path, candidate) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                return Err(rollback_service_stages(
+                    synchronizer,
+                    &previous,
+                    &error.context("prepare durable service snapshot before activation"),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(error) = synchronizer.config.set(0, desired.config, 0) {
+        let pending_cleanup = discard_service_pending_state(&synchronizer.state_path);
+        let activation_error = anyhow!(error).context("atomically activate staged service bank");
+        if let Err(cleanup_error) = pending_cleanup {
+            return Err(rollback_service_stages(
+                synchronizer,
+                &previous,
+                &anyhow!(
+                    "{activation_error:#}; pending snapshot cleanup failed: {cleanup_error:#}"
+                ),
+            ));
+        }
+        return Err(rollback_service_stages(
+            synchronizer,
+            &previous,
+            &activation_error,
+        ));
+    }
+    if let Some(prepared) = prepared
+        && let Err(error) = commit_prepared_service_snapshot(&synchronizer.state_path, &prepared)
+    {
+        let config_rollback = synchronizer.config.set(0, previous_config, 0);
+        let stage_rollback = restore_service_bank(synchronizer, &previous);
+        let checkpoint_rollback =
+            restore_service_checkpoint(&synchronizer.state_path, synchronizer.applied.as_ref());
+        let pending_cleanup = discard_service_pending_state(&synchronizer.state_path);
+        return match (
+            config_rollback,
+            stage_rollback,
+            checkpoint_rollback,
+            pending_cleanup,
+        ) {
+            (Ok(()), Ok(()), Ok(()), Ok(())) => Err(error.context(
+                "commit active service snapshot failed; activation pointer and staging bank rolled back",
+            )),
+            (config_result, stage_result, checkpoint_result, pending_result) => Err(anyhow!(
+                "commit active service snapshot failed: {error:#}; config rollback: {config_result:?}; staging rollback: {stage_result:?}; checkpoint rollback: {checkpoint_result:?}; pending cleanup: {pending_result:?}"
+            )),
+        };
+    }
+
+    let previous_active = synchronizer.active_bank;
+    synchronizer.banks[staging_index] = Some(desired);
+    synchronizer.active_bank = staging_bank;
+    synchronizer.applied = Some(candidate.clone());
+    publish_applied_service_snapshot(state, candidate);
+    clear_service_snapshot_error(state);
+    if previous_active != staging_bank {
+        let previous_index = usize::from(previous_active);
+        if let Some(old) = synchronizer.banks[previous_index].clone() {
+            match clear_service_bank(synchronizer, &old) {
+                Ok(()) => synchronizer.banks[previous_index] = None,
+                Err(error) => warn!(
+                    %error,
+                    bank = previous_active,
+                    "could not garbage-collect old service bank; restored it for a later retry"
+                ),
+            }
+        }
+    }
+    info!(
+        service_epoch = candidate.source_epoch,
+        service_revision = candidate.revision.get(),
+        active_bank = synchronizer.active_bank,
+        services = candidate.services.len(),
+        "service snapshot activated in persistent BPF maps"
+    );
+    Ok(())
+}
+
+fn replace_encoded_entries<const K: usize, const V: usize>(
+    map: &mut AyaHashMap<MapData, [u8; K], [u8; V]>,
+    current: &BTreeMap<[u8; K], [u8; V]>,
+    desired: &BTreeMap<[u8; K], [u8; V]>,
+) -> Result<()>
+where
+    [u8; K]: aya::Pod,
+    [u8; V]: aya::Pod,
+{
+    for key in current.keys().filter(|key| !desired.contains_key(*key)) {
+        map.remove(key)?;
+    }
+    for (key, value) in desired {
+        map.insert(key, value, 0)?;
+    }
+    Ok(())
+}
+
+fn validate_encoded_entries<const K: usize, const V: usize>(
+    map: &AyaHashMap<MapData, [u8; K], [u8; V]>,
+    desired: &BTreeMap<[u8; K], [u8; V]>,
+    label: &str,
+) -> Result<()>
+where
+    [u8; K]: aya::Pod,
+    [u8; V]: aya::Pod,
+{
+    for (key, expected) in desired {
+        let actual = map
+            .get(key, 0)
+            .with_context(|| format!("read staged {label} entry"))?;
+        if &actual != expected {
+            bail!("staged {label} readback mismatch");
+        }
+    }
+    Ok(())
+}
+
+fn restore_encoded_bank<const K: usize, const V: usize>(
+    map: &mut AyaHashMap<MapData, [u8; K], [u8; V]>,
+    previous: &BTreeMap<[u8; K], [u8; V]>,
+    bank: u8,
+    bank_offset: usize,
+) -> Result<()>
+where
+    [u8; K]: aya::Pod,
+    [u8; V]: aya::Pod,
+{
+    let keys = map.keys().collect::<Result<Vec<_>, _>>()?;
+    for key in keys.into_iter().filter(|key| key[bank_offset] == bank) {
+        map.remove(&key)?;
+    }
+    for (key, value) in previous {
+        map.insert(key, value, 0)?;
+    }
+    Ok(())
+}
+
+fn restore_service_bank(
+    synchronizer: &mut ServiceSynchronizer,
+    previous: &ServiceDataplaneState,
+) -> Result<()> {
+    let results = [
+        restore_encoded_bank(
+            &mut synchronizer.ipv4_frontends,
+            &previous.ipv4_frontends,
+            previous.bank,
+            7,
+        ),
+        restore_encoded_bank(
+            &mut synchronizer.ipv6_frontends,
+            &previous.ipv6_frontends,
+            previous.bank,
+            19,
+        ),
+        restore_encoded_bank(
+            &mut synchronizer.ipv4_backends,
+            &previous.ipv4_backends,
+            previous.bank,
+            8,
+        ),
+        restore_encoded_bank(
+            &mut synchronizer.ipv6_backends,
+            &previous.ipv6_backends,
+            previous.bank,
+            8,
+        ),
+        restore_encoded_bank(
+            &mut synchronizer.backend_slots,
+            &previous.backend_slots,
+            previous.bank,
+            12,
+        ),
+    ];
+    let failures: Vec<_> = results.into_iter().filter_map(Result::err).collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("restore service bank failed: {failures:?}")
+    }
+}
+
+fn rollback_service_stages(
+    synchronizer: &mut ServiceSynchronizer,
+    previous: &ServiceDataplaneState,
+    cause: &anyhow::Error,
+) -> anyhow::Error {
+    match restore_service_bank(synchronizer, previous) {
+        Ok(()) => anyhow!("service update failed and staging bank was rolled back: {cause:#}"),
+        Err(rollback) => anyhow!("service update failed: {cause:#}; rollback failed: {rollback:#}"),
+    }
+}
+
+fn clear_service_bank(
+    synchronizer: &mut ServiceSynchronizer,
+    old: &ServiceDataplaneState,
+) -> Result<()> {
+    let empty = empty_service_bank(old.bank);
+    let clear = restore_service_bank(synchronizer, &empty);
+    if let Err(error) = clear {
+        let restore = restore_service_bank(synchronizer, old);
+        return match restore {
+            Ok(()) => Err(error.context("old service bank cleanup failed and was restored")),
+            Err(restore) => Err(anyhow!(
+                "old service bank cleanup failed: {error:#}; restoration failed: {restore:#}"
+            )),
+        };
+    }
+    Ok(())
 }
 
 fn service_snapshot_counts(snapshot: &ServiceSnapshot) -> (u64, u64, u64) {
@@ -2081,6 +2595,7 @@ fn plan_abi_cleanup(
     let recognized_maps: &[&str] = match abi_version {
         1 => &ABI_V1_MAP_NAMES,
         2 => &ABI_V2_MAP_NAMES,
+        3 => &ABI_V3_MAP_NAMES,
         _ => &PERSISTENT_MAP_NAMES,
     };
     let mut unknown = Vec::new();
@@ -2491,22 +3006,22 @@ fn register_service_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
     );
     registry.register(
         "unf_service_revision_applied",
-        "Service revision validated and durably adopted in userspace",
+        "Service revision fully applied to the configured agent state boundary",
         metrics.applied_service_revision.clone(),
     );
     registry.register(
         "unf_service_count",
-        "Services in the durable userspace service snapshot",
+        "Services in the active durable service snapshot",
         metrics.service_count.clone(),
     );
     registry.register(
         "unf_service_frontend_count",
-        "Frontends in the durable userspace service snapshot",
+        "Frontends in the active durable service snapshot",
         metrics.service_frontend_count.clone(),
     );
     registry.register(
         "unf_service_backend_count",
-        "Backends in the durable userspace service snapshot",
+        "Backends in the active durable service snapshot",
         metrics.service_backend_count.clone(),
     );
 }
@@ -2557,6 +3072,7 @@ fn register_version_transition_metrics(registry: &mut Registry, metrics: &AgentM
     );
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_dataplane(
     config: DataplaneConfig,
     state: Arc<AgentState>,
@@ -2588,21 +3104,29 @@ async fn run_dataplane(
     .context("open FLOW_EVENTS ring buffer")?;
     let identity_maps = take_identity_maps(&mut ebpf)?;
     let policy_maps = take_policy_maps(&mut ebpf)?;
+    let service_maps = take_service_maps(&mut ebpf)?;
     let controller_management_port = controller_url.as_deref().map(controller_port).transpose()?;
-    let (mut identities, mut policies) = new_synchronizers(
+    let (mut identities, mut policies, mut services) = new_synchronizers(
         identity_maps,
         policy_maps,
+        service_maps,
         controller_url.clone(),
         controller_management_port,
         controller_client.clone(),
         config.agent_token_path.clone(),
         config.identity_sync_interval,
+        config.service_sync_interval,
+        config.service_state_path.clone(),
     );
-    let recovered = recover_persistent_dataplane(&mut identities, &mut policies, pins_existed)?;
-    apply_recovered_state(&state, &identities, &policies, &recovered);
+    let recovered =
+        recover_persistent_dataplane(&mut identities, &mut policies, &mut services, pins_existed)?;
+    apply_recovered_state(&state, &identities, &policies, &services, &recovered);
     let recovered_ready = recovered_dataplane_is_ready(&recovered);
     if !recovered_ready {
-        populate_dataplane_before_attachment(&mut identities, &mut policies, &state).await?;
+        populate_dataplane_before_attachment(&mut identities, &mut policies, &mut services, &state)
+            .await?;
+    } else if services.applied.is_none() {
+        restore_or_populate_service_state(&mut services, &state).await?;
     }
     let mut attachments = attach_dataplane_programs(
         &mut ebpf,
@@ -2632,6 +3156,8 @@ async fn run_dataplane(
             ipv6_policy_entries = policies.ipv6_banks[active_policy_bank].len(),
             egress_ipv4_entries = policies.egress_ipv4_banks[active_policy_bank].len(),
             egress_ipv6_entries = policies.egress_ipv6_banks[active_policy_bank].len(),
+            service_epoch = recovered.service_epoch,
+            service_revision = recovered.service_revision,
             "validated pinned last-known-good dataplane"
         );
     }
@@ -2647,6 +3173,7 @@ async fn run_dataplane(
         &mut attachments,
         &mut identities,
         &mut policies,
+        &mut services,
         &state,
         flow_export_sender.as_ref(),
         cancellation,
@@ -2725,6 +3252,7 @@ fn recovered_dataplane_is_ready(recovered: &RecoveredDataplane) -> bool {
 async fn populate_dataplane_before_attachment(
     identities: &mut IdentitySynchronizer,
     policies: &mut PolicySynchronizer,
+    services: &mut ServiceSynchronizer,
     state: &AgentState,
 ) -> Result<()> {
     if identities.controller_url.is_none() || policies.controller_url.is_none() {
@@ -2736,6 +3264,9 @@ async fn populate_dataplane_before_attachment(
     synchronize_policies(policies, state)
         .await
         .context("populate policy maps before dataplane attachment")?;
+    restore_or_populate_service_state(services, state)
+        .await
+        .context("populate service maps before dataplane attachment")?;
     let active_policy_bank = usize::from(policies.active_bank);
     info!(
         identity_epoch = identities.applied_epoch,
@@ -2754,18 +3285,35 @@ async fn populate_dataplane_before_attachment(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn new_synchronizers(
     identity_maps: IdentityMaps,
     policy_maps: PolicyMaps,
+    service_maps: ServiceMaps,
     controller_url: Option<String>,
     controller_management_port: Option<u16>,
     client: ReloadingControllerClient,
     agent_token_path: PathBuf,
     interval: Duration,
-) -> (IdentitySynchronizer, PolicySynchronizer) {
+    service_interval: Duration,
+    service_state_path: PathBuf,
+) -> (
+    IdentitySynchronizer,
+    PolicySynchronizer,
+    ServiceSynchronizer,
+) {
     let (ipv4_maps, ipv6_maps, identity_config) = identity_maps;
     let (identity_map, ipv4_policy_map, ipv6_policy_map, egress_ipv4_map, egress_ipv6_map, config) =
         policy_maps;
+    let (
+        ipv4_frontends,
+        ipv6_frontends,
+        ipv4_backends,
+        ipv6_backends,
+        backend_slots,
+        service_config,
+        connections,
+    ) = service_maps;
     (
         IdentitySynchronizer {
             ipv4_maps,
@@ -2795,10 +3343,27 @@ fn new_synchronizers(
             egress_ipv6_banks: [BTreeMap::new(), BTreeMap::new()],
             active_bank: 0,
             applied_epoch: 0,
+            controller_url: controller_url.clone(),
+            client: client.clone(),
+            agent_token_path: agent_token_path.clone(),
+            interval,
+        },
+        ServiceSynchronizer {
+            ipv4_frontends,
+            ipv6_frontends,
+            ipv4_backends,
+            ipv6_backends,
+            backend_slots,
+            config: service_config,
+            connections,
+            banks: [None, None],
+            active_bank: 0,
+            applied: None,
             controller_url,
             client,
             agent_token_path,
-            interval,
+            state_path: service_state_path,
+            interval: service_interval,
         },
     )
 }
@@ -3151,9 +3716,11 @@ fn configured_abi_version(path: &Path) -> Option<u16> {
         .ok()
 }
 
+#[allow(clippy::too_many_lines)]
 fn recover_persistent_dataplane(
     identities: &mut IdentitySynchronizer,
     policies: &mut PolicySynchronizer,
+    services: &mut ServiceSynchronizer,
     pins_existed: bool,
 ) -> Result<RecoveredDataplane> {
     for (name, map) in ["IDENTITY_V4", "IDENTITY_V4_B"]
@@ -3187,6 +3754,37 @@ fn recover_persistent_dataplane(
         POLICY_MAP_CAPACITY,
     )?;
     validate_map_capacity("POLICY_CONFIG", policies.config.map(), 1)?;
+    validate_map_capacity(
+        "SERVICE_FRONTENDS_V4",
+        services.ipv4_frontends.map(),
+        SERVICE_FRONTEND_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "SERVICE_FRONTENDS_V6",
+        services.ipv6_frontends.map(),
+        SERVICE_FRONTEND_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "SERVICE_BACKENDS_V4",
+        services.ipv4_backends.map(),
+        SERVICE_BACKEND_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "SERVICE_BACKENDS_V6",
+        services.ipv6_backends.map(),
+        SERVICE_BACKEND_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "SERVICE_BACKEND_SLOTS",
+        services.backend_slots.map(),
+        SERVICE_BACKEND_SLOT_MAP_CAPACITY,
+    )?;
+    validate_map_capacity("SERVICE_CONFIG", services.config.map(), 1)?;
+    validate_map_capacity(
+        "SERVICE_CONNECTIONS",
+        services.connections.map(),
+        SERVICE_CONNECTION_MAP_CAPACITY,
+    )?;
 
     recover_identity_entries(identities)?;
     let identity_config = identities
@@ -3230,6 +3828,7 @@ fn recover_persistent_dataplane(
     } else {
         (None, None)
     };
+    let (service_epoch, service_revision) = recover_service_state(services)?;
 
     if pins_existed {
         info!(
@@ -3238,6 +3837,8 @@ fn recover_persistent_dataplane(
             identity_revision,
             policy_epoch,
             policy_revision,
+            service_epoch,
+            service_revision,
             "persistent BPF maps reopened"
         );
     }
@@ -3246,6 +3847,8 @@ fn recover_persistent_dataplane(
         identity_revision,
         policy_epoch,
         policy_revision,
+        service_epoch,
+        service_revision,
     })
 }
 
@@ -3427,6 +4030,261 @@ fn decode_recovered_policy_config(config: [u8; 24]) -> Result<Option<(u64, u64, 
     decode_recovered_config(config, POLICY_MAP_ABI_VERSION, POLICY_BANK_COUNT, "policy")
 }
 
+fn empty_service_bank(bank: u8) -> ServiceDataplaneState {
+    ServiceDataplaneState {
+        source_epoch: 0,
+        revision: 0,
+        bank,
+        ipv4_frontends: BTreeMap::new(),
+        ipv6_frontends: BTreeMap::new(),
+        ipv4_backends: BTreeMap::new(),
+        ipv6_backends: BTreeMap::new(),
+        backend_slots: BTreeMap::new(),
+        config: [0; 32],
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u64>, Option<u64>)> {
+    let mut banks = [empty_service_bank(0), empty_service_bank(1)];
+    for entry in &services.ipv4_frontends {
+        let (key, value) = entry.context("iterate persistent IPv4 service frontends")?;
+        let bank = service_bank(key[7])?;
+        validate_service_frontend_entry(&key, &value, 7)?;
+        banks[bank].ipv4_frontends.insert(key, value);
+    }
+    for entry in &services.ipv6_frontends {
+        let (key, value) = entry.context("iterate persistent IPv6 service frontends")?;
+        let bank = service_bank(key[19])?;
+        validate_service_frontend_entry(&key, &value, 19)?;
+        banks[bank].ipv6_frontends.insert(key, value);
+    }
+    for entry in &services.ipv4_backends {
+        let (key, value) = entry.context("iterate persistent IPv4 service backends")?;
+        let bank = service_bank(key[8])?;
+        validate_service_backend_entry(&key, &value, 14, 16, 17, 18)?;
+        banks[bank].ipv4_backends.insert(key, value);
+    }
+    for entry in &services.ipv6_backends {
+        let (key, value) = entry.context("iterate persistent IPv6 service backends")?;
+        let bank = service_bank(key[8])?;
+        validate_service_backend_entry(&key, &value, 26, 28, 29, 30)?;
+        banks[bank].ipv6_backends.insert(key, value);
+    }
+    for entry in &services.backend_slots {
+        let (key, value) = entry.context("iterate persistent service backend slots")?;
+        let bank = service_bank(key[12])?;
+        validate_service_backend_slot_entry(&key, &value)?;
+        banks[bank].backend_slots.insert(key, value);
+    }
+    for bank in &banks {
+        validate_recovered_service_bank_capacity(bank)?;
+    }
+
+    let config = services
+        .config
+        .get(&0, 0)
+        .context("read persistent service config")?;
+    let Some((epoch, revision, frontend_count, backend_count, slot_count, bank)) =
+        decode_recovered_service_config(config)?
+    else {
+        discard_service_pending_state(&services.state_path)?;
+        services.banks = banks.map(Some);
+        return Ok((None, None));
+    };
+    let durable = load_service_snapshot_for_active(&services.state_path, epoch, revision)?;
+    let expected = compile_service_dataplane(&durable, bank)?;
+    let active = &banks[usize::from(bank)];
+    if active.ipv4_frontends != expected.ipv4_frontends
+        || active.ipv6_frontends != expected.ipv6_frontends
+        || active.ipv4_backends != expected.ipv4_backends
+        || active.ipv6_backends != expected.ipv6_backends
+        || active.backend_slots != expected.backend_slots
+        || config != expected.config
+    {
+        bail!("persistent active service bank does not match durable last-known-good snapshot");
+    }
+    if frontend_count as usize != active.ipv4_frontends.len() + active.ipv6_frontends.len()
+        || backend_count as usize != active.ipv4_backends.len() + active.ipv6_backends.len()
+        || slot_count as usize != active.backend_slots.len()
+    {
+        bail!("persistent service config counts do not match active maps");
+    }
+    banks[usize::from(bank)] = expected;
+    services.banks = banks.map(Some);
+    services.active_bank = bank;
+    services.applied = Some(durable);
+    Ok((Some(epoch), Some(revision)))
+}
+
+fn validate_recovered_service_bank_capacity(bank: &ServiceDataplaneState) -> Result<()> {
+    for (name, actual, limit) in [
+        (
+            "IPv4 frontends",
+            bank.ipv4_frontends.len(),
+            SERVICE_FRONTEND_BANK_CAPACITY,
+        ),
+        (
+            "IPv6 frontends",
+            bank.ipv6_frontends.len(),
+            SERVICE_FRONTEND_BANK_CAPACITY,
+        ),
+        (
+            "IPv4 backends",
+            bank.ipv4_backends.len(),
+            SERVICE_BACKEND_BANK_CAPACITY,
+        ),
+        (
+            "IPv6 backends",
+            bank.ipv6_backends.len(),
+            SERVICE_BACKEND_BANK_CAPACITY,
+        ),
+        (
+            "backend slots",
+            bank.backend_slots.len(),
+            SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+        ),
+    ] {
+        if actual > limit {
+            bail!(
+                "persistent service bank {} has {actual} {name}; limit is {limit}",
+                bank.bank
+            );
+        }
+    }
+    Ok(())
+}
+
+fn service_bank(bank: u8) -> Result<usize> {
+    if bank >= SERVICE_BANK_COUNT {
+        bail!("persistent service map contains invalid bank {bank}");
+    }
+    Ok(usize::from(bank))
+}
+
+fn validate_service_frontend_entry<const N: usize>(
+    key: &[u8; N],
+    value: &[u8; 32],
+    bank_offset: usize,
+) -> Result<()> {
+    service_bank(key[bank_offset])?;
+    let port_offset = bank_offset - 3;
+    let port = u16::from_be_bytes(key[port_offset..port_offset + 2].try_into().unwrap());
+    let protocol = key[bank_offset - 1];
+    let service_id = u32::from_ne_bytes(value[0..4].try_into().unwrap());
+    let backend_count = u32::from_ne_bytes(value[8..12].try_into().unwrap());
+    let schema = u16::from_ne_bytes(value[12..14].try_into().unwrap());
+    let revision = u64::from_ne_bytes(value[16..24].try_into().unwrap());
+    if !recovered_service_address_is_valid(&key[..port_offset])
+        || port == 0
+        || !matches!(protocol, 6 | 17 | 132)
+        || service_id == 0
+        || backend_count > u32::try_from(MAX_BACKENDS_PER_SERVICE).unwrap_or(u32::MAX)
+        || schema != SERVICE_MAP_ABI_VERSION
+        || value[14..16] != [0; 2]
+        || revision == 0
+        || value[24..32] != [0; 8]
+    {
+        bail!("persistent service frontend map contains an incompatible entry");
+    }
+    Ok(())
+}
+
+fn validate_service_backend_entry<const N: usize>(
+    key: &[u8; 12],
+    value: &[u8; N],
+    schema_offset: usize,
+    protocol_offset: usize,
+    flags_offset: usize,
+    reserved_offset: usize,
+) -> Result<()> {
+    service_bank(key[8])?;
+    let service_id = u32::from_ne_bytes(key[0..4].try_into().unwrap());
+    let backend_id = u32::from_ne_bytes(key[4..8].try_into().unwrap());
+    let revision = u64::from_ne_bytes(value[0..8].try_into().unwrap());
+    let port_offset = schema_offset - 2;
+    let port = u16::from_be_bytes(value[port_offset..schema_offset].try_into().unwrap());
+    let schema = u16::from_ne_bytes(value[schema_offset..schema_offset + 2].try_into().unwrap());
+    let flags = value[flags_offset];
+    if service_id == 0
+        || backend_id == 0
+        || key[9..12] != [0; 3]
+        || revision == 0
+        || !recovered_service_address_is_valid(&value[8..port_offset])
+        || port == 0
+        || schema != SERVICE_MAP_ABI_VERSION
+        || !matches!(value[protocol_offset], 6 | 17 | 132)
+        || flags & !0b111 != 0
+        || value[reserved_offset..].iter().any(|byte| *byte != 0)
+    {
+        bail!("persistent service backend map contains an incompatible entry");
+    }
+    Ok(())
+}
+
+fn recovered_service_address_is_valid(address: &[u8]) -> bool {
+    match address {
+        [a, b, c, d] => {
+            let address = Ipv4Addr::new(*a, *b, *c, *d);
+            !address.is_unspecified() && !address.is_multicast()
+        }
+        bytes if bytes.len() == 16 => {
+            let mut octets = [0_u8; 16];
+            octets.copy_from_slice(bytes);
+            let address = Ipv6Addr::from(octets);
+            !address.is_unspecified() && !address.is_multicast()
+        }
+        _ => false,
+    }
+}
+
+fn validate_service_backend_slot_entry(key: &[u8; 16], value: &[u8; 16]) -> Result<()> {
+    service_bank(key[12])?;
+    let service_id = u32::from_ne_bytes(key[0..4].try_into().unwrap());
+    let backend_id = u32::from_ne_bytes(value[0..4].try_into().unwrap());
+    let schema = u16::from_ne_bytes(value[4..6].try_into().unwrap());
+    let revision = u64::from_ne_bytes(value[8..16].try_into().unwrap());
+    if service_id == 0
+        || backend_id == 0
+        || key[13..16] != [0; 3]
+        || schema != SERVICE_MAP_ABI_VERSION
+        || value[6..8] != [0; 2]
+        || revision == 0
+    {
+        bail!("persistent service backend-slot map contains an incompatible entry");
+    }
+    Ok(())
+}
+
+fn decode_recovered_service_config(config: [u8; 32]) -> Result<Option<RecoveredServiceConfig>> {
+    if config == [0; 32] {
+        return Ok(None);
+    }
+    let epoch = u64::from_ne_bytes(config[0..8].try_into().unwrap());
+    let revision = u64::from_ne_bytes(config[8..16].try_into().unwrap());
+    let frontend_count = u32::from_ne_bytes(config[16..20].try_into().unwrap());
+    let backend_count = u32::from_ne_bytes(config[20..24].try_into().unwrap());
+    let slot_count = u32::from_ne_bytes(config[24..28].try_into().unwrap());
+    let schema = u16::from_ne_bytes(config[28..30].try_into().unwrap());
+    let bank = config[30];
+    if epoch == 0
+        || revision == 0
+        || schema != SERVICE_MAP_ABI_VERSION
+        || bank >= SERVICE_BANK_COUNT
+        || config[31] != 0
+    {
+        bail!("persistent service config is invalid or incompatible");
+    }
+    Ok(Some((
+        epoch,
+        revision,
+        frontend_count,
+        backend_count,
+        slot_count,
+        bank,
+    )))
+}
+
 fn decode_recovered_config(
     config: [u8; 24],
     expected_schema: u16,
@@ -3487,6 +4345,7 @@ fn apply_recovered_state(
     state: &AgentState,
     identities: &IdentitySynchronizer,
     policies: &PolicySynchronizer,
+    services: &ServiceSynchronizer,
     recovered: &RecoveredDataplane,
 ) {
     let identity_entries = identity_entry_count(identities);
@@ -3537,6 +4396,13 @@ fn apply_recovered_state(
             .applied_policy_revision
             .set(metric_value(revision));
         state.metrics.policy_map_entries.set(metric_value(entries));
+    }
+    if recovered.service_epoch.is_some()
+        && recovered.service_revision.is_some()
+        && let Some(snapshot) = &services.applied
+    {
+        publish_desired_service_snapshot(state, snapshot);
+        publish_applied_service_snapshot(state, snapshot);
     }
 }
 
@@ -3642,11 +4508,60 @@ fn take_policy_maps(ebpf: &mut Ebpf) -> Result<PolicyMaps> {
     ))
 }
 
+fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
+    let ipv4_frontends = AyaHashMap::<_, [u8; 8], [u8; 32]>::try_from(
+        ebpf.take_map("SERVICE_FRONTENDS_V4")
+            .context("eBPF object does not contain SERVICE_FRONTENDS_V4 map")?,
+    )
+    .context("open SERVICE_FRONTENDS_V4 map")?;
+    let ipv6_frontends = AyaHashMap::<_, [u8; 20], [u8; 32]>::try_from(
+        ebpf.take_map("SERVICE_FRONTENDS_V6")
+            .context("eBPF object does not contain SERVICE_FRONTENDS_V6 map")?,
+    )
+    .context("open SERVICE_FRONTENDS_V6 map")?;
+    let ipv4_backends = AyaHashMap::<_, [u8; 12], [u8; 24]>::try_from(
+        ebpf.take_map("SERVICE_BACKENDS_V4")
+            .context("eBPF object does not contain SERVICE_BACKENDS_V4 map")?,
+    )
+    .context("open SERVICE_BACKENDS_V4 map")?;
+    let ipv6_backends = AyaHashMap::<_, [u8; 12], [u8; 32]>::try_from(
+        ebpf.take_map("SERVICE_BACKENDS_V6")
+            .context("eBPF object does not contain SERVICE_BACKENDS_V6 map")?,
+    )
+    .context("open SERVICE_BACKENDS_V6 map")?;
+    let backend_slots = AyaHashMap::<_, [u8; 16], [u8; 16]>::try_from(
+        ebpf.take_map("SERVICE_BACKEND_SLOTS")
+            .context("eBPF object does not contain SERVICE_BACKEND_SLOTS map")?,
+    )
+    .context("open SERVICE_BACKEND_SLOTS map")?;
+    let config = AyaArray::<_, [u8; 32]>::try_from(
+        ebpf.take_map("SERVICE_CONFIG")
+            .context("eBPF object does not contain SERVICE_CONFIG map")?,
+    )
+    .context("open SERVICE_CONFIG map")?;
+    let connections = AyaHashMap::<_, [u8; 40], [u8; 88]>::try_from(
+        ebpf.take_map("SERVICE_CONNECTIONS")
+            .context("eBPF object does not contain SERVICE_CONNECTIONS map")?,
+    )
+    .context("open SERVICE_CONNECTIONS map")?;
+    Ok((
+        ipv4_frontends,
+        ipv6_frontends,
+        ipv4_backends,
+        ipv6_backends,
+        backend_slots,
+        config,
+        connections,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn consume_events(
     mut ring: RingBuf<aya::maps::MapData>,
     attachments: &mut InterfaceAttachments<'_>,
     identities: &mut IdentitySynchronizer,
     policies: &mut PolicySynchronizer,
+    services: &mut ServiceSynchronizer,
     state: &AgentState,
     flow_export_sender: Option<&mpsc::Sender<FlowExportRecord>>,
     cancellation: CancellationToken,
@@ -3655,6 +4570,7 @@ async fn consume_events(
     let mut interface_interval = tokio::time::interval(Duration::from_secs(1));
     let mut identity_interval = tokio::time::interval(identities.interval);
     let mut policy_interval = tokio::time::interval(policies.interval);
+    let mut service_interval = tokio::time::interval(services.interval);
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
@@ -3676,6 +4592,15 @@ async fn consume_events(
                     state.metrics.policy_sync_errors.inc();
                     warn!(?error, "policy synchronization failed");
                 } else {
+                    refresh_controller_readiness(state);
+                }
+            }
+            _ = service_interval.tick(), if services.controller_url.is_some() => {
+                if let Err(error) = synchronize_services(services, state).await {
+                    record_service_snapshot_error(state, &error);
+                    warn!(%error, "service map synchronization failed; retaining active bank");
+                } else {
+                    clear_service_snapshot_error(state);
                     refresh_controller_readiness(state);
                 }
             }
@@ -5762,7 +6687,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         )
         .status_label(),
         capabilities: state.capabilities.clone(),
-        limitation: "service snapshots are authenticated durable userspace intent only; no service BPF maps, NAT, or ClusterIP forwarding are active",
+        limitation: "service BPF state is transactional but packet NAT, backend selection, and ClusterIP forwarding are not active before Phase 4.5",
     })
 }
 
@@ -5994,6 +6919,46 @@ mod tests {
         .expect("test service snapshot compiles")
     }
 
+    fn service_test_snapshot_with_backend(epoch: u64, revision: u64) -> ServiceSnapshot {
+        unf_service::compile_service_snapshot(
+            epoch,
+            Revision::new(revision),
+            vec![unf_service::ServiceSource {
+                namespace: "default".to_owned(),
+                name: "api".to_owned(),
+                cluster_ips: vec!["10.96.0.10".parse().unwrap()],
+                ports: vec![unf_service::ServiceSourcePort {
+                    name: Some("http".to_owned()),
+                    protocol: unf_common::Protocol::Tcp,
+                    port: 80,
+                    app_protocol: None,
+                }],
+            }],
+            vec![unf_service::EndpointSliceSource {
+                namespace: "default".to_owned(),
+                name: "api-v4".to_owned(),
+                service_name: "api".to_owned(),
+                address_family: unf_service::AddressFamily::Ipv4,
+                endpoints: vec![unf_service::EndpointSource {
+                    addresses: vec!["10.42.0.20".parse().unwrap()],
+                    target_workload: Some("default/api-0".to_owned()),
+                    node_name: Some("worker-a".to_owned()),
+                    zone: None,
+                    ready: true,
+                    serving: true,
+                    terminating: false,
+                    ports: vec![unf_service::EndpointPortSource {
+                        name: Some("http".to_owned()),
+                        protocol: unf_common::Protocol::Tcp,
+                        port: Some(8080),
+                        app_protocol: None,
+                    }],
+                }],
+            }],
+        )
+        .expect("test service snapshot with backend compiles")
+    }
+
     #[test]
     fn service_snapshot_reconciliation_is_durable_fenced_and_reported() {
         let directory = tempdir().unwrap();
@@ -6061,6 +7026,126 @@ mod tests {
         snapshot.schema_version += 1;
         persist_secure_json(&path, &snapshot, "service").unwrap();
         assert!(load_optional_service_snapshot(&path).is_err());
+    }
+
+    #[test]
+    fn service_map_config_and_entries_reject_corrupt_persistent_state() {
+        let compiled = compile_service_dataplane(&service_test_snapshot(7, 4), 1).unwrap();
+        assert_eq!(
+            decode_recovered_service_config(compiled.config).unwrap(),
+            Some((7, 4, 1, 0, 0, 1))
+        );
+        let (key, value) = compiled.ipv4_frontends.first_key_value().unwrap();
+        validate_service_frontend_entry(key, value, 7).unwrap();
+
+        let mut corrupt_config = compiled.config;
+        corrupt_config[28..30].copy_from_slice(&(SERVICE_MAP_ABI_VERSION + 1).to_ne_bytes());
+        assert!(decode_recovered_service_config(corrupt_config).is_err());
+        let mut corrupt_value = *value;
+        corrupt_value[24] = 1;
+        assert!(validate_service_frontend_entry(key, &corrupt_value, 7).is_err());
+        let mut corrupt_key = *key;
+        corrupt_key[7] = SERVICE_BANK_COUNT;
+        assert!(validate_service_frontend_entry(&corrupt_key, value, 7).is_err());
+    }
+
+    #[test]
+    fn service_map_checkpoint_recovers_each_two_phase_crash_boundary() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("service.json");
+        let first = service_test_snapshot(7, 1);
+        let second = service_test_snapshot(7, 2);
+        persist_secure_json(&path, &first, "service").unwrap();
+
+        let pending = prepare_service_snapshot(&path, &second).unwrap();
+        assert!(pending.exists());
+        let recovered = load_service_snapshot_for_active(&path, 7, 1).unwrap();
+        assert_eq!(recovered, first);
+        assert!(!pending.exists());
+
+        let pending = prepare_service_snapshot(&path, &second).unwrap();
+        let recovered = load_service_snapshot_for_active(&path, 7, 2).unwrap();
+        assert_eq!(recovered, second);
+        assert!(!pending.exists());
+        assert_eq!(load_optional_service_snapshot(&path).unwrap(), Some(second));
+    }
+
+    #[test]
+    #[ignore = "requires root BPF map creation and UNF_EBPF_OBJECT"]
+    fn privileged_service_map_partial_capacity_failure_rolls_back_inactive_bank() {
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut loader = EbpfLoader::new();
+        loader
+            .map_max_entries("SERVICE_FRONTENDS_V4", 4)
+            .map_max_entries("SERVICE_FRONTENDS_V6", 4)
+            .map_max_entries("SERVICE_BACKENDS_V4", 4)
+            .map_max_entries("SERVICE_BACKENDS_V6", 4)
+            .map_max_entries("SERVICE_BACKEND_SLOTS", 1);
+        let mut ebpf = loader
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        let (
+            ipv4_frontends,
+            ipv6_frontends,
+            ipv4_backends,
+            ipv6_backends,
+            backend_slots,
+            config,
+            connections,
+        ) = take_service_maps(&mut ebpf).expect("take service maps");
+        let directory = tempdir().unwrap();
+        let mut synchronizer = ServiceSynchronizer {
+            ipv4_frontends,
+            ipv6_frontends,
+            ipv4_backends,
+            ipv6_backends,
+            backend_slots,
+            config,
+            connections,
+            banks: [None, None],
+            active_bank: 0,
+            applied: None,
+            controller_url: None,
+            client: ReloadingControllerClient::without_custom_trust(
+                Counter::default(),
+                Counter::default(),
+            ),
+            agent_token_path: PathBuf::new(),
+            state_path: directory.path().join("service.json"),
+            interval: Duration::from_secs(1),
+        };
+        let state = test_agent_state();
+        let first = service_test_snapshot_with_backend(7, 1);
+        activate_service_snapshot(&mut synchronizer, &first, false, &state)
+            .expect("first service bank activates");
+        let active_config = synchronizer.config.get(&0, 0).unwrap();
+        assert_eq!(active_config[30], 1);
+
+        let second = service_test_snapshot_with_backend(7, 2);
+        let error = activate_service_snapshot(&mut synchronizer, &second, false, &state)
+            .expect_err("full backend-slot map rejects the partial inactive stage");
+        assert!(error.to_string().contains("staging bank was rolled back"));
+        assert_eq!(synchronizer.config.get(&0, 0).unwrap(), active_config);
+        assert_eq!(synchronizer.active_bank, 1);
+        assert_eq!(synchronizer.applied.as_ref(), Some(&first));
+        assert!(
+            synchronizer
+                .ipv4_frontends
+                .keys()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .iter()
+                .all(|key| key[7] == 1)
+        );
+        assert!(
+            synchronizer
+                .ipv4_backends
+                .keys()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .iter()
+                .all(|key| key[8] == 1)
+        );
     }
 
     #[test]
@@ -6275,6 +7360,8 @@ mod tests {
             identity_revision: Some(11),
             policy_epoch: Some(7),
             policy_revision: Some(13),
+            service_epoch: None,
+            service_revision: None,
         };
         assert!(recovered_dataplane_is_ready(&complete));
 
@@ -6284,18 +7371,24 @@ mod tests {
                 identity_revision: None,
                 policy_epoch: None,
                 policy_revision: None,
+                service_epoch: None,
+                service_revision: None,
             },
             RecoveredDataplane {
                 identity_epoch: Some(7),
                 identity_revision: Some(11),
                 policy_epoch: None,
                 policy_revision: None,
+                service_epoch: None,
+                service_revision: None,
             },
             RecoveredDataplane {
                 identity_epoch: None,
                 identity_revision: None,
                 policy_epoch: Some(7),
                 policy_revision: Some(13),
+                service_epoch: None,
+                service_revision: None,
             },
         ] {
             assert!(!recovered_dataplane_is_ready(&incomplete));
@@ -6412,11 +7505,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v3/links"),
+                Path::new("/sys/fs/bpf/unf/v4/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v3/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v4/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -6482,7 +7575,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("persistent BPF-state ABI controller=4 agent=3")
+                .contains("persistent BPF-state ABI controller=5 agent=4")
         );
 
         controller.persistent_bpf_state_abi_version -= 1;
@@ -6510,19 +7603,19 @@ mod tests {
 
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v3")).is_ok());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v4")).is_ok());
         assert_eq!(
-            configured_abi_version(Path::new("/sys/fs/bpf/unf/v4")),
-            Some(4)
+            configured_abi_version(Path::new("/sys/fs/bpf/unf/v5")),
+            Some(5)
         );
         let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
             error.to_string().contains(
-                "incompatible with persistent BPF-state ABI v3; expected a /v3 directory"
+                "incompatible with persistent BPF-state ABI v4; expected a /v4 directory"
             )
         );
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v3")).is_err());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v4")).is_err());
         assert_eq!(
             configured_abi_version(Path::new("/sys/fs/bpf/unf-v3")),
             None

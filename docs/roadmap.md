@@ -369,10 +369,18 @@ authoritative record of verified results.
   compatibility fencing, bounded polling, atomic mode-0600 agent persistence,
   restart/outage recovery, desired/applied/failed state, metrics, and controller
   convergence are also verified by `make service-distribution-test` and ADR 0076.
-- Next: accept the service hook/connection-state ABI and implement transactional
-  frontend/backend/config maps with staging, readback, activation, rollback, and
-  durable recovery without packet-forwarding claims.
-- Gated: packet translation, conntrack/NAT semantics, backend selection,
+- Implemented and locally/kernel verified: ADR 0077 accepts the source-side
+  Pod-veth TC hook, reverse path, and bounded persistent flow-state contract;
+  ABI v4 adds fixed dual-stack frontend/backend/slot/config tables and the
+  reserved connection LRU. The agent capacity-checks before mutation, stages and
+  reads back every inactive table, atomically activates, couples the durable
+  checkpoint to config/map rollback, exactly recovers, and garbage-collects the
+  old bank. `make service-dataplane-test` includes a real-kernel partial/capacity
+  failure with exact active-bank preservation.
+- Next: implement dual-stack TCP/UDP packet translation, conntrack insertion and
+  expiry, deterministic eligible-backend selection, reverse translation, and
+  no-backend behavior against the accepted ABI.
+- Gated: live packet translation/conntrack behavior,
   service observability/explanation, and kube-proxy-free dual-stack ClusterIP.
 - Later service slices: NodePort, LoadBalancer, session affinity,
   `externalTrafficPolicy`, `internalTrafficPolicy`, topology-aware routing,

@@ -67,7 +67,7 @@ sudo target/debug/unf-agent \
 ```
 
 TC attachment changes host network state. On Linux 6.6+, the agent leaves its
-per-interface TCX links pinned below `/sys/fs/bpf/unf/v3/links` so a replacement
+per-interface TCX links pinned below `/sys/fs/bpf/unf/v4/links` so a replacement
 can update them atomically. On older kernels it leaves the clsact qdisc and its
 stable legacy filters in place for in-place replacement. Use a disposable
 environment for testing.
@@ -92,16 +92,16 @@ names. It refuses symbolic links, non-directory targets, and any unknown direct
 content instead of recursively deleting it. A missing target is an idempotent
 no-op.
 
-Removing current v3 state is an uninstall or controlled-reset operation. First
+Removing current v4 state is an uninstall or controlled-reset operation. First
 stop every agent using that node so no process is reading or recreating the maps
 or attachments, inspect the dry run, and provide the additional confirmation:
 
 ```bash
 sudo target/debug/unf-agent cleanup \
-  --abi-version 3 --allow-current-abi \
+  --abi-version 4 --allow-current-abi \
   --legacy-attachments --all-interfaces --legacy-direction both
 sudo target/debug/unf-agent cleanup \
-  --abi-version 3 --allow-current-abi \
+  --abi-version 4 --allow-current-abi \
   --legacy-attachments --all-interfaces --legacy-direction both --execute
 ```
 
@@ -489,8 +489,9 @@ controller and agent fixtures from it. It upgrades the controller first, then
 replaces one agent at a time. Every fresh ABI directory must commit identity and
 policy snapshots before attachment, report populated state, and converge while
 the prior ABI remains pinned. Only after full convergence does the gate retire
-old state. It repeats the process back to v3 and uses an exact-node cleanup Pod
-from the v4 image to remove only v4 state. A continuous 8080 allow/9090 deny
+old state. It repeats the process back to the compiled current ABI and uses an
+exact-node cleanup Pod from the generated future-ABI image to remove only that
+future state. A continuous 8080 allow/9090 deny
 probe is mandatory throughout. This qualifies snapshot-driven clean rebuild,
 not byte migration or simultaneous wire-schema changes; ADR 0051 defines the
 boundary.
@@ -501,10 +502,11 @@ To include the unsupported direct-downgrade boundary in that lifecycle, run:
 make kind-unsupported-downgrade-test
 ```
 
-After v4 convergence, this target starts the current v3 agent with the `/v4`
-path and requires rejection before BPF access plus an identical canonical digest
-across all eleven v4 maps. It then requires compatible-v4 recovery and completes
-the supported clean rebuild back to v3. This distinguishes same-tuple software
+After future-ABI convergence, this target starts the current agent with the
+future pin path and requires rejection before BPF access plus an identical
+canonical digest across its complete map set. It then requires compatible
+future-agent recovery and completes the supported clean rebuild back to the
+current ABI. This distinguishes same-tuple software
 rollback, ABI-boundary clean rebuild, and unsupported direct state adoption;
 ADR 0052 records the evidence.
 
@@ -617,8 +619,8 @@ fixed, rechecks the established allow/deny flows, releases pressure, and require
 that waiting revision to activate before restoring enforcement. Cleanup removes
 only the scoped synthetic keys and fault aliases. It also adds unknown content to
 a recognized v1 directory to prove refusal, verifies dry-run preservation, then
-uses the deployed agent command to remove v1 state on both nodes while all eleven
-v3 pins remain. The helper is removed before offline replacement and is not part
+uses the deployed agent command to remove v1 state on both nodes while all
+eighteen current v4 pins remain. The helper is removed before offline replacement and is not part
 of the production kustomization.
 
 The DaemonSet attaches ingress classification to every non-loopback node interface

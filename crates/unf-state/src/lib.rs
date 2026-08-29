@@ -22,7 +22,7 @@ pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 pub const SHADOW_IMPACT_SCHEMA_VERSION: u16 = 1;
 pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 3;
 pub const COMPONENT_COMPATIBILITY_SCHEMA_VERSION: u16 = 2;
-pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 3;
+pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 4;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
 /// One half of the dual-bank eBPF policy map's 262,144-entry capacity.
