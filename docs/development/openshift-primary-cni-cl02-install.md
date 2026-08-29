@@ -209,12 +209,11 @@ before the agent published `/run/unf/cni.sock` at 11:28:38. CRI-O removed each
 result cache anyway, and replacement ADD calls at 11:28:50 allocated new
 attachments. Explicit GC restored 10/10/10 with no missing link.
 
-ADR 0072 now implements a durable owner-only deferred-delete queue. Offline DEL
+ADR 0072 implements a durable owner-only deferred-delete queue. Offline DEL
 returns success only after exact intent persistence; the next lifecycle command
 must drain it through the agent before proceeding. The default applies even to
 older compatible network configurations retained in CRI-O caches. Local CNI,
-strict workspace, eBPF, support-matrix, and OpenShift package gates pass. A new
-immutable rollout and a second clean reboot are required for live credit. The
+strict workspace, eBPF, support-matrix, and OpenShift package gates pass. The
 `221168c` images remain the successful GC reconciliation evidence, but do not
 contain ADR 0072's implementation.
 
@@ -256,14 +255,39 @@ and agent/CNI digest
 All were anonymously resolved after publication; the test-tools content remains
 `sha256:f57a7ee9668d6b87f4e00c4e8df9240b8889c6ee50f817ea1e884732b2f42b13`.
 
+The final agent image rolled one Node at a time and the controller rolled with
+Recreate. Every component exposed the exact `15866c4` revision. Four agents and
+the controller retained zero restarts; the agent on `10.50.60.200` restarted
+once after a projected-token request returned 403 during cache startup, then
+self-recovered. All five agents converged on epoch `7679427618012921356` before
+the reboot.
+
+Worker `bc-24-11-74-2b-8d` changed boot ID from
+`8a61e7f5-65ed-427e-860c-806887a5fcda` to
+`dae93ed0-0ff4-4eab-916a-efac30d3a078`. CRI-O issued exactly ten old-sandbox
+DEL calls at 12:24:40, the agent restored last-known-good routes and published
+the local transaction socket at 12:24:49, and exactly ten replacement ADD calls
+began at 12:24:53. There was no UNF CNI failure. The queue drained before new
+allocation without manual GC.
+
+Post-reboot cluster-wide Pod/attachment/cache/link counts were respectively
+37/37/37/37, 33/33/33/33, 16/16/16/16, 20/20/20/20, and 10/10/10/10. Every
+deferred queue contained zero JSON records. The rebooted worker had ten Ready
+attachments, ten unique leases per address family, eleven BPF map files, and
+fourteen protocol-196 routes per family. Its retained ingress-canary Pod UID
+received new dual-stack addresses and passed direct cross-worker HTTPS with
+HTTP 200 over both families. A hold retained exact state and restart counts.
+All five kubelet proxy and Node-local DNS checks passed; 34 operators other than
+the pre-existing external Insights condition were healthy. Controller status
+returned five expected, reporting, fresh, and converged agents at exact identity
+228, policy 435, and route 1 revisions. This closes the clean-reboot recovery
+criterion.
+
 ## Remaining exit criteria
 
 The live primary-CNI lifecycle remains **In progress** until repository changes
 and repeatable gates prove the remaining items:
 
-- immutable deferred-delete image rollout and Node reboot last-known-good
-  recovery with an empty deferred queue and exact journal/cache/link/Pod
-  cardinality;
 - CRI-O ADD/CHECK/DEL and lease/link cleanup under deliberate failure;
 - exact artifact, route, and BPF teardown, no-CNI baseline behavior, and clean
   reprovision recovery; and

@@ -334,8 +334,10 @@ authoritative record of verified results.
   reconciliation is live-verified across all five Nodes. The following clean
   reboot exposed CRI-O issuing DEL before the agent socket existed and then
   discarding its cache. ADR 0072 adds a durable exact deferred-delete queue that
-  fences later ADD/CHECK/GC work; its immutable rollout and second clean reboot,
-  CRI-O fault cleanup, teardown, and reprovision remain the live exit path.
+  fences later ADD/CHECK/GC work. Its digest-pinned rollout and second clean
+  reboot now pass with ten early DELs drained before replacement ADDs and exact
+  five-Node state restored without manual GC; CRI-O fault cleanup, teardown,
+  and reprovision remain the live exit path.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

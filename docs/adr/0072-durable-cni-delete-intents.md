@@ -1,7 +1,6 @@
 # ADR 0072: CNI delete intent survives transaction-service outages
 
-Status: Accepted and implemented locally; immutable cl02 rollout and second
-clean-reboot qualification in progress
+Status: Accepted, implemented, and live clean-reboot recovery verified
 
 ## Context
 
@@ -110,10 +109,32 @@ and agent/CNI digest
 The unchanged test-tools digest remains
 `sha256:f57a7ee9668d6b87f4e00c4e8df9240b8889c6ee50f817ea1e884732b2f42b13`.
 
-Live credit remains pending. These images must be rolled to cl02, and the same
-worker must complete a real boot-ID-changing
-reboot with no deferred records left behind and exact equality among running
-Pods, CRI-O caches, attachments, links, routes, leases, and restored BPF state.
+The provenance-correct images rolled serially to all five cl02 agents and then
+to the Recreate controller. All components exposed the exact embedded revision.
+Four agents and the controller rolled with zero restarts; the control-plane
+agent on `10.50.60.200` restarted once after a projected-token request returned
+403 during cache startup, then recovered without intervention. Before reboot,
+all five agents converged on epoch `7679427618012921356` and every Node retained
+equal Pod/attachment/cache/link cardinality with an empty queue.
+
+Worker `bc-24-11-74-2b-8d` then completed a real reboot from boot ID
+`8a61e7f5-65ed-427e-860c-806887a5fcda` to
+`dae93ed0-0ff4-4eab-916a-efac30d3a078`. CRI-O invoked DEL for all ten old
+sandboxes at 12:24:40, before the agent restored eight last-known-good remote
+routes and published its CNI socket at 12:24:49. The plugin returned no CNI
+error because each exact delete was durable. Ten replacement ADDs began at
+12:24:53 and drained the serialized queue before allocation.
+
+Without manual GC, the worker stabilized at exactly ten running non-host Pods,
+ten Ready attachments, ten CRI-O caches, ten UNF links, ten unique IPv4 leases,
+and ten unique IPv6 leases. No deferred JSON record remained; only the expected
+per-network lock remained. Eleven BPF map files, fourteen protocol-196 routes
+per family, the same canary Pod UID, and direct cross-worker IPv4/IPv6 HTTPS
+were restored. A subsequent hold retained the exact cardinality and restart
+counts. All five kubelet proxy and Node-local DNS checks passed, 34 operators
+other than the pre-existing external Insights condition were healthy, and the
+controller reported five expected, reporting, fresh, and converged agents with
+matching identity 228, policy 435, and route 1 revisions.
 
 ## Consequences
 
