@@ -82,7 +82,7 @@ spec:
           args:
             - cleanup
             - --abi-version
-            - "3"
+            - "4"
             - --allow-current-abi
             - --legacy-attachments
             - --all-interfaces
@@ -108,6 +108,7 @@ for node in "${nodes[@]}"; do
     sudo "${container_runtime}" exec "${node}" sh -ec '
         state_dir=/var/lib/unf/cni/v1
         routes=${state_dir}/remote-routes.json
+        services=${state_dir}/service-snapshot.json
         marker=${state_dir}/install.env
         binary=/opt/cni/bin/unf
         config=/etc/cni/net.d/10-unf.conflist
@@ -147,11 +148,36 @@ EOF
         test "$(sha256sum "$config" | cut -d " " -f 1)" = "$config_sha"
         test "$(ip -j -d link | jq '\''[.[] | select(.ifname | startswith("unf"))] | length'\'')" -eq 0
 
+        test -f "$services" && test ! -L "$services"
+        test "$(stat -c %a "$services")" = 600
+        test "$(jq -r .schemaVersion "$services")" = 1
+        test "$(jq -r .revision "$services")" -gt 0
+        test "$(jq ".services | length" "$services")" -gt 0
+
+        for temporary in \
+            "${state_dir}/attachments.json.tmp" \
+            "${state_dir}/.node-block.json.tmp" \
+            "${state_dir}/.remote-routes.json.tmp" \
+            "${state_dir}/.service-snapshot.json.tmp"; do
+            if [ -e "$temporary" ]; then
+                test -f "$temporary" && test ! -L "$temporary"
+                test "$(stat -c %a "$temporary")" = 600
+                rm -f "$temporary"
+            fi
+        done
+
         rm -f /run/unf/cni.sock
         rm -f "$binary" "$config"
-        rm -f "${state_dir}/attachments.json" "${state_dir}/node-block.json" "$routes" "$marker"
+        rm -f "${state_dir}/attachments.json" "${state_dir}/node-block.json" \
+            "$routes" "$services" "$marker"
         pending=${state_dir}/pending-deletes
         test -d "$pending" && test ! -L "$pending"
+        pending_network=${pending}/unf-primary
+        if [ -e "$pending_network" ]; then
+            test -d "$pending_network" && test ! -L "$pending_network"
+            test -z "$(find "$pending_network" -mindepth 1 -print -quit)"
+            rmdir "$pending_network"
+        fi
         test -z "$(find "$pending" -mindepth 1 -maxdepth 1 ! -name .unf-primary.lock -print -quit)"
         rm -f "$pending/.unf-primary.lock"
         rmdir "$pending"
@@ -173,10 +199,18 @@ done
 
 coredns_template_spec=$("${kc[@]}" -n kube-system get configmap \
     unf-primary-cni-bootstrap-backup -o jsonpath='{.data.coredns-template-spec}')
+coredns_corefile=$("${kc[@]}" -n kube-system get configmap \
+    unf-primary-cni-bootstrap-backup -o jsonpath='{.data.coredns-corefile}')
 coredns_patch=$(jq -cn --argjson spec "${coredns_template_spec}" \
     '[{"op":"replace","path":"/spec/template/spec","value":$spec}]')
 "${kc[@]}" -n kube-system patch deployment coredns --type=json --patch "${coredns_patch}" \
     >/dev/null
+if [[ -n ${coredns_corefile} ]]; then
+    corefile_patch=$(jq -cn --arg corefile "${coredns_corefile}" \
+        '{data:{Corefile:$corefile}}')
+    "${kc[@]}" -n kube-system patch configmap coredns --type=merge \
+        --patch "${corefile_patch}" >/dev/null
+fi
 "${kc[@]}" -n kube-system delete configmap unf-primary-cni-bootstrap-backup >/dev/null
 "${kc[@]}" -n local-path-storage scale deployment/local-path-provisioner --replicas=1 \
     >/dev/null

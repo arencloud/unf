@@ -137,7 +137,7 @@ reprovision from zero all pass committed gates. Qualification remains limited
 to the exact recorded development tuple; production repositories and other
 platform versions are not inferred. Existing overlay deployments are unchanged.
 See the [cl02 installation checkpoint](docs/development/openshift-primary-cni-cl02-install.md).
-Phase 4 is now in progress. Its first six verified slices add strongly typed
+Phase 4 is now in progress. Its first seven verified slices add strongly typed
 `ServiceId`/`BackendId` values and a bounded, schema-versioned,
 Kubernetes-independent dual-stack service IR, plus deterministic Kubernetes
 Service/EndpointSlice compilation with collision-checked IDs, exact family and
@@ -157,8 +157,15 @@ revision provenance. A fixed service-event ABI now carries translation, drop,
 expiry, selected backend, tuple, and revision evidence into low-cardinality
 metrics, agent status, non-blocking flow export, durable history, and
 `unfctl service-explain`; malformed events and inconsistent provenance fail
-closed. Kube-proxy-free Kind/OpenShift qualification remains gated by the
+closed. Platform qualification is tracked by the
 [Phase 4 service-fabric plan](docs/development/phase4-service-fabric-plan.md).
+A dedicated three-node Kubernetes 1.35 dual-stack Kind fixture now runs UNF as
+the sole primary CNI with kube-proxy absent. Its repeatable gate proves direct
+Pod and DNS continuity, native IPv4/IPv6 TCP/UDP ClusterIP lifecycle,
+backendless provenance, controller-offline replacement of both worker agents
+from durable/pinned state, exact workload cleanup, and restoration to the saved
+no-CNI baseline. OpenShift service-fabric qualification remains the final
+foundation milestone; ADR 0080 records the Kind boundary.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

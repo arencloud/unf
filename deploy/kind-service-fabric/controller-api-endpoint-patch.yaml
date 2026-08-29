@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unf-controller
+  namespace: unf-system
+spec:
+  strategy:
+    type: Recreate
+  template:
+    spec:
+      containers:
+        - name: controller
+          env:
+            - name: KUBERNETES_SERVICE_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: KUBERNETES_SERVICE_PORT
+              value: "6443"

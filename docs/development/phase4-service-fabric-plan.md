@@ -21,7 +21,7 @@ cluster support.
 | 4.4 | Transactional eBPF service state | **Verified** | `make service-dataplane-test`; fixed dual-stack ABI, v4/eighteen-pin clean boundary, real-map staging/readback/atomic activation/rollback/capacity fault; ADR 0077 |
 | 4.5 | Dual-stack ClusterIP dataplane | **Verified** | `make service-dataplane-test`; verifier-loaded IPv4/IPv6 TCP/UDP DNAT and reverse SNAT, checksum proof, deterministic ready/non-terminating selection, paired connection provenance, churn persistence, expiry/reselection, and exact no-backend drop; ADR 0078 |
 | 4.6 | Service operations | **Verified** | `make service-operations-test`; fixed event ABI, bounded metrics/status/export/history, durable migration, service explanation, and actionable translation/drop/expiry reasons; ADR 0079 |
-| 4.7 | Kube-proxy-free Kind qualification | **Planned** | Dedicated primary-CNI dual-stack lifecycle/failure/recovery artifact |
+| 4.7 | Kube-proxy-free Kind qualification | **Verified** | `make service-kind-test`; dedicated Kubernetes 1.35 dual-stack primary-CNI fixture, lifecycle/failure/recovery artifact, and exact rollback; ADR 0080 |
 | 4.8 | OpenShift qualification | **Planned** | Kind gate closed; deliberately configured disposable cluster; RHCOS/SELinux/CRI-O/operator evidence |
 
 ## Accepted Phase 4 gate
@@ -46,10 +46,25 @@ SCTP, NodePort, LoadBalancer, session affinity, traffic policies, Maglev, DSR,
 generic NAT/RELATED tracking, and OpenShift are not silently inherited by this
 first gate. They receive separate rows after the ClusterIP foundation closes.
 
+## Reproducing the Kind gate
+
+Create and qualify the isolated fixture from the repository root:
+
+```console
+make service-kind-up
+make service-kind-deploy
+make service-kind-test
+```
+
+The test deliberately rolls UNF back to the saved no-CNI bootstrap baseline
+after writing `.artifacts/phase4-service-kind.json`. Run
+`make service-kind-deploy` before repeating the gate, or
+`make service-kind-down` to remove the disposable cluster.
+
 ## Immediate next slice
 
-Implement Phase 4.7 without widening unsupported Service types: reuse the
-dedicated primary-CNI dual-stack Kind fixture, remove kube-proxy, and prove TCP
-and UDP ClusterIP lifecycle, DNS continuity, no-backend provenance,
-controller/agent recovery, exact cleanup, and schema-versioned evidence. Phase
-4.8 remains blocked on this cluster gate.
+Implement Phase 4.8 without widening unsupported Service types: publish the
+qualified development images by immutable digest, audit the dedicated cl02
+primary-CNI cluster, and prove the same dual-stack TCP/UDP ClusterIP lifecycle,
+failure/recovery, observability, RHCOS, SELinux, CRI-O, and operator-health
+invariants. No behavior is inherited from the Kind result.

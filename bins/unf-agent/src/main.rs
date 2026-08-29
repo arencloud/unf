@@ -1101,12 +1101,7 @@ fn persist_secure_json<T: Serialize>(path: &Path, value: &T, description: &str) 
         .with_context(|| format!("{description} state path must name a file"))?
         .to_string_lossy();
     let temporary = path.with_file_name(format!(".{file_name}.tmp"));
-    if temporary.exists() {
-        bail!(
-            "temporary {description} state {} already exists",
-            temporary.display()
-        );
-    }
+    remove_stale_secure_temporary(&temporary, description)?;
     let bytes =
         serde_json::to_vec_pretty(value).with_context(|| format!("encode {description} state"))?;
     if bytes.len() as u64 > MAX_DURABLE_STATE_BYTES {
@@ -1131,6 +1126,36 @@ fn persist_secure_json<T: Serialize>(path: &Path, value: &T, description: &str) 
         let _ = fs::remove_file(&temporary);
     }
     write_result
+}
+
+fn remove_stale_secure_temporary(path: &Path, description: &str) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "temporary {description} state {} is not a regular file",
+            path.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        bail!(
+            "temporary {description} state {} is accessible outside its owner",
+            path.display()
+        );
+    }
+    fs::remove_file(path).with_context(|| {
+        format!(
+            "remove stale temporary {description} state {}",
+            path.display()
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn load_secure_json<T: DeserializeOwned>(path: &Path, description: &str) -> Result<T> {
@@ -7075,6 +7100,52 @@ mod tests {
         let link = directory.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(persist_node_block_snapshot(&link.join("state.json"), &snapshot).is_err());
+    }
+
+    #[test]
+    fn secure_json_persistence_recovers_only_private_regular_temporary_files() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("node-block.json");
+        let temporary = directory.path().join(".node-block.json.tmp");
+        let snapshot = NodeBlockSnapshot {
+            schema_version: NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION,
+            revision: 4,
+            node_name: "worker-a".to_owned(),
+            node_uid: "worker-a-uid".to_owned(),
+            provider: NodeBlockProvider::new(
+                "10.42.0.0/24".parse().unwrap(),
+                "fd00:42::/64".parse().unwrap(),
+            ),
+        };
+        let mut stale = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .unwrap();
+        stale.write_all(b"{\n").unwrap();
+        stale.sync_all().unwrap();
+
+        persist_node_block_snapshot(&path, &snapshot)
+            .expect("private regular stale temporary state is recoverable");
+        assert!(!temporary.exists());
+        assert_eq!(
+            load_secure_json::<NodeBlockSnapshot>(&path, "node-block").unwrap(),
+            snapshot
+        );
+
+        fs::remove_file(&path).unwrap();
+        let outside = directory.path().join("outside");
+        fs::write(&outside, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&outside, &temporary).unwrap();
+        assert!(persist_node_block_snapshot(&path, &snapshot).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"preserve");
+        assert!(
+            fs::symlink_metadata(&temporary)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

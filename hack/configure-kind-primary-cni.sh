@@ -34,11 +34,47 @@ done
 if ! "${kc[@]}" -n kube-system get configmap unf-primary-cni-bootstrap-backup >/dev/null 2>&1; then
     coredns_template_spec=$("${kc[@]}" -n kube-system get deployment coredns -o json \
         | jq -c '.spec.template.spec')
+    coredns_corefile=$("${kc[@]}" -n kube-system get configmap coredns \
+        -o jsonpath='{.data.Corefile}')
     "${kc[@]}" -n kube-system create configmap unf-primary-cni-bootstrap-backup \
-        --from-literal=coredns-template-spec="${coredns_template_spec}" >/dev/null
+        --from-literal=coredns-template-spec="${coredns_template_spec}" \
+        --from-literal=coredns-corefile="${coredns_corefile}" >/dev/null
+elif [[ -z $("${kc[@]}" -n kube-system get configmap unf-primary-cni-bootstrap-backup \
+    -o jsonpath='{.data.coredns-corefile}') ]]; then
+    # Migrate a bootstrap backup created before the kube-proxy-free fixture
+    # also needed to restore the Corefile.
+    coredns_corefile=$("${kc[@]}" -n kube-system get configmap coredns \
+        -o jsonpath='{.data.Corefile}')
+    corefile_patch=$(jq -cn --arg corefile "${coredns_corefile}" \
+        '{data:{"coredns-corefile":$corefile}}')
+    "${kc[@]}" -n kube-system patch configmap unf-primary-cni-bootstrap-backup \
+        --type=merge --patch "${corefile_patch}" >/dev/null
+fi
+
+if ! "${kc[@]}" -n kube-system get daemonset kube-proxy >/dev/null 2>&1; then
+    control_plane_ipv4=$("${kc[@]}" get nodes -l node-role.kubernetes.io/control-plane \
+        -o json | jq -r '.items[0].status.addresses[] | select(.type == "InternalIP" and (.address | contains("."))) | .address')
+    original_corefile=$("${kc[@]}" -n kube-system get configmap \
+        unf-primary-cni-bootstrap-backup -o jsonpath='{.data.coredns-corefile}')
+    corefile_patch=$(jq -cn --arg corefile "${original_corefile}" \
+        '{data:{Corefile:$corefile}}')
+    "${kc[@]}" -n kube-system patch configmap coredns --type=merge \
+        --patch "${corefile_patch}" >/dev/null
+    coredns_deployment_patch=$(jq -cn --arg host "${control_plane_ipv4}" '
+        {spec:{template:{spec:{
+            hostNetwork:true,
+            dnsPolicy:"Default",
+            tolerations:[{operator:"Exists"}],
+            containers:[{name:"coredns",env:[
+                {name:"KUBERNETES_SERVICE_HOST",value:$host},
+                {name:"KUBERNETES_SERVICE_PORT",value:"6443"}
+            ]}]
+        }}}}')
+else
+    coredns_deployment_patch='{"spec":{"template":{"spec":{"hostNetwork":true,"dnsPolicy":"Default","tolerations":[{"operator":"Exists"}]}}}}'
 fi
 "${kc[@]}" -n kube-system patch deployment coredns --type=strategic --patch \
-    '{"spec":{"template":{"spec":{"hostNetwork":true,"dnsPolicy":"Default","tolerations":[{"operator":"Exists"}]}}}}' >/dev/null
+    "${coredns_deployment_patch}" >/dev/null
 "${kc[@]}" -n kube-system rollout status deployment/coredns --timeout=180s
 
 echo "configured isolated primary-CNI prerequisites for ${context}"

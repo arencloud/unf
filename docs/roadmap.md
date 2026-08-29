@@ -383,9 +383,15 @@ authoritative record of verified results.
   revision-independent persistence, protocol expiry/reselection, and fail-closed
   exact backendless behavior. The privileged packet gate checks all four
   family/protocol combinations and reads fixed provenance from the real map.
-- Next: service translation/failure events, metrics, status, retained history,
-  and explanation.
-- Gated: kube-proxy-free dual-stack Kind and OpenShift ClusterIP qualification.
+- Verified by `make service-operations-test`: fixed translation/failure events,
+  bounded metrics and status, retained history, and service explanation.
+- Verified by `make service-kind-test`: a dedicated three-node Kubernetes 1.35
+  dual-stack primary-CNI fixture with kube-proxy absent proves native TCP/UDP
+  ClusterIP on both families, DNS and endpoint lifecycle, controller-offline
+  worker-agent replacement, durable/pinned recovery, exact cleanup, and
+  restoration to the no-CNI baseline; ADR 0080.
+- Next: digest-pinned OpenShift service-fabric qualification on the deliberate
+  dual-stack cl02 primary-CNI development cluster.
 - Later service slices: NodePort, LoadBalancer, session affinity,
   `externalTrafficPolicy`, `internalTrafficPolicy`, topology-aware routing,
   Maglev, and optional DSR. None is implied by the foundation gate.

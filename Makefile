@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt fmt-check support-matrix-check service-ir-test service-compiler-test service-distribution-test service-dataplane-test service-operations-test ebpf generate-crds controller agent cni cni-protocol-test cni-transaction-test cni-ipam-test cni-veth-test cni-routing-test cni-lifecycle-test cni-node-block-test cni-remote-routing-test cni-route-reconciliation-test cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-upgrade-images openshift-deploy openshift-test openshift-upgrade-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test openshift-primary-cni-audit openshift-primary-cni-preflight openshift-primary-cni-package-check openshift-primary-cni-runtime-fault-test openshift-primary-cni-node-reprovision-test openshift-primary-cni-deploy kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-platform-matrix-test kind-down primary-cni-kind-up primary-cni-kind-load primary-cni-kind-deploy primary-cni-kind-test primary-cni-kind-rollback primary-cni-kind-down
+.PHONY: build test lint fmt fmt-check support-matrix-check service-ir-test service-compiler-test service-distribution-test service-dataplane-test service-operations-test service-kind-up service-kind-load service-kind-deploy service-kind-test service-kind-down ebpf generate-crds controller agent cni cni-protocol-test cni-transaction-test cni-ipam-test cni-veth-test cni-routing-test cni-lifecycle-test cni-node-block-test cni-remote-routing-test cni-route-reconciliation-test cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-upgrade-images openshift-deploy openshift-test openshift-upgrade-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test openshift-primary-cni-audit openshift-primary-cni-preflight openshift-primary-cni-package-check openshift-primary-cni-runtime-fault-test openshift-primary-cni-node-reprovision-test openshift-primary-cni-deploy kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-platform-matrix-test kind-down primary-cni-kind-up primary-cni-kind-load primary-cni-kind-deploy primary-cni-kind-test primary-cni-kind-rollback primary-cni-kind-down
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -36,6 +36,10 @@ PRIMARY_CNI_KIND_NAME ?= unf-cni-dev
 PRIMARY_CNI_KIND_CONFIG ?= $(CURDIR)/hack/kind-primary-cni-config.yaml
 PRIMARY_CNI_KIND_KUBECONFIG ?= $(CURDIR)/.tools/kind-$(PRIMARY_CNI_KIND_NAME).kubeconfig
 PRIMARY_CNI_KUBE_CONTEXT ?= kind-$(PRIMARY_CNI_KIND_NAME)
+SERVICE_KIND_NAME ?= unf-service-dev
+SERVICE_KIND_CONFIG ?= $(CURDIR)/hack/kind-service-fabric-config.yaml
+SERVICE_KIND_KUBECONFIG ?= $(CURDIR)/.tools/kind-$(SERVICE_KIND_NAME).kubeconfig
+SERVICE_KUBE_CONTEXT ?= kind-$(SERVICE_KIND_NAME)
 
 build:
 	cargo build --workspace
@@ -71,6 +75,7 @@ service-distribution-test: service-compiler-test
 	kubectl kustomize deploy >/dev/null
 	kubectl kustomize deploy/openshift >/dev/null
 	kubectl kustomize deploy/kind-primary-cni >/dev/null
+	kubectl kustomize deploy/kind-service-fabric >/dev/null
 	kubectl kustomize deploy/openshift-primary-cni/runtime >/dev/null
 
 service-dataplane-test: service-distribution-test
@@ -82,6 +87,33 @@ service-dataplane-test: service-distribution-test
 service-operations-test: service-dataplane-test
 	cargo test -p unf-state -p unf-agent -p unf-controller -p unfctl
 	cargo clippy -p unf-ebpf-common -p unf-state -p unf-agent -p unf-controller -p unfctl --all-targets --all-features -- -D warnings
+
+service-kind-up: kind-tool
+	hack/verify-kind-host-prerequisites.sh
+	sudo env KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) create cluster --name $(SERVICE_KIND_NAME) --config $(SERVICE_KIND_CONFIG)
+	sudo chown $$(id -u):$$(id -g) $(SERVICE_KIND_KUBECONFIG)
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) hack/configure-kind-primary-cni.sh
+
+service-kind-load: KIND_NAME = $(SERVICE_KIND_NAME)
+service-kind-load: KIND_KUBECONFIG = $(SERVICE_KIND_KUBECONFIG)
+service-kind-load: KUBE_CONTEXT = $(SERVICE_KUBE_CONTEXT)
+service-kind-load: kind-load
+
+service-kind-deploy: service-kind-load
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) UNF_INTERNAL_TLS_DIR=$(CURDIR)/.tools/kind-service-internal-tls hack/configure-internal-tls.sh
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) apply -k deploy/kind-service-fabric
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) hack/configure-kind-service-bootstrap.sh
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout restart deployment/unf-controller -n unf-system
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout restart daemonset/unf-agent -n unf-system
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout status deployment/unf-controller -n unf-system --timeout=180s
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout status daemonset/unf-agent -n unf-system --timeout=180s
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) wait --for=condition=Ready nodes --all --timeout=180s
+
+service-kind-test: service-operations-test cli
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) hack/verify-kind-service-fabric.sh
+
+service-kind-down:
+	sudo env KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KIND_EXPERIMENTAL_PROVIDER=$(KIND_PROVIDER) $(CURDIR)/$(KIND) delete cluster --name $(SERVICE_KIND_NAME)
 
 ebpf:
 	cargo +$(BPF_TOOLCHAIN) build --manifest-path ebpf/unf-ebpf-tc/Cargo.toml -Z build-std=core --target bpfel-unknown-none --release
