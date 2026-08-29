@@ -25,6 +25,7 @@ repeatable test are both present in this repository.
 | Phase 2 — identity and policy enforcement | **Verified** | §102: BPF policy maps, allowed flow passes, denied flow drops, denial event has identity/policy/rule/reason, and accurate `unfctl explain` | `make fmt-check lint test`, `make ebpf`, and `make kind-test` verify the complete gate; `make openshift-test` qualifies both IPv4-only and dual-stack platform slices, while focused rotation, acknowledgement-retention, admission, and uninstall/redeploy gates cover the planned OpenShift hardening |
 | Phase 3 — compatibility and simulation | **Verified** | §103: NetworkPolicy adapter, shadow policies, simulation foundation, improved topology, and historical export | All 42 Phase 3 deliverables are Verified. The committed-revision closure passed static/eBPF/render, complete Kind endpoint, scale/failure, adjacent upgrade/rollback, and digest-pinned dual-stack cl02 gates; ADR 0056 records the one-to-one requirements/limitations audit, immutable artifacts, retries, and exact boundaries |
 | Full-CNI foundation | **Verified** | §104: `unf-cni`, IPAM, veth, routing, MTU, and node-to-node networking | ADRs 0057–0073 and committed gates verify the bounded foundation, isolated Kind lifecycle, five-Node OpenShift bootstrap/remediation, CNI 1.1 reconciliation, durable offline DEL, digest-pinned clean reboot, deliberate runtime fault, exact worker teardown to no CNI, fail-closed sandbox behavior, and host-network reprovision from zero with exact state, 5/5 convergence, and dual-stack traffic. Netkit and post-foundation services remain separate future scope |
+| Phase 4 — service-fabric foundation | **In progress** | Master prompt §§20–21: revisioned Service/EndpointSlice intent, transactional service state, eBPF load balancing, connection persistence, and kube-proxy-free dual-stack ClusterIP | ADRs 0074–0075 and `make service-compiler-test` verify the typed schema-v1 IR plus deterministic controller compilation, collision rejection, last-valid retention, and status. Agent distribution, map ABI, forwarding, conntrack/NAT, observability, and cluster qualification remain tracked work |
 
 Sections 98–99 describe the richer first enforcement and enriched-observability
 scenario. Those scenarios span the Phase 2 gate because they require a real deny
@@ -35,7 +36,8 @@ completed by Phase 1's observation-only shadow evaluation.
 
 | Check | Latest result |
 |---|---|
-| Stable userspace formatting, lint, and tests | Passed: `make fmt-check lint test` with 227 workspace tests passed and one privileged route test excluded from the generic workspace invocation |
+| Stable userspace formatting, lint, and tests | Passed: `make fmt-check lint test` with 251 workspace tests passed and one privileged route test excluded from the generic workspace invocation |
+| Phase 4 service compiler | `make service-compiler-test` passed 14 common/service tests, focused controller lifecycle/retention tests, and strict Clippy. Schema v1 and its Kubernetes adapter preserve exact dual-stack family, port name/protocol, appProtocol, EndpointSlice/workload/Node/zone, and endpoint lifecycle provenance; collision or malformed input retains the last valid compiled revision and appears in status; ADRs 0074–0075 |
 | eBPF target build and manifest rendering | Passed: `make ebpf` and `kubectl kustomize deploy` |
 | Full-CNI node-block distribution | `make cni-node-block-test` passed the complete privileged local CNI lifecycle plus IPAM/controller/agent distribution and strict-lint gates; unchanged overlay manifests rendered successfully |
 | Full-CNI remote native routing | `make cni-remote-routing-test` passed all prerequisite CNI/node-block gates plus provider-neutral intent, strict lint, real dual-stack block forwarding, replay/readback/repair, scoped partial-failure rollback, exact deletion, and foreign-route preservation |
@@ -150,7 +152,7 @@ release gate.
   State resets when the eBPF program is replaced and does not provide generic
   conntrack `RELATED`, ICMP error association, NAT tuple reconstruction, or
   non-initial fragment tracking.
-- Identity and compiled policy desired state remain in-memory, but their nine
+- Identity and compiled policy desired state remain in-memory, but their eleven
   dual-bank enforcement maps are pinned and strictly validated across agent
   restart. Linux 6.6+ TCX links are pinned and atomically updated during agent
   replacement; the legacy netlink fallback reserves priority `0x554e` and handles
@@ -161,6 +163,10 @@ release gate.
   can be removed with the dry-run-first cleanup command after a validated
   rollout. Standalone current-v2 cleanup still requires explicit confirmation;
   ADR 0029 now coordinates and live-verifies it for OpenShift uninstall.
+- Service and EndpointSlice topology now compiles into retained-last-valid,
+  revisioned userspace service IR with explicit status. No service snapshot is distributed to an
+  agent; no service BPF map, backend-selection algorithm, conntrack/NAT path, or
+  kube-proxy replacement claim exists yet.
 - Partial pin sets, malformed active policy config, and invalid inactive-stage
   values are live-verified as rejected using isolated bpffs fault sets. Physical
   inactive-bank exhaustion, rollback, active-traffic preservation, scoped
@@ -292,6 +298,20 @@ release gate.
 | OpenShift primary-CNI installation boundary | **Verified** | `make openshift-primary-cni-audit` records exact CNO, dual-stack, MachineConfigPool, Node PodCIDR, OVN, RHCOS path, SELinux, route, and UNF ownership state. ADR 0068 accepts installation-time custom-CNI ownership and rejects forced conversion. The 2026-08-28 cl02 record correctly classifies its healthy OVN installation as requiring reprovisioning |
 | OpenShift primary-CNI reinstall package | **Verified** | `make openshift-primary-cni-package-check` verifies Assisted and exact five-host Agent-based installer-time `None` inputs, host/Node-block identity, anonymously pullable digest-pinned images with no cluster Quay credential, DNS-independent bootstrap, forwarding MachineConfigs, SCC/admission boundaries, RHCOS paths, sole socket-fenced CNI publication, fingerprinted replay, and foreign/drift refusal. OpenShift Installer 4.22.10 successfully generated the patched/custom-manifest agent ISO; ADR 0069 records the static and server-dry-run evidence, with no live support claim |
 | Full-CNI node networking | **Verified** | Distribution, runtime reconciliation, isolated Kind lifecycle, OpenShift installation boundary/package, live CNI 1.1 reconciliation, durable offline DEL, clean reboot, deliberate CRI-O failure, exact route/BPF/artifact teardown, no-CNI sandbox failure, and clean worker reprovision are Verified by committed gates and ADRs 0057–0073 |
+
+## Phase 4 work breakdown
+
+| Deliverable | State | Evidence / next gate |
+|---|---|---|
+| Universal Network Fabric product boundary | **Verified** | README and architecture define eBPF as the primary local fast path without forcing routing protocols, WireGuard control, gateways, or L7 into kernel programs |
+| Typed, bounded service IR | **Verified** | `unf-common` defines `ServiceId`/`BackendId`; `unf-service` validates schema/epoch/revision, provenance, supported protocols, addresses, ports, uniqueness, per-frontend same-family backend references, and explicit capacity bounds, then normalizes deterministically; `make service-ir-test`; ADR 0074 |
+| Kubernetes Service/EndpointSlice compiler | **Verified** | Stable length-delimited provisional IDs with collision admission; exact family/name/protocol/port matching; appProtocol plus slice/workload/Node/zone and readiness/serving/terminating provenance; equivalent-slice merge and ambiguous ownership rejection; controller last-valid retention and status; topology resource-version non-regression; `make service-compiler-test`; ADR 0075 |
+| Authenticated service snapshot distribution | **Planned** | Add service schema to the compatibility tuple, node snapshot endpoint, agent desired/applied acknowledgement, bounded polling, and last-known-good persistence |
+| Transactional service BPF maps | **Planned** | Accept frontend/backend/revision layout only after the conntrack/NAT hook ADR; stage, validate, atomically activate, recover, and capacity-fail without disturbing active service state |
+| ClusterIP forwarding and connection persistence | **Planned** | Dual-stack TCP/UDP first; deterministic backend selection, reverse translation, endpoint churn, no-backend behavior, timeouts, and program-replacement semantics must pass shared and live-kernel gates |
+| Service observability and explanation | **Planned** | Service/backend IDs, selected backend, revision, translation, no-backend/drop reasons, metrics, status, flow history, and `unfctl` explanation |
+| Kube-proxy-free Kind qualification | **Planned** | Dedicated dual-stack primary-CNI fixture with kube-proxy absent, direct Pod plus DNS continuity, Service lifecycle/failure recovery, exact cleanup, and schema-versioned evidence |
+| OpenShift service-fabric qualification | **Planned** | Only after Kind closure; use a deliberate disposable configuration and never disable the current cl02 kube-proxy path implicitly |
 
 ## Updating this tracker
 

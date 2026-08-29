@@ -2966,6 +2966,7 @@ dependencies = [
  "unf-ipam",
  "unf-policy",
  "unf-route",
+ "unf-service",
  "unf-state",
 ]
 
@@ -3026,6 +3027,16 @@ dependencies = [
  "unf-cni-state",
  "unf-ipam",
  "unf-link",
+]
+
+[[package]]
+name = "unf-service"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "unf-common",
 ]
 
 [[package]]

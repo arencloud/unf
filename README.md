@@ -1,11 +1,18 @@
-# Universal eBPF Network Fabric (UNF)
+# Universal Network Fabric (UNF)
 
-UNF is an early-stage, Rust-first network observability and policy project for
-Kubernetes and OpenShift. Its long-term goal is an identity-aware, explainable,
-multi-cluster eBPF network fabric. Phase 1 established observation, Phase 2 added
-the first identity-aware L3/L4 enforcement path, and Phase 3 completed its
-bounded Kubernetes compatibility and simulation gate. UNF is **not production-ready or
-a CNI replacement**.
+UNF is an early-stage, Rust-first Universal Network Fabric for Kubernetes and
+OpenShift, powered by an eBPF node dataplane. Its goal is one identity-aware,
+explainable, programmable fabric spanning policy, services, routing, egress,
+encryption, observability, and eventually multiple clusters. eBPF is the primary
+high-performance local execution engine; it does not force control-plane,
+routing-protocol, encryption, gateway, or L7 responsibilities into kernel
+programs where another bounded provider is safer.
+
+Phase 1 established observation, Phase 2 added identity-aware L3/L4 enforcement,
+Phase 3 completed bounded Kubernetes compatibility and simulation, and the
+full-CNI foundation now owns dual-stack Pod networking on exact qualified Kind
+and OpenShift tuples. UNF is **not production-ready**; these results are bounded
+development qualifications, not a general production support claim.
 
 ## Project status
 
@@ -89,7 +96,7 @@ The Phase 3 gate and all 42 deliverables are Verified. Exact closure evidence,
 limits, and the separately tracked full-CNI entry are maintained in the
 [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md)
 and ADR 0056.
-The full-CNI foundation is now in progress under ADRs 0057–0072. The `unf-cni`
+The bounded full-CNI foundation is Verified under ADRs 0057–0073. The `unf-cni`
 executable now composes dual-stack IPAM, exact veth, and native routing through
 atomic ADD/CHECK/DEL transactions and reconciles reboot-stale ownership from the
 CNI 1.1 `cni.dev/valid-attachments` authority. GC uses bounded network-scoped
@@ -129,6 +136,14 @@ reprovision from zero all pass committed gates. Qualification remains limited
 to the exact recorded development tuple; production repositories and other
 platform versions are not inferred. Existing overlay deployments are unchanged.
 See the [cl02 installation checkpoint](docs/development/openshift-primary-cni-cl02-install.md).
+Phase 4 is now in progress. Its first two verified slices add strongly typed
+`ServiceId`/`BackendId` values and a bounded, schema-versioned,
+Kubernetes-independent dual-stack service IR, plus deterministic Kubernetes
+Service/EndpointSlice compilation with collision-checked IDs, exact family and
+port matching, lifecycle provenance, last-valid retention, and explicit status.
+Authenticated agent distribution, eBPF service maps, connection persistence,
+and kube-proxy-free forwarding remain explicitly gated by the
+[Phase 4 service-fabric plan](docs/development/phase4-service-fabric-plan.md).
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -241,6 +256,11 @@ Implemented in the repository:
 - a kube-rs controller watching Nodes, Pods, Namespaces, Services, EndpointSlices,
   SecurityPolicies, and NetworkPolicies, with accepted/rejected compatibility
   status;
+- a validated service-fabric domain boundary with strongly typed service/backend
+  IDs, deterministic dual-stack frontend/backend normalization, EndpointSlice
+  readiness-state retention, exact per-frontend same-family backend references,
+  strict schema/revision fencing, and bounded snapshot cardinalities; this is not
+  yet distributed to agents or enforced by eBPF;
 - controller health, readiness, metrics, status, and userspace explanation APIs;
 - controller-aggregated per-node desired/applied identity and policy convergence;
 - bounded, schema-validated ConfigMap persistence for authenticated agent reports,
@@ -333,7 +353,8 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-Not implemented yet: service load balancing, production routing/CNI integration,
+Not implemented yet: eBPF service load balancing and kube-proxy replacement,
+production-scale routing/CNI qualification,
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
 multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production
 fail-closed recovery. Bounded TCP/UDP/SCTP reply state survives unrelated policy
@@ -343,7 +364,7 @@ tuples; runtime state resets when the eBPF program is replaced.
 ## Repository layout
 
 ```text
-crates/                 Domain, API, policy, and state libraries
+crates/                 Domain, API, policy, service, and state libraries
 bins/                   controller, node agent, and unfctl
 ebpf/                   shared ABI and separately-built Aya TC program
 deploy/                 generated CRDs and initial Kubernetes manifests

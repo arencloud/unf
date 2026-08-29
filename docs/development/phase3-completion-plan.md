@@ -1,6 +1,6 @@
 # Phase 3 completion and full-CNI entry plan
 
-Last reviewed: **2026-08-28**
+Last reviewed: **2026-08-29**
 
 This is the execution matrix for Phase 3 closure and the separately tracked
 full-CNI entry work. The
@@ -16,7 +16,7 @@ complete its parent milestone.
 | 1 | Broader failure and scale qualification | **Verified** | Existing two-node dual-stack Kind fixture | `make kind-scale-failure-test` plus a schema-versioned result record; ADR 0048 |
 | 2 | Expanded version compatibility matrix | **Verified** | Milestone 1 budgets and the compatibility tuple from ADR 0047 | Same-tuple skipped upgrade, incompatible-tuple rejection, persistent-state clean rebuild, supported/unsupported downgrade behavior, and transition reporting are Verified; ADRs 0049–0053 |
 | 3 | OpenShift cl02 upgrade qualification | **Verified** | Milestone 2 Kind evidence and development images in Quay | `make openshift-upgrade-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig`; ADR 0054 |
-| 4 | Broader platform/version coverage | **Verified** | Available clusters for each claimed platform | Four exact qualified tuples, including an isolated Kubernetes 1.34.8 endpoint/recovery/upgrade record; ADR 0055 |
+| 4 | Broader platform/version coverage | **Verified** | Available clusters for each claimed platform | Five exact qualified tuples, including isolated Kubernetes 1.34.8 and OpenShift 4.22.10 UNF primary-CNI records; ADRs 0055 and 0073 |
 | 5 | Phase 3 closure | **Verified** | Milestones 1–4 Verified | Complete release audit and Phase 3 marked **Verified** in `project-status.md`; ADR 0056 |
 | 6 | Full-CNI foundation entry | **Verified** | Milestone 5 Verified; architecture entry explicitly approved | ADRs 0057–0073 plus bounded CNI/IPAM/veth/routing/MTU/node-networking and exact Kind/OpenShift lifecycle gates |
 

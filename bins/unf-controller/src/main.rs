@@ -49,6 +49,10 @@ use unf_route::{
     MAX_REMOTE_NODES, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION, RemoteNodeIntent, RemoteRouteSnapshot,
     RemoteRouteSnapshotNode,
 };
+use unf_service::{
+    AddressFamily, EndpointPortSource, EndpointSliceSource, EndpointSource, ServiceSnapshot,
+    ServiceSource, ServiceSourcePort, compile_service_snapshot,
+};
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
     ComponentCompatibility, EgressIpv4PolicyMapEntry, EgressIpv4PolicyMapKey,
@@ -219,6 +223,10 @@ struct ControllerState {
     host_network_gateways: RwLock<BTreeMap<String, HostNetworkGateways>>,
     services: RwLock<BTreeMap<String, ServiceRecord>>,
     endpoint_slices: RwLock<BTreeMap<String, EndpointSliceRecord>>,
+    rejected_service_sources: RwLock<BTreeMap<String, String>>,
+    rejected_endpoint_slice_sources: RwLock<BTreeMap<String, String>>,
+    compiled_service_snapshot: RwLock<Option<ServiceSnapshot>>,
+    service_compilation_error: RwLock<Option<String>>,
     namespaces: RwLock<BTreeMap<String, BTreeMap<String, String>>>,
     security_policies: RwLock<BTreeMap<String, SecurityPolicy>>,
     compiled_security_policies: RwLock<BTreeMap<String, PolicyIr>>,
@@ -332,12 +340,14 @@ struct ServiceRecord {
     cluster_ips: BTreeSet<IpAddr>,
     selector: BTreeMap<String, String>,
     ports: Vec<TopologyServicePort>,
+    compiler_source: ServiceSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EndpointSliceRecord {
     service_reference: String,
     backends: Vec<TopologyServiceBackend>,
+    compiler_source: EndpointSliceSource,
 }
 
 #[derive(Debug, Serialize)]
@@ -353,6 +363,13 @@ struct StatusBody {
     unroutable_node_transports: usize,
     services: usize,
     endpoint_slices: usize,
+    rejected_service_sources: usize,
+    rejected_endpoint_slice_sources: usize,
+    compiled_services: usize,
+    compiled_service_frontends: usize,
+    compiled_service_backends: usize,
+    compiled_service_revision: u64,
+    service_compilation_error: Option<String>,
     namespaces: usize,
     security_policies: usize,
     network_policies: usize,
@@ -1008,6 +1025,10 @@ fn new_state_with_client_and_selector(
         host_network_gateways: RwLock::new(BTreeMap::new()),
         services: RwLock::new(BTreeMap::new()),
         endpoint_slices: RwLock::new(BTreeMap::new()),
+        rejected_service_sources: RwLock::new(BTreeMap::new()),
+        rejected_endpoint_slice_sources: RwLock::new(BTreeMap::new()),
+        compiled_service_snapshot: RwLock::new(None),
+        service_compilation_error: RwLock::new(None),
         namespaces: RwLock::new(BTreeMap::new()),
         security_policies: RwLock::new(BTreeMap::new()),
         compiled_security_policies: RwLock::new(BTreeMap::new()),
@@ -2280,6 +2301,7 @@ fn apply_service_event(state: &ControllerState, event: Event<Service>) {
             let key = object_key(&service);
             match service_record(&service) {
                 Ok(record) => {
+                    write_lock(&state.rejected_service_sources).remove(&key);
                     let previous = write_lock(&state.services).insert(key, record.clone());
                     state.metrics.reconciles.inc();
                     if previous.as_ref() != Some(&record) {
@@ -2288,15 +2310,16 @@ fn apply_service_event(state: &ControllerState, event: Event<Service>) {
                 }
                 Err(error) => {
                     state.metrics.errors.inc();
+                    write_lock(&state.rejected_service_sources)
+                        .insert(key.clone(), error.to_string());
                     warn!(%error, %key, "Service topology admission failed");
                 }
             }
         }
         Event::Delete(service) => {
-            if write_lock(&state.services)
-                .remove(&object_key(&service))
-                .is_some()
-            {
+            let key = object_key(&service);
+            write_lock(&state.rejected_service_sources).remove(&key);
+            if write_lock(&state.services).remove(&key).is_some() {
                 bump_service_and_topology_revision(state);
             }
         }
@@ -2304,6 +2327,7 @@ fn apply_service_event(state: &ControllerState, event: Event<Service>) {
             begin_topology_initialization(state);
             let had_services = !read_lock(&state.services).is_empty();
             write_lock(&state.services).clear();
+            write_lock(&state.rejected_service_sources).clear();
             if had_services {
                 bump_service_and_topology_revision(state);
             }
@@ -2334,6 +2358,7 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
         })?);
     }
     let mut ports = Vec::new();
+    let mut compiler_ports = Vec::new();
     for port in spec.ports.iter().flatten() {
         let number = u16::try_from(port.port).with_context(|| {
             format!(
@@ -2346,20 +2371,35 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
                 "Service {namespace}/{name} cannot expose port zero"
             ));
         }
+        let protocol = port.protocol.clone().unwrap_or_else(|| "TCP".to_owned());
+        let target_port = Some(port.target_port.as_ref().map_or_else(
+            || number.to_string(),
+            |target| match target {
+                IntOrString::Int(number) => number.to_string(),
+                IntOrString::String(name) => name.clone(),
+            },
+        ));
         ports.push(TopologyServicePort {
             name: port.name.clone(),
-            protocol: port.protocol.clone().unwrap_or_else(|| "TCP".to_owned()),
+            protocol: protocol.clone(),
             port: number,
-            target_port: Some(port.target_port.as_ref().map_or_else(
-                || number.to_string(),
-                |target| match target {
-                    IntOrString::Int(number) => number.to_string(),
-                    IntOrString::String(name) => name.clone(),
-                },
-            )),
+            target_port,
+        });
+        compiler_ports.push(ServiceSourcePort {
+            name: port.name.clone(),
+            protocol: service_protocol(&protocol)?,
+            port: number,
+            app_protocol: port.app_protocol.clone(),
         });
     }
     ports.sort();
+    compiler_ports.sort();
+    let compiler_source = ServiceSource {
+        namespace: namespace.clone(),
+        name: name.clone(),
+        cluster_ips: cluster_ips.iter().copied().collect(),
+        ports: compiler_ports,
+    };
     Ok(ServiceRecord {
         namespace,
         name,
@@ -2372,7 +2412,19 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
             .into_iter()
             .collect(),
         ports,
+        compiler_source,
     })
+}
+
+fn service_protocol(protocol: &str) -> Result<Protocol> {
+    match protocol {
+        "TCP" => Ok(Protocol::Tcp),
+        "UDP" => Ok(Protocol::Udp),
+        "SCTP" => Ok(Protocol::Sctp),
+        _ => Err(anyhow!(
+            "unsupported Service or EndpointSlice protocol {protocol:?}"
+        )),
+    }
 }
 
 async fn watch_endpoint_slices(
@@ -2404,6 +2456,7 @@ fn apply_endpoint_slice_event(state: &ControllerState, event: Event<EndpointSlic
             let key = object_key(&endpoint_slice);
             match endpoint_slice_record(&endpoint_slice) {
                 Ok(record) => {
+                    write_lock(&state.rejected_endpoint_slice_sources).remove(&key);
                     let previous = write_lock(&state.endpoint_slices).insert(key, record.clone());
                     state.metrics.reconciles.inc();
                     if previous.as_ref() != Some(&record) {
@@ -2412,18 +2465,16 @@ fn apply_endpoint_slice_event(state: &ControllerState, event: Event<EndpointSlic
                 }
                 Err(error) => {
                     state.metrics.errors.inc();
-                    if write_lock(&state.endpoint_slices).remove(&key).is_some() {
-                        bump_service_and_topology_revision(state);
-                    }
+                    write_lock(&state.rejected_endpoint_slice_sources)
+                        .insert(key.clone(), error.to_string());
                     warn!(%error, %key, "EndpointSlice topology admission failed");
                 }
             }
         }
         Event::Delete(endpoint_slice) => {
-            if write_lock(&state.endpoint_slices)
-                .remove(&object_key(&endpoint_slice))
-                .is_some()
-            {
+            let key = object_key(&endpoint_slice);
+            write_lock(&state.rejected_endpoint_slice_sources).remove(&key);
+            if write_lock(&state.endpoint_slices).remove(&key).is_some() {
                 bump_service_and_topology_revision(state);
             }
         }
@@ -2431,6 +2482,7 @@ fn apply_endpoint_slice_event(state: &ControllerState, event: Event<EndpointSlic
             begin_topology_initialization(state);
             let had_endpoint_slices = !read_lock(&state.endpoint_slices).is_empty();
             write_lock(&state.endpoint_slices).clear();
+            write_lock(&state.rejected_endpoint_slice_sources).clear();
             if had_endpoint_slices {
                 bump_service_and_topology_revision(state);
             }
@@ -2439,6 +2491,7 @@ fn apply_endpoint_slice_event(state: &ControllerState, event: Event<EndpointSlic
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn endpoint_slice_record(endpoint_slice: &EndpointSlice) -> Result<EndpointSliceRecord> {
     let namespace = endpoint_slice.namespace().ok_or_else(|| {
         anyhow!(
@@ -2457,6 +2510,15 @@ fn endpoint_slice_record(endpoint_slice: &EndpointSlice) -> Result<EndpointSlice
             anyhow!("EndpointSlice {namespace}/{name} is missing kubernetes.io/service-name")
         })?;
     let slice_reference = format!("{namespace}/{name}");
+    let address_family = match endpoint_slice.address_type.as_str() {
+        "IPv4" => AddressFamily::Ipv4,
+        "IPv6" => AddressFamily::Ipv6,
+        other => {
+            return Err(anyhow!(
+                "EndpointSlice {slice_reference} has unsupported address type {other:?}"
+            ));
+        }
+    };
     let ports = endpoint_slice
         .ports
         .iter()
@@ -2479,12 +2541,38 @@ fn endpoint_slice_record(endpoint_slice: &EndpointSlice) -> Result<EndpointSlice
         .collect::<Result<Vec<_>>>()?;
     let mut ports = ports;
     ports.sort();
+    let mut compiler_ports = endpoint_slice
+        .ports
+        .iter()
+        .flatten()
+        .map(|port| {
+            let protocol = port.protocol.as_deref().unwrap_or("TCP");
+            Ok(EndpointPortSource {
+                name: port.name.clone(),
+                protocol: service_protocol(protocol)?,
+                port: port.port.map(u16::try_from).transpose().with_context(|| {
+                    format!("EndpointSlice {slice_reference} contains a port outside the u16 range")
+                })?,
+                app_protocol: port.app_protocol.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    compiler_ports.sort();
 
     let mut backends = Vec::with_capacity(endpoint_slice.endpoints.len());
+    let mut compiler_endpoints = Vec::with_capacity(endpoint_slice.endpoints.len());
     for endpoint in &endpoint_slice.endpoints {
         let mut addresses = endpoint.addresses.clone();
         addresses.sort();
         addresses.dedup();
+        let compiler_addresses = addresses
+            .iter()
+            .map(|address| {
+                address.parse().with_context(|| {
+                    format!("EndpointSlice {slice_reference} contains invalid address {address:?}")
+                })
+            })
+            .collect::<Result<Vec<IpAddr>>>()?;
         let conditions = endpoint.conditions.as_ref();
         let ready = conditions.and_then(|value| value.ready).unwrap_or(true);
         let serving = conditions.and_then(|value| value.serving).unwrap_or(ready);
@@ -2507,7 +2595,7 @@ fn endpoint_slice_record(endpoint_slice: &EndpointSlice) -> Result<EndpointSlice
             endpoint_slice: slice_reference.clone(),
             address_type: endpoint_slice.address_type.clone(),
             addresses,
-            target_workload,
+            target_workload: target_workload.clone(),
             node_name: endpoint.node_name.clone(),
             zone: endpoint.zone.clone(),
             ready,
@@ -2515,11 +2603,29 @@ fn endpoint_slice_record(endpoint_slice: &EndpointSlice) -> Result<EndpointSlice
             terminating,
             ports: ports.clone(),
         });
+        compiler_endpoints.push(EndpointSource {
+            addresses: compiler_addresses,
+            target_workload,
+            node_name: endpoint.node_name.clone(),
+            zone: endpoint.zone.clone(),
+            ready,
+            serving,
+            terminating,
+            ports: compiler_ports.clone(),
+        });
     }
     backends.sort();
+    compiler_endpoints.sort();
     Ok(EndpointSliceRecord {
         service_reference: format!("{namespace}/{service_name}"),
         backends,
+        compiler_source: EndpointSliceSource {
+            namespace,
+            name,
+            service_name: service_name.clone(),
+            address_family,
+            endpoints: compiler_endpoints,
+        },
     })
 }
 
@@ -2737,6 +2843,12 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         revisions.policy,
         unix_time_millis(),
     );
+    let (
+        compiled_services,
+        compiled_service_frontends,
+        compiled_service_backends,
+        compiled_service_revision,
+    ) = compiled_service_counts(&state);
     Ok(Json(StatusBody {
         component: "unf-controller",
         healthy: true,
@@ -2756,6 +2868,13 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
             .count(),
         services: read_lock(&state.services).len(),
         endpoint_slices: read_lock(&state.endpoint_slices).len(),
+        rejected_service_sources: read_lock(&state.rejected_service_sources).len(),
+        rejected_endpoint_slice_sources: read_lock(&state.rejected_endpoint_slice_sources).len(),
+        compiled_services,
+        compiled_service_frontends,
+        compiled_service_backends,
+        compiled_service_revision,
+        service_compilation_error: read_lock(&state.service_compilation_error).clone(),
         namespaces: read_lock(&state.namespaces).len(),
         security_policies: read_lock(&state.security_policies).len(),
         network_policies: read_lock(&state.network_policies).len(),
@@ -2783,6 +2902,27 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
             "agent acknowledgements and the newest bounded flow history use separate single-controller ConfigMap checkpoints",
         ],
     }))
+}
+
+fn compiled_service_counts(state: &ControllerState) -> (usize, usize, usize, u64) {
+    read_lock(&state.compiled_service_snapshot)
+        .as_ref()
+        .map_or((0, 0, 0, 0), |snapshot| {
+            (
+                snapshot.services.len(),
+                snapshot
+                    .services
+                    .iter()
+                    .map(|service| service.frontends.len())
+                    .sum(),
+                snapshot
+                    .services
+                    .iter()
+                    .map(|service| service.backends.len())
+                    .sum(),
+                snapshot.revision.get(),
+            )
+        })
 }
 
 async fn agent_state(State(state): State<Arc<ControllerState>>) -> Json<AgentConvergenceSnapshot> {
@@ -5151,7 +5291,31 @@ fn bump_service_and_topology_revision(state: &ControllerState) {
         revisions.service = revisions.service.next();
         revisions.topology = revisions.topology.next();
     }
+    reconcile_service_snapshot(state);
     capture_topology_history(state);
+}
+
+fn reconcile_service_snapshot(state: &ControllerState) {
+    let revision = mutex_lock(&state.revisions).service;
+    let services = read_lock(&state.services)
+        .values()
+        .map(|record| record.compiler_source.clone())
+        .collect();
+    let endpoint_slices = read_lock(&state.endpoint_slices)
+        .values()
+        .map(|record| record.compiler_source.clone())
+        .collect();
+    match compile_service_snapshot(state.identity_epoch, revision, services, endpoint_slices) {
+        Ok(snapshot) => {
+            *write_lock(&state.compiled_service_snapshot) = Some(snapshot);
+            write_lock(&state.service_compilation_error).take();
+        }
+        Err(error) => {
+            state.metrics.errors.inc();
+            *write_lock(&state.service_compilation_error) = Some(error.to_string());
+            warn!(%error, revision = revision.get(), "retaining last-valid compiled service snapshot");
+        }
+    }
 }
 
 fn capture_topology_history(state: &ControllerState) {
@@ -5767,7 +5931,8 @@ mod tests {
                     "name": "http",
                     "protocol": "TCP",
                     "port": 80,
-                    "targetPort": 8080
+                    "targetPort": 8080,
+                    "appProtocol": "kubernetes.io/h2c"
                 }]
             }
         }))
@@ -5784,7 +5949,12 @@ mod tests {
                 "labels": {"kubernetes.io/service-name": "client"}
             },
             "addressType": "IPv4",
-            "ports": [{"name": "http", "protocol": "TCP", "port": 8080}],
+            "ports": [{
+                "name": "http",
+                "protocol": "TCP",
+                "port": 8080,
+                "appProtocol": "kubernetes.io/h2c"
+            }],
             "endpoints": [{
                 "addresses": ["10.42.0.10"],
                 "conditions": {
@@ -5803,6 +5973,48 @@ mod tests {
             }]
         }))
         .expect("test EndpointSlice is valid Kubernetes JSON")
+    }
+
+    fn topology_only_service_record() -> ServiceRecord {
+        ServiceRecord {
+            namespace: "backend".to_owned(),
+            name: "server".to_owned(),
+            service_type: "ClusterIP".to_owned(),
+            cluster_ips: BTreeSet::new(),
+            selector: BTreeMap::new(),
+            ports: Vec::new(),
+            compiler_source: ServiceSource {
+                namespace: "backend".to_owned(),
+                name: "server".to_owned(),
+                cluster_ips: Vec::new(),
+                ports: Vec::new(),
+            },
+        }
+    }
+
+    fn topology_only_endpoint_slice_record() -> EndpointSliceRecord {
+        EndpointSliceRecord {
+            service_reference: "backend/server".to_owned(),
+            backends: vec![TopologyServiceBackend {
+                endpoint_slice: "backend/server-abc".to_owned(),
+                address_type: "IPv4".to_owned(),
+                addresses: vec!["10.42.1.20".to_owned()],
+                target_workload: Some("backend/server".to_owned()),
+                node_name: Some("worker-a".to_owned()),
+                zone: None,
+                ready: true,
+                serving: true,
+                terminating: false,
+                ports: Vec::new(),
+            }],
+            compiler_source: EndpointSliceSource {
+                namespace: "backend".to_owned(),
+                name: "server-abc".to_owned(),
+                service_name: "server".to_owned(),
+                address_family: AddressFamily::Ipv4,
+                endpoints: Vec::new(),
+            },
+        }
     }
 
     fn flow_batch(observed_events: u64) -> FlowExportBatch {
@@ -6781,6 +6993,14 @@ mod tests {
             snapshot.services[0].ports[0].target_port.as_deref(),
             Some("8080")
         );
+        {
+            let compiled = read_lock(&state.compiled_service_snapshot);
+            let compiled = compiled.as_ref().expect("service intent compiled");
+            assert_eq!(compiled.revision, Revision::new(1));
+            assert_eq!(compiled.services.len(), 1);
+            assert_eq!(compiled.services[0].frontends.len(), 1);
+            assert!(compiled.services[0].backends.is_empty());
+        }
 
         let mut unchanged_service = service();
         unchanged_service.metadata.resource_version = Some("2".to_owned());
@@ -6822,7 +7042,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_slice_readiness_is_revisioned_and_removes_stale_state() {
+    fn endpoint_slice_readiness_is_revisioned_and_rejection_retains_valid_state() {
         let state = new_state(true);
         write_lock(&state.pods).insert(
             "frontend/client".to_owned(),
@@ -6845,6 +7065,24 @@ mod tests {
         assert!(backend.serving);
         assert!(!backend.terminating);
         assert_eq!(backend.ports[0].port, Some(8080));
+        {
+            let compiled = read_lock(&state.compiled_service_snapshot);
+            let compiled = compiled.as_ref().expect("EndpointSlice intent compiled");
+            assert_eq!(compiled.revision, Revision::new(2));
+            assert_eq!(compiled.services[0].backends.len(), 1);
+            let compiled_backend = &compiled.services[0].backends[0];
+            assert_eq!(compiled_backend.protocol, Protocol::Tcp);
+            assert_eq!(compiled_backend.port_name.as_deref(), Some("http"));
+            assert_eq!(
+                compiled_backend.app_protocol.as_deref(),
+                Some("kubernetes.io/h2c")
+            );
+            assert_eq!(
+                compiled_backend.target_workload.as_deref(),
+                Some("frontend/client")
+            );
+            assert!(!compiled_backend.ready);
+        }
 
         let mut metadata_only = endpoint_slice(false);
         metadata_only.metadata.resource_version = Some("2".to_owned());
@@ -6859,15 +7097,69 @@ mod tests {
         let mut malformed = endpoint_slice(true);
         malformed.metadata.labels = None;
         apply_endpoint_slice_event(&state, Event::Apply(malformed));
+        assert_eq!(mutex_lock(&state.revisions).service, Revision::new(3));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(3));
+        assert!(topology_snapshot(&state).services[0].backends[0].ready);
+        assert_eq!(read_lock(&state.rejected_endpoint_slice_sources).len(), 1);
+        assert_eq!(
+            read_lock(&state.compiled_service_snapshot)
+                .as_ref()
+                .expect("last-valid service intent retained")
+                .revision,
+            Revision::new(3)
+        );
+
+        apply_endpoint_slice_event(&state, Event::Apply(endpoint_slice(true)));
+        assert!(read_lock(&state.rejected_endpoint_slice_sources).is_empty());
+        apply_endpoint_slice_event(&state, Event::Delete(endpoint_slice(true)));
         assert_eq!(mutex_lock(&state.revisions).service, Revision::new(4));
         assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(4));
         assert!(topology_snapshot(&state).services[0].backends.is_empty());
+    }
 
-        apply_endpoint_slice_event(&state, Event::Apply(endpoint_slice(true)));
-        apply_endpoint_slice_event(&state, Event::Delete(endpoint_slice(true)));
-        assert_eq!(mutex_lock(&state.revisions).service, Revision::new(6));
-        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(6));
-        assert!(topology_snapshot(&state).services[0].backends.is_empty());
+    #[tokio::test]
+    async fn service_snapshot_collision_retains_last_valid_ir_and_is_reported() {
+        let state = Arc::new(new_state(true));
+        apply_service_event(&state, Event::Apply(service()));
+
+        let mut conflicting = service();
+        conflicting.metadata.name = Some("conflicting".to_owned());
+        apply_service_event(&state, Event::Apply(conflicting.clone()));
+
+        assert_eq!(mutex_lock(&state.revisions).service, Revision::new(2));
+        assert!(
+            read_lock(&state.service_compilation_error)
+                .as_deref()
+                .is_some_and(|error| error.contains("owned by more than one service"))
+        );
+        {
+            let snapshot = read_lock(&state.compiled_service_snapshot);
+            let snapshot = snapshot.as_ref().expect("last-valid snapshot retained");
+            assert_eq!(snapshot.revision, Revision::new(1));
+            assert_eq!(snapshot.services.len(), 1);
+        }
+
+        let status = status(State(Arc::clone(&state)))
+            .await
+            .expect("status remains available")
+            .0;
+        assert_eq!(status.services, 2);
+        assert_eq!(status.compiled_services, 1);
+        assert_eq!(status.compiled_service_frontends, 1);
+        assert_eq!(status.compiled_service_backends, 0);
+        assert_eq!(status.compiled_service_revision, 1);
+        assert!(status.service_compilation_error.is_some());
+
+        apply_service_event(&state, Event::Delete(conflicting));
+        assert_eq!(mutex_lock(&state.revisions).service, Revision::new(3));
+        assert!(read_lock(&state.service_compilation_error).is_none());
+        assert_eq!(
+            read_lock(&state.compiled_service_snapshot)
+                .as_ref()
+                .expect("valid state recompiles")
+                .revision,
+            Revision::new(3)
+        );
     }
 
     #[tokio::test]
@@ -7039,34 +7331,11 @@ mod tests {
         )
         .expect("current policy compiles");
         write_lock(&state.compiled_security_policies).insert(key.to_owned(), current.clone());
-        write_lock(&state.services).insert(
-            "backend/server".to_owned(),
-            ServiceRecord {
-                namespace: "backend".to_owned(),
-                name: "server".to_owned(),
-                service_type: "ClusterIP".to_owned(),
-                cluster_ips: BTreeSet::new(),
-                selector: BTreeMap::new(),
-                ports: Vec::new(),
-            },
-        );
+        write_lock(&state.services)
+            .insert("backend/server".to_owned(), topology_only_service_record());
         write_lock(&state.endpoint_slices).insert(
             "backend/server-abc".to_owned(),
-            EndpointSliceRecord {
-                service_reference: "backend/server".to_owned(),
-                backends: vec![TopologyServiceBackend {
-                    endpoint_slice: "backend/server-abc".to_owned(),
-                    address_type: "IPv4".to_owned(),
-                    addresses: vec!["10.42.1.20".to_owned()],
-                    target_workload: Some("backend/server".to_owned()),
-                    node_name: Some("worker-a".to_owned()),
-                    zone: None,
-                    ready: true,
-                    serving: true,
-                    terminating: false,
-                    ports: Vec::new(),
-                }],
-            },
+            topology_only_endpoint_slice_record(),
         );
         mutex_lock(&state.flow_history).ingest(flow_batch(12), 100);
         mutex_lock(&state.revisions).policy = Revision::new(7);

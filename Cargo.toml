@@ -11,6 +11,7 @@ members = [
     "crates/unf-ipam",
     "crates/unf-link",
     "crates/unf-route",
+    "crates/unf-service",
     "crates/unf-policy",
     "crates/unf-state",
     "ebpf/unf-ebpf-common",
@@ -22,7 +23,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
-repository = "https://github.com/unf-project/unf"
+repository = "https://github.com/arencloud/unf"
 
 [workspace.dependencies]
 anyhow = "1.0.100"

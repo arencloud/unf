@@ -257,8 +257,8 @@ matrix and reproducible evidence.
 
 Phase 3 is closed by the committed-revision regression, one-to-one requirements
 and limitations audit, and immutable release-readiness evidence in ADR 0056.
-Full CNI/IPAM, routing, service load balancing, encryption, L7, and multi-cluster
-transport remain gated or planned after these foundations. Additional external
+Post-foundation service load balancing, advanced routing providers, encryption,
+L7, and multi-cluster transport remain gated or planned. Additional external
 transport adapters remain conditional on product requirements.
 
 The ordered milestones and their evidence-bearing subpoints are maintained in
@@ -347,6 +347,29 @@ authoritative record of verified results.
   additionally prove exact CRI-O drain before agent stop, route/BPF/artifact
   teardown, a genuine no-CNI sandbox failure, host-network reinstall from zero,
   exact recovered state, platform health, and dual-stack forwarding.
-- Netkit, OpenShift primary-CNI installation, service load balancing,
+- Netkit, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.
+
+## Phase 4 — service-fabric foundation
+
+**Gate: In progress.** The ordered evidence matrix is maintained in the
+[Phase 4 service-fabric plan](development/phase4-service-fabric-plan.md).
+
+- Implemented and locally verified: strongly typed `ServiceId` and `BackendId`;
+  a Kubernetes-independent schema-v1 service snapshot; bounded service,
+  frontend, backend, and per-service cardinalities; strict epoch/revision,
+  protocol, address, port, provenance, and uniqueness validation; deterministic
+  normalization; deterministic Kubernetes Service/EndpointSlice compilation;
+  stable collision-checked IDs; exact family/name/protocol/port and appProtocol
+  provenance; lifecycle retention; ambiguous-source rejection; controller
+  last-valid retention; and truthful status. `make service-compiler-test`; ADRs
+  0074–0075.
+- Next: authenticated, revision/epoch-fenced service snapshot distribution with
+  agent desired/applied/error state and durable last-known-good recovery.
+- Gated: service compatibility tuple changes beyond the distribution contract,
+  transactional eBPF service maps, conntrack/NAT semantics, backend selection,
+  service observability/explanation, and kube-proxy-free dual-stack ClusterIP.
+- Later service slices: NodePort, LoadBalancer, session affinity,
+  `externalTrafficPolicy`, `internalTrafficPolicy`, topology-aware routing,
+  Maglev, and optional DSR. None is implied by the foundation gate.

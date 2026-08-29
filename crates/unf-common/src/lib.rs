@@ -26,6 +26,8 @@ macro_rules! numeric_id {
 numeric_id!(IdentityId);
 numeric_id!(PolicyId);
 numeric_id!(RuleId);
+numeric_id!(ServiceId);
+numeric_id!(BackendId);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -111,7 +113,10 @@ mod tests {
     fn ids_do_not_implicitly_mix() {
         let identity = IdentityId::new(7);
         let policy = PolicyId::new(7);
+        let service = ServiceId::new(7);
+        let backend = BackendId::new(7);
         assert_eq!(identity.get(), policy.get());
+        assert_eq!(service.get(), backend.get());
     }
 
     #[test]

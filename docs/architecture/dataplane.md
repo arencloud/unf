@@ -156,5 +156,10 @@ the exact cluster resources, and proves full redeploy recovery. The OpenShift
 agent uses the constrained three-capability boundary defined by ADR 0025, the
 exact mount boundary in ADR 0028, and the uninstall ordering in ADR 0029. The
 Phase 3 NetworkPolicy compatibility is complete at its documented bounded L4
-scope. Full-CNI dataplane ownership has entered its separate architecture under
-ADR 0057; link, routing, and cluster lifecycle implementation remain planned.
+scope. Full-CNI dataplane ownership, link/routing lifecycle, and exact Kind and
+OpenShift recovery are Verified under ADRs 0057–0073. Phase 4 now has a
+Kubernetes-independent service IR and deterministic retained-last-valid
+Kubernetes compiler under ADRs 0074–0075. Service distribution, map ABI, backend
+selection, conntrack/NAT behavior, eBPF forwarding, and kube-proxy replacement
+remain gated until their hook and failure semantics are separately accepted and
+tested.

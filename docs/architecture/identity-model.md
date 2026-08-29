@@ -27,8 +27,8 @@ are compiled into `POLICY_IPV4` while destination workload identity and normal
 policy provenance remain mandatory. Native identity policy and compatibility
 decisions still converge in the shared evaluator before lowering.
 
-Identity BPF distribution and controller-epoch recovery are verified. Map pinning,
-durable allocation, multi-controller ownership, and explicit unknown-identity
+Identity BPF distribution, pinning, and controller-epoch recovery are verified.
+Durable allocation, multi-controller ownership, and explicit unknown-identity
 enforcement semantics remain open. IPv6 `ipBlock` is enforced separately through
 bounded prefix-policy state and does not change identity allocation. See ADRs
 0005, 0006, 0013, and 0014.
