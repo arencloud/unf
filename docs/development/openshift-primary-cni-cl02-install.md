@@ -89,6 +89,14 @@ oc get networkpolicy -A -o json | jq '
   )]'
 ```
 
+## Remediation status
+
+ADR 0070 implements fixes for all four observed gaps and the complete isolated
+dual-stack primary-CNI Kind lifecycle passes with those changes. The fixes are
+not credited as live cl02 evidence until immutable images are deployed, all 24
+temporary policies are removed, and operator, canary, convergence, outage, and
+reboot checks pass without recreating them.
+
 ## Remaining exit criteria
 
 The live primary-CNI lifecycle remains **In progress** until repository changes
@@ -103,4 +111,3 @@ and repeatable gates eliminate the temporary policies and prove:
 - exact artifact, route, and BPF teardown, no-CNI baseline behavior, and clean
   reprovision recovery; and
 - a committed, self-cleaning qualification command and evidence artifact.
-

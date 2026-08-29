@@ -32,6 +32,8 @@ spec:
             - --listen
             - 0.0.0.0:9963
             - --all-interfaces
+            - --hook-coverage
+            - both
             - --ebpf-object
             - /opt/unf/ebpf/unf-ebpf-tc
             - --bpf-pin-path

@@ -152,15 +152,15 @@ pub const fn packet_starts_connection(protocol: u8, tcp_flags: u8) -> bool {
 #[must_use]
 pub const fn connection_is_active(
     state: ConnectionState,
-    policy_revision: u64,
+    active_policy_revision: u64,
     now_ns: u64,
     protocol: u8,
 ) -> bool {
     let Some(timeout_ns) = connection_timeout_ns(protocol) else {
         return false;
     };
-    state.policy_revision == policy_revision
-        && policy_revision != 0
+    state.policy_revision != 0
+        && active_policy_revision != 0
         && now_ns.saturating_sub(state.last_seen_ns) <= timeout_ns
 }
 
@@ -427,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_state_is_protocol_bounded_and_revision_scoped() {
+    fn connection_state_is_protocol_bounded_and_survives_policy_churn() {
         let state = ConnectionState {
             last_seen_ns: 10,
             policy_revision: 7,
@@ -444,7 +444,8 @@ mod tests {
             11 + CONNECTION_TCP_TIMEOUT_NS,
             6
         ));
-        assert!(!connection_is_active(state, 8, 11, 6));
+        assert!(connection_is_active(state, 8, 11, 6));
+        assert!(!connection_is_active(state, 0, 11, 6));
         assert!(!connection_is_active(state, 7, 11, 1));
     }
 

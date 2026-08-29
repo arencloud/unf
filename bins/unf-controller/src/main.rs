@@ -55,12 +55,12 @@ use unf_state::{
     EgressIpv6PolicyMapEntry, EgressIpv6PolicyMapKey, FLOW_EXPORT_BATCH_LIMIT,
     FLOW_EXPORT_SCHEMA_VERSION, FLOW_HISTORY_CAPACITY, FlowExportBatch, FlowExportRecord,
     FlowHistoryCheckpoint, FlowHistoryQuerySummary, FlowHistorySnapshot, FlowHistoryStore,
-    IdentityRegistry, IdentityStateSnapshot, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
-    PolicyDecisionRecord, PolicyStateSnapshot, RevisionSet, TOPOLOGY_HISTORY_CAPACITY,
-    TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyHistoryCheckpoint, TopologyHistorySnapshot,
-    TopologyHistoryStore, TopologyNode, TopologyService, TopologyServiceBackend,
-    TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
-    provisional_identity_id,
+    IdentityRegistry, IdentityStateSnapshot, Ipv4PolicyMapEntry, Ipv6PolicyMapEntry,
+    NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord, PolicyStateSnapshot,
+    RevisionSet, TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION,
+    TopologyHistoryCheckpoint, TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode,
+    TopologyService, TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort,
+    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
 };
 
 mod external_flow_export;
@@ -308,6 +308,7 @@ struct PodRecord {
     name: String,
     uid: String,
     node_name: Option<String>,
+    host_network: bool,
     endpoint: Endpoint,
     ipv4_addresses: BTreeSet<std::net::Ipv4Addr>,
     ipv6_addresses: BTreeSet<Ipv6Addr>,
@@ -1559,22 +1560,14 @@ async fn watch_pods(api: Api<Pod>, state: Arc<ControllerState>, cancellation: Ca
 fn apply_pod_event(state: &ControllerState, event: Event<Pod>) {
     let _policy_state_guard = write_lock(&state.policy_state_guard);
     match event {
-        Event::Apply(pod) | Event::InitApply(pod) => upsert_pod(state, &pod),
-        Event::Delete(pod) => {
-            let key = object_key(&pod);
-            let removed = write_lock(&state.pods).remove(&key);
-            mutex_lock(&state.identities).remove_pod(&key);
-            if let Some(removed) = removed {
-                bump_topology_revision(state);
-                if !removed.ipv4_addresses.is_empty()
-                    || !read_lock(&state.pods)
-                        .values()
-                        .any(|pod| pod.endpoint.identity == removed.endpoint.identity)
-                {
-                    bump_policy_revision(state);
-                }
+        Event::Apply(pod) | Event::InitApply(pod) => {
+            if pod_is_terminal(&pod) {
+                remove_pod(state, &object_key(&pod));
+            } else {
+                upsert_pod(state, &pod);
             }
         }
+        Event::Delete(pod) => remove_pod(state, &object_key(&pod)),
         Event::Init => {
             begin_topology_initialization(state);
             let had_pods = !read_lock(&state.pods).is_empty();
@@ -1586,6 +1579,31 @@ fn apply_pod_event(state: &ControllerState, event: Event<Pod>) {
             }
         }
         Event::InitDone => finish_topology_initialization(state),
+    }
+}
+
+fn pod_is_terminal(pod: &Pod) -> bool {
+    matches!(
+        pod.status
+            .as_ref()
+            .and_then(|status| status.phase.as_deref()),
+        Some("Succeeded" | "Failed")
+    )
+}
+
+fn remove_pod(state: &ControllerState, key: &str) {
+    let removed = write_lock(&state.pods).remove(key);
+    mutex_lock(&state.identities).remove_pod(key);
+    if let Some(removed) = removed {
+        bump_topology_revision(state);
+        if !removed.ipv4_addresses.is_empty()
+            || !removed.ipv6_addresses.is_empty()
+            || !read_lock(&state.pods)
+                .values()
+                .any(|pod| pod.endpoint.identity == removed.endpoint.identity)
+        {
+            bump_policy_revision(state);
+        }
     }
 }
 
@@ -1636,6 +1654,7 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
         labels: labels.clone(),
     };
     let key = format!("{namespace}/{name}");
+    let host_network = pod_uses_host_network(pod);
     let addresses = pod_addresses(pod);
     if let Err(error) = mutex_lock(&state.identities).admit_pod(
         key.clone(),
@@ -1656,30 +1675,23 @@ fn upsert_pod(state: &ControllerState, pod: &Pod) {
         labels,
         named_ports,
     };
+    let (ipv4_addresses, ipv6_addresses) = pod_address_families(pod);
     let record = PodRecord {
         namespace,
         name,
         uid: pod.metadata.uid.clone().unwrap_or_default(),
         node_name: pod.spec.as_ref().and_then(|spec| spec.node_name.clone()),
+        host_network,
         endpoint,
-        ipv4_addresses: addresses
-            .iter()
-            .filter_map(|address| match address {
-                IpAddr::V4(address) => Some(*address),
-                IpAddr::V6(_) => None,
-            })
-            .collect(),
-        ipv6_addresses: addresses
-            .iter()
-            .filter_map(|address| match address {
-                IpAddr::V4(_) => None,
-                IpAddr::V6(address) => Some(*address),
-            })
-            .collect(),
+        ipv4_addresses,
+        ipv6_addresses,
     };
     let previous = write_lock(&state.pods).insert(key, record.clone());
     if previous.as_ref().is_none_or(|previous| {
-        previous.endpoint != record.endpoint || previous.ipv4_addresses != record.ipv4_addresses
+        previous.endpoint != record.endpoint
+            || previous.host_network != record.host_network
+            || previous.ipv4_addresses != record.ipv4_addresses
+            || previous.ipv6_addresses != record.ipv6_addresses
     }) {
         bump_policy_revision(state);
     }
@@ -1724,15 +1736,37 @@ fn pod_named_ports(pod: &Pod) -> Result<BTreeMap<NamedPort, u16>> {
 }
 
 fn pod_addresses(pod: &Pod) -> BTreeSet<IpAddr> {
-    let mut addresses = BTreeSet::new();
-    if pod
-        .spec
+    if pod_uses_host_network(pod) {
+        return BTreeSet::new();
+    }
+    pod_status_addresses(pod)
+}
+
+fn pod_uses_host_network(pod: &Pod) -> bool {
+    pod.spec
         .as_ref()
         .and_then(|spec| spec.host_network)
         .unwrap_or(false)
-    {
-        return addresses;
+}
+
+fn pod_address_families(pod: &Pod) -> (BTreeSet<Ipv4Addr>, BTreeSet<Ipv6Addr>) {
+    let mut ipv4 = BTreeSet::new();
+    let mut ipv6 = BTreeSet::new();
+    for address in pod_status_addresses(pod) {
+        match address {
+            IpAddr::V4(address) => {
+                ipv4.insert(address);
+            }
+            IpAddr::V6(address) => {
+                ipv6.insert(address);
+            }
+        }
     }
+    (ipv4, ipv6)
+}
+
+fn pod_status_addresses(pod: &Pod) -> BTreeSet<IpAddr> {
+    let mut addresses = BTreeSet::new();
     if let Some(status) = &pod.status {
         if let Some(pod_ips) = &status.pod_ips {
             for pod_ip in pod_ips {
@@ -3672,13 +3706,20 @@ fn dataplane_policy_state(state: &ControllerState) -> Result<DataplanePolicyStat
     let entries = compile_dataplane_entries(&ingress_policies, &endpoints)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let ipv4_endpoints = ipv4_endpoints_with_namespace_labels(state);
-    let ipv4_entries =
+    let mut ipv4_entries =
         compile_ipv4_dataplane_entries(&ingress_policies, &endpoints, &ipv4_endpoints)
             .map_err(|error| ApiError::internal(error.to_string()))?;
     let ipv6_endpoints = ipv6_endpoints_with_namespace_labels(state);
-    let ipv6_entries =
+    let mut ipv6_entries =
         compile_ipv6_dataplane_entries(&ingress_policies, &endpoints, &ipv6_endpoints)
             .map_err(|error| ApiError::internal(error.to_string()))?;
+    add_host_network_ingress_entries(
+        state,
+        &ingress_policies,
+        &endpoints,
+        &mut ipv4_entries,
+        &mut ipv6_entries,
+    )?;
     let mut egress_ipv4_entries =
         compile_egress_ipv4_dataplane_entries(&egress_policies, &endpoints, &ipv4_endpoints)
             .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -3703,6 +3744,102 @@ fn dataplane_policy_state(state: &ControllerState) -> Result<DataplanePolicyStat
     );
     *cache = Some(snapshot.clone());
     Ok(snapshot)
+}
+
+fn add_host_network_ingress_entries(
+    state: &ControllerState,
+    ingress_policies: &[PolicyIr],
+    endpoints: &[Endpoint],
+    ipv4_entries: &mut Vec<Ipv4PolicyMapEntry>,
+    ipv6_entries: &mut Vec<Ipv6PolicyMapEntry>,
+) -> Result<(), ApiError> {
+    let namespaces = read_lock(&state.namespaces);
+    let pods = read_lock(&state.pods);
+    for pod in pods.values().filter(|pod| pod.host_network) {
+        let endpoint = endpoint_with_namespace_labels(&pod.endpoint, &namespaces);
+        for address in &pod.ipv4_addresses {
+            let source = Ipv4Endpoint {
+                address: *address,
+                endpoint: endpoint.clone(),
+            };
+            let candidates = compile_ipv4_dataplane_entries(
+                ingress_policies,
+                endpoints,
+                std::slice::from_ref(&source),
+            )
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+            for candidate in candidates
+                .into_iter()
+                .filter(|entry| entry.key.source_address == *address)
+            {
+                merge_host_network_ipv4_entry(ipv4_entries, candidate)?;
+            }
+        }
+        for address in &pod.ipv6_addresses {
+            let source = Ipv6Endpoint {
+                address: *address,
+                endpoint: endpoint.clone(),
+            };
+            let candidates = compile_ipv6_dataplane_entries(
+                ingress_policies,
+                endpoints,
+                std::slice::from_ref(&source),
+            )
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+            for candidate in candidates.into_iter().filter(|entry| {
+                entry.key.source_network == *address && entry.key.source_prefix_len == 128
+            }) {
+                merge_host_network_ipv6_entry(ipv6_entries, candidate)?;
+            }
+        }
+    }
+    ipv4_entries.sort_by_key(|entry| entry.key);
+    ipv6_entries.sort_by_key(|entry| entry.key);
+    Ok(())
+}
+
+fn merge_host_network_ipv4_entry(
+    entries: &mut Vec<Ipv4PolicyMapEntry>,
+    candidate: Ipv4PolicyMapEntry,
+) -> Result<(), ApiError> {
+    if let Some(existing) = entries.iter_mut().find(|entry| entry.key == candidate.key) {
+        if candidate.decision.verdict == Verdict::Allow
+            && existing.decision.verdict != Verdict::Allow
+        {
+            *existing = candidate;
+        }
+        return Ok(());
+    }
+    if entries.len() >= unf_state::POLICY_MAP_BANK_ENTRY_LIMIT {
+        return Err(ApiError::internal(format!(
+            "IPv4 policy entry limit {} exceeded while adding host-network peers",
+            unf_state::POLICY_MAP_BANK_ENTRY_LIMIT
+        )));
+    }
+    entries.push(candidate);
+    Ok(())
+}
+
+fn merge_host_network_ipv6_entry(
+    entries: &mut Vec<Ipv6PolicyMapEntry>,
+    candidate: Ipv6PolicyMapEntry,
+) -> Result<(), ApiError> {
+    if let Some(existing) = entries.iter_mut().find(|entry| entry.key == candidate.key) {
+        if candidate.decision.verdict == Verdict::Allow
+            && existing.decision.verdict != Verdict::Allow
+        {
+            *existing = candidate;
+        }
+        return Ok(());
+    }
+    if entries.len() >= unf_state::POLICY_MAP_BANK_ENTRY_LIMIT {
+        return Err(ApiError::internal(format!(
+            "IPv6 policy entry limit {} exceeded while adding host-network peers",
+            unf_state::POLICY_MAP_BANK_ENTRY_LIMIT
+        )));
+    }
+    entries.push(candidate);
+    Ok(())
 }
 
 fn add_ovn_host_network_reply_entries(
@@ -4669,6 +4806,7 @@ fn ipv4_endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Ipv4Endp
     let namespaces = read_lock(&state.namespaces);
     let mut endpoints: Vec<_> = read_lock(&state.pods)
         .values()
+        .filter(|pod| !pod.host_network)
         .flat_map(|pod| {
             let endpoint = endpoint_with_namespace_labels(&pod.endpoint, &namespaces);
             pod.ipv4_addresses
@@ -4697,6 +4835,7 @@ fn ipv6_endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Ipv6Endp
     let namespaces = read_lock(&state.namespaces);
     let mut endpoints: Vec<_> = read_lock(&state.pods)
         .values()
+        .filter(|pod| !pod.host_network)
         .flat_map(|pod| {
             let endpoint = endpoint_with_namespace_labels(&pod.endpoint, &namespaces);
             pod.ipv6_addresses
@@ -5052,6 +5191,7 @@ mod tests {
             name: name.to_owned(),
             uid: format!("{namespace}-{name}-uid"),
             node_name: Some("worker-a".to_owned()),
+            host_network: false,
             endpoint: Endpoint {
                 identity: unf_common::IdentityId::new(id),
                 namespace: namespace.to_owned(),
@@ -5268,6 +5408,90 @@ mod tests {
         assert!(!egress_ipv4.iter().any(|entry| {
             entry.key.source_identity == IdentityId::new(20)
                 && entry.key.destination_address == "10.131.0.2".parse::<Ipv4Addr>().unwrap()
+                && entry.decision.verdict == Verdict::Allow
+        }));
+    }
+
+    #[test]
+    fn physical_host_network_sources_use_pod_namespace_identity() {
+        let state = new_state(true);
+        write_lock(&state.namespaces).extend([
+            (
+                "openshift-ingress".to_owned(),
+                BTreeMap::from([(
+                    "kubernetes.io/metadata.name".to_owned(),
+                    "openshift-ingress".to_owned(),
+                )]),
+            ),
+            (
+                "other".to_owned(),
+                BTreeMap::from([("kubernetes.io/metadata.name".to_owned(), "other".to_owned())]),
+            ),
+        ]);
+        let mut target = pod_record(10, "openshift-ingress-canary", "canary", "canary");
+        target
+            .ipv4_addresses
+            .insert("10.128.0.10".parse().expect("valid target IPv4"));
+        target
+            .ipv6_addresses
+            .insert("fd01::10".parse().expect("valid target IPv6"));
+        let mut router = pod_record(20, "openshift-ingress", "router", "router");
+        router.host_network = true;
+        router
+            .ipv4_addresses
+            .insert("10.50.60.202".parse().expect("valid Node IPv4"));
+        router
+            .ipv6_addresses
+            .insert("fdff::202".parse().expect("valid Node IPv6"));
+        let mut unrelated = pod_record(30, "other", "host-daemon", "host-daemon");
+        unrelated.host_network = true;
+        unrelated.ipv4_addresses = router.ipv4_addresses.clone();
+        unrelated.ipv6_addresses = router.ipv6_addresses.clone();
+        write_lock(&state.pods).extend([
+            ("openshift-ingress-canary/canary".to_owned(), target),
+            ("openshift-ingress/router".to_owned(), router),
+            ("other/host-daemon".to_owned(), unrelated),
+        ]);
+        let policy: NetworkPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": "ingress-canary",
+                "namespace": "openshift-ingress-canary"
+            },
+            "spec": {
+                "podSelector": {"matchLabels": {"app": "canary"}},
+                "policyTypes": ["Ingress"],
+                "ingress": [{
+                    "from": [{
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": "openshift-ingress"
+                            }
+                        }
+                    }],
+                    "ports": [{"protocol": "TCP", "port": 8443}]
+                }]
+            }
+        }))
+        .expect("test host-network policy is valid Kubernetes JSON");
+        apply_network_policy_event(&state, Event::Apply(policy));
+
+        let (_, _, ipv4, ipv6, _, _) =
+            dataplane_policy_state(&state).expect("host-network peers lower without conflicts");
+        assert!(ipv4.iter().any(|entry| {
+            entry.key.source_address == "10.50.60.202".parse::<Ipv4Addr>().unwrap()
+                && entry.key.destination_identity == IdentityId::new(10)
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 8443
+                && entry.decision.verdict == Verdict::Allow
+        }));
+        assert!(ipv6.iter().any(|entry| {
+            entry.key.source_network == "fdff::202".parse::<Ipv6Addr>().unwrap()
+                && entry.key.source_prefix_len == 128
+                && entry.key.destination_identity == IdentityId::new(10)
+                && entry.key.protocol == Protocol::Tcp as u8
+                && entry.key.destination_port == 8443
                 && entry.decision.verdict == Verdict::Allow
         }));
     }
@@ -6297,6 +6521,64 @@ mod tests {
         apply_pod_event(&state, Event::Apply(rescheduled));
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(1));
         assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(2));
+    }
+
+    #[test]
+    fn terminal_pod_releases_identity_for_same_ip_replacement() {
+        let state = new_state(true);
+        let address = "10.42.0.10".parse().expect("valid test address");
+        let pod = scheduled_pod("worker-a");
+        apply_pod_event(&state, Event::Apply(pod.clone()));
+        let original_identity = mutex_lock(&state.identities)
+            .identity_for_ip(address)
+            .expect("running Pod IP is indexed");
+
+        let mut terminal = pod;
+        terminal.metadata.resource_version = Some("2".to_owned());
+        terminal.status.get_or_insert_default().phase = Some("Succeeded".to_owned());
+        apply_pod_event(&state, Event::Apply(terminal));
+
+        assert!(!read_lock(&state.pods).contains_key("frontend/client"));
+        assert_eq!(mutex_lock(&state.identities).identity_for_ip(address), None);
+
+        let mut replacement = scheduled_pod("worker-b");
+        replacement.metadata.name = Some("replacement".to_owned());
+        replacement
+            .metadata
+            .labels
+            .get_or_insert_default()
+            .insert("app".to_owned(), "replacement".to_owned());
+        apply_pod_event(&state, Event::Apply(replacement));
+
+        let replacement_identity = mutex_lock(&state.identities)
+            .identity_for_ip(address)
+            .expect("replacement Pod reuses the released IP");
+        assert_ne!(replacement_identity, original_identity);
+        assert!(read_lock(&state.pods).contains_key("frontend/replacement"));
+        assert_eq!(mutex_lock(&state.identities).revision(), Revision::new(3));
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(3));
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::new(3));
+    }
+
+    #[test]
+    fn terminal_pods_in_initial_list_are_not_admitted() {
+        let state = new_state(true);
+        let mut terminal = scheduled_pod("worker-a");
+        terminal.status.get_or_insert_default().phase = Some("Failed".to_owned());
+
+        apply_pod_event(&state, Event::Init);
+        apply_pod_event(&state, Event::InitApply(terminal));
+        apply_pod_event(&state, Event::InitDone);
+
+        assert!(read_lock(&state.pods).is_empty());
+        assert_eq!(mutex_lock(&state.identities).identity_count(), 0);
+        assert_eq!(mutex_lock(&state.identities).address_count(), 0);
+        assert_eq!(
+            mutex_lock(&state.identities).revision(),
+            Revision::default()
+        );
+        assert_eq!(mutex_lock(&state.revisions).policy, Revision::default());
+        assert_eq!(mutex_lock(&state.revisions).topology, Revision::default());
     }
 
     #[test]

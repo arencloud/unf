@@ -198,9 +198,10 @@ matrix and reproducible evidence.
 - Implemented and two-node kind verified: source-node agent replacement with the
   controller offline retains populated IPv4/IPv6 egress maps, the exact policy
   revision, and direct-Pod allow/deny forwarding before clean reconvergence;
-- Implemented and two-node kind verified: bounded, revision-scoped TCP/UDP/SCTP
-  reply state, including the formerly excluded same-Namespace target-exception
-  path over both address families and explicit established provenance;
+- Implemented and primary-CNI Kind verified: bounded TCP/UDP/SCTP reply state
+  survives unrelated policy revision churn, primary mode observes both TC
+  directions for translated tuples, and replies retain explicit established
+  provenance; ADR 0070 records the refined boundary;
 - Completed on dual-stack OpenShift: source-selected egress and stateful replies,
   including OVN host-network gateway identity, same-node router replies, named
   TCP/UDP, protocol-only SCTP, bounded IPv4/global IPv6 `ipBlock` exceptions,

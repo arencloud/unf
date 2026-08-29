@@ -154,5 +154,5 @@ allow/default-deny/exception recovery and bounded extension-header traversal.
 Non-L4 related-flow association, non-initial fragments, IPv6 jumbograms/ESP/reassembly,
 malformed or over-limit extension chains, unbounded compiler output, and complete
 upstream suite execution remain outside this claim. Runtime reply state is bounded,
-revision-scoped, and reset by eBPF program replacement; those boundaries stay visible
-in the authoritative [project tracker](../project-status.md).
+survives unrelated policy revisions, and resets on eBPF program replacement; those
+boundaries stay visible in the authoritative [project tracker](../project-status.md).

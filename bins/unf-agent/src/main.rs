@@ -130,6 +130,10 @@ struct Args {
     all_interfaces: bool,
     #[arg(long, value_enum, default_value = "ingress")]
     direction: Direction,
+    /// Select one TC hook or both hooks so pre- and post-NAT tuples can share
+    /// the bounded reply-state map.
+    #[arg(long, env = "UNF_HOOK_COVERAGE", value_enum, default_value = "single")]
+    hook_coverage: HookCoverage,
     #[arg(long, env = "UNF_CONTROLLER_URL")]
     controller_url: Option<String>,
     #[arg(
@@ -295,6 +299,12 @@ struct CleanupArgs {
 enum Direction {
     Ingress,
     Egress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum HookCoverage {
+    Single,
+    Both,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -484,6 +494,7 @@ struct DataplaneConfig {
     interface: Option<String>,
     all_interfaces: bool,
     direction: Direction,
+    hook_coverage: HookCoverage,
     controller_url: Option<String>,
     controller_ca_path: PathBuf,
     identity_sync_interval: Duration,
@@ -511,6 +522,7 @@ struct RemoteRouteRuntime {
     controller_url: String,
     client: ReloadingControllerClient,
     token_path: PathBuf,
+    node_block_state_path: PathBuf,
     state_path: PathBuf,
     local: NodeBlockSnapshot,
     ipv4_output_interface: u32,
@@ -574,26 +586,53 @@ struct LegacyCleanupTarget {
     direction: &'static str,
 }
 
-struct InterfaceAttachments<'program> {
-    program: &'program mut SchedClassifier,
+struct InterfaceAttachments<'ebpf> {
+    ebpf: &'ebpf mut Ebpf,
+    interface: Option<String>,
     all_interfaces: bool,
-    attach_type: TcAttachType,
-    direction: Direction,
+    primary_direction: Direction,
+    hook_coverage: HookCoverage,
     mode: TcAttachmentMode,
     pin_root: PathBuf,
-    attached: HashMap<String, u32>,
+    ingress_attached: HashMap<String, u32>,
+    egress_attached: HashMap<String, u32>,
 }
 
 impl InterfaceAttachments<'_> {
     fn refresh(&mut self) -> Result<()> {
-        refresh_interfaces(
-            self.program,
-            self.attach_type,
-            self.direction,
-            self.mode,
-            &self.pin_root,
-            &mut self.attached,
-        )
+        let discovered = if self.all_interfaces {
+            discover_interfaces()?
+        } else if let Some(interface) = self.interface.as_deref() {
+            HashMap::from([(interface.to_owned(), interface_index(interface)?)])
+        } else {
+            HashMap::new()
+        };
+        if self.hook_coverage == HookCoverage::Both || self.primary_direction == Direction::Ingress
+        {
+            refresh_direction(
+                self.ebpf,
+                Direction::Ingress,
+                self.mode,
+                &self.pin_root,
+                &discovered,
+                &mut self.ingress_attached,
+            )?;
+        }
+        if self.hook_coverage == HookCoverage::Both || self.primary_direction == Direction::Egress {
+            refresh_direction(
+                self.ebpf,
+                Direction::Egress,
+                self.mode,
+                &self.pin_root,
+                &discovered,
+                &mut self.egress_attached,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ingress_attached.is_empty() && self.egress_attached.is_empty()
     }
 }
 
@@ -688,6 +727,7 @@ async fn main() -> Result<()> {
             let object = object.clone();
             let interface = interface.clone();
             let direction = args.direction;
+            let hook_coverage = args.hook_coverage;
             let controller_url = args.controller_url.clone();
             let controller_ca_path = args.controller_ca_path.clone();
             let identity_sync_interval = Duration::from_secs(args.identity_sync_seconds.max(1));
@@ -702,6 +742,7 @@ async fn main() -> Result<()> {
                     interface,
                     all_interfaces,
                     direction,
+                    hook_coverage,
                     controller_url,
                     controller_ca_path,
                     identity_sync_interval,
@@ -881,6 +922,26 @@ async fn resolve_cni_provider(
     }
 }
 
+async fn fetch_node_block_snapshot(
+    controller_url: &str,
+    client: &ReloadingControllerClient,
+    token_path: &Path,
+) -> Result<NodeBlockSnapshot> {
+    authenticated_get(
+        client,
+        format!("{controller_url}/v1/state/node-block"),
+        token_path,
+    )?
+    .send()
+    .await
+    .context("request controller node-block snapshot")?
+    .error_for_status()
+    .context("controller rejected node-block snapshot request")?
+    .json()
+    .await
+    .context("decode controller node-block snapshot")
+}
+
 fn validate_node_block_snapshot(snapshot: &NodeBlockSnapshot, node_name: &str) -> Result<()> {
     if snapshot.schema_version != NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION {
         bail!(
@@ -1052,6 +1113,7 @@ async fn initialize_remote_routes(
         controller_url,
         client,
         token_path: args.agent_token_path.clone(),
+        node_block_state_path: args.cni_node_block_state_path.clone(),
         state_path: args.cni_remote_route_state_path.clone(),
         local,
         ipv4_output_interface,
@@ -1120,6 +1182,30 @@ async fn run_remote_route_reconciler(
         tokio::select! {
             () = cancellation.cancelled() => break,
             _ = interval.tick() => {
+                let local = match fetch_node_block_snapshot(
+                    &runtime.controller_url,
+                    &runtime.client,
+                    &runtime.token_path,
+                ).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        record_remote_route_error(&state);
+                        warn!(%error, "node-block refresh failed; retaining last-known-good routes");
+                        repair_last_known_good_routes(&runtime.applied, &state).await;
+                        continue;
+                    }
+                };
+                if let Err(error) = adopt_node_block_refresh(
+                    &mut runtime.local,
+                    local,
+                    &runtime.node_block_state_path,
+                    &state,
+                ) {
+                    record_remote_route_error(&state);
+                    warn!(%error, "node-block refresh rejected; retaining last-known-good routes");
+                    repair_last_known_good_routes(&runtime.applied, &state).await;
+                    continue;
+                }
                 match fetch_remote_route_snapshot(
                     &runtime.controller_url,
                     &runtime.client,
@@ -1156,6 +1242,45 @@ async fn run_remote_route_reconciler(
             }
         }
     }
+}
+
+fn adopt_node_block_refresh(
+    current: &mut NodeBlockSnapshot,
+    candidate: NodeBlockSnapshot,
+    state_path: &Path,
+    state: &AgentState,
+) -> Result<bool> {
+    validate_node_block_snapshot(&candidate, &current.node_name)?;
+    state
+        .desired_node_block_revision
+        .store(candidate.revision, Ordering::Release);
+    if candidate.node_uid != current.node_uid {
+        bail!(
+            "refreshed node-block snapshot changed Node UID from {:?} to {:?}",
+            current.node_uid,
+            candidate.node_uid
+        );
+    }
+    if candidate.provider != current.provider {
+        bail!(
+            "live node-block address changes require a drained CNI restart; refusing to replace active attachments"
+        );
+    }
+    if candidate == *current {
+        return Ok(false);
+    }
+    persist_node_block_snapshot(state_path, &candidate)?;
+    info!(
+        old_revision = current.revision,
+        new_revision = candidate.revision,
+        path = %state_path.display(),
+        "adopted refreshed controller node-block assignment provenance"
+    );
+    *current = candidate;
+    state
+        .applied_node_block_revision
+        .store(current.revision, Ordering::Release);
+    Ok(true)
 }
 
 async fn repair_last_known_good_routes(applied: &AppliedRemoteRoutes, state: &AgentState) {
@@ -2096,7 +2221,7 @@ async fn run_dataplane(
     if !recovered_ready {
         populate_dataplane_before_attachment(&mut identities, &mut policies, &state).await?;
     }
-    let mut attachments = attach_dataplane_program(
+    let mut attachments = attach_dataplane_programs(
         &mut ebpf,
         &config,
         select_tc_attachment_mode(
@@ -2152,53 +2277,59 @@ async fn run_dataplane(
     Ok(())
 }
 
-fn attach_dataplane_program<'ebpf>(
+fn attach_dataplane_programs<'ebpf>(
     ebpf: &'ebpf mut Ebpf,
     config: &DataplaneConfig,
     mode: TcAttachmentMode,
 ) -> Result<InterfaceAttachments<'ebpf>> {
-    let program_name = match config.direction {
-        Direction::Ingress => "unf_observe_ingress",
-        Direction::Egress => "unf_observe_egress",
+    if config.hook_coverage == HookCoverage::Both || config.direction == Direction::Ingress {
+        load_dataplane_program(ebpf, Direction::Ingress)?;
+    }
+    if config.hook_coverage == HookCoverage::Both || config.direction == Direction::Egress {
+        load_dataplane_program(ebpf, Direction::Egress)?;
+    }
+    let mut attachments = InterfaceAttachments {
+        ebpf,
+        interface: config.interface.clone(),
+        all_interfaces: config.all_interfaces,
+        primary_direction: config.direction,
+        hook_coverage: config.hook_coverage,
+        mode,
+        pin_root: config.bpf_pin_path.join("links"),
+        ingress_attached: HashMap::new(),
+        egress_attached: HashMap::new(),
     };
+    attachments.refresh()?;
+    if attachments.is_empty() {
+        bail!("no non-loopback network interfaces are available");
+    }
+    Ok(attachments)
+}
+
+fn load_dataplane_program(ebpf: &mut Ebpf, direction: Direction) -> Result<()> {
+    let program_name = dataplane_program_name(direction);
     let program: &mut SchedClassifier = ebpf
         .program_mut(program_name)
         .with_context(|| format!("eBPF object does not contain program {program_name}"))?
         .try_into()
-        .context("unf_observe is not a TC classifier")?;
-    program.load().context("load TC classifier into kernel")?;
-    let attach_type = match config.direction {
+        .context("UNF dataplane program is not a TC classifier")?;
+    program
+        .load()
+        .with_context(|| format!("load {program_name} TC classifier into kernel"))
+}
+
+const fn dataplane_program_name(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Ingress => "unf_observe_ingress",
+        Direction::Egress => "unf_observe_egress",
+    }
+}
+
+const fn tc_attach_type(direction: Direction) -> TcAttachType {
+    match direction {
         Direction::Ingress => TcAttachType::Ingress,
         Direction::Egress => TcAttachType::Egress,
-    };
-    let mut attachments = InterfaceAttachments {
-        program,
-        all_interfaces: config.all_interfaces,
-        attach_type,
-        direction: config.direction,
-        mode,
-        pin_root: config.bpf_pin_path.join("links"),
-        attached: HashMap::new(),
-    };
-    if config.all_interfaces {
-        attachments.refresh()?;
-        if attachments.attached.is_empty() {
-            bail!("no non-loopback network interfaces are available");
-        }
-    } else if let Some(interface) = config.interface.as_deref() {
-        let if_index = interface_index(interface)?;
-        attach_interface(
-            attachments.program,
-            interface,
-            if_index,
-            attachments.attach_type,
-            attachments.direction,
-            attachments.mode,
-            &attachments.pin_root,
-        )?;
-        attachments.attached.insert(interface.to_owned(), if_index);
     }
-    Ok(attachments)
 }
 
 fn recovered_dataplane_is_ready(recovered: &RecoveredDataplane) -> bool {
@@ -4789,21 +4920,27 @@ fn metric_value(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn refresh_interfaces(
-    program: &mut SchedClassifier,
-    attach_type: TcAttachType,
+fn refresh_direction(
+    ebpf: &mut Ebpf,
     direction: Direction,
     mode: TcAttachmentMode,
     pin_root: &Path,
+    discovered: &HashMap<String, u32>,
     attached: &mut HashMap<String, u32>,
 ) -> Result<()> {
-    let discovered = discover_interfaces()?;
     attached.retain(|interface, if_index| discovered.get(interface) == Some(if_index));
     let unattached: Vec<_> = discovered
         .iter()
         .filter(|(interface, if_index)| attached.get(*interface) != Some(*if_index))
         .map(|(interface, if_index)| (interface.clone(), *if_index))
         .collect();
+    let program_name = dataplane_program_name(direction);
+    let program: &mut SchedClassifier = ebpf
+        .program_mut(program_name)
+        .with_context(|| format!("eBPF object does not contain program {program_name}"))?
+        .try_into()
+        .context("UNF dataplane program is not a TC classifier")?;
+    let attach_type = tc_attach_type(direction);
     for (interface, if_index) in unattached {
         match attach_interface(
             program,
@@ -5325,6 +5462,47 @@ mod tests {
         let link = directory.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(persist_node_block_snapshot(&link.join("state.json"), &snapshot).is_err());
+    }
+
+    #[test]
+    fn node_block_refresh_adopts_revision_only_epoch_changes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("node-block.json");
+        let state = test_agent_state();
+        let (mut current, _) = route_test_snapshots();
+        let mut refreshed = current.clone();
+        refreshed.revision = 1;
+
+        assert!(
+            adopt_node_block_refresh(&mut current, refreshed.clone(), &path, &state)
+                .expect("revision-only refresh is adopted")
+        );
+        assert_eq!(current, refreshed);
+        assert_eq!(state.desired_node_block_revision.load(Ordering::Acquire), 1);
+        assert_eq!(state.applied_node_block_revision.load(Ordering::Acquire), 1);
+        assert_eq!(
+            load_secure_json::<NodeBlockSnapshot>(&path, "node-block").unwrap(),
+            refreshed
+        );
+        assert!(
+            !adopt_node_block_refresh(&mut current, refreshed.clone(), &path, &state)
+                .expect("idempotent refresh succeeds")
+        );
+
+        let mut changed_provider = refreshed.clone();
+        changed_provider.revision = 2;
+        changed_provider.provider = NodeBlockProvider::new(
+            "10.99.0.0/24".parse().unwrap(),
+            "fd00:99::/64".parse().unwrap(),
+        );
+        assert!(adopt_node_block_refresh(&mut current, changed_provider, &path, &state).is_err());
+        assert_eq!(current, refreshed);
+
+        let mut replaced_node = refreshed.clone();
+        replaced_node.revision = 3;
+        replaced_node.node_uid = "replacement-uid".to_owned();
+        assert!(adopt_node_block_refresh(&mut current, replaced_node, &path, &state).is_err());
+        assert_eq!(current, refreshed);
     }
 
     fn route_test_snapshots() -> (NodeBlockSnapshot, RemoteRouteSnapshot) {

@@ -325,8 +325,9 @@ Implemented in the repository:
 Not implemented yet: service load balancing, production routing/CNI integration,
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
 multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production
-fail-closed recovery. Bounded revision-scoped TCP/UDP/SCTP reply state is
-implemented; it resets when the eBPF program is replaced.
+fail-closed recovery. Bounded TCP/UDP/SCTP reply state survives unrelated policy
+revision churn, and primary-CNI mode observes both TC directions for translated
+tuples; runtime state resets when the eBPF program is replaced.
 
 ## Repository layout
 
