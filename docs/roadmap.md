@@ -377,11 +377,15 @@ authoritative record of verified results.
   checkpoint to config/map rollback, exactly recovers, and garbage-collects the
   old bank. `make service-dataplane-test` includes a real-kernel partial/capacity
   failure with exact active-bank preservation.
-- Next: implement dual-stack TCP/UDP packet translation, conntrack insertion and
-  expiry, deterministic eligible-backend selection, reverse translation, and
-  no-backend behavior against the accepted ABI.
-- Gated: live packet translation/conntrack behavior,
-  service observability/explanation, and kube-proxy-free dual-stack ClusterIP.
+- Implemented and verifier/kernel-execution verified: ADR 0078 adds exact
+  IPv4/IPv6 TCP/UDP frontend lookup, deterministic ready/non-terminating backend
+  selection, DNAT and checksum repair, reverse-key-first paired state and SNAT,
+  revision-independent persistence, protocol expiry/reselection, and fail-closed
+  exact backendless behavior. The privileged packet gate checks all four
+  family/protocol combinations and reads fixed provenance from the real map.
+- Next: service translation/failure events, metrics, status, retained history,
+  and explanation.
+- Gated: kube-proxy-free dual-stack Kind and OpenShift ClusterIP qualification.
 - Later service slices: NodePort, LoadBalancer, session affinity,
   `externalTrafficPolicy`, `internalTrafficPolicy`, topology-aware routing,
   Maglev, and optional DSR. None is implied by the foundation gate.

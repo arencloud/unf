@@ -42,11 +42,11 @@ key layout without an ABI change.
 | `EGRESS_IPV4` | exact/fallback destination IPv4, source identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller egress compiler; agent transactional writer; TC reader | exact destination then arbitrary-destination fallbacks in the active bank; staged and validated with ingress | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
 | `EGRESS_IPV6` | source identity, port, protocol, bank, and destination IPv6 prefix | same policy decision/provenance value as `POLICY_RULES` | controller egress compiler; agent transactional writer; TC LPM reader | longest-prefix destination lookup for exact, protocol-wildcard, then global-wildcard dimensions; staged and validated with ingress | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
 | `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks; pinned | one entry; failed activation preserves the previous pointer |
-| `SERVICE_FRONTENDS_V4`, `SERVICE_FRONTENDS_V6` | exact address, network-order port, protocol, bank | ServiceId, revision-local frontend index, backend count, schema, revision | service compiler; agent transactional writer; Phase 4.5 TC reader | both families stage/read back together; pinned under ABI v4 | 262,144 physical entries each, capped at 131,072 per bank; capacity failure preserves the active config |
-| `SERVICE_BACKENDS_V4`, `SERVICE_BACKENDS_V6` | ServiceId, BackendId, bank | revision, address, network-order port, protocol, lifecycle flags, schema | service compiler; agent transactional writer; Phase 4.5 TC reader | staged/read back with frontends; pinned | 524,288 physical entries each, capped at 262,144 per bank |
-| `SERVICE_BACKEND_SLOTS` | ServiceId, revision-local frontend index, ordered slot, bank | stable BackendId, schema, revision | service compiler; agent transactional writer; Phase 4.5 TC reader | exact frontend membership stages with both families; pinned | 1,048,576 physical entries, capped at 524,288 per bank |
-| `SERVICE_CONFIG` | constant `u32` slot 0 | controller epoch, service revision, frontend/backend/slot counts, schema, active bank | agent writer; Phase 4.5 TC reader | one write activates all five service tables; durable-checkpoint failure restores the prior pointer | one entry; absent config is no active service state |
-| `SERVICE_CONNECTIONS` | complete IPv4/IPv6 L4 tuple plus forward/reverse role | last-seen, service revision, client/frontend/backend tuples, ServiceId, BackendId, schema/flags | Phase 4.5 TC writer/reader | persistent ABI reserved by ADR 0077; no packet-path access in Phase 4.4 | bounded 262,144-entry LRU; pair insertion/expiry behavior is gated on Phase 4.5 |
+| `SERVICE_FRONTENDS_V4`, `SERVICE_FRONTENDS_V6` | exact address, network-order port, protocol, bank | ServiceId, revision-local frontend index, eligible backend count, schema, revision | service compiler; agent transactional writer; TC reader | both families stage/read back together; pinned under ABI v4 | 262,144 physical entries each, capped at 131,072 per bank; an exact zero-backend frontend drops new flows while an unrelated tuple passes |
+| `SERVICE_BACKENDS_V4`, `SERVICE_BACKENDS_V6` | ServiceId, BackendId, bank | revision, address, network-order port, protocol, lifecycle flags, schema | service compiler; agent transactional writer; TC reader | all endpoint lifecycle records stage with frontends; pinned | 524,288 physical entries each, capped at 262,144 per bank; new-flow slots admit only ready, non-terminating entries |
+| `SERVICE_BACKEND_SLOTS` | ServiceId, revision-local frontend index, ordered slot, bank | stable BackendId, schema, revision | service compiler; agent transactional writer; TC reader | deterministic eligible membership stages with both families; pinned | 1,048,576 physical entries, capped at 524,288 per bank |
+| `SERVICE_CONFIG` | constant `u32` slot 0 | controller epoch, service revision, frontend/backend/slot counts, schema, active bank | agent writer; TC reader | one write activates all five service tables; durable-checkpoint failure restores the prior pointer | one entry; absent/invalid config means no desired service lookup, while an existing valid connection remains usable until timeout |
+| `SERVICE_CONNECTIONS` | complete IPv4/IPv6 L4 tuple plus forward/reverse role | last-seen, service revision, client/frontend/backend tuples, ServiceId, BackendId, schema/flags | TC writer/reader | persistent ABI v4; reverse inserts first, forward second, partial failure removes reverse; lookups validate the complete peer tuple and refresh both entries | bounded 262,144-entry LRU; valid TCP/UDP pairs survive desired-state churn until protocol timeout; corrupt/expired pairs are removed |
 
 `FlowEvent` carries no Kubernetes strings. ABI v2 records the applied policy
 revision, actual verdict/reason/policy/rule, and optional shadow
@@ -57,6 +57,11 @@ Identity, policy, and service config/value pairs must have the expected schema a
 identical nonzero revision.
 Event and map ABIs use fixed C layouts, explicit schema/version fields, and
 compile-time size assertions.
+
+Runtime-only per-CPU scratch arrays hold flow observations, service keys/values,
+policy decisions, connection keys, and event construction state. They are not
+persistent ownership pins; they keep every verifier call chain within the
+512-byte eBPF stack bound.
 
 Userspace flow export preserves forwarding priority. Direction-selected events
 enter a 4,096-record non-blocking channel and a 2,048-key pending aggregator. A
@@ -165,7 +170,7 @@ Phase 3 NetworkPolicy compatibility is complete at its documented bounded L4
 scope. Full-CNI dataplane ownership, link/routing lifecycle, and exact Kind and
 OpenShift recovery are Verified under ADRs 0057–0073. Phase 4 now has a
 Kubernetes-independent service IR and deterministic retained-last-valid
-Kubernetes compiler, authenticated durable agent distribution, and transactional
-service map/connection-state ABI under ADRs 0074–0077. Backend selection,
-conntrack/NAT packet handling, eBPF forwarding, and kube-proxy replacement remain
-gated on Phase 4.5 and later cluster evidence.
+Kubernetes compiler, authenticated durable agent distribution, transactional
+service state, and verifier-executed dual-stack TCP/UDP service translation
+under ADRs 0074–0078. Service operations, kube-proxy-free Kind, and OpenShift
+qualification remain gated on Phase 4.6 and later evidence.

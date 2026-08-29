@@ -1,7 +1,7 @@
 # ADR 0077: Transactional service maps precede source-side TC translation
 
-Status: Accepted and implemented for Phase 4.4 map state. Packet translation is
-still gated on Phase 4.5.
+Status: Accepted and implemented. Phase 4.5 packet behavior is recorded by ADR
+0078.
 
 ## Context
 
@@ -34,10 +34,9 @@ BackendId, service revision, protocol/family, flags, and last-seen time. A flow
 will install both directions transactionally as far as BPF map operations
 permit: reverse first, forward second, and reverse removal if forward insertion
 fails. Existing entries retain their BackendId across service revisions;
-new-flow selection consults only the active service bank. Protocol timeouts,
-checksum mutation, pair validation, and packet-path failure behavior are Phase
-4.5 work, but their ABI is reserved now to avoid another immediate persistent
-state migration.
+new-flow selection consults only the active service bank. ADR 0078 implements
+protocol timeouts, checksum mutation, pair validation, and packet-path failure
+behavior against this reserved ABI.
 
 Service map ABI v1 consists of:
 
@@ -90,8 +89,9 @@ loads the real eBPF object with a one-entry backend-slot map, activates revision
 proves the active config/revision and all earlier tables rolled back exactly.
 
 Deployment renders, cleanup scripts, incompatible-version fixtures, and
-clean-rebuild fixtures use the v4/eighteen-pin boundary. Live kube-proxy-free
-translation, connection insertion/expiry, and cluster lifecycle evidence are
+clean-rebuild fixtures use the v4/eighteen-pin boundary. ADR 0078 separately
+verifies packet translation and connection insertion/expiry through the live
+kernel's program-test interface. Kube-proxy-free cluster lifecycle evidence is
 not claimed by this ADR.
 
 ## Consequences
@@ -101,7 +101,7 @@ kernel state and durable checkpoint commit. Controller outage and process
 replacement can reconstruct the exact active service bank without treating
 Kubernetes strings as packet-path ABI.
 
-Phase 4.5 can implement dual-stack TCP/UDP translation and connection
-persistence against an already versioned map and hook contract. SCTP forwarding,
+Phase 4.5 implements dual-stack TCP/UDP translation and connection persistence
+against this versioned map and hook contract. SCTP forwarding,
 Maglev, session affinity, topology-aware selection, generic NAT/RELATED
 tracking, and broader service exposure remain deliberately unclaimed.

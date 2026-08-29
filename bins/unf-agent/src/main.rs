@@ -6687,7 +6687,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         )
         .status_label(),
         capabilities: state.capabilities.clone(),
-        limitation: "service BPF state is transactional but packet NAT, backend selection, and ClusterIP forwarding are not active before Phase 4.5",
+        limitation: "ClusterIP translation is limited to primary-CNI Pod-veth IPv4/IPv6 TCP/UDP; service operations and kube-proxy-free cluster qualification remain pending",
     })
 }
 
@@ -6709,6 +6709,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aya::programs::{TestRun, TestRunOptions};
     use tempfile::tempdir;
     use unf_route::{RemoteNodeIntent, RemoteRouteSnapshotNode};
 
@@ -6959,6 +6960,291 @@ mod tests {
         .expect("test service snapshot with backend compiles")
     }
 
+    fn dual_stack_service_snapshot(
+        revision: u64,
+        ipv4_backend: Ipv4Addr,
+        ipv6_backend: Ipv6Addr,
+        include_backends: bool,
+    ) -> ServiceSnapshot {
+        let ports = vec![
+            unf_service::ServiceSourcePort {
+                name: Some("http".to_owned()),
+                protocol: unf_common::Protocol::Tcp,
+                port: 80,
+                app_protocol: None,
+            },
+            unf_service::ServiceSourcePort {
+                name: Some("dns".to_owned()),
+                protocol: unf_common::Protocol::Udp,
+                port: 53,
+                app_protocol: None,
+            },
+        ];
+        let endpoint_ports = vec![
+            unf_service::EndpointPortSource {
+                name: Some("http".to_owned()),
+                protocol: unf_common::Protocol::Tcp,
+                port: Some(8080),
+                app_protocol: None,
+            },
+            unf_service::EndpointPortSource {
+                name: Some("dns".to_owned()),
+                protocol: unf_common::Protocol::Udp,
+                port: Some(5353),
+                app_protocol: None,
+            },
+        ];
+        let slices = if include_backends {
+            vec![
+                unf_service::EndpointSliceSource {
+                    namespace: "default".to_owned(),
+                    name: "api-v4".to_owned(),
+                    service_name: "api".to_owned(),
+                    address_family: unf_service::AddressFamily::Ipv4,
+                    endpoints: vec![unf_service::EndpointSource {
+                        addresses: vec![ipv4_backend.into()],
+                        target_workload: Some("default/api-v4".to_owned()),
+                        node_name: Some("worker-a".to_owned()),
+                        zone: None,
+                        ready: true,
+                        serving: true,
+                        terminating: false,
+                        ports: endpoint_ports.clone(),
+                    }],
+                },
+                unf_service::EndpointSliceSource {
+                    namespace: "default".to_owned(),
+                    name: "api-v6".to_owned(),
+                    service_name: "api".to_owned(),
+                    address_family: unf_service::AddressFamily::Ipv6,
+                    endpoints: vec![unf_service::EndpointSource {
+                        addresses: vec![ipv6_backend.into()],
+                        target_workload: Some("default/api-v6".to_owned()),
+                        node_name: Some("worker-a".to_owned()),
+                        zone: None,
+                        ready: true,
+                        serving: true,
+                        terminating: false,
+                        ports: endpoint_ports,
+                    }],
+                },
+            ]
+        } else {
+            Vec::new()
+        };
+        unf_service::compile_service_snapshot(
+            7,
+            Revision::new(revision),
+            vec![unf_service::ServiceSource {
+                namespace: "default".to_owned(),
+                name: "api".to_owned(),
+                cluster_ips: vec![
+                    Ipv4Addr::new(10, 96, 0, 10).into(),
+                    "fd00:96::10".parse::<Ipv6Addr>().unwrap().into(),
+                ],
+                ports,
+            }],
+            slices,
+        )
+        .expect("dual-stack service snapshot compiles")
+    }
+
+    fn checksum(bytes: &[u8]) -> u16 {
+        let mut sum = 0_u32;
+        let mut chunks = bytes.chunks_exact(2);
+        for chunk in &mut chunks {
+            sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+        if let Some(byte) = chunks.remainder().first() {
+            sum += u32::from(*byte) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !u16::try_from(sum).expect("folded checksum fits u16")
+    }
+
+    fn transport_segment(protocol: u8, source_port: u16, destination_port: u16) -> Vec<u8> {
+        if protocol == 6 {
+            let mut segment = vec![0_u8; 20];
+            segment[0..2].copy_from_slice(&source_port.to_be_bytes());
+            segment[2..4].copy_from_slice(&destination_port.to_be_bytes());
+            segment[12] = 5 << 4;
+            segment[13] = 0x02;
+            segment[14..16].copy_from_slice(&65_535_u16.to_be_bytes());
+            segment
+        } else {
+            let mut segment = vec![0_u8; 12];
+            let segment_length = u16::try_from(segment.len()).expect("test segment fits u16");
+            segment[0..2].copy_from_slice(&source_port.to_be_bytes());
+            segment[2..4].copy_from_slice(&destination_port.to_be_bytes());
+            segment[4..6].copy_from_slice(&segment_length.to_be_bytes());
+            segment[8..12].copy_from_slice(b"unf!");
+            segment
+        }
+    }
+
+    fn ipv4_packet(
+        protocol: u8,
+        source: Ipv4Addr,
+        destination: Ipv4Addr,
+        source_port: u16,
+        destination_port: u16,
+    ) -> Vec<u8> {
+        let mut transport = transport_segment(protocol, source_port, destination_port);
+        let mut pseudo = Vec::with_capacity(12 + transport.len());
+        pseudo.extend_from_slice(&source.octets());
+        pseudo.extend_from_slice(&destination.octets());
+        pseudo.extend_from_slice(&[0, protocol]);
+        pseudo.extend_from_slice(
+            &u16::try_from(transport.len())
+                .expect("test segment fits u16")
+                .to_be_bytes(),
+        );
+        pseudo.extend_from_slice(&transport);
+        let checksum_offset = if protocol == 6 { 16 } else { 6 };
+        let mut transport_checksum = checksum(&pseudo);
+        if protocol == 17 && transport_checksum == 0 {
+            transport_checksum = u16::MAX;
+        }
+        transport[checksum_offset..checksum_offset + 2]
+            .copy_from_slice(&transport_checksum.to_be_bytes());
+
+        let mut packet = vec![0_u8; 14 + 20];
+        packet[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        packet[14] = 0x45;
+        packet[16..18].copy_from_slice(
+            &u16::try_from(20 + transport.len())
+                .expect("test packet fits u16")
+                .to_be_bytes(),
+        );
+        packet[22] = 64;
+        packet[23] = protocol;
+        packet[26..30].copy_from_slice(&source.octets());
+        packet[30..34].copy_from_slice(&destination.octets());
+        let header_checksum = checksum(&packet[14..34]);
+        packet[24..26].copy_from_slice(&header_checksum.to_be_bytes());
+        packet.extend_from_slice(&transport);
+        packet
+    }
+
+    fn ipv6_packet(
+        protocol: u8,
+        source: Ipv6Addr,
+        destination: Ipv6Addr,
+        source_port: u16,
+        destination_port: u16,
+    ) -> Vec<u8> {
+        let mut transport = transport_segment(protocol, source_port, destination_port);
+        let mut pseudo = Vec::with_capacity(40 + transport.len());
+        pseudo.extend_from_slice(&source.octets());
+        pseudo.extend_from_slice(&destination.octets());
+        pseudo.extend_from_slice(
+            &u32::try_from(transport.len())
+                .expect("test segment fits u32")
+                .to_be_bytes(),
+        );
+        pseudo.extend_from_slice(&[0, 0, 0, protocol]);
+        pseudo.extend_from_slice(&transport);
+        let checksum_offset = if protocol == 6 { 16 } else { 6 };
+        let mut transport_checksum = checksum(&pseudo);
+        if transport_checksum == 0 {
+            transport_checksum = u16::MAX;
+        }
+        transport[checksum_offset..checksum_offset + 2]
+            .copy_from_slice(&transport_checksum.to_be_bytes());
+
+        let mut packet = vec![0_u8; 14 + 40];
+        packet[12..14].copy_from_slice(&0x86dd_u16.to_be_bytes());
+        packet[14] = 0x60;
+        packet[18..20].copy_from_slice(
+            &u16::try_from(transport.len())
+                .expect("test segment fits u16")
+                .to_be_bytes(),
+        );
+        packet[20] = protocol;
+        packet[21] = 64;
+        packet[22..38].copy_from_slice(&source.octets());
+        packet[38..54].copy_from_slice(&destination.octets());
+        packet.extend_from_slice(&transport);
+        packet
+    }
+
+    fn run_tc(ebpf: &mut Ebpf, program_name: &str, packet: &[u8]) -> (u32, Vec<u8>) {
+        let mut output = vec![0_u8; packet.len() + 64];
+        let program: &mut SchedClassifier = ebpf
+            .program_mut(program_name)
+            .expect("service TC program exists")
+            .try_into()
+            .expect("service program is a TC classifier");
+        let result = program
+            .test_run(TestRunOptions {
+                data_in: Some(packet),
+                data_out: Some(&mut output),
+                ..Default::default()
+            })
+            .expect("TC packet test run succeeds");
+        output.truncate(result.data_size_out as usize);
+        (result.return_value, output)
+    }
+
+    fn assert_ipv4_packet(
+        packet: &[u8],
+        protocol: u8,
+        source: Ipv4Addr,
+        destination: Ipv4Addr,
+        source_port: u16,
+        destination_port: u16,
+    ) {
+        assert_eq!(&packet[26..30], &source.octets());
+        assert_eq!(&packet[30..34], &destination.octets());
+        assert_eq!(u16::from_be_bytes([packet[34], packet[35]]), source_port);
+        assert_eq!(
+            u16::from_be_bytes([packet[36], packet[37]]),
+            destination_port
+        );
+        assert_eq!(checksum(&packet[14..34]), 0);
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&source.octets());
+        pseudo.extend_from_slice(&destination.octets());
+        pseudo.extend_from_slice(&[0, protocol]);
+        pseudo.extend_from_slice(
+            &u16::try_from(packet.len() - 34)
+                .expect("test segment fits u16")
+                .to_be_bytes(),
+        );
+        pseudo.extend_from_slice(&packet[34..]);
+        assert_eq!(checksum(&pseudo), 0);
+    }
+
+    fn assert_ipv6_packet(
+        packet: &[u8],
+        protocol: u8,
+        source: Ipv6Addr,
+        destination: Ipv6Addr,
+        source_port: u16,
+        destination_port: u16,
+    ) {
+        assert_eq!(&packet[22..38], &source.octets());
+        assert_eq!(&packet[38..54], &destination.octets());
+        assert_eq!(u16::from_be_bytes([packet[54], packet[55]]), source_port);
+        assert_eq!(
+            u16::from_be_bytes([packet[56], packet[57]]),
+            destination_port
+        );
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&source.octets());
+        pseudo.extend_from_slice(&destination.octets());
+        pseudo.extend_from_slice(
+            &u32::try_from(packet.len() - 54)
+                .expect("test segment fits u32")
+                .to_be_bytes(),
+        );
+        pseudo.extend_from_slice(&[0, 0, 0, protocol]);
+        pseudo.extend_from_slice(&packet[54..]);
+        assert_eq!(checksum(&pseudo), 0);
+    }
+
     #[test]
     fn service_snapshot_reconciliation_is_durable_fenced_and_reported() {
         let directory = tempdir().unwrap();
@@ -7084,6 +7370,16 @@ mod tests {
         let mut ebpf = loader
             .load_file(object)
             .expect("load verifier-approved eBPF object");
+        for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(program_name)
+                .expect("service TC program exists")
+                .try_into()
+                .expect("service program is a TC classifier");
+            program
+                .load()
+                .expect("kernel verifier accepts service TC program");
+        }
         let (
             ipv4_frontends,
             ipv6_frontends,
@@ -7146,6 +7442,175 @@ mod tests {
                 .iter()
                 .all(|key| key[8] == 1)
         );
+    }
+
+    #[test]
+    #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
+    fn privileged_service_packets_translate_dual_stack_and_survive_churn() {
+        const TC_ACT_SHOT: u32 = 2;
+        const TC_ACT_PIPE: u32 = 3;
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new()
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(program_name)
+                .expect("service TC program exists")
+                .try_into()
+                .expect("service program is a TC classifier");
+            program
+                .load()
+                .expect("kernel verifier accepts service TC program");
+        }
+        let (
+            ipv4_frontends,
+            ipv6_frontends,
+            ipv4_backends,
+            ipv6_backends,
+            backend_slots,
+            config,
+            connections,
+        ) = take_service_maps(&mut ebpf).expect("take service maps");
+        let directory = tempdir().unwrap();
+        let mut synchronizer = ServiceSynchronizer {
+            ipv4_frontends,
+            ipv6_frontends,
+            ipv4_backends,
+            ipv6_backends,
+            backend_slots,
+            config,
+            connections,
+            banks: [None, None],
+            active_bank: 0,
+            applied: None,
+            controller_url: None,
+            client: ReloadingControllerClient::without_custom_trust(
+                Counter::default(),
+                Counter::default(),
+            ),
+            agent_token_path: PathBuf::new(),
+            state_path: directory.path().join("service.json"),
+            interval: Duration::from_secs(1),
+        };
+        let state = test_agent_state();
+        let service_v4 = Ipv4Addr::new(10, 96, 0, 10);
+        let backend_v4 = Ipv4Addr::new(10, 42, 0, 20);
+        let client_v4 = Ipv4Addr::new(10, 42, 0, 5);
+        let service_v6 = "fd00:96::10".parse::<Ipv6Addr>().unwrap();
+        let backend_v6 = "fd00:42::20".parse::<Ipv6Addr>().unwrap();
+        let client_v6 = "fd00:42::5".parse::<Ipv6Addr>().unwrap();
+        let first = dual_stack_service_snapshot(1, backend_v4, backend_v6, true);
+        activate_service_snapshot(&mut synchronizer, &first, false, &state)
+            .expect("dual-stack service activates");
+
+        let ipv4_tcp = ipv4_packet(6, client_v4, service_v4, 40_000, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, backend_v4, 40_000, 8080);
+        let reverse = ipv4_packet(6, backend_v4, client_v4, 8080, 40_000);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, service_v4, client_v4, 80, 40_000);
+
+        let ipv4_udp = ipv4_packet(17, client_v4, service_v4, 40_001, 53);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 17, client_v4, backend_v4, 40_001, 5353);
+        let reverse = ipv4_packet(17, backend_v4, client_v4, 5353, 40_001);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 17, service_v4, client_v4, 53, 40_001);
+
+        let ipv6_tcp = ipv6_packet(6, client_v6, service_v6, 40_002, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv6_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 6, client_v6, backend_v6, 40_002, 8080);
+        let reverse = ipv6_packet(6, backend_v6, client_v6, 8080, 40_002);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 6, service_v6, client_v6, 80, 40_002);
+
+        let ipv6_udp = ipv6_packet(17, client_v6, service_v6, 40_003, 53);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv6_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, client_v6, backend_v6, 40_003, 5353);
+        let reverse = ipv6_packet(17, backend_v6, client_v6, 5353, 40_003);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, service_v6, client_v6, 53, 40_003);
+        assert_eq!(
+            synchronizer
+                .connections
+                .keys()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .len(),
+            8
+        );
+
+        let replacement_v4 = Ipv4Addr::new(10, 42, 0, 21);
+        let replacement_v6 = "fd00:42::21".parse::<Ipv6Addr>().unwrap();
+        let second = dual_stack_service_snapshot(2, replacement_v4, replacement_v6, true);
+        activate_service_snapshot(&mut synchronizer, &second, false, &state)
+            .expect("replacement backend activates");
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, backend_v4, 40_000, 8080);
+        let new_flow = ipv4_packet(6, client_v4, service_v4, 41_000, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &new_flow);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, replacement_v4, 41_000, 8080);
+
+        let connection_keys = synchronizer
+            .connections
+            .keys()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut expired_pair_entries = 0;
+        for key in connection_keys {
+            let mut value = synchronizer.connections.get(&key, 0).unwrap();
+            if value[72..74] == 40_000_u16.to_be_bytes() {
+                value[0..8].copy_from_slice(&0_u64.to_ne_bytes());
+                synchronizer.connections.insert(key, value, 0).unwrap();
+                expired_pair_entries += 1;
+            }
+        }
+        assert_eq!(expired_pair_entries, 2);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, replacement_v4, 40_000, 8080);
+        let refreshed_pair = synchronizer
+            .connections
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, value)| value[72..74] == 40_000_u16.to_be_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(refreshed_pair.len(), 2);
+        assert!(refreshed_pair.iter().all(|(_, value)| {
+            u64::from_ne_bytes(value[8..16].try_into().unwrap()) == 2
+                && u32::from_ne_bytes(value[64..68].try_into().unwrap()) != 0
+                && u32::from_ne_bytes(value[68..72].try_into().unwrap()) != 0
+                && value[48..52] == replacement_v4.octets()
+                && value[52..64] == [0; 12]
+        }));
+
+        let backendless = dual_stack_service_snapshot(3, replacement_v4, replacement_v6, false);
+        activate_service_snapshot(&mut synchronizer, &backendless, false, &state)
+            .expect("backendless frontend activates");
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, replacement_v4, 40_000, 8080);
+        let no_backend = ipv4_packet(6, client_v4, service_v4, 42_000, 80);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &no_backend);
+        assert_eq!(action, TC_ACT_SHOT);
+        let unrelated = ipv4_packet(6, client_v4, Ipv4Addr::new(192, 0, 2, 10), 42_001, 80);
+        let (action, output) = run_tc(&mut ebpf, "unf_observe_ingress", &unrelated);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_eq!(output, unrelated);
     }
 
     #[test]

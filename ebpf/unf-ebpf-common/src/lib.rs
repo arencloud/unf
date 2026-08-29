@@ -16,6 +16,8 @@ pub const SERVICE_BANK_COUNT: u8 = 2;
 pub const SERVICE_BACKEND_FLAG_READY: u8 = 1 << 0;
 pub const SERVICE_BACKEND_FLAG_SERVING: u8 = 1 << 1;
 pub const SERVICE_BACKEND_FLAG_TERMINATING: u8 = 1 << 2;
+pub const SERVICE_CONNECTION_ROLE_FORWARD: u8 = 1;
+pub const SERVICE_CONNECTION_ROLE_REVERSE: u8 = 2;
 pub const POLICY_FLAG_HAS_POLICY: u16 = 1 << 0;
 pub const POLICY_FLAG_HAS_RULE: u16 = 1 << 1;
 pub const POLICY_FLAG_HAS_SHADOW: u16 = 1 << 2;
@@ -143,6 +145,135 @@ pub const fn connection_timeout_ns(protocol: u8) -> Option<u64> {
         132 => Some(CONNECTION_SCTP_TIMEOUT_NS),
         _ => None,
     }
+}
+
+/// New service flows may select only a ready endpoint that is not draining.
+/// `serving` remains provenance for graceful termination: an already selected
+/// flow keeps its persisted tuple until timeout even after the endpoint leaves
+/// the active slot set.
+#[must_use]
+pub const fn service_backend_is_eligible(flags: u8) -> bool {
+    flags & SERVICE_BACKEND_FLAG_READY != 0 && flags & SERVICE_BACKEND_FLAG_TERMINATING == 0
+}
+
+/// A service translation survives desired-state revision changes and expires
+/// only by protocol lifetime or an incompatible fixed-layout value.
+#[must_use]
+pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns: u64) -> bool {
+    let Some(timeout_ns) = connection_timeout_ns(state.protocol) else {
+        return false;
+    };
+    state.schema_version == SERVICE_MAP_ABI_VERSION
+        && matches!(state.address_family, 4 | 6)
+        && state.service_revision != 0
+        && state.service_id.get() != 0
+        && state.backend_id.get() != 0
+        && state.flags == 0
+        && state.reserved[0] == 0
+        && state.reserved[1] == 0
+        && state.reserved[2] == 0
+        && state.reserved[3] == 0
+        && now_ns.saturating_sub(state.last_seen_ns) <= timeout_ns
+}
+
+/// Deterministic flow hash used only for selecting a new revision-local slot.
+/// Persistence is provided by `SERVICE_CONNECTIONS`, not by relying on this
+/// hash after membership changes.
+#[must_use]
+pub const fn service_flow_hash(key: &ServiceConnectionKey, service_id: ServiceId) -> u32 {
+    const OFFSET: u32 = 2_166_136_261;
+    const PRIME: u32 = 16_777_619;
+
+    const fn mix(hash: u32, value: u32) -> u32 {
+        (hash ^ value).wrapping_mul(PRIME)
+    }
+
+    let mut hash = mix(OFFSET, service_id.get());
+    hash = mix(
+        hash,
+        u32::from_be_bytes([
+            key.source_address[0],
+            key.source_address[1],
+            key.source_address[2],
+            key.source_address[3],
+        ]),
+    );
+    hash = mix(
+        hash,
+        u32::from_be_bytes([
+            key.source_address[4],
+            key.source_address[5],
+            key.source_address[6],
+            key.source_address[7],
+        ]),
+    );
+    hash = mix(
+        hash,
+        u32::from_be_bytes([
+            key.source_address[8],
+            key.source_address[9],
+            key.source_address[10],
+            key.source_address[11],
+        ]),
+    );
+    hash = mix(
+        hash,
+        u32::from_be_bytes([
+            key.source_address[12],
+            key.source_address[13],
+            key.source_address[14],
+            key.source_address[15],
+        ]),
+    );
+    hash = mix(
+        hash,
+        u32::from_be_bytes([
+            key.destination_address[0],
+            key.destination_address[1],
+            key.destination_address[2],
+            key.destination_address[3],
+        ]),
+    );
+    hash = mix(
+        hash,
+        u32::from_be_bytes([
+            key.destination_address[4],
+            key.destination_address[5],
+            key.destination_address[6],
+            key.destination_address[7],
+        ]),
+    );
+    hash = mix(
+        hash,
+        u32::from_be_bytes([
+            key.destination_address[8],
+            key.destination_address[9],
+            key.destination_address[10],
+            key.destination_address[11],
+        ]),
+    );
+    hash = mix(
+        hash,
+        u32::from_be_bytes([
+            key.destination_address[12],
+            key.destination_address[13],
+            key.destination_address[14],
+            key.destination_address[15],
+        ]),
+    );
+    hash = mix(
+        hash,
+        u32::from_be_bytes([
+            key.source_port[0],
+            key.source_port[1],
+            key.destination_port[0],
+            key.destination_port[1],
+        ]),
+    );
+    mix(
+        hash,
+        u32::from_be_bytes([key.protocol, key.address_family, 0, 0]),
+    )
 }
 
 #[must_use]
@@ -633,6 +764,87 @@ mod tests {
         assert!(packet_starts_connection(17, 0));
         assert!(packet_starts_connection(132, 0));
         assert!(!packet_starts_connection(1, 0));
+    }
+
+    fn service_connection(protocol: u8) -> ServiceConnectionValue {
+        ServiceConnectionValue {
+            last_seen_ns: 10,
+            service_revision: 3,
+            client_address: [1; 16],
+            frontend_address: [2; 16],
+            backend_address: [3; 16],
+            service_id: ServiceId::new(4),
+            backend_id: BackendId::new(5),
+            client_port: 32_000_u16.to_be_bytes(),
+            frontend_port: 80_u16.to_be_bytes(),
+            backend_port: 8080_u16.to_be_bytes(),
+            schema_version: SERVICE_MAP_ABI_VERSION,
+            protocol,
+            address_family: AddressFamily::Ipv6 as u8,
+            flags: 0,
+            reserved: [0; 4],
+        }
+    }
+
+    #[test]
+    fn service_backend_eligibility_excludes_draining_and_unready_endpoints() {
+        assert!(service_backend_is_eligible(
+            SERVICE_BACKEND_FLAG_READY | SERVICE_BACKEND_FLAG_SERVING
+        ));
+        assert!(!service_backend_is_eligible(SERVICE_BACKEND_FLAG_SERVING));
+        assert!(!service_backend_is_eligible(
+            SERVICE_BACKEND_FLAG_READY | SERVICE_BACKEND_FLAG_TERMINATING
+        ));
+    }
+
+    #[test]
+    fn service_connections_expire_without_following_desired_state_revisions() {
+        let tcp = service_connection(6);
+        assert!(service_connection_is_active(
+            &tcp,
+            10 + CONNECTION_TCP_TIMEOUT_NS
+        ));
+        assert!(!service_connection_is_active(
+            &tcp,
+            11 + CONNECTION_TCP_TIMEOUT_NS
+        ));
+
+        let mut invalid = tcp;
+        invalid.schema_version = SERVICE_MAP_ABI_VERSION + 1;
+        assert!(!service_connection_is_active(&invalid, 11));
+        invalid = tcp;
+        invalid.address_family = 5;
+        assert!(!service_connection_is_active(&invalid, 11));
+        invalid = tcp;
+        invalid.backend_id = BackendId::new(0);
+        assert!(!service_connection_is_active(&invalid, 11));
+        invalid = tcp;
+        invalid.flags = 1;
+        assert!(!service_connection_is_active(&invalid, 11));
+    }
+
+    #[test]
+    fn service_flow_hash_is_stable_and_covers_both_families_and_ports() {
+        let key = ServiceConnectionKey {
+            source_address: [1; 16],
+            destination_address: [2; 16],
+            source_port: 32_000_u16.to_be_bytes(),
+            destination_port: 443_u16.to_be_bytes(),
+            protocol: 6,
+            address_family: AddressFamily::Ipv6 as u8,
+            role: SERVICE_CONNECTION_ROLE_FORWARD,
+            reserved: 0,
+        };
+        let expected = service_flow_hash(&key, ServiceId::new(7));
+        assert_eq!(service_flow_hash(&key, ServiceId::new(7)), expected);
+
+        let mut changed = key;
+        changed.destination_address[15] ^= 1;
+        assert_ne!(service_flow_hash(&changed, ServiceId::new(7)), expected);
+        changed = key;
+        changed.destination_port = 8443_u16.to_be_bytes();
+        assert_ne!(service_flow_hash(&changed, ServiceId::new(7)), expected);
+        assert_ne!(service_flow_hash(&key, ServiceId::new(8)), expected);
     }
 
     #[test]

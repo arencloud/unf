@@ -27,6 +27,7 @@ UNF_DEV_IMAGE_TAG ?= dev
 UNF_CONTROLLER_DEV_IMAGE ?= quay.io/arencloud/unf-controller-dev:$(UNF_DEV_IMAGE_TAG)
 UNF_AGENT_DEV_IMAGE ?= quay.io/arencloud/unf-agent-dev:$(UNF_DEV_IMAGE_TAG)
 UNF_TEST_TOOLS_DEV_IMAGE ?= quay.io/arencloud/unf-test-tools-dev:$(UNF_DEV_IMAGE_TAG)
+BPF_TOOLCHAIN ?= nightly-2026-07-15
 UNF_OPENSHIFT_UPGRADE_BASELINE_REF ?= HEAD^
 UNF_OPENSHIFT_UPGRADE_IMAGE_RECORD ?= $(CURDIR)/.artifacts/phase3-openshift-upgrade-images.json
 OPENSHIFT_KUBECONFIG ?= $(CURDIR)/.tools/cl01-audit.kubeconfig
@@ -76,10 +77,10 @@ service-dataplane-test: service-distribution-test
 	cargo test -p unf-ebpf-common -p unf-service
 	cargo test -p unf-agent service_map
 	cargo clippy -p unf-ebpf-common -p unf-service -p unf-agent --all-targets --all-features -- -D warnings
-	hack/verify-service-map-transaction.sh
+	UNF_BPF_TOOLCHAIN=$(BPF_TOOLCHAIN) hack/verify-service-map-transaction.sh
 
 ebpf:
-	cargo +nightly build --manifest-path ebpf/unf-ebpf-tc/Cargo.toml -Z build-std=core --target bpfel-unknown-none --release
+	cargo +$(BPF_TOOLCHAIN) build --manifest-path ebpf/unf-ebpf-tc/Cargo.toml -Z build-std=core --target bpfel-unknown-none --release
 
 generate-crds:
 	cargo run -p unf-api --example crdgen > deploy/crds/network.unf.io_securitypolicies.yaml

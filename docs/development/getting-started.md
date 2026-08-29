@@ -42,14 +42,16 @@ dedicated SCC, explicit `spc_t` domain, and exact host mounts.
 ## Build the eBPF object
 
 ```bash
-rustup toolchain install nightly --component rust-src
+rustup toolchain install nightly-2026-07-15 --component rust-src
 cargo install bpf-linker --locked
 make ebpf
 ```
 
-`bpf-linker` features track LLVM majors. If its default LLVM does not match the
-host, select the matching feature. For example, the Fedora LLVM 22 development
-host used for the initial verification required:
+The Makefile pins `nightly-2026-07-15`, whose LLVM 22 output matches the
+qualified linker. Override `BPF_TOOLCHAIN` (and `UNF_BPF_TOOLCHAIN` for the
+privileged script) only with a deliberately matched compiler/linker pair.
+`bpf-linker` features track LLVM majors. The Fedora LLVM 22 development host
+uses:
 
 ```bash
 cargo install bpf-linker --version 0.11.0 \

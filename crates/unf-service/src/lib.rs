@@ -885,6 +885,12 @@ pub fn compile_service_dataplane(
     let mut backend_slots = BTreeMap::new();
 
     for service in &snapshot.services {
+        let eligible_backends = service
+            .backends
+            .iter()
+            .filter(|backend| backend.ready && !backend.terminating)
+            .map(|backend| backend.id)
+            .collect::<BTreeSet<_>>();
         for backend in &service.backends {
             let key = encode_service_backend_key(service.id, backend.id, bank);
             let flags = encode_backend_flags(backend);
@@ -917,10 +923,16 @@ pub fn compile_service_dataplane(
         }
         for (frontend_index, frontend) in service.frontends.iter().enumerate() {
             let frontend_index = bounded_u32(frontend_index);
+            let eligible_frontend_backends = frontend
+                .backend_ids
+                .iter()
+                .filter(|backend_id| eligible_backends.contains(backend_id))
+                .copied()
+                .collect::<Vec<_>>();
             let value = encode_service_frontend_value(
                 service.id,
                 frontend_index,
-                frontend.backend_ids.len(),
+                eligible_frontend_backends.len(),
                 snapshot.revision.get(),
             );
             match frontend.address {
@@ -947,7 +959,7 @@ pub fn compile_service_dataplane(
                     );
                 }
             }
-            for (slot, backend_id) in frontend.backend_ids.iter().enumerate() {
+            for (slot, backend_id) in eligible_frontend_backends.iter().enumerate() {
                 let slot = bounded_u32(slot);
                 backend_slots.insert(
                     encode_service_backend_slot_key(service.id, frontend_index, slot, bank),
@@ -1316,6 +1328,30 @@ mod tests {
         service.backends.clear();
         service.frontends[0].backend_ids.clear();
         assert!(snapshot(vec![service]).validate_and_normalize().is_ok());
+    }
+
+    #[test]
+    fn dataplane_slots_admit_only_ready_non_terminating_backends() {
+        let mut service = service(2, "lifecycle");
+        let mut draining = backend(3, "10.244.0.11", 8443);
+        draining.ready = true;
+        draining.serving = true;
+        draining.terminating = true;
+        let mut unready = backend(4, "10.244.0.12", 8443);
+        unready.ready = false;
+        unready.serving = false;
+        service.backends.extend([draining, unready]);
+        service.frontends[0].backend_ids =
+            vec![BackendId::new(2), BackendId::new(3), BackendId::new(4)];
+
+        let state = compile_service_dataplane(&snapshot(vec![service]), 0)
+            .expect("valid lifecycle-aware service state");
+        assert_eq!(state.ipv4_backends.len(), 3);
+        assert_eq!(state.backend_slots.len(), 1);
+        let frontend = state.ipv4_frontends.first_key_value().unwrap().1;
+        assert_eq!(u32::from_ne_bytes(frontend[8..12].try_into().unwrap()), 1);
+        let slot = state.backend_slots.first_key_value().unwrap().1;
+        assert_eq!(u32::from_ne_bytes(slot[0..4].try_into().unwrap()), 2);
     }
 
     #[test]
