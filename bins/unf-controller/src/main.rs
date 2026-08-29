@@ -386,7 +386,7 @@ struct StatusBody {
     identity_epoch: u64,
     revisions: RevisionSet,
     agents: AgentConvergenceSnapshot,
-    limitations: [&'static str; 2],
+    limitations: [&'static str; 3],
 }
 
 #[derive(Debug, Deserialize)]
@@ -736,6 +736,7 @@ async fn spawn_internal_api(
         .route("/v1/version", get(version))
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
+        .route("/v1/state/services", get(service_snapshot))
         .route("/v1/state/node-block", get(node_block_snapshot))
         .route("/v1/state/remote-routes", get(remote_route_snapshot))
         .route("/v1/state/agents", post(ingest_agent_status))
@@ -2900,6 +2901,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         limitations: [
             "desired state and identity allocations are currently in-memory only",
             "agent acknowledgements and the newest bounded flow history use separate single-controller ConfigMap checkpoints",
+            "service snapshots are distributed and durable userspace intent only; no service BPF map or ClusterIP forwarding is active",
         ],
     }))
 }
@@ -3198,6 +3200,43 @@ fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
             "active_policy_bank must identify transactional bank 0 or 1",
         ));
     }
+    if report
+        .service_last_error
+        .as_ref()
+        .is_some_and(|error| error.is_empty() || error.len() > 1_024)
+    {
+        return Err(ApiError::bad_request(
+            "service_last_error must be nonempty and at most 1024 bytes when present",
+        ));
+    }
+    let service_revision_pairs = [
+        (
+            report.desired_service_epoch,
+            report.desired_service_revision,
+        ),
+        (
+            report.applied_service_epoch,
+            report.applied_service_revision,
+        ),
+        (report.failed_service_epoch, report.failed_service_revision),
+    ];
+    if service_revision_pairs
+        .iter()
+        .any(|(epoch, revision)| (*epoch == 0) != (*revision == 0))
+    {
+        return Err(ApiError::bad_request(
+            "service epoch and revision must both be zero or both be nonzero",
+        ));
+    }
+    if report.applied_service_revision == 0
+        && (report.service_count != 0
+            || report.service_frontend_count != 0
+            || report.service_backend_count != 0)
+    {
+        return Err(ApiError::bad_request(
+            "service counts require a nonzero applied service revision",
+        ));
+    }
     Ok(())
 }
 
@@ -3218,6 +3257,10 @@ fn agent_convergence_snapshot(
         .map(|(node_name, assignment)| (node_name.clone(), assignment.revision))
         .collect();
     let routing_revision = mutex_lock(&state.revisions).routing;
+    let service_revision = read_lock(&state.compiled_service_snapshot)
+        .as_ref()
+        .map(|snapshot| (snapshot.source_epoch, snapshot.revision))
+        .unwrap_or_default();
     let unexpected_agents = reports
         .iter()
         .filter(|(node_name, stored)| {
@@ -3250,6 +3293,7 @@ fn agent_convergence_snapshot(
                         state.identity_epoch,
                         identity_revision,
                         policy_revision,
+                        service_revision,
                         node_block_revisions
                             .get(node_name)
                             .copied()
@@ -3350,6 +3394,7 @@ fn agent_report_matches(
     expected_epoch: u64,
     identity_revision: Revision,
     policy_revision: Revision,
+    service_revision: (u64, Revision),
     node_block_revision: Revision,
     remote_route_revision: (u64, Revision),
 ) -> bool {
@@ -3363,6 +3408,13 @@ fn agent_report_matches(
         && report.applied_policy_epoch == expected_epoch
         && report.desired_policy_revision == policy_revision.get()
         && report.applied_policy_revision == policy_revision.get()
+        && report.desired_service_epoch == service_revision.0
+        && report.applied_service_epoch == service_revision.0
+        && report.desired_service_revision == service_revision.1.get()
+        && report.applied_service_revision == service_revision.1.get()
+        && report.failed_service_epoch == 0
+        && report.failed_service_revision == 0
+        && report.service_last_error.is_none()
         && report.desired_node_block_revision == node_block_revision.get()
         && report.applied_node_block_revision == node_block_revision.get()
         && report.desired_remote_route_epoch == remote_route_revision.0
@@ -3398,6 +3450,22 @@ async fn policy_snapshot(
         egress_ipv4_entries,
         egress_ipv6_entries,
     }))
+}
+
+async fn service_snapshot(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<ServiceSnapshot>, ApiError> {
+    authenticate_internal_agent(&state, &headers).await?;
+    service_snapshot_for(&state).map(Json)
+}
+
+fn service_snapshot_for(state: &ControllerState) -> Result<ServiceSnapshot, ApiError> {
+    read_lock(&state.compiled_service_snapshot)
+        .clone()
+        .ok_or_else(|| {
+            ApiError::service_unavailable("service state has no authoritative compiled revision")
+        })
 }
 
 async fn node_block_snapshot(
@@ -5416,6 +5484,10 @@ mod tests {
             version.agent_status_schema_version,
             AGENT_STATUS_SCHEMA_VERSION
         );
+        assert_eq!(
+            version.service_snapshot_schema_version,
+            unf_service::SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
     }
 
     fn security_policy(name: &str, action: &str) -> SecurityPolicy {
@@ -6318,6 +6390,17 @@ mod tests {
             applied_policy_epoch: epoch,
             policy_map_entries: 1,
             active_policy_bank: 0,
+            desired_service_epoch: 0,
+            desired_service_revision: 0,
+            applied_service_epoch: 0,
+            applied_service_revision: 0,
+            failed_service_epoch: 0,
+            failed_service_revision: 0,
+            service_count: 0,
+            service_frontend_count: 0,
+            service_backend_count: 0,
+            service_reconcile_errors: 0,
+            service_last_error: None,
             desired_node_block_revision: 0,
             applied_node_block_revision: 0,
             desired_remote_route_epoch: 0,
@@ -6854,6 +6937,49 @@ mod tests {
     }
 
     #[test]
+    fn agent_convergence_requires_the_compiled_service_revision() {
+        let state = new_state(true);
+        apply_node_event(&state, Event::Apply(node(true)));
+        apply_service_event(&state, Event::Apply(service()));
+        let snapshot = service_snapshot_for(&state).expect("compiled service snapshot");
+        let mut report = converged_agent_report(state.identity_epoch);
+        report.desired_service_epoch = snapshot.source_epoch;
+        report.applied_service_epoch = snapshot.source_epoch;
+        report.desired_service_revision = snapshot.revision.get();
+        report.applied_service_revision = snapshot.revision.get();
+        report.service_count = snapshot.services.len() as u64;
+        report.service_frontend_count = snapshot.services[0].frontends.len() as u64;
+        validate_agent_status(&report).expect("service acknowledgement is valid");
+        write_lock(&state.agent_reports).insert(
+            report.node_name.clone(),
+            StoredAgentReport {
+                report: report.clone(),
+                last_received_unix_ms: 100,
+            },
+        );
+        assert!(
+            agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
+                .all_converged
+        );
+
+        report.applied_service_epoch = 0;
+        report.applied_service_revision = 0;
+        report.service_count = 0;
+        report.service_frontend_count = 0;
+        write_lock(&state.agent_reports).insert(
+            report.node_name.clone(),
+            StoredAgentReport {
+                report,
+                last_received_unix_ms: 100,
+            },
+        );
+        assert!(
+            !agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
+                .all_converged
+        );
+    }
+
+    #[test]
     fn agent_node_selector_accepts_presence_and_exact_value_forms() {
         let mut candidate = topology_node(&node(true));
         candidate
@@ -7138,6 +7264,12 @@ mod tests {
             assert_eq!(snapshot.revision, Revision::new(1));
             assert_eq!(snapshot.services.len(), 1);
         }
+        assert_eq!(
+            service_snapshot_for(&state)
+                .expect("distribution retains last-valid snapshot")
+                .revision,
+            Revision::new(1)
+        );
 
         let status = status(State(Arc::clone(&state)))
             .await

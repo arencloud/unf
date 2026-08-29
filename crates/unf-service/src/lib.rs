@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{BackendId, Protocol, Revision, ServiceId};
 
-pub const SERVICE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub use unf_common::SERVICE_SNAPSHOT_SCHEMA_VERSION;
+
 pub const MAX_SERVICES: usize = 65_536;
 pub const MAX_SERVICE_FRONTENDS: usize = 131_072;
 pub const MAX_SERVICE_BACKENDS: usize = 262_144;

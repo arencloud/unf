@@ -17,7 +17,7 @@ cluster support.
 |---|---|---|---|
 | 4.1 | Service domain contract | **Verified** | `make service-ir-test`; explicit per-frontend same-family backend references; ADR 0074 |
 | 4.2 | Kubernetes service compiler | **Verified** | `make service-compiler-test`; deterministic exact dual-stack translation, stable collision rejection, lifecycle provenance, retained-last-valid status and topology non-regression; ADR 0075 |
-| 4.3 | Revisioned agent distribution | **Planned** | Authenticated snapshot, compatibility tuple, desired/applied status, LKG persistence and outage recovery |
+| 4.3 | Revisioned agent distribution | **Verified** | `make service-distribution-test`; authenticated snapshot, compatibility fencing, desired/applied/failed status, durable mode-0600 LKG persistence and outage recovery; ADR 0076 |
 | 4.4 | Transactional eBPF service state | **Planned** | Accepted map/connection-state ADR, verifier build, staging/readback/atomic activation/rollback and capacity fault gate |
 | 4.5 | Dual-stack ClusterIP dataplane | **Planned** | TCP/UDP translation, deterministic backend persistence, reverse path, endpoint churn, no-backend behavior and provenance |
 | 4.6 | Service operations | **Planned** | Metrics, status, flow history, explanation, cleanup and actionable failure reasons |
@@ -48,9 +48,8 @@ first gate. They receive separate rows after the ClusterIP foundation closes.
 
 ## Immediate next slice
 
-Define Phase 4.3's authenticated service distribution contract. Add the service
-schema to component compatibility, expose an epoch/revision-fenced snapshot to
-authenticated Node agents, persist a validated owner-only last-known-good copy,
-report desired/applied/error revisions independently from policy and routing,
-and prove controller outage, stale epoch/revision rejection, replacement, and
-recovery without defining or mutating service BPF maps.
+Before implementing Phase 4.4, accept the service dataplane hook and connection
+state ADR. Define fixed-layout frontend/backend/config capacity, transactional
+staging and atomic activation, readback, last-known-good recovery, rollback on
+partial or capacity failure, and exact ownership/cleanup semantics. Then build
+and test those maps without yet claiming packet translation or ClusterIP support.

@@ -159,7 +159,7 @@ Phase 3 NetworkPolicy compatibility is complete at its documented bounded L4
 scope. Full-CNI dataplane ownership, link/routing lifecycle, and exact Kind and
 OpenShift recovery are Verified under ADRs 0057–0073. Phase 4 now has a
 Kubernetes-independent service IR and deterministic retained-last-valid
-Kubernetes compiler under ADRs 0074–0075. Service distribution, map ABI, backend
-selection, conntrack/NAT behavior, eBPF forwarding, and kube-proxy replacement
+Kubernetes compiler plus authenticated durable agent distribution under ADRs
+0074–0076. Service map ABI, backend selection, conntrack/NAT behavior, eBPF forwarding, and kube-proxy replacement
 remain gated until their hook and failure semantics are separately accepted and
 tested.

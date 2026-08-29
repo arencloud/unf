@@ -76,14 +76,14 @@ unsafe_path=$(jq '
     (.spec.template.spec.volumes[] | select(.name == "bpffs").hostPath.path) = "/etc"
 ' <<<"${daemonset}")
 expect_replace_denied "${unsafe_path}" \
-    'must use exactly the bpffs=/sys/fs/bpf' \
+    'must use exactly bpffs, BTF, and the durable UNF state directory' \
     'unsafe DaemonSet host path'
 
 unsafe_type=$(jq '
     (.spec.template.spec.volumes[] | select(.name == "btf").hostPath.type) = "DirectoryOrCreate"
 ' <<<"${daemonset}")
 expect_replace_denied "${unsafe_type}" \
-    'must use exactly the bpffs=/sys/fs/bpf' \
+    'must use exactly bpffs, BTF, and the durable UNF state directory' \
     'host-path creation request'
 
 writable_btf=$(jq '
@@ -168,7 +168,7 @@ if output=$("${kc[@]}" create --dry-run=server -f - <<<"${unsafe_pod}" 2>&1); th
     echo "unsafe direct agent Pod host path was admitted" >&2
     exit 1
 fi
-grep -q 'must use exactly the bpffs=/sys/fs/bpf' <<<"${output}"
+grep -q 'must use exactly bpffs, BTF, and the durable UNF state directory' <<<"${output}"
 
 unrelated_pod=$("${kc[@]}" run unf-host-mount-unrelated -n unf-system \
     --image=docker.io/library/busybox:1.37.0 --restart=Never \
@@ -183,15 +183,17 @@ jq -e '
         ([.spec.volumes[] | select(has("hostPath")) |
             [.name, .hostPath.path, .hostPath.type]] | sort) == [
                 ["bpffs", "/sys/fs/bpf", "Directory"],
-                ["btf", "/sys/kernel/btf", "Directory"]
+                ["btf", "/sys/kernel/btf", "Directory"],
+                ["cni-state", "/var/lib/unf/cni", "DirectoryOrCreate"]
             ]
         and (.spec.containers | length) == 1
         and .spec.containers[0].name == "agent"
         and ([.spec.containers[0].volumeMounts[] |
-            select(.name == "bpffs" or .name == "btf") |
+            select(.name == "bpffs" or .name == "btf" or .name == "cni-state") |
             [.name, .mountPath, (.readOnly // false)]] | sort) == [
                 ["bpffs", "/sys/fs/bpf", false],
-                ["btf", "/sys/kernel/btf", true]
+                ["btf", "/sys/kernel/btf", true],
+                ["cni-state", "/var/lib/unf/cni", false]
             ])
 ' <<<"${agents}" >/dev/null
 
@@ -207,4 +209,4 @@ if output=$("${kc[@]}" -n unf-system patch pod "${agent}" \
 fi
 grep -q 'only the agent container may mount' <<<"${output}"
 
-echo "OpenShift host-mount admission qualification passed: exact bpffs/BTF volumes admitted; service-account replacement, alternate paths/types/modes, subPath/propagation, sidecar/init/direct-Pod/ephemeral host mounts denied"
+echo "OpenShift host-mount admission qualification passed: exact bpffs/BTF/durable-state volumes admitted; service-account replacement, alternate paths/types/modes, subPath/propagation, sidecar/init/direct-Pod/ephemeral host mounts denied"

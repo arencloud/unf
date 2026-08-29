@@ -49,6 +49,7 @@ use unf_route::{
     NativeIpv4NextHop, NativeIpv6NextHop, NativeRemoteNode, NativeRemoteRoutePlan,
     NativeRemoteRoutingProvider, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION, RemoteRouteSnapshot,
 };
+use unf_service::ServiceSnapshot;
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
     EgressIpv4PolicyMapEntry, EgressIpv6PolicyMapEntry, FLOW_EXPORT_BATCH_LIMIT,
@@ -71,6 +72,9 @@ const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.cr
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
 const DEFAULT_CNI_NODE_BLOCK_STATE_PATH: &str = "/var/lib/unf/cni/v1/node-block.json";
 const DEFAULT_CNI_REMOTE_ROUTE_STATE_PATH: &str = "/var/lib/unf/cni/v1/remote-routes.json";
+const DEFAULT_SERVICE_STATE_PATH: &str = "/var/lib/unf/cni/v1/service-snapshot.json";
+const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
+const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
 const BLOCKED_TRANSITION_REPORTING_WINDOW: Duration = Duration::from_secs(30);
 const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
@@ -144,6 +148,16 @@ struct Args {
     controller_ca_path: PathBuf,
     #[arg(long, env = "UNF_IDENTITY_SYNC_SECONDS", default_value_t = 2)]
     identity_sync_seconds: u64,
+    /// Poll interval for validated userspace service snapshots.
+    #[arg(long, env = "UNF_SERVICE_SYNC_SECONDS", default_value_t = 2)]
+    service_sync_seconds: u64,
+    /// Durable owner-only last-known-good service snapshot.
+    #[arg(
+        long,
+        env = "UNF_SERVICE_STATE_PATH",
+        default_value = DEFAULT_SERVICE_STATE_PATH
+    )]
+    service_state_path: PathBuf,
     #[arg(long, env = "UNF_NODE_NAME", default_value = "unknown")]
     node_name: String,
     #[arg(long, env = "UNF_POD_NAME", default_value = "unknown")]
@@ -380,6 +394,12 @@ struct AgentMetrics {
     desired_policy_revision: Gauge,
     applied_policy_revision: Gauge,
     policy_map_entries: Gauge,
+    service_sync_errors: Counter,
+    desired_service_revision: Gauge,
+    applied_service_revision: Gauge,
+    service_count: Gauge,
+    service_frontend_count: Gauge,
+    service_backend_count: Gauge,
     remote_route_sync_errors: Counter,
     desired_remote_route_revision: Gauge,
     applied_remote_route_revision: Gauge,
@@ -415,6 +435,17 @@ struct AgentState {
     applied_policy_epoch: AtomicU64,
     policy_map_entries: AtomicU64,
     active_policy_bank: AtomicU64,
+    desired_service_epoch: AtomicU64,
+    desired_service_revision: AtomicU64,
+    applied_service_epoch: AtomicU64,
+    applied_service_revision: AtomicU64,
+    failed_service_epoch: AtomicU64,
+    failed_service_revision: AtomicU64,
+    service_count: AtomicU64,
+    service_frontend_count: AtomicU64,
+    service_backend_count: AtomicU64,
+    service_reconcile_errors: AtomicU64,
+    service_last_error: Mutex<Option<String>>,
     desired_node_block_revision: AtomicU64,
     applied_node_block_revision: AtomicU64,
     desired_remote_route_epoch: AtomicU64,
@@ -701,7 +732,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(initial_agent_state(&args));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
-    spawn_startup_agent_status_reporter(&args, &state, &cancellation, &mut tasks)?;
+    spawn_control_plane_tasks(&args, &state, &cancellation, &mut tasks)?;
     let (service_failure_tx, mut service_failure_rx) = mpsc::channel(1);
     let mut supervised_service_configured = false;
 
@@ -994,6 +1025,9 @@ fn persist_secure_json<T: Serialize>(path: &Path, value: &T, description: &str) 
     }
     let bytes =
         serde_json::to_vec_pretty(value).with_context(|| format!("encode {description} state"))?;
+    if bytes.len() as u64 > MAX_DURABLE_STATE_BYTES {
+        bail!("{description} state exceeds the 64 MiB durable-state limit");
+    }
     let write_result = (|| -> Result<()> {
         let mut output = OpenOptions::new()
             .create_new(true)
@@ -1022,7 +1056,7 @@ fn load_secure_json<T: DeserializeOwned>(path: &Path, description: &str) -> Resu
     reject_node_block_symlinks(path)?;
     let metadata = fs::metadata(path)
         .with_context(|| format!("inspect {description} state {}", path.display()))?;
-    if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
+    if !metadata.is_file() || metadata.len() > MAX_DURABLE_STATE_BYTES {
         bail!("{description} state must be a regular file no larger than 64 MiB");
     }
     if metadata.permissions().mode() & 0o077 != 0 {
@@ -1620,6 +1654,304 @@ fn spawn_startup_agent_status_reporter(
     Ok(())
 }
 
+fn spawn_control_plane_tasks(
+    args: &Args,
+    state: &Arc<AgentState>,
+    cancellation: &CancellationToken,
+    tasks: &mut JoinSet<()>,
+) -> Result<()> {
+    spawn_startup_agent_status_reporter(args, state, cancellation, tasks)?;
+    spawn_service_snapshot_reconciler(args, state, cancellation, tasks)
+}
+
+fn spawn_service_snapshot_reconciler(
+    args: &Args,
+    state: &Arc<AgentState>,
+    cancellation: &CancellationToken,
+    tasks: &mut JoinSet<()>,
+) -> Result<()> {
+    let Some(controller_url) = args.controller_url.as_deref() else {
+        return Ok(());
+    };
+    let controller_url = controller_url.trim_end_matches('/').to_owned();
+    let client =
+        dataplane_controller_client(Some(&controller_url), &args.controller_ca_path, state)?;
+    let token_path = args.agent_token_path.clone();
+    let state_path = args.service_state_path.clone();
+    let interval = Duration::from_secs(args.service_sync_seconds.max(1));
+    let service_state = Arc::clone(state);
+    let service_cancellation = cancellation.clone();
+    tasks.spawn(async move {
+        reconcile_service_snapshots(
+            controller_url,
+            client,
+            token_path,
+            state_path,
+            interval,
+            service_state,
+            service_cancellation,
+        )
+        .await;
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_service_snapshots(
+    controller_url: String,
+    client: ReloadingControllerClient,
+    token_path: PathBuf,
+    state_path: PathBuf,
+    interval_duration: Duration,
+    state: Arc<AgentState>,
+    cancellation: CancellationToken,
+) {
+    let mut applied = match load_optional_service_snapshot(&state_path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            record_service_snapshot_error(&state, &error);
+            warn!(%error, path = %state_path.display(), "rejected durable service snapshot");
+            None
+        }
+    };
+    if let Some(snapshot) = &applied {
+        publish_desired_service_snapshot(&state, snapshot);
+        publish_applied_service_snapshot(&state, snapshot);
+        info!(
+            epoch = snapshot.source_epoch,
+            revision = snapshot.revision.get(),
+            path = %state_path.display(),
+            "restored last-known-good userspace service snapshot"
+        );
+    }
+
+    let mut interval = tokio::time::interval(interval_duration);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut compatibility_confirmed = false;
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            _ = interval.tick() => {
+                let result = async {
+                    if !compatibility_confirmed {
+                        ensure_service_controller_compatibility(
+                            &client,
+                            &controller_url,
+                            &token_path,
+                        )
+                        .await?;
+                        compatibility_confirmed = true;
+                    }
+                    let candidate = fetch_service_snapshot(
+                        &controller_url,
+                        &client,
+                        &token_path,
+                    )
+                    .await?;
+                    adopt_service_snapshot(candidate, &mut applied, &state_path, &state)
+                }
+                .await;
+                if let Err(error) = result {
+                    record_service_snapshot_error(&state, &error);
+                    warn!(%error, "service snapshot sync failed; retaining last-known-good userspace state");
+                }
+            }
+        }
+    }
+}
+
+async fn fetch_service_snapshot(
+    controller_url: &str,
+    client: &ReloadingControllerClient,
+    token_path: &Path,
+) -> Result<ServiceSnapshot> {
+    authenticated_get(
+        client,
+        format!("{controller_url}/v1/state/services"),
+        token_path,
+    )?
+    .send()
+    .await
+    .context("request controller service snapshot")?
+    .error_for_status()
+    .context("controller rejected service snapshot request")?
+    .json()
+    .await
+    .context("decode controller service snapshot")
+}
+
+async fn ensure_service_controller_compatibility(
+    client: &ReloadingControllerClient,
+    controller_url: &str,
+    token_path: &Path,
+) -> Result<()> {
+    let compatibility: ComponentCompatibility =
+        authenticated_get(client, format!("{controller_url}/v1/version"), token_path)?
+            .send()
+            .await
+            .context("request controller compatibility for service snapshots")?
+            .error_for_status()
+            .context("controller rejected service compatibility preflight")?
+            .json()
+            .await
+            .context("decode service compatibility preflight")?;
+    ensure_controller_compatibility(&compatibility)
+}
+
+fn load_optional_service_snapshot(path: &Path) -> Result<Option<ServiceSnapshot>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect durable service snapshot {}", path.display())),
+        Ok(_) => {
+            let snapshot: ServiceSnapshot = load_secure_json(path, "service")?;
+            Ok(Some(snapshot.validate_and_normalize()?))
+        }
+    }
+}
+
+fn adopt_service_snapshot(
+    candidate: ServiceSnapshot,
+    applied: &mut Option<ServiceSnapshot>,
+    state_path: &Path,
+    state: &AgentState,
+) -> Result<()> {
+    let candidate = candidate.validate_and_normalize()?;
+    publish_desired_service_snapshot(state, &candidate);
+    if !validate_service_snapshot_transition(&candidate, applied.as_ref())? {
+        clear_service_snapshot_error(state);
+        return Ok(());
+    }
+    persist_secure_json(state_path, &candidate, "service")?;
+    publish_applied_service_snapshot(state, &candidate);
+    info!(
+        epoch = candidate.source_epoch,
+        revision = candidate.revision.get(),
+        services = candidate.services.len(),
+        "durably adopted userspace service snapshot"
+    );
+    *applied = Some(candidate);
+    clear_service_snapshot_error(state);
+    Ok(())
+}
+
+fn validate_service_snapshot_transition(
+    candidate: &ServiceSnapshot,
+    applied: Option<&ServiceSnapshot>,
+) -> Result<bool> {
+    let Some(applied) = applied else {
+        return Ok(true);
+    };
+    if candidate.source_epoch != applied.source_epoch {
+        return Ok(true);
+    }
+    if candidate.revision < applied.revision {
+        bail!(
+            "service revision regressed from {} to {} in controller epoch {}",
+            applied.revision.get(),
+            candidate.revision.get(),
+            candidate.source_epoch
+        );
+    }
+    if candidate.revision == applied.revision {
+        if candidate != applied {
+            bail!("service snapshot content changed without a revision change");
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn service_snapshot_counts(snapshot: &ServiceSnapshot) -> (u64, u64, u64) {
+    let services = snapshot.services.len() as u64;
+    let frontends = snapshot
+        .services
+        .iter()
+        .map(|service| service.frontends.len() as u64)
+        .sum();
+    let backends = snapshot
+        .services
+        .iter()
+        .map(|service| service.backends.len() as u64)
+        .sum();
+    (services, frontends, backends)
+}
+
+fn publish_desired_service_snapshot(state: &AgentState, snapshot: &ServiceSnapshot) {
+    state
+        .desired_service_epoch
+        .store(snapshot.source_epoch, Ordering::Release);
+    state
+        .desired_service_revision
+        .store(snapshot.revision.get(), Ordering::Release);
+    state
+        .metrics
+        .desired_service_revision
+        .set(metric_value(snapshot.revision.get()));
+}
+
+fn publish_applied_service_snapshot(state: &AgentState, snapshot: &ServiceSnapshot) {
+    let (services, frontends, backends) = service_snapshot_counts(snapshot);
+    state
+        .applied_service_epoch
+        .store(snapshot.source_epoch, Ordering::Release);
+    state
+        .applied_service_revision
+        .store(snapshot.revision.get(), Ordering::Release);
+    state.service_count.store(services, Ordering::Release);
+    state
+        .service_frontend_count
+        .store(frontends, Ordering::Release);
+    state
+        .service_backend_count
+        .store(backends, Ordering::Release);
+    state
+        .metrics
+        .applied_service_revision
+        .set(metric_value(snapshot.revision.get()));
+    state.metrics.service_count.set(metric_value(services));
+    state
+        .metrics
+        .service_frontend_count
+        .set(metric_value(frontends));
+    state
+        .metrics
+        .service_backend_count
+        .set(metric_value(backends));
+}
+
+fn record_service_snapshot_error(state: &AgentState, error: &anyhow::Error) {
+    state
+        .service_reconcile_errors
+        .fetch_add(1, Ordering::AcqRel);
+    state.metrics.service_sync_errors.inc();
+    state.failed_service_epoch.store(
+        state.desired_service_epoch.load(Ordering::Acquire),
+        Ordering::Release,
+    );
+    state.failed_service_revision.store(
+        state.desired_service_revision.load(Ordering::Acquire),
+        Ordering::Release,
+    );
+    let mut message = error.to_string();
+    if message.len() > MAX_SERVICE_ERROR_BYTES {
+        let boundary = message
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= MAX_SERVICE_ERROR_BYTES)
+            .last()
+            .unwrap_or(0);
+        message.truncate(boundary);
+    }
+    *mutex_lock(&state.service_last_error) = Some(message);
+}
+
+fn clear_service_snapshot_error(state: &AgentState) {
+    state.failed_service_epoch.store(0, Ordering::Release);
+    state.failed_service_revision.store(0, Ordering::Release);
+    mutex_lock(&state.service_last_error).take();
+}
+
 async fn hold_blocked_transition_reporting_window(
     dataplane_failure: Option<&anyhow::Error>,
     state: &AgentState,
@@ -1938,6 +2270,12 @@ fn new_state(
         desired_policy_revision: Gauge::default(),
         applied_policy_revision: Gauge::default(),
         policy_map_entries: Gauge::default(),
+        service_sync_errors: Counter::default(),
+        desired_service_revision: Gauge::default(),
+        applied_service_revision: Gauge::default(),
+        service_count: Gauge::default(),
+        service_frontend_count: Gauge::default(),
+        service_backend_count: Gauge::default(),
         remote_route_sync_errors: Counter::default(),
         desired_remote_route_revision: Gauge::default(),
         applied_remote_route_revision: Gauge::default(),
@@ -1974,6 +2312,17 @@ fn new_state(
         applied_policy_epoch: AtomicU64::new(0),
         policy_map_entries: AtomicU64::new(0),
         active_policy_bank: AtomicU64::new(0),
+        desired_service_epoch: AtomicU64::new(0),
+        desired_service_revision: AtomicU64::new(0),
+        applied_service_epoch: AtomicU64::new(0),
+        applied_service_revision: AtomicU64::new(0),
+        failed_service_epoch: AtomicU64::new(0),
+        failed_service_revision: AtomicU64::new(0),
+        service_count: AtomicU64::new(0),
+        service_frontend_count: AtomicU64::new(0),
+        service_backend_count: AtomicU64::new(0),
+        service_reconcile_errors: AtomicU64::new(0),
+        service_last_error: Mutex::new(None),
         desired_node_block_revision: AtomicU64::new(0),
         applied_node_block_revision: AtomicU64::new(0),
         desired_remote_route_epoch: AtomicU64::new(0),
@@ -2099,6 +2448,7 @@ fn register_agent_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         "Policy entries in the active BPF map bank",
         metrics.policy_map_entries.clone(),
     );
+    register_service_metrics(registry, metrics);
     register_remote_route_metrics(registry, metrics);
     registry.register(
         "unf_telemetry_dropped_events",
@@ -2126,6 +2476,39 @@ fn register_agent_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         metrics.controller_trust_reload_errors.clone(),
     );
     register_version_transition_metrics(registry, metrics);
+}
+
+fn register_service_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
+    registry.register(
+        "unf_service_sync_errors",
+        "Service snapshots rejected or not durably adopted",
+        metrics.service_sync_errors.clone(),
+    );
+    registry.register(
+        "unf_service_revision_desired",
+        "Latest valid service revision observed from the controller",
+        metrics.desired_service_revision.clone(),
+    );
+    registry.register(
+        "unf_service_revision_applied",
+        "Service revision validated and durably adopted in userspace",
+        metrics.applied_service_revision.clone(),
+    );
+    registry.register(
+        "unf_service_count",
+        "Services in the durable userspace service snapshot",
+        metrics.service_count.clone(),
+    );
+    registry.register(
+        "unf_service_frontend_count",
+        "Frontends in the durable userspace service snapshot",
+        metrics.service_frontend_count.clone(),
+    );
+    registry.register(
+        "unf_service_backend_count",
+        "Backends in the durable userspace service snapshot",
+        metrics.service_backend_count.clone(),
+    );
 }
 
 fn register_remote_route_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
@@ -2646,6 +3029,7 @@ async fn preflight_controller_compatibility(
         controller_revision = %compatibility.build_revision,
         persistent_bpf_state_abi_version = compatibility.persistent_bpf_state_abi_version,
         policy_snapshot_schema_version = compatibility.policy_snapshot_schema_version,
+        service_snapshot_schema_version = compatibility.service_snapshot_schema_version,
         "controller compatibility preflight passed before persistent BPF state access"
     );
     Ok(())
@@ -2673,6 +3057,11 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
             "policy snapshot schema",
             controller.policy_snapshot_schema_version,
             local.policy_snapshot_schema_version,
+        ),
+        (
+            "service snapshot schema",
+            controller.service_snapshot_schema_version,
+            local.service_snapshot_schema_version,
         ),
         (
             "agent-status schema",
@@ -3620,6 +4009,17 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
         applied_policy_epoch: state.applied_policy_epoch.load(Ordering::Acquire),
         policy_map_entries: state.policy_map_entries.load(Ordering::Acquire),
         active_policy_bank: state.active_policy_bank.load(Ordering::Acquire),
+        desired_service_epoch: state.desired_service_epoch.load(Ordering::Acquire),
+        desired_service_revision: state.desired_service_revision.load(Ordering::Acquire),
+        applied_service_epoch: state.applied_service_epoch.load(Ordering::Acquire),
+        applied_service_revision: state.applied_service_revision.load(Ordering::Acquire),
+        failed_service_epoch: state.failed_service_epoch.load(Ordering::Acquire),
+        failed_service_revision: state.failed_service_revision.load(Ordering::Acquire),
+        service_count: state.service_count.load(Ordering::Acquire),
+        service_frontend_count: state.service_frontend_count.load(Ordering::Acquire),
+        service_backend_count: state.service_backend_count.load(Ordering::Acquire),
+        service_reconcile_errors: state.service_reconcile_errors.load(Ordering::Acquire),
+        service_last_error: mutex_lock(&state.service_last_error).clone(),
         desired_node_block_revision: state.desired_node_block_revision.load(Ordering::Acquire),
         applied_node_block_revision: state.applied_node_block_revision.load(Ordering::Acquire),
         desired_remote_route_epoch: state.desired_remote_route_epoch.load(Ordering::Acquire),
@@ -5362,7 +5762,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         )
         .status_label(),
         capabilities: state.capabilities.clone(),
-        limitation: "TC policy enforcement uses transactional pinned maps and persistent atomic attachment replacement; internal controller traffic uses dedicated CA-pinned TLS and Pod-bound Kubernetes TokenReview authentication",
+        limitation: "service snapshots are authenticated durable userspace intent only; no service BPF maps, NAT, or ClusterIP forwarding are active",
     })
 }
 
@@ -5572,6 +5972,95 @@ mod tests {
             }],
         };
         (local, snapshot)
+    }
+
+    fn service_test_snapshot(epoch: u64, revision: u64) -> ServiceSnapshot {
+        unf_service::compile_service_snapshot(
+            epoch,
+            Revision::new(revision),
+            vec![unf_service::ServiceSource {
+                namespace: "default".to_owned(),
+                name: "api".to_owned(),
+                cluster_ips: vec!["10.96.0.10".parse().unwrap()],
+                ports: vec![unf_service::ServiceSourcePort {
+                    name: Some("http".to_owned()),
+                    protocol: unf_common::Protocol::Tcp,
+                    port: 80,
+                    app_protocol: Some("kubernetes.io/h2c".to_owned()),
+                }],
+            }],
+            Vec::new(),
+        )
+        .expect("test service snapshot compiles")
+    }
+
+    #[test]
+    fn service_snapshot_reconciliation_is_durable_fenced_and_reported() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("service-snapshot.json");
+        let state = test_agent_state();
+        let first = service_test_snapshot(7, 4);
+        let mut applied = None;
+
+        adopt_service_snapshot(first.clone(), &mut applied, &path, &state)
+            .expect("first snapshot is durably adopted");
+        assert_eq!(applied.as_ref(), Some(&first));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            load_optional_service_snapshot(&path).unwrap(),
+            Some(first.clone())
+        );
+        let report = agent_state_report(&state);
+        assert_eq!(report.desired_service_epoch, 7);
+        assert_eq!(report.applied_service_epoch, 7);
+        assert_eq!(report.desired_service_revision, 4);
+        assert_eq!(report.applied_service_revision, 4);
+        assert_eq!(report.service_count, 1);
+        assert_eq!(report.service_frontend_count, 1);
+        assert_eq!(report.service_backend_count, 0);
+        assert!(report.service_last_error.is_none());
+
+        let regressed = service_test_snapshot(7, 3);
+        let error = adopt_service_snapshot(regressed, &mut applied, &path, &state)
+            .expect_err("same-epoch regression is rejected");
+        record_service_snapshot_error(&state, &error);
+        assert_eq!(applied.as_ref(), Some(&first));
+        let report = agent_state_report(&state);
+        assert_eq!(report.desired_service_revision, 3);
+        assert_eq!(report.applied_service_revision, 4);
+        assert_eq!(report.failed_service_epoch, 7);
+        assert_eq!(report.failed_service_revision, 3);
+        assert_eq!(report.service_reconcile_errors, 1);
+        assert!(report.service_last_error.is_some());
+
+        let mut mutated = first.clone();
+        mutated.services[0].frontends[0].app_protocol = Some("example.com/other".to_owned());
+        assert!(validate_service_snapshot_transition(&mutated, applied.as_ref()).is_err());
+
+        let replacement = service_test_snapshot(8, 1);
+        adopt_service_snapshot(replacement.clone(), &mut applied, &path, &state)
+            .expect("new controller epoch is accepted");
+        assert_eq!(applied.as_ref(), Some(&replacement));
+        let report = agent_state_report(&state);
+        assert_eq!(report.desired_service_epoch, 8);
+        assert_eq!(report.applied_service_epoch, 8);
+        assert_eq!(report.applied_service_revision, 1);
+        assert_eq!(report.failed_service_epoch, 0);
+        assert_eq!(report.failed_service_revision, 0);
+        assert!(report.service_last_error.is_none());
+    }
+
+    #[test]
+    fn malformed_durable_service_snapshot_is_not_restored() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("service-snapshot.json");
+        let mut snapshot = service_test_snapshot(7, 4);
+        snapshot.schema_version += 1;
+        persist_secure_json(&path, &snapshot, "service").unwrap();
+        assert!(load_optional_service_snapshot(&path).is_err());
     }
 
     #[test]
@@ -5962,6 +6451,10 @@ mod tests {
             version.agent_status_schema_version,
             AGENT_STATUS_SCHEMA_VERSION
         );
+        assert_eq!(
+            version.service_snapshot_schema_version,
+            unf_service::SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -5990,6 +6483,16 @@ mod tests {
             error
                 .to_string()
                 .contains("persistent BPF-state ABI controller=4 agent=3")
+        );
+
+        controller.persistent_bpf_state_abi_version -= 1;
+        controller.service_snapshot_schema_version += 1;
+        let error = ensure_controller_compatibility(&controller)
+            .expect_err("a service-schema mismatch is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("service snapshot schema controller=2 agent=1")
         );
     }
 

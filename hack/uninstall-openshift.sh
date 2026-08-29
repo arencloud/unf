@@ -169,9 +169,9 @@ security_context=$(jq -c '.spec.template.spec.containers[] |
     select(.name == "agent").securityContext' <<<"${daemonset}")
 volume_mounts=$(jq -c '[.spec.template.spec.containers[] |
     select(.name == "agent").volumeMounts[] |
-    select(.name == "bpffs" or .name == "btf")]' <<<"${daemonset}")
+    select(.name == "bpffs" or .name == "btf" or .name == "cni-state")]' <<<"${daemonset}")
 volumes=$(jq -c '[.spec.template.spec.volumes[] |
-    select(.name == "bpffs" or .name == "btf")]' <<<"${daemonset}")
+    select(.name == "bpffs" or .name == "btf" or .name == "cni-state")]' <<<"${daemonset}")
 
 "${kc[@]}" -n unf-system delete daemonset unf-agent \
     --cascade=foreground --wait=true --timeout=180s

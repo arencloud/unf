@@ -2,6 +2,9 @@
 
 //! Small domain primitives shared across UNF components.
 
+/// Wire schema shared by service producers, consumers, and compatibility checks.
+pub const SERVICE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+
 macro_rules! numeric_id {
     ($name:ident) => {
         #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

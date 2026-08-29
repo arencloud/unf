@@ -30,20 +30,22 @@ spec:
       message: the unf-agent DaemonSet must retain the unf-agent service account
     - expression: >-
         has(variables.podSpec.volumes) &&
-        variables.podSpec.volumes.filter(volume, has(volume.hostPath)).size() == 2 &&
+        variables.podSpec.volumes.filter(volume, has(volume.hostPath)).size() == 3 &&
         variables.podSpec.volumes.exists(volume,
           volume.name == 'bpffs' && has(volume.hostPath) &&
           volume.hostPath.path == '/sys/fs/bpf' && volume.hostPath.type == 'Directory') &&
         variables.podSpec.volumes.exists(volume,
           volume.name == 'btf' && has(volume.hostPath) &&
-          volume.hostPath.path == '/sys/kernel/btf' && volume.hostPath.type == 'Directory')
+          volume.hostPath.path == '/sys/kernel/btf' && volume.hostPath.type == 'Directory') &&
+        variables.podSpec.volumes.exists(volume,
+          volume.name == 'cni-state' && has(volume.hostPath) &&
+          volume.hostPath.path == '/var/lib/unf/cni' && volume.hostPath.type == 'DirectoryOrCreate')
       message: >-
-        unf-agent must use exactly the bpffs=/sys/fs/bpf and
-        btf=/sys/kernel/btf Directory hostPath volumes
+        unf-agent must use exactly bpffs, BTF, and the durable UNF state directory
     - expression: >-
         variables.podSpec.containers.exists(container,
           container.name == 'agent' && has(container.volumeMounts) &&
-          container.volumeMounts.filter(mount, mount.name in ['bpffs', 'btf']).size() == 2 &&
+          container.volumeMounts.filter(mount, mount.name in ['bpffs', 'btf', 'cni-state']).size() == 3 &&
           container.volumeMounts.exists(mount,
             mount.name == 'bpffs' && mount.mountPath == '/sys/fs/bpf' &&
             (!has(mount.readOnly) || !mount.readOnly) &&
@@ -55,19 +57,26 @@ spec:
             has(mount.readOnly) && mount.readOnly &&
             (!has(mount.subPath) || mount.subPath == '') &&
             (!has(mount.subPathExpr) || mount.subPathExpr == '') &&
+            (!has(mount.mountPropagation) || mount.mountPropagation == 'None')) &&
+          container.volumeMounts.exists(mount,
+            mount.name == 'cni-state' && mount.mountPath == '/var/lib/unf/cni' &&
+            (!has(mount.readOnly) || !mount.readOnly) &&
+            (!has(mount.subPath) || mount.subPath == '') &&
+            (!has(mount.subPathExpr) || mount.subPathExpr == '') &&
             (!has(mount.mountPropagation) || mount.mountPropagation == 'None')))
       message: >-
         the agent container must mount bpffs read/write at /sys/fs/bpf and BTF
-        read-only at /sys/kernel/btf without subpaths or mount propagation
+        read-only at /sys/kernel/btf and durable state at /var/lib/unf/cni
+        without subpaths or mount propagation
     - expression: >-
         variables.podSpec.containers.all(container,
           container.name == 'agent' || !has(container.volumeMounts) ||
-          container.volumeMounts.all(mount, !(mount.name in ['bpffs', 'btf']))) &&
+          container.volumeMounts.all(mount, !(mount.name in ['bpffs', 'btf', 'cni-state']))) &&
         (!has(variables.podSpec.initContainers) ||
           variables.podSpec.initContainers.all(container,
             !has(container.volumeMounts) ||
-            container.volumeMounts.all(mount, !(mount.name in ['bpffs', 'btf']))))
-      message: only the agent container may mount the bpffs or BTF host volumes
+            container.volumeMounts.all(mount, !(mount.name in ['bpffs', 'btf', 'cni-state']))))
+      message: only the agent container may mount the bpffs, BTF, or durable state host volumes
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -103,20 +112,22 @@ spec:
   validations:
     - expression: >-
         has(variables.podSpec.volumes) &&
-        variables.podSpec.volumes.filter(volume, has(volume.hostPath)).size() == 2 &&
+        variables.podSpec.volumes.filter(volume, has(volume.hostPath)).size() == 3 &&
         variables.podSpec.volumes.exists(volume,
           volume.name == 'bpffs' && has(volume.hostPath) &&
           volume.hostPath.path == '/sys/fs/bpf' && volume.hostPath.type == 'Directory') &&
         variables.podSpec.volumes.exists(volume,
           volume.name == 'btf' && has(volume.hostPath) &&
-          volume.hostPath.path == '/sys/kernel/btf' && volume.hostPath.type == 'Directory')
+          volume.hostPath.path == '/sys/kernel/btf' && volume.hostPath.type == 'Directory') &&
+        variables.podSpec.volumes.exists(volume,
+          volume.name == 'cni-state' && has(volume.hostPath) &&
+          volume.hostPath.path == '/var/lib/unf/cni' && volume.hostPath.type == 'DirectoryOrCreate')
       message: >-
-        unf-agent must use exactly the bpffs=/sys/fs/bpf and
-        btf=/sys/kernel/btf Directory hostPath volumes
+        unf-agent must use exactly bpffs, BTF, and the durable UNF state directory
     - expression: >-
         variables.podSpec.containers.exists(container,
           container.name == 'agent' && has(container.volumeMounts) &&
-          container.volumeMounts.filter(mount, mount.name in ['bpffs', 'btf']).size() == 2 &&
+          container.volumeMounts.filter(mount, mount.name in ['bpffs', 'btf', 'cni-state']).size() == 3 &&
           container.volumeMounts.exists(mount,
             mount.name == 'bpffs' && mount.mountPath == '/sys/fs/bpf' &&
             (!has(mount.readOnly) || !mount.readOnly) &&
@@ -128,24 +139,31 @@ spec:
             has(mount.readOnly) && mount.readOnly &&
             (!has(mount.subPath) || mount.subPath == '') &&
             (!has(mount.subPathExpr) || mount.subPathExpr == '') &&
+            (!has(mount.mountPropagation) || mount.mountPropagation == 'None')) &&
+          container.volumeMounts.exists(mount,
+            mount.name == 'cni-state' && mount.mountPath == '/var/lib/unf/cni' &&
+            (!has(mount.readOnly) || !mount.readOnly) &&
+            (!has(mount.subPath) || mount.subPath == '') &&
+            (!has(mount.subPathExpr) || mount.subPathExpr == '') &&
             (!has(mount.mountPropagation) || mount.mountPropagation == 'None')))
       message: >-
         the agent container must mount bpffs read/write at /sys/fs/bpf and BTF
-        read-only at /sys/kernel/btf without subpaths or mount propagation
+        read-only at /sys/kernel/btf and durable state at /var/lib/unf/cni
+        without subpaths or mount propagation
     - expression: >-
         variables.podSpec.containers.all(container,
           container.name == 'agent' || !has(container.volumeMounts) ||
-          container.volumeMounts.all(mount, !(mount.name in ['bpffs', 'btf']))) &&
+          container.volumeMounts.all(mount, !(mount.name in ['bpffs', 'btf', 'cni-state']))) &&
         (!has(variables.podSpec.initContainers) ||
           variables.podSpec.initContainers.all(container,
             !has(container.volumeMounts) ||
-            container.volumeMounts.all(mount, !(mount.name in ['bpffs', 'btf'])))) &&
+            container.volumeMounts.all(mount, !(mount.name in ['bpffs', 'btf', 'cni-state'])))) &&
         (!has(variables.podSpec.ephemeralContainers) ||
           variables.podSpec.ephemeralContainers.all(container,
             !has(container.volumeMounts) ||
-            container.volumeMounts.all(mount, !(mount.name in ['bpffs', 'btf']))))
+            container.volumeMounts.all(mount, !(mount.name in ['bpffs', 'btf', 'cni-state']))))
       message: >-
-        only the agent container may mount the bpffs or BTF host volumes;
+        only the agent container may mount the bpffs, BTF, or durable state host volumes;
         init and ephemeral containers may not mount them
 ---
 apiVersion: admissionregistration.k8s.io/v1

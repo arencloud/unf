@@ -8,8 +8,9 @@ ADR 0025 replaced the built-in privileged SCC with a dedicated, constrained
 agent SCC. OpenShift SCC can allow or deny the `hostPath` volume class, but it
 cannot restrict allowed source paths. A user able to alter or create an agent
 workload could therefore request another host directory while still satisfying
-the SCC. The agent needs only writable bpffs state at `/sys/fs/bpf` and read-only
-kernel BTF metadata at `/sys/kernel/btf`.
+the SCC. The agent needs writable bpffs state at `/sys/fs/bpf`, read-only kernel
+BTF metadata at `/sys/kernel/btf`, and owner-only durable UNF state below
+`/var/lib/unf/cni`.
 
 This boundary must fail before an unsafe DaemonSet rollout, protect direct Pod
 creation and ephemeral-container updates, and avoid an external admission
@@ -31,15 +32,16 @@ validation by replacing its service account:
   updates, covering controller-generated Pods, direct Pods, and debug-container
   injection.
 
-Both policies require exactly two `hostPath` volumes:
+Both policies require exactly three `hostPath` volumes:
 
 - `bpffs` must be an existing `Directory` at `/sys/fs/bpf`;
-- `btf` must be an existing `Directory` at `/sys/kernel/btf`.
+- `btf` must be an existing `Directory` at `/sys/kernel/btf`; and
+- `cni-state` must be `DirectoryOrCreate` at `/var/lib/unf/cni`.
 
-The container named `agent` must mount bpffs read/write at `/sys/fs/bpf` and BTF
-read-only at `/sys/kernel/btf`. Subpaths, subpath expressions, and mount
+The container named `agent` must mount bpffs read/write at `/sys/fs/bpf`, BTF
+read-only at `/sys/kernel/btf`, and durable state read/write at `/var/lib/unf/cni`. Subpaths, subpath expressions, and mount
 propagation are rejected. Sidecars, init containers, and ephemeral containers
-cannot mount either host volume. The policy is deliberately scoped by workload
+cannot mount any of these host volumes. The policy is deliberately scoped by workload
 identity; unrelated workloads are not forced to adopt the UNF mount contract.
 
 The admission policies complement rather than replace SCC. SCC continues to
@@ -76,6 +78,10 @@ An SCC-authorized agent workload can no longer broaden its host filesystem view
 without a cluster administrator changing or removing the admission policy. A bad
 DaemonSet update is rejected without disrupting running agents, and debug
 containers cannot inherit the admitted host volumes.
+
+Phase 4.3 extended the same exact allowlist with `/var/lib/unf/cni` for durable
+mode-0600 service snapshots; alternate state paths, mount modes, consumers, and
+subpaths remain fail-closed.
 
 The policy uses the cluster-scoped `admissionregistration.k8s.io/v1` API and is
 live-qualified on OpenShift 4.22 / Kubernetes 1.35. Installers targeting clusters

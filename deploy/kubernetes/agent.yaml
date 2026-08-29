@@ -71,6 +71,8 @@ spec:
             - name: btf
               mountPath: /sys/kernel/btf
               readOnly: true
+            - name: cni-state
+              mountPath: /var/lib/unf/cni
             - name: agent-token
               mountPath: /var/run/secrets/unf-agent
               readOnly: true
@@ -86,6 +88,10 @@ spec:
           hostPath:
             path: /sys/kernel/btf
             type: Directory
+        - name: cni-state
+          hostPath:
+            path: /var/lib/unf/cni
+            type: DirectoryOrCreate
         - name: agent-token
           projected:
             defaultMode: 0400

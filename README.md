@@ -136,13 +136,16 @@ reprovision from zero all pass committed gates. Qualification remains limited
 to the exact recorded development tuple; production repositories and other
 platform versions are not inferred. Existing overlay deployments are unchanged.
 See the [cl02 installation checkpoint](docs/development/openshift-primary-cni-cl02-install.md).
-Phase 4 is now in progress. Its first two verified slices add strongly typed
+Phase 4 is now in progress. Its first three verified slices add strongly typed
 `ServiceId`/`BackendId` values and a bounded, schema-versioned,
 Kubernetes-independent dual-stack service IR, plus deterministic Kubernetes
 Service/EndpointSlice compilation with collision-checked IDs, exact family and
 port matching, lifecycle provenance, last-valid retention, and explicit status.
-Authenticated agent distribution, eBPF service maps, connection persistence,
-and kube-proxy-free forwarding remain explicitly gated by the
+Agents now retrieve that snapshot over the authenticated internal TLS channel,
+reject compatibility or epoch/revision violations, persist a mode-0600
+last-known-good copy before acknowledging it, and expose desired/applied/failed
+service state. eBPF service maps, connection persistence, and kube-proxy-free
+forwarding remain explicitly gated by the
 [Phase 4 service-fabric plan](docs/development/phase4-service-fabric-plan.md).
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
@@ -271,8 +274,8 @@ Implemented in the repository:
   TokenReview-authenticated internal HTTPS for agent snapshots and writes;
 - in-place server-certificate and CA-bundle reload with overlapping-root support,
   last-known-good fallback, reload/error metrics, and an OpenShift rotation gate;
-- OpenShift-native fail-closed admission for the agent's exact bpffs/BTF host
-  paths, mount modes, and single-container ownership;
+- OpenShift-native fail-closed admission for the agent's exact
+  bpffs/BTF/durable-state host paths, mount modes, and single-container ownership;
 - revision-fenced, read-only native policy simulation through the shared evaluator;
 - bounded non-blocking agent telemetry export and a 4,096-flow controller history
   with explicit drop/eviction accounting, schema-validated ConfigMap restart

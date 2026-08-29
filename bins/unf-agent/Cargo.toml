@@ -25,6 +25,7 @@ unf-cni-state = { path = "../../crates/unf-cni-state" }
 unf-ebpf-common = { path = "../../ebpf/unf-ebpf-common" }
 unf-ipam = { path = "../../crates/unf-ipam" }
 unf-route = { path = "../../crates/unf-route" }
+unf-service = { path = "../../crates/unf-service" }
 unf-state = { path = "../../crates/unf-state" }
 
 [dev-dependencies]

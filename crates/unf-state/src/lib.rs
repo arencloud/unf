@@ -5,7 +5,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use unf_common::{IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, RuleId, Verdict};
+use unf_common::{
+    IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, RuleId,
+    SERVICE_SNAPSHOT_SCHEMA_VERSION, Verdict,
+};
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
@@ -17,8 +20,8 @@ pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 3;
 pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 pub const SHADOW_IMPACT_SCHEMA_VERSION: u16 = 1;
-pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 2;
-pub const COMPONENT_COMPATIBILITY_SCHEMA_VERSION: u16 = 1;
+pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 3;
+pub const COMPONENT_COMPATIBILITY_SCHEMA_VERSION: u16 = 2;
 pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 3;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
@@ -34,6 +37,7 @@ pub struct ComponentCompatibility {
     pub persistent_bpf_state_abi_version: u16,
     pub identity_snapshot_schema_version: u16,
     pub policy_snapshot_schema_version: u16,
+    pub service_snapshot_schema_version: u16,
     pub agent_status_schema_version: u16,
     pub flow_export_schema_version: u16,
 }
@@ -49,6 +53,7 @@ impl ComponentCompatibility {
             persistent_bpf_state_abi_version: PERSISTENT_BPF_STATE_ABI_VERSION,
             identity_snapshot_schema_version: IDENTITY_SNAPSHOT_SCHEMA_VERSION,
             policy_snapshot_schema_version: POLICY_SNAPSHOT_SCHEMA_VERSION,
+            service_snapshot_schema_version: SERVICE_SNAPSHOT_SCHEMA_VERSION,
             agent_status_schema_version: AGENT_STATUS_SCHEMA_VERSION,
             flow_export_schema_version: FLOW_EXPORT_SCHEMA_VERSION,
         }
@@ -98,6 +103,28 @@ pub struct AgentStateReport {
     pub applied_policy_epoch: u64,
     pub policy_map_entries: u64,
     pub active_policy_bank: u64,
+    #[serde(default)]
+    pub desired_service_epoch: u64,
+    #[serde(default)]
+    pub desired_service_revision: u64,
+    #[serde(default)]
+    pub applied_service_epoch: u64,
+    #[serde(default)]
+    pub applied_service_revision: u64,
+    #[serde(default)]
+    pub failed_service_epoch: u64,
+    #[serde(default)]
+    pub failed_service_revision: u64,
+    #[serde(default)]
+    pub service_count: u64,
+    #[serde(default)]
+    pub service_frontend_count: u64,
+    #[serde(default)]
+    pub service_backend_count: u64,
+    #[serde(default)]
+    pub service_reconcile_errors: u64,
+    #[serde(default)]
+    pub service_last_error: Option<String>,
     #[serde(default)]
     pub desired_node_block_revision: u64,
     #[serde(default)]
@@ -1453,6 +1480,10 @@ mod tests {
         assert_eq!(
             compatibility.agent_status_schema_version,
             AGENT_STATUS_SCHEMA_VERSION
+        );
+        assert_eq!(
+            compatibility.service_snapshot_schema_version,
+            SERVICE_SNAPSHOT_SCHEMA_VERSION
         );
         assert_eq!(
             compatibility.flow_export_schema_version,

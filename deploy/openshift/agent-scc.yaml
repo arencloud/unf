@@ -4,7 +4,7 @@ metadata:
   name: unf-agent
   annotations:
     kubernetes.io/description: >-
-      Constrained SCC for the UNF worker agent: host networking, two scoped
+      Constrained SCC for the UNF worker agent: host networking, three scoped
       host paths, and only the capabilities required for eBPF and TC lifecycle.
 allowHostDirVolumePlugin: true
 allowHostIPC: false

@@ -93,12 +93,13 @@ matrix and reproducible evidence.
   before watchers begin, but the new controller epoch keeps restored reports
   non-converged until agents acknowledge current desired state. A restart gate
   proves both reports restore, reconverge, and advance without agent replacement;
-- Implemented and OpenShift verified: native fail-closed admission validates the
-  agent DaemonSet before rollout plus direct/generated Pods and ephemeral updates.
-  Only the exact existing `/sys/fs/bpf` and `/sys/kernel/btf` directories are
-  admitted, with writable bpffs, read-only BTF, no subpaths/propagation, and no
-  sidecar/init/ephemeral access. The focused negative gate is also part of the
-  complete dual-stack qualification;
+- Implemented with the original two paths OpenShift verified: native fail-closed
+  admission validates the agent DaemonSet before rollout plus direct/generated
+  Pods and ephemeral updates. Writable bpffs, read-only BTF, no
+  subpaths/propagation, and no sidecar/init/ephemeral access were live-qualified.
+  Phase 4.3 adds the exact `/var/lib/unf/cni` durable-state path under the same
+  rules and renders it statically; the additive path awaits Phase 4.8 live
+  requalification;
 - Implemented and OpenShift verified: coordinated uninstall is dry-run-first,
   requires exact context confirmation, stops every agent before host mutation,
   runs one SCC/admission-constrained cleanup Job per selected worker, verifies
@@ -364,11 +365,14 @@ authoritative record of verified results.
   stable collision-checked IDs; exact family/name/protocol/port and appProtocol
   provenance; lifecycle retention; ambiguous-source rejection; controller
   last-valid retention; and truthful status. `make service-compiler-test`; ADRs
-  0074–0075.
-- Next: authenticated, revision/epoch-fenced service snapshot distribution with
-  agent desired/applied/error state and durable last-known-good recovery.
-- Gated: service compatibility tuple changes beyond the distribution contract,
-  transactional eBPF service maps, conntrack/NAT semantics, backend selection,
+  0074–0075. Authenticated internal-TLS distribution, service-schema
+  compatibility fencing, bounded polling, atomic mode-0600 agent persistence,
+  restart/outage recovery, desired/applied/failed state, metrics, and controller
+  convergence are also verified by `make service-distribution-test` and ADR 0076.
+- Next: accept the service hook/connection-state ABI and implement transactional
+  frontend/backend/config maps with staging, readback, activation, rollback, and
+  durable recovery without packet-forwarding claims.
+- Gated: packet translation, conntrack/NAT semantics, backend selection,
   service observability/explanation, and kube-proxy-free dual-stack ClusterIP.
 - Later service slices: NodePort, LoadBalancer, session affinity,
   `externalTrafficPolicy`, `internalTrafficPolicy`, topology-aware routing,
