@@ -655,7 +655,10 @@ fn operation_result<T: TransactionApi>(
             operation,
         ))
         .map_err(|error| {
-            CniError::retry_with_details(version, format!("unf-agent transaction failed: {error}"))
+            CniError::agent_transport_failure(
+                version,
+                format!("unf-agent transaction failed: {error}"),
+            )
         })?;
     if response.schema_version != CNI_TRANSACTION_SCHEMA_VERSION {
         return Err(CniError::retry_with_details(

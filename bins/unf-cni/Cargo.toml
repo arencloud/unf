@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+rustix = { workspace = true, features = ["process"] }
 tokio.workspace = true
 unf-cni-state = { path = "../../crates/unf-cni-state" }
 unf-link = { path = "../../crates/unf-link" }

@@ -150,6 +150,11 @@ EOF
         rm -f /run/unf/cni.sock
         rm -f "$binary" "$config"
         rm -f "${state_dir}/attachments.json" "${state_dir}/node-block.json" "$routes" "$marker"
+        pending=${state_dir}/pending-deletes
+        test -d "$pending" && test ! -L "$pending"
+        test -z "$(find "$pending" -mindepth 1 -maxdepth 1 ! -name .unf-primary.lock -print -quit)"
+        rm -f "$pending/.unf-primary.lock"
+        rmdir "$pending"
         rmdir "$state_dir"
         rmdir /var/lib/unf/cni
         rmdir /run/unf

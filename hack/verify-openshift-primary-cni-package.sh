@@ -128,6 +128,7 @@ jq -e '
   .plugins[0].type == "unf" and
   .plugins[0].mode == "primary" and
   .plugins[0].agentSocket == "/run/unf/cni.sock" and
+  .plugins[0].deferredDeleteDirectory == "/var/lib/unf/cni/v1/pending-deletes" and
   .plugins[0].mtu == 1500
 ' "${runtime}/10-unf.conflist" >/dev/null
 
@@ -138,6 +139,7 @@ for exact_path in \
     /host/run/unf/cni.sock; do
     grep -q "${exact_path}" "${runtime}/install.sh"
 done
+grep -q '"${state_dir}/pending-deletes"' "${runtime}/install.sh"
 
 echo "OpenShift primary-CNI reinstall package passed static safety and render checks"
 "${project_root}/hack/verify-openshift-primary-cni-installer.sh"

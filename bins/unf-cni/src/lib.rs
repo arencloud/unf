@@ -1,8 +1,11 @@
 use std::env;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod deferred;
 mod lifecycle;
 
 pub use lifecycle::{SocketTransactionApi, TransactionApi};
@@ -12,7 +15,9 @@ pub const CURRENT_CNI_VERSION: &str = "1.1.0";
 pub const SUPPORTED_CNI_VERSIONS: [&str; 2] = ["1.0.0", CURRENT_CNI_VERSION];
 
 const DEFAULT_AGENT_SOCKET: &str = "/run/unf/cni.sock";
+const DEFAULT_DEFERRED_DELETE_DIRECTORY: &str = "/var/lib/unf/cni/v1/pending-deletes";
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
+const MAX_HOST_PATH_BYTES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
@@ -81,6 +86,8 @@ struct NetworkConfig {
     #[serde(default)]
     agent_socket: Option<String>,
     #[serde(default)]
+    deferred_delete_directory: Option<PathBuf>,
+    #[serde(default)]
     mtu: Option<u32>,
     ipam: IpamConfig,
     #[serde(default)]
@@ -122,6 +129,8 @@ pub struct CniError {
     pub code: u32,
     pub msg: String,
     pub details: String,
+    #[serde(skip)]
+    agent_transport_failure: bool,
 }
 
 impl CniError {
@@ -151,6 +160,7 @@ impl CniError {
             code,
             msg: msg.into(),
             details: details.into(),
+            agent_transport_failure: false,
         }
     }
 
@@ -185,6 +195,16 @@ impl CniError {
 
     fn retry_with_details(version: &str, details: impl Into<String>) -> Self {
         Self::new(version, 11, "Try again later", details)
+    }
+
+    fn agent_transport_failure(version: &str, details: impl Into<String>) -> Self {
+        let mut error = Self::retry_with_details(version, details);
+        error.agent_transport_failure = true;
+        error
+    }
+
+    fn is_agent_transport_failure(&self) -> bool {
+        self.agent_transport_failure
     }
 }
 
@@ -270,12 +290,92 @@ pub fn execute(environment: &InvocationEnvironment, input: &[u8]) -> Result<Succ
         .enable_all()
         .build()
         .map_err(|error| CniError::io(format!("create CNI lifecycle runtime: {error}")))?;
-    runtime.block_on(lifecycle::execute_validated(
+    if matches!(
+        command,
+        Command::Add | Command::Delete | Command::Check | Command::GarbageCollect
+    ) && let Err(error) = drain_deferred_deletes(&runtime, &config, &mut transaction)
+    {
+        if command == Command::Delete {
+            enqueue_current_delete(&config, environment)?;
+            if error.is_agent_transport_failure() {
+                return Ok(Success::Empty);
+            }
+        }
+        return Err(error);
+    }
+    let result = runtime.block_on(lifecycle::execute_validated(
         environment,
         &config,
         command,
         &mut transaction,
-    ))
+    ));
+    if command != Command::Delete {
+        return result;
+    }
+    match result {
+        Ok(success) => Ok(success),
+        Err(error) => {
+            enqueue_current_delete(&config, environment)?;
+            if error.is_agent_transport_failure() {
+                Ok(Success::Empty)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn drain_deferred_deletes(
+    runtime: &tokio::runtime::Runtime,
+    config: &NetworkConfig,
+    transaction: &mut SocketTransactionApi,
+) -> Result<(), CniError> {
+    let root = deferred_delete_directory(config);
+    let pending = deferred::list(root, &config.name).map_err(CniError::io)?;
+    for entry in pending {
+        let environment = InvocationEnvironment {
+            command: Some("DEL".to_owned()),
+            container_id: Some(entry.key.container_id.clone()),
+            netns: None,
+            ifname: Some(entry.key.ifname.clone()),
+            args: None,
+            path: None,
+        };
+        runtime.block_on(lifecycle::execute_validated(
+            &environment,
+            config,
+            Command::Delete,
+            transaction,
+        ))?;
+        deferred::complete(&entry).map_err(CniError::io)?;
+    }
+    Ok(())
+}
+
+fn enqueue_current_delete(
+    config: &NetworkConfig,
+    environment: &InvocationEnvironment,
+) -> Result<(), CniError> {
+    let root = deferred_delete_directory(config);
+    let key = unf_cni_state::AttachmentKey {
+        network: config.name.clone(),
+        container_id: environment
+            .container_id
+            .clone()
+            .expect("validated DEL has a container ID"),
+        ifname: environment
+            .ifname
+            .clone()
+            .expect("validated DEL has an interface name"),
+    };
+    deferred::enqueue(root, &key).map_err(CniError::io)
+}
+
+fn deferred_delete_directory(config: &NetworkConfig) -> &Path {
+    config
+        .deferred_delete_directory
+        .as_deref()
+        .unwrap_or_else(|| Path::new(DEFAULT_DEFERRED_DELETE_DIRECTORY))
 }
 
 /// Validates and runs one invocation through a supplied durable transaction API.
@@ -372,6 +472,16 @@ fn validate_config(config: &NetworkConfig, command: Command) -> Result<(), CniEr
             format!("agentSocket exceeds {MAX_UNIX_SOCKET_PATH_BYTES} bytes"),
         ));
     }
+    if let Some(path) = &config.deferred_delete_directory
+        && (!valid_absolute_path(path) || path.as_os_str().as_bytes().len() > MAX_HOST_PATH_BYTES)
+    {
+        return Err(CniError::invalid_config(
+            &config.cni_version,
+            format!(
+                "deferredDeleteDirectory must be an absolute non-NUL path no longer than {MAX_HOST_PATH_BYTES} bytes"
+            ),
+        ));
+    }
     if let Some(mtu) = config.mtu
         && !(1280..=65_535).contains(&mtu)
     {
@@ -447,6 +557,7 @@ fn valid_identifier(value: &str) -> bool {
     bytes
         .next()
         .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value.len() <= 253
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
@@ -462,8 +573,20 @@ fn valid_netns(value: &str) -> bool {
     value.starts_with('/') && !value.as_bytes().contains(&0)
 }
 
+fn valid_absolute_path(value: &Path) -> bool {
+    value.is_absolute() && !value.as_os_str().as_bytes().contains(&0)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    use unf_cni_state::{
+        CNI_TRANSACTION_SCHEMA_VERSION, TransactionOutcome, TransactionRequest, TransactionResponse,
+    };
+
     use super::*;
 
     fn environment(command: &str) -> InvocationEnvironment {
@@ -511,12 +634,69 @@ mod tests {
     }
 
     #[test]
-    fn delete_fails_retryably_when_durable_ownership_is_unavailable() {
-        let mut invocation = environment("DEL");
-        invocation.netns = None;
-        let error = execute(&invocation, &config(""))
-            .expect_err("DEL cannot release ownership while its journal is unavailable");
-        assert_eq!(error.code, 11);
+    fn deferred_delete_is_durable_and_drained_before_add() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let socket = directory.path().join("agent.sock");
+        let queue = directory.path().join("pending");
+        let input = serde_json::to_vec(&serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "unf-test",
+            "type": "unf",
+            "agentSocket": socket,
+            "deferredDeleteDirectory": queue,
+            "ipam": {"type": "unf"}
+        }))
+        .expect("network config");
+        let mut deletion = environment("DEL");
+        deletion.netns = None;
+        assert_eq!(
+            execute(&deletion, &input).expect("transport-offline DEL is deferred"),
+            Success::Empty
+        );
+        assert_eq!(
+            deferred::list(&queue, "unf-test")
+                .expect("list deferred delete")
+                .len(),
+            1
+        );
+
+        let listener = UnixListener::bind(&socket).expect("bind mock agent socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept deferred delete request");
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).expect("read request");
+            let request: TransactionRequest =
+                serde_json::from_slice(&bytes).expect("decode request");
+            assert!(matches!(
+                request,
+                TransactionRequest::BeginDelete {
+                    schema_version: CNI_TRANSACTION_SCHEMA_VERSION,
+                    ref key
+                } if key.network == "unf-test"
+                    && key.container_id == "container-1"
+                    && key.ifname == "eth0"
+            ));
+            let response = TransactionResponse {
+                schema_version: CNI_TRANSACTION_SCHEMA_VERSION,
+                outcome: TransactionOutcome::Ok {
+                    attachment: None,
+                    attachments: Vec::new(),
+                    attachment_count: 0,
+                },
+            };
+            stream
+                .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                .expect("write response");
+        });
+        let add_error =
+            execute(&environment("ADD"), &input).expect_err("mock serves only the drain");
+        assert_eq!(add_error.code, 11);
+        server.join().expect("mock agent thread");
+        assert!(
+            deferred::list(&queue, "unf-test")
+                .expect("list drained queue")
+                .is_empty()
+        );
     }
 
     #[test]

@@ -9,7 +9,8 @@ config_target=/host/etc/cni/net.d/10-unf.conflist
 state_dir=/host/var/lib/unf/cni/v1
 marker=${state_dir}/install.env
 
-mkdir -p /host/opt/cni/bin /host/etc/cni/net.d "${state_dir}" /host/run/unf
+mkdir -p /host/opt/cni/bin /host/etc/cni/net.d \
+    "${state_dir}" "${state_dir}/pending-deletes" /host/run/unf
 
 foreign_configs=$(find /host/etc/cni/net.d -mindepth 1 -maxdepth 1 -type f ! -name 10-unf.conflist -print)
 if [ -n "${foreign_configs}" ]; then

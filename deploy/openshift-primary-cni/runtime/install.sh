@@ -25,7 +25,7 @@ for directory in /host/var/lib/cni/bin /host/etc/kubernetes/cni/net.d; do
         exit 1
     fi
 done
-mkdir -p "${state_dir}"
+mkdir -p "${state_dir}" "${state_dir}/pending-deletes"
 
 foreign_configs=$(find /host/etc/kubernetes/cni/net.d -mindepth 1 -maxdepth 1 \
     -type f ! -name 10-unf.conflist -print)

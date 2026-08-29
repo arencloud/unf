@@ -1,7 +1,7 @@
 # ADR 0071: CNI garbage collection reconciles durable attachments from runtime authority
 
-Status: Accepted and implemented locally; live OpenShift rollout and reboot
-qualification in progress
+Status: Accepted, implemented, and live reconciliation verified; clean-reboot
+ordering exposed the follow-on handled by ADR 0072
 
 ## Context
 
@@ -68,14 +68,24 @@ The broader static gate also passed:
 `make fmt-check lint test ebpf support-matrix-check
 openshift-primary-cni-package-check`.
 
+The immutable revision `221168c` agent/CNI image was rolled serially to all
+five cl02 Nodes. Exact standards-shaped requests used CRI-O's authoritative
+result caches and removed 36 stale records across the cluster, including the 26
+previously observed on one worker. Every Node then had equal runtime cache,
+durable record, host-link, and running non-host-network Pod counts; all records
+were Ready, traffic and platform health passed, and a 50-second hold introduced
+no controller restart.
+
 ## Consequences
 
 Abrupt runtime loss now has an authoritative, retryable path to reclaim stale
 UNF links, routes, journal records, and dual-stack leases without weakening DEL
-or exact ownership. The local implementation is not yet credited as cl02 reboot
-qualification: new immutable agent/CNI images must be rolled out, the observed
-stale records must be reconciled, and a clean reboot must prove journal/link/Pod
-cardinality returns to equality.
+or exact ownership. This GC behavior is live-verified on cl02, but it does not
+by itself close reboot qualification. The next clean reboot proved that CRI-O
+can call DEL and discard its cache before the agent socket is restored, then
+start replacement ADD calls; the worker temporarily grew from 10 to 20 records.
+An explicit GC restored equality. ADR 0072 preserves those early DEL intents
+durably so replacement ADD cannot overtake their cleanup.
 
 This decision does not claim that CRI-O invokes GC at a particular interval.
 The live gate must record the runtime invocation behavior and may issue one

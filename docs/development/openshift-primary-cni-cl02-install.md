@@ -181,27 +181,51 @@ ADR 0071 implements CNI 1.1 `cni.dev/valid-attachments` reconciliation through
 network-scoped, ordered eight-record transaction pages. Stale records use the
 existing route-first exact cleanup and two-step durable deletion. A conflicted
 record and lease remain retryable while GC continues with other stale records.
-`make cni-lifecycle-test` and the complete static/eBPF/package gate pass. This
-fix is local evidence only until a new immutable agent/CNI image is rolled out,
-the 26 observed stale records are reconciled, and a clean reboot returns exact
-journal/link/Pod cardinality.
+`make cni-lifecycle-test` and the complete static/eBPF/package gate pass.
 
-The rollout candidate is exact source revision `221168c`, controller digest
+Revision `221168c` was rolled to all five Nodes using controller digest
 `sha256:45737844f39bd84b0e1929013ee01e8f364aa8d90fd8eb20430ad8d60e3cdb45`,
 and agent/CNI digest
 `sha256:822f79780fc28d46ff9a7e1a9127d43319a6b7368ece225cfcd883d8c5a74c52`.
-Both public Quay references were resolved anonymously after publication. They
-remain candidate evidence until the staged rollout and live reconciliation
-gates pass.
+Two replacement agents briefly retried after projected-token authorization
+returned 403 during cache startup; both recovered and the rollout converged.
+Both public Quay references were resolved anonymously after publication.
+
+Authoritative CRI-O CNI result caches drove one exact standards-shaped GC call
+per Node. Before GC, record/cache/link counts were 39/37/37, 35/33/33,
+20/16/16, 22/20/20, and 36/10/10. Afterwards they were exactly 37/37/37,
+33/33/33, 16/16/16, 20/20/20, and 10/10/10, with no missing link and every
+retained record Ready. This removed 36 stale records in total. Direct
+cross-worker IPv4/IPv6 traffic, external routing, all five kubelet proxy paths,
+DNS, and operators other than the pre-existing external Insights condition
+passed; a 50-second hold had no new controller restart.
+
+The next worker reboot changed its boot ID and restored the Node, agent,
+controller convergence, eleven BPF maps, four remote routes per family, and
+dual-stack canary traffic. It did not pass attachment cardinality: the worker
+grew from 10 records/caches/links to 20 records, 10 caches, and 10 links. CRI-O
+journal evidence showed DEL calls for all ten old sandboxes at 11:28:07–08,
+before the agent published `/run/unf/cni.sock` at 11:28:38. CRI-O removed each
+result cache anyway, and replacement ADD calls at 11:28:50 allocated new
+attachments. Explicit GC restored 10/10/10 with no missing link.
+
+ADR 0072 now implements a durable owner-only deferred-delete queue. Offline DEL
+returns success only after exact intent persistence; the next lifecycle command
+must drain it through the agent before proceeding. The default applies even to
+older compatible network configurations retained in CRI-O caches. Local CNI,
+strict workspace, eBPF, support-matrix, and OpenShift package gates pass. A new
+immutable rollout and a second clean reboot are required for live credit. The
+`221168c` images remain the successful GC reconciliation evidence, but do not
+contain ADR 0072's implementation.
 
 ## Remaining exit criteria
 
 The live primary-CNI lifecycle remains **In progress** until repository changes
 and repeatable gates prove the remaining items:
 
-- immutable GC image rollout, reconciliation of the retained reboot-stale
-  records, and Node reboot last-known-good recovery with exact
-  journal/link/Pod cardinality;
+- immutable deferred-delete image rollout and Node reboot last-known-good
+  recovery with an empty deferred queue and exact journal/cache/link/Pod
+  cardinality;
 - CRI-O ADD/CHECK/DEL and lease/link cleanup under deliberate failure;
 - exact artifact, route, and BPF teardown, no-CNI baseline behavior, and clean
   reprovision recovery; and

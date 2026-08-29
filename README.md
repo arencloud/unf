@@ -89,12 +89,16 @@ The Phase 3 gate and all 42 deliverables are Verified. Exact closure evidence,
 limits, and the separately tracked full-CNI entry are maintained in the
 [Phase 3 completion and full-CNI entry plan](docs/development/phase3-completion-plan.md)
 and ADR 0056.
-The full-CNI foundation is now in progress under ADRs 0057–0071. The `unf-cni`
+The full-CNI foundation is now in progress under ADRs 0057–0072. The `unf-cni`
 executable now composes dual-stack IPAM, exact veth, and native routing through
 atomic ADD/CHECK/DEL transactions and reconciles reboot-stale ownership from the
 CNI 1.1 `cni.dev/valid-attachments` authority. GC uses bounded network-scoped
 pages, retains conflicting records and leases for retry, and continues cleaning
-independent stale attachments. An explicitly enabled local-agent Unix service
+independent stale attachments. When the agent socket is unavailable during
+reboot, DEL first journals its exact key in an owner-only bounded queue; the next
+ADD/CHECK/DEL/GC drains that queue through the same exact lifecycle before it can
+proceed. The default path also protects compatible CRI-O caches written before
+the setting existed. An explicitly enabled local-agent Unix service
 provides the root-authenticated, bounded schema-v2 transaction boundary and
 atomic durable attachment/dual-stack lease journal beneath that lifecycle. Its
 modular IPAM provider allocates deterministically from explicit node blocks, migrates

@@ -56,7 +56,9 @@ run_installer() {
 run_installer
 run_installer
 marker=${fixture}/host/var/lib/unf/cni/v1/install.env
+pending=${fixture}/host/var/lib/unf/cni/v1/pending-deletes
 [[ $(stat -c '%a' "${marker}") == 600 ]]
+[[ -d ${pending} && ! -L ${pending} && $(stat -c '%a' "${pending}") == 700 ]]
 grep -q '^schema=1$' "${marker}"
 grep -q '^platform=openshift$' "${marker}"
 

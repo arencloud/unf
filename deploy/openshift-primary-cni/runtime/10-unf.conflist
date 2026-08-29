@@ -7,6 +7,7 @@
       "mode": "primary",
       "dataplane": "veth",
       "agentSocket": "/run/unf/cni.sock",
+      "deferredDeleteDirectory": "/var/lib/unf/cni/v1/pending-deletes",
       "mtu": 1500,
       "ipam": {
         "type": "unf"
