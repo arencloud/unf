@@ -218,6 +218,16 @@ immutable rollout and a second clean reboot are required for live credit. The
 `221168c` images remain the successful GC reconciliation evidence, but do not
 contain ADR 0072's implementation.
 
+The second-reboot candidate is exact source revision
+`8f4165a00451713edf57b041a8a3cc9516f09793`, controller digest
+`sha256:532ed06a91ab636b27ac8dca7457b24d10cf5765bc4b7904333da5eebed08d85`,
+and agent/CNI digest
+`sha256:17efacea6d20d2bf26cef5f0b5adfbf03c99c05f694d793de931a0f036329c86`.
+All three development references, including unchanged test-tools digest
+`sha256:f57a7ee9668d6b87f4e00c4e8df9240b8889c6ee50f817ea1e884732b2f42b13`,
+were resolved anonymously after publication. They remain candidate evidence
+until the staged rollout and reboot gate pass.
+
 ## Remaining exit criteria
 
 The live primary-CNI lifecycle remains **In progress** until repository changes

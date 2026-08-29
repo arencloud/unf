@@ -79,7 +79,15 @@ explicit owner-only host path. The complete local gates pass:
 `make fmt-check lint test ebpf support-matrix-check
 openshift-primary-cni-package-check`.
 
-Live credit remains pending. Fresh immutable images must be rolled to cl02 and
+Exact source revision `8f4165a00451713edf57b041a8a3cc9516f09793` is
+published and anonymously pullable as controller digest
+`sha256:532ed06a91ab636b27ac8dca7457b24d10cf5765bc4b7904333da5eebed08d85`
+and agent/CNI digest
+`sha256:17efacea6d20d2bf26cef5f0b5adfbf03c99c05f694d793de931a0f036329c86`.
+The unchanged test-tools content resolves to
+`sha256:f57a7ee9668d6b87f4e00c4e8df9240b8889c6ee50f817ea1e884732b2f42b13`.
+
+Live credit remains pending. These immutable images must be rolled to cl02 and
 the same worker must complete a real boot-ID-changing reboot with no deferred
 records left behind and exact equality among running Pods, CRI-O caches,
 attachments, links, routes, leases, and restored BPF state.

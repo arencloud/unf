@@ -2,7 +2,7 @@
 set -euo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-agent_image=${UNF_OPENSHIFT_PRIMARY_AGENT_IMAGE:-quay.io/arencloud/unf-agent-dev@sha256:822f79780fc28d46ff9a7e1a9127d43319a6b7368ece225cfcd883d8c5a74c52}
+agent_image=${UNF_OPENSHIFT_PRIMARY_AGENT_IMAGE:-quay.io/arencloud/unf-agent-dev@sha256:17efacea6d20d2bf26cef5f0b5adfbf03c99c05f694d793de931a0f036329c86}
 fixture=$(mktemp -d /tmp/unf-primary-installer.XXXXXX)
 anonymous_auth=${fixture}/anonymous-auth.json
 socket_pid=
