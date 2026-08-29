@@ -476,6 +476,7 @@ mod tests {
                         destination_ipv6: None,
                         protocol: 6,
                         destination_port: 443,
+                        service: None,
                     },
                     policy_revision: Revision::new(7),
                     decision: FlowExportDecision {
@@ -485,6 +486,7 @@ mod tests {
                         rule_id: None,
                     },
                     shadow: None,
+                    service: None,
                     observed_events,
                 }],
             },

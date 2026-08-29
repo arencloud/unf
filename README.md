@@ -137,7 +137,7 @@ reprovision from zero all pass committed gates. Qualification remains limited
 to the exact recorded development tuple; production repositories and other
 platform versions are not inferred. Existing overlay deployments are unchanged.
 See the [cl02 installation checkpoint](docs/development/openshift-primary-cni-cl02-install.md).
-Phase 4 is now in progress. Its first five verified slices add strongly typed
+Phase 4 is now in progress. Its first six verified slices add strongly typed
 `ServiceId`/`BackendId` values and a bounded, schema-versioned,
 Kubernetes-independent dual-stack service IR, plus deterministic Kubernetes
 Service/EndpointSlice compilation with collision-checked IDs, exact family and
@@ -153,8 +153,11 @@ SNAT, checksum repair, deterministic ready/non-terminating backend selection,
 connection persistence through service churn, protocol-bounded expiry, and
 explicit backendless drop. A privileged repeatable gate executes packets through
 the verifier-loaded release object and validates fixed ServiceId/BackendId/
-revision provenance. Service operations and kube-proxy-free Kind/OpenShift
-qualification remain gated by the
+revision provenance. A fixed service-event ABI now carries translation, drop,
+expiry, selected backend, tuple, and revision evidence into low-cardinality
+metrics, agent status, non-blocking flow export, durable history, and
+`unfctl service-explain`; malformed events and inconsistent provenance fail
+closed. Kube-proxy-free Kind/OpenShift qualification remains gated by the
 [Phase 4 service-fabric plan](docs/development/phase4-service-fabric-plan.md).
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

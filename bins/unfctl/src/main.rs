@@ -66,6 +66,27 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Correlate a Service/backend with current intent and observed dataplane outcomes.
+    ServiceExplain {
+        /// Stable service ID reported by agent status, flow history, or metrics.
+        #[arg(long)]
+        service_id: u32,
+        /// Optional stable backend ID to narrow the explanation.
+        #[arg(long)]
+        backend_id: Option<u32>,
+        /// Restrict outcomes to this recent duration (for example 15m or 2h).
+        #[arg(long, value_parser = parse_duration_millis, conflicts_with = "since_unix_ms")]
+        last: Option<u64>,
+        /// Inclusive lower bound for the outcome timestamp.
+        #[arg(long)]
+        since_unix_ms: Option<u64>,
+        /// Inclusive upper bound for the outcome timestamp.
+        #[arg(long)]
+        until_unix_ms: Option<u64>,
+        /// Maximum number of newest matching outcomes to return.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Explain a policy decision using live controller state.
     Explain {
         /// Source pod as namespace/name.
@@ -241,6 +262,29 @@ async fn run() -> Result<()> {
                 *since_unix_ms,
                 *until_unix_ms,
                 *limit,
+            )
+            .await?
+        }
+        Command::ServiceExplain {
+            service_id,
+            backend_id,
+            last,
+            since_unix_ms,
+            until_unix_ms,
+            limit,
+        } => {
+            let (since_unix_ms, until_unix_ms) =
+                resolve_time_window(*last, *since_unix_ms, *until_unix_ms, unix_time_millis()?)?;
+            get_json(
+                &client,
+                &service_explanation_url(
+                    &cli.controller_url,
+                    *service_id,
+                    *backend_id,
+                    since_unix_ms,
+                    until_unix_ms,
+                    *limit,
+                ),
             )
             .await?
         }
@@ -494,6 +538,10 @@ fn print_value(value: &Value, output: Output) -> Result<()> {
 }
 
 fn print_table(value: &Value) {
+    if value.get("current_service").is_some() && value.get("outcomes").is_some() {
+        print_service_explanation_table(value);
+        return;
+    }
     if value.get("component").and_then(Value::as_str) == Some("unf-controller")
         && value.get("agents").is_some()
     {
@@ -502,7 +550,7 @@ fn print_table(value: &Value) {
     }
     if matches!(
         value.get("schema_version").and_then(Value::as_u64),
-        Some(1..=4)
+        Some(1..=5)
     ) && value.get("retained_flows").is_some()
         && value.get("entries").is_some()
     {
@@ -544,6 +592,87 @@ fn print_table(value: &Value) {
         }
     } else {
         println!("{value}");
+    }
+}
+
+fn print_service_explanation_table(value: &Value) {
+    println!("Service Explanation");
+    println!(
+        "service                  id={} backend={} current_revision={}",
+        number_field(value, "service_id"),
+        optional_number_field(value, "backend_id"),
+        optional_number_field(value, "current_service_revision")
+    );
+    if let Some(service) = value
+        .get("current_service")
+        .filter(|value| !value.is_null())
+    {
+        println!(
+            "intent                   {}/{} frontends={} backends={}",
+            text_field(service, "namespace"),
+            text_field(service, "name"),
+            service["frontends"].as_array().map_or(0, Vec::len),
+            service["backends"].as_array().map_or(0, Vec::len)
+        );
+    } else {
+        println!("intent                   not present in current compiled revision");
+    }
+    println!(
+        "evidence                 outcomes={} observations={}",
+        number_field(value, "matched_outcomes"),
+        number_field(value, "matched_observations")
+    );
+    if let Some(outcomes) = value.get("outcomes").and_then(Value::as_array) {
+        for entry in outcomes.iter().take(50) {
+            let key = &entry["key"];
+            let service = &entry["service"];
+            println!(
+                "outcome                  {} -> {} {}/{} action={} reason={} backend={} observations={} nodes={}",
+                flow_address(key, "source_ipv4", "source_ipv6"),
+                flow_address(key, "destination_ipv4", "destination_ipv6"),
+                protocol_label(number_field(key, "protocol")),
+                number_field(key, "destination_port"),
+                service_action_label(number_field(service, "action")),
+                service_reason_label(number_field(service, "reason")),
+                optional_number_field(service, "backend_id"),
+                number_field(entry, "observed_events"),
+                joined_strings(&entry["reporting_nodes"])
+            );
+        }
+    }
+}
+
+fn flow_address<'value>(value: &'value Value, ipv4: &str, ipv6: &str) -> &'value str {
+    value
+        .get(ipv4)
+        .and_then(Value::as_str)
+        .or_else(|| value.get(ipv6).and_then(Value::as_str))
+        .unwrap_or("-")
+}
+
+const fn service_action_label(action: u64) -> &'static str {
+    match action {
+        1 => "translate",
+        2 => "drop",
+        3 => "expire",
+        _ => "unknown",
+    }
+}
+
+const fn service_reason_label(reason: u64) -> &'static str {
+    match reason {
+        1 => "forward-translated",
+        2 => "reverse-translated",
+        3 => "no-backend",
+        4 => "invalid-frontend",
+        5 => "missing-slot",
+        6 => "invalid-slot",
+        7 => "missing-backend",
+        8 => "invalid-backend",
+        9 => "pair-insert-failed",
+        10 => "rewrite-failed",
+        11 => "expired-or-corrupt",
+        _ => "unknown",
     }
 }
 
@@ -729,6 +858,22 @@ fn print_flow_history_table(value: &Value) {
             let key = &entry["key"];
             let sources = joined_strings(&entry["source_workloads"]);
             let destinations = joined_strings(&entry["destination_workloads"]);
+            if let Some(service) = entry.get("service").filter(|value| !value.is_null()) {
+                println!(
+                    "service outcome          id={} {} -> {} {}/{} action={} reason={} backend={} observations={} nodes={}",
+                    number_field(service, "service_id"),
+                    flow_address(key, "source_ipv4", "source_ipv6"),
+                    flow_address(key, "destination_ipv4", "destination_ipv6"),
+                    protocol_label(number_field(key, "protocol")),
+                    number_field(key, "destination_port"),
+                    service_action_label(number_field(service, "action")),
+                    service_reason_label(number_field(service, "reason")),
+                    optional_number_field(service, "backend_id"),
+                    number_field(entry, "observed_events"),
+                    joined_strings(&entry["reporting_nodes"]),
+                );
+                continue;
+            }
             println!(
                 "flow                     {} -> {} {}/{} verdict={} observations={} nodes={}",
                 if sources.is_empty() {
@@ -904,6 +1049,32 @@ fn flow_history_url(
     } else {
         format!("{base}?{}", parameters.join("&"))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn service_explanation_url(
+    controller_url: &str,
+    service_id: u32,
+    backend_id: Option<u32>,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+) -> String {
+    let mut parameters = vec![format!("service_id={service_id}")];
+    for (name, value) in [
+        ("backend_id", backend_id.map(u64::from)),
+        ("since_unix_ms", since_unix_ms),
+        ("until_unix_ms", until_unix_ms),
+        ("limit", limit.map(|value| value as u64)),
+    ] {
+        if let Some(value) = value {
+            parameters.push(format!("{name}={value}"));
+        }
+    }
+    format!(
+        "{controller_url}/v1/services/explain?{}",
+        parameters.join("&")
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1392,6 +1563,44 @@ mod tests {
                 Some(25)
             ),
             "http://controller/v1/flows?since_unix_ms=1100000&until_unix_ms=2000000&limit=25"
+        );
+    }
+
+    #[test]
+    fn service_explanation_command_builds_bounded_query() {
+        let cli = Cli::try_parse_from([
+            "unfctl",
+            "service-explain",
+            "--service-id",
+            "11",
+            "--backend-id",
+            "13",
+            "--last",
+            "15m",
+            "--limit",
+            "25",
+        ])
+        .expect("service explanation command parses");
+        assert!(matches!(
+            cli.command,
+            Command::ServiceExplain {
+                service_id: 11,
+                backend_id: Some(13),
+                last: Some(900_000),
+                limit: Some(25),
+                ..
+            }
+        ));
+        assert_eq!(
+            service_explanation_url(
+                "http://controller",
+                11,
+                Some(13),
+                Some(1_100_000),
+                Some(2_000_000),
+                Some(25),
+            ),
+            "http://controller/v1/services/explain?service_id=11&backend_id=13&since_unix_ms=1100000&until_unix_ms=2000000&limit=25"
         );
     }
 

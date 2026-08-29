@@ -7,6 +7,7 @@ use unf_common::{BackendId, IdentityId, PolicyId, RuleId, ServiceId, Verdict};
 pub use unf_common::PolicyDirection as Direction;
 
 pub const FLOW_ABI_VERSION: u16 = 2;
+pub const SERVICE_EVENT_ABI_VERSION: u16 = 1;
 pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
@@ -18,6 +19,20 @@ pub const SERVICE_BACKEND_FLAG_SERVING: u8 = 1 << 1;
 pub const SERVICE_BACKEND_FLAG_TERMINATING: u8 = 1 << 2;
 pub const SERVICE_CONNECTION_ROLE_FORWARD: u8 = 1;
 pub const SERVICE_CONNECTION_ROLE_REVERSE: u8 = 2;
+pub const SERVICE_EVENT_ACTION_TRANSLATE: u8 = 1;
+pub const SERVICE_EVENT_ACTION_DROP: u8 = 2;
+pub const SERVICE_EVENT_ACTION_EXPIRE: u8 = 3;
+pub const SERVICE_EVENT_REASON_FORWARD_TRANSLATED: u8 = 1;
+pub const SERVICE_EVENT_REASON_REVERSE_TRANSLATED: u8 = 2;
+pub const SERVICE_EVENT_REASON_NO_BACKEND: u8 = 3;
+pub const SERVICE_EVENT_REASON_INVALID_FRONTEND: u8 = 4;
+pub const SERVICE_EVENT_REASON_MISSING_SLOT: u8 = 5;
+pub const SERVICE_EVENT_REASON_INVALID_SLOT: u8 = 6;
+pub const SERVICE_EVENT_REASON_MISSING_BACKEND: u8 = 7;
+pub const SERVICE_EVENT_REASON_INVALID_BACKEND: u8 = 8;
+pub const SERVICE_EVENT_REASON_PAIR_INSERT_FAILED: u8 = 9;
+pub const SERVICE_EVENT_REASON_REWRITE_FAILED: u8 = 10;
+pub const SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT: u8 = 11;
 pub const POLICY_FLAG_HAS_POLICY: u16 = 1 << 0;
 pub const POLICY_FLAG_HAS_RULE: u16 = 1 << 1;
 pub const POLICY_FLAG_HAS_SHADOW: u16 = 1 << 2;
@@ -174,6 +189,30 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
         && state.reserved[2] == 0
         && state.reserved[3] == 0
         && now_ns.saturating_sub(state.last_seen_ns) <= timeout_ns
+}
+
+#[must_use]
+pub const fn service_event_action_reason_is_valid(action: u8, reason: u8) -> bool {
+    matches!(
+        (action, reason),
+        (
+            SERVICE_EVENT_ACTION_TRANSLATE,
+            SERVICE_EVENT_REASON_FORWARD_TRANSLATED | SERVICE_EVENT_REASON_REVERSE_TRANSLATED
+        ) | (
+            SERVICE_EVENT_ACTION_DROP,
+            SERVICE_EVENT_REASON_NO_BACKEND
+                | SERVICE_EVENT_REASON_INVALID_FRONTEND
+                | SERVICE_EVENT_REASON_MISSING_SLOT
+                | SERVICE_EVENT_REASON_INVALID_SLOT
+                | SERVICE_EVENT_REASON_MISSING_BACKEND
+                | SERVICE_EVENT_REASON_INVALID_BACKEND
+                | SERVICE_EVENT_REASON_PAIR_INSERT_FAILED
+                | SERVICE_EVENT_REASON_REWRITE_FAILED
+        ) | (
+            SERVICE_EVENT_ACTION_EXPIRE,
+            SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT
+        )
+    )
 }
 
 /// Deterministic flow hash used only for selecting a new revision-local slot.
@@ -624,6 +663,30 @@ pub struct ServiceConnectionValue {
     pub reserved: [u8; 4],
 }
 
+/// Fixed machine-readable service dataplane outcome. Kubernetes strings remain
+/// in userspace; stable IDs and exact tuples are sufficient for enrichment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ServiceEvent {
+    pub timestamp_ns: u64,
+    pub service_revision: u64,
+    pub client_address: [u8; 16],
+    pub frontend_address: [u8; 16],
+    pub backend_address: [u8; 16],
+    pub service_id: ServiceId,
+    pub backend_id: BackendId,
+    pub client_port: [u8; 2],
+    pub frontend_port: [u8; 2],
+    pub backend_port: [u8; 2],
+    pub version: u16,
+    pub size: u16,
+    pub protocol: u8,
+    pub address_family: u8,
+    pub action: u8,
+    pub reason: u8,
+    pub reserved: [u8; 10],
+}
+
 const _: () = assert!(core::mem::size_of::<FlowKey>() == 48);
 const _: () = assert!(core::mem::size_of::<FlowEvent>() == 96);
 const _: () = assert!(core::mem::size_of::<ConnectionKey>() == 40);
@@ -650,6 +713,7 @@ const _: () = assert!(core::mem::size_of::<ServiceBackendSlotValue>() == 16);
 const _: () = assert!(core::mem::size_of::<ServiceMapConfig>() == 32);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionKey>() == 40);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionValue>() == 88);
+const _: () = assert!(core::mem::size_of::<ServiceEvent>() == 96);
 
 #[cfg(test)]
 mod tests {
@@ -795,6 +859,27 @@ mod tests {
         assert!(!service_backend_is_eligible(
             SERVICE_BACKEND_FLAG_READY | SERVICE_BACKEND_FLAG_TERMINATING
         ));
+    }
+
+    #[test]
+    fn service_event_actions_accept_only_their_bounded_reasons() {
+        assert!(service_event_action_reason_is_valid(
+            SERVICE_EVENT_ACTION_TRANSLATE,
+            SERVICE_EVENT_REASON_FORWARD_TRANSLATED
+        ));
+        assert!(service_event_action_reason_is_valid(
+            SERVICE_EVENT_ACTION_DROP,
+            SERVICE_EVENT_REASON_NO_BACKEND
+        ));
+        assert!(service_event_action_reason_is_valid(
+            SERVICE_EVENT_ACTION_EXPIRE,
+            SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT
+        ));
+        assert!(!service_event_action_reason_is_valid(
+            SERVICE_EVENT_ACTION_TRANSLATE,
+            SERVICE_EVENT_REASON_NO_BACKEND
+        ));
+        assert!(!service_event_action_reason_is_valid(0, 0));
     }
 
     #[test]

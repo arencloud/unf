@@ -20,7 +20,7 @@ cluster support.
 | 4.3 | Revisioned agent distribution | **Verified** | `make service-distribution-test`; authenticated snapshot, compatibility fencing, desired/applied/failed status, durable mode-0600 LKG persistence and outage recovery; ADR 0076 |
 | 4.4 | Transactional eBPF service state | **Verified** | `make service-dataplane-test`; fixed dual-stack ABI, v4/eighteen-pin clean boundary, real-map staging/readback/atomic activation/rollback/capacity fault; ADR 0077 |
 | 4.5 | Dual-stack ClusterIP dataplane | **Verified** | `make service-dataplane-test`; verifier-loaded IPv4/IPv6 TCP/UDP DNAT and reverse SNAT, checksum proof, deterministic ready/non-terminating selection, paired connection provenance, churn persistence, expiry/reselection, and exact no-backend drop; ADR 0078 |
-| 4.6 | Service operations | **Planned** | Metrics, status, flow history, explanation, cleanup and actionable failure reasons |
+| 4.6 | Service operations | **Verified** | `make service-operations-test`; fixed event ABI, bounded metrics/status/export/history, durable migration, service explanation, and actionable translation/drop/expiry reasons; ADR 0079 |
 | 4.7 | Kube-proxy-free Kind qualification | **Planned** | Dedicated primary-CNI dual-stack lifecycle/failure/recovery artifact |
 | 4.8 | OpenShift qualification | **Planned** | Kind gate closed; deliberately configured disposable cluster; RHCOS/SELinux/CRI-O/operator evidence |
 
@@ -48,9 +48,8 @@ first gate. They receive separate rows after the ClusterIP foundation closes.
 
 ## Immediate next slice
 
-Implement Phase 4.6 without widening the forwarding claim: export bounded
-service translation and failure records from the existing TC paths, aggregate
-metrics/status/history in userspace, and add an `unfctl` explanation surface for
-ServiceId, BackendId, selected tuple, service revision, no-backend, corrupt-state,
-and pair-insertion outcomes. Phase 4.7 remains the first kube-proxy-free cluster
-forwarding claim.
+Implement Phase 4.7 without widening unsupported Service types: reuse the
+dedicated primary-CNI dual-stack Kind fixture, remove kube-proxy, and prove TCP
+and UDP ClusterIP lifecycle, DNS continuity, no-backend provenance,
+controller/agent recovery, exact cleanup, and schema-versioned evidence. Phase
+4.8 remains blocked on this cluster gate.

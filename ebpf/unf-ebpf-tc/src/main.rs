@@ -7,7 +7,7 @@ use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::TcContext;
-use unf_common::{IdentityId, PolicyId, PolicyReason, RuleId, Verdict};
+use unf_common::{BackendId, IdentityId, PolicyId, PolicyReason, RuleId, ServiceId, Verdict};
 use unf_ebpf_common::{
     AddressFamily, ConnectionKey, ConnectionState, Direction, EgressIpv4PolicyMapKey,
     EgressIpv6PolicyMapData, FLOW_ABI_VERSION, FlowEvent, IDENTITY_BANK_COUNT,
@@ -18,9 +18,16 @@ use unf_ebpf_common::{
     POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, SERVICE_BANK_COUNT,
-    SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_MAP_ABI_VERSION,
-    ServiceBackendKey, ServiceBackendSlotKey, ServiceBackendSlotValue, ServiceConnectionKey,
-    ServiceConnectionValue, ServiceFrontendValue, ServiceMapConfig, connection_is_active,
+    SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_EVENT_ABI_VERSION,
+    SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
+    SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT, SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
+    SERVICE_EVENT_REASON_INVALID_BACKEND, SERVICE_EVENT_REASON_INVALID_FRONTEND,
+    SERVICE_EVENT_REASON_INVALID_SLOT, SERVICE_EVENT_REASON_MISSING_BACKEND,
+    SERVICE_EVENT_REASON_MISSING_SLOT, SERVICE_EVENT_REASON_NO_BACKEND,
+    SERVICE_EVENT_REASON_PAIR_INSERT_FAILED, SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
+    SERVICE_EVENT_REASON_REWRITE_FAILED, SERVICE_MAP_ABI_VERSION, ServiceBackendKey,
+    ServiceBackendSlotKey, ServiceBackendSlotValue, ServiceConnectionKey, ServiceConnectionValue,
+    ServiceEvent, ServiceFrontendValue, ServiceMapConfig, connection_is_active,
     ipv6_extension_step, packet_starts_connection, service_backend_is_eligible,
     service_connection_is_active, service_flow_hash,
 };
@@ -49,6 +56,12 @@ static FLOW_COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
 static FLOW_EVENT_SCRATCH: PerCpuArray<FlowEvent> = PerCpuArray::with_max_entries(1, 0);
+
+#[map]
+static SERVICE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+#[map]
+static SERVICE_EVENT_SCRATCH: PerCpuArray<ServiceEvent> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
 static POLICY_CONNECTION_SCRATCH: PerCpuArray<ConnectionKey> = PerCpuArray::with_max_entries(2, 0);
@@ -265,8 +278,18 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                         translation.address[3],
                     ];
                     if !rewrite_ipv4(ctx, transport_offset, protocol, &translation, false) {
+                        emit_service_connection_event(
+                            SERVICE_EVENT_ACTION_DROP,
+                            SERVICE_EVENT_REASON_REWRITE_FAILED,
+                            now_ns,
+                        );
                         return TC_ACT_SHOT;
                     }
+                    emit_service_connection_event(
+                        SERVICE_EVENT_ACTION_TRANSLATE,
+                        SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
+                        now_ns,
+                    );
                     destination_ipv4 = backend_address;
                     destination_port = translation.port;
                 }
@@ -286,10 +309,20 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             reverse_key.address_family = AddressFamily::Ipv4 as u8;
             reverse_key.role = SERVICE_CONNECTION_ROLE_REVERSE;
             reverse_key.reserved = 0;
-            if let Some(translation) = lookup_reverse_service(reverse_key, now_ns)
-                && !rewrite_ipv4(ctx, transport_offset, protocol, &translation, true)
-            {
-                return TC_ACT_SHOT;
+            if let Some(translation) = lookup_reverse_service(reverse_key, now_ns) {
+                if !rewrite_ipv4(ctx, transport_offset, protocol, &translation, true) {
+                    emit_service_connection_event(
+                        SERVICE_EVENT_ACTION_DROP,
+                        SERVICE_EVENT_REASON_REWRITE_FAILED,
+                        now_ns,
+                    );
+                    return TC_ACT_SHOT;
+                }
+                emit_service_connection_event(
+                    SERVICE_EVENT_ACTION_TRANSLATE,
+                    SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
+                    now_ns,
+                );
             }
         }
     }
@@ -387,8 +420,18 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 ServiceLookup::Drop => return TC_ACT_SHOT,
                 ServiceLookup::Translation(translation) => {
                     if !rewrite_ipv6(ctx, transport_offset, protocol, &translation, false) {
+                        emit_service_connection_event(
+                            SERVICE_EVENT_ACTION_DROP,
+                            SERVICE_EVENT_REASON_REWRITE_FAILED,
+                            now_ns,
+                        );
                         return TC_ACT_SHOT;
                     }
+                    emit_service_connection_event(
+                        SERVICE_EVENT_ACTION_TRANSLATE,
+                        SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
+                        now_ns,
+                    );
                     observation.destination_address = translation.address;
                     observation.destination_port = translation.port;
                 }
@@ -408,10 +451,20 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             reverse_key.address_family = AddressFamily::Ipv6 as u8;
             reverse_key.role = SERVICE_CONNECTION_ROLE_REVERSE;
             reverse_key.reserved = 0;
-            if let Some(translation) = lookup_reverse_service(reverse_key, now_ns)
-                && !rewrite_ipv6(ctx, transport_offset, protocol, &translation, true)
-            {
-                return TC_ACT_SHOT;
+            if let Some(translation) = lookup_reverse_service(reverse_key, now_ns) {
+                if !rewrite_ipv6(ctx, transport_offset, protocol, &translation, true) {
+                    emit_service_connection_event(
+                        SERVICE_EVENT_ACTION_DROP,
+                        SERVICE_EVENT_REASON_REWRITE_FAILED,
+                        now_ns,
+                    );
+                    return TC_ACT_SHOT;
+                }
+                emit_service_connection_event(
+                    SERVICE_EVENT_ACTION_TRANSLATE,
+                    SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
+                    now_ns,
+                );
             }
         }
     }
@@ -537,6 +590,75 @@ fn active_service_config() -> Option<ServiceMapConfig> {
     Some(config)
 }
 
+#[inline(never)]
+fn emit_service_connection_event(action: u8, reason: u8, timestamp_ns: u64) {
+    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    // SAFETY: this CPU owns the initialized connection scratch value.
+    #[allow(unsafe_code)]
+    let value = unsafe { &*value_ptr };
+    let Some(event_ptr) = SERVICE_EVENT_SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    // SAFETY: this CPU owns the per-CPU event slot for this invocation.
+    #[allow(unsafe_code)]
+    let event = unsafe { &mut *event_ptr };
+    event.timestamp_ns = timestamp_ns;
+    event.service_revision = value.service_revision;
+    event.client_address = value.client_address;
+    event.frontend_address = value.frontend_address;
+    event.backend_address = value.backend_address;
+    event.service_id = value.service_id;
+    event.backend_id = value.backend_id;
+    event.client_port = value.client_port;
+    event.frontend_port = value.frontend_port;
+    event.backend_port = value.backend_port;
+    event.version = SERVICE_EVENT_ABI_VERSION;
+    event.size = core::mem::size_of::<ServiceEvent>() as u16;
+    event.protocol = value.protocol;
+    event.address_family = value.address_family;
+    event.action = action;
+    event.reason = reason;
+    event.reserved = [0; 10];
+    let _ = SERVICE_EVENTS.output::<ServiceEvent>(&*event, 0);
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn emit_service_lookup_failure(
+    key: &ServiceConnectionKey,
+    service_id: ServiceId,
+    service_revision: u64,
+    reason: u8,
+    timestamp_ns: u64,
+) {
+    let Some(event_ptr) = SERVICE_EVENT_SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    // SAFETY: this CPU owns the per-CPU event slot for this invocation.
+    #[allow(unsafe_code)]
+    let event = unsafe { &mut *event_ptr };
+    event.timestamp_ns = timestamp_ns;
+    event.service_revision = service_revision;
+    event.client_address = key.source_address;
+    event.frontend_address = key.destination_address;
+    event.backend_address = [0; 16];
+    event.service_id = service_id;
+    event.backend_id = BackendId::new(0);
+    event.client_port = key.source_port;
+    event.frontend_port = key.destination_port;
+    event.backend_port = [0; 2];
+    event.version = SERVICE_EVENT_ABI_VERSION;
+    event.size = core::mem::size_of::<ServiceEvent>() as u16;
+    event.protocol = key.protocol;
+    event.address_family = key.address_family;
+    event.action = SERVICE_EVENT_ACTION_DROP;
+    event.reason = reason;
+    event.reserved = [0; 10];
+    let _ = SERVICE_EVENTS.output::<ServiceEvent>(&*event, 0);
+}
+
 #[inline(always)]
 fn service_forward_key(value: &ServiceConnectionValue) -> ServiceConnectionKey {
     ServiceConnectionKey {
@@ -618,6 +740,11 @@ fn refresh_service_connection(
         return None;
     };
     if expected != *key || !service_connection_is_active(value, now_ns) {
+        emit_service_connection_event(
+            SERVICE_EVENT_ACTION_EXPIRE,
+            SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT,
+            now_ns,
+        );
         remove_service_pair(value);
         return None;
     }
@@ -716,9 +843,23 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         || frontend.flags != 0
         || frontend.reserved != [0; 8]
     {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_INVALID_FRONTEND,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     }
     if frontend.backend_count == 0 {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_NO_BACKEND,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     }
     let slot_key = ServiceBackendSlotKey {
@@ -731,6 +872,13 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     // SAFETY: the exact key and fixed-layout value match the declared map ABI.
     #[allow(unsafe_code)]
     let Some(slot) = (unsafe { SERVICE_BACKEND_SLOTS.get(&slot_key).copied() }) else {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_MISSING_SLOT,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     };
     if slot.schema_version != SERVICE_MAP_ABI_VERSION
@@ -738,6 +886,13 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         || slot.backend_id.get() == 0
         || slot.flags != 0
     {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_INVALID_SLOT,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     }
     let backend_key = ServiceBackendKey {
@@ -749,6 +904,13 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     // SAFETY: the exact key and fixed-layout value match the declared map ABI.
     #[allow(unsafe_code)]
     let Some(backend) = (unsafe { SERVICE_BACKENDS_V4.get(&backend_key).copied() }) else {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_MISSING_BACKEND,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     };
     if backend.schema_version != SERVICE_MAP_ABI_VERSION
@@ -757,6 +919,13 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         || backend.flags & !0b111 != 0
         || !service_backend_is_eligible(backend.flags)
     {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_INVALID_BACKEND,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     }
     let mut backend_address = [0_u8; 16];
@@ -777,6 +946,11 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         slot.backend_id,
         now_ns,
     ) else {
+        emit_service_connection_event(
+            SERVICE_EVENT_ACTION_DROP,
+            SERVICE_EVENT_REASON_PAIR_INSERT_FAILED,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     };
     ServiceLookup::Translation(translation)
@@ -810,9 +984,23 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         || frontend.flags != 0
         || frontend.reserved != [0; 8]
     {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_INVALID_FRONTEND,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     }
     if frontend.backend_count == 0 {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_NO_BACKEND,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     }
     let slot_key = ServiceBackendSlotKey {
@@ -825,6 +1013,13 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     // SAFETY: the exact key and fixed-layout value match the declared map ABI.
     #[allow(unsafe_code)]
     let Some(slot) = (unsafe { SERVICE_BACKEND_SLOTS.get(&slot_key).copied() }) else {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_MISSING_SLOT,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     };
     if slot.schema_version != SERVICE_MAP_ABI_VERSION
@@ -832,6 +1027,13 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         || slot.backend_id.get() == 0
         || slot.flags != 0
     {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_INVALID_SLOT,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     }
     let backend_key = ServiceBackendKey {
@@ -843,6 +1045,13 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     // SAFETY: the exact key and fixed-layout value match the declared map ABI.
     #[allow(unsafe_code)]
     let Some(backend) = (unsafe { SERVICE_BACKENDS_V6.get(&backend_key).copied() }) else {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_MISSING_BACKEND,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     };
     if backend.schema_version != SERVICE_MAP_ABI_VERSION
@@ -851,6 +1060,13 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         || backend.flags & !0b111 != 0
         || !service_backend_is_eligible(backend.flags)
     {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.revision,
+            SERVICE_EVENT_REASON_INVALID_BACKEND,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     }
     let Some(translation) = new_service_connection(
@@ -866,6 +1082,11 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         slot.backend_id,
         now_ns,
     ) else {
+        emit_service_connection_event(
+            SERVICE_EVENT_ACTION_DROP,
+            SERVICE_EVENT_REASON_PAIR_INSERT_FAILED,
+            now_ns,
+        );
         return ServiceLookup::Drop;
     };
     ServiceLookup::Translation(translation)

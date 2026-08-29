@@ -32,7 +32,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_api::SecurityPolicy;
 use unf_common::{
-    IdentityId, PolicyAction, PolicyDirection, PolicyId, PolicyReason, Protocol, Revision, Verdict,
+    BackendId, IdentityId, PolicyAction, PolicyDirection, PolicyId, PolicyReason, Protocol,
+    Revision, ServiceId, Verdict,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -50,22 +51,22 @@ use unf_route::{
     RemoteRouteSnapshotNode,
 };
 use unf_service::{
-    AddressFamily, EndpointPortSource, EndpointSliceSource, EndpointSource, ServiceSnapshot,
-    ServiceSource, ServiceSourcePort, compile_service_snapshot,
+    AddressFamily, EndpointPortSource, EndpointSliceSource, EndpointSource, ServiceBackend,
+    ServiceIr, ServiceSnapshot, ServiceSource, ServiceSourcePort, compile_service_snapshot,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
     ComponentCompatibility, EgressIpv4PolicyMapEntry, EgressIpv4PolicyMapKey,
     EgressIpv6PolicyMapEntry, EgressIpv6PolicyMapKey, FLOW_EXPORT_BATCH_LIMIT,
     FLOW_EXPORT_SCHEMA_VERSION, FLOW_HISTORY_CAPACITY, FlowExportBatch, FlowExportRecord,
-    FlowHistoryCheckpoint, FlowHistoryQuerySummary, FlowHistorySnapshot, FlowHistoryStore,
-    IdentityRegistry, IdentityStateSnapshot, Ipv4PolicyMapEntry, Ipv4PolicyMapKey,
-    Ipv6PolicyMapEntry, Ipv6PolicyMapKey, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
-    PolicyDecisionRecord, PolicyStateSnapshot, RevisionSet, TOPOLOGY_HISTORY_CAPACITY,
-    TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyHistoryCheckpoint, TopologyHistorySnapshot,
-    TopologyHistoryStore, TopologyNode, TopologyService, TopologyServiceBackend,
-    TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
-    provisional_identity_id,
+    FlowHistoryCheckpoint, FlowHistoryEntry, FlowHistoryQuerySummary, FlowHistorySnapshot,
+    FlowHistoryStore, IdentityRegistry, IdentityStateSnapshot, Ipv4PolicyMapEntry,
+    Ipv4PolicyMapKey, Ipv6PolicyMapEntry, Ipv6PolicyMapKey, NetworkIdentity,
+    POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord, PolicyStateSnapshot, RevisionSet,
+    TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyHistoryCheckpoint,
+    TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode, TopologyService,
+    TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot,
+    TopologyWorkload, provisional_identity_id,
 };
 
 mod external_flow_export;
@@ -566,6 +567,29 @@ struct FlowHistoryQuery {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct ServiceExplainQuery {
+    service_id: u32,
+    backend_id: Option<u32>,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceExplanation {
+    schema_version: u16,
+    service_id: ServiceId,
+    backend_id: Option<BackendId>,
+    current_service_revision: Option<Revision>,
+    current_service: Option<ServiceIr>,
+    current_backend: Option<ServiceBackend>,
+    matched_outcomes: usize,
+    matched_observations: u64,
+    outcomes: Vec<FlowHistoryEntry>,
+    note: &'static str,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct TopologyHistoryQuery {
     since_revision: Option<u64>,
     until_revision: Option<u64>,
@@ -669,6 +693,7 @@ async fn main() -> Result<()> {
         .route("/v1/topology", get(topology))
         .route("/v1/topology/history", get(topology_history))
         .route("/v1/flows", get(flow_history))
+        .route("/v1/services/explain", get(explain_service))
         .route("/v1/explain", post(explain))
         .route("/v1/policy/simulate", post(simulate_policy))
         .with_state(Arc::clone(&state));
@@ -1265,6 +1290,7 @@ fn validate_flow_history_checkpoint(
                 policy_revision: entry.policy_revision,
                 decision: entry.decision,
                 shadow: entry.shadow,
+                service: entry.service,
                 observed_events: entry.observed_events,
             }],
         };
@@ -3209,6 +3235,7 @@ fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
             "service_last_error must be nonempty and at most 1024 bytes when present",
         ));
     }
+    validate_service_dataplane_status(report)?;
     let service_revision_pairs = [
         (
             report.desired_service_epoch,
@@ -3235,6 +3262,40 @@ fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
     {
         return Err(ApiError::bad_request(
             "service counts require a nonzero applied service revision",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_service_dataplane_status(report: &AgentStateReport) -> Result<(), ApiError> {
+    if report
+        .service_translations
+        .saturating_add(report.service_drops)
+        .saturating_add(report.service_expirations)
+        != report.service_dataplane_events
+    {
+        return Err(ApiError::bad_request(
+            "service dataplane outcome counters must sum to service_dataplane_events",
+        ));
+    }
+    let last_is_empty = report.last_service_id == 0
+        && report.last_backend_id == 0
+        && report.last_service_revision == 0
+        && report.last_service_action == 0
+        && report.last_service_reason == 0;
+    let last_action_reason_is_valid = matches!(
+        (report.last_service_action, report.last_service_reason),
+        (1, 1 | 2) | (2, 3..=10) | (3, 11)
+    );
+    if (report.service_dataplane_events == 0 && !last_is_empty)
+        || (report.service_dataplane_events != 0
+            && (!last_action_reason_is_valid
+                || report.last_service_id == 0
+                || report.last_service_revision == 0
+                || (report.last_service_action == 1 && report.last_backend_id == 0)))
+    {
+        return Err(ApiError::bad_request(
+            "last service dataplane outcome is inconsistent with its event count",
         ));
     }
     Ok(())
@@ -3711,6 +3772,78 @@ async fn flow_history(
     )))
 }
 
+async fn explain_service(
+    State(state): State<Arc<ControllerState>>,
+    Query(query): Query<ServiceExplainQuery>,
+) -> Result<Json<ServiceExplanation>, ApiError> {
+    if query.service_id == 0 || query.backend_id == Some(0) {
+        return Err(ApiError::bad_request(
+            "service_id and backend_id must be nonzero",
+        ));
+    }
+    let limit = validate_flow_history_query(&FlowHistoryQuery {
+        since_unix_ms: query.since_unix_ms,
+        until_unix_ms: query.until_unix_ms,
+        limit: query.limit,
+    })?;
+    let service_id = ServiceId::new(query.service_id);
+    let backend_id = query.backend_id.map(BackendId::new);
+    let current_snapshot = read_lock(&state.compiled_service_snapshot).clone();
+    let current_service_revision = current_snapshot.as_ref().map(|snapshot| snapshot.revision);
+    let current_service = current_snapshot.and_then(|snapshot| {
+        snapshot
+            .services
+            .into_iter()
+            .find(|service| service.id == service_id)
+    });
+    let current_backend = current_service.as_ref().and_then(|service| {
+        backend_id.and_then(|backend_id| {
+            service
+                .backends
+                .iter()
+                .find(|backend| backend.id == backend_id)
+                .cloned()
+        })
+    });
+    let mut history = flow_history_snapshot_window(
+        &state,
+        query.since_unix_ms,
+        query.until_unix_ms,
+        FLOW_HISTORY_CAPACITY,
+    );
+    history.entries.retain(|entry| {
+        entry.service.is_some_and(|outcome| {
+            outcome.service_id == service_id
+                && backend_id.is_none_or(|backend_id| outcome.backend_id == Some(backend_id))
+        })
+    });
+    let matched_outcomes = history.entries.len();
+    let matched_observations = history
+        .entries
+        .iter()
+        .map(|entry| entry.observed_events)
+        .fold(0_u64, u64::saturating_add);
+    history.entries.truncate(limit);
+    if current_service.is_none() && history.entries.is_empty() {
+        return Err(ApiError::not_found(format!(
+            "service ID {} has no current state or retained outcomes",
+            query.service_id
+        )));
+    }
+    Ok(Json(ServiceExplanation {
+        schema_version: 1,
+        service_id,
+        backend_id,
+        current_service_revision,
+        current_service,
+        current_backend,
+        matched_outcomes,
+        matched_observations,
+        outcomes: history.entries,
+        note: "Current compiled intent is correlated with bounded, durable dataplane outcomes; absence of an outcome is not proof that no traffic occurred.",
+    }))
+}
+
 fn validate_flow_history_query(query: &FlowHistoryQuery) -> Result<usize, ApiError> {
     let limit = query.limit.unwrap_or(FLOW_HISTORY_CAPACITY);
     if limit == 0 || limit > FLOW_HISTORY_CAPACITY {
@@ -3866,16 +3999,6 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
                 "flow export must contain exactly one complete IPv4 or IPv6 address pair",
             ));
         }
-        let selected_identity = match entry.key.direction {
-            PolicyDirection::Ingress => entry.key.destination_identity,
-            PolicyDirection::Egress => entry.key.source_identity,
-        };
-        if selected_identity.get() == 0 {
-            return Err(ApiError::bad_request(format!(
-                "flow export selected {:?} identity must be resolved",
-                entry.key.direction
-            )));
-        }
         if entry.observed_events == 0 {
             return Err(ApiError::bad_request(
                 "flow export observed_events must be greater than zero",
@@ -3892,11 +4015,80 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
                 "TCP/UDP/SCTP flow export destination_port must be greater than zero",
             ));
         }
-        if entry.decision.reason > 6 || entry.shadow.is_some_and(|shadow| shadow.reason > 6) {
-            return Err(ApiError::bad_request(
-                "flow export decision reason must be a known ABI reason code",
-            ));
+        if let Some(service) = entry.service {
+            validate_service_flow_export(entry, service)?;
+        } else {
+            if entry.key.service.is_some() {
+                return Err(ApiError::bad_request(
+                    "policy flow export must not contain a service history key",
+                ));
+            }
+            let selected_identity = match entry.key.direction {
+                PolicyDirection::Ingress => entry.key.destination_identity,
+                PolicyDirection::Egress => entry.key.source_identity,
+            };
+            if selected_identity.get() == 0 {
+                return Err(ApiError::bad_request(format!(
+                    "flow export selected {:?} identity must be resolved",
+                    entry.key.direction
+                )));
+            }
+            if entry.decision.reason > 6 || entry.shadow.is_some_and(|shadow| shadow.reason > 6) {
+                return Err(ApiError::bad_request(
+                    "flow export decision reason must be a known ABI reason code",
+                ));
+            }
         }
+    }
+    Ok(())
+}
+
+fn validate_service_flow_export(
+    entry: &FlowExportRecord,
+    service: unf_state::ServiceFlowOutcome,
+) -> Result<(), ApiError> {
+    let action_reason_valid = matches!(
+        (service.action, service.reason),
+        (1, 1 | 2) | (2, 3..=10) | (3, 11)
+    );
+    let backend_address_valid = service.backend_ipv4.is_some() ^ service.backend_ipv6.is_some();
+    let backend_family_matches = (service.backend_ipv4.is_some()
+        && entry.key.source_ipv4.is_some())
+        || (service.backend_ipv6.is_some() && entry.key.source_ipv6.is_some())
+        || service.backend_id.is_none();
+    let backend_complete = service.backend_id.is_some()
+        == (backend_address_valid && service.backend_port.is_some_and(|port| port != 0));
+    let verdict_matches = matches!(
+        (service.action, entry.decision.verdict),
+        (1, Verdict::Allow) | (2, Verdict::Deny) | (3, Verdict::Audit)
+    );
+    let service_key_matches = entry.key.service.as_ref().is_some_and(|key| {
+        key.service_id == service.service_id
+            && key.backend_id == service.backend_id
+            && key.service_revision == service.service_revision
+            && key.action == service.action
+            && key.reason == service.reason
+    });
+    if !service_key_matches
+        || !action_reason_valid
+        || service.service_id.get() == 0
+        || service.service_revision.get() == 0
+        || service.frontend_port == 0
+        || service.frontend_port != entry.key.destination_port
+        || !backend_complete
+        || !backend_family_matches
+        || !verdict_matches
+        || (service.action == 1 && service.backend_id.is_none())
+        || !matches!(entry.key.protocol, 6 | 17)
+        || entry.policy_revision.get() != 0
+        || entry.decision.reason != service.reason
+        || entry.decision.policy_id.is_some()
+        || entry.decision.rule_id.is_some()
+        || entry.shadow.is_some()
+    {
+        return Err(ApiError::bad_request(
+            "service flow export contains inconsistent dataplane provenance",
+        ));
     }
     Ok(())
 }
@@ -6105,6 +6297,7 @@ mod tests {
                     destination_ipv6: None,
                     protocol: 6,
                     destination_port: 8080,
+                    service: None,
                 },
                 policy_revision: Revision::new(7),
                 decision: unf_state::FlowExportDecision {
@@ -6114,6 +6307,7 @@ mod tests {
                     rule_id: Some(unf_common::RuleId::new(0)),
                 },
                 shadow: None,
+                service: None,
                 observed_events,
             }],
         }
@@ -6401,6 +6595,16 @@ mod tests {
             service_backend_count: 0,
             service_reconcile_errors: 0,
             service_last_error: None,
+            service_dataplane_events: 0,
+            service_translations: 0,
+            service_drops: 0,
+            service_expirations: 0,
+            invalid_service_events: 0,
+            last_service_id: 0,
+            last_backend_id: 0,
+            last_service_revision: 0,
+            last_service_action: 0,
+            last_service_reason: 0,
             desired_node_block_revision: 0,
             applied_node_block_revision: 0,
             desired_remote_route_epoch: 0,
@@ -7385,6 +7589,46 @@ mod tests {
             ingest_flow_batch(&state, invalid).expect_err("unknown flow schema is rejected");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert_eq!(external_metrics.enqueued_batches.get(), 1);
+    }
+
+    #[test]
+    fn service_flow_ingestion_validates_bounded_dataplane_provenance() {
+        let mut batch = flow_batch(1);
+        let entry = &mut batch.entries[0];
+        entry.key.source_identity = IdentityId::default();
+        entry.key.destination_identity = IdentityId::default();
+        entry.key.destination_ipv4 = Some("10.96.0.80".parse().unwrap());
+        entry.key.destination_port = 80;
+        entry.key.service = Some(unf_state::ServiceFlowKey {
+            service_id: ServiceId::new(11),
+            backend_id: Some(BackendId::new(13)),
+            service_revision: Revision::new(7),
+            action: 1,
+            reason: 1,
+        });
+        entry.policy_revision = Revision::default();
+        entry.decision.reason = 1;
+        entry.decision.policy_id = None;
+        entry.decision.rule_id = None;
+        entry.service = Some(unf_state::ServiceFlowOutcome {
+            service_id: ServiceId::new(11),
+            backend_id: Some(BackendId::new(13)),
+            service_revision: Revision::new(7),
+            backend_ipv4: Some("10.42.1.20".parse().unwrap()),
+            backend_ipv6: None,
+            frontend_port: 80,
+            backend_port: Some(8080),
+            action: 1,
+            reason: 1,
+        });
+        validate_flow_export_batch(&batch)
+            .expect("service outcomes use service provenance instead of identities");
+        batch.entries[0]
+            .service
+            .as_mut()
+            .expect("service outcome")
+            .backend_id = None;
+        assert!(validate_flow_export_batch(&batch).is_err());
     }
 
     #[test]

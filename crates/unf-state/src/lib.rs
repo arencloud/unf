@@ -6,8 +6,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{
-    IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, RuleId,
-    SERVICE_SNAPSHOT_SCHEMA_VERSION, Verdict,
+    BackendId, IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, RuleId,
+    SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceId, Verdict,
 };
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
@@ -16,11 +16,11 @@ pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const TOPOLOGY_HISTORY_SCHEMA_VERSION: u16 = 1;
 pub const TOPOLOGY_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 pub const TOPOLOGY_HISTORY_CAPACITY: usize = 32;
-pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 3;
-pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
-pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
+pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 4;
+pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 5;
+pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 3;
 pub const SHADOW_IMPACT_SCHEMA_VERSION: u16 = 1;
-pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 3;
+pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 4;
 pub const COMPONENT_COMPATIBILITY_SCHEMA_VERSION: u16 = 2;
 pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 4;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
@@ -126,6 +126,26 @@ pub struct AgentStateReport {
     #[serde(default)]
     pub service_last_error: Option<String>,
     #[serde(default)]
+    pub service_dataplane_events: u64,
+    #[serde(default)]
+    pub service_translations: u64,
+    #[serde(default)]
+    pub service_drops: u64,
+    #[serde(default)]
+    pub service_expirations: u64,
+    #[serde(default)]
+    pub invalid_service_events: u64,
+    #[serde(default)]
+    pub last_service_id: u32,
+    #[serde(default)]
+    pub last_backend_id: u32,
+    #[serde(default)]
+    pub last_service_revision: u64,
+    #[serde(default)]
+    pub last_service_action: u8,
+    #[serde(default)]
+    pub last_service_reason: u8,
+    #[serde(default)]
     pub desired_node_block_revision: u64,
     #[serde(default)]
     pub applied_node_block_revision: u64,
@@ -166,6 +186,15 @@ pub struct AgentConvergenceSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ServiceFlowKey {
+    pub service_id: ServiceId,
+    pub backend_id: Option<BackendId>,
+    pub service_revision: Revision,
+    pub action: u8,
+    pub reason: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FlowHistoryKey {
     #[serde(default)]
     pub direction: PolicyDirection,
@@ -177,6 +206,8 @@ pub struct FlowHistoryKey {
     pub destination_ipv6: Option<Ipv6Addr>,
     pub protocol: u8,
     pub destination_port: u16,
+    #[serde(default)]
+    pub service: Option<ServiceFlowKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,7 +224,22 @@ pub struct FlowExportRecord {
     pub policy_revision: Revision,
     pub decision: FlowExportDecision,
     pub shadow: Option<FlowExportDecision>,
+    #[serde(default)]
+    pub service: Option<ServiceFlowOutcome>,
     pub observed_events: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceFlowOutcome {
+    pub service_id: ServiceId,
+    pub backend_id: Option<BackendId>,
+    pub service_revision: Revision,
+    pub backend_ipv4: Option<Ipv4Addr>,
+    pub backend_ipv6: Option<Ipv6Addr>,
+    pub frontend_port: u16,
+    pub backend_port: Option<u16>,
+    pub action: u8,
+    pub reason: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +258,8 @@ pub struct FlowHistoryEntry {
     pub policy_revision: Revision,
     pub decision: FlowExportDecision,
     pub shadow: Option<FlowExportDecision>,
+    #[serde(default)]
+    pub service: Option<ServiceFlowOutcome>,
     pub observed_events: u64,
     pub first_received_unix_ms: u64,
     pub last_received_unix_ms: u64,
@@ -546,6 +594,7 @@ impl FlowHistoryStore {
                 retained.record.policy_revision = record.policy_revision;
                 retained.record.decision = record.decision;
                 retained.record.shadow = record.shadow;
+                retained.record.service = record.service;
                 retained.record.observed_events = retained
                     .record
                     .observed_events
@@ -637,6 +686,7 @@ impl FlowHistoryStore {
                 policy_revision: retained.record.policy_revision,
                 decision: retained.record.decision,
                 shadow: retained.record.shadow,
+                service: retained.record.service,
                 observed_events: retained.record.observed_events,
                 first_received_unix_ms: retained.first_received_unix_ms,
                 last_received_unix_ms: retained.last_received_unix_ms,
@@ -706,9 +756,10 @@ impl FlowHistoryStore {
         checkpoint: FlowHistoryCheckpoint,
         capacity: usize,
     ) -> Result<Self, FlowHistoryCheckpointError> {
-        if checkpoint.schema_version != 1
-            && checkpoint.schema_version != FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION
-        {
+        if !matches!(
+            checkpoint.schema_version,
+            1 | 2 | FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION
+        ) {
             return Err(FlowHistoryCheckpointError::UnsupportedSchema {
                 actual: checkpoint.schema_version,
                 expected: FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION,
@@ -739,6 +790,7 @@ impl FlowHistoryStore {
                     policy_revision: entry.policy_revision,
                     decision: entry.decision,
                     shadow: entry.shadow,
+                    service: entry.service,
                     observed_events: entry.observed_events,
                 },
                 first_received_unix_ms: entry.first_received_unix_ms,
@@ -1797,6 +1849,7 @@ mod tests {
                 destination_ipv6: None,
                 protocol: 6,
                 destination_port: port,
+                service: None,
             },
             policy_revision: Revision::new(7),
             decision: FlowExportDecision {
@@ -1806,6 +1859,7 @@ mod tests {
                 rule_id: Some(RuleId::new(2)),
             },
             shadow: None,
+            service: None,
             observed_events: observations,
         }
     }
@@ -1842,6 +1896,84 @@ mod tests {
         );
         assert_eq!(snapshot.entries[0].first_received_unix_ms, 100);
         assert_eq!(snapshot.entries[0].last_received_unix_ms, 200);
+    }
+
+    #[test]
+    fn flow_history_retains_service_outcome_provenance() {
+        let mut record = flow_record(0, 0, 80, 2);
+        record.policy_revision = Revision::default();
+        record.decision = FlowExportDecision {
+            verdict: Verdict::Allow,
+            reason: 1,
+            policy_id: None,
+            rule_id: None,
+        };
+        record.service = Some(ServiceFlowOutcome {
+            service_id: ServiceId::new(11),
+            backend_id: Some(BackendId::new(13)),
+            service_revision: Revision::new(7),
+            backend_ipv4: Some(Ipv4Addr::new(10, 42, 1, 20)),
+            backend_ipv6: None,
+            frontend_port: 80,
+            backend_port: Some(8080),
+            action: 1,
+            reason: 1,
+        });
+        record.key.service = Some(ServiceFlowKey {
+            service_id: ServiceId::new(11),
+            backend_id: Some(BackendId::new(13)),
+            service_revision: Revision::new(7),
+            action: 1,
+            reason: 1,
+        });
+        let mut failure = record.clone();
+        failure.key.service = Some(ServiceFlowKey {
+            service_id: ServiceId::new(11),
+            backend_id: None,
+            service_revision: Revision::new(8),
+            action: 2,
+            reason: 3,
+        });
+        failure.decision.verdict = Verdict::Deny;
+        failure.decision.reason = 3;
+        failure.service = Some(ServiceFlowOutcome {
+            service_id: ServiceId::new(11),
+            backend_id: None,
+            service_revision: Revision::new(8),
+            backend_ipv4: None,
+            backend_ipv6: None,
+            frontend_port: 80,
+            backend_port: None,
+            action: 2,
+            reason: 3,
+        });
+        let mut store = FlowHistoryStore::with_capacity(2);
+        store.ingest(
+            FlowExportBatch {
+                schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                node_name: "worker-a".to_owned(),
+                dropped_events: 0,
+                entries: vec![record, failure],
+            },
+            100,
+        );
+        let checkpoint = store.checkpoint(2);
+        let restored = FlowHistoryStore::from_checkpoint(checkpoint, 2)
+            .expect("service history checkpoint is restorable");
+        let snapshot = restored.snapshot(17);
+        assert_eq!(snapshot.retained_flows, 2);
+        assert!(snapshot.entries.iter().any(|entry| {
+            entry.service.is_some_and(|outcome| {
+                outcome.service_id == ServiceId::new(11)
+                    && outcome.backend_id == Some(BackendId::new(13))
+                    && outcome.backend_port == Some(8080)
+            })
+        }));
+        assert!(snapshot.entries.iter().any(|entry| {
+            entry
+                .service
+                .is_some_and(|outcome| outcome.action == 2 && outcome.reason == 3)
+        }));
     }
 
     #[test]

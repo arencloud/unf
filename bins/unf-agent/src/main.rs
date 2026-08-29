@@ -39,7 +39,9 @@ use unf_ebpf_common::{
     FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey,
     Ipv6IdentityKey, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
     POLICY_FLAG_HAS_SHADOW, POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE,
-    POLICY_MAP_ABI_VERSION, SERVICE_BANK_COUNT, SERVICE_MAP_ABI_VERSION,
+    POLICY_MAP_ABI_VERSION, SERVICE_BANK_COUNT, SERVICE_EVENT_ABI_VERSION,
+    SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
+    SERVICE_MAP_ABI_VERSION, ServiceEvent, service_event_action_reason_is_valid,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -61,7 +63,7 @@ use unf_state::{
     FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
     Ipv4PolicyMapEntry, Ipv6IdentityMapping, Ipv6PolicyMapEntry, PERSISTENT_BPF_STATE_ABI_VERSION,
     POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord,
-    PolicyMapEntry, PolicyStateSnapshot, VersionTransition,
+    PolicyMapEntry, PolicyStateSnapshot, ServiceFlowKey, ServiceFlowOutcome, VersionTransition,
 };
 
 mod cni_server;
@@ -428,6 +430,11 @@ struct AgentMetrics {
     service_count: Gauge,
     service_frontend_count: Gauge,
     service_backend_count: Gauge,
+    service_dataplane_events: Counter,
+    service_translations: Counter,
+    service_drops: Counter,
+    service_expirations: Counter,
+    invalid_service_events: Counter,
     remote_route_sync_errors: Counter,
     desired_remote_route_revision: Gauge,
     applied_remote_route_revision: Gauge,
@@ -474,6 +481,16 @@ struct AgentState {
     service_backend_count: AtomicU64,
     service_reconcile_errors: AtomicU64,
     service_last_error: Mutex<Option<String>>,
+    service_dataplane_events: AtomicU64,
+    service_translations: AtomicU64,
+    service_drops: AtomicU64,
+    service_expirations: AtomicU64,
+    invalid_service_events: AtomicU64,
+    last_service_id: AtomicU64,
+    last_backend_id: AtomicU64,
+    last_service_revision: AtomicU64,
+    last_service_action: AtomicU64,
+    last_service_reason: AtomicU64,
     desired_node_block_revision: AtomicU64,
     applied_node_block_revision: AtomicU64,
     desired_remote_route_epoch: AtomicU64,
@@ -2763,6 +2780,7 @@ fn install_crypto_provider() -> Result<()> {
         .map_err(|_| anyhow!("install process-wide Rustls crypto provider"))
 }
 
+#[allow(clippy::too_many_lines)]
 fn new_state(
     capabilities: KernelCapabilities,
     node_name: String,
@@ -2791,6 +2809,11 @@ fn new_state(
         service_count: Gauge::default(),
         service_frontend_count: Gauge::default(),
         service_backend_count: Gauge::default(),
+        service_dataplane_events: Counter::default(),
+        service_translations: Counter::default(),
+        service_drops: Counter::default(),
+        service_expirations: Counter::default(),
+        invalid_service_events: Counter::default(),
         remote_route_sync_errors: Counter::default(),
         desired_remote_route_revision: Gauge::default(),
         applied_remote_route_revision: Gauge::default(),
@@ -2838,6 +2861,16 @@ fn new_state(
         service_backend_count: AtomicU64::new(0),
         service_reconcile_errors: AtomicU64::new(0),
         service_last_error: Mutex::new(None),
+        service_dataplane_events: AtomicU64::new(0),
+        service_translations: AtomicU64::new(0),
+        service_drops: AtomicU64::new(0),
+        service_expirations: AtomicU64::new(0),
+        invalid_service_events: AtomicU64::new(0),
+        last_service_id: AtomicU64::new(0),
+        last_backend_id: AtomicU64::new(0),
+        last_service_revision: AtomicU64::new(0),
+        last_service_action: AtomicU64::new(0),
+        last_service_reason: AtomicU64::new(0),
         desired_node_block_revision: AtomicU64::new(0),
         applied_node_block_revision: AtomicU64::new(0),
         desired_remote_route_epoch: AtomicU64::new(0),
@@ -3024,6 +3057,31 @@ fn register_service_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         "Backends in the active durable service snapshot",
         metrics.service_backend_count.clone(),
     );
+    registry.register(
+        "unf_service_dataplane_events",
+        "Validated service dataplane outcomes consumed from eBPF",
+        metrics.service_dataplane_events.clone(),
+    );
+    registry.register(
+        "unf_service_translations",
+        "Successful forward and reverse service translations",
+        metrics.service_translations.clone(),
+    );
+    registry.register(
+        "unf_service_drops",
+        "Service packets dropped with a machine-readable reason",
+        metrics.service_drops.clone(),
+    );
+    registry.register(
+        "unf_service_expirations",
+        "Expired or corrupt service connection pairs retired by eBPF",
+        metrics.service_expirations.clone(),
+    );
+    registry.register(
+        "unf_service_invalid_events",
+        "Service event records rejected due to ABI or semantic mismatch",
+        metrics.invalid_service_events.clone(),
+    );
 }
 
 fn register_remote_route_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
@@ -3097,11 +3155,16 @@ async fn run_dataplane(
     // Compatibility is checked before this call because opening the persistent
     // map set may create pins or adopt existing kernel state.
     let (mut ebpf, pins_existed) = load_persistent_ebpf(&config)?;
-    let ring = RingBuf::try_from(
+    let flow_ring = RingBuf::try_from(
         ebpf.take_map("FLOW_EVENTS")
             .context("eBPF object does not contain FLOW_EVENTS ring buffer")?,
     )
     .context("open FLOW_EVENTS ring buffer")?;
+    let service_ring = RingBuf::try_from(
+        ebpf.take_map("SERVICE_EVENTS")
+            .context("eBPF object does not contain SERVICE_EVENTS ring buffer")?,
+    )
+    .context("open SERVICE_EVENTS ring buffer")?;
     let identity_maps = take_identity_maps(&mut ebpf)?;
     let policy_maps = take_policy_maps(&mut ebpf)?;
     let service_maps = take_service_maps(&mut ebpf)?;
@@ -3169,7 +3232,8 @@ async fn run_dataplane(
         &cancellation,
     );
     consume_events(
-        ring,
+        flow_ring,
+        service_ring,
         &mut attachments,
         &mut identities,
         &mut policies,
@@ -4557,7 +4621,8 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
 
 #[allow(clippy::too_many_arguments)]
 async fn consume_events(
-    mut ring: RingBuf<aya::maps::MapData>,
+    mut flow_ring: RingBuf<aya::maps::MapData>,
+    mut service_ring: RingBuf<aya::maps::MapData>,
     attachments: &mut InterfaceAttachments<'_>,
     identities: &mut IdentitySynchronizer,
     policies: &mut PolicySynchronizer,
@@ -4605,7 +4670,7 @@ async fn consume_events(
                 }
             }
             _ = event_interval.tick() => {
-                while let Some(item) = ring.next() {
+                while let Some(item) = flow_ring.next() {
                     if item.len() != size_of::<FlowEvent>() {
                         state.metrics.invalid_events.inc();
                         continue;
@@ -4650,8 +4715,43 @@ async fn consume_events(
                         "flow observed"
                     );
                 }
+                drain_service_events(&mut service_ring, state, flow_export_sender);
             }
         }
+    }
+}
+
+fn drain_service_events(
+    ring: &mut RingBuf<MapData>,
+    state: &AgentState,
+    flow_export_sender: Option<&mpsc::Sender<FlowExportRecord>>,
+) {
+    while let Some(item) = ring.next() {
+        let Some(event) = decode_service_event(&item) else {
+            state.invalid_service_events.fetch_add(1, Ordering::Relaxed);
+            state.metrics.invalid_service_events.inc();
+            continue;
+        };
+        record_service_event(state, &event);
+        if let Some(sender) = flow_export_sender {
+            enqueue_flow_export(sender, state, service_flow_export_record(&event));
+        }
+        info!(
+            service_id = event.service_id.get(),
+            backend_id = event.backend_id.get(),
+            service_revision = event.service_revision,
+            client = ?event.client_address,
+            frontend = ?event.frontend_address,
+            backend = ?event.backend_address,
+            client_port = u16::from_be_bytes(event.client_port),
+            frontend_port = u16::from_be_bytes(event.frontend_port),
+            backend_port = u16::from_be_bytes(event.backend_port),
+            protocol = event.protocol,
+            address_family = event.address_family,
+            action = event.action,
+            reason = event.reason,
+            "service dataplane outcome"
+        );
     }
 }
 
@@ -4703,6 +4803,7 @@ fn flow_export_record(event: &FlowEvent) -> FlowExportRecord {
             destination_ipv6: event_ipv6(event.flow.address_family, event.flow.destination_address),
             protocol: event.flow.protocol,
             destination_port: u16::from_be_bytes(event.flow.destination_port),
+            service: None,
         },
         policy_revision: Revision::new(event.policy_revision),
         decision: FlowExportDecision {
@@ -4717,8 +4818,69 @@ fn flow_export_record(event: &FlowEvent) -> FlowExportRecord {
             policy_id: nonzero_policy_id(event.shadow_policy_id),
             rule_id: rule_id_for_reason(event.shadow_rule_id, event.shadow_reason),
         }),
+        service: None,
         observed_events: 1,
     }
+}
+
+fn service_flow_export_record(event: &ServiceEvent) -> FlowExportRecord {
+    let backend_id = (event.backend_id.get() != 0).then_some(event.backend_id);
+    let (backend_ipv4, backend_ipv6) = service_event_backend_address(event);
+    FlowExportRecord {
+        key: FlowHistoryKey {
+            direction: PolicyDirection::Ingress,
+            source_identity: IdentityId::new(0),
+            destination_identity: IdentityId::new(0),
+            source_ipv4: event_ipv4(event.address_family, event.client_address),
+            destination_ipv4: event_ipv4(event.address_family, event.frontend_address),
+            source_ipv6: event_ipv6(event.address_family, event.client_address),
+            destination_ipv6: event_ipv6(event.address_family, event.frontend_address),
+            protocol: event.protocol,
+            destination_port: u16::from_be_bytes(event.frontend_port),
+            service: Some(ServiceFlowKey {
+                service_id: event.service_id,
+                backend_id,
+                service_revision: Revision::new(event.service_revision),
+                action: event.action,
+                reason: event.reason,
+            }),
+        },
+        policy_revision: Revision::default(),
+        decision: FlowExportDecision {
+            verdict: match event.action {
+                SERVICE_EVENT_ACTION_TRANSLATE => Verdict::Allow,
+                SERVICE_EVENT_ACTION_DROP => Verdict::Deny,
+                SERVICE_EVENT_ACTION_EXPIRE => Verdict::Audit,
+                _ => unreachable!("validated service event action"),
+            },
+            reason: event.reason,
+            policy_id: None,
+            rule_id: None,
+        },
+        shadow: None,
+        service: Some(ServiceFlowOutcome {
+            service_id: event.service_id,
+            backend_id,
+            service_revision: Revision::new(event.service_revision),
+            backend_ipv4,
+            backend_ipv6,
+            frontend_port: u16::from_be_bytes(event.frontend_port),
+            backend_port: backend_id.map(|_| u16::from_be_bytes(event.backend_port)),
+            action: event.action,
+            reason: event.reason,
+        }),
+        observed_events: 1,
+    }
+}
+
+fn service_event_backend_address(event: &ServiceEvent) -> (Option<Ipv4Addr>, Option<Ipv6Addr>) {
+    if event.backend_id.get() == 0 || event.backend_address.iter().all(|byte| *byte == 0) {
+        return (None, None);
+    }
+    (
+        event_ipv4(event.address_family, event.backend_address),
+        event_ipv6(event.address_family, event.backend_address),
+    )
 }
 
 const fn policy_direction(direction: u8) -> Option<PolicyDirection> {
@@ -4735,6 +4897,43 @@ fn event_has_selected_identity(event: &FlowEvent) -> bool {
         Some(PolicyDirection::Egress) => event.flow.source_identity.get() != 0,
         None => false,
     }
+}
+
+fn record_service_event(state: &AgentState, event: &ServiceEvent) {
+    state
+        .service_dataplane_events
+        .fetch_add(1, Ordering::Relaxed);
+    state.metrics.service_dataplane_events.inc();
+    match event.action {
+        SERVICE_EVENT_ACTION_TRANSLATE => {
+            state.service_translations.fetch_add(1, Ordering::Relaxed);
+            state.metrics.service_translations.inc();
+        }
+        SERVICE_EVENT_ACTION_DROP => {
+            state.service_drops.fetch_add(1, Ordering::Relaxed);
+            state.metrics.service_drops.inc();
+        }
+        SERVICE_EVENT_ACTION_EXPIRE => {
+            state.service_expirations.fetch_add(1, Ordering::Relaxed);
+            state.metrics.service_expirations.inc();
+        }
+        _ => return,
+    }
+    state
+        .last_service_id
+        .store(u64::from(event.service_id.get()), Ordering::Release);
+    state
+        .last_backend_id
+        .store(u64::from(event.backend_id.get()), Ordering::Release);
+    state
+        .last_service_revision
+        .store(event.service_revision, Ordering::Release);
+    state
+        .last_service_action
+        .store(u64::from(event.action), Ordering::Release);
+    state
+        .last_service_reason
+        .store(u64::from(event.reason), Ordering::Release);
 }
 
 fn event_ipv4(address_family: u8, address: [u8; 16]) -> Option<Ipv4Addr> {
@@ -4945,6 +5144,20 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
         service_backend_count: state.service_backend_count.load(Ordering::Acquire),
         service_reconcile_errors: state.service_reconcile_errors.load(Ordering::Acquire),
         service_last_error: mutex_lock(&state.service_last_error).clone(),
+        service_dataplane_events: state.service_dataplane_events.load(Ordering::Acquire),
+        service_translations: state.service_translations.load(Ordering::Acquire),
+        service_drops: state.service_drops.load(Ordering::Acquire),
+        service_expirations: state.service_expirations.load(Ordering::Acquire),
+        invalid_service_events: state.invalid_service_events.load(Ordering::Acquire),
+        last_service_id: u32::try_from(state.last_service_id.load(Ordering::Acquire))
+            .expect("stored service ID fits u32"),
+        last_backend_id: u32::try_from(state.last_backend_id.load(Ordering::Acquire))
+            .expect("stored backend ID fits u32"),
+        last_service_revision: state.last_service_revision.load(Ordering::Acquire),
+        last_service_action: u8::try_from(state.last_service_action.load(Ordering::Acquire))
+            .expect("stored service action fits u8"),
+        last_service_reason: u8::try_from(state.last_service_reason.load(Ordering::Acquire))
+            .expect("stored service reason fits u8"),
         desired_node_block_revision: state.desired_node_block_revision.load(Ordering::Acquire),
         applied_node_block_revision: state.applied_node_block_revision.load(Ordering::Acquire),
         desired_remote_route_epoch: state.desired_remote_route_epoch.load(Ordering::Acquire),
@@ -4965,6 +5178,7 @@ fn aggregate_pending_flow(
         existing.policy_revision = record.policy_revision;
         existing.decision = record.decision;
         existing.shadow = record.shadow;
+        existing.service = record.service;
         existing.observed_events = existing
             .observed_events
             .saturating_add(record.observed_events);
@@ -6589,6 +6803,46 @@ fn decode_event(bytes: &[u8]) -> Option<FlowEvent> {
     })
 }
 
+fn decode_service_event(bytes: &[u8]) -> Option<ServiceEvent> {
+    if bytes.len() != size_of::<ServiceEvent>() {
+        return None;
+    }
+    let version = u16::from_ne_bytes(copy_bytes(bytes, 78)?);
+    let size = u16::from_ne_bytes(copy_bytes(bytes, 80)?);
+    let protocol = bytes[82];
+    let address_family = bytes[83];
+    let action = bytes[84];
+    let reason = bytes[85];
+    if version != SERVICE_EVENT_ABI_VERSION
+        || usize::from(size) != size_of::<ServiceEvent>()
+        || !matches!(protocol, 6 | 17)
+        || !matches!(address_family, 4 | 6)
+        || !service_event_action_reason_is_valid(action, reason)
+        || bytes[86..96] != [0; 10]
+    {
+        return None;
+    }
+    Some(ServiceEvent {
+        timestamp_ns: u64::from_ne_bytes(copy_bytes(bytes, 0)?),
+        service_revision: u64::from_ne_bytes(copy_bytes(bytes, 8)?),
+        client_address: copy_bytes(bytes, 16)?,
+        frontend_address: copy_bytes(bytes, 32)?,
+        backend_address: copy_bytes(bytes, 48)?,
+        service_id: unf_common::ServiceId::new(u32::from_ne_bytes(copy_bytes(bytes, 64)?)),
+        backend_id: unf_common::BackendId::new(u32::from_ne_bytes(copy_bytes(bytes, 68)?)),
+        client_port: copy_bytes(bytes, 72)?,
+        frontend_port: copy_bytes(bytes, 74)?,
+        backend_port: copy_bytes(bytes, 76)?,
+        version,
+        size,
+        protocol,
+        address_family,
+        action,
+        reason,
+        reserved: copy_bytes(bytes, 86)?,
+    })
+}
+
 fn copy_bytes<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
     bytes.get(offset..offset + N)?.try_into().ok()
 }
@@ -7464,6 +7718,11 @@ mod tests {
                 .load()
                 .expect("kernel verifier accepts service TC program");
         }
+        let mut service_events = RingBuf::try_from(
+            ebpf.take_map("SERVICE_EVENTS")
+                .expect("service event ring exists"),
+        )
+        .expect("service event ring opens");
         let (
             ipv4_frontends,
             ipv6_frontends,
@@ -7611,6 +7870,40 @@ mod tests {
         let (action, output) = run_tc(&mut ebpf, "unf_observe_ingress", &unrelated);
         assert_eq!(action, TC_ACT_PIPE);
         assert_eq!(output, unrelated);
+
+        let mut events = Vec::new();
+        while let Some(item) = service_events.next() {
+            events.push(decode_service_event(&item).expect("kernel service event is valid"));
+        }
+        assert_eq!(events.len(), 14);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == SERVICE_EVENT_ACTION_TRANSLATE)
+                .count(),
+            12
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == SERVICE_EVENT_ACTION_EXPIRE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == SERVICE_EVENT_ACTION_DROP)
+                .count(),
+            1
+        );
+        let no_backend = events
+            .iter()
+            .find(|event| event.reason == unf_ebpf_common::SERVICE_EVENT_REASON_NO_BACKEND)
+            .expect("backendless drop has explicit provenance");
+        assert_ne!(no_backend.service_id.get(), 0);
+        assert_eq!(no_backend.backend_id.get(), 0);
+        assert_eq!(no_backend.service_revision, 3);
     }
 
     #[test]
@@ -7933,6 +8226,63 @@ mod tests {
     }
 
     #[test]
+    fn service_event_decoder_and_status_preserve_bounded_provenance() {
+        let mut bytes = [0_u8; size_of::<ServiceEvent>()];
+        bytes[8..16].copy_from_slice(&7_u64.to_ne_bytes());
+        bytes[16..20].copy_from_slice(&[10, 42, 0, 10]);
+        bytes[32..36].copy_from_slice(&[10, 96, 0, 80]);
+        bytes[48..52].copy_from_slice(&[10, 42, 1, 20]);
+        bytes[64..68].copy_from_slice(&11_u32.to_ne_bytes());
+        bytes[68..72].copy_from_slice(&13_u32.to_ne_bytes());
+        bytes[72..74].copy_from_slice(&40_000_u16.to_be_bytes());
+        bytes[74..76].copy_from_slice(&80_u16.to_be_bytes());
+        bytes[76..78].copy_from_slice(&8080_u16.to_be_bytes());
+        bytes[78..80].copy_from_slice(&SERVICE_EVENT_ABI_VERSION.to_ne_bytes());
+        bytes[80..82].copy_from_slice(
+            &u16::try_from(size_of::<ServiceEvent>())
+                .expect("service event size fits u16")
+                .to_ne_bytes(),
+        );
+        bytes[82] = 6;
+        bytes[83] = 4;
+        bytes[84] = SERVICE_EVENT_ACTION_TRANSLATE;
+        bytes[85] = unf_ebpf_common::SERVICE_EVENT_REASON_FORWARD_TRANSLATED;
+        let event = decode_service_event(&bytes).expect("service event ABI is valid");
+        let record = service_flow_export_record(&event);
+        assert_eq!(record.key.source_ipv4, Some(Ipv4Addr::new(10, 42, 0, 10)));
+        assert_eq!(
+            record.key.destination_ipv4,
+            Some(Ipv4Addr::new(10, 96, 0, 80))
+        );
+        assert_eq!(record.key.destination_port, 80);
+        assert_eq!(record.decision.verdict, Verdict::Allow);
+        let outcome = record.service.expect("service provenance is exported");
+        assert_eq!(outcome.service_id.get(), 11);
+        assert_eq!(outcome.backend_id.expect("backend ID").get(), 13);
+        assert_eq!(outcome.backend_ipv4, Some(Ipv4Addr::new(10, 42, 1, 20)));
+        assert_eq!(outcome.backend_port, Some(8080));
+        let state = test_agent_state();
+        record_service_event(&state, &event);
+        let report = agent_state_report(&state);
+        assert_eq!(report.service_dataplane_events, 1);
+        assert_eq!(report.service_translations, 1);
+        assert_eq!(report.service_drops, 0);
+        assert_eq!(report.last_service_id, 11);
+        assert_eq!(report.last_backend_id, 13);
+        assert_eq!(report.last_service_revision, 7);
+        assert_eq!(report.last_service_action, SERVICE_EVENT_ACTION_TRANSLATE);
+        assert_eq!(
+            report.last_service_reason,
+            unf_ebpf_common::SERVICE_EVENT_REASON_FORWARD_TRANSLATED
+        );
+
+        bytes[85] = unf_ebpf_common::SERVICE_EVENT_REASON_NO_BACKEND;
+        assert!(decode_service_event(&bytes).is_none());
+        bytes[86] = 1;
+        assert!(decode_service_event(&bytes).is_none());
+    }
+
+    #[test]
     fn capability_detection_is_total() {
         let capabilities = detect_capabilities();
         assert!(!capabilities.kernel_release.is_empty());
@@ -8142,6 +8492,7 @@ mod tests {
                 destination_ipv6: None,
                 protocol: 6,
                 destination_port: port,
+                service: None,
             },
             policy_revision: Revision::new(7),
             decision: FlowExportDecision {
@@ -8151,6 +8502,7 @@ mod tests {
                 rule_id: Some(RuleId::new(0)),
             },
             shadow: None,
+            service: None,
             observed_events: 1,
         }
     }
