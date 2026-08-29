@@ -37,6 +37,20 @@ yq -o=json '.' "${agent_based}/agent-config.yaml" \
 grep -q 'nodeName: unf-primary-controller-node.invalid' "${temporary_dir}/runtime.yaml"
 [[ $(yq -r 'select(.kind == "Deployment" and .metadata.name == "unf-controller") | .spec.strategy.type' \
   "${temporary_dir}/runtime.yaml") == Recreate ]]
+yq -o=json 'select(.kind == "Deployment" and .metadata.name == "unf-controller")' \
+  "${temporary_dir}/runtime.yaml" | jq -e '
+    .spec.template.spec.containers[] | select(.name == "controller") |
+    .startupProbe.httpGet.path == "/healthz" and
+    .startupProbe.timeoutSeconds == 5 and
+    .startupProbe.periodSeconds == 10 and
+    .startupProbe.failureThreshold == 60 and
+    .livenessProbe.timeoutSeconds == 5 and
+    .livenessProbe.periodSeconds == 10 and
+    .livenessProbe.failureThreshold == 6 and
+    .readinessProbe.timeoutSeconds == 5 and
+    .readinessProbe.periodSeconds == 10 and
+    .readinessProbe.failureThreshold == 6
+  ' >/dev/null
 grep -q 'ip: 192.0.2.1' "${temporary_dir}/runtime.yaml"
 grep -q 'https://unf-primary-controller.internal:9964' "${temporary_dir}/runtime.yaml"
 [[ $(grep -c 'path: /etc/sysctl.d/90-unf-primary-cni.conf' "${temporary_dir}/machineconfig.yaml") -eq 2 ]]

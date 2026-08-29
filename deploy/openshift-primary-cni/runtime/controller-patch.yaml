@@ -21,3 +21,28 @@ spec:
       containers:
         - name: controller
           imagePullPolicy: IfNotPresent
+          # Initial relist/restore after broad Pod churn can hold the controller
+          # longer than the generic one-second probe budget. Keep liveness
+          # disabled until one health response succeeds, then tolerate bounded
+          # transient reconciliation pressure without masking a lasting stall.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 5
+            periodSeconds: 10
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            timeoutSeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6

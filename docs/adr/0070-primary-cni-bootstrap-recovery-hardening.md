@@ -101,9 +101,24 @@ epoch and the 340 terminal retry artifacts were removed. The package now
 requires `Recreate` so an update has one bounded controller outage while agents
 continue from last-known-good state.
 
-Live OpenShift verification still requires deletion of every annotated
-temporary policy, operator/canary closure, and explicit outage and Node reboot
-evidence.
+All 25 annotated temporary policies were removed in guarded batches. After
+every batch, all five agents reported exact desired/applied convergence; DNS,
+kubelet proxy health, operators, and IPv4/IPv6 ingress canaries passed a
+60-second hold without new restarts. A retained terminal Pod released its
+dual-stack lease, its live replacement reused both exact addresses, and
+cross-worker traffic plus exact attachment cleanup passed. With the controller
+absent, a replacement server-node agent restored last-known-good Node-block and
+route state while IPv4/IPv6 traffic continued; the restored controller issued a
+new epoch adopted by all five agents.
+
+The first Node-reboot attempt exposed a stale pre-reboot Pod readiness condition
+in the fixture and self-cleaned without a claim. The retry exposed an actual
+packaging limit: the inherited one-second probes repeatedly killed the
+controller while it replayed large policy, flow, and topology state after Pod
+churn. The primary package now uses a startup probe and bounded five-second
+readiness/liveness budgets. The live controller then converged all five agents
+and passed a 120-second zero-restart hold. A clean reboot rerun is still
+required before the live gate is credited.
 
 ## Consequences
 

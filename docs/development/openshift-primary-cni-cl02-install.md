@@ -141,16 +141,41 @@ not manually altered, and only the 340 terminal failed-Pod records were then
 deleted. The runtime package and package check now require `Recreate`. This
 retry remains part of the qualification record.
 
+### Workaround removal and lifecycle recovery
+
+All 25 policies carrying `network.unf.io/temporary-reason` were removed in
+seven guarded batches. Each batch retained a sanitized in-memory rollback copy,
+required a changed compiled policy revision with exact desired/applied state on
+all five agents, and passed API, five-Node kubelet proxy, DNS, operator, and
+IPv4/IPv6 ingress-canary checks before and after a 60-second hold. No rollback
+was required. The final count is zero; native OpenShift policies were not
+removed, and DNS/canary restart counts did not change during policy removal.
+
+A disposable retained terminal Pod released its CNI attachment while its API
+object remained. A live replacement on the same worker received the same IPv4
+and IPv6 addresses, passed direct cross-worker traffic, and self-cleaned to the
+exact pre-test attachment counts. A separate controller-outage gate replaced
+the server-node agent while the controller was absent. The replacement restored
+last-known-good Node-block and eight-route state, uninterrupted dual-stack
+traffic passed, and all five agents adopted the restored controller's new exact
+epoch before fixture cleanup.
+
+The Node reboot gate retains two unsuccessful attempts. The first correctly
+rejected a stale pre-reboot Pod readiness condition and self-cleaned. The second
+rebooted the worker, reconstructed all eleven BPF maps and four remote routes
+per family, but could not close controller convergence because the generic
+one-second liveness probe restarted the controller six times during post-churn
+state replay. A live primary-specific startup/readiness/liveness patch restored
+five-agent convergence and held the controller Ready with zero restarts for 120
+seconds. That probe contract is now package-checked; the clean reboot retry
+remains open.
+
 ## Remaining exit criteria
 
 The live primary-CNI lifecycle remains **In progress** until repository changes
-and repeatable gates eliminate the temporary policies and prove:
+and repeatable gates prove the remaining items:
 
-- terminal-Pod identity release and same-IP replacement without manual cleanup;
-- reply handling across DNS, API, Service NAT, TokenReview, Ironic, monitoring,
-  and router host-network paths without workload-specific exceptions;
-- automatic Node-block/remote-route recovery across controller epoch changes;
-- controller outage plus agent and Node reboot last-known-good recovery;
+- Node reboot last-known-good recovery with the hardened controller probes;
 - CRI-O ADD/CHECK/DEL and lease/link cleanup under deliberate failure;
 - exact artifact, route, and BPF teardown, no-CNI baseline behavior, and clean
   reprovision recovery; and
