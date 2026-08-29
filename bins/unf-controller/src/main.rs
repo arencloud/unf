@@ -55,12 +55,13 @@ use unf_state::{
     EgressIpv6PolicyMapEntry, EgressIpv6PolicyMapKey, FLOW_EXPORT_BATCH_LIMIT,
     FLOW_EXPORT_SCHEMA_VERSION, FLOW_HISTORY_CAPACITY, FlowExportBatch, FlowExportRecord,
     FlowHistoryCheckpoint, FlowHistoryQuerySummary, FlowHistorySnapshot, FlowHistoryStore,
-    IdentityRegistry, IdentityStateSnapshot, Ipv4PolicyMapEntry, Ipv6PolicyMapEntry,
-    NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord, PolicyStateSnapshot,
-    RevisionSet, TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION,
-    TopologyHistoryCheckpoint, TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode,
-    TopologyService, TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort,
-    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
+    IdentityRegistry, IdentityStateSnapshot, Ipv4PolicyMapEntry, Ipv4PolicyMapKey,
+    Ipv6PolicyMapEntry, Ipv6PolicyMapKey, NetworkIdentity, POLICY_SNAPSHOT_SCHEMA_VERSION,
+    PolicyDecisionRecord, PolicyStateSnapshot, RevisionSet, TOPOLOGY_HISTORY_CAPACITY,
+    TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyHistoryCheckpoint, TopologyHistorySnapshot,
+    TopologyHistoryStore, TopologyNode, TopologyService, TopologyServiceBackend,
+    TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
+    provisional_identity_id,
 };
 
 mod external_flow_export;
@@ -271,7 +272,7 @@ struct AssignedNodeBlock {
     transport: Result<NodeTransport, String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct NodeTransport {
     ipv4: Ipv4Addr,
     ipv6: Ipv6Addr,
@@ -2153,6 +2154,9 @@ fn recompute_node_blocks(state: &ControllerState) {
     let changed = assignments_changed || *read_lock(&state.rejected_node_blocks) != rejected;
     if changed {
         bump_routing_revision(state);
+        if assignments_changed {
+            bump_policy_revision(state);
+        }
         let routing_revision = mutex_lock(&state.revisions).routing;
         let assignments = candidates
             .into_iter()
@@ -3726,6 +3730,13 @@ fn dataplane_policy_state(state: &ControllerState) -> Result<DataplanePolicyStat
     let mut egress_ipv6_entries =
         compile_egress_ipv6_dataplane_entries(&egress_policies, &endpoints, &ipv6_endpoints)
             .map_err(|error| ApiError::internal(error.to_string()))?;
+    add_primary_node_traffic_entries(
+        state,
+        &mut ipv4_entries,
+        &mut ipv6_entries,
+        &mut egress_ipv4_entries,
+        &mut egress_ipv6_entries,
+    )?;
     add_ovn_host_network_reply_entries(
         state,
         &ingress_policies,
@@ -3795,6 +3806,90 @@ fn add_host_network_ingress_entries(
     }
     ipv4_entries.sort_by_key(|entry| entry.key);
     ipv6_entries.sort_by_key(|entry| entry.key);
+    Ok(())
+}
+
+fn add_primary_node_traffic_entries(
+    state: &ControllerState,
+    ingress_ipv4_entries: &mut Vec<Ipv4PolicyMapEntry>,
+    ingress_ipv6_entries: &mut Vec<Ipv6PolicyMapEntry>,
+    egress_ipv4_entries: &mut Vec<EgressIpv4PolicyMapEntry>,
+    egress_ipv6_entries: &mut Vec<EgressIpv6PolicyMapEntry>,
+) -> Result<(), ApiError> {
+    let node_transports: BTreeSet<_> = read_lock(&state.node_blocks)
+        .values()
+        .filter_map(|assignment| assignment.transport.as_ref().ok().copied())
+        .collect();
+    if node_transports.is_empty() {
+        return Ok(());
+    }
+
+    let decision = PolicyDecisionRecord {
+        verdict: Verdict::Allow,
+        reason: PolicyReason::NoApplicablePolicy,
+        policy_id: None,
+        rule_id: None,
+    };
+    for transport in node_transports {
+        merge_host_network_ipv4_entry(
+            ingress_ipv4_entries,
+            Ipv4PolicyMapEntry {
+                key: Ipv4PolicyMapKey {
+                    source_address: transport.ipv4,
+                    destination_identity: IdentityId::new(0),
+                    protocol: 0,
+                    destination_port: 0,
+                },
+                decision,
+                shadow: None,
+            },
+        )?;
+        merge_host_network_ipv6_entry(
+            ingress_ipv6_entries,
+            Ipv6PolicyMapEntry {
+                key: Ipv6PolicyMapKey {
+                    source_network: transport.ipv6,
+                    source_prefix_len: 128,
+                    destination_identity: IdentityId::new(0),
+                    protocol: 0,
+                    destination_port: 0,
+                },
+                decision,
+                shadow: None,
+            },
+        )?;
+        upsert_egress_ipv4_entry(
+            egress_ipv4_entries,
+            EgressIpv4PolicyMapEntry {
+                key: EgressIpv4PolicyMapKey {
+                    source_identity: IdentityId::new(0),
+                    destination_address: transport.ipv4,
+                    protocol: 0,
+                    destination_port: 0,
+                },
+                decision,
+                shadow: None,
+            },
+        )?;
+        upsert_egress_ipv6_entry(
+            egress_ipv6_entries,
+            EgressIpv6PolicyMapEntry {
+                key: EgressIpv6PolicyMapKey {
+                    source_identity: IdentityId::new(0),
+                    destination_network: transport.ipv6,
+                    destination_prefix_len: 128,
+                    protocol: 0,
+                    destination_port: 0,
+                },
+                decision,
+                shadow: None,
+            },
+        )?;
+    }
+    ingress_ipv4_entries.sort_by_key(|entry| entry.key);
+    ingress_ipv6_entries.sort_by_key(|entry| entry.key);
+    egress_ipv4_entries.sort_by_key(|entry| entry.key);
+    egress_ipv6_entries.sort_by_key(|entry| entry.key);
     Ok(())
 }
 
@@ -3936,7 +4031,7 @@ fn upsert_egress_ipv4_entry(
     } else {
         if entries.len() >= unf_state::POLICY_MAP_BANK_ENTRY_LIMIT {
             return Err(ApiError::internal(format!(
-                "egress IPv4 policy entry limit {} exceeded while adding OVN reply state",
+                "egress IPv4 policy entry limit {} exceeded while adding compatibility state",
                 unf_state::POLICY_MAP_BANK_ENTRY_LIMIT
             )));
         }
@@ -3957,7 +4052,7 @@ fn upsert_egress_ipv6_entry(
     } else {
         if entries.len() >= unf_state::POLICY_MAP_BANK_ENTRY_LIMIT {
             return Err(ApiError::internal(format!(
-                "egress IPv6 policy entry limit {} exceeded while adding OVN reply state",
+                "egress IPv6 policy entry limit {} exceeded while adding compatibility state",
                 unf_state::POLICY_MAP_BANK_ENTRY_LIMIT
             )));
         }
@@ -5409,6 +5504,80 @@ mod tests {
             entry.key.source_identity == IdentityId::new(20)
                 && entry.key.destination_address == "10.131.0.2".parse::<Ipv4Addr>().unwrap()
                 && entry.decision.verdict == Verdict::Allow
+        }));
+    }
+
+    #[test]
+    fn primary_node_transport_bypasses_namespace_policy_isolation() {
+        let state = egress_policy_state();
+        apply_node_event(
+            &state,
+            Event::Apply(primary_node("worker-a", "10.42.0.0/24", "fd00:42::/64")),
+        );
+        let ingress_deny: NetworkPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": "deny-ingress", "namespace": "frontend"},
+            "spec": {
+                "podSelector": {"matchLabels": {"app": "client"}},
+                "policyTypes": ["Ingress"]
+            }
+        }))
+        .expect("test ingress deny NetworkPolicy is valid Kubernetes JSON");
+        apply_network_policy_event(&state, Event::Apply(ingress_deny));
+
+        let (_, _, ingress_ipv4, ingress_ipv6, egress_ipv4, egress_ipv6) =
+            dataplane_policy_state(&state)
+                .expect("primary Node exception lowers into the snapshot");
+        let node_ipv4 = "192.0.2.1".parse::<Ipv4Addr>().expect("valid Node IPv4");
+        let node_ipv6 = "fdff::1".parse::<Ipv6Addr>().expect("valid Node IPv6");
+        let client_identity = IdentityId::new(10);
+        let platform_allow = |decision: &PolicyDecisionRecord| {
+            decision.verdict == Verdict::Allow
+                && decision.reason == PolicyReason::NoApplicablePolicy
+                && decision.policy_id.is_none()
+                && decision.rule_id.is_none()
+        };
+
+        assert!(ingress_ipv4.iter().any(|entry| {
+            entry.key.source_address == node_ipv4
+                && entry.key.destination_identity == IdentityId::new(0)
+                && entry.key.protocol == 0
+                && entry.key.destination_port == 0
+                && platform_allow(&entry.decision)
+        }));
+        assert!(ingress_ipv6.iter().any(|entry| {
+            entry.key.source_network == node_ipv6
+                && entry.key.source_prefix_len == 128
+                && entry.key.destination_identity == IdentityId::new(0)
+                && entry.key.protocol == 0
+                && entry.key.destination_port == 0
+                && platform_allow(&entry.decision)
+        }));
+        assert!(egress_ipv4.iter().any(|entry| {
+            entry.key.source_identity == IdentityId::new(0)
+                && entry.key.destination_address == node_ipv4
+                && entry.key.protocol == 0
+                && entry.key.destination_port == 0
+                && platform_allow(&entry.decision)
+        }));
+        assert!(egress_ipv6.iter().any(|entry| {
+            entry.key.source_identity == IdentityId::new(0)
+                && entry.key.destination_network == node_ipv6
+                && entry.key.destination_prefix_len == 128
+                && entry.key.protocol == 0
+                && entry.key.destination_port == 0
+                && platform_allow(&entry.decision)
+        }));
+        assert!(ingress_ipv4.iter().any(|entry| {
+            entry.key.source_address == Ipv4Addr::UNSPECIFIED
+                && entry.key.destination_identity == client_identity
+                && entry.decision.verdict == Verdict::Deny
+        }));
+        assert!(egress_ipv4.iter().any(|entry| {
+            entry.key.source_identity == client_identity
+                && entry.key.destination_address == Ipv4Addr::UNSPECIFIED
+                && entry.decision.verdict == Verdict::Deny
         }));
     }
 

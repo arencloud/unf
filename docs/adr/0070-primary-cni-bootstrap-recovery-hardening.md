@@ -1,7 +1,7 @@
 # ADR 0070: Primary-CNI bootstrap recovery is identity-, NAT-, and epoch-aware
 
-Status: Accepted and implemented; isolated dual-stack Kind verified, live
-OpenShift rollout pending
+Status: Accepted and implemented; expanded isolated dual-stack Kind verified,
+live OpenShift rerun pending
 
 ## Context
 
@@ -24,13 +24,25 @@ address indexes, and unreferenced identity before a replacement can claim a
 reused address. Other phases, including `Unknown`, remain admitted until a
 terminal or delete event is observed.
 
-Primary-CNI agents select `--hook-coverage both`. The ingress and egress TC
-programs share one bounded runtime connection map, allowing pre- and post-NAT
-observations of the same request to seed both reverse tuple forms. Overlay mode
+Primary-CNI agents select `--hook-coverage both`. Ingress attachments on every
+non-loopback interface are the single policy enforcement and flow-telemetry
+point. Egress attachments are supplemental: they can refresh or seed the shared
+bounded connection map for the other side of translated and locally originated
+tuples, but always return `TC_ACT_PIPE` and emit no duplicate flow event. This
+preserves Pod ingress enforcement on forwarded traffic while excluding local
+kubelet-to-Pod probes from a second, directionally wrong verdict. Overlay mode
 retains its existing single-hook default. Established TCP, UDP, and SCTP state
 remains protocol-time-bounded and requires a live nonzero policy configuration,
 but no longer disappears because an unrelated Pod or policy update advances the
 global revision. Replacing the eBPF program still resets all runtime state.
+
+Accepted primary-CNI Node InternalIPs receive Kubernetes' Node-traffic
+exception in both directions and address families. The controller lowers one
+exact-address fallback per Node, not one entry per Node and workload identity.
+The reserved-identity fallback is accepted by agents only when it is an exact
+nonzero address, wildcard protocol/port, provenance-free allow with no shadow;
+all other reserved-identity policy shapes fail validation. Node assignment or
+transport changes advance the policy revision as well as routing state.
 
 Host-network Pods keep their status addresses and real Namespace, Pod labels,
 service account, and named ports for address-aware policy lowering, while their
@@ -57,11 +69,23 @@ policy revision changes, and refusal without active policy state. Agent tests
 prove revision-only Node-block adoption, secure persistence, idempotence, and
 rejection of Node UID or provider changes.
 
-`make ebpf`, `make openshift-primary-cni-package-check`, and the complete
-`make primary-cni-kind-test` gate pass. The Kind gate loaded both TC programs on
-three default-CNI-disabled Nodes and completed dual-stack forwarding, controller
-outage, agent replacement, last-known-good recovery, cleanup, and rollback to a
-no-CNI baseline.
+The expanded `make primary-cni-kind-test` gate passes on three
+default-CNI-disabled Nodes. In addition to its prior dual-stack lifecycle,
+outage, foreign-CNI, and exact rollback coverage, it proves kubelet HTTP probes
+remain healthy under namespace default-deny, Pod-to-Node IPv4/IPv6 traffic
+bypasses egress isolation, IPv4 Service forwarding, retained terminal-Pod
+dual-stack lease reuse, and exact controller-epoch reconvergence. The host
+kernel does not expose an ip6tables NAT table, so kube-proxy explicitly disables
+its IPv6 proxier; the evidence artifact records IPv6 ClusterIP forwarding as a
+fixture exclusion while retaining direct IPv6 and dual-stack Service discovery.
+
+The first staged cl02 agent rollout from revision `58e4deb` proved that making
+both TC directions authoritative is incorrect: CoreDNS kubelet probes were
+dropped and authentication degraded. The controller was not upgraded. Agents
+were rolled back to the prior digest, and scoped legacy-netlink cleanup removed
+only the residual UNF egress filters. Authentication, console, and DNS recovered;
+Insights retained its pre-existing external upload timeout. This failed attempt
+is retained as evidence rather than credited as qualification.
 
 Live OpenShift verification still requires immutable images, a staged cl02
 rollout, deletion of every annotated temporary policy, operator/canary closure,
@@ -70,8 +94,10 @@ and explicit outage and Node reboot evidence.
 ## Consequences
 
 Bootstrap traffic no longer depends on a globally revision-fenced reply cache,
-and Service NAT has both tuple observation points in primary-CNI mode. The
-single-hook overlay default and persistent eleven-map ABI remain unchanged.
+and Service NAT has both tuple observation points in primary-CNI mode without
+two enforcement or telemetry points. Exact Node exceptions grow linearly with
+Nodes rather than with Nodes multiplied by identities. The single-hook overlay
+default and persistent eleven-map ABI remain unchanged.
 Runtime reply entries are still bounded and ephemeral; generic `RELATED` ICMP,
 arbitrary conntrack helpers, non-L4 association, and survival across program
 replacement remain outside this decision.

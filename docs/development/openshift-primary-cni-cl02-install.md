@@ -91,11 +91,33 @@ oc get networkpolicy -A -o json | jq '
 
 ## Remediation status
 
-ADR 0070 implements fixes for all four observed gaps and the complete isolated
-dual-stack primary-CNI Kind lifecycle passes with those changes. The fixes are
-not credited as live cl02 evidence until immutable images are deployed, all 24
-temporary policies are removed, and operator, canary, convergence, outage, and
-reboot checks pass without recreating them.
+ADR 0070 implements fixes for all four observed gaps. Its expanded isolated
+dual-stack primary-CNI Kind lifecycle passes, including the kubelet-probe and
+exact Node-traffic regressions exposed by the first rollout. The fixes are not
+credited as live cl02 evidence until corrected immutable images are deployed,
+all temporary policies are removed, and operator, canary, convergence, outage,
+and reboot checks pass without recreating them.
+
+### First remediation rollout attempt
+
+The first agent-only rollout used revision `58e4deb` and agent digest
+`sha256:3f6426bd0ee205ca539b7655a5768c55be992a306cce6f64a43c05ce57a4dd87`.
+It exposed a missing gate: treating both TC directions as policy enforcement
+points blocked kubelet HTTP probes to CoreDNS ports 8080 and 8181, which in turn
+degraded authentication. The new controller image was never deployed.
+
+All five agents were returned to the checkpoint digest. Because legacy TC
+filters persist independently of the Pod that installed them, a dry-run-first,
+per-Node cleanup removed only `unf_observe_egress` attachments; ingress filters,
+routes, CNI files, leases, and workload links were untouched. Authentication,
+console, and DNS recovered. Insights remained degraded on its pre-existing
+timeout to `console.redhat.com`, which is outside UNF dataplane qualification.
+The 24 original policies remain installed. One additional exact Node-address
+return policy was added to `openshift-dns` after the rollback so CoreDNS could
+re-establish API watches with the old controller; all five DNS Pods then became
+Ready. The live temporary-policy count is therefore 25. The rejected image tag
+and digest will not be reused; the next attempt requires a new committed
+revision and new immutable digests.
 
 ## Remaining exit criteria
 

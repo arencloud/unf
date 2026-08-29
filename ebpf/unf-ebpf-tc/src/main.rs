@@ -93,28 +93,28 @@ static POLICY_CONFIG: Array<PolicyMapConfig> = Array::with_max_entries(1, 0);
 
 #[classifier]
 pub fn unf_observe_ingress(ctx: TcContext) -> i32 {
-    observe(&ctx, Direction::Ingress)
+    observe(&ctx, Direction::Ingress, true)
 }
 
 #[classifier]
 pub fn unf_observe_egress(ctx: TcContext) -> i32 {
-    observe(&ctx, Direction::Egress)
+    observe(&ctx, Direction::Egress, false)
 }
 
 #[inline(always)]
-fn observe(ctx: &TcContext, direction: Direction) -> i32 {
+fn observe(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     let Ok(ether_type) = ctx.load::<u16>(12) else {
         return TC_ACT_PIPE;
     };
     match u16::from_be(ether_type) {
-        ETHERTYPE_IPV4 => observe_ipv4(ctx, direction),
-        ETHERTYPE_IPV6 => observe_ipv6(ctx, direction),
+        ETHERTYPE_IPV4 => observe_ipv4(ctx, direction, enforce),
+        ETHERTYPE_IPV6 => observe_ipv6(ctx, direction, enforce),
         _ => TC_ACT_PIPE,
     }
 }
 
 #[inline(always)]
-fn observe_ipv4(ctx: &TcContext, direction: Direction) -> i32 {
+fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     let Ok(version_ihl) = ctx.load::<u8>(ETHERNET_HEADER_LEN) else {
         return TC_ACT_PIPE;
     };
@@ -183,11 +183,12 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction) -> i32 {
         None,
         None,
         tcp_flags,
+        enforce,
     )
 }
 
 #[inline(always)]
-fn observe_ipv6(ctx: &TcContext, direction: Direction) -> i32 {
+fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     let Ok(version) = ctx.load::<u8>(ETHERNET_HEADER_LEN) else {
         return TC_ACT_PIPE;
     };
@@ -233,6 +234,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction) -> i32 {
         Some(source_address),
         Some(destination_address),
         tcp_flags,
+        enforce,
     )
 }
 
@@ -303,7 +305,25 @@ fn emit_flow(
     source_ipv6: Option<[u8; 16]>,
     destination_ipv6: Option<[u8; 16]>,
     tcp_flags: u8,
+    enforce: bool,
 ) -> i32 {
+    let connection_key = ConnectionKey {
+        source_address,
+        destination_address,
+        source_port,
+        destination_port,
+        protocol,
+        address_family: address_family as u8,
+        reserved: [0; 2],
+    };
+    let policy_revision = active_policy_revision();
+    // SAFETY: this helper has no preconditions and returns monotonic kernel time.
+    #[allow(unsafe_code)]
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    if !enforce {
+        seed_forwarded_connection(connection_key, policy_revision, timestamp_ns, tcp_flags);
+        return TC_ACT_PIPE;
+    }
     if let Some(counter) = FLOW_COUNTERS.get_ptr_mut(0) {
         // SAFETY: get_ptr_mut returned a non-null pointer to the current CPU's
         // u64 slot at the valid, constant map index 0. No other CPU aliases it.
@@ -313,9 +333,6 @@ fn emit_flow(
         };
     }
 
-    // SAFETY: this helper has no preconditions and returns monotonic kernel time.
-    #[allow(unsafe_code)]
-    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
     let mut decision = lookup_policy(
         direction,
         source_ipv4,
@@ -327,16 +344,6 @@ fn emit_flow(
         destination_port,
         protocol,
     );
-    let connection_key = ConnectionKey {
-        source_address,
-        destination_address,
-        source_port,
-        destination_port,
-        protocol,
-        address_family: address_family as u8,
-        reserved: [0; 2],
-    };
-    let policy_revision = active_policy_revision();
     if decision.verdict == Verdict::Deny {
         if refresh_connection(connection_key.reverse(), policy_revision, timestamp_ns) {
             decision = DataplaneDecision::established(decision);
@@ -390,6 +397,27 @@ fn emit_flow(
     } else {
         TC_ACT_PIPE
     }
+}
+
+#[inline(always)]
+fn seed_forwarded_connection(
+    key: ConnectionKey,
+    policy_revision: u64,
+    now_ns: u64,
+    tcp_flags: u8,
+) {
+    if policy_revision == 0
+        || refresh_connection(key, policy_revision, now_ns)
+        || refresh_connection(key.reverse(), policy_revision, now_ns)
+        || !packet_starts_connection(key.protocol, tcp_flags)
+    {
+        return;
+    }
+    let state = ConnectionState {
+        last_seen_ns: now_ns,
+        policy_revision,
+    };
+    let _ = CONNECTIONS.insert(&key, &state, 0);
 }
 
 #[derive(Clone, Copy)]
@@ -539,6 +567,13 @@ fn lookup_ingress_policy(
     }
 
     if let Some(source_ipv4) = source_ipv4 {
+        let ipv4_node_fallback = Ipv4PolicyMapKey {
+            source_address: source_ipv4,
+            destination_identity: IdentityId::new(0),
+            destination_port: [0; 2],
+            protocol: 0,
+            bank: config.active_bank,
+        };
         let ipv4_exact = Ipv4PolicyMapKey {
             source_address: source_ipv4,
             destination_identity,
@@ -581,7 +616,8 @@ fn lookup_ingress_policy(
             protocol,
             bank: config.active_bank,
         };
-        if let Some(value) = lookup_ipv4_policy_value(&ipv4_exact, config.revision)
+        if let Some(value) = lookup_ipv4_policy_value(&ipv4_node_fallback, config.revision)
+            .or_else(|| lookup_ipv4_policy_value(&ipv4_exact, config.revision))
             .or_else(|| lookup_ipv4_policy_value(&ipv4_source_protocol_fallback, config.revision))
             .or_else(|| lookup_ipv4_policy_value(&ipv4_source_fallback, config.revision))
             .or_else(|| lookup_ipv4_policy_value(&ipv4_external_exact, config.revision))
@@ -594,6 +630,13 @@ fn lookup_ingress_policy(
         }
     }
     if let Some(source_ipv6) = source_ipv6 {
+        let node_fallback = Ipv6PolicyMapData {
+            destination_identity: IdentityId::new(0),
+            destination_port: [0; 2],
+            protocol: 0,
+            bank: config.active_bank,
+            source_address: source_ipv6,
+        };
         let exact = Ipv6PolicyMapData {
             destination_identity,
             destination_port,
@@ -615,7 +658,8 @@ fn lookup_ingress_policy(
             bank: config.active_bank,
             source_address: source_ipv6,
         };
-        if let Some(value) = lookup_ipv6_policy_value(&exact, config.revision)
+        if let Some(value) = lookup_ipv6_policy_value(&node_fallback, config.revision)
+            .or_else(|| lookup_ipv6_policy_value(&exact, config.revision))
             .or_else(|| lookup_ipv6_policy_value(&protocol_fallback, config.revision))
             .or_else(|| lookup_ipv6_policy_value(&global_fallback, config.revision))
         {
@@ -669,6 +713,13 @@ fn lookup_egress_policy(
         return DataplaneDecision::observed(Direction::Egress, ReasonCode::IdentityUnknown);
     }
     if let Some(destination_ipv4) = destination_ipv4 {
+        let node_fallback = EgressIpv4PolicyMapKey {
+            destination_address: destination_ipv4,
+            source_identity: IdentityId::new(0),
+            destination_port: [0; 2],
+            protocol: 0,
+            bank: config.active_bank,
+        };
         let exact = EgressIpv4PolicyMapKey {
             destination_address: destination_ipv4,
             source_identity,
@@ -711,7 +762,8 @@ fn lookup_egress_policy(
             protocol: 0,
             bank: config.active_bank,
         };
-        if let Some(value) = lookup_egress_ipv4_policy_value(&exact, config.revision)
+        if let Some(value) = lookup_egress_ipv4_policy_value(&node_fallback, config.revision)
+            .or_else(|| lookup_egress_ipv4_policy_value(&exact, config.revision))
             .or_else(|| lookup_egress_ipv4_policy_value(&protocol_fallback, config.revision))
             .or_else(|| lookup_egress_ipv4_policy_value(&global_fallback, config.revision))
             .or_else(|| lookup_egress_ipv4_policy_value(&external_exact, config.revision))
@@ -726,6 +778,13 @@ fn lookup_egress_policy(
         }
     }
     if let Some(destination_ipv6) = destination_ipv6 {
+        let node_fallback = EgressIpv6PolicyMapData {
+            source_identity: IdentityId::new(0),
+            destination_port: [0; 2],
+            protocol: 0,
+            bank: config.active_bank,
+            destination_address: destination_ipv6,
+        };
         let exact = EgressIpv6PolicyMapData {
             source_identity,
             destination_port,
@@ -747,7 +806,8 @@ fn lookup_egress_policy(
             bank: config.active_bank,
             destination_address: destination_ipv6,
         };
-        if let Some(value) = lookup_egress_ipv6_policy_value(&exact, config.revision)
+        if let Some(value) = lookup_egress_ipv6_policy_value(&node_fallback, config.revision)
+            .or_else(|| lookup_egress_ipv6_policy_value(&exact, config.revision))
             .or_else(|| lookup_egress_ipv6_policy_value(&protocol_fallback, config.revision))
             .or_else(|| lookup_egress_ipv6_policy_value(&global_fallback, config.revision))
         {

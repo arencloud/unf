@@ -81,6 +81,40 @@ attachment_names() {
     '
 }
 
+controller_raw() {
+    local path=$1
+    local pod
+    pod=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller -o json \
+        | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name' \
+        | head -n 1)
+    [[ -n ${pod} ]]
+    "${kc[@]}" get --raw \
+        "/api/v1/namespaces/unf-system/pods/${pod}:9962/proxy${path}"
+}
+
+wait_for_convergence() {
+    local snapshot=
+    for _ in $(seq 1 120); do
+        snapshot=$(controller_raw /v1/state/agents 2>/dev/null || true)
+        if jq -e --argjson expected "${#nodes[@]}" '
+            .expected_agents == $expected
+            and .reporting_agents == $expected
+            and .missing_agents == 0
+            and .stale_agents == 0
+            and .converged_agents == $expected
+            and .unexpected_agents == 0
+            and .all_converged == true
+            and all(.nodes[]; .fresh and .converged and .report.ready and .report.bpf_loaded)
+        ' <<<"${snapshot}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "primary-CNI agents did not converge" >&2
+    jq . <<<"${snapshot}" >&2 || true
+    return 1
+}
+
 run_cached_checks() {
     local node=$1
     sudo "${container_runtime}" exec "${node}" sh -ec '
@@ -134,6 +168,18 @@ spec:
       imagePullPolicy: Never
       command: [/usr/local/bin/unf-flow-receiver]
       args: ["8080"]
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        periodSeconds: 2
+        failureThreshold: 3
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        periodSeconds: 2
+        failureThreshold: 3
 ---
 apiVersion: v1
 kind: Pod
@@ -165,6 +211,7 @@ spec:
 EOF
 "${kc[@]}" -n "${qualification_namespace}" wait --for=condition=Ready \
     pod/client pod/server --timeout=120s >/dev/null
+wait_for_convergence
 
 server_json=$("${kc[@]}" -n "${qualification_namespace}" get pod server -o json)
 client_json=$("${kc[@]}" -n "${qualification_namespace}" get pod client -o json)
@@ -191,10 +238,125 @@ for target in "http://${server_v4}:8080/health" "http://[${server_v6}]:8080/heal
     "${kc[@]}" -n "${qualification_namespace}" exec client -- \
         wget -T 5 -t 1 -qO- "${target}" | grep -qx ok
 done
+service_v4=${service_ips[0]}
+service_v6=${service_ips[1]}
+"${kc[@]}" -n "${qualification_namespace}" exec client -- \
+    wget -T 5 -t 1 -qO- "http://${service_v4}:8080/health" | grep -qx ok
+service_limitations='[]'
+if sudo "${container_runtime}" exec "${client_node}" ip6tables -t nat -S >/dev/null 2>&1; then
+    "${kc[@]}" -n "${qualification_namespace}" exec client -- \
+        wget -T 5 -t 1 -qO- "http://[${service_v6}]:8080/health" | grep -qx ok
+else
+    kube_proxy=$("${kc[@]}" -n kube-system get pod -l k8s-app=kube-proxy \
+        --field-selector spec.nodeName="${client_node}" -o jsonpath='{.items[0].metadata.name}')
+    "${kc[@]}" -n kube-system logs "${kube_proxy}" \
+        | grep -q 'No iptables support for family.*IPv6'
+    service_limitations=$(jq -nc '["IPv6 ClusterIP forwarding excluded: the Kind node kernel exposes no ip6tables nat table and kube-proxy disables its IPv6 proxier"]')
+fi
 service_resolution=$("${kc[@]}" -n "${qualification_namespace}" exec client -- \
     getent ahosts server)
 grep -q "${service_ips[0]}" <<<"${service_resolution}"
 grep -q "${service_ips[1]}" <<<"${service_resolution}"
+
+"${kc[@]}" -n "${qualification_namespace}" apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+EOF
+wait_for_convergence
+if "${kc[@]}" -n "${qualification_namespace}" exec client -- \
+    wget -T 2 -t 1 -qO- "http://${server_v4}:8080/health" >/dev/null 2>&1; then
+    echo "default-deny ingress unexpectedly allowed Pod-to-Pod traffic" >&2
+    exit 1
+fi
+for _ in $(seq 1 5); do
+    [[ $("${kc[@]}" -n "${qualification_namespace}" get pod server \
+        -o jsonpath='{.status.containerStatuses[0].ready}') == true ]]
+    [[ $("${kc[@]}" -n "${qualification_namespace}" get pod server \
+        -o jsonpath='{.status.containerStatuses[0].restartCount}') -eq 0 ]]
+    sleep 2
+done
+"${kc[@]}" -n "${qualification_namespace}" delete networkpolicy/default-deny-ingress \
+    --wait=true >/dev/null
+wait_for_convergence
+
+control_plane_v4=$("${kc[@]}" get node "${control_plane}" -o json \
+    | jq -r '.status.addresses[] | select(.type == "InternalIP" and (.address | contains("."))) | .address')
+control_plane_v6=$("${kc[@]}" get node "${control_plane}" -o json \
+    | jq -r '.status.addresses[] | select(.type == "InternalIP" and (.address | contains(":"))) | .address')
+"${kc[@]}" -n "${qualification_namespace}" apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+EOF
+wait_for_convergence
+if "${kc[@]}" -n "${qualification_namespace}" exec client -- \
+    wget -T 2 -t 1 -qO- "http://${server_v4}:8080/health" >/dev/null 2>&1; then
+    echo "default-deny egress unexpectedly allowed Pod-to-Pod traffic" >&2
+    exit 1
+fi
+"${kc[@]}" -n "${qualification_namespace}" exec client -- \
+    sh -ec "socat -T 5 - TCP4:${control_plane_v4}:6443 </dev/null"
+"${kc[@]}" -n "${qualification_namespace}" exec client -- \
+    sh -ec "socat -T 5 - 'TCP6:[${control_plane_v6}]:6443' </dev/null"
+"${kc[@]}" -n "${qualification_namespace}" delete networkpolicy/default-deny-egress \
+    --wait=true >/dev/null
+wait_for_convergence
+
+client_active_count=$(attachment_count "${client_node}")
+"${kc[@]}" -n "${qualification_namespace}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: terminal-retained
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: ${client_node}
+  containers:
+    - name: terminal
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
+      command: [/bin/true]
+EOF
+"${kc[@]}" -n "${qualification_namespace}" wait --for=jsonpath='{.status.phase}'=Succeeded \
+    pod/terminal-retained --timeout=120s >/dev/null
+terminal_ips=$("${kc[@]}" -n "${qualification_namespace}" get pod terminal-retained \
+    -o json | jq -c '[.status.podIPs[].ip] | sort')
+[[ $(jq 'length' <<<"${terminal_ips}") -eq 2 ]]
+for _ in $(seq 1 120); do
+    [[ $(attachment_count "${client_node}") -eq ${client_active_count} ]] && break
+    sleep 1
+done
+[[ $(attachment_count "${client_node}") -eq ${client_active_count} ]]
+"${kc[@]}" -n "${qualification_namespace}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: terminal-replacement
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: ${client_node}
+  containers:
+    - name: replacement
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
+      command: [sh, -c, "sleep infinity"]
+EOF
+"${kc[@]}" -n "${qualification_namespace}" wait --for=condition=Ready \
+    pod/terminal-replacement --timeout=120s >/dev/null
+replacement_ips=$("${kc[@]}" -n "${qualification_namespace}" get pod terminal-replacement \
+    -o json | jq -c '[.status.podIPs[].ip] | sort')
+[[ ${replacement_ips} == "${terminal_ips}" ]]
+wait_for_convergence
 
 "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=0 >/dev/null
 controller_scaled_down=true
@@ -220,6 +382,7 @@ grep -q 'restored last-known-good remote routes' <<<"${agent_logs}"
 controller_scaled_down=false
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=120s >/dev/null
 "${kc[@]}" -n unf-system rollout status daemonset/unf-agent --timeout=120s >/dev/null
+wait_for_convergence
 run_cached_checks "${server_node}"
 
 foreign_node=${control_plane}
@@ -271,7 +434,8 @@ jq -n \
     --arg context "${context}" \
     --arg kubernetesVersion "$("${kc[@]}" version -o json | jq -r .serverVersion.gitVersion)" \
     --argjson nodes "${node_evidence}" \
-    '{schemaVersion:($schemaVersion|tonumber),generatedAt:$generatedAt,revision:$revision,context:$context,kubernetesVersion:$kubernetesVersion,nodes:$nodes,verified:["exclusive fingerprinted installation","dual-stack cross-worker ADD","containerd-normalized CHECK","IPv4 and IPv6 direct forwarding","dual-stack Service DNS discovery","controller-outage agent restart","last-known-good route recovery","foreign-CNI refusal and recovery","DEL and lease release","exact veth cleanup"]}' \
+    --argjson limitations "${service_limitations}" \
+    '{schemaVersion:($schemaVersion|tonumber),generatedAt:$generatedAt,revision:$revision,context:$context,kubernetesVersion:$kubernetesVersion,nodes:$nodes,verified:["exclusive fingerprinted installation","dual-stack cross-worker ADD","containerd-normalized CHECK","IPv4 and IPv6 direct forwarding","IPv4 Service forwarding and dual-stack Service DNS discovery","supplemental egress hook preserves kubelet probes","primary Node IPv4 and IPv6 traffic exception","terminal Pod dual-stack lease reuse without identity conflict","controller-outage agent restart","controller-epoch exact reconvergence","last-known-good route recovery","foreign-CNI refusal and recovery","DEL and lease release","exact veth cleanup"],limitations:$limitations}' \
     >"${artifact}"
 
 if [[ ${UNF_PRIMARY_CNI_SKIP_ROLLBACK:-false} != true ]]; then

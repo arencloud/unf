@@ -4289,7 +4289,12 @@ fn validate_policy_entry(entry: &PolicyMapEntry) -> Result<()> {
 }
 
 fn validate_ipv4_policy_entry(entry: &Ipv4PolicyMapEntry) -> Result<()> {
-    if entry.key.destination_identity.get() == 0 {
+    if entry.key.destination_identity.get() == 0
+        && !(entry.key.source_address != Ipv4Addr::UNSPECIFIED
+            && entry.key.protocol == 0
+            && entry.key.destination_port == 0
+            && platform_node_exception(&entry.decision, entry.shadow.as_ref()))
+    {
         bail!("IPv4 policy entry contains reserved destination identity ID zero");
     }
     match (entry.key.protocol, entry.key.destination_port) {
@@ -4304,7 +4309,13 @@ fn validate_ipv4_policy_entry(entry: &Ipv4PolicyMapEntry) -> Result<()> {
 }
 
 fn validate_ipv6_policy_entry(entry: &Ipv6PolicyMapEntry) -> Result<()> {
-    if entry.key.destination_identity.get() == 0 {
+    if entry.key.destination_identity.get() == 0
+        && !(entry.key.source_network != Ipv6Addr::UNSPECIFIED
+            && entry.key.source_prefix_len == 128
+            && entry.key.protocol == 0
+            && entry.key.destination_port == 0
+            && platform_node_exception(&entry.decision, entry.shadow.as_ref()))
+    {
         bail!("IPv6 policy entry contains reserved destination identity ID zero");
     }
     if entry.key.source_prefix_len > 128 {
@@ -4331,7 +4342,12 @@ fn validate_ipv6_policy_entry(entry: &Ipv6PolicyMapEntry) -> Result<()> {
 }
 
 fn validate_egress_ipv4_policy_entry(entry: &EgressIpv4PolicyMapEntry) -> Result<()> {
-    if entry.key.source_identity.get() == 0 {
+    if entry.key.source_identity.get() == 0
+        && !(entry.key.destination_address != Ipv4Addr::UNSPECIFIED
+            && entry.key.protocol == 0
+            && entry.key.destination_port == 0
+            && platform_node_exception(&entry.decision, entry.shadow.as_ref()))
+    {
         bail!("IPv4 egress policy entry contains reserved source identity ID zero");
     }
     validate_policy_transport(
@@ -4347,7 +4363,13 @@ fn validate_egress_ipv4_policy_entry(entry: &EgressIpv4PolicyMapEntry) -> Result
 }
 
 fn validate_egress_ipv6_policy_entry(entry: &EgressIpv6PolicyMapEntry) -> Result<()> {
-    if entry.key.source_identity.get() == 0 {
+    if entry.key.source_identity.get() == 0
+        && !(entry.key.destination_network != Ipv6Addr::UNSPECIFIED
+            && entry.key.destination_prefix_len == 128
+            && entry.key.protocol == 0
+            && entry.key.destination_port == 0
+            && platform_node_exception(&entry.decision, entry.shadow.as_ref()))
+    {
         bail!("IPv6 egress policy entry contains reserved source identity ID zero");
     }
     if entry.key.destination_prefix_len > 128 {
@@ -4380,6 +4402,17 @@ fn validate_policy_transport(protocol: u8, destination_port: u16, label: &str) -
         (0, 0) | (6 | 17 | 132, 0..=u16::MAX) => Ok(()),
         _ => bail!("{label} policy entry contains an invalid protocol/port wildcard combination"),
     }
+}
+
+fn platform_node_exception(
+    decision: &PolicyDecisionRecord,
+    shadow: Option<&PolicyDecisionRecord>,
+) -> bool {
+    decision.verdict == Verdict::Allow
+        && decision.reason == PolicyReason::NoApplicablePolicy
+        && decision.policy_id.is_none()
+        && decision.rule_id.is_none()
+        && shadow.is_none()
 }
 
 fn validate_policy_decision(decision: &PolicyDecisionRecord) -> Result<()> {
@@ -6402,6 +6435,68 @@ mod tests {
         assert_eq!(key[7], 1);
         assert_eq!(&key[8..24], &destination_network.octets());
         assert_eq!(u64::from_ne_bytes(value[16..24].try_into().unwrap()), 17);
+    }
+
+    #[test]
+    fn exact_platform_node_fallback_is_the_only_reserved_address_policy_shape() {
+        let decision = PolicyDecisionRecord {
+            verdict: Verdict::Allow,
+            reason: PolicyReason::NoApplicablePolicy,
+            policy_id: None,
+            rule_id: None,
+        };
+        let mut ingress_v4 = Ipv4PolicyMapEntry {
+            key: unf_state::Ipv4PolicyMapKey {
+                source_address: "192.0.2.1".parse().unwrap(),
+                destination_identity: IdentityId::new(0),
+                protocol: 0,
+                destination_port: 0,
+            },
+            decision,
+            shadow: None,
+        };
+        let ingress_v6 = Ipv6PolicyMapEntry {
+            key: unf_state::Ipv6PolicyMapKey {
+                source_network: "fdff::1".parse().unwrap(),
+                source_prefix_len: 128,
+                destination_identity: IdentityId::new(0),
+                protocol: 0,
+                destination_port: 0,
+            },
+            decision,
+            shadow: None,
+        };
+        let egress_v4 = EgressIpv4PolicyMapEntry {
+            key: unf_state::EgressIpv4PolicyMapKey {
+                source_identity: IdentityId::new(0),
+                destination_address: "192.0.2.1".parse().unwrap(),
+                protocol: 0,
+                destination_port: 0,
+            },
+            decision,
+            shadow: None,
+        };
+        let egress_v6 = EgressIpv6PolicyMapEntry {
+            key: unf_state::EgressIpv6PolicyMapKey {
+                source_identity: IdentityId::new(0),
+                destination_network: "fdff::1".parse().unwrap(),
+                destination_prefix_len: 128,
+                protocol: 0,
+                destination_port: 0,
+            },
+            decision,
+            shadow: None,
+        };
+        assert!(desired_ipv4_policy_entries(&[ingress_v4], 17, 1).is_ok());
+        assert!(desired_ipv6_policy_entries(&[ingress_v6], 17, 1).is_ok());
+        assert!(desired_egress_ipv4_policy_entries(&[egress_v4], 17, 1).is_ok());
+        assert!(desired_egress_ipv6_policy_entries(&[egress_v6], 17, 1).is_ok());
+
+        ingress_v4.decision.verdict = Verdict::Deny;
+        assert!(desired_ipv4_policy_entries(&[ingress_v4], 17, 1).is_err());
+        ingress_v4.decision = decision;
+        ingress_v4.key.source_address = Ipv4Addr::UNSPECIFIED;
+        assert!(desired_ipv4_policy_entries(&[ingress_v4], 17, 1).is_err());
     }
 
     #[test]
