@@ -99,8 +99,19 @@ the same records, remain safe through idempotence, but incur avoidable retries.
 The reboot was deliberately withheld, the lock scope was expanded, and a
 concurrency test now proves enqueue waits for the entire drain.
 
-Live credit remains pending. A superseding immutable image must be published
-and rolled to cl02, and the same worker must complete a real boot-ID-changing
+The first superseding publication was rejected before pinning or rollout
+because its supplied embedded full revision did not equal `git rev-parse`.
+The provenance-correct exact revision
+`15866c44bca4953b5401d0cdce66a65d3462af42` is published and anonymously
+pullable as controller digest
+`sha256:51e195e2b69ee28fa5f81d51b4bfa43c28f3d2ce3033d94fe2e0ce994c471b0e`
+and agent/CNI digest
+`sha256:a6552fbb7eec17d92c40ad5ef89c127faaec86daffb8e4727bb49eb9370ad9a8`.
+The unchanged test-tools digest remains
+`sha256:f57a7ee9668d6b87f4e00c4e8df9240b8889c6ee50f817ea1e884732b2f42b13`.
+
+Live credit remains pending. These images must be rolled to cl02, and the same
+worker must complete a real boot-ID-changing
 reboot with no deferred records left behind and exact equality among running
 Pods, CRI-O caches, attachments, links, routes, leases, and restored BPF state.
 

@@ -246,6 +246,16 @@ holds one exclusive per-network lock through list, agent delete, and exact
 completion, with a blocking concurrency test. A superseding image rollout is
 required before reboot qualification.
 
+The first superseding publication was rejected before package pinning or cl02
+rollout because its embedded full revision did not match `git rev-parse`. The
+provenance-correct candidate is exact revision
+`15866c44bca4953b5401d0cdce66a65d3462af42`, controller digest
+`sha256:51e195e2b69ee28fa5f81d51b4bfa43c28f3d2ce3033d94fe2e0ce994c471b0e`,
+and agent/CNI digest
+`sha256:a6552fbb7eec17d92c40ad5ef89c127faaec86daffb8e4727bb49eb9370ad9a8`.
+All were anonymously resolved after publication; the test-tools content remains
+`sha256:f57a7ee9668d6b87f4e00c4e8df9240b8889c6ee50f817ea1e884732b2f42b13`.
+
 ## Remaining exit criteria
 
 The live primary-CNI lifecycle remains **In progress** until repository changes
