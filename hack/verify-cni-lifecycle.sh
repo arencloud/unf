@@ -5,7 +5,11 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 test_id="${BASHPID}"
 host_namespace="unf-ch-${test_id}"
 pod_namespace="unf-cp-${test_id}"
+valid_namespace="unf-cv-${test_id}"
+stale_namespace="unf-cs-${test_id}"
 pod_namespace_path="/run/netns/${pod_namespace}"
+valid_namespace_path="/run/netns/${valid_namespace}"
+stale_namespace_path="/run/netns/${stale_namespace}"
 state_directory=$(mktemp -d)
 state_path="${state_directory}/attachments.json"
 lifecycle="${project_root}/target/debug/examples/disposable_lifecycle"
@@ -20,6 +24,8 @@ sudo -n true
 
 cleanup() {
     sudo -n ip netns del "${pod_namespace}" >/dev/null 2>&1 || true
+    sudo -n ip netns del "${valid_namespace}" >/dev/null 2>&1 || true
+    sudo -n ip netns del "${stale_namespace}" >/dev/null 2>&1 || true
     sudo -n ip netns del "${host_namespace}" >/dev/null 2>&1 || true
     rm -rf -- "${state_directory}"
 }
@@ -31,6 +37,8 @@ cargo build --manifest-path "${project_root}/Cargo.toml" \
 
 sudo -n ip netns add "${host_namespace}"
 sudo -n ip netns add "${pod_namespace}"
+sudo -n ip netns add "${valid_namespace}"
+sudo -n ip netns add "${stale_namespace}"
 
 run_cni() {
     local command=$1
@@ -112,6 +120,54 @@ sudo -n jq -e '.attachments == []' "${state_path}" >/dev/null
 [[ -z $(sudo -n ip -n "${host_namespace}" route show protocol "${route_protocol}") ]]
 [[ -z $(sudo -n ip -n "${host_namespace}" -6 route show protocol "${route_protocol}") ]]
 
+failing_output=$(run_cni ADD "${config}" \
+    CNI_CONTAINERID=container-failing CNI_NETNS="${pod_namespace_path}")
+stale_output=$(run_cni ADD "${config}" \
+    CNI_CONTAINERID=container-stale CNI_NETNS="${stale_namespace_path}")
+valid_output=$(run_cni ADD "${config}" \
+    CNI_CONTAINERID=container-valid CNI_NETNS="${valid_namespace_path}")
+failing_interface=$(jq -r '.interfaces[0].name' <<<"${failing_output}")
+stale_interface=$(jq -r '.interfaces[0].name' <<<"${stale_output}")
+valid_interface=$(jq -r '.interfaces[0].name' <<<"${valid_output}")
+gc_config=$(jq -cn '
+    {
+        cniVersion:"1.1.0",
+        name:"unf-lifecycle-test",
+        type:"unf",
+        mtu:1400,
+        ipam:{type:"unf"},
+        "cni.dev/valid-attachments":[{containerID:"container-valid",ifname:"eth0"}]
+    }
+')
+sudo -n ip -n "${host_namespace}" link set dev "${failing_interface}" mtu 1399
+set +e
+gc_failure=$(run_cni GC "${gc_config}" CNI_PATH=/opt/cni/bin)
+gc_exit=$?
+set -e
+[[ ${gc_exit} -ne 0 ]]
+jq -e '.code == 11 and (.details | contains("container-failing"))' \
+    <<<"${gc_failure}" >/dev/null
+sudo -n jq -e '
+    (.attachments | length) == 2
+    and any(.attachments[]; .spec.key.containerId == "container-failing" and .phase == "deleting")
+    and any(.attachments[]; .spec.key.containerId == "container-valid" and .phase == "ready")
+' "${state_path}" >/dev/null
+! sudo -n ip -n "${host_namespace}" link show dev "${stale_interface}" >/dev/null 2>&1
+sudo -n ip -n "${host_namespace}" link show dev "${failing_interface}" >/dev/null
+sudo -n ip -n "${host_namespace}" link set dev "${failing_interface}" mtu 1400
+[[ -z $(run_cni GC "${gc_config}" CNI_PATH=/opt/cni/bin) ]]
+sudo -n jq -e '
+    (.attachments | length) == 1
+    and .attachments[0].spec.key.containerId == "container-valid"
+    and .attachments[0].phase == "ready"
+' "${state_path}" >/dev/null
+! sudo -n ip -n "${host_namespace}" link show dev "${failing_interface}" >/dev/null 2>&1
+! sudo -n ip -n "${host_namespace}" link show dev "${stale_interface}" >/dev/null 2>&1
+sudo -n ip -n "${host_namespace}" link show dev "${valid_interface}" >/dev/null
+[[ -z $(run_cni DEL "${config}" CNI_CONTAINERID=container-valid) ]]
+sudo -n jq -e '.attachments == []' "${state_path}" >/dev/null
+! sudo -n ip -n "${host_namespace}" link show dev "${valid_interface}" >/dev/null 2>&1
+
 prepare_only
 host_interface=$(sudo -n jq -r '.attachments[0].hostInterface' "${state_path}")
 sudo -n ip netns exec "${host_namespace}" \
@@ -142,4 +198,4 @@ sudo -n ip netns del "${pod_namespace}"
 [[ -z $(run_cni DEL "${config}") ]]
 sudo -n jq -e '.attachments == []' "${state_path}" >/dev/null
 
-echo "UNF atomic CNI lifecycle passed: preparing recovery, ADD replay/result, CHECK drift, durable/missing-netns DEL, conflict preservation, abort retention, and recovery"
+echo "UNF atomic CNI lifecycle passed: preparing recovery, ADD replay/result, CHECK drift, bounded valid-attachment GC, durable/missing-netns DEL, conflict preservation, abort retention, and recovery"

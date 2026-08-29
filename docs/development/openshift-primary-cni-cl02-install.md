@@ -167,15 +167,33 @@ per family, but could not close controller convergence because the generic
 one-second liveness probe restarted the controller six times during post-churn
 state replay. A live primary-specific startup/readiness/liveness patch restored
 five-agent convergence and held the controller Ready with zero restarts for 120
-seconds. That probe contract is now package-checked; the clean reboot retry
-remains open.
+seconds. That probe contract is now package-checked.
+
+The retained reboot evidence then exposed a separate CNI lifecycle defect.
+Attachment records on the rebooted worker grew from 14 before the attempts to
+25 and then 36. All 36 records were unique and Ready, but only ten corresponding
+UNF host links existed, exactly matching the ten running non-host-network Pods;
+26 records referred to vanished pre-reboot sandboxes. The journal correctly
+retained their leases because CRI-O had not delivered DEL, but GC was still a
+no-op and could not reclaim them.
+
+ADR 0071 implements CNI 1.1 `cni.dev/valid-attachments` reconciliation through
+network-scoped, ordered eight-record transaction pages. Stale records use the
+existing route-first exact cleanup and two-step durable deletion. A conflicted
+record and lease remain retryable while GC continues with other stale records.
+`make cni-lifecycle-test` and the complete static/eBPF/package gate pass. This
+fix is local evidence only until a new immutable agent/CNI image is rolled out,
+the 26 observed stale records are reconciled, and a clean reboot returns exact
+journal/link/Pod cardinality.
 
 ## Remaining exit criteria
 
 The live primary-CNI lifecycle remains **In progress** until repository changes
 and repeatable gates prove the remaining items:
 
-- Node reboot last-known-good recovery with the hardened controller probes;
+- immutable GC image rollout, reconciliation of the retained reboot-stale
+  records, and Node reboot last-known-good recovery with exact
+  journal/link/Pod cardinality;
 - CRI-O ADD/CHECK/DEL and lease/link cleanup under deliberate failure;
 - exact artifact, route, and BPF teardown, no-CNI baseline behavior, and clean
   reprovision recovery; and

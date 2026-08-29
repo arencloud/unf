@@ -96,8 +96,8 @@ struct IpamConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ValidAttachment {
+    #[serde(rename = "containerID")]
     container_id: String,
     ifname: String,
 }
@@ -582,5 +582,16 @@ mod tests {
             assert_eq!(error.code, 7);
             assert!(error.details.contains("1.1.0"));
         }
+    }
+
+    #[test]
+    fn gc_accepts_the_specified_container_id_wire_name() {
+        let parsed: NetworkConfig = serde_json::from_slice(&config(
+            r#","cni.dev/valid-attachments":[{"containerID":"container-valid","ifname":"eth0"}]"#,
+        ))
+        .expect("the CNI 1.1 GC attachment shape must decode");
+        assert_eq!(parsed.valid_attachments.len(), 1);
+        assert_eq!(parsed.valid_attachments[0].container_id, "container-valid");
+        assert_eq!(parsed.valid_attachments[0].ifname, "eth0");
     }
 }

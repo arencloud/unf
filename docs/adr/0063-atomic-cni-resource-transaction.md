@@ -43,10 +43,10 @@ explicit cleanup inputs, while foreign same-key routes or same-named links stop
 cleanup and retain the lease. Agent unavailability makes ADD, CHECK, and DEL
 retryable because none can safely change durable ownership without the journal.
 
-STATUS succeeds only when the transaction service answers. GC remains a bounded
-pre-ownership no-op until cluster installation provides authoritative valid
-attachment reconciliation. The overlay deployment does not enable the service
-and remains unchanged.
+STATUS succeeds only when the transaction service answers. At the time of this
+decision, GC remained a bounded pre-ownership no-op pending cluster runtime
+authority. ADR 0071 subsequently adds CNI 1.1 valid-attachment reconciliation
+without changing the ADD/CHECK/DEL transaction or overlay deployment.
 
 ## Alternatives
 

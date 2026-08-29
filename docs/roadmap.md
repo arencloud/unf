@@ -324,8 +324,15 @@ authoritative record of verified results.
 - ADR 0069 now verifies the reinstall and activation package: DNS-independent
   controller bootstrap, immutable development images, forwarding
   MachineConfigs, exact SCC/admission/host paths, socket-fenced installation,
-  and replay/foreign/drift fixtures. The next action is the cl02 reinstall and
-  live CRI-O/recovery/teardown gate; no live OpenShift primary-CNI claim exists.
+  and replay/foreign/drift fixtures. The five-Node cl02 reinstall, operator
+  closure, zero-workaround dual-stack traffic, terminal same-IP reuse, and
+  controller-outage recovery now pass.
+- ADR 0071 adds bounded CNI 1.1 valid-attachment GC after cl02 reboot evidence
+  found 26 journal records whose pre-reboot sandboxes had vanished. Local
+  privileged verification passes, including continue-on-error cleanup with
+  conflicted leases retained. Immutable cl02 rollout, exact stale-state
+  reconciliation, clean reboot, CRI-O fault cleanup, teardown, and reprovision
+  remain the live exit path.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

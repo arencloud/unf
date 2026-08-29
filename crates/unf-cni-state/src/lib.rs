@@ -10,6 +10,7 @@ use unf_ipam::{DualStackLease, IpamError, IpamProvider, NodeBlockProvider, UsedA
 
 pub const CNI_TRANSACTION_SCHEMA_VERSION: u16 = 2;
 pub const MAX_TRANSACTION_MESSAGE_BYTES: usize = 65_536;
+pub const MAX_ATTACHMENT_LIST_RECORDS: u16 = 8;
 
 const ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 2;
 const LEGACY_ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 1;
@@ -57,14 +58,35 @@ pub struct AttachmentRecord {
 #[serde(deny_unknown_fields, tag = "operation", rename_all = "snake_case")]
 pub enum TransactionOperation {
     Status,
-    Inspect { key: AttachmentKey },
-    Prepare { attachment: AttachmentSpec },
-    Commit { key: AttachmentKey },
-    BeginAbort { key: AttachmentKey },
-    CompleteAbort { key: AttachmentKey },
-    Check { attachment: AttachmentSpec },
-    BeginDelete { key: AttachmentKey },
-    CompleteDelete { key: AttachmentKey },
+    List {
+        network: String,
+        after: Option<AttachmentKey>,
+        limit: u16,
+    },
+    Inspect {
+        key: AttachmentKey,
+    },
+    Prepare {
+        attachment: AttachmentSpec,
+    },
+    Commit {
+        key: AttachmentKey,
+    },
+    BeginAbort {
+        key: AttachmentKey,
+    },
+    CompleteAbort {
+        key: AttachmentKey,
+    },
+    Check {
+        attachment: AttachmentSpec,
+    },
+    BeginDelete {
+        key: AttachmentKey,
+    },
+    CompleteDelete {
+        key: AttachmentKey,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -77,6 +99,12 @@ pub enum TransactionOperation {
 pub enum TransactionRequest {
     Status {
         schema_version: u16,
+    },
+    List {
+        schema_version: u16,
+        network: String,
+        after: Option<AttachmentKey>,
+        limit: u16,
     },
     Inspect {
         schema_version: u16,
@@ -117,6 +145,16 @@ impl TransactionRequest {
     pub fn new(schema_version: u16, operation: TransactionOperation) -> Self {
         match operation {
             TransactionOperation::Status => Self::Status { schema_version },
+            TransactionOperation::List {
+                network,
+                after,
+                limit,
+            } => Self::List {
+                schema_version,
+                network,
+                after,
+                limit,
+            },
             TransactionOperation::Inspect { key } => Self::Inspect {
                 schema_version,
                 key,
@@ -155,6 +193,7 @@ impl TransactionRequest {
     const fn schema_version(&self) -> u16 {
         match self {
             Self::Status { schema_version }
+            | Self::List { schema_version, .. }
             | Self::Inspect { schema_version, .. }
             | Self::Prepare { schema_version, .. }
             | Self::Commit { schema_version, .. }
@@ -169,6 +208,16 @@ impl TransactionRequest {
     fn into_operation(self) -> TransactionOperation {
         match self {
             Self::Status { .. } => TransactionOperation::Status,
+            Self::List {
+                network,
+                after,
+                limit,
+                ..
+            } => TransactionOperation::List {
+                network,
+                after,
+                limit,
+            },
             Self::Inspect { key, .. } => TransactionOperation::Inspect { key },
             Self::Prepare { attachment, .. } => TransactionOperation::Prepare { attachment },
             Self::Commit { key, .. } => TransactionOperation::Commit { key },
@@ -200,6 +249,8 @@ pub enum TransactionOutcome {
     #[serde(rename = "ok")]
     Ok {
         attachment: Option<AttachmentRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<AttachmentRecord>,
         attachment_count: usize,
     },
     #[serde(rename = "error")]
@@ -366,39 +417,71 @@ impl AttachmentJournal {
         }
 
         let previous = self.attachments.clone();
-        let attachment = match request.into_operation() {
-            TransactionOperation::Status => None,
+        let (attachment, attachments) = match request.into_operation() {
+            TransactionOperation::Status => (None, Vec::new()),
+            TransactionOperation::List {
+                network,
+                after,
+                limit,
+            } => {
+                if !valid_identifier(&network, MAX_IDENTIFIER_BYTES) {
+                    return Err(JournalError::Invalid(
+                        "attachment list network is invalid".to_owned(),
+                    ));
+                }
+                if let Some(after) = &after {
+                    validate_key(after)?;
+                }
+                if !(1..=MAX_ATTACHMENT_LIST_RECORDS).contains(&limit) {
+                    return Err(JournalError::Invalid(format!(
+                        "attachment list limit must be between 1 and {MAX_ATTACHMENT_LIST_RECORDS}"
+                    )));
+                }
+                let records = self
+                    .attachments
+                    .values()
+                    .filter(|record| record.spec.key.network == network)
+                    .filter(|record| {
+                        after
+                            .as_ref()
+                            .is_none_or(|cursor| record.spec.key > *cursor)
+                    })
+                    .take(usize::from(limit))
+                    .cloned()
+                    .collect();
+                (None, records)
+            }
             TransactionOperation::Inspect { key } => {
                 validate_key(&key)?;
-                self.attachments.get(&key).cloned()
+                (self.attachments.get(&key).cloned(), Vec::new())
             }
             TransactionOperation::Prepare { attachment } => {
                 validate_spec(&attachment)?;
-                Some(self.prepare(attachment)?)
+                (Some(self.prepare(attachment)?), Vec::new())
             }
             TransactionOperation::Commit { key } => {
                 validate_key(&key)?;
-                Some(self.commit(&key)?)
+                (Some(self.commit(&key)?), Vec::new())
             }
             TransactionOperation::BeginAbort { key } => {
                 validate_key(&key)?;
-                self.begin_abort(&key)?
+                (self.begin_abort(&key)?, Vec::new())
             }
             TransactionOperation::CompleteAbort { key } => {
                 validate_key(&key)?;
-                self.complete_abort(&key)?
+                (self.complete_abort(&key)?, Vec::new())
             }
             TransactionOperation::Check { attachment } => {
                 validate_spec(&attachment)?;
-                Some(self.check(&attachment)?)
+                (Some(self.check(&attachment)?), Vec::new())
             }
             TransactionOperation::BeginDelete { key } => {
                 validate_key(&key)?;
-                self.begin_delete(&key)?
+                (self.begin_delete(&key)?, Vec::new())
             }
             TransactionOperation::CompleteDelete { key } => {
                 validate_key(&key)?;
-                self.complete_delete(&key)?
+                (self.complete_delete(&key)?, Vec::new())
             }
         };
 
@@ -412,6 +495,7 @@ impl AttachmentJournal {
             schema_version: CNI_TRANSACTION_SCHEMA_VERSION,
             outcome: TransactionOutcome::Ok {
                 attachment,
+                attachments,
                 attachment_count: self.attachments.len(),
             },
         })
@@ -897,6 +981,105 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn attachment_listing_is_network_scoped_ordered_and_bounded() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("attachments.json");
+        let mut journal = AttachmentJournal::open(path, provider()).expect("open journal");
+        for index in 0..12 {
+            let attachment = spec(&format!("container-{index:03}"));
+            let key = attachment.key.clone();
+            journal
+                .apply(request(TransactionOperation::Prepare { attachment }))
+                .expect("prepare listed attachment");
+            journal
+                .apply(request(TransactionOperation::Commit { key }))
+                .expect("commit listed attachment");
+        }
+        let mut foreign = spec("foreign-container");
+        foreign.key.network = "other-network".to_owned();
+        let foreign_key = foreign.key.clone();
+        journal
+            .apply(request(TransactionOperation::Prepare {
+                attachment: foreign,
+            }))
+            .expect("prepare foreign attachment");
+        journal
+            .apply(request(TransactionOperation::Commit { key: foreign_key }))
+            .expect("commit foreign attachment");
+
+        let first = journal
+            .apply(request(TransactionOperation::List {
+                network: "unf-test".to_owned(),
+                after: None,
+                limit: MAX_ATTACHMENT_LIST_RECORDS,
+            }))
+            .expect("list first page");
+        let TransactionOutcome::Ok {
+            attachments: first,
+            attachment_count: 13,
+            ..
+        } = first.outcome
+        else {
+            panic!("list must return a successful first page");
+        };
+        assert_eq!(first.len(), usize::from(MAX_ATTACHMENT_LIST_RECORDS));
+        assert!(
+            first
+                .windows(2)
+                .all(|pair| pair[0].spec.key < pair[1].spec.key)
+        );
+
+        let second = journal
+            .apply(request(TransactionOperation::List {
+                network: "unf-test".to_owned(),
+                after: first.last().map(|record| record.spec.key.clone()),
+                limit: MAX_ATTACHMENT_LIST_RECORDS,
+            }))
+            .expect("list second page");
+        let TransactionOutcome::Ok {
+            attachments: second,
+            ..
+        } = second.outcome
+        else {
+            panic!("list must return a successful second page");
+        };
+        assert_eq!(second.len(), 4);
+        assert!(
+            second
+                .iter()
+                .all(|record| record.spec.key.network == "unf-test")
+        );
+        assert!(
+            journal
+                .apply(request(TransactionOperation::List {
+                    network: "unf-test".to_owned(),
+                    after: None,
+                    limit: 0,
+                }))
+                .is_err()
+        );
+
+        let mut largest = first[0].clone();
+        largest.spec.key.network = "n".repeat(MAX_IDENTIFIER_BYTES);
+        largest.spec.key.container_id = "c".repeat(MAX_IDENTIFIER_BYTES);
+        largest.spec.netns = format!("/{}", "p".repeat(MAX_NETNS_BYTES - 1));
+        let maximal_page = TransactionResponse {
+            schema_version: CNI_TRANSACTION_SCHEMA_VERSION,
+            outcome: TransactionOutcome::Ok {
+                attachment: None,
+                attachments: vec![largest; usize::from(MAX_ATTACHMENT_LIST_RECORDS)],
+                attachment_count: usize::MAX,
+            },
+        };
+        assert!(
+            serde_json::to_vec(&maximal_page)
+                .expect("serialize maximal attachment page")
+                .len()
+                <= MAX_TRANSACTION_MESSAGE_BYTES
+        );
     }
 
     #[test]

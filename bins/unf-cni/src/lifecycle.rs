@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -7,8 +9,9 @@ use std::time::Duration;
 use serde_json::Value;
 use unf_cni_state::{
     AttachmentKey, AttachmentPhase, AttachmentRecord, AttachmentSpec,
-    CNI_TRANSACTION_SCHEMA_VERSION, MAX_TRANSACTION_MESSAGE_BYTES, TransactionErrorCode,
-    TransactionOperation, TransactionOutcome, TransactionRequest, TransactionResponse,
+    CNI_TRANSACTION_SCHEMA_VERSION, MAX_ATTACHMENT_LIST_RECORDS, MAX_TRANSACTION_MESSAGE_BYTES,
+    TransactionErrorCode, TransactionOperation, TransactionOutcome, TransactionRequest,
+    TransactionResponse,
 };
 use unf_link::{LinkReadback, VethPlan};
 use unf_route::{NativeRoutePlan, NativeRoutingProvider, RoutingProvider};
@@ -20,6 +23,7 @@ use super::{
 
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MTU: u32 = 1_500;
+const MAX_REPORTED_GC_FAILURES: usize = 8;
 
 /// Versioned request boundary used by the CNI lifecycle.
 pub trait TransactionApi {
@@ -122,9 +126,124 @@ pub(crate) async fn execute_validated<T: TransactionApi>(
             })?;
             Ok(Success::Empty)
         }
-        Command::GarbageCollect => Ok(Success::Empty),
+        Command::GarbageCollect => {
+            garbage_collect(config, transaction).await?;
+            Ok(Success::Empty)
+        }
         Command::Version => unreachable!("VERSION is handled before lifecycle execution"),
     }
+}
+
+async fn garbage_collect<T: TransactionApi>(
+    config: &NetworkConfig,
+    transaction: &mut T,
+) -> Result<(), CniError> {
+    let valid = config
+        .valid_attachments
+        .iter()
+        .map(|attachment| (attachment.container_id.as_str(), attachment.ifname.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut after = None;
+    let mut failure_count = 0_usize;
+    let mut failures = Vec::new();
+    loop {
+        let records = match list_attachments(
+            transaction,
+            &config.cni_version,
+            config.name.clone(),
+            after.clone(),
+        ) {
+            Ok(records) => records,
+            Err(error) => {
+                failure_count += 1;
+                if failures.len() < MAX_REPORTED_GC_FAILURES {
+                    failures.push(format!("list attachments: {}", error.details));
+                }
+                break;
+            }
+        };
+        let Some(last) = records.last() else {
+            break;
+        };
+        after = Some(last.spec.key.clone());
+        let page_full = records.len() == usize::from(MAX_ATTACHMENT_LIST_RECORDS);
+        for record in records {
+            if valid.contains(&(
+                record.spec.key.container_id.as_str(),
+                record.spec.key.ifname.as_str(),
+            )) {
+                continue;
+            }
+            if let Err(error) = garbage_collect_record(config, transaction, &record).await {
+                failure_count += 1;
+                if failures.len() < MAX_REPORTED_GC_FAILURES {
+                    failures.push(format!(
+                        "{}/{}/{}: {}",
+                        record.spec.key.network,
+                        record.spec.key.container_id,
+                        record.spec.key.ifname,
+                        error.details
+                    ));
+                }
+            }
+        }
+        if !page_full {
+            break;
+        }
+    }
+    if failure_count == 0 {
+        return Ok(());
+    }
+    let omitted = failure_count.saturating_sub(failures.len());
+    let mut details = format!(
+        "garbage collection encountered {failure_count} error(s): {}",
+        failures.join("; ")
+    );
+    if omitted > 0 {
+        write!(details, "; {omitted} additional error(s) omitted")
+            .expect("writing to a String cannot fail");
+    }
+    Err(CniError::retry_with_details(&config.cni_version, details))
+}
+
+async fn garbage_collect_record<T: TransactionApi>(
+    config: &NetworkConfig,
+    transaction: &mut T,
+    record: &AttachmentRecord,
+) -> Result<(), CniError> {
+    match record.phase {
+        AttachmentPhase::Aborting => {
+            cleanup_record(config, record).await?;
+            operation(
+                transaction,
+                &config.cni_version,
+                TransactionOperation::CompleteAbort {
+                    key: record.spec.key.clone(),
+                },
+            )?;
+        }
+        AttachmentPhase::Preparing | AttachmentPhase::Ready | AttachmentPhase::Deleting => {
+            let Some(deleting) = operation(
+                transaction,
+                &config.cni_version,
+                TransactionOperation::BeginDelete {
+                    key: record.spec.key.clone(),
+                },
+            )?
+            else {
+                return Ok(());
+            };
+            cleanup_record(config, &deleting).await?;
+            operation(
+                transaction,
+                &config.cni_version,
+                TransactionOperation::CompleteDelete {
+                    key: record.spec.key.clone(),
+                },
+            )?;
+        }
+    }
+    Ok(())
 }
 
 async fn add<T: TransactionApi>(
@@ -503,6 +622,33 @@ fn operation<T: TransactionApi>(
     version: &str,
     operation: TransactionOperation,
 ) -> Result<Option<AttachmentRecord>, CniError> {
+    let (attachment, _) = operation_result(transaction, version, operation)?;
+    Ok(attachment)
+}
+
+fn list_attachments<T: TransactionApi>(
+    transaction: &mut T,
+    version: &str,
+    network: String,
+    after: Option<AttachmentKey>,
+) -> Result<Vec<AttachmentRecord>, CniError> {
+    let (_, attachments) = operation_result(
+        transaction,
+        version,
+        TransactionOperation::List {
+            network,
+            after,
+            limit: MAX_ATTACHMENT_LIST_RECORDS,
+        },
+    )?;
+    Ok(attachments)
+}
+
+fn operation_result<T: TransactionApi>(
+    transaction: &mut T,
+    version: &str,
+    operation: TransactionOperation,
+) -> Result<(Option<AttachmentRecord>, Vec<AttachmentRecord>), CniError> {
     let response = transaction
         .transact(TransactionRequest::new(
             CNI_TRANSACTION_SCHEMA_VERSION,
@@ -521,7 +667,11 @@ fn operation<T: TransactionApi>(
         ));
     }
     match response.outcome {
-        TransactionOutcome::Ok { attachment, .. } => Ok(attachment),
+        TransactionOutcome::Ok {
+            attachment,
+            attachments,
+            ..
+        } => Ok((attachment, attachments)),
         TransactionOutcome::Error { code, message } => {
             Err(transaction_error(version, code, &message))
         }
@@ -700,6 +850,7 @@ mod tests {
             schema_version: 1,
             outcome: TransactionOutcome::Ok {
                 attachment: None,
+                attachments: Vec::new(),
                 attachment_count: 0,
             },
         })]));
@@ -799,6 +950,7 @@ mod tests {
                     schema_version: CNI_TRANSACTION_SCHEMA_VERSION,
                     outcome: TransactionOutcome::Ok {
                         attachment: None,
+                        attachments: Vec::new(),
                         attachment_count: 0,
                     },
                 },

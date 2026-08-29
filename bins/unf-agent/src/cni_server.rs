@@ -310,6 +310,7 @@ mod tests {
         let TransactionOutcome::Ok {
             attachment: Some(preparing),
             attachment_count: 1,
+            ..
         } = prepare.outcome
         else {
             panic!("prepare must return one attachment");
@@ -324,6 +325,7 @@ mod tests {
         let TransactionOutcome::Ok {
             attachment: Some(ready),
             attachment_count: 1,
+            ..
         } = commit.outcome
         else {
             panic!("commit must return one attachment");

@@ -55,10 +55,15 @@ set -e
 jq -e '.cniVersion == "1.1.0" and .code == 11' \
     <<<"${delete_output}" >/dev/null
 
+set +e
 gc_output=$(printf '%s' "${config}" | env \
     CNI_COMMAND=GC \
     CNI_PATH=/opt/cni/bin \
     "${binary}")
-[[ -z ${gc_output} ]]
+gc_exit=$?
+set -e
+[[ ${gc_exit} -ne 0 ]]
+jq -e '.cniVersion == "1.1.0" and .code == 11' \
+    <<<"${gc_output}" >/dev/null
 
-echo "UNF CNI protocol passed: VERSION, bounded fail-closed ADD/STATUS/DEL, and pre-ownership GC"
+echo "UNF CNI protocol passed: VERSION and bounded fail-closed ADD/STATUS/DEL/GC"
