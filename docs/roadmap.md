@@ -264,7 +264,7 @@ authoritative record of verified results.
 
 ## Full-CNI foundation
 
-**Gate: in progress.**
+**Gate: Verified for the bounded foundation scope.**
 
 - Architecture and ownership are accepted in ADR 0057: the current overlay is
   unchanged, primary ownership is opt-in and Kind-first, durable attachment/IPAM
@@ -339,7 +339,10 @@ authoritative record of verified results.
   five-Node state restored without manual GC. A committed self-cleaning fault
   gate now also verifies CHECK, socket-offline CRI-O DEL, exact deferred
   ownership, recovery ADD ordering, dual-stack lease reuse, zero-leak cleanup,
-  and 5/5 reconvergence. Teardown and reprovision remain the live exit path.
+  and 5/5 reconvergence. ADR 0073 and the committed node-reprovision gate now
+  additionally prove exact CRI-O drain before agent stop, route/BPF/artifact
+  teardown, a genuine no-CNI sandbox failure, host-network reinstall from zero,
+  exact recovered state, platform health, and dual-stack forwarding.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

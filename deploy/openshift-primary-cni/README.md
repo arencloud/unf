@@ -85,6 +85,23 @@ Strict preflight passes after the explicit Node-block assignment, or immediately
 when an installer has already populated the exact values. The deployer performs
 that strict check before MachineConfig or CNI installation. Any other audit
 failure, especially on an OVN-installed cluster, must not be bypassed by
-deleting the Cluster Network Operator's applied-state ConfigMap. Live teardown
-and reprovision recovery remain part of the qualification gate; this package is
-not a production installer.
+deleting the Cluster Network Operator's applied-state ConfigMap.
+
+The exact cl02 development tuple now passes the guarded, worker-scoped teardown
+and reprovision gate:
+
+```bash
+OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" \
+UNF_PRIMARY_CNI_REPROVISION_NODE="<exact-worker-name>" \
+UNF_PRIMARY_CNI_SSH_TARGET="core@<worker-address>" \
+UNF_PRIMARY_CNI_SSH_KNOWN_HOSTS="<pinned-known-hosts-file>" \
+UNF_PRIMARY_CNI_REPROVISION_CONFIRM="<context>:<exact-worker-name>" \
+UNF_PRIMARY_CNI_REPROVISION_ACKNOWLEDGE_DISPOSABLE="<infrastructure-name>" \
+  make openshift-primary-cni-node-reprovision-test
+```
+
+The command is destructive to the selected worker and refuses without both
+exact confirmations. It proves drain/DEL ordering, fingerprinted teardown,
+no-CNI failure, and clean host-network bootstrap. This package remains a
+development installer; production repositories and other platform tuples are
+not qualified transitively.

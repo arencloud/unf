@@ -121,13 +121,14 @@ authenticated epoch/revision-fenced remote-route snapshots, and an explicitly
 configured agent reconciler restores owner-only last-known-good state, applies
 atomic route-set replacements, retires stale routes after replacement, and
 reports desired/applied/error state. A five-Node dual-stack OpenShift 4.22.10
-Agent-based installation now reaches installer completion with UNF as the
-primary Pod network, healthy operators, converged agents, and cross-worker
-IPv4/IPv6 forwarding. That checkpoint still depends on annotated bootstrap
-NetworkPolicies and exposes identity/reply/recovery gaps, so workaround-free
-primary-mode qualification and production support are not claimed. Existing
-overlay deployments are unchanged. See the
-[cl02 installation checkpoint](docs/development/openshift-primary-cni-cl02-install.md).
+Agent-based installation now runs UNF as the primary Pod network with zero
+temporary policies, healthy operators, five converged agents, and cross-worker
+IPv4/IPv6 forwarding. Digest-pinned clean reboot, socket-offline CRI-O DEL,
+runtime-fault cleanup, exact worker teardown to no CNI, and host-network
+reprovision from zero all pass committed gates. Qualification remains limited
+to the exact recorded development tuple; production repositories and other
+platform versions are not inferred. Existing overlay deployments are unchanged.
+See the [cl02 installation checkpoint](docs/development/openshift-primary-cni-cl02-install.md).
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

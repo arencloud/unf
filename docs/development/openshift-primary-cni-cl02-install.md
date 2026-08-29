@@ -301,10 +301,36 @@ returned five fresh converged agents. Schema-v1 evidence was emitted to
 `.artifacts/phase3-openshift-primary-cni-runtime-fault.json`. This closes the
 deliberate CRI-O failure cleanup and committed self-cleaning-command criteria.
 
-## Remaining exit criteria
+The final committed gate, `make openshift-primary-cni-node-reprovision-test`,
+then cordoned and drained worker `bc-24-11-74-2b-8d`, froze kubelet replay, and
+removed every exact CRI-O sandbox represented by an `unf-primary` cache while
+the local agent still served DEL. It used the product cleanup command for the
+eleven current-ABI BPF maps and exact UNF filters, validated and removed four
+persisted remote routes per family, verified installed fingerprints, and
+removed the binary, sole CNI configuration, socket, queue, and durable state.
 
-The live primary-CNI lifecycle remains **In progress** until repository changes
-and repeatable gates prove the remaining items:
+With kubelet active but the Node still cordoned and excluded from the agent
+DaemonSet, the host contained zero attachments, caches, links, pending deletes,
+maps, protocol-196 routes, and CNI configurations. A restricted pinned Pod
+remained `ContainerCreating` without an IP or container ID; CRI-O emitted
+`FailedCreatePodSandBox` because `/etc/kubernetes/cni/net.d` contained no CNI
+configuration. Four non-target agents remained fresh and converged while the
+controller truthfully retained the maintained worker in its five-Node desired
+topology.
 
-- exact artifact, route, and BPF teardown, no-CNI baseline behavior, and clean
-  reprovision recovery.
+Restoring only `network.unf.io/primary-cni=enabled` bootstrapped new agent Pod
+`unf-agent-frd2f` and its installer through host networking. They recreated the
+socket, binary/config fingerprints, durable state, eleven maps, and dual-stack
+routes from zero with no restart. After uncordon, target state returned exactly
+from baseline `9/9/9/0/11/13/13` through no-CNI `0/0/0/0/0/0/0` to recovered
+`9/9/9/0/11/13/13` for attachment/cache/link/pending/map/IPv4-route/IPv6-route.
+All Nodes and pools were healthy, all five agents converged, kubelet and DNS
+passed, 34 operators other than Insights were healthy, and cross-worker IPv4
+and IPv6 HTTPS returned 200. ADR 0073 records the two rejected self-recovering
+attempts and final proof.
+
+## Exit criteria
+
+The bounded live primary-CNI lifecycle is complete for the exact recorded cl02
+development tuple. Broader OpenShift releases, kernels, architectures, cluster
+shapes, and production artifacts require independent qualification.
