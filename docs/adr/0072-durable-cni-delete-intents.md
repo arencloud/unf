@@ -136,6 +136,24 @@ other than the pre-existing external Insights condition were healthy, and the
 controller reported five expected, reporting, fresh, and converged agents with
 matching identity 228, policy 435, and route 1 revisions.
 
+`make openshift-primary-cni-runtime-fault-test` provides the repeatable,
+self-cleaning destructive gate. It requires an exact context-and-Node
+confirmation, a healthy `networkType: None` cluster, one ready local agent,
+balanced baseline state, and an empty queue. On cl02 it created one pinned Pod,
+passed a standards-shaped CHECK from its CRI-O cache, temporarily displaced only
+the local transaction socket, and deleted the Pod through CRI-O. State moved
+from 11/11/11/0 attachments/caches/links/pending intents to 11/10/10/1: CRI-O
+discarded its cache and kernel namespace teardown removed the veth, while the
+exact attachment/lease and mode-0600 delete intent remained.
+
+After restoring the socket, the recovery ADD drained the old attachment before
+allocation, reused exact addresses `10.128.4.12` and `fd01:0:0:2::c`, passed
+CHECK, and removed the old attachment and link ownership. Online DEL returned
+the worker to its exact 10/10/10/0 baseline and all five agents reconverged. The
+gate refuses a pre-existing fixture Namespace, restores the socket before any
+trap cleanup, deletes its fixture, and writes schema-v1 evidence under
+`.artifacts/`.
+
 ## Consequences
 
 Runtime DEL is now availability-tolerant without weakening durable ownership:

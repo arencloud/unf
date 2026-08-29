@@ -98,9 +98,12 @@ independent stale attachments. When the agent socket is unavailable during
 reboot, DEL first journals its exact key in an owner-only bounded queue; the next
 ADD/CHECK/DEL/GC drains that queue through the same exact lifecycle before it can
 proceed. The default path also protects compatible CRI-O caches written before
-the setting existed. An explicitly enabled local-agent Unix service
-provides the root-authenticated, bounded schema-v2 transaction boundary and
-atomic durable attachment/dual-stack lease journal beneath that lifecycle. Its
+the setting existed. A committed OpenShift fault gate verifies pre/post CHECK,
+socket-offline CRI-O DEL persistence, serialized cleanup before recovery ADD,
+exact dual-stack lease reuse, and final zero-leak state. An explicitly enabled
+local-agent Unix service provides the root-authenticated, bounded schema-v2
+transaction boundary and atomic durable attachment/dual-stack lease journal
+beneath that lifecycle. Its
 modular IPAM provider allocates deterministically from explicit node blocks, migrates
 schema-v1 attachment state, and releases leases only after abort/delete
 completion. A typed-netlink `unf-link` primitive now creates, moves, configures,

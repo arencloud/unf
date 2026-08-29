@@ -283,12 +283,28 @@ returned five expected, reporting, fresh, and converged agents at exact identity
 228, policy 435, and route 1 revisions. This closes the clean-reboot recovery
 criterion.
 
+The committed `make openshift-primary-cni-runtime-fault-test` gate then injected
+a bounded local transaction outage on the same worker. It required the exact
+`admin:bc-24-11-74-2b-8d` confirmation, created one restricted pinned Pod, and
+passed CHECK from its CRI-O result cache. With only `/run/unf/cni.sock`
+temporarily displaced, CRI-O DEL changed attachment/cache/link/pending counts
+from 11/11/11/0 to 11/10/10/1. Kernel namespace teardown removed the veth;
+the attachment, exact dual-stack lease, and mode-0600 deferred intent remained.
+
+The gate restored the socket before recovery. The following CRI-O ADD drained
+the old delete before allocation, removed the old attachment/link ownership,
+reused `10.128.4.12` and `fd01:0:0:2::c`, and passed a second CHECK. Final online
+DEL and fixture removal restored the exact 10/10/10/0 baseline. The target Node
+remained Ready, component restart counts did not advance, 34 operators excluding
+the retained external Insights condition were healthy, and controller status
+returned five fresh converged agents. Schema-v1 evidence was emitted to
+`.artifacts/phase3-openshift-primary-cni-runtime-fault.json`. This closes the
+deliberate CRI-O failure cleanup and committed self-cleaning-command criteria.
+
 ## Remaining exit criteria
 
 The live primary-CNI lifecycle remains **In progress** until repository changes
 and repeatable gates prove the remaining items:
 
-- CRI-O ADD/CHECK/DEL and lease/link cleanup under deliberate failure;
 - exact artifact, route, and BPF teardown, no-CNI baseline behavior, and clean
-  reprovision recovery; and
-- a committed, self-cleaning qualification command and evidence artifact.
+  reprovision recovery.

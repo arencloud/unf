@@ -336,8 +336,10 @@ authoritative record of verified results.
   discarding its cache. ADR 0072 adds a durable exact deferred-delete queue that
   fences later ADD/CHECK/GC work. Its digest-pinned rollout and second clean
   reboot now pass with ten early DELs drained before replacement ADDs and exact
-  five-Node state restored without manual GC; CRI-O fault cleanup, teardown,
-  and reprovision remain the live exit path.
+  five-Node state restored without manual GC. A committed self-cleaning fault
+  gate now also verifies CHECK, socket-offline CRI-O DEL, exact deferred
+  ownership, recovery ADD ordering, dual-stack lease reuse, zero-leak cleanup,
+  and 5/5 reconvergence. Teardown and reprovision remain the live exit path.
 - Netkit, OpenShift primary-CNI installation, service load balancing,
   kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
   this foundation slice.

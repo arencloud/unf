@@ -18,7 +18,8 @@ done
 for script in \
     "${project_root}/hack/audit-openshift-primary-cni.sh" \
     "${project_root}/hack/configure-openshift-primary-cni-node-blocks.sh" \
-    "${project_root}/hack/deploy-openshift-primary-cni.sh"; do
+    "${project_root}/hack/deploy-openshift-primary-cni.sh" \
+    "${project_root}/hack/verify-openshift-primary-cni-runtime-fault.sh"; do
     bash -n "${script}"
 done
 sh -n "${runtime}/install.sh"
