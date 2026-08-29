@@ -228,6 +228,24 @@ All three development references, including unchanged test-tools digest
 were resolved anonymously after publication. They remain candidate evidence
 until the staged rollout and reboot gate pass.
 
+The `8f4165a` agents rolled one Node at a time. All five new Pods were Ready
+with zero restarts and exposed the exact embedded revision while the prior
+controller still reported five fresh converged agents. The controller then
+rolled with `Recreate`, remained at zero restarts, and established a new epoch
+with five exactly converged agents. Every Node retained equal record/cache/link
+counts (37, 33, 16, 20, and 10), an empty mode-0700 deferred queue, and the
+explicit installed path. Five kubelet proxy checks, DNS from all five Nodes,
+cross-worker IPv4/IPv6 canary HTTPS, and all operators other than the retained
+external Insights condition passed.
+
+No Node was rebooted with this image. Pre-reboot concurrency review found that
+the first queue lock ended after listing, allowing simultaneous kubelet ADD
+calls to read the same deferred records. Exact idempotence kept this fail
+closed, but could force redundant deletes and retries. The implementation now
+holds one exclusive per-network lock through list, agent delete, and exact
+completion, with a blocking concurrency test. A superseding image rollout is
+required before reboot qualification.
+
 ## Remaining exit criteria
 
 The live primary-CNI lifecycle remains **In progress** until repository changes

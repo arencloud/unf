@@ -332,7 +332,7 @@ fn drain_deferred_deletes(
 ) -> Result<(), CniError> {
     let root = deferred_delete_directory(config);
     let pending = deferred::list(root, &config.name).map_err(CniError::io)?;
-    for entry in pending {
+    for entry in pending.iter() {
         let environment = InvocationEnvironment {
             command: Some("DEL".to_owned()),
             container_id: Some(entry.key.container_id.clone()),
@@ -347,7 +347,7 @@ fn drain_deferred_deletes(
             Command::Delete,
             transaction,
         ))?;
-        deferred::complete(&entry).map_err(CniError::io)?;
+        deferred::complete(entry).map_err(CniError::io)?;
     }
     Ok(())
 }

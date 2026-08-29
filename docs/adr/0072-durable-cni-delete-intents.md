@@ -56,10 +56,12 @@ Queue documents use schema version 1 and a deterministic
 write, file sync, rename, and parent-directory sync; they require mode 0600, a
 single hard link, exact path/content agreement, and no symlink component.
 Directories are owner-owned and mode 0700; the plugin refuses rather than
-changing a weakly protected configured root. Per-network enqueue/list operations
-use an owner-owned advisory lock, listing is deterministic, and publication is
-capped at 65,536 records per network. Malformed, weakly protected, linked, or
-over-capacity state fails closed rather than being skipped.
+changing a weakly protected configured root. An owner-owned advisory lock
+serializes enqueue and the complete per-network list/delete/complete drain, so
+concurrent kubelet ADD calls cannot overtake or duplicate queue consumption.
+Listing is deterministic and publication is capped at 65,536 records per
+network. Malformed, weakly protected, linked, or over-capacity state fails
+closed rather than being skipped.
 
 ## Verification
 
@@ -87,10 +89,20 @@ and agent/CNI digest
 The unchanged test-tools content resolves to
 `sha256:f57a7ee9668d6b87f4e00c4e8df9240b8889c6ee50f817ea1e884732b2f42b13`.
 
-Live credit remains pending. These immutable images must be rolled to cl02 and
-the same worker must complete a real boot-ID-changing reboot with no deferred
-records left behind and exact equality among running Pods, CRI-O caches,
-attachments, links, routes, leases, and restored BPF state.
+The `8f4165a` images rolled serially to all five cl02 agents with zero restarts,
+then the controller established a new epoch with all five agents exactly
+converged. Every Node retained equal attachment/cache/link counts; every queue
+was empty, mode 0700, and explicitly configured. The pre-reboot review then
+found that the initial lock protected publication/listing but not the complete
+agent-driven drain. Several simultaneous kubelet ADD calls could therefore read
+the same records, remain safe through idempotence, but incur avoidable retries.
+The reboot was deliberately withheld, the lock scope was expanded, and a
+concurrency test now proves enqueue waits for the entire drain.
+
+Live credit remains pending. A superseding immutable image must be published
+and rolled to cl02, and the same worker must complete a real boot-ID-changing
+reboot with no deferred records left behind and exact equality among running
+Pods, CRI-O caches, attachments, links, routes, leases, and restored BPF state.
 
 ## Consequences
 

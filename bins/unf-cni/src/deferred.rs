@@ -1,5 +1,6 @@
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::Write;
+use std::ops::Deref;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,20 @@ const MAX_PENDING_DELETES: usize = 65_536;
 pub(crate) struct PendingDelete {
     pub(crate) key: AttachmentKey,
     path: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingDeleteQueue {
+    entries: Vec<PendingDelete>,
+    _lock: Option<File>,
+}
+
+impl Deref for PendingDeleteQueue {
+    type Target = [PendingDelete];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -117,13 +132,19 @@ pub(crate) fn enqueue(root: &Path, key: &AttachmentKey) -> Result<(), String> {
     write_result
 }
 
-pub(crate) fn list(root: &Path, network: &str) -> Result<Vec<PendingDelete>, String> {
+pub(crate) fn list(root: &Path, network: &str) -> Result<PendingDeleteQueue, String> {
     validate_root(root)?;
     if !root.exists() {
-        return Ok(Vec::new());
+        return Ok(PendingDeleteQueue {
+            entries: Vec::new(),
+            _lock: None,
+        });
     }
-    let _lock = queue_lock(root, network, FlockOperation::LockShared)?;
-    list_unlocked(root, network)
+    let lock = queue_lock(root, network, FlockOperation::LockExclusive)?;
+    Ok(PendingDeleteQueue {
+        entries: list_unlocked(root, network)?,
+        _lock: Some(lock),
+    })
 }
 
 fn list_unlocked(root: &Path, network: &str) -> Result<Vec<PendingDelete>, String> {
@@ -367,6 +388,9 @@ fn remove_empty_directory(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     use super::*;
 
@@ -395,11 +419,37 @@ mod tests {
             ["container-a", "container-b"]
         );
         complete(&pending[0]).expect("complete a");
+        drop(pending);
         let remaining = list(&root, "unf-test").expect("list remaining queue");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].key, key("container-b"));
         complete(&remaining[0]).expect("complete b");
+        drop(remaining);
         assert!(list(&root, "unf-test").expect("empty queue").is_empty());
+    }
+
+    #[test]
+    fn queue_lock_serializes_enqueue_with_the_complete_drain() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("pending");
+        enqueue(&root, &key("container-a")).expect("enqueue a");
+        let drain = list(&root, "unf-test").expect("lock drain");
+        let concurrent_root = root.clone();
+        let (sent, received) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            sent.send(enqueue(&concurrent_root, &key("container-b")))
+                .expect("report enqueue result");
+        });
+        assert!(
+            received.recv_timeout(Duration::from_millis(50)).is_err(),
+            "enqueue must wait until the complete drain releases its lock"
+        );
+        drop(drain);
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("enqueue resumes after drain")
+            .expect("concurrent enqueue succeeds");
+        writer.join().expect("enqueue thread");
     }
 
     #[test]
