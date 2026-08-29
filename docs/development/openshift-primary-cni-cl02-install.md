@@ -186,6 +186,14 @@ fix is local evidence only until a new immutable agent/CNI image is rolled out,
 the 26 observed stale records are reconciled, and a clean reboot returns exact
 journal/link/Pod cardinality.
 
+The rollout candidate is exact source revision `221168c`, controller digest
+`sha256:45737844f39bd84b0e1929013ee01e8f364aa8d90fd8eb20430ad8d60e3cdb45`,
+and agent/CNI digest
+`sha256:822f79780fc28d46ff9a7e1a9127d43319a6b7368ece225cfcd883d8c5a74c52`.
+Both public Quay references were resolved anonymously after publication. They
+remain candidate evidence until the staged rollout and live reconciliation
+gates pass.
+
 ## Remaining exit criteria
 
 The live primary-CNI lifecycle remains **In progress** until repository changes
