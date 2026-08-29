@@ -249,7 +249,11 @@ matrix and reproducible evidence.
 - Completed on an isolated two-node Kind fixture: Kubernetes 1.34.8 on Debian
   13/containerd 2.3.1 independently passed full dual-stack endpoint/recovery,
   TCX and legacy attachment, and adjacent-revision upgrade/rollback, creating a
-  fourth exact support-matrix row alongside Kubernetes 1.35 and OpenShift 4.22.
+  fourth exact support-matrix row alongside Kubernetes 1.35 and OpenShift 4.22;
+- Completed on the five-node dual-stack cl02 fixture: OpenShift 4.22.10 with UNF
+  as the installer-time primary CNI passed bootstrap, clean reboot, deliberate
+  CRI-O cache-loss recovery, exact worker teardown/no-CNI failure, and clean
+  worker reprovision, creating a fifth non-transitive support-matrix row.
 
 Phase 3 is closed by the committed-revision regression, one-to-one requirements
 and limitations audit, and immutable release-readiness evidence in ADR 0056.

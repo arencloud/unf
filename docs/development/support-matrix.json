@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_reviewed": "2026-08-28",
+  "last_reviewed": "2026-08-29",
   "qualification_semantics": {
     "qualified": "The exact row passed every listed gate at the recorded evidence revision.",
     "non_transitive": true,
@@ -225,6 +225,65 @@
         "native legacy-netlink attachment",
         "digest-pinned controller-first and worker-serial upgrade, rollback, and recovery"
       ]
+    },
+    {
+      "id": "cl02-openshift-4.22-dual-unf-primary-amd64",
+      "state": "qualified",
+      "platform": {
+        "distribution": "OpenShift",
+        "environment": "cl02-primary-cni",
+        "kubernetes_version": "v1.35.6",
+        "openshift_version": "4.22.10"
+      },
+      "nodes": {
+        "count": 5,
+        "os": "Red Hat Enterprise Linux CoreOS 9.8.20260812-0 (Plow)",
+        "kernels": [
+          "5.14.0-687.39.1.el9_8.x86_64"
+        ],
+        "architecture": "amd64",
+        "container_runtime": "CRI-O 1.35.6-4.rhaos4.22.git41f610b.el9"
+      },
+      "networking": {
+        "cni": "UNF primary CNI revision 15866c44bca4953b5401d0cdce66a65d3462af42",
+        "address_families": [
+          "ipv4",
+          "ipv6"
+        ]
+      },
+      "dataplane": {
+        "attachment_modes": [
+          "legacy_netlink"
+        ]
+      },
+      "evidence": {
+        "outcome": "passed",
+        "verified_at": "2026-08-29",
+        "revision": "5a93a5194476e42dd45cf46e96ea82f574306fff",
+        "commands": [
+          "make openshift-primary-cni-package-check",
+          "make openshift-primary-cni-runtime-fault-test",
+          "make openshift-primary-cni-node-reprovision-test"
+        ],
+        "records": [
+          ".artifacts/phase3-openshift-primary-cni-runtime-fault.json",
+          ".artifacts/phase3-openshift-primary-cni-node-reprovision.json",
+          "docs/development/openshift-primary-cni-cl02-install.md"
+        ],
+        "decisions": [
+          "docs/adr/0069-openshift-primary-cni-bootstrap-package.md",
+          "docs/adr/0071-cni-valid-attachment-garbage-collection.md",
+          "docs/adr/0072-durable-cni-delete-intents.md",
+          "docs/adr/0073-openshift-primary-cni-node-reprovision.md"
+        ]
+      },
+      "qualified_scope": [
+        "five-node installer-time UNF primary-CNI bootstrap",
+        "dual-stack cross-worker pod forwarding and DNS",
+        "RHCOS enforcing-SELinux and native legacy-netlink operation",
+        "clean reboot and deliberate CRI-O cache-loss recovery",
+        "exact worker teardown, no-CNI failure, reprovision, and controller reconvergence"
+      ]
     }
   ],
   "unsupported_boundaries": [
@@ -233,14 +292,15 @@
       "qualified_values": [
         "v1.34.8",
         "v1.35.0",
-        "v1.35.6 as shipped by OpenShift 4.22.9"
+        "v1.35.6 as shipped by OpenShift 4.22.9 and 4.22.10"
       ],
       "boundary": "Other Kubernetes minor releases are unqualified until a separate row passes the required gates."
     },
     {
       "dimension": "OpenShift release",
       "qualified_values": [
-        "4.22.9"
+        "4.22.9",
+        "4.22.10 for the exact UNF primary-CNI development tuple"
       ],
       "boundary": "Other OpenShift releases and upgrades of the OpenShift platform itself are unqualified."
     },
@@ -248,7 +308,8 @@
       "dimension": "Kernel and operating system",
       "qualified_values": [
         "Debian 12 and Debian 13 Kind nodes on Fedora-hosted Linux 7.1.4",
-        "RHCOS 9.8 Linux 5.14.0-687.35.1.el9_8"
+        "RHCOS 9.8 Linux 5.14.0-687.35.1.el9_8",
+        "RHCOS 9.8.20260812-0 Linux 5.14.0-687.39.1.el9_8"
       ],
       "boundary": "Adjacent kernels, other distributions, and PREEMPT_RT kernels are not inferred."
     },
@@ -263,14 +324,16 @@
       "dimension": "CNI",
       "qualified_values": [
         "kindnetd",
-        "OVN-Kubernetes"
+        "OVN-Kubernetes",
+        "UNF primary CNI revision 15866c44bca4953b5401d0cdce66a65d3462af42"
       ],
-      "boundary": "Other CNIs and CNI chaining combinations are unqualified."
+      "boundary": "Other UNF revisions, other CNIs, and CNI chaining combinations are unqualified."
     },
     {
       "dimension": "Cluster shape",
       "qualified_values": [
-        "two selected nodes"
+        "two selected nodes",
+        "five-node OpenShift primary-CNI cluster with three control-plane and two worker nodes"
       ],
       "boundary": "Larger clusters, multiple controller replicas, mixed kernels, and mixed attachment modes are unqualified."
     },
