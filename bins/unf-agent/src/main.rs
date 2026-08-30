@@ -9279,6 +9279,47 @@ mod tests {
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
         assert_eq!(action, TC_ACT_PIPE);
         assert_ipv6_packet(&translated, 17, service_v6, client_v6, 53, 40_003);
+
+        // Host-network and Node-origin flows encounter only an uplink egress
+        // hook before leaving the Node. They must receive the same exact
+        // frontend translation and ingress-side reply restoration.
+        let host_v4 = Ipv4Addr::new(192, 0, 2, 20);
+        let host_v6 = "2001:db8::20".parse::<Ipv6Addr>().unwrap();
+        let host_ipv4_tcp = ipv4_packet(6, host_v4, service_v4, 40_010, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &host_ipv4_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, host_v4, backend_v4, 40_010, 8080);
+        let reverse = ipv4_packet(6, backend_v4, host_v4, 8080, 40_010);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, service_v4, host_v4, 80, 40_010);
+
+        let host_ipv4_udp = ipv4_packet(17, host_v4, service_v4, 40_011, 53);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &host_ipv4_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 17, host_v4, backend_v4, 40_011, 5353);
+        let reverse = ipv4_packet(17, backend_v4, host_v4, 5353, 40_011);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 17, service_v4, host_v4, 53, 40_011);
+
+        let host_ipv6_tcp = ipv6_packet(6, host_v6, service_v6, 40_012, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &host_ipv6_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 6, host_v6, backend_v6, 40_012, 8080);
+        let reverse = ipv6_packet(6, backend_v6, host_v6, 8080, 40_012);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 6, service_v6, host_v6, 80, 40_012);
+
+        let host_ipv6_udp = ipv6_packet(17, host_v6, service_v6, 40_013, 53);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &host_ipv6_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, host_v6, backend_v6, 40_013, 5353);
+        let reverse = ipv6_packet(17, backend_v6, host_v6, 5353, 40_013);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, service_v6, host_v6, 53, 40_013);
         assert_eq!(
             synchronizer
                 .connections
@@ -9286,7 +9327,7 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap()
                 .len(),
-            8
+            16
         );
 
         let replacement_v4 = Ipv4Addr::new(10, 42, 0, 21);
@@ -9355,13 +9396,13 @@ mod tests {
         while let Some(item) = service_events.next() {
             events.push(decode_service_event(&item).expect("kernel service event is valid"));
         }
-        assert_eq!(events.len(), 14);
+        assert_eq!(events.len(), 22);
         assert_eq!(
             events
                 .iter()
                 .filter(|event| event.action == SERVICE_EVENT_ACTION_TRANSLATE)
                 .count(),
-            12
+            20
         );
         assert_eq!(
             events

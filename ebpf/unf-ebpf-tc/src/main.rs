@@ -363,16 +363,16 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             };
             // SAFETY: this CPU owns the per-CPU slot for the invocation.
             #[allow(unsafe_code)]
-            let reverse_key = unsafe { &mut *key_ptr };
-            reverse_key.source_address = ipv4_address(source_ipv4);
-            reverse_key.destination_address = ipv4_address(destination_ipv4);
-            reverse_key.source_port = source_port;
-            reverse_key.destination_port = destination_port;
-            reverse_key.protocol = protocol;
-            reverse_key.address_family = AddressFamily::Ipv4 as u8;
-            reverse_key.role = SERVICE_CONNECTION_ROLE_REVERSE;
-            reverse_key.reserved = 0;
-            if let Some(translation) = lookup_reverse_service(reverse_key, now_ns) {
+            let service_key = unsafe { &mut *key_ptr };
+            service_key.source_address = ipv4_address(source_ipv4);
+            service_key.destination_address = ipv4_address(destination_ipv4);
+            service_key.source_port = source_port;
+            service_key.destination_port = destination_port;
+            service_key.protocol = protocol;
+            service_key.address_family = AddressFamily::Ipv4 as u8;
+            service_key.role = SERVICE_CONNECTION_ROLE_REVERSE;
+            service_key.reserved = 0;
+            if let Some(translation) = lookup_reverse_service(service_key, now_ns) {
                 if !rewrite_ipv4(ctx, transport_offset, protocol, &translation, true)
                     || service_connection_translation(false).is_some_and(
                         |destination_translation| {
@@ -398,6 +398,50 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                     SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
                     now_ns,
                 );
+            } else {
+                // Host-network and Node-origin traffic reaches the uplink's
+                // egress hook without first traversing a workload-veth ingress
+                // hook. Give an untranslated frontend the same bounded lookup
+                // and connection-pair transaction used for workload traffic.
+                service_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
+                match lookup_forward_service_v4(service_key, now_ns) {
+                    ServiceLookup::Miss => {}
+                    ServiceLookup::Drop => return TC_ACT_SHOT,
+                    ServiceLookup::Translation(translation) => {
+                        let backend_address = [
+                            translation.address[0],
+                            translation.address[1],
+                            translation.address[2],
+                            translation.address[3],
+                        ];
+                        if service_connection_translation(true).is_some_and(
+                            |source_translation| {
+                                !rewrite_ipv4(
+                                    ctx,
+                                    transport_offset,
+                                    protocol,
+                                    &source_translation,
+                                    true,
+                                )
+                            },
+                        ) || !rewrite_ipv4(ctx, transport_offset, protocol, &translation, false)
+                        {
+                            emit_service_connection_event(
+                                SERVICE_EVENT_ACTION_DROP,
+                                SERVICE_EVENT_REASON_REWRITE_FAILED,
+                                now_ns,
+                            );
+                            return TC_ACT_SHOT;
+                        }
+                        emit_service_connection_event(
+                            SERVICE_EVENT_ACTION_TRANSLATE,
+                            SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
+                            now_ns,
+                        );
+                        destination_ipv4 = backend_address;
+                        destination_port = translation.port;
+                    }
+                }
             }
         }
     }
@@ -555,16 +599,16 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             };
             // SAFETY: this CPU owns the per-CPU slot for the invocation.
             #[allow(unsafe_code)]
-            let reverse_key = unsafe { &mut *key_ptr };
-            reverse_key.source_address = observation.source_address;
-            reverse_key.destination_address = observation.destination_address;
-            reverse_key.source_port = observation.source_port;
-            reverse_key.destination_port = observation.destination_port;
-            reverse_key.protocol = protocol;
-            reverse_key.address_family = AddressFamily::Ipv6 as u8;
-            reverse_key.role = SERVICE_CONNECTION_ROLE_REVERSE;
-            reverse_key.reserved = 0;
-            if let Some(translation) = lookup_reverse_service(reverse_key, now_ns) {
+            let service_key = unsafe { &mut *key_ptr };
+            service_key.source_address = observation.source_address;
+            service_key.destination_address = observation.destination_address;
+            service_key.source_port = observation.source_port;
+            service_key.destination_port = observation.destination_port;
+            service_key.protocol = protocol;
+            service_key.address_family = AddressFamily::Ipv6 as u8;
+            service_key.role = SERVICE_CONNECTION_ROLE_REVERSE;
+            service_key.reserved = 0;
+            if let Some(translation) = lookup_reverse_service(service_key, now_ns) {
                 if !rewrite_ipv6(ctx, transport_offset, protocol, &translation, true)
                     || service_connection_translation(false).is_some_and(
                         |destination_translation| {
@@ -590,6 +634,40 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                     SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
                     now_ns,
                 );
+            } else {
+                service_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
+                match lookup_forward_service_v6(service_key, now_ns) {
+                    ServiceLookup::Miss => {}
+                    ServiceLookup::Drop => return TC_ACT_SHOT,
+                    ServiceLookup::Translation(translation) => {
+                        if service_connection_translation(true).is_some_and(
+                            |source_translation| {
+                                !rewrite_ipv6(
+                                    ctx,
+                                    transport_offset,
+                                    protocol,
+                                    &source_translation,
+                                    true,
+                                )
+                            },
+                        ) || !rewrite_ipv6(ctx, transport_offset, protocol, &translation, false)
+                        {
+                            emit_service_connection_event(
+                                SERVICE_EVENT_ACTION_DROP,
+                                SERVICE_EVENT_REASON_REWRITE_FAILED,
+                                now_ns,
+                            );
+                            return TC_ACT_SHOT;
+                        }
+                        emit_service_connection_event(
+                            SERVICE_EVENT_ACTION_TRANSLATE,
+                            SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
+                            now_ns,
+                        );
+                        observation.destination_address = translation.address;
+                        observation.destination_port = translation.port;
+                    }
+                }
             }
         }
     }
