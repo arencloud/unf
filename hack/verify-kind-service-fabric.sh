@@ -470,6 +470,8 @@ kind: Pod
 metadata:
   name: client
   namespace: ${namespace}
+  labels:
+    app: service-client
 spec:
   nodeSelector:
     kubernetes.io/hostname: ${client_node}
@@ -498,6 +500,17 @@ spec:
       protocol: UDP
       port: 5353
       targetPort: 5353
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: isolate-client-ingress
+  namespace: ${namespace}
+spec:
+  podSelector:
+    matchLabels:
+      app: service-client
+  policyTypes: [Ingress]
 EOF
 if [[ ${node_port_mode} == true ]]; then
     "${kc[@]}" apply -f - >/dev/null <<EOF
@@ -1046,7 +1059,7 @@ jq -n \
     --argjson nodes "${node_evidence}" \
     --argjson images "${image_evidence}" \
     --argjson agents "${final_agents}" \
-    '{schemaVersion:1,generatedAt:$generatedAt,revision:$revision,context:$context,kubernetesVersion:$kubernetesVersion,kubeProxyPresent:false,service:{id:$serviceId,ipv4:$serviceIPv4,ipv6:$serviceIPv6,activeRevision:$activeRevision,recoveredRevision:$recoveredRevision},nodes:$nodes,images:$images,agents:$agents,verified:["exclusive UNF primary CNI","kube-proxy absent","headless controller bootstrap","direct dual-stack Pod forwarding","IPv4 and IPv6 TCP ClusterIP","IPv4 and IPv6 UDP ClusterIP","DNS continuity through UNF Service translation","stable repeated connection translation","readiness withdrawal","terminating endpoint exclusion","backend deletion and recovery","no-backend drop provenance","metrics and agent status","durable flow history","unfctl service explanation","controller-outage source and destination agent replacement","last-known-good service recovery","desired service-map cleanup","CNI attachment and veth cleanup"]}' \
+    '{schemaVersion:1,generatedAt:$generatedAt,revision:$revision,context:$context,kubernetesVersion:$kubernetesVersion,kubeProxyPresent:false,service:{id:$serviceId,ipv4:$serviceIPv4,ipv6:$serviceIPv6,activeRevision:$activeRevision,recoveredRevision:$recoveredRevision},nodes:$nodes,images:$images,agents:$agents,verified:["exclusive UNF primary CNI","kube-proxy absent","headless controller bootstrap","direct dual-stack Pod forwarding","IPv4 and IPv6 TCP ClusterIP","IPv4 and IPv6 UDP ClusterIP","Service reply restoration into an ingress-isolated client","DNS continuity through UNF Service translation","stable repeated connection translation","readiness withdrawal","terminating endpoint exclusion","backend deletion and recovery","no-backend drop provenance","metrics and agent status","durable flow history","unfctl service explanation","controller-outage source and destination agent replacement","last-known-good service recovery","desired service-map cleanup","CNI attachment and veth cleanup"]}' \
     >"${artifact}"
 if [[ ${node_port_mode} == true ]]; then
     jq \

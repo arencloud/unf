@@ -270,6 +270,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     };
 
     let service_protocol = protocol == PROTOCOL_TCP || protocol == PROTOCOL_UDP;
+    let mut service_forward_translated = false;
     if service_protocol && service_translatable {
         // SAFETY: this helper has no preconditions and returns monotonic kernel time.
         #[allow(unsafe_code)]
@@ -325,6 +326,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
                 ServiceLookup::Translation(translation) => {
+                    service_forward_translated = true;
                     let backend_address = [
                         translation.address[0],
                         translation.address[1],
@@ -408,6 +410,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                     ServiceLookup::Miss => {}
                     ServiceLookup::Drop => return TC_ACT_SHOT,
                     ServiceLookup::Translation(translation) => {
+                        service_forward_translated = true;
                         let backend_address = [
                             translation.address[0],
                             translation.address[1],
@@ -470,6 +473,9 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     if action == TC_ACT_SHOT {
         return action;
     }
+    if service_forward_translated {
+        seed_service_frontend_policy_connection(tcp_flags);
+    }
     action
 }
 
@@ -515,6 +521,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
         0
     };
     let service_protocol = protocol == PROTOCOL_TCP || protocol == PROTOCOL_UDP;
+    let mut service_forward_translated = false;
     if service_protocol && service_translatable {
         // SAFETY: this helper has no preconditions and returns monotonic kernel time.
         #[allow(unsafe_code)]
@@ -567,6 +574,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
                 ServiceLookup::Translation(translation) => {
+                    service_forward_translated = true;
                     if service_connection_translation(true).is_some_and(|source_translation| {
                         !rewrite_ipv6(
                             ctx,
@@ -640,6 +648,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                     ServiceLookup::Miss => {}
                     ServiceLookup::Drop => return TC_ACT_SHOT,
                     ServiceLookup::Translation(translation) => {
+                        service_forward_translated = true;
                         if service_connection_translation(true).is_some_and(
                             |source_translation| {
                                 !rewrite_ipv6(
@@ -683,6 +692,9 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     let action = emit_flow(observation);
     if action == TC_ACT_SHOT {
         return action;
+    }
+    if service_forward_translated {
+        seed_service_frontend_policy_connection(observation.tcp_flags);
     }
     action
 }
@@ -2055,6 +2067,56 @@ fn seed_forwarded_connection(
         policy_revision,
     };
     let _ = CONNECTIONS.insert(key, &state, 0);
+}
+
+/// Preserve the client-to-frontend tuple as policy connection state after an
+/// allowed Service flow has been evaluated against its selected backend. A
+/// reverse Service translation can otherwise expose the frontend tuple to a
+/// later enforcing hook, where an ingress-isolated client would reject the
+/// legitimate reply because only the client-to-backend tuple was retained.
+#[inline(always)]
+fn seed_service_frontend_policy_connection(tcp_flags: u8) {
+    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    // SAFETY: the caller invokes this only after a successful forward Service
+    // lookup initialized this CPU's service-connection scratch slot.
+    #[allow(unsafe_code)]
+    let value = unsafe { &*value_ptr };
+    let (Some(connection_ptr), Some(reverse_ptr)) = (
+        POLICY_CONNECTION_SCRATCH.get_ptr_mut(0),
+        POLICY_CONNECTION_SCRATCH.get_ptr_mut(1),
+    ) else {
+        return;
+    };
+    // SAFETY: each pointer names a distinct slot owned by this CPU.
+    #[allow(unsafe_code)]
+    let (connection_key, reverse_key) = unsafe { (&mut *connection_ptr, &mut *reverse_ptr) };
+    connection_key.source_address = value.client_address;
+    connection_key.destination_address = value.frontend_address;
+    connection_key.source_port = value.client_port;
+    connection_key.destination_port = value.frontend_port;
+    connection_key.protocol = value.protocol;
+    connection_key.address_family = value.address_family;
+    connection_key.reserved = [0; 2];
+    reverse_key.source_address = value.frontend_address;
+    reverse_key.destination_address = value.client_address;
+    reverse_key.source_port = value.frontend_port;
+    reverse_key.destination_port = value.client_port;
+    reverse_key.protocol = value.protocol;
+    reverse_key.address_family = value.address_family;
+    reverse_key.reserved = [0; 2];
+    let policy_revision = active_policy_revision();
+    // SAFETY: this helper has no preconditions and returns monotonic kernel time.
+    #[allow(unsafe_code)]
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    seed_forwarded_connection(
+        connection_key,
+        reverse_key,
+        policy_revision,
+        now_ns,
+        tcp_flags,
+    );
 }
 
 #[derive(Clone, Copy)]
