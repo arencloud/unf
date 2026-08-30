@@ -22,6 +22,7 @@ pub const SERVICE_BACKEND_FLAG_SERVING: u8 = 1 << 1;
 pub const SERVICE_BACKEND_FLAG_TERMINATING: u8 = 1 << 2;
 pub const SERVICE_CONNECTION_ROLE_FORWARD: u8 = 1;
 pub const SERVICE_CONNECTION_ROLE_REVERSE: u8 = 2;
+pub const SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER: u16 = 1 << 0;
 pub const SERVICE_EVENT_ACTION_TRANSLATE: u8 = 1;
 pub const SERVICE_EVENT_ACTION_DROP: u8 = 2;
 pub const SERVICE_EVENT_ACTION_EXPIRE: u8 = 3;
@@ -186,11 +187,17 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
         && state.service_revision != 0
         && state.service_id.get() != 0
         && state.backend_id.get() != 0
-        && state.flags == 0
-        && state.reserved[0] == 0
-        && state.reserved[1] == 0
-        && state.reserved[2] == 0
-        && state.reserved[3] == 0
+        && state.flags & !SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER == 0
+        && if state.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
+            u16::from_be_bytes([state.reserved[0], state.reserved[1]]) >= 32_768
+                && state.reserved[2] == 0
+                && state.reserved[3] == 0
+        } else {
+            state.reserved[0] == 0
+                && state.reserved[1] == 0
+                && state.reserved[2] == 0
+                && state.reserved[3] == 0
+        }
         && now_ns.saturating_sub(state.last_seen_ns) <= timeout_ns
 }
 
@@ -967,8 +974,13 @@ mod tests {
         invalid.backend_id = BackendId::new(0);
         assert!(!service_connection_is_active(&invalid, 11));
         invalid = tcp;
-        invalid.flags = 1;
+        invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER << 1;
         assert!(!service_connection_is_active(&invalid, 11));
+        invalid = tcp;
+        invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER;
+        assert!(!service_connection_is_active(&invalid, 11));
+        invalid.reserved[0..2].copy_from_slice(&32_768_u16.to_be_bytes());
+        assert!(service_connection_is_active(&invalid, 11));
     }
 
     #[test]

@@ -196,8 +196,15 @@ persistent ABI v5 owns an exact 21-map set, and the agent uses a composite
 service/Node checkpoint plus independently banked NodePort maps for transactional
 staging, readback, address-only switching, rollback, dual-pointer crash repair,
 restart recovery, and v4/v5 cleanup. `make nodeport-transaction-test` and ADR
-0085 verify that lifecycle. No host hook consumes the maps yet; the active Phase
-5.4 milestone is dual-stack TCP/UDP `externalTrafficPolicy: Cluster` forwarding.
+0085 verify that lifecycle. Phase 5.4 is now verified by
+`make nodeport-cluster-dataplane-test`: exact Node-address/port/protocol matches
+perform dual-stack TCP/UDP DNAT and paired NodePort reverse SNAT through the
+coherent service bank, retain connections across backend churn, preserve
+checksums and provenance, use bounded collision-safe Node source ports so
+cross-node replies return to the owning connection, and apply ingress policy to
+the original source plus translated backend identity and port. `Local` matches
+remain explicitly fail-closed until the
+active Phase 5.5 local-eligibility milestone; ADR 0086 defines that boundary.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -423,8 +423,13 @@ matrix is maintained in the
   21-map runtime from historical 18-map v4 state; composite checkpoints,
   independent service/NodePort banks, real-map failure injection, address-only
   switching, dual-pointer crash repair, and scoped cleanup pass; ADR 0085.
-- In progress after host maps: dual-stack TCP/UDP `Cluster`; source-preserving
-  `Local` dataplanes,
-  operations/simulation, and independent kube-proxy-free Kind/OpenShift gates.
+- Verified by `make nodeport-cluster-dataplane-test`: exact coherent NodePort
+  lookups perform dual-stack TCP/UDP `Cluster` DNAT/reverse SNAT, retain
+  connection selection across churn, preserve checksums/provenance, and apply
+  ingress policy to the translated backend tuple; `Local` cannot broaden to
+  Cluster; ADR 0086.
+- In progress: node-local eligibility and source-preserving `Local` forwarding;
+  operations/simulation and independent kube-proxy-free Kind/OpenShift gates
+  follow.
 - LoadBalancer, session affinity, topology-aware selection, Maglev, and DSR
   remain separate future milestones.

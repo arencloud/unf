@@ -8200,12 +8200,24 @@ mod tests {
     }
 
     fn dual_stack_node_port_snapshot(revision: u64) -> ServiceSnapshot {
-        let mut snapshot = dual_stack_service_snapshot(
+        dual_stack_node_port_snapshot_with_backend(
             revision,
             Ipv4Addr::new(10, 42, 0, 20),
             "fd00:42::20".parse().unwrap(),
             true,
-        );
+            unf_service::ServiceTrafficPolicy::Cluster,
+        )
+    }
+
+    fn dual_stack_node_port_snapshot_with_backend(
+        revision: u64,
+        ipv4_backend: Ipv4Addr,
+        ipv6_backend: Ipv6Addr,
+        include_backends: bool,
+        traffic_policy: unf_service::ServiceTrafficPolicy,
+    ) -> ServiceSnapshot {
+        let mut snapshot =
+            dual_stack_service_snapshot(revision, ipv4_backend, ipv6_backend, include_backends);
         let node_ports = snapshot.services[0]
             .frontends
             .iter()
@@ -8225,7 +8237,7 @@ mod tests {
                 name: frontend.name.clone(),
                 app_protocol: frontend.app_protocol.clone(),
                 backend_ids: frontend.backend_ids.clone(),
-                traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+                traffic_policy,
             })
             .collect();
         snapshot.services[0].node_ports = node_ports;
@@ -9057,7 +9069,7 @@ mod tests {
         assert_eq!(action, TC_ACT_PIPE);
         assert_ipv4_packet(&translated, 6, client_v4, backend_v4, 40_000, 8080);
         let reverse = ipv4_packet(6, backend_v4, client_v4, 8080, 40_000);
-        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
         assert_eq!(action, TC_ACT_PIPE);
         assert_ipv4_packet(&translated, 6, service_v4, client_v4, 80, 40_000);
 
@@ -9066,7 +9078,7 @@ mod tests {
         assert_eq!(action, TC_ACT_PIPE);
         assert_ipv4_packet(&translated, 17, client_v4, backend_v4, 40_001, 5353);
         let reverse = ipv4_packet(17, backend_v4, client_v4, 5353, 40_001);
-        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
         assert_eq!(action, TC_ACT_PIPE);
         assert_ipv4_packet(&translated, 17, service_v4, client_v4, 53, 40_001);
 
@@ -9192,6 +9204,296 @@ mod tests {
         assert_ne!(no_backend.service_id.get(), 0);
         assert_eq!(no_backend.backend_id.get(), 0);
         assert_eq!(no_backend.service_revision, 3);
+    }
+
+    #[test]
+    #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
+    fn privileged_node_port_cluster_packets_translate_dual_stack_and_survive_churn() {
+        const TC_ACT_SHOT: u32 = 2;
+        const TC_ACT_PIPE: u32 = 3;
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new()
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(program_name)
+                .expect("service TC program exists")
+                .try_into()
+                .expect("service program is a TC classifier");
+            program
+                .load()
+                .expect("kernel verifier accepts NodePort TC program");
+        }
+        let mut service_events = RingBuf::try_from(
+            ebpf.take_map("SERVICE_EVENTS")
+                .expect("service event ring exists"),
+        )
+        .expect("service event ring opens");
+        let mut flow_events = RingBuf::try_from(
+            ebpf.take_map("FLOW_EVENTS")
+                .expect("flow event ring exists"),
+        )
+        .expect("flow event ring opens");
+        let (mut identity_v4_maps, _identity_v6_maps, mut identity_config) =
+            take_identity_maps(&mut ebpf).expect("take identity maps");
+        let (
+            _identity_policy,
+            mut ipv4_policy,
+            _ipv6_policy,
+            _egress_ipv4_policy,
+            _egress_ipv6_policy,
+            mut policy_config,
+        ) = take_policy_maps(&mut ebpf).expect("take policy maps");
+        let directory = tempdir().unwrap();
+        let mut synchronizer =
+            test_service_synchronizer(&mut ebpf, directory.path().join("service.json"));
+        let state = test_agent_state();
+        let node = node_port_node_snapshot(1);
+        let node_v4 = Ipv4Addr::new(192, 0, 2, 10);
+        let node_v6 = "fdff::10".parse::<Ipv6Addr>().unwrap();
+        let backend_v4 = Ipv4Addr::new(10, 42, 0, 20);
+        let backend_v6 = "fd00:42::20".parse::<Ipv6Addr>().unwrap();
+        let client_v4 = Ipv4Addr::new(203, 0, 113, 5);
+        let client_v6 = "2001:db8::5".parse::<Ipv6Addr>().unwrap();
+        let first = dual_stack_node_port_snapshot_with_backend(
+            1,
+            backend_v4,
+            backend_v6,
+            true,
+            unf_service::ServiceTrafficPolicy::Cluster,
+        );
+        activate_service_snapshot(&mut synchronizer, &first, Some(&node), true, &state)
+            .expect("dual-stack Cluster NodePort activates");
+
+        let ipv4_tcp = ipv4_packet(6, client_v4, node_v4, 40_000, 30_080);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        let ipv4_tcp_snat = u16::from_be_bytes([translated[34], translated[35]]);
+        assert!((32_768..=u16::MAX).contains(&ipv4_tcp_snat));
+        assert_ipv4_packet(&translated, 6, node_v4, backend_v4, ipv4_tcp_snat, 8080);
+        let reverse = ipv4_packet(6, backend_v4, node_v4, 8080, ipv4_tcp_snat);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, node_v4, client_v4, 30_080, 40_000);
+
+        let ipv4_udp = ipv4_packet(17, client_v4, node_v4, 40_001, 30_053);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        let ipv4_udp_snat = u16::from_be_bytes([translated[34], translated[35]]);
+        assert_ipv4_packet(&translated, 17, node_v4, backend_v4, ipv4_udp_snat, 5353);
+        let reverse = ipv4_packet(17, backend_v4, node_v4, 5353, ipv4_udp_snat);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 17, node_v4, client_v4, 30_053, 40_001);
+
+        let ipv6_tcp = ipv6_packet(6, client_v6, node_v6, 40_002, 30_080);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv6_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        let ipv6_tcp_snat = u16::from_be_bytes([translated[54], translated[55]]);
+        assert_ipv6_packet(&translated, 6, node_v6, backend_v6, ipv6_tcp_snat, 8080);
+        let reverse = ipv6_packet(6, backend_v6, node_v6, 8080, ipv6_tcp_snat);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 6, node_v6, client_v6, 30_080, 40_002);
+
+        let ipv6_udp = ipv6_packet(17, client_v6, node_v6, 40_003, 30_053);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv6_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        let ipv6_udp_snat = u16::from_be_bytes([translated[54], translated[55]]);
+        assert_ipv6_packet(&translated, 17, node_v6, backend_v6, ipv6_udp_snat, 5353);
+        let reverse = ipv6_packet(17, backend_v6, node_v6, 5353, ipv6_udp_snat);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, node_v6, client_v6, 30_053, 40_003);
+        assert_eq!(
+            synchronizer
+                .connections
+                .keys()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .len(),
+            8
+        );
+
+        // The source-port high bit does not change the low 15-bit initial NAT
+        // candidate. The second flow therefore proves bounded collision probing
+        // instead of overwriting the first reverse tuple.
+        let colliding_client_port = 0x9c40_u16 ^ 0x8000;
+        let colliding = ipv4_packet(6, client_v4, node_v4, colliding_client_port, 30_080);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &colliding);
+        assert_eq!(action, TC_ACT_PIPE);
+        let colliding_snat = u16::from_be_bytes([translated[34], translated[35]]);
+        let expected_probe = 32_768 + ((ipv4_tcp_snat - 32_768 + 1) & 32_767);
+        assert_eq!(colliding_snat, expected_probe);
+        assert_ipv4_packet(&translated, 6, node_v4, backend_v4, colliding_snat, 8080);
+        let reverse = ipv4_packet(6, backend_v4, node_v4, 8080, colliding_snat);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(
+            &translated,
+            6,
+            node_v4,
+            client_v4,
+            30_080,
+            colliding_client_port,
+        );
+        assert_eq!(
+            synchronizer
+                .connections
+                .keys()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .len(),
+            10
+        );
+
+        let backend_identity = IdentityId::new(22);
+        identity_v4_maps[0]
+            .insert(
+                backend_v4.octets(),
+                encode_identity_value(IdentityMapValue::new(backend_identity, 9)),
+                0,
+            )
+            .expect("backend identity is staged");
+        identity_config
+            .set(0, encode_identity_config(7, 9, 1, 0).unwrap(), 0)
+            .expect("backend identity is activated");
+        let deny = Ipv4PolicyMapEntry {
+            key: unf_state::Ipv4PolicyMapKey {
+                source_address: Ipv4Addr::UNSPECIFIED,
+                destination_identity: backend_identity,
+                protocol: 6,
+                destination_port: 8080,
+            },
+            decision: PolicyDecisionRecord {
+                verdict: Verdict::Deny,
+                reason: PolicyReason::DefaultAction,
+                policy_id: Some(PolicyId::new(7)),
+                rule_id: None,
+            },
+            shadow: None,
+        };
+        let deny_key = encode_ipv4_policy_key(&deny, 0);
+        let deny_value = encode_policy_decisions(&deny.decision, None, 9);
+        ipv4_policy
+            .insert(deny_key, deny_value, 0)
+            .expect("external-source deny is staged");
+        policy_config
+            .set(0, encode_policy_config(7, 9, 1, 0).unwrap(), 0)
+            .expect("external-source deny is activated");
+        let denied = ipv4_packet(6, client_v4, node_v4, 40_100, 30_080);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &denied);
+        assert_eq!(action, TC_ACT_SHOT);
+        identity_config
+            .set(0, [0; 24], 0)
+            .expect("test identity state is disabled");
+        policy_config
+            .set(0, [0; 24], 0)
+            .expect("test policy state is disabled");
+
+        let replacement_v4 = Ipv4Addr::new(10, 42, 0, 21);
+        let replacement_v6 = "fd00:42::21".parse::<Ipv6Addr>().unwrap();
+        let second = dual_stack_node_port_snapshot_with_backend(
+            2,
+            replacement_v4,
+            replacement_v6,
+            true,
+            unf_service::ServiceTrafficPolicy::Cluster,
+        );
+        activate_service_snapshot(&mut synchronizer, &second, Some(&node), true, &state)
+            .expect("replacement NodePort backend activates");
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, node_v4, backend_v4, ipv4_tcp_snat, 8080);
+        let new_flow = ipv4_packet(6, client_v4, node_v4, 41_000, 30_080);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &new_flow);
+        assert_eq!(action, TC_ACT_PIPE);
+        let new_flow_snat = u16::from_be_bytes([translated[34], translated[35]]);
+        assert_ipv4_packet(&translated, 6, node_v4, replacement_v4, new_flow_snat, 8080);
+
+        let backendless = dual_stack_node_port_snapshot_with_backend(
+            3,
+            replacement_v4,
+            replacement_v6,
+            false,
+            unf_service::ServiceTrafficPolicy::Cluster,
+        );
+        activate_service_snapshot(&mut synchronizer, &backendless, Some(&node), true, &state)
+            .expect("backendless NodePort frontend activates");
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &new_flow);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, node_v4, replacement_v4, new_flow_snat, 8080);
+        let no_backend = ipv4_packet(6, client_v4, node_v4, 42_000, 30_080);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &no_backend);
+        assert_eq!(action, TC_ACT_SHOT);
+
+        let local = dual_stack_node_port_snapshot_with_backend(
+            4,
+            replacement_v4,
+            replacement_v6,
+            true,
+            unf_service::ServiceTrafficPolicy::Local,
+        );
+        activate_service_snapshot(&mut synchronizer, &local, Some(&node), true, &state)
+            .expect("Local NodePort intent activates without Cluster broadening");
+        let local_flow = ipv4_packet(6, client_v4, node_v4, 42_001, 30_080);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &local_flow);
+        assert_eq!(action, TC_ACT_SHOT);
+
+        let unrelated = ipv4_packet(6, client_v4, node_v4, 42_002, 30_081);
+        let (action, output) = run_tc(&mut ebpf, "unf_observe_ingress", &unrelated);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_eq!(output, unrelated);
+
+        let mut events = Vec::new();
+        while let Some(item) = service_events.next() {
+            events.push(decode_service_event(&item).expect("kernel service event is valid"));
+        }
+        assert_eq!(events.len(), 16);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == SERVICE_EVENT_ACTION_TRANSLATE)
+                .count(),
+            14
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == SERVICE_EVENT_ACTION_DROP)
+                .count(),
+            2
+        );
+        let first_forward = events
+            .iter()
+            .find(|event| {
+                event.client_port == 40_000_u16.to_be_bytes()
+                    && event.action == SERVICE_EVENT_ACTION_TRANSLATE
+            })
+            .expect("NodePort forward translation has provenance");
+        assert_eq!(&first_forward.frontend_address[..4], &node_v4.octets());
+        assert_eq!(first_forward.frontend_address[4..], [0; 12]);
+        assert_eq!(first_forward.frontend_port, 30_080_u16.to_be_bytes());
+        assert_ne!(first_forward.service_id.get(), 0);
+        assert_ne!(first_forward.backend_id.get(), 0);
+        assert_eq!(first_forward.service_revision, 1);
+
+        let mut policy_events = Vec::new();
+        while let Some(item) = flow_events.next() {
+            policy_events.push(decode_event(&item).expect("kernel policy event is valid"));
+        }
+        let denied = policy_events
+            .iter()
+            .find(|event| event.verdict == Verdict::Deny)
+            .expect("NodePort policy denial is emitted");
+        assert_eq!(denied.flow.destination_identity, backend_identity);
+        assert_eq!(&denied.flow.destination_address[..4], &backend_v4.octets());
+        assert_eq!(denied.flow.destination_address[4..], [0; 12]);
+        assert_eq!(denied.flow.destination_port, 8080_u16.to_be_bytes());
+        assert_eq!(denied.policy_revision, 9);
+        assert_eq!(denied.policy_id, PolicyId::new(7));
     }
 
     #[test]

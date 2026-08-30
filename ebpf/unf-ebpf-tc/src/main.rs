@@ -1,7 +1,9 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::bindings::{BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR, TC_ACT_PIPE, TC_ACT_SHOT};
+use aya_ebpf::bindings::{
+    BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_SHOT,
+};
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
@@ -16,10 +18,12 @@ use unf_ebpf_common::{
     Ipv4NodePortFrontendKey, Ipv4PolicyMapKey, Ipv4ServiceBackendValue, Ipv4ServiceFrontendKey,
     Ipv6ExtensionStep, Ipv6IdentityKey, Ipv6NodePortFrontendKey, Ipv6PolicyMapData,
     Ipv6ServiceBackendValue, Ipv6ServiceFrontendKey, NodePortFrontendValue, NodePortMapConfig,
+    NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_MAP_ABI_VERSION,
     POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, SERVICE_BANK_COUNT,
-    SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_EVENT_ABI_VERSION,
+    SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER, SERVICE_CONNECTION_ROLE_FORWARD,
+    SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_EVENT_ABI_VERSION,
     SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
     SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT, SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
     SERVICE_EVENT_REASON_INVALID_BACKEND, SERVICE_EVENT_REASON_INVALID_FRONTEND,
@@ -45,6 +49,9 @@ const SERVICE_FRONTEND_CAPACITY: u32 = 262_144;
 const SERVICE_BACKEND_CAPACITY: u32 = 524_288;
 const SERVICE_BACKEND_SLOT_CAPACITY: u32 = 1_048_576;
 const SERVICE_CONNECTION_CAPACITY: u32 = 262_144;
+const NODE_PORT_SNAT_PORT_BASE: u16 = 32_768;
+const NODE_PORT_SNAT_PORT_MASK: u32 = 32_767;
+const NODE_PORT_SNAT_PORT_PROBES: u32 = 32;
 const IPV4_HEADER_CHECKSUM_OFFSET: usize = ETHERNET_HEADER_LEN + 10;
 const TCP_CHECKSUM_OFFSET: usize = 16;
 const UDP_CHECKSUM_OFFSET: usize = 6;
@@ -157,8 +164,8 @@ static SERVICE_BACKEND_SLOTS: HashMap<ServiceBackendSlotKey, ServiceBackendSlotV
 static SERVICE_CONFIG: Array<ServiceMapConfig> = Array::with_max_entries(1, 0);
 
 /// Host-facing state has an independent activation pointer. Values name the
-/// exact service bank they reference; no packet hook consumes these maps until
-/// the Phase 5.4 dataplane gate.
+/// exact service bank they reference; the ingress hook admits only validated
+/// `Cluster` frontends while `Local` remains fail-closed until Phase 5.5.
 #[map]
 static NODE_PORT_FRONTENDS_V4: HashMap<Ipv4NodePortFrontendKey, NodePortFrontendValue> =
     HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
@@ -280,8 +287,40 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             forward_key.destination_port = destination_port;
             forward_key.protocol = protocol;
             forward_key.address_family = AddressFamily::Ipv4 as u8;
-            forward_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
             forward_key.reserved = 0;
+            // A Cluster NodePort reply from a remote backend returns to the
+            // receiving Node's SNAT address on an ingress hook. Restore it
+            // before treating the tuple as a possible new frontend flow.
+            forward_key.role = SERVICE_CONNECTION_ROLE_REVERSE;
+            if let Some(translation) = lookup_reverse_service(forward_key, now_ns) {
+                if !rewrite_ipv4(ctx, transport_offset, protocol, &translation, true)
+                    || service_connection_translation(false).is_some_and(
+                        |destination_translation| {
+                            !rewrite_ipv4(
+                                ctx,
+                                transport_offset,
+                                protocol,
+                                &destination_translation,
+                                false,
+                            )
+                        },
+                    )
+                {
+                    emit_service_connection_event(
+                        SERVICE_EVENT_ACTION_DROP,
+                        SERVICE_EVENT_REASON_REWRITE_FAILED,
+                        now_ns,
+                    );
+                    return TC_ACT_SHOT;
+                }
+                emit_service_connection_event(
+                    SERVICE_EVENT_ACTION_TRANSLATE,
+                    SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
+                    now_ns,
+                );
+                return TC_ACT_PIPE;
+            }
+            forward_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
             match lookup_forward_service_v4(forward_key, now_ns) {
                 ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
@@ -292,7 +331,16 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                         translation.address[2],
                         translation.address[3],
                     ];
-                    if !rewrite_ipv4(ctx, transport_offset, protocol, &translation, false) {
+                    if service_connection_translation(true).is_some_and(|source_translation| {
+                        !rewrite_ipv4(
+                            ctx,
+                            transport_offset,
+                            protocol,
+                            &source_translation,
+                            true,
+                        )
+                    }) || !rewrite_ipv4(ctx, transport_offset, protocol, &translation, false)
+                    {
                         emit_service_connection_event(
                             SERVICE_EVENT_ACTION_DROP,
                             SERVICE_EVENT_REASON_REWRITE_FAILED,
@@ -325,7 +373,19 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             reverse_key.role = SERVICE_CONNECTION_ROLE_REVERSE;
             reverse_key.reserved = 0;
             if let Some(translation) = lookup_reverse_service(reverse_key, now_ns) {
-                if !rewrite_ipv4(ctx, transport_offset, protocol, &translation, true) {
+                if !rewrite_ipv4(ctx, transport_offset, protocol, &translation, true)
+                    || service_connection_translation(false).is_some_and(
+                        |destination_translation| {
+                            !rewrite_ipv4(
+                                ctx,
+                                transport_offset,
+                                protocol,
+                                &destination_translation,
+                                false,
+                            )
+                        },
+                    )
+                {
                     emit_service_connection_event(
                         SERVICE_EVENT_ACTION_DROP,
                         SERVICE_EVENT_REASON_REWRITE_FAILED,
@@ -428,13 +488,51 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             forward_key.destination_port = observation.destination_port;
             forward_key.protocol = protocol;
             forward_key.address_family = AddressFamily::Ipv6 as u8;
-            forward_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
             forward_key.reserved = 0;
+            forward_key.role = SERVICE_CONNECTION_ROLE_REVERSE;
+            if let Some(translation) = lookup_reverse_service(forward_key, now_ns) {
+                if !rewrite_ipv6(ctx, transport_offset, protocol, &translation, true)
+                    || service_connection_translation(false).is_some_and(
+                        |destination_translation| {
+                            !rewrite_ipv6(
+                                ctx,
+                                transport_offset,
+                                protocol,
+                                &destination_translation,
+                                false,
+                            )
+                        },
+                    )
+                {
+                    emit_service_connection_event(
+                        SERVICE_EVENT_ACTION_DROP,
+                        SERVICE_EVENT_REASON_REWRITE_FAILED,
+                        now_ns,
+                    );
+                    return TC_ACT_SHOT;
+                }
+                emit_service_connection_event(
+                    SERVICE_EVENT_ACTION_TRANSLATE,
+                    SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
+                    now_ns,
+                );
+                return TC_ACT_PIPE;
+            }
+            forward_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
             match lookup_forward_service_v6(forward_key, now_ns) {
                 ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
                 ServiceLookup::Translation(translation) => {
-                    if !rewrite_ipv6(ctx, transport_offset, protocol, &translation, false) {
+                    if service_connection_translation(true).is_some_and(|source_translation| {
+                        !rewrite_ipv6(
+                            ctx,
+                            transport_offset,
+                            protocol,
+                            &source_translation,
+                            true,
+                        )
+                    }) || !rewrite_ipv6(ctx, transport_offset, protocol, &translation, false)
+                    {
                         emit_service_connection_event(
                             SERVICE_EVENT_ACTION_DROP,
                             SERVICE_EVENT_REASON_REWRITE_FAILED,
@@ -467,7 +565,19 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             reverse_key.role = SERVICE_CONNECTION_ROLE_REVERSE;
             reverse_key.reserved = 0;
             if let Some(translation) = lookup_reverse_service(reverse_key, now_ns) {
-                if !rewrite_ipv6(ctx, transport_offset, protocol, &translation, true) {
+                if !rewrite_ipv6(ctx, transport_offset, protocol, &translation, true)
+                    || service_connection_translation(false).is_some_and(
+                        |destination_translation| {
+                            !rewrite_ipv6(
+                                ctx,
+                                transport_offset,
+                                protocol,
+                                &destination_translation,
+                                false,
+                            )
+                        },
+                    )
+                {
                     emit_service_connection_event(
                         SERVICE_EVENT_ACTION_DROP,
                         SERVICE_EVENT_REASON_REWRITE_FAILED,
@@ -605,6 +715,99 @@ fn active_service_config() -> Option<ServiceMapConfig> {
     Some(config)
 }
 
+#[inline(always)]
+fn active_node_port_config(service: ServiceMapConfig) -> Option<NodePortMapConfig> {
+    let config = NODE_PORT_CONFIG.get(0).copied()?;
+    if config.schema_version != NODE_PORT_MAP_ABI_VERSION
+        || config.active_bank >= NODE_PORT_BANK_COUNT
+        || config.source_epoch == 0
+        || config.service_revision == 0
+        || config.node_revision == 0
+        || config.source_epoch != service.source_epoch
+        || config.service_revision != service.revision
+        || config.ipv4_count > SERVICE_FRONTEND_CAPACITY / 2
+        || config.ipv6_count > SERVICE_FRONTEND_CAPACITY / 2
+        || config.flags != 0
+        || config.reserved != 0
+    {
+        return None;
+    }
+    Some(config)
+}
+
+/// Returns the additional source translation for a Cluster NodePort forward
+/// packet, or the destination restoration for its reverse packet.
+#[inline(always)]
+fn service_connection_translation(forward: bool) -> Option<ServiceTranslation> {
+    let value_ptr = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0)?;
+    // SAFETY: the active lookup initialized this CPU's unique scratch slot.
+    #[allow(unsafe_code)]
+    let value = unsafe { &*value_ptr };
+    if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER == 0 {
+        return None;
+    }
+    if forward {
+        Some(ServiceTranslation {
+            address: value.frontend_address,
+            port: node_port_snat_port(value),
+        })
+    } else {
+        Some(ServiceTranslation {
+            address: value.client_address,
+            port: value.client_port,
+        })
+    }
+}
+
+#[inline(always)]
+fn validate_node_port_frontend(
+    forward_key: &ServiceConnectionKey,
+    frontend: NodePortFrontendValue,
+    config: NodePortMapConfig,
+    service: ServiceMapConfig,
+    now_ns: u64,
+) -> Result<ServiceFrontendValue, ()> {
+    if frontend.schema_version != NODE_PORT_MAP_ABI_VERSION
+        || frontend.service_revision != config.service_revision
+        || frontend.service_revision != service.revision
+        || frontend.service_id.get() == 0
+        || frontend.service_bank != service.active_bank
+        || frontend.flags & !NODE_PORT_FRONTEND_FLAG_LOCAL != 0
+        || frontend.reserved != [0; 7]
+    {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.service_revision,
+            SERVICE_EVENT_REASON_INVALID_FRONTEND,
+            now_ns,
+        );
+        return Err(());
+    }
+    if frontend.flags & NODE_PORT_FRONTEND_FLAG_LOCAL != 0 {
+        // An exact Local-policy match must never broaden to Cluster selection.
+        // Phase 5.5 replaces this explicit fail-closed boundary with local
+        // eligibility and source-preserving forwarding.
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.service_revision,
+            SERVICE_EVENT_REASON_INVALID_FRONTEND,
+            now_ns,
+        );
+        return Err(());
+    }
+    Ok(ServiceFrontendValue {
+        service_id: frontend.service_id,
+        frontend_index: frontend.frontend_index,
+        backend_count: frontend.backend_count,
+        schema_version: SERVICE_MAP_ABI_VERSION,
+        flags: 0,
+        revision: frontend.service_revision,
+        reserved: [0; 8],
+    })
+}
+
 #[inline(never)]
 fn emit_service_connection_event(action: u8, reason: u8, timestamp_ns: u64) {
     let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
@@ -690,16 +893,31 @@ fn service_forward_key(value: &ServiceConnectionValue) -> ServiceConnectionKey {
 
 #[inline(always)]
 fn service_reverse_key(value: &ServiceConnectionValue) -> ServiceConnectionKey {
+    let node_port_cluster =
+        value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0;
     ServiceConnectionKey {
         source_address: value.backend_address,
-        destination_address: value.client_address,
+        destination_address: if node_port_cluster {
+            value.frontend_address
+        } else {
+            value.client_address
+        },
         source_port: value.backend_port,
-        destination_port: value.client_port,
+        destination_port: if node_port_cluster {
+            node_port_snat_port(value)
+        } else {
+            value.client_port
+        },
         protocol: value.protocol,
         address_family: value.address_family,
         role: SERVICE_CONNECTION_ROLE_REVERSE,
         reserved: 0,
     }
+}
+
+#[inline(always)]
+fn node_port_snat_port(value: &ServiceConnectionValue) -> [u8; 2] {
+    [value.reserved[0], value.reserved[1]]
 }
 
 #[inline(always)]
@@ -716,6 +934,26 @@ fn store_service_pair(value: &ServiceConnectionValue) -> bool {
     }
     let forward = service_forward_key(value);
     if SERVICE_CONNECTIONS.insert(&forward, value, 0).is_err() {
+        let _ = SERVICE_CONNECTIONS.remove(&reverse);
+        return false;
+    }
+    true
+}
+
+#[inline(always)]
+fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
+    let reverse = service_reverse_key(value);
+    if SERVICE_CONNECTIONS
+        .insert(&reverse, value, BPF_NOEXIST as u64)
+        .is_err()
+    {
+        return false;
+    }
+    let forward = service_forward_key(value);
+    if SERVICE_CONNECTIONS
+        .insert(&forward, value, BPF_NOEXIST as u64)
+        .is_err()
+    {
         let _ = SERVICE_CONNECTIONS.remove(&reverse);
         return false;
     }
@@ -795,6 +1033,7 @@ fn new_service_connection(
     address_family: AddressFamily,
     frontend: ServiceFrontendValue,
     backend_id: unf_common::BackendId,
+    flags: u16,
     now_ns: u64,
 ) -> Option<ServiceTranslation> {
     let scratch = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0)?;
@@ -814,9 +1053,26 @@ fn new_service_connection(
     value.schema_version = SERVICE_MAP_ABI_VERSION;
     value.protocol = protocol;
     value.address_family = address_family as u8;
-    value.flags = 0;
+    value.flags = flags;
     value.reserved = [0; 4];
-    if !store_service_pair(value) {
+    if flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
+        let hash = service_flow_hash(&service_forward_key(value), frontend.service_id);
+        let mut probe = 0_u32;
+        while probe < NODE_PORT_SNAT_PORT_PROBES {
+            let port = NODE_PORT_SNAT_PORT_BASE
+                .wrapping_add(((hash.wrapping_add(probe)) & NODE_PORT_SNAT_PORT_MASK) as u16);
+            value.reserved[0..2].copy_from_slice(&port.to_be_bytes());
+            if insert_new_service_pair(value) {
+                return Some(ServiceTranslation {
+                    address: backend_address,
+                    port: backend_port,
+                });
+            }
+            probe += 1;
+        }
+        return None;
+    }
+    if !insert_new_service_pair(value) {
         return None;
     }
     Some(ServiceTranslation {
@@ -849,8 +1105,46 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     // SAFETY: the exact key and fixed-layout value match the declared map ABI;
     // the value is copied before any other map operation.
     #[allow(unsafe_code)]
-    let Some(frontend) = (unsafe { SERVICE_FRONTENDS_V4.get(&frontend_key).copied() }) else {
-        return ServiceLookup::Miss;
+    let cluster_frontend = unsafe { SERVICE_FRONTENDS_V4.get(&frontend_key).copied() };
+    let (frontend, service_bank, connection_flags) = if let Some(frontend) = cluster_frontend {
+        (frontend, config.active_bank, 0)
+    } else {
+        let Some(node_port_config) = active_node_port_config(config) else {
+            return ServiceLookup::Miss;
+        };
+        let node_port_key = Ipv4NodePortFrontendKey {
+            address: [
+                forward_key.destination_address[0],
+                forward_key.destination_address[1],
+                forward_key.destination_address[2],
+                forward_key.destination_address[3],
+            ],
+            port: forward_key.destination_port,
+            protocol: forward_key.protocol,
+            bank: node_port_config.active_bank,
+        };
+        // SAFETY: the exact key and fixed-layout value match the declared map
+        // ABI and the value is copied before any other map operation.
+        #[allow(unsafe_code)]
+        let Some(node_port_frontend) =
+            (unsafe { NODE_PORT_FRONTENDS_V4.get(&node_port_key).copied() })
+        else {
+            return ServiceLookup::Miss;
+        };
+        let Ok(frontend) = validate_node_port_frontend(
+            forward_key,
+            node_port_frontend,
+            node_port_config,
+            config,
+            now_ns,
+        ) else {
+            return ServiceLookup::Drop;
+        };
+        (
+            frontend,
+            node_port_frontend.service_bank,
+            SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER,
+        )
     };
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
         || frontend.revision != config.revision
@@ -881,7 +1175,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         service_id: frontend.service_id,
         frontend_index: frontend.frontend_index,
         slot: service_flow_hash(forward_key, frontend.service_id) % frontend.backend_count,
-        bank: config.active_bank,
+        bank: service_bank,
         reserved: [0; 3],
     };
     // SAFETY: the exact key and fixed-layout value match the declared map ABI.
@@ -913,7 +1207,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     let backend_key = ServiceBackendKey {
         service_id: frontend.service_id,
         backend_id: slot.backend_id,
-        bank: config.active_bank,
+        bank: service_bank,
         reserved: [0; 3],
     };
     // SAFETY: the exact key and fixed-layout value match the declared map ABI.
@@ -959,6 +1253,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         AddressFamily::Ipv4,
         frontend,
         slot.backend_id,
+        connection_flags,
         now_ns,
     ) else {
         emit_service_connection_event(
@@ -990,8 +1285,41 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     // SAFETY: the exact key and fixed-layout value match the declared map ABI;
     // the value is copied before any other map operation.
     #[allow(unsafe_code)]
-    let Some(frontend) = (unsafe { SERVICE_FRONTENDS_V6.get(&frontend_key).copied() }) else {
-        return ServiceLookup::Miss;
+    let cluster_frontend = unsafe { SERVICE_FRONTENDS_V6.get(&frontend_key).copied() };
+    let (frontend, service_bank, connection_flags) = if let Some(frontend) = cluster_frontend {
+        (frontend, config.active_bank, 0)
+    } else {
+        let Some(node_port_config) = active_node_port_config(config) else {
+            return ServiceLookup::Miss;
+        };
+        let node_port_key = Ipv6NodePortFrontendKey {
+            address: forward_key.destination_address,
+            port: forward_key.destination_port,
+            protocol: forward_key.protocol,
+            bank: node_port_config.active_bank,
+        };
+        // SAFETY: the exact key and fixed-layout value match the declared map
+        // ABI and the value is copied before any other map operation.
+        #[allow(unsafe_code)]
+        let Some(node_port_frontend) =
+            (unsafe { NODE_PORT_FRONTENDS_V6.get(&node_port_key).copied() })
+        else {
+            return ServiceLookup::Miss;
+        };
+        let Ok(frontend) = validate_node_port_frontend(
+            forward_key,
+            node_port_frontend,
+            node_port_config,
+            config,
+            now_ns,
+        ) else {
+            return ServiceLookup::Drop;
+        };
+        (
+            frontend,
+            node_port_frontend.service_bank,
+            SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER,
+        )
     };
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
         || frontend.revision != config.revision
@@ -1022,7 +1350,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         service_id: frontend.service_id,
         frontend_index: frontend.frontend_index,
         slot: service_flow_hash(forward_key, frontend.service_id) % frontend.backend_count,
-        bank: config.active_bank,
+        bank: service_bank,
         reserved: [0; 3],
     };
     // SAFETY: the exact key and fixed-layout value match the declared map ABI.
@@ -1054,7 +1382,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     let backend_key = ServiceBackendKey {
         service_id: frontend.service_id,
         backend_id: slot.backend_id,
-        bank: config.active_bank,
+        bank: service_bank,
         reserved: [0; 3],
     };
     // SAFETY: the exact key and fixed-layout value match the declared map ABI.
@@ -1095,6 +1423,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         AddressFamily::Ipv6,
         frontend,
         slot.backend_id,
+        connection_flags,
         now_ns,
     ) else {
         emit_service_connection_event(
