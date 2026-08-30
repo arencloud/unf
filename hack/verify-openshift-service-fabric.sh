@@ -195,10 +195,20 @@ attachment_count() {
     grep -E '^[0-9]+$' <<<"${output}" | tail -n 1
 }
 
-tcp_probe() {
+tcp_probe_once() {
     local address=$1 port=${2:-8080}
     "${kc[@]}" -n "${namespace}" exec client -- \
         wget -T 4 -t 1 -qO- "http://${address}:${port}/health" | grep -qx ok
+}
+
+tcp_probe() {
+    local address=$1 port=${2:-8080}
+    for _ in $(seq 1 3); do
+        if tcp_probe_once "${address}" "${port}"; then return 0; fi
+        sleep 0.2
+    done
+    echo "TCP service probe failed for ${address}:${port}" >&2
+    return 1
 }
 
 udp_probe_once() {
