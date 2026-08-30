@@ -428,8 +428,12 @@ matrix is maintained in the
   connection selection across churn, preserve checksums/provenance, and apply
   ingress policy to the translated backend tuple; `Local` cannot broaden to
   Cluster; ADR 0086.
-- In progress: node-local eligibility and source-preserving `Local` forwarding;
-  operations/simulation and independent kube-proxy-free Kind/OpenShift gates
-  follow.
+- Verified by `make nodeport-local-dataplane-test`: disjoint node-scoped slots
+  admit only ready non-terminating backends placed on the receiving Node; Local
+  preserves the external source and proves exact reverse translation,
+  no-local-backend behavior, placement/readiness churn, recovery, and policy
+  ordering; ADR 0087. LoadBalancer health-check NodePorts remain separate.
+- In progress: NodePort operations and simulation; independent kube-proxy-free
+  Kind/OpenShift gates follow.
 - LoadBalancer, session affinity, topology-aware selection, Maglev, and DSR
   remain separate future milestones.

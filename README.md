@@ -202,9 +202,12 @@ perform dual-stack TCP/UDP DNAT and paired NodePort reverse SNAT through the
 coherent service bank, retain connections across backend churn, preserve
 checksums and provenance, use bounded collision-safe Node source ports so
 cross-node replies return to the owning connection, and apply ingress policy to
-the original source plus translated backend identity and port. `Local` matches
-remain explicitly fail-closed until the
-active Phase 5.5 local-eligibility milestone; ADR 0086 defines that boundary.
+the original source plus translated backend identity and port. Phase 5.5 is
+also verified: `Local` uses transactionally merged receiving-Node slots, admits
+only ready non-terminating local backends, preserves the external source, and
+returns exact no-local-backend evidence through placement/readiness loss and
+recovery. `make nodeport-local-dataplane-test` and ADR 0087 define that gate;
+NodePort operations are the active Phase 5.6 milestone.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

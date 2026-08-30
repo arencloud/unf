@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{BackendId, Protocol, Revision, ServiceId};
 use unf_ebpf_common::{
-    NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_MAP_ABI_VERSION,
-    SERVICE_BACKEND_FLAG_READY, SERVICE_BACKEND_FLAG_SERVING, SERVICE_BACKEND_FLAG_TERMINATING,
-    SERVICE_BANK_COUNT, SERVICE_MAP_ABI_VERSION,
+    NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG,
+    NODE_PORT_MAP_ABI_VERSION, SERVICE_BACKEND_FLAG_READY, SERVICE_BACKEND_FLAG_SERVING,
+    SERVICE_BACKEND_FLAG_TERMINATING, SERVICE_BANK_COUNT, SERVICE_MAP_ABI_VERSION,
 };
 
 pub use unf_common::SERVICE_SNAPSHOT_SCHEMA_VERSION;
@@ -477,6 +477,8 @@ pub enum NodePortFabricDataplaneError {
     Service(#[from] ServiceDataplaneError),
     #[error(transparent)]
     NodePort(#[from] NodePortDataplaneError),
+    #[error("node-local NodePort slot key collided with a ClusterIP slot")]
+    LocalSlotCollision,
 }
 
 /// Canonical fixed-width local `NodePort` state. Values reference one already
@@ -490,6 +492,9 @@ pub struct NodePortDataplaneState {
     pub bank: u8,
     pub ipv4_frontends: BTreeMap<[u8; 8], [u8; 32]>,
     pub ipv6_frontends: BTreeMap<[u8; 20], [u8; 32]>,
+    /// Node-local slot entries merged into the referenced service bank by the
+    /// complete fabric compiler. Cluster-policy frontends leave this empty.
+    pub service_backend_slots: BTreeMap<[u8; 16], [u8; 16]>,
     pub config: [u8; 40],
 }
 
@@ -502,6 +507,7 @@ pub struct NodePortFabricDataplaneState {
 struct CompiledNodePortFrontends {
     ipv4: BTreeMap<[u8; 8], [u8; 32]>,
     ipv6: BTreeMap<[u8; 20], [u8; 32]>,
+    service_backend_slots: BTreeMap<[u8; 16], [u8; 16]>,
 }
 
 #[derive(Default)]
@@ -1498,6 +1504,7 @@ pub fn compile_node_port_dataplane(
         bank,
         ipv4_frontends: frontends.ipv4,
         ipv6_frontends: frontends.ipv6,
+        service_backend_slots: frontends.service_backend_slots,
         config,
     })
 }
@@ -1523,7 +1530,25 @@ pub fn compile_node_port_fabric_dataplane(
     for service in &mut cluster_ip.services {
         service.node_ports.clear();
     }
-    let service = compile_service_dataplane(&cluster_ip, service_bank)?;
+    let mut service = compile_service_dataplane(&cluster_ip, service_bank)?;
+    for (key, value) in &node_port.service_backend_slots {
+        if service.backend_slots.insert(*key, *value).is_some() {
+            return Err(NodePortFabricDataplaneError::LocalSlotCollision);
+        }
+    }
+    validate_dataplane_capacity(
+        "SERVICE_BACKEND_SLOTS",
+        service.backend_slots.len(),
+        SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+    )?;
+    service.config = encode_service_config(
+        service.source_epoch,
+        service.revision,
+        service.ipv4_frontends.len() + service.ipv6_frontends.len(),
+        service.ipv4_backends.len() + service.ipv6_backends.len(),
+        service.backend_slots.len(),
+        service.bank,
+    );
     Ok(NodePortFabricDataplaneState { service, node_port })
 }
 
@@ -1578,14 +1603,9 @@ fn compile_node_port_frontends(
 ) -> Result<CompiledNodePortFrontends, NodePortDataplaneError> {
     let mut ipv4_frontends = BTreeMap::new();
     let mut ipv6_frontends = BTreeMap::new();
+    let mut service_backend_slots = BTreeMap::new();
     for service in &snapshot.services {
-        let eligible_backends = service
-            .backends
-            .iter()
-            .filter(|backend| backend.ready && !backend.terminating)
-            .map(|backend| backend.id)
-            .collect::<BTreeSet<_>>();
-        for node_port in &service.node_ports {
+        for (node_port_index, node_port) in service.node_ports.iter().enumerate() {
             if !matches!(node_port.protocol, Protocol::Tcp | Protocol::Udp) {
                 return Err(NodePortDataplaneError::UnsupportedProtocol(
                     node_port.protocol,
@@ -1605,19 +1625,30 @@ fn compile_node_port_frontends(
                     service_id: service.id,
                     node_port: node_port.port,
                 })?;
-            let eligible_count = node_port
-                .backend_ids
-                .iter()
-                .filter(|backend| eligible_backends.contains(backend))
-                .count();
-            let flags = match node_port.traffic_policy {
-                ServiceTrafficPolicy::Cluster => 0,
-                ServiceTrafficPolicy::Local => NODE_PORT_FRONTEND_FLAG_LOCAL,
+            let eligible_backend_ids = eligible_node_port_backend_ids(service, node_port, node);
+            let (frontend_index, flags) = match node_port.traffic_policy {
+                ServiceTrafficPolicy::Cluster => (bounded_u32(frontend_index), 0),
+                ServiceTrafficPolicy::Local => {
+                    let local_frontend_index =
+                        NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG + bounded_u32(node_port_index);
+                    for (slot, backend_id) in eligible_backend_ids.iter().enumerate() {
+                        service_backend_slots.insert(
+                            encode_service_backend_slot_key(
+                                service.id,
+                                local_frontend_index,
+                                bounded_u32(slot),
+                                service_bank,
+                            ),
+                            encode_service_backend_slot_value(*backend_id, snapshot.revision.get()),
+                        );
+                    }
+                    (local_frontend_index, NODE_PORT_FRONTEND_FLAG_LOCAL)
+                }
             };
             let value = encode_node_port_frontend_value(
                 service.id,
-                bounded_u32(frontend_index),
-                eligible_count,
+                frontend_index,
+                eligible_backend_ids.len(),
                 flags,
                 snapshot.revision.get(),
                 service_bank,
@@ -1655,7 +1686,29 @@ fn compile_node_port_frontends(
     Ok(CompiledNodePortFrontends {
         ipv4: ipv4_frontends,
         ipv6: ipv6_frontends,
+        service_backend_slots,
     })
+}
+
+fn eligible_node_port_backend_ids(
+    service: &ServiceIr,
+    node_port: &ServiceNodePort,
+    node: &NodePortNodeSnapshot,
+) -> Vec<BackendId> {
+    node_port
+        .backend_ids
+        .iter()
+        .filter(|backend_id| {
+            service.backends.iter().any(|backend| {
+                backend.id == **backend_id
+                    && backend.ready
+                    && !backend.terminating
+                    && (node_port.traffic_policy == ServiceTrafficPolicy::Cluster
+                        || backend.node_name.as_deref() == Some(node.node_name.as_str()))
+            })
+        })
+        .copied()
+        .collect()
 }
 
 fn validate_node_port_capacity(
@@ -2345,6 +2398,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn node_port_dataplane_is_node_scoped_banked_and_policy_typed() {
         let mut source = source_service();
         source.external_traffic_policy = ServiceTrafficPolicy::Local;
@@ -2404,6 +2458,34 @@ mod tests {
             7
         );
         assert_eq!(state.config[34], 0);
+
+        let mut local_snapshot = snapshot.clone();
+        for backend in &mut local_snapshot.services[0].backends {
+            backend.ready = true;
+            backend.terminating = false;
+        }
+        let mut local_node = node.clone();
+        local_node.node_name = "api-v4-node".to_owned();
+        let local = compile_node_port_dataplane(&local_snapshot, &local_node, 1, 0)
+            .expect("Local NodePort slots compile for only the receiving Node");
+        assert_eq!(local.service_backend_slots.len(), 1);
+        assert!(local.ipv4_frontends.values().all(|value| {
+            u32::from_ne_bytes(value[4..8].try_into().unwrap())
+                >= NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG
+                && u32::from_ne_bytes(value[8..12].try_into().unwrap()) == 1
+        }));
+        assert!(local.ipv6_frontends.values().all(|value| {
+            u32::from_ne_bytes(value[4..8].try_into().unwrap())
+                >= NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG
+                && u32::from_ne_bytes(value[8..12].try_into().unwrap()) == 0
+        }));
+        let fabric = compile_node_port_fabric_dataplane(&local_snapshot, &local_node, 1, 0)
+            .expect("node-local slots merge into the same service transaction");
+        assert_eq!(fabric.service.backend_slots.len(), 5);
+        assert_eq!(
+            u32::from_ne_bytes(fabric.service.config[24..28].try_into().unwrap()),
+            5
+        );
 
         let mut skewed = node;
         skewed.source_epoch = 10;

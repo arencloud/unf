@@ -18,12 +18,13 @@ use unf_ebpf_common::{
     Ipv4NodePortFrontendKey, Ipv4PolicyMapKey, Ipv4ServiceBackendValue, Ipv4ServiceFrontendKey,
     Ipv6ExtensionStep, Ipv6IdentityKey, Ipv6NodePortFrontendKey, Ipv6PolicyMapData,
     Ipv6ServiceBackendValue, Ipv6ServiceFrontendKey, NodePortFrontendValue, NodePortMapConfig,
-    NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_MAP_ABI_VERSION,
+    NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG,
+    NODE_PORT_MAP_ABI_VERSION,
     POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, SERVICE_BANK_COUNT,
-    SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER, SERVICE_CONNECTION_ROLE_FORWARD,
-    SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_EVENT_ABI_VERSION,
+    SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER, SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL,
+    SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_EVENT_ABI_VERSION,
     SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
     SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT, SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
     SERVICE_EVENT_REASON_INVALID_BACKEND, SERVICE_EVENT_REASON_INVALID_FRONTEND,
@@ -164,8 +165,8 @@ static SERVICE_BACKEND_SLOTS: HashMap<ServiceBackendSlotKey, ServiceBackendSlotV
 static SERVICE_CONFIG: Array<ServiceMapConfig> = Array::with_max_entries(1, 0);
 
 /// Host-facing state has an independent activation pointer. Values name the
-/// exact service bank they reference; the ingress hook admits only validated
-/// `Cluster` frontends while `Local` remains fail-closed until Phase 5.5.
+/// exact service bank they reference; the ingress hook distinguishes validated
+/// Cluster and node-local slot semantics without widening either policy.
 #[map]
 static NODE_PORT_FRONTENDS_V4: HashMap<Ipv4NodePortFrontendKey, NodePortFrontendValue> =
     HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
@@ -766,13 +767,17 @@ fn validate_node_port_frontend(
     config: NodePortMapConfig,
     service: ServiceMapConfig,
     now_ns: u64,
-) -> Result<ServiceFrontendValue, ()> {
+) -> Result<(ServiceFrontendValue, u16), ()> {
     if frontend.schema_version != NODE_PORT_MAP_ABI_VERSION
         || frontend.service_revision != config.service_revision
         || frontend.service_revision != service.revision
         || frontend.service_id.get() == 0
         || frontend.service_bank != service.active_bank
         || frontend.flags & !NODE_PORT_FRONTEND_FLAG_LOCAL != 0
+        || (frontend.flags & NODE_PORT_FRONTEND_FLAG_LOCAL != 0
+            && frontend.frontend_index & NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG == 0)
+        || (frontend.flags & NODE_PORT_FRONTEND_FLAG_LOCAL == 0
+            && frontend.frontend_index & NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG != 0)
         || frontend.reserved != [0; 7]
     {
         emit_service_lookup_failure(
@@ -784,28 +789,23 @@ fn validate_node_port_frontend(
         );
         return Err(());
     }
-    if frontend.flags & NODE_PORT_FRONTEND_FLAG_LOCAL != 0 {
-        // An exact Local-policy match must never broaden to Cluster selection.
-        // Phase 5.5 replaces this explicit fail-closed boundary with local
-        // eligibility and source-preserving forwarding.
-        emit_service_lookup_failure(
-            forward_key,
-            frontend.service_id,
-            frontend.service_revision,
-            SERVICE_EVENT_REASON_INVALID_FRONTEND,
-            now_ns,
-        );
-        return Err(());
-    }
-    Ok(ServiceFrontendValue {
-        service_id: frontend.service_id,
-        frontend_index: frontend.frontend_index,
-        backend_count: frontend.backend_count,
-        schema_version: SERVICE_MAP_ABI_VERSION,
-        flags: 0,
-        revision: frontend.service_revision,
-        reserved: [0; 8],
-    })
+    let connection_flags = if frontend.flags & NODE_PORT_FRONTEND_FLAG_LOCAL != 0 {
+        SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
+    } else {
+        SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
+    };
+    Ok((
+        ServiceFrontendValue {
+            service_id: frontend.service_id,
+            frontend_index: frontend.frontend_index,
+            backend_count: frontend.backend_count,
+            schema_version: SERVICE_MAP_ABI_VERSION,
+            flags: 0,
+            revision: frontend.service_revision,
+            reserved: [0; 8],
+        },
+        connection_flags,
+    ))
 }
 
 #[inline(never)]
@@ -1131,7 +1131,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         else {
             return ServiceLookup::Miss;
         };
-        let Ok(frontend) = validate_node_port_frontend(
+        let Ok((frontend, connection_flags)) = validate_node_port_frontend(
             forward_key,
             node_port_frontend,
             node_port_config,
@@ -1143,7 +1143,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         (
             frontend,
             node_port_frontend.service_bank,
-            SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER,
+            connection_flags,
         )
     };
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
@@ -1306,7 +1306,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         else {
             return ServiceLookup::Miss;
         };
-        let Ok(frontend) = validate_node_port_frontend(
+        let Ok((frontend, connection_flags)) = validate_node_port_frontend(
             forward_key,
             node_port_frontend,
             node_port_config,
@@ -1318,7 +1318,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         (
             frontend,
             node_port_frontend.service_bank,
-            SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER,
+            connection_flags,
         )
     };
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION

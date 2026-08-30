@@ -44,10 +44,10 @@ key layout without an ABI change.
 | `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks; pinned | one entry; failed activation preserves the previous pointer |
 | `SERVICE_FRONTENDS_V4`, `SERVICE_FRONTENDS_V6` | exact address, network-order port, protocol, bank | ServiceId, revision-local frontend index, eligible backend count, schema, revision | service compiler; agent transactional writer; TC reader | both families stage/read back together; pinned under ABI v5 | 262,144 physical entries each, capped at 131,072 per bank; an exact zero-backend frontend drops new flows while an unrelated tuple passes |
 | `SERVICE_BACKENDS_V4`, `SERVICE_BACKENDS_V6` | ServiceId, BackendId, bank | revision, address, network-order port, protocol, lifecycle flags, schema | service compiler; agent transactional writer; TC reader | all endpoint lifecycle records stage with frontends; pinned | 524,288 physical entries each, capped at 262,144 per bank; new-flow slots admit only ready, non-terminating entries |
-| `SERVICE_BACKEND_SLOTS` | ServiceId, revision-local frontend index, ordered slot, bank | stable BackendId, schema, revision | service compiler; agent transactional writer; TC reader | deterministic eligible membership stages with both families; pinned | 1,048,576 physical entries, capped at 524,288 per bank |
+| `SERVICE_BACKEND_SLOTS` | ServiceId, revision-local frontend index, ordered slot, bank | stable BackendId, schema, revision | service compiler; agent transactional writer; TC reader | deterministic eligible membership stages with both families; Local NodePort entries use a disjoint high-index namespace and merge into the same service transaction; pinned | 1,048,576 physical entries, capped at 524,288 per bank |
 | `SERVICE_CONFIG` | constant `u32` slot 0 | controller epoch, service revision, frontend/backend/slot counts, schema, active bank | agent writer; TC reader | one write activates all five service tables; durable-checkpoint failure restores the prior pointer | one entry; absent/invalid config means no desired service lookup, while an existing valid connection remains usable until timeout |
 | `SERVICE_CONNECTIONS` | complete IPv4/IPv6 L4 tuple plus forward/reverse role | last-seen, service revision, client/frontend/backend tuples, ServiceId, BackendId, schema/flags | TC writer/reader | persistent ABI v5; reverse inserts first, forward second, partial failure removes reverse; lookups validate the complete peer tuple and refresh both entries | bounded 262,144-entry LRU; valid TCP/UDP pairs survive desired-state churn until protocol timeout; corrupt/expired pairs are removed |
-| `NODE_PORT_FRONTENDS_V4`, `NODE_PORT_FRONTENDS_V6` | local Node address, network-order NodePort, protocol, bank | ServiceId, frontend index, eligible-backend count, service revision/bank, schema, traffic-policy flag | service compiler; agent transactional writer; ingress TC reader | both families stage/read back together under a NodePort-specific bank; pinned under ABI v5; exact `Cluster` matches reuse service slots while `Local` matches fail closed pending Phase 5.5 | 262,144 physical entries each, capped at 131,072 per bank; arithmetic address × NodePort preflight fails before allocation |
+| `NODE_PORT_FRONTENDS_V4`, `NODE_PORT_FRONTENDS_V6` | local Node address, network-order NodePort, protocol, bank | ServiceId, frontend index, eligible-backend count, service revision/bank, schema, traffic-policy flag | service compiler; agent transactional writer; ingress TC reader | both families stage/read back together under a NodePort-specific bank and pin under ABI v5; exact Cluster matches use global service slots, while Local matches use receiving-Node-only slots | 262,144 physical entries each, capped at 131,072 per bank; arithmetic address × NodePort preflight fails before allocation |
 | `NODE_PORT_CONFIG` | constant `u32` slot 0 | controller epoch, service and local-Node revisions, family counts, schema, active NodePort bank | agent writer; ingress TC reader | independent pointer references values that must name the exact active service epoch, revision, and bank; address-only changes do not churn ClusterIP maps | one entry; dual-pointer crash recovery either commits the complete prepared tuple or restores the prior durable tuple before attachment |
 
 `FlowEvent` carries no Kubernetes strings. ABI v2 records the applied policy
@@ -70,6 +70,14 @@ recognizes the exact reverse role and restores cross-node replies before local
 delivery. Both restore the NodePort source and original client destination.
 Policy retains the original external source while evaluating the selected
 backend identity and backend port after DNAT.
+
+Local NodePort compilation filters the linked backend IDs by readiness,
+non-termination, and exact EndpointSlice `nodeName`, then writes those slots in
+a disjoint high frontend-index namespace in the referenced service bank. Local
+forwarding performs destination translation only, so the backend sees the
+external source; the same-node egress hook restores the NodePort source tuple.
+An empty local slot set is an exact new-flow drop, while established connection
+pairs retain their bounded timeout behavior across placement churn.
 
 Runtime-only per-CPU scratch arrays hold flow observations, service keys/values,
 policy decisions, connection keys, and event construction state. They are not

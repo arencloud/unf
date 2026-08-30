@@ -4648,6 +4648,7 @@ fn empty_node_port_bank(bank: u8) -> NodePortDataplaneState {
         bank,
         ipv4_frontends: BTreeMap::new(),
         ipv6_frontends: BTreeMap::new(),
+        service_backend_slots: BTreeMap::new(),
         config: [0; 40],
     }
 }
@@ -5000,6 +5001,7 @@ fn validate_node_port_frontend_entry<const N: usize>(
     let port = u16::from_be_bytes(key[port_offset..port_offset + 2].try_into().unwrap());
     let protocol = key[bank_offset - 1];
     let service_id = u32::from_ne_bytes(value[0..4].try_into().unwrap());
+    let frontend_index = u32::from_ne_bytes(value[4..8].try_into().unwrap());
     let backend_count = u32::from_ne_bytes(value[8..12].try_into().unwrap());
     let schema = u16::from_ne_bytes(value[12..14].try_into().unwrap());
     let flags = u16::from_ne_bytes(value[14..16].try_into().unwrap());
@@ -5011,6 +5013,10 @@ fn validate_node_port_frontend_entry<const N: usize>(
         || backend_count > u32::try_from(MAX_BACKENDS_PER_SERVICE).unwrap_or(u32::MAX)
         || schema != unf_ebpf_common::NODE_PORT_MAP_ABI_VERSION
         || flags & !unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL != 0
+        || (flags & unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL != 0
+            && frontend_index & unf_ebpf_common::NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG == 0)
+        || (flags & unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL == 0
+            && frontend_index & unf_ebpf_common::NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG != 0)
         || service_revision == 0
         || value[24] >= SERVICE_BANK_COUNT
         || value[25..32] != [0; 7]
@@ -8684,6 +8690,11 @@ mod tests {
         let mut corrupt_value = *value;
         corrupt_value[24] = SERVICE_BANK_COUNT;
         assert!(validate_node_port_frontend_entry(key, &corrupt_value, 7).is_err());
+        let mut corrupt_value = *value;
+        let frontend_index = u32::from_ne_bytes(corrupt_value[4..8].try_into().unwrap())
+            | unf_ebpf_common::NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG;
+        corrupt_value[4..8].copy_from_slice(&frontend_index.to_ne_bytes());
+        assert!(validate_node_port_frontend_entry(key, &corrupt_value, 7).is_err());
         let mut corrupt_config = node_port.config;
         corrupt_config[35] = 1;
         assert!(decode_recovered_node_port_config(corrupt_config).is_err());
@@ -9209,7 +9220,7 @@ mod tests {
     #[test]
     #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
     #[allow(clippy::too_many_lines)]
-    fn privileged_node_port_cluster_packets_translate_dual_stack_and_survive_churn() {
+    fn privileged_node_port_cluster_and_local_packets_translate_dual_stack_and_survive_churn() {
         const TC_ACT_SHOT: u32 = 2;
         const TC_ACT_PIPE: u32 = 3;
         let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
@@ -9437,12 +9448,122 @@ mod tests {
             unf_service::ServiceTrafficPolicy::Local,
         );
         activate_service_snapshot(&mut synchronizer, &local, Some(&node), true, &state)
-            .expect("Local NodePort intent activates without Cluster broadening");
+            .expect("Local NodePort intent activates with node-local slots");
         let local_flow = ipv4_packet(6, client_v4, node_v4, 42_001, 30_080);
-        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &local_flow);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &local_flow);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, replacement_v4, 42_001, 8080);
+        let reverse = ipv4_packet(6, replacement_v4, client_v4, 8080, 42_001);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, node_v4, client_v4, 30_080, 42_001);
+
+        let local_udp = ipv4_packet(17, client_v4, node_v4, 42_002, 30_053);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &local_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 17, client_v4, replacement_v4, 42_002, 5353);
+        let reverse = ipv4_packet(17, replacement_v4, client_v4, 5353, 42_002);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 17, node_v4, client_v4, 30_053, 42_002);
+
+        let local_v6_tcp = ipv6_packet(6, client_v6, node_v6, 42_003, 30_080);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &local_v6_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 6, client_v6, replacement_v6, 42_003, 8080);
+        let reverse = ipv6_packet(6, replacement_v6, client_v6, 8080, 42_003);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 6, node_v6, client_v6, 30_080, 42_003);
+
+        let local_v6_udp = ipv6_packet(17, client_v6, node_v6, 42_004, 30_053);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &local_v6_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, client_v6, replacement_v6, 42_004, 5353);
+        let reverse = ipv6_packet(17, replacement_v6, client_v6, 5353, 42_004);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, node_v6, client_v6, 30_053, 42_004);
+
+        identity_v4_maps[0]
+            .insert(
+                replacement_v4.octets(),
+                encode_identity_value(IdentityMapValue::new(backend_identity, 10)),
+                0,
+            )
+            .expect("local backend identity is staged");
+        identity_config
+            .set(0, encode_identity_config(7, 10, 1, 0).unwrap(), 0)
+            .expect("local backend identity is activated");
+        let local_deny_value = encode_policy_decisions(&deny.decision, None, 10);
+        ipv4_policy
+            .insert(deny_key, local_deny_value, 0)
+            .expect("local external-source deny is staged");
+        policy_config
+            .set(0, encode_policy_config(7, 10, 1, 0).unwrap(), 0)
+            .expect("local external-source deny is activated");
+        let denied_local = ipv4_packet(6, client_v4, node_v4, 42_100, 30_080);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &denied_local);
+        assert_eq!(action, TC_ACT_SHOT);
+        identity_config.set(0, [0; 24], 0).unwrap();
+        policy_config.set(0, [0; 24], 0).unwrap();
+
+        let mut remote_only = dual_stack_node_port_snapshot_with_backend(
+            5,
+            replacement_v4,
+            replacement_v6,
+            true,
+            unf_service::ServiceTrafficPolicy::Local,
+        );
+        for backend in &mut remote_only.services[0].backends {
+            backend.node_name = Some("worker-b".to_owned());
+        }
+        remote_only = remote_only.validate_and_normalize().unwrap();
+        activate_service_snapshot(&mut synchronizer, &remote_only, Some(&node), true, &state)
+            .expect("remote-only Local intent activates with no local slots");
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &local_flow);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, replacement_v4, 42_001, 8080);
+        let no_local = ipv4_packet(6, client_v4, node_v4, 42_101, 30_080);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &no_local);
         assert_eq!(action, TC_ACT_SHOT);
 
-        let unrelated = ipv4_packet(6, client_v4, node_v4, 42_002, 30_081);
+        let mut unready_local = dual_stack_node_port_snapshot_with_backend(
+            6,
+            replacement_v4,
+            replacement_v6,
+            true,
+            unf_service::ServiceTrafficPolicy::Local,
+        );
+        for backend in &mut unready_local.services[0].backends {
+            backend.ready = false;
+        }
+        unready_local = unready_local.validate_and_normalize().unwrap();
+        activate_service_snapshot(&mut synchronizer, &unready_local, Some(&node), true, &state)
+            .expect("unready Local intent activates with no eligible slots");
+        let unready = ipv4_packet(6, client_v4, node_v4, 42_102, 30_080);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &unready);
+        assert_eq!(action, TC_ACT_SHOT);
+
+        let recovered = dual_stack_node_port_snapshot_with_backend(
+            7,
+            replacement_v4,
+            replacement_v6,
+            true,
+            unf_service::ServiceTrafficPolicy::Local,
+        );
+        activate_service_snapshot(&mut synchronizer, &recovered, Some(&node), true, &state)
+            .expect("ready local backend recovers");
+        let recovered_flow = ipv4_packet(6, client_v4, node_v4, 42_103, 30_080);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &recovered_flow);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, replacement_v4, 42_103, 8080);
+        let reverse = ipv4_packet(6, replacement_v4, client_v4, 8080, 42_103);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, node_v4, client_v4, 30_080, 42_103);
+
+        let unrelated = ipv4_packet(6, client_v4, node_v4, 42_200, 30_081);
         let (action, output) = run_tc(&mut ebpf, "unf_observe_ingress", &unrelated);
         assert_eq!(action, TC_ACT_PIPE);
         assert_eq!(output, unrelated);
@@ -9451,20 +9572,20 @@ mod tests {
         while let Some(item) = service_events.next() {
             events.push(decode_service_event(&item).expect("kernel service event is valid"));
         }
-        assert_eq!(events.len(), 16);
+        assert_eq!(events.len(), 29);
         assert_eq!(
             events
                 .iter()
                 .filter(|event| event.action == SERVICE_EVENT_ACTION_TRANSLATE)
                 .count(),
-            14
+            26
         );
         assert_eq!(
             events
                 .iter()
                 .filter(|event| event.action == SERVICE_EVENT_ACTION_DROP)
                 .count(),
-            2
+            3
         );
         let first_forward = events
             .iter()
@@ -9479,6 +9600,20 @@ mod tests {
         assert_ne!(first_forward.service_id.get(), 0);
         assert_ne!(first_forward.backend_id.get(), 0);
         assert_eq!(first_forward.service_revision, 1);
+        let local_forward = events
+            .iter()
+            .find(|event| {
+                event.client_port == 42_001_u16.to_be_bytes()
+                    && event.reason == unf_ebpf_common::SERVICE_EVENT_REASON_FORWARD_TRANSLATED
+            })
+            .expect("Local forward translation has provenance");
+        assert_eq!(&local_forward.client_address[..4], &client_v4.octets());
+        assert_eq!(&local_forward.frontend_address[..4], &node_v4.octets());
+        assert_eq!(
+            &local_forward.backend_address[..4],
+            &replacement_v4.octets()
+        );
+        assert_eq!(local_forward.service_revision, 4);
 
         let mut policy_events = Vec::new();
         while let Some(item) = flow_events.next() {
@@ -9494,6 +9629,17 @@ mod tests {
         assert_eq!(denied.flow.destination_port, 8080_u16.to_be_bytes());
         assert_eq!(denied.policy_revision, 9);
         assert_eq!(denied.policy_id, PolicyId::new(7));
+        let denied_local = policy_events
+            .iter()
+            .find(|event| event.verdict == Verdict::Deny && event.policy_revision == 10)
+            .expect("Local NodePort policy denial is emitted");
+        assert_eq!(&denied_local.flow.source_address[..4], &client_v4.octets());
+        assert_eq!(denied_local.flow.source_port, 42_100_u16.to_be_bytes());
+        assert_eq!(
+            &denied_local.flow.destination_address[..4],
+            &replacement_v4.octets()
+        );
+        assert_eq!(denied_local.flow.destination_port, 8080_u16.to_be_bytes());
     }
 
     #[test]

@@ -18,7 +18,7 @@ test_binary=$(cargo test -p unf-agent --no-run --message-format=json \
 
 sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
     --ignored --exact \
-    tests::privileged_node_port_cluster_packets_translate_dual_stack_and_survive_churn
+    tests::privileged_node_port_cluster_and_local_packets_translate_dual_stack_and_survive_churn
 
 # Preserve the complete Phase 4 ClusterIP packet path while enabling the
 # host-facing lookup fallback.

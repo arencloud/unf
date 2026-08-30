@@ -17,12 +17,14 @@ pub const SERVICE_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_MAP_ABI_VERSION: u16 = 1;
 pub const NODE_PORT_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_FRONTEND_FLAG_LOCAL: u16 = 1;
+pub const NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG: u32 = 1 << 31;
 pub const SERVICE_BACKEND_FLAG_READY: u8 = 1 << 0;
 pub const SERVICE_BACKEND_FLAG_SERVING: u8 = 1 << 1;
 pub const SERVICE_BACKEND_FLAG_TERMINATING: u8 = 1 << 2;
 pub const SERVICE_CONNECTION_ROLE_FORWARD: u8 = 1;
 pub const SERVICE_CONNECTION_ROLE_REVERSE: u8 = 2;
 pub const SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER: u16 = 1 << 0;
+pub const SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL: u16 = 1 << 1;
 pub const SERVICE_EVENT_ACTION_TRANSLATE: u8 = 1;
 pub const SERVICE_EVENT_ACTION_DROP: u8 = 2;
 pub const SERVICE_EVENT_ACTION_EXPIRE: u8 = 3;
@@ -187,7 +189,11 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
         && state.service_revision != 0
         && state.service_id.get() != 0
         && state.backend_id.get() != 0
-        && state.flags & !SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER == 0
+        && state.flags
+            & !(SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
+            == 0
+        && state.flags
+            != SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
         && if state.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
             u16::from_be_bytes([state.reserved[0], state.reserved[1]]) >= 32_768
                 && state.reserved[2] == 0
@@ -974,13 +980,18 @@ mod tests {
         invalid.backend_id = BackendId::new(0);
         assert!(!service_connection_is_active(&invalid, 11));
         invalid = tcp;
-        invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER << 1;
+        invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER << 2;
         assert!(!service_connection_is_active(&invalid, 11));
         invalid = tcp;
         invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER;
         assert!(!service_connection_is_active(&invalid, 11));
         invalid.reserved[0..2].copy_from_slice(&32_768_u16.to_be_bytes());
         assert!(service_connection_is_active(&invalid, 11));
+        invalid = tcp;
+        invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL;
+        assert!(service_connection_is_active(&invalid, 11));
+        invalid.flags |= SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER;
+        assert!(!service_connection_is_active(&invalid, 11));
     }
 
     #[test]
