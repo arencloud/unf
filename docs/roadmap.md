@@ -397,13 +397,14 @@ matrix is maintained in the
   removed kube-proxy and proved the complete dual-stack ClusterIP lifecycle,
   controller-offline source/destination agent replacement, observability,
   exact cleanup, and operator-health boundary on RHCOS/SELinux/CRI-O; ADR 0081.
-- Later service slices: NodePort, LoadBalancer, session affinity,
-  `externalTrafficPolicy`, `internalTrafficPolicy`, topology-aware routing,
-  Maglev, and optional DSR. None is implied by the foundation gate.
+- Subsequent service slices: Phase 5 now independently verifies NodePort and
+  `externalTrafficPolicy`; LoadBalancer, session affinity,
+  `internalTrafficPolicy`, topology-aware routing, Maglev, and optional DSR
+  remain separate. None is implied by the Phase 4 foundation gate.
 
 ## Phase 5 — NodePort exposure
 
-**Gate: In progress.** The ordered evidence matrix is maintained in the
+**Gate: Verified.** The ordered evidence matrix is maintained in the
 [Phase 5 NodePort plan](development/phase5-nodeport-plan.md).
 
 - Verified by `make service-ir-test` and focused controller tests: service
@@ -438,7 +439,14 @@ matrix is maintained in the
   label-free metrics, agent-status schema v5, flow-export schema v5, history
   schema v6/checkpoint v5, filtered explanation, and read-only exact-Node
   simulation retain bounded evidence across churn and restart; ADR 0088.
-- In progress: independent kube-proxy-free Kind qualification, followed by the
-  digest-pinned OpenShift gate.
+- Verified by `make nodeport-kind-test`: runtime/qualification revision
+  `bc03d5c` passed the 820-second three-Node Kubernetes v1.35.0 dual-stack gate
+  with kube-proxy absent, all-node host-origin ClusterIP, both NodePort traffic
+  policies, lifecycle, offline recovery, cleanup, and exact rollback.
+- Verified by guarded `make nodeport-openshift-deploy` and
+  `make nodeport-openshift-test`: runtime revision `bc03d5c`, qualifier
+  `76828c3`, and three immutable public image digests passed the 3,803-second
+  five-Node OpenShift 4.22.10 cl02 gate with exact cleanup and no new unhealthy
+  ClusterOperator beyond baseline disconnected `insights`; ADR 0092.
 - LoadBalancer, session affinity, topology-aware selection, Maglev, and DSR
   remain separate future milestones.

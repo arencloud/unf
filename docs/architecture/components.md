@@ -16,7 +16,7 @@
 | `unf-agent` | Capability detection, Aya lifecycle, events, non-blocking telemetry export, authenticated transactional service/NodePort-map and durable node-block adoption, exact service/NodePort/identity/policy recovery, remote-route reconciliation, and opt-in root-authenticated local CNI transaction service | Kubernetes policy semantics or CNI namespace mutation |
 | `unf-cni` | Bounded CNI protocol/socket handling and atomic durable-IPAM plus link/route ADD/CHECK/DEL orchestration | Kubernetes access, policy compilation, durable IPAM storage, routing protocols, or telemetry aggregation |
 | `unfctl` | Operator-facing status, topology, flow history, explanation, and simulation | Fabric state ownership |
-| `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, telemetry, and source-side dual-stack TCP/UDP ClusterIP translation with paired persistent connection state | Selectors, enrichment strings, host-network/NodePort/LoadBalancer service translation, or L7 processing |
+| `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, telemetry, source-side and host-origin dual-stack TCP/UDP ClusterIP translation, and `Cluster`/`Local` NodePort translation with paired persistent connection state | Selectors, enrichment strings, LoadBalancer translation, host-origin NodePort translation, or L7 processing |
 
 The allowed dependency direction is from binaries toward libraries and from API
 conversion toward domain types. Kernel ABI types depend only on `no_std`

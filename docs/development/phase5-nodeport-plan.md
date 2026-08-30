@@ -1,6 +1,6 @@
 # Phase 5 NodePort execution plan
 
-Last reviewed: **2026-08-30**
+Last reviewed: **2026-08-31**
 
 Phase 5 extends the verified ClusterIP foundation with the smallest sound
 host-facing Service exposure. It does not infer LoadBalancer, session affinity,
@@ -17,8 +17,8 @@ authoritative feature state remains in [project-status.md](../project-status.md)
 | 5.4 | `externalTrafficPolicy: Cluster` dataplane | **Verified** | Exact Node-address/port/protocol lookup, coherent service-bank validation, IPv4/IPv6 TCP/UDP DNAT with bounded collision-safe Node SNAT, paired reverse restoration, deterministic slots, connection persistence, backend policy ordering, checksum/provenance packet execution; `make nodeport-cluster-dataplane-test`; ADR 0086 |
 | 5.5 | `externalTrafficPolicy: Local` | **Verified** | Deterministic per-Node slot namespace merged transactionally with the service bank; ready/non-terminating placement eligibility; source preservation; exact no-local-backend drop; placement/readiness loss, established-flow retention, recovery, reverse translation, and backend policy ordering; NodePort/LoadBalancer health-check boundary; `make nodeport-local-dataplane-test`; ADR 0087 |
 | 5.6 | NodePort operations | **Verified** | Fixed-width event classification; label-free metrics; status v5; export/history/checkpoint v5/v6/v5; filtered explanation; read-only simulation; actionable bounded failures; restart migration; `make nodeport-operations-test`; ADR 0088 |
-| 5.7 | Kube-proxy-free Kind qualification | **Verified** | Committed revision `892ef1a` passed `make nodeport-kind-test`: cross-node dual-stack Cluster/Local lifecycle, source and reverse tuple checks, retained UDP connections, classified operations, controller outage, both worker-agent replacements, empty-map cleanup, exact rollback, reversible IPv4 host prerequisites, dispersed bounded SNAT allocation across restart churn, and schema-v2 evidence; ADRs 0089–0091 |
-| 5.8 | OpenShift qualification | **Implemented** | `make nodeport-openshift-deploy` and `make nodeport-openshift-test` encode the guarded ABI-v4→v5 MachineConfig/agent transition, digest-pinned RHCOS/SELinux/CRI-O rollout, kube-proxy-free cross-worker Cluster/Local NodePort lifecycle, source/reverse semantics, offline composite recovery, operations/simulation, empty-map cleanup, ABI-v4 retirement, and platform evidence; live cl02 execution remains; ADR 0092 |
+| 5.7 | Kube-proxy-free Kind qualification | **Verified** | Runtime and qualification revision `bc03d5c` passed `make nodeport-kind-test` in 820 seconds: all-node host-origin ClusterIP, cross-node dual-stack Cluster/Local lifecycle, source and reverse tuple checks, retained UDP connections, classified operations, controller outage, both worker-agent replacements, empty-map cleanup, exact rollback, reversible IPv4 host prerequisites, and schema-v2 evidence; ADRs 0089–0091 |
+| 5.8 | OpenShift qualification | **Verified** | Runtime revision `bc03d5c` and qualification revision `76828c3` passed the guarded digest-pinned deployment and 3,803-second `make nodeport-openshift-test` gate on five-Node dual-stack cl02: RHCOS/SELinux/CRI-O, kube-proxy absence, all-node host-origin ClusterIP, cross-worker Cluster/Local lifecycle and tuples, offline composite recovery, operations/simulation, exact cleanup, ABI-v4 rollback classification, five-agent convergence, and unchanged `insights`-only unhealthy baseline; ADR 0092 |
 
 ## Accepted Phase 5 gate
 
@@ -38,16 +38,14 @@ run with kube-proxy absent and demonstrate:
 - immutable schema-versioned source, image, and platform evidence.
 
 SCTP forwarding, LoadBalancer, session affinity, topology hints, Maglev, DSR,
-host-network clients, fragments, generic NAT/RELATED tracking, and production
+host-origin NodePort clients, fragments, generic NAT/RELATED tracking, and production
 availability/scale require independent later gates.
 
-## Immediate next slice
+## Closure evidence
 
-Phase 5.8 must qualify the exact committed NodePort implementation on the
-five-Node dual-stack OpenShift cl02 tuple with kube-proxy absent. Images must be
-published and deployed by digest, the master and worker MachineConfigPools must
-converge on the NodePort host contract, and the Kind NodePort matrix must be
-repeated across RHCOS/SELinux/CRI-O workers. Evidence must include source and
-image provenance, Cluster/Local dual-stack TCP/UDP, lifecycle and offline-agent
-recovery, operations/simulation, host-map cleanup, and cluster health before
-Phase 5 can close.
+Phase 5 closed after the exact runtime revision `bc03d5c` passed both platform
+gates. The final OpenShift schema-v2 artifact binds qualification revision
+`76828c3`, three immutable public image digests, OpenShift 4.22.10/Kubernetes
+1.35.6, five converged ABI-v5 agents, kube-proxy absence, complete cleanup, and
+identical baseline/final unhealthy-operator sets containing only disconnected
+`insights`. The artifact records every bounded exclusion explicitly.

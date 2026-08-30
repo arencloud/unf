@@ -1,6 +1,6 @@
 # ADR 0092: Qualify NodePort independently on OpenShift
 
-**Status:** Accepted and implemented; live evidence pending (2026-08-30)
+**Status:** Accepted and live verified (2026-08-31)
 
 ## Context
 
@@ -75,5 +75,27 @@ make nodeport-openshift-deploy OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig
 make nodeport-openshift-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig
 ```
 
-This ADR and milestone 5.8 become live verified only after both commands pass
-on one exact source/image/platform tuple and their artifacts are audited.
+## Live evidence
+
+The guarded deployment and qualification commands passed on cl02 with runtime
+revision `bc03d5c` and committed qualification revision `76828c3`. The
+schema-v2 artifact records OpenShift 4.22.10/Kubernetes 1.35.6, five RHCOS
+Nodes and five converged ABI-v5 agents, kube-proxy absence, the three immutable
+public image digests, 3,803 seconds of qualification, complete fixture/map/
+checkpoint cleanup, and matching baseline/final unhealthy-operator sets
+containing only disconnected `insights`.
+
+The immutable images were:
+
+- controller: `sha256:d212b8ba7124def5c363582aa1f667e1e8e62fb003b4f52f09d21464c68bb4c6`;
+- agent: `sha256:4d0ab82012a4f7502dfe80978d4c0fd2619d0d7905b9ed838f37d7ee46d6e5dc`;
+- test tools: `sha256:78c2be1c47fdb47f84b4201b6259c091cb565be025ccf8311c61fde54db16bb0`.
+
+The verified matrix includes all-five-Node host-origin IPv4/IPv6 TCP/UDP
+ClusterIP, cross-worker IPv4/IPv6 TCP/UDP NodePort `Cluster` and `Local`, source
+and reverse tuple semantics, retained UDP, endpoint lifecycle, independent
+source/destination agent replacement while the controller is offline,
+operations/simulation, ABI-v4 rollback classification, and final convergence.
+The artifact explicitly retains the bounded exclusions listed above. This
+closes milestone 5.8 and Phase 5 without making the OpenShift result transitive
+to another platform tuple.

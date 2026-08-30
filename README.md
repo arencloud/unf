@@ -224,18 +224,24 @@ classified operations, controller-offline worker-agent replacement, empty-map
 cleanup, exact ABI-v5 rollback, and immutable evidence. The fixture also
 captures, applies, and restores the exact IPv4 reverse-path/local-source host
 settings needed by NodePort; OpenShift persists the same settings through both
-MachineConfigPools. Committed revision `892ef1a` passed the uninterrupted gate
-on Kubernetes v1.35.0 with kube-proxy absent, including both controller-offline
+MachineConfigPools. Runtime and qualification revision `bc03d5c` passed the
+uninterrupted gate in 820 seconds on Kubernetes v1.35.0 with kube-proxy absent,
+including all-node host-origin ClusterIP and both controller-offline
 worker-agent replacements, empty-map audit, and exact no-CNI/sysctl rollback.
 ADRs 0089–0091 define and record the gate, host contract, and restart allocation
-invariant. Phase 5.8 now carries the independent OpenShift boundary.
-That final gate is implemented as `make nodeport-openshift-deploy` followed by
-`make nodeport-openshift-test`: it persists the host contract through both
+invariant. Phase 5.8 independently verifies the OpenShift boundary.
+`make nodeport-openshift-deploy` followed by `make nodeport-openshift-test`
+persists the host contract through both
 MachineConfigPools, stages ABI v5 controller-first and one agent at a time from
 digest-only Quay images while kube-proxy remains absent, then repeats the
 cross-worker lifecycle, source/reverse, offline-recovery, operations, cleanup,
-and platform-health matrix. ADR 0092 records this non-transitive boundary; live
-cl02 evidence is required before Phase 5 closes.
+and platform-health matrix. Runtime revision `bc03d5c` and committed qualifier
+`76828c3` passed that 3,803-second gate on five-Node dual-stack OpenShift 4.22.10
+cl02 with five converged agents, exact cleanup, and no new unhealthy operator
+beyond baseline disconnected `insights`. ADR 0092 records this non-transitive
+boundary. All Phase 5 milestones are Verified; LoadBalancer, affinity, topology
+hints, Maglev, DSR, host-origin NodePort, SCTP, fragments, generic NAT `RELATED`,
+and production availability/scale retain independent gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
