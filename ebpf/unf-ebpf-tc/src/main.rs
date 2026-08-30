@@ -275,6 +275,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
 
     let service_protocol = protocol == PROTOCOL_TCP || protocol == PROTOCOL_UDP;
     let mut service_forward_translated = false;
+    let mut reroute_host_cluster_ip = false;
     if service_protocol && service_translatable {
         // SAFETY: this helper has no preconditions and returns monotonic kernel time.
         #[allow(unsafe_code)]
@@ -415,6 +416,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                     ServiceLookup::Drop => return TC_ACT_SHOT,
                     ServiceLookup::Translation(translation) => {
                         service_forward_translated = true;
+                        reroute_host_cluster_ip = service_connection_is_cluster_ip();
                         let backend_address = [
                             translation.address[0],
                             translation.address[1],
@@ -479,7 +481,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     }
     if service_forward_translated {
         seed_service_frontend_policy_connection(tcp_flags);
-        if !enforce && service_connection_is_cluster_ip() {
+        if !enforce && reroute_host_cluster_ip {
             return reroute_host_service_v4(ctx, observation);
         }
     }
@@ -529,6 +531,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     };
     let service_protocol = protocol == PROTOCOL_TCP || protocol == PROTOCOL_UDP;
     let mut service_forward_translated = false;
+    let mut reroute_host_cluster_ip = false;
     if service_protocol && service_translatable {
         // SAFETY: this helper has no preconditions and returns monotonic kernel time.
         #[allow(unsafe_code)]
@@ -653,10 +656,11 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 service_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
                 match lookup_forward_service_v6(service_key, now_ns) {
                     ServiceLookup::Miss => {}
-                    ServiceLookup::Drop => return TC_ACT_SHOT,
-                    ServiceLookup::Translation(translation) => {
-                        service_forward_translated = true;
-                        if service_connection_translation(true).is_some_and(
+                ServiceLookup::Drop => return TC_ACT_SHOT,
+                ServiceLookup::Translation(translation) => {
+                    service_forward_translated = true;
+                    reroute_host_cluster_ip = service_connection_is_cluster_ip();
+                    if service_connection_translation(true).is_some_and(
                             |source_translation| {
                                 !rewrite_ipv6(
                                     ctx,
@@ -702,7 +706,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     }
     if service_forward_translated {
         seed_service_frontend_policy_connection(observation.tcp_flags);
-        if !enforce && service_connection_is_cluster_ip() {
+        if !enforce && reroute_host_cluster_ip {
             return reroute_host_service_v6(ctx, observation);
         }
     }
