@@ -415,7 +415,13 @@ matrix is maintained in the
   all four old/new controller-agent pairings, read-time v1 migration with
   rollback-safe v1 persistence, and capability-aware convergence fencing keep
   NodePort intent away from legacy consumers; ADR 0083.
-- In progress: authenticated Node-address intent and transactional host-facing maps.
+- Verified by `make nodeport-host-state-test`: Pod-bound TokenReview scope,
+  independently revisioned local Node address intent, last-valid/relist
+  behavior, and a fixed dual-stack two-bank compiler ABI establish the bounded
+  host-state contract without exposing an uncommitted map; ADR 0084.
+- In progress: agent inactive-map mutation/readback, activation ordering,
+  rollback, persistence, recovery, and cleanup for the coherent service/Node
+  tuple.
 - Planned after host maps: dual-stack TCP/UDP `Cluster` and source-preserving
   `Local` dataplanes,
   operations/simulation, and independent kube-proxy-free Kind/OpenShift gates.

@@ -14,6 +14,9 @@ pub const POLICY_MAP_ABI_VERSION: u16 = 3;
 pub const POLICY_BANK_COUNT: u8 = 2;
 pub const SERVICE_MAP_ABI_VERSION: u16 = 1;
 pub const SERVICE_BANK_COUNT: u8 = 2;
+pub const NODE_PORT_MAP_ABI_VERSION: u16 = 1;
+pub const NODE_PORT_BANK_COUNT: u8 = 2;
+pub const NODE_PORT_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const SERVICE_BACKEND_FLAG_READY: u8 = 1 << 0;
 pub const SERVICE_BACKEND_FLAG_SERVING: u8 = 1 << 1;
 pub const SERVICE_BACKEND_FLAG_TERMINATING: u8 = 1 << 2;
@@ -625,6 +628,56 @@ pub struct ServiceMapConfig {
     pub flags: u8,
 }
 
+/// A host-facing `NodePort` key. The bank belongs to `NODE_PORT_CONFIG`, not to
+/// the `ClusterIP` service map family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv4NodePortFrontendKey {
+    pub address: [u8; 4],
+    pub port: [u8; 2],
+    pub protocol: u8,
+    pub bank: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv6NodePortFrontendKey {
+    pub address: [u8; 16],
+    pub port: [u8; 2],
+    pub protocol: u8,
+    pub bank: u8,
+}
+
+/// `NodePort` frontend metadata points to the independently active `ClusterIP`
+/// service bank so Node-address-only updates never churn backend state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct NodePortFrontendValue {
+    pub service_id: ServiceId,
+    pub frontend_index: u32,
+    pub backend_count: u32,
+    pub schema_version: u16,
+    pub flags: u16,
+    pub service_revision: u64,
+    pub service_bank: u8,
+    pub reserved: [u8; 7],
+}
+
+/// Independent atomic pointer for the complete local `NodePort` frontend family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct NodePortMapConfig {
+    pub source_epoch: u64,
+    pub service_revision: u64,
+    pub node_revision: u64,
+    pub ipv4_count: u32,
+    pub ipv6_count: u32,
+    pub schema_version: u16,
+    pub active_bank: u8,
+    pub flags: u8,
+    pub reserved: u32,
+}
+
 /// Forward or reverse service-flow key. The role disambiguates identical
 /// tuples admitted in opposite translation directions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,6 +764,10 @@ const _: () = assert!(core::mem::size_of::<Ipv6ServiceBackendValue>() == 32);
 const _: () = assert!(core::mem::size_of::<ServiceBackendSlotKey>() == 16);
 const _: () = assert!(core::mem::size_of::<ServiceBackendSlotValue>() == 16);
 const _: () = assert!(core::mem::size_of::<ServiceMapConfig>() == 32);
+const _: () = assert!(core::mem::size_of::<Ipv4NodePortFrontendKey>() == 8);
+const _: () = assert!(core::mem::size_of::<Ipv6NodePortFrontendKey>() == 20);
+const _: () = assert!(core::mem::size_of::<NodePortFrontendValue>() == 32);
+const _: () = assert!(core::mem::size_of::<NodePortMapConfig>() == 40);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionKey>() == 40);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionValue>() == 88);
 const _: () = assert!(core::mem::size_of::<ServiceEvent>() == 96);
@@ -766,6 +823,12 @@ mod tests {
         assert_eq!(core::mem::size_of::<ServiceBackendSlotValue>(), 16);
         assert_eq!(core::mem::align_of::<ServiceMapConfig>(), 8);
         assert_eq!(core::mem::size_of::<ServiceMapConfig>(), 32);
+        assert_eq!(core::mem::size_of::<Ipv4NodePortFrontendKey>(), 8);
+        assert_eq!(core::mem::size_of::<Ipv6NodePortFrontendKey>(), 20);
+        assert_eq!(core::mem::align_of::<NodePortFrontendValue>(), 8);
+        assert_eq!(core::mem::size_of::<NodePortFrontendValue>(), 32);
+        assert_eq!(core::mem::align_of::<NodePortMapConfig>(), 8);
+        assert_eq!(core::mem::size_of::<NodePortMapConfig>(), 40);
         assert_eq!(core::mem::align_of::<ServiceConnectionKey>(), 1);
         assert_eq!(core::mem::size_of::<ServiceConnectionKey>(), 40);
         assert_eq!(core::mem::align_of::<ServiceConnectionValue>(), 8);

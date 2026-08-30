@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{BackendId, Protocol, Revision, ServiceId};
 use unf_ebpf_common::{
+    NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_MAP_ABI_VERSION,
     SERVICE_BACKEND_FLAG_READY, SERVICE_BACKEND_FLAG_SERVING, SERVICE_BACKEND_FLAG_TERMINATING,
     SERVICE_BANK_COUNT, SERVICE_MAP_ABI_VERSION,
 };
@@ -18,6 +19,8 @@ use unf_ebpf_common::{
 pub use unf_common::SERVICE_SNAPSHOT_SCHEMA_VERSION;
 
 pub const LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const MAX_NODE_PORT_NODE_ADDRESSES: usize = 64;
 pub const MAX_SERVICES: usize = 65_536;
 pub const MAX_SERVICE_FRONTENDS: usize = 131_072;
 pub const MAX_SERVICE_NODE_PORTS: usize = 131_072;
@@ -72,6 +75,49 @@ pub enum ServiceTrafficPolicy {
     #[default]
     Cluster,
     Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NodeAddressKind {
+    Internal,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ServiceNodeAddress {
+    pub address: IpAddr,
+    pub kind: NodeAddressKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NodePortNodeSnapshot {
+    pub schema_version: u16,
+    pub source_epoch: u64,
+    pub revision: Revision,
+    pub node_name: String,
+    pub node_uid: String,
+    pub addresses: Vec<ServiceNodeAddress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum NodePortNodeError {
+    #[error("unsupported NodePort Node snapshot schema {actual}; expected {expected}")]
+    UnsupportedSchema { actual: u16, expected: u16 },
+    #[error("NodePort Node snapshot source epoch and revision must be nonzero")]
+    ZeroRevision,
+    #[error("NodePort Node snapshot has invalid {field}")]
+    InvalidIdentity { field: &'static str },
+    #[error("NodePort Node snapshot has no eligible addresses")]
+    MissingAddress,
+    #[error("NodePort Node snapshot has {actual} addresses; limit is {limit}")]
+    TooManyAddresses { actual: usize, limit: usize },
+    #[error("NodePort Node snapshot repeats address {0:?}")]
+    DuplicateAddress(ServiceNodeAddress),
+    #[error("NodePort Node snapshot contains unusable address {0:?}")]
+    UnusableAddress(ServiceNodeAddress),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -153,6 +199,73 @@ pub struct ServiceSnapshot {
     pub source_epoch: u64,
     pub revision: Revision,
     pub services: Vec<ServiceIr>,
+}
+
+impl NodePortNodeSnapshot {
+    /// Validates local Node ownership and returns canonical address ordering.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported schemas, missing provenance, unusable or duplicate
+    /// addresses, and snapshots outside the explicit per-Node bound.
+    pub fn validate_and_normalize(mut self) -> Result<Self, NodePortNodeError> {
+        if self.schema_version != NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION {
+            return Err(NodePortNodeError::UnsupportedSchema {
+                actual: self.schema_version,
+                expected: NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
+            });
+        }
+        if self.source_epoch == 0 || self.revision == Revision::INITIAL {
+            return Err(NodePortNodeError::ZeroRevision);
+        }
+        if self.node_name.is_empty() || self.node_name.len() > 253 {
+            return Err(NodePortNodeError::InvalidIdentity { field: "node name" });
+        }
+        if self.node_uid.is_empty() || self.node_uid.len() > 128 {
+            return Err(NodePortNodeError::InvalidIdentity { field: "node UID" });
+        }
+        if self.addresses.is_empty() {
+            return Err(NodePortNodeError::MissingAddress);
+        }
+        if self.addresses.len() > MAX_NODE_PORT_NODE_ADDRESSES {
+            return Err(NodePortNodeError::TooManyAddresses {
+                actual: self.addresses.len(),
+                limit: MAX_NODE_PORT_NODE_ADDRESSES,
+            });
+        }
+        self.addresses.sort();
+        for pair in self.addresses.windows(2) {
+            if pair[0].address == pair[1].address {
+                return Err(NodePortNodeError::DuplicateAddress(pair[1]));
+            }
+        }
+        if let Some(address) = self
+            .addresses
+            .iter()
+            .find(|address| !usable_node_port_address(address.address))
+        {
+            return Err(NodePortNodeError::UnusableAddress(*address));
+        }
+        Ok(self)
+    }
+}
+
+const fn usable_node_port_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !address.is_broadcast()
+                && !address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !address.is_unicast_link_local()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -329,6 +442,50 @@ pub struct ServiceDataplaneState {
     pub ipv6_backends: BTreeMap<[u8; 12], [u8; 32]>,
     pub backend_slots: BTreeMap<[u8; 16], [u8; 16]>,
     pub config: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum NodePortDataplaneError {
+    #[error(transparent)]
+    InvalidService(#[from] ServiceIrError),
+    #[error(transparent)]
+    InvalidNode(#[from] NodePortNodeError),
+    #[error("service and NodePort Node snapshots have different source epochs")]
+    SourceEpochMismatch,
+    #[error("invalid service bank {0}; expected 0 or 1")]
+    InvalidServiceBank(u8),
+    #[error("invalid NodePort bank {0}; expected 0 or 1")]
+    InvalidNodePortBank(u8),
+    #[error("NodePort {node_port} for service {service_id:?} has no exact ClusterIP frontend")]
+    MissingFrontendLink {
+        service_id: ServiceId,
+        node_port: u16,
+    },
+    #[error("NodePort map {map} requires {actual} entries; per-bank limit is {limit}")]
+    Capacity {
+        map: &'static str,
+        actual: usize,
+        limit: usize,
+    },
+}
+
+/// Canonical fixed-width local `NodePort` state. Values reference one already
+/// staged `ClusterIP` service bank and become visible through a separate pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodePortDataplaneState {
+    pub source_epoch: u64,
+    pub service_revision: u64,
+    pub node_revision: u64,
+    pub service_bank: u8,
+    pub bank: u8,
+    pub ipv4_frontends: BTreeMap<[u8; 8], [u8; 32]>,
+    pub ipv6_frontends: BTreeMap<[u8; 20], [u8; 32]>,
+    pub config: [u8; 40],
+}
+
+struct CompiledNodePortFrontends {
+    ipv4: BTreeMap<[u8; 8], [u8; 32]>,
+    ipv6: BTreeMap<[u8; 20], [u8; 32]>,
 }
 
 #[derive(Default)]
@@ -1281,6 +1438,194 @@ pub fn compile_service_dataplane(
     })
 }
 
+/// Lowers validated `NodePort` intent for one authenticated local Node. The
+/// resulting values reference an already staged `ClusterIP` service bank.
+///
+/// # Errors
+///
+/// Rejects invalid snapshots, epoch skew, invalid banks, missing exact
+/// frontend linkage, and per-family map capacity overflow.
+pub fn compile_node_port_dataplane(
+    snapshot: &ServiceSnapshot,
+    node: &NodePortNodeSnapshot,
+    service_bank: u8,
+    bank: u8,
+) -> Result<NodePortDataplaneState, NodePortDataplaneError> {
+    if service_bank >= SERVICE_BANK_COUNT {
+        return Err(NodePortDataplaneError::InvalidServiceBank(service_bank));
+    }
+    if bank >= NODE_PORT_BANK_COUNT {
+        return Err(NodePortDataplaneError::InvalidNodePortBank(bank));
+    }
+    let snapshot = snapshot.clone().validate_and_normalize()?;
+    let node = node.clone().validate_and_normalize()?;
+    if snapshot.source_epoch != node.source_epoch {
+        return Err(NodePortDataplaneError::SourceEpochMismatch);
+    }
+    preflight_node_port_capacity(&snapshot, &node)?;
+    let frontends = compile_node_port_frontends(&snapshot, &node, service_bank, bank)?;
+    validate_node_port_capacity("NODE_PORT_FRONTENDS_V4", frontends.ipv4.len())?;
+    validate_node_port_capacity("NODE_PORT_FRONTENDS_V6", frontends.ipv6.len())?;
+    let config = encode_node_port_config(
+        snapshot.source_epoch,
+        snapshot.revision.get(),
+        node.revision.get(),
+        frontends.ipv4.len(),
+        frontends.ipv6.len(),
+        bank,
+    );
+    Ok(NodePortDataplaneState {
+        source_epoch: snapshot.source_epoch,
+        service_revision: snapshot.revision.get(),
+        node_revision: node.revision.get(),
+        service_bank,
+        bank,
+        ipv4_frontends: frontends.ipv4,
+        ipv6_frontends: frontends.ipv6,
+        config,
+    })
+}
+
+fn preflight_node_port_capacity(
+    snapshot: &ServiceSnapshot,
+    node: &NodePortNodeSnapshot,
+) -> Result<(), NodePortDataplaneError> {
+    let ipv4_address_count = node
+        .addresses
+        .iter()
+        .filter(|address| address.address.is_ipv4())
+        .count();
+    let ipv6_address_count = node.addresses.len() - ipv4_address_count;
+    let ipv4_node_port_count = snapshot
+        .services
+        .iter()
+        .flat_map(|service| &service.node_ports)
+        .filter(|node_port| node_port.family == AddressFamily::Ipv4)
+        .count();
+    let ipv6_node_port_count = snapshot
+        .services
+        .iter()
+        .flat_map(|service| &service.node_ports)
+        .filter(|node_port| node_port.family == AddressFamily::Ipv6)
+        .count();
+    preflight_node_port_family_capacity(
+        "NODE_PORT_FRONTENDS_V4",
+        ipv4_address_count,
+        ipv4_node_port_count,
+    )?;
+    preflight_node_port_family_capacity(
+        "NODE_PORT_FRONTENDS_V6",
+        ipv6_address_count,
+        ipv6_node_port_count,
+    )
+}
+
+fn preflight_node_port_family_capacity(
+    map: &'static str,
+    address_count: usize,
+    node_port_count: usize,
+) -> Result<(), NodePortDataplaneError> {
+    let actual = address_count.saturating_mul(node_port_count);
+    validate_node_port_capacity(map, actual)
+}
+
+fn compile_node_port_frontends(
+    snapshot: &ServiceSnapshot,
+    node: &NodePortNodeSnapshot,
+    service_bank: u8,
+    bank: u8,
+) -> Result<CompiledNodePortFrontends, NodePortDataplaneError> {
+    let mut ipv4_frontends = BTreeMap::new();
+    let mut ipv6_frontends = BTreeMap::new();
+    for service in &snapshot.services {
+        let eligible_backends = service
+            .backends
+            .iter()
+            .filter(|backend| backend.ready && !backend.terminating)
+            .map(|backend| backend.id)
+            .collect::<BTreeSet<_>>();
+        for node_port in &service.node_ports {
+            let frontend_index = service
+                .frontends
+                .iter()
+                .position(|frontend| {
+                    frontend.address.is_ipv4() == matches!(node_port.family, AddressFamily::Ipv4)
+                        && frontend.port == node_port.service_port
+                        && frontend.protocol == node_port.protocol
+                        && frontend.name == node_port.name
+                        && frontend.app_protocol == node_port.app_protocol
+                })
+                .ok_or(NodePortDataplaneError::MissingFrontendLink {
+                    service_id: service.id,
+                    node_port: node_port.port,
+                })?;
+            let eligible_count = node_port
+                .backend_ids
+                .iter()
+                .filter(|backend| eligible_backends.contains(backend))
+                .count();
+            let flags = match node_port.traffic_policy {
+                ServiceTrafficPolicy::Cluster => 0,
+                ServiceTrafficPolicy::Local => NODE_PORT_FRONTEND_FLAG_LOCAL,
+            };
+            let value = encode_node_port_frontend_value(
+                service.id,
+                bounded_u32(frontend_index),
+                eligible_count,
+                flags,
+                snapshot.revision.get(),
+                service_bank,
+            );
+            for address in node.addresses.iter().filter(|address| {
+                address.address.is_ipv4() == matches!(node_port.family, AddressFamily::Ipv4)
+            }) {
+                match address.address {
+                    IpAddr::V4(address) => {
+                        ipv4_frontends.insert(
+                            encode_ipv4_service_frontend_key(
+                                address.octets(),
+                                node_port.port,
+                                node_port.protocol,
+                                bank,
+                            ),
+                            value,
+                        );
+                    }
+                    IpAddr::V6(address) => {
+                        ipv6_frontends.insert(
+                            encode_ipv6_service_frontend_key(
+                                address.octets(),
+                                node_port.port,
+                                node_port.protocol,
+                                bank,
+                            ),
+                            value,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(CompiledNodePortFrontends {
+        ipv4: ipv4_frontends,
+        ipv6: ipv6_frontends,
+    })
+}
+
+fn validate_node_port_capacity(
+    map: &'static str,
+    actual: usize,
+) -> Result<(), NodePortDataplaneError> {
+    if actual > SERVICE_FRONTEND_BANK_CAPACITY {
+        return Err(NodePortDataplaneError::Capacity {
+            map,
+            actual,
+            limit: SERVICE_FRONTEND_BANK_CAPACITY,
+        });
+    }
+    Ok(())
+}
+
 fn validate_dataplane_capacity(
     map: &'static str,
     actual: usize,
@@ -1332,6 +1677,25 @@ fn encode_service_frontend_value(
     value[8..12].copy_from_slice(&bounded_u32(backend_count).to_ne_bytes());
     value[12..14].copy_from_slice(&SERVICE_MAP_ABI_VERSION.to_ne_bytes());
     value[16..24].copy_from_slice(&revision.to_ne_bytes());
+    value
+}
+
+fn encode_node_port_frontend_value(
+    service_id: ServiceId,
+    frontend_index: u32,
+    backend_count: usize,
+    flags: u16,
+    service_revision: u64,
+    service_bank: u8,
+) -> [u8; 32] {
+    let mut value = [0_u8; 32];
+    value[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
+    value[4..8].copy_from_slice(&frontend_index.to_ne_bytes());
+    value[8..12].copy_from_slice(&bounded_u32(backend_count).to_ne_bytes());
+    value[12..14].copy_from_slice(&NODE_PORT_MAP_ABI_VERSION.to_ne_bytes());
+    value[14..16].copy_from_slice(&flags.to_ne_bytes());
+    value[16..24].copy_from_slice(&service_revision.to_ne_bytes());
+    value[24] = service_bank;
     value
 }
 
@@ -1421,6 +1785,25 @@ fn encode_service_config(
     config[24..28].copy_from_slice(&bounded_u32(backend_slot_count).to_ne_bytes());
     config[28..30].copy_from_slice(&SERVICE_MAP_ABI_VERSION.to_ne_bytes());
     config[30] = bank;
+    config
+}
+
+fn encode_node_port_config(
+    source_epoch: u64,
+    service_revision: u64,
+    node_revision: u64,
+    ipv4_count: usize,
+    ipv6_count: usize,
+    bank: u8,
+) -> [u8; 40] {
+    let mut config = [0_u8; 40];
+    config[0..8].copy_from_slice(&source_epoch.to_ne_bytes());
+    config[8..16].copy_from_slice(&service_revision.to_ne_bytes());
+    config[16..24].copy_from_slice(&node_revision.to_ne_bytes());
+    config[24..28].copy_from_slice(&bounded_u32(ipv4_count).to_ne_bytes());
+    config[28..32].copy_from_slice(&bounded_u32(ipv6_count).to_ne_bytes());
+    config[32..34].copy_from_slice(&NODE_PORT_MAP_ABI_VERSION.to_ne_bytes());
+    config[34] = bank;
     config
 }
 
@@ -1736,6 +2119,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn node_port_node_snapshot_is_bounded_owned_and_canonical() {
+        let snapshot = NodePortNodeSnapshot {
+            schema_version: NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
+            source_epoch: 9,
+            revision: Revision::new(4),
+            node_name: "worker-a".to_owned(),
+            node_uid: "worker-a-uid".to_owned(),
+            addresses: vec![
+                ServiceNodeAddress {
+                    address: "fdff::10".parse().unwrap(),
+                    kind: NodeAddressKind::External,
+                },
+                ServiceNodeAddress {
+                    address: "192.0.2.10".parse().unwrap(),
+                    kind: NodeAddressKind::Internal,
+                },
+            ],
+        }
+        .validate_and_normalize()
+        .expect("valid dual-stack Node addresses");
+        assert!(snapshot.addresses[0].address.is_ipv4());
+        assert_eq!(snapshot.addresses[1].kind, NodeAddressKind::External);
+
+        let mut duplicate = snapshot.clone();
+        duplicate.addresses.push(ServiceNodeAddress {
+            address: "192.0.2.10".parse().unwrap(),
+            kind: NodeAddressKind::External,
+        });
+        assert!(matches!(
+            duplicate.validate_and_normalize(),
+            Err(NodePortNodeError::DuplicateAddress(_))
+        ));
+        let mut unusable = snapshot;
+        unusable.addresses[0].address = "127.0.0.1".parse().unwrap();
+        assert!(matches!(
+            unusable.validate_and_normalize(),
+            Err(NodePortNodeError::UnusableAddress(_))
+        ));
+    }
+
     fn source_service() -> ServiceSource {
         ServiceSource {
             namespace: "demo".to_owned(),
@@ -1871,6 +2295,87 @@ mod tests {
         assert_eq!(
             compile_service_dataplane(&compiled, 0),
             Err(ServiceDataplaneError::UnsupportedNodePort { actual: 4 })
+        );
+    }
+
+    #[test]
+    fn node_port_dataplane_is_node_scoped_banked_and_policy_typed() {
+        let mut source = source_service();
+        source.external_traffic_policy = ServiceTrafficPolicy::Local;
+        source.ports[1].node_port = Some(30_080);
+        let snapshot = compile_service_snapshot(
+            9,
+            Revision::new(3),
+            vec![source],
+            vec![
+                source_slice(AddressFamily::Ipv4, "api-v4", "10.244.0.20"),
+                source_slice(AddressFamily::Ipv6, "api-v6", "fd01::20"),
+            ],
+        )
+        .expect("valid NodePort service intent");
+        let node = NodePortNodeSnapshot {
+            schema_version: NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
+            source_epoch: 9,
+            revision: Revision::new(7),
+            node_name: "worker-a".to_owned(),
+            node_uid: "worker-a-uid".to_owned(),
+            addresses: vec![
+                ServiceNodeAddress {
+                    address: "192.0.2.10".parse().unwrap(),
+                    kind: NodeAddressKind::Internal,
+                },
+                ServiceNodeAddress {
+                    address: "198.51.100.10".parse().unwrap(),
+                    kind: NodeAddressKind::External,
+                },
+                ServiceNodeAddress {
+                    address: "fdff::10".parse().unwrap(),
+                    kind: NodeAddressKind::Internal,
+                },
+            ],
+        };
+        let state =
+            compile_node_port_dataplane(&snapshot, &node, 1, 0).expect("valid local NodePort maps");
+        assert_eq!(state.ipv4_frontends.len(), 2);
+        assert_eq!(state.ipv6_frontends.len(), 1);
+        for value in state
+            .ipv4_frontends
+            .values()
+            .chain(state.ipv6_frontends.values())
+        {
+            assert_eq!(
+                u16::from_ne_bytes(value[14..16].try_into().unwrap()),
+                NODE_PORT_FRONTEND_FLAG_LOCAL
+            );
+            assert_eq!(value[24], 1);
+        }
+        assert_eq!(
+            u64::from_ne_bytes(state.config[8..16].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            u64::from_ne_bytes(state.config[16..24].try_into().unwrap()),
+            7
+        );
+        assert_eq!(state.config[34], 0);
+
+        let mut skewed = node;
+        skewed.source_epoch = 10;
+        assert_eq!(
+            compile_node_port_dataplane(&snapshot, &skewed, 1, 0),
+            Err(NodePortDataplaneError::SourceEpochMismatch)
+        );
+        assert_eq!(
+            preflight_node_port_family_capacity(
+                "NODE_PORT_FRONTENDS_V4",
+                2,
+                (SERVICE_FRONTEND_BANK_CAPACITY / 2) + 1,
+            ),
+            Err(NodePortDataplaneError::Capacity {
+                map: "NODE_PORT_FRONTENDS_V4",
+                actual: SERVICE_FRONTEND_BANK_CAPACITY + 2,
+                limit: SERVICE_FRONTEND_BANK_CAPACITY,
+            })
         );
     }
 

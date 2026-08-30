@@ -52,9 +52,10 @@ use unf_route::{
 };
 use unf_service::{
     AddressFamily, EndpointPortSource, EndpointSliceSource, EndpointSource,
-    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceBackend,
-    ServiceIr, ServiceSnapshot, ServiceSource, ServiceSourcePort, ServiceTrafficPolicy,
-    compile_service_snapshot,
+    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
+    NodeAddressKind, NodePortNodeSnapshot, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceBackend,
+    ServiceIr, ServiceNodeAddress, ServiceSnapshot, ServiceSource, ServiceSourcePort,
+    ServiceTrafficPolicy, compile_service_snapshot,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
@@ -219,6 +220,9 @@ struct ControllerState {
     agent_node_selector: Option<String>,
     pods: RwLock<BTreeMap<String, PodRecord>>,
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
+    node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
+    rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
+    node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
     node_block_inputs: RwLock<BTreeMap<String, NodeBlockInput>>,
     node_block_initialization: Mutex<Option<BTreeMap<String, NodeBlockInput>>>,
     node_blocks: RwLock<BTreeMap<String, AssignedNodeBlock>>,
@@ -287,6 +291,13 @@ struct AssignedNodeBlock {
 struct NodeTransport {
     ipv4: Ipv4Addr,
     ipv6: Ipv6Addr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodePortNodeRecord {
+    node_uid: String,
+    revision: Revision,
+    addresses: Vec<ServiceNodeAddress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -770,6 +781,7 @@ async fn spawn_internal_api(
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
         .route("/v1/state/services", get(service_snapshot))
+        .route("/v1/state/node-port-node", get(node_port_node_snapshot))
         .route("/v1/state/node-block", get(node_block_snapshot))
         .route("/v1/state/remote-routes", get(remote_route_snapshot))
         .route("/v1/state/agents", post(ingest_agent_status))
@@ -1052,6 +1064,9 @@ fn new_state_with_client_and_selector(
         agent_node_selector,
         pods: RwLock::new(BTreeMap::new()),
         nodes: RwLock::new(BTreeMap::new()),
+        node_port_nodes: RwLock::new(BTreeMap::new()),
+        rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
+        node_port_node_initialization: Mutex::new(None),
         node_block_inputs: RwLock::new(BTreeMap::new()),
         node_block_initialization: Mutex::new(None),
         node_blocks: RwLock::new(BTreeMap::new()),
@@ -1945,6 +1960,8 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
         Event::InitApply(node) => reconcile_node(state, &node, true),
         Event::Delete(node) => {
             let node_name = node.name_any();
+            write_lock(&state.node_port_nodes).remove(&node_name);
+            write_lock(&state.rejected_node_port_nodes).remove(&node_name);
             if write_lock(&state.node_block_inputs)
                 .remove(&node_name)
                 .is_some()
@@ -1969,6 +1986,7 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
         }
         Event::Init => {
             begin_topology_initialization(state);
+            *mutex_lock(&state.node_port_node_initialization) = Some(BTreeSet::new());
             *mutex_lock(&state.node_block_initialization) = Some(BTreeMap::new());
             let had_nodes = !read_lock(&state.nodes).is_empty();
             write_lock(&state.nodes).clear();
@@ -1982,6 +2000,12 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             }
         }
         Event::InitDone => {
+            if let Some(initialized) = mutex_lock(&state.node_port_node_initialization).take() {
+                write_lock(&state.node_port_nodes)
+                    .retain(|node_name, _| initialized.contains(node_name));
+                write_lock(&state.rejected_node_port_nodes)
+                    .retain(|node_name, _| initialized.contains(node_name));
+            }
             if let Some(initialized) = mutex_lock(&state.node_block_initialization).take() {
                 let changed = *read_lock(&state.node_block_inputs) != initialized;
                 if changed {
@@ -2006,6 +2030,12 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
 fn reconcile_node(state: &ControllerState, node: &Node, initializing: bool) {
     let normalized = topology_node(node);
     let gateways = ovn_host_network_gateways(node);
+    if initializing
+        && let Some(initialized) = mutex_lock(&state.node_port_node_initialization).as_mut()
+    {
+        initialized.insert(normalized.name.clone());
+    }
+    reconcile_node_port_node(state, node);
     if initializing {
         stage_node_block_input(state, node);
     } else {
@@ -2028,6 +2058,82 @@ fn reconcile_node(state: &ControllerState, node: &Node, initializing: bool) {
     if gateways_changed {
         bump_policy_revision(state);
     }
+}
+
+fn reconcile_node_port_node(state: &ControllerState, node: &Node) {
+    let node_name = node.name_any();
+    let previous = read_lock(&state.node_port_nodes).get(&node_name).cloned();
+    let next_revision = previous
+        .as_ref()
+        .map_or(Revision::new(1), |record| record.revision.next());
+    match node_port_node_record(node, state.identity_epoch, next_revision) {
+        Ok(candidate) => {
+            write_lock(&state.rejected_node_port_nodes).remove(&node_name);
+            if previous.as_ref().is_some_and(|record| {
+                record.node_uid == candidate.node_uid && record.addresses == candidate.addresses
+            }) {
+                return;
+            }
+            write_lock(&state.node_port_nodes).insert(node_name, candidate);
+        }
+        Err(error) => {
+            state.metrics.errors.inc();
+            write_lock(&state.rejected_node_port_nodes)
+                .insert(node_name.clone(), error.to_string());
+            warn!(%error, %node_name, "NodePort Node-address admission failed; retaining last-valid state");
+        }
+    }
+}
+
+fn node_port_node_record(
+    node: &Node,
+    source_epoch: u64,
+    revision: Revision,
+) -> Result<NodePortNodeRecord> {
+    let node_name = node.name_any();
+    let node_uid = node
+        .metadata
+        .uid
+        .clone()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| anyhow!("Node {node_name} has no authoritative UID"))?;
+    let mut addresses = Vec::new();
+    for address in node
+        .status
+        .as_ref()
+        .and_then(|status| status.addresses.as_ref())
+        .into_iter()
+        .flatten()
+    {
+        let kind = match address.type_.as_str() {
+            "InternalIP" => NodeAddressKind::Internal,
+            "ExternalIP" => NodeAddressKind::External,
+            _ => continue,
+        };
+        addresses.push(ServiceNodeAddress {
+            address: address.address.parse().with_context(|| {
+                format!(
+                    "Node {node_name} {} {:?} is not an IP address",
+                    address.type_, address.address
+                )
+            })?,
+            kind,
+        });
+    }
+    let snapshot = NodePortNodeSnapshot {
+        schema_version: NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
+        source_epoch,
+        revision,
+        node_name,
+        node_uid,
+        addresses,
+    }
+    .validate_and_normalize()?;
+    Ok(NodePortNodeRecord {
+        node_uid: snapshot.node_uid,
+        revision: snapshot.revision,
+        addresses: snapshot.addresses,
+    })
 }
 
 fn update_node_block_input(state: &ControllerState, node: &Node) {
@@ -3656,6 +3762,42 @@ async fn node_block_snapshot(
 ) -> Result<Json<NodeBlockSnapshot>, ApiError> {
     let agent = authenticate_internal_agent(&state, &headers).await?;
     Ok(Json(node_block_snapshot_for(&state, &agent.node_name)?))
+}
+
+async fn node_port_node_snapshot(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<NodePortNodeSnapshot>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    node_port_node_snapshot_for(&state, &agent.node_name).map(Json)
+}
+
+fn node_port_node_snapshot_for(
+    state: &ControllerState,
+    node_name: &str,
+) -> Result<NodePortNodeSnapshot, ApiError> {
+    let record = read_lock(&state.node_port_nodes)
+        .get(node_name)
+        .cloned()
+        .ok_or_else(|| {
+            let detail = read_lock(&state.rejected_node_port_nodes)
+                .get(node_name)
+                .cloned()
+                .unwrap_or_else(|| "Node has not published eligible addresses".to_owned());
+            ApiError::service_unavailable(format!(
+                "node {node_name} has no valid NodePort address intent: {detail}"
+            ))
+        })?;
+    NodePortNodeSnapshot {
+        schema_version: NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
+        source_epoch: state.identity_epoch,
+        revision: record.revision,
+        node_name: node_name.to_owned(),
+        node_uid: record.node_uid,
+        addresses: record.addresses,
+    }
+    .validate_and_normalize()
+    .map_err(|error| ApiError::internal(format!("validate NodePort Node state: {error}")))
 }
 
 async fn remote_route_snapshot(
@@ -6301,9 +6443,14 @@ mod tests {
             "kind": "Node",
             "metadata": {
                 "name": "worker-a",
+                "uid": "worker-a-uid",
                 "labels": {"kubernetes.io/hostname": "worker-a"}
             },
             "status": {
+                "addresses": [
+                    {"type": "InternalIP", "address": "192.0.2.1"},
+                    {"type": "InternalIP", "address": "fdff::1"}
+                ],
                 "conditions": [{
                     "type": "Ready",
                     "status": if ready { "True" } else { "False" },
@@ -7043,6 +7190,78 @@ mod tests {
         apply_node_event(&state, Event::Apply(invalid));
         assert!(read_lock(&state.node_blocks).is_empty());
         assert!(read_lock(&state.rejected_node_blocks)["worker-a"].contains("exactly one"));
+    }
+
+    #[test]
+    fn node_port_node_intent_is_scoped_revisioned_and_last_valid() {
+        let state = new_state(true);
+        let mut source = primary_node("worker-a", "10.42.0.0/24", "fd00:42::/64");
+        source
+            .status
+            .as_mut()
+            .unwrap()
+            .addresses
+            .as_mut()
+            .unwrap()
+            .push(k8s_openapi::api::core::v1::NodeAddress {
+                type_: "ExternalIP".to_owned(),
+                address: "198.51.100.10".to_owned(),
+            });
+        apply_node_event(&state, Event::Apply(source.clone()));
+        let first = node_port_node_snapshot_for(&state, "worker-a").unwrap();
+        assert_eq!(first.revision, Revision::new(1));
+        assert_eq!(first.addresses.len(), 3);
+        assert!(
+            first
+                .addresses
+                .iter()
+                .any(|address| address.kind == NodeAddressKind::External)
+        );
+        assert!(node_port_node_snapshot_for(&state, "worker-b").is_err());
+
+        apply_node_event(&state, Event::Apply(source.clone()));
+        assert_eq!(
+            node_port_node_snapshot_for(&state, "worker-a")
+                .unwrap()
+                .revision,
+            Revision::new(1)
+        );
+        source.status.as_mut().unwrap().addresses.as_mut().unwrap()[0].address =
+            "not-an-address".to_owned();
+        apply_node_event(&state, Event::Apply(source));
+        assert_eq!(
+            node_port_node_snapshot_for(&state, "worker-a")
+                .unwrap()
+                .revision,
+            Revision::new(1)
+        );
+        assert!(read_lock(&state.rejected_node_port_nodes).contains_key("worker-a"));
+
+        let relisted = primary_node("worker-a", "10.42.0.0/24", "fd00:42::/64");
+        apply_node_event(&state, Event::Init);
+        apply_node_event(&state, Event::InitApply(relisted.clone()));
+        apply_node_event(&state, Event::InitDone);
+        assert_eq!(
+            node_port_node_snapshot_for(&state, "worker-a")
+                .unwrap()
+                .revision,
+            Revision::new(2)
+        );
+        assert!(read_lock(&state.rejected_node_port_nodes).is_empty());
+
+        apply_node_event(&state, Event::Init);
+        apply_node_event(&state, Event::InitApply(relisted));
+        apply_node_event(&state, Event::InitDone);
+        assert_eq!(
+            node_port_node_snapshot_for(&state, "worker-a")
+                .unwrap()
+                .revision,
+            Revision::new(2)
+        );
+
+        apply_node_event(&state, Event::Init);
+        apply_node_event(&state, Event::InitDone);
+        assert!(node_port_node_snapshot_for(&state, "worker-a").is_err());
     }
 
     #[test]

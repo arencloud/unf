@@ -185,8 +185,14 @@ schema v2, new controllers project an exact schema-v1 ClusterIP view for old
 agents, new agents read old-controller v1 state without rewriting rollback-safe
 checkpoints, and capability-aware acknowledgements prevent a legacy agent from
 claiming convergence when NodePort intent exists. ADR 0083 records the four-way
-mixed-version contract. Transactional Node-address and host-facing map state is
-the active next milestone.
+mixed-version contract. The first transactional host-state slice is also
+verified: the controller derives bounded Node `InternalIP`/`ExternalIP` intent,
+serves only the TokenReview-authenticated agent's Node with independent
+revision/relist/last-valid semantics, and compiles it into a fixed dual-stack,
+independently banked NodePort ABI referencing an exact ClusterIP service bank.
+No agent mutates those maps and no host hook consumes them yet. ADR 0084 and
+`make nodeport-host-state-test` define that boundary; inactive-map activation,
+rollback, durable recovery, and cleanup are the active Phase 5.3b milestone.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
