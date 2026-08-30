@@ -176,7 +176,6 @@ assert_agent() {
     wait_for_agent_service_state "${node}"
     host_state=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
         test "$(getenforce)" = Enforcing
-        test -d /sys/fs/bpf/unf/v4
         test -d /sys/fs/bpf/unf/v5
         for pin in SERVICE_CONFIG SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 \
             SERVICE_BACKENDS_V4 SERVICE_BACKENDS_V6 SERVICE_CONNECTIONS \
@@ -418,11 +417,23 @@ done
 stage=evidence
 mkdir -p "$(dirname "${artifact}")"
 artifact_tmp="${artifact}.tmp.$$"
+retained_abi4_nodes='[]'
+rebuild_abi4_nodes='[]'
+for node in "${nodes[@]}"; do
+    if "${kc[@]}" debug "node/${node}" --quiet -- chroot /host \
+        test -d /sys/fs/bpf/unf/v4 >/dev/null 2>&1; then
+        retained_abi4_nodes=$(jq -c --arg node "${node}" '. + [$node]' <<<"${retained_abi4_nodes}")
+    else
+        rebuild_abi4_nodes=$(jq -c --arg node "${node}" '. + [$node]' <<<"${rebuild_abi4_nodes}")
+    fi
+done
 jq -n \
     --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg context "${context}" --arg infrastructure "${infrastructure}" \
     --arg sourceRevision "${source_revision}" --arg controllerImage "${controller_image}" \
     --arg agentImage "${agent_image}" --argjson nodes "${transitioned}" \
+    --argjson retainedAbi4Nodes "${retained_abi4_nodes}" \
+    --argjson rebuildAbi4Nodes "${rebuild_abi4_nodes}" \
     --argjson agents "${agents}" '
     {
       schemaVersion:1, generatedAt:$generatedAt, phase:"5.8",
@@ -430,12 +441,16 @@ jq -n \
       sourceRevision:$sourceRevision,
       images:{controller:$controllerImage,agent:$agentImage},
       strategy:"controller-first-machineconfig-interleaved-agent-ondelete-node-serial",
-      kubeProxyPresent:false, retainedPersistentAbi:[4,5], nodes:$nodes, agents:$agents,
+      kubeProxyPresent:false,
+      retainedPersistentAbi:(if ($retainedAbi4Nodes | length) > 0 then [4,5] else [5] end),
+      rollbackAbi4:{retainedNodes:$retainedAbi4Nodes,rebuildRequiredNodes:$rebuildAbi4Nodes},
+      nodes:$nodes, agents:$agents,
       verified:["immutable public image digests","controller-first compatibility boundary",
         "MachineConfig-aware five-node serial agent replacement","RHCOS SELinux enforcing","legacy-netlink TC attachment",
         "persistent NodePort host sysctl contract","durable composite service snapshot",
         "host-origin Kubernetes API Service reachability","no functional kube-proxy rule residue",
-        "ABI-v5 service and NodePort maps","full agent convergence","kube-proxy remains absent"]
+        "ABI-v5 service and NodePort maps","explicit ABI-v4 retain-or-rebuild rollback state",
+        "full agent convergence","kube-proxy remains absent"]
     }
 ' >"${artifact_tmp}"
 chmod 0600 "${artifact_tmp}"

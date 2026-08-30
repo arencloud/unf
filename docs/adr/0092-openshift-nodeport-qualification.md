@@ -27,7 +27,9 @@ schema-v2 Phase 5.7 Kind result, and public Quay images resolved by digest. It:
    its Node completes the MachineConfig reboot, so host-origin Kubernetes API
    Service recovery cannot deadlock behind an ingress-router disruption budget;
 4. requires five-Node schema-v5 status convergence and ABI-v5 service/NodePort
-   state while retaining ABI v4 only as a bounded rollback boundary;
+   state, and records whether each Node retained ABI v4 or must rebuild it from
+   the compatible old image and durable checkpoint after a host reboot cleared
+   bpffs;
 5. rejects functional `KUBE-SVC`/`KUBE-SEP` residue, proves the host-origin
    Kubernetes API Service path on every rebooted Node, and then proves IPv4/IPv6
    TCP/UDP host-network ClusterIP traffic on all five Nodes;
@@ -38,8 +40,9 @@ schema-v2 Phase 5.7 Kind result, and public Quay images resolved by digest. It:
    and continuously probes ClusterIP and NodePort paths;
 8. verifies classified metrics/history/explanation, exact read-only simulation,
    empty NodePort maps and legacy checkpoint after fixture cleanup; and
-9. retires only the historical ABI-v4 maps, requires five-Node convergence, and
-   permits no new unhealthy ClusterOperator beyond the recorded baseline.
+9. retires historical ABI-v4 maps where retained, classifies reboot-cleared
+   Nodes as rollback-rebuild paths, requires five-Node convergence, and permits
+   no new unhealthy ClusterOperator beyond the recorded baseline.
 
 Evidence is written locally as schema-v2
 `.artifacts/phase5-nodeport-openshift.json`. Registry credentials, kubeconfig
@@ -49,6 +52,9 @@ contents, projected tokens, and kubeadmin credentials are never included.
 
 - The MachineConfig change may reboot all five lab Nodes in pool-controlled
   order. Agent transition is interleaved after each completed Node reboot.
+- ABI-versioned bpffs pins survive process replacement but not a host reboot.
+  Therefore rollback evidence distinguishes retained ABI-v4 maps from Nodes
+  that must reconstruct ABI v4 using the old digest and compatible checkpoint.
 - The disconnected Insights operator may remain in the baseline; any additional
   unavailable, degraded, or progressing operator fails the final comparison.
 - A live failure preserves kube-proxy absence and restores only temporary test

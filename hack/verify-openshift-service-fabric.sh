@@ -504,7 +504,7 @@ for node in "${nodes[@]}"; do
     [[ $("${kc[@]}" -n unf-system get pod "$(agent_pod_on_node "${node}")" -o jsonpath='{.spec.containers[0].image}') == "${agent_image}" ]]
     host_check=$(host_exec "${node}" '
         test "$(getenforce)" = Enforcing
-        test -d /sys/fs/bpf/unf/v4 && test -d /sys/fs/bpf/unf/v5
+        test -d /sys/fs/bpf/unf/v5
         test -e /sys/fs/bpf/unf/v5/NODE_PORT_CONFIG
         test -e /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V4
         test -e /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V6
@@ -911,20 +911,27 @@ for node in "${nodes[@]}"; do
 done
 
 stage=retire-abi-v4-pins
+retired_abi4_nodes='[]'
+rebuild_abi4_nodes='[]'
 for node in "${nodes[@]}"; do
     pod=$(agent_pod_on_node "${node}")
-    plan=$("${kc[@]}" -n unf-system exec "${pod}" -- \
-        /usr/local/bin/unf-component cleanup --bpf-root /sys/fs/bpf/unf --abi-version 4)
-    grep -Fq 'UNF cleanup plan (dry-run)' <<<"${plan}"
-    grep -Fq 'ABI directory: /sys/fs/bpf/unf/v4' <<<"${plan}"
-    if grep -Fq 'legacy attachment' <<<"${plan}"; then
-        echo "ABI-v4 map retirement unexpectedly included live TC attachments" >&2
-        exit 1
+    if host_exec "${node}" 'test -d /sys/fs/bpf/unf/v4' >/dev/null 2>&1; then
+        plan=$("${kc[@]}" -n unf-system exec "${pod}" -- \
+            /usr/local/bin/unf-component cleanup --bpf-root /sys/fs/bpf/unf --abi-version 4)
+        grep -Fq 'UNF cleanup plan (dry-run)' <<<"${plan}"
+        grep -Fq 'ABI directory: /sys/fs/bpf/unf/v4' <<<"${plan}"
+        if grep -Fq 'legacy attachment' <<<"${plan}"; then
+            echo "ABI-v4 map retirement unexpectedly included live TC attachments" >&2
+            exit 1
+        fi
+        output=$("${kc[@]}" -n unf-system exec "${pod}" -- \
+            /usr/local/bin/unf-component cleanup --bpf-root /sys/fs/bpf/unf \
+            --abi-version 4 --execute)
+        grep -Fq 'UNF cleanup completed' <<<"${output}"
+        retired_abi4_nodes=$(jq -c --arg node "${node}" '. + [$node]' <<<"${retired_abi4_nodes}")
+    else
+        rebuild_abi4_nodes=$(jq -c --arg node "${node}" '. + [$node]' <<<"${rebuild_abi4_nodes}")
     fi
-    output=$("${kc[@]}" -n unf-system exec "${pod}" -- \
-        /usr/local/bin/unf-component cleanup --bpf-root /sys/fs/bpf/unf \
-        --abi-version 4 --execute)
-    grep -Fq 'UNF cleanup completed' <<<"${output}"
     host_check=$(host_exec "${node}" '
         test ! -e /sys/fs/bpf/unf/v4
         test -d /sys/fs/bpf/unf/v5
@@ -964,6 +971,8 @@ jq -n --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg serverNodeIPv4 "${server_node_v4}" --arg serverNodeIPv6 "${server_node_v6}" \
     --argjson serviceId "${service_id}" --argjson clusterServiceId "${cluster_service_id}" \
     --argjson localServiceId "${local_service_id}" \
+    --argjson retiredAbi4Nodes "${retired_abi4_nodes}" \
+    --argjson rebuildAbi4Nodes "${rebuild_abi4_nodes}" \
     --argjson durationSeconds "$(( $(date +%s) - started_unix ))" --argjson nodes "${node_evidence}" \
     --argjson agents "${agents}" --argjson baselineUnhealthy "${baseline_unhealthy}" '
     {
@@ -973,6 +982,7 @@ jq -n --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       durationSeconds:$durationSeconds,
       images:{controller:$controllerImage,agent:$agentImage,testTools:$testToolsImage},
       kubeProxyPresent:false, persistentBpfAbis:[5], baselineUnhealthyOperators:$baselineUnhealthy,
+      rollbackAbi4:{retiredNodes:$retiredAbi4Nodes,rebuildRequiredNodes:$rebuildAbi4Nodes},
       service:{id:$serviceId,ipv4:$serviceIPv4,ipv6:$serviceIPv6}, nodes:$nodes, agents:$agents,
       nodePort:{clusterServiceId:$clusterServiceId,localServiceId:$localServiceId,
         clientNode:{name:$clientNode,ipv4:$clientNodeIPv4,ipv6:$clientNodeIPv6},
@@ -993,7 +1003,8 @@ jq -n --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         "backend deletion and recovery","translation and no-backend provenance",
         "service explanation","controller-outage source and destination agent replacement",
         "durable composite service recovery","empty NodePort maps and legacy checkpoint after cleanup",
-        "persistent IPv4 NodePort host sysctls","exact qualification cleanup","scoped ABI-v4 map retirement",
+        "persistent IPv4 NodePort host sysctls","exact qualification cleanup",
+        "scoped retained ABI-v4 retirement and reboot-cleared ABI-v4 rebuild classification",
         "five-node convergence","no new unhealthy ClusterOperators"]
     }
 ' >"${artifact_tmp}"
