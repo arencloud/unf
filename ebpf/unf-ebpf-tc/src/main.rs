@@ -3,10 +3,10 @@
 
 use aya_ebpf::bindings::{
     BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR, BPF_FIB_LOOKUP_OUTPUT,
-    BPF_FIB_LOOKUP_SKIP_NEIGH, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT,
+    BPF_FIB_LKUP_RET_NO_NEIGH, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT,
     bpf_fib_lookup as BpfFibLookup,
 };
-use aya_ebpf::helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect_neigh};
+use aya_ebpf::helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh};
 use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
@@ -1652,21 +1652,19 @@ fn reroute_host_service_v4(ctx: &TcContext, observation: &FlowObservation) -> i3
         observation.destination_address[2],
         observation.destination_address[3],
     ]);
-    // SAFETY: pointers and length exactly match the TC helper ABI; skipping the
-    // first neighbor lookup lets `bpf_redirect_neigh` resolve or refresh it.
+    // SAFETY: pointers and length exactly match the TC helper ABI. A successful
+    // lookup supplies the exact L2 addresses required by direct workload-veth
+    // routes; unresolved physical neighbors use the helper fallback below.
     #[allow(unsafe_code)]
     let result = unsafe {
         bpf_fib_lookup(
             ctx.skb.skb.cast(),
             &mut lookup,
             core::mem::size_of::<BpfFibLookup>() as i32,
-            BPF_FIB_LOOKUP_OUTPUT | BPF_FIB_LOOKUP_SKIP_NEIGH,
+            BPF_FIB_LOOKUP_OUTPUT,
         )
     };
-    if result != 0 || lookup.ifindex == 0 {
-        return service_reroute_failed();
-    }
-    redirect_service_neighbor(lookup.ifindex)
+    redirect_service_route(ctx, &lookup, result)
 }
 
 #[inline(never)]
@@ -1698,13 +1696,10 @@ fn reroute_host_service_v6(ctx: &TcContext, observation: &FlowObservation) -> i3
             ctx.skb.skb.cast(),
             &mut lookup,
             core::mem::size_of::<BpfFibLookup>() as i32,
-            BPF_FIB_LOOKUP_OUTPUT | BPF_FIB_LOOKUP_SKIP_NEIGH,
+            BPF_FIB_LOOKUP_OUTPUT,
         )
     };
-    if result != 0 || lookup.ifindex == 0 {
-        return service_reroute_failed();
-    }
-    redirect_service_neighbor(lookup.ifindex)
+    redirect_service_route(ctx, &lookup, result)
 }
 
 #[inline(always)]
@@ -1718,11 +1713,34 @@ fn ipv6_fib_words(address: [u8; 16]) -> [u32; 4] {
 }
 
 #[inline(always)]
-fn redirect_service_neighbor(ifindex: u32) -> i32 {
+fn redirect_service_route(ctx: &TcContext, lookup: &BpfFibLookup, result: i64) -> i32 {
+    if lookup.ifindex == 0 {
+        return service_reroute_failed();
+    }
+    if result == 0 {
+        if ctx.store(0, &lookup.dmac, 0).is_err()
+            || ctx.store(6, &lookup.smac, 0).is_err()
+        {
+            return service_reroute_failed();
+        }
+        // SAFETY: the successful FIB lookup returned a live output interface
+        // and the Ethernet header now carries that route's exact addresses.
+        #[allow(unsafe_code)]
+        let action = unsafe { bpf_redirect(lookup.ifindex, 0) };
+        return if action == i64::from(TC_ACT_REDIRECT) {
+            TC_ACT_REDIRECT
+        } else {
+            service_reroute_failed()
+        };
+    }
+    if result != i64::from(BPF_FIB_LKUP_RET_NO_NEIGH) {
+        return service_reroute_failed();
+    }
     // SAFETY: a null neighbor parameter requests the helper's documented FIB
-    // resolution from the already rewritten packet headers.
+    // resolution for a route whose first lookup reported only a missing
+    // neighbor entry.
     #[allow(unsafe_code)]
-    let action = unsafe { bpf_redirect_neigh(ifindex, core::ptr::null_mut(), 0, 0) };
+    let action = unsafe { bpf_redirect_neigh(lookup.ifindex, core::ptr::null_mut(), 0, 0) };
     if action == i64::from(TC_ACT_REDIRECT) {
         TC_ACT_REDIRECT
     } else {
