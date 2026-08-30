@@ -210,9 +210,9 @@ fresh_tcp_probe() {
     local source_port target
     source_port=$(qualification_source_port 20000 negative "${family}" "${address}" "${port}")
     if [[ ${family} == 4 ]]; then
-        target="TCP4:${address}:${port},sourceport=${source_port},reuseaddr"
+        target="TCP4:${address}:${port},sourceport=${source_port},reuseaddr,connect-timeout=1"
     else
-        target="TCP6:[${address}]:${port},sourceport=${source_port},reuseaddr"
+        target="TCP6:[${address}]:${port},sourceport=${source_port},reuseaddr,connect-timeout=1"
     fi
     "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
         "printf 'GET /health HTTP/1.0\\r\\nHost: qualification\\r\\n\\r\\n' | socat -T 1 - '${target}'" \
