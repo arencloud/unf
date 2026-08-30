@@ -27,8 +27,8 @@ use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -52,10 +52,10 @@ use unf_route::{
     NativeRemoteRoutingProvider, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION, RemoteRouteSnapshot,
 };
 use unf_service::{
-    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, MAX_BACKENDS_PER_SERVICE,
-    SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, MAX_BACKENDS_PER_SERVICE, NodePortDataplaneState,
+    NodePortNodeSnapshot, SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
     SERVICE_FRONTEND_BANK_CAPACITY, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceDataplaneState,
-    ServiceSnapshot, compile_service_dataplane,
+    ServiceSnapshot, compile_node_port_fabric_dataplane, compile_service_dataplane,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
@@ -73,7 +73,7 @@ use cni_server::CniTransactionServer;
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v4";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v5";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
@@ -82,6 +82,7 @@ const DEFAULT_CNI_REMOTE_ROUTE_STATE_PATH: &str = "/var/lib/unf/cni/v1/remote-ro
 const DEFAULT_SERVICE_STATE_PATH: &str = "/var/lib/unf/cni/v1/service-snapshot.json";
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
+const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
 const BLOCKED_TRANSITION_REPORTING_WINDOW: Duration = Duration::from_secs(30);
 const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
@@ -120,7 +121,7 @@ const ABI_V3_MAP_NAMES: [&str; 11] = [
     "EGRESS_IPV6",
     "POLICY_CONFIG",
 ];
-const PERSISTENT_MAP_NAMES: [&str; 18] = [
+const ABI_V4_MAP_NAMES: [&str; 18] = [
     "IDENTITY_V4",
     "IDENTITY_V4_B",
     "IDENTITY_V6",
@@ -139,6 +140,29 @@ const PERSISTENT_MAP_NAMES: [&str; 18] = [
     "SERVICE_BACKEND_SLOTS",
     "SERVICE_CONFIG",
     "SERVICE_CONNECTIONS",
+];
+const PERSISTENT_MAP_NAMES: [&str; 21] = [
+    "IDENTITY_V4",
+    "IDENTITY_V4_B",
+    "IDENTITY_V6",
+    "IDENTITY_V6_B",
+    "IDENTITY_CONFIG",
+    "POLICY_RULES",
+    "POLICY_IPV4",
+    "POLICY_IPV6",
+    "EGRESS_IPV4",
+    "EGRESS_IPV6",
+    "POLICY_CONFIG",
+    "SERVICE_FRONTENDS_V4",
+    "SERVICE_FRONTENDS_V6",
+    "SERVICE_BACKENDS_V4",
+    "SERVICE_BACKENDS_V6",
+    "SERVICE_BACKEND_SLOTS",
+    "SERVICE_CONFIG",
+    "SERVICE_CONNECTIONS",
+    "NODE_PORT_FRONTENDS_V4",
+    "NODE_PORT_FRONTENDS_V6",
+    "NODE_PORT_CONFIG",
 ];
 const IDENTITY_MAP_CAPACITY: u32 = 65_536;
 const POLICY_MAP_CAPACITY: u32 = 262_144;
@@ -553,14 +577,37 @@ struct ServiceSynchronizer {
     backend_slots: AyaHashMap<MapData, [u8; 16], [u8; 16]>,
     config: AyaArray<MapData, [u8; 32]>,
     connections: AyaHashMap<MapData, [u8; 40], [u8; 88]>,
+    node_port_ipv4_frontends: AyaHashMap<MapData, [u8; 8], [u8; 32]>,
+    node_port_ipv6_frontends: AyaHashMap<MapData, [u8; 20], [u8; 32]>,
+    node_port_config: AyaArray<MapData, [u8; 40]>,
     banks: [Option<ServiceDataplaneState>; SERVICE_BANK_COUNT as usize],
+    node_port_banks:
+        [Option<NodePortDataplaneState>; unf_ebpf_common::NODE_PORT_BANK_COUNT as usize],
     active_bank: u8,
+    active_node_port_bank: u8,
     applied: Option<ServiceSnapshot>,
+    applied_node_port_node: Option<NodePortNodeSnapshot>,
+    node_name: String,
     controller_url: Option<String>,
     client: ReloadingControllerClient,
     agent_token_path: PathBuf,
     state_path: PathBuf,
     interval: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct NodePortServiceCheckpoint {
+    schema_version: u16,
+    service: ServiceSnapshot,
+    node_port_node: NodePortNodeSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StoredServiceCheckpoint {
+    Legacy(ServiceSnapshot),
+    NodePort(NodePortServiceCheckpoint),
 }
 
 type EncodedPolicyMap = AyaHashMap<MapData, [u8; 12], [u8; 32]>;
@@ -591,8 +638,12 @@ type ServiceMaps = (
     AyaHashMap<MapData, [u8; 16], [u8; 16]>,
     AyaArray<MapData, [u8; 32]>,
     AyaHashMap<MapData, [u8; 40], [u8; 88]>,
+    AyaHashMap<MapData, [u8; 8], [u8; 32]>,
+    AyaHashMap<MapData, [u8; 20], [u8; 32]>,
+    AyaArray<MapData, [u8; 40]>,
 );
 type RecoveredServiceConfig = (u64, u64, u32, u32, u32, u8);
+type RecoveredNodePortConfig = (u64, u64, u64, u32, u32, u8);
 
 struct DataplaneConfig {
     object: PathBuf,
@@ -1897,6 +1948,26 @@ async fn fetch_service_snapshot(
     .context("decode controller service snapshot")
 }
 
+async fn fetch_node_port_node_snapshot(
+    controller_url: &str,
+    client: &ReloadingControllerClient,
+    token_path: &Path,
+) -> Result<NodePortNodeSnapshot> {
+    authenticated_get(
+        client,
+        format!("{controller_url}/v1/state/node-port-node"),
+        token_path,
+    )?
+    .send()
+    .await
+    .context("request controller local NodePort Node snapshot")?
+    .error_for_status()
+    .context("controller rejected local NodePort Node snapshot request")?
+    .json()
+    .await
+    .context("decode controller local NodePort Node snapshot")
+}
+
 async fn ensure_service_controller_compatibility(
     client: &ReloadingControllerClient,
     controller_url: &str,
@@ -1922,13 +1993,53 @@ async fn ensure_service_controller_compatibility(
 }
 
 fn load_optional_service_snapshot(path: &Path) -> Result<Option<ServiceSnapshot>> {
+    Ok(load_optional_service_checkpoint(path)?.map(|(service, _)| service))
+}
+
+fn load_optional_service_checkpoint(
+    path: &Path,
+) -> Result<Option<(ServiceSnapshot, Option<NodePortNodeSnapshot>)>> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error)
             .with_context(|| format!("inspect durable service snapshot {}", path.display())),
         Ok(_) => {
-            let snapshot: ServiceSnapshot = load_secure_json(path, "service")?;
-            Ok(Some(snapshot.validate_and_normalize()?))
+            let stored: StoredServiceCheckpoint = load_secure_json(path, "service")?;
+            match stored {
+                StoredServiceCheckpoint::Legacy(snapshot) => {
+                    let snapshot = snapshot.validate_and_normalize()?;
+                    if snapshot
+                        .services
+                        .iter()
+                        .any(|service| !service.node_ports.is_empty())
+                    {
+                        bail!("durable NodePort service snapshot has no local Node checkpoint");
+                    }
+                    Ok(Some((snapshot, None)))
+                }
+                StoredServiceCheckpoint::NodePort(checkpoint) => {
+                    if checkpoint.schema_version != NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION {
+                        bail!(
+                            "unsupported NodePort service checkpoint schema {}; expected {}",
+                            checkpoint.schema_version,
+                            NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION
+                        );
+                    }
+                    let service = checkpoint.service.validate_and_normalize()?;
+                    let node = checkpoint.node_port_node.validate_and_normalize()?;
+                    if service.source_epoch != node.source_epoch {
+                        bail!("durable service and local Node checkpoints have different epochs");
+                    }
+                    if service
+                        .services
+                        .iter()
+                        .all(|service| service.node_ports.is_empty())
+                    {
+                        bail!("durable NodePort checkpoint has no NodePort service intent");
+                    }
+                    Ok(Some((service, Some(node))))
+                }
+            }
         }
     }
 }
@@ -1947,6 +2058,39 @@ fn persist_service_snapshot(
         persist_secure_json(path, &legacy, description)
     } else {
         persist_secure_json(path, snapshot, description)
+    }
+}
+
+fn persist_service_checkpoint(
+    path: &Path,
+    service: &ServiceSnapshot,
+    node_port_node: Option<&NodePortNodeSnapshot>,
+    description: &str,
+) -> Result<()> {
+    let service = service.clone().validate_and_normalize()?;
+    let has_node_ports = service
+        .services
+        .iter()
+        .any(|candidate| !candidate.node_ports.is_empty());
+    match (has_node_ports, node_port_node) {
+        (false, None) => persist_service_snapshot(path, &service, description),
+        (true, Some(node)) => {
+            let node = node.clone().validate_and_normalize()?;
+            if service.source_epoch != node.source_epoch {
+                bail!("service and local Node checkpoint epochs differ");
+            }
+            persist_secure_json(
+                path,
+                &NodePortServiceCheckpoint {
+                    schema_version: NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION,
+                    service,
+                    node_port_node: node,
+                },
+                description,
+            )
+        }
+        (true, None) => bail!("NodePort service checkpoint requires local Node state"),
+        (false, Some(_)) => bail!("local Node checkpoint requires NodePort service intent"),
     }
 }
 
@@ -1975,10 +2119,19 @@ fn discard_service_pending_state(path: &Path) -> Result<()> {
     }
 }
 
-fn prepare_service_snapshot(path: &Path, snapshot: &ServiceSnapshot) -> Result<PathBuf> {
+fn prepare_service_checkpoint(
+    path: &Path,
+    service: &ServiceSnapshot,
+    node_port_node: Option<&NodePortNodeSnapshot>,
+) -> Result<PathBuf> {
     discard_service_pending_state(path)?;
     let pending = service_pending_state_path(path)?;
-    persist_service_snapshot(&pending, snapshot, "pending service")?;
+    persist_service_checkpoint(
+        &pending,
+        service,
+        node_port_node,
+        "pending NodePort service",
+    )?;
     Ok(pending)
 }
 
@@ -2015,6 +2168,23 @@ fn restore_service_checkpoint(path: &Path, previous: Option<&ServiceSnapshot>) -
     Ok(())
 }
 
+fn restore_service_fabric_checkpoint(
+    path: &Path,
+    previous_service: Option<&ServiceSnapshot>,
+    previous_node_port_node: Option<&NodePortNodeSnapshot>,
+) -> Result<()> {
+    if let Some(previous) = previous_service {
+        return persist_service_checkpoint(
+            path,
+            previous,
+            previous_node_port_node,
+            "NodePort service rollback",
+        );
+    }
+    restore_service_checkpoint(path, None)
+}
+
+#[cfg(test)]
 fn load_service_snapshot_for_active(
     path: &Path,
     epoch: u64,
@@ -2109,9 +2279,9 @@ async fn restore_or_populate_service_state(
     if synchronizer.applied.is_some() {
         return Ok(());
     }
-    if let Some(snapshot) = load_optional_service_snapshot(&synchronizer.state_path)? {
+    if let Some((snapshot, node)) = load_optional_service_checkpoint(&synchronizer.state_path)? {
         publish_desired_service_snapshot(state, &snapshot);
-        activate_service_snapshot(synchronizer, &snapshot, false, state)?;
+        activate_service_snapshot(synchronizer, &snapshot, node.as_ref(), false, state)?;
         return Ok(());
     }
     if synchronizer.controller_url.is_some() {
@@ -2135,33 +2305,304 @@ async fn synchronize_services(
     )
     .await?
     .validate_and_normalize()?;
+    let node_port_node = if service_has_node_ports(&candidate) {
+        let node = fetch_node_port_node_snapshot(
+            controller_url,
+            &synchronizer.client,
+            &synchronizer.agent_token_path,
+        )
+        .await?
+        .validate_and_normalize()?;
+        if node.node_name != synchronizer.node_name {
+            bail!(
+                "controller returned NodePort state for Node {}; authenticated agent owns {}",
+                node.node_name,
+                synchronizer.node_name
+            );
+        }
+        Some(node)
+    } else {
+        None
+    };
     publish_desired_service_snapshot(state, &candidate);
-    if !validate_service_snapshot_transition(&candidate, synchronizer.applied.as_ref())? {
+    let service_changed =
+        validate_service_snapshot_transition(&candidate, synchronizer.applied.as_ref())?;
+    let node_changed = validate_node_port_node_transition(
+        node_port_node.as_ref(),
+        synchronizer.applied_node_port_node.as_ref(),
+    )?;
+    if !service_changed && !node_changed {
         return Ok(());
     }
-    activate_service_snapshot(synchronizer, &candidate, true, state)
+    activate_service_snapshot(
+        synchronizer,
+        &candidate,
+        node_port_node.as_ref(),
+        true,
+        state,
+    )
+}
+
+fn service_has_node_ports(snapshot: &ServiceSnapshot) -> bool {
+    snapshot
+        .services
+        .iter()
+        .any(|service| !service.node_ports.is_empty())
+}
+
+fn validate_node_port_node_transition(
+    candidate: Option<&NodePortNodeSnapshot>,
+    applied: Option<&NodePortNodeSnapshot>,
+) -> Result<bool> {
+    let (Some(candidate), Some(applied)) = (candidate, applied) else {
+        return Ok(candidate != applied);
+    };
+    if candidate.source_epoch != applied.source_epoch || candidate.node_uid != applied.node_uid {
+        return Ok(true);
+    }
+    if candidate.revision < applied.revision {
+        bail!(
+            "NodePort Node revision regressed from {} to {} in controller epoch {}",
+            applied.revision.get(),
+            candidate.revision.get(),
+            candidate.source_epoch
+        );
+    }
+    if candidate.revision == applied.revision {
+        if candidate != applied {
+            bail!("NodePort Node snapshot content changed without a revision change");
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_lines)]
 fn activate_service_snapshot(
     synchronizer: &mut ServiceSynchronizer,
     candidate: &ServiceSnapshot,
+    node_port_node: Option<&NodePortNodeSnapshot>,
     persist: bool,
     state: &AgentState,
 ) -> Result<()> {
-    let staging_bank = (synchronizer.active_bank + 1) % SERVICE_BANK_COUNT;
-    let staging_index = usize::from(staging_bank);
-    let desired = compile_service_dataplane(candidate, staging_bank)?;
-    let previous = synchronizer.banks[staging_index]
-        .clone()
-        .unwrap_or_else(|| empty_service_bank(staging_bank));
+    let candidate = candidate.clone().validate_and_normalize()?;
+    let node_port_node = node_port_node
+        .cloned()
+        .map(NodePortNodeSnapshot::validate_and_normalize)
+        .transpose()?;
+    if service_has_node_ports(&candidate) != node_port_node.is_some() {
+        bail!("NodePort service intent and local Node state must be present together");
+    }
+    if let Some(node) = &node_port_node {
+        if node.node_name != synchronizer.node_name {
+            bail!("local NodePort state does not belong to this agent");
+        }
+        if node.source_epoch != candidate.source_epoch {
+            bail!("service and local NodePort state have different controller epochs");
+        }
+    }
+    let service_changed = synchronizer.applied.as_ref() != Some(&candidate);
+    let node_port_changed = synchronizer.applied_node_port_node.as_ref() != node_port_node.as_ref();
+    if !service_changed && !node_port_changed {
+        return Ok(());
+    }
 
+    let service_bank = if service_changed {
+        (synchronizer.active_bank + 1) % SERVICE_BANK_COUNT
+    } else {
+        synchronizer.active_bank
+    };
+    let node_port_must_change = node_port_changed || (service_changed && node_port_node.is_some());
+    let node_port_bank = if node_port_must_change {
+        (synchronizer.active_node_port_bank + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT
+    } else {
+        synchronizer.active_node_port_bank
+    };
+
+    let (desired_service, desired_node_port) = if let Some(node) = &node_port_node {
+        let desired =
+            compile_node_port_fabric_dataplane(&candidate, node, service_bank, node_port_bank)?;
+        (
+            service_changed.then_some(desired.service),
+            Some(desired.node_port),
+        )
+    } else {
+        let desired_service = service_changed
+            .then(|| compile_service_dataplane(&candidate, service_bank))
+            .transpose()?;
+        let desired_node_port = node_port_must_change.then(|| empty_node_port_bank(node_port_bank));
+        (desired_service, desired_node_port)
+    };
+
+    let previous_service_stage = desired_service.as_ref().map(|desired| {
+        synchronizer.banks[usize::from(desired.bank)]
+            .clone()
+            .unwrap_or_else(|| empty_service_bank(desired.bank))
+    });
+    let previous_node_port_stage = desired_node_port.as_ref().map(|desired| {
+        synchronizer.node_port_banks[usize::from(desired.bank)]
+            .clone()
+            .unwrap_or_else(|| empty_node_port_bank(desired.bank))
+    });
+    let previous_service_config = synchronizer
+        .config
+        .get(&0, 0)
+        .context("read service activation pointer before staging")?;
+    let previous_node_port_config = synchronizer
+        .node_port_config
+        .get(&0, 0)
+        .context("read NodePort activation pointer before staging")?;
+    if let (Some(previous), Some(desired)) = (&previous_service_stage, &desired_service)
+        && let Err(error) = stage_service_bank(synchronizer, previous, desired)
+    {
+        return Err(error);
+    }
+    if let (Some(previous), Some(desired)) = (&previous_node_port_stage, &desired_node_port)
+        && let Err(error) = stage_node_port_bank(synchronizer, previous, desired)
+    {
+        let service_rollback = previous_service_stage
+            .as_ref()
+            .map_or(Ok(()), |bank| restore_service_bank(synchronizer, bank));
+        return match service_rollback {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(anyhow!(
+                "{error:#}; service staging rollback also failed: {rollback:#}"
+            )),
+        };
+    }
+
+    let prepared = if persist {
+        match prepare_service_checkpoint(
+            &synchronizer.state_path,
+            &candidate,
+            node_port_node.as_ref(),
+        ) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                let service_rollback = previous_service_stage
+                    .as_ref()
+                    .map_or(Ok(()), |bank| restore_service_bank(synchronizer, bank));
+                let node_port_rollback = previous_node_port_stage
+                    .as_ref()
+                    .map_or(Ok(()), |bank| restore_node_port_bank(synchronizer, bank));
+                bail!(
+                    "prepare NodePort service checkpoint failed: {error:#}; service staging rollback: {service_rollback:?}; NodePort staging rollback: {node_port_rollback:?}"
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let activation = (|| -> Result<()> {
+        if let Some(desired) = &desired_service {
+            synchronizer
+                .config
+                .set(0, desired.config, 0)
+                .context("atomically activate staged service bank")?;
+        }
+        if let Some(desired) = &desired_node_port {
+            synchronizer
+                .node_port_config
+                .set(0, desired.config, 0)
+                .context("atomically activate staged NodePort bank")?;
+        }
+        if let Some(prepared) = &prepared {
+            commit_prepared_service_snapshot(&synchronizer.state_path, prepared)
+                .context("commit active NodePort service checkpoint")?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = activation {
+        let service_config_rollback = synchronizer.config.set(0, previous_service_config, 0);
+        let node_port_config_rollback =
+            synchronizer
+                .node_port_config
+                .set(0, previous_node_port_config, 0);
+        let service_stage_rollback = previous_service_stage
+            .as_ref()
+            .map_or(Ok(()), |bank| restore_service_bank(synchronizer, bank));
+        let node_port_stage_rollback = previous_node_port_stage
+            .as_ref()
+            .map_or(Ok(()), |bank| restore_node_port_bank(synchronizer, bank));
+        let checkpoint_rollback = restore_service_fabric_checkpoint(
+            &synchronizer.state_path,
+            synchronizer.applied.as_ref(),
+            synchronizer.applied_node_port_node.as_ref(),
+        );
+        let pending_cleanup = discard_service_pending_state(&synchronizer.state_path);
+        bail!(
+            "NodePort service transaction failed: {error:#}; service config rollback: {service_config_rollback:?}; NodePort config rollback: {node_port_config_rollback:?}; service stage rollback: {service_stage_rollback:?}; NodePort stage rollback: {node_port_stage_rollback:?}; checkpoint rollback: {checkpoint_rollback:?}; pending cleanup: {pending_cleanup:?}"
+        );
+    }
+
+    let previous_active = synchronizer.active_bank;
+    let previous_node_port_active = synchronizer.active_node_port_bank;
+    if let Some(desired) = desired_service {
+        let desired_index = usize::from(desired.bank);
+        synchronizer.banks[desired_index] = Some(desired);
+        synchronizer.active_bank = service_bank;
+    }
+    if let Some(desired) = desired_node_port {
+        let desired_index = usize::from(desired.bank);
+        synchronizer.node_port_banks[desired_index] = Some(desired);
+        synchronizer.active_node_port_bank = node_port_bank;
+    }
+    synchronizer.applied = Some(candidate.clone());
+    synchronizer
+        .applied_node_port_node
+        .clone_from(&node_port_node);
+    publish_applied_service_snapshot(state, &candidate);
+    clear_service_snapshot_error(state);
+    if previous_node_port_active != synchronizer.active_node_port_bank {
+        let previous_index = usize::from(previous_node_port_active);
+        if let Some(old) = synchronizer.node_port_banks[previous_index].clone() {
+            match clear_node_port_bank(synchronizer, &old) {
+                Ok(()) => synchronizer.node_port_banks[previous_index] = None,
+                Err(error) => warn!(
+                    %error,
+                    bank = previous_node_port_active,
+                    "could not garbage-collect old NodePort bank; retained for retry"
+                ),
+            }
+        }
+    }
+    if previous_active != synchronizer.active_bank {
+        let previous_index = usize::from(previous_active);
+        if let Some(old) = synchronizer.banks[previous_index].clone() {
+            match clear_service_bank(synchronizer, &old) {
+                Ok(()) => synchronizer.banks[previous_index] = None,
+                Err(error) => warn!(
+                    %error,
+                    bank = previous_active,
+                    "could not garbage-collect old service bank; restored it for a later retry"
+                ),
+            }
+        }
+    }
+    info!(
+        service_epoch = candidate.source_epoch,
+        service_revision = candidate.revision.get(),
+        active_bank = synchronizer.active_bank,
+        node_port_revision = node_port_node.as_ref().map(|node| node.revision.get()),
+        active_node_port_bank = synchronizer.active_node_port_bank,
+        services = candidate.services.len(),
+        "service and NodePort snapshot activated in persistent BPF maps"
+    );
+    Ok(())
+}
+
+fn stage_service_bank(
+    synchronizer: &mut ServiceSynchronizer,
+    previous: &ServiceDataplaneState,
+    desired: &ServiceDataplaneState,
+) -> Result<()> {
     macro_rules! stage {
-        ($map:expr, $current:expr, $desired:expr, $label:literal) => {
-            if let Err(error) = replace_encoded_entries($map, $current, $desired) {
+        ($map:expr, $current:expr, $next:expr, $label:literal) => {
+            if let Err(error) = replace_encoded_entries($map, $current, $next) {
                 return Err(rollback_service_stages(
                     synchronizer,
-                    &previous,
+                    previous,
                     &error.context(concat!("stage ", $label)),
                 ));
             }
@@ -2197,7 +2638,6 @@ fn activate_service_snapshot(
         &desired.backend_slots,
         "service backend slots"
     );
-
     let validation = validate_encoded_entries(
         &synchronizer.ipv4_frontends,
         &desired.ipv4_frontends,
@@ -2232,94 +2672,51 @@ fn activate_service_snapshot(
         )
     });
     if let Err(error) = validation {
-        return Err(rollback_service_stages(synchronizer, &previous, &error));
+        return Err(rollback_service_stages(synchronizer, previous, &error));
     }
+    Ok(())
+}
 
-    let previous_config = synchronizer
-        .config
-        .get(&0, 0)
-        .context("read service activation pointer before update")?;
-    let prepared = if persist {
-        match prepare_service_snapshot(&synchronizer.state_path, candidate) {
-            Ok(path) => Some(path),
-            Err(error) => {
-                return Err(rollback_service_stages(
-                    synchronizer,
-                    &previous,
-                    &error.context("prepare durable service snapshot before activation"),
-                ));
-            }
-        }
-    } else {
-        None
-    };
-    if let Err(error) = synchronizer.config.set(0, desired.config, 0) {
-        let pending_cleanup = discard_service_pending_state(&synchronizer.state_path);
-        let activation_error = anyhow!(error).context("atomically activate staged service bank");
-        if let Err(cleanup_error) = pending_cleanup {
-            return Err(rollback_service_stages(
-                synchronizer,
-                &previous,
-                &anyhow!(
-                    "{activation_error:#}; pending snapshot cleanup failed: {cleanup_error:#}"
-                ),
-            ));
-        }
-        return Err(rollback_service_stages(
-            synchronizer,
-            &previous,
-            &activation_error,
-        ));
-    }
-    if let Some(prepared) = prepared
-        && let Err(error) = commit_prepared_service_snapshot(&synchronizer.state_path, &prepared)
-    {
-        let config_rollback = synchronizer.config.set(0, previous_config, 0);
-        let stage_rollback = restore_service_bank(synchronizer, &previous);
-        let checkpoint_rollback =
-            restore_service_checkpoint(&synchronizer.state_path, synchronizer.applied.as_ref());
-        let pending_cleanup = discard_service_pending_state(&synchronizer.state_path);
-        return match (
-            config_rollback,
-            stage_rollback,
-            checkpoint_rollback,
-            pending_cleanup,
-        ) {
-            (Ok(()), Ok(()), Ok(()), Ok(())) => Err(error.context(
-                "commit active service snapshot failed; activation pointer and staging bank rolled back",
-            )),
-            (config_result, stage_result, checkpoint_result, pending_result) => Err(anyhow!(
-                "commit active service snapshot failed: {error:#}; config rollback: {config_result:?}; staging rollback: {stage_result:?}; checkpoint rollback: {checkpoint_result:?}; pending cleanup: {pending_result:?}"
+fn stage_node_port_bank(
+    synchronizer: &mut ServiceSynchronizer,
+    previous: &NodePortDataplaneState,
+    desired: &NodePortDataplaneState,
+) -> Result<()> {
+    if let Err(error) = replace_encoded_entries(
+        &mut synchronizer.node_port_ipv4_frontends,
+        &previous.ipv4_frontends,
+        &desired.ipv4_frontends,
+    )
+    .context("stage IPv4 NodePort frontends")
+    .and_then(|()| {
+        replace_encoded_entries(
+            &mut synchronizer.node_port_ipv6_frontends,
+            &previous.ipv6_frontends,
+            &desired.ipv6_frontends,
+        )
+        .context("stage IPv6 NodePort frontends")
+    })
+    .and_then(|()| {
+        validate_encoded_entries(
+            &synchronizer.node_port_ipv4_frontends,
+            &desired.ipv4_frontends,
+            "IPv4 NodePort frontend",
+        )
+    })
+    .and_then(|()| {
+        validate_encoded_entries(
+            &synchronizer.node_port_ipv6_frontends,
+            &desired.ipv6_frontends,
+            "IPv6 NodePort frontend",
+        )
+    }) {
+        return match restore_node_port_bank(synchronizer, previous) {
+            Ok(()) => Err(error.context("NodePort staging bank rolled back")),
+            Err(rollback) => Err(anyhow!(
+                "NodePort staging failed: {error:#}; rollback failed: {rollback:#}"
             )),
         };
     }
-
-    let previous_active = synchronizer.active_bank;
-    synchronizer.banks[staging_index] = Some(desired);
-    synchronizer.active_bank = staging_bank;
-    synchronizer.applied = Some(candidate.clone());
-    publish_applied_service_snapshot(state, candidate);
-    clear_service_snapshot_error(state);
-    if previous_active != staging_bank {
-        let previous_index = usize::from(previous_active);
-        if let Some(old) = synchronizer.banks[previous_index].clone() {
-            match clear_service_bank(synchronizer, &old) {
-                Ok(()) => synchronizer.banks[previous_index] = None,
-                Err(error) => warn!(
-                    %error,
-                    bank = previous_active,
-                    "could not garbage-collect old service bank; restored it for a later retry"
-                ),
-            }
-        }
-    }
-    info!(
-        service_epoch = candidate.source_epoch,
-        service_revision = candidate.revision.get(),
-        active_bank = synchronizer.active_bank,
-        services = candidate.services.len(),
-        "service snapshot activated in persistent BPF maps"
-    );
     Ok(())
 }
 
@@ -2425,6 +2822,32 @@ fn restore_service_bank(
     }
 }
 
+fn restore_node_port_bank(
+    synchronizer: &mut ServiceSynchronizer,
+    previous: &NodePortDataplaneState,
+) -> Result<()> {
+    let results = [
+        restore_encoded_bank(
+            &mut synchronizer.node_port_ipv4_frontends,
+            &previous.ipv4_frontends,
+            previous.bank,
+            7,
+        ),
+        restore_encoded_bank(
+            &mut synchronizer.node_port_ipv6_frontends,
+            &previous.ipv6_frontends,
+            previous.bank,
+            19,
+        ),
+    ];
+    let failures: Vec<_> = results.into_iter().filter_map(Result::err).collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("restore NodePort bank failed: {failures:?}")
+    }
+}
+
 fn rollback_service_stages(
     synchronizer: &mut ServiceSynchronizer,
     previous: &ServiceDataplaneState,
@@ -2448,6 +2871,24 @@ fn clear_service_bank(
             Ok(()) => Err(error.context("old service bank cleanup failed and was restored")),
             Err(restore) => Err(anyhow!(
                 "old service bank cleanup failed: {error:#}; restoration failed: {restore:#}"
+            )),
+        };
+    }
+    Ok(())
+}
+
+fn clear_node_port_bank(
+    synchronizer: &mut ServiceSynchronizer,
+    old: &NodePortDataplaneState,
+) -> Result<()> {
+    let empty = empty_node_port_bank(old.bank);
+    let clear = restore_node_port_bank(synchronizer, &empty);
+    if let Err(error) = clear {
+        let restore = restore_node_port_bank(synchronizer, old);
+        return match restore {
+            Ok(()) => Err(error.context("old NodePort bank cleanup failed and was restored")),
+            Err(restore) => Err(anyhow!(
+                "old NodePort bank cleanup failed: {error:#}; restoration failed: {restore:#}"
             )),
         };
     }
@@ -2674,6 +3115,7 @@ fn plan_abi_cleanup(
         1 => &ABI_V1_MAP_NAMES,
         2 => &ABI_V2_MAP_NAMES,
         3 => &ABI_V3_MAP_NAMES,
+        4 => &ABI_V4_MAP_NAMES,
         _ => &PERSISTENT_MAP_NAMES,
     };
     let mut unknown = Vec::new();
@@ -3241,6 +3683,7 @@ async fn run_dataplane(
         config.identity_sync_interval,
         config.service_sync_interval,
         config.service_state_path.clone(),
+        config.node_name.clone(),
     );
     let recovered =
         recover_persistent_dataplane(&mut identities, &mut policies, &mut services, pins_existed)?;
@@ -3422,6 +3865,7 @@ fn new_synchronizers(
     interval: Duration,
     service_interval: Duration,
     service_state_path: PathBuf,
+    node_name: String,
 ) -> (
     IdentitySynchronizer,
     PolicySynchronizer,
@@ -3438,6 +3882,9 @@ fn new_synchronizers(
         backend_slots,
         service_config,
         connections,
+        node_port_ipv4_frontends,
+        node_port_ipv6_frontends,
+        node_port_config,
     ) = service_maps;
     (
         IdentitySynchronizer {
@@ -3481,9 +3928,16 @@ fn new_synchronizers(
             backend_slots,
             config: service_config,
             connections,
+            node_port_ipv4_frontends,
+            node_port_ipv6_frontends,
+            node_port_config,
             banks: [None, None],
+            node_port_banks: [None, None],
             active_bank: 0,
+            active_node_port_bank: 0,
             applied: None,
+            applied_node_port_node: None,
+            node_name,
             controller_url,
             client,
             agent_token_path,
@@ -3915,6 +4369,17 @@ fn recover_persistent_dataplane(
         services.connections.map(),
         SERVICE_CONNECTION_MAP_CAPACITY,
     )?;
+    validate_map_capacity(
+        "NODE_PORT_FRONTENDS_V4",
+        services.node_port_ipv4_frontends.map(),
+        SERVICE_FRONTEND_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "NODE_PORT_FRONTENDS_V6",
+        services.node_port_ipv6_frontends.map(),
+        SERVICE_FRONTEND_MAP_CAPACITY,
+    )?;
+    validate_map_capacity("NODE_PORT_CONFIG", services.node_port_config.map(), 1)?;
 
     recover_identity_entries(identities)?;
     let identity_config = identities
@@ -4174,6 +4639,19 @@ fn empty_service_bank(bank: u8) -> ServiceDataplaneState {
     }
 }
 
+fn empty_node_port_bank(bank: u8) -> NodePortDataplaneState {
+    NodePortDataplaneState {
+        source_epoch: 0,
+        service_revision: 0,
+        node_revision: 0,
+        service_bank: 0,
+        bank,
+        ipv4_frontends: BTreeMap::new(),
+        ipv6_frontends: BTreeMap::new(),
+        config: [0; 40],
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u64>, Option<u64>)> {
     let mut banks = [empty_service_bank(0), empty_service_bank(1)];
@@ -4211,27 +4689,169 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
         validate_recovered_service_bank_capacity(bank)?;
     }
 
+    let mut node_port_banks = [empty_node_port_bank(0), empty_node_port_bank(1)];
+    for entry in &services.node_port_ipv4_frontends {
+        let (key, value) = entry.context("iterate persistent IPv4 NodePort frontends")?;
+        let bank = node_port_bank(key[7])?;
+        validate_node_port_frontend_entry(&key, &value, 7)?;
+        node_port_banks[bank].ipv4_frontends.insert(key, value);
+    }
+    for entry in &services.node_port_ipv6_frontends {
+        let (key, value) = entry.context("iterate persistent IPv6 NodePort frontends")?;
+        let bank = node_port_bank(key[19])?;
+        validate_node_port_frontend_entry(&key, &value, 19)?;
+        node_port_banks[bank].ipv6_frontends.insert(key, value);
+    }
+    for bank in &node_port_banks {
+        validate_recovered_node_port_bank_capacity(bank)?;
+    }
+
     let config = services
         .config
         .get(&0, 0)
         .context("read persistent service config")?;
-    let Some((epoch, revision, frontend_count, backend_count, slot_count, bank)) =
+    let node_port_config = services
+        .node_port_config
+        .get(&0, 0)
+        .context("read persistent NodePort config")?;
+    let decoded_node_port = decode_recovered_node_port_config(node_port_config)?;
+    let Some((epoch, revision, _frontend_count, _backend_count, _slot_count, bank)) =
         decode_recovered_service_config(config)?
     else {
+        if decoded_node_port.is_some() {
+            bail!("persistent NodePort state is active without service state");
+        }
         discard_service_pending_state(&services.state_path)?;
         services.banks = banks.map(Some);
+        services.node_port_banks = node_port_banks.map(Some);
         return Ok((None, None));
     };
-    let durable = load_service_snapshot_for_active(&services.state_path, epoch, revision)?;
-    let expected = compile_service_dataplane(&durable, bank)?;
-    let active = &banks[usize::from(bank)];
-    if active.ipv4_frontends != expected.ipv4_frontends
-        || active.ipv6_frontends != expected.ipv6_frontends
-        || active.ipv4_backends != expected.ipv4_backends
-        || active.ipv6_backends != expected.ipv6_backends
-        || active.backend_slots != expected.backend_slots
-        || config != expected.config
+    let pending_path = service_pending_state_path(&services.state_path)?;
+    let current = load_optional_service_checkpoint(&services.state_path)?;
+    let pending = load_optional_service_checkpoint(&pending_path)?;
+    let mut selected = None;
+    for (is_pending, checkpoint) in [(false, current.clone()), (true, pending.clone())] {
+        let Some((durable, node)) = checkpoint else {
+            continue;
+        };
+        if durable.source_epoch != epoch || durable.revision.get() != revision {
+            continue;
+        }
+        let node_matches = match (&node, decoded_node_port) {
+            (None, None) => true,
+            (Some(node), Some((node_epoch, service_revision, node_revision, _, _, _))) => {
+                node.source_epoch == node_epoch
+                    && revision == service_revision
+                    && node.revision.get() == node_revision
+            }
+            _ => false,
+        };
+        if node_matches {
+            selected = Some((is_pending, durable, node));
+            break;
+        }
+    }
+    if selected.is_none()
+        && let (Some((current_service, current_node)), Some((pending_service, pending_node))) =
+            (current.clone(), pending.clone())
+        && pending_service.source_epoch == epoch
+        && pending_service.revision.get() == revision
+        && checkpoint_matches_node_port_config(
+            &current_service,
+            current_node.as_ref(),
+            decoded_node_port,
+        )
     {
+        let previous_service_bank = (bank + 1) % SERVICE_BANK_COUNT;
+        let expected_current_service = if let Some(current_node) = &current_node {
+            let (_, _, _, _, _, current_node_port_bank) = decoded_node_port
+                .context("current NodePort checkpoint lost its activation pointer")?;
+            compile_node_port_fabric_dataplane(
+                &current_service,
+                current_node,
+                previous_service_bank,
+                current_node_port_bank,
+            )?
+            .service
+        } else {
+            compile_service_dataplane(&current_service, previous_service_bank)?
+        };
+        let expected_pending_service = if let Some(pending_node) = &pending_node {
+            let pending_node_port_bank = decoded_node_port.map_or(1, |config| {
+                (config.5 + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT
+            });
+            compile_node_port_fabric_dataplane(
+                &pending_service,
+                pending_node,
+                bank,
+                pending_node_port_bank,
+            )?
+            .service
+        } else {
+            compile_service_dataplane(&pending_service, bank)?
+        };
+        if !service_bank_matches(
+            &banks[usize::from(previous_service_bank)],
+            &expected_current_service,
+        ) || !service_bank_matches(&banks[usize::from(bank)], &expected_pending_service)
+            || config != expected_pending_service.config
+        {
+            bail!("interrupted service activation cannot be rolled back from exact map state");
+        }
+        services
+            .config
+            .set(0, expected_current_service.config, 0)
+            .context("roll back interrupted service activation pointer")?;
+        restore_service_bank(services, &empty_service_bank(bank))?;
+        banks[usize::from(previous_service_bank)] = expected_current_service;
+        banks[usize::from(bank)] = empty_service_bank(bank);
+        if let Some(pending_node) = &pending_node {
+            let pending_node_port_bank = decoded_node_port.map_or(1, |config| {
+                (config.5 + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT
+            });
+            let pending_node_port = compile_node_port_fabric_dataplane(
+                &pending_service,
+                pending_node,
+                bank,
+                pending_node_port_bank,
+            )?
+            .node_port;
+            if node_port_bank_matches(
+                &node_port_banks[usize::from(pending_node_port_bank)],
+                &pending_node_port,
+            ) {
+                restore_node_port_bank(services, &empty_node_port_bank(pending_node_port_bank))?;
+                node_port_banks[usize::from(pending_node_port_bank)] =
+                    empty_node_port_bank(pending_node_port_bank);
+            }
+        }
+        discard_service_pending_state(&services.state_path)?;
+        selected = Some((false, current_service, current_node));
+    }
+    let (selected_pending, durable, node) = selected.context(
+        "persistent service/NodePort activation tuple has no matching durable or prepared checkpoint",
+    )?;
+    let recovered_config = services
+        .config
+        .get(&0, 0)
+        .context("read repaired persistent service config")?;
+    let (epoch, revision, frontend_count, backend_count, slot_count, bank) =
+        decode_recovered_service_config(recovered_config)?
+            .context("repaired persistent service config became empty")?;
+    if durable.source_epoch != epoch || durable.revision.get() != revision {
+        bail!("repaired service config does not match selected durable checkpoint");
+    }
+    let (expected, expected_node_port) = if let Some(node) = &node {
+        let (_, _, _, _, _, node_port_bank) = decoded_node_port
+            .context("durable NodePort checkpoint has no active NodePort config")?;
+        let expected = compile_node_port_fabric_dataplane(&durable, node, bank, node_port_bank)?;
+        (expected.service, Some(expected.node_port))
+    } else {
+        (compile_service_dataplane(&durable, bank)?, None)
+    };
+    let active_service_bank = expected.bank;
+    let active = &banks[usize::from(active_service_bank)];
+    if !service_bank_matches(active, &expected) || recovered_config != expected.config {
         bail!("persistent active service bank does not match durable last-known-good snapshot");
     }
     if frontend_count as usize != active.ipv4_frontends.len() + active.ipv6_frontends.len()
@@ -4240,10 +4860,32 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
     {
         bail!("persistent service config counts do not match active maps");
     }
-    banks[usize::from(bank)] = expected;
+    if let Some(expected_node_port) = &expected_node_port {
+        let (_, _, _, ipv4_count, ipv6_count, node_port_bank) =
+            decoded_node_port.expect("NodePort config was checked above");
+        let active_node_port = &node_port_banks[usize::from(node_port_bank)];
+        if active_node_port.ipv4_frontends != expected_node_port.ipv4_frontends
+            || active_node_port.ipv6_frontends != expected_node_port.ipv6_frontends
+            || node_port_config != expected_node_port.config
+            || ipv4_count as usize != active_node_port.ipv4_frontends.len()
+            || ipv6_count as usize != active_node_port.ipv6_frontends.len()
+        {
+            bail!("persistent active NodePort bank does not match durable local Node state");
+        }
+        node_port_banks[usize::from(node_port_bank)] = expected_node_port.clone();
+        services.active_node_port_bank = node_port_bank;
+    }
+    if selected_pending {
+        commit_prepared_service_snapshot(&services.state_path, &pending_path)?;
+    } else {
+        discard_service_pending_state(&services.state_path)?;
+    }
+    banks[usize::from(active_service_bank)] = expected;
     services.banks = banks.map(Some);
-    services.active_bank = bank;
+    services.node_port_banks = node_port_banks.map(Some);
+    services.active_bank = active_service_bank;
     services.applied = Some(durable);
+    services.applied_node_port_node = node;
     Ok((Some(epoch), Some(revision)))
 }
 
@@ -4285,11 +4927,97 @@ fn validate_recovered_service_bank_capacity(bank: &ServiceDataplaneState) -> Res
     Ok(())
 }
 
+fn validate_recovered_node_port_bank_capacity(bank: &NodePortDataplaneState) -> Result<()> {
+    for (name, actual) in [
+        ("IPv4 frontends", bank.ipv4_frontends.len()),
+        ("IPv6 frontends", bank.ipv6_frontends.len()),
+    ] {
+        if actual > SERVICE_FRONTEND_BANK_CAPACITY {
+            bail!(
+                "persistent NodePort bank {} has {actual} {name}; limit is {}",
+                bank.bank,
+                SERVICE_FRONTEND_BANK_CAPACITY
+            );
+        }
+    }
+    Ok(())
+}
+
+fn service_bank_matches(actual: &ServiceDataplaneState, expected: &ServiceDataplaneState) -> bool {
+    actual.ipv4_frontends == expected.ipv4_frontends
+        && actual.ipv6_frontends == expected.ipv6_frontends
+        && actual.ipv4_backends == expected.ipv4_backends
+        && actual.ipv6_backends == expected.ipv6_backends
+        && actual.backend_slots == expected.backend_slots
+}
+
+fn node_port_bank_matches(
+    actual: &NodePortDataplaneState,
+    expected: &NodePortDataplaneState,
+) -> bool {
+    actual.ipv4_frontends == expected.ipv4_frontends
+        && actual.ipv6_frontends == expected.ipv6_frontends
+}
+
+fn checkpoint_matches_node_port_config(
+    service: &ServiceSnapshot,
+    node: Option<&NodePortNodeSnapshot>,
+    config: Option<RecoveredNodePortConfig>,
+) -> bool {
+    match (node, config) {
+        (None, None) => !service_has_node_ports(service),
+        (Some(node), Some((epoch, service_revision, node_revision, _, _, _))) => {
+            service_has_node_ports(service)
+                && node.source_epoch == epoch
+                && service.revision.get() == service_revision
+                && node.revision.get() == node_revision
+        }
+        _ => false,
+    }
+}
+
 fn service_bank(bank: u8) -> Result<usize> {
     if bank >= SERVICE_BANK_COUNT {
         bail!("persistent service map contains invalid bank {bank}");
     }
     Ok(usize::from(bank))
+}
+
+fn node_port_bank(bank: u8) -> Result<usize> {
+    if bank >= unf_ebpf_common::NODE_PORT_BANK_COUNT {
+        bail!("persistent NodePort map contains invalid bank {bank}");
+    }
+    Ok(usize::from(bank))
+}
+
+fn validate_node_port_frontend_entry<const N: usize>(
+    key: &[u8; N],
+    value: &[u8; 32],
+    bank_offset: usize,
+) -> Result<()> {
+    node_port_bank(key[bank_offset])?;
+    let port_offset = bank_offset - 3;
+    let port = u16::from_be_bytes(key[port_offset..port_offset + 2].try_into().unwrap());
+    let protocol = key[bank_offset - 1];
+    let service_id = u32::from_ne_bytes(value[0..4].try_into().unwrap());
+    let backend_count = u32::from_ne_bytes(value[8..12].try_into().unwrap());
+    let schema = u16::from_ne_bytes(value[12..14].try_into().unwrap());
+    let flags = u16::from_ne_bytes(value[14..16].try_into().unwrap());
+    let service_revision = u64::from_ne_bytes(value[16..24].try_into().unwrap());
+    if !recovered_service_address_is_valid(&key[..port_offset])
+        || port == 0
+        || !matches!(protocol, 6 | 17)
+        || service_id == 0
+        || backend_count > u32::try_from(MAX_BACKENDS_PER_SERVICE).unwrap_or(u32::MAX)
+        || schema != unf_ebpf_common::NODE_PORT_MAP_ABI_VERSION
+        || flags & !unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL != 0
+        || service_revision == 0
+        || value[24] >= SERVICE_BANK_COUNT
+        || value[25..32] != [0; 7]
+    {
+        bail!("persistent NodePort frontend map contains an incompatible entry");
+    }
+    Ok(())
 }
 
 fn validate_service_frontend_entry<const N: usize>(
@@ -4411,6 +5139,36 @@ fn decode_recovered_service_config(config: [u8; 32]) -> Result<Option<RecoveredS
         frontend_count,
         backend_count,
         slot_count,
+        bank,
+    )))
+}
+
+fn decode_recovered_node_port_config(config: [u8; 40]) -> Result<Option<RecoveredNodePortConfig>> {
+    if config == [0; 40] {
+        return Ok(None);
+    }
+    let epoch = u64::from_ne_bytes(config[0..8].try_into().unwrap());
+    let service_revision = u64::from_ne_bytes(config[8..16].try_into().unwrap());
+    let node_revision = u64::from_ne_bytes(config[16..24].try_into().unwrap());
+    let ipv4_count = u32::from_ne_bytes(config[24..28].try_into().unwrap());
+    let ipv6_count = u32::from_ne_bytes(config[28..32].try_into().unwrap());
+    let schema = u16::from_ne_bytes(config[32..34].try_into().unwrap());
+    let bank = config[34];
+    if epoch == 0
+        || service_revision == 0
+        || node_revision == 0
+        || schema != unf_ebpf_common::NODE_PORT_MAP_ABI_VERSION
+        || bank >= unf_ebpf_common::NODE_PORT_BANK_COUNT
+        || config[35..40] != [0; 5]
+    {
+        bail!("persistent NodePort config is invalid or incompatible");
+    }
+    Ok(Some((
+        epoch,
+        service_revision,
+        node_revision,
+        ipv4_count,
+        ipv6_count,
         bank,
     )))
 }
@@ -4674,6 +5432,21 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
             .context("eBPF object does not contain SERVICE_CONNECTIONS map")?,
     )
     .context("open SERVICE_CONNECTIONS map")?;
+    let node_port_ipv4_frontends = AyaHashMap::<_, [u8; 8], [u8; 32]>::try_from(
+        ebpf.take_map("NODE_PORT_FRONTENDS_V4")
+            .context("eBPF object does not contain NODE_PORT_FRONTENDS_V4 map")?,
+    )
+    .context("open NODE_PORT_FRONTENDS_V4 map")?;
+    let node_port_ipv6_frontends = AyaHashMap::<_, [u8; 20], [u8; 32]>::try_from(
+        ebpf.take_map("NODE_PORT_FRONTENDS_V6")
+            .context("eBPF object does not contain NODE_PORT_FRONTENDS_V6 map")?,
+    )
+    .context("open NODE_PORT_FRONTENDS_V6 map")?;
+    let node_port_config = AyaArray::<_, [u8; 40]>::try_from(
+        ebpf.take_map("NODE_PORT_CONFIG")
+            .context("eBPF object does not contain NODE_PORT_CONFIG map")?,
+    )
+    .context("open NODE_PORT_CONFIG map")?;
     Ok((
         ipv4_frontends,
         ipv6_frontends,
@@ -4682,6 +5455,9 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
         backend_slots,
         config,
         connections,
+        node_port_ipv4_frontends,
+        node_port_ipv6_frontends,
+        node_port_config,
     ))
 }
 
@@ -7423,6 +8199,109 @@ mod tests {
         .expect("dual-stack service snapshot compiles")
     }
 
+    fn dual_stack_node_port_snapshot(revision: u64) -> ServiceSnapshot {
+        let mut snapshot = dual_stack_service_snapshot(
+            revision,
+            Ipv4Addr::new(10, 42, 0, 20),
+            "fd00:42::20".parse().unwrap(),
+            true,
+        );
+        let node_ports = snapshot.services[0]
+            .frontends
+            .iter()
+            .map(|frontend| unf_service::ServiceNodePort {
+                family: if frontend.address.is_ipv4() {
+                    unf_service::AddressFamily::Ipv4
+                } else {
+                    unf_service::AddressFamily::Ipv6
+                },
+                port: if frontend.protocol == unf_common::Protocol::Tcp {
+                    30_080
+                } else {
+                    30_053
+                },
+                service_port: frontend.port,
+                protocol: frontend.protocol,
+                name: frontend.name.clone(),
+                app_protocol: frontend.app_protocol.clone(),
+                backend_ids: frontend.backend_ids.clone(),
+                traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+            })
+            .collect();
+        snapshot.services[0].node_ports = node_ports;
+        snapshot
+            .validate_and_normalize()
+            .expect("dual-stack NodePort snapshot validates")
+    }
+
+    fn node_port_node_snapshot(revision: u64) -> NodePortNodeSnapshot {
+        NodePortNodeSnapshot {
+            schema_version: unf_service::NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
+            source_epoch: 7,
+            revision: Revision::new(revision),
+            node_name: "worker-a".to_owned(),
+            node_uid: "worker-a-uid".to_owned(),
+            addresses: vec![
+                unf_service::ServiceNodeAddress {
+                    address: "192.0.2.10".parse().unwrap(),
+                    kind: unf_service::NodeAddressKind::Internal,
+                },
+                unf_service::ServiceNodeAddress {
+                    address: "198.51.100.10".parse().unwrap(),
+                    kind: unf_service::NodeAddressKind::External,
+                },
+                unf_service::ServiceNodeAddress {
+                    address: "fdff::10".parse().unwrap(),
+                    kind: unf_service::NodeAddressKind::Internal,
+                },
+            ],
+        }
+        .validate_and_normalize()
+        .expect("local NodePort Node snapshot validates")
+    }
+
+    fn test_service_synchronizer(ebpf: &mut Ebpf, state_path: PathBuf) -> ServiceSynchronizer {
+        let (
+            ipv4_frontends,
+            ipv6_frontends,
+            ipv4_backends,
+            ipv6_backends,
+            backend_slots,
+            config,
+            connections,
+            node_port_ipv4_frontends,
+            node_port_ipv6_frontends,
+            node_port_config,
+        ) = take_service_maps(ebpf).expect("take service and NodePort maps");
+        ServiceSynchronizer {
+            ipv4_frontends,
+            ipv6_frontends,
+            ipv4_backends,
+            ipv6_backends,
+            backend_slots,
+            config,
+            connections,
+            node_port_ipv4_frontends,
+            node_port_ipv6_frontends,
+            node_port_config,
+            banks: [None, None],
+            node_port_banks: [None, None],
+            active_bank: 0,
+            active_node_port_bank: 0,
+            applied: None,
+            applied_node_port_node: None,
+            node_name: "worker-a".to_owned(),
+            controller_url: None,
+            client: ReloadingControllerClient::without_custom_trust(
+                Counter::default(),
+                Counter::default(),
+            ),
+            agent_token_path: PathBuf::new(),
+            state_path,
+            interval: Duration::from_secs(1),
+        }
+    }
+
     fn checksum(bytes: &[u8]) -> u16 {
         let mut sum = 0_u32;
         let mut chunks = bytes.chunks_exact(2);
@@ -7689,6 +8568,32 @@ mod tests {
     }
 
     #[test]
+    fn node_port_service_checkpoint_is_composite_private_and_transition_fenced() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("service.json");
+        let service = dual_stack_node_port_snapshot(4);
+        let node = node_port_node_snapshot(7);
+        persist_service_checkpoint(&path, &service, Some(&node), "test NodePort service")
+            .expect("composite checkpoint persists");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            load_optional_service_checkpoint(&path).unwrap(),
+            Some((service.clone(), Some(node.clone())))
+        );
+        assert!(persist_service_checkpoint(&path, &service, None, "missing Node").is_err());
+
+        let mut mutated = node.clone();
+        mutated.addresses[0].address = "192.0.2.11".parse().unwrap();
+        assert!(validate_node_port_node_transition(Some(&mutated), Some(&node)).is_err());
+        mutated.revision = node.revision.next();
+        assert!(validate_node_port_node_transition(Some(&mutated), Some(&node)).unwrap());
+        assert!(validate_node_port_node_transition(None, Some(&node)).unwrap());
+    }
+
+    #[test]
     fn service_schema_transition_reads_v1_without_breaking_rollback() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("service-snapshot.json");
@@ -7749,6 +8654,27 @@ mod tests {
         let mut corrupt_key = *key;
         corrupt_key[7] = SERVICE_BANK_COUNT;
         assert!(validate_service_frontend_entry(&corrupt_key, value, 7).is_err());
+
+        let node_port = compile_node_port_fabric_dataplane(
+            &dual_stack_node_port_snapshot(4),
+            &node_port_node_snapshot(7),
+            1,
+            0,
+        )
+        .unwrap()
+        .node_port;
+        assert_eq!(
+            decode_recovered_node_port_config(node_port.config).unwrap(),
+            Some((7, 4, 7, 4, 2, 0))
+        );
+        let (key, value) = node_port.ipv4_frontends.first_key_value().unwrap();
+        validate_node_port_frontend_entry(key, value, 7).unwrap();
+        let mut corrupt_value = *value;
+        corrupt_value[24] = SERVICE_BANK_COUNT;
+        assert!(validate_node_port_frontend_entry(key, &corrupt_value, 7).is_err());
+        let mut corrupt_config = node_port.config;
+        corrupt_config[35] = 1;
+        assert!(decode_recovered_node_port_config(corrupt_config).is_err());
     }
 
     #[test]
@@ -7759,13 +8685,13 @@ mod tests {
         let second = service_test_snapshot(7, 2);
         persist_secure_json(&path, &first, "service").unwrap();
 
-        let pending = prepare_service_snapshot(&path, &second).unwrap();
+        let pending = prepare_service_checkpoint(&path, &second, None).unwrap();
         assert!(pending.exists());
         let recovered = load_service_snapshot_for_active(&path, 7, 1).unwrap();
         assert_eq!(recovered, first);
         assert!(!pending.exists());
 
-        let pending = prepare_service_snapshot(&path, &second).unwrap();
+        let pending = prepare_service_checkpoint(&path, &second, None).unwrap();
         let recovered = load_service_snapshot_for_active(&path, 7, 2).unwrap();
         assert_eq!(recovered, second);
         assert!(!pending.exists());
@@ -7804,6 +8730,9 @@ mod tests {
             backend_slots,
             config,
             connections,
+            node_port_ipv4_frontends,
+            node_port_ipv6_frontends,
+            node_port_config,
         ) = take_service_maps(&mut ebpf).expect("take service maps");
         let directory = tempdir().unwrap();
         let mut synchronizer = ServiceSynchronizer {
@@ -7814,9 +8743,16 @@ mod tests {
             backend_slots,
             config,
             connections,
+            node_port_ipv4_frontends,
+            node_port_ipv6_frontends,
+            node_port_config,
             banks: [None, None],
+            node_port_banks: [None, None],
             active_bank: 0,
+            active_node_port_bank: 0,
             applied: None,
+            applied_node_port_node: None,
+            node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
                 Counter::default(),
@@ -7828,13 +8764,13 @@ mod tests {
         };
         let state = test_agent_state();
         let first = service_test_snapshot_with_backend(7, 1);
-        activate_service_snapshot(&mut synchronizer, &first, false, &state)
+        activate_service_snapshot(&mut synchronizer, &first, None, false, &state)
             .expect("first service bank activates");
         let active_config = synchronizer.config.get(&0, 0).unwrap();
         assert_eq!(active_config[30], 1);
 
         let second = service_test_snapshot_with_backend(7, 2);
-        let error = activate_service_snapshot(&mut synchronizer, &second, false, &state)
+        let error = activate_service_snapshot(&mut synchronizer, &second, None, false, &state)
             .expect_err("full backend-slot map rejects the partial inactive stage");
         assert!(error.to_string().contains("staging bank was rolled back"));
         assert_eq!(synchronizer.config.get(&0, 0).unwrap(), active_config);
@@ -7858,6 +8794,186 @@ mod tests {
                 .iter()
                 .all(|key| key[8] == 1)
         );
+    }
+
+    #[test]
+    #[ignore = "requires root BPF map creation and UNF_EBPF_OBJECT"]
+    fn privileged_node_port_partial_stage_rolls_back_service_and_host_banks() {
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut loader = EbpfLoader::new();
+        loader
+            .map_max_entries("NODE_PORT_FRONTENDS_V4", 1)
+            .map_max_entries("NODE_PORT_FRONTENDS_V6", 1);
+        let mut ebpf = loader
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        let directory = tempdir().unwrap();
+        let state_path = directory.path().join("service.json");
+        let mut synchronizer = test_service_synchronizer(&mut ebpf, state_path.clone());
+        let state = test_agent_state();
+        let first = dual_stack_service_snapshot(
+            1,
+            Ipv4Addr::new(10, 42, 0, 20),
+            "fd00:42::20".parse().unwrap(),
+            true,
+        );
+        activate_service_snapshot(&mut synchronizer, &first, None, true, &state)
+            .expect("ClusterIP baseline activates");
+        let service_config = synchronizer.config.get(&0, 0).unwrap();
+        let node_port_config = synchronizer.node_port_config.get(&0, 0).unwrap();
+        assert_eq!(node_port_config, [0; 40]);
+
+        let node_port = dual_stack_node_port_snapshot(2);
+        let node = node_port_node_snapshot(1);
+        let error =
+            activate_service_snapshot(&mut synchronizer, &node_port, Some(&node), true, &state)
+                .expect_err("undersized NodePort map rejects the inactive transaction");
+        assert!(error.to_string().contains("NodePort staging"));
+        assert_eq!(synchronizer.config.get(&0, 0).unwrap(), service_config);
+        assert_eq!(
+            synchronizer.node_port_config.get(&0, 0).unwrap(),
+            node_port_config
+        );
+        assert_eq!(synchronizer.applied.as_ref(), Some(&first));
+        assert!(synchronizer.applied_node_port_node.is_none());
+        assert!(!service_pending_state_path(&state_path).unwrap().exists());
+    }
+
+    #[test]
+    #[ignore = "requires root BPF map creation and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
+    fn privileged_node_port_activation_address_only_switch_and_recovery_are_exact() {
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new()
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        let directory = tempdir().unwrap();
+        let state_path = directory.path().join("service.json");
+        let mut synchronizer = test_service_synchronizer(&mut ebpf, state_path.clone());
+        let state = test_agent_state();
+        let service = dual_stack_node_port_snapshot(2);
+        let first_node = node_port_node_snapshot(1);
+        activate_service_snapshot(&mut synchronizer, &service, Some(&first_node), true, &state)
+            .expect("complete NodePort transaction activates");
+        let service_config = synchronizer.config.get(&0, 0).unwrap();
+        let first_node_port_config = synchronizer.node_port_config.get(&0, 0).unwrap();
+        let service_bank = synchronizer.active_bank;
+        let first_node_port_bank = synchronizer.active_node_port_bank;
+
+        let mut second_node = first_node.clone();
+        second_node.revision = first_node.revision.next();
+        second_node.addresses[0].address = "192.0.2.11".parse().unwrap();
+        second_node = second_node.validate_and_normalize().unwrap();
+        activate_service_snapshot(
+            &mut synchronizer,
+            &service,
+            Some(&second_node),
+            true,
+            &state,
+        )
+        .expect("Node-address-only transaction activates");
+        assert_eq!(synchronizer.config.get(&0, 0).unwrap(), service_config);
+        assert_eq!(synchronizer.active_bank, service_bank);
+        assert_ne!(synchronizer.active_node_port_bank, first_node_port_bank);
+        assert_ne!(
+            synchronizer.node_port_config.get(&0, 0).unwrap(),
+            first_node_port_config
+        );
+        assert_eq!(
+            load_optional_service_checkpoint(&state_path).unwrap(),
+            Some((service.clone(), Some(second_node.clone())))
+        );
+
+        synchronizer.banks = [None, None];
+        synchronizer.node_port_banks = [None, None];
+        synchronizer.active_bank = 0;
+        synchronizer.active_node_port_bank = 0;
+        synchronizer.applied = None;
+        synchronizer.applied_node_port_node = None;
+        assert_eq!(
+            recover_service_state(&mut synchronizer).unwrap(),
+            (Some(7), Some(2))
+        );
+        assert_eq!(synchronizer.active_bank, service_bank);
+        assert_eq!(
+            synchronizer.applied_node_port_node.as_ref(),
+            Some(&second_node)
+        );
+
+        let next_service = dual_stack_node_port_snapshot(3);
+        let next_service_bank = (synchronizer.active_bank + 1) % SERVICE_BANK_COUNT;
+        let next_node_port_bank =
+            (synchronizer.active_node_port_bank + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT;
+        let next = compile_node_port_fabric_dataplane(
+            &next_service,
+            &second_node,
+            next_service_bank,
+            next_node_port_bank,
+        )
+        .unwrap();
+        let previous_service_stage = synchronizer.banks[usize::from(next_service_bank)]
+            .clone()
+            .unwrap_or_else(|| empty_service_bank(next_service_bank));
+        let previous_node_port_stage = synchronizer.node_port_banks
+            [usize::from(next_node_port_bank)]
+        .clone()
+        .unwrap_or_else(|| empty_node_port_bank(next_node_port_bank));
+        stage_service_bank(&mut synchronizer, &previous_service_stage, &next.service).unwrap();
+        stage_node_port_bank(
+            &mut synchronizer,
+            &previous_node_port_stage,
+            &next.node_port,
+        )
+        .unwrap();
+        prepare_service_checkpoint(&state_path, &next_service, Some(&second_node)).unwrap();
+        synchronizer.config.set(0, next.service.config, 0).unwrap();
+        synchronizer.banks = [None, None];
+        synchronizer.node_port_banks = [None, None];
+        synchronizer.applied = None;
+        synchronizer.applied_node_port_node = None;
+        recover_service_state(&mut synchronizer)
+            .expect("crash between activation pointers rolls back to the durable tuple");
+        assert_eq!(synchronizer.applied.as_ref(), Some(&service));
+        assert_eq!(synchronizer.config.get(&0, 0).unwrap(), service_config);
+        assert!(!service_pending_state_path(&state_path).unwrap().exists());
+
+        let next = compile_node_port_fabric_dataplane(
+            &next_service,
+            &second_node,
+            next_service_bank,
+            next_node_port_bank,
+        )
+        .unwrap();
+        let previous_service_stage = synchronizer.banks[usize::from(next_service_bank)]
+            .clone()
+            .unwrap_or_else(|| empty_service_bank(next_service_bank));
+        let previous_node_port_stage = synchronizer.node_port_banks
+            [usize::from(next_node_port_bank)]
+        .clone()
+        .unwrap_or_else(|| empty_node_port_bank(next_node_port_bank));
+        stage_service_bank(&mut synchronizer, &previous_service_stage, &next.service).unwrap();
+        stage_node_port_bank(
+            &mut synchronizer,
+            &previous_node_port_stage,
+            &next.node_port,
+        )
+        .unwrap();
+        prepare_service_checkpoint(&state_path, &next_service, Some(&second_node)).unwrap();
+        synchronizer.config.set(0, next.service.config, 0).unwrap();
+        synchronizer
+            .node_port_config
+            .set(0, next.node_port.config, 0)
+            .unwrap();
+        synchronizer.banks = [None, None];
+        synchronizer.node_port_banks = [None, None];
+        synchronizer.applied = None;
+        synchronizer.applied_node_port_node = None;
+        assert_eq!(
+            recover_service_state(&mut synchronizer).unwrap(),
+            (Some(7), Some(3))
+        );
+        assert_eq!(synchronizer.applied.as_ref(), Some(&next_service));
+        assert!(!service_pending_state_path(&state_path).unwrap().exists());
     }
 
     #[test]
@@ -7893,6 +9009,9 @@ mod tests {
             backend_slots,
             config,
             connections,
+            node_port_ipv4_frontends,
+            node_port_ipv6_frontends,
+            node_port_config,
         ) = take_service_maps(&mut ebpf).expect("take service maps");
         let directory = tempdir().unwrap();
         let mut synchronizer = ServiceSynchronizer {
@@ -7903,9 +9022,16 @@ mod tests {
             backend_slots,
             config,
             connections,
+            node_port_ipv4_frontends,
+            node_port_ipv6_frontends,
+            node_port_config,
             banks: [None, None],
+            node_port_banks: [None, None],
             active_bank: 0,
+            active_node_port_bank: 0,
             applied: None,
+            applied_node_port_node: None,
+            node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
                 Counter::default(),
@@ -7923,7 +9049,7 @@ mod tests {
         let backend_v6 = "fd00:42::20".parse::<Ipv6Addr>().unwrap();
         let client_v6 = "fd00:42::5".parse::<Ipv6Addr>().unwrap();
         let first = dual_stack_service_snapshot(1, backend_v4, backend_v6, true);
-        activate_service_snapshot(&mut synchronizer, &first, false, &state)
+        activate_service_snapshot(&mut synchronizer, &first, None, false, &state)
             .expect("dual-stack service activates");
 
         let ipv4_tcp = ipv4_packet(6, client_v4, service_v4, 40_000, 80);
@@ -7974,7 +9100,7 @@ mod tests {
         let replacement_v4 = Ipv4Addr::new(10, 42, 0, 21);
         let replacement_v6 = "fd00:42::21".parse::<Ipv6Addr>().unwrap();
         let second = dual_stack_service_snapshot(2, replacement_v4, replacement_v6, true);
-        activate_service_snapshot(&mut synchronizer, &second, false, &state)
+        activate_service_snapshot(&mut synchronizer, &second, None, false, &state)
             .expect("replacement backend activates");
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
         assert_eq!(action, TC_ACT_PIPE);
@@ -8020,7 +9146,7 @@ mod tests {
         }));
 
         let backendless = dual_stack_service_snapshot(3, replacement_v4, replacement_v6, false);
-        activate_service_snapshot(&mut synchronizer, &backendless, false, &state)
+        activate_service_snapshot(&mut synchronizer, &backendless, None, false, &state)
             .expect("backendless frontend activates");
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
         assert_eq!(action, TC_ACT_PIPE);
@@ -8337,6 +9463,27 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_distinguishes_complete_v4_and_v5_map_ownership() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("unf");
+        for (version, names) in [
+            (4_u16, ABI_V4_MAP_NAMES.as_slice()),
+            (CURRENT_BPF_ABI_VERSION, PERSISTENT_MAP_NAMES.as_slice()),
+        ] {
+            let abi = root.join(format!("v{version}"));
+            fs::create_dir_all(&abi).unwrap();
+            for name in names {
+                fs::write(abi.join(name), []).unwrap();
+            }
+            let plan = plan_abi_cleanup(&root, version, version == CURRENT_BPF_ABI_VERSION)
+                .expect("complete known ABI map set is recognized");
+            assert_eq!(plan.map_pins.len(), names.len());
+        }
+        assert_eq!(ABI_V4_MAP_NAMES.len(), 18);
+        assert_eq!(PERSISTENT_MAP_NAMES.len(), 21);
+    }
+
+    #[test]
     fn cleanup_refuses_unknown_abi_content_without_mutation() {
         let temporary = tempdir().expect("temporary directory is created");
         let root = temporary.path().join("unf");
@@ -8482,11 +9629,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v4/links"),
+                Path::new("/sys/fs/bpf/unf/v5/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v4/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v5/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -8553,11 +9700,11 @@ mod tests {
         controller.persistent_bpf_state_abi_version += 1;
         let error = ensure_controller_compatibility(&controller)
             .expect_err("a persistent-ABI mismatch is rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("persistent BPF-state ABI controller=5 agent=4")
-        );
+        assert!(error.to_string().contains(&format!(
+            "persistent BPF-state ABI controller={} agent={}",
+            PERSISTENT_BPF_STATE_ABI_VERSION + 1,
+            PERSISTENT_BPF_STATE_ABI_VERSION
+        )));
 
         controller.persistent_bpf_state_abi_version -= 1;
         controller.service_snapshot_schema_version += 1;
@@ -8584,7 +9731,7 @@ mod tests {
 
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v4")).is_ok());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v5")).is_ok());
         assert_eq!(
             configured_abi_version(Path::new("/sys/fs/bpf/unf/v5")),
             Some(5)
@@ -8593,7 +9740,7 @@ mod tests {
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
             error.to_string().contains(
-                "incompatible with persistent BPF-state ABI v4; expected a /v4 directory"
+                "incompatible with persistent BPF-state ABI v5; expected a /v5 directory"
             )
         );
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v4")).is_err());

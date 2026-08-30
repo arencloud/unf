@@ -102,10 +102,14 @@ compile N+1 -> populate all staging maps -> read back and validate
 Existing applied state must remain usable if the controller or Kubernetes API is
 temporarily unavailable. New identity, policy, and service state never partially
 overwrites active maps; each prior bank remains selected through any pre-switch
-failure. Eighteen maps are pinned under the `/sys/fs/bpf/unf/v4` ABI directory,
+failure. Twenty-one maps are pinned under the `/sys/fs/bpf/unf/v5` ABI directory,
 reopened with strict all-or-none validation, and reconstructed into userspace
-caches after restart. The active service bank must exactly recompile from its
-owner-only durable snapshot. A fresh or incomplete map set must receive and
+caches after restart. ABI v4 remains an explicitly recognized 18-map cleanup
+boundary and is never interpreted as partial v5 state. The active service and
+NodePort banks must exactly recompile from their owner-only composite durable
+checkpoint. A crash between their two activation pointers restores the prior
+coherent tuple; a crash after both pointers commits the prepared tuple. A fresh
+or incomplete map set must receive and
 commit identity, policy, and available service snapshots before any TC program is attached;
 failure leaves the new ABI state unattached for safe retry. A complete validated
 last-known-good set may restore service without the controller. On Linux 6.6+,

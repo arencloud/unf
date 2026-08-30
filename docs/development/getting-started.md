@@ -69,7 +69,7 @@ sudo target/debug/unf-agent \
 ```
 
 TC attachment changes host network state. On Linux 6.6+, the agent leaves its
-per-interface TCX links pinned below `/sys/fs/bpf/unf/v4/links` so a replacement
+per-interface TCX links pinned below `/sys/fs/bpf/unf/v5/links` so a replacement
 can update them atomically. On older kernels it leaves the clsact qdisc and its
 stable legacy filters in place for in-place replacement. Use a disposable
 environment for testing.

@@ -22,4 +22,12 @@ sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
 
 sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
     --ignored --exact \
+    tests::privileged_node_port_partial_stage_rolls_back_service_and_host_banks
+
+sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
+    --ignored --exact \
+    tests::privileged_node_port_activation_address_only_switch_and_recovery_are_exact
+
+sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
+    --ignored --exact \
     tests::privileged_service_packets_translate_dual_stack_and_survive_churn

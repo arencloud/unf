@@ -190,9 +190,14 @@ verified: the controller derives bounded Node `InternalIP`/`ExternalIP` intent,
 serves only the TokenReview-authenticated agent's Node with independent
 revision/relist/last-valid semantics, and compiles it into a fixed dual-stack,
 independently banked NodePort ABI referencing an exact ClusterIP service bank.
-No agent mutates those maps and no host hook consumes them yet. ADR 0084 and
-`make nodeport-host-state-test` define that boundary; inactive-map activation,
-rollback, durable recovery, and cleanup are the active Phase 5.3b milestone.
+At that 5.3a boundary no agent mutated those maps. ADR 0084 and
+`make nodeport-host-state-test` define it. Phase 5.3 is now complete:
+persistent ABI v5 owns an exact 21-map set, and the agent uses a composite
+service/Node checkpoint plus independently banked NodePort maps for transactional
+staging, readback, address-only switching, rollback, dual-pointer crash repair,
+restart recovery, and v4/v5 cleanup. `make nodeport-transaction-test` and ADR
+0085 verify that lifecycle. No host hook consumes the maps yet; the active Phase
+5.4 milestone is dual-stack TCP/UDP `externalTrafficPolicy: Cluster` forwarding.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

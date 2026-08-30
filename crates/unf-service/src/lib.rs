@@ -461,12 +461,22 @@ pub enum NodePortDataplaneError {
         service_id: ServiceId,
         node_port: u16,
     },
+    #[error("NodePort dataplane does not support protocol {0:?}")]
+    UnsupportedProtocol(Protocol),
     #[error("NodePort map {map} requires {actual} entries; per-bank limit is {limit}")]
     Capacity {
         map: &'static str,
         actual: usize,
         limit: usize,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum NodePortFabricDataplaneError {
+    #[error(transparent)]
+    Service(#[from] ServiceDataplaneError),
+    #[error(transparent)]
+    NodePort(#[from] NodePortDataplaneError),
 }
 
 /// Canonical fixed-width local `NodePort` state. Values reference one already
@@ -481,6 +491,12 @@ pub struct NodePortDataplaneState {
     pub ipv4_frontends: BTreeMap<[u8; 8], [u8; 32]>,
     pub ipv6_frontends: BTreeMap<[u8; 20], [u8; 32]>,
     pub config: [u8; 40],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodePortFabricDataplaneState {
+    pub service: ServiceDataplaneState,
+    pub node_port: NodePortDataplaneState,
 }
 
 struct CompiledNodePortFrontends {
@@ -1486,6 +1502,31 @@ pub fn compile_node_port_dataplane(
     })
 }
 
+/// Explicitly lowers one complete service snapshot into coherent `ClusterIP`
+/// and local `NodePort` staging banks.
+///
+/// # Errors
+///
+/// Rejects either side of the complete service/Node contract before returning
+/// any state suitable for map mutation.
+pub fn compile_node_port_fabric_dataplane(
+    snapshot: &ServiceSnapshot,
+    node: &NodePortNodeSnapshot,
+    service_bank: u8,
+    node_port_bank: u8,
+) -> Result<NodePortFabricDataplaneState, NodePortFabricDataplaneError> {
+    let node_port = compile_node_port_dataplane(snapshot, node, service_bank, node_port_bank)?;
+    let mut cluster_ip = snapshot
+        .clone()
+        .validate_and_normalize()
+        .map_err(ServiceDataplaneError::from)?;
+    for service in &mut cluster_ip.services {
+        service.node_ports.clear();
+    }
+    let service = compile_service_dataplane(&cluster_ip, service_bank)?;
+    Ok(NodePortFabricDataplaneState { service, node_port })
+}
+
 fn preflight_node_port_capacity(
     snapshot: &ServiceSnapshot,
     node: &NodePortNodeSnapshot,
@@ -1545,6 +1586,11 @@ fn compile_node_port_frontends(
             .map(|backend| backend.id)
             .collect::<BTreeSet<_>>();
         for node_port in &service.node_ports {
+            if !matches!(node_port.protocol, Protocol::Tcp | Protocol::Udp) {
+                return Err(NodePortDataplaneError::UnsupportedProtocol(
+                    node_port.protocol,
+                ));
+            }
             let frontend_index = service
                 .frontends
                 .iter()

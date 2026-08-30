@@ -13,8 +13,9 @@ use unf_ebpf_common::{
     EgressIpv6PolicyMapData, FLOW_ABI_VERSION, FlowEvent, IDENTITY_BANK_COUNT,
     IDENTITY_MAP_ABI_VERSION, IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT,
     IPV6_NEXT_HEADER_HOP_BY_HOP, IdentityMapConfig, IdentityMapValue, Ipv4IdentityKey,
-    Ipv4PolicyMapKey, Ipv4ServiceBackendValue, Ipv4ServiceFrontendKey, Ipv6ExtensionStep,
-    Ipv6IdentityKey, Ipv6PolicyMapData, Ipv6ServiceBackendValue, Ipv6ServiceFrontendKey,
+    Ipv4NodePortFrontendKey, Ipv4PolicyMapKey, Ipv4ServiceBackendValue, Ipv4ServiceFrontendKey,
+    Ipv6ExtensionStep, Ipv6IdentityKey, Ipv6NodePortFrontendKey, Ipv6PolicyMapData,
+    Ipv6ServiceBackendValue, Ipv6ServiceFrontendKey, NodePortFrontendValue, NodePortMapConfig,
     POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, SERVICE_BANK_COUNT,
@@ -154,6 +155,20 @@ static SERVICE_BACKEND_SLOTS: HashMap<ServiceBackendSlotKey, ServiceBackendSlotV
 
 #[map]
 static SERVICE_CONFIG: Array<ServiceMapConfig> = Array::with_max_entries(1, 0);
+
+/// Host-facing state has an independent activation pointer. Values name the
+/// exact service bank they reference; no packet hook consumes these maps until
+/// the Phase 5.4 dataplane gate.
+#[map]
+static NODE_PORT_FRONTENDS_V4: HashMap<Ipv4NodePortFrontendKey, NodePortFrontendValue> =
+    HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static NODE_PORT_FRONTENDS_V6: HashMap<Ipv6NodePortFrontendKey, NodePortFrontendValue> =
+    HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static NODE_PORT_CONFIG: Array<NodePortMapConfig> = Array::with_max_entries(1, 0);
 
 /// Bounded persistent flow translations owned by the Phase 4.5 source-side
 /// ClusterIP dataplane.

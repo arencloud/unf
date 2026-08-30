@@ -33,7 +33,7 @@ key layout without an ABI change.
 | `FLOW_COUNTERS` | constant `u32` slot 0 | per-CPU `u64` | eBPF program | increment per parsed flow; program lifetime | one entry; forwarding continues if lookup fails |
 | `FLOW_EVENTS` | none (ring) | `FlowEvent` ABI v2 | eBPF producer, agent consumer | ephemeral, unpinned | 256 KiB; events drop under pressure without changing the already-computed forwarding decision |
 | `CONNECTIONS` | complete IPv4/IPv6 L4 tuple | last-seen time and admission revision | authoritative ingress and supplemental egress TC programs | runtime-only LRU; primary-CNI mode seeds pre/post-NAT tuples from both hooks, while only ingress attachments enforce and emit telemetry; protocol-bounded and reset on program replacement | 65,536 entries; an entry requires active policy state but survives unrelated revision churn; misses fall through to current policy |
-| `IDENTITY_V4`, `IDENTITY_V4_B` | IPv4 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent transactional writer; TC reader | physical banks 0/1; inactive map is replaced and validated before activation; pinned under `/sys/fs/bpf/unf/v4` | 65,536 entries per bank; unknown/mismatched identity resolves to ID zero and forwarding continues |
+| `IDENTITY_V4`, `IDENTITY_V4_B` | IPv4 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent transactional writer; TC reader | physical banks 0/1; inactive map is replaced and validated before activation; pinned under `/sys/fs/bpf/unf/v5` | 65,536 entries per bank; unknown/mismatched identity resolves to ID zero and forwarding continues |
 | `IDENTITY_V6`, `IDENTITY_V6_B` | 16 IPv6 network-order bytes | identity ID, schema version, flags, revision | controller desired state; agent transactional writer; TC reader | physical banks 0/1 stage with their IPv4 counterpart; pinned under the same ABI directory | 65,536 entries per bank; unknown/mismatched identity resolves to ID zero and forwarding continues |
 | `IDENTITY_CONFIG` | constant `u32` slot 0 | controller epoch, identity revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates both address-family maps; pinned | one entry; failed activation preserves the previous pointer |
 | `POLICY_RULES` | source/destination identity, protocol, destination port, bank | actual/shadow verdict and policy/rule/reason provenance, schema, revision | controller compiler; agent transactional writer | stale inactive keys are removed, then populated and validated before activation; pinned | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries, and the active bank remains selected when staging fails |
@@ -42,11 +42,13 @@ key layout without an ABI change.
 | `EGRESS_IPV4` | exact/fallback destination IPv4, source identity, protocol, destination port, bank | same policy decision/provenance value as `POLICY_RULES` | controller egress compiler; agent transactional writer; TC reader | exact destination then arbitrary-destination fallbacks in the active bank; staged and validated with ingress | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
 | `EGRESS_IPV6` | source identity, port, protocol, bank, and destination IPv6 prefix | same policy decision/provenance value as `POLICY_RULES` | controller egress compiler; agent transactional writer; TC LPM reader | longest-prefix destination lookup for exact, protocol-wildcard, then global-wildcard dimensions; staged and validated with ingress | 262,144 entries across two banks; compiler and agent cap each bank at 131,072 entries |
 | `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks; pinned | one entry; failed activation preserves the previous pointer |
-| `SERVICE_FRONTENDS_V4`, `SERVICE_FRONTENDS_V6` | exact address, network-order port, protocol, bank | ServiceId, revision-local frontend index, eligible backend count, schema, revision | service compiler; agent transactional writer; TC reader | both families stage/read back together; pinned under ABI v4 | 262,144 physical entries each, capped at 131,072 per bank; an exact zero-backend frontend drops new flows while an unrelated tuple passes |
+| `SERVICE_FRONTENDS_V4`, `SERVICE_FRONTENDS_V6` | exact address, network-order port, protocol, bank | ServiceId, revision-local frontend index, eligible backend count, schema, revision | service compiler; agent transactional writer; TC reader | both families stage/read back together; pinned under ABI v5 | 262,144 physical entries each, capped at 131,072 per bank; an exact zero-backend frontend drops new flows while an unrelated tuple passes |
 | `SERVICE_BACKENDS_V4`, `SERVICE_BACKENDS_V6` | ServiceId, BackendId, bank | revision, address, network-order port, protocol, lifecycle flags, schema | service compiler; agent transactional writer; TC reader | all endpoint lifecycle records stage with frontends; pinned | 524,288 physical entries each, capped at 262,144 per bank; new-flow slots admit only ready, non-terminating entries |
 | `SERVICE_BACKEND_SLOTS` | ServiceId, revision-local frontend index, ordered slot, bank | stable BackendId, schema, revision | service compiler; agent transactional writer; TC reader | deterministic eligible membership stages with both families; pinned | 1,048,576 physical entries, capped at 524,288 per bank |
 | `SERVICE_CONFIG` | constant `u32` slot 0 | controller epoch, service revision, frontend/backend/slot counts, schema, active bank | agent writer; TC reader | one write activates all five service tables; durable-checkpoint failure restores the prior pointer | one entry; absent/invalid config means no desired service lookup, while an existing valid connection remains usable until timeout |
-| `SERVICE_CONNECTIONS` | complete IPv4/IPv6 L4 tuple plus forward/reverse role | last-seen, service revision, client/frontend/backend tuples, ServiceId, BackendId, schema/flags | TC writer/reader | persistent ABI v4; reverse inserts first, forward second, partial failure removes reverse; lookups validate the complete peer tuple and refresh both entries | bounded 262,144-entry LRU; valid TCP/UDP pairs survive desired-state churn until protocol timeout; corrupt/expired pairs are removed |
+| `SERVICE_CONNECTIONS` | complete IPv4/IPv6 L4 tuple plus forward/reverse role | last-seen, service revision, client/frontend/backend tuples, ServiceId, BackendId, schema/flags | TC writer/reader | persistent ABI v5; reverse inserts first, forward second, partial failure removes reverse; lookups validate the complete peer tuple and refresh both entries | bounded 262,144-entry LRU; valid TCP/UDP pairs survive desired-state churn until protocol timeout; corrupt/expired pairs are removed |
+| `NODE_PORT_FRONTENDS_V4`, `NODE_PORT_FRONTENDS_V6` | local Node address, network-order NodePort, protocol, bank | ServiceId, frontend index, eligible-backend count, service revision/bank, schema, traffic-policy flag | service compiler; agent transactional writer | both families stage/read back together under a NodePort-specific bank; pinned under ABI v5; no packet reader until Phase 5.4 | 262,144 physical entries each, capped at 131,072 per bank; arithmetic address × NodePort preflight fails before allocation |
+| `NODE_PORT_CONFIG` | constant `u32` slot 0 | controller epoch, service and local-Node revisions, family counts, schema, active NodePort bank | agent writer | independent pointer references values that name an exact active service bank; address-only changes do not churn ClusterIP maps | one entry; dual-pointer crash recovery either commits the complete prepared tuple or restores the prior durable tuple before attachment |
 
 `FlowEvent` carries no Kubernetes strings. ABI v2 records the applied policy
 revision, actual verdict/reason/policy/rule, and optional shadow
@@ -121,7 +123,7 @@ source-prefix entry exists; egress requires the selected source identity.
 Fail-open events are marked observed/identity-unknown with revision zero. TC
 attachments use persistent replacement identities. On Linux 6.6 and newer, the
 agent pins one TCX link per interface index in the configured direction below the
-ABI v4 link directory and atomically updates that link to the newly loaded
+current ABI v5 link directory and atomically updates that link to the newly loaded
 program. On older kernels, it owns a fixed priority/handle tuple per direction
 and replaces the legacy netlink filter in place. The old program therefore
 remains attached until the replacement program is loaded and handed over.
@@ -132,8 +134,8 @@ and proves that the reserved netlink filter alone preserves enforcement through
 replacement before restoring TCX and removing the legacy tuple.
 Operators can inspect and remove recognized persistent state with `unf-agent
 cleanup`. Planning is the default; `--execute` applies the plan. ABI cleanup
-accepts only the known v1/v2/v3/v4 map names and numeric UNF TCX link-pin names,
-refuses unknown directory content, and requires `--allow-current-abi` for v4. Legacy
+accepts only the known v1/v2/v3/v4/v5 map names and numeric UNF TCX link-pin names,
+refuses unknown directory content, and requires `--allow-current-abi` for v5. Legacy
 cleanup matches only UNF program names and leaves clsact and unrelated filters
 untouched.
 Invalid map state never becomes a deny by accident. The kind gate also fills the
@@ -142,7 +144,7 @@ bank, requires the staging failure to preserve the selected bank and applied
 revision, then removes only those keys and verifies that the waiting revision
 activates.
 Old ABI pin directories are not removed automatically; operators may use the
-scoped cleanup command only after validating an ABI v4 rollout. See ADRs 0008
+scoped cleanup command only after validating the replacement ABI rollout. See ADRs 0008
 and 0016 through 0022.
 Permanent startup validation failures terminate the agent after readiness is
 fenced so the orchestrator can retry after repair.

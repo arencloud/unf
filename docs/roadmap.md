@@ -419,10 +419,11 @@ matrix is maintained in the
   independently revisioned local Node address intent, last-valid/relist
   behavior, and a fixed dual-stack two-bank compiler ABI establish the bounded
   host-state contract without exposing an uncommitted map; ADR 0084.
-- In progress: agent inactive-map mutation/readback, activation ordering,
-  rollback, persistence, recovery, and cleanup for the coherent service/Node
-  tuple.
-- Planned after host maps: dual-stack TCP/UDP `Cluster` and source-preserving
+- Verified by `make nodeport-transaction-test`: persistent ABI v5 separates the
+  21-map runtime from historical 18-map v4 state; composite checkpoints,
+  independent service/NodePort banks, real-map failure injection, address-only
+  switching, dual-pointer crash repair, and scoped cleanup pass; ADR 0085.
+- In progress after host maps: dual-stack TCP/UDP `Cluster`; source-preserving
   `Local` dataplanes,
   operations/simulation, and independent kube-proxy-free Kind/OpenShift gates.
 - LoadBalancer, session affinity, topology-aware selection, Maglev, and DSR
