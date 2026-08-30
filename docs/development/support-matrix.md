@@ -20,7 +20,7 @@ refreshing the old result.
 | Kind matrix | Kubernetes 1.34.8 | Debian 13 node / Fedora host, Linux 7.1.4, amd64 | kindnetd, IPv4/IPv6 | TCX and legacy netlink | `da73359`, isolated endpoint/recovery/upgrade gate; ADR 0055 |
 | cl01 | OpenShift 4.22.9 / Kubernetes 1.35.6 | RHCOS 9.8, Linux 5.14, amd64 | OVN-Kubernetes, IPv4 | legacy netlink | `4f213c7`, adaptive OpenShift endpoint gate |
 | cl02 | OpenShift 4.22.9 / Kubernetes 1.35.6 | RHCOS 9.8, Linux 5.14, amd64 | OVN-Kubernetes, IPv4/IPv6 | legacy netlink | `9a376ae`, endpoint and digest-pinned transition gates |
-| cl02 primary CNI | OpenShift 4.22.10 / Kubernetes 1.35.6 | RHCOS 9.8.20260812-0, Linux 5.14.0-687.39.1, amd64 | UNF `15866c4`, IPv4/IPv6 | legacy netlink | `5a93a51`, bootstrap, runtime-fault, teardown, and worker-reprovision gates; ADR 0073 |
+| cl02 primary CNI | OpenShift 4.22.10 / Kubernetes 1.35.6 | RHCOS 9.8.20260812-0, Linux 5.14.0-687.39.1, amd64 | UNF `f721f9a`, IPv4/IPv6 | legacy netlink | `a0ab2e5`, bootstrap/recovery plus kube-proxy-free service lifecycle and outage gates; ADRs 0073 and 0081 |
 
 The JSON record contains the exact runtime versions, full Git revisions,
 commands, result/ADR references, and scope for every row. Its explicit

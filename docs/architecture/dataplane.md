@@ -168,9 +168,9 @@ agent uses the constrained three-capability boundary defined by ADR 0025, the
 exact mount boundary in ADR 0028, and the uninstall ordering in ADR 0029. The
 Phase 3 NetworkPolicy compatibility is complete at its documented bounded L4
 scope. Full-CNI dataplane ownership, link/routing lifecycle, and exact Kind and
-OpenShift recovery are Verified under ADRs 0057–0073. Phase 4 now has a
+OpenShift recovery are Verified under ADRs 0057–0073. Phase 4 adds a
 Kubernetes-independent service IR and deterministic retained-last-valid
 Kubernetes compiler, authenticated durable agent distribution, transactional
-service state, and verifier-executed dual-stack TCP/UDP service translation
-under ADRs 0074–0078. Service operations, kube-proxy-free Kind, and OpenShift
-qualification remain gated on Phase 4.6 and later evidence.
+service state, verifier-executed dual-stack TCP/UDP service translation,
+bounded operations, and kube-proxy-free Kind and OpenShift qualification under
+ADRs 0074–0081.

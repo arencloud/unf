@@ -98,8 +98,8 @@ matrix and reproducible evidence.
   Pods and ephemeral updates. Writable bpffs, read-only BTF, no
   subpaths/propagation, and no sidecar/init/ephemeral access were live-qualified.
   Phase 4.3 adds the exact `/var/lib/unf/cni` durable-state path under the same
-  rules and renders it statically; the additive path awaits Phase 4.8 live
-  requalification;
+  rules and renders it statically; Phase 4.8 live-qualified that additive path
+  through controller-offline agent replacement on five OpenShift Nodes;
 - Implemented and OpenShift verified: coordinated uninstall is dry-run-first,
   requires exact context confirmation, stops every agent before host mutation,
   runs one SCC/admission-constrained cleanup Job per selected worker, verifies
@@ -258,8 +258,8 @@ matrix and reproducible evidence.
 
 Phase 3 is closed by the committed-revision regression, one-to-one requirements
 and limitations audit, and immutable release-readiness evidence in ADR 0056.
-Post-foundation service load balancing, advanced routing providers, encryption,
-L7, and multi-cluster transport remain gated or planned. Additional external
+Advanced Service modes, routing providers, encryption, L7, and multi-cluster
+transport remain gated or planned. Additional external
 transport adapters remain conditional on product requirements.
 
 The ordered milestones and their evidence-bearing subpoints are maintained in
@@ -348,13 +348,14 @@ authoritative record of verified results.
   additionally prove exact CRI-O drain before agent stop, route/BPF/artifact
   teardown, a genuine no-CNI sandbox failure, host-network reinstall from zero,
   exact recovered state, platform health, and dual-stack forwarding.
-- Netkit, service load balancing,
-  kube-proxy replacement, BGP, encryption, L7, and multi-cluster remain outside
-  this foundation slice.
+- Netkit, Service handling beyond the separately qualified Phase 4 ClusterIP
+  contract, BGP, encryption, L7, and multi-cluster remain outside this
+  foundation slice.
 
 ## Phase 4 — service-fabric foundation
 
-**Gate: In progress.** The ordered evidence matrix is maintained in the
+**Gate: Verified for the bounded ClusterIP foundation.** The ordered evidence
+matrix is maintained in the
 [Phase 4 service-fabric plan](development/phase4-service-fabric-plan.md).
 
 - Implemented and locally verified: strongly typed `ServiceId` and `BackendId`;
@@ -390,8 +391,12 @@ authoritative record of verified results.
   ClusterIP on both families, DNS and endpoint lifecycle, controller-offline
   worker-agent replacement, durable/pinned recovery, exact cleanup, and
   restoration to the no-CNI baseline; ADR 0080.
-- Next: digest-pinned OpenShift service-fabric qualification on the deliberate
-  dual-stack cl02 primary-CNI development cluster.
+- Verified by `make openshift-service-deploy` and
+  `make openshift-service-test`: the exact digest-pinned candidate recovered a
+  preserved legacy checkpoint, moved five cl02 agents serially to ABI v4, then
+  removed kube-proxy and proved the complete dual-stack ClusterIP lifecycle,
+  controller-offline source/destination agent replacement, observability,
+  exact cleanup, and operator-health boundary on RHCOS/SELinux/CRI-O; ADR 0081.
 - Later service slices: NodePort, LoadBalancer, session affinity,
   `externalTrafficPolicy`, `internalTrafficPolicy`, topology-aware routing,
   Maglev, and optional DSR. None is implied by the foundation gate.

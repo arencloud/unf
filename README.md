@@ -9,10 +9,11 @@ routing-protocol, encryption, gateway, or L7 responsibilities into kernel
 programs where another bounded provider is safer.
 
 Phase 1 established observation, Phase 2 added identity-aware L3/L4 enforcement,
-Phase 3 completed bounded Kubernetes compatibility and simulation, and the
-full-CNI foundation now owns dual-stack Pod networking on exact qualified Kind
-and OpenShift tuples. UNF is **not production-ready**; these results are bounded
-development qualifications, not a general production support claim.
+Phase 3 completed bounded Kubernetes compatibility and simulation, the full-CNI
+foundation owns dual-stack Pod networking, and Phase 4 adds a native eBPF
+dual-stack ClusterIP fabric on exact kube-proxy-free Kind and OpenShift tuples.
+UNF is **not production-ready**; these results are bounded development
+qualifications, not a general production support claim.
 
 ## Project status
 
@@ -137,7 +138,7 @@ reprovision from zero all pass committed gates. Qualification remains limited
 to the exact recorded development tuple; production repositories and other
 platform versions are not inferred. Existing overlay deployments are unchanged.
 See the [cl02 installation checkpoint](docs/development/openshift-primary-cni-cl02-install.md).
-Phase 4 is now in progress. Its first seven verified slices add strongly typed
+Phase 4 is Verified across all eight bounded milestones. It adds strongly typed
 `ServiceId`/`BackendId` values and a bounded, schema-versioned,
 Kubernetes-independent dual-stack service IR, plus deterministic Kubernetes
 Service/EndpointSlice compilation with collision-checked IDs, exact family and
@@ -164,8 +165,13 @@ the sole primary CNI with kube-proxy absent. Its repeatable gate proves direct
 Pod and DNS continuity, native IPv4/IPv6 TCP/UDP ClusterIP lifecycle,
 backendless provenance, controller-offline replacement of both worker agents
 from durable/pinned state, exact workload cleanup, and restoration to the saved
-no-CNI baseline. OpenShift service-fabric qualification remains the final
-foundation milestone; ADR 0080 records the Kind boundary.
+no-CNI baseline. The five-node OpenShift 4.22.10 gate then migrates the preserved
+service state controller-first, replaces agents serially, removes kube-proxy,
+and repeats the dual-stack TCP/UDP/DNS lifecycle plus controller-offline source
+and destination agent recovery on RHCOS/SELinux/CRI-O. It leaves all five agents
+converged on persistent ABI v4, retires only ABI v3, and introduces no new
+unhealthy operator. ADRs 0080–0081 record the non-transitive Kind and OpenShift
+boundaries.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -376,8 +382,9 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-Not implemented yet: eBPF service load balancing and kube-proxy replacement,
-production-scale routing/CNI qualification,
+Not implemented yet: advanced Service modes such as NodePort, LoadBalancer,
+session affinity, traffic policies, topology-aware routing, Maglev, and DSR;
+production-scale routing/CNI qualification;
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
 multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production
 fail-closed recovery. Bounded TCP/UDP/SCTP reply state survives unrelated policy

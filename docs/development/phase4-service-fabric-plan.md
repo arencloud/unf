@@ -22,7 +22,7 @@ cluster support.
 | 4.5 | Dual-stack ClusterIP dataplane | **Verified** | `make service-dataplane-test`; verifier-loaded IPv4/IPv6 TCP/UDP DNAT and reverse SNAT, checksum proof, deterministic ready/non-terminating selection, paired connection provenance, churn persistence, expiry/reselection, and exact no-backend drop; ADR 0078 |
 | 4.6 | Service operations | **Verified** | `make service-operations-test`; fixed event ABI, bounded metrics/status/export/history, durable migration, service explanation, and actionable translation/drop/expiry reasons; ADR 0079 |
 | 4.7 | Kube-proxy-free Kind qualification | **Verified** | `make service-kind-test`; dedicated Kubernetes 1.35 dual-stack primary-CNI fixture, lifecycle/failure/recovery artifact, and exact rollback; ADR 0080 |
-| 4.8 | OpenShift qualification | **In progress** | Revision `f721f9a` passed the complete kube-proxy-free Kind gate and is published by three immutable public Quay digests. Its guarded cl02 rollout recovered the preserved clock-regressed schema-v3 flow checkpoint into valid schema v4, then moved all five agents serially to the exact candidate with 5/5 convergence while kube-proxy remained available. The uninterrupted kube-proxy-free outage/recovery gate remains |
+| 4.8 | OpenShift qualification | **Verified** | `make openshift-service-deploy` and `make openshift-service-test`; exact digest-pinned revision `f721f9a`, guarded controller-first five-Node rollout, preserved schema-v3→v4 checkpoint recovery, kube-proxy-free IPv4/IPv6 TCP/UDP/DNS lifecycle, controller-offline source/destination agent replacement, bounded outcome/explanation evidence, exact cleanup, ABI-v3 retirement, and no new unhealthy operator; ADR 0081 |
 
 ## Accepted Phase 4 gate
 
@@ -43,8 +43,9 @@ UNF primary CNI with kube-proxy absent and demonstrates:
 - schema-versioned environment and Git evidence.
 
 SCTP, NodePort, LoadBalancer, session affinity, traffic policies, Maglev, DSR,
-generic NAT/RELATED tracking, and OpenShift are not silently inherited by this
-first gate. They receive separate rows after the ClusterIP foundation closes.
+and generic NAT/RELATED tracking are not silently inherited by this first gate.
+OpenShift receives its independent bounded qualification in row 4.8; the other
+modes require separate post-foundation rows.
 
 ## Reproducing the Kind gate
 
@@ -62,14 +63,11 @@ after writing `.artifacts/phase4-service-kind.json`. Run
 restores the primary-CNI labels and CoreDNS bootstrap prerequisites. Run
 `make service-kind-down` to remove the disposable cluster.
 
-## Immediate next slice
+## Closure and next scope
 
-Execute Phase 4.8 without widening unsupported Service types. The qualified
-revision and immutable release record are now published, and the checked-in
-workflow deliberately crosses persistent BPF ABI v3 to v4 controller-first and
-one Node at a time while kube-proxy remains a safety net. The second gate may
-remove kube-proxy only after all five agents converge; it then proves the same
-dual-stack TCP/UDP ClusterIP lifecycle, failure/recovery, observability, RHCOS,
-SELinux, CRI-O, and operator-health invariants and retires only the obsolete v3
-map directory. Passing live cl02 evidence remains required; no behavior is
-inherited from the Kind result.
+All eight Phase 4 milestones are Verified. The exact OpenShift tuple and
+evidence are recorded by ADR 0081 and the support matrix; the result does not
+broaden the unsupported Service modes listed above. The next phase must select
+and independently gate advanced Service exposure and selection, routing,
+encryption, gateway, or multi-cluster slices rather than silently extending the
+bounded ClusterIP claim.

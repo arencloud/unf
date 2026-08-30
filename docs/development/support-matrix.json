@@ -245,7 +245,7 @@
         "container_runtime": "CRI-O 1.35.6-4.rhaos4.22.git41f610b.el9"
       },
       "networking": {
-        "cni": "UNF primary CNI revision 15866c44bca4953b5401d0cdce66a65d3462af42",
+        "cni": "UNF primary CNI runtime revision f721f9a7a0084e908bfa3eda2896ec2c3521ebbb",
         "address_families": [
           "ipv4",
           "ipv6"
@@ -258,23 +258,28 @@
       },
       "evidence": {
         "outcome": "passed",
-        "verified_at": "2026-08-29",
-        "revision": "5a93a5194476e42dd45cf46e96ea82f574306fff",
+        "verified_at": "2026-08-30",
+        "revision": "a0ab2e5dbbe29f65950cd36eb3834bca85809283",
         "commands": [
           "make openshift-primary-cni-package-check",
           "make openshift-primary-cni-runtime-fault-test",
-          "make openshift-primary-cni-node-reprovision-test"
+          "make openshift-primary-cni-node-reprovision-test",
+          "make openshift-service-deploy OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig",
+          "make openshift-service-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig"
         ],
         "records": [
           ".artifacts/phase3-openshift-primary-cni-runtime-fault.json",
           ".artifacts/phase3-openshift-primary-cni-node-reprovision.json",
-          "docs/development/openshift-primary-cni-cl02-install.md"
+          "docs/development/openshift-primary-cni-cl02-install.md",
+          ".artifacts/phase4-openshift-service-deploy.json",
+          ".artifacts/phase4-openshift-service.json"
         ],
         "decisions": [
           "docs/adr/0069-openshift-primary-cni-bootstrap-package.md",
           "docs/adr/0071-cni-valid-attachment-garbage-collection.md",
           "docs/adr/0072-durable-cni-delete-intents.md",
-          "docs/adr/0073-openshift-primary-cni-node-reprovision.md"
+          "docs/adr/0073-openshift-primary-cni-node-reprovision.md",
+          "docs/adr/0081-openshift-kube-proxy-free-service-qualification.md"
         ]
       },
       "qualified_scope": [
@@ -282,7 +287,9 @@
         "dual-stack cross-worker pod forwarding and DNS",
         "RHCOS enforcing-SELinux and native legacy-netlink operation",
         "clean reboot and deliberate CRI-O cache-loss recovery",
-        "exact worker teardown, no-CNI failure, reprovision, and controller reconvergence"
+        "exact worker teardown, no-CNI failure, reprovision, and controller reconvergence",
+        "kube-proxy-free dual-stack TCP and UDP ClusterIP lifecycle",
+        "controller-offline source and destination agent replacement with durable service recovery"
       ]
     }
   ],
@@ -325,7 +332,7 @@
       "qualified_values": [
         "kindnetd",
         "OVN-Kubernetes",
-        "UNF primary CNI revision 15866c44bca4953b5401d0cdce66a65d3462af42"
+        "UNF primary CNI runtime revision f721f9a7a0084e908bfa3eda2896ec2c3521ebbb"
       ],
       "boundary": "Other UNF revisions, other CNIs, and CNI chaining combinations are unqualified."
     },
