@@ -126,6 +126,51 @@ for node in "${nodes[@]}"; do
             done
         done
 
+        cleanup_pending_deletes() {
+            pending=${state_dir}/pending-deletes
+            [ -e "$pending" ] || return 0
+            test "$(ip -j -d link | jq '\''[.[] | select(.ifname | startswith("unf"))] | length'\'')" -eq 0
+            test -d "$pending" && test ! -L "$pending"
+            test "$(stat -c %a "$pending")" = 700
+            pending_network=${pending}/unf-primary
+            if [ -e "$pending_network" ]; then
+                test -d "$pending_network" && test ! -L "$pending_network"
+                test "$(stat -c %a "$pending_network")" = 700
+                test -z "$(find "$pending_network" -mindepth 3 -print -quit)"
+                test -z "$(find "$pending_network" -mindepth 1 -maxdepth 1 ! -type d -print -quit)"
+                for container_directory in "$pending_network"/*; do
+                    [ -e "$container_directory" ] || break
+                    test -d "$container_directory" && test ! -L "$container_directory"
+                    test "$(stat -c %a "$container_directory")" = 700
+                    container_id=${container_directory##*/}
+                    printf "%s\n" "$container_id" | grep -Eq "^[0-9a-f]{64}$"
+                    for intent in "$container_directory"/*.json; do
+                        [ -e "$intent" ] || break
+                        test -f "$intent" && test ! -L "$intent"
+                        test "$(stat -c %a "$intent")" = 600
+                        jq -e --arg container_id "$container_id" \
+                            '\''.schemaVersion == 1
+                            and .key.network == "unf-primary"
+                            and .key.containerId == $container_id
+                            and (.key.ifname | test("^[A-Za-z0-9_.-]{1,15}$"))'\'' \
+                            "$intent" >/dev/null
+                        ifname=$(jq -r .key.ifname "$intent")
+                        test "${intent##*/}" = "${ifname}.json"
+                        rm -f "$intent"
+                    done
+                    rmdir "$container_directory"
+                done
+                rmdir "$pending_network"
+            fi
+            test -z "$(find "$pending" -mindepth 1 -maxdepth 1 ! -name .unf-primary.lock -print -quit)"
+            if [ -e "$pending/.unf-primary.lock" ]; then
+                test -f "$pending/.unf-primary.lock" && test ! -L "$pending/.unf-primary.lock"
+                test "$(stat -c %a "$pending/.unf-primary.lock")" = 600
+                rm -f "$pending/.unf-primary.lock"
+            fi
+            rmdir "$pending"
+        }
+
         # A previous rollback attempt may already have removed the complete
         # owned transaction on this Node before another Node failed. Resume only
         # from an exact empty owned boundary; any partial combination remains
@@ -134,7 +179,7 @@ for node in "${nodes[@]}"; do
             && [ ! -e "$binary" ] && [ ! -e "$config" ]; then
             test ! -e "${state_dir}/attachments.json"
             test ! -e "${state_dir}/node-block.json"
-            test ! -e "${state_dir}/pending-deletes"
+            cleanup_pending_deletes
             if [ -d "$state_dir" ]; then
                 test -z "$(find "$state_dir" -mindepth 1 -print -quit)"
                 rmdir "$state_dir"
@@ -204,26 +249,7 @@ EOF
         rm -f "$binary" "$config"
         rm -f "${state_dir}/attachments.json" "${state_dir}/node-block.json" \
             "$routes" "$services" "$marker"
-        pending=${state_dir}/pending-deletes
-        test -d "$pending" && test ! -L "$pending"
-        pending_network=${pending}/unf-primary
-        if [ -e "$pending_network" ]; then
-            test -d "$pending_network" && test ! -L "$pending_network"
-            test "$(stat -c %a "$pending_network")" = 700
-            test -z "$(find "$pending_network" -mindepth 2 -print -quit)"
-            test -z "$(find "$pending_network" -mindepth 1 -maxdepth 1 ! -type d -print -quit)"
-            for container_directory in "$pending_network"/*; do
-                [ -e "$container_directory" ] || break
-                test -d "$container_directory" && test ! -L "$container_directory"
-                test "$(stat -c %a "$container_directory")" = 700
-                printf "%s\n" "${container_directory##*/}" | grep -Eq "^[0-9a-f]{64}$"
-                rmdir "$container_directory"
-            done
-            rmdir "$pending_network"
-        fi
-        test -z "$(find "$pending" -mindepth 1 -maxdepth 1 ! -name .unf-primary.lock -print -quit)"
-        rm -f "$pending/.unf-primary.lock"
-        rmdir "$pending"
+        cleanup_pending_deletes
         rmdir "$state_dir"
         rmdir /var/lib/unf/cni
         rmdir /run/unf
