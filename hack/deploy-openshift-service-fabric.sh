@@ -172,22 +172,30 @@ wait_for_agent_service_state() {
 }
 
 assert_agent() {
-    local node=$1 host_state
+    local node=$1 host_state=
     wait_for_agent_service_state "${node}"
-    host_state=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
-        test "$(getenforce)" = Enforcing
-        test -d /sys/fs/bpf/unf/v5
-        for pin in SERVICE_CONFIG SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 \
-            SERVICE_BACKENDS_V4 SERVICE_BACKENDS_V6 SERVICE_CONNECTIONS \
-            NODE_PORT_CONFIG NODE_PORT_FRONTENDS_V4 NODE_PORT_FRONTENDS_V6; do
-            test -e "/sys/fs/bpf/unf/v5/$pin"
-        done
-        snapshot=/var/lib/unf/cni/v1/service-snapshot.json
-        test -f "$snapshot" && test ! -L "$snapshot" && test "$(stat -c %a "$snapshot")" = 600
-        jq -e ".schemaVersion == 1 and .revision > 0 and (.services | length) > 0" "$snapshot" >/dev/null
-        echo service-state-ready
-    ' 2>&1)
-    grep -q '^service-state-ready$' <<<"${host_state}"
+    for _ in $(seq 1 60); do
+        host_state=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
+            test "$(getenforce)" = Enforcing
+            test -d /sys/fs/bpf/unf/v5
+            for pin in SERVICE_CONFIG SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 \
+                SERVICE_BACKENDS_V4 SERVICE_BACKENDS_V6 SERVICE_CONNECTIONS \
+                NODE_PORT_CONFIG NODE_PORT_FRONTENDS_V4 NODE_PORT_FRONTENDS_V6; do
+                test -e "/sys/fs/bpf/unf/v5/$pin"
+            done
+            snapshot=/var/lib/unf/cni/v1/service-snapshot.json
+            test -f "$snapshot" && test ! -L "$snapshot" && test "$(stat -c %a "$snapshot")" = 600
+            jq -e ".schemaVersion == 1 and .revision > 0 and (.services | length) > 0" "$snapshot" >/dev/null
+            echo service-state-ready
+        ' 2>&1 || true)
+        if grep -q '^service-state-ready$' <<<"${host_state}"; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "agent on ${node} did not expose complete durable ABI-v5 host state" >&2
+    printf '%s\n' "${host_state}" >&2
+    return 1
 }
 
 wait_for_convergence() {
