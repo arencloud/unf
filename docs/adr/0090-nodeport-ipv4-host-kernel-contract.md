@@ -1,6 +1,6 @@
 # ADR 0090: Make the IPv4 NodePort host-kernel contract explicit
 
-**Status:** Accepted and implemented; live evidence pending (2026-08-30)
+**Status:** Accepted and live verified on Kind (2026-08-30)
 
 ## Context
 
@@ -54,7 +54,7 @@ contains `bpftool`.
 ## Verification
 
 The static installer gate verifies both persistent MachineConfigs and the
-reversible Kind scripts. `make nodeport-kind-test` must then pass the complete
-dual-stack NodePort lifecycle and exact rollback before ADRs 0089–0090 become
-live verified. Phase 5.8 independently qualifies the persistent settings on
-RHCOS.
+reversible Kind scripts. Committed revision `892ef1a` passed the complete
+dual-stack NodePort lifecycle and restored the exact saved values on all three
+Kind Nodes: `rp_filter` all/default/eth0 `1/1/2` and `accept_local` `0/0/0`.
+Phase 5.8 independently qualifies the persistent settings on RHCOS.

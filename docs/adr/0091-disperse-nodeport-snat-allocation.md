@@ -1,6 +1,6 @@
 # ADR 0091: Disperse bounded NodePort SNAT allocation
 
-**Status:** Accepted and implemented; live restart evidence pending (2026-08-30)
+**Status:** Accepted and live verified (2026-08-30)
 
 ## Context
 
@@ -44,6 +44,10 @@ The shared unit test proves unique, in-range candidates and simulates 4,096
 sequential short TCP flows without exhausting the bounded search. The focused
 privileged gate proves that the release eBPF object passes the kernel verifier
 and retains collision-safe dual-stack NodePort translation. The full
-`make nodeport-kind-test` gate must additionally reproduce controller-offline
-agent replacement with live traffic before this ADR and milestone 5.7 become
-live verified.
+`make nodeport-kind-test` gate additionally reproduces controller-offline agent
+replacement with live traffic.
+
+Committed revision `892ef1a` subsequently passed that uninterrupted gate. Both
+worker agents recovered independently from validated local state while the
+controller was offline, and fresh dual-stack NodePort traffic passed after each
+replacement without `PAIR_INSERT_FAILED`.

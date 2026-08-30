@@ -1,6 +1,6 @@
 # ADR 0089: Qualify NodePort on the kube-proxy-free Kind fixture
 
-**Status:** Accepted and implemented; live evidence pending (2026-08-30)
+**Status:** Accepted and live verified (2026-08-30)
 
 ## Context
 
@@ -52,8 +52,8 @@ both the legacy ClusterIP checkpoint and the composite NodePort checkpoint.
 - The qualification intentionally excludes SCTP, LoadBalancer, session
   affinity, topology hints, Maglev, DSR, host-network clients, fragments,
   generic NAT `RELATED` tracking, and production availability or scale.
-- The milestone is Implemented, not Verified, until committed images complete
-  the gate and the resulting immutable evidence is audited.
+- The milestone became Verified when committed revision `892ef1a` completed the
+  gate and the resulting immutable evidence and restored baseline were audited.
 - ADR 0090 records the host-kernel contract discovered by the first live run.
 
 ## Verification
@@ -68,3 +68,13 @@ make nodeport-kind-test
 
 The final command writes `.artifacts/phase5-nodeport-kind.json` and restores the
 fixture to its saved no-CNI baseline.
+
+The accepted evidence uses schema v2, binds both product and qualification to
+revision `892ef1a063273ede485687c81a785cf02ed65652`, records Kubernetes
+v1.35.0 with kube-proxy absent, and completed in 822 seconds. It records agent
+image `sha256:678d67a8cc23fedc66120cb85805157dab4a561e453e8d0ee915ba7e874ce19f`
+and controller image
+`sha256:57b4b46aeb9f941be7e5c2c2043ab43679497cf70d7e424400f31b816a99dea0`.
+An independent post-gate audit found no UNF namespace, CNI file, bpffs/state
+root, or kube-proxy DaemonSet and confirmed exact `rp_filter` and
+`accept_local` restoration on every Node.

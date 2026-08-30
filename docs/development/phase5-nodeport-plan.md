@@ -17,7 +17,7 @@ authoritative feature state remains in [project-status.md](../project-status.md)
 | 5.4 | `externalTrafficPolicy: Cluster` dataplane | **Verified** | Exact Node-address/port/protocol lookup, coherent service-bank validation, IPv4/IPv6 TCP/UDP DNAT with bounded collision-safe Node SNAT, paired reverse restoration, deterministic slots, connection persistence, backend policy ordering, checksum/provenance packet execution; `make nodeport-cluster-dataplane-test`; ADR 0086 |
 | 5.5 | `externalTrafficPolicy: Local` | **Verified** | Deterministic per-Node slot namespace merged transactionally with the service bank; ready/non-terminating placement eligibility; source preservation; exact no-local-backend drop; placement/readiness loss, established-flow retention, recovery, reverse translation, and backend policy ordering; NodePort/LoadBalancer health-check boundary; `make nodeport-local-dataplane-test`; ADR 0087 |
 | 5.6 | NodePort operations | **Verified** | Fixed-width event classification; label-free metrics; status v5; export/history/checkpoint v5/v6/v5; filtered explanation; read-only simulation; actionable bounded failures; restart migration; `make nodeport-operations-test`; ADR 0088 |
-| 5.7 | Kube-proxy-free Kind qualification | **Implemented** | `make nodeport-kind-test` now encodes cross-node dual-stack Cluster/Local lifecycle, source and reverse tuple checks, retained UDP connections, classified operations, controller outage, both worker-agent replacements, cleanup, exact rollback, reversible IPv4 host prerequisites, dispersed bounded SNAT allocation across restart churn, and schema-v2 evidence; execution on committed images remains the verification gate; ADRs 0089–0091 |
+| 5.7 | Kube-proxy-free Kind qualification | **Verified** | Committed revision `892ef1a` passed `make nodeport-kind-test`: cross-node dual-stack Cluster/Local lifecycle, source and reverse tuple checks, retained UDP connections, classified operations, controller outage, both worker-agent replacements, empty-map cleanup, exact rollback, reversible IPv4 host prerequisites, dispersed bounded SNAT allocation across restart churn, and schema-v2 evidence; ADRs 0089–0091 |
 | 5.8 | OpenShift qualification | **Planned** | Digest-pinned RHCOS/SELinux/CRI-O rollout and kube-proxy-free cross-worker NodePort lifecycle/recovery on the exact disposable tuple |
 
 ## Accepted Phase 5 gate
@@ -43,21 +43,11 @@ availability/scale require independent later gates.
 
 ## Immediate next slice
 
-Phase 5.7's implemented gate must qualify the committed operations-capable images on the dedicated
-three-Node dual-stack primary-CNI Kind fixture with kube-proxy absent. The gate
-must cover cross-node IPv4/IPv6 TCP/UDP for both traffic policies, source/reverse
-tuples, readiness/termination/deletion/local-loss recovery, controller outage,
-source and destination agent replacement from last-known-good state, classified
-metrics/status/history/explanation/simulation, exact fixture and ABI cleanup,
-and restoration to the saved no-CNI baseline. Evidence must bind the product
-and qualification-harness revisions, images, Kubernetes/Kind/kernel tuple,
-timing, and exclusions.
-
-The first live execution isolated a distribution-default host prerequisite:
-reverse-translated IPv4 replies require `rp_filter=0` and `accept_local=1` on
-all current and future interfaces. ADR 0090 makes that contract persistent on
-OpenShift and exactly reversible in the disposable Kind fixture. The committed
-fix must pass the complete gate before milestone 5.7 changes to Verified. A
-subsequent controller-offline agent replacement exposed adjacent SNAT-candidate
-exhaustion under retained short-flow churn; ADR 0091 replaces that correlated
-window with a verifier-bounded, full-range odd-stride permutation.
+Phase 5.8 must qualify the exact committed NodePort implementation on the
+five-Node dual-stack OpenShift cl02 tuple with kube-proxy absent. Images must be
+published and deployed by digest, the master and worker MachineConfigPools must
+converge on the NodePort host contract, and the Kind NodePort matrix must be
+repeated across RHCOS/SELinux/CRI-O workers. Evidence must include source and
+image provenance, Cluster/Local dual-stack TCP/UDP, lifecycle and offline-agent
+recovery, operations/simulation, host-map cleanup, and cluster health before
+Phase 5 can close.
