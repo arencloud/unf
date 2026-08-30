@@ -18,13 +18,14 @@ pub const TOPOLOGY_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 pub const TOPOLOGY_HISTORY_CAPACITY: usize = 32;
 pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 4;
 pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 5;
-pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 3;
+pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 4;
 pub const SHADOW_IMPACT_SCHEMA_VERSION: u16 = 1;
 pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 4;
 pub const COMPONENT_COMPATIBILITY_SCHEMA_VERSION: u16 = 2;
 pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 4;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
+const FLOW_HISTORY_LEGACY_MAX_CLOCK_REGRESSION_MILLIS: u64 = 1_000;
 /// One half of the dual-bank eBPF policy map's 262,144-entry capacity.
 pub const POLICY_MAP_BANK_ENTRY_LIMIT: usize = 131_072;
 
@@ -599,7 +600,8 @@ impl FlowHistoryStore {
                     .record
                     .observed_events
                     .saturating_add(record.observed_events);
-                retained.last_received_unix_ms = received_unix_ms;
+                retained.last_received_unix_ms =
+                    retained.last_received_unix_ms.max(received_unix_ms);
                 retained.reporting_nodes.insert(node_name.clone());
                 continue;
             }
@@ -756,15 +758,14 @@ impl FlowHistoryStore {
         checkpoint: FlowHistoryCheckpoint,
         capacity: usize,
     ) -> Result<Self, FlowHistoryCheckpointError> {
-        if !matches!(
-            checkpoint.schema_version,
-            1 | 2 | FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION
-        ) {
+        if !(1..=FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION).contains(&checkpoint.schema_version) {
             return Err(FlowHistoryCheckpointError::UnsupportedSchema {
                 actual: checkpoint.schema_version,
                 expected: FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION,
             });
         }
+        let migrate_legacy_clock_regression =
+            checkpoint.schema_version < FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION;
         if checkpoint.entries.len() > capacity {
             return Err(FlowHistoryCheckpointError::CapacityExceeded {
                 actual: checkpoint.entries.len(),
@@ -772,11 +773,20 @@ impl FlowHistoryStore {
             });
         }
         let mut entries = BTreeMap::new();
-        for entry in checkpoint.entries {
-            if entry.first_received_unix_ms == 0
-                || entry.last_received_unix_ms < entry.first_received_unix_ms
-            {
+        for mut entry in checkpoint.entries {
+            if entry.first_received_unix_ms == 0 {
                 return Err(FlowHistoryCheckpointError::InvalidTimestamps);
+            }
+            if entry.last_received_unix_ms < entry.first_received_unix_ms {
+                let regression = entry
+                    .first_received_unix_ms
+                    .saturating_sub(entry.last_received_unix_ms);
+                if !migrate_legacy_clock_regression
+                    || regression > FLOW_HISTORY_LEGACY_MAX_CLOCK_REGRESSION_MILLIS
+                {
+                    return Err(FlowHistoryCheckpointError::InvalidTimestamps);
+                }
+                entry.last_received_unix_ms = entry.first_received_unix_ms;
             }
             if entry.observed_events == 0 {
                 return Err(FlowHistoryCheckpointError::ZeroObservations);
@@ -1896,6 +1906,50 @@ mod tests {
         );
         assert_eq!(snapshot.entries[0].first_received_unix_ms, 100);
         assert_eq!(snapshot.entries[0].last_received_unix_ms, 200);
+    }
+
+    #[test]
+    fn flow_history_clamps_clock_regression_and_migrates_bounded_v3_checkpoint() {
+        let mut store = FlowHistoryStore::with_capacity(1);
+        let first = FlowExportBatch {
+            schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+            node_name: "worker-a".to_owned(),
+            dropped_events: 0,
+            entries: vec![flow_record(1, 2, 8080, 1)],
+        };
+        assert!(store.ingest(first.clone(), 200));
+        assert!(store.ingest(first, 199));
+        let checkpoint = store.checkpoint(1);
+        assert_eq!(
+            checkpoint.schema_version,
+            FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION
+        );
+        assert_eq!(checkpoint.entries[0].first_received_unix_ms, 200);
+        assert_eq!(checkpoint.entries[0].last_received_unix_ms, 200);
+        FlowHistoryStore::from_checkpoint(checkpoint.clone(), 1)
+            .expect("current checkpoint remains restart-valid after clock regression");
+
+        let mut legacy = checkpoint.clone();
+        legacy.schema_version = 3;
+        legacy.entries[0].first_received_unix_ms = 200;
+        legacy.entries[0].last_received_unix_ms = 199;
+        let migrated = FlowHistoryStore::from_checkpoint(legacy.clone(), 1)
+            .expect("bounded schema-v3 clock regression is migrated");
+        assert_eq!(migrated.snapshot(17).entries[0].last_received_unix_ms, 200);
+
+        let mut current = legacy.clone();
+        current.schema_version = FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION;
+        assert_eq!(
+            FlowHistoryStore::from_checkpoint(current, 1),
+            Err(FlowHistoryCheckpointError::InvalidTimestamps)
+        );
+
+        legacy.entries[0].first_received_unix_ms = 1_200;
+        legacy.entries[0].last_received_unix_ms = 199;
+        assert_eq!(
+            FlowHistoryStore::from_checkpoint(legacy, 1),
+            Err(FlowHistoryCheckpointError::InvalidTimestamps)
+        );
     }
 
     #[test]
