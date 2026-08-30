@@ -175,7 +175,16 @@ EOF
         pending_network=${pending}/unf-primary
         if [ -e "$pending_network" ]; then
             test -d "$pending_network" && test ! -L "$pending_network"
-            test -z "$(find "$pending_network" -mindepth 1 -print -quit)"
+            test "$(stat -c %a "$pending_network")" = 700
+            test -z "$(find "$pending_network" -mindepth 2 -print -quit)"
+            test -z "$(find "$pending_network" -mindepth 1 -maxdepth 1 ! -type d -print -quit)"
+            for container_directory in "$pending_network"/*; do
+                [ -e "$container_directory" ] || break
+                test -d "$container_directory" && test ! -L "$container_directory"
+                test "$(stat -c %a "$container_directory")" = 700
+                printf "%s\n" "${container_directory##*/}" | grep -Eq "^[0-9a-f]{64}$"
+                rmdir "$container_directory"
+            done
             rmdir "$pending_network"
         fi
         test -z "$(find "$pending" -mindepth 1 -maxdepth 1 ! -name .unf-primary.lock -print -quit)"

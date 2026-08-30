@@ -43,8 +43,9 @@ symlinks, non-files, or owner-access violations remain fail closed.
 Finally, the gate deletes its exact namespace, requires attachment counts and
 host veths to return to baseline, waits for the desired service maps to shed the
 fixture, writes schema-v1 evidence, and invokes scoped primary-CNI rollback.
-Rollback validates recognized snapshots and interrupted-write files, drains the
-empty network-scoped pending-delete directory, removes only current ABI state,
+Rollback validates recognized snapshots and interrupted-write files, drains
+empty exact-hash attachment directories below the network-scoped pending-delete
+directory, removes only current ABI state,
 restores CoreDNS, and proves the saved no-CNI baseline.
 
 ## Verification
