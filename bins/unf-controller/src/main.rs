@@ -51,7 +51,8 @@ use unf_route::{
     RemoteRouteSnapshotNode,
 };
 use unf_service::{
-    AddressFamily, EndpointPortSource, EndpointSliceSource, EndpointSource, ServiceBackend,
+    AddressFamily, EndpointPortSource, EndpointSliceSource, EndpointSource,
+    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceBackend,
     ServiceIr, ServiceSnapshot, ServiceSource, ServiceSourcePort, ServiceTrafficPolicy,
     compile_service_snapshot,
 };
@@ -588,6 +589,12 @@ struct ServiceExplanation {
     matched_observations: u64,
     outcomes: Vec<FlowHistoryEntry>,
     note: &'static str,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ServiceSchemaQuery {
+    service_snapshot_schema_version: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2879,12 +2886,41 @@ async fn metrics(State(state): State<Arc<ControllerState>>) -> Response {
     }
 }
 
-async fn version() -> Json<ComponentCompatibility> {
-    Json(component_compatibility())
+async fn version(
+    Query(query): Query<ServiceSchemaQuery>,
+) -> Result<Json<ComponentCompatibility>, ApiError> {
+    compatibility_for_service_schema(requested_service_schema(&query)?).map(Json)
 }
 
 fn component_compatibility() -> ComponentCompatibility {
     ComponentCompatibility::current("unf-controller", env!("CARGO_PKG_VERSION"), BUILD_REVISION)
+}
+
+fn requested_service_schema(query: &ServiceSchemaQuery) -> Result<u16, ApiError> {
+    let requested = query
+        .service_snapshot_schema_version
+        .unwrap_or(LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION);
+    if matches!(
+        requested,
+        LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION | SERVICE_SNAPSHOT_SCHEMA_VERSION
+    ) {
+        Ok(requested)
+    } else {
+        Err(ApiError::bad_request(format!(
+            "unsupported requested service snapshot schema {requested}; supported schemas are 1 and {SERVICE_SNAPSHOT_SCHEMA_VERSION}"
+        )))
+    }
+}
+
+fn compatibility_for_service_schema(
+    requested_schema: u16,
+) -> Result<ComponentCompatibility, ApiError> {
+    requested_service_schema(&ServiceSchemaQuery {
+        service_snapshot_schema_version: Some(requested_schema),
+    })?;
+    let mut compatibility = component_compatibility();
+    compatibility.service_snapshot_schema_version = requested_schema;
+    Ok(compatibility)
 }
 
 async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<StatusBody>, ApiError> {
@@ -2976,7 +3012,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         limitations: [
             "desired state and identity allocations are currently in-memory only",
             "agent acknowledgements and the newest bounded flow history use separate single-controller ConfigMap checkpoints",
-            "ClusterIP translation is qualified only for primary-CNI Pod-veth IPv4/IPv6 TCP/UDP on recorded tuples; NodePort schema-v2 intent is not yet distributed or lowered to a host-facing dataplane",
+            "ClusterIP translation is qualified only for primary-CNI Pod-veth IPv4/IPv6 TCP/UDP on recorded tuples; negotiated NodePort schema-v2 intent is distributed but explicitly rejected until host-facing lowering is implemented",
         ],
     }))
 }
@@ -3275,6 +3311,12 @@ fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
             "active_policy_bank must identify transactional bank 0 or 1",
         ));
     }
+    if report.service_snapshot_schema_version > SERVICE_SNAPSHOT_SCHEMA_VERSION {
+        return Err(ApiError::bad_request(format!(
+            "unsupported reported service snapshot schema {}; controller supports at most {}",
+            report.service_snapshot_schema_version, SERVICE_SNAPSHOT_SCHEMA_VERSION
+        )));
+    }
     if report
         .service_last_error
         .as_ref()
@@ -3369,7 +3411,16 @@ fn agent_convergence_snapshot(
     let routing_revision = mutex_lock(&state.revisions).routing;
     let service_revision = read_lock(&state.compiled_service_snapshot)
         .as_ref()
-        .map(|snapshot| (snapshot.source_epoch, snapshot.revision))
+        .map(|snapshot| {
+            (
+                snapshot.source_epoch,
+                snapshot.revision,
+                snapshot
+                    .services
+                    .iter()
+                    .any(|service| !service.node_ports.is_empty()),
+            )
+        })
         .unwrap_or_default();
     let unexpected_agents = reports
         .iter()
@@ -3504,7 +3555,7 @@ fn agent_report_matches(
     expected_epoch: u64,
     identity_revision: Revision,
     policy_revision: Revision,
-    service_revision: (u64, Revision),
+    service_revision: (u64, Revision, bool),
     node_block_revision: Revision,
     remote_route_revision: (u64, Revision),
 ) -> bool {
@@ -3522,6 +3573,8 @@ fn agent_report_matches(
         && report.applied_service_epoch == service_revision.0
         && report.desired_service_revision == service_revision.1.get()
         && report.applied_service_revision == service_revision.1.get()
+        && (!service_revision.2
+            || report.service_snapshot_schema_version >= SERVICE_SNAPSHOT_SCHEMA_VERSION)
         && report.failed_service_epoch == 0
         && report.failed_service_revision == 0
         && report.service_last_error.is_none()
@@ -3564,10 +3617,11 @@ async fn policy_snapshot(
 
 async fn service_snapshot(
     State(state): State<Arc<ControllerState>>,
+    Query(query): Query<ServiceSchemaQuery>,
     headers: HeaderMap,
 ) -> Result<Json<ServiceSnapshot>, ApiError> {
     authenticate_internal_agent(&state, &headers).await?;
-    service_snapshot_for(&state).map(Json)
+    service_snapshot_for_schema(&state, requested_service_schema(&query)?).map(Json)
 }
 
 fn service_snapshot_for(state: &ControllerState) -> Result<ServiceSnapshot, ApiError> {
@@ -3576,6 +3630,24 @@ fn service_snapshot_for(state: &ControllerState) -> Result<ServiceSnapshot, ApiE
         .ok_or_else(|| {
             ApiError::service_unavailable("service state has no authoritative compiled revision")
         })
+}
+
+fn service_snapshot_for_schema(
+    state: &ControllerState,
+    requested_service_schema: u16,
+) -> Result<ServiceSnapshot, ApiError> {
+    let snapshot = service_snapshot_for(state)?;
+    match requested_service_schema {
+        SERVICE_SNAPSHOT_SCHEMA_VERSION => Ok(snapshot),
+        LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION => {
+            snapshot.legacy_v1_projection().map_err(|error| {
+                ApiError::internal(format!("project legacy service snapshot: {error}"))
+            })
+        }
+        _ => Err(ApiError::bad_request(format!(
+            "unsupported requested service snapshot schema {requested_service_schema}"
+        ))),
+    }
 }
 
 async fn node_block_snapshot(
@@ -5731,6 +5803,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn service_schema_transition_negotiates_and_projects_legacy_state() {
+        assert_eq!(
+            requested_service_schema(&ServiceSchemaQuery::default()).unwrap(),
+            LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
+        let current_compatibility =
+            compatibility_for_service_schema(SERVICE_SNAPSHOT_SCHEMA_VERSION).unwrap();
+        assert_eq!(
+            current_compatibility.service_snapshot_schema_version,
+            SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
+        let legacy_compatibility =
+            compatibility_for_service_schema(LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION).unwrap();
+        assert_eq!(
+            legacy_compatibility.service_snapshot_schema_version,
+            LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert!(compatibility_for_service_schema(3).is_err());
+
+        let state = new_state(true);
+        apply_service_event(&state, Event::Apply(node_port_service()));
+        let current = service_snapshot_for_schema(&state, SERVICE_SNAPSHOT_SCHEMA_VERSION)
+            .expect("schema-v2 state is available");
+        assert_eq!(current.schema_version, SERVICE_SNAPSHOT_SCHEMA_VERSION);
+        assert!(!current.services[0].node_ports.is_empty());
+        let legacy = service_snapshot_for_schema(&state, LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION)
+            .expect("schema-v1 projection is available");
+        assert_eq!(
+            legacy.schema_version,
+            LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert!(legacy.services[0].node_ports.is_empty());
+        let encoded = serde_json::to_value(legacy).expect("legacy projection encodes");
+        assert!(encoded["services"][0].get("nodePorts").is_none());
+    }
+
     fn security_policy(name: &str, action: &str) -> SecurityPolicy {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "network.unf.io/v1alpha1",
@@ -6663,6 +6772,7 @@ mod tests {
             desired_service_revision: 0,
             applied_service_epoch: 0,
             applied_service_revision: 0,
+            service_snapshot_schema_version: SERVICE_SNAPSHOT_SCHEMA_VERSION,
             failed_service_epoch: 0,
             failed_service_revision: 0,
             service_count: 0,
@@ -7302,6 +7412,45 @@ mod tests {
         );
         assert!(
             !agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
+                .all_converged
+        );
+
+        apply_service_event(&state, Event::Apply(node_port_service()));
+        let snapshot = service_snapshot_for(&state).expect("NodePort intent compiled");
+        let mut legacy_report = converged_agent_report(state.identity_epoch);
+        legacy_report.desired_service_epoch = snapshot.source_epoch;
+        legacy_report.applied_service_epoch = snapshot.source_epoch;
+        legacy_report.desired_service_revision = snapshot.revision.get();
+        legacy_report.applied_service_revision = snapshot.revision.get();
+        legacy_report.service_count = snapshot.services.len() as u64;
+        legacy_report.service_frontend_count = snapshot
+            .services
+            .iter()
+            .map(|service| service.frontends.len() as u64)
+            .sum();
+        legacy_report.service_snapshot_schema_version = LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        write_lock(&state.agent_reports).insert(
+            legacy_report.node_name.clone(),
+            StoredAgentReport {
+                report: legacy_report.clone(),
+                last_received_unix_ms: 100,
+            },
+        );
+        assert!(
+            !agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
+                .all_converged
+        );
+
+        legacy_report.service_snapshot_schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        write_lock(&state.agent_reports).insert(
+            legacy_report.node_name.clone(),
+            StoredAgentReport {
+                report: legacy_report,
+                last_received_unix_ms: 100,
+            },
+        );
+        assert!(
+            agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
                 .all_converged
         );
     }

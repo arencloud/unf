@@ -113,6 +113,8 @@ pub struct AgentStateReport {
     #[serde(default)]
     pub applied_service_revision: u64,
     #[serde(default)]
+    pub service_snapshot_schema_version: u16,
+    #[serde(default)]
     pub failed_service_epoch: u64,
     #[serde(default)]
     pub failed_service_revision: u64,

@@ -100,7 +100,7 @@ assert_version() {
         and .persistent_bpf_state_abi_version == 4
         and .identity_snapshot_schema_version == 2
         and .policy_snapshot_schema_version == 4
-        and .service_snapshot_schema_version == 1
+        and .service_snapshot_schema_version == 2
         and .agent_status_schema_version == 4
         and .flow_export_schema_version == 4
     ' <<<"${json}" >/dev/null
@@ -109,7 +109,7 @@ assert_version() {
 wait_for_controller() {
     local version= status=
     for _ in $(seq 1 300); do
-        version=$(controller_raw /v1/version 2>/dev/null || true)
+        version=$(controller_raw '/v1/version?serviceSnapshotSchemaVersion=2' 2>/dev/null || true)
         status=$(controller_raw /v1/status 2>/dev/null || true)
         if assert_version "${version}" unf-controller 2>/dev/null \
             && jq -e '.service_compilation_error == null' <<<"${status}" >/dev/null 2>&1; then
@@ -198,6 +198,7 @@ wait_for_convergence() {
             and .stale_agents == 0 and .converged_agents == $expected
             and .unexpected_agents == 0 and .all_converged == true
             and all(.nodes[]; .fresh and .converged and .report.ready and .report.bpf_loaded
+                and .report.service_snapshot_schema_version == 2
                 and .report.desired_service_revision > 0
                 and .report.applied_service_revision == .report.desired_service_revision)
         ' <<<"${snapshot}" >/dev/null 2>&1; then

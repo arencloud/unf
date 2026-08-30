@@ -71,6 +71,9 @@ service-compiler-test: service-ir-test
 
 service-distribution-test: service-compiler-test
 	cargo test -p unf-agent service_snapshot
+	cargo test -p unf-service service_schema_transition
+	cargo test -p unf-controller service_schema_transition
+	cargo test -p unf-agent service_schema_transition
 	cargo test -p unf-controller agent_convergence_requires_the_compiled_service_revision
 	cargo clippy -p unf-agent -p unf-controller -p unf-state --all-targets --all-features -- -D warnings
 	kubectl kustomize deploy >/dev/null

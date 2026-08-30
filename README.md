@@ -177,9 +177,16 @@ snapshot schema v2 preserves the allocated NodePort per address family, its
 exact ClusterIP Service-port and backend linkage, and explicit `Cluster` or
 `Local` external traffic policy. Collision, malformed linkage/policy, and
 capacity failures are rejected deterministically. NodePort is intentionally
-rejected by the current ClusterIP-only eBPF lowerer until distribution and
-host-facing dataplane milestones pass; see the
+rejected by the current ClusterIP-only eBPF lowerer until host-facing dataplane
+milestones pass; see the
 [Phase 5 NodePort plan](docs/development/phase5-nodeport-plan.md) and ADR 0082.
+The distribution transition is now verified: agents explicitly negotiate
+schema v2, new controllers project an exact schema-v1 ClusterIP view for old
+agents, new agents read old-controller v1 state without rewriting rollback-safe
+checkpoints, and capability-aware acknowledgements prevent a legacy agent from
+claiming convergence when NodePort intent exists. ADR 0083 records the four-way
+mixed-version contract. Transactional Node-address and host-facing map state is
+the active next milestone.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

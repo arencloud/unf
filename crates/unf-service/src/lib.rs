@@ -17,6 +17,7 @@ use unf_ebpf_common::{
 
 pub use unf_common::SERVICE_SNAPSHOT_SCHEMA_VERSION;
 
+pub const LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_SERVICES: usize = 65_536;
 pub const MAX_SERVICE_FRONTENDS: usize = 131_072;
 pub const MAX_SERVICE_NODE_PORTS: usize = 131_072;
@@ -140,6 +141,7 @@ pub struct ServiceIr {
     pub namespace: String,
     pub name: String,
     pub frontends: Vec<ServiceFrontend>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub node_ports: Vec<ServiceNodePort>,
     pub backends: Vec<ServiceBackend>,
 }
@@ -157,6 +159,8 @@ pub struct ServiceSnapshot {
 pub enum ServiceIrError {
     #[error("unsupported service snapshot schema {actual}; expected {expected}")]
     UnsupportedSchema { actual: u16, expected: u16 },
+    #[error("legacy service snapshot schema v1 cannot contain NodePort intent")]
+    LegacyNodePortIntent,
     #[error("service snapshot source epoch must be nonzero")]
     ZeroSourceEpoch,
     #[error("service snapshot revision must be nonzero")]
@@ -641,7 +645,16 @@ impl ServiceSnapshot {
     /// identities/endpoints, unusable addresses/ports, and bounded-capacity
     /// violations.
     pub fn validate_and_normalize(mut self) -> Result<Self, ServiceIrError> {
-        if self.schema_version != SERVICE_SNAPSHOT_SCHEMA_VERSION {
+        if self.schema_version == LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION {
+            if self
+                .services
+                .iter()
+                .any(|service| !service.node_ports.is_empty())
+            {
+                return Err(ServiceIrError::LegacyNodePortIntent);
+            }
+            self.schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        } else if self.schema_version != SERVICE_SNAPSHOT_SCHEMA_VERSION {
             return Err(ServiceIrError::UnsupportedSchema {
                 actual: self.schema_version,
                 expected: SERVICE_SNAPSHOT_SCHEMA_VERSION,
@@ -729,6 +742,22 @@ impl ServiceSnapshot {
                 .then_with(|| left.name.cmp(&right.name))
         });
         Ok(self)
+    }
+
+    /// Produces the exact additive-schema-v1 view used only for old agents
+    /// during the bounded controller-first v1-to-v2 transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation error as [`Self::validate_and_normalize`]
+    /// when the source snapshot is not valid current or migratable state.
+    pub fn legacy_v1_projection(&self) -> Result<Self, ServiceIrError> {
+        let mut projected = self.clone().validate_and_normalize()?;
+        for service in &mut projected.services {
+            service.node_ports.clear();
+        }
+        projected.schema_version = LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        Ok(projected)
     }
 }
 
@@ -1666,6 +1695,45 @@ mod tests {
             "futureField": true
         });
         assert!(serde_json::from_value::<ServiceSnapshot>(value).is_err());
+    }
+
+    #[test]
+    fn service_schema_transition_migrates_v1_and_projects_without_node_port_intent() {
+        let current = snapshot(vec![service(1, "one")])
+            .validate_and_normalize()
+            .expect("current snapshot is valid");
+        let legacy = current
+            .legacy_v1_projection()
+            .expect("current snapshot has a legacy projection");
+        let legacy_value = serde_json::to_value(&legacy).expect("legacy snapshot encodes");
+        assert_eq!(legacy_value["schemaVersion"], 1);
+        assert!(legacy_value["services"][0].get("nodePorts").is_none());
+        assert_eq!(
+            serde_json::from_value::<ServiceSnapshot>(legacy_value)
+                .expect("legacy snapshot decodes")
+                .validate_and_normalize()
+                .expect("legacy snapshot migrates"),
+            current
+        );
+
+        let mut node_port_source = source_service();
+        node_port_source.ports[0].node_port = Some(30_080);
+        let node_port_snapshot = compile_service_snapshot(
+            9,
+            Revision::new(3),
+            vec![node_port_source],
+            vec![source_slice(AddressFamily::Ipv4, "api-v4", "10.244.0.20")],
+        )
+        .expect("valid NodePort snapshot");
+        let mut disguised_legacy =
+            serde_json::to_value(node_port_snapshot).expect("NodePort snapshot encodes");
+        disguised_legacy["schemaVersion"] = serde_json::json!(1);
+        assert_eq!(
+            serde_json::from_value::<ServiceSnapshot>(disguised_legacy)
+                .expect("additive field decodes")
+                .validate_and_normalize(),
+            Err(ServiceIrError::LegacyNodePortIntent)
+        );
     }
 
     fn source_service() -> ServiceSource {

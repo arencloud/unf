@@ -12,8 +12,8 @@ authoritative feature state remains in [project-status.md](../project-status.md)
 | ID | Milestone | State | Exit evidence |
 |---|---|---|---|
 | 5.1 | NodePort domain and Kubernetes compiler | **Verified** | Service snapshot schema v2, typed family/policy/backend linkage, collision and malformed-input rejection, Kubernetes translation, explicit ClusterIP-lowerer rejection; `make service-ir-test`; ADR 0082 |
-| 5.2 | Compatible distribution transition | **In progress** | Define schema-v1→v2 controller-first behavior, durable snapshot migration/rebuild, mixed-version fencing, desired/applied status, and rendered compatibility evidence |
-| 5.3 | Transactional host-facing state | **Planned** | Authenticated Node-address intent, fixed dual-stack NodePort maps, capacity preflight, inactive-bank validation, atomic activation, rollback, and recovery |
+| 5.2 | Compatible distribution transition | **Verified** | Explicit schema negotiation supports every old/new controller-agent pairing, read-time v1 migration with rollback-safe persistence, NodePort-capability convergence fencing, desired/applied failure status, rendering, and `make service-distribution-test`; ADR 0083 |
+| 5.3 | Transactional host-facing state | **In progress** | Authenticated Node-address intent, fixed dual-stack NodePort maps, capacity preflight, inactive-bank validation, atomic activation, rollback, and recovery |
 | 5.4 | `externalTrafficPolicy: Cluster` dataplane | **Planned** | IPv4/IPv6 TCP/UDP Node-address ingress, deterministic backend selection, reverse translation, connection persistence, checksum and provenance packet execution |
 | 5.5 | `externalTrafficPolicy: Local` | **Planned** | Node-local eligibility, source preservation, no-local-backend behavior, endpoint churn, health-check boundary, and direction-correct policy composition |
 | 5.6 | NodePort operations | **Planned** | Metrics, status, flow history, explanation, simulation, actionable failures, and bounded restart recovery |
@@ -41,7 +41,8 @@ availability/scale require independent later gates.
 
 ## Immediate next slice
 
-Phase 5.2 must make the schema transition deployable without weakening the
-Phase 4 last-known-good contract. It must choose and verify either bounded
-migration or explicit clean rebuild, keep mixed binaries fail closed, and avoid
-publishing NodePort intent to a consumer that can only lower ClusterIP.
+Phase 5.3 must derive eligible IPv4/IPv6 Node addresses from authenticated,
+revisioned controller intent and stage a fixed host-facing NodePort map domain
+without mutating the verified ClusterIP maps. Capacity, readback, activation,
+rollback, durable recovery, cleanup, and unsupported address forms must fail
+before any host hook can consume partial state.

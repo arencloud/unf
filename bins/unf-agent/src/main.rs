@@ -52,9 +52,10 @@ use unf_route::{
     NativeRemoteRoutingProvider, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION, RemoteRouteSnapshot,
 };
 use unf_service::{
-    MAX_BACKENDS_PER_SERVICE, SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
-    SERVICE_FRONTEND_BANK_CAPACITY, ServiceDataplaneState, ServiceSnapshot,
-    compile_service_dataplane,
+    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, MAX_BACKENDS_PER_SERVICE,
+    SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+    SERVICE_FRONTEND_BANK_CAPACITY, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceDataplaneState,
+    ServiceSnapshot, compile_service_dataplane,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
@@ -1881,7 +1882,9 @@ async fn fetch_service_snapshot(
 ) -> Result<ServiceSnapshot> {
     authenticated_get(
         client,
-        format!("{controller_url}/v1/state/services"),
+        format!(
+            "{controller_url}/v1/state/services?serviceSnapshotSchemaVersion={SERVICE_SNAPSHOT_SCHEMA_VERSION}"
+        ),
         token_path,
     )?
     .send()
@@ -1900,7 +1903,13 @@ async fn ensure_service_controller_compatibility(
     token_path: &Path,
 ) -> Result<()> {
     let compatibility: ComponentCompatibility =
-        authenticated_get(client, format!("{controller_url}/v1/version"), token_path)?
+        authenticated_get(
+            client,
+            format!(
+                "{controller_url}/v1/version?serviceSnapshotSchemaVersion={SERVICE_SNAPSHOT_SCHEMA_VERSION}"
+            ),
+            token_path,
+        )?
             .send()
             .await
             .context("request controller compatibility for service snapshots")?
@@ -1921,6 +1930,23 @@ fn load_optional_service_snapshot(path: &Path) -> Result<Option<ServiceSnapshot>
             let snapshot: ServiceSnapshot = load_secure_json(path, "service")?;
             Ok(Some(snapshot.validate_and_normalize()?))
         }
+    }
+}
+
+fn persist_service_snapshot(
+    path: &Path,
+    snapshot: &ServiceSnapshot,
+    description: &str,
+) -> Result<()> {
+    if snapshot
+        .services
+        .iter()
+        .all(|service| service.node_ports.is_empty())
+    {
+        let legacy = snapshot.legacy_v1_projection()?;
+        persist_secure_json(path, &legacy, description)
+    } else {
+        persist_secure_json(path, snapshot, description)
     }
 }
 
@@ -1952,7 +1978,7 @@ fn discard_service_pending_state(path: &Path) -> Result<()> {
 fn prepare_service_snapshot(path: &Path, snapshot: &ServiceSnapshot) -> Result<PathBuf> {
     discard_service_pending_state(path)?;
     let pending = service_pending_state_path(path)?;
-    persist_secure_json(&pending, snapshot, "pending service")?;
+    persist_service_snapshot(&pending, snapshot, "pending service")?;
     Ok(pending)
 }
 
@@ -1973,7 +1999,7 @@ fn commit_prepared_service_snapshot(path: &Path, pending: &Path) -> Result<()> {
 
 fn restore_service_checkpoint(path: &Path, previous: Option<&ServiceSnapshot>) -> Result<()> {
     if let Some(previous) = previous {
-        return persist_secure_json(path, previous, "service rollback");
+        return persist_service_snapshot(path, previous, "service rollback");
     }
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -2022,11 +2048,21 @@ fn adopt_service_snapshot(
 ) -> Result<()> {
     let candidate = candidate.validate_and_normalize()?;
     publish_desired_service_snapshot(state, &candidate);
+    let node_port_count = candidate
+        .services
+        .iter()
+        .map(|service| service.node_ports.len())
+        .sum::<usize>();
+    if node_port_count != 0 {
+        bail!(
+            "NodePort intent contains {node_port_count} frontends but host-facing lowering is not implemented"
+        );
+    }
     if !validate_service_snapshot_transition(&candidate, applied.as_ref())? {
         clear_service_snapshot_error(state);
         return Ok(());
     }
-    persist_secure_json(state_path, &candidate, "service")?;
+    persist_service_snapshot(state_path, &candidate, "service")?;
     publish_applied_service_snapshot(state, &candidate);
     info!(
         epoch = candidate.source_epoch,
@@ -3657,7 +3693,9 @@ async fn preflight_controller_compatibility(
 ) -> Result<()> {
     let response = match authenticated_get(
         client,
-        format!("{controller_url}/v1/version"),
+        format!(
+            "{controller_url}/v1/version?serviceSnapshotSchemaVersion={SERVICE_SNAPSHOT_SCHEMA_VERSION}"
+        ),
         token_path,
     )?
     .send()
@@ -3691,7 +3729,7 @@ async fn preflight_controller_compatibility(
 
 fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Result<()> {
     let local = component_compatibility();
-    let mismatches = [
+    let mut mismatches = [
         (
             "compatibility schema",
             controller.schema_version,
@@ -3713,11 +3751,6 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
             local.policy_snapshot_schema_version,
         ),
         (
-            "service snapshot schema",
-            controller.service_snapshot_schema_version,
-            local.service_snapshot_schema_version,
-        ),
-        (
             "agent-status schema",
             controller.agent_status_schema_version,
             local.agent_status_schema_version,
@@ -3732,6 +3765,14 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
     .filter(|(_, remote, expected)| remote != expected)
     .map(|(name, remote, expected)| format!("{name} controller={remote} agent={expected}"))
     .collect::<Vec<_>>();
+    if controller.service_snapshot_schema_version != local.service_snapshot_schema_version
+        && controller.service_snapshot_schema_version != LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
+    {
+        mismatches.push(format!(
+            "service snapshot schema controller={} agent={}",
+            controller.service_snapshot_schema_version, local.service_snapshot_schema_version
+        ));
+    }
     if controller.component != "unf-controller" {
         bail!(
             "incompatible controller compatibility response: component={}; expected unf-controller",
@@ -5162,6 +5203,7 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
         desired_service_revision: state.desired_service_revision.load(Ordering::Acquire),
         applied_service_epoch: state.applied_service_epoch.load(Ordering::Acquire),
         applied_service_revision: state.applied_service_revision.load(Ordering::Acquire),
+        service_snapshot_schema_version: SERVICE_SNAPSHOT_SCHEMA_VERSION,
         failed_service_epoch: state.failed_service_epoch.load(Ordering::Acquire),
         failed_service_revision: state.failed_service_revision.load(Ordering::Acquire),
         service_count: state.service_count.load(Ordering::Acquire),
@@ -6966,7 +7008,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         )
         .status_label(),
         capabilities: state.capabilities.clone(),
-        limitation: "ClusterIP translation is qualified only for primary-CNI Pod-veth IPv4/IPv6 TCP/UDP on recorded tuples; NodePort schema-v2 intent is not yet distributed or lowered to a host-facing dataplane",
+        limitation: "ClusterIP translation is qualified only for primary-CNI Pod-veth IPv4/IPv6 TCP/UDP on recorded tuples; negotiated NodePort schema-v2 intent is distributed but explicitly rejected until host-facing lowering is implemented",
     })
 }
 
@@ -7644,6 +7686,48 @@ mod tests {
         snapshot.schema_version += 1;
         persist_secure_json(&path, &snapshot, "service").unwrap();
         assert!(load_optional_service_snapshot(&path).is_err());
+    }
+
+    #[test]
+    fn service_schema_transition_reads_v1_without_breaking_rollback() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("service-snapshot.json");
+        let mut legacy = service_test_snapshot(7, 4);
+        legacy.schema_version = LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        persist_secure_json(&path, &legacy, "legacy service").unwrap();
+
+        let migrated = load_optional_service_snapshot(&path)
+            .expect("legacy checkpoint migration succeeds")
+            .expect("legacy checkpoint exists");
+        assert_eq!(migrated.schema_version, SERVICE_SNAPSHOT_SCHEMA_VERSION);
+        let persisted: ServiceSnapshot = load_secure_json(&path, "service").unwrap();
+        assert_eq!(
+            persisted.schema_version,
+            LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
+
+        let node_port_path = directory.path().join("node-port-snapshot.json");
+        let mut node_port = service_test_snapshot(7, 5);
+        node_port.services[0]
+            .node_ports
+            .push(unf_service::ServiceNodePort {
+                family: unf_service::AddressFamily::Ipv4,
+                port: 30_080,
+                service_port: 80,
+                protocol: unf_common::Protocol::Tcp,
+                name: Some("http".to_owned()),
+                app_protocol: Some("kubernetes.io/h2c".to_owned()),
+                traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+                backend_ids: Vec::new(),
+            });
+        let state = test_agent_state();
+        let mut applied = None;
+        let error = adopt_service_snapshot(node_port, &mut applied, &node_port_path, &state)
+            .expect_err("userspace reconciliation rejects NodePort intent");
+        assert!(error.to_string().contains("host-facing lowering"));
+        assert!(!node_port_path.exists());
+        assert_eq!(agent_state_report(&state).desired_service_revision, 5);
+        assert_eq!(agent_state_report(&state).applied_service_revision, 0);
     }
 
     #[test]
@@ -8444,13 +8528,17 @@ mod tests {
     }
 
     #[test]
-    fn controller_preflight_accepts_only_the_exact_local_tuple() {
+    fn controller_preflight_accepts_the_bounded_service_schema_transition() {
         let mut controller = ComponentCompatibility::current(
             "unf-controller",
             env!("CARGO_PKG_VERSION"),
             "controller-revision",
         );
         assert!(ensure_controller_compatibility(&controller).is_ok());
+
+        controller.service_snapshot_schema_version = LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        assert!(ensure_controller_compatibility(&controller).is_ok());
+        controller.service_snapshot_schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
 
         controller.policy_snapshot_schema_version += 1;
         let error = ensure_controller_compatibility(&controller)
@@ -8556,6 +8644,10 @@ mod tests {
         assert_eq!(report.applied_identity_revision, 11);
         assert_eq!(report.applied_policy_epoch, 7);
         assert_eq!(report.applied_policy_revision, 13);
+        assert_eq!(
+            report.service_snapshot_schema_version,
+            SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
     }
 
     fn test_flow_record(port: u16) -> FlowExportRecord {

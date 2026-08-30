@@ -411,10 +411,13 @@ matrix is maintained in the
   exact Service-port/backend linkage, and explicit `Cluster`/`Local` external
   traffic policy. Duplicate port/protocol ownership, inexact links, unknown
   policy, and silent ClusterIP-only dataplane lowering fail closed; ADR 0082.
-- In progress: schema-v1→v2 distribution and durable recovery with explicit
-  mixed-version fencing before any NodePort intent can reach an agent.
-- Planned: authenticated Node-address intent, transactional host-facing maps,
-  dual-stack TCP/UDP `Cluster` and source-preserving `Local` dataplanes,
+- Verified by `make service-distribution-test`: explicit v1/v2 negotiation,
+  all four old/new controller-agent pairings, read-time v1 migration with
+  rollback-safe v1 persistence, and capability-aware convergence fencing keep
+  NodePort intent away from legacy consumers; ADR 0083.
+- In progress: authenticated Node-address intent and transactional host-facing maps.
+- Planned after host maps: dual-stack TCP/UDP `Cluster` and source-preserving
+  `Local` dataplanes,
   operations/simulation, and independent kube-proxy-free Kind/OpenShift gates.
 - LoadBalancer, session affinity, topology-aware selection, Maglev, and DSR
   remain separate future milestones.
