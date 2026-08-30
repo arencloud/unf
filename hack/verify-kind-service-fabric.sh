@@ -215,7 +215,7 @@ fresh_tcp_probe() {
         target="TCP6:[${address}]:${port},sourceport=${source_port},reuseaddr"
     fi
     "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
-        "printf 'GET /health HTTP/1.0\\r\\nHost: qualification\\r\\n\\r\\n' | socat -T 4 - '${target}'" \
+        "printf 'GET /health HTTP/1.0\\r\\nHost: qualification\\r\\n\\r\\n' | socat -T 1 - '${target}'" \
         | tr -d '\r' | grep -qx ok
 }
 
@@ -231,7 +231,7 @@ fresh_udp_probe() {
         target="UDP6:[${address}]:${port},sourceport=${source_port},reuseaddr"
     fi
     "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
-        "printf udp-ok | socat -T 4 - '${target}'" | grep -qx udp-ok
+        "printf udp-ok | socat -T 1 - '${target}'" | grep -qx udp-ok
 }
 
 udp_probe() {
