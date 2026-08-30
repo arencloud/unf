@@ -52,16 +52,22 @@ require_text docs/development/phase6-loadbalancer-plan.md \
     '| 6.1 | Architecture, ownership, and acceptance boundary | **Verified** |' \
     "milestone 6.1 must remain verified"
 require_text docs/development/phase6-loadbalancer-plan.md \
-    '| 6.2 | LoadBalancer domain and Kubernetes compiler | **In progress** |' \
-    "milestone 6.2 must be the active implementation slice"
+    '| 6.2 | LoadBalancer domain and Kubernetes compiler | **Verified** |' \
+    "milestone 6.2 must remain verified"
 require_text docs/project-status.md \
-    '| LoadBalancer domain and Kubernetes compiler | **In progress** |' \
-    "the authoritative tracker must identify milestone 6.2 as active"
+    '| LoadBalancer domain and Kubernetes compiler | **Verified** |' \
+    "the authoritative tracker must identify milestone 6.2 as verified"
+require_text docs/development/phase6-loadbalancer-plan.md \
+    '| 6.3 | Address allocation and reachability-provider contract | **In progress** |' \
+    "milestone 6.3 must be the active implementation slice"
+require_text docs/project-status.md \
+    '| Address allocation and reachability-provider contract | **In progress** |' \
+    "the authoritative tracker must identify milestone 6.3 as active"
 require_text docs/adr/0093-separate-loadbalancer-ownership-domains.md \
     '**Status:** Accepted and implemented for the Phase 6.1 architecture boundary' \
     "ADR 0093 must record the implemented architecture boundary"
 require_text README.md \
-    'no LoadBalancer packet-support claim exists yet.' \
+    'or packet-support claim exists yet.' \
     "the README must not overstate LoadBalancer packet support"
 require_text docs/development/phase6-loadbalancer-plan.md \
     '`allocateLoadBalancerNodePorts: false` is preserved.' \

@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,14 +20,18 @@ use unf_ebpf_common::{
 pub use unf_common::SERVICE_SNAPSHOT_SCHEMA_VERSION;
 
 pub const LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const UNF_LOAD_BALANCER_CLASS: &str = "network.unf.io/load-balancer";
 pub const MAX_NODE_PORT_NODE_ADDRESSES: usize = 64;
 pub const MAX_SERVICES: usize = 65_536;
 pub const MAX_SERVICE_FRONTENDS: usize = 131_072;
 pub const MAX_SERVICE_NODE_PORTS: usize = 131_072;
+pub const MAX_SERVICE_LOAD_BALANCER_FRONTENDS: usize = 131_072;
 pub const MAX_SERVICE_BACKENDS: usize = 262_144;
 pub const MAX_SERVICE_BACKEND_REFERENCES: usize = 524_288;
 pub const MAX_BACKENDS_PER_SERVICE: usize = 4_096;
+pub const MAX_LOAD_BALANCER_SOURCE_RANGES_PER_SERVICE: usize = 64;
 pub const MAX_PROVENANCE_COMPONENT_BYTES: usize = 253;
 pub const MAX_ENDPOINT_SLICE_PROVENANCE: usize = 128;
 pub const SERVICE_FRONTEND_BANK_CAPACITY: usize = MAX_SERVICE_FRONTENDS;
@@ -75,6 +80,90 @@ pub enum ServiceTrafficPolicy {
     #[default]
     Cluster,
     Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceIpFamilyPolicy {
+    SingleStack,
+    PreferDualStack,
+    RequireDualStack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ServiceIpPrefix {
+    pub address: IpAddr,
+    pub prefix_length: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ServiceIpPrefixParseError {
+    #[error("IP prefix must use address/prefix-length syntax")]
+    MissingPrefixLength,
+    #[error("invalid IP address in prefix")]
+    InvalidAddress,
+    #[error("invalid IP prefix length")]
+    InvalidPrefixLength,
+    #[error("IP prefix address has host bits set")]
+    NonCanonical,
+}
+
+impl FromStr for ServiceIpPrefix {
+    type Err = ServiceIpPrefixParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (address, prefix_length) = value
+            .split_once('/')
+            .ok_or(ServiceIpPrefixParseError::MissingPrefixLength)?;
+        let address = address
+            .parse()
+            .map_err(|_| ServiceIpPrefixParseError::InvalidAddress)?;
+        let prefix_length = prefix_length
+            .parse()
+            .map_err(|_| ServiceIpPrefixParseError::InvalidPrefixLength)?;
+        let prefix = Self {
+            address,
+            prefix_length,
+        };
+        if !prefix.is_canonical() {
+            return Err(ServiceIpPrefixParseError::NonCanonical);
+        }
+        Ok(prefix)
+    }
+}
+
+impl ServiceIpPrefix {
+    #[must_use]
+    pub const fn family(self) -> AddressFamily {
+        match self.address {
+            IpAddr::V4(_) => AddressFamily::Ipv4,
+            IpAddr::V6(_) => AddressFamily::Ipv6,
+        }
+    }
+
+    #[must_use]
+    pub fn is_canonical(self) -> bool {
+        match self.address {
+            IpAddr::V4(address) if self.prefix_length <= 32 => {
+                let mask = if self.prefix_length == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.prefix_length)
+                };
+                u32::from(address) & mask == u32::from(address)
+            }
+            IpAddr::V6(address) if self.prefix_length <= 128 => {
+                let mask = if self.prefix_length == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - self.prefix_length)
+                };
+                u128::from(address) & mask == u128::from(address)
+            }
+            IpAddr::V4(_) | IpAddr::V6(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -133,6 +222,42 @@ pub struct ServiceNodePort {
     pub backend_ids: Vec<BackendId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ServiceLoadBalancerFrontend {
+    pub family: AddressFamily,
+    pub service_port: u16,
+    pub protocol: Protocol,
+    pub name: Option<String>,
+    pub app_protocol: Option<String>,
+    pub backend_ids: Vec<BackendId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ServiceLoadBalancer {
+    pub class: String,
+    pub ip_families: Vec<AddressFamily>,
+    pub ip_family_policy: ServiceIpFamilyPolicy,
+    pub requested_ips: Vec<IpAddr>,
+    pub traffic_policy: ServiceTrafficPolicy,
+    pub source_ranges: Vec<ServiceIpPrefix>,
+    pub allocate_node_ports: bool,
+    pub health_check_node_port: Option<u16>,
+    pub frontends: Vec<ServiceLoadBalancerFrontend>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ServiceLoadBalancerSource {
+    pub class: String,
+    pub ip_families: Vec<AddressFamily>,
+    pub ip_family_policy: ServiceIpFamilyPolicy,
+    pub requested_ips: Vec<IpAddr>,
+    pub source_ranges: Vec<ServiceIpPrefix>,
+    pub allocate_node_ports: bool,
+    pub health_check_node_port: Option<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ServiceSourcePort {
     pub name: Option<String>,
@@ -148,6 +273,7 @@ pub struct ServiceSource {
     pub name: String,
     pub cluster_ips: Vec<IpAddr>,
     pub external_traffic_policy: ServiceTrafficPolicy,
+    pub load_balancer: Option<ServiceLoadBalancerSource>,
     pub ports: Vec<ServiceSourcePort>,
 }
 
@@ -189,6 +315,8 @@ pub struct ServiceIr {
     pub frontends: Vec<ServiceFrontend>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub node_ports: Vec<ServiceNodePort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_balancer: Option<ServiceLoadBalancer>,
     pub backends: Vec<ServiceBackend>,
 }
 
@@ -274,6 +402,8 @@ pub enum ServiceIrError {
     UnsupportedSchema { actual: u16, expected: u16 },
     #[error("legacy service snapshot schema v1 cannot contain NodePort intent")]
     LegacyNodePortIntent,
+    #[error("service snapshot schema v{schema} cannot contain LoadBalancer intent")]
+    LegacyLoadBalancerIntent { schema: u16 },
     #[error("service snapshot source epoch must be nonzero")]
     ZeroSourceEpoch,
     #[error("service snapshot revision must be nonzero")]
@@ -284,6 +414,8 @@ pub enum ServiceIrError {
     TooManyFrontends { actual: usize, limit: usize },
     #[error("service snapshot has {actual} NodePort frontends; limit is {limit}")]
     TooManyNodePorts { actual: usize, limit: usize },
+    #[error("service snapshot has {actual} LoadBalancer frontends; limit is {limit}")]
+    TooManyLoadBalancerFrontends { actual: usize, limit: usize },
     #[error("service snapshot has {actual} backends; limit is {limit}")]
     TooManyBackends { actual: usize, limit: usize },
     #[error("service snapshot has {actual} frontend/backend references; limit is {limit}")]
@@ -336,6 +468,27 @@ pub enum ServiceIrError {
         node_port: ServiceNodePort,
         reason: &'static str,
     },
+    #[error("service {service:?} has invalid LoadBalancer intent: {reason}")]
+    InvalidLoadBalancer {
+        service: ServiceId,
+        reason: &'static str,
+    },
+    #[error("service {service:?} has invalid LoadBalancer frontend {frontend:?}: {reason}")]
+    InvalidLoadBalancerFrontend {
+        service: ServiceId,
+        frontend: ServiceLoadBalancerFrontend,
+        reason: &'static str,
+    },
+    #[error(
+        "LoadBalancer requested IP {address} is owned by services {existing:?} and {candidate:?}"
+    )]
+    DuplicateLoadBalancerAddress {
+        address: IpAddr,
+        existing: ServiceId,
+        candidate: ServiceId,
+    },
+    #[error("LoadBalancer requested IP {address} collides with a ClusterIP")]
+    LoadBalancerClusterIpCollision { address: IpAddr },
     #[error("frontend {frontend:?} repeats backend reference {backend:?}")]
     DuplicateFrontendBackend {
         frontend: ServiceFrontend,
@@ -422,6 +575,8 @@ pub enum ServiceDataplaneError {
         "NodePort intent contains {actual} frontends but host-facing lowering is not implemented"
     )]
     UnsupportedNodePort { actual: usize },
+    #[error("LoadBalancer intent contains {actual} frontends but VIP lowering is not implemented")]
+    UnsupportedLoadBalancer { actual: usize },
     #[error("service map {map} requires {actual} entries; per-bank limit is {limit}")]
     Capacity {
         map: &'static str,
@@ -577,7 +732,7 @@ pub fn compile_service_snapshot(
         let mut backends = BTreeMap::<(IpAddr, u16, Protocol), ServiceBackend>::new();
         let mut frontends = Vec::new();
         let mut node_ports = Vec::new();
-        for cluster_ip in service.cluster_ips {
+        for cluster_ip in service.cluster_ips.iter().copied() {
             for service_port in &service.ports {
                 let mut backend_ids = BTreeSet::new();
                 for slice in &matching_slices {
@@ -660,12 +815,49 @@ pub fn compile_service_snapshot(
                 }
             }
         }
+        let load_balancer = service.load_balancer.map(|source| {
+            let mut load_balancer_frontends = Vec::new();
+            for family in &source.ip_families {
+                for service_port in &service.ports {
+                    let backend_ids = frontends
+                        .iter()
+                        .find(|frontend| {
+                            frontend.address.is_ipv4() == (*family == AddressFamily::Ipv4)
+                                && frontend.port == service_port.port
+                                && frontend.protocol == service_port.protocol
+                                && frontend.name == service_port.name
+                                && frontend.app_protocol == service_port.app_protocol
+                        })
+                        .map_or_else(Vec::new, |frontend| frontend.backend_ids.clone());
+                    load_balancer_frontends.push(ServiceLoadBalancerFrontend {
+                        family: *family,
+                        service_port: service_port.port,
+                        protocol: service_port.protocol,
+                        name: service_port.name.clone(),
+                        app_protocol: service_port.app_protocol.clone(),
+                        backend_ids,
+                    });
+                }
+            }
+            ServiceLoadBalancer {
+                class: source.class,
+                ip_families: source.ip_families,
+                ip_family_policy: source.ip_family_policy,
+                requested_ips: source.requested_ips,
+                traffic_policy: service.external_traffic_policy,
+                source_ranges: source.source_ranges,
+                allocate_node_ports: source.allocate_node_ports,
+                health_check_node_port: source.health_check_node_port,
+                frontends: load_balancer_frontends,
+            }
+        });
         compiled.push(ServiceIr {
             id: service_id,
             namespace: service.namespace,
             name: service.name,
             frontends,
             node_ports,
+            load_balancer,
             backends: backends.into_values().collect(),
         });
     }
@@ -824,21 +1016,7 @@ impl ServiceSnapshot {
     /// identities/endpoints, unusable addresses/ports, and bounded-capacity
     /// violations.
     pub fn validate_and_normalize(mut self) -> Result<Self, ServiceIrError> {
-        if self.schema_version == LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION {
-            if self
-                .services
-                .iter()
-                .any(|service| !service.node_ports.is_empty())
-            {
-                return Err(ServiceIrError::LegacyNodePortIntent);
-            }
-            self.schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
-        } else if self.schema_version != SERVICE_SNAPSHOT_SCHEMA_VERSION {
-            return Err(ServiceIrError::UnsupportedSchema {
-                actual: self.schema_version,
-                expected: SERVICE_SNAPSHOT_SCHEMA_VERSION,
-            });
-        }
+        migrate_service_snapshot_schema(&mut self)?;
         if self.source_epoch == 0 {
             return Err(ServiceIrError::ZeroSourceEpoch);
         }
@@ -856,8 +1034,15 @@ impl ServiceSnapshot {
         let mut service_names = BTreeSet::new();
         let mut frontend_owners = BTreeMap::new();
         let mut node_port_owners = BTreeMap::new();
+        let mut load_balancer_address_owners = BTreeMap::new();
+        let cluster_ip_addresses = self
+            .services
+            .iter()
+            .flat_map(|service| service.frontends.iter().map(|frontend| frontend.address))
+            .collect::<BTreeSet<_>>();
         let mut total_frontends = 0_usize;
         let mut total_node_ports = 0_usize;
+        let mut total_load_balancer_frontends = 0_usize;
         let mut total_backends = 0_usize;
         let mut total_backend_references = 0_usize;
 
@@ -904,6 +1089,16 @@ impl ServiceSnapshot {
             validate_backends(service)?;
             validate_frontend_backends(service)?;
             validate_node_port_backends(service)?;
+            let (load_balancer_frontends, load_balancer_references) =
+                validate_and_normalize_load_balancer(
+                    service,
+                    &cluster_ip_addresses,
+                    &mut load_balancer_address_owners,
+                )?;
+            total_load_balancer_frontends =
+                total_load_balancer_frontends.saturating_add(load_balancer_frontends);
+            total_backend_references =
+                total_backend_references.saturating_add(load_balancer_references);
             service.frontends.sort();
             service.backends.sort();
         }
@@ -911,6 +1106,7 @@ impl ServiceSnapshot {
         validate_snapshot_capacities(
             total_frontends,
             total_node_ports,
+            total_load_balancer_frontends,
             total_backends,
             total_backend_references,
         )?;
@@ -923,8 +1119,7 @@ impl ServiceSnapshot {
         Ok(self)
     }
 
-    /// Produces the exact additive-schema-v1 view used only for old agents
-    /// during the bounded controller-first v1-to-v2 transition.
+    /// Produces the exact additive-schema-v1 view used only for old agents.
     ///
     /// # Errors
     ///
@@ -934,15 +1129,78 @@ impl ServiceSnapshot {
         let mut projected = self.clone().validate_and_normalize()?;
         for service in &mut projected.services {
             service.node_ports.clear();
+            service.load_balancer = None;
         }
         projected.schema_version = LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION;
         Ok(projected)
     }
+
+    /// Produces the exact schema-v2 `NodePort` view for consumers that do not
+    /// understand `LoadBalancer` intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation error as [`Self::validate_and_normalize`]
+    /// when the source snapshot is not valid current or migratable state.
+    pub fn node_port_v2_projection(&self) -> Result<Self, ServiceIrError> {
+        let mut projected = self.clone().validate_and_normalize()?;
+        for service in &mut projected.services {
+            service.load_balancer = None;
+        }
+        projected.schema_version = NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        Ok(projected)
+    }
+}
+
+fn migrate_service_snapshot_schema(snapshot: &mut ServiceSnapshot) -> Result<(), ServiceIrError> {
+    match snapshot.schema_version {
+        LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION => {
+            if snapshot
+                .services
+                .iter()
+                .any(|service| !service.node_ports.is_empty())
+            {
+                return Err(ServiceIrError::LegacyNodePortIntent);
+            }
+            reject_legacy_load_balancer_intent(snapshot, LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION)?;
+            snapshot.schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        }
+        NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION => {
+            reject_legacy_load_balancer_intent(
+                snapshot,
+                NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION,
+            )?;
+            snapshot.schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        }
+        SERVICE_SNAPSHOT_SCHEMA_VERSION => {}
+        actual => {
+            return Err(ServiceIrError::UnsupportedSchema {
+                actual,
+                expected: SERVICE_SNAPSHOT_SCHEMA_VERSION,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn reject_legacy_load_balancer_intent(
+    snapshot: &ServiceSnapshot,
+    schema: u16,
+) -> Result<(), ServiceIrError> {
+    if snapshot
+        .services
+        .iter()
+        .any(|service| service.load_balancer.is_some())
+    {
+        return Err(ServiceIrError::LegacyLoadBalancerIntent { schema });
+    }
+    Ok(())
 }
 
 fn validate_snapshot_capacities(
     frontends: usize,
     node_ports: usize,
+    load_balancer_frontends: usize,
     backends: usize,
     backend_references: usize,
 ) -> Result<(), ServiceIrError> {
@@ -956,6 +1214,12 @@ fn validate_snapshot_capacities(
         return Err(ServiceIrError::TooManyNodePorts {
             actual: node_ports,
             limit: MAX_SERVICE_NODE_PORTS,
+        });
+    }
+    if load_balancer_frontends > MAX_SERVICE_LOAD_BALANCER_FRONTENDS {
+        return Err(ServiceIrError::TooManyLoadBalancerFrontends {
+            actual: load_balancer_frontends,
+            limit: MAX_SERVICE_LOAD_BALANCER_FRONTENDS,
         });
     }
     if backends > MAX_SERVICE_BACKENDS {
@@ -1111,6 +1375,292 @@ fn validate_and_normalize_node_ports(
     }
     service.node_ports.sort();
     Ok((service.node_ports.len(), backend_references))
+}
+
+fn validate_and_normalize_load_balancer(
+    service: &mut ServiceIr,
+    cluster_ip_addresses: &BTreeSet<IpAddr>,
+    address_owners: &mut BTreeMap<IpAddr, ServiceId>,
+) -> Result<(usize, usize), ServiceIrError> {
+    let Some(mut load_balancer) = service.load_balancer.take() else {
+        return Ok((0, 0));
+    };
+    validate_load_balancer_ownership(service.id, &mut load_balancer)?;
+    validate_load_balancer_requested_ips(
+        service.id,
+        &mut load_balancer,
+        cluster_ip_addresses,
+        address_owners,
+    )?;
+    validate_load_balancer_source_controls(service.id, &mut load_balancer)?;
+    let backend_references =
+        validate_load_balancer_frontends(service.id, &service.frontends, &mut load_balancer)?;
+    let frontend_count = load_balancer.frontends.len();
+    service.load_balancer = Some(load_balancer);
+    Ok((frontend_count, backend_references))
+}
+
+fn invalid_load_balancer(service: ServiceId, reason: &'static str) -> ServiceIrError {
+    ServiceIrError::InvalidLoadBalancer { service, reason }
+}
+
+fn validate_load_balancer_ownership(
+    service: ServiceId,
+    load_balancer: &mut ServiceLoadBalancer,
+) -> Result<(), ServiceIrError> {
+    if load_balancer.class != UNF_LOAD_BALANCER_CLASS {
+        return Err(invalid_load_balancer(service, "class is not owned by UNF"));
+    }
+    if load_balancer.ip_families.is_empty() || load_balancer.ip_families.len() > 2 {
+        return Err(invalid_load_balancer(
+            service,
+            "must request one or two address families",
+        ));
+    }
+    load_balancer.ip_families.sort();
+    if load_balancer
+        .ip_families
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+    {
+        return Err(invalid_load_balancer(service, "repeats an address family"));
+    }
+    match load_balancer.ip_family_policy {
+        ServiceIpFamilyPolicy::SingleStack if load_balancer.ip_families.len() != 1 => {
+            return Err(invalid_load_balancer(
+                service,
+                "SingleStack requires exactly one address family",
+            ));
+        }
+        ServiceIpFamilyPolicy::RequireDualStack if load_balancer.ip_families.len() != 2 => {
+            return Err(invalid_load_balancer(
+                service,
+                "RequireDualStack requires both address families",
+            ));
+        }
+        ServiceIpFamilyPolicy::SingleStack
+        | ServiceIpFamilyPolicy::PreferDualStack
+        | ServiceIpFamilyPolicy::RequireDualStack => {}
+    }
+    Ok(())
+}
+
+fn validate_load_balancer_requested_ips(
+    service: ServiceId,
+    load_balancer: &mut ServiceLoadBalancer,
+    cluster_ip_addresses: &BTreeSet<IpAddr>,
+    address_owners: &mut BTreeMap<IpAddr, ServiceId>,
+) -> Result<(), ServiceIrError> {
+    if load_balancer.requested_ips.len() > load_balancer.ip_families.len() {
+        return Err(invalid_load_balancer(
+            service,
+            "requested IP count exceeds the requested address-family count",
+        ));
+    }
+    load_balancer.requested_ips.sort();
+    for pair in load_balancer.requested_ips.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(invalid_load_balancer(service, "repeats a requested IP"));
+        }
+    }
+    let mut requested_families = BTreeSet::new();
+    for address in &load_balancer.requested_ips {
+        let family = address_family(*address);
+        if !load_balancer.ip_families.contains(&family) {
+            return Err(invalid_load_balancer(
+                service,
+                "requested IP family is not admitted",
+            ));
+        }
+        if !requested_families.insert(family) {
+            return Err(invalid_load_balancer(
+                service,
+                "requests more than one IP in one address family",
+            ));
+        }
+        if !usable_node_port_address(*address) {
+            return Err(invalid_load_balancer(
+                service,
+                "requested IP must be a usable unicast address",
+            ));
+        }
+        if cluster_ip_addresses.contains(address) {
+            return Err(ServiceIrError::LoadBalancerClusterIpCollision { address: *address });
+        }
+        if let Some(existing) = address_owners.insert(*address, service)
+            && existing != service
+        {
+            return Err(ServiceIrError::DuplicateLoadBalancerAddress {
+                address: *address,
+                existing,
+                candidate: service,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_load_balancer_source_controls(
+    service: ServiceId,
+    load_balancer: &mut ServiceLoadBalancer,
+) -> Result<(), ServiceIrError> {
+    if load_balancer.source_ranges.len() > MAX_LOAD_BALANCER_SOURCE_RANGES_PER_SERVICE {
+        return Err(invalid_load_balancer(
+            service,
+            "source-range count exceeds the per-Service bound",
+        ));
+    }
+    load_balancer.source_ranges.sort();
+    for pair in load_balancer.source_ranges.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(invalid_load_balancer(service, "repeats a source range"));
+        }
+    }
+    for prefix in &load_balancer.source_ranges {
+        if !prefix.is_canonical() {
+            return Err(invalid_load_balancer(
+                service,
+                "source ranges must be canonical IP prefixes",
+            ));
+        }
+        if !load_balancer.ip_families.contains(&prefix.family()) {
+            return Err(invalid_load_balancer(
+                service,
+                "source-range family is not admitted",
+            ));
+        }
+        if prefix.address.is_multicast() {
+            return Err(invalid_load_balancer(
+                service,
+                "source ranges cannot be multicast",
+            ));
+        }
+    }
+    if load_balancer.health_check_node_port == Some(0) {
+        return Err(invalid_load_balancer(
+            service,
+            "health-check NodePort must be nonzero",
+        ));
+    }
+    if load_balancer.health_check_node_port.is_some()
+        && load_balancer.traffic_policy != ServiceTrafficPolicy::Local
+    {
+        return Err(invalid_load_balancer(
+            service,
+            "health-check NodePort requires Local external traffic policy",
+        ));
+    }
+    Ok(())
+}
+
+type LoadBalancerFrontendIdentity = (AddressFamily, u16, Protocol, Option<String>, Option<String>);
+
+fn validate_load_balancer_frontends(
+    service: ServiceId,
+    cluster_ip_frontends: &[ServiceFrontend],
+    load_balancer: &mut ServiceLoadBalancer,
+) -> Result<usize, ServiceIrError> {
+    let expected_frontends = cluster_ip_frontends
+        .iter()
+        .filter_map(|frontend| {
+            let family = address_family(frontend.address);
+            load_balancer.ip_families.contains(&family).then(|| {
+                (
+                    family,
+                    frontend.port,
+                    frontend.protocol,
+                    frontend.name.clone(),
+                    frontend.app_protocol.clone(),
+                )
+            })
+        })
+        .collect::<BTreeSet<LoadBalancerFrontendIdentity>>();
+    let mut actual_frontends = BTreeSet::<LoadBalancerFrontendIdentity>::new();
+    let mut backend_references = 0_usize;
+    for frontend in &mut load_balancer.frontends {
+        if frontend.service_port == 0 {
+            return Err(ServiceIrError::InvalidLoadBalancerFrontend {
+                service,
+                frontend: frontend.clone(),
+                reason: "linked Service port must be nonzero",
+            });
+        }
+        if !matches!(frontend.protocol, Protocol::Tcp | Protocol::Udp) {
+            return Err(ServiceIrError::InvalidLoadBalancerFrontend {
+                service,
+                frontend: frontend.clone(),
+                reason: "only TCP and UDP LoadBalancer frontends are admitted",
+            });
+        }
+        if !load_balancer.ip_families.contains(&frontend.family) {
+            return Err(ServiceIrError::InvalidLoadBalancerFrontend {
+                service,
+                frontend: frontend.clone(),
+                reason: "address family is not admitted",
+            });
+        }
+        if !valid_optional_provenance(frontend.name.as_deref())
+            || !valid_optional_provenance(frontend.app_protocol.as_deref())
+        {
+            return Err(ServiceIrError::InvalidLoadBalancerFrontend {
+                service,
+                frontend: frontend.clone(),
+                reason: "port name and app protocol must be nonempty and bounded when present",
+            });
+        }
+        let key = (
+            frontend.family,
+            frontend.service_port,
+            frontend.protocol,
+            frontend.name.clone(),
+            frontend.app_protocol.clone(),
+        );
+        if !actual_frontends.insert(key) {
+            return Err(ServiceIrError::InvalidLoadBalancerFrontend {
+                service,
+                frontend: frontend.clone(),
+                reason: "repeats an exact frontend",
+            });
+        }
+        frontend.backend_ids.sort();
+        let linked = cluster_ip_frontends.iter().find(|candidate| {
+            address_family(candidate.address) == frontend.family
+                && candidate.port == frontend.service_port
+                && candidate.protocol == frontend.protocol
+                && candidate.name == frontend.name
+                && candidate.app_protocol == frontend.app_protocol
+        });
+        let Some(linked) = linked else {
+            return Err(ServiceIrError::InvalidLoadBalancerFrontend {
+                service,
+                frontend: frontend.clone(),
+                reason: "does not link to an exact same-family ClusterIP frontend",
+            });
+        };
+        if frontend.backend_ids != linked.backend_ids {
+            return Err(ServiceIrError::InvalidLoadBalancerFrontend {
+                service,
+                frontend: frontend.clone(),
+                reason: "backend linkage differs from the exact ClusterIP frontend",
+            });
+        }
+        backend_references = backend_references.saturating_add(frontend.backend_ids.len());
+    }
+    if actual_frontends != expected_frontends {
+        return Err(invalid_load_balancer(
+            service,
+            "frontends do not exactly cover every admitted family and Service port",
+        ));
+    }
+    load_balancer.frontends.sort();
+    Ok(backend_references)
+}
+
+const fn address_family(address: IpAddr) -> AddressFamily {
+    match address {
+        IpAddr::V4(_) => AddressFamily::Ipv4,
+        IpAddr::V6(_) => AddressFamily::Ipv6,
+    }
 }
 
 fn validate_backends(service: &ServiceIr) -> Result<(), ServiceIrError> {
@@ -1319,6 +1869,17 @@ pub fn compile_service_dataplane(
     if node_port_count != 0 {
         return Err(ServiceDataplaneError::UnsupportedNodePort {
             actual: node_port_count,
+        });
+    }
+    let load_balancer_count = snapshot
+        .services
+        .iter()
+        .filter_map(|service| service.load_balancer.as_ref())
+        .map(|load_balancer| load_balancer.frontends.len())
+        .sum();
+    if load_balancer_count != 0 {
+        return Err(ServiceDataplaneError::UnsupportedLoadBalancer {
+            actual: load_balancer_count,
         });
     }
     let mut ipv4_frontends = BTreeMap::new();
@@ -1957,6 +2518,7 @@ mod tests {
                 )
             }],
             node_ports: Vec::new(),
+            load_balancer: None,
             backends: vec![backend(
                 id,
                 if id == 1 { "fd01::10" } else { "10.244.0.10" },
@@ -2180,10 +2742,28 @@ mod tests {
     }
 
     #[test]
-    fn service_schema_transition_migrates_v1_and_projects_without_node_port_intent() {
+    fn service_schema_transition_migrates_v1_v2_and_projects_newer_intent() {
         let current = snapshot(vec![service(1, "one")])
             .validate_and_normalize()
             .expect("current snapshot is valid");
+        let node_port_v2 = current
+            .node_port_v2_projection()
+            .expect("current snapshot has a schema-v2 projection");
+        let node_port_v2_value =
+            serde_json::to_value(&node_port_v2).expect("schema-v2 snapshot encodes");
+        assert_eq!(node_port_v2_value["schemaVersion"], 2);
+        assert!(
+            node_port_v2_value["services"][0]
+                .get("loadBalancer")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::from_value::<ServiceSnapshot>(node_port_v2_value)
+                .expect("schema-v2 snapshot decodes")
+                .validate_and_normalize()
+                .expect("schema-v2 snapshot migrates"),
+            current
+        );
         let legacy = current
             .legacy_v1_projection()
             .expect("current snapshot has a legacy projection");
@@ -2215,6 +2795,30 @@ mod tests {
                 .expect("additive field decodes")
                 .validate_and_normalize(),
             Err(ServiceIrError::LegacyNodePortIntent)
+        );
+
+        let mut lb_service = source_service();
+        lb_service.external_traffic_policy = ServiceTrafficPolicy::Local;
+        lb_service.load_balancer = Some(load_balancer_source());
+        let load_balancer_snapshot =
+            compile_service_snapshot(9, Revision::new(4), vec![lb_service], Vec::new())
+                .expect("valid LoadBalancer snapshot");
+        let projected_v2 = load_balancer_snapshot
+            .node_port_v2_projection()
+            .expect("LoadBalancer intent has a safe schema-v2 projection");
+        assert_eq!(
+            projected_v2.schema_version,
+            NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert!(projected_v2.services[0].load_balancer.is_none());
+        let mut disguised_v2 =
+            serde_json::to_value(load_balancer_snapshot).expect("LoadBalancer snapshot encodes");
+        disguised_v2["schemaVersion"] = serde_json::json!(2);
+        assert_eq!(
+            serde_json::from_value::<ServiceSnapshot>(disguised_v2)
+                .expect("additive LoadBalancer field decodes")
+                .validate_and_normalize(),
+            Err(ServiceIrError::LegacyLoadBalancerIntent { schema: 2 })
         );
     }
 
@@ -2268,6 +2872,7 @@ mod tests {
                 "10.96.0.10".parse().expect("valid IPv4 address"),
             ],
             external_traffic_policy: ServiceTrafficPolicy::Cluster,
+            load_balancer: None,
             ports: vec![
                 ServiceSourcePort {
                     name: Some("dns".to_owned()),
@@ -2284,6 +2889,24 @@ mod tests {
                     node_port: None,
                 },
             ],
+        }
+    }
+
+    fn load_balancer_source() -> ServiceLoadBalancerSource {
+        ServiceLoadBalancerSource {
+            class: UNF_LOAD_BALANCER_CLASS.to_owned(),
+            ip_families: vec![AddressFamily::Ipv6, AddressFamily::Ipv4],
+            ip_family_policy: ServiceIpFamilyPolicy::RequireDualStack,
+            requested_ips: vec![
+                "2001:db8::60".parse().unwrap(),
+                "192.0.2.60".parse().unwrap(),
+            ],
+            source_ranges: vec![
+                "2001:db8:100::/56".parse().unwrap(),
+                "198.51.100.0/24".parse().unwrap(),
+            ],
+            allocate_node_ports: false,
+            health_check_node_port: Some(32_000),
         }
     }
 
@@ -2373,7 +2996,7 @@ mod tests {
         )
         .expect("valid dual-stack NodePort sources");
         let service = &compiled.services[0];
-        assert_eq!(compiled.schema_version, 2);
+        assert_eq!(compiled.schema_version, SERVICE_SNAPSHOT_SCHEMA_VERSION);
         assert_eq!(service.node_ports.len(), 4);
         assert!(service.node_ports.iter().all(|node_port| {
             node_port.traffic_policy == ServiceTrafficPolicy::Local
@@ -2395,6 +3018,118 @@ mod tests {
             compile_service_dataplane(&compiled, 0),
             Err(ServiceDataplaneError::UnsupportedNodePort { actual: 4 })
         );
+    }
+
+    #[test]
+    fn compiler_preserves_bounded_dual_stack_load_balancer_intent() {
+        let mut source = source_service();
+        source.external_traffic_policy = ServiceTrafficPolicy::Local;
+        source.load_balancer = Some(load_balancer_source());
+        let compiled = compile_service_snapshot(
+            9,
+            Revision::new(3),
+            vec![source],
+            vec![
+                source_slice(AddressFamily::Ipv4, "api-v4", "10.244.0.20"),
+                source_slice(AddressFamily::Ipv6, "api-v6", "fd01::20"),
+            ],
+        )
+        .expect("valid dual-stack LoadBalancer source");
+
+        assert_eq!(compiled.schema_version, SERVICE_SNAPSHOT_SCHEMA_VERSION);
+        let service = &compiled.services[0];
+        let load_balancer = service
+            .load_balancer
+            .as_ref()
+            .expect("explicit UNF LoadBalancer intent");
+        assert_eq!(load_balancer.class, UNF_LOAD_BALANCER_CLASS);
+        assert_eq!(
+            load_balancer.ip_families,
+            [AddressFamily::Ipv4, AddressFamily::Ipv6]
+        );
+        assert_eq!(
+            load_balancer.ip_family_policy,
+            ServiceIpFamilyPolicy::RequireDualStack
+        );
+        assert!(!load_balancer.allocate_node_ports);
+        assert_eq!(load_balancer.health_check_node_port, Some(32_000));
+        assert_eq!(load_balancer.traffic_policy, ServiceTrafficPolicy::Local);
+        assert_eq!(load_balancer.requested_ips.len(), 2);
+        assert_eq!(load_balancer.source_ranges.len(), 2);
+        assert_eq!(load_balancer.frontends.len(), 4);
+        assert!(load_balancer.frontends.iter().all(|frontend| {
+            frontend.backend_ids.len() == 1
+                && service.frontends.iter().any(|cluster_ip| {
+                    address_family(cluster_ip.address) == frontend.family
+                        && cluster_ip.port == frontend.service_port
+                        && cluster_ip.protocol == frontend.protocol
+                        && cluster_ip.name == frontend.name
+                        && cluster_ip.backend_ids == frontend.backend_ids
+                })
+        }));
+        assert_eq!(
+            compile_service_dataplane(&compiled, 0),
+            Err(ServiceDataplaneError::UnsupportedLoadBalancer { actual: 4 })
+        );
+    }
+
+    #[test]
+    fn load_balancer_validation_rejects_foreign_ambiguous_and_broadening_intent() {
+        assert!("198.51.100.1/24".parse::<ServiceIpPrefix>().is_err());
+        assert!("2001:db8::/129".parse::<ServiceIpPrefix>().is_err());
+
+        let mut foreign = source_service();
+        let mut foreign_intent = load_balancer_source();
+        foreign_intent.class = "example.com/foreign".to_owned();
+        foreign.load_balancer = Some(foreign_intent);
+        assert!(matches!(
+            compile_service_snapshot(9, Revision::new(3), vec![foreign], Vec::new()),
+            Err(ServiceCompileError::InvalidIr(
+                ServiceIrError::InvalidLoadBalancer { .. }
+            ))
+        ));
+
+        let mut first = source_service();
+        first.name = "first".to_owned();
+        first.external_traffic_policy = ServiceTrafficPolicy::Local;
+        first.load_balancer = Some(load_balancer_source());
+        let mut second = source_service();
+        second.name = "second".to_owned();
+        second.external_traffic_policy = ServiceTrafficPolicy::Local;
+        second.cluster_ips = vec!["10.97.0.10".parse().unwrap(), "fd03::10".parse().unwrap()];
+        second.load_balancer = Some(load_balancer_source());
+        assert!(matches!(
+            compile_service_snapshot(9, Revision::new(3), vec![first, second], Vec::new()),
+            Err(ServiceCompileError::InvalidIr(
+                ServiceIrError::DuplicateLoadBalancerAddress { .. }
+            ))
+        ));
+
+        let mut unsupported_protocol = source_service();
+        unsupported_protocol.external_traffic_policy = ServiceTrafficPolicy::Local;
+        unsupported_protocol.ports[0].protocol = Protocol::Sctp;
+        unsupported_protocol.load_balancer = Some(load_balancer_source());
+        assert!(matches!(
+            compile_service_snapshot(9, Revision::new(3), vec![unsupported_protocol], Vec::new()),
+            Err(ServiceCompileError::InvalidIr(
+                ServiceIrError::InvalidLoadBalancerFrontend { .. }
+            ))
+        ));
+
+        let mut mismatched_range = source_service();
+        let mut intent = load_balancer_source();
+        intent.ip_families = vec![AddressFamily::Ipv4];
+        intent.ip_family_policy = ServiceIpFamilyPolicy::SingleStack;
+        intent.requested_ips = vec!["192.0.2.60".parse().unwrap()];
+        intent.source_ranges = vec!["2001:db8:100::/56".parse().unwrap()];
+        mismatched_range.cluster_ips = vec!["10.96.0.10".parse().unwrap()];
+        mismatched_range.load_balancer = Some(intent);
+        assert!(matches!(
+            compile_service_snapshot(9, Revision::new(3), vec![mismatched_range], Vec::new()),
+            Err(ServiceCompileError::InvalidIr(
+                ServiceIrError::InvalidLoadBalancer { .. }
+            ))
+        ));
     }
 
     #[test]

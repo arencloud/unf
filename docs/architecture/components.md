@@ -23,14 +23,14 @@ conversion toward domain types. Kernel ABI types depend only on `no_std`
 primitives. No core library calls the Kubernetes API.
 
 The accepted Phase 6 extension keeps LoadBalancer ownership split across
-components before implementation: `unf-service` will own bounded provider-
-neutral VIP intent; `unf-controller` will own explicit-class admission and
-narrow allocation/status/provider orchestration; `unf-agent` will own
-authenticated transactional host adoption and health state; reachability
-providers will own only their revisioned advertisement artifacts; and
-`unf-ebpf-tc` will own only validated VIP translation. Allocation,
+components. `unf-service` now owns bounded provider-neutral schema-v3 VIP
+intent, and `unf-controller` owns explicit-class Kubernetes admission plus
+retained-last-valid compilation. Existing service lowerers reject that intent.
+The controller's allocation/status/provider orchestration, authenticated agent
+host adoption and health state, provider-owned advertisement artifacts, and
+`unf-ebpf-tc` VIP translation remain separate ordered milestones. Allocation,
 advertisement, translation, and published readiness are not interchangeable.
-ADR 0093 defines this boundary.
+ADRs 0093–0094 define the implemented boundary.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

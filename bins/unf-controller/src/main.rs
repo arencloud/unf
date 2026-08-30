@@ -16,7 +16,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Service, ServiceSpec};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -53,9 +53,11 @@ use unf_route::{
 use unf_service::{
     AddressFamily, EndpointPortSource, EndpointSliceSource, EndpointSource,
     LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
-    NodeAddressKind, NodePortNodeSnapshot, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceBackend,
-    ServiceIr, ServiceNodeAddress, ServiceNodePort, ServiceSnapshot, ServiceSource,
-    ServiceSourcePort, ServiceTrafficPolicy, compile_service_snapshot,
+    NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION, NodeAddressKind, NodePortNodeSnapshot,
+    SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceBackend, ServiceIpFamilyPolicy, ServiceIpPrefix,
+    ServiceIr, ServiceLoadBalancerSource, ServiceNodeAddress, ServiceNodePort, ServiceSnapshot,
+    ServiceSource, ServiceSourcePort, ServiceTrafficPolicy, UNF_LOAD_BALANCER_CLASS,
+    compile_service_snapshot,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
@@ -2545,6 +2547,7 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
     }
     let mut ports = Vec::new();
     let mut compiler_ports = Vec::new();
+    let service_type = spec.type_.clone().unwrap_or_else(|| "ClusterIP".to_owned());
     let external_traffic_policy = service_external_traffic_policy(
         &namespace,
         &name,
@@ -2587,17 +2590,20 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
     }
     ports.sort();
     compiler_ports.sort();
+    let load_balancer =
+        service_load_balancer_source(&namespace, &name, &service_type, spec, &cluster_ips)?;
     let compiler_source = ServiceSource {
         namespace: namespace.clone(),
         name: name.clone(),
         cluster_ips: cluster_ips.iter().copied().collect(),
         external_traffic_policy,
+        load_balancer,
         ports: compiler_ports,
     };
     Ok(ServiceRecord {
         namespace,
         name,
-        service_type: spec.type_.clone().unwrap_or_else(|| "ClusterIP".to_owned()),
+        service_type,
         cluster_ips,
         selector: spec
             .selector
@@ -2608,6 +2614,123 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
         ports,
         compiler_source,
     })
+}
+
+fn service_load_balancer_source(
+    namespace: &str,
+    name: &str,
+    service_type: &str,
+    spec: &ServiceSpec,
+    cluster_ips: &BTreeSet<IpAddr>,
+) -> Result<Option<ServiceLoadBalancerSource>> {
+    if service_type != "LoadBalancer" {
+        if spec.load_balancer_class.is_some() {
+            return Err(anyhow!(
+                "Service {namespace}/{name} sets loadBalancerClass without type LoadBalancer"
+            ));
+        }
+        return Ok(None);
+    }
+    let Some(class) = spec.load_balancer_class.as_deref() else {
+        return Ok(None);
+    };
+    if class != UNF_LOAD_BALANCER_CLASS {
+        return Ok(None);
+    }
+    if spec
+        .internal_traffic_policy
+        .as_deref()
+        .is_some_and(|policy| policy != "Cluster")
+    {
+        return Err(anyhow!(
+            "Service {namespace}/{name} uses unsupported internalTrafficPolicy"
+        ));
+    }
+    if spec
+        .session_affinity
+        .as_deref()
+        .is_some_and(|affinity| affinity != "None")
+    {
+        return Err(anyhow!(
+            "Service {namespace}/{name} uses unsupported sessionAffinity"
+        ));
+    }
+    if spec.traffic_distribution.is_some() {
+        return Err(anyhow!(
+            "Service {namespace}/{name} uses unsupported trafficDistribution"
+        ));
+    }
+
+    let ip_families = if let Some(families) = &spec.ip_families {
+        families
+            .iter()
+            .map(|family| service_ip_family(namespace, name, family))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        cluster_ips
+            .iter()
+            .map(|address| {
+                if address.is_ipv4() {
+                    AddressFamily::Ipv4
+                } else {
+                    AddressFamily::Ipv6
+                }
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let ip_family_policy = match spec.ip_family_policy.as_deref() {
+        Some("PreferDualStack") => ServiceIpFamilyPolicy::PreferDualStack,
+        Some("RequireDualStack") => ServiceIpFamilyPolicy::RequireDualStack,
+        None if ip_families.len() == 2 => ServiceIpFamilyPolicy::PreferDualStack,
+        Some("SingleStack") | None => ServiceIpFamilyPolicy::SingleStack,
+        Some(policy) => {
+            return Err(anyhow!(
+                "Service {namespace}/{name} has unsupported ipFamilyPolicy {policy:?}"
+            ));
+        }
+    };
+    let requested_ips = spec
+        .load_balancer_ip
+        .iter()
+        .map(|address| {
+            address.parse().with_context(|| {
+                format!("Service {namespace}/{name} has invalid loadBalancerIP {address:?}")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let source_ranges = spec
+        .load_balancer_source_ranges
+        .iter()
+        .flatten()
+        .map(|prefix| {
+            prefix.parse::<ServiceIpPrefix>().with_context(|| {
+                format!("Service {namespace}/{name} has invalid loadBalancerSourceRange {prefix:?}")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let health_check_node_port = service_node_port(namespace, name, spec.health_check_node_port)?;
+
+    Ok(Some(ServiceLoadBalancerSource {
+        class: class.to_owned(),
+        ip_families,
+        ip_family_policy,
+        requested_ips,
+        source_ranges,
+        allocate_node_ports: spec.allocate_load_balancer_node_ports.unwrap_or(true),
+        health_check_node_port,
+    }))
+}
+
+fn service_ip_family(namespace: &str, name: &str, family: &str) -> Result<AddressFamily> {
+    match family {
+        "IPv4" => Ok(AddressFamily::Ipv4),
+        "IPv6" => Ok(AddressFamily::Ipv6),
+        family => Err(anyhow!(
+            "Service {namespace}/{name} has unsupported IP family {family:?}"
+        )),
+    }
 }
 
 fn service_external_traffic_policy(
@@ -3039,12 +3162,14 @@ fn requested_service_schema(query: &ServiceSchemaQuery) -> Result<u16, ApiError>
         .unwrap_or(LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION);
     if matches!(
         requested,
-        LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION | SERVICE_SNAPSHOT_SCHEMA_VERSION
+        LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
+            | NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION
+            | SERVICE_SNAPSHOT_SCHEMA_VERSION
     ) {
         Ok(requested)
     } else {
         Err(ApiError::bad_request(format!(
-            "unsupported requested service snapshot schema {requested}; supported schemas are 1 and {SERVICE_SNAPSHOT_SCHEMA_VERSION}"
+            "unsupported requested service snapshot schema {requested}; supported schemas are 1, 2, and {SERVICE_SNAPSHOT_SCHEMA_VERSION}"
         )))
     }
 }
@@ -3149,7 +3274,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         limitations: [
             "desired state and identity allocations are currently in-memory only",
             "agent acknowledgements and the newest bounded flow history use separate single-controller ConfigMap checkpoints",
-            "service translation is bounded to primary-CNI Pod clients plus host-origin ClusterIP, IPv4/IPv6 TCP/UDP, and NodePort Cluster/Local traffic; LoadBalancer, session affinity, DSR, SCTP, fragments, and host-origin NodePort clients remain unqualified",
+            "service translation is bounded to primary-CNI Pod clients plus host-origin ClusterIP, IPv4/IPv6 TCP/UDP, and NodePort Cluster/Local traffic; LoadBalancer allocation/reachability/host state/packet translation, session affinity, DSR, SCTP, fragments, and host-origin NodePort clients remain unqualified",
         ],
     }))
 }
@@ -3581,10 +3706,9 @@ fn agent_convergence_snapshot(
             (
                 snapshot.source_epoch,
                 snapshot.revision,
-                snapshot
-                    .services
-                    .iter()
-                    .any(|service| !service.node_ports.is_empty()),
+                snapshot.services.iter().any(|service| {
+                    !service.node_ports.is_empty() || service.load_balancer.is_some()
+                }),
             )
         })
         .unwrap_or_default();
@@ -3805,6 +3929,11 @@ fn service_snapshot_for_schema(
     let snapshot = service_snapshot_for(state)?;
     match requested_service_schema {
         SERVICE_SNAPSHOT_SCHEMA_VERSION => Ok(snapshot),
+        NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION => {
+            snapshot.node_port_v2_projection().map_err(|error| {
+                ApiError::internal(format!("project NodePort service snapshot: {error}"))
+            })
+        }
         LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION => {
             snapshot.legacy_v1_projection().map_err(|error| {
                 ApiError::internal(format!("project legacy service snapshot: {error}"))
@@ -6141,7 +6270,7 @@ mod tests {
     }
 
     #[test]
-    fn service_schema_transition_negotiates_and_projects_legacy_state() {
+    fn service_schema_transition_negotiates_and_projects_v1_v2_state() {
         assert_eq!(
             requested_service_schema(&ServiceSchemaQuery::default()).unwrap(),
             LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
@@ -6158,14 +6287,29 @@ mod tests {
             legacy_compatibility.service_snapshot_schema_version,
             LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
         );
-        assert!(compatibility_for_service_schema(3).is_err());
+        let node_port_compatibility =
+            compatibility_for_service_schema(NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION).unwrap();
+        assert_eq!(
+            node_port_compatibility.service_snapshot_schema_version,
+            NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert!(compatibility_for_service_schema(SERVICE_SNAPSHOT_SCHEMA_VERSION + 1).is_err());
 
         let state = new_state(true);
         apply_service_event(&state, Event::Apply(node_port_service()));
         let current = service_snapshot_for_schema(&state, SERVICE_SNAPSHOT_SCHEMA_VERSION)
-            .expect("schema-v2 state is available");
+            .expect("schema-v3 state is available");
         assert_eq!(current.schema_version, SERVICE_SNAPSHOT_SCHEMA_VERSION);
         assert!(!current.services[0].node_ports.is_empty());
+        let node_port =
+            service_snapshot_for_schema(&state, NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION)
+                .expect("schema-v2 projection is available");
+        assert_eq!(
+            node_port.schema_version,
+            NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert!(!node_port.services[0].node_ports.is_empty());
+        assert!(node_port.services[0].load_balancer.is_none());
         let legacy = service_snapshot_for_schema(&state, LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION)
             .expect("schema-v1 projection is available");
         assert_eq!(
@@ -6728,6 +6872,44 @@ mod tests {
         .expect("test NodePort Service is valid Kubernetes JSON")
     }
 
+    fn load_balancer_service() -> Service {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "public-api", "namespace": "frontend"},
+            "spec": {
+                "type": "LoadBalancer",
+                "loadBalancerClass": "network.unf.io/load-balancer",
+                "clusterIP": "10.43.0.30",
+                "clusterIPs": ["10.43.0.30", "fd02::30"],
+                "ipFamilies": ["IPv4", "IPv6"],
+                "ipFamilyPolicy": "RequireDualStack",
+                "externalTrafficPolicy": "Local",
+                "allocateLoadBalancerNodePorts": false,
+                "loadBalancerIP": "192.0.2.60",
+                "loadBalancerSourceRanges": ["198.51.100.0/24", "2001:db8:100::/56"],
+                "healthCheckNodePort": 32000,
+                "selector": {"app": "public-api"},
+                "ports": [
+                    {
+                        "name": "https",
+                        "protocol": "TCP",
+                        "port": 443,
+                        "targetPort": 8443,
+                        "appProtocol": "kubernetes.io/h2c"
+                    },
+                    {
+                        "name": "dns",
+                        "protocol": "UDP",
+                        "port": 53,
+                        "targetPort": 5353
+                    }
+                ]
+            }
+        }))
+        .expect("test LoadBalancer Service is valid Kubernetes JSON")
+    }
+
     fn endpoint_slice(ready: bool) -> EndpointSlice {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "discovery.k8s.io/v1",
@@ -6777,6 +6959,7 @@ mod tests {
                 name: "server".to_owned(),
                 cluster_ips: Vec::new(),
                 external_traffic_policy: ServiceTrafficPolicy::Cluster,
+                load_balancer: None,
                 ports: Vec::new(),
             },
         }
@@ -7881,6 +8064,27 @@ mod tests {
             agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
                 .all_converged
         );
+
+        apply_service_event(&state, Event::Apply(load_balancer_service()));
+        let snapshot = service_snapshot_for(&state).expect("LoadBalancer intent compiled");
+        let mut node_port_report = converged_agent_report(state.identity_epoch);
+        node_port_report.desired_service_epoch = snapshot.source_epoch;
+        node_port_report.applied_service_epoch = snapshot.source_epoch;
+        node_port_report.desired_service_revision = snapshot.revision.get();
+        node_port_report.applied_service_revision = snapshot.revision.get();
+        node_port_report.service_snapshot_schema_version =
+            NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        write_lock(&state.agent_reports).insert(
+            node_port_report.node_name.clone(),
+            StoredAgentReport {
+                report: node_port_report,
+                last_received_unix_ms: 100,
+            },
+        );
+        assert!(
+            !agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
+                .all_converged
+        );
     }
 
     #[test]
@@ -8099,6 +8303,96 @@ mod tests {
         let mut invalid = node_port_service();
         invalid.spec.as_mut().unwrap().external_traffic_policy = Some("Nearest".to_owned());
         assert!(service_record(&invalid).is_err());
+    }
+
+    #[test]
+    fn load_balancer_translation_is_explicit_exact_and_last_valid() {
+        let service = load_balancer_service();
+        let record = service_record(&service).expect("valid UNF LoadBalancer source");
+        assert_eq!(record.service_type, "LoadBalancer");
+        assert!(
+            record
+                .compiler_source
+                .ports
+                .iter()
+                .all(|port| port.node_port.is_none())
+        );
+        let source = record
+            .compiler_source
+            .load_balancer
+            .as_ref()
+            .expect("explicit UNF class is admitted");
+        assert_eq!(source.class, UNF_LOAD_BALANCER_CLASS);
+        assert_eq!(
+            source.ip_families,
+            [AddressFamily::Ipv4, AddressFamily::Ipv6]
+        );
+        assert_eq!(
+            source.ip_family_policy,
+            ServiceIpFamilyPolicy::RequireDualStack
+        );
+        assert!(!source.allocate_node_ports);
+        assert_eq!(source.health_check_node_port, Some(32_000));
+        assert_eq!(
+            source.requested_ips,
+            ["192.0.2.60".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(source.source_ranges.len(), 2);
+
+        let snapshot = compile_service_snapshot(
+            7,
+            Revision::new(1),
+            vec![record.compiler_source],
+            Vec::new(),
+        )
+        .expect("valid LoadBalancer intent");
+        let intent = snapshot.services[0]
+            .load_balancer
+            .as_ref()
+            .expect("LoadBalancer intent compiled");
+        assert_eq!(intent.frontends.len(), 4);
+        assert!(intent.frontends.iter().all(|frontend| {
+            matches!(frontend.protocol, Protocol::Tcp | Protocol::Udp)
+                && frontend.backend_ids.is_empty()
+        }));
+
+        let mut classless = service.clone();
+        classless.spec.as_mut().unwrap().load_balancer_class = None;
+        assert!(
+            service_record(&classless)
+                .expect("classless Service remains foreign")
+                .compiler_source
+                .load_balancer
+                .is_none()
+        );
+        let mut foreign = service.clone();
+        foreign.spec.as_mut().unwrap().load_balancer_class = Some("example.com/foreign".to_owned());
+        assert!(
+            service_record(&foreign)
+                .expect("foreign-class Service remains foreign")
+                .compiler_source
+                .load_balancer
+                .is_none()
+        );
+
+        let state = new_state(true);
+        apply_service_event(&state, Event::Apply(service.clone()));
+        let retained_revision = read_lock(&state.compiled_service_snapshot)
+            .as_ref()
+            .expect("valid LoadBalancer snapshot")
+            .revision;
+        let mut malformed = service;
+        malformed.spec.as_mut().unwrap().load_balancer_source_ranges =
+            Some(vec!["198.51.100.1/24".to_owned()]);
+        apply_service_event(&state, Event::Apply(malformed));
+        assert_eq!(
+            read_lock(&state.compiled_service_snapshot)
+                .as_ref()
+                .expect("last-valid LoadBalancer snapshot retained")
+                .revision,
+            retained_revision
+        );
+        assert_eq!(read_lock(&state.rejected_service_sources).len(), 1);
     }
 
     #[tokio::test]

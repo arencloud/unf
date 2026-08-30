@@ -55,8 +55,9 @@ use unf_route::{
     NativeRemoteRoutingProvider, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION, RemoteRouteSnapshot,
 };
 use unf_service::{
-    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, MAX_BACKENDS_PER_SERVICE, NodePortDataplaneState,
-    NodePortNodeSnapshot, SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, MAX_BACKENDS_PER_SERVICE,
+    NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION, NodePortDataplaneState, NodePortNodeSnapshot,
+    SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
     SERVICE_FRONTEND_BANK_CAPACITY, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceDataplaneState,
     ServiceSnapshot, ServiceTrafficPolicy, compile_node_port_fabric_dataplane,
     compile_service_dataplane,
@@ -4325,6 +4326,7 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
     .collect::<Vec<_>>();
     if controller.service_snapshot_schema_version != local.service_snapshot_schema_version
         && controller.service_snapshot_schema_version != LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        && controller.service_snapshot_schema_version != NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION
     {
         mismatches.push(format!(
             "service snapshot schema controller={} agent={}",
@@ -7951,7 +7953,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         )
         .status_label(),
         capabilities: state.capabilities.clone(),
-        limitation: "service translation is bounded to primary-CNI Pod clients plus host-origin ClusterIP, IPv4/IPv6 TCP/UDP, and NodePort Cluster/Local traffic; LoadBalancer, session affinity, DSR, SCTP, fragments, and host-origin NodePort clients remain unqualified",
+        limitation: "service translation is bounded to primary-CNI Pod clients plus host-origin ClusterIP, IPv4/IPv6 TCP/UDP, and NodePort Cluster/Local traffic; LoadBalancer allocation/reachability/host state/packet translation, session affinity, DSR, SCTP, fragments, and host-origin NodePort clients remain unqualified",
     })
 }
 
@@ -8219,6 +8221,7 @@ mod tests {
                 name: "api".to_owned(),
                 cluster_ips: vec!["10.96.0.10".parse().unwrap()],
                 external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+                load_balancer: None,
                 ports: vec![unf_service::ServiceSourcePort {
                     name: Some("http".to_owned()),
                     protocol: unf_common::Protocol::Tcp,
@@ -8241,6 +8244,7 @@ mod tests {
                 name: "api".to_owned(),
                 cluster_ips: vec!["10.96.0.10".parse().unwrap()],
                 external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+                load_balancer: None,
                 ports: vec![unf_service::ServiceSourcePort {
                     name: Some("http".to_owned()),
                     protocol: unf_common::Protocol::Tcp,
@@ -8359,6 +8363,7 @@ mod tests {
                     "fd00:96::10".parse::<Ipv6Addr>().unwrap().into(),
                 ],
                 external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+                load_balancer: None,
                 ports,
             }],
             slices,
@@ -10376,6 +10381,8 @@ mod tests {
         assert!(ensure_controller_compatibility(&controller).is_ok());
 
         controller.service_snapshot_schema_version = LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        assert!(ensure_controller_compatibility(&controller).is_ok());
+        controller.service_snapshot_schema_version = NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION;
         assert!(ensure_controller_compatibility(&controller).is_ok());
         controller.service_snapshot_schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
 

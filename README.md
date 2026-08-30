@@ -250,9 +250,13 @@ transactions. Status may publish a VIP only after the admitted provider and
 dataplane converge, direct delivery cannot depend on a traffic NodePort, and
 foreign controller/network state must survive reconciliation. The
 [Phase 6 LoadBalancer plan](docs/development/phase6-loadbalancer-plan.md) and
-ADR 0093 define the ordered schema, provider, dataplane, operations, Kind, and
-OpenShift gates. Milestone 6.2 domain/compiler implementation is in progress;
-no LoadBalancer packet-support claim exists yet.
+ADRs 0093–0094 define the ordered schema, provider, dataplane, operations,
+Kind, and OpenShift gates. Milestone 6.2 is verified: schema v3 carries exact
+dual-stack class/family/policy/source-range/requested-VIP intent, projects safe
+v2/v1 views, retains last-valid Kubernetes compilation, and makes existing
+lowerers reject VIP intent. Milestone 6.3 allocation/reachability contracts are
+in progress; no LoadBalancer allocation, advertisement, status-publication,
+host-state, or packet-support claim exists yet.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
