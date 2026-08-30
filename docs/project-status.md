@@ -26,7 +26,7 @@ repeatable test are both present in this repository.
 | Phase 3 — compatibility and simulation | **Verified** | §103: NetworkPolicy adapter, shadow policies, simulation foundation, improved topology, and historical export | All 42 Phase 3 deliverables are Verified. The committed-revision closure passed static/eBPF/render, complete Kind endpoint, scale/failure, adjacent upgrade/rollback, and digest-pinned dual-stack cl02 gates; ADR 0056 records the one-to-one requirements/limitations audit, immutable artifacts, retries, and exact boundaries |
 | Full-CNI foundation | **Verified** | §104: `unf-cni`, IPAM, veth, routing, MTU, and node-to-node networking | ADRs 0057–0073 and committed gates verify the bounded foundation, isolated Kind lifecycle, five-Node OpenShift bootstrap/remediation, CNI 1.1 reconciliation, durable offline DEL, digest-pinned clean reboot, deliberate runtime fault, exact worker teardown to no CNI, fail-closed sandbox behavior, and host-network reprovision from zero with exact state, 5/5 convergence, and dual-stack traffic. Netkit and post-foundation services remain separate future scope |
 | Phase 4 — service-fabric foundation | **Verified** | Master prompt §§20–21: revisioned Service/EndpointSlice intent, transactional service state, eBPF load balancing, connection persistence, and kube-proxy-free dual-stack ClusterIP | ADRs 0074–0081 and the complete unit, kernel, Kind, staged OpenShift, and kube-proxy-free OpenShift gates verify typed intent, deterministic compilation/distribution/recovery, transactional ABI-v4 state, native IPv4/IPv6 TCP/UDP ClusterIP, bounded operations evidence, lifecycle and outage recovery, exact cleanup, and non-transitive platform qualification |
-| Phase 5 — NodePort exposure | **In progress** | Master prompt §20: NodePort plus external traffic-policy behavior on the verified service foundation | Milestones 5.1–5.6 are Verified: schema-v2 intent and transactional ABI-v5 host state feed exact dual-stack TCP/UDP Cluster and Local forwarding, while explicit fixed-width event classification drives bounded metrics/status/history/explanation/simulation and restart recovery. Independent Kind and OpenShift qualification remain; ADRs 0082–0088 |
+| Phase 5 — NodePort exposure | **In progress** | Master prompt §20: NodePort plus external traffic-policy behavior on the verified service foundation | Milestones 5.1–5.6 are Verified. The repeatable Phase 5.7 kube-proxy-free Kind gate is Implemented and awaits execution on its committed images; OpenShift qualification follows; ADRs 0082–0089 |
 
 Sections 98–99 describe the richer first enforcement and enriched-observability
 scenario. Those scenarios span the Phase 2 gate because they require a real deny
@@ -183,10 +183,11 @@ release gate.
   deterministic backend selection, bounded connection persistence, lifecycle,
   no-backend evidence, and kube-proxy-free recovery are qualified only on the
   recorded Kind and OpenShift tuples. Schema-v2 NodePort intent, Kubernetes
-  translation, authenticated distribution, and transactional host-map activation
-  are implemented, but packet forwarding is not.
-  SCTP Services, NodePort dataplane, LoadBalancer, session affinity,
-  traffic policies beyond preserved NodePort `externalTrafficPolicy`,
+  translation, authenticated distribution, transactional host-map activation,
+  and exact IPv4/IPv6 TCP/UDP Cluster/Local forwarding are implemented; live
+  NodePort cluster qualification remains in progress.
+  SCTP Services, LoadBalancer, session affinity,
+  traffic policies beyond NodePort `externalTrafficPolicy`,
   topology-aware routing, Maglev, DSR,
   generic conntrack, HA control plane, and production scale remain unqualified.
   Under the final high-cardinality cl02 checkpoint burst the single controller
@@ -350,7 +351,7 @@ release gate.
 | NodePort `Cluster` dataplane | **Verified** | Exact coherent Node-address/port/protocol lookup performs IPv4/IPv6 TCP/UDP DNAT with bounded collision-safe Node SNAT and paired reverse client/NodePort restoration through the referenced service bank. Stable hash slots, connection persistence through churn, backendless drop, unrelated pass-through, checksums, original-source/translated-backend ingress policy ordering, and bounded service/policy provenance pass `make nodeport-cluster-dataplane-test`. Its Phase 5.4 boundary kept `Local` fail-closed; ADR 0087 subsequently enabled Local without widening Cluster; ADR 0086 |
 | NodePort `Local` dataplane | **Verified** | A deterministic high frontend-index namespace adds receiving-Node-only ready/non-terminating slots to the same service transaction. IPv4/IPv6 TCP/UDP preserve the client source and reverse to the exact NodePort; placement/readiness loss, established-flow retention, no-local-backend drop, recovery, policy ordering, and Cluster regression pass `make nodeport-local-dataplane-test`. LoadBalancer health-check NodePorts remain outside this NodePort-only gate; ADR 0087 |
 | Operations and simulation | **Verified** | Fixed-size service-event ABI v2 distinguishes ClusterIP, NodePort/Cluster, and NodePort/Local across restart. Six fixed-cardinality metrics, status v5 desired/applied/outcome fields, flow export v5, history/checkpoint v6/v5 with older-checkpoint migration, filtered explanation, exact read-only simulation, bounded failure status, CLI output, and unchanged ABI-v5 cleanup pass `make nodeport-operations-test`; ADR 0088 |
-| Kube-proxy-free Kind qualification | **Planned** | Dual-stack NodePort lifecycle, outage/replacement recovery, exact cleanup, rollback, and schema-versioned evidence |
+| Kube-proxy-free Kind qualification | **Implemented** | `make nodeport-kind-test` encodes dual-stack TCP/UDP Cluster and Local paths through exact worker addresses, source/reverse tuples, established UDP retention, readiness/termination/deletion/recovery, Local fail-closed behavior, operations/simulation, controller-offline worker-agent replacement, composite recovery, empty-map/attachment cleanup, exact ABI-v5 rollback, and schema-v2 evidence. It becomes Verified only after the committed images pass; ADR 0089 |
 | OpenShift qualification | **Planned** | Digest-pinned five-node RHCOS/SELinux/CRI-O rollout and kube-proxy-free cross-worker NodePort lifecycle/recovery |
 
 ## Updating this tracker

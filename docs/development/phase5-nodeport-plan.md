@@ -17,7 +17,7 @@ authoritative feature state remains in [project-status.md](../project-status.md)
 | 5.4 | `externalTrafficPolicy: Cluster` dataplane | **Verified** | Exact Node-address/port/protocol lookup, coherent service-bank validation, IPv4/IPv6 TCP/UDP DNAT with bounded collision-safe Node SNAT, paired reverse restoration, deterministic slots, connection persistence, backend policy ordering, checksum/provenance packet execution; `make nodeport-cluster-dataplane-test`; ADR 0086 |
 | 5.5 | `externalTrafficPolicy: Local` | **Verified** | Deterministic per-Node slot namespace merged transactionally with the service bank; ready/non-terminating placement eligibility; source preservation; exact no-local-backend drop; placement/readiness loss, established-flow retention, recovery, reverse translation, and backend policy ordering; NodePort/LoadBalancer health-check boundary; `make nodeport-local-dataplane-test`; ADR 0087 |
 | 5.6 | NodePort operations | **Verified** | Fixed-width event classification; label-free metrics; status v5; export/history/checkpoint v5/v6/v5; filtered explanation; read-only simulation; actionable bounded failures; restart migration; `make nodeport-operations-test`; ADR 0088 |
-| 5.7 | Kube-proxy-free Kind qualification | **Planned** | Cross-node dual-stack NodePort lifecycle, controller outage, source/destination agent replacement, cleanup, and exact rollback |
+| 5.7 | Kube-proxy-free Kind qualification | **Implemented** | `make nodeport-kind-test` now encodes cross-node dual-stack Cluster/Local lifecycle, source and reverse tuple checks, retained UDP connections, classified operations, controller outage, both worker-agent replacements, cleanup, exact rollback, and schema-v2 evidence; execution on committed images remains the verification gate; ADR 0089 |
 | 5.8 | OpenShift qualification | **Planned** | Digest-pinned RHCOS/SELinux/CRI-O rollout and kube-proxy-free cross-worker NodePort lifecycle/recovery on the exact disposable tuple |
 
 ## Accepted Phase 5 gate
@@ -41,7 +41,7 @@ availability/scale require independent later gates.
 
 ## Immediate next slice
 
-Phase 5.7 must qualify the committed operations-capable images on the dedicated
+Phase 5.7's implemented gate must qualify the committed operations-capable images on the dedicated
 three-Node dual-stack primary-CNI Kind fixture with kube-proxy absent. The gate
 must cover cross-node IPv4/IPv6 TCP/UDP for both traffic policies, source/reverse
 tuples, readiness/termination/deletion/local-loss recovery, controller outage,

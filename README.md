@@ -212,6 +212,13 @@ outcome counts; schema-v5 export plus schema-v6 history retain the class across
 bounded schema-v5 checkpoint recovery; explanation can filter it; and
 `unfctl service-simulate` predicts exact current Node/address/port/protocol
 eligibility without mutation. ADR 0088 records the schema and restart boundary.
+Phase 5.7's repeatable `make nodeport-kind-test` gate is implemented as a strict
+superset of the kube-proxy-free dual-stack Service fixture. It covers both
+traffic policies through exact worker addresses, source/reverse tuple behavior,
+retained UDP flows across readiness withdrawal, lifecycle failure and recovery,
+classified operations, controller-offline worker-agent replacement, empty-map
+cleanup, exact ABI-v5 rollback, and immutable evidence. ADR 0089 defines the
+gate; a committed-image execution is required before it is marked Verified.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

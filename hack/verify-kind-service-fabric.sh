@@ -5,7 +5,17 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 kubeconfig=${KUBECONFIG:-"${project_root}/.tools/kind-unf-service-dev.kubeconfig"}
 context=${KUBE_CONTEXT:-kind-unf-service-dev}
 container_runtime=${KIND_PROVIDER:-podman}
-artifact=${UNF_SERVICE_KIND_EVIDENCE:-"${project_root}/.artifacts/phase4-service-kind.json"}
+node_port_mode=${UNF_NODEPORT_KIND:-false}
+if [[ ${node_port_mode} != true && ${node_port_mode} != false ]]; then
+    echo "UNF_NODEPORT_KIND must be true or false" >&2
+    exit 1
+fi
+if [[ ${node_port_mode} == true ]]; then
+    default_artifact="${project_root}/.artifacts/phase5-nodeport-kind.json"
+else
+    default_artifact="${project_root}/.artifacts/phase4-service-kind.json"
+fi
+artifact=${UNF_SERVICE_KIND_EVIDENCE:-"${default_artifact}"}
 controller_port=${UNF_SERVICE_KIND_CONTROLLER_PORT:-19966}
 unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 namespace=unf-service-qualification
@@ -14,6 +24,7 @@ temporary_dir=$(mktemp -d)
 forward_pid=
 controller_scaled_down=false
 qualification_stage=initialization
+started_unix_seconds=$(date +%s)
 
 report_failure() {
     local status=$?
@@ -52,6 +63,12 @@ fi
 client_node=${workers[0]}
 server_node=${workers[1]}
 mapfile -t nodes < <(printf '%s\n' "${control_plane}" "${workers[@]}" | sort)
+client_node_json=$("${kc[@]}" get node "${client_node}" -o json)
+server_node_json=$("${kc[@]}" get node "${server_node}" -o json)
+client_node_v4=$(jq -er '[.status.addresses[] | select(.type == "InternalIP") | .address | select(contains("."))][0]' <<<"${client_node_json}")
+client_node_v6=$(jq -er '[.status.addresses[] | select(.type == "InternalIP") | .address | select(contains(":"))][0]' <<<"${client_node_json}")
+server_node_v4=$(jq -er '[.status.addresses[] | select(.type == "InternalIP") | .address | select(contains("."))][0]' <<<"${server_node_json}")
+server_node_v6=$(jq -er '[.status.addresses[] | select(.type == "InternalIP") | .address | select(contains(":"))][0]' <<<"${server_node_json}")
 
 controller_raw() {
     local path=$1
@@ -76,7 +93,7 @@ wait_for_convergence() {
     for _ in $(seq 1 180); do
         snapshot=$(controller_raw /v1/state/agents 2>/dev/null || true)
         if jq -e --argjson expected "${#nodes[@]}" '
-            .schema_version == 4
+            .schema_version == 5
             and .expected_agents == $expected
             and .reporting_agents == $expected
             and .missing_agents == 0
@@ -102,13 +119,15 @@ wait_for_service_shape() {
     local expected_services=$1
     local expected_frontends=$2
     local expected_backends=$3
+    local expected_node_ports=${4:--1}
     local status=
     for _ in $(seq 1 120); do
         status=$(controller_raw /v1/status 2>/dev/null || true)
         if jq -e \
             --argjson services "${expected_services}" \
             --argjson frontends "${expected_frontends}" \
-            --argjson backends "${expected_backends}" '
+            --argjson backends "${expected_backends}" \
+            --argjson node_ports "${expected_node_ports}" '
                 .compiled_services == $services
                 and .compiled_service_frontends == $frontends
                 and .compiled_service_backends == $backends
@@ -117,7 +136,12 @@ wait_for_service_shape() {
                 and all(.agents.nodes[];
                     .report.service_count == $services
                     and .report.service_frontend_count == $frontends
-                    and .report.service_backend_count == $backends)
+                    and .report.service_backend_count == $backends
+                    and ($node_ports < 0 or (
+                        .report.desired_node_port_frontend_count == $node_ports
+                        and .report.applied_node_port_frontend_count == $node_ports
+                        and .report.node_port_cluster_frontend_count == ($node_ports / 2)
+                        and .report.node_port_local_frontend_count == ($node_ports / 2))))
             ' <<<"${status}" >/dev/null 2>&1; then
             printf '%s\n' "${status}"
             return 0
@@ -147,21 +171,70 @@ attachment_names() {
 
 tcp_probe() {
     local address=$1
+    local port=${2:-8080}
     "${kc[@]}" -n "${namespace}" exec client -- \
-        wget -T 4 -t 1 -qO- "http://${address}:8080/health" | grep -qx ok
+        wget -T 4 -t 1 -qO- "http://${address}:${port}/health" | grep -qx ok
 }
 
 udp_probe() {
     local family=$1
     local address=$2
+    local port=${3:-5353}
     local target
     if [[ ${family} == 4 ]]; then
-        target="UDP4:${address}:5353"
+        target="UDP4:${address}:${port}"
     else
-        target="UDP6:[${address}]:5353"
+        target="UDP6:[${address}]:${port}"
     fi
     "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
         "printf udp-ok | socat -T 4 - '${target}'" | grep -qx udp-ok
+}
+
+udp_probe_with_source_port() {
+    local family=$1
+    local address=$2
+    local port=$3
+    local source_port=$4
+    local target
+    if [[ ${family} == 4 ]]; then
+        target="UDP4:${address}:${port},sourceport=${source_port},reuseaddr"
+    else
+        target="UDP6:[${address}]:${port},sourceport=${source_port},reuseaddr"
+    fi
+    "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
+        "printf retained | socat -T 4 - '${target}'" | grep -qx retained
+}
+
+retained_node_port_matrix() {
+    [[ ${node_port_mode} == true ]] || return 0
+    udp_probe_with_source_port 4 "${client_node_v4}" 30053 42001
+    udp_probe_with_source_port 6 "${client_node_v6}" 30053 42002
+    udp_probe_with_source_port 4 "${server_node_v4}" 31053 42003
+    udp_probe_with_source_port 6 "${server_node_v6}" 31053 42004
+}
+
+source_probe() {
+    local family=$1
+    local address=$2
+    local port=$3
+    local target
+    if [[ ${family} == 4 ]]; then
+        target="TCP4:${address}:${port}"
+    else
+        target="TCP6:[${address}]:${port}"
+    fi
+    "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
+        "printf probe | socat -T 4 - '${target}'" | tr -d '\r\n'
+}
+
+verify_node_port_sources() {
+    [[ ${node_port_mode} == true ]] || return 0
+    [[ $(source_probe 4 "${client_node_v4}" 30081) == "${client_node_v4}" ]]
+    [[ $(source_probe 6 "${client_node_v6}" 30081) == "${client_node_v6}" ]]
+    [[ $(source_probe 4 "${server_node_v4}" 30081) == "${server_node_v4}" ]]
+    [[ $(source_probe 6 "${server_node_v6}" 30081) == "${server_node_v6}" ]]
+    [[ $(source_probe 4 "${server_node_v4}" 31081) == "${client_v4}" ]]
+    [[ $(source_probe 6 "${server_node_v6}" 31081) == "${client_v6}" ]]
 }
 
 service_probe_matrix() {
@@ -169,6 +242,41 @@ service_probe_matrix() {
     tcp_probe "[${service_v6}]"
     udp_probe 4 "${service_v4}"
     udp_probe 6 "${service_v6}"
+}
+
+node_port_probe_matrix() {
+    [[ ${node_port_mode} == true ]] || return 0
+    tcp_probe "${client_node_v4}" 30080
+    tcp_probe "[${client_node_v6}]" 30080
+    tcp_probe "${server_node_v4}" 30080
+    tcp_probe "[${server_node_v6}]" 30080
+    udp_probe 4 "${client_node_v4}" 30053
+    udp_probe 6 "${client_node_v6}" 30053
+    udp_probe 4 "${server_node_v4}" 30053
+    udp_probe 6 "${server_node_v6}" 30053
+
+    tcp_probe "${server_node_v4}" 31080
+    tcp_probe "[${server_node_v6}]" 31080
+    udp_probe 4 "${server_node_v4}" 31053
+    udp_probe 6 "${server_node_v6}" 31053
+    expect_local_node_port_blocked
+}
+
+expect_local_node_port_blocked() {
+    local succeeded=false
+    if tcp_probe "${client_node_v4}" 31080 >/dev/null 2>&1; then succeeded=true; fi
+    if tcp_probe "[${client_node_v6}]" 31080 >/dev/null 2>&1; then succeeded=true; fi
+    if udp_probe 4 "${client_node_v4}" 31053 >/dev/null 2>&1; then succeeded=true; fi
+    if udp_probe 6 "${client_node_v6}" 31053 >/dev/null 2>&1; then succeeded=true; fi
+    if [[ ${succeeded} == true ]]; then
+        echo "Local NodePort unexpectedly forwarded without a local backend" >&2
+        return 1
+    fi
+}
+
+active_probe_matrix() {
+    service_probe_matrix
+    node_port_probe_matrix
 }
 
 expect_service_matrix_blocked() {
@@ -179,6 +287,33 @@ expect_service_matrix_blocked() {
     if udp_probe 6 "${service_v6}" >/dev/null 2>&1; then succeeded=true; fi
     if [[ ${succeeded} == true ]]; then
         echo "backendless Service unexpectedly forwarded traffic" >&2
+        return 1
+    fi
+}
+
+expect_all_service_frontends_blocked() {
+    expect_service_matrix_blocked
+    [[ ${node_port_mode} == true ]] || return 0
+    local succeeded=false
+    for endpoint in \
+        "4 ${client_node_v4} 30080 tcp" "6 ${client_node_v6} 30080 tcp" \
+        "4 ${server_node_v4} 30080 tcp" "6 ${server_node_v6} 30080 tcp" \
+        "4 ${client_node_v4} 31080 tcp" "6 ${client_node_v6} 31080 tcp" \
+        "4 ${server_node_v4} 31080 tcp" "6 ${server_node_v6} 31080 tcp" \
+        "4 ${client_node_v4} 30053 udp" "6 ${client_node_v6} 30053 udp" \
+        "4 ${server_node_v4} 30053 udp" "6 ${server_node_v6} 30053 udp" \
+        "4 ${client_node_v4} 31053 udp" "6 ${client_node_v6} 31053 udp" \
+        "4 ${server_node_v4} 31053 udp" "6 ${server_node_v6} 31053 udp"; do
+        read -r family address port protocol <<<"${endpoint}"
+        if [[ ${protocol} == tcp ]]; then
+            if [[ ${family} == 6 ]]; then address="[${address}]"; fi
+            if tcp_probe "${address}" "${port}" >/dev/null 2>&1; then succeeded=true; fi
+        elif udp_probe "${family}" "${address}" "${port}" >/dev/null 2>&1; then
+            succeeded=true
+        fi
+    done
+    if [[ ${succeeded} == true ]]; then
+        echo "backendless NodePort unexpectedly forwarded traffic" >&2
         return 1
     fi
 }
@@ -205,6 +340,8 @@ spec:
         - |
           socat UDP4-RECVFROM:5353,reuseaddr,fork EXEC:/bin/cat &
           socat UDP6-RECVFROM:5353,reuseaddr,fork,ipv6-v6only=1 EXEC:/bin/cat &
+          socat TCP4-LISTEN:8081,reuseaddr,fork "SYSTEM:echo \$SOCAT_PEERADDR" &
+          socat TCP6-LISTEN:8081,reuseaddr,fork,ipv6-v6only=1 "SYSTEM:echo \$SOCAT_PEERADDR" &
           exec /usr/local/bin/unf-flow-receiver 8080
       readinessProbe:
         exec:
@@ -296,6 +433,67 @@ spec:
       port: 5353
       targetPort: 5353
 EOF
+if [[ ${node_port_mode} == true ]]; then
+    "${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: server-cluster
+  namespace: ${namespace}
+spec:
+  type: NodePort
+  externalTrafficPolicy: Cluster
+  ipFamilyPolicy: RequireDualStack
+  ipFamilies: [IPv4, IPv6]
+  selector:
+    app: service-server
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080
+    - name: echo
+      protocol: UDP
+      port: 5353
+      targetPort: 5353
+      nodePort: 30053
+    - name: source
+      protocol: TCP
+      port: 8081
+      targetPort: 8081
+      nodePort: 30081
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: server-local
+  namespace: ${namespace}
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  ipFamilyPolicy: RequireDualStack
+  ipFamilies: [IPv4, IPv6]
+  selector:
+    app: service-server
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+      nodePort: 31080
+    - name: echo
+      protocol: UDP
+      port: 5353
+      targetPort: 5353
+      nodePort: 31053
+    - name: source
+      protocol: TCP
+      port: 8081
+      targetPort: 8081
+      nodePort: 31081
+EOF
+fi
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/client pod/server \
     --timeout=180s >/dev/null
 wait_for_convergence
@@ -303,6 +501,9 @@ wait_for_convergence
 server_json=$("${kc[@]}" -n "${namespace}" get pod server -o json)
 server_v4=$(jq -r '.status.podIPs[].ip | select(contains("."))' <<<"${server_json}")
 server_v6=$(jq -r '.status.podIPs[].ip | select(contains(":"))' <<<"${server_json}")
+client_json=$("${kc[@]}" -n "${namespace}" get pod client -o json)
+client_v4=$(jq -r '.status.podIPs[].ip | select(contains("."))' <<<"${client_json}")
+client_v6=$(jq -r '.status.podIPs[].ip | select(contains(":"))' <<<"${client_json}")
 mapfile -t service_ips < <("${kc[@]}" -n "${namespace}" get service server \
     -o json | jq -r '.spec.clusterIPs[]')
 service_v4=${service_ips[0]}
@@ -317,11 +518,20 @@ server_link=$(comm -13 <(printf '%s\n' "${server_names_before}") \
 [[ -n ${client_link} && ${client_link} != *$'\n'* ]]
 [[ -n ${server_link} && ${server_link} != *$'\n'* ]]
 
-expected_services=$((baseline_services + 1))
-expected_frontends=$((baseline_frontends + 4))
-expected_backends=$((baseline_backends + 4))
+if [[ ${node_port_mode} == true ]]; then
+    expected_services=$((baseline_services + 3))
+    expected_frontends=$((baseline_frontends + 16))
+    expected_backends=$((baseline_backends + 16))
+    expected_node_ports=12
+else
+    expected_services=$((baseline_services + 1))
+    expected_frontends=$((baseline_frontends + 4))
+    expected_backends=$((baseline_backends + 4))
+    expected_node_ports=-1
+fi
 active_status=$(wait_for_service_shape \
-    "${expected_services}" "${expected_frontends}" "${expected_backends}")
+    "${expected_services}" "${expected_frontends}" "${expected_backends}" \
+    "${expected_node_ports}")
 active_revision=$(jq -r .compiled_service_revision <<<"${active_status}")
 
 qualification_stage=direct-and-clusterip-forwarding
@@ -330,8 +540,9 @@ tcp_probe "[${server_v6}]"
 udp_probe 4 "${server_v4}"
 udp_probe 6 "${server_v6}"
 for _ in $(seq 1 8); do
-    service_probe_matrix
+    active_probe_matrix
 done
+verify_node_port_sources
 
 qualification_stage=dns-continuity
 service_resolution=$("${kc[@]}" -n "${namespace}" exec client -- getent ahosts server)
@@ -345,7 +556,7 @@ history=
 for _ in $(seq 1 90); do
     history=$(controller_raw /v1/flows 2>/dev/null || true)
     if jq -e --arg v4 "${service_v4}" --arg v6 "${service_v6}" '
-        .schema_version == 5
+        .schema_version == 6
         and any(.entries[]; .key.destination_ipv4 == $v4 and .key.protocol == 6 and .service.action == 1)
         and any(.entries[]; .key.destination_ipv4 == $v4 and .key.protocol == 17 and .service.action == 1)
         and any(.entries[]; .key.destination_ipv6 == $v6 and .key.protocol == 6 and .service.action == 1)
@@ -397,7 +608,135 @@ jq -e --argjson service_id "${service_id}" '
     and any(.outcomes[]; .service.action == 1 and .service.backend_id > 0)
 ' <<<"${explanation}" >/dev/null
 
+if [[ ${node_port_mode} == true ]]; then
+    qualification_stage=nodeport-observability-and-simulation
+    for _ in $(seq 1 90); do
+        history=$(controller_raw /v1/flows 2>/dev/null || true)
+        if jq -e \
+            --arg client_v4 "${client_node_v4}" --arg client_v6 "${client_node_v6}" \
+            --arg server_v4 "${server_node_v4}" --arg server_v6 "${server_node_v6}" '
+            .schema_version == 6
+            and any(.entries[];
+                .key.destination_ipv4 == $client_v4 and .key.destination_port == 30080
+                and .key.protocol == 6 and .service.frontend_kind == "node_port_cluster"
+                and .service.action == 1)
+            and any(.entries[];
+                .key.destination_ipv6 == $client_v6 and .key.destination_port == 30053
+                and .key.protocol == 17 and .service.frontend_kind == "node_port_cluster"
+                and .service.action == 1)
+            and any(.entries[];
+                .key.destination_ipv4 == $server_v4 and .key.destination_port == 31080
+                and .key.protocol == 6 and .service.frontend_kind == "node_port_local"
+                and .service.action == 1)
+            and any(.entries[];
+                .key.destination_ipv6 == $server_v6 and .key.destination_port == 31053
+                and .key.protocol == 17 and .service.frontend_kind == "node_port_local"
+                and .service.action == 1)
+            and any(.entries[];
+                .key.destination_ipv4 == $client_v4 and .key.destination_port == 31080
+                and .service.frontend_kind == "node_port_local"
+                and .service.action == 2 and .service.reason == 3)
+        ' <<<"${history}" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    cluster_service_id=$(jq -r --arg address "${client_node_v4}" '
+        [.entries[] | select(
+            .key.destination_ipv4 == $address
+            and .service.frontend_kind == "node_port_cluster"
+            and .service.action == 1)][0].service.service_id
+    ' <<<"${history}")
+    local_service_id=$(jq -r --arg address "${server_node_v4}" '
+        [.entries[] | select(
+            .key.destination_ipv4 == $address
+            and .service.frontend_kind == "node_port_local"
+            and .service.action == 1)][0].service.service_id
+    ' <<<"${history}")
+    [[ ${cluster_service_id} =~ ^[1-9][0-9]*$ ]]
+    [[ ${local_service_id} =~ ^[1-9][0-9]*$ ]]
+
+    agent_snapshot=$(controller_raw /v1/state/agents)
+    jq -e --arg client_node "${client_node}" --arg server_node "${server_node}" '
+        all(.nodes[];
+            .report.invalid_service_events == 0
+            and .report.desired_node_port_frontend_count == 12
+            and .report.applied_node_port_frontend_count == 12
+            and .report.node_port_cluster_frontend_count == 6
+            and .report.node_port_local_frontend_count == 6)
+        and any(.nodes[];
+            .node_name == $client_node
+            and .report.node_port_cluster_translations > 0
+            and .report.node_port_no_backend_drops > 0)
+        and any(.nodes[];
+            .node_name == $server_node
+            and .report.node_port_cluster_translations > 0
+            and .report.node_port_local_translations > 0)
+    ' <<<"${agent_snapshot}" >/dev/null
+    while read -r agent_pod; do
+        metrics=$(agent_raw "${agent_pod}" /metrics)
+        grep -Eq '^unf_nodeport_frontend_count 12(\.0)?$' <<<"${metrics}"
+        grep -Eq '^unf_nodeport_cluster_frontend_count 6(\.0)?$' <<<"${metrics}"
+        grep -Eq '^unf_nodeport_local_frontend_count 6(\.0)?$' <<<"${metrics}"
+        grep -q '^unf_nodeport_cluster_translations' <<<"${metrics}"
+        grep -q '^unf_nodeport_local_translations' <<<"${metrics}"
+        grep -q '^unf_nodeport_no_backend_drops' <<<"${metrics}"
+    done < <("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+
+    cluster_explanation=$("${unfctl}" --controller-url "http://127.0.0.1:${controller_port}" \
+        --output json service-explain --service-id "${cluster_service_id}" \
+        --frontend-kind node-port-cluster --last 15m --limit 100)
+    local_explanation=$("${unfctl}" --controller-url "http://127.0.0.1:${controller_port}" \
+        --output json service-explain --service-id "${local_service_id}" \
+        --frontend-kind node-port-local --last 15m --limit 100)
+    jq -e --argjson service_id "${cluster_service_id}" '
+        .schema_version == 1 and .service_id == $service_id
+        and .frontend_kind == "node_port_cluster"
+        and .current_service.name == "server-cluster"
+        and any(.outcomes[]; .service.action == 1)
+    ' <<<"${cluster_explanation}" >/dev/null
+    jq -e --argjson service_id "${local_service_id}" '
+        .schema_version == 1 and .service_id == $service_id
+        and .frontend_kind == "node_port_local"
+        and .current_service.name == "server-local"
+        and any(.outcomes[]; .service.action == 1)
+        and any(.outcomes[]; .service.action == 2 and .service.reason == 3)
+    ' <<<"${local_explanation}" >/dev/null
+
+    simulation_revision_before=$(controller_raw /v1/status | jq -er .compiled_service_revision)
+    cluster_simulation=$("${unfctl}" --controller-url "http://127.0.0.1:${controller_port}" \
+        --output json service-simulate --node "${client_node}" \
+        --address "${client_node_v4}" --port 30080 --protocol tcp)
+    local_simulation=$("${unfctl}" --controller-url "http://127.0.0.1:${controller_port}" \
+        --output json service-simulate --node "${server_node}" \
+        --address "${server_node_v6}" --port 31080 --protocol tcp)
+    blocked_simulation=$("${unfctl}" --controller-url "http://127.0.0.1:${controller_port}" \
+        --output json service-simulate --node "${client_node}" \
+        --address "${client_node_v4}" --port 31080 --protocol tcp)
+    jq -e '
+        .schema_version == 1 and .name == "server-cluster"
+        and .frontend_kind == "node_port_cluster"
+        and .traffic_policy == "cluster" and .source_preserved == false
+        and .decision == "translate" and (.eligible_backend_ids | length) > 0
+    ' <<<"${cluster_simulation}" >/dev/null
+    jq -e '
+        .schema_version == 1 and .name == "server-local"
+        and .frontend_kind == "node_port_local"
+        and .traffic_policy == "local" and .source_preserved == true
+        and .decision == "translate" and (.eligible_backend_ids | length) > 0
+    ' <<<"${local_simulation}" >/dev/null
+    jq -e '
+        .schema_version == 1 and .name == "server-local"
+        and .frontend_kind == "node_port_local"
+        and .traffic_policy == "local" and .source_preserved == true
+        and .decision == "drop_no_backend" and (.eligible_backend_ids | length) == 0
+    ' <<<"${blocked_simulation}" >/dev/null
+    [[ $(controller_raw /v1/status | jq -er .compiled_service_revision) == "${simulation_revision_before}" ]]
+fi
+
 qualification_stage=readiness-withdrawal
+retained_node_port_matrix
 "${kc[@]}" -n "${namespace}" exec server -- touch /tmp/unready
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready=false pod/server --timeout=60s >/dev/null
 for _ in $(seq 1 90); do
@@ -409,7 +748,8 @@ for _ in $(seq 1 90); do
     sleep 1
 done
 wait_for_convergence
-expect_service_matrix_blocked
+expect_all_service_frontends_blocked
+retained_node_port_matrix
 for _ in $(seq 1 90); do
     history=$(controller_raw /v1/flows 2>/dev/null || true)
     if jq -e --argjson service_id "${service_id}" '
@@ -429,7 +769,7 @@ jq -e --argjson service_id "${service_id}" '
 "${kc[@]}" -n "${namespace}" exec server -- rm -f /tmp/unready
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/server --timeout=60s >/dev/null
 wait_for_convergence
-service_probe_matrix
+active_probe_matrix
 
 qualification_stage=termination-and-deletion
 "${kc[@]}" -n "${namespace}" delete pod server --wait=false >/dev/null
@@ -445,7 +785,7 @@ done
     -l kubernetes.io/service-name=server -o json \
     | jq -e 'any(.items[] | (.endpoints // [])[]; .conditions.terminating == true)' >/dev/null
 wait_for_convergence
-expect_service_matrix_blocked
+expect_all_service_frontends_blocked
 "${kc[@]}" -n "${namespace}" wait --for=delete pod/server --timeout=90s >/dev/null
 for _ in $(seq 1 90); do
     endpoint_count=$("${kc[@]}" -n "${namespace}" get endpointslice \
@@ -456,16 +796,17 @@ for _ in $(seq 1 90); do
 done
 [[ ${endpoint_count} -eq 0 ]]
 wait_for_convergence
-expect_service_matrix_blocked
+expect_all_service_frontends_blocked
 
 qualification_stage=backend-recovery
 apply_server
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/server --timeout=180s >/dev/null
 recovered_status=$(wait_for_service_shape \
-    "${expected_services}" "${expected_frontends}" "${expected_backends}")
+    "${expected_services}" "${expected_frontends}" "${expected_backends}" \
+    "${expected_node_ports}")
 recovered_revision=$(jq -r .compiled_service_revision <<<"${recovered_status}")
 (( recovered_revision > active_revision ))
-service_probe_matrix
+active_probe_matrix
 
 qualification_stage=controller-outage-agent-recovery
 "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=0 >/dev/null
@@ -476,7 +817,7 @@ for replacement_node in "${client_node}" "${server_node}"; do
     probe_log="${temporary_dir}/probe-${replacement_node}.log"
     (
         for _ in $(seq 1 30); do
-            service_probe_matrix
+            active_probe_matrix
         done
     ) >"${probe_log}" 2>&1 &
     probe_pid=$!
@@ -490,7 +831,7 @@ for replacement_node in "${client_node}" "${server_node}"; do
     [[ ${new_agent} != "${old_agent}" ]]
     recovered_agent_status=$(agent_raw "${new_agent}" /v1/status)
     jq -e '
-        .schema_version == 4
+        .schema_version == 5
         and .ready and .bpf_loaded
         and .desired_service_revision > 0
         and .applied_service_revision == .desired_service_revision
@@ -506,7 +847,7 @@ for replacement_node in "${client_node}" "${server_node}"; do
         snapshot=/var/lib/unf/cni/v1/service-snapshot.json
         test -f "$snapshot"
         test "$(stat -c %a "$snapshot")" = 600
-        jq -e ".schemaVersion == 1 and .revision > 0 and (.services | length) > 0" "$snapshot" >/dev/null
+        jq -e "if has(\"service\") then .schemaVersion == 1 and .service.schemaVersion == 2 and .service.revision > 0 and (.service.services | length) > 0 and .nodePortNode.schemaVersion == 1 else .schemaVersion == 1 and .revision > 0 and (.services | length) > 0 end" "$snapshot" >/dev/null
         test -e /sys/fs/bpf/unf/v5/SERVICE_CONFIG
         test -e /sys/fs/bpf/unf/v5/SERVICE_FRONTENDS_V4
         test -e /sys/fs/bpf/unf/v5/SERVICE_FRONTENDS_V6
@@ -521,7 +862,7 @@ done
 controller_scaled_down=false
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=180s >/dev/null
 wait_for_convergence
-service_probe_matrix
+active_probe_matrix
 
 qualification_stage=fixture-cleanup
 "${kc[@]}" delete namespace "${namespace}" --wait=true --timeout=180s >/dev/null
@@ -540,8 +881,20 @@ sudo "${container_runtime}" exec "${client_node}" sh -ec \
     "! ip link show '${client_link}' >/dev/null 2>&1"
 sudo "${container_runtime}" exec "${server_node}" sh -ec \
     "! ip link show '${server_link}' >/dev/null 2>&1"
+if [[ ${node_port_mode} == true ]]; then cleanup_node_ports=0; else cleanup_node_ports=-1; fi
 wait_for_service_shape "${baseline_services}" "${baseline_frontends}" "${baseline_backends}" \
+    "${cleanup_node_ports}" \
     >/dev/null
+if [[ ${node_port_mode} == true ]]; then
+    for node in "${nodes[@]}"; do
+        sudo "${container_runtime}" exec "${node}" sh -ec '
+            test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V4 | jq length)" -eq 0
+            test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V6 | jq length)" -eq 0
+            snapshot=/var/lib/unf/cni/v1/service-snapshot.json
+            jq -e ".schemaVersion == 1 and has(\"service\") == false and (.services | all(.nodePorts | length == 0))" "$snapshot" >/dev/null
+        '
+    done
+fi
 
 qualification_stage=evidence
 mkdir -p "$(dirname "${artifact}")"
@@ -558,7 +911,9 @@ while read -r agent_pod; do
 done < <("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 node_evidence=$("${kc[@]}" get nodes -o json | jq \
-    '[.items[] | {name:.metadata.name,podCIDRs:.spec.podCIDRs,internalIPs:[.status.addresses[] | select(.type=="InternalIP") | .address]}]')
+    '[.items[] | {name:.metadata.name,podCIDRs:.spec.podCIDRs,internalIPs:[.status.addresses[] | select(.type=="InternalIP") | .address],kernelVersion:.status.nodeInfo.kernelVersion,containerRuntimeVersion:.status.nodeInfo.containerRuntimeVersion,osImage:.status.nodeInfo.osImage}]')
+image_evidence=$("${kc[@]}" -n unf-system get pods -l 'app.kubernetes.io/name in (unf-controller,unf-agent)' -o json | jq \
+    '[.items[] | {pod:.metadata.name,node:.spec.nodeName,containers:[.status.containerStatuses[] | {name,image,imageID}]}]')
 final_agents=$(controller_raw /v1/state/agents)
 jq -n \
     --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -571,14 +926,56 @@ jq -n \
     --argjson activeRevision "${active_revision}" \
     --argjson recoveredRevision "${recovered_revision}" \
     --argjson nodes "${node_evidence}" \
+    --argjson images "${image_evidence}" \
     --argjson agents "${final_agents}" \
-    '{schemaVersion:1,generatedAt:$generatedAt,revision:$revision,context:$context,kubernetesVersion:$kubernetesVersion,kubeProxyPresent:false,service:{id:$serviceId,ipv4:$serviceIPv4,ipv6:$serviceIPv6,activeRevision:$activeRevision,recoveredRevision:$recoveredRevision},nodes:$nodes,agents:$agents,verified:["exclusive UNF primary CNI","kube-proxy absent","headless controller bootstrap","direct dual-stack Pod forwarding","IPv4 and IPv6 TCP ClusterIP","IPv4 and IPv6 UDP ClusterIP","DNS continuity through UNF Service translation","stable repeated connection translation","readiness withdrawal","terminating endpoint exclusion","backend deletion and recovery","no-backend drop provenance","metrics and agent status","durable flow history","unfctl service explanation","controller-outage source and destination agent replacement","last-known-good service recovery","desired service-map cleanup","CNI attachment and veth cleanup"]}' \
+    '{schemaVersion:1,generatedAt:$generatedAt,revision:$revision,context:$context,kubernetesVersion:$kubernetesVersion,kubeProxyPresent:false,service:{id:$serviceId,ipv4:$serviceIPv4,ipv6:$serviceIPv6,activeRevision:$activeRevision,recoveredRevision:$recoveredRevision},nodes:$nodes,images:$images,agents:$agents,verified:["exclusive UNF primary CNI","kube-proxy absent","headless controller bootstrap","direct dual-stack Pod forwarding","IPv4 and IPv6 TCP ClusterIP","IPv4 and IPv6 UDP ClusterIP","DNS continuity through UNF Service translation","stable repeated connection translation","readiness withdrawal","terminating endpoint exclusion","backend deletion and recovery","no-backend drop provenance","metrics and agent status","durable flow history","unfctl service explanation","controller-outage source and destination agent replacement","last-known-good service recovery","desired service-map cleanup","CNI attachment and veth cleanup"]}' \
     >"${artifact}"
+if [[ ${node_port_mode} == true ]]; then
+    jq \
+        --argjson durationSeconds "$(( $(date +%s) - started_unix_seconds ))" \
+        --arg clientNode "${client_node}" --arg serverNode "${server_node}" \
+        --arg clientNodeIPv4 "${client_node_v4}" --arg clientNodeIPv6 "${client_node_v6}" \
+        --arg serverNodeIPv4 "${server_node_v4}" --arg serverNodeIPv6 "${server_node_v6}" \
+        --argjson clusterServiceId "${cluster_service_id}" \
+        --argjson localServiceId "${local_service_id}" '
+        .schemaVersion = 2
+        | .phase = "5.7"
+        | .durationSeconds = $durationSeconds
+        | .nodePort = {
+            clusterServiceId:$clusterServiceId,
+            localServiceId:$localServiceId,
+            clientNode:{name:$clientNode,ipv4:$clientNodeIPv4,ipv6:$clientNodeIPv6},
+            serverNode:{name:$serverNode,ipv4:$serverNodeIPv4,ipv6:$serverNodeIPv6},
+            clusterPorts:{tcp:30080,udp:30053,source:30081},
+            localPorts:{tcp:31080,udp:31053,source:31081}
+        }
+        | .verified += [
+            "IPv4 and IPv6 TCP/UDP NodePort Cluster through both workers",
+            "IPv4 and IPv6 TCP/UDP NodePort Local through the backend worker",
+            "Local no-backend fail-closed behavior on the non-backend worker",
+            "Cluster Node source translation",
+            "Local client source preservation",
+            "reverse NodePort tuple restoration",
+            "established UDP NodePort retention across readiness withdrawal",
+            "NodePort readiness, termination, deletion, and recovery",
+            "NodePort classified metrics, status, history, and explanation",
+            "read-only exact NodePort simulation",
+            "controller-outage source and destination agent replacement with composite checkpoint",
+            "empty NodePort maps and legacy-format checkpoint after fixture cleanup"
+        ]
+        | .excluded = [
+            "SCTP","LoadBalancer","session affinity","topology-aware hints",
+            "Maglev","DSR","host-network clients","fragments",
+            "generic NAT RELATED tracking","production availability and scale"
+        ]
+    ' "${artifact}" >"${artifact}.tmp"
+    mv -f "${artifact}.tmp" "${artifact}"
+fi
 
 qualification_stage=exact-platform-rollback
 KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" KIND_PROVIDER="${container_runtime}" \
     "${project_root}/hack/rollback-kind-primary-cni.sh"
-jq '.verified += ["scoped ABI-v4 BPF cleanup","exact remote-route deletion","fingerprinted CNI artifact removal","CoreDNS bootstrap restoration","no-CNI baseline restoration"]' \
+jq '.verified += ["scoped ABI-v5 BPF cleanup","exact remote-route deletion","fingerprinted CNI artifact removal","CoreDNS bootstrap restoration","no-CNI baseline restoration"]' \
     "${artifact}" >"${artifact}.tmp"
 mv -f "${artifact}.tmp" "${artifact}"
 

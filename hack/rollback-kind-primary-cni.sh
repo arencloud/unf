@@ -82,7 +82,7 @@ spec:
           args:
             - cleanup
             - --abi-version
-            - "4"
+            - "5"
             - --allow-current-abi
             - --legacy-attachments
             - --all-interfaces
@@ -150,9 +150,7 @@ EOF
 
         test -f "$services" && test ! -L "$services"
         test "$(stat -c %a "$services")" = 600
-        test "$(jq -r .schemaVersion "$services")" = 1
-        test "$(jq -r .revision "$services")" -gt 0
-        test "$(jq ".services | length" "$services")" -gt 0
+        jq -e "if has(\"service\") then .schemaVersion == 1 and .service.schemaVersion == 2 and .service.revision > 0 and (.service.services | length) > 0 and .nodePortNode.schemaVersion == 1 else .schemaVersion == 1 and .revision > 0 and (.services | length) > 0 end" "$services" >/dev/null
 
         for temporary in \
             "${state_dir}/attachments.json.tmp" \
