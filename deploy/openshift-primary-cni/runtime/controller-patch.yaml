@@ -21,6 +21,16 @@ spec:
       containers:
         - name: controller
           imagePullPolicy: IfNotPresent
+          # The controller must be able to bootstrap while UNF's Service
+          # dataplane is unavailable on a rebooting host. The deployment gate
+          # replaces this sentinel with Infrastructure.status.apiServerInternalURI.
+          env:
+            - name: KUBERNETES_SERVICE_HOST
+              value: unf-primary-apiserver.internal.invalid
+            - name: KUBERNETES_SERVICE_PORT
+              value: "16443"
+            - name: KUBERNETES_SERVICE_PORT_HTTPS
+              value: "16443"
           # Initial relist/restore after broad Pod churn can hold the controller
           # longer than the generic one-second probe budget. Keep liveness
           # disabled until one health response succeeds, then tolerate bounded

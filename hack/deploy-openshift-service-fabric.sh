@@ -240,6 +240,7 @@ wait_for_machineconfig_render() {
 stage=cluster-preflight
 network=$("${kc[@]}" get network.config.openshift.io cluster -o json)
 operator_network=$("${kc[@]}" get network.operator.openshift.io cluster -o json)
+infrastructure_state=$("${kc[@]}" get infrastructure cluster -o json)
 jq -e '
     .spec.networkType == "None"
     and ([.spec.clusterNetwork[].cidr | contains(":")] | any)
@@ -257,6 +258,39 @@ for node in "${nodes[@]}"; do
     [[ $("${kc[@]}" get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]
 done
 [[ $("${kc[@]}" -n openshift-kube-proxy get daemonsets -o json | jq '.items | length') -eq 0 ]]
+
+stage=controller-bootstrap
+controller_node=$("${kc[@]}" -n unf-system get deployment/unf-controller -o jsonpath='{.spec.template.spec.nodeName}')
+controller_ipv4=$("${kc[@]}" get "node/${controller_node}" -o json | jq -r '
+    [.status.addresses[] | select(.type == "InternalIP" and (.address | contains(":") | not)) | .address]
+    | if length == 1 then .[0] else empty end')
+api_server_internal_uri=$(jq -er '.status.apiServerInternalURI' <<<"${infrastructure_state}")
+if [[ ! ${api_server_internal_uri} =~ ^https://([^:/]+):([0-9]+)$ ]]; then
+    echo "unsupported internal API URI: ${api_server_internal_uri}" >&2
+    exit 1
+fi
+api_server_internal_host=${BASH_REMATCH[1]}
+api_server_internal_port=${BASH_REMATCH[2]}
+[[ -n ${controller_node} && -n ${controller_ipv4} && -n ${api_server_internal_host} ]]
+rendered=$(mktemp)
+oc kustomize "${project_root}/deploy/openshift-primary-cni/runtime" >"${rendered}"
+sed -i -e "s/unf-primary-controller-node\.invalid/${controller_node}/g" \
+    -e "s/192\.0\.2\.1/${controller_ipv4}/g" \
+    -e "s/unf-primary-apiserver\.internal\.invalid/${api_server_internal_host}/g" \
+    -e "s/16443/${api_server_internal_port}/g" "${rendered}"
+grep -Fq "image: ${controller_image}" "${rendered}"
+[[ $(grep -Fc "image: ${agent_image}" "${rendered}") -eq 2 ]]
+grep -Fq "value: ${api_server_internal_host}" "${rendered}"
+[[ $(grep -Fc "value: \"${api_server_internal_port}\"" "${rendered}") -eq 2 ]]
+grep -A4 '^kind: DaemonSet$' "${rendered}" >/dev/null
+grep -q 'type: OnDelete' "${rendered}"
+"${kc[@]}" apply -f "${rendered}" >/dev/null
+[[ $("${kc[@]}" -n unf-system get daemonset/unf-agent -o jsonpath='{.spec.updateStrategy.type}') == OnDelete ]]
+
+stage=controller-first
+"${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=10m >/dev/null
+wait_for_controller
+[[ $("${kc[@]}" get --raw /readyz) == ok ]]
 
 stage=nodeport-host-contract
 "${kc[@]}" apply -f "${project_root}/deploy/openshift-primary-cni/machineconfig/master-forwarding.yaml" >/dev/null
@@ -277,28 +311,6 @@ for node in "${nodes[@]}"; do
     ' 2>&1)
     grep -q '^nodeport-host-ready$' <<<"${host_contract}"
 done
-
-stage=render-and-apply
-controller_node=$("${kc[@]}" -n unf-system get deployment/unf-controller -o jsonpath='{.spec.template.spec.nodeName}')
-controller_ipv4=$("${kc[@]}" get "node/${controller_node}" -o json | jq -r '
-    [.status.addresses[] | select(.type == "InternalIP" and (.address | contains(":") | not)) | .address]
-    | if length == 1 then .[0] else empty end')
-[[ -n ${controller_node} && -n ${controller_ipv4} ]]
-rendered=$(mktemp)
-oc kustomize "${project_root}/deploy/openshift-primary-cni/runtime" >"${rendered}"
-sed -i -e "s/unf-primary-controller-node\.invalid/${controller_node}/g" \
-    -e "s/192\.0\.2\.1/${controller_ipv4}/g" "${rendered}"
-grep -Fq "image: ${controller_image}" "${rendered}"
-[[ $(grep -Fc "image: ${agent_image}" "${rendered}") -eq 2 ]]
-grep -A4 '^kind: DaemonSet$' "${rendered}" >/dev/null
-grep -q 'type: OnDelete' "${rendered}"
-"${kc[@]}" apply -f "${rendered}" >/dev/null
-[[ $("${kc[@]}" -n unf-system get daemonset/unf-agent -o jsonpath='{.spec.updateStrategy.type}') == OnDelete ]]
-
-stage=controller-first
-"${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=10m >/dev/null
-wait_for_controller
-[[ $("${kc[@]}" get --raw /readyz) == ok ]]
 
 stage=node-serial-agent-transition
 transitioned='[]'
