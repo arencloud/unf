@@ -23,18 +23,22 @@ schema-v2 Phase 5.7 Kind result, and public Quay images resolved by digest. It:
    MachineConfigs and waits for both pools to finish rolling;
 2. verifies SELinux enforcement and every current interface's `rp_filter=0`
    and `accept_local=1` values;
-3. deploys the controller first, then replaces the `OnDelete` agent on one Node
-   at a time while kube-proxy remains absent;
+3. deploys the controller first, then replaces each `OnDelete` agent as soon as
+   its Node completes the MachineConfig reboot, so host-origin Kubernetes API
+   Service recovery cannot deadlock behind an ingress-router disruption budget;
 4. requires five-Node schema-v5 status convergence and ABI-v5 service/NodePort
    state while retaining ABI v4 only as a bounded rollback boundary;
-5. runs dual-stack TCP/UDP Cluster and Local NodePort through both workers,
+5. rejects functional `KUBE-SVC`/`KUBE-SEP` residue, proves the host-origin
+   Kubernetes API Service path on every rebooted Node, and then proves IPv4/IPv6
+   TCP/UDP host-network ClusterIP traffic on all five Nodes;
+6. runs dual-stack TCP/UDP Cluster and Local NodePort through both workers,
    including Node-SNAT versus client-source preservation, reverse tuples,
    readiness/termination/deletion recovery, and Local fail-closed behavior;
-6. replaces both worker agents independently while the controller is offline
+7. replaces both worker agents independently while the controller is offline
    and continuously probes ClusterIP and NodePort paths;
-7. verifies classified metrics/history/explanation, exact read-only simulation,
+8. verifies classified metrics/history/explanation, exact read-only simulation,
    empty NodePort maps and legacy checkpoint after fixture cleanup; and
-8. retires only the historical ABI-v4 maps, requires five-Node convergence, and
+9. retires only the historical ABI-v4 maps, requires five-Node convergence, and
    permits no new unhealthy ClusterOperator beyond the recorded baseline.
 
 Evidence is written locally as schema-v2
@@ -44,15 +48,17 @@ contents, projected tokens, and kubeadmin credentials are never included.
 ## Consequences
 
 - The MachineConfig change may reboot all five lab Nodes in pool-controlled
-  order before the product rollout begins.
+  order. Agent transition is interleaved after each completed Node reboot.
 - The disconnected Insights operator may remain in the baseline; any additional
   unavailable, degraded, or progressing operator fails the final comparison.
 - A live failure preserves kube-proxy absence and restores only temporary test
   resources/controller replicas. Operators inspect and repair the exact failed
   stage rather than silently widening the dataplane.
 - This remains a bounded NodePort claim. LoadBalancer, session affinity,
-  topology hints, Maglev, DSR, host-network clients, SCTP, fragments, generic
-  NAT `RELATED` tracking, and production availability/scale need later gates.
+  topology hints, Maglev, DSR, host-origin NodePort clients, SCTP, fragments,
+  generic NAT `RELATED` tracking, and production availability/scale need later
+  gates. Host-origin ClusterIP is included because OpenShift control-plane and
+  router components require it after a clean reboot.
 
 ## Verification
 

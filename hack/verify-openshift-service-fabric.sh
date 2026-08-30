@@ -301,6 +301,22 @@ service_matrix() {
     udp_probe 6 "${service_v6}"
 }
 
+host_service_matrix() {
+    local pod=$1 target source_port
+    "${kc[@]}" -n "${namespace}" exec "${pod}" -- \
+        wget -T 4 -t 1 -qO- "http://${service_v4}:8080/health" | grep -qx ok
+    "${kc[@]}" -n "${namespace}" exec "${pod}" -- \
+        wget -T 4 -t 1 -qO- "http://[${service_v6}]:8080/health" | grep -qx ok
+    source_port=$(qualification_source_port 32000 host 4 "${service_v4}" 5353)
+    target="UDP4:${service_v4}:5353,sourceport=${source_port},reuseaddr"
+    "${kc[@]}" -n "${namespace}" exec "${pod}" -- sh -ec \
+        "printf host-udp | socat -T 4 - '${target}'" | grep -qx host-udp
+    source_port=$(qualification_source_port 32000 host 6 "${service_v6}" 5353)
+    target="UDP6:[${service_v6}]:5353,sourceport=${source_port},reuseaddr"
+    "${kc[@]}" -n "${namespace}" exec "${pod}" -- sh -ec \
+        "printf host-udp | socat -T 4 - '${target}'" | grep -qx host-udp
+}
+
 node_port_matrix() {
     tcp_probe "${client_node_v4}" 30080
     tcp_probe "[${client_node_v6}]" 30080
@@ -614,6 +630,44 @@ spec:
       nodePort: 31081
 EOF
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/client pod/server --timeout=240s >/dev/null
+host_clients=()
+host_client_index=0
+for node in "${nodes[@]}"; do
+    host_client="host-client-${host_client_index}"
+    host_clients+=("${host_client}")
+    "${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${host_client}
+  namespace: ${namespace}
+  labels:
+    qualification.unf.io/role: host-client
+spec:
+  nodeName: ${node}
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  automountServiceAccountToken: false
+  tolerations:
+    - operator: Exists
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: client
+      image: ${test_tools_image}
+      imagePullPolicy: IfNotPresent
+      command: [sh, -ec, "sleep infinity"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+EOF
+    host_client_index=$((host_client_index + 1))
+done
+"${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod \
+    -l qualification.unf.io/role=host-client --timeout=240s >/dev/null
 service_snapshot=$(wait_for_service 4)
 service_id=$(jq -r --arg namespace "${namespace}" \
     '.services[] | select(.namespace == $namespace and .name == "server") | .id' <<<"${service_snapshot}")
@@ -639,6 +693,11 @@ server_node_v6=$(jq -r '.status.addresses[] | select(.type == "InternalIP" and (
 for address in "${client_v4}" "${client_v6}" "${client_node_v4}" "${client_node_v6}" \
     "${server_node_v4}" "${server_node_v6}"; do [[ -n ${address} ]]; done
 wait_for_convergence >/dev/null
+
+stage=host-origin-service-proof
+for host_client in "${host_clients[@]}"; do
+    host_service_matrix "${host_client}"
+done
 
 stage=pre-removal-service-proof
 for _ in $(seq 1 8); do active_matrix; done
@@ -923,6 +982,7 @@ jq -n --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       verified:["digest-pinned staged ABI-v4 to ABI-v5 transition","RHCOS and SELinux enforcement",
         "CRI-O primary-CNI lifecycle","kube-proxy and KUBE-SVC absence",
         "IPv4 and IPv6 TCP ClusterIP","IPv4 and IPv6 UDP ClusterIP",
+        "five-node IPv4 and IPv6 TCP/UDP host-origin ClusterIP",
         "DNS continuity","IPv4 and IPv6 TCP/UDP NodePort Cluster through both workers",
         "IPv4 and IPv6 TCP/UDP NodePort Local through the backend worker",
         "Local no-backend fail-closed behavior on the non-backend worker",

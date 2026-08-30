@@ -72,6 +72,12 @@ explanation, and read-only NodePort simulation; ADR 0088 defines the contract.
 
 On a ClusterIP lookup miss, ingress may perform an exact NodePort lookup only
 when both active pointers form a coherent epoch/revision/service-bank tuple.
+An uplink egress reverse-connection miss also performs the exact ClusterIP
+frontend lookup. This covers host-network and Node-origin traffic that never
+traverses a workload-veth ingress hook; workload traffic is already translated
+before uplink egress and therefore cannot match the frontend a second time.
+Replies use the same paired reverse connection and ingress-side source
+restoration as workload-originated Service traffic.
 `Cluster` forwarding stores the original client and Node frontend, selects a
 bounded collision-safe high source port, and rewrites the forward source to the
 receiving Node so cross-node replies return through the owning connection. The

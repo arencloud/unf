@@ -237,6 +237,43 @@ wait_for_machineconfig_render() {
     return 1
 }
 
+node_machineconfig_pool() {
+    local node=$1
+    if "${kc[@]}" get "node/${node}" -o json \
+        | jq -e '.metadata.labels | has("node-role.kubernetes.io/master")' >/dev/null; then
+        printf 'master\n'
+    else
+        printf 'worker\n'
+    fi
+}
+
+assert_host_service_path() {
+    local node=$1 probe
+    probe=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host \
+        sh -euc '
+            curl -fsSk --connect-timeout 5 --max-time 10 "$1" | grep -qx ok
+            echo host-service-ready
+        ' sh "https://${kubernetes_service_ipv4}:443/readyz" 2>&1)
+    grep -q '^host-service-ready$' <<<"${probe}"
+}
+
+transition_agent() {
+    local node=$1 pod current_image old_uid
+    pod=$(agent_pod_on_node "${node}")
+    [[ -n ${pod} ]]
+    current_image=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.spec.containers[0].image}')
+    if [[ ${current_image} != "${agent_image}" ]]; then
+        old_uid=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.metadata.uid}')
+        echo "transitioning UNF agent on ${node} to persistent BPF ABI v5"
+        "${kc[@]}" -n unf-system delete pod "${pod}" --wait=false >/dev/null
+        wait_for_agent_replacement "${node}" "${old_uid}"
+    fi
+    assert_agent "${node}"
+    assert_host_service_path "${node}"
+    [[ $("${kc[@]}" get --raw /readyz) == ok ]]
+    [[ $("${kc[@]}" get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]
+}
+
 stage=cluster-preflight
 network=$("${kc[@]}" get network.config.openshift.io cluster -o json)
 operator_network=$("${kc[@]}" get network.operator.openshift.io cluster -o json)
@@ -258,6 +295,10 @@ for node in "${nodes[@]}"; do
     [[ $("${kc[@]}" get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]
 done
 [[ $("${kc[@]}" -n openshift-kube-proxy get daemonsets -o json | jq '.items | length') -eq 0 ]]
+kubernetes_service=$("${kc[@]}" -n default get service kubernetes -o json)
+kubernetes_service_ipv4=$(jq -r '[.spec.clusterIPs[] | select(contains(":") | not)] | if length == 1 then .[0] else empty end' \
+    <<<"${kubernetes_service}")
+[[ -n ${kubernetes_service_ipv4} ]]
 
 stage=controller-bootstrap
 controller_node=$("${kc[@]}" -n unf-system get deployment/unf-controller -o jsonpath='{.spec.template.spec.nodeName}')
@@ -297,7 +338,51 @@ stage=nodeport-host-contract
 "${kc[@]}" apply -f "${project_root}/deploy/openshift-primary-cni/machineconfig/worker-forwarding.yaml" >/dev/null
 wait_for_machineconfig_render master 99-unf-primary-master-forwarding
 wait_for_machineconfig_render worker 99-unf-primary-worker-forwarding
-"${kc[@]}" wait mcp/master mcp/worker --for=condition=Updated --timeout=45m >/dev/null
+master_rendered=$("${kc[@]}" get machineconfigpool/master -o jsonpath='{.spec.configuration.name}')
+worker_rendered=$("${kc[@]}" get machineconfigpool/worker -o jsonpath='{.spec.configuration.name}')
+transitioned='[]'
+declare -A transition_complete=()
+rollout_complete=false
+for _ in $(seq 1 540); do
+    for pool in master worker; do
+        if "${kc[@]}" get "machineconfigpool/${pool}" -o json | jq -e '
+            any(.status.conditions[];
+                (.type == "Degraded" or .type == "NodeDegraded") and .status == "True")
+        ' >/dev/null; then
+            echo "MachineConfigPool ${pool} degraded during the NodePort host rollout" >&2
+            exit 1
+        fi
+    done
+    for node in "${nodes[@]}"; do
+        [[ -z ${transition_complete[${node}]:-} ]] || continue
+        pool=$(node_machineconfig_pool "${node}")
+        if [[ ${pool} == master ]]; then
+            expected_config=${master_rendered}
+        else
+            expected_config=${worker_rendered}
+        fi
+        node_state=$("${kc[@]}" get "node/${node}" -o json)
+        current_config=$(jq -r '.metadata.annotations["machineconfiguration.openshift.io/currentConfig"] // ""' \
+            <<<"${node_state}")
+        ready=$(jq -r '.status.conditions[] | select(.type == "Ready") | .status' <<<"${node_state}")
+        if [[ ${current_config} == "${expected_config}" && ${ready} == True ]]; then
+            transition_agent "${node}"
+            transition_complete[${node}]=true
+            transitioned=$(jq -c --arg node "${node}" '. + [$node]' <<<"${transitioned}")
+        fi
+    done
+    pools_updated=$("${kc[@]}" get machineconfigpool/master machineconfigpool/worker -o json \
+        | jq '[.items[] | any(.status.conditions[]; .type == "Updated" and .status == "True")] | all')
+    if [[ ${pools_updated} == true && ${#transition_complete[@]} -eq ${#nodes[@]} ]]; then
+        rollout_complete=true
+        break
+    fi
+    sleep 5
+done
+if [[ ${rollout_complete} != true ]]; then
+    echo "MachineConfig rollout and interleaved ABI-v5 agent transition did not complete in 45 minutes" >&2
+    exit 1
+fi
 for node in "${nodes[@]}"; do
     host_contract=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
         test "$(getenforce)" = Enforcing
@@ -307,27 +392,20 @@ for node in "${nodes[@]}"; do
         done
         for path in /proc/sys/net/ipv4/conf/*/rp_filter; do test "$(cat "$path")" -eq 0; done
         for path in /proc/sys/net/ipv4/conf/*/accept_local; do test "$(cat "$path")" -eq 1; done
+        ! iptables-save | grep -Eq "KUBE-(SVC|SEP)-"
+        ! ip6tables-save | grep -Eq "KUBE-(SVC|SEP)-"
         echo nodeport-host-ready
     ' 2>&1)
     grep -q '^nodeport-host-ready$' <<<"${host_contract}"
+    assert_host_service_path "${node}"
 done
 
 stage=node-serial-agent-transition
-transitioned='[]'
 for node in "${nodes[@]}"; do
-    pod=$(agent_pod_on_node "${node}")
-    [[ -n ${pod} ]]
-    current_image=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.spec.containers[0].image}')
-    if [[ ${current_image} != "${agent_image}" ]]; then
-        old_uid=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.metadata.uid}')
-        echo "transitioning UNF agent on ${node} to persistent BPF ABI v5"
-        "${kc[@]}" -n unf-system delete pod "${pod}" --wait=false >/dev/null
-        wait_for_agent_replacement "${node}" "${old_uid}"
-    fi
     assert_agent "${node}"
+    assert_host_service_path "${node}"
     [[ $("${kc[@]}" get --raw /readyz) == ok ]]
     [[ $("${kc[@]}" get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]
-    transitioned=$(jq -c --arg node "${node}" '. + [$node]' <<<"${transitioned}")
 done
 
 stage=full-v5-convergence
@@ -351,11 +429,12 @@ jq -n \
       stage:"abi-v5-nodeport-staged-deployment", context:$context, infrastructure:$infrastructure,
       sourceRevision:$sourceRevision,
       images:{controller:$controllerImage,agent:$agentImage},
-      strategy:"controller-first-agent-ondelete-node-serial",
+      strategy:"controller-first-machineconfig-interleaved-agent-ondelete-node-serial",
       kubeProxyPresent:false, retainedPersistentAbi:[4,5], nodes:$nodes, agents:$agents,
       verified:["immutable public image digests","controller-first compatibility boundary",
-        "five-node serial agent replacement","RHCOS SELinux enforcing","legacy-netlink TC attachment",
+        "MachineConfig-aware five-node serial agent replacement","RHCOS SELinux enforcing","legacy-netlink TC attachment",
         "persistent NodePort host sysctl contract","durable composite service snapshot",
+        "host-origin Kubernetes API Service reachability","no functional kube-proxy rule residue",
         "ABI-v5 service and NodePort maps","full agent convergence","kube-proxy remains absent"]
     }
 ' >"${artifact_tmp}"
