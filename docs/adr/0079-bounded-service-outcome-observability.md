@@ -28,7 +28,7 @@ event is also placed on the existing non-blocking flow-export queue. Queue
 pressure therefore uses the established explicit drop accounting and cannot
 block forwarding.
 
-Flow-export schema v4 and flow-history snapshot/checkpoint schemas v5/v3 add an
+Flow-export schema v4 and flow-history snapshot/checkpoint schemas v5/v4 add an
 optional service outcome. The logical history key includes service, backend,
 revision, action, and reason so a later failure cannot overwrite a successful
 translation for the same client/frontend tuple. Policy observations preserve
