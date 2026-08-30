@@ -16,10 +16,10 @@ generatorOptions:
 images:
   - name: localhost/unf-controller:dev
     newName: quay.io/arencloud/unf-controller-dev
-    digest: sha256:d0ed5d47fd0fd3f09e609465490632913b20bfae0be5190029e64bdc0ae6f644
+    digest: sha256:a9ee0f2c33229394591d32b7e6311efe73c2222e13a4d3270276ecfcb4e82062
   - name: localhost/unf-agent:dev
     newName: quay.io/arencloud/unf-agent-dev
-    digest: sha256:32b9fac0ceeda1c8a0adc7d60d6827c7f9244dcf38c72338b35d9ab9e2bd716e
+    digest: sha256:48e3b72c620eeeb116b36b503dd5a468313f2d7e68608bdc329b6decb7f87ade
 patches:
   - path: controller-patch.yaml
   - path: agent-patch.yaml
