@@ -400,3 +400,21 @@ matrix is maintained in the
 - Later service slices: NodePort, LoadBalancer, session affinity,
   `externalTrafficPolicy`, `internalTrafficPolicy`, topology-aware routing,
   Maglev, and optional DSR. None is implied by the foundation gate.
+
+## Phase 5 — NodePort exposure
+
+**Gate: In progress.** The ordered evidence matrix is maintained in the
+[Phase 5 NodePort plan](development/phase5-nodeport-plan.md).
+
+- Verified by `make service-ir-test` and focused controller tests: service
+  snapshot schema v2 carries deterministic address-family-aware NodePort intent,
+  exact Service-port/backend linkage, and explicit `Cluster`/`Local` external
+  traffic policy. Duplicate port/protocol ownership, inexact links, unknown
+  policy, and silent ClusterIP-only dataplane lowering fail closed; ADR 0082.
+- In progress: schema-v1→v2 distribution and durable recovery with explicit
+  mixed-version fencing before any NodePort intent can reach an agent.
+- Planned: authenticated Node-address intent, transactional host-facing maps,
+  dual-stack TCP/UDP `Cluster` and source-preserving `Local` dataplanes,
+  operations/simulation, and independent kube-proxy-free Kind/OpenShift gates.
+- LoadBalancer, session affinity, topology-aware selection, Maglev, and DSR
+  remain separate future milestones.

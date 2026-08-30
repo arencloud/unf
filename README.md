@@ -172,6 +172,14 @@ and destination agent recovery on RHCOS/SELinux/CRI-O. It leaves all five agents
 converged on persistent ABI v4, retires only ABI v3, and introduces no new
 unhealthy operator. ADRs 0080–0081 record the non-transitive Kind and OpenShift
 boundaries.
+Phase 5 has started with a bounded NodePort domain/compiler milestone. Service
+snapshot schema v2 preserves the allocated NodePort per address family, its
+exact ClusterIP Service-port and backend linkage, and explicit `Cluster` or
+`Local` external traffic policy. Collision, malformed linkage/policy, and
+capacity failures are rejected deterministically. NodePort is intentionally
+rejected by the current ClusterIP-only eBPF lowerer until distribution and
+host-facing dataplane milestones pass; see the
+[Phase 5 NodePort plan](docs/development/phase5-nodeport-plan.md) and ADR 0082.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -382,8 +390,9 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-Not implemented yet: advanced Service modes such as NodePort, LoadBalancer,
-session affinity, traffic policies, topology-aware routing, Maglev, and DSR;
+Not implemented yet: NodePort forwarding and advanced Service modes such as
+LoadBalancer, session affinity, traffic-policy execution, topology-aware
+routing, Maglev, and DSR;
 production-scale routing/CNI qualification;
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
 multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production

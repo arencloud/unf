@@ -19,6 +19,7 @@ pub use unf_common::SERVICE_SNAPSHOT_SCHEMA_VERSION;
 
 pub const MAX_SERVICES: usize = 65_536;
 pub const MAX_SERVICE_FRONTENDS: usize = 131_072;
+pub const MAX_SERVICE_NODE_PORTS: usize = 131_072;
 pub const MAX_SERVICE_BACKENDS: usize = 262_144;
 pub const MAX_SERVICE_BACKEND_REFERENCES: usize = 524_288;
 pub const MAX_BACKENDS_PER_SERVICE: usize = 4_096;
@@ -57,10 +58,32 @@ pub struct ServiceBackend {
     pub terminating: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum AddressFamily {
     Ipv4,
     Ipv6,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceTrafficPolicy {
+    #[default]
+    Cluster,
+    Local,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ServiceNodePort {
+    pub family: AddressFamily,
+    pub port: u16,
+    pub service_port: u16,
+    pub protocol: Protocol,
+    pub name: Option<String>,
+    pub app_protocol: Option<String>,
+    pub traffic_policy: ServiceTrafficPolicy,
+    pub backend_ids: Vec<BackendId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -69,6 +92,7 @@ pub struct ServiceSourcePort {
     pub protocol: Protocol,
     pub port: u16,
     pub app_protocol: Option<String>,
+    pub node_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -76,6 +100,7 @@ pub struct ServiceSource {
     pub namespace: String,
     pub name: String,
     pub cluster_ips: Vec<IpAddr>,
+    pub external_traffic_policy: ServiceTrafficPolicy,
     pub ports: Vec<ServiceSourcePort>,
 }
 
@@ -115,6 +140,7 @@ pub struct ServiceIr {
     pub namespace: String,
     pub name: String,
     pub frontends: Vec<ServiceFrontend>,
+    pub node_ports: Vec<ServiceNodePort>,
     pub backends: Vec<ServiceBackend>,
 }
 
@@ -139,6 +165,8 @@ pub enum ServiceIrError {
     TooManyServices { actual: usize, limit: usize },
     #[error("service snapshot has {actual} frontends; limit is {limit}")]
     TooManyFrontends { actual: usize, limit: usize },
+    #[error("service snapshot has {actual} NodePort frontends; limit is {limit}")]
+    TooManyNodePorts { actual: usize, limit: usize },
     #[error("service snapshot has {actual} backends; limit is {limit}")]
     TooManyBackends { actual: usize, limit: usize },
     #[error("service snapshot has {actual} frontend/backend references; limit is {limit}")]
@@ -173,6 +201,24 @@ pub enum ServiceIrError {
     },
     #[error("frontend {0:?} is owned by more than one service")]
     DuplicateFrontend(ServiceFrontend),
+    #[error("NodePort {port}/{protocol:?} is owned by services {existing:?} and {candidate:?}")]
+    DuplicateNodePort {
+        port: u16,
+        protocol: Protocol,
+        existing: ServiceId,
+        candidate: ServiceId,
+    },
+    #[error("service {service:?} has duplicate NodePort frontend {node_port:?}")]
+    DuplicateNodePortFrontend {
+        service: ServiceId,
+        node_port: ServiceNodePort,
+    },
+    #[error("service {service:?} has invalid NodePort frontend {node_port:?}: {reason}")]
+    InvalidNodePort {
+        service: ServiceId,
+        node_port: ServiceNodePort,
+        reason: &'static str,
+    },
     #[error("frontend {frontend:?} repeats backend reference {backend:?}")]
     DuplicateFrontendBackend {
         frontend: ServiceFrontend,
@@ -255,6 +301,10 @@ pub enum ServiceDataplaneError {
     InvalidIr(#[from] ServiceIrError),
     #[error("invalid service map bank {0}; expected 0 or 1")]
     InvalidBank(u8),
+    #[error(
+        "NodePort intent contains {actual} frontends but host-facing lowering is not implemented"
+    )]
+    UnsupportedNodePort { actual: usize },
     #[error("service map {map} requires {actual} entries; per-bank limit is {limit}")]
     Capacity {
         map: &'static str,
@@ -343,6 +393,7 @@ pub fn compile_service_snapshot(
 
         let mut backends = BTreeMap::<(IpAddr, u16, Protocol), ServiceBackend>::new();
         let mut frontends = Vec::new();
+        let mut node_ports = Vec::new();
         for cluster_ip in service.cluster_ips {
             for service_port in &service.ports {
                 let mut backend_ids = BTreeSet::new();
@@ -399,14 +450,31 @@ pub fn compile_service_snapshot(
                         }
                     }
                 }
+                let backend_ids = backend_ids.into_iter().collect::<Vec<_>>();
                 frontends.push(ServiceFrontend {
                     address: cluster_ip,
                     port: service_port.port,
                     protocol: service_port.protocol,
                     name: service_port.name.clone(),
                     app_protocol: service_port.app_protocol.clone(),
-                    backend_ids: backend_ids.into_iter().collect(),
+                    backend_ids: backend_ids.clone(),
                 });
+                if let Some(node_port) = service_port.node_port {
+                    node_ports.push(ServiceNodePort {
+                        family: if cluster_ip.is_ipv4() {
+                            AddressFamily::Ipv4
+                        } else {
+                            AddressFamily::Ipv6
+                        },
+                        port: node_port,
+                        service_port: service_port.port,
+                        protocol: service_port.protocol,
+                        name: service_port.name.clone(),
+                        app_protocol: service_port.app_protocol.clone(),
+                        traffic_policy: service.external_traffic_policy,
+                        backend_ids,
+                    });
+                }
             }
         }
         compiled.push(ServiceIr {
@@ -414,6 +482,7 @@ pub fn compile_service_snapshot(
             namespace: service.namespace,
             name: service.name,
             frontends,
+            node_ports,
             backends: backends.into_values().collect(),
         });
     }
@@ -594,7 +663,9 @@ impl ServiceSnapshot {
         let mut service_ids = BTreeSet::new();
         let mut service_names = BTreeSet::new();
         let mut frontend_owners = BTreeMap::new();
+        let mut node_port_owners = BTreeMap::new();
         let mut total_frontends = 0_usize;
+        let mut total_node_ports = 0_usize;
         let mut total_backends = 0_usize;
         let mut total_backend_references = 0_usize;
 
@@ -613,6 +684,9 @@ impl ServiceSnapshot {
                 });
             }
             total_frontends = total_frontends.saturating_add(service.frontends.len());
+            let (service_node_port_count, service_node_port_references) =
+                validate_and_normalize_node_ports(service, &mut node_port_owners)?;
+            total_node_ports = total_node_ports.saturating_add(service_node_port_count);
             total_backends = total_backends.saturating_add(service.backends.len());
             total_backend_references = service
                 .frontends
@@ -620,6 +694,8 @@ impl ServiceSnapshot {
                 .fold(total_backend_references, |count, frontend| {
                     count.saturating_add(frontend.backend_ids.len())
                 });
+            total_backend_references =
+                total_backend_references.saturating_add(service_node_port_references);
 
             for frontend in &mut service.frontends {
                 validate_frontend(service.id, frontend)?;
@@ -635,28 +711,17 @@ impl ServiceSnapshot {
             }
             validate_backends(service)?;
             validate_frontend_backends(service)?;
+            validate_node_port_backends(service)?;
             service.frontends.sort();
             service.backends.sort();
         }
 
-        if total_frontends > MAX_SERVICE_FRONTENDS {
-            return Err(ServiceIrError::TooManyFrontends {
-                actual: total_frontends,
-                limit: MAX_SERVICE_FRONTENDS,
-            });
-        }
-        if total_backends > MAX_SERVICE_BACKENDS {
-            return Err(ServiceIrError::TooManyBackends {
-                actual: total_backends,
-                limit: MAX_SERVICE_BACKENDS,
-            });
-        }
-        if total_backend_references > MAX_SERVICE_BACKEND_REFERENCES {
-            return Err(ServiceIrError::TooManyBackendReferences {
-                actual: total_backend_references,
-                limit: MAX_SERVICE_BACKEND_REFERENCES,
-            });
-        }
+        validate_snapshot_capacities(
+            total_frontends,
+            total_node_ports,
+            total_backends,
+            total_backend_references,
+        )?;
         self.services.sort_by(|left, right| {
             left.id
                 .cmp(&right.id)
@@ -665,6 +730,39 @@ impl ServiceSnapshot {
         });
         Ok(self)
     }
+}
+
+fn validate_snapshot_capacities(
+    frontends: usize,
+    node_ports: usize,
+    backends: usize,
+    backend_references: usize,
+) -> Result<(), ServiceIrError> {
+    if frontends > MAX_SERVICE_FRONTENDS {
+        return Err(ServiceIrError::TooManyFrontends {
+            actual: frontends,
+            limit: MAX_SERVICE_FRONTENDS,
+        });
+    }
+    if node_ports > MAX_SERVICE_NODE_PORTS {
+        return Err(ServiceIrError::TooManyNodePorts {
+            actual: node_ports,
+            limit: MAX_SERVICE_NODE_PORTS,
+        });
+    }
+    if backends > MAX_SERVICE_BACKENDS {
+        return Err(ServiceIrError::TooManyBackends {
+            actual: backends,
+            limit: MAX_SERVICE_BACKENDS,
+        });
+    }
+    if backend_references > MAX_SERVICE_BACKEND_REFERENCES {
+        return Err(ServiceIrError::TooManyBackendReferences {
+            actual: backend_references,
+            limit: MAX_SERVICE_BACKEND_REFERENCES,
+        });
+    }
+    Ok(())
 }
 
 fn validate_service_identity(
@@ -743,6 +841,68 @@ fn validate_frontend(service: ServiceId, frontend: &ServiceFrontend) -> Result<(
         });
     }
     Ok(())
+}
+
+fn validate_node_port(
+    service: ServiceId,
+    node_port: &ServiceNodePort,
+) -> Result<(), ServiceIrError> {
+    if node_port.port == 0 || node_port.service_port == 0 {
+        return Err(ServiceIrError::InvalidNodePort {
+            service,
+            node_port: node_port.clone(),
+            reason: "NodePort and linked Service port must be nonzero",
+        });
+    }
+    if !is_service_protocol(node_port.protocol) {
+        return Err(ServiceIrError::InvalidNodePort {
+            service,
+            node_port: node_port.clone(),
+            reason: "only TCP, UDP, and SCTP NodePorts are supported in intent",
+        });
+    }
+    if !valid_optional_provenance(node_port.name.as_deref())
+        || !valid_optional_provenance(node_port.app_protocol.as_deref())
+    {
+        return Err(ServiceIrError::InvalidNodePort {
+            service,
+            node_port: node_port.clone(),
+            reason: "port name and app protocol must be nonempty and bounded when present",
+        });
+    }
+    Ok(())
+}
+
+fn validate_and_normalize_node_ports(
+    service: &mut ServiceIr,
+    owners: &mut BTreeMap<(u16, Protocol), ServiceId>,
+) -> Result<(usize, usize), ServiceIrError> {
+    let mut exact_frontends = BTreeSet::new();
+    let mut backend_references = 0_usize;
+    for node_port in &mut service.node_ports {
+        validate_node_port(service.id, node_port)?;
+        if !exact_frontends.insert((node_port.family, node_port.port, node_port.protocol)) {
+            return Err(ServiceIrError::DuplicateNodePortFrontend {
+                service: service.id,
+                node_port: node_port.clone(),
+            });
+        }
+        let key = (node_port.port, node_port.protocol);
+        if let Some(existing) = owners.insert(key, service.id)
+            && existing != service.id
+        {
+            return Err(ServiceIrError::DuplicateNodePort {
+                port: node_port.port,
+                protocol: node_port.protocol,
+                existing,
+                candidate: service.id,
+            });
+        }
+        backend_references = backend_references.saturating_add(node_port.backend_ids.len());
+        node_port.backend_ids.sort();
+    }
+    service.node_ports.sort();
+    Ok((service.node_ports.len(), backend_references))
 }
 
 fn validate_backends(service: &ServiceIr) -> Result<(), ServiceIrError> {
@@ -856,6 +1016,63 @@ fn validate_frontend_backends(service: &ServiceIr) -> Result<(), ServiceIrError>
     Ok(())
 }
 
+fn validate_node_port_backends(service: &ServiceIr) -> Result<(), ServiceIrError> {
+    let backends: BTreeMap<BackendId, &ServiceBackend> = service
+        .backends
+        .iter()
+        .map(|backend| (backend.id, backend))
+        .collect();
+    for node_port in &service.node_ports {
+        let linked_frontend = service.frontends.iter().any(|frontend| {
+            let family_matches = match node_port.family {
+                AddressFamily::Ipv4 => frontend.address.is_ipv4(),
+                AddressFamily::Ipv6 => frontend.address.is_ipv6(),
+            };
+            family_matches
+                && frontend.port == node_port.service_port
+                && frontend.protocol == node_port.protocol
+                && frontend.name == node_port.name
+                && frontend.app_protocol == node_port.app_protocol
+        });
+        if !linked_frontend {
+            return Err(ServiceIrError::InvalidNodePort {
+                service: service.id,
+                node_port: node_port.clone(),
+                reason: "does not link to an exact same-family ClusterIP frontend",
+            });
+        }
+        let mut references = BTreeSet::new();
+        for backend_id in &node_port.backend_ids {
+            if !references.insert(*backend_id) {
+                return Err(ServiceIrError::InvalidNodePort {
+                    service: service.id,
+                    node_port: node_port.clone(),
+                    reason: "repeats a backend reference",
+                });
+            }
+            let Some(backend) = backends.get(backend_id) else {
+                return Err(ServiceIrError::InvalidNodePort {
+                    service: service.id,
+                    node_port: node_port.clone(),
+                    reason: "references an unknown backend",
+                });
+            };
+            let family_matches = match node_port.family {
+                AddressFamily::Ipv4 => backend.address.is_ipv4(),
+                AddressFamily::Ipv6 => backend.address.is_ipv6(),
+            };
+            if !family_matches || node_port.protocol != backend.protocol {
+                return Err(ServiceIrError::InvalidNodePort {
+                    service: service.id,
+                    node_port: node_port.clone(),
+                    reason: "backend family or protocol differs from the NodePort frontend",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn valid_optional_provenance(value: Option<&str>) -> bool {
     value.is_none_or(|value| !value.is_empty() && value.len() <= MAX_PROVENANCE_COMPONENT_BYTES)
 }
@@ -886,6 +1103,16 @@ pub fn compile_service_dataplane(
         return Err(ServiceDataplaneError::InvalidBank(bank));
     }
     let snapshot = snapshot.clone().validate_and_normalize()?;
+    let node_port_count = snapshot
+        .services
+        .iter()
+        .map(|service| service.node_ports.len())
+        .sum();
+    if node_port_count != 0 {
+        return Err(ServiceDataplaneError::UnsupportedNodePort {
+            actual: node_port_count,
+        });
+    }
     let mut ipv4_frontends = BTreeMap::new();
     let mut ipv6_frontends = BTreeMap::new();
     let mut ipv4_backends = BTreeMap::new();
@@ -1218,6 +1445,7 @@ mod tests {
                     443,
                 )
             }],
+            node_ports: Vec::new(),
             backends: vec![backend(
                 id,
                 if id == 1 { "fd01::10" } else { "10.244.0.10" },
@@ -1448,18 +1676,21 @@ mod tests {
                 "fd02::10".parse().expect("valid IPv6 address"),
                 "10.96.0.10".parse().expect("valid IPv4 address"),
             ],
+            external_traffic_policy: ServiceTrafficPolicy::Cluster,
             ports: vec![
                 ServiceSourcePort {
                     name: Some("dns".to_owned()),
                     protocol: Protocol::Udp,
                     port: 53,
                     app_protocol: None,
+                    node_port: None,
                 },
                 ServiceSourcePort {
                     name: Some("http".to_owned()),
                     protocol: Protocol::Tcp,
                     port: 80,
                     app_protocol: Some("kubernetes.io/h2c".to_owned()),
+                    node_port: None,
                 },
             ],
         }
@@ -1532,6 +1763,85 @@ mod tests {
             assert!(backend.node_name.is_some());
             assert!(backend.zone.is_some());
         }
+    }
+
+    #[test]
+    fn compiler_preserves_dual_stack_node_ports_and_external_traffic_policy() {
+        let mut service = source_service();
+        service.external_traffic_policy = ServiceTrafficPolicy::Local;
+        service.ports[0].node_port = Some(30_053);
+        service.ports[1].node_port = Some(30_080);
+        let compiled = compile_service_snapshot(
+            9,
+            Revision::new(3),
+            vec![service],
+            vec![
+                source_slice(AddressFamily::Ipv4, "api-v4", "10.244.0.20"),
+                source_slice(AddressFamily::Ipv6, "api-v6", "fd01::20"),
+            ],
+        )
+        .expect("valid dual-stack NodePort sources");
+        let service = &compiled.services[0];
+        assert_eq!(compiled.schema_version, 2);
+        assert_eq!(service.node_ports.len(), 4);
+        assert!(service.node_ports.iter().all(|node_port| {
+            node_port.traffic_policy == ServiceTrafficPolicy::Local
+                && node_port.backend_ids.len() == 1
+                && service.frontends.iter().any(|frontend| {
+                    frontend.address.is_ipv4() == matches!(node_port.family, AddressFamily::Ipv4)
+                        && frontend.port == node_port.service_port
+                        && frontend.protocol == node_port.protocol
+                        && frontend.name == node_port.name
+                })
+        }));
+        assert!(service.node_ports.iter().any(|node_port| {
+            node_port.family == AddressFamily::Ipv4 && node_port.port == 30_080
+        }));
+        assert!(service.node_ports.iter().any(|node_port| {
+            node_port.family == AddressFamily::Ipv6 && node_port.port == 30_053
+        }));
+        assert_eq!(
+            compile_service_dataplane(&compiled, 0),
+            Err(ServiceDataplaneError::UnsupportedNodePort { actual: 4 })
+        );
+    }
+
+    #[test]
+    fn node_port_validation_rejects_collisions_and_inexact_links() {
+        let mut first = service(2, "one");
+        first.node_ports.push(ServiceNodePort {
+            family: AddressFamily::Ipv4,
+            port: 30_080,
+            service_port: 443,
+            protocol: Protocol::Tcp,
+            name: Some("https".to_owned()),
+            app_protocol: Some("kubernetes.io/h2c".to_owned()),
+            traffic_policy: ServiceTrafficPolicy::Cluster,
+            backend_ids: vec![BackendId::new(2)],
+        });
+        let mut second = service(3, "two");
+        second.frontends[0].address = "10.96.0.11".parse().unwrap();
+        second.backends[0].address = "10.244.0.11".parse().unwrap();
+        second.node_ports.push(ServiceNodePort {
+            family: AddressFamily::Ipv4,
+            port: 30_080,
+            service_port: 443,
+            protocol: Protocol::Tcp,
+            name: Some("https".to_owned()),
+            app_protocol: Some("kubernetes.io/h2c".to_owned()),
+            traffic_policy: ServiceTrafficPolicy::Cluster,
+            backend_ids: vec![BackendId::new(3)],
+        });
+        assert!(matches!(
+            snapshot(vec![first.clone(), second]).validate_and_normalize(),
+            Err(ServiceIrError::DuplicateNodePort { .. })
+        ));
+
+        first.node_ports[0].service_port = 444;
+        assert!(matches!(
+            snapshot(vec![first]).validate_and_normalize(),
+            Err(ServiceIrError::InvalidNodePort { .. })
+        ));
     }
 
     #[test]
@@ -1625,12 +1935,14 @@ mod tests {
                 protocol: Protocol::Tcp,
                 port: 6388,
                 app_protocol: None,
+                node_port: None,
             },
             ServiceSourcePort {
                 name: Some("ironic-api".to_owned()),
                 protocol: Protocol::Tcp,
                 port: 6385,
                 app_protocol: Some("example.io/api".to_owned()),
+                node_port: None,
             },
         ];
         let mut slice = source_slice(AddressFamily::Ipv4, "metal3", "10.244.0.20");

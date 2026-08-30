@@ -6966,7 +6966,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         )
         .status_label(),
         capabilities: state.capabilities.clone(),
-        limitation: "ClusterIP translation is limited to primary-CNI Pod-veth IPv4/IPv6 TCP/UDP; service operations and kube-proxy-free cluster qualification remain pending",
+        limitation: "ClusterIP translation is qualified only for primary-CNI Pod-veth IPv4/IPv6 TCP/UDP on recorded tuples; NodePort schema-v2 intent is not yet distributed or lowered to a host-facing dataplane",
     })
 }
 
@@ -7233,11 +7233,13 @@ mod tests {
                 namespace: "default".to_owned(),
                 name: "api".to_owned(),
                 cluster_ips: vec!["10.96.0.10".parse().unwrap()],
+                external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
                 ports: vec![unf_service::ServiceSourcePort {
                     name: Some("http".to_owned()),
                     protocol: unf_common::Protocol::Tcp,
                     port: 80,
                     app_protocol: Some("kubernetes.io/h2c".to_owned()),
+                    node_port: None,
                 }],
             }],
             Vec::new(),
@@ -7253,11 +7255,13 @@ mod tests {
                 namespace: "default".to_owned(),
                 name: "api".to_owned(),
                 cluster_ips: vec!["10.96.0.10".parse().unwrap()],
+                external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
                 ports: vec![unf_service::ServiceSourcePort {
                     name: Some("http".to_owned()),
                     protocol: unf_common::Protocol::Tcp,
                     port: 80,
                     app_protocol: None,
+                    node_port: None,
                 }],
             }],
             vec![unf_service::EndpointSliceSource {
@@ -7297,12 +7301,14 @@ mod tests {
                 protocol: unf_common::Protocol::Tcp,
                 port: 80,
                 app_protocol: None,
+                node_port: None,
             },
             unf_service::ServiceSourcePort {
                 name: Some("dns".to_owned()),
                 protocol: unf_common::Protocol::Udp,
                 port: 53,
                 app_protocol: None,
+                node_port: None,
             },
         ];
         let endpoint_ports = vec![
@@ -7367,6 +7373,7 @@ mod tests {
                     Ipv4Addr::new(10, 96, 0, 10).into(),
                     "fd00:96::10".parse::<Ipv6Addr>().unwrap().into(),
                 ],
+                external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
                 ports,
             }],
             slices,
@@ -8468,11 +8475,11 @@ mod tests {
         controller.service_snapshot_schema_version += 1;
         let error = ensure_controller_compatibility(&controller)
             .expect_err("a service-schema mismatch is rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("service snapshot schema controller=2 agent=1")
-        );
+        assert!(error.to_string().contains(&format!(
+            "service snapshot schema controller={} agent={}",
+            unf_service::SERVICE_SNAPSHOT_SCHEMA_VERSION + 1,
+            unf_service::SERVICE_SNAPSHOT_SCHEMA_VERSION
+        )));
     }
 
     #[test]

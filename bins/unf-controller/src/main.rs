@@ -52,7 +52,8 @@ use unf_route::{
 };
 use unf_service::{
     AddressFamily, EndpointPortSource, EndpointSliceSource, EndpointSource, ServiceBackend,
-    ServiceIr, ServiceSnapshot, ServiceSource, ServiceSourcePort, compile_service_snapshot,
+    ServiceIr, ServiceSnapshot, ServiceSource, ServiceSourcePort, ServiceTrafficPolicy,
+    compile_service_snapshot,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
@@ -2400,6 +2401,11 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
     }
     let mut ports = Vec::new();
     let mut compiler_ports = Vec::new();
+    let external_traffic_policy = service_external_traffic_policy(
+        &namespace,
+        &name,
+        spec.external_traffic_policy.as_deref(),
+    )?;
     for port in spec.ports.iter().flatten() {
         let number = u16::try_from(port.port).with_context(|| {
             format!(
@@ -2412,6 +2418,7 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
                 "Service {namespace}/{name} cannot expose port zero"
             ));
         }
+        let node_port = service_node_port(&namespace, &name, port.node_port)?;
         let protocol = port.protocol.clone().unwrap_or_else(|| "TCP".to_owned());
         let target_port = Some(port.target_port.as_ref().map_or_else(
             || number.to_string(),
@@ -2431,6 +2438,7 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
             protocol: service_protocol(&protocol)?,
             port: number,
             app_protocol: port.app_protocol.clone(),
+            node_port,
         });
     }
     ports.sort();
@@ -2439,6 +2447,7 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
         namespace: namespace.clone(),
         name: name.clone(),
         cluster_ips: cluster_ips.iter().copied().collect(),
+        external_traffic_policy,
         ports: compiler_ports,
     };
     Ok(ServiceRecord {
@@ -2455,6 +2464,32 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
         ports,
         compiler_source,
     })
+}
+
+fn service_external_traffic_policy(
+    namespace: &str,
+    name: &str,
+    policy: Option<&str>,
+) -> Result<ServiceTrafficPolicy> {
+    match policy.unwrap_or("Cluster") {
+        "Cluster" => Ok(ServiceTrafficPolicy::Cluster),
+        "Local" => Ok(ServiceTrafficPolicy::Local),
+        policy => Err(anyhow!(
+            "Service {namespace}/{name} has unsupported externalTrafficPolicy {policy:?}"
+        )),
+    }
+}
+
+fn service_node_port(namespace: &str, name: &str, node_port: Option<i32>) -> Result<Option<u16>> {
+    let node_port = node_port.map(u16::try_from).transpose().with_context(|| {
+        format!("Service {namespace}/{name} nodePort {node_port:?} is outside the u16 range")
+    })?;
+    if node_port == Some(0) {
+        return Err(anyhow!(
+            "Service {namespace}/{name} cannot expose NodePort zero"
+        ));
+    }
+    Ok(node_port)
 }
 
 fn service_protocol(protocol: &str) -> Result<Protocol> {
@@ -2941,7 +2976,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         limitations: [
             "desired state and identity allocations are currently in-memory only",
             "agent acknowledgements and the newest bounded flow history use separate single-controller ConfigMap checkpoints",
-            "ClusterIP translation is limited to primary-CNI Pod-veth IPv4/IPv6 TCP/UDP; service operations and kube-proxy-free cluster qualification remain pending",
+            "ClusterIP translation is qualified only for primary-CNI Pod-veth IPv4/IPv6 TCP/UDP on recorded tuples; NodePort schema-v2 intent is not yet distributed or lowered to a host-facing dataplane",
         ],
     }))
 }
@@ -6217,6 +6252,31 @@ mod tests {
         .expect("test Service is valid Kubernetes JSON")
     }
 
+    fn node_port_service() -> Service {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "edge", "namespace": "frontend"},
+            "spec": {
+                "type": "NodePort",
+                "clusterIP": "10.43.0.20",
+                "clusterIPs": ["10.43.0.20", "fd02::20"],
+                "ipFamilies": ["IPv4", "IPv6"],
+                "externalTrafficPolicy": "Local",
+                "selector": {"app": "edge"},
+                "ports": [{
+                    "name": "https",
+                    "protocol": "TCP",
+                    "port": 443,
+                    "targetPort": 8443,
+                    "nodePort": 30443,
+                    "appProtocol": "kubernetes.io/h2c"
+                }]
+            }
+        }))
+        .expect("test NodePort Service is valid Kubernetes JSON")
+    }
+
     fn endpoint_slice(ready: bool) -> EndpointSlice {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "discovery.k8s.io/v1",
@@ -6265,6 +6325,7 @@ mod tests {
                 namespace: "backend".to_owned(),
                 name: "server".to_owned(),
                 cluster_ips: Vec::new(),
+                external_traffic_policy: ServiceTrafficPolicy::Cluster,
                 ports: Vec::new(),
             },
         }
@@ -7431,6 +7492,36 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn node_port_service_translation_preserves_family_port_and_policy() {
+        let record = service_record(&node_port_service()).expect("valid NodePort source");
+        assert_eq!(record.service_type, "NodePort");
+        assert_eq!(
+            record.compiler_source.external_traffic_policy,
+            ServiceTrafficPolicy::Local
+        );
+        assert_eq!(record.compiler_source.ports[0].node_port, Some(30_443));
+        let snapshot = compile_service_snapshot(
+            7,
+            Revision::new(1),
+            vec![record.compiler_source],
+            Vec::new(),
+        )
+        .expect("valid NodePort intent");
+        assert_eq!(snapshot.services[0].node_ports.len(), 2);
+        assert!(snapshot.services[0].node_ports.iter().all(|node_port| {
+            node_port.port == 30_443
+                && node_port.service_port == 443
+                && node_port.protocol == Protocol::Tcp
+                && node_port.traffic_policy == ServiceTrafficPolicy::Local
+                && node_port.backend_ids.is_empty()
+        }));
+
+        let mut invalid = node_port_service();
+        invalid.spec.as_mut().unwrap().external_traffic_policy = Some("Nearest".to_owned());
+        assert!(service_record(&invalid).is_err());
     }
 
     #[test]

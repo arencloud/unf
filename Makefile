@@ -65,6 +65,7 @@ service-ir-test:
 
 service-compiler-test: service-ir-test
 	cargo test -p unf-controller service_snapshot
+	cargo test -p unf-controller node_port_service_translation_preserves_family_port_and_policy
 	cargo test -p unf-controller endpoint_slice_readiness
 	cargo clippy -p unf-controller --all-targets --all-features -- -D warnings
 
