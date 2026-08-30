@@ -893,7 +893,11 @@ for replacement_node in "${client_node}" "${server_node}"; do
         --field-selector spec.nodeName="${replacement_node}" -o jsonpath='{.items[0].metadata.name}')
     "${kc[@]}" -n unf-system delete pod "${old_agent}" --wait=false >/dev/null
     "${kc[@]}" -n unf-system rollout status daemonset/unf-agent --timeout=180s >/dev/null
-    wait "${probe_pid}"
+    if ! wait "${probe_pid}"; then
+        echo "continuous NodePort probes failed while replacing the agent on ${replacement_node}" >&2
+        sed 's/^/probe: /' "${probe_log}" >&2
+        exit 1
+    fi
     new_agent=$("${kc[@]}" -n unf-system get pod -l app.kubernetes.io/name=unf-agent \
         --field-selector spec.nodeName="${replacement_node}" -o jsonpath='{.items[0].metadata.name}')
     [[ ${new_agent} != "${old_agent}" ]]
