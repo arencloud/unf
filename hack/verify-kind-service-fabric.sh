@@ -180,11 +180,13 @@ udp_probe_once() {
     local family=$1
     local address=$2
     local port=${3:-5353}
-    local target
+    local checksum source_port target
+    checksum=$(printf '%s' "${family}|${address}|${port}" | cksum | awk '{print $1}')
+    source_port=$((43000 + checksum % 10000))
     if [[ ${family} == 4 ]]; then
-        target="UDP4:${address}:${port}"
+        target="UDP4:${address}:${port},sourceport=${source_port},reuseaddr"
     else
-        target="UDP6:[${address}]:${port}"
+        target="UDP6:[${address}]:${port},sourceport=${source_port},reuseaddr"
     fi
     "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
         "printf udp-ok | socat -T 4 - '${target}'" | grep -qx udp-ok
