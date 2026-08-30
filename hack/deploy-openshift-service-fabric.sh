@@ -6,8 +6,8 @@ kubeconfig=${KUBECONFIG:-"${project_root}/.tools/cl02-audit.kubeconfig"}
 context=${KUBE_CONTEXT:-}
 expected_infrastructure=${UNF_OPENSHIFT_SERVICE_EXPECTED_INFRASTRUCTURE:-}
 acknowledgement=${UNF_OPENSHIFT_SERVICE_ACKNOWLEDGE_DISPOSABLE:-}
-release_record=${UNF_OPENSHIFT_SERVICE_RELEASE_RECORD:-"${project_root}/deploy/openshift-primary-cni/runtime/service-fabric-release.json"}
-artifact=${UNF_OPENSHIFT_SERVICE_DEPLOY_EVIDENCE:-"${project_root}/.artifacts/phase4-openshift-service-deploy.json"}
+release_record=${UNF_OPENSHIFT_SERVICE_RELEASE_RECORD:-"${project_root}/deploy/openshift-primary-cni/runtime/nodeport-release.json"}
+artifact=${UNF_OPENSHIFT_SERVICE_DEPLOY_EVIDENCE:-"${project_root}/.artifacts/phase5-nodeport-openshift-deploy.json"}
 stage=initialization
 rendered=
 artifact_tmp=
@@ -36,8 +36,10 @@ if [[ ! -s ${kubeconfig} || $(stat -c '%a' "${kubeconfig}") != 600 ]]; then
     exit 1
 fi
 if [[ ! -s ${release_record} ]] || ! jq -e '
-    .schemaVersion == 1 and .phase == "4.8"
+    .schemaVersion == 1 and .phase == "5.8"
     and (.sourceRevision | test("^[0-9a-f]{40}$"))
+    and .kindQualification.schemaVersion == 2
+    and .kindQualification.phase == "5.7"
     and .kindQualification.result == "passed"
     and all(.images[]; test("^quay\\.io/arencloud/unf-[a-z-]+-dev@sha256:[0-9a-f]{64}$"))
 ' "${release_record}" >/dev/null; then
@@ -97,12 +99,12 @@ assert_version() {
     local json=$1 component=$2
     jq -e --arg component "${component}" --arg revision "${source_revision}" '
         .schema_version == 2 and .component == $component and .build_revision == $revision
-        and .persistent_bpf_state_abi_version == 4
+        and .persistent_bpf_state_abi_version == 5
         and .identity_snapshot_schema_version == 2
         and .policy_snapshot_schema_version == 4
         and .service_snapshot_schema_version == 2
-        and .agent_status_schema_version == 4
-        and .flow_export_schema_version == 4
+        and .agent_status_schema_version == 5
+        and .flow_export_schema_version == 5
     ' <<<"${json}" >/dev/null
 }
 
@@ -117,7 +119,7 @@ wait_for_controller() {
         fi
         sleep 1
     done
-    echo "controller did not expose the qualified ABI-v4 revision" >&2
+    echo "controller did not expose the qualified ABI-v5 revision" >&2
     jq . <<<"${version}" >&2 || true
     jq . <<<"${status}" >&2 || true
     return 1
@@ -148,7 +150,7 @@ wait_for_agent_service_state() {
         status=$(agent_raw "${node}" /v1/status 2>/dev/null || true)
         if assert_version "$(agent_raw "${node}" /v1/version 2>/dev/null || true)" unf-agent 2>/dev/null \
             && jq -e '
-                .schema_version == 4 and .ready == true and .bpf_loaded == true
+                .schema_version == 5 and .ready == true and .bpf_loaded == true
                 and .tc_attachment_mode == "legacy_netlink"
                 and .capabilities.btf == true and .capabilities.bpffs == true
                 and .capabilities.cgroup_v2 == true
@@ -164,7 +166,7 @@ wait_for_agent_service_state() {
         fi
         sleep 1
     done
-    echo "agent on ${node} did not converge on healthy ABI-v4 service state" >&2
+    echo "agent on ${node} did not converge on healthy ABI-v5 service state" >&2
     jq . <<<"${status}" >&2 || true
     return 1
 }
@@ -174,11 +176,12 @@ assert_agent() {
     wait_for_agent_service_state "${node}"
     host_state=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
         test "$(getenforce)" = Enforcing
-        test -d /sys/fs/bpf/unf/v3
         test -d /sys/fs/bpf/unf/v4
+        test -d /sys/fs/bpf/unf/v5
         for pin in SERVICE_CONFIG SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 \
-            SERVICE_BACKENDS_V4 SERVICE_BACKENDS_V6 SERVICE_CONNECTIONS; do
-            test -e "/sys/fs/bpf/unf/v4/$pin"
+            SERVICE_BACKENDS_V4 SERVICE_BACKENDS_V6 SERVICE_CONNECTIONS \
+            NODE_PORT_CONFIG NODE_PORT_FRONTENDS_V4 NODE_PORT_FRONTENDS_V6; do
+            test -e "/sys/fs/bpf/unf/v5/$pin"
         done
         snapshot=/var/lib/unf/cni/v1/service-snapshot.json
         test -f "$snapshot" && test ! -L "$snapshot" && test "$(stat -c %a "$snapshot")" = 600
@@ -193,7 +196,7 @@ wait_for_convergence() {
     for _ in $(seq 1 300); do
         snapshot=$(controller_raw /v1/state/agents 2>/dev/null || true)
         if jq -e --argjson expected "${#nodes[@]}" '
-            .schema_version == 4 and .expected_agents == $expected
+            .schema_version == 5 and .expected_agents == $expected
             and .reporting_agents == $expected and .missing_agents == 0
             and .stale_agents == 0 and .converged_agents == $expected
             and .unexpected_agents == 0 and .all_converged == true
@@ -207,7 +210,7 @@ wait_for_convergence() {
         fi
         sleep 1
     done
-    echo "all agents did not converge on ABI v4" >&2
+    echo "all agents did not converge on ABI v5" >&2
     jq . <<<"${snapshot}" >&2 || true
     return 1
 }
@@ -222,7 +225,7 @@ jq -e '
     and ([.spec.serviceNetwork[] | contains(":")] | any)
     and ([.spec.serviceNetwork[] | contains(":") | not] | any)
 ' <<<"${network}" >/dev/null
-jq -e '.spec.defaultNetwork.type == "None" and .spec.deployKubeProxy == true' \
+jq -e '.spec.defaultNetwork.type == "None" and .spec.deployKubeProxy == false' \
     <<<"${operator_network}" >/dev/null
 mapfile -t nodes < <("${kc[@]}" get nodes -l network.unf.io/primary-cni=enabled \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
@@ -231,8 +234,25 @@ mapfile -t nodes < <("${kc[@]}" get nodes -l network.unf.io/primary-cni=enabled 
 for node in "${nodes[@]}"; do
     [[ $("${kc[@]}" get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]
 done
-[[ $("${kc[@]}" -n openshift-kube-proxy get daemonset openshift-kube-proxy \
-    -o json | jq '.status.numberReady') -eq ${#nodes[@]} ]]
+[[ $("${kc[@]}" -n openshift-kube-proxy get daemonsets -o json | jq '.items | length') -eq 0 ]]
+
+stage=nodeport-host-contract
+"${kc[@]}" apply -f "${project_root}/deploy/openshift-primary-cni/machineconfig/master-forwarding.yaml" >/dev/null
+"${kc[@]}" apply -f "${project_root}/deploy/openshift-primary-cni/machineconfig/worker-forwarding.yaml" >/dev/null
+"${kc[@]}" wait mcp/master mcp/worker --for=condition=Updated --timeout=45m >/dev/null
+for node in "${nodes[@]}"; do
+    host_contract=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
+        test "$(getenforce)" = Enforcing
+        for key in all default; do
+            test "$(cat /proc/sys/net/ipv4/conf/${key}/rp_filter)" -eq 0
+            test "$(cat /proc/sys/net/ipv4/conf/${key}/accept_local)" -eq 1
+        done
+        for path in /proc/sys/net/ipv4/conf/*/rp_filter; do test "$(cat "$path")" -eq 0; done
+        for path in /proc/sys/net/ipv4/conf/*/accept_local; do test "$(cat "$path")" -eq 1; done
+        echo nodeport-host-ready
+    ' 2>&1)
+    grep -q '^nodeport-host-ready$' <<<"${host_contract}"
+done
 
 stage=render-and-apply
 controller_node=$("${kc[@]}" -n unf-system get deployment/unf-controller -o jsonpath='{.spec.template.spec.nodeName}')
@@ -264,7 +284,7 @@ for node in "${nodes[@]}"; do
     current_image=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.spec.containers[0].image}')
     if [[ ${current_image} != "${agent_image}" ]]; then
         old_uid=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.metadata.uid}')
-        echo "transitioning UNF agent on ${node} to persistent BPF ABI v4"
+        echo "transitioning UNF agent on ${node} to persistent BPF ABI v5"
         "${kc[@]}" -n unf-system delete pod "${pod}" --wait=false >/dev/null
         wait_for_agent_replacement "${node}" "${old_uid}"
     fi
@@ -274,12 +294,12 @@ for node in "${nodes[@]}"; do
     transitioned=$(jq -c --arg node "${node}" '. + [$node]' <<<"${transitioned}")
 done
 
-stage=full-v4-convergence
+stage=full-v5-convergence
 agents=$(wait_for_convergence)
 for node in "${nodes[@]}"; do
     assert_agent "${node}"
 done
-[[ $("${kc[@]}" get network.operator.openshift.io cluster -o jsonpath='{.spec.deployKubeProxy}') == true ]]
+[[ $("${kc[@]}" get network.operator.openshift.io cluster -o jsonpath='{.spec.deployKubeProxy}') == false ]]
 
 stage=evidence
 mkdir -p "$(dirname "${artifact}")"
@@ -291,16 +311,16 @@ jq -n \
     --arg agentImage "${agent_image}" --argjson nodes "${transitioned}" \
     --argjson agents "${agents}" '
     {
-      schemaVersion:1, generatedAt:$generatedAt, phase:"4.8",
-      stage:"abi-v4-staged-deployment", context:$context, infrastructure:$infrastructure,
+      schemaVersion:1, generatedAt:$generatedAt, phase:"5.8",
+      stage:"abi-v5-nodeport-staged-deployment", context:$context, infrastructure:$infrastructure,
       sourceRevision:$sourceRevision,
       images:{controller:$controllerImage,agent:$agentImage},
       strategy:"controller-first-agent-ondelete-node-serial",
-      kubeProxyPresent:true, retainedPersistentAbi:[3,4], nodes:$nodes, agents:$agents,
+      kubeProxyPresent:false, retainedPersistentAbi:[4,5], nodes:$nodes, agents:$agents,
       verified:["immutable public image digests","controller-first compatibility boundary",
         "five-node serial agent replacement","RHCOS SELinux enforcing","legacy-netlink TC attachment",
-        "durable service snapshot","ABI-v4 service maps","full agent convergence",
-        "kube-proxy safety net retained"]
+        "persistent NodePort host sysctl contract","durable composite service snapshot",
+        "ABI-v5 service and NodePort maps","full agent convergence","kube-proxy remains absent"]
     }
 ' >"${artifact_tmp}"
 chmod 0600 "${artifact_tmp}"
@@ -308,4 +328,4 @@ mv -f "${artifact_tmp}" "${artifact}"
 artifact_tmp=
 
 trap - ERR EXIT
-echo "OpenShift service-fabric ABI-v4 staged deployment passed; kube-proxy remains enabled; evidence: ${artifact}"
+echo "OpenShift NodePort ABI-v5 staged deployment passed; kube-proxy remains absent; evidence: ${artifact}"
