@@ -533,7 +533,26 @@ wait_for_convergence >/dev/null
 service_matrix
 
 stage=observability-and-explanation
-history=$(controller_raw /v1/flows)
+"${kc[@]}" -n "${namespace}" exec server -- touch /tmp/unready
+"${kc[@]}" -n "${namespace}" wait --for=condition=Ready=false pod/server --timeout=90s >/dev/null
+wait_for_service 0 >/dev/null
+wait_for_convergence >/dev/null
+expect_service_blocked
+"${kc[@]}" -n "${namespace}" exec server -- rm -f /tmp/unready
+"${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/server --timeout=90s >/dev/null
+wait_for_service 4 >/dev/null
+wait_for_convergence >/dev/null
+service_matrix
+history=
+for _ in $(seq 1 90); do
+    history=$(controller_raw /v1/flows 2>/dev/null || true)
+    if jq -e --argjson service_id "${service_id}" '
+        .schema_version == 5
+        and any(.entries[]; .service.service_id == $service_id and .service.action == 1 and .service.backend_id > 0)
+        and any(.entries[]; .service.service_id == $service_id and .service.action == 2 and .service.reason == 3)
+    ' <<<"${history}" >/dev/null 2>&1; then break; fi
+    sleep 1
+done
 jq -e --argjson service_id "${service_id}" '
     .schema_version == 5
     and any(.entries[]; .service.service_id == $service_id and .service.action == 1 and .service.backend_id > 0)
