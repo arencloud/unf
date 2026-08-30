@@ -176,7 +176,7 @@ tcp_probe() {
         wget -T 4 -t 1 -qO- "http://${address}:${port}/health" | grep -qx ok
 }
 
-udp_probe() {
+udp_probe_once() {
     local family=$1
     local address=$2
     local port=${3:-5353}
@@ -190,6 +190,19 @@ udp_probe() {
         "printf udp-ok | socat -T 4 - '${target}'" | grep -qx udp-ok
 }
 
+udp_probe() {
+    local family=$1
+    local address=$2
+    local port=${3:-5353}
+    for _ in $(seq 1 3); do
+        if udp_probe_once "${family}" "${address}" "${port}"; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
 udp_probe_with_source_port() {
     local family=$1
     local address=$2
@@ -201,8 +214,14 @@ udp_probe_with_source_port() {
     else
         target="UDP6:[${address}]:${port},sourceport=${source_port},reuseaddr"
     fi
-    "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
-        "printf retained | socat -T 4 - '${target}'" | grep -qx retained
+    for _ in $(seq 1 3); do
+        if "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
+            "printf retained | socat -T 4 - '${target}'" | grep -qx retained; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
 }
 
 retained_node_port_matrix() {
@@ -266,8 +285,8 @@ expect_local_node_port_blocked() {
     local succeeded=false
     if tcp_probe "${client_node_v4}" 31080 >/dev/null 2>&1; then succeeded=true; fi
     if tcp_probe "[${client_node_v6}]" 31080 >/dev/null 2>&1; then succeeded=true; fi
-    if udp_probe 4 "${client_node_v4}" 31053 >/dev/null 2>&1; then succeeded=true; fi
-    if udp_probe 6 "${client_node_v6}" 31053 >/dev/null 2>&1; then succeeded=true; fi
+    if udp_probe_once 4 "${client_node_v4}" 31053 >/dev/null 2>&1; then succeeded=true; fi
+    if udp_probe_once 6 "${client_node_v6}" 31053 >/dev/null 2>&1; then succeeded=true; fi
     if [[ ${succeeded} == true ]]; then
         echo "Local NodePort unexpectedly forwarded without a local backend" >&2
         return 1
@@ -283,8 +302,8 @@ expect_service_matrix_blocked() {
     local succeeded=false
     if tcp_probe "${service_v4}" >/dev/null 2>&1; then succeeded=true; fi
     if tcp_probe "[${service_v6}]" >/dev/null 2>&1; then succeeded=true; fi
-    if udp_probe 4 "${service_v4}" >/dev/null 2>&1; then succeeded=true; fi
-    if udp_probe 6 "${service_v6}" >/dev/null 2>&1; then succeeded=true; fi
+    if udp_probe_once 4 "${service_v4}" >/dev/null 2>&1; then succeeded=true; fi
+    if udp_probe_once 6 "${service_v6}" >/dev/null 2>&1; then succeeded=true; fi
     if [[ ${succeeded} == true ]]; then
         echo "backendless Service unexpectedly forwarded traffic" >&2
         return 1
@@ -308,7 +327,7 @@ expect_all_service_frontends_blocked() {
         if [[ ${protocol} == tcp ]]; then
             if [[ ${family} == 6 ]]; then address="[${address}]"; fi
             if tcp_probe "${address}" "${port}" >/dev/null 2>&1; then succeeded=true; fi
-        elif udp_probe "${family}" "${address}" "${port}" >/dev/null 2>&1; then
+        elif udp_probe_once "${family}" "${address}" "${port}" >/dev/null 2>&1; then
             succeeded=true
         fi
     done
