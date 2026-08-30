@@ -239,6 +239,7 @@ images: artifacts
 	podman build --build-arg UNF_BUILD_REVISION=$(UNF_BUILD_REVISION) --build-arg UNF_PACKAGE=unf-controller --tag localhost/unf-controller:dev --file images/Containerfile .
 	podman build --build-arg UNF_BUILD_REVISION=$(UNF_BUILD_REVISION) --build-arg UNF_PACKAGE=unf-agent --tag localhost/unf-agent:dev --file images/Containerfile .
 	podman build --tag $(TEST_TOOLS_IMAGE) --file images/SctpTestContainerfile .
+	podman run --rm --entrypoint sh $(TEST_TOOLS_IMAGE) -ec 'command -v bpftool >/dev/null && command -v jq >/dev/null'
 
 upgrade-baseline-images:
 	UNF_UPGRADE_BASELINE_REF=$(UNF_UPGRADE_BASELINE_REF) UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE=$(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE) UNF_UPGRADE_BASELINE_AGENT_IMAGE=$(UNF_UPGRADE_BASELINE_AGENT_IMAGE) hack/build-upgrade-baseline-images.sh
