@@ -50,6 +50,8 @@ cleanup() {
 }
 trap failure ERR
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 for command in git jq oc stat timeout; do
     command -v "${command}" >/dev/null || {
@@ -293,17 +295,19 @@ wait_for_agent_replacement() {
 }
 
 wait_for_agent_service_state() {
-    local node=$1 status=
+    local node=$1 allow_controller_outage=${2:-false} status=
     for _ in $(seq 1 300); do
         status=$(agent_raw "${node}" /v1/status 2>/dev/null || true)
-        if jq -e '
+        if jq -e --argjson allow_controller_outage "${allow_controller_outage}" '
             .schema_version == 4 and .ready and .bpf_loaded
             and .desired_service_revision > 0
             and .applied_service_revision == .desired_service_revision
             and .applied_service_epoch == .desired_service_epoch
             and .service_count > 0 and .service_frontend_count > 0
             and .service_backend_count > 0
-            and has("service_last_error") and .service_last_error == null
+            and has("service_last_error")
+            and (.service_last_error == null or ($allow_controller_outage
+                and .service_last_error == "request controller service snapshot"))
         ' <<<"${status}" >/dev/null 2>&1; then
             return 0
         fi
@@ -331,7 +335,7 @@ replace_agent_with_traffic() {
         return 1
     fi
     probe_pid=
-    wait_for_agent_service_state "${node}"
+    wait_for_agent_service_state "${node}" true
 }
 
 stage=preflight
