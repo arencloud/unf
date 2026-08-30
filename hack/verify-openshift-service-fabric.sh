@@ -501,6 +501,8 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 jq -e 'any(.items[] | (.endpoints // [])[]; .conditions.terminating == true)' <<<"${slices}" >/dev/null
+wait_for_service 0 >/dev/null
+wait_for_convergence >/dev/null
 expect_service_blocked
 "${kc[@]}" -n "${namespace}" wait --for=delete pod/server --timeout=120s >/dev/null
 wait_for_service 0 >/dev/null
