@@ -487,8 +487,6 @@ fn merge_backend(
     };
     let candidate_slice = candidate.endpoint_slices[0].clone();
     let same_provenance = existing.id == candidate.id
-        && existing.port_name == candidate.port_name
-        && existing.app_protocol == candidate.app_protocol
         && existing.target_workload == candidate.target_workload
         && existing.node_name == candidate.node_name
         && existing.zone == candidate.zone
@@ -502,6 +500,16 @@ fn merge_backend(
             port: candidate.port,
             protocol: candidate.protocol,
         });
+    }
+    // Kubernetes permits multiple named Service ports to resolve to the same
+    // address/port/protocol backend tuple. A backend has one dataplane identity,
+    // so retain a singular port/appProtocol value only when every reference
+    // agrees; otherwise the optional provenance is intentionally unspecific.
+    if existing.port_name != candidate.port_name {
+        existing.port_name = None;
+    }
+    if existing.app_protocol != candidate.app_protocol {
+        existing.app_protocol = None;
     }
     if !existing.endpoint_slices.contains(&candidate_slice) {
         existing.endpoint_slices.push(candidate_slice);
@@ -1605,6 +1613,67 @@ mod tests {
             ),
             Err(ServiceCompileError::ConflictingBackendProvenance { .. })
         ));
+    }
+
+    #[test]
+    fn compiler_merges_named_service_ports_that_share_one_backend_tuple() {
+        let mut service = source_service();
+        service.cluster_ips = vec!["10.96.0.10".parse().expect("valid IPv4 address")];
+        service.ports = vec![
+            ServiceSourcePort {
+                name: Some("ironic".to_owned()),
+                protocol: Protocol::Tcp,
+                port: 6388,
+                app_protocol: None,
+            },
+            ServiceSourcePort {
+                name: Some("ironic-api".to_owned()),
+                protocol: Protocol::Tcp,
+                port: 6385,
+                app_protocol: Some("example.io/api".to_owned()),
+            },
+        ];
+        let mut slice = source_slice(AddressFamily::Ipv4, "metal3", "10.244.0.20");
+        slice.endpoints[0].ready = true;
+        slice.endpoints[0].terminating = false;
+        slice.endpoints[0].ports = vec![
+            EndpointPortSource {
+                name: Some("ironic".to_owned()),
+                protocol: Protocol::Tcp,
+                port: Some(6388),
+                app_protocol: None,
+            },
+            EndpointPortSource {
+                name: Some("ironic-api".to_owned()),
+                protocol: Protocol::Tcp,
+                port: Some(6388),
+                app_protocol: Some("example.io/api".to_owned()),
+            },
+        ];
+
+        let expected = compile_service_snapshot(
+            9,
+            Revision::new(3),
+            vec![service.clone()],
+            vec![slice.clone()],
+        )
+        .expect("valid shared target port");
+        service.ports.reverse();
+        slice.endpoints[0].ports.reverse();
+        let reordered = compile_service_snapshot(9, Revision::new(3), vec![service], vec![slice])
+            .expect("source ordering does not alter shared target lowering");
+
+        assert_eq!(expected, reordered);
+        let compiled = &expected.services[0];
+        assert_eq!(compiled.frontends.len(), 2);
+        assert_eq!(compiled.backends.len(), 1);
+        assert_eq!(
+            compiled.frontends[0].backend_ids,
+            compiled.frontends[1].backend_ids
+        );
+        assert_eq!(compiled.backends[0].port, 6388);
+        assert_eq!(compiled.backends[0].port_name, None);
+        assert_eq!(compiled.backends[0].app_protocol, None);
     }
 
     #[test]

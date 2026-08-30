@@ -107,16 +107,19 @@ assert_version() {
 }
 
 wait_for_controller() {
-    local version=
+    local version= status=
     for _ in $(seq 1 300); do
         version=$(controller_raw /v1/version 2>/dev/null || true)
-        if assert_version "${version}" unf-controller 2>/dev/null; then
+        status=$(controller_raw /v1/status 2>/dev/null || true)
+        if assert_version "${version}" unf-controller 2>/dev/null \
+            && jq -e '.service_compilation_error == null' <<<"${status}" >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
     done
     echo "controller did not expose the qualified ABI-v4 revision" >&2
     jq . <<<"${version}" >&2 || true
+    jq . <<<"${status}" >&2 || true
     return 1
 }
 
