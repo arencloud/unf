@@ -192,6 +192,48 @@ udp_probe_once() {
         "printf udp-ok | socat -T 4 - '${target}'" | grep -qx udp-ok
 }
 
+qualification_source_port() {
+    local base=$1
+    local salt=$2
+    local family=$3
+    local address=$4
+    local port=$5
+    local checksum
+    checksum=$(printf '%s' "${salt}|${family}|${address}|${port}" | cksum | awk '{print $1}')
+    printf '%s\n' "$((base + checksum % 10000))"
+}
+
+fresh_tcp_probe() {
+    local family=$1
+    local address=$2
+    local port=${3:-8080}
+    local source_port target
+    source_port=$(qualification_source_port 20000 negative "${family}" "${address}" "${port}")
+    if [[ ${family} == 4 ]]; then
+        target="TCP4:${address}:${port},sourceport=${source_port},reuseaddr"
+    else
+        target="TCP6:[${address}]:${port},sourceport=${source_port},reuseaddr"
+    fi
+    "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
+        "printf 'GET /health HTTP/1.0\\r\\nHost: qualification\\r\\n\\r\\n' | socat -T 4 - '${target}'" \
+        | tr -d '\r' | grep -qx ok
+}
+
+fresh_udp_probe() {
+    local family=$1
+    local address=$2
+    local port=${3:-5353}
+    local source_port target
+    source_port=$(qualification_source_port 20000 negative "${family}" "${address}" "${port}")
+    if [[ ${family} == 4 ]]; then
+        target="UDP4:${address}:${port},sourceport=${source_port},reuseaddr"
+    else
+        target="UDP6:[${address}]:${port},sourceport=${source_port},reuseaddr"
+    fi
+    "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
+        "printf udp-ok | socat -T 4 - '${target}'" | grep -qx udp-ok
+}
+
 udp_probe() {
     local family=$1
     local address=$2
@@ -289,10 +331,10 @@ node_port_probe_matrix() {
 
 expect_local_node_port_blocked() {
     local succeeded=false
-    if tcp_probe "${client_node_v4}" 31080 >/dev/null 2>&1; then succeeded=true; fi
-    if tcp_probe "[${client_node_v6}]" 31080 >/dev/null 2>&1; then succeeded=true; fi
-    if udp_probe_once 4 "${client_node_v4}" 31053 >/dev/null 2>&1; then succeeded=true; fi
-    if udp_probe_once 6 "${client_node_v6}" 31053 >/dev/null 2>&1; then succeeded=true; fi
+    if fresh_tcp_probe 4 "${client_node_v4}" 31080 >/dev/null 2>&1; then succeeded=true; fi
+    if fresh_tcp_probe 6 "${client_node_v6}" 31080 >/dev/null 2>&1; then succeeded=true; fi
+    if fresh_udp_probe 4 "${client_node_v4}" 31053 >/dev/null 2>&1; then succeeded=true; fi
+    if fresh_udp_probe 6 "${client_node_v6}" 31053 >/dev/null 2>&1; then succeeded=true; fi
     if [[ ${succeeded} == true ]]; then
         echo "Local NodePort unexpectedly forwarded without a local backend" >&2
         return 1
@@ -306,10 +348,10 @@ active_probe_matrix() {
 
 expect_service_matrix_blocked() {
     local succeeded=false
-    if tcp_probe "${service_v4}" >/dev/null 2>&1; then succeeded=true; fi
-    if tcp_probe "[${service_v6}]" >/dev/null 2>&1; then succeeded=true; fi
-    if udp_probe_once 4 "${service_v4}" >/dev/null 2>&1; then succeeded=true; fi
-    if udp_probe_once 6 "${service_v6}" >/dev/null 2>&1; then succeeded=true; fi
+    if fresh_tcp_probe 4 "${service_v4}" >/dev/null 2>&1; then succeeded=true; fi
+    if fresh_tcp_probe 6 "${service_v6}" >/dev/null 2>&1; then succeeded=true; fi
+    if fresh_udp_probe 4 "${service_v4}" >/dev/null 2>&1; then succeeded=true; fi
+    if fresh_udp_probe 6 "${service_v6}" >/dev/null 2>&1; then succeeded=true; fi
     if [[ ${succeeded} == true ]]; then
         echo "backendless Service unexpectedly forwarded traffic" >&2
         return 1
@@ -331,9 +373,8 @@ expect_all_service_frontends_blocked() {
         "4 ${server_node_v4} 31053 udp" "6 ${server_node_v6} 31053 udp"; do
         read -r family address port protocol <<<"${endpoint}"
         if [[ ${protocol} == tcp ]]; then
-            if [[ ${family} == 6 ]]; then address="[${address}]"; fi
-            if tcp_probe "${address}" "${port}" >/dev/null 2>&1; then succeeded=true; fi
-        elif udp_probe_once "${family}" "${address}" "${port}" >/dev/null 2>&1; then
+            if fresh_tcp_probe "${family}" "${address}" "${port}" >/dev/null 2>&1; then succeeded=true; fi
+        elif fresh_udp_probe "${family}" "${address}" "${port}" >/dev/null 2>&1; then
             succeeded=true
         fi
     done
