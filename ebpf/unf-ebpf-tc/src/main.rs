@@ -2,7 +2,7 @@
 #![no_main]
 
 use aya_ebpf::bindings::{
-    BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR, BPF_FIB_LOOKUP_OUTPUT,
+    BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR,
     BPF_FIB_LKUP_RET_NO_NEIGH, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT,
     bpf_fib_lookup as BpfFibLookup,
 };
@@ -1645,16 +1645,19 @@ fn reroute_host_service_v4(ctx: &TcContext, observation: &FlowObservation) -> i3
         observation.destination_address[2],
         observation.destination_address[3],
     ]);
-    // SAFETY: pointers and length exactly match the TC helper ABI. A successful
-    // lookup supplies the exact L2 addresses required by direct workload-veth
-    // routes; unresolved physical neighbors use the helper fallback below.
+    // SAFETY: pointers and length exactly match the TC helper ABI. This is a
+    // forwarding lookup rather than BPF_FIB_LOOKUP_OUTPUT: the output flag
+    // constrains flowi4_oif to the frontend route's interface and therefore
+    // cannot discover a same-node backend veth after DNAT. A successful lookup
+    // supplies the exact L2 addresses required by direct workload-veth routes;
+    // unresolved physical neighbors use the helper fallback below.
     #[allow(unsafe_code)]
     let result = unsafe {
         bpf_fib_lookup(
             ctx.skb.skb.cast(),
             &mut lookup,
             core::mem::size_of::<BpfFibLookup>() as i32,
-            BPF_FIB_LOOKUP_OUTPUT,
+            0,
         )
     };
     redirect_service_route(ctx, &lookup, result)
@@ -1682,14 +1685,16 @@ fn reroute_host_service_v6(ctx: &TcContext, observation: &FlowObservation) -> i3
     lookup.ifindex = ifindex;
     lookup.__bindgen_anon_3.ipv6_src = ipv6_fib_words(observation.source_address);
     lookup.__bindgen_anon_4.ipv6_dst = ipv6_fib_words(observation.destination_address);
-    // SAFETY: pointers and length exactly match the TC helper ABI.
+    // SAFETY: pointers and length exactly match the TC helper ABI. As for IPv4,
+    // leaving the output flag clear permits the lookup to select a different
+    // backend interface after translation.
     #[allow(unsafe_code)]
     let result = unsafe {
         bpf_fib_lookup(
             ctx.skb.skb.cast(),
             &mut lookup,
             core::mem::size_of::<BpfFibLookup>() as i32,
-            BPF_FIB_LOOKUP_OUTPUT,
+            0,
         )
     };
     redirect_service_route(ctx, &lookup, result)
