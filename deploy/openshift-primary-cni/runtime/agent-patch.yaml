@@ -4,6 +4,10 @@ metadata:
   name: unf-agent
   namespace: unf-system
 spec:
+  # Persistent BPF ABI transitions are deliberately advanced one Node at a
+  # time by the guarded OpenShift service-fabric workflow.
+  updateStrategy:
+    type: OnDelete
   template:
     metadata:
       annotations:

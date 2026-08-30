@@ -22,7 +22,7 @@ cluster support.
 | 4.5 | Dual-stack ClusterIP dataplane | **Verified** | `make service-dataplane-test`; verifier-loaded IPv4/IPv6 TCP/UDP DNAT and reverse SNAT, checksum proof, deterministic ready/non-terminating selection, paired connection provenance, churn persistence, expiry/reselection, and exact no-backend drop; ADR 0078 |
 | 4.6 | Service operations | **Verified** | `make service-operations-test`; fixed event ABI, bounded metrics/status/export/history, durable migration, service explanation, and actionable translation/drop/expiry reasons; ADR 0079 |
 | 4.7 | Kube-proxy-free Kind qualification | **Verified** | `make service-kind-test`; dedicated Kubernetes 1.35 dual-stack primary-CNI fixture, lifecycle/failure/recovery artifact, and exact rollback; ADR 0080 |
-| 4.8 | OpenShift qualification | **Planned** | Kind gate closed; deliberately configured disposable cluster; RHCOS/SELinux/CRI-O/operator evidence |
+| 4.8 | OpenShift qualification | **In progress** | The Kind-qualified revision is published by three immutable public Quay digests. `make openshift-service-deploy` provides the guarded controller-first, `OnDelete`, five-Node ABI-v3→v4 handoff while kube-proxy remains available; `make openshift-service-test` removes kube-proxy only after full convergence and owns the RHCOS/SELinux/CRI-O/lifecycle/recovery/operator gate |
 
 ## Accepted Phase 4 gate
 
@@ -64,8 +64,12 @@ restores the primary-CNI labels and CoreDNS bootstrap prerequisites. Run
 
 ## Immediate next slice
 
-Implement Phase 4.8 without widening unsupported Service types: publish the
-qualified development images by immutable digest, audit the dedicated cl02
-primary-CNI cluster, and prove the same dual-stack TCP/UDP ClusterIP lifecycle,
-failure/recovery, observability, RHCOS, SELinux, CRI-O, and operator-health
-invariants. No behavior is inherited from the Kind result.
+Execute Phase 4.8 without widening unsupported Service types. The qualified
+revision and immutable release record are now published, and the checked-in
+workflow deliberately crosses persistent BPF ABI v3 to v4 controller-first and
+one Node at a time while kube-proxy remains a safety net. The second gate may
+remove kube-proxy only after all five agents converge; it then proves the same
+dual-stack TCP/UDP ClusterIP lifecycle, failure/recovery, observability, RHCOS,
+SELinux, CRI-O, and operator-health invariants and retires only the obsolete v3
+map directory. Passing live cl02 evidence remains required; no behavior is
+inherited from the Kind result.
