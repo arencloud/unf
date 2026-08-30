@@ -113,6 +113,42 @@ for node in "${nodes[@]}"; do
         binary=/opt/cni/bin/unf
         config=/etc/cni/net.d/10-unf.conflist
 
+        for temporary_pattern in \
+            "${marker}.tmp.*" \
+            "${binary}.tmp.*" \
+            "${config}.tmp.*"; do
+            for temporary in $temporary_pattern; do
+                [ -e "$temporary" ] || break
+                test -f "$temporary" && test ! -L "$temporary"
+                printf "%s\n" "${temporary##*/}" \
+                    | grep -Eq "^(install.env|unf|10-unf.conflist)\\.tmp\\.[0-9]+$"
+                rm -f "$temporary"
+            done
+        done
+
+        # A previous rollback attempt may already have removed the complete
+        # owned transaction on this Node before another Node failed. Resume only
+        # from an exact empty owned boundary; any partial combination remains
+        # a hard error and follows the full validation path below.
+        if [ ! -e "$routes" ] && [ ! -e "$services" ] && [ ! -e "$marker" ] \
+            && [ ! -e "$binary" ] && [ ! -e "$config" ]; then
+            test ! -e "${state_dir}/attachments.json"
+            test ! -e "${state_dir}/node-block.json"
+            test ! -e "${state_dir}/pending-deletes"
+            if [ -d "$state_dir" ]; then
+                test -z "$(find "$state_dir" -mindepth 1 -print -quit)"
+                rmdir "$state_dir"
+            fi
+            [ ! -d /var/lib/unf/cni ] || rmdir /var/lib/unf/cni
+            rm -f /run/unf/cni.sock
+            [ ! -d /run/unf ] || rmdir /run/unf
+            if [ -d /sys/fs/bpf/unf ]; then
+                test -z "$(find /sys/fs/bpf/unf -mindepth 1 -maxdepth 1 -print -quit)"
+                rmdir /sys/fs/bpf/unf
+            fi
+            exit 0
+        fi
+
         test -f "$routes" && test ! -L "$routes"
         test "$(jq -r .schemaVersion "$routes")" = 1
         expected=$(jq ".remoteNodes | length" "$routes")
