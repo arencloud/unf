@@ -771,8 +771,10 @@ for _ in $(seq 1 90); do
     sleep 1
 done
 wait_for_convergence
-expect_all_service_frontends_blocked
+# Reuse the established UDP tuples before the exhaustive negative matrix can
+# legitimately age them beyond the protocol's bounded idle lifetime.
 retained_node_port_matrix
+expect_all_service_frontends_blocked
 for _ in $(seq 1 90); do
     history=$(controller_raw /v1/flows 2>/dev/null || true)
     if jq -e --argjson service_id "${service_id}" '
