@@ -35,6 +35,8 @@ observation ports. The gate requires:
 - zero desired NodePort frontends, empty host frontend maps, legacy-format
   ClusterIP-only checkpoints, CNI attachment/veth cleanup, and scoped ABI-v5
   platform rollback; and
+- explicit IPv4 NodePort host prerequisites with exact pre-activation sysctl
+  capture and rollback restoration; and
 - schema-v2 evidence binding the exact source revision, image IDs, Kubernetes,
   Node addresses, kernel/runtime/OS tuple, duration, assertions, and exclusions.
 
@@ -51,6 +53,7 @@ both the legacy ClusterIP checkpoint and the composite NodePort checkpoint.
   generic NAT `RELATED` tracking, and production availability or scale.
 - The milestone is Implemented, not Verified, until committed images complete
   the gate and the resulting immutable evidence is audited.
+- ADR 0090 records the host-kernel contract discovered by the first live run.
 
 ## Verification
 

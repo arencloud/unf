@@ -56,6 +56,13 @@ yq -o=json 'select(.kind == "Deployment" and .metadata.name == "unf-controller")
 grep -q 'ip: 192.0.2.1' "${temporary_dir}/runtime.yaml"
 grep -q 'https://unf-primary-controller.internal:9964' "${temporary_dir}/runtime.yaml"
 [[ $(grep -c 'path: /etc/sysctl.d/90-unf-primary-cni.conf' "${temporary_dir}/machineconfig.yaml") -eq 2 ]]
+for setting in \
+    'net.ipv4.conf.default.rp_filter%3D0' \
+    'net.ipv4.conf.%2A.rp_filter%3D0' \
+    'net.ipv4.conf.default.accept_local%3D1' \
+    'net.ipv4.conf.%2A.accept_local%3D1'; do
+    [[ $(grep -c "${setting}" "${temporary_dir}/machineconfig.yaml") -eq 2 ]]
+done
 grep -q 'networkType: None' "${project_root}/deploy/openshift-primary-cni/install-config-networking.yaml"
 grep -q 'type: None' "${project_root}/deploy/openshift-primary-cni/manifests/cluster-network-03-config.yaml"
 jq -e '

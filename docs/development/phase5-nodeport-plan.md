@@ -17,7 +17,7 @@ authoritative feature state remains in [project-status.md](../project-status.md)
 | 5.4 | `externalTrafficPolicy: Cluster` dataplane | **Verified** | Exact Node-address/port/protocol lookup, coherent service-bank validation, IPv4/IPv6 TCP/UDP DNAT with bounded collision-safe Node SNAT, paired reverse restoration, deterministic slots, connection persistence, backend policy ordering, checksum/provenance packet execution; `make nodeport-cluster-dataplane-test`; ADR 0086 |
 | 5.5 | `externalTrafficPolicy: Local` | **Verified** | Deterministic per-Node slot namespace merged transactionally with the service bank; ready/non-terminating placement eligibility; source preservation; exact no-local-backend drop; placement/readiness loss, established-flow retention, recovery, reverse translation, and backend policy ordering; NodePort/LoadBalancer health-check boundary; `make nodeport-local-dataplane-test`; ADR 0087 |
 | 5.6 | NodePort operations | **Verified** | Fixed-width event classification; label-free metrics; status v5; export/history/checkpoint v5/v6/v5; filtered explanation; read-only simulation; actionable bounded failures; restart migration; `make nodeport-operations-test`; ADR 0088 |
-| 5.7 | Kube-proxy-free Kind qualification | **Implemented** | `make nodeport-kind-test` now encodes cross-node dual-stack Cluster/Local lifecycle, source and reverse tuple checks, retained UDP connections, classified operations, controller outage, both worker-agent replacements, cleanup, exact rollback, and schema-v2 evidence; execution on committed images remains the verification gate; ADR 0089 |
+| 5.7 | Kube-proxy-free Kind qualification | **Implemented** | `make nodeport-kind-test` now encodes cross-node dual-stack Cluster/Local lifecycle, source and reverse tuple checks, retained UDP connections, classified operations, controller outage, both worker-agent replacements, cleanup, exact rollback, reversible IPv4 host prerequisites, and schema-v2 evidence; execution on committed images remains the verification gate; ADRs 0089–0090 |
 | 5.8 | OpenShift qualification | **Planned** | Digest-pinned RHCOS/SELinux/CRI-O rollout and kube-proxy-free cross-worker NodePort lifecycle/recovery on the exact disposable tuple |
 
 ## Accepted Phase 5 gate
@@ -33,6 +33,8 @@ run with kube-proxy absent and demonstrate:
   last-known-good state;
 - NodePort-specific metrics, status, history, explanation, and simulation;
 - exact host-map, attachment, fixture, and legacy-state cleanup; and
+- exact backup, application, and restoration of the IPv4 NodePort host sysctl
+  contract; and
 - immutable schema-versioned source, image, and platform evidence.
 
 SCTP forwarding, LoadBalancer, session affinity, topology hints, Maglev, DSR,
@@ -49,3 +51,9 @@ source and destination agent replacement from last-known-good state, classified
 metrics/status/history/explanation/simulation, exact fixture and ABI cleanup,
 and restoration to the saved no-CNI baseline. Evidence must bind the source
 revision, images, Kubernetes/Kind/kernel tuple, timing, and exclusions.
+
+The first live execution isolated a distribution-default host prerequisite:
+reverse-translated IPv4 replies require `rp_filter=0` and `accept_local=1` on
+all current and future interfaces. ADR 0090 makes that contract persistent on
+OpenShift and exactly reversible in the disposable Kind fixture. The committed
+fix must pass the complete gate before milestone 5.7 changes to Verified.

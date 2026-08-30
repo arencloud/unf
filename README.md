@@ -217,8 +217,11 @@ superset of the kube-proxy-free dual-stack Service fixture. It covers both
 traffic policies through exact worker addresses, source/reverse tuple behavior,
 retained UDP flows across readiness withdrawal, lifecycle failure and recovery,
 classified operations, controller-offline worker-agent replacement, empty-map
-cleanup, exact ABI-v5 rollback, and immutable evidence. ADR 0089 defines the
-gate; a committed-image execution is required before it is marked Verified.
+cleanup, exact ABI-v5 rollback, and immutable evidence. The fixture also
+captures, applies, and restores the exact IPv4 reverse-path/local-source host
+settings needed by NodePort; OpenShift persists the same settings through both
+MachineConfigPools. ADRs 0089–0090 define the gate and host contract; a
+committed-image execution is required before it is marked Verified.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

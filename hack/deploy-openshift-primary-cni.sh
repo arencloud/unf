@@ -150,6 +150,16 @@ for node in "${nodes[@]}"; do
             test "$(sysctl -n net.ipv4.ip_forward)" = 1
             test "$(sysctl -n net.ipv6.conf.all.forwarding)" = 1
             test "$(sysctl -n net.ipv6.conf.default.forwarding)" = 1
+            test "$(sysctl -n net.ipv4.conf.all.rp_filter)" = 0
+            test "$(sysctl -n net.ipv4.conf.default.rp_filter)" = 0
+            test "$(sysctl -n net.ipv4.conf.all.accept_local)" = 1
+            test "$(sysctl -n net.ipv4.conf.default.accept_local)" = 1
+            for path in /proc/sys/net/ipv4/conf/*/rp_filter; do
+                test "$(cat "$path")" = 0
+            done
+            for path in /proc/sys/net/ipv4/conf/*/accept_local; do
+                test "$(cat "$path")" = 1
+            done
             test -f /etc/sysctl.d/90-unf-primary-cni.conf
             test ! -L /etc/sysctl.d/90-unf-primary-cni.conf
             echo forwarding-ready

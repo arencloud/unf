@@ -886,14 +886,58 @@ wait_for_service_shape "${baseline_services}" "${baseline_frontends}" "${baselin
     "${cleanup_node_ports}" \
     >/dev/null
 if [[ ${node_port_mode} == true ]]; then
+    map_audit_label=qualification.unf.io/nodeport-map-audit
     for node in "${nodes[@]}"; do
-        sudo "${container_runtime}" exec "${node}" sh -ec '
-            test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V4 | jq length)" -eq 0
-            test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V6 | jq length)" -eq 0
-            snapshot=/var/lib/unf/cni/v1/service-snapshot.json
-            jq -e ".schemaVersion == 1 and has(\"service\") == false and (.services | all(.nodePorts | length == 0))" "$snapshot" >/dev/null
-        '
+        audit_pod="unf-nodeport-map-audit-${node##*-}"
+        "${kc[@]}" -n unf-system delete pod "${audit_pod}" \
+            --ignore-not-found --wait=true >/dev/null
+        "${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${audit_pod}
+  namespace: unf-system
+  labels:
+    qualification.unf.io/nodeport-map-audit: "true"
+spec:
+  nodeName: ${node}
+  hostNetwork: true
+  restartPolicy: Never
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: audit
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
+      command: [sh, -ec]
+      args:
+        - |
+          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V4 | jq length)" -eq 0
+          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V6 | jq length)" -eq 0
+          snapshot=/var/lib/unf/cni/v1/service-snapshot.json
+          jq -e '.schemaVersion == 1 and has("service") == false and (.services | all(.nodePorts | length == 0))' "\$snapshot" >/dev/null
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: bpffs
+          mountPath: /sys/fs/bpf
+        - name: state
+          mountPath: /var/lib/unf
+  volumes:
+    - name: bpffs
+      hostPath:
+        path: /sys/fs/bpf
+        type: Directory
+    - name: state
+      hostPath:
+        path: /var/lib/unf
+        type: Directory
+EOF
+        "${kc[@]}" -n unf-system wait --for=jsonpath='{.status.phase}'=Succeeded \
+            "pod/${audit_pod}" --timeout=60s >/dev/null
     done
+    "${kc[@]}" -n unf-system delete pods -l "${map_audit_label}=true" \
+        --wait=true --timeout=60s >/dev/null
 fi
 
 qualification_stage=evidence

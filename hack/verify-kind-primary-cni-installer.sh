@@ -16,6 +16,15 @@ for command in podman skopeo; do
         exit 1
     }
 done
+bash -n "${project_root}/hack/configure-kind-primary-cni.sh"
+bash -n "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'nodeport-sysctls' "${project_root}/hack/configure-kind-primary-cni.sh"
+grep -q 'nodeport-sysctls' "${project_root}/hack/rollback-kind-primary-cni.sh"
+for setting in rp_filter accept_local; do
+    grep -q "/proc/sys/net/ipv4/conf/\*/${setting}" \
+        "${project_root}/hack/configure-kind-primary-cni.sh"
+done
+grep -q 'conf/${key}' "${project_root}/hack/rollback-kind-primary-cni.sh"
 printf '%s\n' '{"auths":{}}' >"${anonymous_auth}"
 chmod 0600 "${anonymous_auth}"
 skopeo inspect --authfile "${anonymous_auth}" "docker://${agent_image}" >/dev/null

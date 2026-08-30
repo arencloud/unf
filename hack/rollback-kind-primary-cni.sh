@@ -21,8 +21,8 @@ fi
 # Drain every ordinary fixture workload first so kubelet invokes DEL while the
 # local transaction socket is still available. Host-network bootstrap Pods are
 # intentionally retained until owned routes and files are gone.
-"${kc[@]}" delete namespace unf-cni-qualification --ignore-not-found --wait=true \
-    --timeout=120s >/dev/null
+"${kc[@]}" delete namespace unf-cni-qualification unf-service-qualification \
+    --ignore-not-found --wait=true --timeout=120s >/dev/null
 "${kc[@]}" -n local-path-storage scale deployment/local-path-provisioner --replicas=0 \
     >/dev/null
 "${kc[@]}" -n local-path-storage wait --for=delete pod \
@@ -208,6 +208,13 @@ coredns_template_spec=$("${kc[@]}" -n kube-system get configmap \
     unf-primary-cni-bootstrap-backup -o jsonpath='{.data.coredns-template-spec}')
 coredns_corefile=$("${kc[@]}" -n kube-system get configmap \
     unf-primary-cni-bootstrap-backup -o jsonpath='{.data.coredns-corefile}')
+nodeport_sysctls=$("${kc[@]}" -n kube-system get configmap \
+    unf-primary-cni-bootstrap-backup -o jsonpath='{.data.nodeport-sysctls}')
+if ! jq -e --argjson node_count "${#nodes[@]}" \
+    'type == "object" and length == $node_count' <<<"${nodeport_sysctls}" >/dev/null; then
+    echo "primary-CNI rollback backup lacks exact NodePort sysctl state" >&2
+    exit 1
+fi
 coredns_patch=$(jq -cn --argjson spec "${coredns_template_spec}" \
     '[{"op":"replace","path":"/spec/template/spec","value":$spec}]')
 "${kc[@]}" -n kube-system patch deployment coredns --type=json --patch "${coredns_patch}" \
@@ -218,6 +225,23 @@ if [[ -n ${coredns_corefile} ]]; then
     "${kc[@]}" -n kube-system patch configmap coredns --type=merge \
         --patch "${corefile_patch}" >/dev/null
 fi
+
+for node in "${nodes[@]}"; do
+    sysctl_rows=$(jq -er --arg node "${node}" '
+        .[$node] | to_entries[] | [.key, (.value | tostring)] | @tsv
+    ' <<<"${nodeport_sysctls}")
+    sudo "${container_runtime}" exec -i "${node}" sh -ec '
+        tab=$(printf "\t")
+        while IFS="$tab" read -r key value; do
+            path=/proc/sys/net/ipv4/conf/${key}
+            # Interfaces captured before CNI activation may have disappeared
+            # after kubelet DEL. Every surviving captured key is exact.
+            [ -e "$path" ] || continue
+            printf "%s" "$value" >"$path"
+            test "$(cat "$path")" = "$value"
+        done
+    ' <<<"${sysctl_rows}"
+done
 "${kc[@]}" -n kube-system delete configmap unf-primary-cni-bootstrap-backup >/dev/null
 "${kc[@]}" -n local-path-storage scale deployment/local-path-provisioner --replicas=1 \
     >/dev/null

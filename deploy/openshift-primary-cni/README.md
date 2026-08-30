@@ -51,7 +51,9 @@ UNF_OPENSHIFT_PRIMARY_ACKNOWLEDGE_DISPOSABLE="$infrastructure" \
 The deployment's candidate audit first allows only a missing-PodCIDR condition,
 then validates and assigns the exact five-Node dual-stack map in
 `node-blocks.json`. It applies
-the forwarding MachineConfigs and waits for both pools, verifies the pinned
+the forwarding and NodePort host-kernel MachineConfigs and waits for both pools,
+disables IPv4 reverse-path filtering and enables local-source acceptance on
+every current and future interface, verifies the pinned
 uplinks and SELinux, creates disposable TLS, labels the exact Nodes, and applies
 the anonymously pullable digest-pinned
 host-network controller and agent. The installer sidecar waits for the local
