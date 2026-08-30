@@ -107,7 +107,7 @@ controller_raw() {
     local path=$1 pod
     pod=$(controller_pod)
     [[ -n ${pod} ]]
-    "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${pod}:9962/proxy${path}"
+    timeout 15 "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${pod}:9962/proxy${path}"
 }
 
 agent_pod_on_node() {
@@ -123,7 +123,7 @@ agent_raw() {
     local node=$1 path=$2 pod
     pod=$(agent_pod_on_node "${node}")
     [[ -n ${pod} ]]
-    "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${pod}:9963/proxy${path}"
+    timeout 15 "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${pod}:9963/proxy${path}"
 }
 
 host_exec() {
@@ -166,9 +166,11 @@ wait_for_convergence() {
 }
 
 wait_for_service() {
-    local expected_ready_backends=$1 snapshot=
+    local expected_ready_backends=$1 pod= snapshot=
     for _ in $(seq 1 180); do
-        snapshot=$(controller_raw /v1/state/services 2>/dev/null || true)
+        pod=$(agent_pod_on_node "${client_node}")
+        snapshot=$(timeout 15 "${kc[@]}" -n unf-system exec "${pod}" -c agent -- \
+            cat /var/lib/unf/cni/v1/service-snapshot.json 2>/dev/null || true)
         if jq -e --arg namespace "${namespace}" --argjson backends "${expected_ready_backends}" '
             .schemaVersion == 1
             and any(.services[];
