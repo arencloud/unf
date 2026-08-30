@@ -330,7 +330,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             match lookup_forward_service_v4(forward_key, now_ns) {
                 ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
-                ServiceLookup::Translation(translation) => {
+                ServiceLookup::Translation(translation, _) => {
                     service_forward_translated = true;
                     let backend_address = [
                         translation.address[0],
@@ -414,9 +414,9 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 match lookup_forward_service_v4(service_key, now_ns) {
                     ServiceLookup::Miss => {}
                     ServiceLookup::Drop => return TC_ACT_SHOT,
-                    ServiceLookup::Translation(translation) => {
+                    ServiceLookup::Translation(translation, cluster_ip) => {
                         service_forward_translated = true;
-                        reroute_host_cluster_ip = service_connection_is_cluster_ip();
+                        reroute_host_cluster_ip = cluster_ip;
                         let backend_address = [
                             translation.address[0],
                             translation.address[1],
@@ -583,7 +583,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             match lookup_forward_service_v6(forward_key, now_ns) {
                 ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
-                ServiceLookup::Translation(translation) => {
+                ServiceLookup::Translation(translation, _) => {
                     service_forward_translated = true;
                     if service_connection_translation(true).is_some_and(|source_translation| {
                         !rewrite_ipv6(
@@ -657,9 +657,9 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 match lookup_forward_service_v6(service_key, now_ns) {
                     ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
-                ServiceLookup::Translation(translation) => {
+                ServiceLookup::Translation(translation, cluster_ip) => {
                     service_forward_translated = true;
-                    reroute_host_cluster_ip = service_connection_is_cluster_ip();
+                    reroute_host_cluster_ip = cluster_ip;
                     if service_connection_translation(true).is_some_and(
                             |source_translation| {
                                 !rewrite_ipv6(
@@ -792,7 +792,7 @@ struct ServiceTranslation {
 enum ServiceLookup {
     Miss,
     Drop,
-    Translation(ServiceTranslation),
+    Translation(ServiceTranslation, bool),
 }
 
 #[inline(always)]
@@ -1098,7 +1098,7 @@ fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
 fn refresh_service_connection(
     key: &ServiceConnectionKey,
     now_ns: u64,
-) -> Option<ServiceTranslation> {
+) -> Option<(ServiceTranslation, bool)> {
     // SAFETY: the fixed-layout value is copied before any update and no map
     // reference escapes this lookup.
     #[allow(unsafe_code)]
@@ -1151,7 +1151,10 @@ fn refresh_service_connection(
         remove_service_pair(value);
         return None;
     }
-    Some(translation)
+    let cluster_ip = value.flags
+        & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
+        == 0;
+    Some((translation, cluster_ip))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1217,8 +1220,8 @@ fn new_service_connection(
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) -> ServiceLookup {
-    if let Some(translation) = refresh_service_connection(forward_key, now_ns) {
-        return ServiceLookup::Translation(translation);
+    if let Some((translation, cluster_ip)) = refresh_service_connection(forward_key, now_ns) {
+        return ServiceLookup::Translation(translation, cluster_ip);
     }
 
     let Some(config) = active_service_config() else {
@@ -1398,14 +1401,14 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         );
         return ServiceLookup::Drop;
     };
-    ServiceLookup::Translation(translation)
+    ServiceLookup::Translation(translation, connection_flags == 0)
 }
 
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) -> ServiceLookup {
-    if let Some(translation) = refresh_service_connection(forward_key, now_ns) {
-        return ServiceLookup::Translation(translation);
+    if let Some((translation, cluster_ip)) = refresh_service_connection(forward_key, now_ns) {
+        return ServiceLookup::Translation(translation, cluster_ip);
     }
 
     let Some(config) = active_service_config() else {
@@ -1570,7 +1573,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         );
         return ServiceLookup::Drop;
     };
-    ServiceLookup::Translation(translation)
+    ServiceLookup::Translation(translation, connection_flags == 0)
 }
 
 #[inline(never)]
@@ -1578,7 +1581,7 @@ fn lookup_reverse_service(
     reverse_key: &ServiceConnectionKey,
     now_ns: u64,
 ) -> Option<ServiceTranslation> {
-    refresh_service_connection(reverse_key, now_ns)
+    refresh_service_connection(reverse_key, now_ns).map(|(translation, _)| translation)
 }
 
 #[inline(always)]
@@ -1600,20 +1603,6 @@ const fn l4_checksum_flags(protocol: u8, size: u64, pseudo_header: bool) -> u64 
         flags |= BPF_F_MARK_MANGLED_0 as u64;
     }
     flags
-}
-
-#[inline(always)]
-fn service_connection_is_cluster_ip() -> bool {
-    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
-        return false;
-    };
-    // SAFETY: callers use this only after a successful Service lookup populated
-    // the current CPU's connection scratch value.
-    #[allow(unsafe_code)]
-    let value = unsafe { &*value_ptr };
-    value.flags
-        & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
-        == 0
 }
 
 /// Host-origin traffic reaches TC after the kernel selected a route for the
