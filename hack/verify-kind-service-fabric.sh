@@ -542,12 +542,24 @@ wait_for_service_shape "${baseline_services}" "${baseline_frontends}" "${baselin
 
 qualification_stage=evidence
 mkdir -p "$(dirname "${artifact}")"
+release_revision=$(controller_raw /v1/version | jq -er '
+    select(.schema_version == 2 and .component == "unf-controller") | .build_revision
+')
+[[ ${release_revision} =~ ^[0-9a-f]{40}$ ]]
+git -C "${project_root}" merge-base --is-ancestor "${release_revision}" HEAD
+while read -r agent_pod; do
+    agent_revision=$(agent_raw "${agent_pod}" /v1/version | jq -er '
+        select(.schema_version == 2 and .component == "unf-agent") | .build_revision
+    ')
+    [[ ${agent_revision} == "${release_revision}" ]]
+done < <("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 node_evidence=$("${kc[@]}" get nodes -o json | jq \
     '[.items[] | {name:.metadata.name,podCIDRs:.spec.podCIDRs,internalIPs:[.status.addresses[] | select(.type=="InternalIP") | .address]}]')
 final_agents=$(controller_raw /v1/state/agents)
 jq -n \
     --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --arg revision "$(git -C "${project_root}" rev-parse HEAD)" \
+    --arg revision "${release_revision}" \
     --arg context "${context}" \
     --arg kubernetesVersion "$("${kc[@]}" version -o json | jq -r .serverVersion.gitVersion)" \
     --arg serviceIPv4 "${service_v4}" \
