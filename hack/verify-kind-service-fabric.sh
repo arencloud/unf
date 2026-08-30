@@ -246,14 +246,18 @@ source_probe() {
         "printf probe | socat -T 4 - '${target}'" | tr -d '\r\n'
 }
 
+canonical_ip() {
+    python3 -c 'import ipaddress,sys; print(ipaddress.ip_address(sys.argv[1].strip("[]")))' "$1"
+}
+
 verify_node_port_sources() {
     [[ ${node_port_mode} == true ]] || return 0
-    [[ $(source_probe 4 "${client_node_v4}" 30081) == "${client_node_v4}" ]]
-    [[ $(source_probe 6 "${client_node_v6}" 30081) == "${client_node_v6}" ]]
-    [[ $(source_probe 4 "${server_node_v4}" 30081) == "${server_node_v4}" ]]
-    [[ $(source_probe 6 "${server_node_v6}" 30081) == "${server_node_v6}" ]]
-    [[ $(source_probe 4 "${server_node_v4}" 31081) == "${client_v4}" ]]
-    [[ $(source_probe 6 "${server_node_v6}" 31081) == "${client_v6}" ]]
+    [[ $(canonical_ip "$(source_probe 4 "${client_node_v4}" 30081)") == $(canonical_ip "${client_node_v4}") ]]
+    [[ $(canonical_ip "$(source_probe 6 "${client_node_v6}" 30081)") == $(canonical_ip "${client_node_v6}") ]]
+    [[ $(canonical_ip "$(source_probe 4 "${server_node_v4}" 30081)") == $(canonical_ip "${server_node_v4}") ]]
+    [[ $(canonical_ip "$(source_probe 6 "${server_node_v6}" 30081)") == $(canonical_ip "${server_node_v6}") ]]
+    [[ $(canonical_ip "$(source_probe 4 "${server_node_v4}" 31081)") == $(canonical_ip "${client_v4}") ]]
+    [[ $(canonical_ip "$(source_probe 6 "${server_node_v6}" 31081)") == $(canonical_ip "${client_v6}") ]]
 }
 
 service_probe_matrix() {
