@@ -100,6 +100,7 @@ service-kind-load: KUBE_CONTEXT = $(SERVICE_KUBE_CONTEXT)
 service-kind-load: kind-load
 
 service-kind-deploy: service-kind-load
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) hack/configure-kind-primary-cni.sh
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) UNF_INTERNAL_TLS_DIR=$(CURDIR)/.tools/kind-service-internal-tls hack/configure-internal-tls.sh
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) apply -k deploy/kind-service-fabric
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) hack/configure-kind-service-bootstrap.sh

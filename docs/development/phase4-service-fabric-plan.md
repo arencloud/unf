@@ -58,7 +58,8 @@ make service-kind-test
 
 The test deliberately rolls UNF back to the saved no-CNI bootstrap baseline
 after writing `.artifacts/phase4-service-kind.json`. Run
-`make service-kind-deploy` before repeating the gate, or
+`make service-kind-deploy` before repeating the gate; that target idempotently
+restores the primary-CNI labels and CoreDNS bootstrap prerequisites. Run
 `make service-kind-down` to remove the disposable cluster.
 
 ## Immediate next slice
