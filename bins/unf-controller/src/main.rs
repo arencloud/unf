@@ -1105,10 +1105,17 @@ async fn restore_agent_reports(state: &ControllerState) -> Result<()> {
         info!("durable agent acknowledgement store is empty");
         return Ok(());
     };
-    let reports = decode_agent_report_store(encoded, unix_time_millis())?;
+    let (reports, ignored_older_reports) = decode_agent_report_store(encoded, unix_time_millis())?;
     let restored = reports.len() as u64;
     *write_lock(&state.agent_reports) = reports;
     state.metrics.agent_reports_restored.inc_by(restored);
+    if ignored_older_reports > 0 {
+        warn!(
+            ignored_older_reports,
+            expected_schema = AGENT_STATUS_SCHEMA_VERSION,
+            "ignored durable agent acknowledgements from an older status schema"
+        );
+    }
     info!(restored, "restored durable agent acknowledgements");
     Ok(())
 }
@@ -1116,7 +1123,7 @@ async fn restore_agent_reports(state: &ControllerState) -> Result<()> {
 fn decode_agent_report_store(
     encoded: &str,
     now_unix_ms: u64,
-) -> Result<BTreeMap<String, StoredAgentReport>> {
+) -> Result<(BTreeMap<String, StoredAgentReport>, usize)> {
     let store: DurableAgentReportStore =
         serde_json::from_str(encoded).context("decode durable agent-report checkpoint")?;
     if store.schema_version != AGENT_REPORT_STORE_SCHEMA_VERSION {
@@ -1133,16 +1140,15 @@ fn decode_agent_report_store(
             AGENT_REPORT_STORE_CAPACITY
         ));
     }
-    for (node_name, stored) in &store.reports {
-        if node_name != &stored.report.node_name {
+    let mut reports = BTreeMap::new();
+    let mut ignored_older_reports = 0usize;
+    for (node_name, stored) in store.reports {
+        if node_name.as_str() != stored.report.node_name {
             return Err(anyhow!(
                 "durable agent-report key {node_name:?} does not match report node {:?}",
                 stored.report.node_name
             ));
         }
-        validate_agent_status(&stored.report).map_err(|error| {
-            anyhow!("invalid durable report for {node_name}: {}", error.message)
-        })?;
         if stored.last_received_unix_ms == 0 {
             return Err(anyhow!(
                 "durable agent report for {node_name} has no receive timestamp"
@@ -1155,8 +1161,16 @@ fn decode_agent_report_store(
                 "durable agent report for {node_name} is unreasonably far in the future"
             ));
         }
+        if stored.report.schema_version < AGENT_STATUS_SCHEMA_VERSION {
+            ignored_older_reports = ignored_older_reports.saturating_add(1);
+            continue;
+        }
+        validate_agent_status(&stored.report).map_err(|error| {
+            anyhow!("invalid durable report for {node_name}: {}", error.message)
+        })?;
+        reports.insert(node_name, stored);
     }
-    Ok(store.reports)
+    Ok((reports, ignored_older_reports))
 }
 
 fn spawn_agent_report_persistence(
@@ -6628,10 +6642,58 @@ mod tests {
         };
         let encoded = serde_json::to_string(&store).expect("durable store encodes");
 
-        let decoded = decode_agent_report_store(&encoded, 10_001)
+        let (decoded, ignored) = decode_agent_report_store(&encoded, 10_001)
             .expect("valid durable acknowledgement is restored");
 
         assert_eq!(decoded, BTreeMap::from([("worker-a".to_owned(), stored)]));
+        assert_eq!(ignored, 0);
+    }
+
+    #[test]
+    fn durable_agent_report_store_ignores_only_older_status_schemas() {
+        let current = StoredAgentReport {
+            report: converged_agent_report(7),
+            last_received_unix_ms: 10_000,
+        };
+        let mut older = current.clone();
+        older.report.node_name = "worker-old".to_owned();
+        older.report.schema_version = AGENT_STATUS_SCHEMA_VERSION - 1;
+        let store = DurableAgentReportStore {
+            schema_version: AGENT_REPORT_STORE_SCHEMA_VERSION,
+            reports: BTreeMap::from([
+                ("worker-a".to_owned(), current.clone()),
+                ("worker-old".to_owned(), older),
+            ]),
+        };
+
+        let (decoded, ignored) = decode_agent_report_store(
+            &serde_json::to_string(&store).expect("store encodes"),
+            10_001,
+        )
+        .expect("older report schemas are safely omitted during upgrade");
+
+        assert_eq!(decoded, BTreeMap::from([("worker-a".to_owned(), current)]));
+        assert_eq!(ignored, 1);
+
+        let mut future = converged_agent_report(7);
+        future.schema_version = AGENT_STATUS_SCHEMA_VERSION + 1;
+        let future_store = DurableAgentReportStore {
+            schema_version: AGENT_REPORT_STORE_SCHEMA_VERSION,
+            reports: BTreeMap::from([(
+                "worker-a".to_owned(),
+                StoredAgentReport {
+                    report: future,
+                    last_received_unix_ms: 10_000,
+                },
+            )]),
+        };
+        assert!(
+            decode_agent_report_store(
+                &serde_json::to_string(&future_store).expect("store encodes"),
+                10_001,
+            )
+            .is_err()
+        );
     }
 
     #[test]
