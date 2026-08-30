@@ -26,6 +26,8 @@ use unf_ebpf_common::{
     SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER, SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL,
     SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_EVENT_ABI_VERSION,
     SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
+    SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
+    SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL,
     SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT, SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
     SERVICE_EVENT_REASON_INVALID_BACKEND, SERVICE_EVENT_REASON_INVALID_FRONTEND,
     SERVICE_EVENT_REASON_INVALID_SLOT, SERVICE_EVENT_REASON_MISSING_BACKEND,
@@ -784,7 +786,10 @@ fn validate_node_port_frontend(
             forward_key,
             frontend.service_id,
             frontend.service_revision,
-            SERVICE_EVENT_REASON_INVALID_FRONTEND,
+            service_event_failure_metadata(
+                SERVICE_EVENT_REASON_INVALID_FRONTEND,
+                node_port_event_frontend_kind(frontend.flags),
+            ),
             now_ns,
         );
         return Err(());
@@ -806,6 +811,31 @@ fn validate_node_port_frontend(
         },
         connection_flags,
     ))
+}
+
+#[inline(always)]
+const fn node_port_event_frontend_kind(flags: u16) -> u8 {
+    if flags & NODE_PORT_FRONTEND_FLAG_LOCAL != 0 {
+        SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL
+    } else {
+        SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER
+    }
+}
+
+#[inline(always)]
+const fn connection_event_frontend_kind(flags: u16) -> u8 {
+    if flags & SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL != 0 {
+        SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL
+    } else if flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
+        SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER
+    } else {
+        SERVICE_EVENT_FRONTEND_CLUSTER_IP
+    }
+}
+
+#[inline(always)]
+const fn service_event_failure_metadata(reason: u8, frontend_kind: u8) -> u16 {
+    reason as u16 | ((frontend_kind as u16) << 8)
 }
 
 #[inline(never)]
@@ -839,18 +869,20 @@ fn emit_service_connection_event(action: u8, reason: u8, timestamp_ns: u64) {
     event.action = action;
     event.reason = reason;
     event.reserved = [0; 10];
+    event.reserved[0] = connection_event_frontend_kind(value.flags);
     let _ = SERVICE_EVENTS.output::<ServiceEvent>(&*event, 0);
 }
 
-#[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn emit_service_lookup_failure(
     key: &ServiceConnectionKey,
     service_id: ServiceId,
     service_revision: u64,
-    reason: u8,
+    failure_metadata: u16,
     timestamp_ns: u64,
 ) {
+    let reason = failure_metadata as u8;
+    let frontend_kind = (failure_metadata >> 8) as u8;
     let Some(event_ptr) = SERVICE_EVENT_SCRATCH.get_ptr_mut(0) else {
         return;
     };
@@ -874,6 +906,7 @@ fn emit_service_lookup_failure(
     event.action = SERVICE_EVENT_ACTION_DROP;
     event.reason = reason;
     event.reserved = [0; 10];
+    event.reserved[0] = frontend_kind;
     let _ = SERVICE_EVENTS.output::<ServiceEvent>(&*event, 0);
 }
 
@@ -1106,8 +1139,9 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     // the value is copied before any other map operation.
     #[allow(unsafe_code)]
     let cluster_frontend = unsafe { SERVICE_FRONTENDS_V4.get(&frontend_key).copied() };
-    let (frontend, service_bank, connection_flags) = if let Some(frontend) = cluster_frontend {
-        (frontend, config.active_bank, 0)
+    let (frontend, service_bank, connection_flags, frontend_kind) =
+        if let Some(frontend) = cluster_frontend {
+            (frontend, config.active_bank, 0, SERVICE_EVENT_FRONTEND_CLUSTER_IP)
     } else {
         let Some(node_port_config) = active_node_port_config(config) else {
             return ServiceLookup::Miss;
@@ -1144,6 +1178,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             frontend,
             node_port_frontend.service_bank,
             connection_flags,
+            node_port_event_frontend_kind(node_port_frontend.flags),
         )
     };
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
@@ -1156,7 +1191,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_INVALID_FRONTEND,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_INVALID_FRONTEND, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;
@@ -1166,7 +1201,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_NO_BACKEND,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_NO_BACKEND, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;
@@ -1185,7 +1220,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_MISSING_SLOT,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_MISSING_SLOT, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;
@@ -1199,7 +1234,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_INVALID_SLOT,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_INVALID_SLOT, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;
@@ -1217,7 +1252,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_MISSING_BACKEND,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_MISSING_BACKEND, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;
@@ -1232,7 +1267,7 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_INVALID_BACKEND,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_INVALID_BACKEND, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;
@@ -1286,8 +1321,9 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     // the value is copied before any other map operation.
     #[allow(unsafe_code)]
     let cluster_frontend = unsafe { SERVICE_FRONTENDS_V6.get(&frontend_key).copied() };
-    let (frontend, service_bank, connection_flags) = if let Some(frontend) = cluster_frontend {
-        (frontend, config.active_bank, 0)
+    let (frontend, service_bank, connection_flags, frontend_kind) =
+        if let Some(frontend) = cluster_frontend {
+            (frontend, config.active_bank, 0, SERVICE_EVENT_FRONTEND_CLUSTER_IP)
     } else {
         let Some(node_port_config) = active_node_port_config(config) else {
             return ServiceLookup::Miss;
@@ -1319,6 +1355,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             frontend,
             node_port_frontend.service_bank,
             connection_flags,
+            node_port_event_frontend_kind(node_port_frontend.flags),
         )
     };
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
@@ -1331,7 +1368,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_INVALID_FRONTEND,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_INVALID_FRONTEND, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;
@@ -1341,7 +1378,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_NO_BACKEND,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_NO_BACKEND, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;
@@ -1360,7 +1397,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_MISSING_SLOT,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_MISSING_SLOT, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;
@@ -1374,7 +1411,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_INVALID_SLOT,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_INVALID_SLOT, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;
@@ -1392,7 +1429,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_MISSING_BACKEND,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_MISSING_BACKEND, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;
@@ -1407,7 +1444,7 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
             forward_key,
             frontend.service_id,
             frontend.revision,
-            SERVICE_EVENT_REASON_INVALID_BACKEND,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_INVALID_BACKEND, frontend_kind),
             now_ns,
         );
         return ServiceLookup::Drop;

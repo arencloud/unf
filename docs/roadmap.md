@@ -433,7 +433,12 @@ matrix is maintained in the
   preserves the external source and proves exact reverse translation,
   no-local-backend behavior, placement/readiness churn, recovery, and policy
   ordering; ADR 0087. LoadBalancer health-check NodePorts remain separate.
-- In progress: NodePort operations and simulation; independent kube-proxy-free
-  Kind/OpenShift gates follow.
+- Verified by `make nodeport-operations-test`: service-event ABI v2 adds an
+  explicit fixed-width ClusterIP/NodePort-Cluster/NodePort-Local dimension;
+  label-free metrics, agent-status schema v5, flow-export schema v5, history
+  schema v6/checkpoint v5, filtered explanation, and read-only exact-Node
+  simulation retain bounded evidence across churn and restart; ADR 0088.
+- In progress: independent kube-proxy-free Kind qualification, followed by the
+  digest-pinned OpenShift gate.
 - LoadBalancer, session affinity, topology-aware selection, Maglev, and DSR
   remain separate future milestones.

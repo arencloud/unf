@@ -345,6 +345,10 @@ target/debug/unfctl --controller-url http://127.0.0.1:9962 flows
 target/debug/unfctl --controller-url http://127.0.0.1:9962 flows --last 15m --limit 100
 target/debug/unfctl --controller-url http://127.0.0.1:9962 flows \
   --since-unix-ms 1787688000000 --until-unix-ms 1787688900000
+target/debug/unfctl --controller-url http://127.0.0.1:9962 service-explain \
+  --service-id 11 --frontend-kind node-port-local --last 15m --limit 50
+target/debug/unfctl --controller-url http://127.0.0.1:9962 service-simulate \
+  --node worker-a --address 192.0.2.1 --port 30443 --protocol tcp
 target/debug/unfctl --controller-url http://127.0.0.1:9962 status
 target/debug/unfctl --controller-url http://127.0.0.1:9962 explain \
   --from frontend/client --to backend/server --direction ingress \
@@ -368,6 +372,13 @@ Flow bounds are inclusive and select aggregate entries by their exact
 `last_received_unix_ms`; they do not bucket each observation by event time. The
 newest bounded checkpoint survives controller restart. Run its focused gate with
 `make kind-flow-history-retention-test`.
+
+NodePort simulation is read-only and exact: the Node name/address must be in the
+controller's admitted NodePort state, and port/protocol must have one current
+owner. The response applies current readiness, termination, placement, and
+Cluster/Local traffic-policy eligibility and predicts `translate` or
+`drop_no_backend`; an already-established connection can retain an older
+revision-local backend until expiry.
 
 The controller can also forward each validated agent batch to one external HTTP
 receiver. HTTPS is mandatory unless the explicit development-only plaintext flag

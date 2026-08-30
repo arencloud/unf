@@ -54,8 +54,8 @@ use unf_service::{
     AddressFamily, EndpointPortSource, EndpointSliceSource, EndpointSource,
     LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
     NodeAddressKind, NodePortNodeSnapshot, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceBackend,
-    ServiceIr, ServiceNodeAddress, ServiceSnapshot, ServiceSource, ServiceSourcePort,
-    ServiceTrafficPolicy, compile_service_snapshot,
+    ServiceIr, ServiceNodeAddress, ServiceNodePort, ServiceSnapshot, ServiceSource,
+    ServiceSourcePort, ServiceTrafficPolicy, compile_service_snapshot,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentConvergenceEntry, AgentConvergenceSnapshot, AgentStateReport,
@@ -66,10 +66,10 @@ use unf_state::{
     FlowHistoryStore, IdentityRegistry, IdentityStateSnapshot, Ipv4PolicyMapEntry,
     Ipv4PolicyMapKey, Ipv6PolicyMapEntry, Ipv6PolicyMapKey, NetworkIdentity,
     POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord, PolicyStateSnapshot, RevisionSet,
-    TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyHistoryCheckpoint,
-    TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode, TopologyService,
-    TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot,
-    TopologyWorkload, provisional_identity_id,
+    ServiceFrontendKind, TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION,
+    TopologyHistoryCheckpoint, TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode,
+    TopologyService, TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort,
+    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
 };
 
 mod external_flow_export;
@@ -583,6 +583,7 @@ struct FlowHistoryQuery {
 struct ServiceExplainQuery {
     service_id: u32,
     backend_id: Option<u32>,
+    frontend_kind: Option<ServiceFrontendKind>,
     since_unix_ms: Option<u64>,
     until_unix_ms: Option<u64>,
     limit: Option<usize>,
@@ -593,12 +594,41 @@ struct ServiceExplanation {
     schema_version: u16,
     service_id: ServiceId,
     backend_id: Option<BackendId>,
+    frontend_kind: Option<ServiceFrontendKind>,
     current_service_revision: Option<Revision>,
     current_service: Option<ServiceIr>,
     current_backend: Option<ServiceBackend>,
     matched_outcomes: usize,
     matched_observations: u64,
     outcomes: Vec<FlowHistoryEntry>,
+    note: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodePortSimulationQuery {
+    node_name: String,
+    address: IpAddr,
+    port: u16,
+    protocol: String,
+}
+
+#[derive(Debug, Serialize)]
+struct NodePortSimulation {
+    schema_version: u16,
+    node_name: String,
+    address: IpAddr,
+    port: u16,
+    protocol: Protocol,
+    service_revision: Revision,
+    service_id: ServiceId,
+    namespace: String,
+    name: String,
+    frontend_kind: ServiceFrontendKind,
+    traffic_policy: ServiceTrafficPolicy,
+    source_preserved: bool,
+    eligible_backend_ids: Vec<BackendId>,
+    eligible_backends: Vec<ServiceBackend>,
+    decision: &'static str,
     note: &'static str,
 }
 
@@ -713,6 +743,7 @@ async fn main() -> Result<()> {
         .route("/v1/topology/history", get(topology_history))
         .route("/v1/flows", get(flow_history))
         .route("/v1/services/explain", get(explain_service))
+        .route("/v1/services/nodeport/simulate", get(simulate_node_port))
         .route("/v1/explain", post(explain))
         .route("/v1/policy/simulate", post(simulate_policy))
         .with_state(Arc::clone(&state));
@@ -3452,13 +3483,32 @@ fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
             "service epoch and revision must both be zero or both be nonzero",
         ));
     }
+    validate_service_status_counts(report)
+}
+
+fn validate_service_status_counts(report: &AgentStateReport) -> Result<(), ApiError> {
     if report.applied_service_revision == 0
         && (report.service_count != 0
             || report.service_frontend_count != 0
-            || report.service_backend_count != 0)
+            || report.service_backend_count != 0
+            || report.applied_node_port_frontend_count != 0)
     {
         return Err(ApiError::bad_request(
             "service counts require a nonzero applied service revision",
+        ));
+    }
+    if report.desired_service_revision == 0 && report.desired_node_port_frontend_count != 0 {
+        return Err(ApiError::bad_request(
+            "desired NodePort count requires a nonzero desired service revision",
+        ));
+    }
+    if report
+        .node_port_cluster_frontend_count
+        .saturating_add(report.node_port_local_frontend_count)
+        != report.applied_node_port_frontend_count
+    {
+        return Err(ApiError::bad_request(
+            "NodePort Cluster and Local counts must sum to the applied NodePort count",
         ));
     }
     Ok(())
@@ -3473,6 +3523,16 @@ fn validate_service_dataplane_status(report: &AgentStateReport) -> Result<(), Ap
     {
         return Err(ApiError::bad_request(
             "service dataplane outcome counters must sum to service_dataplane_events",
+        ));
+    }
+    if report
+        .node_port_cluster_translations
+        .saturating_add(report.node_port_local_translations)
+        > report.service_translations
+        || report.node_port_no_backend_drops > report.service_drops
+    {
+        return Err(ApiError::bad_request(
+            "NodePort outcome counters must be bounded by service outcome counters",
         ));
     }
     let last_is_empty = report.last_service_id == 0
@@ -4078,6 +4138,9 @@ async fn explain_service(
         entry.service.is_some_and(|outcome| {
             outcome.service_id == service_id
                 && backend_id.is_none_or(|backend_id| outcome.backend_id == Some(backend_id))
+                && query
+                    .frontend_kind
+                    .is_none_or(|frontend_kind| outcome.frontend_kind == frontend_kind)
         })
     });
     let matched_outcomes = history.entries.len();
@@ -4097,6 +4160,7 @@ async fn explain_service(
         schema_version: 1,
         service_id,
         backend_id,
+        frontend_kind: query.frontend_kind,
         current_service_revision,
         current_service,
         current_backend,
@@ -4105,6 +4169,136 @@ async fn explain_service(
         outcomes: history.entries,
         note: "Current compiled intent is correlated with bounded, durable dataplane outcomes; absence of an outcome is not proof that no traffic occurred.",
     }))
+}
+
+async fn simulate_node_port(
+    State(state): State<Arc<ControllerState>>,
+    Query(query): Query<NodePortSimulationQuery>,
+) -> Result<Json<NodePortSimulation>, ApiError> {
+    if query.node_name.is_empty() || query.node_name.len() > 253 || query.port == 0 {
+        return Err(ApiError::bad_request(
+            "node_name must be nonempty and port must be nonzero",
+        ));
+    }
+    let protocol = node_port_simulation_protocol(&query.protocol)?;
+    let node = read_lock(&state.node_port_nodes)
+        .get(&query.node_name)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "node {} has no admitted NodePort address state",
+                query.node_name
+            ))
+        })?;
+    if !node
+        .addresses
+        .iter()
+        .any(|address| address.address == query.address)
+    {
+        return Err(ApiError::bad_request(format!(
+            "address {} is not an admitted NodePort address for node {}",
+            query.address, query.node_name
+        )));
+    }
+    let snapshot = service_snapshot_for(&state)?;
+    let family = if query.address.is_ipv4() {
+        AddressFamily::Ipv4
+    } else {
+        AddressFamily::Ipv6
+    };
+    let (service, node_port) =
+        find_node_port_owner(&snapshot, family, query.port, protocol, query.address)?;
+    let eligible_backends = eligible_node_port_backends(service, node_port, &query.node_name);
+    let eligible_backend_ids = eligible_backends.iter().map(|backend| backend.id).collect();
+    let (frontend_kind, source_preserved) = match node_port.traffic_policy {
+        ServiceTrafficPolicy::Cluster => (ServiceFrontendKind::NodePortCluster, false),
+        ServiceTrafficPolicy::Local => (ServiceFrontendKind::NodePortLocal, true),
+    };
+    let decision = if eligible_backends.is_empty() {
+        "drop_no_backend"
+    } else {
+        "translate"
+    };
+    Ok(Json(NodePortSimulation {
+        schema_version: 1,
+        node_name: query.node_name,
+        address: query.address,
+        port: query.port,
+        protocol,
+        service_revision: snapshot.revision,
+        service_id: service.id,
+        namespace: service.namespace.clone(),
+        name: service.name.clone(),
+        frontend_kind,
+        traffic_policy: node_port.traffic_policy,
+        source_preserved,
+        eligible_backend_ids,
+        eligible_backends,
+        decision,
+        note: "Read-only prediction from the current validated Service and Node snapshots; an existing connection may retain its revision-local backend until expiry.",
+    }))
+}
+
+fn node_port_simulation_protocol(value: &str) -> Result<Protocol, ApiError> {
+    match value.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(Protocol::Tcp),
+        "udp" => Ok(Protocol::Udp),
+        _ => Err(ApiError::bad_request(
+            "NodePort simulation protocol must be tcp or udp",
+        )),
+    }
+}
+
+fn find_node_port_owner(
+    snapshot: &ServiceSnapshot,
+    family: AddressFamily,
+    port: u16,
+    protocol: Protocol,
+    address: IpAddr,
+) -> Result<(&ServiceIr, &ServiceNodePort), ApiError> {
+    let mut matched = snapshot.services.iter().filter_map(|service| {
+        service
+            .node_ports
+            .iter()
+            .find(|node_port| {
+                node_port.family == family
+                    && node_port.port == port
+                    && node_port.protocol == protocol
+            })
+            .map(|node_port| (service, node_port))
+    });
+    let owner = matched.next().ok_or_else(|| {
+        ApiError::not_found(format!(
+            "no NodePort owns {port}/{protocol:?} on address {address}"
+        ))
+    })?;
+    if matched.next().is_some() {
+        return Err(ApiError::internal(
+            "validated service state contains an ambiguous NodePort owner",
+        ));
+    }
+    Ok(owner)
+}
+
+fn eligible_node_port_backends(
+    service: &ServiceIr,
+    node_port: &ServiceNodePort,
+    node_name: &str,
+) -> Vec<ServiceBackend> {
+    node_port
+        .backend_ids
+        .iter()
+        .filter_map(|backend_id| {
+            service.backends.iter().find(|backend| {
+                backend.id == *backend_id
+                    && backend.ready
+                    && !backend.terminating
+                    && (node_port.traffic_policy == ServiceTrafficPolicy::Cluster
+                        || backend.node_name.as_deref() == Some(node_name))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 fn validate_flow_history_query(query: &FlowHistoryQuery) -> Result<usize, ApiError> {
@@ -4331,6 +4525,7 @@ fn validate_service_flow_export(
             && key.service_revision == service.service_revision
             && key.action == service.action
             && key.reason == service.reason
+            && key.frontend_kind == service.frontend_kind
     });
     if !service_key_matches
         || !action_reason_valid
@@ -6925,12 +7120,19 @@ mod tests {
             service_count: 0,
             service_frontend_count: 0,
             service_backend_count: 0,
+            desired_node_port_frontend_count: 0,
+            applied_node_port_frontend_count: 0,
+            node_port_cluster_frontend_count: 0,
+            node_port_local_frontend_count: 0,
             service_reconcile_errors: 0,
             service_last_error: None,
             service_dataplane_events: 0,
             service_translations: 0,
             service_drops: 0,
             service_expirations: 0,
+            node_port_cluster_translations: 0,
+            node_port_local_translations: 0,
+            node_port_no_backend_drops: 0,
             invalid_service_events: 0,
             last_service_id: 0,
             last_backend_id: 0,
@@ -7545,6 +7747,13 @@ mod tests {
         assert_eq!(mismatched.converged_agents, 0);
         assert!(!mismatched.all_converged);
 
+        let mut invalid_node_port = report.clone();
+        invalid_node_port.applied_node_port_frontend_count = 1;
+        assert!(validate_agent_status(&invalid_node_port).is_err());
+        let mut invalid_outcomes = report.clone();
+        invalid_outcomes.node_port_cluster_translations = 1;
+        assert!(validate_agent_status(&invalid_outcomes).is_err());
+
         let mut invalid = report;
         invalid.active_policy_bank = 2;
         assert!(validate_agent_status(&invalid).is_err());
@@ -7892,6 +8101,83 @@ mod tests {
         assert!(service_record(&invalid).is_err());
     }
 
+    #[tokio::test]
+    async fn node_port_simulation_is_node_local_read_only_and_fail_closed() {
+        let state = Arc::new(new_state(true));
+        apply_node_event(
+            &state,
+            Event::Apply(primary_node("worker-a", "10.42.0.0/24", "fd00:42::/64")),
+        );
+        apply_service_event(&state, Event::Apply(node_port_service()));
+        let endpoint: EndpointSlice = serde_json::from_value(serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "edge-v4",
+                "namespace": "frontend",
+                "labels": {"kubernetes.io/service-name": "edge"}
+            },
+            "addressType": "IPv4",
+            "ports": [{"name": "https", "protocol": "TCP", "port": 8443,
+                "appProtocol": "kubernetes.io/h2c"}],
+            "endpoints": [{
+                "addresses": ["10.42.0.20"],
+                "conditions": {"ready": true, "serving": true, "terminating": false},
+                "nodeName": "worker-a"
+            }]
+        }))
+        .expect("test NodePort EndpointSlice is valid");
+        apply_endpoint_slice_event(&state, Event::Apply(endpoint.clone()));
+
+        let Json(allowed) = simulate_node_port(
+            State(Arc::clone(&state)),
+            Query(NodePortSimulationQuery {
+                node_name: "worker-a".to_owned(),
+                address: "192.0.2.1".parse().unwrap(),
+                port: 30_443,
+                protocol: "tcp".to_owned(),
+            }),
+        )
+        .await
+        .expect("local NodePort simulation succeeds");
+        assert_eq!(allowed.frontend_kind, ServiceFrontendKind::NodePortLocal);
+        assert!(allowed.source_preserved);
+        assert_eq!(allowed.decision, "translate");
+        assert_eq!(allowed.eligible_backends.len(), 1);
+
+        let mut remote_only = endpoint;
+        remote_only.endpoints[0].node_name = Some("worker-b".to_owned());
+        remote_only.metadata.resource_version = Some("2".to_owned());
+        apply_endpoint_slice_event(&state, Event::Apply(remote_only));
+        let Json(denied) = simulate_node_port(
+            State(Arc::clone(&state)),
+            Query(NodePortSimulationQuery {
+                node_name: "worker-a".to_owned(),
+                address: "192.0.2.1".parse().unwrap(),
+                port: 30_443,
+                protocol: "TCP".to_owned(),
+            }),
+        )
+        .await
+        .expect("backendless Local NodePort remains explainable");
+        assert_eq!(denied.decision, "drop_no_backend");
+        assert!(denied.eligible_backend_ids.is_empty());
+
+        assert!(
+            simulate_node_port(
+                State(state),
+                Query(NodePortSimulationQuery {
+                    node_name: "worker-a".to_owned(),
+                    address: "192.0.2.99".parse().unwrap(),
+                    port: 30_443,
+                    protocol: "tcp".to_owned(),
+                }),
+            )
+            .await
+            .is_err()
+        );
+    }
+
     #[test]
     fn endpoint_slice_readiness_is_revisioned_and_rejection_retains_valid_state() {
         let state = new_state(true);
@@ -8126,6 +8412,7 @@ mod tests {
             service_revision: Revision::new(7),
             action: 1,
             reason: 1,
+            frontend_kind: unf_state::ServiceFrontendKind::NodePortCluster,
         });
         entry.policy_revision = Revision::default();
         entry.decision.reason = 1;
@@ -8141,6 +8428,7 @@ mod tests {
             backend_port: Some(8080),
             action: 1,
             reason: 1,
+            frontend_kind: unf_state::ServiceFrontendKind::NodePortCluster,
         });
         validate_flow_export_batch(&batch)
             .expect("service outcomes use service provenance instead of identities");

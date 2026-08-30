@@ -7,7 +7,10 @@ use unf_common::{BackendId, IdentityId, PolicyId, RuleId, ServiceId, Verdict};
 pub use unf_common::PolicyDirection as Direction;
 
 pub const FLOW_ABI_VERSION: u16 = 2;
-pub const SERVICE_EVENT_ABI_VERSION: u16 = 1;
+pub const SERVICE_EVENT_ABI_VERSION: u16 = 2;
+pub const SERVICE_EVENT_FRONTEND_CLUSTER_IP: u8 = 1;
+pub const SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER: u8 = 2;
+pub const SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL: u8 = 3;
 pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
@@ -228,6 +231,16 @@ pub const fn service_event_action_reason_is_valid(action: u8, reason: u8) -> boo
             SERVICE_EVENT_ACTION_EXPIRE,
             SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT
         )
+    )
+}
+
+#[must_use]
+pub const fn service_event_frontend_kind_is_valid(kind: u8) -> bool {
+    matches!(
+        kind,
+        SERVICE_EVENT_FRONTEND_CLUSTER_IP
+            | SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER
+            | SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL
     )
 }
 
@@ -956,6 +969,17 @@ mod tests {
             SERVICE_EVENT_REASON_NO_BACKEND
         ));
         assert!(!service_event_action_reason_is_valid(0, 0));
+        assert!(service_event_frontend_kind_is_valid(
+            SERVICE_EVENT_FRONTEND_CLUSTER_IP
+        ));
+        assert!(service_event_frontend_kind_is_valid(
+            SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER
+        ));
+        assert!(service_event_frontend_kind_is_valid(
+            SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL
+        ));
+        assert!(!service_event_frontend_kind_is_valid(0));
+        assert!(!service_event_frontend_kind_is_valid(4));
     }
 
     #[test]

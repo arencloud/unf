@@ -31,25 +31,29 @@ traffic probe or load-balancing implementation. Historical snapshot persistence,
 pagination, and routing relationships remain future state domains.
 
 Telemetry revision advances when the controller accepts a changed node export.
-Flow export schema v4 requires exactly one complete IPv4 or IPv6 address pair.
+Flow export schema v5 requires exactly one complete IPv4 or IPv6 address pair.
 Policy records retain the decisive direction and require the selected
 destination identity for ingress or selected source identity for egress,
 permitting external egress without a fabricated destination identity. Service
 records instead carry a validated optional service outcome containing stable
-ServiceId/BackendId, service revision, backend tuple, and action/reason.
+ServiceId/BackendId, service revision, backend tuple, action/reason, and an
+explicit ClusterIP, NodePort/Cluster, or NodePort/Local frontend kind.
 The current flow-history store retains 4,096 deterministic logical keys and
 tracks observation totals, controller evictions, and cumulative agent-side drops.
-Flow snapshot schema v5 supports inclusive `last_received_unix_ms` bounds,
-newest-first limits, and distinct ingress/egress keys. A separate schema-v3
+Flow snapshot schema v6 supports inclusive `last_received_unix_ms` bounds,
+newest-first limits, and distinct ingress/egress keys. A separate schema-v5
 ConfigMap checkpoint preserves the newest 1,024 keys within
 a 900,000-byte payload across controller restart while reporting every capacity
-omission. The reader accepts schemas v1/v2, migrates schema-v1 records to
-ingress, and defaults their absent service outcome. See
+omission. The reader accepts every prior schema, migrates schema-v1 records to
+ingress, defaults absent service outcomes, and classifies pre-NodePort service
+outcomes as ClusterIP. See
 [ADR 0012](../adr/0012-bounded-flow-history-export.md) and
 [ADR 0030](../adr/0030-durable-flow-history-checkpoint-and-time-windows.md), and
 [ADR 0039](../adr/0039-direction-aware-flow-history.md). Service outcome
 extension and migration are defined by
 [ADR 0079](../adr/0079-bounded-service-outcome-observability.md).
+NodePort classification and migration are defined by
+[ADR 0088](../adr/0088-nodeport-operations-and-simulation.md).
 
 Agents poll internal identity and policy snapshot endpoints and publish each
 desired/applied epoch and revision. Identity schema v2 is written to inactive
@@ -68,12 +72,14 @@ mutation, applies complete route replacements before stale retirement, and
 commits persistence only after kernel readback. ADR 0066 defines this recovery
 transaction.
 
-Each agent also posts a schema v4 acknowledgement containing its Node and Pod
+Each agent also posts a schema v5 acknowledgement containing its Node and Pod
 identity, readiness, BPF load state, desired/applied identity and policy
 epoch/revisions, optional primary-CNI Node-block revision, desired/applied remote
 route epoch/revision, route/error counts, active policy bank, and map counts.
-Service outcome totals and the last bounded ServiceId/BackendId/revision/action/reason
-tuple are included without introducing per-Service metric labels. A dedicated-audience,
+Service outcome totals, NodePort desired/applied and Cluster/Local counts,
+Cluster/Local translation and no-backend totals, and the last bounded
+ServiceId/BackendId/revision/action/reason tuple are included without introducing
+per-Service metric labels. A dedicated-audience,
 short-lived projected service-account token authenticates the request through
 Kubernetes TokenReview. The controller binds its service account and Pod name/UID
 to watched Pod placement before accepting the reported Node. It timestamps reports

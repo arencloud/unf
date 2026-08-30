@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,6 +75,9 @@ enum Command {
         /// Optional stable backend ID to narrow the explanation.
         #[arg(long)]
         backend_id: Option<u32>,
+        /// Restrict outcomes to one service frontend class.
+        #[arg(long, value_enum)]
+        frontend_kind: Option<ServiceFrontend>,
         /// Restrict outcomes to this recent duration (for example 15m or 2h).
         #[arg(long, value_parser = parse_duration_millis, conflicts_with = "since_unix_ms")]
         last: Option<u64>,
@@ -86,6 +90,21 @@ enum Command {
         /// Maximum number of newest matching outcomes to return.
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Predict a `NodePort` outcome from current validated Service and Node state.
+    ServiceSimulate {
+        /// Receiving Node name.
+        #[arg(long)]
+        node: String,
+        /// Exact admitted Node address.
+        #[arg(long)]
+        address: IpAddr,
+        /// `NodePort` number.
+        #[arg(long)]
+        port: u16,
+        /// Transport protocol.
+        #[arg(long, value_enum, default_value = "tcp")]
+        protocol: NodePortProtocol,
     },
     /// Explain a policy decision using live controller state.
     Explain {
@@ -168,6 +187,29 @@ enum Protocol {
     Tcp,
     Udp,
     Sctp,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum NodePortProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ServiceFrontend {
+    ClusterIp,
+    NodePortCluster,
+    NodePortLocal,
+}
+
+impl ServiceFrontend {
+    const fn query_value(self) -> &'static str {
+        match self {
+            Self::ClusterIp => "cluster_ip",
+            Self::NodePortCluster => "node_port_cluster",
+            Self::NodePortLocal => "node_port_local",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ValueEnum)]
@@ -268,6 +310,7 @@ async fn run() -> Result<()> {
         Command::ServiceExplain {
             service_id,
             backend_id,
+            frontend_kind,
             last,
             since_unix_ms,
             until_unix_ms,
@@ -281,10 +324,26 @@ async fn run() -> Result<()> {
                     &cli.controller_url,
                     *service_id,
                     *backend_id,
+                    *frontend_kind,
                     since_unix_ms,
                     until_unix_ms,
                     *limit,
                 ),
+            )
+            .await?
+        }
+        Command::ServiceSimulate {
+            node,
+            address,
+            port,
+            protocol,
+        } => {
+            if *port == 0 {
+                bail!("port must be between 1 and 65535");
+            }
+            get_json(
+                &client,
+                &node_port_simulation_url(&cli.controller_url, node, *address, *port, *protocol),
             )
             .await?
         }
@@ -550,7 +609,7 @@ fn print_table(value: &Value) {
     }
     if matches!(
         value.get("schema_version").and_then(Value::as_u64),
-        Some(1..=5)
+        Some(1..=6)
     ) && value.get("retained_flows").is_some()
         && value.get("entries").is_some()
     {
@@ -576,6 +635,13 @@ fn print_table(value: &Value) {
     }
     if value.get("summary").is_some() && value.get("operation").is_some() {
         print_simulation_table(value);
+        return;
+    }
+    if value.get("frontend_kind").is_some()
+        && value.get("traffic_policy").is_some()
+        && value.get("decision").is_some()
+    {
+        print_node_port_simulation_table(value);
         return;
     }
     if value.get("analysis").and_then(Value::as_str) == Some("shadow_impact") {
@@ -627,7 +693,8 @@ fn print_service_explanation_table(value: &Value) {
             let key = &entry["key"];
             let service = &entry["service"];
             println!(
-                "outcome                  {} -> {} {}/{} action={} reason={} backend={} observations={} nodes={}",
+                "outcome                  kind={} {} -> {} {}/{} action={} reason={} backend={} observations={} nodes={}",
+                text_field(service, "frontend_kind"),
                 flow_address(key, "source_ipv4", "source_ipv6"),
                 flow_address(key, "destination_ipv4", "destination_ipv6"),
                 protocol_label(number_field(key, "protocol")),
@@ -640,6 +707,35 @@ fn print_service_explanation_table(value: &Value) {
             );
         }
     }
+}
+
+fn print_node_port_simulation_table(value: &Value) {
+    println!("NodePort Simulation");
+    println!(
+        "frontend                 node={} address={}:{} protocol={} kind={} policy={}",
+        text_field(value, "node_name"),
+        text_field(value, "address"),
+        number_field(value, "port"),
+        text_field(value, "protocol"),
+        text_field(value, "frontend_kind"),
+        text_field(value, "traffic_policy")
+    );
+    println!(
+        "service                  {}/{} id={} revision={}",
+        text_field(value, "namespace"),
+        text_field(value, "name"),
+        number_field(value, "service_id"),
+        number_field(value, "service_revision")
+    );
+    println!(
+        "prediction               decision={} source_preserved={} eligible_backends={}",
+        text_field(value, "decision"),
+        value
+            .get("source_preserved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        value["eligible_backend_ids"].as_array().map_or(0, Vec::len)
+    );
 }
 
 fn flow_address<'value>(value: &'value Value, ipv4: &str, ipv6: &str) -> &'value str {
@@ -814,6 +910,16 @@ fn print_controller_status_table(value: &Value) {
                 number_field(report, "remote_route_entries"),
                 number_field(report, "remote_route_reconcile_errors")
             );
+            println!(
+                "  NodePort               desired={} applied={} cluster={} local={} translations={}/{} no_backend_drops={}",
+                number_field(report, "desired_node_port_frontend_count"),
+                number_field(report, "applied_node_port_frontend_count"),
+                number_field(report, "node_port_cluster_frontend_count"),
+                number_field(report, "node_port_local_frontend_count"),
+                number_field(report, "node_port_cluster_translations"),
+                number_field(report, "node_port_local_translations"),
+                number_field(report, "node_port_no_backend_drops")
+            );
         }
     }
 }
@@ -860,8 +966,9 @@ fn print_flow_history_table(value: &Value) {
             let destinations = joined_strings(&entry["destination_workloads"]);
             if let Some(service) = entry.get("service").filter(|value| !value.is_null()) {
                 println!(
-                    "service outcome          id={} {} -> {} {}/{} action={} reason={} backend={} observations={} nodes={}",
+                    "service outcome          id={} kind={} {} -> {} {}/{} action={} reason={} backend={} observations={} nodes={}",
                     number_field(service, "service_id"),
+                    text_field(service, "frontend_kind"),
                     flow_address(key, "source_ipv4", "source_ipv6"),
                     flow_address(key, "destination_ipv4", "destination_ipv6"),
                     protocol_label(number_field(key, "protocol")),
@@ -1056,11 +1163,15 @@ fn service_explanation_url(
     controller_url: &str,
     service_id: u32,
     backend_id: Option<u32>,
+    frontend_kind: Option<ServiceFrontend>,
     since_unix_ms: Option<u64>,
     until_unix_ms: Option<u64>,
     limit: Option<usize>,
 ) -> String {
     let mut parameters = vec![format!("service_id={service_id}")];
+    if let Some(frontend_kind) = frontend_kind {
+        parameters.push(format!("frontend_kind={}", frontend_kind.query_value()));
+    }
     for (name, value) in [
         ("backend_id", backend_id.map(u64::from)),
         ("since_unix_ms", since_unix_ms),
@@ -1074,6 +1185,22 @@ fn service_explanation_url(
     format!(
         "{controller_url}/v1/services/explain?{}",
         parameters.join("&")
+    )
+}
+
+fn node_port_simulation_url(
+    controller_url: &str,
+    node: &str,
+    address: IpAddr,
+    port: u16,
+    protocol: NodePortProtocol,
+) -> String {
+    let protocol = match protocol {
+        NodePortProtocol::Tcp => "tcp",
+        NodePortProtocol::Udp => "udp",
+    };
+    format!(
+        "{controller_url}/v1/services/nodeport/simulate?node_name={node}&address={address}&port={port}&protocol={protocol}"
     )
 }
 
@@ -1575,6 +1702,8 @@ mod tests {
             "11",
             "--backend-id",
             "13",
+            "--frontend-kind",
+            "node-port-local",
             "--last",
             "15m",
             "--limit",
@@ -1586,6 +1715,7 @@ mod tests {
             Command::ServiceExplain {
                 service_id: 11,
                 backend_id: Some(13),
+                frontend_kind: Some(ServiceFrontend::NodePortLocal),
                 last: Some(900_000),
                 limit: Some(25),
                 ..
@@ -1596,11 +1726,48 @@ mod tests {
                 "http://controller",
                 11,
                 Some(13),
+                Some(ServiceFrontend::NodePortLocal),
                 Some(1_100_000),
                 Some(2_000_000),
                 Some(25),
             ),
-            "http://controller/v1/services/explain?service_id=11&backend_id=13&since_unix_ms=1100000&until_unix_ms=2000000&limit=25"
+            "http://controller/v1/services/explain?service_id=11&frontend_kind=node_port_local&backend_id=13&since_unix_ms=1100000&until_unix_ms=2000000&limit=25"
+        );
+    }
+
+    #[test]
+    fn node_port_simulation_command_builds_exact_query() {
+        let cli = Cli::try_parse_from([
+            "unfctl",
+            "service-simulate",
+            "--node",
+            "worker-a",
+            "--address",
+            "fdff::1",
+            "--port",
+            "30443",
+            "--protocol",
+            "udp",
+        ])
+        .expect("NodePort simulation command parses");
+        assert!(matches!(
+            cli.command,
+            Command::ServiceSimulate {
+                node,
+                address,
+                port: 30_443,
+                protocol: NodePortProtocol::Udp,
+            } if node == "worker-a" && address == "fdff::1".parse::<IpAddr>().unwrap()
+        ));
+        assert_eq!(
+            node_port_simulation_url(
+                "http://controller",
+                "worker-a",
+                "192.0.2.1".parse().unwrap(),
+                30_443,
+                NodePortProtocol::Tcp,
+            ),
+            "http://controller/v1/services/nodeport/simulate?node_name=worker-a&address=192.0.2.1&port=30443&protocol=tcp"
         );
     }
 

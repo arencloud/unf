@@ -172,13 +172,11 @@ and destination agent recovery on RHCOS/SELinux/CRI-O. It leaves all five agents
 converged on persistent ABI v4, retires only ABI v3, and introduces no new
 unhealthy operator. ADRs 0080–0081 record the non-transitive Kind and OpenShift
 boundaries.
-Phase 5 has started with a bounded NodePort domain/compiler milestone. Service
+Phase 5 advances the verified ClusterIP fabric with bounded NodePort exposure. Service
 snapshot schema v2 preserves the allocated NodePort per address family, its
 exact ClusterIP Service-port and backend linkage, and explicit `Cluster` or
 `Local` external traffic policy. Collision, malformed linkage/policy, and
-capacity failures are rejected deterministically. NodePort is intentionally
-rejected by the current ClusterIP-only eBPF lowerer until host-facing dataplane
-milestones pass; see the
+capacity failures are rejected deterministically; see the
 [Phase 5 NodePort plan](docs/development/phase5-nodeport-plan.md) and ADR 0082.
 The distribution transition is now verified: agents explicitly negotiate
 schema v2, new controllers project an exact schema-v1 ClusterIP view for old
@@ -206,8 +204,14 @@ the original source plus translated backend identity and port. Phase 5.5 is
 also verified: `Local` uses transactionally merged receiving-Node slots, admits
 only ready non-terminating local backends, preserves the external source, and
 returns exact no-local-backend evidence through placement/readiness loss and
-recovery. `make nodeport-local-dataplane-test` and ADR 0087 define that gate;
-NodePort operations are the active Phase 5.6 milestone.
+recovery. `make nodeport-local-dataplane-test` and ADR 0087 define that gate.
+Phase 5.6 is verified by `make nodeport-operations-test`: fixed-size service
+events explicitly classify ClusterIP, NodePort/Cluster, and NodePort/Local;
+fixed-cardinality metrics and schema-v5 agent status expose desired/applied and
+outcome counts; schema-v5 export plus schema-v6 history retain the class across
+bounded schema-v5 checkpoint recovery; explanation can filter it; and
+`unfctl service-simulate` predicts exact current Node/address/port/protocol
+eligibility without mutation. ADR 0088 records the schema and restart boundary.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -418,8 +422,8 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-Not implemented yet: NodePort forwarding and advanced Service modes such as
-LoadBalancer, session affinity, traffic-policy execution, topology-aware
+Not implemented yet: advanced Service modes such as LoadBalancer, session
+affinity, internal traffic policy, topology-aware
 routing, Maglev, and DSR;
 production-scale routing/CNI qualification;
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
@@ -450,6 +454,7 @@ make test
 make lint
 make fmt-check
 make cni-route-reconciliation-test
+make nodeport-operations-test
 ```
 
 The reconciliation gate requires passwordless `sudo` and Linux network

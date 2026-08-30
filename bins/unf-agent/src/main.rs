@@ -41,7 +41,10 @@ use unf_ebpf_common::{
     POLICY_FLAG_HAS_SHADOW, POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE,
     POLICY_MAP_ABI_VERSION, SERVICE_BANK_COUNT, SERVICE_EVENT_ABI_VERSION,
     SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
+    SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
+    SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL, SERVICE_EVENT_REASON_NO_BACKEND,
     SERVICE_MAP_ABI_VERSION, ServiceEvent, service_event_action_reason_is_valid,
+    service_event_frontend_kind_is_valid,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -55,7 +58,8 @@ use unf_service::{
     LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, MAX_BACKENDS_PER_SERVICE, NodePortDataplaneState,
     NodePortNodeSnapshot, SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
     SERVICE_FRONTEND_BANK_CAPACITY, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceDataplaneState,
-    ServiceSnapshot, compile_node_port_fabric_dataplane, compile_service_dataplane,
+    ServiceSnapshot, ServiceTrafficPolicy, compile_node_port_fabric_dataplane,
+    compile_service_dataplane,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
@@ -64,7 +68,8 @@ use unf_state::{
     FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
     Ipv4PolicyMapEntry, Ipv6IdentityMapping, Ipv6PolicyMapEntry, PERSISTENT_BPF_STATE_ABI_VERSION,
     POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord,
-    PolicyMapEntry, PolicyStateSnapshot, ServiceFlowKey, ServiceFlowOutcome, VersionTransition,
+    PolicyMapEntry, PolicyStateSnapshot, ServiceFlowKey, ServiceFlowOutcome, ServiceFrontendKind,
+    VersionTransition,
 };
 
 mod cni_server;
@@ -455,10 +460,16 @@ struct AgentMetrics {
     service_count: Gauge,
     service_frontend_count: Gauge,
     service_backend_count: Gauge,
+    node_port_frontend_count: Gauge,
+    node_port_cluster_frontend_count: Gauge,
+    node_port_local_frontend_count: Gauge,
     service_dataplane_events: Counter,
     service_translations: Counter,
     service_drops: Counter,
     service_expirations: Counter,
+    node_port_cluster_translations: Counter,
+    node_port_local_translations: Counter,
+    node_port_no_backend_drops: Counter,
     invalid_service_events: Counter,
     remote_route_sync_errors: Counter,
     desired_remote_route_revision: Gauge,
@@ -504,12 +515,19 @@ struct AgentState {
     service_count: AtomicU64,
     service_frontend_count: AtomicU64,
     service_backend_count: AtomicU64,
+    desired_node_port_frontend_count: AtomicU64,
+    applied_node_port_frontend_count: AtomicU64,
+    node_port_cluster_frontend_count: AtomicU64,
+    node_port_local_frontend_count: AtomicU64,
     service_reconcile_errors: AtomicU64,
     service_last_error: Mutex<Option<String>>,
     service_dataplane_events: AtomicU64,
     service_translations: AtomicU64,
     service_drops: AtomicU64,
     service_expirations: AtomicU64,
+    node_port_cluster_translations: AtomicU64,
+    node_port_local_translations: AtomicU64,
+    node_port_no_backend_drops: AtomicU64,
     invalid_service_events: AtomicU64,
     last_service_id: AtomicU64,
     last_backend_id: AtomicU64,
@@ -2910,13 +2928,33 @@ fn service_snapshot_counts(snapshot: &ServiceSnapshot) -> (u64, u64, u64) {
     (services, frontends, backends)
 }
 
+fn service_snapshot_node_port_counts(snapshot: &ServiceSnapshot) -> (u64, u64, u64) {
+    let mut cluster = 0_u64;
+    let mut local = 0_u64;
+    for node_port in snapshot
+        .services
+        .iter()
+        .flat_map(|service| &service.node_ports)
+    {
+        match node_port.traffic_policy {
+            ServiceTrafficPolicy::Cluster => cluster = cluster.saturating_add(1),
+            ServiceTrafficPolicy::Local => local = local.saturating_add(1),
+        }
+    }
+    (cluster.saturating_add(local), cluster, local)
+}
+
 fn publish_desired_service_snapshot(state: &AgentState, snapshot: &ServiceSnapshot) {
+    let (node_ports, _, _) = service_snapshot_node_port_counts(snapshot);
     state
         .desired_service_epoch
         .store(snapshot.source_epoch, Ordering::Release);
     state
         .desired_service_revision
         .store(snapshot.revision.get(), Ordering::Release);
+    state
+        .desired_node_port_frontend_count
+        .store(node_ports, Ordering::Release);
     state
         .metrics
         .desired_service_revision
@@ -2925,6 +2963,8 @@ fn publish_desired_service_snapshot(state: &AgentState, snapshot: &ServiceSnapsh
 
 fn publish_applied_service_snapshot(state: &AgentState, snapshot: &ServiceSnapshot) {
     let (services, frontends, backends) = service_snapshot_counts(snapshot);
+    let (node_ports, cluster_node_ports, local_node_ports) =
+        service_snapshot_node_port_counts(snapshot);
     state
         .applied_service_epoch
         .store(snapshot.source_epoch, Ordering::Release);
@@ -2939,6 +2979,15 @@ fn publish_applied_service_snapshot(state: &AgentState, snapshot: &ServiceSnapsh
         .service_backend_count
         .store(backends, Ordering::Release);
     state
+        .applied_node_port_frontend_count
+        .store(node_ports, Ordering::Release);
+    state
+        .node_port_cluster_frontend_count
+        .store(cluster_node_ports, Ordering::Release);
+    state
+        .node_port_local_frontend_count
+        .store(local_node_ports, Ordering::Release);
+    state
         .metrics
         .applied_service_revision
         .set(metric_value(snapshot.revision.get()));
@@ -2951,6 +3000,18 @@ fn publish_applied_service_snapshot(state: &AgentState, snapshot: &ServiceSnapsh
         .metrics
         .service_backend_count
         .set(metric_value(backends));
+    state
+        .metrics
+        .node_port_frontend_count
+        .set(metric_value(node_ports));
+    state
+        .metrics
+        .node_port_cluster_frontend_count
+        .set(metric_value(cluster_node_ports));
+    state
+        .metrics
+        .node_port_local_frontend_count
+        .set(metric_value(local_node_ports));
 }
 
 fn record_service_snapshot_error(state: &AgentState, error: &anyhow::Error) {
@@ -3312,10 +3373,16 @@ fn new_state(
         service_count: Gauge::default(),
         service_frontend_count: Gauge::default(),
         service_backend_count: Gauge::default(),
+        node_port_frontend_count: Gauge::default(),
+        node_port_cluster_frontend_count: Gauge::default(),
+        node_port_local_frontend_count: Gauge::default(),
         service_dataplane_events: Counter::default(),
         service_translations: Counter::default(),
         service_drops: Counter::default(),
         service_expirations: Counter::default(),
+        node_port_cluster_translations: Counter::default(),
+        node_port_local_translations: Counter::default(),
+        node_port_no_backend_drops: Counter::default(),
         invalid_service_events: Counter::default(),
         remote_route_sync_errors: Counter::default(),
         desired_remote_route_revision: Gauge::default(),
@@ -3362,12 +3429,19 @@ fn new_state(
         service_count: AtomicU64::new(0),
         service_frontend_count: AtomicU64::new(0),
         service_backend_count: AtomicU64::new(0),
+        desired_node_port_frontend_count: AtomicU64::new(0),
+        applied_node_port_frontend_count: AtomicU64::new(0),
+        node_port_cluster_frontend_count: AtomicU64::new(0),
+        node_port_local_frontend_count: AtomicU64::new(0),
         service_reconcile_errors: AtomicU64::new(0),
         service_last_error: Mutex::new(None),
         service_dataplane_events: AtomicU64::new(0),
         service_translations: AtomicU64::new(0),
         service_drops: AtomicU64::new(0),
         service_expirations: AtomicU64::new(0),
+        node_port_cluster_translations: AtomicU64::new(0),
+        node_port_local_translations: AtomicU64::new(0),
+        node_port_no_backend_drops: AtomicU64::new(0),
         invalid_service_events: AtomicU64::new(0),
         last_service_id: AtomicU64::new(0),
         last_backend_id: AtomicU64::new(0),
@@ -3561,6 +3635,21 @@ fn register_service_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         metrics.service_backend_count.clone(),
     );
     registry.register(
+        "unf_nodeport_frontend_count",
+        "NodePort frontends in the active durable service snapshot",
+        metrics.node_port_frontend_count.clone(),
+    );
+    registry.register(
+        "unf_nodeport_cluster_frontend_count",
+        "Cluster-traffic-policy NodePort frontends in the active durable service snapshot",
+        metrics.node_port_cluster_frontend_count.clone(),
+    );
+    registry.register(
+        "unf_nodeport_local_frontend_count",
+        "Local-traffic-policy NodePort frontends in the active durable service snapshot",
+        metrics.node_port_local_frontend_count.clone(),
+    );
+    registry.register(
         "unf_service_dataplane_events",
         "Validated service dataplane outcomes consumed from eBPF",
         metrics.service_dataplane_events.clone(),
@@ -3579,6 +3668,21 @@ fn register_service_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         "unf_service_expirations",
         "Expired or corrupt service connection pairs retired by eBPF",
         metrics.service_expirations.clone(),
+    );
+    registry.register(
+        "unf_nodeport_cluster_translations",
+        "Successful forward and reverse Cluster-policy NodePort translations",
+        metrics.node_port_cluster_translations.clone(),
+    );
+    registry.register(
+        "unf_nodeport_local_translations",
+        "Successful forward and reverse Local-policy NodePort translations",
+        metrics.node_port_local_translations.clone(),
+    );
+    registry.register(
+        "unf_nodeport_no_backend_drops",
+        "NodePort packets dropped because the selected traffic policy had no eligible backend",
+        metrics.node_port_no_backend_drops.clone(),
     );
     registry.register(
         "unf_service_invalid_events",
@@ -5598,6 +5702,7 @@ fn drain_service_events(
             address_family = event.address_family,
             action = event.action,
             reason = event.reason,
+            frontend_kind = ?service_event_frontend_kind(&event),
             "service dataplane outcome"
         );
     }
@@ -5674,6 +5779,7 @@ fn flow_export_record(event: &FlowEvent) -> FlowExportRecord {
 fn service_flow_export_record(event: &ServiceEvent) -> FlowExportRecord {
     let backend_id = (event.backend_id.get() != 0).then_some(event.backend_id);
     let (backend_ipv4, backend_ipv6) = service_event_backend_address(event);
+    let frontend_kind = service_event_frontend_kind(event);
     FlowExportRecord {
         key: FlowHistoryKey {
             direction: PolicyDirection::Ingress,
@@ -5691,6 +5797,7 @@ fn service_flow_export_record(event: &ServiceEvent) -> FlowExportRecord {
                 service_revision: Revision::new(event.service_revision),
                 action: event.action,
                 reason: event.reason,
+                frontend_kind,
             }),
         },
         policy_revision: Revision::default(),
@@ -5716,8 +5823,18 @@ fn service_flow_export_record(event: &ServiceEvent) -> FlowExportRecord {
             backend_port: backend_id.map(|_| u16::from_be_bytes(event.backend_port)),
             action: event.action,
             reason: event.reason,
+            frontend_kind,
         }),
         observed_events: 1,
+    }
+}
+
+fn service_event_frontend_kind(event: &ServiceEvent) -> ServiceFrontendKind {
+    match event.reserved[0] {
+        SERVICE_EVENT_FRONTEND_CLUSTER_IP => ServiceFrontendKind::ClusterIp,
+        SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER => ServiceFrontendKind::NodePortCluster,
+        SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL => ServiceFrontendKind::NodePortLocal,
+        _ => unreachable!("validated service event frontend kind"),
     }
 }
 
@@ -5756,10 +5873,36 @@ fn record_service_event(state: &AgentState, event: &ServiceEvent) {
         SERVICE_EVENT_ACTION_TRANSLATE => {
             state.service_translations.fetch_add(1, Ordering::Relaxed);
             state.metrics.service_translations.inc();
+            match service_event_frontend_kind(event) {
+                ServiceFrontendKind::NodePortCluster => {
+                    state
+                        .node_port_cluster_translations
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.metrics.node_port_cluster_translations.inc();
+                }
+                ServiceFrontendKind::NodePortLocal => {
+                    state
+                        .node_port_local_translations
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.metrics.node_port_local_translations.inc();
+                }
+                ServiceFrontendKind::ClusterIp => {}
+            }
         }
         SERVICE_EVENT_ACTION_DROP => {
             state.service_drops.fetch_add(1, Ordering::Relaxed);
             state.metrics.service_drops.inc();
+            if event.reason == SERVICE_EVENT_REASON_NO_BACKEND
+                && matches!(
+                    service_event_frontend_kind(event),
+                    ServiceFrontendKind::NodePortCluster | ServiceFrontendKind::NodePortLocal
+                )
+            {
+                state
+                    .node_port_no_backend_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                state.metrics.node_port_no_backend_drops.inc();
+            }
         }
         SERVICE_EVENT_ACTION_EXPIRE => {
             state.service_expirations.fetch_add(1, Ordering::Relaxed);
@@ -5991,12 +6134,29 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
         service_count: state.service_count.load(Ordering::Acquire),
         service_frontend_count: state.service_frontend_count.load(Ordering::Acquire),
         service_backend_count: state.service_backend_count.load(Ordering::Acquire),
+        desired_node_port_frontend_count: state
+            .desired_node_port_frontend_count
+            .load(Ordering::Acquire),
+        applied_node_port_frontend_count: state
+            .applied_node_port_frontend_count
+            .load(Ordering::Acquire),
+        node_port_cluster_frontend_count: state
+            .node_port_cluster_frontend_count
+            .load(Ordering::Acquire),
+        node_port_local_frontend_count: state
+            .node_port_local_frontend_count
+            .load(Ordering::Acquire),
         service_reconcile_errors: state.service_reconcile_errors.load(Ordering::Acquire),
         service_last_error: mutex_lock(&state.service_last_error).clone(),
         service_dataplane_events: state.service_dataplane_events.load(Ordering::Acquire),
         service_translations: state.service_translations.load(Ordering::Acquire),
         service_drops: state.service_drops.load(Ordering::Acquire),
         service_expirations: state.service_expirations.load(Ordering::Acquire),
+        node_port_cluster_translations: state
+            .node_port_cluster_translations
+            .load(Ordering::Acquire),
+        node_port_local_translations: state.node_port_local_translations.load(Ordering::Acquire),
+        node_port_no_backend_drops: state.node_port_no_backend_drops.load(Ordering::Acquire),
         invalid_service_events: state.invalid_service_events.load(Ordering::Acquire),
         last_service_id: u32::try_from(state.last_service_id.load(Ordering::Acquire))
             .expect("stored service ID fits u32"),
@@ -7667,7 +7827,8 @@ fn decode_service_event(bytes: &[u8]) -> Option<ServiceEvent> {
         || !matches!(protocol, 6 | 17)
         || !matches!(address_family, 4 | 6)
         || !service_event_action_reason_is_valid(action, reason)
-        || bytes[86..96] != [0; 10]
+        || !service_event_frontend_kind_is_valid(bytes[86])
+        || bytes[87..96] != [0; 9]
     {
         return None;
     }
@@ -8601,6 +8762,14 @@ mod tests {
             load_optional_service_checkpoint(&path).unwrap(),
             Some((service.clone(), Some(node.clone())))
         );
+        let state = test_agent_state();
+        publish_desired_service_snapshot(&state, &service);
+        publish_applied_service_snapshot(&state, &service);
+        let report = agent_state_report(&state);
+        assert_eq!(report.desired_node_port_frontend_count, 4);
+        assert_eq!(report.applied_node_port_frontend_count, 4);
+        assert_eq!(report.node_port_cluster_frontend_count, 4);
+        assert_eq!(report.node_port_local_frontend_count, 0);
         assert!(persist_service_checkpoint(&path, &service, None, "missing Node").is_err());
 
         let mut mutated = node.clone();
@@ -9600,6 +9769,10 @@ mod tests {
         assert_ne!(first_forward.service_id.get(), 0);
         assert_ne!(first_forward.backend_id.get(), 0);
         assert_eq!(first_forward.service_revision, 1);
+        assert_eq!(
+            service_event_frontend_kind(first_forward),
+            ServiceFrontendKind::NodePortCluster
+        );
         let local_forward = events
             .iter()
             .find(|event| {
@@ -9614,6 +9787,20 @@ mod tests {
             &replacement_v4.octets()
         );
         assert_eq!(local_forward.service_revision, 4);
+        assert_eq!(
+            service_event_frontend_kind(local_forward),
+            ServiceFrontendKind::NodePortLocal
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.reason == SERVICE_EVENT_REASON_NO_BACKEND
+                        && service_event_frontend_kind(event) == ServiceFrontendKind::NodePortLocal
+                })
+                .count()
+                >= 2
+        );
 
         let mut policy_events = Vec::new();
         while let Some(item) = flow_events.next() {
@@ -10004,6 +10191,7 @@ mod tests {
         bytes[83] = 4;
         bytes[84] = SERVICE_EVENT_ACTION_TRANSLATE;
         bytes[85] = unf_ebpf_common::SERVICE_EVENT_REASON_FORWARD_TRANSLATED;
+        bytes[86] = SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER;
         let event = decode_service_event(&bytes).expect("service event ABI is valid");
         let record = service_flow_export_record(&event);
         assert_eq!(record.key.source_ipv4, Some(Ipv4Addr::new(10, 42, 0, 10)));
@@ -10018,11 +10206,14 @@ mod tests {
         assert_eq!(outcome.backend_id.expect("backend ID").get(), 13);
         assert_eq!(outcome.backend_ipv4, Some(Ipv4Addr::new(10, 42, 1, 20)));
         assert_eq!(outcome.backend_port, Some(8080));
+        assert_eq!(outcome.frontend_kind, ServiceFrontendKind::NodePortCluster);
         let state = test_agent_state();
         record_service_event(&state, &event);
         let report = agent_state_report(&state);
         assert_eq!(report.service_dataplane_events, 1);
         assert_eq!(report.service_translations, 1);
+        assert_eq!(report.node_port_cluster_translations, 1);
+        assert_eq!(report.node_port_local_translations, 0);
         assert_eq!(report.service_drops, 0);
         assert_eq!(report.last_service_id, 11);
         assert_eq!(report.last_backend_id, 13);
@@ -10033,9 +10224,21 @@ mod tests {
             unf_ebpf_common::SERVICE_EVENT_REASON_FORWARD_TRANSLATED
         );
 
+        bytes[48..64].fill(0);
+        bytes[68..72].fill(0);
+        bytes[76..78].fill(0);
+        bytes[84] = SERVICE_EVENT_ACTION_DROP;
         bytes[85] = unf_ebpf_common::SERVICE_EVENT_REASON_NO_BACKEND;
+        bytes[86] = SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL;
+        let no_backend = decode_service_event(&bytes).expect("Local no-backend event is valid");
+        record_service_event(&state, &no_backend);
+        let report = agent_state_report(&state);
+        assert_eq!(report.service_drops, 1);
+        assert_eq!(report.node_port_no_backend_drops, 1);
+
+        bytes[84] = SERVICE_EVENT_ACTION_TRANSLATE;
         assert!(decode_service_event(&bytes).is_none());
-        bytes[86] = 1;
+        bytes[86] = 0;
         assert!(decode_service_event(&bytes).is_none());
     }
 

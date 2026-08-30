@@ -60,6 +60,16 @@ identical nonzero revision.
 Event and map ABIs use fixed C layouts, explicit schema/version fields, and
 compile-time size assertions.
 
+`ServiceEvent` ABI v2 remains 96 bytes. One formerly reserved byte records only
+the bounded frontend class (ClusterIP, NodePort/Cluster, or NodePort/Local), and
+the other nine bytes must remain zero. New-connection failures receive the class
+from the exact validated frontend; forward, reverse, and expiry events derive it
+from the persistent connection flags. This keeps classification correct through
+snapshot churn and restart without adding Kubernetes strings to the ABI. Agent
+status schema v5, flow export schema v5, and history schema v6 then preserve the
+dimension through fixed-cardinality metrics, bounded status, durable history,
+explanation, and read-only NodePort simulation; ADR 0088 defines the contract.
+
 On a ClusterIP lookup miss, ingress may perform an exact NodePort lookup only
 when both active pointers form a coherent epoch/revision/service-bank tuple.
 `Cluster` forwarding stores the original client and Node frontend, selects a

@@ -16,11 +16,11 @@ pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const TOPOLOGY_HISTORY_SCHEMA_VERSION: u16 = 1;
 pub const TOPOLOGY_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 pub const TOPOLOGY_HISTORY_CAPACITY: usize = 32;
-pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 4;
-pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 5;
-pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 4;
+pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 5;
+pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 6;
+pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 5;
 pub const SHADOW_IMPACT_SCHEMA_VERSION: u16 = 1;
-pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 4;
+pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 5;
 pub const COMPONENT_COMPATIBILITY_SCHEMA_VERSION: u16 = 2;
 pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 5;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
@@ -125,6 +125,14 @@ pub struct AgentStateReport {
     #[serde(default)]
     pub service_backend_count: u64,
     #[serde(default)]
+    pub desired_node_port_frontend_count: u64,
+    #[serde(default)]
+    pub applied_node_port_frontend_count: u64,
+    #[serde(default)]
+    pub node_port_cluster_frontend_count: u64,
+    #[serde(default)]
+    pub node_port_local_frontend_count: u64,
+    #[serde(default)]
     pub service_reconcile_errors: u64,
     #[serde(default)]
     pub service_last_error: Option<String>,
@@ -136,6 +144,12 @@ pub struct AgentStateReport {
     pub service_drops: u64,
     #[serde(default)]
     pub service_expirations: u64,
+    #[serde(default)]
+    pub node_port_cluster_translations: u64,
+    #[serde(default)]
+    pub node_port_local_translations: u64,
+    #[serde(default)]
+    pub node_port_no_backend_drops: u64,
     #[serde(default)]
     pub invalid_service_events: u64,
     #[serde(default)]
@@ -188,6 +202,15 @@ pub struct AgentConvergenceSnapshot {
     pub nodes: Vec<AgentConvergenceEntry>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceFrontendKind {
+    #[default]
+    ClusterIp,
+    NodePortCluster,
+    NodePortLocal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ServiceFlowKey {
     pub service_id: ServiceId,
@@ -195,6 +218,8 @@ pub struct ServiceFlowKey {
     pub service_revision: Revision,
     pub action: u8,
     pub reason: u8,
+    #[serde(default)]
+    pub frontend_kind: ServiceFrontendKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -243,6 +268,8 @@ pub struct ServiceFlowOutcome {
     pub backend_port: Option<u16>,
     pub action: u8,
     pub reason: u8,
+    #[serde(default)]
+    pub frontend_kind: ServiceFrontendKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1974,6 +2001,7 @@ mod tests {
             backend_port: Some(8080),
             action: 1,
             reason: 1,
+            frontend_kind: ServiceFrontendKind::NodePortCluster,
         });
         record.key.service = Some(ServiceFlowKey {
             service_id: ServiceId::new(11),
@@ -1981,6 +2009,7 @@ mod tests {
             service_revision: Revision::new(7),
             action: 1,
             reason: 1,
+            frontend_kind: ServiceFrontendKind::NodePortCluster,
         });
         let mut failure = record.clone();
         failure.key.service = Some(ServiceFlowKey {
@@ -1989,6 +2018,7 @@ mod tests {
             service_revision: Revision::new(8),
             action: 2,
             reason: 3,
+            frontend_kind: ServiceFrontendKind::NodePortLocal,
         });
         failure.decision.verdict = Verdict::Deny;
         failure.decision.reason = 3;
@@ -2002,6 +2032,7 @@ mod tests {
             backend_port: None,
             action: 2,
             reason: 3,
+            frontend_kind: ServiceFrontendKind::NodePortLocal,
         });
         let mut store = FlowHistoryStore::with_capacity(2);
         store.ingest(
@@ -2030,6 +2061,70 @@ mod tests {
                 .service
                 .is_some_and(|outcome| outcome.action == 2 && outcome.reason == 3)
         }));
+    }
+
+    #[test]
+    fn flow_history_migrates_pre_nodeport_classification_checkpoints() {
+        let mut record = flow_record(0, 0, 80, 1);
+        record.key.service = Some(ServiceFlowKey {
+            service_id: ServiceId::new(11),
+            backend_id: None,
+            service_revision: Revision::new(7),
+            action: 2,
+            reason: 3,
+            frontend_kind: ServiceFrontendKind::NodePortLocal,
+        });
+        record.policy_revision = Revision::default();
+        record.decision = FlowExportDecision {
+            verdict: Verdict::Deny,
+            reason: 3,
+            policy_id: None,
+            rule_id: None,
+        };
+        record.service = Some(ServiceFlowOutcome {
+            service_id: ServiceId::new(11),
+            backend_id: None,
+            service_revision: Revision::new(7),
+            backend_ipv4: None,
+            backend_ipv6: None,
+            frontend_port: 80,
+            backend_port: None,
+            action: 2,
+            reason: 3,
+            frontend_kind: ServiceFrontendKind::NodePortLocal,
+        });
+        let mut store = FlowHistoryStore::with_capacity(1);
+        store.ingest(
+            FlowExportBatch {
+                schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                node_name: "worker-a".to_owned(),
+                dropped_events: 0,
+                entries: vec![record],
+            },
+            100,
+        );
+        let mut legacy = serde_json::to_value(store.checkpoint(1)).unwrap();
+        legacy["schema_version"] = serde_json::json!(4);
+        legacy["entries"][0]["key"]["service"]
+            .as_object_mut()
+            .unwrap()
+            .remove("frontend_kind");
+        legacy["entries"][0]["service"]
+            .as_object_mut()
+            .unwrap()
+            .remove("frontend_kind");
+        let checkpoint: FlowHistoryCheckpoint = serde_json::from_value(legacy).unwrap();
+        let restored = FlowHistoryStore::from_checkpoint(checkpoint, 1)
+            .expect("schema-v4 ClusterIP history remains restart compatible");
+        let entry = &restored.snapshot(17).entries[0];
+        assert_eq!(
+            entry.service.unwrap().frontend_kind,
+            ServiceFrontendKind::ClusterIp
+        );
+        assert_eq!(
+            entry.key.service.as_ref().unwrap().frontend_kind,
+            ServiceFrontendKind::ClusterIp
+        );
     }
 
     #[test]
