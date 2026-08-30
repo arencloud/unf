@@ -498,7 +498,7 @@ for replacement_node in "${client_node}" "${server_node}"; do
         and .service_count > 0
         and .service_frontend_count > 0
         and .service_backend_count > 0
-        and .last_service_error == null
+        and has("service_last_error") and .service_last_error == null
     ' <<<"${recovered_agent_status}" >/dev/null
     sudo "${container_runtime}" exec "${replacement_node}" sh -ec '
         snapshot=/var/lib/unf/cni/v1/service-snapshot.json

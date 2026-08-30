@@ -142,22 +142,36 @@ wait_for_agent_replacement() {
     return 1
 }
 
-assert_agent() {
+wait_for_agent_service_state() {
     local node=$1 status
-    assert_version "$(agent_raw "${node}" /v1/version)" unf-agent
-    status=$(agent_raw "${node}" /v1/status)
-    jq -e '
-        .schema_version == 4 and .ready == true and .bpf_loaded == true
-        and .tc_attachment_mode == "legacy_netlink"
-        and .capabilities.btf == true and .capabilities.bpffs == true
-        and .capabilities.cgroup_v2 == true
-        and .desired_identity_revision == .applied_identity_revision
-        and .desired_policy_revision == .applied_policy_revision
-        and .desired_service_revision == .applied_service_revision
-        and .desired_service_revision > 0
-        and .service_count > 0 and .service_frontend_count > 0
-        and .service_backend_count > 0 and .last_service_error == null
-    ' <<<"${status}" >/dev/null
+    for _ in $(seq 1 300); do
+        status=$(agent_raw "${node}" /v1/status 2>/dev/null || true)
+        if assert_version "$(agent_raw "${node}" /v1/version 2>/dev/null || true)" unf-agent 2>/dev/null \
+            && jq -e '
+                .schema_version == 4 and .ready == true and .bpf_loaded == true
+                and .tc_attachment_mode == "legacy_netlink"
+                and .capabilities.btf == true and .capabilities.bpffs == true
+                and .capabilities.cgroup_v2 == true
+                and .desired_identity_revision == .applied_identity_revision
+                and .desired_policy_revision == .applied_policy_revision
+                and .desired_service_revision == .applied_service_revision
+                and .desired_service_revision > 0
+                and .service_count > 0 and .service_frontend_count > 0
+                and .service_backend_count > 0
+                and has("service_last_error") and .service_last_error == null
+            ' <<<"${status}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "agent on ${node} did not converge on healthy ABI-v4 service state" >&2
+    jq . <<<"${status}" >&2 || true
+    return 1
+}
+
+assert_agent() {
+    local node=$1 host_state
+    wait_for_agent_service_state "${node}"
     host_state=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
         test "$(getenforce)" = Enforcing
         test -d /sys/fs/bpf/unf/v3

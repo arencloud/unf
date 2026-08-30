@@ -290,6 +290,28 @@ wait_for_agent_replacement() {
     return 1
 }
 
+wait_for_agent_service_state() {
+    local node=$1 status=
+    for _ in $(seq 1 300); do
+        status=$(agent_raw "${node}" /v1/status 2>/dev/null || true)
+        if jq -e '
+            .schema_version == 4 and .ready and .bpf_loaded
+            and .desired_service_revision > 0
+            and .applied_service_revision == .desired_service_revision
+            and .applied_service_epoch == .desired_service_epoch
+            and .service_count > 0 and .service_frontend_count > 0
+            and .service_backend_count > 0
+            and has("service_last_error") and .service_last_error == null
+        ' <<<"${status}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "replacement agent on ${node} did not recover healthy service state" >&2
+    jq . <<<"${status}" >&2 || true
+    return 1
+}
+
 replace_agent_with_traffic() {
     local node=$1 old_pod old_uid log
     log="${temporary_dir}/traffic-${node}.log"
@@ -307,15 +329,7 @@ replace_agent_with_traffic() {
         return 1
     fi
     probe_pid=
-    status=$(agent_raw "${node}" /v1/status)
-    jq -e '
-        .schema_version == 4 and .ready and .bpf_loaded
-        and .desired_service_revision > 0
-        and .applied_service_revision == .desired_service_revision
-        and .applied_service_epoch == .desired_service_epoch
-        and .service_count > 0 and .service_frontend_count > 0
-        and .service_backend_count > 0 and .last_service_error == null
-    ' <<<"${status}" >/dev/null
+    wait_for_agent_service_state "${node}"
 }
 
 stage=preflight
