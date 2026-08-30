@@ -124,8 +124,18 @@ agent_raw() {
 }
 
 host_exec() {
-    local node=$1 script=$2
-    "${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc "${script}"
+    local node=$1 script=$2 output=
+    for _ in $(seq 1 3); do
+        if output=$("${kc[@]}" debug "node/${node}" --quiet -- \
+            chroot /host sh -euc "${script}" 2>&1); then
+            printf '%s\n' "${output}"
+            return 0
+        fi
+        sleep 1
+    done
+    printf '%s\n' "${output}" >&2
+    echo "host inspection failed after three attempts on ${node}" >&2
+    return 1
 }
 
 unhealthy_operators() {
