@@ -7951,7 +7951,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         )
         .status_label(),
         capabilities: state.capabilities.clone(),
-        limitation: "ClusterIP translation is qualified only for primary-CNI Pod-veth IPv4/IPv6 TCP/UDP on recorded tuples; negotiated NodePort schema-v2 intent is distributed but explicitly rejected until host-facing lowering is implemented",
+        limitation: "service translation is bounded to primary-CNI Pod clients, IPv4/IPv6 TCP/UDP, ClusterIP, and NodePort Cluster/Local traffic; LoadBalancer, session affinity, DSR, SCTP, fragments, and host-network clients remain unqualified",
     })
 }
 
@@ -9498,15 +9498,15 @@ mod tests {
         );
 
         // The source-port high bit does not change the low 15-bit initial NAT
-        // candidate. The second flow therefore proves bounded collision probing
-        // instead of overwriting the first reverse tuple.
+        // candidate. The second flow therefore proves bounded, dispersed collision
+        // probing instead of overwriting the first reverse tuple.
         let colliding_client_port = 0x9c40_u16 ^ 0x8000;
         let colliding = ipv4_packet(6, client_v4, node_v4, colliding_client_port, 30_080);
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &colliding);
         assert_eq!(action, TC_ACT_PIPE);
         let colliding_snat = u16::from_be_bytes([translated[34], translated[35]]);
-        let expected_probe = 32_768 + ((ipv4_tcp_snat - 32_768 + 1) & 32_767);
-        assert_eq!(colliding_snat, expected_probe);
+        assert!((32_768..=u16::MAX).contains(&colliding_snat));
+        assert_ne!(colliding_snat, ipv4_tcp_snat);
         assert_ipv4_packet(&translated, 6, node_v4, backend_v4, colliding_snat, 8080);
         let reverse = ipv4_packet(6, backend_v4, node_v4, 8080, colliding_snat);
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);

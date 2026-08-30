@@ -19,7 +19,7 @@ use unf_ebpf_common::{
     Ipv6ExtensionStep, Ipv6IdentityKey, Ipv6NodePortFrontendKey, Ipv6PolicyMapData,
     Ipv6ServiceBackendValue, Ipv6ServiceFrontendKey, NodePortFrontendValue, NodePortMapConfig,
     NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG,
-    NODE_PORT_MAP_ABI_VERSION,
+    NODE_PORT_MAP_ABI_VERSION, NODE_PORT_SNAT_PORT_PROBES,
     POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, SERVICE_BANK_COUNT,
@@ -37,7 +37,7 @@ use unf_ebpf_common::{
     ServiceBackendSlotKey, ServiceBackendSlotValue, ServiceConnectionKey, ServiceConnectionValue,
     ServiceEvent, ServiceFrontendValue, ServiceMapConfig, connection_is_active,
     ipv6_extension_step, packet_starts_connection, service_backend_is_eligible,
-    service_connection_is_active, service_flow_hash,
+    node_port_snat_candidate, service_connection_is_active, service_flow_hash,
 };
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -52,9 +52,6 @@ const SERVICE_FRONTEND_CAPACITY: u32 = 262_144;
 const SERVICE_BACKEND_CAPACITY: u32 = 524_288;
 const SERVICE_BACKEND_SLOT_CAPACITY: u32 = 1_048_576;
 const SERVICE_CONNECTION_CAPACITY: u32 = 262_144;
-const NODE_PORT_SNAT_PORT_BASE: u16 = 32_768;
-const NODE_PORT_SNAT_PORT_MASK: u32 = 32_767;
-const NODE_PORT_SNAT_PORT_PROBES: u32 = 32;
 const IPV4_HEADER_CHECKSUM_OFFSET: usize = ETHERNET_HEADER_LEN + 10;
 const TCP_CHECKSUM_OFFSET: usize = 16;
 const UDP_CHECKSUM_OFFSET: usize = 6;
@@ -1092,8 +1089,7 @@ fn new_service_connection(
         let hash = service_flow_hash(&service_forward_key(value), frontend.service_id);
         let mut probe = 0_u32;
         while probe < NODE_PORT_SNAT_PORT_PROBES {
-            let port = NODE_PORT_SNAT_PORT_BASE
-                .wrapping_add(((hash.wrapping_add(probe)) & NODE_PORT_SNAT_PORT_MASK) as u16);
+            let port = node_port_snat_candidate(hash, probe);
             value.reserved[0..2].copy_from_slice(&port.to_be_bytes());
             if insert_new_service_pair(value) {
                 return Some(ServiceTranslation {

@@ -21,6 +21,9 @@ pub const NODE_PORT_MAP_ABI_VERSION: u16 = 1;
 pub const NODE_PORT_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG: u32 = 1 << 31;
+pub const NODE_PORT_SNAT_PORT_BASE: u16 = 32_768;
+pub const NODE_PORT_SNAT_PORT_MASK: u32 = 32_767;
+pub const NODE_PORT_SNAT_PORT_PROBES: u32 = 32;
 pub const SERVICE_BACKEND_FLAG_READY: u8 = 1 << 0;
 pub const SERVICE_BACKEND_FLAG_SERVING: u8 = 1 << 1;
 pub const SERVICE_BACKEND_FLAG_TERMINATING: u8 = 1 << 2;
@@ -341,6 +344,16 @@ pub const fn service_flow_hash(key: &ServiceConnectionKey, service_id: ServiceId
     mix(
         hash,
         u32::from_be_bytes([key.protocol, key.address_family, 0, 0]),
+    )
+}
+
+/// Returns one bounded `NodePort` SNAT candidate from a full-cycle permutation
+/// of the dynamic/private half of the port space.
+#[must_use]
+pub const fn node_port_snat_candidate(hash: u32, probe: u32) -> u16 {
+    let stride = ((hash >> 16) & NODE_PORT_SNAT_PORT_MASK) | 1;
+    NODE_PORT_SNAT_PORT_BASE.wrapping_add(
+        (hash.wrapping_add(probe.wrapping_mul(stride)) & NODE_PORT_SNAT_PORT_MASK) as u16,
     )
 }
 
@@ -800,6 +813,8 @@ const _: () = assert!(core::mem::size_of::<ServiceEvent>() == 96);
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     #[test]
@@ -1040,6 +1055,40 @@ mod tests {
         changed.destination_port = 8443_u16.to_be_bytes();
         assert_ne!(service_flow_hash(&changed, ServiceId::new(7)), expected);
         assert_ne!(service_flow_hash(&key, ServiceId::new(8)), expected);
+    }
+
+    #[test]
+    fn node_port_snat_candidates_are_bounded_dispersed_and_churn_safe() {
+        let mut candidates = std::collections::HashSet::new();
+        for probe in 0..NODE_PORT_SNAT_PORT_PROBES {
+            let candidate = node_port_snat_candidate(7, probe);
+            assert!(candidate >= NODE_PORT_SNAT_PORT_BASE);
+            assert!(candidates.insert(candidate));
+        }
+        assert_eq!(candidates.len(), NODE_PORT_SNAT_PORT_PROBES as usize);
+
+        let mut allocated = std::collections::HashSet::new();
+        let mut key = ServiceConnectionKey {
+            source_address: [1; 16],
+            destination_address: [2; 16],
+            source_port: 10_000_u16.to_be_bytes(),
+            destination_port: 30_080_u16.to_be_bytes(),
+            protocol: 6,
+            address_family: AddressFamily::Ipv4 as u8,
+            role: SERVICE_CONNECTION_ROLE_FORWARD,
+            reserved: 0,
+        };
+        for source_port in 10_000_u16..14_096_u16 {
+            key.source_port = source_port.to_be_bytes();
+            let hash = service_flow_hash(&key, ServiceId::new(7));
+            let candidate = (0..NODE_PORT_SNAT_PORT_PROBES)
+                .map(|probe| node_port_snat_candidate(hash, probe))
+                .find(|candidate| allocated.insert(*candidate));
+            assert!(
+                candidate.is_some(),
+                "bounded allocation failed at source port {source_port}"
+            );
+        }
     }
 
     #[test]

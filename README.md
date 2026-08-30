@@ -200,7 +200,11 @@ perform dual-stack TCP/UDP DNAT and paired NodePort reverse SNAT through the
 coherent service bank, retain connections across backend churn, preserve
 checksums and provenance, use bounded collision-safe Node source ports so
 cross-node replies return to the owning connection, and apply ingress policy to
-the original source plus translated backend identity and port. Phase 5.5 is
+the original source plus translated backend identity and port. The bounded
+allocator now uses a per-flow odd-stride permutation of the complete dynamic
+port range, avoiding correlated adjacent-port exhaustion across compatible
+agent replacement without increasing verifier work; ADR 0091 records this
+recovery invariant. Phase 5.5 is
 also verified: `Local` uses transactionally merged receiving-Node slots, admits
 only ready non-terminating local backends, preserves the external source, and
 returns exact no-local-backend evidence through placement/readiness loss and
@@ -220,7 +224,8 @@ classified operations, controller-offline worker-agent replacement, empty-map
 cleanup, exact ABI-v5 rollback, and immutable evidence. The fixture also
 captures, applies, and restores the exact IPv4 reverse-path/local-source host
 settings needed by NodePort; OpenShift persists the same settings through both
-MachineConfigPools. ADRs 0089–0090 define the gate and host contract; a
+MachineConfigPools. ADRs 0089–0091 define the gate, host contract, and restart
+allocation invariant; a
 committed-image execution is required before it is marked Verified.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
