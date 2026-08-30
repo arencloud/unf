@@ -10,6 +10,9 @@ state_dir=/host/var/lib/unf/cni/v1
 marker=${state_dir}/install.env
 socket=/host/run/unf/cni.sock
 
+desired_binary_sha256=$(sha256sum "${binary_source}" | cut -d ' ' -f 1)
+desired_config_sha256=$(sha256sum "${config_source}" | cut -d ' ' -f 1)
+
 for _ in $(seq 1 180); do
     [ -S "${socket}" ] && break
     sleep 1
@@ -33,15 +36,7 @@ if [ -n "${foreign_configs}" ]; then
     echo "refusing primary-CNI installation beside foreign CNI configuration: ${foreign_configs}" >&2
     exit 1
 fi
-if [ -e "${binary_target}" ] && [ ! -f "${marker}" ]; then
-    echo "refusing to replace unowned CNI binary ${binary_target}" >&2
-    exit 1
-fi
-if [ -e "${config_target}" ] && [ ! -f "${marker}" ]; then
-    echo "refusing to replace unowned CNI configuration ${config_target}" >&2
-    exit 1
-fi
-if [ -e "${marker}" ]; then
+if [ -e "${marker}" ] || [ -L "${marker}" ]; then
     if [ -L "${marker}" ] || [ ! -f "${marker}" ] || [ "$(wc -l <"${marker}")" -ne 4 ]; then
         echo "refusing malformed or non-regular ownership marker ${marker}" >&2
         exit 1
@@ -56,15 +51,40 @@ if [ -e "${marker}" ]; then
         echo "refusing invalid ownership marker ${marker}" >&2
         exit 1
     fi
-    if [ -L "${binary_target}" ] || [ ! -f "${binary_target}" ] \
-        || [ "$(sha256sum "${binary_target}" | cut -d ' ' -f 1)" != "${owned_binary_sha256}" ]; then
+    if [ -L "${binary_target}" ] || [ ! -f "${binary_target}" ]; then
         echo "refusing to replace drifted owned CNI binary ${binary_target}" >&2
         exit 1
     fi
-    if [ -L "${config_target}" ] || [ ! -f "${config_target}" ] \
-        || [ "$(sha256sum "${config_target}" | cut -d ' ' -f 1)" != "${owned_config_sha256}" ]; then
+    actual_binary_sha256=$(sha256sum "${binary_target}" | cut -d ' ' -f 1)
+    if [ "${actual_binary_sha256}" != "${owned_binary_sha256}" ] \
+        && [ "${actual_binary_sha256}" != "${desired_binary_sha256}" ]; then
+        echo "refusing to replace drifted owned CNI binary ${binary_target}" >&2
+        exit 1
+    fi
+    if [ -L "${config_target}" ] || [ ! -f "${config_target}" ]; then
         echo "refusing to replace drifted owned CNI configuration ${config_target}" >&2
         exit 1
+    fi
+    actual_config_sha256=$(sha256sum "${config_target}" | cut -d ' ' -f 1)
+    if [ "${actual_config_sha256}" != "${owned_config_sha256}" ] \
+        && [ "${actual_config_sha256}" != "${desired_config_sha256}" ]; then
+        echo "refusing to replace drifted owned CNI configuration ${config_target}" >&2
+        exit 1
+    fi
+else
+    if [ -e "${binary_target}" ] || [ -L "${binary_target}" ]; then
+        if [ -L "${binary_target}" ] || [ ! -f "${binary_target}" ] \
+            || [ "$(sha256sum "${binary_target}" | cut -d ' ' -f 1)" != "${desired_binary_sha256}" ]; then
+            echo "refusing to replace unowned CNI binary ${binary_target}" >&2
+            exit 1
+        fi
+    fi
+    if [ -e "${config_target}" ] || [ -L "${config_target}" ]; then
+        if [ -L "${config_target}" ] || [ ! -f "${config_target}" ] \
+            || [ "$(sha256sum "${config_target}" | cut -d ' ' -f 1)" != "${desired_config_sha256}" ]; then
+            echo "refusing to replace unowned CNI configuration ${config_target}" >&2
+            exit 1
+        fi
     fi
 fi
 

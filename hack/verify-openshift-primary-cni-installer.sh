@@ -62,6 +62,26 @@ pending=${fixture}/host/var/lib/unf/cni/v1/pending-deletes
 grep -q '^schema=1$' "${marker}"
 grep -q '^platform=openshift$' "${marker}"
 
+# A terminated init container can move release-exact artifacts before its
+# atomic ownership marker. The next run may adopt only those exact bytes.
+unlink "${marker}"
+run_installer
+[[ $(stat -c '%a' "${marker}") == 600 ]]
+
+# A valid old marker plus one already-updated artifact is the other bounded
+# interruption point. Release-exact desired bytes may finish that transaction.
+desired_binary_sha256=$(sha256sum "${fixture}/host/var/lib/cni/bin/unf" | cut -d ' ' -f 1)
+desired_config_sha256=$(sha256sum "${fixture}/host/etc/kubernetes/cni/net.d/10-unf.conflist" | cut -d ' ' -f 1)
+{
+    echo 'schema=1'
+    echo 'platform=openshift'
+    printf '%064d\n' 0 | sed 's/^/binary_sha256=/'
+    echo "config_sha256=${desired_config_sha256}"
+} >"${marker}"
+chmod 0600 "${marker}"
+run_installer
+grep -q "^binary_sha256=${desired_binary_sha256}$" "${marker}"
+
 touch "${fixture}/host/etc/kubernetes/cni/net.d/20-foreign.conf"
 set +e
 foreign_output=$(run_installer 2>&1)
@@ -79,5 +99,13 @@ drift_rc=$?
 set -e
 [[ ${drift_rc} -ne 0 ]]
 grep -q 'refusing to replace drifted owned CNI binary' <<<"${drift_output}"
+
+unlink "${marker}"
+set +e
+unowned_output=$(run_installer 2>&1)
+unowned_rc=$?
+set -e
+[[ ${unowned_rc} -ne 0 ]]
+grep -q 'refusing to replace unowned CNI binary' <<<"${unowned_output}"
 
 echo "OpenShift primary-CNI installer transaction fixture passed"
