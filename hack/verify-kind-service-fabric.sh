@@ -340,8 +340,8 @@ spec:
         - |
           socat UDP4-RECVFROM:5353,reuseaddr,fork EXEC:/bin/cat &
           socat UDP6-RECVFROM:5353,reuseaddr,fork,ipv6-v6only=1 EXEC:/bin/cat &
-          socat TCP4-LISTEN:8081,reuseaddr,fork "SYSTEM:echo \$SOCAT_PEERADDR" &
-          socat TCP6-LISTEN:8081,reuseaddr,fork,ipv6-v6only=1 "SYSTEM:echo \$SOCAT_PEERADDR" &
+          socat TCP4-LISTEN:8081,reuseaddr,fork 'SYSTEM:echo \$SOCAT_PEERADDR' &
+          socat TCP6-LISTEN:8081,reuseaddr,fork,ipv6-v6only=1 'SYSTEM:echo \$SOCAT_PEERADDR' &
           exec /usr/local/bin/unf-flow-receiver 8080
       readinessProbe:
         exec:
@@ -947,6 +947,8 @@ release_revision=$(controller_raw /v1/version | jq -er '
 ')
 [[ ${release_revision} =~ ^[0-9a-f]{40}$ ]]
 git -C "${project_root}" merge-base --is-ancestor "${release_revision}" HEAD
+qualification_revision=$(git -C "${project_root}" rev-parse HEAD)
+[[ ${qualification_revision} =~ ^[0-9a-f]{40}$ ]]
 while read -r agent_pod; do
     agent_revision=$(agent_raw "${agent_pod}" /v1/version | jq -er '
         select(.schema_version == 2 and .component == "unf-agent") | .build_revision
@@ -977,6 +979,7 @@ jq -n \
 if [[ ${node_port_mode} == true ]]; then
     jq \
         --argjson durationSeconds "$(( $(date +%s) - started_unix_seconds ))" \
+        --arg qualificationRevision "${qualification_revision}" \
         --arg clientNode "${client_node}" --arg serverNode "${server_node}" \
         --arg clientNodeIPv4 "${client_node_v4}" --arg clientNodeIPv6 "${client_node_v6}" \
         --arg serverNodeIPv4 "${server_node_v4}" --arg serverNodeIPv6 "${server_node_v6}" \
@@ -984,6 +987,7 @@ if [[ ${node_port_mode} == true ]]; then
         --argjson localServiceId "${local_service_id}" '
         .schemaVersion = 2
         | .phase = "5.7"
+        | .qualificationRevision = $qualificationRevision
         | .durationSeconds = $durationSeconds
         | .nodePort = {
             clusterServiceId:$clusterServiceId,
@@ -1005,7 +1009,8 @@ if [[ ${node_port_mode} == true ]]; then
             "NodePort classified metrics, status, history, and explanation",
             "read-only exact NodePort simulation",
             "controller-outage source and destination agent replacement with composite checkpoint",
-            "empty NodePort maps and legacy-format checkpoint after fixture cleanup"
+            "empty NodePort maps and legacy-format checkpoint after fixture cleanup",
+            "exact IPv4 NodePort host sysctl restoration"
         ]
         | .excluded = [
             "SCTP","LoadBalancer","session affinity","topology-aware hints",

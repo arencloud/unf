@@ -49,8 +49,9 @@ must cover cross-node IPv4/IPv6 TCP/UDP for both traffic policies, source/revers
 tuples, readiness/termination/deletion/local-loss recovery, controller outage,
 source and destination agent replacement from last-known-good state, classified
 metrics/status/history/explanation/simulation, exact fixture and ABI cleanup,
-and restoration to the saved no-CNI baseline. Evidence must bind the source
-revision, images, Kubernetes/Kind/kernel tuple, timing, and exclusions.
+and restoration to the saved no-CNI baseline. Evidence must bind the product
+and qualification-harness revisions, images, Kubernetes/Kind/kernel tuple,
+timing, and exclusions.
 
 The first live execution isolated a distribution-default host prerequisite:
 reverse-translated IPv4 replies require `rp_filter=0` and `accept_local=1` on

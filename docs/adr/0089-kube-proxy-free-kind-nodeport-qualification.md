@@ -37,8 +37,9 @@ observation ports. The gate requires:
   platform rollback; and
 - explicit IPv4 NodePort host prerequisites with exact pre-activation sysctl
   capture and rollback restoration; and
-- schema-v2 evidence binding the exact source revision, image IDs, Kubernetes,
-  Node addresses, kernel/runtime/OS tuple, duration, assertions, and exclusions.
+- schema-v2 evidence binding the exact product and qualification-harness
+  revisions, image IDs, Kubernetes, Node addresses, kernel/runtime/OS tuple,
+  duration, assertions, and exclusions.
 
 The Phase 4 `service-kind-test` mode remains available. Its schema assertions
 are updated to the current operations contracts, and the shared rollback accepts
