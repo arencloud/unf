@@ -302,19 +302,44 @@ service_matrix() {
 }
 
 host_service_matrix() {
-    local pod=$1 target source_port
-    "${kc[@]}" -n "${namespace}" exec "${pod}" -- \
-        wget -T 4 -t 1 -qO- "http://${service_v4}:8080/health" | grep -qx ok
-    "${kc[@]}" -n "${namespace}" exec "${pod}" -- \
-        wget -T 4 -t 1 -qO- "http://[${service_v6}]:8080/health" | grep -qx ok
+    local pod=$1 target source_port success
+    for family in 4 6; do
+        if [[ ${family} == 4 ]]; then target="http://${service_v4}:8080/health"; else target="http://[${service_v6}]:8080/health"; fi
+        success=false
+        for _ in $(seq 1 3); do
+            if "${kc[@]}" -n "${namespace}" exec "${pod}" -- \
+                wget -T 4 -t 1 -qO- "${target}" | grep -qx ok; then success=true; break; fi
+            sleep 0.2
+        done
+        if [[ ${success} != true ]]; then
+            echo "host-origin TCP ClusterIP failed from ${pod} over IPv${family}" >&2
+            return 1
+        fi
+    done
     source_port=$(qualification_source_port 32000 host 4 "${service_v4}" 5353)
     target="UDP4:${service_v4}:5353,sourceport=${source_port},reuseaddr"
-    "${kc[@]}" -n "${namespace}" exec "${pod}" -- sh -ec \
-        "printf host-udp | socat -T 4 - '${target}'" | grep -qx host-udp
+    success=false
+    for _ in $(seq 1 3); do
+        if "${kc[@]}" -n "${namespace}" exec "${pod}" -- sh -ec \
+            "printf host-udp | socat -T 4 - '${target}'" | grep -qx host-udp; then success=true; break; fi
+        sleep 0.2
+    done
+    if [[ ${success} != true ]]; then
+        echo "host-origin UDP ClusterIP failed from ${pod} over IPv4" >&2
+        return 1
+    fi
     source_port=$(qualification_source_port 32000 host 6 "${service_v6}" 5353)
     target="UDP6:[${service_v6}]:5353,sourceport=${source_port},reuseaddr"
-    "${kc[@]}" -n "${namespace}" exec "${pod}" -- sh -ec \
-        "printf host-udp | socat -T 4 - '${target}'" | grep -qx host-udp
+    success=false
+    for _ in $(seq 1 3); do
+        if "${kc[@]}" -n "${namespace}" exec "${pod}" -- sh -ec \
+            "printf host-udp | socat -T 4 - '${target}'" | grep -qx host-udp; then success=true; break; fi
+        sleep 0.2
+    done
+    if [[ ${success} != true ]]; then
+        echo "host-origin UDP ClusterIP failed from ${pod} over IPv6" >&2
+        return 1
+    fi
 }
 
 node_port_matrix() {

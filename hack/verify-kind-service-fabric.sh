@@ -192,6 +192,42 @@ udp_probe_once() {
         "printf udp-ok | socat -T 4 - '${target}'" | grep -qx udp-ok
 }
 
+host_service_matrix() {
+    local pod=$1 family target source_port success
+    for family in 4 6; do
+        if [[ ${family} == 4 ]]; then target="http://${service_v4}:8080/health"; else target="http://[${service_v6}]:8080/health"; fi
+        success=false
+        for _ in $(seq 1 3); do
+            if "${kc[@]}" -n "${namespace}" exec "${pod}" -- \
+                wget -T 4 -t 1 -qO- "${target}" | grep -qx ok; then success=true; break; fi
+            sleep 0.2
+        done
+        [[ ${success} == true ]] || {
+            echo "host-origin TCP ClusterIP failed from ${pod} over IPv${family}" >&2
+            return 1
+        }
+    done
+    for family in 4 6; do
+        if [[ ${family} == 4 ]]; then
+            source_port=$(qualification_source_port 32000 host 4 "${service_v4}" 5353)
+            target="UDP4:${service_v4}:5353,sourceport=${source_port},reuseaddr"
+        else
+            source_port=$(qualification_source_port 32000 host 6 "${service_v6}" 5353)
+            target="UDP6:[${service_v6}]:5353,sourceport=${source_port},reuseaddr"
+        fi
+        success=false
+        for _ in $(seq 1 3); do
+            if "${kc[@]}" -n "${namespace}" exec "${pod}" -- sh -ec \
+                "printf host-udp | socat -T 4 - '${target}'" | grep -qx host-udp; then success=true; break; fi
+            sleep 0.2
+        done
+        [[ ${success} == true ]] || {
+            echo "host-origin UDP ClusterIP failed from ${pod} over IPv${family}" >&2
+            return 1
+        }
+    done
+}
+
 qualification_source_port() {
     local base=$1
     local salt=$2
@@ -573,8 +609,39 @@ spec:
       nodePort: 31081
 EOF
 fi
+host_clients=()
+host_client_index=0
+for node in "${nodes[@]}"; do
+    host_client="host-client-${host_client_index}"
+    host_clients+=("${host_client}")
+    "${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${host_client}
+  namespace: ${namespace}
+  labels:
+    qualification.unf.io/role: host-client
+spec:
+  nodeName: ${node}
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: client
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
+      command: [sh, -ec, "sleep infinity"]
+EOF
+    host_client_index=$((host_client_index + 1))
+done
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/client pod/server \
     --timeout=180s >/dev/null
+"${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod \
+    -l qualification.unf.io/role=host-client --timeout=180s >/dev/null
 wait_for_convergence
 
 server_json=$("${kc[@]}" -n "${namespace}" get pod server -o json)
@@ -620,6 +687,10 @@ udp_probe 4 "${server_v4}"
 udp_probe 6 "${server_v6}"
 for _ in $(seq 1 8); do
     active_probe_matrix
+done
+qualification_stage=host-origin-clusterip-forwarding
+for host_client in "${host_clients[@]}"; do
+    host_service_matrix "${host_client}"
 done
 verify_node_port_sources
 
@@ -1059,7 +1130,7 @@ jq -n \
     --argjson nodes "${node_evidence}" \
     --argjson images "${image_evidence}" \
     --argjson agents "${final_agents}" \
-    '{schemaVersion:1,generatedAt:$generatedAt,revision:$revision,context:$context,kubernetesVersion:$kubernetesVersion,kubeProxyPresent:false,service:{id:$serviceId,ipv4:$serviceIPv4,ipv6:$serviceIPv6,activeRevision:$activeRevision,recoveredRevision:$recoveredRevision},nodes:$nodes,images:$images,agents:$agents,verified:["exclusive UNF primary CNI","kube-proxy absent","headless controller bootstrap","direct dual-stack Pod forwarding","IPv4 and IPv6 TCP ClusterIP","IPv4 and IPv6 UDP ClusterIP","Service reply restoration into an ingress-isolated client","DNS continuity through UNF Service translation","stable repeated connection translation","readiness withdrawal","terminating endpoint exclusion","backend deletion and recovery","no-backend drop provenance","metrics and agent status","durable flow history","unfctl service explanation","controller-outage source and destination agent replacement","last-known-good service recovery","desired service-map cleanup","CNI attachment and veth cleanup"]}' \
+    '{schemaVersion:1,generatedAt:$generatedAt,revision:$revision,context:$context,kubernetesVersion:$kubernetesVersion,kubeProxyPresent:false,service:{id:$serviceId,ipv4:$serviceIPv4,ipv6:$serviceIPv6,activeRevision:$activeRevision,recoveredRevision:$recoveredRevision},nodes:$nodes,images:$images,agents:$agents,verified:["exclusive UNF primary CNI","kube-proxy absent","headless controller bootstrap","direct dual-stack Pod forwarding","IPv4 and IPv6 TCP ClusterIP","IPv4 and IPv6 UDP ClusterIP","Service reply restoration into an ingress-isolated client","all-node IPv4 and IPv6 TCP/UDP host-origin ClusterIP","DNS continuity through UNF Service translation","stable repeated connection translation","readiness withdrawal","terminating endpoint exclusion","backend deletion and recovery","no-backend drop provenance","metrics and agent status","durable flow history","unfctl service explanation","controller-outage source and destination agent replacement","last-known-good service recovery","desired service-map cleanup","CNI attachment and veth cleanup"]}' \
     >"${artifact}"
 if [[ ${node_port_mode} == true ]]; then
     jq \
@@ -1099,7 +1170,7 @@ if [[ ${node_port_mode} == true ]]; then
         ]
         | .excluded = [
             "SCTP","LoadBalancer","session affinity","topology-aware hints",
-            "Maglev","DSR","host-network clients","fragments",
+            "Maglev","DSR","host-origin NodePort clients","fragments",
             "generic NAT RELATED tracking","production availability and scale"
         ]
     ' "${artifact}" >"${artifact}.tmp"

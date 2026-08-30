@@ -7951,7 +7951,7 @@ async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
         )
         .status_label(),
         capabilities: state.capabilities.clone(),
-        limitation: "service translation is bounded to primary-CNI Pod clients, IPv4/IPv6 TCP/UDP, ClusterIP, and NodePort Cluster/Local traffic; LoadBalancer, session affinity, DSR, SCTP, fragments, and host-network clients remain unqualified",
+        limitation: "service translation is bounded to primary-CNI Pod clients plus host-origin ClusterIP, IPv4/IPv6 TCP/UDP, and NodePort Cluster/Local traffic; LoadBalancer, session affinity, DSR, SCTP, fragments, and host-origin NodePort clients remain unqualified",
     })
 }
 

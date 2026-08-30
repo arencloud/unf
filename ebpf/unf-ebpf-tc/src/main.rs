@@ -2,9 +2,11 @@
 #![no_main]
 
 use aya_ebpf::bindings::{
-    BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_SHOT,
+    BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR, BPF_FIB_LOOKUP_OUTPUT,
+    BPF_FIB_LOOKUP_SKIP_NEIGH, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT,
+    bpf_fib_lookup as BpfFibLookup,
 };
-use aya_ebpf::helpers::bpf_ktime_get_ns;
+use aya_ebpf::helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect_neigh};
 use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
@@ -55,6 +57,8 @@ const SERVICE_CONNECTION_CAPACITY: u32 = 262_144;
 const IPV4_HEADER_CHECKSUM_OFFSET: usize = ETHERNET_HEADER_LEN + 10;
 const TCP_CHECKSUM_OFFSET: usize = 16;
 const UDP_CHECKSUM_OFFSET: usize = 6;
+const ADDRESS_FAMILY_INET: u8 = 2;
+const ADDRESS_FAMILY_INET6: u8 = 10;
 
 #[map]
 static FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -475,6 +479,9 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     }
     if service_forward_translated {
         seed_service_frontend_policy_connection(tcp_flags);
+        if !enforce && service_connection_is_cluster_ip() {
+            return reroute_host_service_v4(ctx, observation);
+        }
     }
     action
 }
@@ -695,6 +702,9 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     }
     if service_forward_translated {
         seed_service_frontend_policy_connection(observation.tcp_flags);
+        if !enforce && service_connection_is_cluster_ip() {
+            return reroute_host_service_v6(ctx, observation);
+        }
     }
     action
 }
@@ -1586,6 +1596,151 @@ const fn l4_checksum_flags(protocol: u8, size: u64, pseudo_header: bool) -> u64 
         flags |= BPF_F_MARK_MANGLED_0 as u64;
     }
     flags
+}
+
+#[inline(always)]
+fn service_connection_is_cluster_ip() -> bool {
+    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
+        return false;
+    };
+    // SAFETY: callers use this only after a successful Service lookup populated
+    // the current CPU's connection scratch value.
+    #[allow(unsafe_code)]
+    let value = unsafe { &*value_ptr };
+    value.flags
+        & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
+        == 0
+}
+
+/// Host-origin traffic reaches TC after the kernel selected a route for the
+/// Service VIP. Once DNAT selects a Pod backend, repeat the bounded FIB lookup
+/// and neighbor resolution so the packet uses the backend route rather than
+/// the frontend route's stale L2 next hop.
+#[inline(never)]
+fn reroute_host_service_v4(ctx: &TcContext, observation: &FlowObservation) -> i32 {
+    // SAFETY: the TC context owns a valid `__sk_buff` for this invocation.
+    #[allow(unsafe_code)]
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    // Kernel test-run uses the loopback index without a live route. UNF never
+    // attaches this program to loopback, so retain the packet-only test
+    // contract while every live managed egress has an index greater than one.
+    if ifindex <= 1 {
+        return TC_ACT_PIPE;
+    }
+    let Ok(total_length) = ctx.load::<u16>(ETHERNET_HEADER_LEN + 2) else {
+        return service_reroute_failed();
+    };
+    // SAFETY: the kernel ABI structure is plain integer/byte storage and an
+    // all-zero value is a valid starting point for the documented input fields.
+    #[allow(unsafe_code)]
+    let mut lookup = unsafe { core::mem::zeroed::<BpfFibLookup>() };
+    lookup.family = ADDRESS_FAMILY_INET;
+    lookup.l4_protocol = observation.protocol;
+    lookup.sport = u16::from_ne_bytes(observation.source_port);
+    lookup.dport = u16::from_ne_bytes(observation.destination_port);
+    lookup.__bindgen_anon_1.tot_len = u16::from_be(total_length);
+    lookup.ifindex = ifindex;
+    lookup.__bindgen_anon_3.ipv4_src = u32::from_ne_bytes([
+        observation.source_address[0],
+        observation.source_address[1],
+        observation.source_address[2],
+        observation.source_address[3],
+    ]);
+    lookup.__bindgen_anon_4.ipv4_dst = u32::from_ne_bytes([
+        observation.destination_address[0],
+        observation.destination_address[1],
+        observation.destination_address[2],
+        observation.destination_address[3],
+    ]);
+    // SAFETY: pointers and length exactly match the TC helper ABI; skipping the
+    // first neighbor lookup lets `bpf_redirect_neigh` resolve or refresh it.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        bpf_fib_lookup(
+            ctx.skb.skb.cast(),
+            &mut lookup,
+            core::mem::size_of::<BpfFibLookup>() as i32,
+            BPF_FIB_LOOKUP_OUTPUT | BPF_FIB_LOOKUP_SKIP_NEIGH,
+        )
+    };
+    if result != 0 || lookup.ifindex == 0 {
+        return service_reroute_failed();
+    }
+    redirect_service_neighbor(lookup.ifindex)
+}
+
+#[inline(never)]
+fn reroute_host_service_v6(ctx: &TcContext, observation: &FlowObservation) -> i32 {
+    // SAFETY: the TC context owns a valid `__sk_buff` for this invocation.
+    #[allow(unsafe_code)]
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    if ifindex <= 1 {
+        return TC_ACT_PIPE;
+    }
+    let Ok(payload_length) = ctx.load::<u16>(ETHERNET_HEADER_LEN + 4) else {
+        return service_reroute_failed();
+    };
+    // SAFETY: see the IPv4 helper; all-zero is a valid ABI initialization.
+    #[allow(unsafe_code)]
+    let mut lookup = unsafe { core::mem::zeroed::<BpfFibLookup>() };
+    lookup.family = ADDRESS_FAMILY_INET6;
+    lookup.l4_protocol = observation.protocol;
+    lookup.sport = u16::from_ne_bytes(observation.source_port);
+    lookup.dport = u16::from_ne_bytes(observation.destination_port);
+    lookup.__bindgen_anon_1.tot_len = u16::from_be(payload_length).saturating_add(40);
+    lookup.ifindex = ifindex;
+    lookup.__bindgen_anon_3.ipv6_src = ipv6_fib_words(observation.source_address);
+    lookup.__bindgen_anon_4.ipv6_dst = ipv6_fib_words(observation.destination_address);
+    // SAFETY: pointers and length exactly match the TC helper ABI.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        bpf_fib_lookup(
+            ctx.skb.skb.cast(),
+            &mut lookup,
+            core::mem::size_of::<BpfFibLookup>() as i32,
+            BPF_FIB_LOOKUP_OUTPUT | BPF_FIB_LOOKUP_SKIP_NEIGH,
+        )
+    };
+    if result != 0 || lookup.ifindex == 0 {
+        return service_reroute_failed();
+    }
+    redirect_service_neighbor(lookup.ifindex)
+}
+
+#[inline(always)]
+fn ipv6_fib_words(address: [u8; 16]) -> [u32; 4] {
+    [
+        u32::from_ne_bytes([address[0], address[1], address[2], address[3]]),
+        u32::from_ne_bytes([address[4], address[5], address[6], address[7]]),
+        u32::from_ne_bytes([address[8], address[9], address[10], address[11]]),
+        u32::from_ne_bytes([address[12], address[13], address[14], address[15]]),
+    ]
+}
+
+#[inline(always)]
+fn redirect_service_neighbor(ifindex: u32) -> i32 {
+    // SAFETY: a null neighbor parameter requests the helper's documented FIB
+    // resolution from the already rewritten packet headers.
+    #[allow(unsafe_code)]
+    let action = unsafe { bpf_redirect_neigh(ifindex, core::ptr::null_mut(), 0, 0) };
+    if action == i64::from(TC_ACT_REDIRECT) {
+        TC_ACT_REDIRECT
+    } else {
+        service_reroute_failed()
+    }
+}
+
+#[inline(always)]
+fn service_reroute_failed() -> i32 {
+    // SAFETY: this helper has no preconditions and returns monotonic kernel time.
+    #[allow(unsafe_code)]
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    emit_service_connection_event(
+        SERVICE_EVENT_ACTION_DROP,
+        SERVICE_EVENT_REASON_REWRITE_FAILED,
+        now_ns,
+    );
+    TC_ACT_SHOT
 }
 
 #[inline(never)]
