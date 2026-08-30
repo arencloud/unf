@@ -215,6 +215,28 @@ wait_for_convergence() {
     return 1
 }
 
+wait_for_machineconfig_render() {
+    local pool=$1 machine_config=$2 expected_source rendered actual_source=
+    expected_source=$("${kc[@]}" get "machineconfig/${machine_config}" -o json | jq -er '
+        .spec.config.storage.files[]
+        | select(.path == "/etc/sysctl.d/90-unf-primary-cni.conf")
+        | .contents.source')
+    for _ in $(seq 1 300); do
+        rendered=$("${kc[@]}" get "machineconfigpool/${pool}" \
+            -o jsonpath='{.spec.configuration.name}')
+        actual_source=$("${kc[@]}" get "machineconfig/${rendered}" -o json 2>/dev/null | jq -er '
+            .spec.config.storage.files[]
+            | select(.path == "/etc/sysctl.d/90-unf-primary-cni.conf")
+            | .contents.source' 2>/dev/null || true)
+        if [[ ${actual_source} == "${expected_source}" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "MachineConfigPool ${pool} did not render ${machine_config}" >&2
+    return 1
+}
+
 stage=cluster-preflight
 network=$("${kc[@]}" get network.config.openshift.io cluster -o json)
 operator_network=$("${kc[@]}" get network.operator.openshift.io cluster -o json)
@@ -239,6 +261,8 @@ done
 stage=nodeport-host-contract
 "${kc[@]}" apply -f "${project_root}/deploy/openshift-primary-cni/machineconfig/master-forwarding.yaml" >/dev/null
 "${kc[@]}" apply -f "${project_root}/deploy/openshift-primary-cni/machineconfig/worker-forwarding.yaml" >/dev/null
+wait_for_machineconfig_render master 99-unf-primary-master-forwarding
+wait_for_machineconfig_render worker 99-unf-primary-worker-forwarding
 "${kc[@]}" wait mcp/master mcp/worker --for=condition=Updated --timeout=45m >/dev/null
 for node in "${nodes[@]}"; do
     host_contract=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
