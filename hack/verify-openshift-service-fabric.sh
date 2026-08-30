@@ -72,6 +72,8 @@ if [[ -n $(git -C "${project_root}" status --porcelain) ]]; then
     echo "qualification requires a clean committed worktree" >&2
     exit 1
 fi
+qualification_revision=$(git -C "${project_root}" rev-parse HEAD)
+[[ ${qualification_revision} =~ ^[0-9a-f]{40}$ ]]
 
 source_revision=$(jq -er .sourceRevision "${release_record}")
 controller_image=$(jq -er .images.controller "${release_record}")
@@ -1064,7 +1066,8 @@ node_evidence=$("${kc[@]}" get nodes -o json | jq '[.items[] | {
 }]')
 jq -n --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg context "${context}" --arg infrastructure "${infrastructure}" \
-    --arg sourceRevision "${source_revision}" --arg controllerImage "${controller_image}" \
+    --arg sourceRevision "${source_revision}" --arg qualificationRevision "${qualification_revision}" \
+    --arg controllerImage "${controller_image}" \
     --arg agentImage "${agent_image}" --arg testToolsImage "${test_tools_image}" \
     --arg openshiftVersion "$("${kc[@]}" get clusterversion version -o jsonpath='{.status.desired.version}')" \
     --arg kubernetesVersion "$("${kc[@]}" version -o json | jq -r .serverVersion.gitVersion)" \
@@ -1077,14 +1080,17 @@ jq -n --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson retiredAbi4Nodes "${retired_abi4_nodes}" \
     --argjson rebuildAbi4Nodes "${rebuild_abi4_nodes}" \
     --argjson durationSeconds "$(( $(date +%s) - started_unix ))" --argjson nodes "${node_evidence}" \
-    --argjson agents "${agents}" --argjson baselineUnhealthy "${baseline_unhealthy}" '
+    --argjson agents "${agents}" --argjson baselineUnhealthy "${baseline_unhealthy}" \
+    --argjson finalUnhealthy "${final_unhealthy}" '
     {
       schemaVersion:2, generatedAt:$generatedAt, phase:"5.8", result:"passed",
       context:$context, infrastructure:$infrastructure, sourceRevision:$sourceRevision,
+      qualificationRevision:$qualificationRevision,
       openshiftVersion:$openshiftVersion, kubernetesVersion:$kubernetesVersion,
       durationSeconds:$durationSeconds,
       images:{controller:$controllerImage,agent:$agentImage,testTools:$testToolsImage},
-      kubeProxyPresent:false, persistentBpfAbis:[5], baselineUnhealthyOperators:$baselineUnhealthy,
+      kubeProxyPresent:false, persistentBpfAbis:[5],
+      baselineUnhealthyOperators:$baselineUnhealthy, finalUnhealthyOperators:$finalUnhealthy,
       rollbackAbi4:{retiredNodes:$retiredAbi4Nodes,rebuildRequiredNodes:$rebuildAbi4Nodes},
       service:{id:$serviceId,ipv4:$serviceIPv4,ipv6:$serviceIPv6}, nodes:$nodes, agents:$agents,
       nodePort:{clusterServiceId:$clusterServiceId,localServiceId:$localServiceId,
@@ -1108,7 +1114,10 @@ jq -n --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         "durable composite service recovery","empty NodePort maps and legacy checkpoint after cleanup",
         "persistent IPv4 NodePort host sysctls","exact qualification cleanup",
         "scoped retained ABI-v4 retirement and reboot-cleared ABI-v4 rebuild classification",
-        "five-node convergence","no new unhealthy ClusterOperators"]
+        "five-node convergence","no new unhealthy ClusterOperators"],
+      excluded:["LoadBalancer","session affinity","topology hints","Maglev","DSR",
+        "host-origin NodePort clients","SCTP","fragments","generic NAT RELATED tracking",
+        "production availability and scale"]
     }
 ' >"${artifact_tmp}"
 chmod 0600 "${artifact_tmp}"
