@@ -10,11 +10,13 @@ release_record=${UNF_OPENSHIFT_SERVICE_RELEASE_RECORD:-"${project_root}/deploy/o
 deploy_evidence=${UNF_OPENSHIFT_SERVICE_DEPLOY_EVIDENCE:-"${project_root}/.artifacts/phase5-nodeport-openshift-deploy.json"}
 artifact=${UNF_OPENSHIFT_SERVICE_EVIDENCE:-"${project_root}/.artifacts/phase5-nodeport-openshift.json"}
 namespace=unf-service-qualification
+map_audit_label=qualification.unf.io/nodeport-map-audit
 stage=initialization
 temporary_dir=$(mktemp -d)
 probe_pid=
 controller_scaled_down=false
 namespace_created=false
+map_audit_pods_created=false
 artifact_tmp=
 started_unix=$(date +%s)
 
@@ -38,6 +40,10 @@ cleanup() {
     if [[ ${namespace_created} == true ]]; then
         "${kc[@]}" delete namespace "${namespace}" --ignore-not-found --wait=true \
             --timeout=180s >/dev/null 2>&1 || true
+    fi
+    if [[ ${map_audit_pods_created} == true ]]; then
+        "${kc[@]}" -n unf-system delete pods -l "${map_audit_label}=true" \
+            --ignore-not-found --wait=false >/dev/null 2>&1 || true
     fi
     [[ -z ${artifact_tmp} ]] || rm -f -- "${artifact_tmp}"
     rm -rf -- "${temporary_dir}"
@@ -944,16 +950,68 @@ done
 [[ ${client_count} -eq ${client_attachment_baseline} ]]
 [[ ${server_count} -eq ${server_attachment_baseline} ]]
 wait_for_convergence >/dev/null
+map_audit_pods_created=true
+"${kc[@]}" -n unf-system delete pods -l "${map_audit_label}=true" \
+    --ignore-not-found --wait=true --timeout=60s >/dev/null
+map_audit_index=0
 for node in "${nodes[@]}"; do
-    map_audit=$(host_exec "${node}" '
-        test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V4 | jq length)" -eq 0
-        test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V6 | jq length)" -eq 0
-        snapshot=/var/lib/unf/cni/v1/service-snapshot.json
-        jq -e ".schemaVersion == 1 and has(\"service\") == false and (.services | all(.nodePorts | length == 0))" "$snapshot" >/dev/null
-        echo nodeport-state-empty
-    ' 2>&1)
-    grep -q '^nodeport-state-empty$' <<<"${map_audit}"
+    audit_pod="unf-nodeport-map-audit-${map_audit_index}"
+    "${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${audit_pod}
+  namespace: unf-system
+  labels:
+    ${map_audit_label}: "true"
+spec:
+  nodeName: ${node}
+  hostNetwork: true
+  restartPolicy: Never
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: audit
+      image: ${test_tools_image}
+      imagePullPolicy: IfNotPresent
+      command: [sh, -ec]
+      args:
+        - |
+          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V4 | jq length)" -eq 0
+          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V6 | jq length)" -eq 0
+          snapshot=/var/lib/unf/cni/v1/service-snapshot.json
+          jq -e '.schemaVersion == 1 and has("service") == false and (.services | all(.nodePorts | length == 0))' "\$snapshot" >/dev/null
+          echo nodeport-state-empty
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: bpffs
+          mountPath: /sys/fs/bpf
+          readOnly: true
+        - name: state
+          mountPath: /var/lib/unf
+          readOnly: true
+  volumes:
+    - name: bpffs
+      hostPath:
+        path: /sys/fs/bpf
+        type: Directory
+    - name: state
+      hostPath:
+        path: /var/lib/unf
+        type: Directory
+EOF
+    if ! "${kc[@]}" -n unf-system wait --for=jsonpath='{.status.phase}'=Succeeded \
+        "pod/${audit_pod}" --timeout=90s >/dev/null; then
+        "${kc[@]}" -n unf-system logs "${audit_pod}" >&2 || true
+        exit 1
+    fi
+    grep -qx nodeport-state-empty < <("${kc[@]}" -n unf-system logs "${audit_pod}")
+    map_audit_index=$((map_audit_index + 1))
 done
+"${kc[@]}" -n unf-system delete pods -l "${map_audit_label}=true" \
+    --wait=true --timeout=60s >/dev/null
+map_audit_pods_created=false
 
 stage=retire-abi-v4-pins
 retired_abi4_nodes='[]'
