@@ -450,3 +450,24 @@ matrix is maintained in the
   ClusterOperator beyond baseline disconnected `insights`; ADR 0092.
 - LoadBalancer, session affinity, topology-aware selection, Maglev, and DSR
   remain separate future milestones.
+
+## Phase 6 — LoadBalancer exposure
+
+**Gate: In progress.** The ordered evidence matrix is maintained in the
+[Phase 6 LoadBalancer plan](development/phase6-loadbalancer-plan.md).
+
+- Verified architecture boundary: ADR 0093 separates VIP allocation,
+  advertisement, and eBPF translation into independently revisioned ownership
+  domains. Default admission requires the explicit
+  `network.unf.io/load-balancer` class, and Kubernetes status cannot promise a
+  VIP before reachability plus dataplane convergence.
+- In progress: schema-v3 Kubernetes-independent LoadBalancer intent and exact
+  Service/EndpointSlice compiler semantics, followed by provider-neutral
+  allocation/reachability contracts.
+- Planned: compatible distribution and transactional host state; dual-stack
+  TCP/UDP `Cluster` and `Local` dataplanes; source ranges and
+  `healthCheckNodePort`; operations/simulation/recovery; independent
+  kube-proxy-free Kind and digest-pinned OpenShift gates.
+- Production BGP/cloud takeover, session affinity, internal traffic policy,
+  topology-aware selection, Maglev, DSR, SCTP, Gateway API, multi-cluster, and
+  production availability/scale remain independent future gates.

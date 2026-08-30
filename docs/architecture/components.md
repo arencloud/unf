@@ -22,6 +22,16 @@ The allowed dependency direction is from binaries toward libraries and from API
 conversion toward domain types. Kernel ABI types depend only on `no_std`
 primitives. No core library calls the Kubernetes API.
 
+The accepted Phase 6 extension keeps LoadBalancer ownership split across
+components before implementation: `unf-service` will own bounded provider-
+neutral VIP intent; `unf-controller` will own explicit-class admission and
+narrow allocation/status/provider orchestration; `unf-agent` will own
+authenticated transactional host adoption and health state; reachability
+providers will own only their revisioned advertisement artifacts; and
+`unf-ebpf-tc` will own only validated VIP translation. Allocation,
+advertisement, translation, and published readiness are not interchangeable.
+ADR 0093 defines this boundary.
+
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,
 control-plane-only collections; packet processing and event records do not

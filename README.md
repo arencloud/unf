@@ -242,6 +242,17 @@ beyond baseline disconnected `insights`. ADR 0092 records this non-transitive
 boundary. All Phase 5 milestones are Verified; LoadBalancer, affinity, topology
 hints, Maglev, DSR, host-origin NodePort, SCTP, fragments, generic NAT `RELATED`,
 and production availability/scale retain independent gates.
+Phase 6 now begins bounded LoadBalancer exposure. Its first verified milestone
+is the ownership and acceptance boundary: UNF admits the explicit
+`network.unf.io/load-balancer` class by default and models VIP allocation,
+network advertisement, and eBPF translation as independent revisioned
+transactions. Status may publish a VIP only after the admitted provider and
+dataplane converge, direct delivery cannot depend on a traffic NodePort, and
+foreign controller/network state must survive reconciliation. The
+[Phase 6 LoadBalancer plan](docs/development/phase6-loadbalancer-plan.md) and
+ADR 0093 define the ordered schema, provider, dataplane, operations, Kind, and
+OpenShift gates. Milestone 6.2 domain/compiler implementation is in progress;
+no LoadBalancer packet-support claim exists yet.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
