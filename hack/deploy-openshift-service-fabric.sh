@@ -255,13 +255,21 @@ node_machineconfig_pool() {
 }
 
 assert_host_service_path() {
-    local node=$1 probe
-    probe=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host \
-        sh -euc '
-            curl -fsSk --connect-timeout 5 --max-time 10 "$1" | grep -qx ok
-            echo host-service-ready
-        ' sh "https://${kubernetes_service_ipv4}:443/readyz" 2>&1)
-    grep -q '^host-service-ready$' <<<"${probe}"
+    local node=$1 probe=
+    for _ in $(seq 1 60); do
+        probe=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host \
+            sh -euc '
+                curl -fsSk --connect-timeout 5 --max-time 10 "$1" | grep -qx ok
+                echo host-service-ready
+            ' sh "https://${kubernetes_service_ipv4}:443/readyz" 2>&1 || true)
+        if grep -q '^host-service-ready$' <<<"${probe}"; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "host-origin Kubernetes API Service path did not recover on ${node}" >&2
+    printf '%s\n' "${probe}" >&2
+    return 1
 }
 
 transition_agent() {
