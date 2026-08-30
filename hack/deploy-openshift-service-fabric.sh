@@ -213,7 +213,8 @@ mapfile -t nodes < <("${kc[@]}" get nodes -l network.unf.io/primary-cni=enabled 
 for node in "${nodes[@]}"; do
     [[ $("${kc[@]}" get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]
 done
-[[ $("${kc[@]}" -n openshift-kube-proxy get daemonset kube-proxy -o json | jq '.status.numberReady') -eq ${#nodes[@]} ]]
+[[ $("${kc[@]}" -n openshift-kube-proxy get daemonset openshift-kube-proxy \
+    -o json | jq '.status.numberReady') -eq ${#nodes[@]} ]]
 
 stage=render-and-apply
 controller_node=$("${kc[@]}" -n unf-system get deployment/unf-controller -o jsonpath='{.spec.template.spec.nodeName}')
