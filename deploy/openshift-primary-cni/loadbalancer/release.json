@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "phase": "6.9",
+  "sourceRevision": "dd11ae3f46b68571b013599577b0258bf3b99729",
+  "kindQualification": {
+    "schemaVersion": 1,
+    "phase": "6.8",
+    "context": "kind-unf-service-dev",
+    "sourceRevision": "dd11ae3f46b68571b013599577b0258bf3b99729",
+    "qualificationRevision": "793273f96e9edff1a64593aab613d66a9cf316a1",
+    "kubeProxyPresent": false,
+    "result": "passed"
+  },
+  "contracts": {
+    "compatibilitySchemaVersion": 2,
+    "persistentBpfStateAbiVersion": 7,
+    "identitySnapshotSchemaVersion": 2,
+    "policySnapshotSchemaVersion": 4,
+    "serviceSnapshotSchemaVersion": 3,
+    "agentStatusSchemaVersion": 6,
+    "flowExportSchemaVersion": 5
+  },
+  "images": {
+    "controller": "quay.io/arencloud/unf-controller-dev@sha256:47d47e824c31256d4bd0c35d7fab1d0e2d3f8a94a926175b27c779d79292646d",
+    "agent": "quay.io/arencloud/unf-agent-dev@sha256:47779e3e8d2e5df83cd1b03f3f554b6bcae54a6c1212d63e0335b17b25c2cc93",
+    "testTools": "quay.io/arencloud/unf-test-tools-dev@sha256:78c2be1c47fdb47f84b4201b6259c091cb565be025ccf8311c61fde54db16bb0"
+  }
+}

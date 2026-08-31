@@ -20,6 +20,9 @@ required_files=(
     docs/adr/0100-qualify-loadbalancer-on-kube-proxy-free-kind.md
     deploy/kind-loadbalancer/kustomization.yaml
     deploy/kind-loadbalancer/controller-loadbalancer-patch.yaml
+    deploy/openshift-primary-cni/loadbalancer/kustomization.yaml
+    deploy/openshift-primary-cni/loadbalancer/controller-loadbalancer-patch.yaml
+    deploy/openshift-primary-cni/loadbalancer/release.json
     hack/verify-kind-loadbalancer.sh
 )
 
@@ -122,9 +125,15 @@ require_text README.md \
 require_text Makefile \
     'loadbalancer-kind-test:' \
     "the build must expose an isolated LoadBalancer Kind qualification gate"
+require_text Makefile \
+    'loadbalancer-openshift-deploy:' \
+    "the build must expose a guarded LoadBalancer OpenShift deployment gate"
 require_text deploy/kind-loadbalancer/controller-loadbalancer-patch.yaml \
     'kind-direct-node-v1' \
     "the Kind provider identity must remain explicit and stable"
+require_text deploy/openshift-primary-cni/loadbalancer/controller-loadbalancer-patch.yaml \
+    'openshift-direct-node-v1' \
+    "the OpenShift qualification provider identity must remain explicit and stable"
 require_text docs/development/phase6-loadbalancer-plan.md \
     '`allocateLoadBalancerNodePorts: false` is preserved.' \
     "direct VIP delivery must not depend on traffic NodePorts"

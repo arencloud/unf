@@ -8,6 +8,7 @@ expected_infrastructure=${UNF_OPENSHIFT_SERVICE_EXPECTED_INFRASTRUCTURE:-}
 acknowledgement=${UNF_OPENSHIFT_SERVICE_ACKNOWLEDGE_DISPOSABLE:-}
 release_record=${UNF_OPENSHIFT_SERVICE_RELEASE_RECORD:-"${project_root}/deploy/openshift-primary-cni/runtime/nodeport-release.json"}
 artifact=${UNF_OPENSHIFT_SERVICE_DEPLOY_EVIDENCE:-"${project_root}/.artifacts/phase5-nodeport-openshift-deploy.json"}
+render_path=${UNF_OPENSHIFT_SERVICE_RENDER_PATH:-"${project_root}/deploy/openshift-primary-cni/runtime"}
 stage=initialization
 rendered=
 artifact_tmp=
@@ -36,10 +37,24 @@ if [[ ! -s ${kubeconfig} || $(stat -c '%a' "${kubeconfig}") != 600 ]]; then
     exit 1
 fi
 if [[ ! -s ${release_record} ]] || ! jq -e '
-    .schemaVersion == 1 and .phase == "5.8"
+    .schemaVersion == 1
+    and (.phase == "5.8" or .phase == "6.9")
     and (.sourceRevision | test("^[0-9a-f]{40}$"))
-    and .kindQualification.schemaVersion == 2
-    and .kindQualification.phase == "5.7"
+    and ((.phase == "5.8"
+          and .kindQualification.schemaVersion == 2
+          and .kindQualification.phase == "5.7")
+      or (.phase == "6.9"
+          and .kindQualification.schemaVersion == 1
+          and .kindQualification.phase == "6.8"
+          and .kindQualification.sourceRevision == .sourceRevision
+          and (.contracts | type == "object")
+          and .contracts.compatibilitySchemaVersion == 2
+          and .contracts.persistentBpfStateAbiVersion == 7
+          and .contracts.identitySnapshotSchemaVersion == 2
+          and .contracts.policySnapshotSchemaVersion == 4
+          and .contracts.serviceSnapshotSchemaVersion == 3
+          and .contracts.agentStatusSchemaVersion == 6
+          and .contracts.flowExportSchemaVersion == 5))
     and .kindQualification.result == "passed"
     and all(.images[]; test("^quay\\.io/arencloud/unf-[a-z-]+-dev@sha256:[0-9a-f]{64}$"))
 ' "${release_record}" >/dev/null; then
@@ -54,6 +69,26 @@ fi
 source_revision=$(jq -er .sourceRevision "${release_record}")
 controller_image=$(jq -er .images.controller "${release_record}")
 agent_image=$(jq -er .images.agent "${release_record}")
+release_phase=$(jq -er .phase "${release_record}")
+if [[ ${release_phase} == 6.9 ]]; then
+    compatibility_schema=$(jq -er .contracts.compatibilitySchemaVersion "${release_record}")
+    persistent_abi=$(jq -er .contracts.persistentBpfStateAbiVersion "${release_record}")
+    identity_schema=$(jq -er .contracts.identitySnapshotSchemaVersion "${release_record}")
+    policy_schema=$(jq -er .contracts.policySnapshotSchemaVersion "${release_record}")
+    service_schema=$(jq -er .contracts.serviceSnapshotSchemaVersion "${release_record}")
+    agent_status_schema=$(jq -er .contracts.agentStatusSchemaVersion "${release_record}")
+    flow_export_schema=$(jq -er .contracts.flowExportSchemaVersion "${release_record}")
+    deployment_stage=abi-v7-loadbalancer-staged-deployment
+else
+    compatibility_schema=2
+    persistent_abi=5
+    identity_schema=2
+    policy_schema=4
+    service_schema=2
+    agent_status_schema=5
+    flow_export_schema=5
+    deployment_stage=abi-v5-nodeport-staged-deployment
+fi
 git -C "${project_root}" merge-base --is-ancestor "${source_revision}" HEAD
 
 if [[ -z ${context} ]]; then
@@ -97,21 +132,26 @@ agent_raw() {
 
 assert_version() {
     local json=$1 component=$2
-    jq -e --arg component "${component}" --arg revision "${source_revision}" '
-        .schema_version == 2 and .component == $component and .build_revision == $revision
-        and .persistent_bpf_state_abi_version == 5
-        and .identity_snapshot_schema_version == 2
-        and .policy_snapshot_schema_version == 4
-        and .service_snapshot_schema_version == 2
-        and .agent_status_schema_version == 5
-        and .flow_export_schema_version == 5
+    jq -e --arg component "${component}" --arg revision "${source_revision}" \
+        --argjson compatibility "${compatibility_schema}" \
+        --argjson persistent "${persistent_abi}" \
+        --argjson identity "${identity_schema}" --argjson policy "${policy_schema}" \
+        --argjson service "${service_schema}" --argjson agent "${agent_status_schema}" \
+        --argjson flow "${flow_export_schema}" '
+        .schema_version == $compatibility and .component == $component and .build_revision == $revision
+        and .persistent_bpf_state_abi_version == $persistent
+        and .identity_snapshot_schema_version == $identity
+        and .policy_snapshot_schema_version == $policy
+        and .service_snapshot_schema_version == $service
+        and .agent_status_schema_version == $agent
+        and .flow_export_schema_version == $flow
     ' <<<"${json}" >/dev/null
 }
 
 wait_for_controller() {
     local version= status=
     for _ in $(seq 1 300); do
-        version=$(controller_raw '/v1/version?serviceSnapshotSchemaVersion=2' 2>/dev/null || true)
+        version=$(controller_raw "/v1/version?serviceSnapshotSchemaVersion=${service_schema}" 2>/dev/null || true)
         status=$(controller_raw /v1/status 2>/dev/null || true)
         if assert_version "${version}" unf-controller 2>/dev/null \
             && jq -e '.service_compilation_error == null' <<<"${status}" >/dev/null 2>&1; then
@@ -119,7 +159,7 @@ wait_for_controller() {
         fi
         sleep 1
     done
-    echo "controller did not expose the qualified ABI-v6 revision" >&2
+    echo "controller did not expose the qualified ABI-v${persistent_abi} revision" >&2
     jq . <<<"${version}" >&2 || true
     jq . <<<"${status}" >&2 || true
     return 1
@@ -149,8 +189,8 @@ wait_for_agent_service_state() {
     for _ in $(seq 1 300); do
         status=$(agent_raw "${node}" /v1/status 2>/dev/null || true)
         if assert_version "$(agent_raw "${node}" /v1/version 2>/dev/null || true)" unf-agent 2>/dev/null \
-            && jq -e '
-                .schema_version == 5 and .ready == true and .bpf_loaded == true
+            && jq -e --argjson status_schema "${agent_status_schema}" '
+                .schema_version == $status_schema and .ready == true and .bpf_loaded == true
                 and .tc_attachment_mode == "legacy_netlink"
                 and .capabilities.btf == true and .capabilities.bpffs == true
                 and .capabilities.cgroup_v2 == true
@@ -166,7 +206,7 @@ wait_for_agent_service_state() {
         fi
         sleep 1
     done
-    echo "agent on ${node} did not converge on healthy ABI-v6 service state" >&2
+    echo "agent on ${node} did not converge on healthy ABI-v${persistent_abi} service state" >&2
     jq . <<<"${status}" >&2 || true
     return 1
 }
@@ -185,15 +225,22 @@ assert_agent() {
             done
             snapshot=/var/lib/unf/cni/v1/service-snapshot.json
             test -f "$snapshot" && test ! -L "$snapshot" && test "$(stat -c %a "$snapshot")" = 600
-            jq -e ".schemaVersion == 1 and .revision > 0 and (.services | length) > 0" "$snapshot" >/dev/null
+            jq -e --argjson service_schema "$1" \
+                "if has(\"service\") then
+                    .schemaVersion == 1 and .service.schemaVersion == \$service_schema
+                    and .service.revision > 0 and (.service.services | length) > 0
+                    and .nodePortNode.schemaVersion == 1
+                 else
+                    .schemaVersion == 1 and .revision > 0 and (.services | length) > 0
+                 end" "$snapshot" >/dev/null
             echo service-state-ready
-        ' 2>&1 || true)
+        ' sh "${service_schema}" 2>&1 || true)
         if grep -q '^service-state-ready$' <<<"${host_state}"; then
             return 0
         fi
         sleep 2
     done
-    echo "agent on ${node} did not expose complete durable ABI-v6 host state" >&2
+    echo "agent on ${node} did not expose complete durable ABI-v${persistent_abi} host state" >&2
     printf '%s\n' "${host_state}" >&2
     return 1
 }
@@ -202,13 +249,15 @@ wait_for_convergence() {
     local snapshot=
     for _ in $(seq 1 300); do
         snapshot=$(controller_raw /v1/state/agents 2>/dev/null || true)
-        if jq -e --argjson expected "${#nodes[@]}" '
-            .schema_version == 5 and .expected_agents == $expected
+        if jq -e --argjson expected "${#nodes[@]}" \
+            --argjson status_schema "${agent_status_schema}" \
+            --argjson service_schema "${service_schema}" '
+            .schema_version == $status_schema and .expected_agents == $expected
             and .reporting_agents == $expected and .missing_agents == 0
             and .stale_agents == 0 and .converged_agents == $expected
             and .unexpected_agents == 0 and .all_converged == true
             and all(.nodes[]; .fresh and .converged and .report.ready and .report.bpf_loaded
-                and .report.service_snapshot_schema_version == 2
+                and .report.service_snapshot_schema_version == $service_schema
                 and .report.desired_service_revision > 0
                 and .report.applied_service_revision == .report.desired_service_revision)
         ' <<<"${snapshot}" >/dev/null 2>&1; then
@@ -217,7 +266,7 @@ wait_for_convergence() {
         fi
         sleep 1
     done
-    echo "all agents did not converge on ABI v7" >&2
+    echo "all agents did not converge on persistent ABI v${persistent_abi}" >&2
     jq . <<<"${snapshot}" >&2 || true
     return 1
 }
@@ -279,7 +328,7 @@ transition_agent() {
     current_image=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.spec.containers[0].image}')
     if [[ ${current_image} != "${agent_image}" ]]; then
         old_uid=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.metadata.uid}')
-        echo "transitioning UNF agent on ${node} to persistent BPF ABI v7"
+        echo "transitioning UNF agent on ${node} to persistent BPF ABI v${persistent_abi}"
         "${kc[@]}" -n unf-system delete pod "${pod}" --wait=false >/dev/null
         wait_for_agent_replacement "${node}" "${old_uid}"
     fi
@@ -329,7 +378,7 @@ api_server_internal_host=${BASH_REMATCH[1]}
 api_server_internal_port=${BASH_REMATCH[2]}
 [[ -n ${controller_node} && -n ${controller_ipv4} && -n ${api_server_internal_host} ]]
 rendered=$(mktemp)
-oc kustomize "${project_root}/deploy/openshift-primary-cni/runtime" >"${rendered}"
+oc kustomize "${render_path}" >"${rendered}"
 sed -i -e "s/unf-primary-controller-node\.invalid/${controller_node}/g" \
     -e "s/192\.0\.2\.1/${controller_ipv4}/g" \
     -e "s/unf-primary-apiserver\.internal\.invalid/${api_server_internal_host}/g" \
@@ -348,7 +397,7 @@ stage=controller-first
 wait_for_controller
 [[ $("${kc[@]}" get --raw /readyz) == ok ]]
 
-stage=nodeport-host-contract
+stage=service-host-contract
 "${kc[@]}" apply -f "${project_root}/deploy/openshift-primary-cni/machineconfig/master-forwarding.yaml" >/dev/null
 "${kc[@]}" apply -f "${project_root}/deploy/openshift-primary-cni/machineconfig/worker-forwarding.yaml" >/dev/null
 wait_for_machineconfig_render master 99-unf-primary-master-forwarding
@@ -364,7 +413,7 @@ for _ in $(seq 1 540); do
             any(.status.conditions[];
                 (.type == "Degraded" or .type == "NodeDegraded") and .status == "True")
         ' >/dev/null; then
-            echo "MachineConfigPool ${pool} degraded during the NodePort host rollout" >&2
+            echo "MachineConfigPool ${pool} degraded during the service host rollout" >&2
             exit 1
         fi
     done
@@ -395,7 +444,7 @@ for _ in $(seq 1 540); do
     sleep 5
 done
 if [[ ${rollout_complete} != true ]]; then
-    echo "MachineConfig rollout and interleaved ABI-v6 agent transition did not complete in 45 minutes" >&2
+    echo "MachineConfig rollout and interleaved ABI-v${persistent_abi} agent transition did not complete in 45 minutes" >&2
     exit 1
 fi
 for node in "${nodes[@]}"; do
@@ -409,9 +458,9 @@ for node in "${nodes[@]}"; do
         for path in /proc/sys/net/ipv4/conf/*/accept_local; do test "$(cat "$path")" -eq 1; done
         ! iptables-save | grep -Eq "KUBE-(SVC|SEP)-"
         ! ip6tables-save | grep -Eq "KUBE-(SVC|SEP)-"
-        echo nodeport-host-ready
+        echo service-host-ready
     ' 2>&1)
-    grep -q '^nodeport-host-ready$' <<<"${host_contract}"
+    grep -q '^service-host-ready$' <<<"${host_contract}"
     assert_host_service_path "${node}"
 done
 
@@ -423,7 +472,7 @@ for node in "${nodes[@]}"; do
     [[ $("${kc[@]}" get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]
 done
 
-stage=full-v5-convergence
+stage=full-service-convergence
 agents=$(wait_for_convergence)
 for node in "${nodes[@]}"; do
     assert_agent "${node}"
@@ -433,6 +482,39 @@ done
 stage=evidence
 mkdir -p "$(dirname "${artifact}")"
 artifact_tmp="${artifact}.tmp.$$"
+if [[ ${release_phase} == 6.9 ]]; then
+    node_evidence=$("${kc[@]}" get nodes -o json | jq '[.items[] | {
+        name:.metadata.name, osImage:.status.nodeInfo.osImage,
+        kernelVersion:.status.nodeInfo.kernelVersion,
+        containerRuntime:.status.nodeInfo.containerRuntimeVersion,
+        podCIDRs:.spec.podCIDRs,
+        internalIPs:[.status.addresses[] | select(.type == "InternalIP") | .address]
+    }]')
+    jq -n \
+        --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg context "${context}" --arg infrastructure "${infrastructure}" \
+        --arg sourceRevision "${source_revision}" --arg controllerImage "${controller_image}" \
+        --arg agentImage "${agent_image}" --arg stage "${deployment_stage}" \
+        --argjson persistentAbi "${persistent_abi}" --argjson serviceSchema "${service_schema}" \
+        --argjson statusSchema "${agent_status_schema}" --argjson nodes "${node_evidence}" \
+        --argjson agents "${agents}" '
+        {
+          schemaVersion:1, generatedAt:$generatedAt, phase:"6.9", stage:$stage,
+          context:$context, infrastructure:$infrastructure, sourceRevision:$sourceRevision,
+          images:{controller:$controllerImage,agent:$agentImage},
+          strategy:"controller-first-machineconfig-aware-agent-ondelete-node-serial",
+          kubeProxyPresent:false, persistentBpfAbi:$persistentAbi,
+          serviceSnapshotSchemaVersion:$serviceSchema, agentStatusSchemaVersion:$statusSchema,
+          nodes:$nodes, agents:$agents,
+          verified:["immutable public image digests","controller-first schema-v3 compatibility boundary",
+            "MachineConfig-aware five-node serial agent replacement","RHCOS SELinux enforcing",
+            "legacy-netlink TC attachment","persistent host forwarding contract",
+            "current-schema durable composite service checkpoint","host-origin Kubernetes API Service reachability",
+            "no functional kube-proxy rule residue","exact ABI-v7 map ownership",
+            "full five-node convergence","kube-proxy remains absent"]
+        }
+    ' >"${artifact_tmp}"
+else
 retained_abi4_nodes='[]'
 rebuild_abi4_nodes='[]'
 for node in "${nodes[@]}"; do
@@ -469,9 +551,10 @@ jq -n \
         "full agent convergence","kube-proxy remains absent"]
     }
 ' >"${artifact_tmp}"
+fi
 chmod 0600 "${artifact_tmp}"
 mv -f "${artifact_tmp}" "${artifact}"
 artifact_tmp=
 
 trap - ERR EXIT
-echo "OpenShift NodePort ABI-v6 staged deployment passed; kube-proxy remains absent; evidence: ${artifact}"
+echo "OpenShift ${release_phase} persistent ABI-v${persistent_abi} staged deployment passed; kube-proxy remains absent; evidence: ${artifact}"
