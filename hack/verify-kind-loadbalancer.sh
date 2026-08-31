@@ -367,7 +367,8 @@ remove_external_clients
 for external_client in "${allowed_client}" "${denied_client}"; do
     sudo "${container_runtime}" run -d --name "${external_client}" \
         --network "${kind_network}" --cap-add NET_ADMIN --pull never \
-        localhost/unf-test-tools:ipv6-ext-v1 sleep infinity >/dev/null
+        --entrypoint /bin/sh localhost/unf-test-tools:ipv6-ext-v1 \
+        -c 'sleep infinity' >/dev/null
 done
 allowed_v4=$(external_address "${allowed_client}" 4)
 allowed_v6=$(external_address "${allowed_client}" 6)
