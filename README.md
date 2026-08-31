@@ -303,6 +303,13 @@ measurements, while DSR remains opt-in until return routing, MTU, policy,
 source-range, telemetry, and cleanup invariants pass. The
 [Phase 7 service-selection plan](docs/development/phase7-service-selection-plan.md)
 and ADR 0102 define the ordered implementation and qualification gates.
+Milestone 7.2 is verified: service schema v4 carries normalized internal policy,
+ClientIP affinity timeout, topology preference, selection algorithm, and
+forwarding mode. Kubernetes defaults and aliases are canonicalized, timeout and
+unknown values fail closed, schemas v1/v2/v3 migrate only default state, and
+legacy projection refuses advanced intent. Existing lowerers explicitly reject
+advanced behavior until transactional state exists; `make
+service-selection-ir-test` and ADR 0103 record this non-dataplane boundary.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

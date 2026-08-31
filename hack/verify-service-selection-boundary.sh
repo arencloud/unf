@@ -11,6 +11,7 @@ required_files=(
     docs/architecture/components.md
     docs/development/phase7-service-selection-plan.md
     docs/adr/0102-bound-advanced-service-selection.md
+    docs/adr/0103-model-advanced-service-selection-in-schema-v4.md
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -45,6 +46,12 @@ require_text docs/development/phase7-service-selection-plan.md \
 require_text docs/project-status.md \
     '| Architecture and acceptance boundary | **Verified** |' \
     "the work breakdown must identify milestone 7.1 as verified"
+require_text docs/development/phase7-service-selection-plan.md \
+    '| 7.2 | Service schema v4 and Kubernetes compiler | **Verified** |' \
+    "milestone 7.2 must remain verified"
+require_text docs/project-status.md \
+    '| Service schema v4 and Kubernetes compiler | **Verified** |' \
+    "the work breakdown must identify milestone 7.2 as verified"
 
 for relative_file in \
     README.md \
@@ -71,6 +78,9 @@ require_text docs/architecture/components.md \
 require_text Makefile \
     'service-selection-boundary-test:' \
     "the build must expose an isolated Phase 7 boundary gate"
+require_text Makefile \
+    'service-selection-ir-test:' \
+    "the build must expose an isolated schema-v4 compiler gate"
 
 for excluded_capability in \
     'weighted traffic splitting' \

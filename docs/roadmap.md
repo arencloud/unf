@@ -513,6 +513,11 @@ matrix is maintained in the
 - Verified architecture boundary: strict `Local` eligibility takes precedence
   over topology preferences; `ClientIP` affinity can reuse only a currently
   eligible backend; connection persistence remains separately revisioned.
+- Verified schema/compiler boundary: schema v4 normalizes internal policy,
+  ClientIP timeout, topology preference, algorithm, and forwarding mode;
+  Kubernetes defaulting, v1/v2/v3 migration/projection, legacy fencing, and
+  explicit pre-transaction lowerer rejection pass
+  `make service-selection-ir-test`; ADR 0103.
 - Per-Node eligibility and selection plans are compiled in userspace and must
   activate transactionally. The eBPF path performs bounded lookups and does not
   interpret Kubernetes topology or affinity configuration.

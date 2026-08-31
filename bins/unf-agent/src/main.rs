@@ -64,9 +64,9 @@ use unf_route::{
 #[cfg(test)]
 use unf_service::compile_service_dataplane;
 use unf_service::{
-    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, MAX_BACKENDS_PER_SERVICE,
-    NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION, NodePortDataplaneState, NodePortNodeSnapshot,
-    SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION,
+    MAX_BACKENDS_PER_SERVICE, NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION, NodePortDataplaneState,
+    NodePortNodeSnapshot, SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
     SERVICE_FRONTEND_BANK_CAPACITY, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceDataplaneState,
     ServiceSnapshot, ServiceTrafficPolicy, compile_node_port_fabric_dataplane,
     compile_service_load_balancer_fabric_dataplane,
@@ -5520,6 +5520,8 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
     if controller.service_snapshot_schema_version != local.service_snapshot_schema_version
         && controller.service_snapshot_schema_version != LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
         && controller.service_snapshot_schema_version != NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        && controller.service_snapshot_schema_version
+            != LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION
     {
         mismatches.push(format!(
             "service snapshot schema controller={} agent={}",
@@ -9871,6 +9873,7 @@ mod tests {
         (local, snapshot)
     }
 
+    #[allow(clippy::default_trait_access)]
     fn service_test_snapshot(epoch: u64, revision: u64) -> ServiceSnapshot {
         unf_service::compile_service_snapshot(
             epoch,
@@ -9880,6 +9883,11 @@ mod tests {
                 name: "api".to_owned(),
                 cluster_ips: vec!["10.96.0.10".parse().unwrap()],
                 external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+                internal_traffic_policy: Default::default(),
+                session_affinity: Default::default(),
+                traffic_distribution: Default::default(),
+                selection_algorithm: Default::default(),
+                forwarding_mode: Default::default(),
                 load_balancer: None,
                 ports: vec![unf_service::ServiceSourcePort {
                     name: Some("http".to_owned()),
@@ -9894,6 +9902,7 @@ mod tests {
         .expect("test service snapshot compiles")
     }
 
+    #[allow(clippy::default_trait_access)]
     fn service_test_snapshot_with_backend(epoch: u64, revision: u64) -> ServiceSnapshot {
         unf_service::compile_service_snapshot(
             epoch,
@@ -9903,6 +9912,11 @@ mod tests {
                 name: "api".to_owned(),
                 cluster_ips: vec!["10.96.0.10".parse().unwrap()],
                 external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+                internal_traffic_policy: Default::default(),
+                session_affinity: Default::default(),
+                traffic_distribution: Default::default(),
+                selection_algorithm: Default::default(),
+                forwarding_mode: Default::default(),
                 load_balancer: None,
                 ports: vec![unf_service::ServiceSourcePort {
                     name: Some("http".to_owned()),
@@ -9937,6 +9951,7 @@ mod tests {
         .expect("test service snapshot with backend compiles")
     }
 
+    #[allow(clippy::default_trait_access)]
     fn load_balancer_service_test_snapshot(epoch: u64, revision: u64) -> ServiceSnapshot {
         let sources = [("api", "10.96.0.10"), ("web", "10.96.0.11")]
             .into_iter()
@@ -9945,6 +9960,11 @@ mod tests {
                 name: name.to_owned(),
                 cluster_ips: vec![cluster_ip.parse().unwrap()],
                 external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+                internal_traffic_policy: Default::default(),
+                session_affinity: Default::default(),
+                traffic_distribution: Default::default(),
+                selection_algorithm: Default::default(),
+                forwarding_mode: Default::default(),
                 load_balancer: Some(unf_service::ServiceLoadBalancerSource {
                     class: unf_service::UNF_LOAD_BALANCER_CLASS.to_owned(),
                     ip_families: vec![unf_service::AddressFamily::Ipv4],
@@ -10065,6 +10085,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::default_trait_access, clippy::too_many_lines)]
     fn dual_stack_service_snapshot_with_load_balancer(
         revision: u64,
         ipv4_backend: Ipv4Addr,
@@ -10151,6 +10172,11 @@ mod tests {
                     "fd00:96::10".parse::<Ipv6Addr>().unwrap().into(),
                 ],
                 external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+                internal_traffic_policy: Default::default(),
+                session_affinity: Default::default(),
+                traffic_distribution: Default::default(),
+                selection_algorithm: Default::default(),
+                forwarding_mode: Default::default(),
                 load_balancer: load_balancer.then(|| unf_service::ServiceLoadBalancerSource {
                     class: unf_service::UNF_LOAD_BALANCER_CLASS.to_owned(),
                     ip_families: vec![
@@ -13137,6 +13163,9 @@ mod tests {
         controller.service_snapshot_schema_version = LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION;
         assert!(ensure_controller_compatibility(&controller).is_ok());
         controller.service_snapshot_schema_version = NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        assert!(ensure_controller_compatibility(&controller).is_ok());
+        controller.service_snapshot_schema_version =
+            LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION;
         assert!(ensure_controller_compatibility(&controller).is_ok());
         controller.service_snapshot_schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
 

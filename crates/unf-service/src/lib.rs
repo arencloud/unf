@@ -22,6 +22,7 @@ pub use unf_common::SERVICE_SNAPSHOT_SCHEMA_VERSION;
 
 pub const LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub const NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+pub const LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub const UNF_LOAD_BALANCER_CLASS: &str = "network.unf.io/load-balancer";
 pub const MAX_NODE_PORT_NODE_ADDRESSES: usize = 64;
@@ -81,6 +82,70 @@ pub enum ServiceTrafficPolicy {
     #[default]
     Cluster,
     Local,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceTrafficDistribution {
+    #[default]
+    Any,
+    PreferSameZone,
+    PreferSameNode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(
+    tag = "mode",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ServiceSessionAffinity {
+    #[default]
+    None,
+    ClientIp {
+        timeout_seconds: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceSelectionAlgorithm {
+    #[default]
+    StableHash,
+    Maglev,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceForwardingMode {
+    #[default]
+    Nat,
+    Dsr,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_cluster_policy(value: &ServiceTrafficPolicy) -> bool {
+    matches!(value, ServiceTrafficPolicy::Cluster)
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_any_distribution(value: &ServiceTrafficDistribution) -> bool {
+    matches!(value, ServiceTrafficDistribution::Any)
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_no_affinity(value: &ServiceSessionAffinity) -> bool {
+    matches!(value, ServiceSessionAffinity::None)
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_stable_hash(value: &ServiceSelectionAlgorithm) -> bool {
+    matches!(value, ServiceSelectionAlgorithm::StableHash)
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_nat(value: &ServiceForwardingMode) -> bool {
+    matches!(value, ServiceForwardingMode::Nat)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -274,6 +339,11 @@ pub struct ServiceSource {
     pub name: String,
     pub cluster_ips: Vec<IpAddr>,
     pub external_traffic_policy: ServiceTrafficPolicy,
+    pub internal_traffic_policy: ServiceTrafficPolicy,
+    pub session_affinity: ServiceSessionAffinity,
+    pub traffic_distribution: ServiceTrafficDistribution,
+    pub selection_algorithm: ServiceSelectionAlgorithm,
+    pub forwarding_mode: ServiceForwardingMode,
     pub load_balancer: Option<ServiceLoadBalancerSource>,
     pub ports: Vec<ServiceSourcePort>,
 }
@@ -313,6 +383,16 @@ pub struct ServiceIr {
     pub id: ServiceId,
     pub namespace: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "is_cluster_policy")]
+    pub internal_traffic_policy: ServiceTrafficPolicy,
+    #[serde(default, skip_serializing_if = "is_no_affinity")]
+    pub session_affinity: ServiceSessionAffinity,
+    #[serde(default, skip_serializing_if = "is_any_distribution")]
+    pub traffic_distribution: ServiceTrafficDistribution,
+    #[serde(default, skip_serializing_if = "is_stable_hash")]
+    pub selection_algorithm: ServiceSelectionAlgorithm,
+    #[serde(default, skip_serializing_if = "is_nat")]
+    pub forwarding_mode: ServiceForwardingMode,
     pub frontends: Vec<ServiceFrontend>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub node_ports: Vec<ServiceNodePort>,
@@ -405,6 +485,8 @@ pub enum ServiceIrError {
     LegacyNodePortIntent,
     #[error("service snapshot schema v{schema} cannot contain LoadBalancer intent")]
     LegacyLoadBalancerIntent { schema: u16 },
+    #[error("service snapshot schema v{schema} cannot contain advanced selection intent")]
+    LegacyAdvancedSelectionIntent { schema: u16 },
     #[error("service snapshot source epoch must be nonzero")]
     ZeroSourceEpoch,
     #[error("service snapshot revision must be nonzero")]
@@ -578,6 +660,8 @@ pub enum ServiceDataplaneError {
     UnsupportedNodePort { actual: usize },
     #[error("LoadBalancer intent contains {actual} frontends but VIP lowering is not implemented")]
     UnsupportedLoadBalancer { actual: usize },
+    #[error("advanced Service selection intent requires the Phase 7 transactional lowerer")]
+    UnsupportedAdvancedSelection,
     #[error("Local LoadBalancer slot index overflow for service {service:?} on Node {node}")]
     LocalLoadBalancerIndex { service: ServiceId, node: String },
     #[error("Local LoadBalancer slot key collided with another service slot")]
@@ -623,6 +707,8 @@ pub enum NodePortDataplaneError {
     },
     #[error("NodePort dataplane does not support protocol {0:?}")]
     UnsupportedProtocol(Protocol),
+    #[error("advanced Service selection intent requires the Phase 7 transactional lowerer")]
+    UnsupportedAdvancedSelection,
     #[error("NodePort map {map} requires {actual} entries; per-bank limit is {limit}")]
     Capacity {
         map: &'static str,
@@ -883,6 +969,11 @@ pub fn compile_service_snapshot(
             id: service_id,
             namespace: service.namespace,
             name: service.name,
+            internal_traffic_policy: service.internal_traffic_policy,
+            session_affinity: service.session_affinity,
+            traffic_distribution: service.traffic_distribution,
+            selection_algorithm: service.selection_algorithm,
+            forwarding_mode: service.forwarding_mode,
             frontends,
             node_ports,
             load_balancer,
@@ -1043,6 +1134,7 @@ impl ServiceSnapshot {
     /// Rejects incompatible schemas, unversioned state, invalid or duplicate
     /// identities/endpoints, unusable addresses/ports, and bounded-capacity
     /// violations.
+    #[allow(clippy::too_many_lines)]
     pub fn validate_and_normalize(mut self) -> Result<Self, ServiceIrError> {
         migrate_service_snapshot_schema(&mut self)?;
         if self.source_epoch == 0 {
@@ -1076,6 +1168,15 @@ impl ServiceSnapshot {
 
         for service in &mut self.services {
             validate_service_identity(service, &mut service_ids, &mut service_names)?;
+            if let ServiceSessionAffinity::ClientIp { timeout_seconds } = service.session_affinity
+                && !(1..=86_400).contains(&timeout_seconds)
+            {
+                return Err(ServiceIrError::InvalidServiceField {
+                    service: service.id,
+                    field: "session affinity timeout",
+                    reason: "must be between 1 and 86400 seconds",
+                });
+            }
             if service.frontends.is_empty() {
                 return Err(ServiceIrError::MissingFrontend {
                     service: service.id,
@@ -1155,6 +1256,10 @@ impl ServiceSnapshot {
     /// when the source snapshot is not valid current or migratable state.
     pub fn legacy_v1_projection(&self) -> Result<Self, ServiceIrError> {
         let mut projected = self.clone().validate_and_normalize()?;
+        reject_legacy_advanced_selection_intent(
+            &projected,
+            LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION,
+        )?;
         for service in &mut projected.services {
             service.node_ports.clear();
             service.load_balancer = None;
@@ -1172,10 +1277,31 @@ impl ServiceSnapshot {
     /// when the source snapshot is not valid current or migratable state.
     pub fn node_port_v2_projection(&self) -> Result<Self, ServiceIrError> {
         let mut projected = self.clone().validate_and_normalize()?;
+        reject_legacy_advanced_selection_intent(
+            &projected,
+            NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION,
+        )?;
         for service in &mut projected.services {
             service.load_balancer = None;
         }
         projected.schema_version = NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        Ok(projected)
+    }
+
+    /// Produces the exact schema-v3 `LoadBalancer` view when advanced selection
+    /// intent is absent.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid current state or any advanced selection intent that a
+    /// schema-v3 consumer would ignore.
+    pub fn load_balancer_v3_projection(&self) -> Result<Self, ServiceIrError> {
+        let mut projected = self.clone().validate_and_normalize()?;
+        reject_legacy_advanced_selection_intent(
+            &projected,
+            LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION,
+        )?;
+        projected.schema_version = LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION;
         Ok(projected)
     }
 }
@@ -1200,6 +1326,13 @@ fn migrate_service_snapshot_schema(snapshot: &mut ServiceSnapshot) -> Result<(),
             )?;
             snapshot.schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
         }
+        LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION => {
+            reject_legacy_advanced_selection_intent(
+                snapshot,
+                LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION,
+            )?;
+            snapshot.schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        }
         SERVICE_SNAPSHOT_SCHEMA_VERSION => {}
         actual => {
             return Err(ServiceIrError::UnsupportedSchema {
@@ -1209,6 +1342,26 @@ fn migrate_service_snapshot_schema(snapshot: &mut ServiceSnapshot) -> Result<(),
         }
     }
     Ok(())
+}
+
+fn reject_legacy_advanced_selection_intent(
+    snapshot: &ServiceSnapshot,
+    schema: u16,
+) -> Result<(), ServiceIrError> {
+    if has_advanced_selection_intent(snapshot) {
+        return Err(ServiceIrError::LegacyAdvancedSelectionIntent { schema });
+    }
+    Ok(())
+}
+
+fn has_advanced_selection_intent(snapshot: &ServiceSnapshot) -> bool {
+    snapshot.services.iter().any(|service| {
+        service.internal_traffic_policy != ServiceTrafficPolicy::Cluster
+            || service.session_affinity != ServiceSessionAffinity::None
+            || service.traffic_distribution != ServiceTrafficDistribution::Any
+            || service.selection_algorithm != ServiceSelectionAlgorithm::StableHash
+            || service.forwarding_mode != ServiceForwardingMode::Nat
+    })
 }
 
 fn reject_legacy_load_balancer_intent(
@@ -1889,6 +2042,9 @@ pub fn compile_service_dataplane(
         return Err(ServiceDataplaneError::InvalidBank(bank));
     }
     let snapshot = snapshot.clone().validate_and_normalize()?;
+    if has_advanced_selection_intent(&snapshot) {
+        return Err(ServiceDataplaneError::UnsupportedAdvancedSelection);
+    }
     let node_port_count = snapshot
         .services
         .iter()
@@ -2061,6 +2217,9 @@ pub fn compile_service_load_balancer_fabric_dataplane(
     bank: u8,
 ) -> Result<ServiceDataplaneState, ServiceDataplaneError> {
     let snapshot = snapshot.clone().validate_and_normalize()?;
+    if has_advanced_selection_intent(&snapshot) {
+        return Err(ServiceDataplaneError::UnsupportedAdvancedSelection);
+    }
     let mut cluster_ip = snapshot.clone();
     for service in &mut cluster_ip.services {
         service.node_ports.clear();
@@ -2173,6 +2332,9 @@ pub fn compile_node_port_dataplane(
         return Err(NodePortDataplaneError::InvalidNodePortBank(bank));
     }
     let snapshot = snapshot.clone().validate_and_normalize()?;
+    if has_advanced_selection_intent(&snapshot) {
+        return Err(NodePortDataplaneError::UnsupportedAdvancedSelection);
+    }
     let node = node.clone().validate_and_normalize()?;
     if snapshot.source_epoch != node.source_epoch {
         return Err(NodePortDataplaneError::SourceEpochMismatch);
@@ -2643,6 +2805,11 @@ mod tests {
             id: ServiceId::new(id),
             namespace: "default".to_owned(),
             name: name.to_owned(),
+            internal_traffic_policy: ServiceTrafficPolicy::Cluster,
+            session_affinity: ServiceSessionAffinity::None,
+            traffic_distribution: ServiceTrafficDistribution::Any,
+            selection_algorithm: ServiceSelectionAlgorithm::StableHash,
+            forwarding_mode: ServiceForwardingMode::Nat,
             frontends: vec![ServiceFrontend {
                 backend_ids: vec![BackendId::new(id)],
                 ..frontend(
@@ -2876,7 +3043,7 @@ mod tests {
     }
 
     #[test]
-    fn service_schema_transition_migrates_v1_v2_and_projects_newer_intent() {
+    fn service_schema_transition_migrates_v1_v2_v3_and_projects_newer_intent() {
         let current = snapshot(vec![service(1, "one")])
             .validate_and_normalize()
             .expect("current snapshot is valid");
@@ -2946,7 +3113,7 @@ mod tests {
         );
         assert!(projected_v2.services[0].load_balancer.is_none());
         let mut disguised_v2 =
-            serde_json::to_value(load_balancer_snapshot).expect("LoadBalancer snapshot encodes");
+            serde_json::to_value(&load_balancer_snapshot).expect("LoadBalancer snapshot encodes");
         disguised_v2["schemaVersion"] = serde_json::json!(2);
         assert_eq!(
             serde_json::from_value::<ServiceSnapshot>(disguised_v2)
@@ -2954,6 +3121,70 @@ mod tests {
                 .validate_and_normalize(),
             Err(ServiceIrError::LegacyLoadBalancerIntent { schema: 2 })
         );
+
+        let projected_v3 = load_balancer_snapshot
+            .load_balancer_v3_projection()
+            .expect("default selection intent has a safe schema-v3 projection");
+        assert_eq!(
+            projected_v3.schema_version,
+            LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            projected_v3
+                .validate_and_normalize()
+                .expect("schema-v3 snapshot migrates"),
+            load_balancer_snapshot
+        );
+    }
+
+    #[test]
+    fn compiler_preserves_advanced_selection_and_fences_legacy_projection() {
+        let mut source = source_service();
+        source.internal_traffic_policy = ServiceTrafficPolicy::Local;
+        source.session_affinity = ServiceSessionAffinity::ClientIp {
+            timeout_seconds: 900,
+        };
+        source.traffic_distribution = ServiceTrafficDistribution::PreferSameNode;
+        source.selection_algorithm = ServiceSelectionAlgorithm::Maglev;
+        source.forwarding_mode = ServiceForwardingMode::Dsr;
+        let snapshot = compile_service_snapshot(11, Revision::new(7), vec![source], Vec::new())
+            .expect("advanced selection intent compiles");
+        let service = &snapshot.services[0];
+        assert_eq!(service.internal_traffic_policy, ServiceTrafficPolicy::Local);
+        assert_eq!(
+            service.session_affinity,
+            ServiceSessionAffinity::ClientIp {
+                timeout_seconds: 900
+            }
+        );
+        assert_eq!(
+            service.traffic_distribution,
+            ServiceTrafficDistribution::PreferSameNode
+        );
+        assert_eq!(
+            service.selection_algorithm,
+            ServiceSelectionAlgorithm::Maglev
+        );
+        assert_eq!(service.forwarding_mode, ServiceForwardingMode::Dsr);
+        assert_eq!(
+            compile_service_dataplane(&snapshot, 0),
+            Err(ServiceDataplaneError::UnsupportedAdvancedSelection)
+        );
+        assert_eq!(
+            snapshot.load_balancer_v3_projection(),
+            Err(ServiceIrError::LegacyAdvancedSelectionIntent { schema: 3 })
+        );
+
+        let mut invalid = snapshot;
+        invalid.services[0].session_affinity =
+            ServiceSessionAffinity::ClientIp { timeout_seconds: 0 };
+        assert!(matches!(
+            invalid.validate_and_normalize(),
+            Err(ServiceIrError::InvalidServiceField {
+                field: "session affinity timeout",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3006,6 +3237,11 @@ mod tests {
                 "10.96.0.10".parse().expect("valid IPv4 address"),
             ],
             external_traffic_policy: ServiceTrafficPolicy::Cluster,
+            internal_traffic_policy: ServiceTrafficPolicy::Cluster,
+            session_affinity: ServiceSessionAffinity::None,
+            traffic_distribution: ServiceTrafficDistribution::Any,
+            selection_algorithm: ServiceSelectionAlgorithm::StableHash,
+            forwarding_mode: ServiceForwardingMode::Nat,
             load_balancer: None,
             ports: vec![
                 ServiceSourcePort {

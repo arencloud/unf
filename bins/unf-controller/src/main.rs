@@ -58,11 +58,13 @@ use unf_route::{
 };
 use unf_service::{
     AddressFamily, EndpointPortSource, EndpointSliceSource, EndpointSource,
-    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
-    NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION, NodeAddressKind, NodePortNodeSnapshot,
-    SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceBackend, ServiceIpFamilyPolicy, ServiceIpPrefix,
-    ServiceIr, ServiceLoadBalancerSource, ServiceNodeAddress, ServiceNodePort, ServiceSnapshot,
-    ServiceSource, ServiceSourcePort, ServiceTrafficPolicy, UNF_LOAD_BALANCER_CLASS,
+    LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION,
+    NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION, NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION,
+    NodeAddressKind, NodePortNodeSnapshot, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceBackend,
+    ServiceForwardingMode, ServiceIpFamilyPolicy, ServiceIpPrefix, ServiceIr,
+    ServiceLoadBalancerSource, ServiceNodeAddress, ServiceNodePort, ServiceSelectionAlgorithm,
+    ServiceSessionAffinity, ServiceSnapshot, ServiceSource, ServiceSourcePort,
+    ServiceTrafficDistribution, ServiceTrafficPolicy, UNF_LOAD_BALANCER_CLASS,
     compile_service_snapshot,
 };
 use unf_state::{
@@ -3055,6 +3057,7 @@ fn service_record_semantics_equal(left: &ServiceRecord, right: &ServiceRecord) -
         && left.compiler_source == right.compiler_source
 }
 
+#[allow(clippy::too_many_lines)]
 fn service_record(service: &Service) -> Result<ServiceRecord> {
     let namespace = service.namespace().unwrap_or_default();
     let name = service.name_any();
@@ -3090,6 +3093,14 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
         &name,
         spec.external_traffic_policy.as_deref(),
     )?;
+    let internal_traffic_policy = service_internal_traffic_policy(
+        &namespace,
+        &name,
+        spec.internal_traffic_policy.as_deref(),
+    )?;
+    let session_affinity = service_session_affinity(&namespace, &name, spec)?;
+    let traffic_distribution =
+        service_traffic_distribution(&namespace, &name, spec.traffic_distribution.as_deref())?;
     for port in spec.ports.iter().flatten() {
         let number = u16::try_from(port.port).with_context(|| {
             format!(
@@ -3134,6 +3145,11 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
         name: name.clone(),
         cluster_ips: cluster_ips.iter().copied().collect(),
         external_traffic_policy,
+        internal_traffic_policy,
+        session_affinity,
+        traffic_distribution,
+        selection_algorithm: ServiceSelectionAlgorithm::StableHash,
+        forwarding_mode: ServiceForwardingMode::Nat,
         load_balancer,
         ports: compiler_ports,
     };
@@ -3178,30 +3194,6 @@ fn service_load_balancer_source(
     if class != UNF_LOAD_BALANCER_CLASS {
         return Ok(None);
     }
-    if spec
-        .internal_traffic_policy
-        .as_deref()
-        .is_some_and(|policy| policy != "Cluster")
-    {
-        return Err(anyhow!(
-            "Service {namespace}/{name} uses unsupported internalTrafficPolicy"
-        ));
-    }
-    if spec
-        .session_affinity
-        .as_deref()
-        .is_some_and(|affinity| affinity != "None")
-    {
-        return Err(anyhow!(
-            "Service {namespace}/{name} uses unsupported sessionAffinity"
-        ));
-    }
-    if spec.traffic_distribution.is_some() {
-        return Err(anyhow!(
-            "Service {namespace}/{name} uses unsupported trafficDistribution"
-        ));
-    }
-
     let ip_families = if let Some(families) = &spec.ip_families {
         families
             .iter()
@@ -3284,6 +3276,74 @@ fn service_external_traffic_policy(
         "Local" => Ok(ServiceTrafficPolicy::Local),
         policy => Err(anyhow!(
             "Service {namespace}/{name} has unsupported externalTrafficPolicy {policy:?}"
+        )),
+    }
+}
+
+fn service_internal_traffic_policy(
+    namespace: &str,
+    name: &str,
+    policy: Option<&str>,
+) -> Result<ServiceTrafficPolicy> {
+    match policy.unwrap_or("Cluster") {
+        "Cluster" => Ok(ServiceTrafficPolicy::Cluster),
+        "Local" => Ok(ServiceTrafficPolicy::Local),
+        policy => Err(anyhow!(
+            "Service {namespace}/{name} has unsupported internalTrafficPolicy {policy:?}"
+        )),
+    }
+}
+
+fn service_session_affinity(
+    namespace: &str,
+    name: &str,
+    spec: &ServiceSpec,
+) -> Result<ServiceSessionAffinity> {
+    match spec.session_affinity.as_deref().unwrap_or("None") {
+        "None" => {
+            if spec.session_affinity_config.is_some() {
+                return Err(anyhow!(
+                    "Service {namespace}/{name} sets sessionAffinityConfig without ClientIP affinity"
+                ));
+            }
+            Ok(ServiceSessionAffinity::None)
+        }
+        "ClientIP" => {
+            let timeout = spec
+                .session_affinity_config
+                .as_ref()
+                .and_then(|config| config.client_ip.as_ref())
+                .and_then(|config| config.timeout_seconds)
+                .unwrap_or(10_800);
+            let timeout_seconds = u32::try_from(timeout).map_err(|_| {
+                anyhow!(
+                    "Service {namespace}/{name} has invalid ClientIP affinity timeout {timeout}"
+                )
+            })?;
+            if !(1..=86_400).contains(&timeout_seconds) {
+                return Err(anyhow!(
+                    "Service {namespace}/{name} ClientIP affinity timeout must be between 1 and 86400 seconds"
+                ));
+            }
+            Ok(ServiceSessionAffinity::ClientIp { timeout_seconds })
+        }
+        affinity => Err(anyhow!(
+            "Service {namespace}/{name} has unsupported sessionAffinity {affinity:?}"
+        )),
+    }
+}
+
+fn service_traffic_distribution(
+    namespace: &str,
+    name: &str,
+    distribution: Option<&str>,
+) -> Result<ServiceTrafficDistribution> {
+    match distribution {
+        None => Ok(ServiceTrafficDistribution::Any),
+        Some("PreferClose" | "PreferSameZone") => Ok(ServiceTrafficDistribution::PreferSameZone),
+        Some("PreferSameNode") => Ok(ServiceTrafficDistribution::PreferSameNode),
+        Some(distribution) => Err(anyhow!(
+            "Service {namespace}/{name} has unsupported trafficDistribution {distribution:?}"
         )),
     }
 }
@@ -3705,12 +3765,13 @@ fn requested_service_schema(query: &ServiceSchemaQuery) -> Result<u16, ApiError>
         requested,
         LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
             | NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION
+            | LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION
             | SERVICE_SNAPSHOT_SCHEMA_VERSION
     ) {
         Ok(requested)
     } else {
         Err(ApiError::bad_request(format!(
-            "unsupported requested service snapshot schema {requested}; supported schemas are 1, 2, and {SERVICE_SNAPSHOT_SCHEMA_VERSION}"
+            "unsupported requested service snapshot schema {requested}; supported schemas are 1, 2, 3, and {SERVICE_SNAPSHOT_SCHEMA_VERSION}"
         )))
     }
 }
@@ -4497,7 +4558,8 @@ fn agent_report_matches(
         && report.desired_service_revision == service_revision.1.get()
         && report.applied_service_revision == service_revision.1.get()
         && (!service_revision.2
-            || report.service_snapshot_schema_version >= SERVICE_SNAPSHOT_SCHEMA_VERSION)
+            || report.service_snapshot_schema_version
+                >= LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION)
         && report.failed_service_epoch == 0
         && report.failed_service_revision == 0
         && report.service_last_error.is_none()
@@ -4573,6 +4635,11 @@ fn service_snapshot_for_schema(
     let snapshot = service_snapshot_for(state)?;
     match requested_service_schema {
         SERVICE_SNAPSHOT_SCHEMA_VERSION => Ok(snapshot),
+        LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION => {
+            snapshot.load_balancer_v3_projection().map_err(|error| {
+                ApiError::internal(format!("project LoadBalancer service snapshot: {error}"))
+            })
+        }
         NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION => {
             snapshot.node_port_v2_projection().map_err(|error| {
                 ApiError::internal(format!("project NodePort service snapshot: {error}"))
@@ -7148,7 +7215,7 @@ mod tests {
     }
 
     #[test]
-    fn service_schema_transition_negotiates_and_projects_v1_v2_state() {
+    fn service_schema_transition_negotiates_and_projects_v1_v2_v3_state() {
         assert_eq!(
             requested_service_schema(&ServiceSchemaQuery::default()).unwrap(),
             LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
@@ -7171,12 +7238,19 @@ mod tests {
             node_port_compatibility.service_snapshot_schema_version,
             NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION
         );
+        let load_balancer_compatibility =
+            compatibility_for_service_schema(LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION)
+                .unwrap();
+        assert_eq!(
+            load_balancer_compatibility.service_snapshot_schema_version,
+            LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
         assert!(compatibility_for_service_schema(SERVICE_SNAPSHOT_SCHEMA_VERSION + 1).is_err());
 
         let state = new_state(true);
         apply_service_event(&state, Event::Apply(node_port_service()));
         let current = service_snapshot_for_schema(&state, SERVICE_SNAPSHOT_SCHEMA_VERSION)
-            .expect("schema-v3 state is available");
+            .expect("schema-v4 state is available");
         assert_eq!(current.schema_version, SERVICE_SNAPSHOT_SCHEMA_VERSION);
         assert!(!current.services[0].node_ports.is_empty());
         let node_port =
@@ -7188,6 +7262,15 @@ mod tests {
         );
         assert!(!node_port.services[0].node_ports.is_empty());
         assert!(node_port.services[0].load_balancer.is_none());
+        let load_balancer = service_snapshot_for_schema(
+            &state,
+            LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION,
+        )
+        .expect("schema-v3 projection is available");
+        assert_eq!(
+            load_balancer.schema_version,
+            LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
         let legacy = service_snapshot_for_schema(&state, LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION)
             .expect("schema-v1 projection is available");
         assert_eq!(
@@ -7197,6 +7280,59 @@ mod tests {
         assert!(legacy.services[0].node_ports.is_empty());
         let encoded = serde_json::to_value(legacy).expect("legacy projection encodes");
         assert!(encoded["services"][0].get("nodePorts").is_none());
+    }
+
+    #[test]
+    fn service_selection_fields_default_validate_and_canonicalize() {
+        let defaults = ServiceSpec::default();
+        assert_eq!(
+            service_internal_traffic_policy("apps", "api", None).unwrap(),
+            ServiceTrafficPolicy::Cluster
+        );
+        assert_eq!(
+            service_session_affinity("apps", "api", &defaults).unwrap(),
+            ServiceSessionAffinity::None
+        );
+        assert_eq!(
+            service_traffic_distribution("apps", "api", None).unwrap(),
+            ServiceTrafficDistribution::Any
+        );
+
+        let configured: ServiceSpec = serde_json::from_value(serde_json::json!({
+            "internalTrafficPolicy": "Local",
+            "sessionAffinity": "ClientIP",
+            "sessionAffinityConfig": {"clientIP": {"timeoutSeconds": 900}},
+            "trafficDistribution": "PreferClose"
+        }))
+        .unwrap();
+        assert_eq!(
+            service_internal_traffic_policy(
+                "apps",
+                "api",
+                configured.internal_traffic_policy.as_deref()
+            )
+            .unwrap(),
+            ServiceTrafficPolicy::Local
+        );
+        assert_eq!(
+            service_session_affinity("apps", "api", &configured).unwrap(),
+            ServiceSessionAffinity::ClientIp {
+                timeout_seconds: 900
+            }
+        );
+        assert_eq!(
+            service_traffic_distribution("apps", "api", configured.traffic_distribution.as_deref())
+                .unwrap(),
+            ServiceTrafficDistribution::PreferSameZone
+        );
+
+        let invalid: ServiceSpec = serde_json::from_value(serde_json::json!({
+            "sessionAffinity": "ClientIP",
+            "sessionAffinityConfig": {"clientIP": {"timeoutSeconds": 0}}
+        }))
+        .unwrap();
+        assert!(service_session_affinity("apps", "api", &invalid).is_err());
+        assert!(service_traffic_distribution("apps", "api", Some("Random")).is_err());
     }
 
     fn security_policy(name: &str, action: &str) -> SecurityPolicy {
@@ -7841,6 +7977,11 @@ mod tests {
                 name: "server".to_owned(),
                 cluster_ips: Vec::new(),
                 external_traffic_policy: ServiceTrafficPolicy::Cluster,
+                internal_traffic_policy: ServiceTrafficPolicy::Cluster,
+                session_affinity: ServiceSessionAffinity::None,
+                traffic_distribution: ServiceTrafficDistribution::Any,
+                selection_algorithm: ServiceSelectionAlgorithm::StableHash,
+                forwarding_mode: ServiceForwardingMode::Nat,
                 load_balancer: None,
                 ports: Vec::new(),
             },

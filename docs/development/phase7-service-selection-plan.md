@@ -14,7 +14,7 @@ and connection-state foundation. The authoritative feature state remains in
 | ID | Milestone | State | Exit evidence |
 |---|---|---|---|
 | 7.1 | Architecture and acceptance boundary | **Verified** | ADR 0102 fixes semantic precedence, ownership, compatibility, transactional state, measurement, operations, platform gates, cleanup, and exclusions; `make service-selection-boundary-test` prevents drift across the plan, tracker, roadmap, README, and component boundary |
-| 7.2 | Service schema v4 and Kubernetes compiler | **Planned** | Typed/defaulted `internalTrafficPolicy`, session affinity/timeout, traffic distribution, topology provenance, and explicit algorithm/forwarding intent; deterministic bounds, last-valid retention, exact rejection, and safe legacy projection |
+| 7.2 | Service schema v4 and Kubernetes compiler | **Verified** | Schema v4 carries typed/defaulted `internalTrafficPolicy`, ClientIP timeout, canonical traffic distribution, algorithm, and forwarding intent. Exact timeout/enum validation, v1/v2/v3 migration and safe projection, legacy fencing, Kubernetes conversion, unchanged default lowering, and explicit pre-transaction rejection pass `make service-selection-ir-test`; ADR 0103 |
 | 7.3 | Compatible distribution and transactional selection state | **Planned** | Explicit old/new negotiation, per-Node eligibility plans, owner-only checkpoints, inactive staging/readback/activation, rollback/crash repair/restart reconstruction, and exact versioned cleanup |
 | 7.4 | Internal locality and topology-aware dataplane | **Planned** | Dual-stack TCP/UDP strict internal Local plus ordered same-Node/same-zone/cluster fallback across applicable frontends, external-policy precedence, lifecycle, policy ordering, provenance, and inherited regressions |
 | 7.5 | ClientIP affinity and graceful draining | **Planned** | Original-client keyed bounded affinity, timeout/defaulting, current-eligibility revalidation, flow-versus-session precedence, ready/serving/terminating transitions, recovery, and exact retirement |
@@ -102,9 +102,9 @@ production availability/scale. Those capabilities require independent gates.
 
 ## Immediate next slice
 
-Milestone 7.2 introduces service schema v4 and its Kubernetes-independent
-types before any BPF map or packet behavior changes. It must preserve exact
-Phase 6 schema-v3 behavior, default omitted Kubernetes fields correctly, reject
-unsupported or contradictory intent without replacing last-valid state, and
-define a safe legacy projection. No advanced behavior is considered implemented
-until its later transactional and real-packet gates pass.
+Milestone 7.3 introduces per-Node eligibility and selection state. It must
+negotiate schema capability, preserve safe schema-v3 rollback while advanced
+intent is absent, reject false legacy convergence when it is present, and stage,
+read back, activate, checkpoint, recover, and clean exact owner-only state. No
+advanced packet behavior is considered implemented until its later real-packet
+gates pass.

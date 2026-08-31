@@ -2101,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::default_trait_access, clippy::too_many_lines)]
     fn load_balancer_host_bank_is_exact_banked_and_revision_bound() {
         let service_id = ServiceId::new(44);
         let frontends = vec![
@@ -2148,6 +2148,11 @@ mod tests {
                 id: service_id,
                 namespace: "apps".to_owned(),
                 name: "api".to_owned(),
+                internal_traffic_policy: Default::default(),
+                session_affinity: Default::default(),
+                traffic_distribution: Default::default(),
+                selection_algorithm: Default::default(),
+                forwarding_mode: Default::default(),
                 frontends,
                 node_ports: Vec::new(),
                 load_balancer: Some(unf_service::ServiceLoadBalancer {
@@ -2308,11 +2313,17 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::default_trait_access)]
     fn service_adapter_claims_only_explicit_class_and_preserves_exact_intent() {
         let mut service = ServiceIr {
             id: ServiceId::new(44),
             namespace: "apps".to_owned(),
             name: "api".to_owned(),
+            internal_traffic_policy: Default::default(),
+            session_affinity: Default::default(),
+            traffic_distribution: Default::default(),
+            selection_algorithm: Default::default(),
+            forwarding_mode: Default::default(),
             frontends: Vec::new(),
             node_ports: Vec::new(),
             load_balancer: Some(unf_service::ServiceLoadBalancer {
