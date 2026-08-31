@@ -14,8 +14,8 @@ spec:
             - name: UNF_CONTROLLER_LOAD_BALANCER_POOL_NAME
               value: qualification
             - name: UNF_CONTROLLER_LOAD_BALANCER_IPV4_POOL
-              value: 198.51.100.240/28
+              value: 10.50.60.240/28
             - name: UNF_CONTROLLER_LOAD_BALANCER_IPV6_POOL
-              value: 2001:db8:ffff::f0/124
+              value: 2a02:abcd:1234:5600::f0/124
             - name: UNF_CONTROLLER_LOAD_BALANCER_PROVIDER_INSTANCE
               value: openshift-direct-node-v1
