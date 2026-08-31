@@ -278,8 +278,13 @@ advertise_vips() {
             done
             ! ip -6 -o address show dev br-ex to "$address/128" | grep -q tentative
         done
+        # Some routed lab gateways learn only from unsolicited ARP replies;
+        # send both update forms so a VIP moved by a previous failed run cannot
+        # remain pinned to the old worker while this gate exercises the new one.
         chroot /host arping -U -c 3 -I br-ex "$1" >/dev/null
+        chroot /host arping -A -c 3 -I br-ex "$1" >/dev/null
         chroot /host arping -U -c 3 -I br-ex "$3" >/dev/null
+        chroot /host arping -A -c 3 -I br-ex "$3" >/dev/null
     ' sh "${first_v4}" "${first_v6}" "${second_v4}" "${second_v6}"
 }
 
