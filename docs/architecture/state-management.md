@@ -108,12 +108,13 @@ compile N+1 -> populate all staging maps -> read back and validate
 Existing applied state must remain usable if the controller or Kubernetes API is
 temporarily unavailable. New identity, policy, and service state never partially
 overwrites active maps; each prior bank remains selected through any pre-switch
-failure. Twenty-one maps are pinned under the `/sys/fs/bpf/unf/v5` ABI directory,
+failure. Twenty-four maps are pinned under the `/sys/fs/bpf/unf/v6` ABI directory,
 reopened with strict all-or-none validation, and reconstructed into userspace
-caches after restart. ABI v4 remains an explicitly recognized 18-map cleanup
-boundary and is never interpreted as partial v5 state. The active service and
-NodePort banks must exactly recompile from their owner-only composite durable
-checkpoint. A crash between their two activation pointers restores the prior
+caches after restart. ABI v4 and v5 remain explicitly recognized 18-map and
+21-map cleanup boundaries and are never interpreted as partial v6 state. The
+active service, NodePort, and LoadBalancer banks must exactly recompile from
+their owner-only durable checkpoints. A crash between the service and NodePort
+activation pointers restores the prior
 coherent tuple; a crash after both pointers commits the prepared tuple. A fresh
 or incomplete map set must receive and
 commit identity, policy, and available service snapshots before any TC program is attached;
@@ -133,8 +134,10 @@ acknowledgements, and telemetry behind dedicated TLS plus Pod-bound TokenReview;
 serving certificates and CA bundles reload with last-known-good fallback and an
 overlapping-trust rotation gate. Agent reports and the newest bounded flow
 history survive controller replacement. The agent's applied primary-CNI
-Node-block and remote-route provenance also survives locally; other desired state
-and identity allocation remain current-process state.
+Node-block, remote-route, and LoadBalancer reachability provenance also survives
+locally. The controller persists bounded LoadBalancer allocation and
+reachability revision state before distributing it; other desired state and
+identity allocation remain current-process state.
 
 Controller and agent `GET /v1/version` responses publish compatibility schema
 v1: embedded build revision, persistent BPF-state ABI, identity/policy snapshot

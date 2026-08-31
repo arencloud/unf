@@ -33,7 +33,7 @@ spec:
             - --ebpf-object
             - /opt/unf/ebpf/unf-ebpf-tc
             - --bpf-pin-path
-            - /sys/fs/bpf/unf/v5
+            - /sys/fs/bpf/unf/v6
             - --controller-url
             - https://unf-primary-controller.internal:9964
             - --controller-ca-path

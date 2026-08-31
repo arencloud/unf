@@ -1004,14 +1004,14 @@ for replacement_node in "${client_node}" "${server_node}"; do
         test -f "$snapshot"
         test "$(stat -c %a "$snapshot")" = 600
         jq -e "if has(\"service\") then .schemaVersion == 1 and .service.schemaVersion == 2 and .service.revision > 0 and (.service.services | length) > 0 and .nodePortNode.schemaVersion == 1 else .schemaVersion == 1 and .revision > 0 and (.services | length) > 0 end" "$snapshot" >/dev/null
-        test -e /sys/fs/bpf/unf/v5/SERVICE_CONFIG
-        test -e /sys/fs/bpf/unf/v5/SERVICE_FRONTENDS_V4
-        test -e /sys/fs/bpf/unf/v5/SERVICE_FRONTENDS_V6
-        test -e /sys/fs/bpf/unf/v5/SERVICE_BACKENDS_V4
-        test -e /sys/fs/bpf/unf/v5/SERVICE_BACKENDS_V6
-        test -e /sys/fs/bpf/unf/v5/NODE_PORT_CONFIG
-        test -e /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V4
-        test -e /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V6
+        test -e /sys/fs/bpf/unf/v6/SERVICE_CONFIG
+        test -e /sys/fs/bpf/unf/v6/SERVICE_FRONTENDS_V4
+        test -e /sys/fs/bpf/unf/v6/SERVICE_FRONTENDS_V6
+        test -e /sys/fs/bpf/unf/v6/SERVICE_BACKENDS_V4
+        test -e /sys/fs/bpf/unf/v6/SERVICE_BACKENDS_V6
+        test -e /sys/fs/bpf/unf/v6/NODE_PORT_CONFIG
+        test -e /sys/fs/bpf/unf/v6/NODE_PORT_FRONTENDS_V4
+        test -e /sys/fs/bpf/unf/v6/NODE_PORT_FRONTENDS_V6
     '
 done
 "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 >/dev/null
@@ -1068,8 +1068,8 @@ spec:
       command: [sh, -ec]
       args:
         - |
-          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V4 | jq length)" -eq 0
-          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v5/NODE_PORT_FRONTENDS_V6 | jq length)" -eq 0
+          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v6/NODE_PORT_FRONTENDS_V4 | jq length)" -eq 0
+          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v6/NODE_PORT_FRONTENDS_V6 | jq length)" -eq 0
           snapshot=/var/lib/unf/cni/v1/service-snapshot.json
           jq -e '.schemaVersion == 1 and has("service") == false and (.services | all(.nodePorts | length == 0))' "\$snapshot" >/dev/null
       securityContext:

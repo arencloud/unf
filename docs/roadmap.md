@@ -469,9 +469,11 @@ matrix is maintained in the
   leases, exact pool/provider/Service provenance, complete revisioned
   direct-Node reachability and acknowledgements, fail-closed finalizer/status
   ordering, recovery/withdrawal, and foreign-state preservation; ADR 0095.
-- In progress: compatible distribution and transactional host state. Planned:
-  dual-stack
-  TCP/UDP `Cluster` and `Local` dataplanes; source ranges and
+- Verified compatible distribution and transactional host state: explicit
+  negotiation, durable allocation production, authenticated per-Node intent,
+  capability-aware convergence, and independent ABI-v6 inactive-bank
+  activation/recovery pass `make loadbalancer-host-state-test`; ADR 0096.
+  Planned: dual-stack TCP/UDP `Cluster` and `Local` dataplanes; source ranges and
   `healthCheckNodePort`; operations/simulation/recovery; independent
   kube-proxy-free Kind and digest-pinned OpenShift gates.
 - Production BGP/cloud takeover, session affinity, internal traffic policy,

@@ -17,9 +17,11 @@ use unf_ebpf_common::{
     EgressIpv6PolicyMapData, FLOW_ABI_VERSION, FlowEvent, IDENTITY_BANK_COUNT,
     IDENTITY_MAP_ABI_VERSION, IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT,
     IPV6_NEXT_HEADER_HOP_BY_HOP, IdentityMapConfig, IdentityMapValue, Ipv4IdentityKey,
-    Ipv4NodePortFrontendKey, Ipv4PolicyMapKey, Ipv4ServiceBackendValue, Ipv4ServiceFrontendKey,
-    Ipv6ExtensionStep, Ipv6IdentityKey, Ipv6NodePortFrontendKey, Ipv6PolicyMapData,
-    Ipv6ServiceBackendValue, Ipv6ServiceFrontendKey, NodePortFrontendValue, NodePortMapConfig,
+    Ipv4LoadBalancerFrontendKey, Ipv4NodePortFrontendKey, Ipv4PolicyMapKey,
+    Ipv4ServiceBackendValue, Ipv4ServiceFrontendKey, Ipv6ExtensionStep, Ipv6IdentityKey,
+    Ipv6LoadBalancerFrontendKey, Ipv6NodePortFrontendKey, Ipv6PolicyMapData,
+    Ipv6ServiceBackendValue, Ipv6ServiceFrontendKey, LoadBalancerFrontendValue,
+    LoadBalancerMapConfig, NodePortFrontendValue, NodePortMapConfig,
     NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG,
     NODE_PORT_MAP_ABI_VERSION, NODE_PORT_SNAT_PORT_PROBES,
     POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
@@ -180,6 +182,23 @@ static NODE_PORT_FRONTENDS_V6: HashMap<Ipv6NodePortFrontendKey, NodePortFrontend
 
 #[map]
 static NODE_PORT_CONFIG: Array<NodePortMapConfig> = Array::with_max_entries(1, 0);
+
+/// Phase 6 host state is staged independently and remains unconsumed until the
+/// following packet-path milestone explicitly admits its revision tuple.
+#[map]
+static LOAD_BALANCER_FRONTENDS_V4: HashMap<
+    Ipv4LoadBalancerFrontendKey,
+    LoadBalancerFrontendValue,
+> = HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static LOAD_BALANCER_FRONTENDS_V6: HashMap<
+    Ipv6LoadBalancerFrontendKey,
+    LoadBalancerFrontendValue,
+> = HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static LOAD_BALANCER_CONFIG: Array<LoadBalancerMapConfig> = Array::with_max_entries(1, 0);
 
 /// Bounded persistent flow translations owned by the Phase 4.5 source-side
 /// ClusterIP dataplane.

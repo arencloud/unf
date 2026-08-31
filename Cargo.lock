@@ -2892,6 +2892,7 @@ dependencies = [
  "unf-common",
  "unf-ebpf-common",
  "unf-ipam",
+ "unf-loadbalancer",
  "unf-route",
  "unf-service",
  "unf-state",
@@ -2965,6 +2966,7 @@ dependencies = [
  "unf-api",
  "unf-common",
  "unf-ipam",
+ "unf-loadbalancer",
  "unf-policy",
  "unf-route",
  "unf-service",
@@ -3008,6 +3010,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "unf-common",
+ "unf-ebpf-common",
  "unf-service",
 ]
 

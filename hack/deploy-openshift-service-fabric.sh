@@ -119,7 +119,7 @@ wait_for_controller() {
         fi
         sleep 1
     done
-    echo "controller did not expose the qualified ABI-v5 revision" >&2
+    echo "controller did not expose the qualified ABI-v6 revision" >&2
     jq . <<<"${version}" >&2 || true
     jq . <<<"${status}" >&2 || true
     return 1
@@ -166,7 +166,7 @@ wait_for_agent_service_state() {
         fi
         sleep 1
     done
-    echo "agent on ${node} did not converge on healthy ABI-v5 service state" >&2
+    echo "agent on ${node} did not converge on healthy ABI-v6 service state" >&2
     jq . <<<"${status}" >&2 || true
     return 1
 }
@@ -177,11 +177,11 @@ assert_agent() {
     for _ in $(seq 1 60); do
         host_state=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
             test "$(getenforce)" = Enforcing
-            test -d /sys/fs/bpf/unf/v5
+            test -d /sys/fs/bpf/unf/v6
             for pin in SERVICE_CONFIG SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 \
                 SERVICE_BACKENDS_V4 SERVICE_BACKENDS_V6 SERVICE_CONNECTIONS \
                 NODE_PORT_CONFIG NODE_PORT_FRONTENDS_V4 NODE_PORT_FRONTENDS_V6; do
-                test -e "/sys/fs/bpf/unf/v5/$pin"
+                test -e "/sys/fs/bpf/unf/v6/$pin"
             done
             snapshot=/var/lib/unf/cni/v1/service-snapshot.json
             test -f "$snapshot" && test ! -L "$snapshot" && test "$(stat -c %a "$snapshot")" = 600
@@ -193,7 +193,7 @@ assert_agent() {
         fi
         sleep 2
     done
-    echo "agent on ${node} did not expose complete durable ABI-v5 host state" >&2
+    echo "agent on ${node} did not expose complete durable ABI-v6 host state" >&2
     printf '%s\n' "${host_state}" >&2
     return 1
 }
@@ -217,7 +217,7 @@ wait_for_convergence() {
         fi
         sleep 1
     done
-    echo "all agents did not converge on ABI v5" >&2
+    echo "all agents did not converge on ABI v6" >&2
     jq . <<<"${snapshot}" >&2 || true
     return 1
 }
@@ -279,7 +279,7 @@ transition_agent() {
     current_image=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.spec.containers[0].image}')
     if [[ ${current_image} != "${agent_image}" ]]; then
         old_uid=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.metadata.uid}')
-        echo "transitioning UNF agent on ${node} to persistent BPF ABI v5"
+        echo "transitioning UNF agent on ${node} to persistent BPF ABI v6"
         "${kc[@]}" -n unf-system delete pod "${pod}" --wait=false >/dev/null
         wait_for_agent_replacement "${node}" "${old_uid}"
     fi
@@ -395,7 +395,7 @@ for _ in $(seq 1 540); do
     sleep 5
 done
 if [[ ${rollout_complete} != true ]]; then
-    echo "MachineConfig rollout and interleaved ABI-v5 agent transition did not complete in 45 minutes" >&2
+    echo "MachineConfig rollout and interleaved ABI-v6 agent transition did not complete in 45 minutes" >&2
     exit 1
 fi
 for node in "${nodes[@]}"; do
@@ -465,7 +465,7 @@ jq -n \
         "MachineConfig-aware five-node serial agent replacement","RHCOS SELinux enforcing","legacy-netlink TC attachment",
         "persistent NodePort host sysctl contract","durable composite service snapshot",
         "host-origin Kubernetes API Service reachability","no functional kube-proxy rule residue",
-        "ABI-v5 service and NodePort maps","explicit ABI-v4 retain-or-rebuild rollback state",
+        "ABI-v6 service, NodePort, and LoadBalancer maps","explicit ABI-v5 retain-or-rebuild rollback state",
         "full agent convergence","kube-proxy remains absent"]
     }
 ' >"${artifact_tmp}"
@@ -474,4 +474,4 @@ mv -f "${artifact_tmp}" "${artifact}"
 artifact_tmp=
 
 trap - ERR EXIT
-echo "OpenShift NodePort ABI-v5 staged deployment passed; kube-proxy remains absent; evidence: ${artifact}"
+echo "OpenShift NodePort ABI-v6 staged deployment passed; kube-proxy remains absent; evidence: ${artifact}"

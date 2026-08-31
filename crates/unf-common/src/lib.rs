@@ -4,6 +4,8 @@
 
 /// Wire schema shared by service producers, consumers, and compatibility checks.
 pub const SERVICE_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
+/// Wire schema for authenticated per-Node `LoadBalancer` reachability intent.
+pub const LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION: u16 = 1;
 
 macro_rules! numeric_id {
     ($name:ident) => {

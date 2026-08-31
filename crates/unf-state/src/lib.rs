@@ -6,8 +6,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{
-    BackendId, IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, RuleId,
-    SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceId, Verdict,
+    BackendId, IdentityId, LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION, PolicyDirection, PolicyId,
+    PolicyReason, Revision, RuleId, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceId, Verdict,
 };
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
@@ -20,9 +20,9 @@ pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 5;
 pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 5;
 pub const SHADOW_IMPACT_SCHEMA_VERSION: u16 = 1;
-pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 5;
+pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 6;
 pub const COMPONENT_COMPATIBILITY_SCHEMA_VERSION: u16 = 2;
-pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 5;
+pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 6;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
 pub const FLOW_HISTORY_CAPACITY: usize = 4_096;
 const FLOW_HISTORY_LEGACY_MAX_CLOCK_REGRESSION_MILLIS: u64 = 1_000;
@@ -39,6 +39,8 @@ pub struct ComponentCompatibility {
     pub identity_snapshot_schema_version: u16,
     pub policy_snapshot_schema_version: u16,
     pub service_snapshot_schema_version: u16,
+    #[serde(default)]
+    pub load_balancer_reachability_schema_version: u16,
     pub agent_status_schema_version: u16,
     pub flow_export_schema_version: u16,
 }
@@ -55,6 +57,7 @@ impl ComponentCompatibility {
             identity_snapshot_schema_version: IDENTITY_SNAPSHOT_SCHEMA_VERSION,
             policy_snapshot_schema_version: POLICY_SNAPSHOT_SCHEMA_VERSION,
             service_snapshot_schema_version: SERVICE_SNAPSHOT_SCHEMA_VERSION,
+            load_balancer_reachability_schema_version: LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION,
             agent_status_schema_version: AGENT_STATUS_SCHEMA_VERSION,
             flow_export_schema_version: FLOW_EXPORT_SCHEMA_VERSION,
         }
@@ -132,6 +135,28 @@ pub struct AgentStateReport {
     pub node_port_cluster_frontend_count: u64,
     #[serde(default)]
     pub node_port_local_frontend_count: u64,
+    #[serde(default)]
+    pub load_balancer_reachability_schema_version: u16,
+    #[serde(default)]
+    pub desired_load_balancer_epoch: u64,
+    #[serde(default)]
+    pub desired_load_balancer_revision: u64,
+    #[serde(default)]
+    pub desired_load_balancer_allocation_revision: u64,
+    #[serde(default)]
+    pub applied_load_balancer_epoch: u64,
+    #[serde(default)]
+    pub applied_load_balancer_revision: u64,
+    #[serde(default)]
+    pub applied_load_balancer_allocation_revision: u64,
+    #[serde(default)]
+    pub load_balancer_frontend_count: u64,
+    #[serde(default)]
+    pub active_load_balancer_bank: u64,
+    #[serde(default)]
+    pub load_balancer_reconcile_errors: u64,
+    #[serde(default)]
+    pub load_balancer_last_error: Option<String>,
     #[serde(default)]
     pub service_reconcile_errors: u64,
     #[serde(default)]
@@ -1575,6 +1600,10 @@ mod tests {
         assert_eq!(
             compatibility.service_snapshot_schema_version,
             SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            compatibility.load_balancer_reachability_schema_version,
+            LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION
         );
         assert_eq!(
             compatibility.flow_export_schema_version,

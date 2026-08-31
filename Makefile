@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt fmt-check support-matrix-check loadbalancer-boundary-test loadbalancer-ir-test loadbalancer-control-plane-test service-ir-test service-compiler-test service-distribution-test nodeport-host-state-test nodeport-transaction-test nodeport-cluster-dataplane-test nodeport-local-dataplane-test nodeport-operations-test nodeport-kind-test nodeport-openshift-deploy nodeport-openshift-test service-dataplane-test service-operations-test primary-cni-installer-test service-kind-up service-kind-load service-kind-deploy service-kind-test service-kind-down ebpf generate-crds controller agent cni cni-protocol-test cni-transaction-test cni-ipam-test cni-veth-test cni-routing-test cni-lifecycle-test cni-node-block-test cni-remote-routing-test cni-route-reconciliation-test cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-upgrade-images openshift-deploy openshift-test openshift-upgrade-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test openshift-primary-cni-audit openshift-primary-cni-preflight openshift-primary-cni-package-check openshift-primary-cni-runtime-fault-test openshift-primary-cni-node-reprovision-test openshift-primary-cni-deploy openshift-service-deploy openshift-service-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-platform-matrix-test kind-down primary-cni-kind-up primary-cni-kind-load primary-cni-kind-deploy primary-cni-kind-test primary-cni-kind-rollback primary-cni-kind-down
+.PHONY: build test lint fmt fmt-check support-matrix-check loadbalancer-boundary-test loadbalancer-ir-test loadbalancer-control-plane-test loadbalancer-host-state-test service-ir-test service-compiler-test service-distribution-test nodeport-host-state-test nodeport-transaction-test nodeport-cluster-dataplane-test nodeport-local-dataplane-test nodeport-operations-test nodeport-kind-test nodeport-openshift-deploy nodeport-openshift-test service-dataplane-test service-operations-test primary-cni-installer-test service-kind-up service-kind-load service-kind-deploy service-kind-test service-kind-down ebpf generate-crds controller agent cni cni-protocol-test cni-transaction-test cni-ipam-test cni-veth-test cni-routing-test cni-lifecycle-test cni-node-block-test cni-remote-routing-test cni-route-reconciliation-test cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-upgrade-images openshift-deploy openshift-test openshift-upgrade-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test openshift-primary-cni-audit openshift-primary-cni-preflight openshift-primary-cni-package-check openshift-primary-cni-runtime-fault-test openshift-primary-cni-node-reprovision-test openshift-primary-cni-deploy openshift-service-deploy openshift-service-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-platform-matrix-test kind-down primary-cni-kind-up primary-cni-kind-load primary-cni-kind-deploy primary-cni-kind-test primary-cni-kind-rollback primary-cni-kind-down
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -74,6 +74,19 @@ loadbalancer-control-plane-test: loadbalancer-ir-test
 	cargo test -p unf-loadbalancer
 	cargo clippy -p unf-loadbalancer --all-targets --all-features -- -D warnings
 
+loadbalancer-host-state-test: loadbalancer-control-plane-test
+	cargo test -p unf-controller load_balancer
+	cargo test -p unf-agent load_balancer
+	cargo test -p unf-agent cleanup_distinguishes_complete_v4_v5_and_v6_map_ownership
+	cargo test -p unf-state component_compatibility_fixes_the_upgrade_contract
+	cargo clippy -p unf-common -p unf-ebpf-common -p unf-loadbalancer -p unf-state -p unf-controller -p unf-agent --all-targets --all-features -- -D warnings
+	kubectl kustomize deploy >/dev/null
+	kubectl kustomize deploy/openshift >/dev/null
+	kubectl kustomize deploy/kind-primary-cni >/dev/null
+	kubectl kustomize deploy/kind-service-fabric >/dev/null
+	kubectl kustomize deploy/openshift-primary-cni/runtime >/dev/null
+	UNF_BPF_TOOLCHAIN=$(BPF_TOOLCHAIN) hack/verify-service-map-transaction.sh
+
 service-ir-test:
 	cargo test -p unf-common -p unf-service
 	cargo clippy -p unf-common -p unf-service --all-targets --all-features -- -D warnings
@@ -108,7 +121,7 @@ nodeport-host-state-test: service-distribution-test
 nodeport-transaction-test: nodeport-host-state-test
 	cargo test -p unf-service node_port
 	cargo test -p unf-agent node_port
-	cargo test -p unf-agent cleanup_distinguishes_complete_v4_and_v5_map_ownership
+	cargo test -p unf-agent cleanup_distinguishes_complete_v4_v5_and_v6_map_ownership
 	cargo test -p unf-state component_compatibility_fixes_the_upgrade_contract
 	cargo clippy -p unf-ebpf-common -p unf-service -p unf-state -p unf-agent --all-targets --all-features -- -D warnings
 	UNF_BPF_TOOLCHAIN=$(BPF_TOOLCHAIN) hack/verify-service-map-transaction.sh

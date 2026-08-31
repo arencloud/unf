@@ -250,7 +250,7 @@ transactions. Status may publish a VIP only after the admitted provider and
 dataplane converge, direct delivery cannot depend on a traffic NodePort, and
 foreign controller/network state must survive reconciliation. The
 [Phase 6 LoadBalancer plan](docs/development/phase6-loadbalancer-plan.md) and
-ADRs 0093–0095 define the ordered schema, provider, dataplane, operations,
+ADRs 0093–0096 define the ordered schema, provider, dataplane, operations,
 Kind, and OpenShift gates. Milestone 6.2 is verified: schema v3 carries exact
 dual-stack class/family/policy/source-range/requested-VIP intent, projects safe
 v2/v1 views, retains last-valid Kubernetes compilation, and makes existing
@@ -258,9 +258,12 @@ lowerers reject VIP intent. Milestone 6.3 is also verified: deterministic
 conflict-safe dual-stack leases retain exact pool/provider/Service ownership;
 complete revisioned direct-Node intent, acknowledgements, withdrawal, durable
 recovery, publication ordering, and foreign Kubernetes state preservation pass
-`make loadbalancer-control-plane-test`. Compatible authenticated host
-distribution is in progress; no live advertisement, status-publication,
-host-state, or packet-support claim exists yet.
+`make loadbalancer-control-plane-test`. Milestone 6.4 is also verified:
+explicit compatibility negotiation, epoch-fenced durable allocation,
+finalizer-safe withdrawal, Pod-bound per-Node state, capability-aware
+acknowledgements, private checkpoints, and independent transactional ABI-v6 VIP
+maps pass `make loadbalancer-host-state-test`. The maps are not consumed by TC
+and Kubernetes status is not published until the 6.5 packet gate succeeds.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -471,8 +474,8 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-Not implemented yet: advanced Service modes such as LoadBalancer, session
-affinity, internal traffic policy, topology-aware
+Not implemented yet: LoadBalancer packet translation/status publication and
+advanced Service modes such as session affinity, internal traffic policy, topology-aware
 routing, Maglev, and DSR;
 production-scale routing/CNI qualification;
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,

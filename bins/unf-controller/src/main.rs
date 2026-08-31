@@ -39,6 +39,12 @@ use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
     NodeBlockSnapshot,
 };
+use unf_loadbalancer::{
+    AllocationCheckpoint, LoadBalancerAllocator, LoadBalancerOwner, LoadBalancerPool,
+    NodeReachabilitySnapshot, ReachabilityMode, ReachabilityNode, ReachabilityProviderRef,
+    ReachabilitySnapshot, allocation_request_for_service, compile_direct_node_reachability,
+    reconcile_finalizers,
+};
 use unf_policy::{
     DestinationAddresses, DestinationPort, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort,
     NetworkPolicyCompiler, PolicyCompiler, PolicyIr, compile_dataplane_entries,
@@ -110,6 +116,11 @@ const TOPOLOGY_HISTORY_STORE_KEY: &str = "history.json";
 const TOPOLOGY_HISTORY_CONFIG_MAP_DATA_LIMIT: usize = 900_000;
 const TOPOLOGY_HISTORY_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const TOPOLOGY_HISTORY_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
+const LOAD_BALANCER_STORE_NAME: &str = "unf-load-balancer-control-plane";
+const LOAD_BALANCER_STORE_KEY: &str = "state.json";
+const LOAD_BALANCER_STORE_SCHEMA_VERSION: u16 = 1;
+const LOAD_BALANCER_STORE_DATA_LIMIT: usize = 900_000;
+const LOAD_BALANCER_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const PRIMARY_CNI_NODE_LABEL: &str = "network.unf.io/primary-cni";
 const PRIMARY_CNI_NODE_LABEL_VALUE: &str = "enabled";
 
@@ -182,6 +193,25 @@ struct Args {
         value_parser = parse_flow_export_timeout_seconds
     )]
     flow_export_http_timeout_seconds: u64,
+    /// Stable UID of the explicitly configured `LoadBalancer` address pool.
+    #[arg(long, env = "UNF_CONTROLLER_LOAD_BALANCER_POOL_UID")]
+    load_balancer_pool_uid: Option<String>,
+    #[arg(
+        long,
+        env = "UNF_CONTROLLER_LOAD_BALANCER_POOL_NAME",
+        default_value = "public"
+    )]
+    load_balancer_pool_name: String,
+    #[arg(long, env = "UNF_CONTROLLER_LOAD_BALANCER_IPV4_POOL")]
+    load_balancer_ipv4_pool: Option<ServiceIpPrefix>,
+    #[arg(long, env = "UNF_CONTROLLER_LOAD_BALANCER_IPV6_POOL")]
+    load_balancer_ipv6_pool: Option<ServiceIpPrefix>,
+    #[arg(
+        long,
+        env = "UNF_CONTROLLER_LOAD_BALANCER_PROVIDER_INSTANCE",
+        default_value = "unf-system"
+    )]
+    load_balancer_provider_instance: String,
     /// Run the API server without connecting to Kubernetes (development only).
     #[arg(long)]
     offline: bool,
@@ -235,6 +265,9 @@ struct ControllerState {
     rejected_service_sources: RwLock<BTreeMap<String, String>>,
     rejected_endpoint_slice_sources: RwLock<BTreeMap<String, String>>,
     compiled_service_snapshot: RwLock<Option<ServiceSnapshot>>,
+    compiled_load_balancer_reachability: RwLock<Option<ReachabilitySnapshot>>,
+    load_balancer_runtime: Mutex<Option<LoadBalancerRuntime>>,
+    load_balancer_store: Option<Api<ConfigMap>>,
     service_compilation_error: RwLock<Option<String>>,
     namespaces: RwLock<BTreeMap<String, BTreeMap<String, String>>>,
     security_policies: RwLock<BTreeMap<String, SecurityPolicy>>,
@@ -352,11 +385,31 @@ type DataplanePolicyState = (
 struct ServiceRecord {
     namespace: String,
     name: String,
+    uid: String,
+    resource_version: String,
+    finalizers: Vec<String>,
+    deleting: bool,
     service_type: String,
     cluster_ips: BTreeSet<IpAddr>,
     selector: BTreeMap<String, String>,
     ports: Vec<TopologyServicePort>,
     compiler_source: ServiceSource,
+}
+
+#[derive(Debug, Clone)]
+struct LoadBalancerRuntime {
+    pool_name: String,
+    provider: ReachabilityProviderRef,
+    allocator: LoadBalancerAllocator,
+    reachability_revision: Revision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DurableLoadBalancerState {
+    schema_version: u16,
+    reachability_revision: Revision,
+    allocation: AllocationCheckpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -676,6 +729,7 @@ struct SimulationMatrixFlow {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     install_crypto_provider()?;
     init_tracing();
@@ -715,8 +769,14 @@ async fn main() -> Result<()> {
     }
 
     if args.offline {
+        configure_load_balancer_runtime(&state, &args)
+            .await
+            .context("configure offline LoadBalancer control plane")?;
         warn!("running without Kubernetes watchers");
     } else {
+        configure_load_balancer_runtime(&state, &args)
+            .await
+            .context("configure durable LoadBalancer control plane")?;
         restore_agent_reports(&state)
             .await
             .context("restore durable agent acknowledgements")?;
@@ -730,6 +790,12 @@ async fn main() -> Result<()> {
         spawn_flow_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_topology_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         let client = client.context("Kubernetes client is required in connected mode")?;
+        spawn_load_balancer_reconciler(
+            &mut tasks,
+            client.clone(),
+            Arc::clone(&state),
+            cancellation.clone(),
+        );
         spawn_watchers(&mut tasks, client, Arc::clone(&state), cancellation.clone());
         state.ready.store(true, Ordering::Release);
     }
@@ -814,6 +880,10 @@ async fn spawn_internal_api(
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
         .route("/v1/state/services", get(service_snapshot))
+        .route(
+            "/v1/state/load-balancer-reachability",
+            get(load_balancer_reachability_snapshot),
+        )
         .route("/v1/state/node-port-node", get(node_port_node_snapshot))
         .route("/v1/state/node-block", get(node_block_snapshot))
         .route("/v1/state/remote-routes", get(remote_route_snapshot))
@@ -1110,6 +1180,9 @@ fn new_state_with_client_and_selector(
         rejected_service_sources: RwLock::new(BTreeMap::new()),
         rejected_endpoint_slice_sources: RwLock::new(BTreeMap::new()),
         compiled_service_snapshot: RwLock::new(None),
+        compiled_load_balancer_reachability: RwLock::new(None),
+        load_balancer_runtime: Mutex::new(None),
+        load_balancer_store: config_map_store.clone(),
         service_compilation_error: RwLock::new(None),
         namespaces: RwLock::new(BTreeMap::new()),
         security_policies: RwLock::new(BTreeMap::new()),
@@ -1142,6 +1215,401 @@ fn new_state_with_client_and_selector(
         registry: Mutex::new(registry),
         metrics,
     }
+}
+
+async fn configure_load_balancer_runtime(state: &ControllerState, args: &Args) -> Result<()> {
+    let configured = args.load_balancer_ipv4_pool.is_some()
+        || args.load_balancer_ipv6_pool.is_some()
+        || args.load_balancer_pool_uid.is_some();
+    if !configured {
+        info!("LoadBalancer control plane is disabled because no address pool is configured");
+        return Ok(());
+    }
+    if args.load_balancer_ipv4_pool.is_none() && args.load_balancer_ipv6_pool.is_none() {
+        return Err(anyhow!(
+            "a LoadBalancer pool UID requires at least one IPv4 or IPv6 pool"
+        ));
+    }
+    let pool_uid = args
+        .load_balancer_pool_uid
+        .clone()
+        .context("configured LoadBalancer address pools require --load-balancer-pool-uid")?;
+    let provider = ReachabilityProviderRef {
+        name: "direct-node".to_owned(),
+        instance: args.load_balancer_provider_instance.clone(),
+        mode: ReachabilityMode::DirectNode,
+    };
+    let pool = LoadBalancerPool {
+        name: args.load_balancer_pool_name.clone(),
+        uid: pool_uid,
+        provider: provider.clone(),
+        ipv4: args.load_balancer_ipv4_pool,
+        ipv6: args.load_balancer_ipv6_pool,
+    };
+    let (allocator, reachability_revision) = if state.offline {
+        (
+            LoadBalancerAllocator::new(vec![pool.clone()])?,
+            Revision::INITIAL,
+        )
+    } else {
+        restore_load_balancer_runtime(state, &pool).await?
+    };
+    *mutex_lock(&state.load_balancer_runtime) = Some(LoadBalancerRuntime {
+        pool_name: pool.name,
+        provider,
+        allocator,
+        reachability_revision,
+    });
+    info!("configured durable direct-Node LoadBalancer control plane");
+    Ok(())
+}
+
+async fn restore_load_balancer_runtime(
+    state: &ControllerState,
+    configured_pool: &LoadBalancerPool,
+) -> Result<(LoadBalancerAllocator, Revision)> {
+    let api = state
+        .load_balancer_store
+        .as_ref()
+        .context("durable LoadBalancer API is unavailable")?;
+    let config_map = api
+        .get(LOAD_BALANCER_STORE_NAME)
+        .await
+        .with_context(|| format!("read ConfigMap unf-system/{LOAD_BALANCER_STORE_NAME}"))?;
+    let Some(encoded) = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(LOAD_BALANCER_STORE_KEY))
+    else {
+        info!("durable LoadBalancer control-plane store is empty");
+        return Ok((
+            LoadBalancerAllocator::new(vec![configured_pool.clone()])?,
+            Revision::INITIAL,
+        ));
+    };
+    let durable: DurableLoadBalancerState =
+        serde_json::from_str(encoded).context("decode durable LoadBalancer control-plane state")?;
+    if durable.schema_version != LOAD_BALANCER_STORE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "unsupported durable LoadBalancer schema {}; expected {}",
+            durable.schema_version,
+            LOAD_BALANCER_STORE_SCHEMA_VERSION
+        ));
+    }
+    let allocator = LoadBalancerAllocator::restore(durable.allocation)?;
+    if allocator.checkpoint().pools != [configured_pool.clone()] {
+        return Err(anyhow!(
+            "configured LoadBalancer pool does not exactly match durable ownership"
+        ));
+    }
+    info!(
+        leases = allocator.checkpoint().leases.len(),
+        allocation_revision = allocator.checkpoint().revision.get(),
+        reachability_revision = durable.reachability_revision.get(),
+        "restored durable LoadBalancer control-plane state"
+    );
+    Ok((allocator, durable.reachability_revision))
+}
+
+fn spawn_load_balancer_reconciler(
+    tasks: &mut JoinSet<()>,
+    client: Client,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    if mutex_lock(&state.load_balancer_runtime).is_none() {
+        return;
+    }
+    tasks.spawn(async move {
+        let mut interval = tokio::time::interval(LOAD_BALANCER_RECONCILE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => break,
+                _ = interval.tick() => {
+                    if let Err(error) = reconcile_load_balancer_control_plane(&state, &client).await {
+                        state.metrics.errors.inc();
+                        warn!(%error, "LoadBalancer control-plane reconcile failed; retaining last-valid state");
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_lines)]
+async fn reconcile_load_balancer_control_plane(
+    state: &ControllerState,
+    client: &Client,
+) -> Result<()> {
+    let Some(mut runtime) = mutex_lock(&state.load_balancer_runtime).clone() else {
+        return Ok(());
+    };
+    let Some(service_snapshot) = read_lock(&state.compiled_service_snapshot).clone() else {
+        return Ok(());
+    };
+    let records = read_lock(&state.services).clone();
+    let current_reachability = read_lock(&state.compiled_load_balancer_reachability).clone();
+    let current_converged = current_reachability
+        .as_ref()
+        .is_some_and(|desired| load_balancer_agents_converged(state, desired));
+    let original_checkpoint = runtime.allocator.checkpoint();
+    let original_reachability_revision = runtime.reachability_revision;
+
+    let active_services = service_snapshot
+        .services
+        .iter()
+        .filter(|service| {
+            service
+                .load_balancer
+                .as_ref()
+                .is_some_and(|intent| intent.class == UNF_LOAD_BALANCER_CLASS)
+        })
+        .map(|service| {
+            (
+                format!("{}/{}", service.namespace, service.name),
+                service.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut finalizer_updates = Vec::new();
+    for (key, record) in &records {
+        let admitted = active_services.contains_key(key);
+        let has_finalizer = record
+            .finalizers
+            .iter()
+            .any(|entry| entry == unf_loadbalancer::UNF_LOAD_BALANCER_FINALIZER);
+        if admitted && !record.deleting && !has_finalizer {
+            finalizer_updates.push((record.clone(), true));
+        }
+    }
+
+    let retained_owners = active_services
+        .iter()
+        .filter_map(|(key, service)| {
+            let record = records.get(key)?;
+            let has_finalizer = record
+                .finalizers
+                .iter()
+                .any(|entry| entry == unf_loadbalancer::UNF_LOAD_BALANCER_FINALIZER);
+            (!record.deleting && has_finalizer).then(|| LoadBalancerOwner {
+                service_id: service.id,
+                namespace: service.namespace.clone(),
+                name: service.name.clone(),
+                uid: record.uid.clone(),
+            })
+        })
+        .collect::<BTreeSet<_>>();
+
+    let withdrawable = runtime
+        .allocator
+        .checkpoint()
+        .leases
+        .into_iter()
+        .filter(|lease| !retained_owners.contains(&lease.owner))
+        .filter(|lease| {
+            current_reachability.as_ref().is_some_and(|desired| {
+                current_converged
+                    && desired
+                        .targets
+                        .iter()
+                        .all(|target| target.owner != lease.owner)
+            })
+        })
+        .map(|lease| lease.owner)
+        .collect::<Vec<_>>();
+    for owner in withdrawable {
+        runtime.allocator.release(&owner)?;
+    }
+
+    for (key, service) in &active_services {
+        let Some(record) = records.get(key) else {
+            continue;
+        };
+        let has_finalizer = record
+            .finalizers
+            .iter()
+            .any(|entry| entry == unf_loadbalancer::UNF_LOAD_BALANCER_FINALIZER);
+        if record.deleting || !has_finalizer {
+            continue;
+        }
+        let request = allocation_request_for_service(
+            service,
+            &record.uid,
+            &runtime.pool_name,
+            state.identity_epoch,
+            service_snapshot.revision,
+        )?
+        .context("admitted LoadBalancer Service produced no allocation request")?;
+        runtime.allocator.allocate(request)?;
+    }
+
+    let nodes = read_lock(&state.node_port_nodes)
+        .iter()
+        .map(|(name, node)| ReachabilityNode {
+            name: name.clone(),
+            uid: node.node_uid.clone(),
+        })
+        .collect::<Vec<_>>();
+    let leases = runtime
+        .allocator
+        .checkpoint()
+        .leases
+        .into_iter()
+        .filter(|lease| retained_owners.contains(&lease.owner))
+        .collect::<Vec<_>>();
+    let allocation_revision = runtime.allocator.checkpoint().revision;
+    let candidate_revision = if runtime.reachability_revision == Revision::INITIAL {
+        Revision::new(1)
+    } else {
+        runtime.reachability_revision
+    };
+    let mut desired = compile_direct_node_reachability(
+        state.identity_epoch,
+        candidate_revision,
+        allocation_revision,
+        runtime.provider.clone(),
+        &leases,
+        nodes,
+    )?;
+    let content_changed = current_reachability.as_ref().is_some_and(|current| {
+        current.provider != desired.provider
+            || current.allocation_revision != desired.allocation_revision
+            || current.targets != desired.targets
+    });
+    if content_changed {
+        runtime.reachability_revision = candidate_revision.next();
+        desired.revision = runtime.reachability_revision;
+    } else {
+        runtime.reachability_revision = candidate_revision;
+    }
+
+    let durable_changed = runtime.allocator.checkpoint() != original_checkpoint
+        || runtime.reachability_revision != original_reachability_revision;
+    if durable_changed {
+        persist_load_balancer_runtime(state, &runtime).await?;
+    }
+    *mutex_lock(&state.load_balancer_runtime) = Some(runtime.clone());
+    *write_lock(&state.compiled_load_balancer_reachability) = Some(desired.clone());
+
+    for record in records.values() {
+        let owner_is_retained = retained_owners.iter().any(|owner| {
+            owner.namespace == record.namespace
+                && owner.name == record.name
+                && owner.uid == record.uid
+        });
+        if owner_is_retained
+            || !record
+                .finalizers
+                .iter()
+                .any(|entry| entry == unf_loadbalancer::UNF_LOAD_BALANCER_FINALIZER)
+        {
+            continue;
+        }
+        let owner_has_lease = runtime.allocator.checkpoint().leases.iter().any(|lease| {
+            lease.owner.namespace == record.namespace
+                && lease.owner.name == record.name
+                && lease.owner.uid == record.uid
+        });
+        let can_remove = !owner_has_lease
+            && load_balancer_agents_converged(state, &desired)
+            && desired.allocation_revision == runtime.allocator.checkpoint().revision;
+        if can_remove {
+            finalizer_updates.push((record.clone(), false));
+        }
+    }
+    for (record, retain) in finalizer_updates {
+        patch_load_balancer_finalizer(client, &record, retain).await?;
+    }
+    Ok(())
+}
+
+fn load_balancer_agents_converged(state: &ControllerState, desired: &ReachabilitySnapshot) -> bool {
+    let now = unix_time_millis();
+    let reports = read_lock(&state.agent_reports);
+    read_lock(&state.node_port_nodes).keys().all(|node_name| {
+        reports.get(node_name).is_some_and(|stored| {
+            now.saturating_sub(stored.last_received_unix_ms) <= AGENT_STATUS_FRESHNESS_MILLIS
+                && stored.report.ready
+                && stored.report.bpf_loaded
+                && stored.report.load_balancer_reachability_schema_version
+                    >= unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION
+                && stored.report.applied_load_balancer_epoch == desired.source_epoch
+                && stored.report.applied_load_balancer_revision == desired.revision.get()
+                && stored.report.applied_load_balancer_allocation_revision
+                    == desired.allocation_revision.get()
+                && stored.report.load_balancer_last_error.is_none()
+        })
+    })
+}
+
+async fn persist_load_balancer_runtime(
+    state: &ControllerState,
+    runtime: &LoadBalancerRuntime,
+) -> Result<()> {
+    let api = state
+        .load_balancer_store
+        .as_ref()
+        .context("durable LoadBalancer API is unavailable")?;
+    let durable = DurableLoadBalancerState {
+        schema_version: LOAD_BALANCER_STORE_SCHEMA_VERSION,
+        reachability_revision: runtime.reachability_revision,
+        allocation: runtime.allocator.checkpoint(),
+    };
+    let encoded = serde_json::to_string(&durable)
+        .context("encode durable LoadBalancer control-plane state")?;
+    if encoded.len() > LOAD_BALANCER_STORE_DATA_LIMIT {
+        return Err(anyhow!(
+            "durable LoadBalancer state requires {} bytes; ConfigMap limit is {}",
+            encoded.len(),
+            LOAD_BALANCER_STORE_DATA_LIMIT
+        ));
+    }
+    let data = BTreeMap::from([(LOAD_BALANCER_STORE_KEY.to_owned(), encoded)]);
+    let patch = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": LOAD_BALANCER_STORE_NAME,
+            "namespace": "unf-system",
+        },
+        "data": data,
+    });
+    api.patch(
+        LOAD_BALANCER_STORE_NAME,
+        &PatchParams::apply("unf-controller-load-balancer").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch ConfigMap unf-system/{LOAD_BALANCER_STORE_NAME}"))?;
+    Ok(())
+}
+
+async fn patch_load_balancer_finalizer(
+    client: &Client,
+    record: &ServiceRecord,
+    retain: bool,
+) -> Result<()> {
+    let finalizers = reconcile_finalizers(&record.finalizers, retain);
+    let patch = serde_json::json!({
+        "metadata": {
+            "resourceVersion": record.resource_version,
+            "finalizers": finalizers,
+        }
+    });
+    Api::<Service>::namespaced(client.clone(), &record.namespace)
+        .patch(&record.name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .with_context(|| {
+            format!(
+                "{} UNF finalizer on Service {}/{}",
+                if retain { "add" } else { "remove" },
+                record.namespace,
+                record.name
+            )
+        })?;
+    Ok(())
 }
 
 async fn restore_agent_reports(state: &ControllerState) -> Result<()> {
@@ -2492,7 +2960,10 @@ fn apply_service_event(state: &ControllerState, event: Event<Service>) {
                     write_lock(&state.rejected_service_sources).remove(&key);
                     let previous = write_lock(&state.services).insert(key, record.clone());
                     state.metrics.reconciles.inc();
-                    if previous.as_ref() != Some(&record) {
+                    if previous
+                        .as_ref()
+                        .is_none_or(|previous| !service_record_semantics_equal(previous, &record))
+                    {
                         bump_service_and_topology_revision(state);
                     }
                 }
@@ -2524,9 +2995,25 @@ fn apply_service_event(state: &ControllerState, event: Event<Service>) {
     }
 }
 
+fn service_record_semantics_equal(left: &ServiceRecord, right: &ServiceRecord) -> bool {
+    left.namespace == right.namespace
+        && left.name == right.name
+        && left.service_type == right.service_type
+        && left.cluster_ips == right.cluster_ips
+        && left.selector == right.selector
+        && left.ports == right.ports
+        && left.compiler_source == right.compiler_source
+}
+
 fn service_record(service: &Service) -> Result<ServiceRecord> {
     let namespace = service.namespace().unwrap_or_default();
     let name = service.name_any();
+    let uid = service.metadata.uid.clone().unwrap_or_default();
+    let resource_version = service
+        .metadata
+        .resource_version
+        .clone()
+        .unwrap_or_default();
     let spec = service
         .spec
         .as_ref()
@@ -2603,6 +3090,10 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
     Ok(ServiceRecord {
         namespace,
         name,
+        uid,
+        resource_version,
+        finalizers: service.metadata.finalizers.clone().unwrap_or_default(),
+        deleting: service.metadata.deletion_timestamp.is_some(),
         service_type,
         cluster_ips,
         selector: spec
@@ -3608,7 +4099,54 @@ fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
             "service epoch and revision must both be zero or both be nonzero",
         ));
     }
-    validate_service_status_counts(report)
+    validate_service_status_counts(report)?;
+    validate_load_balancer_status(report)
+}
+
+fn validate_load_balancer_status(report: &AgentStateReport) -> Result<(), ApiError> {
+    if report.load_balancer_reachability_schema_version
+        > unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION
+    {
+        return Err(ApiError::bad_request(
+            "reported LoadBalancer reachability schema is newer than the controller",
+        ));
+    }
+    for (epoch, revision) in [
+        (
+            report.desired_load_balancer_epoch,
+            report.desired_load_balancer_revision,
+        ),
+        (
+            report.applied_load_balancer_epoch,
+            report.applied_load_balancer_revision,
+        ),
+    ] {
+        if (epoch == 0) != (revision == 0) {
+            return Err(ApiError::bad_request(
+                "LoadBalancer epoch and revision must both be zero or both be nonzero",
+            ));
+        }
+    }
+    if report.active_load_balancer_bank > 1
+        || (report.applied_load_balancer_revision == 0 && report.load_balancer_frontend_count != 0)
+        || (report.desired_load_balancer_revision == 0
+            && report.desired_load_balancer_allocation_revision != 0)
+        || (report.applied_load_balancer_revision == 0
+            && report.applied_load_balancer_allocation_revision != 0)
+        || (report.load_balancer_last_error.is_some() && report.load_balancer_reconcile_errors == 0)
+        || report.load_balancer_frontend_count
+            > u64::try_from(unf_loadbalancer::LOAD_BALANCER_FRONTEND_BANK_CAPACITY)
+                .expect("LoadBalancer capacity fits u64")
+        || report
+            .load_balancer_last_error
+            .as_ref()
+            .is_some_and(|error| error.is_empty() || error.len() > 1_024)
+    {
+        return Err(ApiError::bad_request(
+            "LoadBalancer host-state status is internally inconsistent",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_service_status_counts(report: &AgentStateReport) -> Result<(), ApiError> {
@@ -3683,6 +4221,7 @@ fn validate_service_dataplane_status(report: &AgentStateReport) -> Result<(), Ap
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn agent_convergence_snapshot(
     state: &ControllerState,
     identity_revision: Revision,
@@ -3712,6 +4251,15 @@ fn agent_convergence_snapshot(
             )
         })
         .unwrap_or_default();
+    let load_balancer_revision = read_lock(&state.compiled_load_balancer_reachability)
+        .as_ref()
+        .map(|snapshot| {
+            (
+                snapshot.source_epoch,
+                snapshot.revision,
+                snapshot.allocation_revision,
+            )
+        });
     let unexpected_agents = reports
         .iter()
         .filter(|(node_name, stored)| {
@@ -3745,6 +4293,7 @@ fn agent_convergence_snapshot(
                         identity_revision,
                         policy_revision,
                         service_revision,
+                        load_balancer_revision,
                         node_block_revisions
                             .get(node_name)
                             .copied()
@@ -3840,12 +4389,14 @@ fn agent_node_matches(node: &TopologyNode, selector: Option<&str>) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn agent_report_matches(
     report: &AgentStateReport,
     expected_epoch: u64,
     identity_revision: Revision,
     policy_revision: Revision,
     service_revision: (u64, Revision, bool),
+    load_balancer_revision: Option<(u64, Revision, Revision)>,
     node_block_revision: Revision,
     remote_route_revision: (u64, Revision),
 ) -> bool {
@@ -3868,6 +4419,17 @@ fn agent_report_matches(
         && report.failed_service_epoch == 0
         && report.failed_service_revision == 0
         && report.service_last_error.is_none()
+        && load_balancer_revision.is_none_or(|(epoch, revision, allocation_revision)| {
+            report.load_balancer_reachability_schema_version
+                >= unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION
+                && report.desired_load_balancer_epoch == epoch
+                && report.applied_load_balancer_epoch == epoch
+                && report.desired_load_balancer_revision == revision.get()
+                && report.applied_load_balancer_revision == revision.get()
+                && report.desired_load_balancer_allocation_revision == allocation_revision.get()
+                && report.applied_load_balancer_allocation_revision == allocation_revision.get()
+                && report.load_balancer_last_error.is_none()
+        })
         && report.desired_node_block_revision == node_block_revision.get()
         && report.applied_node_block_revision == node_block_revision.get()
         && report.desired_remote_route_epoch == remote_route_revision.0
@@ -3959,6 +4521,41 @@ async fn node_port_node_snapshot(
 ) -> Result<Json<NodePortNodeSnapshot>, ApiError> {
     let agent = authenticate_internal_agent(&state, &headers).await?;
     node_port_node_snapshot_for(&state, &agent.node_name).map(Json)
+}
+
+async fn load_balancer_reachability_snapshot(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<NodeReachabilitySnapshot>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    load_balancer_reachability_snapshot_for(&state, &agent.node_name).map(Json)
+}
+
+fn load_balancer_reachability_snapshot_for(
+    state: &ControllerState,
+    node_name: &str,
+) -> Result<NodeReachabilitySnapshot, ApiError> {
+    let node_uid = read_lock(&state.node_port_nodes)
+        .get(node_name)
+        .map(|node| node.node_uid.clone())
+        .ok_or_else(|| {
+            ApiError::service_unavailable(format!(
+                "node {node_name} has no authoritative UID for LoadBalancer reachability"
+            ))
+        })?;
+    read_lock(&state.compiled_load_balancer_reachability)
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "LoadBalancer reachability has no authoritative desired revision",
+            )
+        })?
+        .for_node(node_name, &node_uid)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "project LoadBalancer reachability for node {node_name}: {error}"
+            ))
+        })
 }
 
 fn node_port_node_snapshot_for(
@@ -6950,6 +7547,10 @@ mod tests {
         ServiceRecord {
             namespace: "backend".to_owned(),
             name: "server".to_owned(),
+            uid: "server-uid".to_owned(),
+            resource_version: "1".to_owned(),
+            finalizers: Vec::new(),
+            deleting: false,
             service_type: "ClusterIP".to_owned(),
             cluster_ips: BTreeSet::new(),
             selector: BTreeMap::new(),
@@ -7307,6 +7908,18 @@ mod tests {
             applied_node_port_frontend_count: 0,
             node_port_cluster_frontend_count: 0,
             node_port_local_frontend_count: 0,
+            load_balancer_reachability_schema_version:
+                unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION,
+            desired_load_balancer_epoch: 0,
+            desired_load_balancer_revision: 0,
+            desired_load_balancer_allocation_revision: 0,
+            applied_load_balancer_epoch: 0,
+            applied_load_balancer_revision: 0,
+            applied_load_balancer_allocation_revision: 0,
+            load_balancer_frontend_count: 0,
+            active_load_balancer_bank: 0,
+            load_balancer_reconcile_errors: 0,
+            load_balancer_last_error: None,
             service_reconcile_errors: 0,
             service_last_error: None,
             service_dataplane_events: 0,
@@ -8110,6 +8723,190 @@ mod tests {
         assert!(validate_agent_node_selector("unf.io/pool=qualification").is_ok());
         assert!(validate_agent_node_selector("unf.io/pool=").is_err());
         assert!(validate_agent_node_selector("unf.io/pool = qualification").is_err());
+    }
+
+    #[test]
+    fn load_balancer_reachability_projection_is_node_uid_bound() {
+        let state = new_state(true);
+        let provider = unf_loadbalancer::ReachabilityProviderRef {
+            name: "direct-node".to_owned(),
+            instance: "qualification-a".to_owned(),
+            mode: unf_loadbalancer::ReachabilityMode::DirectNode,
+        };
+        let owner = unf_loadbalancer::LoadBalancerOwner {
+            service_id: ServiceId::new(44),
+            namespace: "apps".to_owned(),
+            name: "api".to_owned(),
+            uid: "api-uid".to_owned(),
+        };
+        let lease = unf_loadbalancer::LoadBalancerLease {
+            owner,
+            pool: "public".to_owned(),
+            pool_uid: "public-uid".to_owned(),
+            provider: provider.clone(),
+            families: vec![AddressFamily::Ipv4, AddressFamily::Ipv6],
+            requested_ips: Vec::new(),
+            addresses: vec!["192.0.2.4".parse().unwrap(), "2001:db8::4".parse().unwrap()],
+            intent_epoch: state.identity_epoch,
+            intent_revision: Revision::new(2),
+            allocation_revision: Revision::new(3),
+        };
+        let desired = unf_loadbalancer::compile_direct_node_reachability(
+            state.identity_epoch,
+            Revision::new(4),
+            Revision::new(3),
+            provider,
+            &[lease],
+            vec![unf_loadbalancer::ReachabilityNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+            }],
+        )
+        .unwrap();
+        write_lock(&state.node_port_nodes).insert(
+            "worker-a".to_owned(),
+            NodePortNodeRecord {
+                node_uid: "worker-a-uid".to_owned(),
+                revision: Revision::new(1),
+                addresses: Vec::new(),
+            },
+        );
+        *write_lock(&state.compiled_load_balancer_reachability) = Some(desired.clone());
+
+        let projected = load_balancer_reachability_snapshot_for(&state, "worker-a").unwrap();
+        assert_eq!(projected.node.name, "worker-a");
+        assert_eq!(projected.node.uid, "worker-a-uid");
+        assert_eq!(projected.targets.len(), 2);
+
+        write_lock(&state.node_port_nodes)
+            .get_mut("worker-a")
+            .unwrap()
+            .node_uid = "replacement-uid".to_owned();
+        assert!(load_balancer_reachability_snapshot_for(&state, "worker-a").is_err());
+        assert!(load_balancer_reachability_snapshot_for(&state, "worker-b").is_err());
+    }
+
+    #[test]
+    fn load_balancer_convergence_is_capability_revision_and_error_exact() {
+        let state = new_state(true);
+        write_lock(&state.node_port_nodes).insert(
+            "worker-a".to_owned(),
+            NodePortNodeRecord {
+                node_uid: "worker-a-uid".to_owned(),
+                revision: Revision::new(1),
+                addresses: Vec::new(),
+            },
+        );
+        let desired = compile_direct_node_reachability(
+            state.identity_epoch,
+            Revision::new(4),
+            Revision::new(3),
+            ReachabilityProviderRef {
+                name: "direct-node".to_owned(),
+                instance: "qualification-a".to_owned(),
+                mode: ReachabilityMode::DirectNode,
+            },
+            &[],
+            vec![ReachabilityNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+            }],
+        )
+        .unwrap();
+        let mut report = converged_agent_report(state.identity_epoch);
+        report.desired_load_balancer_epoch = desired.source_epoch;
+        report.applied_load_balancer_epoch = desired.source_epoch;
+        report.desired_load_balancer_revision = desired.revision.get();
+        report.applied_load_balancer_revision = desired.revision.get();
+        report.desired_load_balancer_allocation_revision = desired.allocation_revision.get();
+        report.applied_load_balancer_allocation_revision = desired.allocation_revision.get();
+        write_lock(&state.agent_reports).insert(
+            "worker-a".to_owned(),
+            StoredAgentReport {
+                report: report.clone(),
+                last_received_unix_ms: unix_time_millis(),
+            },
+        );
+        assert!(load_balancer_agents_converged(&state, &desired));
+
+        report.load_balancer_reachability_schema_version = 0;
+        write_lock(&state.agent_reports)
+            .get_mut("worker-a")
+            .unwrap()
+            .report = report.clone();
+        assert!(!load_balancer_agents_converged(&state, &desired));
+        report.load_balancer_reachability_schema_version =
+            unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION;
+        report.applied_load_balancer_allocation_revision -= 1;
+        write_lock(&state.agent_reports)
+            .get_mut("worker-a")
+            .unwrap()
+            .report = report.clone();
+        assert!(!load_balancer_agents_converged(&state, &desired));
+        report.applied_load_balancer_allocation_revision += 1;
+        report.load_balancer_reconcile_errors = 1;
+        report.load_balancer_last_error = Some("injected failure".to_owned());
+        write_lock(&state.agent_reports)
+            .get_mut("worker-a")
+            .unwrap()
+            .report = report;
+        assert!(!load_balancer_agents_converged(&state, &desired));
+
+        let mut malformed = converged_agent_report(state.identity_epoch);
+        malformed.desired_load_balancer_allocation_revision = 1;
+        assert!(validate_agent_status(&malformed).is_err());
+        malformed.desired_load_balancer_allocation_revision = 0;
+        malformed.load_balancer_last_error = Some("failure without counter".to_owned());
+        assert!(validate_agent_status(&malformed).is_err());
+    }
+
+    #[tokio::test]
+    async fn load_balancer_runtime_requires_an_explicit_stable_pool() {
+        let disabled = Args::try_parse_from(["unf-controller", "--offline"]).unwrap();
+        let disabled_state = new_state(true);
+        configure_load_balancer_runtime(&disabled_state, &disabled)
+            .await
+            .unwrap();
+        assert!(mutex_lock(&disabled_state.load_balancer_runtime).is_none());
+
+        let missing_uid = Args::try_parse_from([
+            "unf-controller",
+            "--offline",
+            "--load-balancer-ipv4-pool",
+            "192.0.2.0/29",
+        ])
+        .unwrap();
+        assert!(
+            configure_load_balancer_runtime(&new_state(true), &missing_uid)
+                .await
+                .is_err()
+        );
+
+        let configured = Args::try_parse_from([
+            "unf-controller",
+            "--offline",
+            "--load-balancer-pool-uid",
+            "qualification-pool-uid",
+            "--load-balancer-ipv4-pool",
+            "192.0.2.0/29",
+            "--load-balancer-ipv6-pool",
+            "2001:db8::/125",
+            "--load-balancer-provider-instance",
+            "qualification-a",
+        ])
+        .unwrap();
+        let state = new_state(true);
+        configure_load_balancer_runtime(&state, &configured)
+            .await
+            .unwrap();
+        let runtime = mutex_lock(&state.load_balancer_runtime)
+            .clone()
+            .expect("an explicit pool enables the runtime");
+        assert_eq!(runtime.pool_name, "public");
+        assert_eq!(runtime.provider.instance, "qualification-a");
+        assert_eq!(runtime.allocator.checkpoint().pools.len(), 1);
+        assert!(runtime.allocator.checkpoint().leases.is_empty());
+        assert_eq!(runtime.reachability_revision, Revision::INITIAL);
     }
 
     #[test]

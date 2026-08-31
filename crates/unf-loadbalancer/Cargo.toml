@@ -10,6 +10,7 @@ repository.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 unf-common = { path = "../unf-common", features = ["serde"] }
+unf-ebpf-common = { path = "../../ebpf/unf-ebpf-common" }
 unf-service = { path = "../unf-service" }
 
 [dev-dependencies]

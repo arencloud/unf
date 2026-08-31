@@ -30,4 +30,8 @@ sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
 
 sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
     --ignored --exact \
+    tests::privileged_load_balancer_bank_activation_rollback_and_recovery_are_exact
+
+sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
+    --ignored --exact \
     tests::privileged_service_packets_translate_dual_stack_and_survive_churn

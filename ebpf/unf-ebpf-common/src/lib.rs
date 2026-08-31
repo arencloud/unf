@@ -20,6 +20,9 @@ pub const SERVICE_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_MAP_ABI_VERSION: u16 = 1;
 pub const NODE_PORT_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_FRONTEND_FLAG_LOCAL: u16 = 1;
+pub const LOAD_BALANCER_MAP_ABI_VERSION: u16 = 1;
+pub const LOAD_BALANCER_BANK_COUNT: u8 = 2;
+pub const LOAD_BALANCER_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG: u32 = 1 << 31;
 pub const NODE_PORT_SNAT_PORT_BASE: u16 = 32_768;
 pub const NODE_PORT_SNAT_PORT_MASK: u32 = 32_767;
@@ -717,6 +720,60 @@ pub struct NodePortMapConfig {
     pub reserved: u32,
 }
 
+/// A VIP frontend key. Its independent bank is selected by
+/// `LOAD_BALANCER_CONFIG`; the value binds it to one active service bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv4LoadBalancerFrontendKey {
+    pub address: [u8; 4],
+    pub port: [u8; 2],
+    pub protocol: u8,
+    pub bank: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv6LoadBalancerFrontendKey {
+    pub address: [u8; 16],
+    pub port: [u8; 2],
+    pub protocol: u8,
+    pub bank: u8,
+}
+
+/// VIP metadata references exact service slots and all three independently
+/// advancing control-plane revisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct LoadBalancerFrontendValue {
+    pub service_id: ServiceId,
+    pub frontend_index: u32,
+    pub backend_count: u32,
+    pub schema_version: u16,
+    pub flags: u16,
+    pub service_revision: u64,
+    pub reachability_revision: u64,
+    pub allocation_revision: u64,
+    pub service_bank: u8,
+    pub reserved: [u8; 7],
+}
+
+/// Atomic pointer for the complete local VIP frontend family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct LoadBalancerMapConfig {
+    pub source_epoch: u64,
+    pub service_revision: u64,
+    pub reachability_revision: u64,
+    pub allocation_revision: u64,
+    pub ipv4_count: u32,
+    pub ipv6_count: u32,
+    pub schema_version: u16,
+    pub active_bank: u8,
+    pub service_bank: u8,
+    pub flags: u8,
+    pub reserved: [u8; 3],
+}
+
 /// Forward or reverse service-flow key. The role disambiguates identical
 /// tuples admitted in opposite translation directions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -806,6 +863,10 @@ const _: () = assert!(core::mem::size_of::<ServiceMapConfig>() == 32);
 const _: () = assert!(core::mem::size_of::<Ipv4NodePortFrontendKey>() == 8);
 const _: () = assert!(core::mem::size_of::<Ipv6NodePortFrontendKey>() == 20);
 const _: () = assert!(core::mem::size_of::<NodePortFrontendValue>() == 32);
+const _: () = assert!(core::mem::size_of::<Ipv4LoadBalancerFrontendKey>() == 8);
+const _: () = assert!(core::mem::size_of::<Ipv6LoadBalancerFrontendKey>() == 20);
+const _: () = assert!(core::mem::size_of::<LoadBalancerFrontendValue>() == 48);
+const _: () = assert!(core::mem::size_of::<LoadBalancerMapConfig>() == 48);
 const _: () = assert!(core::mem::size_of::<NodePortMapConfig>() == 40);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionKey>() == 40);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionValue>() == 88);

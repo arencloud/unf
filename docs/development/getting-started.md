@@ -69,7 +69,7 @@ sudo target/debug/unf-agent \
 ```
 
 TC attachment changes host network state. On Linux 6.6+, the agent leaves its
-per-interface TCX links pinned below `/sys/fs/bpf/unf/v5/links` so a replacement
+per-interface TCX links pinned below `/sys/fs/bpf/unf/v6/links` so a replacement
 can update them atomically. On older kernels it leaves the clsact qdisc and its
 stable legacy filters in place for in-place replacement. Use a disposable
 environment for testing.
@@ -640,6 +640,29 @@ The DaemonSet attaches ingress classification to every non-loopback node interfa
 and discovers newly created pod veths. A packet can therefore produce multiple
 interface-level events. Logical-key aggregation is implemented, but cross-interface
 deduplication and durable history remain later telemetry work.
+
+## Phase 6 LoadBalancer host-state development
+
+The LoadBalancer controller is disabled unless an operator deliberately
+configures a pool. Set the following controller environment variables (or their
+matching command-line flags) in a development overlay:
+
+```text
+UNF_CONTROLLER_LOAD_BALANCER_POOL_UID=<stable-pool-uid>
+UNF_CONTROLLER_LOAD_BALANCER_POOL_NAME=public
+UNF_CONTROLLER_LOAD_BALANCER_IPV4_POOL=<development-ipv4-prefix>
+UNF_CONTROLLER_LOAD_BALANCER_IPV6_POOL=<development-ipv6-prefix>
+UNF_CONTROLLER_LOAD_BALANCER_PROVIDER_INSTANCE=<stable-provider-instance>
+```
+
+At least one family prefix and the stable UID are required. The prefixes must
+be disjoint from every other configured pool and externally routed to the
+selected Nodes by the qualification environment. UNF persists allocation state
+in `unf-system/unf-load-balancer-control-plane`; changing the configured pool
+under an existing store is rejected rather than adopted. Phase 6.4 activates
+and recovers the Node-local VIP maps, but does not yet consume them in TC or
+publish `status.loadBalancer.ingress`. Use `make loadbalancer-host-state-test`
+before beginning the 6.5 packet-path work.
 
 ## Fedora, RHEL, and OpenShift
 

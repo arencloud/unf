@@ -50,6 +50,11 @@ use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
     NodeBlockSnapshot,
 };
+use unf_loadbalancer::{
+    LOAD_BALANCER_FRONTEND_BANK_CAPACITY, LoadBalancerDataplaneState,
+    NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION, NodeReachabilityCheckpoint,
+    NodeReachabilitySnapshot, compile_load_balancer_dataplane,
+};
 use unf_route::{
     NativeIpv4NextHop, NativeIpv6NextHop, NativeRemoteNode, NativeRemoteRoutePlan,
     NativeRemoteRoutingProvider, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION, RemoteRouteSnapshot,
@@ -79,13 +84,15 @@ use cni_server::CniTransactionServer;
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v5";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v6";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
 const DEFAULT_CNI_NODE_BLOCK_STATE_PATH: &str = "/var/lib/unf/cni/v1/node-block.json";
 const DEFAULT_CNI_REMOTE_ROUTE_STATE_PATH: &str = "/var/lib/unf/cni/v1/remote-routes.json";
 const DEFAULT_SERVICE_STATE_PATH: &str = "/var/lib/unf/cni/v1/service-snapshot.json";
+const DEFAULT_LOAD_BALANCER_REACHABILITY_STATE_PATH: &str =
+    "/var/lib/unf/cni/v1/load-balancer-reachability.json";
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -147,7 +154,7 @@ const ABI_V4_MAP_NAMES: [&str; 18] = [
     "SERVICE_CONFIG",
     "SERVICE_CONNECTIONS",
 ];
-const PERSISTENT_MAP_NAMES: [&str; 21] = [
+const ABI_V5_MAP_NAMES: [&str; 21] = [
     "IDENTITY_V4",
     "IDENTITY_V4_B",
     "IDENTITY_V6",
@@ -169,6 +176,32 @@ const PERSISTENT_MAP_NAMES: [&str; 21] = [
     "NODE_PORT_FRONTENDS_V4",
     "NODE_PORT_FRONTENDS_V6",
     "NODE_PORT_CONFIG",
+];
+const PERSISTENT_MAP_NAMES: [&str; 24] = [
+    "IDENTITY_V4",
+    "IDENTITY_V4_B",
+    "IDENTITY_V6",
+    "IDENTITY_V6_B",
+    "IDENTITY_CONFIG",
+    "POLICY_RULES",
+    "POLICY_IPV4",
+    "POLICY_IPV6",
+    "EGRESS_IPV4",
+    "EGRESS_IPV6",
+    "POLICY_CONFIG",
+    "SERVICE_FRONTENDS_V4",
+    "SERVICE_FRONTENDS_V6",
+    "SERVICE_BACKENDS_V4",
+    "SERVICE_BACKENDS_V6",
+    "SERVICE_BACKEND_SLOTS",
+    "SERVICE_CONFIG",
+    "SERVICE_CONNECTIONS",
+    "NODE_PORT_FRONTENDS_V4",
+    "NODE_PORT_FRONTENDS_V6",
+    "NODE_PORT_CONFIG",
+    "LOAD_BALANCER_FRONTENDS_V4",
+    "LOAD_BALANCER_FRONTENDS_V6",
+    "LOAD_BALANCER_CONFIG",
 ];
 const IDENTITY_MAP_CAPACITY: u32 = 65_536;
 const POLICY_MAP_CAPACITY: u32 = 262_144;
@@ -219,6 +252,13 @@ struct Args {
         default_value = DEFAULT_SERVICE_STATE_PATH
     )]
     service_state_path: PathBuf,
+    /// Durable owner-only last-known-good `LoadBalancer` reachability state.
+    #[arg(
+        long,
+        env = "UNF_LOAD_BALANCER_REACHABILITY_STATE_PATH",
+        default_value = DEFAULT_LOAD_BALANCER_REACHABILITY_STATE_PATH
+    )]
+    load_balancer_reachability_state_path: PathBuf,
     #[arg(long, env = "UNF_NODE_NAME", default_value = "unknown")]
     node_name: String,
     #[arg(long, env = "UNF_POD_NAME", default_value = "unknown")]
@@ -520,6 +560,16 @@ struct AgentState {
     applied_node_port_frontend_count: AtomicU64,
     node_port_cluster_frontend_count: AtomicU64,
     node_port_local_frontend_count: AtomicU64,
+    desired_load_balancer_epoch: AtomicU64,
+    desired_load_balancer_revision: AtomicU64,
+    desired_load_balancer_allocation_revision: AtomicU64,
+    applied_load_balancer_epoch: AtomicU64,
+    applied_load_balancer_revision: AtomicU64,
+    applied_load_balancer_allocation_revision: AtomicU64,
+    load_balancer_frontend_count: AtomicU64,
+    active_load_balancer_bank: AtomicU64,
+    load_balancer_reconcile_errors: AtomicU64,
+    load_balancer_last_error: Mutex<Option<String>>,
     service_reconcile_errors: AtomicU64,
     service_last_error: Mutex<Option<String>>,
     service_dataplane_events: AtomicU64,
@@ -599,18 +649,26 @@ struct ServiceSynchronizer {
     node_port_ipv4_frontends: AyaHashMap<MapData, [u8; 8], [u8; 32]>,
     node_port_ipv6_frontends: AyaHashMap<MapData, [u8; 20], [u8; 32]>,
     node_port_config: AyaArray<MapData, [u8; 40]>,
+    load_balancer_ipv4_frontends: AyaHashMap<MapData, [u8; 8], [u8; 48]>,
+    load_balancer_ipv6_frontends: AyaHashMap<MapData, [u8; 20], [u8; 48]>,
+    load_balancer_config: AyaArray<MapData, [u8; 48]>,
     banks: [Option<ServiceDataplaneState>; SERVICE_BANK_COUNT as usize],
     node_port_banks:
         [Option<NodePortDataplaneState>; unf_ebpf_common::NODE_PORT_BANK_COUNT as usize],
+    load_balancer_banks:
+        [Option<LoadBalancerDataplaneState>; unf_ebpf_common::LOAD_BALANCER_BANK_COUNT as usize],
     active_bank: u8,
     active_node_port_bank: u8,
+    active_load_balancer_bank: u8,
     applied: Option<ServiceSnapshot>,
     applied_node_port_node: Option<NodePortNodeSnapshot>,
+    applied_load_balancer_reachability: Option<NodeReachabilitySnapshot>,
     node_name: String,
     controller_url: Option<String>,
     client: ReloadingControllerClient,
     agent_token_path: PathBuf,
     state_path: PathBuf,
+    load_balancer_state_path: PathBuf,
     interval: Duration,
 }
 
@@ -660,6 +718,9 @@ type ServiceMaps = (
     AyaHashMap<MapData, [u8; 8], [u8; 32]>,
     AyaHashMap<MapData, [u8; 20], [u8; 32]>,
     AyaArray<MapData, [u8; 40]>,
+    AyaHashMap<MapData, [u8; 8], [u8; 48]>,
+    AyaHashMap<MapData, [u8; 20], [u8; 48]>,
+    AyaArray<MapData, [u8; 48]>,
 );
 type RecoveredServiceConfig = (u64, u64, u32, u32, u32, u8);
 type RecoveredNodePortConfig = (u64, u64, u64, u32, u32, u8);
@@ -675,6 +736,7 @@ struct DataplaneConfig {
     identity_sync_interval: Duration,
     service_sync_interval: Duration,
     service_state_path: PathBuf,
+    load_balancer_reachability_state_path: PathBuf,
     node_name: String,
     agent_token_path: PathBuf,
     flow_export_interval: Duration,
@@ -915,6 +977,8 @@ async fn main() -> Result<()> {
             let identity_sync_interval = Duration::from_secs(args.identity_sync_seconds.max(1));
             let service_sync_interval = Duration::from_secs(args.service_sync_seconds.max(1));
             let service_state_path = args.service_state_path.clone();
+            let load_balancer_reachability_state_path =
+                args.load_balancer_reachability_state_path.clone();
             let node_name = args.node_name.clone();
             let agent_token_path = args.agent_token_path.clone();
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
@@ -932,6 +996,7 @@ async fn main() -> Result<()> {
                     identity_sync_interval,
                     service_sync_interval,
                     service_state_path,
+                    load_balancer_reachability_state_path,
                     node_name,
                     agent_token_path,
                     flow_export_interval,
@@ -1845,7 +1910,184 @@ fn spawn_control_plane_tasks(
     if service_dataplane {
         Ok(())
     } else {
+        spawn_load_balancer_reachability_reconciler(args, state, cancellation, tasks)?;
         spawn_service_snapshot_reconciler(args, state, cancellation, tasks)
+    }
+}
+
+fn spawn_load_balancer_reachability_reconciler(
+    args: &Args,
+    state: &Arc<AgentState>,
+    cancellation: &CancellationToken,
+    tasks: &mut JoinSet<()>,
+) -> Result<()> {
+    let Some(controller_url) = args.controller_url.as_deref() else {
+        return Ok(());
+    };
+    let controller_url = controller_url.trim_end_matches('/').to_owned();
+    let client =
+        dataplane_controller_client(Some(&controller_url), &args.controller_ca_path, state)?;
+    let token_path = args.agent_token_path.clone();
+    let state_path = args.load_balancer_reachability_state_path.clone();
+    let node_name = args.node_name.clone();
+    let interval = Duration::from_secs(args.service_sync_seconds.max(1));
+    let task_cancellation = cancellation.clone();
+    tasks.spawn(async move {
+        reconcile_load_balancer_reachability(
+            controller_url,
+            client,
+            token_path,
+            state_path,
+            node_name,
+            interval,
+            task_cancellation,
+        )
+        .await;
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_load_balancer_reachability(
+    controller_url: String,
+    client: ReloadingControllerClient,
+    token_path: PathBuf,
+    state_path: PathBuf,
+    node_name: String,
+    interval_duration: Duration,
+    cancellation: CancellationToken,
+) {
+    let mut applied = match load_optional_load_balancer_reachability(&state_path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warn!(%error, path = %state_path.display(), "rejected durable LoadBalancer reachability state");
+            None
+        }
+    };
+    if let Some(snapshot) = &applied {
+        info!(
+            epoch = snapshot.source_epoch,
+            revision = snapshot.revision.get(),
+            targets = snapshot.targets.len(),
+            path = %state_path.display(),
+            "restored last-known-good LoadBalancer reachability state"
+        );
+    }
+    let mut interval = tokio::time::interval(interval_duration);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            _ = interval.tick() => {
+                let result = async {
+                    let compatibility = fetch_controller_compatibility(
+                        &client,
+                        &controller_url,
+                        &token_path,
+                    ).await?;
+                    if compatibility.load_balancer_reachability_schema_version == 0 {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    ensure_controller_compatibility(&compatibility)?;
+                    let candidate = fetch_load_balancer_reachability(
+                        &controller_url,
+                        &client,
+                        &token_path,
+                    ).await?;
+                    if candidate.node.name != node_name {
+                        bail!(
+                            "controller projected LoadBalancer state for node {:?}; expected {:?}",
+                            candidate.node.name,
+                            node_name
+                        );
+                    }
+                    if !candidate.validate_transition(applied.as_ref())? {
+                        return Ok(());
+                    }
+                    let checkpoint = NodeReachabilityCheckpoint {
+                        schema_version: NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION,
+                        applied: candidate.clone(),
+                    };
+                    persist_secure_json(
+                        &state_path,
+                        &checkpoint,
+                        "LoadBalancer reachability",
+                    )?;
+                    info!(
+                        epoch = candidate.source_epoch,
+                        revision = candidate.revision.get(),
+                        targets = candidate.targets.len(),
+                        "persisted LoadBalancer reachability intent pending host adoption"
+                    );
+                    applied = Some(candidate);
+                    Ok(())
+                }.await;
+                if let Err(error) = result {
+                    warn!(%error, "LoadBalancer reachability sync failed; retaining last-known-good state");
+                }
+            }
+        }
+    }
+}
+
+async fn fetch_controller_compatibility(
+    client: &ReloadingControllerClient,
+    controller_url: &str,
+    token_path: &Path,
+) -> Result<ComponentCompatibility> {
+    authenticated_get(
+        client,
+        format!(
+            "{controller_url}/v1/version?serviceSnapshotSchemaVersion={SERVICE_SNAPSHOT_SCHEMA_VERSION}"
+        ),
+        token_path,
+    )?
+    .send()
+    .await
+    .context("request controller LoadBalancer compatibility")?
+    .error_for_status()
+    .context("controller rejected LoadBalancer compatibility request")?
+    .json()
+    .await
+    .context("decode controller LoadBalancer compatibility")
+}
+
+async fn fetch_load_balancer_reachability(
+    controller_url: &str,
+    client: &ReloadingControllerClient,
+    token_path: &Path,
+) -> Result<NodeReachabilitySnapshot> {
+    authenticated_get(
+        client,
+        format!("{controller_url}/v1/state/load-balancer-reachability"),
+        token_path,
+    )?
+    .send()
+    .await
+    .context("request controller LoadBalancer reachability")?
+    .error_for_status()
+    .context("controller rejected LoadBalancer reachability request")?
+    .json()
+    .await
+    .context("decode controller LoadBalancer reachability")
+}
+
+fn load_optional_load_balancer_reachability(
+    path: &Path,
+) -> Result<Option<NodeReachabilitySnapshot>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "inspect durable LoadBalancer reachability {}",
+                path.display()
+            )
+        }),
+        Ok(_) => {
+            let checkpoint: NodeReachabilityCheckpoint =
+                load_secure_json(path, "LoadBalancer reachability")?;
+            Ok(Some(checkpoint.validate()?.applied))
+        }
     }
 }
 
@@ -2362,11 +2604,274 @@ async fn synchronize_services(
     )
 }
 
+async fn synchronize_load_balancer_maps(
+    synchronizer: &mut ServiceSynchronizer,
+    state: &AgentState,
+) -> Result<()> {
+    let services = synchronizer
+        .applied
+        .as_ref()
+        .context("LoadBalancer synchronization requires active service state")?;
+    let has_load_balancer = services
+        .services
+        .iter()
+        .any(|service| service.load_balancer.is_some());
+    if !has_load_balancer && synchronizer.applied_load_balancer_reachability.is_none() {
+        return Ok(());
+    }
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("LoadBalancer synchronization requires a controller URL")?;
+    let candidate = fetch_load_balancer_reachability(
+        controller_url,
+        &synchronizer.client,
+        &synchronizer.agent_token_path,
+    )
+    .await?
+    .validate()?;
+    if candidate.node.name != synchronizer.node_name {
+        bail!(
+            "controller returned LoadBalancer state for Node {}; authenticated agent owns {}",
+            candidate.node.name,
+            synchronizer.node_name
+        );
+    }
+    publish_desired_load_balancer(state, &candidate);
+    let reachability_changed =
+        candidate.validate_transition(synchronizer.applied_load_balancer_reachability.as_ref())?;
+    let active = synchronizer.load_balancer_banks
+        [usize::from(synchronizer.active_load_balancer_bank)]
+    .as_ref();
+    let linkage_changed = active.is_none_or(|active| {
+        active.service_revision != services.revision
+            || active.service_bank != synchronizer.active_bank
+    });
+    if !reachability_changed && !linkage_changed {
+        return Ok(());
+    }
+    activate_load_balancer_snapshot(synchronizer, &candidate, state)
+}
+
+fn activate_load_balancer_snapshot(
+    synchronizer: &mut ServiceSynchronizer,
+    candidate: &NodeReachabilitySnapshot,
+    state: &AgentState,
+) -> Result<()> {
+    let services = synchronizer
+        .applied
+        .as_ref()
+        .context("LoadBalancer activation requires active service state")?
+        .clone();
+    let bank = 1_u8.saturating_sub(synchronizer.active_load_balancer_bank);
+    let desired =
+        compile_load_balancer_dataplane(&services, candidate, synchronizer.active_bank, bank)?;
+    let desired_index = usize::from(bank);
+    let previous_stage = synchronizer.load_balancer_banks[desired_index]
+        .clone()
+        .unwrap_or_else(|| empty_load_balancer_bank(&desired));
+    stage_load_balancer_bank(synchronizer, &previous_stage, &desired)?;
+
+    let pending = service_pending_state_path(&synchronizer.load_balancer_state_path)?;
+    if let Err(error) = discard_service_pending_state(&synchronizer.load_balancer_state_path)
+        .and_then(|()| {
+            persist_secure_json(
+                &pending,
+                &NodeReachabilityCheckpoint {
+                    schema_version: NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION,
+                    applied: candidate.clone(),
+                },
+                "pending LoadBalancer reachability",
+            )
+        })
+    {
+        let rollback = restore_load_balancer_bank(synchronizer, &previous_stage);
+        bail!("prepare LoadBalancer checkpoint failed: {error:#}; staging rollback: {rollback:?}");
+    }
+
+    let previous_config = synchronizer
+        .load_balancer_config
+        .get(&0, 0)
+        .context("read active LoadBalancer config")?;
+    let previous_checkpoint = synchronizer.applied_load_balancer_reachability.clone();
+    let transaction = synchronizer
+        .load_balancer_config
+        .set(0, desired.config, 0)
+        .context("atomically activate LoadBalancer bank")
+        .and_then(|()| {
+            commit_prepared_service_snapshot(&synchronizer.load_balancer_state_path, &pending)
+                .context("commit active LoadBalancer checkpoint")
+        });
+    if let Err(error) = transaction {
+        let config_rollback = synchronizer.load_balancer_config.set(0, previous_config, 0);
+        let stage_rollback = restore_load_balancer_bank(synchronizer, &previous_stage);
+        let checkpoint_rollback = restore_load_balancer_checkpoint(
+            &synchronizer.load_balancer_state_path,
+            previous_checkpoint.as_ref(),
+        );
+        let pending_cleanup = discard_service_pending_state(&synchronizer.load_balancer_state_path);
+        bail!(
+            "LoadBalancer transaction failed: {error:#}; config rollback: {config_rollback:?}; staging rollback: {stage_rollback:?}; checkpoint rollback: {checkpoint_rollback:?}; pending cleanup: {pending_cleanup:?}"
+        );
+    }
+
+    let previous_active = synchronizer.active_load_balancer_bank;
+    synchronizer.load_balancer_banks[desired_index] = Some(desired);
+    synchronizer.active_load_balancer_bank = bank;
+    synchronizer.applied_load_balancer_reachability = Some(candidate.clone());
+    publish_applied_load_balancer(
+        state,
+        candidate,
+        synchronizer.load_balancer_banks[desired_index]
+            .as_ref()
+            .expect("activated LoadBalancer bank is retained"),
+    );
+    if previous_active != bank {
+        let previous_index = usize::from(previous_active);
+        if let Some(old) = synchronizer.load_balancer_banks[previous_index].clone() {
+            match clear_load_balancer_bank(synchronizer, &old) {
+                Ok(()) => synchronizer.load_balancer_banks[previous_index] = None,
+                Err(error) => warn!(
+                    %error,
+                    bank = previous_active,
+                    "could not garbage-collect old LoadBalancer bank; retained for retry"
+                ),
+            }
+        }
+    }
+    info!(
+        service_revision = services.revision.get(),
+        reachability_revision = candidate.revision.get(),
+        allocation_revision = candidate.allocation_revision.get(),
+        active_bank = bank,
+        targets = candidate.targets.len(),
+        "LoadBalancer host state activated in persistent BPF maps"
+    );
+    Ok(())
+}
+
+fn publish_desired_load_balancer(state: &AgentState, snapshot: &NodeReachabilitySnapshot) {
+    state
+        .desired_load_balancer_epoch
+        .store(snapshot.source_epoch, Ordering::Release);
+    state
+        .desired_load_balancer_revision
+        .store(snapshot.revision.get(), Ordering::Release);
+    state
+        .desired_load_balancer_allocation_revision
+        .store(snapshot.allocation_revision.get(), Ordering::Release);
+}
+
+fn publish_applied_load_balancer(
+    state: &AgentState,
+    snapshot: &NodeReachabilitySnapshot,
+    dataplane: &LoadBalancerDataplaneState,
+) {
+    state
+        .applied_load_balancer_epoch
+        .store(snapshot.source_epoch, Ordering::Release);
+    state
+        .applied_load_balancer_revision
+        .store(snapshot.revision.get(), Ordering::Release);
+    state
+        .applied_load_balancer_allocation_revision
+        .store(snapshot.allocation_revision.get(), Ordering::Release);
+    state.load_balancer_frontend_count.store(
+        (dataplane.ipv4_frontends.len() + dataplane.ipv6_frontends.len()) as u64,
+        Ordering::Release,
+    );
+    state
+        .active_load_balancer_bank
+        .store(u64::from(dataplane.bank), Ordering::Release);
+    *mutex_lock(&state.load_balancer_last_error) = None;
+}
+
+fn record_load_balancer_error(state: &AgentState, error: &anyhow::Error) {
+    state
+        .load_balancer_reconcile_errors
+        .fetch_add(1, Ordering::AcqRel);
+    let mut message = error.to_string();
+    if message.len() > MAX_SERVICE_ERROR_BYTES {
+        let boundary = message
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= MAX_SERVICE_ERROR_BYTES)
+            .last()
+            .unwrap_or(0);
+        message.truncate(boundary);
+    }
+    *mutex_lock(&state.load_balancer_last_error) = Some(message);
+}
+
+fn empty_load_balancer_bank(desired: &LoadBalancerDataplaneState) -> LoadBalancerDataplaneState {
+    let mut empty = desired.clone();
+    empty.ipv4_frontends.clear();
+    empty.ipv6_frontends.clear();
+    empty.config = [0; 48];
+    empty
+}
+
+fn restore_load_balancer_checkpoint(
+    path: &Path,
+    previous: Option<&NodeReachabilitySnapshot>,
+) -> Result<()> {
+    if let Some(previous) = previous {
+        return persist_secure_json(
+            path,
+            &NodeReachabilityCheckpoint {
+                schema_version: NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION,
+                applied: previous.clone(),
+            },
+            "LoadBalancer reachability rollback",
+        );
+    }
+    restore_service_checkpoint(path, None)
+}
+
 fn service_has_node_ports(snapshot: &ServiceSnapshot) -> bool {
     snapshot
         .services
         .iter()
         .any(|service| !service.node_ports.is_empty())
+}
+
+fn service_host_projection(snapshot: &ServiceSnapshot) -> Result<ServiceSnapshot> {
+    if snapshot
+        .services
+        .iter()
+        .any(|service| service.load_balancer.is_some())
+    {
+        snapshot
+            .clone()
+            .node_port_v2_projection()
+            .map_err(Into::into)
+    } else {
+        Ok(snapshot.clone())
+    }
+}
+
+fn compile_service_host_dataplane(
+    snapshot: &ServiceSnapshot,
+    bank: u8,
+) -> Result<ServiceDataplaneState> {
+    Ok(compile_service_dataplane(
+        &service_host_projection(snapshot)?,
+        bank,
+    )?)
+}
+
+fn compile_node_port_host_fabric(
+    snapshot: &ServiceSnapshot,
+    node: &NodePortNodeSnapshot,
+    service_bank: u8,
+    node_port_bank: u8,
+) -> Result<unf_service::NodePortFabricDataplaneState> {
+    Ok(compile_node_port_fabric_dataplane(
+        &service_host_projection(snapshot)?,
+        node,
+        service_bank,
+        node_port_bank,
+    )?)
 }
 
 fn validate_node_port_node_transition(
@@ -2438,16 +2943,21 @@ fn activate_service_snapshot(
         synchronizer.active_node_port_bank
     };
 
+    let host_candidate = service_host_projection(&candidate)?;
     let (desired_service, desired_node_port) = if let Some(node) = &node_port_node {
-        let desired =
-            compile_node_port_fabric_dataplane(&candidate, node, service_bank, node_port_bank)?;
+        let desired = compile_node_port_fabric_dataplane(
+            &host_candidate,
+            node,
+            service_bank,
+            node_port_bank,
+        )?;
         (
             service_changed.then_some(desired.service),
             Some(desired.node_port),
         )
     } else {
         let desired_service = service_changed
-            .then(|| compile_service_dataplane(&candidate, service_bank))
+            .then(|| compile_service_dataplane(&host_candidate, service_bank))
             .transpose()?;
         let desired_node_port = node_port_must_change.then(|| empty_node_port_bank(node_port_bank));
         (desired_service, desired_node_port)
@@ -2739,6 +3249,49 @@ fn stage_node_port_bank(
     Ok(())
 }
 
+fn stage_load_balancer_bank(
+    synchronizer: &mut ServiceSynchronizer,
+    previous: &LoadBalancerDataplaneState,
+    desired: &LoadBalancerDataplaneState,
+) -> Result<()> {
+    if let Err(error) = replace_encoded_entries(
+        &mut synchronizer.load_balancer_ipv4_frontends,
+        &previous.ipv4_frontends,
+        &desired.ipv4_frontends,
+    )
+    .context("stage IPv4 LoadBalancer frontends")
+    .and_then(|()| {
+        replace_encoded_entries(
+            &mut synchronizer.load_balancer_ipv6_frontends,
+            &previous.ipv6_frontends,
+            &desired.ipv6_frontends,
+        )
+        .context("stage IPv6 LoadBalancer frontends")
+    })
+    .and_then(|()| {
+        validate_encoded_entries(
+            &synchronizer.load_balancer_ipv4_frontends,
+            &desired.ipv4_frontends,
+            "IPv4 LoadBalancer frontend",
+        )
+    })
+    .and_then(|()| {
+        validate_encoded_entries(
+            &synchronizer.load_balancer_ipv6_frontends,
+            &desired.ipv6_frontends,
+            "IPv6 LoadBalancer frontend",
+        )
+    }) {
+        return match restore_load_balancer_bank(synchronizer, previous) {
+            Ok(()) => Err(error.context("LoadBalancer staging bank rolled back")),
+            Err(rollback) => Err(anyhow!(
+                "LoadBalancer staging failed: {error:#}; rollback failed: {rollback:#}"
+            )),
+        };
+    }
+    Ok(())
+}
+
 fn replace_encoded_entries<const K: usize, const V: usize>(
     map: &mut AyaHashMap<MapData, [u8; K], [u8; V]>,
     current: &BTreeMap<[u8; K], [u8; V]>,
@@ -2865,6 +3418,42 @@ fn restore_node_port_bank(
     } else {
         bail!("restore NodePort bank failed: {failures:?}")
     }
+}
+
+fn restore_load_balancer_bank(
+    synchronizer: &mut ServiceSynchronizer,
+    previous: &LoadBalancerDataplaneState,
+) -> Result<()> {
+    let results = [
+        restore_encoded_bank(
+            &mut synchronizer.load_balancer_ipv4_frontends,
+            &previous.ipv4_frontends,
+            previous.bank,
+            7,
+        ),
+        restore_encoded_bank(
+            &mut synchronizer.load_balancer_ipv6_frontends,
+            &previous.ipv6_frontends,
+            previous.bank,
+            19,
+        ),
+    ];
+    let failures = results
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("restore LoadBalancer bank failed: {failures:?}")
+    }
+}
+
+fn clear_load_balancer_bank(
+    synchronizer: &mut ServiceSynchronizer,
+    previous: &LoadBalancerDataplaneState,
+) -> Result<()> {
+    restore_load_balancer_bank(synchronizer, &empty_load_balancer_bank(previous))
 }
 
 fn rollback_service_stages(
@@ -3178,6 +3767,7 @@ fn plan_abi_cleanup(
         2 => &ABI_V2_MAP_NAMES,
         3 => &ABI_V3_MAP_NAMES,
         4 => &ABI_V4_MAP_NAMES,
+        5 => &ABI_V5_MAP_NAMES,
         _ => &PERSISTENT_MAP_NAMES,
     };
     let mut unknown = Vec::new();
@@ -3434,6 +4024,16 @@ fn new_state(
         applied_node_port_frontend_count: AtomicU64::new(0),
         node_port_cluster_frontend_count: AtomicU64::new(0),
         node_port_local_frontend_count: AtomicU64::new(0),
+        desired_load_balancer_epoch: AtomicU64::new(0),
+        desired_load_balancer_revision: AtomicU64::new(0),
+        desired_load_balancer_allocation_revision: AtomicU64::new(0),
+        applied_load_balancer_epoch: AtomicU64::new(0),
+        applied_load_balancer_revision: AtomicU64::new(0),
+        applied_load_balancer_allocation_revision: AtomicU64::new(0),
+        load_balancer_frontend_count: AtomicU64::new(0),
+        active_load_balancer_bank: AtomicU64::new(0),
+        load_balancer_reconcile_errors: AtomicU64::new(0),
+        load_balancer_last_error: Mutex::new(None),
         service_reconcile_errors: AtomicU64::new(0),
         service_last_error: Mutex::new(None),
         service_dataplane_events: AtomicU64::new(0),
@@ -3788,6 +4388,7 @@ async fn run_dataplane(
         config.identity_sync_interval,
         config.service_sync_interval,
         config.service_state_path.clone(),
+        config.load_balancer_reachability_state_path.clone(),
         config.node_name.clone(),
     );
     let recovered =
@@ -3970,6 +4571,7 @@ fn new_synchronizers(
     interval: Duration,
     service_interval: Duration,
     service_state_path: PathBuf,
+    load_balancer_state_path: PathBuf,
     node_name: String,
 ) -> (
     IdentitySynchronizer,
@@ -3990,6 +4592,9 @@ fn new_synchronizers(
         node_port_ipv4_frontends,
         node_port_ipv6_frontends,
         node_port_config,
+        load_balancer_ipv4_frontends,
+        load_balancer_ipv6_frontends,
+        load_balancer_config,
     ) = service_maps;
     (
         IdentitySynchronizer {
@@ -4036,17 +4641,24 @@ fn new_synchronizers(
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
+            load_balancer_ipv4_frontends,
+            load_balancer_ipv6_frontends,
+            load_balancer_config,
             banks: [None, None],
             node_port_banks: [None, None],
+            load_balancer_banks: [None, None],
             active_bank: 0,
             active_node_port_bank: 0,
+            active_load_balancer_bank: 0,
             applied: None,
             applied_node_port_node: None,
+            applied_load_balancer_reachability: None,
             node_name,
             controller_url,
             client,
             agent_token_path,
             state_path: service_state_path,
+            load_balancer_state_path,
             interval: service_interval,
         },
     )
@@ -4333,6 +4945,15 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
             controller.service_snapshot_schema_version, local.service_snapshot_schema_version
         ));
     }
+    if controller.load_balancer_reachability_schema_version
+        > local.load_balancer_reachability_schema_version
+    {
+        mismatches.push(format!(
+            "LoadBalancer reachability schema controller={} agent={}",
+            controller.load_balancer_reachability_schema_version,
+            local.load_balancer_reachability_schema_version
+        ));
+    }
     if controller.component != "unf-controller" {
         bail!(
             "incompatible controller compatibility response: component={}; expected unf-controller",
@@ -4486,6 +5107,23 @@ fn recover_persistent_dataplane(
         SERVICE_FRONTEND_MAP_CAPACITY,
     )?;
     validate_map_capacity("NODE_PORT_CONFIG", services.node_port_config.map(), 1)?;
+    validate_map_capacity(
+        "LOAD_BALANCER_FRONTENDS_V4",
+        services.load_balancer_ipv4_frontends.map(),
+        u32::try_from(LOAD_BALANCER_FRONTEND_BANK_CAPACITY)
+            .expect("LoadBalancer map capacity fits u32"),
+    )?;
+    validate_map_capacity(
+        "LOAD_BALANCER_FRONTENDS_V6",
+        services.load_balancer_ipv6_frontends.map(),
+        u32::try_from(LOAD_BALANCER_FRONTEND_BANK_CAPACITY)
+            .expect("LoadBalancer map capacity fits u32"),
+    )?;
+    validate_map_capacity(
+        "LOAD_BALANCER_CONFIG",
+        services.load_balancer_config.map(),
+        1,
+    )?;
 
     recover_identity_entries(identities)?;
     let identity_config = identities
@@ -4530,6 +5168,7 @@ fn recover_persistent_dataplane(
         (None, None)
     };
     let (service_epoch, service_revision) = recover_service_state(services)?;
+    recover_load_balancer_state(services)?;
 
     if pins_existed {
         info!(
@@ -4759,6 +5398,220 @@ fn empty_node_port_bank(bank: u8) -> NodePortDataplaneState {
     }
 }
 
+fn empty_recovered_load_balancer_bank(bank: u8) -> LoadBalancerDataplaneState {
+    LoadBalancerDataplaneState {
+        source_epoch: 0,
+        service_revision: Revision::INITIAL,
+        reachability_revision: Revision::INITIAL,
+        allocation_revision: Revision::INITIAL,
+        service_bank: 0,
+        bank,
+        ipv4_frontends: BTreeMap::new(),
+        ipv6_frontends: BTreeMap::new(),
+        config: [0; 48],
+    }
+}
+
+type RecoveredLoadBalancerConfig = (u64, u64, u64, u64, u32, u32, u8, u8);
+
+#[allow(clippy::too_many_lines)]
+fn recover_load_balancer_state(services: &mut ServiceSynchronizer) -> Result<()> {
+    let mut banks = [
+        empty_recovered_load_balancer_bank(0),
+        empty_recovered_load_balancer_bank(1),
+    ];
+    for entry in &services.load_balancer_ipv4_frontends {
+        let (key, value) = entry.context("iterate persistent IPv4 LoadBalancer frontends")?;
+        let bank = load_balancer_bank(key[7])?;
+        validate_load_balancer_frontend_entry(&key, &value, 7)?;
+        banks[bank].ipv4_frontends.insert(key, value);
+    }
+    for entry in &services.load_balancer_ipv6_frontends {
+        let (key, value) = entry.context("iterate persistent IPv6 LoadBalancer frontends")?;
+        let bank = load_balancer_bank(key[19])?;
+        validate_load_balancer_frontend_entry(&key, &value, 19)?;
+        banks[bank].ipv6_frontends.insert(key, value);
+    }
+    for bank in &banks {
+        let count = bank
+            .ipv4_frontends
+            .len()
+            .saturating_add(bank.ipv6_frontends.len());
+        if count > LOAD_BALANCER_FRONTEND_BANK_CAPACITY {
+            bail!(
+                "persistent LoadBalancer bank {} has {count} frontends; limit is {LOAD_BALANCER_FRONTEND_BANK_CAPACITY}",
+                bank.bank
+            );
+        }
+    }
+    let config = services
+        .load_balancer_config
+        .get(&0, 0)
+        .context("read persistent LoadBalancer config")?;
+    let decoded = decode_recovered_load_balancer_config(config)?;
+    let pending_path = service_pending_state_path(&services.load_balancer_state_path)?;
+    let Some((
+        epoch,
+        service_revision,
+        reachability_revision,
+        allocation_revision,
+        ipv4_count,
+        ipv6_count,
+        bank,
+        service_bank,
+    )) = decoded
+    else {
+        for bank in [0_u8, 1_u8] {
+            restore_load_balancer_bank(services, &empty_recovered_load_balancer_bank(bank))?;
+        }
+        discard_service_pending_state(&services.load_balancer_state_path)?;
+        services.load_balancer_banks = [
+            empty_recovered_load_balancer_bank(0),
+            empty_recovered_load_balancer_bank(1),
+        ]
+        .map(Some);
+        return Ok(());
+    };
+    let service = services
+        .applied
+        .as_ref()
+        .context("persistent LoadBalancer state is active without service state")?;
+    if service.source_epoch != epoch
+        || service.revision.get() != service_revision
+        || services.active_bank != service_bank
+    {
+        bail!("persistent LoadBalancer config does not reference the active service tuple");
+    }
+    let current = load_optional_load_balancer_reachability(&services.load_balancer_state_path)?;
+    let pending = load_optional_load_balancer_reachability(&pending_path)?;
+    let mut selected = None;
+    for (is_pending, candidate) in [(false, current), (true, pending)] {
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        if candidate.source_epoch == epoch
+            && candidate.revision.get() == reachability_revision
+            && candidate.allocation_revision.get() == allocation_revision
+        {
+            selected = Some((is_pending, candidate));
+            break;
+        }
+    }
+    let (selected_pending, durable) = selected.context(
+        "persistent LoadBalancer activation tuple has no matching durable or prepared checkpoint",
+    )?;
+    let expected = compile_load_balancer_dataplane(service, &durable, service_bank, bank)?;
+    let active = &banks[usize::from(bank)];
+    if active.ipv4_frontends != expected.ipv4_frontends
+        || active.ipv6_frontends != expected.ipv6_frontends
+        || config != expected.config
+        || ipv4_count as usize != active.ipv4_frontends.len()
+        || ipv6_count as usize != active.ipv6_frontends.len()
+    {
+        bail!("persistent active LoadBalancer bank does not match durable Node state");
+    }
+    if selected_pending {
+        commit_prepared_service_snapshot(&services.load_balancer_state_path, &pending_path)?;
+    } else {
+        discard_service_pending_state(&services.load_balancer_state_path)?;
+    }
+    let inactive = (bank + 1) % unf_ebpf_common::LOAD_BALANCER_BANK_COUNT;
+    restore_load_balancer_bank(services, &empty_recovered_load_balancer_bank(inactive))?;
+    banks[usize::from(bank)] = expected;
+    banks[usize::from(inactive)] = empty_recovered_load_balancer_bank(inactive);
+    services.load_balancer_banks = banks.map(Some);
+    services.active_load_balancer_bank = bank;
+    services.applied_load_balancer_reachability = Some(durable);
+    Ok(())
+}
+
+fn load_balancer_bank(bank: u8) -> Result<usize> {
+    if bank >= unf_ebpf_common::LOAD_BALANCER_BANK_COUNT {
+        bail!("persistent LoadBalancer map contains invalid bank {bank}");
+    }
+    Ok(usize::from(bank))
+}
+
+fn validate_load_balancer_frontend_entry<const K: usize>(
+    key: &[u8; K],
+    value: &[u8; 48],
+    bank_offset: usize,
+) -> Result<()> {
+    let service_id = u32::from_ne_bytes(value[0..4].try_into().expect("fixed service ID"));
+    let schema = u16::from_ne_bytes(value[12..14].try_into().expect("fixed schema"));
+    let flags = u16::from_ne_bytes(value[14..16].try_into().expect("fixed flags"));
+    let service_revision =
+        u64::from_ne_bytes(value[16..24].try_into().expect("fixed service revision"));
+    let reachability_revision = u64::from_ne_bytes(
+        value[24..32]
+            .try_into()
+            .expect("fixed reachability revision"),
+    );
+    let allocation_revision =
+        u64::from_ne_bytes(value[32..40].try_into().expect("fixed allocation revision"));
+    let service_bank = value[40];
+    let known_flags = unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL;
+    if service_id == 0
+        || schema != unf_ebpf_common::LOAD_BALANCER_MAP_ABI_VERSION
+        || flags & !known_flags != 0
+        || service_revision == 0
+        || reachability_revision == 0
+        || allocation_revision == 0
+        || service_bank >= SERVICE_BANK_COUNT
+        || value[41..48] != [0; 7]
+        || !matches!(key[bank_offset - 1], 6 | 17)
+    {
+        bail!("persistent LoadBalancer frontend contains an incompatible value");
+    }
+    load_balancer_bank(key[bank_offset]).map(|_| ())
+}
+
+fn decode_recovered_load_balancer_config(
+    config: [u8; 48],
+) -> Result<Option<RecoveredLoadBalancerConfig>> {
+    if config == [0; 48] {
+        return Ok(None);
+    }
+    let epoch = u64::from_ne_bytes(config[0..8].try_into().expect("fixed epoch"));
+    let service_revision =
+        u64::from_ne_bytes(config[8..16].try_into().expect("fixed service revision"));
+    let reachability_revision = u64::from_ne_bytes(
+        config[16..24]
+            .try_into()
+            .expect("fixed reachability revision"),
+    );
+    let allocation_revision = u64::from_ne_bytes(
+        config[24..32]
+            .try_into()
+            .expect("fixed allocation revision"),
+    );
+    let ipv4_count = u32::from_ne_bytes(config[32..36].try_into().expect("fixed IPv4 count"));
+    let ipv6_count = u32::from_ne_bytes(config[36..40].try_into().expect("fixed IPv6 count"));
+    let schema = u16::from_ne_bytes(config[40..42].try_into().expect("fixed schema"));
+    let bank = config[42];
+    let service_bank = config[43];
+    if epoch == 0
+        || service_revision == 0
+        || reachability_revision == 0
+        || schema != unf_ebpf_common::LOAD_BALANCER_MAP_ABI_VERSION
+        || bank >= unf_ebpf_common::LOAD_BALANCER_BANK_COUNT
+        || service_bank >= SERVICE_BANK_COUNT
+        || config[44..48] != [0; 4]
+    {
+        bail!("persistent LoadBalancer config is incompatible");
+    }
+    Ok(Some((
+        epoch,
+        service_revision,
+        reachability_revision,
+        allocation_revision,
+        ipv4_count,
+        ipv6_count,
+        bank,
+        service_bank,
+    )))
+}
+
 #[allow(clippy::too_many_lines)]
 fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u64>, Option<u64>)> {
     let mut banks = [empty_service_bank(0), empty_service_bank(1)];
@@ -4873,7 +5726,7 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
         let expected_current_service = if let Some(current_node) = &current_node {
             let (_, _, _, _, _, current_node_port_bank) = decoded_node_port
                 .context("current NodePort checkpoint lost its activation pointer")?;
-            compile_node_port_fabric_dataplane(
+            compile_node_port_host_fabric(
                 &current_service,
                 current_node,
                 previous_service_bank,
@@ -4881,13 +5734,13 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
             )?
             .service
         } else {
-            compile_service_dataplane(&current_service, previous_service_bank)?
+            compile_service_host_dataplane(&current_service, previous_service_bank)?
         };
         let expected_pending_service = if let Some(pending_node) = &pending_node {
             let pending_node_port_bank = decoded_node_port.map_or(1, |config| {
                 (config.5 + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT
             });
-            compile_node_port_fabric_dataplane(
+            compile_node_port_host_fabric(
                 &pending_service,
                 pending_node,
                 bank,
@@ -4895,7 +5748,7 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
             )?
             .service
         } else {
-            compile_service_dataplane(&pending_service, bank)?
+            compile_service_host_dataplane(&pending_service, bank)?
         };
         if !service_bank_matches(
             &banks[usize::from(previous_service_bank)],
@@ -4916,7 +5769,7 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
             let pending_node_port_bank = decoded_node_port.map_or(1, |config| {
                 (config.5 + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT
             });
-            let pending_node_port = compile_node_port_fabric_dataplane(
+            let pending_node_port = compile_node_port_host_fabric(
                 &pending_service,
                 pending_node,
                 bank,
@@ -4951,10 +5804,10 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
     let (expected, expected_node_port) = if let Some(node) = &node {
         let (_, _, _, _, _, node_port_bank) = decoded_node_port
             .context("durable NodePort checkpoint has no active NodePort config")?;
-        let expected = compile_node_port_fabric_dataplane(&durable, node, bank, node_port_bank)?;
+        let expected = compile_node_port_host_fabric(&durable, node, bank, node_port_bank)?;
         (expected.service, Some(expected.node_port))
     } else {
-        (compile_service_dataplane(&durable, bank)?, None)
+        (compile_service_host_dataplane(&durable, bank)?, None)
     };
     let active_service_bank = expected.bank;
     let active = &banks[usize::from(active_service_bank)];
@@ -5404,6 +6257,13 @@ fn apply_recovered_state(
         publish_desired_service_snapshot(state, snapshot);
         publish_applied_service_snapshot(state, snapshot);
     }
+    if let Some(snapshot) = &services.applied_load_balancer_reachability
+        && let Some(dataplane) =
+            &services.load_balancer_banks[usize::from(services.active_load_balancer_bank)]
+    {
+        publish_desired_load_balancer(state, snapshot);
+        publish_applied_load_balancer(state, snapshot, dataplane);
+    }
 }
 
 fn take_identity_maps(ebpf: &mut Ebpf) -> Result<IdentityMaps> {
@@ -5559,6 +6419,21 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
             .context("eBPF object does not contain NODE_PORT_CONFIG map")?,
     )
     .context("open NODE_PORT_CONFIG map")?;
+    let load_balancer_ipv4_frontends = AyaHashMap::<_, [u8; 8], [u8; 48]>::try_from(
+        ebpf.take_map("LOAD_BALANCER_FRONTENDS_V4")
+            .context("eBPF object does not contain LOAD_BALANCER_FRONTENDS_V4 map")?,
+    )
+    .context("open LOAD_BALANCER_FRONTENDS_V4 map")?;
+    let load_balancer_ipv6_frontends = AyaHashMap::<_, [u8; 20], [u8; 48]>::try_from(
+        ebpf.take_map("LOAD_BALANCER_FRONTENDS_V6")
+            .context("eBPF object does not contain LOAD_BALANCER_FRONTENDS_V6 map")?,
+    )
+    .context("open LOAD_BALANCER_FRONTENDS_V6 map")?;
+    let load_balancer_config = AyaArray::<_, [u8; 48]>::try_from(
+        ebpf.take_map("LOAD_BALANCER_CONFIG")
+            .context("eBPF object does not contain LOAD_BALANCER_CONFIG map")?,
+    )
+    .context("open LOAD_BALANCER_CONFIG map")?;
     Ok((
         ipv4_frontends,
         ipv6_frontends,
@@ -5570,6 +6445,9 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
         node_port_ipv4_frontends,
         node_port_ipv6_frontends,
         node_port_config,
+        load_balancer_ipv4_frontends,
+        load_balancer_ipv6_frontends,
+        load_balancer_config,
     ))
 }
 
@@ -5621,6 +6499,10 @@ async fn consume_events(
                 } else {
                     clear_service_snapshot_error(state);
                     refresh_controller_readiness(state);
+                    if let Err(error) = synchronize_load_balancer_maps(services, state).await {
+                        record_load_balancer_error(state, &error);
+                        warn!(%error, "LoadBalancer host-state synchronization failed; retaining active bank");
+                    }
                 }
             }
             _ = event_interval.tick() => {
@@ -6148,6 +7030,28 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
         node_port_local_frontend_count: state
             .node_port_local_frontend_count
             .load(Ordering::Acquire),
+        load_balancer_reachability_schema_version:
+            unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION,
+        desired_load_balancer_epoch: state.desired_load_balancer_epoch.load(Ordering::Acquire),
+        desired_load_balancer_revision: state
+            .desired_load_balancer_revision
+            .load(Ordering::Acquire),
+        desired_load_balancer_allocation_revision: state
+            .desired_load_balancer_allocation_revision
+            .load(Ordering::Acquire),
+        applied_load_balancer_epoch: state.applied_load_balancer_epoch.load(Ordering::Acquire),
+        applied_load_balancer_revision: state
+            .applied_load_balancer_revision
+            .load(Ordering::Acquire),
+        applied_load_balancer_allocation_revision: state
+            .applied_load_balancer_allocation_revision
+            .load(Ordering::Acquire),
+        load_balancer_frontend_count: state.load_balancer_frontend_count.load(Ordering::Acquire),
+        active_load_balancer_bank: state.active_load_balancer_bank.load(Ordering::Acquire),
+        load_balancer_reconcile_errors: state
+            .load_balancer_reconcile_errors
+            .load(Ordering::Acquire),
+        load_balancer_last_error: mutex_lock(&state.load_balancer_last_error).clone(),
         service_reconcile_errors: state.service_reconcile_errors.load(Ordering::Acquire),
         service_last_error: mutex_lock(&state.service_last_error).clone(),
         service_dataplane_events: state.service_dataplane_events.load(Ordering::Acquire),
@@ -8278,6 +9182,77 @@ mod tests {
         .expect("test service snapshot with backend compiles")
     }
 
+    fn load_balancer_service_test_snapshot(epoch: u64, revision: u64) -> ServiceSnapshot {
+        let sources = [("api", "10.96.0.10"), ("web", "10.96.0.11")]
+            .into_iter()
+            .map(|(name, cluster_ip)| unf_service::ServiceSource {
+                namespace: "default".to_owned(),
+                name: name.to_owned(),
+                cluster_ips: vec![cluster_ip.parse().unwrap()],
+                external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+                load_balancer: Some(unf_service::ServiceLoadBalancerSource {
+                    class: unf_service::UNF_LOAD_BALANCER_CLASS.to_owned(),
+                    ip_families: vec![unf_service::AddressFamily::Ipv4],
+                    ip_family_policy: unf_service::ServiceIpFamilyPolicy::SingleStack,
+                    requested_ips: Vec::new(),
+                    source_ranges: Vec::new(),
+                    allocate_node_ports: false,
+                    health_check_node_port: None,
+                }),
+                ports: vec![unf_service::ServiceSourcePort {
+                    name: Some("http".to_owned()),
+                    protocol: unf_common::Protocol::Tcp,
+                    port: 80,
+                    app_protocol: None,
+                    node_port: None,
+                }],
+            })
+            .collect();
+        unf_service::compile_service_snapshot(epoch, Revision::new(revision), sources, Vec::new())
+            .expect("LoadBalancer test service snapshot compiles")
+    }
+
+    fn load_balancer_node_snapshot(
+        services: &ServiceSnapshot,
+        revision: u64,
+        addresses: &[&str],
+    ) -> NodeReachabilitySnapshot {
+        let targets = services
+            .services
+            .iter()
+            .zip(addresses)
+            .map(
+                |(service, address)| unf_loadbalancer::NodeReachabilityTarget {
+                    owner: unf_loadbalancer::LoadBalancerOwner {
+                        service_id: service.id,
+                        namespace: service.namespace.clone(),
+                        name: service.name.clone(),
+                        uid: format!("{}-uid", service.name),
+                    },
+                    address: address.parse().unwrap(),
+                },
+            )
+            .collect();
+        NodeReachabilitySnapshot {
+            schema_version: unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION,
+            source_epoch: services.source_epoch,
+            revision: Revision::new(revision),
+            allocation_revision: Revision::new(revision),
+            provider: unf_loadbalancer::ReachabilityProviderRef {
+                name: "direct-node".to_owned(),
+                instance: "qualification-a".to_owned(),
+                mode: unf_loadbalancer::ReachabilityMode::DirectNode,
+            },
+            node: unf_loadbalancer::ReachabilityNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+            },
+            targets,
+        }
+        .validate()
+        .expect("LoadBalancer Node snapshot validates")
+    }
+
     fn dual_stack_service_snapshot(
         revision: u64,
         ipv4_backend: Ipv4Addr,
@@ -8445,6 +9420,7 @@ mod tests {
     }
 
     fn test_service_synchronizer(ebpf: &mut Ebpf, state_path: PathBuf) -> ServiceSynchronizer {
+        let load_balancer_state_path = state_path.with_file_name("load-balancer.json");
         let (
             ipv4_frontends,
             ipv6_frontends,
@@ -8456,6 +9432,9 @@ mod tests {
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
+            load_balancer_ipv4_frontends,
+            load_balancer_ipv6_frontends,
+            load_balancer_config,
         ) = take_service_maps(ebpf).expect("take service and NodePort maps");
         ServiceSynchronizer {
             ipv4_frontends,
@@ -8468,12 +9447,18 @@ mod tests {
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
+            load_balancer_ipv4_frontends,
+            load_balancer_ipv6_frontends,
+            load_balancer_config,
             banks: [None, None],
             node_port_banks: [None, None],
+            load_balancer_banks: [None, None],
             active_bank: 0,
             active_node_port_bank: 0,
+            active_load_balancer_bank: 0,
             applied: None,
             applied_node_port_node: None,
+            applied_load_balancer_reachability: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -8482,6 +9467,7 @@ mod tests {
             ),
             agent_token_path: PathBuf::new(),
             state_path,
+            load_balancer_state_path,
             interval: Duration::from_secs(1),
         }
     }
@@ -8752,6 +9738,55 @@ mod tests {
     }
 
     #[test]
+    fn load_balancer_reachability_checkpoint_is_private_strict_and_transition_fenced() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("load-balancer-reachability.json");
+        let snapshot = NodeReachabilitySnapshot {
+            schema_version: unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION,
+            source_epoch: 7,
+            revision: Revision::new(4),
+            allocation_revision: Revision::new(3),
+            provider: unf_loadbalancer::ReachabilityProviderRef {
+                name: "direct-node".to_owned(),
+                instance: "qualification-a".to_owned(),
+                mode: unf_loadbalancer::ReachabilityMode::DirectNode,
+            },
+            node: unf_loadbalancer::ReachabilityNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+            },
+            targets: vec![unf_loadbalancer::NodeReachabilityTarget {
+                owner: unf_loadbalancer::LoadBalancerOwner {
+                    service_id: unf_common::ServiceId::new(44),
+                    namespace: "apps".to_owned(),
+                    name: "api".to_owned(),
+                    uid: "api-uid".to_owned(),
+                },
+                address: "192.0.2.4".parse().unwrap(),
+            }],
+        };
+        let checkpoint = NodeReachabilityCheckpoint {
+            schema_version: NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION,
+            applied: snapshot.clone(),
+        };
+        persist_secure_json(&path, &checkpoint, "LoadBalancer reachability").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            load_optional_load_balancer_reachability(&path).unwrap(),
+            Some(snapshot.clone())
+        );
+        assert!(!snapshot.validate_transition(Some(&snapshot)).unwrap());
+
+        let mut malformed = checkpoint;
+        malformed.schema_version += 1;
+        persist_secure_json(&path, &malformed, "LoadBalancer reachability").unwrap();
+        assert!(load_optional_load_balancer_reachability(&path).is_err());
+    }
+
+    #[test]
     fn node_port_service_checkpoint_is_composite_private_and_transition_fenced() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("service.json");
@@ -8897,6 +9932,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires root BPF map creation and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
     fn privileged_service_map_partial_capacity_failure_rolls_back_inactive_bank() {
         let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
         let mut loader = EbpfLoader::new();
@@ -8930,6 +9966,9 @@ mod tests {
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
+            load_balancer_ipv4_frontends,
+            load_balancer_ipv6_frontends,
+            load_balancer_config,
         ) = take_service_maps(&mut ebpf).expect("take service maps");
         let directory = tempdir().unwrap();
         let mut synchronizer = ServiceSynchronizer {
@@ -8943,12 +9982,18 @@ mod tests {
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
+            load_balancer_ipv4_frontends,
+            load_balancer_ipv6_frontends,
+            load_balancer_config,
             banks: [None, None],
             node_port_banks: [None, None],
+            load_balancer_banks: [None, None],
             active_bank: 0,
             active_node_port_bank: 0,
+            active_load_balancer_bank: 0,
             applied: None,
             applied_node_port_node: None,
+            applied_load_balancer_reachability: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -8957,6 +10002,7 @@ mod tests {
             ),
             agent_token_path: PathBuf::new(),
             state_path: directory.path().join("service.json"),
+            load_balancer_state_path: directory.path().join("load-balancer.json"),
             interval: Duration::from_secs(1),
         };
         let state = test_agent_state();
@@ -8991,6 +10037,65 @@ mod tests {
                 .iter()
                 .all(|key| key[8] == 1)
         );
+    }
+
+    #[test]
+    #[ignore = "requires root BPF map creation and UNF_EBPF_OBJECT"]
+    fn privileged_load_balancer_bank_activation_rollback_and_recovery_are_exact() {
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut loader = EbpfLoader::new();
+        loader.map_max_entries("LOAD_BALANCER_FRONTENDS_V4", 1);
+        let mut ebpf = loader
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        let directory = tempdir().unwrap();
+        let service_path = directory.path().join("service.json");
+        let mut synchronizer = test_service_synchronizer(&mut ebpf, service_path);
+        let state = test_agent_state();
+        let services = load_balancer_service_test_snapshot(7, 5);
+        activate_service_snapshot(&mut synchronizer, &services, None, true, &state)
+            .expect("LoadBalancer Service keeps existing service maps exact");
+
+        let first = load_balancer_node_snapshot(&services, 3, &["192.0.2.4"]);
+        publish_desired_load_balancer(&state, &first);
+        activate_load_balancer_snapshot(&mut synchronizer, &first, &state)
+            .expect("first VIP bank activates");
+        let active_config = synchronizer.load_balancer_config.get(&0, 0).unwrap();
+        assert_eq!(active_config[42], 1);
+        assert_eq!(active_config[43], synchronizer.active_bank);
+        assert_eq!(agent_state_report(&state).applied_load_balancer_revision, 3);
+        assert_eq!(
+            load_optional_load_balancer_reachability(&synchronizer.load_balancer_state_path)
+                .unwrap(),
+            Some(first.clone())
+        );
+
+        let second = load_balancer_node_snapshot(&services, 4, &["192.0.2.4", "192.0.2.5"]);
+        publish_desired_load_balancer(&state, &second);
+        let error = activate_load_balancer_snapshot(&mut synchronizer, &second, &state)
+            .expect_err("undersized VIP map rejects partial inactive staging");
+        assert!(error.to_string().contains("staging bank rolled back"));
+        assert_eq!(
+            synchronizer.load_balancer_config.get(&0, 0).unwrap(),
+            active_config
+        );
+        assert_eq!(
+            synchronizer.applied_load_balancer_reachability,
+            Some(first.clone())
+        );
+        assert_eq!(
+            load_optional_load_balancer_reachability(&synchronizer.load_balancer_state_path)
+                .unwrap(),
+            Some(first.clone())
+        );
+
+        synchronizer.load_balancer_banks = [None, None];
+        synchronizer.active_load_balancer_bank = 0;
+        synchronizer.applied_load_balancer_reachability = None;
+        recover_load_balancer_state(&mut synchronizer)
+            .expect("exact active VIP bank and checkpoint recover");
+        assert_eq!(synchronizer.active_load_balancer_bank, 1);
+        assert_eq!(synchronizer.applied_load_balancer_reachability, Some(first));
     }
 
     #[test]
@@ -9209,6 +10314,9 @@ mod tests {
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
+            load_balancer_ipv4_frontends,
+            load_balancer_ipv6_frontends,
+            load_balancer_config,
         ) = take_service_maps(&mut ebpf).expect("take service maps");
         let directory = tempdir().unwrap();
         let mut synchronizer = ServiceSynchronizer {
@@ -9222,12 +10330,18 @@ mod tests {
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
+            load_balancer_ipv4_frontends,
+            load_balancer_ipv6_frontends,
+            load_balancer_config,
             banks: [None, None],
             node_port_banks: [None, None],
+            load_balancer_banks: [None, None],
             active_bank: 0,
             active_node_port_bank: 0,
+            active_load_balancer_bank: 0,
             applied: None,
             applied_node_port_node: None,
+            applied_load_balancer_reachability: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -9236,6 +10350,7 @@ mod tests {
             ),
             agent_token_path: PathBuf::new(),
             state_path: directory.path().join("service.json"),
+            load_balancer_state_path: directory.path().join("load-balancer.json"),
             interval: Duration::from_secs(1),
         };
         let state = test_agent_state();
@@ -10144,11 +11259,12 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_distinguishes_complete_v4_and_v5_map_ownership() {
+    fn cleanup_distinguishes_complete_v4_v5_and_v6_map_ownership() {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("unf");
         for (version, names) in [
             (4_u16, ABI_V4_MAP_NAMES.as_slice()),
+            (5_u16, ABI_V5_MAP_NAMES.as_slice()),
             (CURRENT_BPF_ABI_VERSION, PERSISTENT_MAP_NAMES.as_slice()),
         ] {
             let abi = root.join(format!("v{version}"));
@@ -10161,7 +11277,8 @@ mod tests {
             assert_eq!(plan.map_pins.len(), names.len());
         }
         assert_eq!(ABI_V4_MAP_NAMES.len(), 18);
-        assert_eq!(PERSISTENT_MAP_NAMES.len(), 21);
+        assert_eq!(ABI_V5_MAP_NAMES.len(), 21);
+        assert_eq!(PERSISTENT_MAP_NAMES.len(), 24);
     }
 
     #[test]
@@ -10326,11 +11443,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v5/links"),
+                Path::new("/sys/fs/bpf/unf/v6/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v5/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v6/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -10386,6 +11503,11 @@ mod tests {
         assert!(ensure_controller_compatibility(&controller).is_ok());
         controller.service_snapshot_schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
 
+        controller.load_balancer_reachability_schema_version = 0;
+        assert!(ensure_controller_compatibility(&controller).is_ok());
+        controller.load_balancer_reachability_schema_version =
+            unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION;
+
         controller.policy_snapshot_schema_version += 1;
         let error = ensure_controller_compatibility(&controller)
             .expect_err("a policy-schema mismatch is rejected");
@@ -10414,6 +11536,17 @@ mod tests {
             unf_service::SERVICE_SNAPSHOT_SCHEMA_VERSION + 1,
             unf_service::SERVICE_SNAPSHOT_SCHEMA_VERSION
         )));
+
+        controller.service_snapshot_schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        controller.load_balancer_reachability_schema_version =
+            unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION + 1;
+        let error = ensure_controller_compatibility(&controller)
+            .expect_err("a newer LoadBalancer reachability schema is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("LoadBalancer reachability schema controller=2 agent=1")
+        );
     }
 
     #[test]
@@ -10430,16 +11563,16 @@ mod tests {
 
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v5")).is_ok());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v6")).is_ok());
         assert_eq!(
-            configured_abi_version(Path::new("/sys/fs/bpf/unf/v5")),
-            Some(5)
+            configured_abi_version(Path::new("/sys/fs/bpf/unf/v6")),
+            Some(6)
         );
         let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
             error.to_string().contains(
-                "incompatible with persistent BPF-state ABI v5; expected a /v5 directory"
+                "incompatible with persistent BPF-state ABI v6; expected a /v6 directory"
             )
         );
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v4")).is_err());

@@ -12,6 +12,7 @@ required_files=(
     docs/adr/0093-separate-loadbalancer-ownership-domains.md
     docs/adr/0094-model-loadbalancer-intent-in-service-schema-v3.md
     docs/adr/0095-durable-loadbalancer-allocation-and-reachability.md
+    docs/adr/0096-compatible-loadbalancer-host-state.md
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -66,16 +67,19 @@ require_text docs/project-status.md \
     '| Address allocation and reachability-provider contract | **Verified** |' \
     "the authoritative tracker must identify milestone 6.3 as verified"
 require_text docs/development/phase6-loadbalancer-plan.md \
-    '| 6.4 | Compatible distribution and transactional host state | **In progress** |' \
-    "milestone 6.4 must be the active implementation slice"
+    '| 6.4 | Compatible distribution and transactional host state | **Verified** |' \
+    "milestone 6.4 must remain verified"
 require_text docs/project-status.md \
-    '| Compatible distribution and transactional host state | **In progress** |' \
-    "the authoritative tracker must identify milestone 6.4 as active"
+    '| Compatible distribution and transactional host state | **Verified** |' \
+    "the authoritative tracker must identify milestone 6.4 as verified"
+require_text docs/development/phase6-loadbalancer-plan.md \
+    '| 6.5 | `externalTrafficPolicy: Cluster` LoadBalancer dataplane | **Planned** |' \
+    "milestone 6.5 must be the next packet-path slice"
 require_text docs/adr/0093-separate-loadbalancer-ownership-domains.md \
     '**Status:** Accepted and implemented for the Phase 6.1 architecture boundary' \
     "ADR 0093 must record the implemented architecture boundary"
 require_text README.md \
-    'or packet-support claim exists yet.' \
+    'The maps are not consumed by TC' \
     "the README must not overstate LoadBalancer packet support"
 require_text docs/development/phase6-loadbalancer-plan.md \
     '`allocateLoadBalancerNodePorts: false` is preserved.' \

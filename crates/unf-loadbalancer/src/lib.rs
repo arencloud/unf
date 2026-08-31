@@ -10,18 +10,26 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use unf_common::{Revision, ServiceId};
+use unf_common::{LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION, Revision, ServiceId};
+use unf_ebpf_common::{
+    LOAD_BALANCER_BANK_COUNT, LOAD_BALANCER_FRONTEND_FLAG_LOCAL, LOAD_BALANCER_MAP_ABI_VERSION,
+    SERVICE_BANK_COUNT,
+};
 use unf_service::{AddressFamily, ServiceIpPrefix, ServiceIr, UNF_LOAD_BALANCER_CLASS};
 
-pub const ALLOCATION_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
+pub const ALLOCATION_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
+pub const LEGACY_ALLOCATION_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 pub const REACHABILITY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub const REACHABILITY_ACK_SCHEMA_VERSION: u16 = 1;
+pub const NODE_REACHABILITY_SCHEMA_VERSION: u16 = LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION;
+pub const NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_LOAD_BALANCER_POOLS: usize = 64;
 pub const MAX_LOAD_BALANCER_LEASES: usize = 65_536;
 pub const MAX_LOAD_BALANCER_NODES: usize = 4_096;
 pub const MAX_POOL_ALLOCATION_SCAN: usize = 65_536;
 pub const MAX_REACHABILITY_TARGETS: usize = 524_288;
 pub const MAX_STATUS_INGRESS: usize = 256;
+pub const LOAD_BALANCER_FRONTEND_BANK_CAPACITY: usize = 262_144;
 pub const UNF_LOAD_BALANCER_FINALIZER: &str = "network.unf.io/load-balancer-protection";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -63,6 +71,7 @@ pub struct AllocationRequest {
     pub pool: String,
     pub families: Vec<AddressFamily>,
     pub requested_ips: Vec<IpAddr>,
+    pub intent_epoch: u64,
     pub intent_revision: Revision,
 }
 
@@ -76,6 +85,8 @@ pub struct LoadBalancerLease {
     pub families: Vec<AddressFamily>,
     pub requested_ips: Vec<IpAddr>,
     pub addresses: Vec<IpAddr>,
+    #[serde(default)]
+    pub intent_epoch: u64,
     pub intent_revision: Revision,
     pub allocation_revision: Revision,
 }
@@ -119,7 +130,7 @@ pub enum AllocationError {
         name: String,
         reason: &'static str,
     },
-    #[error("allocation request must have a nonzero intent revision")]
+    #[error("allocation request must have a nonzero intent epoch and revision")]
     ZeroIntentRevision,
     #[error("allocation request has invalid address-family intent: {0}")]
     InvalidFamilies(&'static str),
@@ -140,11 +151,15 @@ pub enum AllocationError {
     ForeignLease { owner: LoadBalancerOwner },
     #[error("owner {owner:?} already has different immutable allocation intent")]
     ImmutableIntentChanged { owner: LoadBalancerOwner },
-    #[error("owner {owner:?} intent revision regressed from {current:?} to {candidate:?}")]
+    #[error(
+        "owner {owner:?} intent tuple regressed from epoch {current_epoch} revision {current_revision:?} to epoch {candidate_epoch} revision {candidate_revision:?}"
+    )]
     IntentRevisionRegression {
         owner: LoadBalancerOwner,
-        current: Revision,
-        candidate: Revision,
+        current_epoch: u64,
+        current_revision: Revision,
+        candidate_epoch: u64,
+        candidate_revision: Revision,
     },
     #[error("cannot release unknown owner {0:?}")]
     UnknownOwner(LoadBalancerOwner),
@@ -178,6 +193,7 @@ pub fn allocation_request_for_service(
     service: &ServiceIr,
     uid: &str,
     pool: &str,
+    intent_epoch: u64,
     intent_revision: Revision,
 ) -> Result<Option<AllocationRequest>, AllocationError> {
     let Some(load_balancer) = &service.load_balancer else {
@@ -201,6 +217,7 @@ pub fn allocation_request_for_service(
         pool: pool.to_owned(),
         families: load_balancer.ip_families.clone(),
         requested_ips: load_balancer.requested_ips.clone(),
+        intent_epoch,
         intent_revision,
     }))
 }
@@ -310,7 +327,9 @@ impl LoadBalancerAllocator {
     /// Rejects schema, pool, lease, collision, provenance, and revision drift
     /// before returning any usable allocator state.
     pub fn restore(checkpoint: AllocationCheckpoint) -> Result<Self, AllocationError> {
-        if checkpoint.schema_version != ALLOCATION_CHECKPOINT_SCHEMA_VERSION {
+        if checkpoint.schema_version != ALLOCATION_CHECKPOINT_SCHEMA_VERSION
+            && checkpoint.schema_version != LEGACY_ALLOCATION_CHECKPOINT_SCHEMA_VERSION
+        {
             return Err(AllocationError::UnsupportedSchema {
                 actual: checkpoint.schema_version,
                 expected: ALLOCATION_CHECKPOINT_SCHEMA_VERSION,
@@ -325,9 +344,13 @@ impl LoadBalancerAllocator {
         if !checkpoint.leases.is_empty() && checkpoint.revision == Revision::INITIAL {
             return Err(AllocationError::ZeroRevision);
         }
+        let legacy = checkpoint.schema_version == LEGACY_ALLOCATION_CHECKPOINT_SCHEMA_VERSION;
         let mut allocator = Self::new(checkpoint.pools)?;
         allocator.revision = checkpoint.revision;
-        for lease in checkpoint.leases {
+        for mut lease in checkpoint.leases {
+            if legacy && lease.intent_epoch == 0 {
+                lease.intent_epoch = 1;
+            }
             allocator.restore_lease(lease)?;
         }
         Ok(allocator)
@@ -358,18 +381,26 @@ impl LoadBalancerAllocator {
                     owner: request.owner,
                 });
             }
-            if request.intent_revision < existing.intent_revision {
+            if request.intent_epoch < existing.intent_epoch
+                || (request.intent_epoch == existing.intent_epoch
+                    && request.intent_revision < existing.intent_revision)
+            {
                 return Err(AllocationError::IntentRevisionRegression {
                     owner: request.owner,
-                    current: existing.intent_revision,
-                    candidate: request.intent_revision,
+                    current_epoch: existing.intent_epoch,
+                    current_revision: existing.intent_revision,
+                    candidate_epoch: request.intent_epoch,
+                    candidate_revision: request.intent_revision,
                 });
             }
-            if request.intent_revision == existing.intent_revision {
+            if request.intent_epoch == existing.intent_epoch
+                && request.intent_revision == existing.intent_revision
+            {
                 return Ok(existing.clone());
             }
             let allocation_revision = self.revision.next();
             let mut refreshed = existing.clone();
+            refreshed.intent_epoch = request.intent_epoch;
             refreshed.intent_revision = request.intent_revision;
             refreshed.allocation_revision = allocation_revision;
             self.leases.insert(request.owner, refreshed.clone());
@@ -387,6 +418,7 @@ impl LoadBalancerAllocator {
             families: request.families,
             requested_ips: request.requested_ips,
             addresses,
+            intent_epoch: request.intent_epoch,
             intent_revision: request.intent_revision,
             allocation_revision,
         };
@@ -445,6 +477,7 @@ impl LoadBalancerAllocator {
             || lease.provider != pool.provider
             || lease.allocation_revision == Revision::INITIAL
             || lease.allocation_revision > self.revision
+            || lease.intent_epoch == 0
             || lease.intent_revision == Revision::INITIAL
             || lease.families.is_empty()
             || lease.families.len() > 2
@@ -648,7 +681,7 @@ fn validate_owner(owner: &LoadBalancerOwner) -> Result<(), AllocationError> {
 }
 
 fn validate_allocation_request(request: &mut AllocationRequest) -> Result<(), AllocationError> {
-    if request.intent_revision == Revision::INITIAL {
+    if request.intent_epoch == 0 || request.intent_revision == Revision::INITIAL {
         return Err(AllocationError::ZeroIntentRevision);
     }
     if request.families.is_empty() || request.families.len() > 2 {
@@ -883,6 +916,10 @@ pub enum ReachabilityError {
     AcknowledgementMismatch,
     #[error("reachability rejection must include a bounded error")]
     MissingRejectionError,
+    #[error("node reachability projection does not match its exact Node identity")]
+    NodeProjectionMismatch,
+    #[error("node reachability revision regressed or mutated at one revision")]
+    NodeRevisionConflict,
 }
 
 /// Compiles complete desired state for the bounded direct-Node provider.
@@ -1051,6 +1088,462 @@ impl ReachabilityAcknowledgement {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NodeReachabilityTarget {
+    pub owner: LoadBalancerOwner,
+    pub address: IpAddr,
+}
+
+/// Complete owner-only reachability state distributed to one authenticated
+/// Node. This is intentionally distinct from service and dataplane snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NodeReachabilitySnapshot {
+    pub schema_version: u16,
+    pub source_epoch: u64,
+    pub revision: Revision,
+    pub allocation_revision: Revision,
+    pub provider: ReachabilityProviderRef,
+    pub node: ReachabilityNode,
+    pub targets: Vec<NodeReachabilityTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NodeReachabilityCheckpoint {
+    pub schema_version: u16,
+    pub applied: NodeReachabilitySnapshot,
+}
+
+impl ReachabilitySnapshot {
+    /// Projects complete provider intent to one authenticated Node identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid global snapshot, invalid Node identity, or any target
+    /// whose matching Node name carries a different UID.
+    pub fn for_node(
+        &self,
+        node_name: &str,
+        node_uid: &str,
+    ) -> Result<NodeReachabilitySnapshot, ReachabilityError> {
+        self.clone().validate()?;
+        let node = ReachabilityNode {
+            name: node_name.to_owned(),
+            uid: node_uid.to_owned(),
+        };
+        if !valid_name(node_name) || !valid_uid(node_uid) {
+            return Err(ReachabilityError::InvalidNode(node));
+        }
+        if self
+            .targets
+            .iter()
+            .any(|target| target.node.name == node_name && target.node.uid != node_uid)
+        {
+            return Err(ReachabilityError::NodeProjectionMismatch);
+        }
+        let targets = self
+            .targets
+            .iter()
+            .filter(|target| target.node == node)
+            .map(|target| NodeReachabilityTarget {
+                owner: target.owner.clone(),
+                address: target.address,
+            })
+            .collect();
+        NodeReachabilitySnapshot {
+            schema_version: NODE_REACHABILITY_SCHEMA_VERSION,
+            source_epoch: self.source_epoch,
+            revision: self.revision,
+            allocation_revision: self.allocation_revision,
+            provider: self.provider.clone(),
+            node,
+            targets,
+        }
+        .validate()
+    }
+}
+
+impl NodeReachabilitySnapshot {
+    /// Validates canonical bounded state before persistence or host staging.
+    ///
+    /// # Errors
+    ///
+    /// Rejects schema/provenance, Node identity, duplicate target, ordering, and
+    /// revision violations.
+    pub fn validate(mut self) -> Result<Self, ReachabilityError> {
+        if self.schema_version != NODE_REACHABILITY_SCHEMA_VERSION {
+            return Err(ReachabilityError::UnsupportedSchema {
+                actual: self.schema_version,
+                expected: NODE_REACHABILITY_SCHEMA_VERSION,
+            });
+        }
+        validate_provider(&self.provider)?;
+        if self.source_epoch == 0
+            || self.revision == Revision::INITIAL
+            || (!self.targets.is_empty() && self.allocation_revision == Revision::INITIAL)
+        {
+            return Err(ReachabilityError::ZeroRevision);
+        }
+        if !valid_name(&self.node.name) || !valid_uid(&self.node.uid) {
+            return Err(ReachabilityError::InvalidNode(self.node));
+        }
+        if self.targets.len() > MAX_LOAD_BALANCER_LEASES.saturating_mul(2) {
+            return Err(ReachabilityError::TooManyTargets {
+                actual: self.targets.len(),
+                limit: MAX_LOAD_BALANCER_LEASES.saturating_mul(2),
+            });
+        }
+        for target in &self.targets {
+            validate_owner(&target.owner).map_err(|_| ReachabilityError::ForeignLease)?;
+        }
+        let owner_families = self
+            .targets
+            .iter()
+            .map(|target| (target.owner.clone(), address_family(target.address)))
+            .collect::<BTreeSet<_>>();
+        if owner_families.len() != self.targets.len() {
+            return Err(ReachabilityError::ForeignLease);
+        }
+        let original = self.targets.clone();
+        self.targets.sort();
+        if self.targets != original || self.targets.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ReachabilityError::NonCanonicalTargets);
+        }
+        Ok(self)
+    }
+
+    /// Fences replay, regression, and same-revision mutation against durable
+    /// last-known-good state. A newer epoch or revision is an admissible change.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any regression or mutation at the currently applied tuple.
+    pub fn validate_transition(&self, applied: Option<&Self>) -> Result<bool, ReachabilityError> {
+        self.clone().validate()?;
+        let Some(applied) = applied else {
+            return Ok(true);
+        };
+        applied.clone().validate()?;
+        if self.source_epoch < applied.source_epoch
+            || (self.source_epoch == applied.source_epoch && self.revision < applied.revision)
+        {
+            return Err(ReachabilityError::NodeRevisionConflict);
+        }
+        if self.source_epoch == applied.source_epoch && self.revision == applied.revision {
+            if self == applied {
+                return Ok(false);
+            }
+            return Err(ReachabilityError::NodeRevisionConflict);
+        }
+        Ok(true)
+    }
+}
+
+impl NodeReachabilityCheckpoint {
+    /// Validates an exact durable Node snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported checkpoint or embedded snapshot schemas.
+    pub fn validate(self) -> Result<Self, ReachabilityError> {
+        if self.schema_version != NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION {
+            return Err(ReachabilityError::UnsupportedSchema {
+                actual: self.schema_version,
+                expected: NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION,
+            });
+        }
+        self.applied.clone().validate()?;
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadBalancerDataplaneState {
+    pub source_epoch: u64,
+    pub service_revision: Revision,
+    pub reachability_revision: Revision,
+    pub allocation_revision: Revision,
+    pub service_bank: u8,
+    pub bank: u8,
+    pub ipv4_frontends: BTreeMap<[u8; 8], [u8; 48]>,
+    pub ipv6_frontends: BTreeMap<[u8; 20], [u8; 48]>,
+    pub config: [u8; 48],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum LoadBalancerDataplaneError {
+    #[error("invalid service snapshot: {0}")]
+    InvalidService(String),
+    #[error(transparent)]
+    InvalidReachability(#[from] ReachabilityError),
+    #[error("service and reachability snapshots have different source epochs")]
+    SourceEpochMismatch,
+    #[error("invalid service bank {0}; expected 0 or 1")]
+    InvalidServiceBank(u8),
+    #[error("invalid LoadBalancer bank {0}; expected 0 or 1")]
+    InvalidLoadBalancerBank(u8),
+    #[error("reachability owner {0:?} has no exact schema-v3 Service")]
+    MissingService(LoadBalancerOwner),
+    #[error("reachability owner {0:?} does not match the referenced Service")]
+    OwnerMismatch(LoadBalancerOwner),
+    #[error("LoadBalancer frontend has no exact ClusterIP service-bank linkage")]
+    MissingFrontendLink,
+    #[error("VIP address {0} is owned by more than one Service")]
+    AddressCollision(IpAddr),
+    #[error("LoadBalancer frontend key collided")]
+    FrontendCollision,
+    #[error("LoadBalancer map {map} requires {actual} entries; per-bank limit is {limit}")]
+    Capacity {
+        map: &'static str,
+        actual: usize,
+        limit: usize,
+    },
+}
+
+/// Lowers one authenticated Node projection into an inactive, readback-safe VIP
+/// frontend bank. It does not activate or consume the bank in a packet path.
+///
+/// # Errors
+///
+/// Rejects invalid schemas, provenance, bank selectors, owner/address
+/// collisions, inexact service linkage, and fixed map-capacity overflow.
+#[allow(clippy::too_many_lines)]
+pub fn compile_load_balancer_dataplane(
+    services: &unf_service::ServiceSnapshot,
+    reachability: &NodeReachabilitySnapshot,
+    service_bank: u8,
+    bank: u8,
+) -> Result<LoadBalancerDataplaneState, LoadBalancerDataplaneError> {
+    let services = services
+        .clone()
+        .validate_and_normalize()
+        .map_err(|error| LoadBalancerDataplaneError::InvalidService(error.to_string()))?;
+    let reachability = reachability.clone().validate()?;
+    if services.source_epoch != reachability.source_epoch {
+        return Err(LoadBalancerDataplaneError::SourceEpochMismatch);
+    }
+    if service_bank >= SERVICE_BANK_COUNT {
+        return Err(LoadBalancerDataplaneError::InvalidServiceBank(service_bank));
+    }
+    if bank >= LOAD_BALANCER_BANK_COUNT {
+        return Err(LoadBalancerDataplaneError::InvalidLoadBalancerBank(bank));
+    }
+    let by_id = services
+        .services
+        .iter()
+        .map(|service| (service.id, service))
+        .collect::<BTreeMap<_, _>>();
+    let mut address_owners = BTreeMap::<IpAddr, ServiceId>::new();
+    let mut ipv4_frontends = BTreeMap::new();
+    let mut ipv6_frontends = BTreeMap::new();
+    for target in &reachability.targets {
+        let service = by_id
+            .get(&target.owner.service_id)
+            .ok_or_else(|| LoadBalancerDataplaneError::MissingService(target.owner.clone()))?;
+        if service.namespace != target.owner.namespace || service.name != target.owner.name {
+            return Err(LoadBalancerDataplaneError::OwnerMismatch(
+                target.owner.clone(),
+            ));
+        }
+        if let Some(existing) = address_owners.insert(target.address, service.id)
+            && existing != service.id
+        {
+            return Err(LoadBalancerDataplaneError::AddressCollision(target.address));
+        }
+        let load_balancer = service
+            .load_balancer
+            .as_ref()
+            .ok_or_else(|| LoadBalancerDataplaneError::MissingService(target.owner.clone()))?;
+        for frontend in load_balancer
+            .frontends
+            .iter()
+            .filter(|frontend| frontend.family == address_family(target.address))
+        {
+            let matching = service
+                .frontends
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| {
+                    address_family(candidate.address) == frontend.family
+                        && candidate.port == frontend.service_port
+                        && candidate.protocol == frontend.protocol
+                        && candidate.name == frontend.name
+                        && candidate.app_protocol == frontend.app_protocol
+                        && candidate.backend_ids == frontend.backend_ids
+                })
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                return Err(LoadBalancerDataplaneError::MissingFrontendLink);
+            }
+            let (frontend_index, _) = matching[0];
+            let frontend_index = u32::try_from(frontend_index)
+                .map_err(|_| LoadBalancerDataplaneError::MissingFrontendLink)?;
+            let flags = if load_balancer.traffic_policy == unf_service::ServiceTrafficPolicy::Local
+            {
+                LOAD_BALANCER_FRONTEND_FLAG_LOCAL
+            } else {
+                0
+            };
+            let value = encode_load_balancer_frontend_value(
+                service.id,
+                frontend_index,
+                frontend.backend_ids.len(),
+                flags,
+                services.revision,
+                reachability.revision,
+                reachability.allocation_revision,
+                service_bank,
+            );
+            let collision = match target.address {
+                IpAddr::V4(address) => ipv4_frontends
+                    .insert(
+                        encode_ipv4_load_balancer_key(
+                            address.octets(),
+                            frontend.service_port,
+                            frontend.protocol,
+                            bank,
+                        ),
+                        value,
+                    )
+                    .is_some(),
+                IpAddr::V6(address) => ipv6_frontends
+                    .insert(
+                        encode_ipv6_load_balancer_key(
+                            address.octets(),
+                            frontend.service_port,
+                            frontend.protocol,
+                            bank,
+                        ),
+                        value,
+                    )
+                    .is_some(),
+            };
+            if collision {
+                return Err(LoadBalancerDataplaneError::FrontendCollision);
+            }
+        }
+    }
+    validate_load_balancer_capacity("LOAD_BALANCER_FRONTENDS_V4", ipv4_frontends.len())?;
+    validate_load_balancer_capacity("LOAD_BALANCER_FRONTENDS_V6", ipv6_frontends.len())?;
+    let config = encode_load_balancer_config(
+        services.source_epoch,
+        services.revision,
+        reachability.revision,
+        reachability.allocation_revision,
+        ipv4_frontends.len(),
+        ipv6_frontends.len(),
+        bank,
+        service_bank,
+    );
+    Ok(LoadBalancerDataplaneState {
+        source_epoch: services.source_epoch,
+        service_revision: services.revision,
+        reachability_revision: reachability.revision,
+        allocation_revision: reachability.allocation_revision,
+        service_bank,
+        bank,
+        ipv4_frontends,
+        ipv6_frontends,
+        config,
+    })
+}
+
+fn encode_ipv4_load_balancer_key(
+    address: [u8; 4],
+    port: u16,
+    protocol: unf_common::Protocol,
+    bank: u8,
+) -> [u8; 8] {
+    let mut key = [0_u8; 8];
+    key[0..4].copy_from_slice(&address);
+    key[4..6].copy_from_slice(&port.to_be_bytes());
+    key[6] = protocol as u8;
+    key[7] = bank;
+    key
+}
+
+fn encode_ipv6_load_balancer_key(
+    address: [u8; 16],
+    port: u16,
+    protocol: unf_common::Protocol,
+    bank: u8,
+) -> [u8; 20] {
+    let mut key = [0_u8; 20];
+    key[0..16].copy_from_slice(&address);
+    key[16..18].copy_from_slice(&port.to_be_bytes());
+    key[18] = protocol as u8;
+    key[19] = bank;
+    key
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_load_balancer_frontend_value(
+    service_id: ServiceId,
+    frontend_index: u32,
+    backend_count: usize,
+    flags: u16,
+    service_revision: Revision,
+    reachability_revision: Revision,
+    allocation_revision: Revision,
+    service_bank: u8,
+) -> [u8; 48] {
+    let mut value = [0_u8; 48];
+    value[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
+    value[4..8].copy_from_slice(&frontend_index.to_ne_bytes());
+    value[8..12].copy_from_slice(&bounded_u32(backend_count).to_ne_bytes());
+    value[12..14].copy_from_slice(&LOAD_BALANCER_MAP_ABI_VERSION.to_ne_bytes());
+    value[14..16].copy_from_slice(&flags.to_ne_bytes());
+    value[16..24].copy_from_slice(&service_revision.get().to_ne_bytes());
+    value[24..32].copy_from_slice(&reachability_revision.get().to_ne_bytes());
+    value[32..40].copy_from_slice(&allocation_revision.get().to_ne_bytes());
+    value[40] = service_bank;
+    value
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_load_balancer_config(
+    source_epoch: u64,
+    service_revision: Revision,
+    reachability_revision: Revision,
+    allocation_revision: Revision,
+    ipv4_count: usize,
+    ipv6_count: usize,
+    bank: u8,
+    service_bank: u8,
+) -> [u8; 48] {
+    let mut config = [0_u8; 48];
+    config[0..8].copy_from_slice(&source_epoch.to_ne_bytes());
+    config[8..16].copy_from_slice(&service_revision.get().to_ne_bytes());
+    config[16..24].copy_from_slice(&reachability_revision.get().to_ne_bytes());
+    config[24..32].copy_from_slice(&allocation_revision.get().to_ne_bytes());
+    config[32..36].copy_from_slice(&bounded_u32(ipv4_count).to_ne_bytes());
+    config[36..40].copy_from_slice(&bounded_u32(ipv6_count).to_ne_bytes());
+    config[40..42].copy_from_slice(&LOAD_BALANCER_MAP_ABI_VERSION.to_ne_bytes());
+    config[42] = bank;
+    config[43] = service_bank;
+    config
+}
+
+fn validate_load_balancer_capacity(
+    map: &'static str,
+    actual: usize,
+) -> Result<(), LoadBalancerDataplaneError> {
+    if actual > LOAD_BALANCER_FRONTEND_BANK_CAPACITY {
+        return Err(LoadBalancerDataplaneError::Capacity {
+            map,
+            actual,
+            limit: LOAD_BALANCER_FRONTEND_BANK_CAPACITY,
+        });
+    }
+    Ok(())
+}
+
+fn bounded_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 fn reachability_leases(
     targets: &[ReachabilityTarget],
     provider: &ReachabilityProviderRef,
@@ -1074,6 +1567,7 @@ fn reachability_leases(
                 families: addresses.iter().copied().map(address_family).collect(),
                 requested_ips: Vec::new(),
                 addresses,
+                intent_epoch: 1,
                 intent_revision: Revision::new(1),
                 allocation_revision: Revision::new(1),
             }
@@ -1218,6 +1712,7 @@ mod tests {
             pool: "public".to_owned(),
             families: vec![AddressFamily::Ipv6, AddressFamily::Ipv4],
             requested_ips,
+            intent_epoch: 7,
             intent_revision: Revision::new(revision),
         }
     }
@@ -1259,6 +1754,18 @@ mod tests {
         assert_eq!(refreshed.intent_revision, Revision::new(2));
         assert_eq!(refreshed.allocation_revision, Revision::new(2));
 
+        let mut new_epoch = request(api.clone(), 1, Vec::new());
+        new_epoch.intent_epoch = 8;
+        let after_restart = allocator.allocate(new_epoch).unwrap();
+        assert_eq!(after_restart.addresses, first.addresses);
+        assert_eq!(after_restart.intent_epoch, 8);
+        assert_eq!(after_restart.intent_revision, Revision::new(1));
+        assert_eq!(after_restart.allocation_revision, Revision::new(3));
+        assert!(matches!(
+            allocator.allocate(request(api.clone(), 3, Vec::new())),
+            Err(AllocationError::IntentRevisionRegression { .. })
+        ));
+
         let web = owner(11, "web");
         let explicit = allocator
             .allocate(request(
@@ -1267,7 +1774,7 @@ mod tests {
                 vec!["2001:db8::3".parse().unwrap(), "192.0.2.3".parse().unwrap()],
             ))
             .unwrap();
-        assert_eq!(explicit.allocation_revision, Revision::new(3));
+        assert_eq!(explicit.allocation_revision, Revision::new(4));
         let before_conflict = allocator.checkpoint();
         assert!(matches!(
             allocator.allocate(request(
@@ -1289,6 +1796,25 @@ mod tests {
         let restored = LoadBalancerAllocator::restore(decoded).unwrap();
         assert_eq!(restored.checkpoint(), allocator.checkpoint());
         assert_eq!(restored.lease(&web), Some(&explicit));
+
+        let mut legacy = serde_json::to_value(allocator.checkpoint()).unwrap();
+        legacy["schemaVersion"] = serde_json::json!(LEGACY_ALLOCATION_CHECKPOINT_SCHEMA_VERSION);
+        for lease in legacy["leases"].as_array_mut().unwrap() {
+            lease.as_object_mut().unwrap().remove("intentEpoch");
+        }
+        let legacy: AllocationCheckpoint = serde_json::from_value(legacy).unwrap();
+        let migrated = LoadBalancerAllocator::restore(legacy).unwrap();
+        assert_eq!(
+            migrated.checkpoint().schema_version,
+            ALLOCATION_CHECKPOINT_SCHEMA_VERSION
+        );
+        assert!(
+            migrated
+                .checkpoint()
+                .leases
+                .iter()
+                .all(|lease| lease.intent_epoch == 1)
+        );
     }
 
     #[test]
@@ -1391,6 +1917,195 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_node_projection_is_strict_replayable_and_recoverable() {
+        let mut allocator = LoadBalancerAllocator::new(vec![pool(
+            "public",
+            "public-uid",
+            "192.0.2.0/29",
+            "2001:db8::/125",
+        )])
+        .unwrap();
+        let lease = allocator
+            .allocate(request(owner(10, "api"), 1, Vec::new()))
+            .unwrap();
+        let nodes = vec![
+            ReachabilityNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+            },
+            ReachabilityNode {
+                name: "worker-b".to_owned(),
+                uid: "worker-b-uid".to_owned(),
+            },
+        ];
+        let desired = compile_direct_node_reachability(
+            7,
+            Revision::new(3),
+            lease.allocation_revision,
+            provider(),
+            &[lease],
+            nodes,
+        )
+        .unwrap();
+        let worker = desired.for_node("worker-a", "worker-a-uid").unwrap();
+        assert_eq!(worker.targets.len(), 2);
+        assert!(
+            worker
+                .targets
+                .iter()
+                .all(|target| target.owner.name == "api")
+        );
+        assert!(!worker.validate_transition(Some(&worker)).unwrap());
+        assert_eq!(
+            desired.for_node("worker-a", "replacement-uid"),
+            Err(ReachabilityError::NodeProjectionMismatch)
+        );
+
+        let checkpoint = NodeReachabilityCheckpoint {
+            schema_version: NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION,
+            applied: worker.clone(),
+        };
+        let encoded = serde_json::to_vec(&checkpoint).unwrap();
+        let restored: NodeReachabilityCheckpoint = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.validate().unwrap(), checkpoint);
+
+        let mut newer = worker.clone();
+        newer.revision = Revision::new(4);
+        assert!(newer.validate_transition(Some(&worker)).unwrap());
+        let mut mutation = worker.clone();
+        mutation.targets.pop();
+        assert_eq!(
+            mutation.validate_transition(Some(&worker)),
+            Err(ReachabilityError::NodeRevisionConflict)
+        );
+        let mut regression = worker;
+        regression.revision = Revision::new(2);
+        assert_eq!(
+            regression.validate_transition(Some(&newer)),
+            Err(ReachabilityError::NodeRevisionConflict)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn load_balancer_host_bank_is_exact_banked_and_revision_bound() {
+        let service_id = ServiceId::new(44);
+        let frontends = vec![
+            unf_service::ServiceFrontend {
+                address: "10.96.0.10".parse().unwrap(),
+                port: 80,
+                protocol: unf_common::Protocol::Tcp,
+                name: Some("http".to_owned()),
+                app_protocol: None,
+                backend_ids: Vec::new(),
+            },
+            unf_service::ServiceFrontend {
+                address: "fd00:96::10".parse().unwrap(),
+                port: 80,
+                protocol: unf_common::Protocol::Tcp,
+                name: Some("http".to_owned()),
+                app_protocol: None,
+                backend_ids: Vec::new(),
+            },
+        ];
+        let load_balancer_frontends = vec![
+            unf_service::ServiceLoadBalancerFrontend {
+                family: AddressFamily::Ipv4,
+                service_port: 80,
+                protocol: unf_common::Protocol::Tcp,
+                name: Some("http".to_owned()),
+                app_protocol: None,
+                backend_ids: Vec::new(),
+            },
+            unf_service::ServiceLoadBalancerFrontend {
+                family: AddressFamily::Ipv6,
+                service_port: 80,
+                protocol: unf_common::Protocol::Tcp,
+                name: Some("http".to_owned()),
+                app_protocol: None,
+                backend_ids: Vec::new(),
+            },
+        ];
+        let services = unf_service::ServiceSnapshot {
+            schema_version: unf_service::SERVICE_SNAPSHOT_SCHEMA_VERSION,
+            source_epoch: 7,
+            revision: Revision::new(5),
+            services: vec![ServiceIr {
+                id: service_id,
+                namespace: "apps".to_owned(),
+                name: "api".to_owned(),
+                frontends,
+                node_ports: Vec::new(),
+                load_balancer: Some(unf_service::ServiceLoadBalancer {
+                    class: UNF_LOAD_BALANCER_CLASS.to_owned(),
+                    ip_families: vec![AddressFamily::Ipv4, AddressFamily::Ipv6],
+                    ip_family_policy: unf_service::ServiceIpFamilyPolicy::RequireDualStack,
+                    requested_ips: Vec::new(),
+                    traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
+                    source_ranges: Vec::new(),
+                    allocate_node_ports: false,
+                    health_check_node_port: None,
+                    frontends: load_balancer_frontends,
+                }),
+                backends: Vec::new(),
+            }],
+        };
+        let owner = LoadBalancerOwner {
+            service_id,
+            namespace: "apps".to_owned(),
+            name: "api".to_owned(),
+            uid: "api-uid".to_owned(),
+        };
+        let reachability = NodeReachabilitySnapshot {
+            schema_version: NODE_REACHABILITY_SCHEMA_VERSION,
+            source_epoch: 7,
+            revision: Revision::new(4),
+            allocation_revision: Revision::new(3),
+            provider: provider(),
+            node: ReachabilityNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+            },
+            targets: vec![
+                NodeReachabilityTarget {
+                    owner: owner.clone(),
+                    address: "192.0.2.4".parse().unwrap(),
+                },
+                NodeReachabilityTarget {
+                    owner,
+                    address: "2001:db8::4".parse().unwrap(),
+                },
+            ],
+        };
+        let state = compile_load_balancer_dataplane(&services, &reachability, 1, 0).unwrap();
+        assert_eq!(state.ipv4_frontends.len(), 1);
+        assert_eq!(state.ipv6_frontends.len(), 1);
+        assert_eq!(state.config[42], 0);
+        assert_eq!(state.config[43], 1);
+        assert_eq!(
+            u64::from_ne_bytes(state.config[16..24].try_into().unwrap()),
+            4
+        );
+        let v4_value = state.ipv4_frontends.values().next().unwrap();
+        assert_eq!(u32::from_ne_bytes(v4_value[0..4].try_into().unwrap()), 44);
+        assert_eq!(v4_value[40], 1);
+
+        let mut wrong_epoch = reachability.clone();
+        wrong_epoch.source_epoch = 8;
+        assert_eq!(
+            compile_load_balancer_dataplane(&services, &wrong_epoch, 1, 0),
+            Err(LoadBalancerDataplaneError::SourceEpochMismatch)
+        );
+        let mut foreign = reachability;
+        foreign.targets[0].owner.service_id = ServiceId::new(45);
+        foreign.targets.sort();
+        assert!(matches!(
+            compile_load_balancer_dataplane(&services, &foreign, 1, 0),
+            Err(LoadBalancerDataplaneError::MissingService(_))
+        ));
+    }
+
+    #[test]
     fn publication_waits_for_all_domains_and_deletes_in_safe_order() {
         let owner = owner(10, "api");
         let addresses = vec!["192.0.2.1".parse().unwrap()];
@@ -1489,7 +2204,7 @@ mod tests {
             backends: Vec::new(),
         };
         let request =
-            allocation_request_for_service(&service, "service-uid", "public", Revision::new(9))
+            allocation_request_for_service(&service, "service-uid", "public", 7, Revision::new(9))
                 .unwrap()
                 .unwrap();
         assert_eq!(
@@ -1510,13 +2225,13 @@ mod tests {
 
         service.load_balancer.as_mut().unwrap().class = "example.com/foreign".to_owned();
         assert_eq!(
-            allocation_request_for_service(&service, "service-uid", "public", Revision::new(9))
+            allocation_request_for_service(&service, "service-uid", "public", 7, Revision::new(9),)
                 .unwrap(),
             None
         );
         service.load_balancer = None;
         assert_eq!(
-            allocation_request_for_service(&service, "service-uid", "public", Revision::new(9))
+            allocation_request_for_service(&service, "service-uid", "public", 7, Revision::new(9),)
                 .unwrap(),
             None
         );
