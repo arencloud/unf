@@ -325,7 +325,11 @@ external_source_probe() {
     if [[ ${family} == 4 ]]; then target="TCP4:${address}:8081"; else target="TCP6:[${address}]:8081"; fi
     observed=$(printf probe | socat -T 5 - "${target}" | tr -d '\r\n')
     observed=${observed#\[}; observed=${observed%\]}
-    if [[ ${family} == 6 ]]; then ip -6 route get "${observed}" | awk 'NR == 1 {print $1}'; else printf '%s\n' "${observed}"; fi
+    if [[ ${family} == 6 ]]; then
+        ip -6 route get "${observed}" | awk 'NR == 1 {print ($1 == "local" ? $2 : $1)}'
+    else
+        printf '%s\n' "${observed}"
+    fi
 }
 
 assert_external_source() {
