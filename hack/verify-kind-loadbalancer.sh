@@ -176,6 +176,15 @@ load_balancer_state() {
         | jq -er '.data["state.json"] | fromjson'
 }
 
+stable_allocation_projection() {
+    jq -Sc '{
+        pools: .allocation.pools,
+        leases: [.allocation.leases[] | {
+            owner, pool, poolUid, provider, families, requestedIps, addresses
+        }]
+    }'
+}
+
 wait_for_leases() {
     local state=
     for _ in $(seq 1 180); do
@@ -666,7 +675,10 @@ external_tcp_probe "${allowed_client}" 6 "${local_v6}"
 
 qualification_stage=controller-provider-and-agent-recovery
 durable_before=$(load_balancer_state)
-durable_before_digest=$(printf '%s' "${durable_before}" | sha256sum | cut -d ' ' -f 1)
+stable_allocation_before=$(stable_allocation_projection <<<"${durable_before}")
+stable_allocation_digest=$(printf '%s' "${stable_allocation_before}" | sha256sum | cut -d ' ' -f 1)
+allocation_revision_before=$(jq -er .allocation.revision <<<"${durable_before}")
+reachability_revision_before=$(jq -er .reachabilityRevision <<<"${durable_before}")
 old_controller=${controller_pod}
 "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=0 >/dev/null
 controller_scaled_down=true
@@ -727,7 +739,12 @@ new_controller=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf
 [[ ${new_controller} != "${old_controller}" ]]
 durable_after=$(load_balancer_state)
 durable_after_digest=$(printf '%s' "${durable_after}" | sha256sum | cut -d ' ' -f 1)
-[[ ${durable_after_digest} == "${durable_before_digest}" ]]
+stable_allocation_after=$(stable_allocation_projection <<<"${durable_after}")
+[[ ${stable_allocation_after} == "${stable_allocation_before}" ]]
+allocation_revision_after=$(jq -er .allocation.revision <<<"${durable_after}")
+reachability_revision_after=$(jq -er .reachabilityRevision <<<"${durable_after}")
+(( allocation_revision_after >= allocation_revision_before ))
+(( reachability_revision_after >= reachability_revision_before ))
 [[ $(lease_address "${durable_after}" server-cluster 4) == "${cluster_v4}" ]]
 [[ $(lease_address "${durable_after}" server-local 6) == "${local_v6}" ]]
 external_tcp_probe "${allowed_client}" 4 "${cluster_v4}"
@@ -799,6 +816,11 @@ jq -n \
     --argjson localServiceId "${local_service_id}" \
     --argjson activeServiceRevision "${active_service_revision}" \
     --arg durableDigest "${durable_after_digest}" \
+    --arg stableAllocationDigest "${stable_allocation_digest}" \
+    --argjson allocationRevisionBefore "${allocation_revision_before}" \
+    --argjson allocationRevisionAfter "${allocation_revision_after}" \
+    --argjson reachabilityRevisionBefore "${reachability_revision_before}" \
+    --argjson reachabilityRevisionAfter "${reachability_revision_after}" \
     --argjson nodes "${node_evidence}" --argjson images "${image_evidence}" \
     --argjson agents "${final_agents}" '
     {
@@ -813,6 +835,11 @@ jq -n \
       },
       externalClients:{allowed:{ipv4:$allowedIPv4,ipv6:$allowedIPv6},denied:{ipv4:$deniedIPv4,ipv6:$deniedIPv6}},
       activeServiceRevision:$activeServiceRevision,durableStateSha256:$durableDigest,
+      recovery:{stableAllocationSha256:$stableAllocationDigest,
+        allocationRevisionBefore:$allocationRevisionBefore,
+        allocationRevisionAfter:$allocationRevisionAfter,
+        reachabilityRevisionBefore:$reachabilityRevisionBefore,
+        reachabilityRevisionAfter:$reachabilityRevisionAfter},
       nodes:$nodes,images:$images,agents:$agents,
       verified:[
         "exclusive UNF primary CNI and kube-proxy absence",
@@ -827,10 +854,10 @@ jq -n \
         "dual-stack healthCheckNodePort 200/503 placement and readiness lifecycle",
         "readiness withdrawal, no-backend behavior, and recovery",
         "fixed-cardinality metrics, validated status, durable history, explanation, and read-only simulation",
-        "controller/direct-node provider restart with byte-identical durable allocation",
+        "controller/direct-node provider restart with stable allocation identity and monotonic intent fencing",
         "controller-offline source and destination agent replacement from last-known-good state",
         "zero traffic NodePorts and intentionally withheld Kubernetes ingress status",
-        "exact lease, frontend map, source-range map, health listener, external client, and fixture cleanup"
+        "exact lease, frontend map, runtime source-range trie, health listener, external client, and fixture cleanup"
       ],
       excluded:[
         "OpenShift","production BGP, EVPN, ECMP, and BFD","cloud-provider adapters",
