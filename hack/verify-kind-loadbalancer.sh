@@ -704,17 +704,18 @@ for replacement_node in "${client_node}" "${server_node}"; do
         and .applied_load_balancer_revision == .desired_load_balancer_revision
         and .applied_load_balancer_allocation_revision == .desired_load_balancer_allocation_revision
         and .load_balancer_frontend_count == 12
+        and .load_balancer_source_range_count > 0
         and .load_balancer_last_error == null
     ' <<<"${recovered_agent}" >/dev/null
     sudo "${container_runtime}" exec "${replacement_node}" sh -ec '
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
         test -f "$state" && test "$(stat -c %a "$state")" = 600
-        jq -e ".schemaVersion == 1 and .revision > 0 and .allocationRevision > 0 and (.targets | length) > 0" "$state" >/dev/null
+        jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and .applied.revision > 0 and .applied.allocationRevision > 0 and (.applied.targets | length) > 0" "$state" >/dev/null
         test -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_CONFIG
         test -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_FRONTENDS_V4
         test -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_FRONTENDS_V6
-        test -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V4
-        test -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V6
+        test ! -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V4
+        test ! -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V6
     '
 done
 "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 >/dev/null
@@ -749,11 +750,13 @@ done
 jq -e '(.allocation.leases | length) == 0' <<<"${cleanup_state}" >/dev/null
 for node in "${nodes[@]}"; do
     sudo "${container_runtime}" exec "${node}" sh -ec '
-        for map in LOAD_BALANCER_FRONTENDS_V4 LOAD_BALANCER_FRONTENDS_V6 LOAD_BALANCER_SOURCE_RANGES_V4 LOAD_BALANCER_SOURCE_RANGES_V6; do
+        for map in LOAD_BALANCER_FRONTENDS_V4 LOAD_BALANCER_FRONTENDS_V6; do
             test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v7/$map | jq length)" -eq 0
         done
+        test ! -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V4
+        test ! -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V6
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
-        test -f "$state" && jq -e ".schemaVersion == 1 and (.targets | length) == 0" "$state" >/dev/null
+        test -f "$state" && jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and (.applied.targets | length) == 0" "$state" >/dev/null
     '
 done
 remove_external_clients
