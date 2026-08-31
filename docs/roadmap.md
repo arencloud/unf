@@ -473,9 +473,15 @@ matrix is maintained in the
   negotiation, durable allocation production, authenticated per-Node intent,
   capability-aware convergence, and independent ABI-v6 inactive-bank
   activation/recovery pass `make loadbalancer-host-state-test`; ADR 0096.
-  Planned: dual-stack TCP/UDP `Cluster` and `Local` dataplanes; source ranges and
-  `healthCheckNodePort`; operations/simulation/recovery; independent
-  kube-proxy-free Kind and digest-pinned OpenShift gates.
+- Verified `externalTrafficPolicy: Cluster` dataplane: coherent independently
+  banked VIP state drives dual-stack TCP/UDP translation, bounded
+  collision-safe VIP source translation and reverse restoration, established
+  flow retention, backendless drop, ingress-policy ordering, and fresh-flow
+  withdrawal. The verifier-loaded release object retains full NodePort and
+  ClusterIP behavior under `make loadbalancer-cluster-dataplane-test`; ADR 0097.
+  Planned: `Local`, source ranges and `healthCheckNodePort`;
+  operations/simulation/recovery; independent kube-proxy-free Kind and
+  digest-pinned OpenShift gates.
 - Production BGP/cloud takeover, session affinity, internal traffic policy,
   topology-aware selection, Maglev, DSR, SCTP, Gateway API, multi-cluster, and
   production availability/scale remain independent future gates.

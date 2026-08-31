@@ -13,6 +13,7 @@ required_files=(
     docs/adr/0094-model-loadbalancer-intent-in-service-schema-v3.md
     docs/adr/0095-durable-loadbalancer-allocation-and-reachability.md
     docs/adr/0096-compatible-loadbalancer-host-state.md
+    docs/adr/0097-enforce-loadbalancer-cluster-vips-in-tc.md
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -73,14 +74,20 @@ require_text docs/project-status.md \
     '| Compatible distribution and transactional host state | **Verified** |' \
     "the authoritative tracker must identify milestone 6.4 as verified"
 require_text docs/development/phase6-loadbalancer-plan.md \
-    '| 6.5 | `externalTrafficPolicy: Cluster` LoadBalancer dataplane | **Planned** |' \
-    "milestone 6.5 must be the next packet-path slice"
+    '| 6.5 | `externalTrafficPolicy: Cluster` LoadBalancer dataplane | **Verified** |' \
+    "milestone 6.5 must remain verified"
+require_text docs/project-status.md \
+    '| LoadBalancer `Cluster` dataplane | **Verified** |' \
+    "the authoritative tracker must identify milestone 6.5 as verified"
+require_text docs/development/phase6-loadbalancer-plan.md \
+    '| 6.6 | `externalTrafficPolicy: Local`, source ranges, and health checks | **Planned** |' \
+    "milestone 6.6 must be the next packet-path slice"
 require_text docs/adr/0093-separate-loadbalancer-ownership-domains.md \
     '**Status:** Accepted and implemented for the Phase 6.1 architecture boundary' \
     "ADR 0093 must record the implemented architecture boundary"
 require_text README.md \
-    'The maps are not consumed by TC' \
-    "the README must not overstate LoadBalancer packet support"
+    'make loadbalancer-cluster-dataplane-test' \
+    "the README must bind LoadBalancer Cluster support to its regression gate"
 require_text docs/development/phase6-loadbalancer-plan.md \
     '`allocateLoadBalancerNodePorts: false` is preserved.' \
     "direct VIP delivery must not depend on traffic NodePorts"

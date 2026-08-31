@@ -30,8 +30,8 @@ use unf_ebpf_common::{
     SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER, SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL,
     SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_EVENT_ABI_VERSION,
     SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
-    SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
-    SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL,
+    SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
+    SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER, SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL,
     SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT, SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
     SERVICE_EVENT_REASON_INVALID_BACKEND, SERVICE_EVENT_REASON_INVALID_FRONTEND,
     SERVICE_EVENT_REASON_INVALID_SLOT, SERVICE_EVENT_REASON_MISSING_BACKEND,
@@ -56,6 +56,8 @@ const SERVICE_FRONTEND_CAPACITY: u32 = 262_144;
 const SERVICE_BACKEND_CAPACITY: u32 = 524_288;
 const SERVICE_BACKEND_SLOT_CAPACITY: u32 = 1_048_576;
 const SERVICE_CONNECTION_CAPACITY: u32 = 262_144;
+const SERVICE_FRONTEND_SELECTION_MISS: u8 = 0;
+const SERVICE_FRONTEND_SELECTION_DROP: u8 = u8::MAX;
 const IPV4_HEADER_CHECKSUM_OFFSET: usize = ETHERNET_HEADER_LEN + 10;
 const TCP_CHECKSUM_OFFSET: usize = 16;
 const UDP_CHECKSUM_OFFSET: usize = 6;
@@ -808,6 +810,33 @@ struct ServiceTranslation {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
+struct ServiceFrontendSelection {
+    frontend: ServiceFrontendValue,
+    service_bank: u8,
+    frontend_kind: u8,
+    connection_flags: u16,
+}
+
+#[inline(always)]
+const fn empty_service_frontend_selection(frontend_kind: u8) -> ServiceFrontendSelection {
+    ServiceFrontendSelection {
+        frontend: ServiceFrontendValue {
+            service_id: ServiceId::new(0),
+            frontend_index: 0,
+            backend_count: 0,
+            schema_version: 0,
+            flags: 0,
+            revision: 0,
+            reserved: [0; 8],
+        },
+        service_bank: 0,
+        frontend_kind,
+        connection_flags: 0,
+    }
+}
+
+#[derive(Clone, Copy)]
 enum ServiceLookup {
     Miss,
     Drop,
@@ -858,6 +887,28 @@ fn active_node_port_config(service: ServiceMapConfig) -> Option<NodePortMapConfi
     Some(config)
 }
 
+#[inline(always)]
+fn active_load_balancer_config(service: ServiceMapConfig) -> Option<LoadBalancerMapConfig> {
+    let config = LOAD_BALANCER_CONFIG.get(0).copied()?;
+    if config.schema_version != unf_ebpf_common::LOAD_BALANCER_MAP_ABI_VERSION
+        || config.active_bank >= unf_ebpf_common::LOAD_BALANCER_BANK_COUNT
+        || config.source_epoch == 0
+        || config.service_revision == 0
+        || config.reachability_revision == 0
+        || config.source_epoch != service.source_epoch
+        || config.service_revision != service.revision
+        || config.service_bank != service.active_bank
+        || (config.allocation_revision == 0 && (config.ipv4_count != 0 || config.ipv6_count != 0))
+        || config.ipv4_count > SERVICE_FRONTEND_CAPACITY / 2
+        || config.ipv6_count > SERVICE_FRONTEND_CAPACITY / 2
+        || config.flags != 0
+        || config.reserved != [0; 3]
+    {
+        return None;
+    }
+    Some(config)
+}
+
 /// Returns the additional source translation for a Cluster NodePort forward
 /// packet, or the destination restoration for its reverse packet.
 #[inline(always)]
@@ -880,6 +931,49 @@ fn service_connection_translation(forward: bool) -> Option<ServiceTranslation> {
             port: value.client_port,
         })
     }
+}
+
+#[inline(always)]
+fn validate_load_balancer_frontend(
+    forward_key: &ServiceConnectionKey,
+    frontend: LoadBalancerFrontendValue,
+    config: LoadBalancerMapConfig,
+    service: ServiceMapConfig,
+    now_ns: u64,
+) -> Result<ServiceFrontendValue, ()> {
+    if frontend.schema_version != unf_ebpf_common::LOAD_BALANCER_MAP_ABI_VERSION
+        || frontend.service_revision != config.service_revision
+        || frontend.service_revision != service.revision
+        || frontend.reachability_revision != config.reachability_revision
+        || frontend.allocation_revision == 0
+        || frontend.allocation_revision != config.allocation_revision
+        || frontend.service_id.get() == 0
+        || frontend.service_bank != config.service_bank
+        || frontend.service_bank != service.active_bank
+        || frontend.flags != 0
+        || frontend.reserved != [0; 7]
+    {
+        emit_service_lookup_failure(
+            forward_key,
+            frontend.service_id,
+            frontend.service_revision,
+            service_event_failure_metadata(
+                SERVICE_EVENT_REASON_INVALID_FRONTEND,
+                SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
+            ),
+            now_ns,
+        );
+        return Err(());
+    }
+    Ok(ServiceFrontendValue {
+        service_id: frontend.service_id,
+        frontend_index: frontend.frontend_index,
+        backend_count: frontend.backend_count,
+        schema_version: SERVICE_MAP_ABI_VERSION,
+        flags: 0,
+        revision: frontend.service_revision,
+        reserved: [0; 8],
+    })
 }
 
 #[inline(always)]
@@ -943,11 +1037,15 @@ const fn node_port_event_frontend_kind(flags: u16) -> u8 {
 }
 
 #[inline(always)]
-const fn connection_event_frontend_kind(flags: u16) -> u8 {
-    if flags & SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL != 0 {
+const fn connection_event_frontend_kind(value: &ServiceConnectionValue) -> u8 {
+    if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL != 0 {
         SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL
-    } else if flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
-        SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER
+    } else if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
+        if value.reserved[2] == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER {
+            SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
+        } else {
+            SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER
+        }
     } else {
         SERVICE_EVENT_FRONTEND_CLUSTER_IP
     }
@@ -989,7 +1087,7 @@ fn emit_service_connection_event(action: u8, reason: u8, timestamp_ns: u64) {
     event.action = action;
     event.reason = reason;
     event.reserved = [0; 10];
-    event.reserved[0] = connection_event_frontend_kind(value.flags);
+    event.reserved[0] = connection_event_frontend_kind(value);
     let _ = SERVICE_EVENTS.output::<ServiceEvent>(&*event, 0);
 }
 
@@ -1046,17 +1144,16 @@ fn service_forward_key(value: &ServiceConnectionValue) -> ServiceConnectionKey {
 
 #[inline(always)]
 fn service_reverse_key(value: &ServiceConnectionValue) -> ServiceConnectionKey {
-    let node_port_cluster =
-        value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0;
+    let source_translated = value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0;
     ServiceConnectionKey {
         source_address: value.backend_address,
-        destination_address: if node_port_cluster {
+        destination_address: if source_translated {
             value.frontend_address
         } else {
             value.client_address
         },
         source_port: value.backend_port,
-        destination_port: if node_port_cluster {
+        destination_port: if source_translated {
             node_port_snat_port(value)
         } else {
             value.client_port
@@ -1074,26 +1171,40 @@ fn node_port_snat_port(value: &ServiceConnectionValue) -> [u8; 2] {
 }
 
 #[inline(always)]
-fn remove_service_pair(value: &ServiceConnectionValue) {
-    let _ = SERVICE_CONNECTIONS.remove(&service_forward_key(value));
-    let _ = SERVICE_CONNECTIONS.remove(&service_reverse_key(value));
+fn service_peer_key(
+    value: &ServiceConnectionValue,
+    current: &ServiceConnectionKey,
+) -> ServiceConnectionKey {
+    if current.role == SERVICE_CONNECTION_ROLE_FORWARD {
+        service_reverse_key(value)
+    } else {
+        service_forward_key(value)
+    }
 }
 
 #[inline(always)]
-fn store_service_pair(value: &ServiceConnectionValue) -> bool {
-    let reverse = service_reverse_key(value);
-    if SERVICE_CONNECTIONS.insert(&reverse, value, 0).is_err() {
+fn remove_service_pair(value: &ServiceConnectionValue, current: &ServiceConnectionKey) {
+    let _ = SERVICE_CONNECTIONS.remove(current);
+    let _ = SERVICE_CONNECTIONS.remove(&service_peer_key(value, current));
+}
+
+#[inline(always)]
+fn store_service_pair(
+    value: &ServiceConnectionValue,
+    current: &ServiceConnectionKey,
+) -> bool {
+    let peer = service_peer_key(value, current);
+    if SERVICE_CONNECTIONS.insert(&peer, value, 0).is_err() {
         return false;
     }
-    let forward = service_forward_key(value);
-    if SERVICE_CONNECTIONS.insert(&forward, value, 0).is_err() {
-        let _ = SERVICE_CONNECTIONS.remove(&reverse);
+    if SERVICE_CONNECTIONS.insert(current, value, 0).is_err() {
+        let _ = SERVICE_CONNECTIONS.remove(&peer);
         return false;
     }
     true
 }
 
-#[inline(always)]
+#[inline(never)]
 fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
     let reverse = service_reverse_key(value);
     if SERVICE_CONNECTIONS
@@ -1113,7 +1224,7 @@ fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
     true
 }
 
-#[inline(always)]
+#[inline(never)]
 fn refresh_service_connection(
     key: &ServiceConnectionKey,
     now_ns: u64,
@@ -1151,7 +1262,7 @@ fn refresh_service_connection(
             SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT,
             now_ns,
         );
-        remove_service_pair(value);
+        remove_service_pair(value, key);
         return None;
     }
     let translation = if key.role == SERVICE_CONNECTION_ROLE_FORWARD {
@@ -1166,61 +1277,36 @@ fn refresh_service_connection(
         }
     };
     value.last_seen_ns = now_ns;
-    if !store_service_pair(value) {
-        remove_service_pair(value);
+    if !store_service_pair(value, key) {
+        remove_service_pair(value, key);
         return None;
     }
-    let cluster_ip = value.flags
-        & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
-        == 0;
+    let cluster_ip =
+        value.flags & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
+            == 0;
     Some((translation, cluster_ip))
 }
 
-#[allow(clippy::too_many_arguments)]
-#[inline(always)]
+#[inline(never)]
 fn new_service_connection(
-    client_address: [u8; 16],
-    frontend_address: [u8; 16],
-    backend_address: [u8; 16],
-    client_port: [u8; 2],
-    frontend_port: [u8; 2],
-    backend_port: [u8; 2],
-    protocol: u8,
-    address_family: AddressFamily,
-    frontend: ServiceFrontendValue,
-    backend_id: unf_common::BackendId,
-    flags: u16,
+    value: &mut ServiceConnectionValue,
+    frontend_kind: u8,
     now_ns: u64,
 ) -> Option<ServiceTranslation> {
-    let scratch = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0)?;
-    // SAFETY: the pointer addresses this CPU's unique, initialized array slot.
-    #[allow(unsafe_code)]
-    let value = unsafe { &mut *scratch };
     value.last_seen_ns = now_ns;
-    value.service_revision = frontend.revision;
-    value.client_address = client_address;
-    value.frontend_address = frontend_address;
-    value.backend_address = backend_address;
-    value.service_id = frontend.service_id;
-    value.backend_id = backend_id;
-    value.client_port = client_port;
-    value.frontend_port = frontend_port;
-    value.backend_port = backend_port;
-    value.schema_version = SERVICE_MAP_ABI_VERSION;
-    value.protocol = protocol;
-    value.address_family = address_family as u8;
-    value.flags = flags;
-    value.reserved = [0; 4];
-    if flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
-        let hash = service_flow_hash(&service_forward_key(value), frontend.service_id);
+    if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
+        if frontend_kind == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER {
+            value.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER;
+        }
+        let hash = service_flow_hash(&service_forward_key(value), value.service_id);
         let mut probe = 0_u32;
         while probe < NODE_PORT_SNAT_PORT_PROBES {
             let port = node_port_snat_candidate(hash, probe);
             value.reserved[0..2].copy_from_slice(&port.to_be_bytes());
             if insert_new_service_pair(value) {
                 return Some(ServiceTranslation {
-                    address: backend_address,
-                    port: backend_port,
+                    address: value.backend_address,
+                    port: value.backend_port,
                 });
             }
             probe += 1;
@@ -1231,18 +1317,159 @@ fn new_service_connection(
         return None;
     }
     Some(ServiceTranslation {
-        address: backend_address,
-        port: backend_port,
+        address: value.backend_address,
+        port: value.backend_port,
     })
+}
+
+#[inline(always)]
+fn lookup_load_balancer_frontend_v4(
+    forward_key: &ServiceConnectionKey,
+    service: ServiceMapConfig,
+    now_ns: u64,
+) -> ServiceFrontendSelection {
+    let Some(config) = active_load_balancer_config(service) else {
+        return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_MISS);
+    };
+    let key = Ipv4LoadBalancerFrontendKey {
+        address: [
+            forward_key.destination_address[0],
+            forward_key.destination_address[1],
+            forward_key.destination_address[2],
+            forward_key.destination_address[3],
+        ],
+        port: forward_key.destination_port,
+        protocol: forward_key.protocol,
+        bank: config.active_bank,
+    };
+    // SAFETY: the exact fixed-layout key/value pair matches the map ABI and is
+    // copied before another map operation.
+    #[allow(unsafe_code)]
+    let Some(value) = (unsafe { LOAD_BALANCER_FRONTENDS_V4.get(&key).copied() }) else {
+        return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_MISS);
+    };
+    let Ok(frontend) =
+        validate_load_balancer_frontend(forward_key, value, config, service, now_ns)
+    else {
+        return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_DROP);
+    };
+    ServiceFrontendSelection {
+        frontend,
+        service_bank: value.service_bank,
+        frontend_kind: SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
+        connection_flags: SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER,
+    }
+}
+
+#[inline(always)]
+fn lookup_load_balancer_frontend_v6(
+    forward_key: &ServiceConnectionKey,
+    service: ServiceMapConfig,
+    now_ns: u64,
+) -> ServiceFrontendSelection {
+    let Some(config) = active_load_balancer_config(service) else {
+        return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_MISS);
+    };
+    let key = Ipv6LoadBalancerFrontendKey {
+        address: forward_key.destination_address,
+        port: forward_key.destination_port,
+        protocol: forward_key.protocol,
+        bank: config.active_bank,
+    };
+    // SAFETY: the exact fixed-layout key/value pair matches the map ABI and is
+    // copied before another map operation.
+    #[allow(unsafe_code)]
+    let Some(value) = (unsafe { LOAD_BALANCER_FRONTENDS_V6.get(&key).copied() }) else {
+        return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_MISS);
+    };
+    let Ok(frontend) =
+        validate_load_balancer_frontend(forward_key, value, config, service, now_ns)
+    else {
+        return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_DROP);
+    };
+    ServiceFrontendSelection {
+        frontend,
+        service_bank: value.service_bank,
+        frontend_kind: SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
+        connection_flags: SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER,
+    }
+}
+
+#[inline(always)]
+fn lookup_external_frontend_v4(
+    forward_key: &ServiceConnectionKey,
+    service: ServiceMapConfig,
+    now_ns: u64,
+) -> ServiceFrontendSelection {
+    if let Some(config) = active_node_port_config(service) {
+        let key = Ipv4NodePortFrontendKey {
+            address: [
+                forward_key.destination_address[0],
+                forward_key.destination_address[1],
+                forward_key.destination_address[2],
+                forward_key.destination_address[3],
+            ],
+            port: forward_key.destination_port,
+            protocol: forward_key.protocol,
+            bank: config.active_bank,
+        };
+        // SAFETY: the exact key/value pair matches the map ABI and is copied.
+        #[allow(unsafe_code)]
+        if let Some(value) = unsafe { NODE_PORT_FRONTENDS_V4.get(&key).copied() } {
+            let Ok((frontend, flags)) =
+                validate_node_port_frontend(forward_key, value, config, service, now_ns)
+            else {
+                return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_DROP);
+            };
+            return ServiceFrontendSelection {
+                frontend,
+                service_bank: value.service_bank,
+                frontend_kind: node_port_event_frontend_kind(value.flags),
+                connection_flags: flags,
+            };
+        }
+    }
+    lookup_load_balancer_frontend_v4(forward_key, service, now_ns)
+}
+
+#[inline(always)]
+fn lookup_external_frontend_v6(
+    forward_key: &ServiceConnectionKey,
+    service: ServiceMapConfig,
+    now_ns: u64,
+) -> ServiceFrontendSelection {
+    if let Some(config) = active_node_port_config(service) {
+        let key = Ipv6NodePortFrontendKey {
+            address: forward_key.destination_address,
+            port: forward_key.destination_port,
+            protocol: forward_key.protocol,
+            bank: config.active_bank,
+        };
+        // SAFETY: the exact key/value pair matches the map ABI and is copied.
+        #[allow(unsafe_code)]
+        if let Some(value) = unsafe { NODE_PORT_FRONTENDS_V6.get(&key).copied() } {
+            let Ok((frontend, flags)) =
+                validate_node_port_frontend(forward_key, value, config, service, now_ns)
+            else {
+                return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_DROP);
+            };
+            return ServiceFrontendSelection {
+                frontend,
+                service_bank: value.service_bank,
+                frontend_kind: node_port_event_frontend_kind(value.flags),
+                connection_flags: flags,
+            };
+        }
+    }
+    lookup_load_balancer_frontend_v6(forward_key, service, now_ns)
 }
 
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) -> ServiceLookup {
-    if let Some((translation, cluster_ip)) = refresh_service_connection(forward_key, now_ns) {
-        return ServiceLookup::Translation(translation, cluster_ip);
-    }
-
+fn lookup_new_forward_service_v4(
+    forward_key: &ServiceConnectionKey,
+    now_ns: u64,
+) -> ServiceLookup {
     let Some(config) = active_service_config() else {
         return ServiceLookup::Miss;
     };
@@ -1261,46 +1488,23 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     // the value is copied before any other map operation.
     #[allow(unsafe_code)]
     let cluster_frontend = unsafe { SERVICE_FRONTENDS_V4.get(&frontend_key).copied() };
-    let (frontend, service_bank, connection_flags, frontend_kind) =
-        if let Some(frontend) = cluster_frontend {
-            (frontend, config.active_bank, 0, SERVICE_EVENT_FRONTEND_CLUSTER_IP)
+    let (frontend, service_bank, connection_flags, frontend_kind) = if let Some(frontend) =
+        cluster_frontend
+    {
+        (frontend, config.active_bank, 0, SERVICE_EVENT_FRONTEND_CLUSTER_IP)
     } else {
-        let Some(node_port_config) = active_node_port_config(config) else {
+        let selection = lookup_external_frontend_v4(forward_key, config, now_ns);
+        if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_MISS {
             return ServiceLookup::Miss;
-        };
-        let node_port_key = Ipv4NodePortFrontendKey {
-            address: [
-                forward_key.destination_address[0],
-                forward_key.destination_address[1],
-                forward_key.destination_address[2],
-                forward_key.destination_address[3],
-            ],
-            port: forward_key.destination_port,
-            protocol: forward_key.protocol,
-            bank: node_port_config.active_bank,
-        };
-        // SAFETY: the exact key and fixed-layout value match the declared map
-        // ABI and the value is copied before any other map operation.
-        #[allow(unsafe_code)]
-        let Some(node_port_frontend) =
-            (unsafe { NODE_PORT_FRONTENDS_V4.get(&node_port_key).copied() })
-        else {
-            return ServiceLookup::Miss;
-        };
-        let Ok((frontend, connection_flags)) = validate_node_port_frontend(
-            forward_key,
-            node_port_frontend,
-            node_port_config,
-            config,
-            now_ns,
-        ) else {
+        }
+        if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_DROP {
             return ServiceLookup::Drop;
-        };
+        }
         (
-            frontend,
-            node_port_frontend.service_bank,
-            connection_flags,
-            node_port_event_frontend_kind(node_port_frontend.flags),
+            selection.frontend,
+            selection.service_bank,
+            selection.connection_flags,
+            selection.frontend_kind,
         )
     };
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
@@ -1399,20 +1603,27 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     backend_address[1] = backend.address[1];
     backend_address[2] = backend.address[2];
     backend_address[3] = backend.address[3];
-    let Some(translation) = new_service_connection(
-        forward_key.source_address,
-        forward_key.destination_address,
-        backend_address,
-        forward_key.source_port,
-        forward_key.destination_port,
-        backend.port,
-        forward_key.protocol,
-        AddressFamily::Ipv4,
-        frontend,
-        slot.backend_id,
-        connection_flags,
-        now_ns,
-    ) else {
+    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
+        return ServiceLookup::Drop;
+    };
+    // SAFETY: this CPU owns the connection scratch value for this invocation.
+    #[allow(unsafe_code)]
+    let value = unsafe { &mut *value_ptr };
+    value.service_revision = frontend.revision;
+    value.client_address = forward_key.source_address;
+    value.frontend_address = forward_key.destination_address;
+    value.backend_address = backend_address;
+    value.service_id = frontend.service_id;
+    value.backend_id = slot.backend_id;
+    value.client_port = forward_key.source_port;
+    value.frontend_port = forward_key.destination_port;
+    value.backend_port = backend.port;
+    value.schema_version = SERVICE_MAP_ABI_VERSION;
+    value.protocol = forward_key.protocol;
+    value.address_family = AddressFamily::Ipv4 as u8;
+    value.flags = connection_flags;
+    value.reserved = [0; 4];
+    let Some(translation) = new_service_connection(value, frontend_kind, now_ns) else {
         emit_service_connection_event(
             SERVICE_EVENT_ACTION_DROP,
             SERVICE_EVENT_REASON_PAIR_INSERT_FAILED,
@@ -1425,11 +1636,10 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
 
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) -> ServiceLookup {
-    if let Some((translation, cluster_ip)) = refresh_service_connection(forward_key, now_ns) {
-        return ServiceLookup::Translation(translation, cluster_ip);
-    }
-
+fn lookup_new_forward_service_v6(
+    forward_key: &ServiceConnectionKey,
+    now_ns: u64,
+) -> ServiceLookup {
     let Some(config) = active_service_config() else {
         return ServiceLookup::Miss;
     };
@@ -1443,41 +1653,23 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
     // the value is copied before any other map operation.
     #[allow(unsafe_code)]
     let cluster_frontend = unsafe { SERVICE_FRONTENDS_V6.get(&frontend_key).copied() };
-    let (frontend, service_bank, connection_flags, frontend_kind) =
-        if let Some(frontend) = cluster_frontend {
-            (frontend, config.active_bank, 0, SERVICE_EVENT_FRONTEND_CLUSTER_IP)
+    let (frontend, service_bank, connection_flags, frontend_kind) = if let Some(frontend) =
+        cluster_frontend
+    {
+        (frontend, config.active_bank, 0, SERVICE_EVENT_FRONTEND_CLUSTER_IP)
     } else {
-        let Some(node_port_config) = active_node_port_config(config) else {
+        let selection = lookup_external_frontend_v6(forward_key, config, now_ns);
+        if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_MISS {
             return ServiceLookup::Miss;
-        };
-        let node_port_key = Ipv6NodePortFrontendKey {
-            address: forward_key.destination_address,
-            port: forward_key.destination_port,
-            protocol: forward_key.protocol,
-            bank: node_port_config.active_bank,
-        };
-        // SAFETY: the exact key and fixed-layout value match the declared map
-        // ABI and the value is copied before any other map operation.
-        #[allow(unsafe_code)]
-        let Some(node_port_frontend) =
-            (unsafe { NODE_PORT_FRONTENDS_V6.get(&node_port_key).copied() })
-        else {
-            return ServiceLookup::Miss;
-        };
-        let Ok((frontend, connection_flags)) = validate_node_port_frontend(
-            forward_key,
-            node_port_frontend,
-            node_port_config,
-            config,
-            now_ns,
-        ) else {
+        }
+        if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_DROP {
             return ServiceLookup::Drop;
-        };
+        }
         (
-            frontend,
-            node_port_frontend.service_bank,
-            connection_flags,
-            node_port_event_frontend_kind(node_port_frontend.flags),
+            selection.frontend,
+            selection.service_bank,
+            selection.connection_flags,
+            selection.frontend_kind,
         )
     };
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
@@ -1571,20 +1763,27 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         );
         return ServiceLookup::Drop;
     }
-    let Some(translation) = new_service_connection(
-        forward_key.source_address,
-        forward_key.destination_address,
-        backend.address,
-        forward_key.source_port,
-        forward_key.destination_port,
-        backend.port,
-        forward_key.protocol,
-        AddressFamily::Ipv6,
-        frontend,
-        slot.backend_id,
-        connection_flags,
-        now_ns,
-    ) else {
+    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
+        return ServiceLookup::Drop;
+    };
+    // SAFETY: this CPU owns the connection scratch value for this invocation.
+    #[allow(unsafe_code)]
+    let value = unsafe { &mut *value_ptr };
+    value.service_revision = frontend.revision;
+    value.client_address = forward_key.source_address;
+    value.frontend_address = forward_key.destination_address;
+    value.backend_address = backend.address;
+    value.service_id = frontend.service_id;
+    value.backend_id = slot.backend_id;
+    value.client_port = forward_key.source_port;
+    value.frontend_port = forward_key.destination_port;
+    value.backend_port = backend.port;
+    value.schema_version = SERVICE_MAP_ABI_VERSION;
+    value.protocol = forward_key.protocol;
+    value.address_family = AddressFamily::Ipv6 as u8;
+    value.flags = connection_flags;
+    value.reserved = [0; 4];
+    let Some(translation) = new_service_connection(value, frontend_kind, now_ns) else {
         emit_service_connection_event(
             SERVICE_EVENT_ACTION_DROP,
             SERVICE_EVENT_REASON_PAIR_INSERT_FAILED,
@@ -1593,6 +1792,24 @@ fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) ->
         return ServiceLookup::Drop;
     };
     ServiceLookup::Translation(translation, connection_flags == 0)
+}
+
+#[inline(always)]
+fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) -> ServiceLookup {
+    if let Some((translation, cluster_ip)) = refresh_service_connection(forward_key, now_ns) {
+        ServiceLookup::Translation(translation, cluster_ip)
+    } else {
+        lookup_new_forward_service_v4(forward_key, now_ns)
+    }
+}
+
+#[inline(always)]
+fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) -> ServiceLookup {
+    if let Some((translation, cluster_ip)) = refresh_service_connection(forward_key, now_ns) {
+        ServiceLookup::Translation(translation, cluster_ip)
+    } else {
+        lookup_new_forward_service_v6(forward_key, now_ns)
+    }
 }
 
 #[inline(never)]

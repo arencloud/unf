@@ -41,10 +41,10 @@ use unf_ebpf_common::{
     POLICY_FLAG_HAS_SHADOW, POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE,
     POLICY_MAP_ABI_VERSION, SERVICE_BANK_COUNT, SERVICE_EVENT_ABI_VERSION,
     SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
-    SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
-    SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL, SERVICE_EVENT_REASON_NO_BACKEND,
-    SERVICE_MAP_ABI_VERSION, ServiceEvent, service_event_action_reason_is_valid,
-    service_event_frontend_kind_is_valid,
+    SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
+    SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER, SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL,
+    SERVICE_EVENT_REASON_NO_BACKEND, SERVICE_MAP_ABI_VERSION, ServiceEvent,
+    service_event_action_reason_is_valid, service_event_frontend_kind_is_valid,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -6718,6 +6718,7 @@ fn service_event_frontend_kind(event: &ServiceEvent) -> ServiceFrontendKind {
         SERVICE_EVENT_FRONTEND_CLUSTER_IP => ServiceFrontendKind::ClusterIp,
         SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER => ServiceFrontendKind::NodePortCluster,
         SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL => ServiceFrontendKind::NodePortLocal,
+        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER => ServiceFrontendKind::LoadBalancerCluster,
         _ => unreachable!("validated service event frontend kind"),
     }
 }
@@ -6770,7 +6771,7 @@ fn record_service_event(state: &AgentState, event: &ServiceEvent) {
                         .fetch_add(1, Ordering::Relaxed);
                     state.metrics.node_port_local_translations.inc();
                 }
-                ServiceFrontendKind::ClusterIp => {}
+                ServiceFrontendKind::ClusterIp | ServiceFrontendKind::LoadBalancerCluster => {}
             }
         }
         SERVICE_EVENT_ACTION_DROP => {
@@ -9253,11 +9254,69 @@ mod tests {
         .expect("LoadBalancer Node snapshot validates")
     }
 
+    fn dual_stack_load_balancer_node_snapshot(
+        services: &ServiceSnapshot,
+        revision: u64,
+        ipv4: Ipv4Addr,
+        ipv6: Ipv6Addr,
+    ) -> NodeReachabilitySnapshot {
+        let service = services.services.first().expect("one test Service exists");
+        let owner = unf_loadbalancer::LoadBalancerOwner {
+            service_id: service.id,
+            namespace: service.namespace.clone(),
+            name: service.name.clone(),
+            uid: format!("{}-uid", service.name),
+        };
+        NodeReachabilitySnapshot {
+            schema_version: unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION,
+            source_epoch: services.source_epoch,
+            revision: Revision::new(revision),
+            allocation_revision: Revision::new(revision),
+            provider: unf_loadbalancer::ReachabilityProviderRef {
+                name: "direct-node".to_owned(),
+                instance: "qualification-a".to_owned(),
+                mode: unf_loadbalancer::ReachabilityMode::DirectNode,
+            },
+            node: unf_loadbalancer::ReachabilityNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+            },
+            targets: vec![
+                unf_loadbalancer::NodeReachabilityTarget {
+                    owner: owner.clone(),
+                    address: ipv4.into(),
+                },
+                unf_loadbalancer::NodeReachabilityTarget {
+                    owner,
+                    address: ipv6.into(),
+                },
+            ],
+        }
+        .validate()
+        .expect("dual-stack LoadBalancer Node snapshot validates")
+    }
+
     fn dual_stack_service_snapshot(
         revision: u64,
         ipv4_backend: Ipv4Addr,
         ipv6_backend: Ipv6Addr,
         include_backends: bool,
+    ) -> ServiceSnapshot {
+        dual_stack_service_snapshot_with_load_balancer(
+            revision,
+            ipv4_backend,
+            ipv6_backend,
+            include_backends,
+            false,
+        )
+    }
+
+    fn dual_stack_service_snapshot_with_load_balancer(
+        revision: u64,
+        ipv4_backend: Ipv4Addr,
+        ipv6_backend: Ipv6Addr,
+        include_backends: bool,
+        load_balancer: bool,
     ) -> ServiceSnapshot {
         let ports = vec![
             unf_service::ServiceSourcePort {
@@ -9338,7 +9397,18 @@ mod tests {
                     "fd00:96::10".parse::<Ipv6Addr>().unwrap().into(),
                 ],
                 external_traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
-                load_balancer: None,
+                load_balancer: load_balancer.then(|| unf_service::ServiceLoadBalancerSource {
+                    class: unf_service::UNF_LOAD_BALANCER_CLASS.to_owned(),
+                    ip_families: vec![
+                        unf_service::AddressFamily::Ipv4,
+                        unf_service::AddressFamily::Ipv6,
+                    ],
+                    ip_family_policy: unf_service::ServiceIpFamilyPolicy::RequireDualStack,
+                    requested_ips: Vec::new(),
+                    source_ranges: Vec::new(),
+                    allocate_node_ports: false,
+                    health_check_node_port: None,
+                }),
                 ports,
             }],
             slices,
@@ -10096,6 +10166,243 @@ mod tests {
             .expect("exact active VIP bank and checkpoint recover");
         assert_eq!(synchronizer.active_load_balancer_bank, 1);
         assert_eq!(synchronizer.applied_load_balancer_reachability, Some(first));
+    }
+
+    #[test]
+    #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
+    fn privileged_load_balancer_cluster_packets_translate_dual_stack_and_survive_churn() {
+        const TC_ACT_SHOT: u32 = 2;
+        const TC_ACT_PIPE: u32 = 3;
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new()
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(program_name)
+                .expect("service TC program exists")
+                .try_into()
+                .expect("service program is a TC classifier");
+            program
+                .load()
+                .expect("kernel verifier accepts LoadBalancer TC program");
+        }
+        let mut service_events = RingBuf::try_from(
+            ebpf.take_map("SERVICE_EVENTS")
+                .expect("service event ring exists"),
+        )
+        .expect("service event ring opens");
+        let (mut identity_v4_maps, _identity_v6_maps, mut identity_config) =
+            take_identity_maps(&mut ebpf).expect("take identity maps");
+        let (
+            _identity_policy,
+            mut ipv4_policy,
+            _ipv6_policy,
+            _egress_ipv4_policy,
+            _egress_ipv6_policy,
+            mut policy_config,
+        ) = take_policy_maps(&mut ebpf).expect("take policy maps");
+        let directory = tempdir().unwrap();
+        let mut synchronizer =
+            test_service_synchronizer(&mut ebpf, directory.path().join("service.json"));
+        let state = test_agent_state();
+        let client_v4 = Ipv4Addr::new(203, 0, 113, 5);
+        let client_v6 = "2001:db8::5".parse::<Ipv6Addr>().unwrap();
+        let vip_v4 = Ipv4Addr::new(192, 0, 2, 60);
+        let vip_v6 = "2001:db8:ffff::60".parse::<Ipv6Addr>().unwrap();
+        let backend_v4 = Ipv4Addr::new(10, 42, 0, 20);
+        let backend_v6 = "fd00:42::20".parse::<Ipv6Addr>().unwrap();
+        let first =
+            dual_stack_service_snapshot_with_load_balancer(1, backend_v4, backend_v6, true, true);
+        activate_service_snapshot(&mut synchronizer, &first, None, true, &state)
+            .expect("dual-stack LoadBalancer Service activates");
+        let first_reachability = dual_stack_load_balancer_node_snapshot(&first, 1, vip_v4, vip_v6);
+        activate_load_balancer_snapshot(&mut synchronizer, &first_reachability, &state)
+            .expect("dual-stack VIP bank activates");
+
+        let ipv4_tcp = ipv4_packet(6, client_v4, vip_v4, 40_000, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        let ipv4_tcp_snat = u16::from_be_bytes([translated[34], translated[35]]);
+        assert!((32_768..=u16::MAX).contains(&ipv4_tcp_snat));
+        assert_ipv4_packet(&translated, 6, vip_v4, backend_v4, ipv4_tcp_snat, 8080);
+        let reverse = ipv4_packet(6, backend_v4, vip_v4, 8080, ipv4_tcp_snat);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, vip_v4, client_v4, 80, 40_000);
+
+        // The source-port high bit does not change the low 15-bit initial NAT
+        // candidate. A second flow proves collision-safe bounded probing for
+        // LoadBalancer Cluster traffic rather than reverse-tuple replacement.
+        let colliding_client_port = 0x9c40_u16 ^ 0x8000;
+        let colliding = ipv4_packet(6, client_v4, vip_v4, colliding_client_port, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &colliding);
+        assert_eq!(action, TC_ACT_PIPE);
+        let colliding_snat = u16::from_be_bytes([translated[34], translated[35]]);
+        assert!((32_768..=u16::MAX).contains(&colliding_snat));
+        assert_ne!(colliding_snat, ipv4_tcp_snat);
+        assert_ipv4_packet(&translated, 6, vip_v4, backend_v4, colliding_snat, 8080);
+        let reverse = ipv4_packet(6, backend_v4, vip_v4, 8080, colliding_snat);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, vip_v4, client_v4, 80, colliding_client_port);
+
+        let ipv4_udp = ipv4_packet(17, client_v4, vip_v4, 40_001, 53);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        let ipv4_udp_snat = u16::from_be_bytes([translated[34], translated[35]]);
+        assert_ipv4_packet(&translated, 17, vip_v4, backend_v4, ipv4_udp_snat, 5353);
+        let reverse = ipv4_packet(17, backend_v4, vip_v4, 5353, ipv4_udp_snat);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 17, vip_v4, client_v4, 53, 40_001);
+
+        let ipv6_tcp = ipv6_packet(6, client_v6, vip_v6, 40_002, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv6_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        let ipv6_tcp_snat = u16::from_be_bytes([translated[54], translated[55]]);
+        assert_ipv6_packet(&translated, 6, vip_v6, backend_v6, ipv6_tcp_snat, 8080);
+        let reverse = ipv6_packet(6, backend_v6, vip_v6, 8080, ipv6_tcp_snat);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 6, vip_v6, client_v6, 80, 40_002);
+
+        let ipv6_udp = ipv6_packet(17, client_v6, vip_v6, 40_003, 53);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv6_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        let ipv6_udp_snat = u16::from_be_bytes([translated[54], translated[55]]);
+        assert_ipv6_packet(&translated, 17, vip_v6, backend_v6, ipv6_udp_snat, 5353);
+        let reverse = ipv6_packet(17, backend_v6, vip_v6, 5353, ipv6_udp_snat);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, vip_v6, client_v6, 53, 40_003);
+
+        // Service translation precedes ingress policy evaluation: policy sees
+        // the external source and selected backend identity/port, not the VIP.
+        let backend_identity = IdentityId::new(22);
+        identity_v4_maps[0]
+            .insert(
+                backend_v4.octets(),
+                encode_identity_value(IdentityMapValue::new(backend_identity, 9)),
+                0,
+            )
+            .expect("backend identity is staged");
+        identity_config
+            .set(0, encode_identity_config(7, 9, 1, 0).unwrap(), 0)
+            .expect("backend identity is activated");
+        let deny = Ipv4PolicyMapEntry {
+            key: unf_state::Ipv4PolicyMapKey {
+                source_address: Ipv4Addr::UNSPECIFIED,
+                destination_identity: backend_identity,
+                protocol: 6,
+                destination_port: 8080,
+            },
+            decision: PolicyDecisionRecord {
+                verdict: Verdict::Deny,
+                reason: PolicyReason::DefaultAction,
+                policy_id: Some(PolicyId::new(7)),
+                rule_id: None,
+            },
+            shadow: None,
+        };
+        ipv4_policy
+            .insert(
+                encode_ipv4_policy_key(&deny, 0),
+                encode_policy_decisions(&deny.decision, None, 9),
+                0,
+            )
+            .expect("external-source deny is staged");
+        policy_config
+            .set(0, encode_policy_config(7, 9, 1, 0).unwrap(), 0)
+            .expect("external-source deny is activated");
+        let denied = ipv4_packet(6, client_v4, vip_v4, 40_100, 80);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &denied);
+        assert_eq!(action, TC_ACT_SHOT);
+        identity_config
+            .set(0, [0; 24], 0)
+            .expect("test identity state is disabled");
+        policy_config
+            .set(0, [0; 24], 0)
+            .expect("test policy state is disabled");
+
+        let replacement_v4 = Ipv4Addr::new(10, 42, 0, 21);
+        let replacement_v6 = "fd00:42::21".parse::<Ipv6Addr>().unwrap();
+        let second = dual_stack_service_snapshot_with_load_balancer(
+            2,
+            replacement_v4,
+            replacement_v6,
+            true,
+            true,
+        );
+        activate_service_snapshot(&mut synchronizer, &second, None, true, &state)
+            .expect("replacement LoadBalancer backend activates");
+        let second_reachability =
+            dual_stack_load_balancer_node_snapshot(&second, 2, vip_v4, vip_v6);
+        activate_load_balancer_snapshot(&mut synchronizer, &second_reachability, &state)
+            .expect("replacement VIP linkage activates");
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, vip_v4, backend_v4, ipv4_tcp_snat, 8080);
+        let new_flow = ipv4_packet(6, client_v4, vip_v4, 41_000, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &new_flow);
+        assert_eq!(action, TC_ACT_PIPE);
+        let new_snat = u16::from_be_bytes([translated[34], translated[35]]);
+        assert_ipv4_packet(&translated, 6, vip_v4, replacement_v4, new_snat, 8080);
+
+        let backendless = dual_stack_service_snapshot_with_load_balancer(
+            3,
+            replacement_v4,
+            replacement_v6,
+            false,
+            true,
+        );
+        activate_service_snapshot(&mut synchronizer, &backendless, None, true, &state)
+            .expect("backendless LoadBalancer Service activates");
+        let backendless_reachability =
+            dual_stack_load_balancer_node_snapshot(&backendless, 3, vip_v4, vip_v6);
+        activate_load_balancer_snapshot(&mut synchronizer, &backendless_reachability, &state)
+            .expect("backendless VIP linkage activates");
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &new_flow);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, vip_v4, replacement_v4, new_snat, 8080);
+        let no_backend = ipv4_packet(6, client_v4, vip_v4, 42_000, 80);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &no_backend);
+        assert_eq!(action, TC_ACT_SHOT);
+
+        let unrelated = ipv4_packet(6, client_v4, Ipv4Addr::new(192, 0, 2, 99), 42_001, 80);
+        let (action, output) = run_tc(&mut ebpf, "unf_observe_ingress", &unrelated);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_eq!(output, unrelated);
+
+        // Withdrawal activates an empty VIP bank before publication can be
+        // removed. Fresh packets are no longer intercepted by this host.
+        let mut withdrawn = backendless_reachability.clone();
+        withdrawn.revision = Revision::new(4);
+        withdrawn.allocation_revision = Revision::new(4);
+        withdrawn.targets.clear();
+        let withdrawn = withdrawn
+            .validate()
+            .expect("empty LoadBalancer reachability validates");
+        activate_load_balancer_snapshot(&mut synchronizer, &withdrawn, &state)
+            .expect("empty VIP bank activates before route/status withdrawal");
+        let after_withdrawal = ipv4_packet(6, client_v4, vip_v4, 42_002, 80);
+        let (action, output) = run_tc(&mut ebpf, "unf_observe_ingress", &after_withdrawal);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_eq!(output, after_withdrawal);
+
+        let mut events = Vec::new();
+        while let Some(item) = service_events.next() {
+            events.push(decode_service_event(&item).expect("kernel service event is valid"));
+        }
+        assert!(events.iter().any(|event| {
+            event.action == SERVICE_EVENT_ACTION_TRANSLATE
+                && service_event_frontend_kind(event) == ServiceFrontendKind::LoadBalancerCluster
+        }));
+        assert!(events.iter().any(|event| {
+            event.reason == SERVICE_EVENT_REASON_NO_BACKEND
+                && service_event_frontend_kind(event) == ServiceFrontendKind::LoadBalancerCluster
+        }));
     }
 
     #[test]
@@ -11385,6 +11692,14 @@ mod tests {
         assert_eq!(
             report.last_service_reason,
             unf_ebpf_common::SERVICE_EVENT_REASON_FORWARD_TRANSLATED
+        );
+
+        bytes[86] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER;
+        let load_balancer = decode_service_event(&bytes)
+            .expect("LoadBalancer Cluster event classification is valid");
+        assert_eq!(
+            service_event_frontend_kind(&load_balancer),
+            ServiceFrontendKind::LoadBalancerCluster
         );
 
         bytes[48..64].fill(0);

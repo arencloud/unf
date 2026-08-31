@@ -17,7 +17,7 @@
 | `unf-cni` | Bounded CNI protocol/socket handling and atomic durable-IPAM plus link/route ADD/CHECK/DEL orchestration | Kubernetes access, policy compilation, durable IPAM storage, routing protocols, or telemetry aggregation |
 | `unf-loadbalancer` | Deterministic dual-stack VIP allocation, exact pool/provider ownership, complete revisioned direct-Node reachability intent/acknowledgement, and fail-closed Kubernetes publication/withdrawal transactions | Kubernetes API calls, host-state mutation, routing protocols, or packet translation |
 | `unfctl` | Operator-facing status, topology, flow history, explanation, and simulation | Fabric state ownership |
-| `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, telemetry, source-side and host-origin dual-stack TCP/UDP ClusterIP translation, and `Cluster`/`Local` NodePort translation with paired persistent connection state | Selectors, enrichment strings, LoadBalancer translation, host-origin NodePort translation, or L7 processing |
+| `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, telemetry, source-side and host-origin dual-stack TCP/UDP ClusterIP translation, `Cluster`/`Local` NodePort translation, and coherent `Cluster` LoadBalancer VIP translation with paired persistent connection state | Selectors, enrichment strings, LoadBalancer allocation or advertisement, host-origin NodePort translation, or L7 processing |
 
 The allowed dependency direction is from binaries toward libraries and from API
 conversion toward domain types. Kernel ABI types depend only on `no_std`
@@ -30,11 +30,13 @@ retained-last-valid compilation. Existing service lowerers reject that intent.
 `unf-loadbalancer` now owns deterministic allocation, the provider-neutral
 reachability contract, and exact publication ordering. The controller now owns
 durable explicit-pool production and finalizer-safe withdrawal; the agent owns
-authenticated, independently banked host adoption and recovery. Live status
-publication, provider-owned external advertisement artifacts, and
-`unf-ebpf-tc` VIP translation remain separate ordered milestones. Allocation,
-advertisement, translation, and published readiness are not interchangeable.
-ADRs 0093–0096 define the implemented boundary.
+authenticated, independently banked host adoption and recovery. `unf-ebpf-tc`
+now owns coherent `Cluster` VIP translation and paired reverse state. Live
+status publication, `Local`/source-range/health behavior, provider-owned
+external advertisement artifacts, and platform qualification remain separate
+ordered milestones. Allocation, advertisement, translation, and published
+readiness are not interchangeable. ADRs 0093–0097 define the implemented
+boundary.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

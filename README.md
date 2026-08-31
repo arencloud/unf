@@ -250,7 +250,7 @@ transactions. Status may publish a VIP only after the admitted provider and
 dataplane converge, direct delivery cannot depend on a traffic NodePort, and
 foreign controller/network state must survive reconciliation. The
 [Phase 6 LoadBalancer plan](docs/development/phase6-loadbalancer-plan.md) and
-ADRs 0093–0096 define the ordered schema, provider, dataplane, operations,
+ADRs 0093–0097 define the ordered schema, provider, dataplane, operations,
 Kind, and OpenShift gates. Milestone 6.2 is verified: schema v3 carries exact
 dual-stack class/family/policy/source-range/requested-VIP intent, projects safe
 v2/v1 views, retains last-valid Kubernetes compilation, and makes existing
@@ -262,8 +262,16 @@ recovery, publication ordering, and foreign Kubernetes state preservation pass
 explicit compatibility negotiation, epoch-fenced durable allocation,
 finalizer-safe withdrawal, Pod-bound per-Node state, capability-aware
 acknowledgements, private checkpoints, and independent transactional ABI-v6 VIP
-maps pass `make loadbalancer-host-state-test`. The maps are not consumed by TC
-and Kubernetes status is not published until the 6.5 packet gate succeeds.
+maps pass `make loadbalancer-host-state-test`. Milestone 6.5 is verified as
+well: the TC path consumes only a coherent Service/reachability/allocation
+tuple, performs dual-stack TCP/UDP VIP DNAT plus bounded collision-safe source
+translation and reverse restoration, retains established flows through churn,
+evaluates ingress policy against the selected backend, and stops intercepting
+fresh flows after transactional VIP withdrawal. The release object and all
+ClusterIP/NodePort regressions pass `make loadbalancer-cluster-dataplane-test`.
+Kubernetes status publication remains gated by the later operations and
+platform qualification milestones; 6.6 Local/source-range/health behavior is
+next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

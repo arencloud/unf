@@ -11,6 +11,7 @@ pub const SERVICE_EVENT_ABI_VERSION: u16 = 2;
 pub const SERVICE_EVENT_FRONTEND_CLUSTER_IP: u8 = 1;
 pub const SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER: u8 = 2;
 pub const SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL: u8 = 3;
+pub const SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER: u8 = 4;
 pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
@@ -26,7 +27,7 @@ pub const LOAD_BALANCER_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG: u32 = 1 << 31;
 pub const NODE_PORT_SNAT_PORT_BASE: u16 = 32_768;
 pub const NODE_PORT_SNAT_PORT_MASK: u32 = 32_767;
-pub const NODE_PORT_SNAT_PORT_PROBES: u32 = 32;
+pub const NODE_PORT_SNAT_PORT_PROBES: u32 = 16;
 pub const SERVICE_BACKEND_FLAG_READY: u8 = 1 << 0;
 pub const SERVICE_BACKEND_FLAG_SERVING: u8 = 1 << 1;
 pub const SERVICE_BACKEND_FLAG_TERMINATING: u8 = 1 << 2;
@@ -198,14 +199,16 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
         && state.service_revision != 0
         && state.service_id.get() != 0
         && state.backend_id.get() != 0
-        && state.flags
-            & !(SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
-            == 0
-        && state.flags
-            != SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
+        && matches!(
+            state.flags,
+            0 | SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
+        )
         && if state.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
             u16::from_be_bytes([state.reserved[0], state.reserved[1]]) >= 32_768
-                && state.reserved[2] == 0
+                && matches!(
+                    state.reserved[2],
+                    0 | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
+                )
                 && state.reserved[3] == 0
         } else {
             state.reserved[0] == 0
@@ -247,6 +250,7 @@ pub const fn service_event_frontend_kind_is_valid(kind: u8) -> bool {
         SERVICE_EVENT_FRONTEND_CLUSTER_IP
             | SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER
             | SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL
+            | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
     )
 }
 
@@ -1054,8 +1058,11 @@ mod tests {
         assert!(service_event_frontend_kind_is_valid(
             SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL
         ));
+        assert!(service_event_frontend_kind_is_valid(
+            SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
+        ));
         assert!(!service_event_frontend_kind_is_valid(0));
-        assert!(!service_event_frontend_kind_is_valid(4));
+        assert!(!service_event_frontend_kind_is_valid(5));
     }
 
     #[test]
@@ -1080,7 +1087,7 @@ mod tests {
         invalid.backend_id = BackendId::new(0);
         assert!(!service_connection_is_active(&invalid, 11));
         invalid = tcp;
-        invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER << 2;
+        invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER << 3;
         assert!(!service_connection_is_active(&invalid, 11));
         invalid = tcp;
         invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER;
@@ -1092,6 +1099,11 @@ mod tests {
         assert!(service_connection_is_active(&invalid, 11));
         invalid.flags |= SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER;
         assert!(!service_connection_is_active(&invalid, 11));
+        invalid = tcp;
+        invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER;
+        invalid.reserved[0..2].copy_from_slice(&32_768_u16.to_be_bytes());
+        invalid.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER;
+        assert!(service_connection_is_active(&invalid, 11));
     }
 
     #[test]
