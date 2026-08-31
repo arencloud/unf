@@ -527,8 +527,8 @@ for service in server-cluster server-local peer-cluster peer-local; do
 done
 
 stage=advertiser-creation
-for worker in "${workers[@]}"; do
-    index=${worker##*-}
+for node in "${nodes[@]}"; do
+    index=${node##*-}
     "${kc[@]}" -n unf-system apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -536,7 +536,7 @@ metadata:
   name: unf-loadbalancer-advertiser-${index}
   labels: {${advertiser_label}: "true"}
 spec:
-  nodeName: ${worker}
+  nodeName: ${node}
   hostNetwork: true
   restartPolicy: Never
   tolerations: [{operator: Exists}]
@@ -772,12 +772,8 @@ for _ in $(seq 1 900); do
 done
 jq -e '(.allocation.leases | length) == 0' <<<"${cleanup_state}" >/dev/null
 for node in "${nodes[@]}"; do
-    pod=$(advertiser_pod_on_node "${node}" 2>/dev/null || true)
-    if [[ -z ${pod} ]]; then
-        pod=$(advertiser_pod_on_node "${server_node}")
-    fi
-    agent=$(agent_pod_on_node "${node}")
-    "${kc[@]}" -n unf-system exec "${agent}" -- sh -euc '
+    pod=$(advertiser_pod_on_node "${node}")
+    "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
         test ! -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V4
         test ! -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V6
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
