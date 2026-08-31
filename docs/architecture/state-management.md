@@ -113,7 +113,10 @@ reopened with strict all-or-none validation, and reconstructed into userspace
 caches after restart. ABI v4, v5, and v6 remain explicitly recognized 18-map,
 21-map, and 24-map cleanup boundaries and are never interpreted as partial v7
 state. The active service, NodePort, and LoadBalancer banks must exactly recompile from
-their owner-only durable checkpoints. LoadBalancer source-range LPM tries are
+their owner-only durable checkpoints. A Service checkpoint retains the current
+schema whenever LoadBalancer intent is present; rollback-compatible legacy
+projection is limited to state with no NodePort or LoadBalancer intent.
+LoadBalancer source-range LPM tries are
 runtime-only maps outside that exact 24-map persistent set; the agent rebuilds
 and reads them back from the same authenticated active Service/reachability
 tuple before attaching TC. A crash between the service and NodePort

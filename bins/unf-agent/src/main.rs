@@ -2373,7 +2373,7 @@ fn persist_service_snapshot(
     if snapshot
         .services
         .iter()
-        .all(|service| service.node_ports.is_empty())
+        .all(|service| service.node_ports.is_empty() && service.load_balancer.is_none())
     {
         let legacy = snapshot.legacy_v1_projection()?;
         persist_secure_json(path, &legacy, description)
@@ -10449,6 +10449,28 @@ mod tests {
     }
 
     #[test]
+    fn load_balancer_service_checkpoint_preserves_current_intent() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("service-snapshot.json");
+        let snapshot = load_balancer_service_test_snapshot(7, 4);
+
+        persist_service_checkpoint(&path, &snapshot, None, "LoadBalancer service")
+            .expect("current LoadBalancer service checkpoint persists");
+        let persisted: ServiceSnapshot = load_secure_json(&path, "service").unwrap();
+        assert_eq!(persisted.schema_version, SERVICE_SNAPSHOT_SCHEMA_VERSION);
+        assert!(
+            persisted
+                .services
+                .iter()
+                .all(|service| service.load_balancer.is_some())
+        );
+        assert_eq!(
+            load_optional_service_checkpoint(&path).unwrap(),
+            Some((snapshot, None))
+        );
+    }
+
+    #[test]
     fn load_balancer_reachability_checkpoint_is_private_strict_and_transition_fenced() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("load-balancer-reachability.json");
@@ -11255,11 +11277,20 @@ mod tests {
             active_load_balancer_bank,
         )
         .unwrap();
+        synchronizer.banks = [None, None];
+        synchronizer.applied = None;
+        assert_eq!(
+            recover_service_state(&mut synchronizer)
+                .expect("Local LoadBalancer service bank recovers before VIP state"),
+            (Some(recovered.source_epoch), Some(recovered.revision.get()))
+        );
+        assert_eq!(synchronizer.applied.as_ref(), Some(&recovered));
+
         synchronizer.load_balancer_banks = [None, None];
         synchronizer.active_load_balancer_bank = 0;
         synchronizer.applied_load_balancer_reachability = None;
         recover_load_balancer_state(&mut synchronizer)
-            .expect("runtime source-range tries rebuild from durable VIP state");
+            .expect("VIP state and runtime source-range tries rebuild after service recovery");
         let after_restart = ipv4_packet(6, client_v4, vip_v4, 43_103, 80);
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &after_restart);
         assert_eq!(action, TC_ACT_PIPE);
