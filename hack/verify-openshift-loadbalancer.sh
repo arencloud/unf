@@ -265,9 +265,18 @@ advertise_vips() {
     [[ -n ${pod} ]]
     "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
         ip -4 address add "$1/32" dev br-ex
-        ip -6 address add "$2/128" dev br-ex nodad
+        ip -6 address add "$2/128" dev br-ex
         ip -4 address add "$3/32" dev br-ex
-        ip -6 address add "$4/128" dev br-ex nodad
+        ip -6 address add "$4/128" dev br-ex
+        for address in "$2" "$4"; do
+            for _ in $(seq 1 20); do
+                ! ip -6 -o address show dev br-ex to "$address/128" | grep -q tentative && break
+                sleep 1
+            done
+            ! ip -6 -o address show dev br-ex to "$address/128" | grep -q tentative
+        done
+        chroot /host arping -U -c 3 -I br-ex "$1" >/dev/null
+        chroot /host arping -U -c 3 -I br-ex "$3" >/dev/null
     ' sh "${cluster_v4}" "${cluster_v6}" "${local_v4}" "${local_v6}"
 }
 
@@ -466,11 +475,14 @@ spec:
       volumeMounts:
         - {name: bpffs, mountPath: /sys/fs/bpf}
         - {name: state, mountPath: /var/lib/unf}
+        - {name: host, mountPath: /host, readOnly: true}
   volumes:
     - name: bpffs
       hostPath: {path: /sys/fs/bpf, type: Directory}
     - name: state
       hostPath: {path: /var/lib/unf, type: Directory}
+    - name: host
+      hostPath: {path: /, type: Directory}
 EOF
 done
 advertisers_created=true
