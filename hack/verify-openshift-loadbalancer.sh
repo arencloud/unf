@@ -389,6 +389,35 @@ for node in "${nodes[@]}"; do
     source_ranges+=$'\n'"    - $(node_address "${node}" 4)/32"
     source_ranges+=$'\n'"    - $(node_address "${node}" 6)/128"
 done
+create_qualification_service() {
+    local name=$1 policy=$2 health_port=$3 include_source_ranges=$4
+    local health_line= source_range_block=
+    if [[ ${health_port} != 0 ]]; then
+        health_line="  healthCheckNodePort: ${health_port}"
+    fi
+    if [[ ${include_source_ranges} == true ]]; then
+        source_range_block="  loadBalancerSourceRanges:"$'\n'"${source_ranges}"
+    fi
+    "${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata: {name: ${name}, namespace: ${namespace}}
+spec:
+  type: LoadBalancer
+  loadBalancerClass: network.unf.io/load-balancer
+  allocateLoadBalancerNodePorts: false
+  externalTrafficPolicy: ${policy}
+${health_line}
+  ipFamilyPolicy: RequireDualStack
+  ipFamilies: [IPv4, IPv6]
+${source_range_block}
+  selector: {app: loadbalancer-server}
+  ports:
+    - {name: http, protocol: TCP, port: 8080, targetPort: 8080}
+    - {name: echo, protocol: UDP, port: 5353, targetPort: 5353}
+    - {name: source, protocol: TCP, port: 8081, targetPort: 8081}
+EOF
+}
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -417,72 +446,6 @@ spec:
         exec: {command: [sh, -ec, "test ! -e /tmp/unready && wget -T 1 -qO- http://127.0.0.1:8080/health | grep -qx ok"]}
         periodSeconds: 1
         failureThreshold: 1
----
-apiVersion: v1
-kind: Service
-metadata: {name: server-cluster, namespace: ${namespace}}
-spec:
-  type: LoadBalancer
-  allocateLoadBalancerNodePorts: false
-  externalTrafficPolicy: Cluster
-  ipFamilyPolicy: RequireDualStack
-  ipFamilies: [IPv4, IPv6]
-  selector: {app: loadbalancer-server}
-  ports:
-    - {name: http, protocol: TCP, port: 8080, targetPort: 8080}
-    - {name: echo, protocol: UDP, port: 5353, targetPort: 5353}
-    - {name: source, protocol: TCP, port: 8081, targetPort: 8081}
----
-apiVersion: v1
-kind: Service
-metadata: {name: server-local, namespace: ${namespace}}
-spec:
-  type: LoadBalancer
-  allocateLoadBalancerNodePorts: false
-  externalTrafficPolicy: Local
-  healthCheckNodePort: 32080
-  ipFamilyPolicy: RequireDualStack
-  ipFamilies: [IPv4, IPv6]
-  loadBalancerSourceRanges:
-${source_ranges}
-  selector: {app: loadbalancer-server}
-  ports:
-    - {name: http, protocol: TCP, port: 8080, targetPort: 8080}
-    - {name: echo, protocol: UDP, port: 5353, targetPort: 5353}
-    - {name: source, protocol: TCP, port: 8081, targetPort: 8081}
----
-apiVersion: v1
-kind: Service
-metadata: {name: peer-cluster, namespace: ${namespace}}
-spec:
-  type: LoadBalancer
-  allocateLoadBalancerNodePorts: false
-  externalTrafficPolicy: Cluster
-  ipFamilyPolicy: RequireDualStack
-  ipFamilies: [IPv4, IPv6]
-  selector: {app: loadbalancer-server}
-  ports:
-    - {name: http, protocol: TCP, port: 8080, targetPort: 8080}
-    - {name: echo, protocol: UDP, port: 5353, targetPort: 5353}
-    - {name: source, protocol: TCP, port: 8081, targetPort: 8081}
----
-apiVersion: v1
-kind: Service
-metadata: {name: peer-local, namespace: ${namespace}}
-spec:
-  type: LoadBalancer
-  allocateLoadBalancerNodePorts: false
-  externalTrafficPolicy: Local
-  healthCheckNodePort: 32081
-  ipFamilyPolicy: RequireDualStack
-  ipFamilies: [IPv4, IPv6]
-  loadBalancerSourceRanges:
-${source_ranges}
-  selector: {app: loadbalancer-server}
-  ports:
-    - {name: http, protocol: TCP, port: 8080, targetPort: 8080}
-    - {name: echo, protocol: UDP, port: 5353, targetPort: 5353}
-    - {name: source, protocol: TCP, port: 8081, targetPort: 8081}
 EOF
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/server --timeout=180s >/dev/null
 # Make allocation order explicit. Kubernetes watch delivery for one multi-object
@@ -490,8 +453,12 @@ EOF
 # to retain the same advertising Node across retries and failed-run cleanup.
 expected_leases=0
 for service in server-cluster server-local peer-cluster peer-local; do
-    "${kc[@]}" -n "${namespace}" patch service "${service}" --type=merge \
-        -p '{"spec":{"loadBalancerClass":"network.unf.io/load-balancer"}}' >/dev/null
+    case ${service} in
+        server-cluster) create_qualification_service "${service}" Cluster 0 false ;;
+        server-local) create_qualification_service "${service}" Local 32080 true ;;
+        peer-cluster) create_qualification_service "${service}" Cluster 0 false ;;
+        peer-local) create_qualification_service "${service}" Local 32081 true ;;
+    esac
     expected_leases=$((expected_leases + 1))
     for _ in $(seq 1 900); do
         allocation=$(load_balancer_state 2>/dev/null || true)
