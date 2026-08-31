@@ -46,7 +46,9 @@ cleanup() {
                 done
             ' sh \
                 "${cluster_v4:-}/32" "${cluster_v6:-}/128" \
-                "${local_v4:-}/32" "${local_v6:-}/128" >/dev/null 2>&1 || true
+                "${local_v4:-}/32" "${local_v6:-}/128" \
+                "${peer_cluster_v4:-}/32" "${peer_cluster_v6:-}/128" \
+                "${peer_local_v4:-}/32" "${peer_local_v6:-}/128" >/dev/null 2>&1 || true
         done
         "${kc[@]}" -n unf-system delete pods -l "${advertiser_label}=true" \
             --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -213,7 +215,7 @@ wait_for_leases() {
         state=$(load_balancer_state 2>/dev/null || true)
         if jq -e '
             .schemaVersion == 1 and .allocation.schemaVersion == 2
-            and (.allocation.leases | length) == 2
+            and (.allocation.leases | length) == 4
             and all(.allocation.leases[];
                 .pool == "qualification" and .poolUid == "openshift-loadbalancer-pool-v1"
                 and .provider.name == "direct-node"
@@ -254,13 +256,14 @@ withdraw_vips() {
         [[ -n ${pod} ]] || continue
         "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
             for address in "$@"; do ip address del "$address" dev br-ex >/dev/null 2>&1 || true; done
-        ' sh "${cluster_v4}/32" "${cluster_v6}/128" "${local_v4}/32" "${local_v6}/128" >/dev/null
+        ' sh "${cluster_v4}/32" "${cluster_v6}/128" "${local_v4}/32" "${local_v6}/128" \
+            "${peer_cluster_v4}/32" "${peer_cluster_v6}/128" \
+            "${peer_local_v4}/32" "${peer_local_v6}/128" >/dev/null
     done < <("${kc[@]}" -n unf-system get pods -l "${advertiser_label}=true" -o name)
 }
 
 advertise_vips() {
-    local node=$1 pod
-    withdraw_vips
+    local node=$1 first_v4=$2 first_v6=$3 second_v4=$4 second_v6=$5 pod
     pod=$(advertiser_pod_on_node "${node}")
     [[ -n ${pod} ]]
     "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
@@ -277,7 +280,7 @@ advertise_vips() {
         done
         chroot /host arping -U -c 3 -I br-ex "$1" >/dev/null
         chroot /host arping -U -c 3 -I br-ex "$3" >/dev/null
-    ' sh "${cluster_v4}" "${cluster_v6}" "${local_v4}" "${local_v6}"
+    ' sh "${first_v4}" "${first_v6}" "${second_v4}" "${second_v6}"
 }
 
 external_tcp_probe() {
@@ -330,8 +333,8 @@ expect_external_blocked() {
 }
 
 health_status() {
-    local family=$1 address=$2 target
-    if [[ ${family} == 4 ]]; then target="http://${address}:32080/healthz"; else target="http://[${address}]:32080/healthz"; fi
+    local family=$1 address=$2 port=${3:-32080} target
+    if [[ ${family} == 4 ]]; then target="http://${address}:${port}/healthz"; else target="http://[${address}]:${port}/healthz"; fi
     curl "-${family}" --silent --output /dev/null --connect-timeout 5 --max-time 10 --write-out '%{http_code}' "${target}" || true
 }
 
@@ -444,18 +447,61 @@ ${source_ranges}
     - {name: http, protocol: TCP, port: 8080, targetPort: 8080}
     - {name: echo, protocol: UDP, port: 5353, targetPort: 5353}
     - {name: source, protocol: TCP, port: 8081, targetPort: 8081}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: peer-cluster, namespace: ${namespace}}
+spec:
+  type: LoadBalancer
+  loadBalancerClass: network.unf.io/load-balancer
+  allocateLoadBalancerNodePorts: false
+  externalTrafficPolicy: Cluster
+  ipFamilyPolicy: RequireDualStack
+  ipFamilies: [IPv4, IPv6]
+  selector: {app: loadbalancer-server}
+  ports:
+    - {name: http, protocol: TCP, port: 8080, targetPort: 8080}
+    - {name: echo, protocol: UDP, port: 5353, targetPort: 5353}
+    - {name: source, protocol: TCP, port: 8081, targetPort: 8081}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: peer-local, namespace: ${namespace}}
+spec:
+  type: LoadBalancer
+  loadBalancerClass: network.unf.io/load-balancer
+  allocateLoadBalancerNodePorts: false
+  externalTrafficPolicy: Local
+  healthCheckNodePort: 32081
+  ipFamilyPolicy: RequireDualStack
+  ipFamilies: [IPv4, IPv6]
+  loadBalancerSourceRanges:
+${source_ranges}
+  selector: {app: loadbalancer-server}
+  ports:
+    - {name: http, protocol: TCP, port: 8080, targetPort: 8080}
+    - {name: echo, protocol: UDP, port: 5353, targetPort: 5353}
+    - {name: source, protocol: TCP, port: 8081, targetPort: 8081}
 EOF
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/server --timeout=180s >/dev/null
 lease_state=$(wait_for_leases)
 cluster_v4=$(lease_address "${lease_state}" server-cluster 4); cluster_v6=$(lease_address "${lease_state}" server-cluster 6)
 local_v4=$(lease_address "${lease_state}" server-local 4); local_v6=$(lease_address "${lease_state}" server-local 6)
+peer_cluster_v4=$(lease_address "${lease_state}" peer-cluster 4); peer_cluster_v6=$(lease_address "${lease_state}" peer-cluster 6)
+peer_local_v4=$(lease_address "${lease_state}" peer-local 4); peer_local_v6=$(lease_address "${lease_state}" peer-local 6)
 cluster_service_id=$(lease_service_id "${lease_state}" server-cluster)
 local_service_id=$(lease_service_id "${lease_state}" server-local)
-for address in "${cluster_v4}" "${local_v4}"; do [[ ${address} == 10.50.60.24[1-9] || ${address} == 10.50.60.25[0-4] ]]; done
-for address in "${cluster_v6}" "${local_v6}"; do [[ ${address} == 2a02:abcd:1234:5600::f* ]]; done
-active_agents=$(wait_for_load_balancer_shape 12 6 6)
+peer_cluster_service_id=$(lease_service_id "${lease_state}" peer-cluster)
+peer_local_service_id=$(lease_service_id "${lease_state}" peer-local)
+for address in "${cluster_v4}" "${local_v4}" "${peer_cluster_v4}" "${peer_local_v4}"; do
+    [[ ${address} == 10.50.60.24[1-9] || ${address} == 10.50.60.25[0-4] ]]
+done
+for address in "${cluster_v6}" "${local_v6}" "${peer_cluster_v6}" "${peer_local_v6}"; do
+    [[ ${address} == 2a02:abcd:1234:5600::f* ]]
+done
+active_agents=$(wait_for_load_balancer_shape 24 12 12)
 active_service_revision=$(controller_raw /v1/status | jq -er .compiled_service_revision)
-for service in server-cluster server-local; do
+for service in server-cluster server-local peer-cluster peer-local; do
     "${kc[@]}" -n "${namespace}" get service "${service}" -o json | jq -e '
         .spec.allocateLoadBalancerNodePorts == false and all(.spec.ports[]; (.nodePort // 0) == 0)
         and ((.status.loadBalancer.ingress // []) | length) == 0
@@ -501,33 +547,39 @@ for worker in "${workers[@]}"; do
     pod=$(advertiser_pod_on_node "${worker}")
     "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
         for address in "$@"; do ! ip -o address show dev br-ex | grep -F "$address"; done
-    ' sh "${cluster_v4}/32" "${cluster_v6}/128" "${local_v4}/32" "${local_v6}/128"
+    ' sh "${cluster_v4}/32" "${cluster_v6}/128" "${local_v4}/32" "${local_v6}/128" \
+        "${peer_cluster_v4}/32" "${peer_cluster_v6}/128" "${peer_local_v4}/32" "${peer_local_v6}/128"
 done
 
 stage=external-cluster-and-local-traffic
-for worker in "${workers[@]}"; do
-    advertise_vips "${worker}"
-    wait_for_external_tcp 4 "${cluster_v4}"
-    wait_for_external_tcp 6 "${cluster_v6}"
-    wait_for_external_udp 4 "${cluster_v4}"
-    wait_for_external_udp 6 "${cluster_v6}"
+advertise_vips "${server_node}" "${cluster_v4}" "${cluster_v6}" "${local_v4}" "${local_v6}"
+advertise_vips "${client_node}" "${peer_cluster_v4}" "${peer_cluster_v6}" "${peer_local_v4}" "${peer_local_v6}"
+for family_and_address in \
+    "4 ${cluster_v4}" "6 ${cluster_v6}" \
+    "4 ${peer_cluster_v4}" "6 ${peer_cluster_v6}"; do
+    read -r family address <<<"${family_and_address}"
+    wait_for_external_tcp "${family}" "${address}"
+    wait_for_external_udp "${family}" "${address}"
 done
-advertise_vips "${server_node}"
 wait_for_external_tcp 4 "${local_v4}"
 wait_for_external_tcp 6 "${local_v6}"
 wait_for_external_udp 4 "${local_v4}"
 wait_for_external_udp 6 "${local_v6}"
 [[ $(external_source_probe 4 "${cluster_v4}") == "${server_node_v4}" ]]
 [[ $(external_source_probe 6 "${cluster_v6}") == "${server_node_v6}" ]]
+[[ $(external_source_probe 4 "${peer_cluster_v4}") == "${client_node_v4}" ]]
+[[ $(external_source_probe 6 "${peer_cluster_v6}") == "${client_node_v6}" ]]
 [[ $(external_source_probe 4 "${local_v4}") == "${allowed_v4}" ]]
 [[ $(external_source_probe 6 "${local_v6}") == "${allowed_v6}" ]]
 [[ $(health_status 4 "${server_node_v4}") == 200 ]]
 [[ $(health_status 6 "${server_node_v6}") == 200 ]]
 [[ $(health_status 4 "${client_node_v4}") == 503 ]]
 [[ $(health_status 6 "${client_node_v6}") == 503 ]]
-advertise_vips "${client_node}"
-expect_external_blocked "${local_v4}" "${local_v6}"
-advertise_vips "${server_node}"
+[[ $(health_status 4 "${server_node_v4}" 32081) == 200 ]]
+[[ $(health_status 6 "${server_node_v6}" 32081) == 200 ]]
+[[ $(health_status 4 "${client_node_v4}" 32081) == 503 ]]
+[[ $(health_status 6 "${client_node_v6}" 32081) == 503 ]]
+expect_external_blocked "${peer_local_v4}" "${peer_local_v6}"
 
 stage=source-range-denial-and-recovery
 "${kc[@]}" -n "${namespace}" patch service server-local --type=merge -p \
@@ -556,7 +608,7 @@ jq -e 'any(.entries[]; .service.frontend_kind == "load_balancer_cluster")
     and any(.entries[]; .service.frontend_kind == "load_balancer_local")' <<<"${history}" >/dev/null
 for node in "${nodes[@]}"; do
     metrics=$(agent_raw "${node}" /metrics)
-    grep -Eq '^unf_loadbalancer_frontend_count 12(\.0)?$' <<<"${metrics}"
+    grep -Eq '^unf_loadbalancer_frontend_count 24(\.0)?$' <<<"${metrics}"
     grep -q '^unf_loadbalancer_cluster_translations_total' <<<"${metrics}"
     grep -q '^unf_loadbalancer_local_translations_total' <<<"${metrics}"
     grep -q '^unf_loadbalancer_source_range_drops_total' <<<"${metrics}"
@@ -596,13 +648,18 @@ stage=readiness-health-and-recovery
 wait_for_convergence >/dev/null
 expect_external_blocked "${cluster_v4}" "${cluster_v6}"
 expect_external_blocked "${local_v4}" "${local_v6}"
+expect_external_blocked "${peer_cluster_v4}" "${peer_cluster_v6}"
+expect_external_blocked "${peer_local_v4}" "${peer_local_v6}"
 [[ $(health_status 4 "${server_node_v4}") == 503 ]]
+[[ $(health_status 4 "${server_node_v4}" 32081) == 503 ]]
 "${kc[@]}" -n "${namespace}" exec server -- rm -f /tmp/unready
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/server --timeout=90s >/dev/null
 wait_for_convergence >/dev/null
 wait_for_external_tcp 4 "${cluster_v4}"
 wait_for_external_tcp 6 "${local_v6}"
+wait_for_external_tcp 4 "${peer_cluster_v4}"
 [[ $(health_status 4 "${server_node_v4}") == 200 ]]
+[[ $(health_status 4 "${server_node_v4}" 32081) == 200 ]]
 
 stage=controller-provider-and-agent-recovery
 durable_before=$(load_balancer_state)
@@ -617,10 +674,15 @@ controller_scaled_down=true
 kill "${forward_pid}" >/dev/null 2>&1 || true; wait "${forward_pid}" >/dev/null 2>&1 || true; forward_pid=
 for replacement_node in "${client_node}" "${server_node}"; do
     probe_log="${temporary_dir}/probe-${replacement_node}.log"
+    if [[ ${replacement_node} == "${client_node}" ]]; then
+        recovery_cluster_v4=${peer_cluster_v4}; recovery_udp_v6=${peer_cluster_v6}
+    else
+        recovery_cluster_v4=${cluster_v4}; recovery_udp_v6=${local_v6}
+    fi
     (
         for _ in $(seq 1 120); do
-            external_tcp_probe 4 "${cluster_v4}"
-            external_udp_probe 6 "${local_v6}"
+            external_tcp_probe 4 "${recovery_cluster_v4}"
+            external_udp_probe 6 "${recovery_udp_v6}"
             sleep 1
         done
     ) >"${probe_log}" 2>&1 &
@@ -639,7 +701,7 @@ for replacement_node in "${client_node}" "${server_node}"; do
         and .applied_service_revision == .desired_service_revision
         and .applied_load_balancer_revision == .desired_load_balancer_revision
         and .applied_load_balancer_allocation_revision == .desired_load_balancer_allocation_revision
-        and .load_balancer_frontend_count == 12 and .load_balancer_source_range_count > 0
+        and .load_balancer_frontend_count == 24 and .load_balancer_source_range_count > 0
         and .load_balancer_last_error == null' <<<"${recovered}" >/dev/null
     pod=$(advertiser_pod_on_node "${replacement_node}")
     "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
@@ -667,6 +729,9 @@ allocation_after=$(jq -er .allocation.revision <<<"${durable_after}")
 reachability_after=$(jq -er .reachabilityRevision <<<"${durable_after}")
 (( allocation_after >= allocation_before && reachability_after >= reachability_before ))
 [[ $(lease_address "${durable_after}" server-cluster 4) == "${cluster_v4}" ]]
+[[ $(lease_address "${durable_after}" server-local 6) == "${local_v6}" ]]
+[[ $(lease_address "${durable_after}" peer-cluster 4) == "${peer_cluster_v4}" ]]
+[[ $(lease_address "${durable_after}" peer-local 6) == "${peer_local_v6}" ]]
 wait_for_external_tcp 4 "${cluster_v4}"
 wait_for_external_udp 6 "${local_v6}"
 
@@ -676,7 +741,8 @@ for worker in "${workers[@]}"; do
     pod=$(advertiser_pod_on_node "${worker}")
     "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
         for address in "$@"; do ! ip -o address show dev br-ex | grep -F "$address"; done
-    ' sh "${cluster_v4}/32" "${cluster_v6}/128" "${local_v4}/32" "${local_v6}/128"
+    ' sh "${cluster_v4}/32" "${cluster_v6}/128" "${local_v4}/32" "${local_v6}/128" \
+        "${peer_cluster_v4}/32" "${peer_cluster_v6}/128" "${peer_local_v4}/32" "${peer_local_v6}/128"
 done
 "${kc[@]}" delete namespace "${namespace}" --wait=true --timeout=15m >/dev/null
 namespace_created=false
@@ -734,8 +800,11 @@ jq -n \
     --arg controllerImage "${controller_image}" --arg agentImage "${agent_image}" --arg testToolsImage "${test_tools_image}" \
     --arg clusterIPv4 "${cluster_v4}" --arg clusterIPv6 "${cluster_v6}" \
     --arg localIPv4 "${local_v4}" --arg localIPv6 "${local_v6}" \
+    --arg peerClusterIPv4 "${peer_cluster_v4}" --arg peerClusterIPv6 "${peer_cluster_v6}" \
+    --arg peerLocalIPv4 "${peer_local_v4}" --arg peerLocalIPv6 "${peer_local_v6}" \
     --arg allowedIPv4 "${allowed_v4}" --arg allowedIPv6 "${allowed_v6}" \
     --argjson clusterServiceId "${cluster_service_id}" --argjson localServiceId "${local_service_id}" \
+    --argjson peerClusterServiceId "${peer_cluster_service_id}" --argjson peerLocalServiceId "${peer_local_service_id}" \
     --argjson activeServiceRevision "${active_service_revision}" --arg stableAllocationDigest "${stable_digest}" \
     --argjson allocationRevisionBefore "${allocation_before}" --argjson allocationRevisionAfter "${allocation_after}" \
     --argjson reachabilityRevisionBefore "${reachability_before}" --argjson reachabilityRevisionAfter "${reachability_after}" \
@@ -753,7 +822,9 @@ jq -n \
       provider:{name:"direct-node",instance:"openshift-direct-node-v1",pool:"qualification",poolUid:"openshift-loadbalancer-pool-v1",
         advertisementFixture:"exact temporary br-ex /32 and /128 ownership"},
       loadBalancers:{cluster:{serviceId:$clusterServiceId,ipv4:$clusterIPv4,ipv6:$clusterIPv6},
-        local:{serviceId:$localServiceId,ipv4:$localIPv4,ipv6:$localIPv6,healthCheckNodePort:32080}},
+        local:{serviceId:$localServiceId,ipv4:$localIPv4,ipv6:$localIPv6,healthCheckNodePort:32080},
+        peerCluster:{serviceId:$peerClusterServiceId,ipv4:$peerClusterIPv4,ipv6:$peerClusterIPv6},
+        peerLocal:{serviceId:$peerLocalServiceId,ipv4:$peerLocalIPv4,ipv6:$peerLocalIPv6,healthCheckNodePort:32081}},
       externalClient:{ipv4:$allowedIPv4,ipv6:$allowedIPv6},activeServiceRevision:$activeServiceRevision,
       recovery:{stableAllocationSha256:$stableAllocationDigest,
         allocationRevisionBefore:$allocationRevisionBefore,allocationRevisionAfter:$allocationRevisionAfter,
@@ -762,8 +833,8 @@ jq -n \
       verified:["digest-pinned controller-first five-node rollout","RHCOS SELinux and CRI-O",
         "UNF primary CNI with kube-proxy absent","explicit LoadBalancer class and zero traffic NodePorts",
         "conflict-safe dual-stack allocation and direct-node provenance",
-        "exact temporary br-ex advertisement ownership and withdrawal",
-        "workstation IPv4 and IPv6 TCP/UDP Cluster traffic through both workers",
+        "stable per-worker temporary br-ex advertisement ownership and exact withdrawal",
+        "workstation IPv4 and IPv6 TCP/UDP Cluster traffic through both workers using distinct VIPs",
         "workstation IPv4 and IPv6 TCP/UDP Local traffic through the backend worker",
         "Cluster receiving-node source translation and Local client source preservation",
         "Local non-backend fail-closed behavior","dual-stack source-range allow and deny",
