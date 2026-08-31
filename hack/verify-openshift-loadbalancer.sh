@@ -423,7 +423,6 @@ kind: Service
 metadata: {name: server-cluster, namespace: ${namespace}}
 spec:
   type: LoadBalancer
-  loadBalancerClass: network.unf.io/load-balancer
   allocateLoadBalancerNodePorts: false
   externalTrafficPolicy: Cluster
   ipFamilyPolicy: RequireDualStack
@@ -439,7 +438,6 @@ kind: Service
 metadata: {name: server-local, namespace: ${namespace}}
 spec:
   type: LoadBalancer
-  loadBalancerClass: network.unf.io/load-balancer
   allocateLoadBalancerNodePorts: false
   externalTrafficPolicy: Local
   healthCheckNodePort: 32080
@@ -458,7 +456,6 @@ kind: Service
 metadata: {name: peer-cluster, namespace: ${namespace}}
 spec:
   type: LoadBalancer
-  loadBalancerClass: network.unf.io/load-balancer
   allocateLoadBalancerNodePorts: false
   externalTrafficPolicy: Cluster
   ipFamilyPolicy: RequireDualStack
@@ -474,7 +471,6 @@ kind: Service
 metadata: {name: peer-local, namespace: ${namespace}}
 spec:
   type: LoadBalancer
-  loadBalancerClass: network.unf.io/load-balancer
   allocateLoadBalancerNodePorts: false
   externalTrafficPolicy: Local
   healthCheckNodePort: 32081
@@ -489,6 +485,33 @@ ${source_ranges}
     - {name: source, protocol: TCP, port: 8081, targetPort: 8081}
 EOF
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/server --timeout=180s >/dev/null
+# Make allocation order explicit. Kubernetes watch delivery for one multi-object
+# apply is not ordered, while this routed qualification requires each stable VIP
+# to retain the same advertising Node across retries and failed-run cleanup.
+expected_leases=0
+for service in server-cluster server-local peer-cluster peer-local; do
+    "${kc[@]}" -n "${namespace}" patch service "${service}" --type=merge \
+        -p '{"spec":{"loadBalancerClass":"network.unf.io/load-balancer"}}' >/dev/null
+    expected_leases=$((expected_leases + 1))
+    for _ in $(seq 1 900); do
+        allocation=$(load_balancer_state 2>/dev/null || true)
+        if jq -e --arg namespace "${namespace}" --arg service "${service}" \
+            --argjson expected "${expected_leases}" '
+            ([.allocation.leases[] | select(.owner.namespace == $namespace)] | length) == $expected
+            and any(.allocation.leases[];
+                .owner.namespace == $namespace and .owner.name == $service)
+        ' <<<"${allocation}" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    jq -e --arg namespace "${namespace}" --arg service "${service}" \
+        --argjson expected "${expected_leases}" '
+        ([.allocation.leases[] | select(.owner.namespace == $namespace)] | length) == $expected
+        and any(.allocation.leases[];
+            .owner.namespace == $namespace and .owner.name == $service)
+    ' <<<"${allocation}" >/dev/null
+done
 lease_state=$(wait_for_leases)
 cluster_v4=$(lease_address "${lease_state}" server-cluster 4); cluster_v6=$(lease_address "${lease_state}" server-cluster 6)
 local_v4=$(lease_address "${lease_state}" server-local 4); local_v6=$(lease_address "${lease_state}" server-local 6)
