@@ -3,8 +3,8 @@
 
 use aya_ebpf::bindings::{
     BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR,
-    BPF_FIB_LOOKUP_SRC, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT,
-    bpf_fib_lookup as BpfFibLookup,
+    BPF_FIB_LOOKUP_OUTPUT, BPF_FIB_LOOKUP_SRC, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_NOEXIST,
+    TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT, bpf_fib_lookup as BpfFibLookup,
 };
 use aya_ebpf::helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh};
 use aya_ebpf::macros::{classifier, map};
@@ -1999,6 +1999,10 @@ fn prepare_load_balancer_cluster_source_v4(ctx: &TcContext, client_address: [u8;
     lookup.family = ADDRESS_FAMILY_INET;
     lookup.ifindex = ifindex;
     lookup.__bindgen_anon_4.ipv4_dst = u32::from_ne_bytes(client_address);
+    // The packet arrived on an ingress hook, but Cluster source translation
+    // needs the address the local host would use for a reply to the client.
+    // The output perspective lets the FIB derive that preferred source even
+    // when the frontend VIP is not a node address.
     // SAFETY: pointers and length exactly match the TC helper ABI.
     #[allow(unsafe_code)]
     let result = unsafe {
@@ -2006,7 +2010,7 @@ fn prepare_load_balancer_cluster_source_v4(ctx: &TcContext, client_address: [u8;
             ctx.skb.skb.cast(),
             lookup,
             core::mem::size_of::<BpfFibLookup>() as i32,
-            BPF_FIB_LOOKUP_SRC,
+            BPF_FIB_LOOKUP_OUTPUT | BPF_FIB_LOOKUP_SRC,
         )
     };
     if result == 0 || result == i64::from(BPF_FIB_LKUP_RET_NO_NEIGH) {
@@ -2040,6 +2044,8 @@ fn prepare_load_balancer_cluster_source_v6(ctx: &TcContext, client_address: [u8;
     lookup.family = ADDRESS_FAMILY_INET6;
     lookup.ifindex = ifindex;
     lookup.__bindgen_anon_4.ipv6_dst = ipv6_fib_words(client_address);
+    // As for IPv4, derive the local egress source rather than reusing a VIP
+    // when the backend resides on another node.
     // SAFETY: pointers and length exactly match the TC helper ABI.
     #[allow(unsafe_code)]
     let result = unsafe {
@@ -2047,7 +2053,7 @@ fn prepare_load_balancer_cluster_source_v6(ctx: &TcContext, client_address: [u8;
             ctx.skb.skb.cast(),
             lookup,
             core::mem::size_of::<BpfFibLookup>() as i32,
-            BPF_FIB_LOOKUP_SRC,
+            BPF_FIB_LOOKUP_OUTPUT | BPF_FIB_LOOKUP_SRC,
         )
     };
     if result == 0 || result == i64::from(BPF_FIB_LKUP_RET_NO_NEIGH) {
