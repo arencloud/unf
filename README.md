@@ -242,7 +242,7 @@ beyond baseline disconnected `insights`. ADR 0092 records this non-transitive
 boundary. All Phase 5 milestones are Verified; LoadBalancer, affinity, topology
 hints, Maglev, DSR, host-origin NodePort, SCTP, fragments, generic NAT `RELATED`,
 and production availability/scale retain independent gates.
-Phase 6 now begins bounded LoadBalancer exposure. Its first verified milestone
+Phase 6 completes bounded LoadBalancer exposure. Its architecture milestone
 is the ownership and acceptance boundary: UNF admits the explicit
 `network.unf.io/load-balancer` class by default and models VIP allocation,
 network advertisement, and eBPF translation as independent revisioned
@@ -250,7 +250,7 @@ transactions. Status may publish a VIP only after the admitted provider and
 dataplane converge, direct delivery cannot depend on a traffic NodePort, and
 foreign controller/network state must survive reconciliation. The
 [Phase 6 LoadBalancer plan](docs/development/phase6-loadbalancer-plan.md) and
-ADRs 0093–0100 define the ordered schema, provider, dataplane, operations,
+ADRs 0093–0101 define the ordered schema, provider, dataplane, operations,
 Kind, and OpenShift gates. Milestone 6.2 is verified: schema v3 carries exact
 dual-stack class/family/policy/source-range/requested-VIP intent, projects safe
 v2/v1 views, retains last-valid Kubernetes compilation, and makes existing
@@ -278,14 +278,19 @@ release verifier and every Cluster/NodePort/ClusterIP regression pass
 fixed-cardinality metrics and validated status,
 durable Cluster/Local history, lease/provider/reachability-aware explanation,
 source-aware read-only VIP simulation, exact recovery, and adjacent additive
-compatibility pass `make loadbalancer-operations-test`. Kubernetes status
-publication remains gated by platform qualification. Milestone 6.8 is verified:
-runtime `dd11ae3` and qualifier `793273f` passed the 285-second three-Node
+compatibility pass `make loadbalancer-operations-test`. Milestone 6.8 is verified:
+runtime/qualifier `830771c` re-passed the 280-second three-Node
 Kubernetes v1.35.0 dual-stack gate with kube-proxy absent. External and
 host-origin IPv4/IPv6 TCP/UDP Cluster/Local paths, source ranges, health,
 lifecycle, controller/provider/agent recovery, exact ABI-v7/CNI cleanup, and
 no-CNI rollback pass `make loadbalancer-kind-test`; ADR 0100 records the
-non-transitive evidence. Digest-pinned OpenShift qualification is next.
+non-transitive evidence. Milestone 6.9 and Phase 6 are verified: runtime
+`830771c`, qualifier `ade286b`, and three immutable public Quay digests passed
+the guarded rollout plus 973-second five-Node OpenShift 4.22.10 cl02 gate.
+Workstation cross-worker dual-stack Cluster/Local traffic, source semantics,
+source ranges, health, lifecycle, operations, recovery, ABI-v7 reconstruction,
+exact owned-state cleanup, convergence, and unchanged unhealthy-operator
+baseline passed; ADR 0101 records the platform boundary.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -496,8 +501,8 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-Not implemented yet: LoadBalancer packet translation/status publication and
-advanced Service modes such as session affinity, internal traffic policy, topology-aware
+Not implemented yet: advanced Service modes such as session affinity,
+internal traffic policy, topology-aware
 routing, Maglev, and DSR;
 production-scale routing/CNI qualification;
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,

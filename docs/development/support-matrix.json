@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_reviewed": "2026-08-29",
+  "last_reviewed": "2026-08-31",
   "qualification_semantics": {
     "qualified": "The exact row passed every listed gate at the recorded evidence revision.",
     "non_transitive": true,
@@ -291,6 +291,65 @@
         "kube-proxy-free dual-stack TCP and UDP ClusterIP lifecycle",
         "controller-offline source and destination agent replacement with durable service recovery"
       ]
+    },
+    {
+      "id": "cl02-openshift-4.22-dual-unf-loadbalancer-amd64",
+      "state": "qualified",
+      "platform": {
+        "distribution": "OpenShift",
+        "environment": "cl02-primary-cni-loadbalancer",
+        "kubernetes_version": "v1.35.6",
+        "openshift_version": "4.22.10"
+      },
+      "nodes": {
+        "count": 5,
+        "os": "Red Hat Enterprise Linux CoreOS 9.8.20260812-0 (Plow)",
+        "kernels": [
+          "5.14.0-687.39.1.el9_8.x86_64"
+        ],
+        "architecture": "amd64",
+        "container_runtime": "CRI-O 1.35.6-4.rhaos4.22.git41f610b.el9"
+      },
+      "networking": {
+        "cni": "UNF primary CNI and LoadBalancer runtime revision 830771c87f52be2d41ce7d700a6c670690e7e516",
+        "address_families": [
+          "ipv4",
+          "ipv6"
+        ]
+      },
+      "dataplane": {
+        "attachment_modes": [
+          "legacy_netlink"
+        ]
+      },
+      "evidence": {
+        "outcome": "passed",
+        "verified_at": "2026-08-31",
+        "revision": "ade286bbb2bba050559b1bcd85290aae7fd4dcf1",
+        "commands": [
+          "make loadbalancer-kind-test",
+          "make loadbalancer-openshift-deploy OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig",
+          "make loadbalancer-openshift-test OPENSHIFT_KUBECONFIG=.tools/cl02-audit.kubeconfig"
+        ],
+        "records": [
+          ".artifacts/phase6-loadbalancer-kind.json",
+          ".artifacts/phase6-loadbalancer-openshift-deploy.json",
+          ".artifacts/phase6-loadbalancer-openshift.json"
+        ],
+        "decisions": [
+          "docs/adr/0100-qualify-loadbalancer-on-kube-proxy-free-kind.md",
+          "docs/adr/0101-qualify-loadbalancer-on-openshift.md"
+        ]
+      },
+      "qualified_scope": [
+        "kube-proxy-free dual-stack TCP and UDP LoadBalancer Cluster and Local exposure",
+        "explicit class ownership and conflict-safe dual-stack allocation",
+        "workstation cross-worker VIP reachability and exact source/reverse behavior",
+        "dual-stack source ranges and placement-sensitive health checks",
+        "controller, provider, and controller-offline agent recovery from last-known-good state",
+        "RHCOS enforcing-SELinux and CRI-O operation with exact ABI-v7 reconstruction",
+        "exact owned-state cleanup, five-agent convergence, and unchanged ClusterOperator health boundary"
+      ]
     }
   ],
   "unsupported_boundaries": [
@@ -332,7 +391,8 @@
       "qualified_values": [
         "kindnetd",
         "OVN-Kubernetes",
-        "UNF primary CNI runtime revision f721f9a7a0084e908bfa3eda2896ec2c3521ebbb"
+        "UNF primary CNI runtime revision f721f9a7a0084e908bfa3eda2896ec2c3521ebbb",
+        "UNF primary CNI and LoadBalancer runtime revision 830771c87f52be2d41ce7d700a6c670690e7e516"
       ],
       "boundary": "Other UNF revisions, other CNIs, and CNI chaining combinations are unqualified."
     },

@@ -23,8 +23,8 @@ evidence and are not reinterpreted by this plan.
 | 6.5 | `externalTrafficPolicy: Cluster` LoadBalancer dataplane | **Verified** | Exact coherent IPv4/IPv6 TCP/UDP VIP lookup; bounded collision-safe VIP source translation and paired reverse restoration; connection persistence through backend churn; backendless drop; policy and withdrawal ordering; bounded event provenance; verifier-loaded release execution plus ClusterIP/NodePort regression under `make loadbalancer-cluster-dataplane-test`; ADR 0097 |
 | 6.6 | `externalTrafficPolicy: Local`, source ranges, and health checks | **Verified** | Receiving-Node-only ready/non-terminating selection, client-source preservation and reverse restoration, no-local-backend drop, transactional IPv4/IPv6 source-range LPM enforcement and restart reconstruction, exact dual-stack `healthCheckNodePort` 200/503 lifecycle, placement/readiness recovery, bounded provenance, and inherited Cluster/NodePort/ClusterIP regression under `make loadbalancer-local-dataplane-test`; ADR 0098 |
 | 6.7 | Operations, simulation, upgrade, and recovery | **Verified** | Fixed-cardinality revision/frontend/source-range/health/outcome metrics; validated additive status; durable Cluster/Local history; allocation/provider/reachability explanation; source-aware read-only VIP simulation and CLI; exact durable controller/provider replay, foreign-provider refusal, agent runtime-state reconstruction, and same-tuple adjacent compatibility under `make loadbalancer-operations-test`; ADR 0099 |
-| 6.8 | Kube-proxy-free Kind qualification | **Verified** | Runtime revision `dd11ae3` and qualifier `793273f` passed the 285-second three-Node Kubernetes v1.35.0 dual-stack gate with kube-proxy absent: external and host-origin IPv4/IPv6 TCP/UDP, Cluster/Local tuples, source ranges, health lifecycle, controller/provider/agent recovery, exact ABI-v7/CNI rollback, and schema-v1 evidence; `make loadbalancer-kind-test`; ADR 0100 |
-| 6.9 | OpenShift qualification | **Planned** | Digest-pinned five-Node dual-stack cl02 gate for RHCOS/SELinux/CRI-O, cross-worker VIP traffic, provider recovery, health/status convergence, exact cleanup, and no new unhealthy ClusterOperator |
+| 6.8 | Kube-proxy-free Kind qualification | **Verified** | Runtime/qualifier `830771c` re-passed the 280-second three-Node Kubernetes v1.35.0 dual-stack gate with kube-proxy absent after receiving-Node source-state hardening: external and host-origin IPv4/IPv6 TCP/UDP, Cluster/Local tuples, source ranges, health lifecycle, controller/provider/agent recovery, exact ABI-v7/CNI rollback, and schema-v1 evidence; `make loadbalancer-kind-test`; ADR 0100 |
+| 6.9 | OpenShift qualification | **Verified** | Runtime `830771c` and qualifier `ade286b` passed guarded digest-pinned deployment and the 973-second five-Node dual-stack OpenShift 4.22.10 cl02 gate. RHCOS/SELinux/CRI-O, kube-proxy absence, workstation cross-worker VIP traffic, exact source behavior, provider/controller/agent recovery, health/status, ABI-v7 reconstruction, exact cleanup, final convergence, and no new unhealthy ClusterOperator passed; `make loadbalancer-openshift-deploy`, `make loadbalancer-openshift-test`; ADR 0101 |
 
 ## Accepted Phase 6 gate
 
@@ -75,12 +75,10 @@ Maglev, DSR, SCTP Service forwarding, fragments, generic NAT `RELATED`
 tracking, multi-cluster VIPs, Gateway API, or production availability/scale.
 Those capabilities require independent implementations and qualification gates.
 
-## Immediate next slice
+## Completion boundary
 
-Milestone 6.9 independently qualifies the bounded LoadBalancer contract on the
-five-Node dual-stack OpenShift cl02 fixture. It must publish digest-pinned
-controller, agent, and test-tool images, stage the compatible transition,
-exercise cross-worker RHCOS/SELinux/CRI-O traffic and provider recovery, compare
-ClusterOperator health, remove only owned fixture and host state, and retain an
-immutable evidence record. The Kind result does not transitively qualify that
-platform or production advertisement providers.
+Phase 6 is complete for the exact Kind and OpenShift tuples recorded by ADRs
+0100–0101. This qualification is deliberately non-transitive: production
+advertisement protocols and cloud adapters, classless ownership, advanced
+Service selection algorithms and traffic policies, SCTP, Gateway API,
+multi-cluster VIPs, and production availability/scale retain independent gates.

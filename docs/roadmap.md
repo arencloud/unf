@@ -453,7 +453,7 @@ matrix is maintained in the
 
 ## Phase 6 — LoadBalancer exposure
 
-**Gate: In progress.** The ordered evidence matrix is maintained in the
+**Gate: Verified.** The ordered evidence matrix is maintained in the
 [Phase 6 LoadBalancer plan](development/phase6-loadbalancer-plan.md).
 
 - Verified architecture boundary: ADR 0093 separates VIP allocation,
@@ -490,11 +490,17 @@ matrix is maintained in the
   allocation/provider/reachability explanation, source-aware read-only VIP
   simulation, durable provider replay, agent reconstruction, and adjacent
   compatibility pass `make loadbalancer-operations-test`; ADR 0099.
-- Verified kube-proxy-free Kind qualification: runtime `dd11ae3` and qualifier
-  `793273f` passed the 285-second three-Node Kubernetes v1.35.0 dual-stack
+- Verified kube-proxy-free Kind qualification: runtime/qualifier `830771c`
+  re-passed the 280-second three-Node Kubernetes v1.35.0 dual-stack
   external-client matrix, controller/provider/agent recovery, exact ABI-v7/CNI
   cleanup, and no-CNI rollback; `make loadbalancer-kind-test`; ADR 0100.
-  Planned: independent digest-pinned OpenShift qualification.
+- Verified OpenShift qualification: runtime `830771c`, qualifier `ade286b`, and
+  three immutable public Quay digests passed guarded deployment plus the
+  973-second five-Node OpenShift 4.22.10 cl02 gate. Kube-proxy-free
+  RHCOS/SELinux/CRI-O, workstation cross-worker dual-stack Cluster/Local VIPs,
+  source semantics, lifecycle, operations, provider/controller/agent recovery,
+  ABI-v7 reconstruction, exact cleanup, final convergence, and unchanged
+  baseline/final unhealthy operators passed; ADR 0101.
 - Production BGP/cloud takeover, session affinity, internal traffic policy,
   topology-aware selection, Maglev, DSR, SCTP, Gateway API, multi-cluster, and
   production availability/scale remain independent future gates.

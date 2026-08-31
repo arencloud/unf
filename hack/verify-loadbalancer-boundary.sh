@@ -18,6 +18,7 @@ required_files=(
     docs/adr/0098-enforce-loadbalancer-local-source-ranges-and-health.md
     docs/adr/0099-operate-simulate-and-recover-loadbalancers.md
     docs/adr/0100-qualify-loadbalancer-on-kube-proxy-free-kind.md
+    docs/adr/0101-qualify-loadbalancer-on-openshift.md
     deploy/kind-loadbalancer/kustomization.yaml
     deploy/kind-loadbalancer/controller-loadbalancer-patch.yaml
     deploy/openshift-primary-cni/loadbalancer/kustomization.yaml
@@ -61,8 +62,8 @@ for relative_file in \
 done
 
 require_text docs/project-status.md \
-    '| Phase 6 — LoadBalancer exposure | **In progress** |' \
-    "the authoritative phase state must be in progress"
+    '| Phase 6 — LoadBalancer exposure | **Verified** |' \
+    "the authoritative phase state must remain verified"
 require_text docs/development/phase6-loadbalancer-plan.md \
     '| 6.1 | Architecture, ownership, and acceptance boundary | **Verified** |' \
     "milestone 6.1 must remain verified"
@@ -108,6 +109,12 @@ require_text docs/development/phase6-loadbalancer-plan.md \
 require_text docs/project-status.md \
     '| Kube-proxy-free Kind qualification | **Verified** |' \
     "the authoritative tracker must identify milestone 6.8 as verified"
+require_text docs/development/phase6-loadbalancer-plan.md \
+    '| 6.9 | OpenShift qualification | **Verified** |' \
+    "milestone 6.9 must remain verified"
+require_text docs/project-status.md \
+    '| OpenShift qualification | **Verified** |' \
+    "the authoritative tracker must identify milestone 6.9 as verified"
 require_text docs/adr/0093-separate-loadbalancer-ownership-domains.md \
     '**Status:** Accepted and implemented for the Phase 6.1 architecture boundary' \
     "ADR 0093 must record the implemented architecture boundary"
@@ -123,6 +130,9 @@ require_text README.md \
 require_text README.md \
     'make loadbalancer-kind-test' \
     "the README must bind LoadBalancer Kind support to its qualification gate"
+require_text README.md \
+    'ADR 0101 records the platform boundary.' \
+    "the README must bind LoadBalancer OpenShift support to its qualification record"
 require_text Makefile \
     'loadbalancer-kind-test:' \
     "the build must expose an isolated LoadBalancer Kind qualification gate"

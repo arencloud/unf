@@ -72,6 +72,15 @@ An independent post-gate audit found no `unf-system` Namespace, UNF bpffs root,
 private CNI state, runtime socket directory, CNI binary, or CNI configuration on
 any Node. All three Nodes were at the expected NotReady no-CNI baseline.
 
+After receiving-Node source selection was hardened for the Linux 5.14
+OpenShift boundary, runtime/qualification revision
+`830771c87f52be2d41ce7d700a6c670690e7e516` re-passed the complete gate in 280
+seconds. Its schema-v1 evidence had SHA-256
+`e3e80933e4ebcfbb9dbe091ca8986158390f3199943f152cf6e4e56c84f13e9f`
+immediately after the run and restored the same exact no-CNI baseline. This
+later pass supersedes the runtime tuple for Phase 6 promotion without erasing
+the original accepted evidence above.
+
 ## Consequences
 
 Phase 6.8 is Verified for this exact Kind tuple. The result is non-transitive:
