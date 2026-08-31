@@ -659,10 +659,24 @@ At least one family prefix and the stable UID are required. The prefixes must
 be disjoint from every other configured pool and externally routed to the
 selected Nodes by the qualification environment. UNF persists allocation state
 in `unf-system/unf-load-balancer-control-plane`; changing the configured pool
-under an existing store is rejected rather than adopted. Phase 6.4 activates
-and recovers the Node-local VIP maps, but does not yet consume them in TC or
-publish `status.loadBalancer.ingress`. Use `make loadbalancer-host-state-test`
-before beginning the 6.5 packet-path work.
+under an existing store is rejected rather than adopted. Milestones 6.5–6.7
+consume coherent Cluster/Local VIP state, enforce source ranges, serve local
+health, and expose bounded operations. Kubernetes
+`status.loadBalancer.ingress` remains withheld until platform qualification.
+Run the complete local gate with:
+
+```bash
+make loadbalancer-operations-test
+```
+
+Inspect retained outcomes and exact current allocation/reachability provenance,
+or simulate a fresh flow without changing live state:
+
+```bash
+unfctl service-explain --service-id 44 --frontend-kind load-balancer-local
+unfctl load-balancer-simulate --node worker-a --address 192.0.2.60 \
+  --source-address 198.51.100.10 --port 443 --protocol tcp
+```
 
 ## Fedora, RHEL, and OpenShift
 

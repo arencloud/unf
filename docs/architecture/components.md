@@ -33,11 +33,13 @@ durable explicit-pool production and finalizer-safe withdrawal; the agent owns
 authenticated, independently banked host adoption and recovery. `unf-ebpf-tc`
 now owns coherent `Cluster`/`Local` VIP translation, paired reverse state, and
 exact source-range lookup. The agent owns transactional runtime trie
-reconstruction and dual-stack Node-local health listeners. Live status
-publication, provider-owned external advertisement artifacts, operations, and
-platform qualification remain separate ordered milestones. Allocation,
+reconstruction and dual-stack Node-local health listeners. Bounded metrics,
+status, history, provenance-aware explanation, exact read-only simulation, and
+durable recovery are now implemented. Live Kubernetes status publication,
+provider-owned external advertisement artifacts, and platform qualification
+remain separate ordered milestones. Allocation,
 advertisement, translation, health, and published readiness are not
-interchangeable. ADRs 0093–0098 define the implemented boundary.
+interchangeable. ADRs 0093–0099 define the implemented boundary.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

@@ -40,10 +40,10 @@ use unf_ipam::{
     NodeBlockSnapshot,
 };
 use unf_loadbalancer::{
-    AllocationCheckpoint, LoadBalancerAllocator, LoadBalancerOwner, LoadBalancerPool,
-    NodeReachabilitySnapshot, ReachabilityMode, ReachabilityNode, ReachabilityProviderRef,
-    ReachabilitySnapshot, allocation_request_for_service, compile_direct_node_reachability,
-    reconcile_finalizers,
+    AllocationCheckpoint, LoadBalancerAllocator, LoadBalancerLease, LoadBalancerOwner,
+    LoadBalancerPool, NodeReachabilitySnapshot, ReachabilityMode, ReachabilityNode,
+    ReachabilityProviderRef, ReachabilitySnapshot, allocation_request_for_service,
+    compile_direct_node_reachability, reconcile_finalizers,
 };
 use unf_policy::{
     DestinationAddresses, DestinationPort, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort,
@@ -653,10 +653,21 @@ struct ServiceExplanation {
     current_service_revision: Option<Revision>,
     current_service: Option<ServiceIr>,
     current_backend: Option<ServiceBackend>,
+    load_balancer: Option<LoadBalancerExplanation>,
     matched_outcomes: usize,
     matched_observations: u64,
     outcomes: Vec<FlowHistoryEntry>,
     note: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct LoadBalancerExplanation {
+    allocation: Option<LoadBalancerLease>,
+    provider: Option<ReachabilityProviderRef>,
+    reachability_revision: Option<Revision>,
+    allocation_revision: Option<Revision>,
+    reachable_nodes: Vec<String>,
+    converged_nodes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -681,6 +692,41 @@ struct NodePortSimulation {
     frontend_kind: ServiceFrontendKind,
     traffic_policy: ServiceTrafficPolicy,
     source_preserved: bool,
+    eligible_backend_ids: Vec<BackendId>,
+    eligible_backends: Vec<ServiceBackend>,
+    decision: &'static str,
+    note: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoadBalancerSimulationQuery {
+    node_name: String,
+    address: IpAddr,
+    source_address: IpAddr,
+    port: u16,
+    protocol: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LoadBalancerSimulation {
+    schema_version: u16,
+    node_name: String,
+    address: IpAddr,
+    source_address: IpAddr,
+    port: u16,
+    protocol: Protocol,
+    service_revision: Revision,
+    reachability_revision: Revision,
+    allocation_revision: Revision,
+    provider: ReachabilityProviderRef,
+    allocation: Option<LoadBalancerLease>,
+    service_id: ServiceId,
+    namespace: String,
+    name: String,
+    frontend_kind: ServiceFrontendKind,
+    traffic_policy: ServiceTrafficPolicy,
+    source_preserved: bool,
+    source_allowed: bool,
     eligible_backend_ids: Vec<BackendId>,
     eligible_backends: Vec<ServiceBackend>,
     decision: &'static str,
@@ -812,6 +858,10 @@ async fn main() -> Result<()> {
         .route("/v1/flows", get(flow_history))
         .route("/v1/services/explain", get(explain_service))
         .route("/v1/services/nodeport/simulate", get(simulate_node_port))
+        .route(
+            "/v1/services/loadbalancer/simulate",
+            get(simulate_load_balancer),
+        )
         .route("/v1/explain", post(explain))
         .route("/v1/policy/simulate", post(simulate_policy))
         .with_state(Arc::clone(&state));
@@ -4128,7 +4178,11 @@ fn validate_load_balancer_status(report: &AgentStateReport) -> Result<(), ApiErr
         }
     }
     if report.active_load_balancer_bank > 1
-        || (report.applied_load_balancer_revision == 0 && report.load_balancer_frontend_count != 0)
+        || (report.applied_load_balancer_revision == 0
+            && (report.load_balancer_frontend_count != 0
+                || report.load_balancer_cluster_frontend_count != 0
+                || report.load_balancer_local_frontend_count != 0
+                || report.load_balancer_source_range_count != 0))
         || (report.desired_load_balancer_revision == 0
             && report.desired_load_balancer_allocation_revision != 0)
         || (report.applied_load_balancer_revision == 0
@@ -4137,6 +4191,14 @@ fn validate_load_balancer_status(report: &AgentStateReport) -> Result<(), ApiErr
         || report.load_balancer_frontend_count
             > u64::try_from(unf_loadbalancer::LOAD_BALANCER_FRONTEND_BANK_CAPACITY)
                 .expect("LoadBalancer capacity fits u64")
+        || report.load_balancer_frontend_count
+            != report
+                .load_balancer_cluster_frontend_count
+                .saturating_add(report.load_balancer_local_frontend_count)
+        || report.load_balancer_source_range_count
+            > u64::try_from(unf_loadbalancer::LOAD_BALANCER_FRONTEND_BANK_CAPACITY)
+                .expect("LoadBalancer capacity fits u64")
+        || report.load_balancer_health_check_ready_count > report.load_balancer_health_check_count
         || report
             .load_balancer_last_error
             .as_ref()
@@ -4854,6 +4916,10 @@ async fn explain_service(
                 .cloned()
         })
     });
+    let load_balancer = current_service
+        .as_ref()
+        .and_then(|service| service.load_balancer.as_ref())
+        .map(|_| load_balancer_explanation(&state, service_id));
     let mut history = flow_history_snapshot_window(
         &state,
         query.since_unix_ms,
@@ -4890,11 +4956,72 @@ async fn explain_service(
         current_service_revision,
         current_service,
         current_backend,
+        load_balancer,
         matched_outcomes,
         matched_observations,
         outcomes: history.entries,
         note: "Current compiled intent is correlated with bounded, durable dataplane outcomes; absence of an outcome is not proof that no traffic occurred.",
     }))
+}
+
+fn load_balancer_explanation(
+    state: &ControllerState,
+    service_id: ServiceId,
+) -> LoadBalancerExplanation {
+    let allocation = mutex_lock(&state.load_balancer_runtime)
+        .as_ref()
+        .and_then(|runtime| {
+            runtime
+                .allocator
+                .checkpoint()
+                .leases
+                .into_iter()
+                .find(|lease| lease.owner.service_id == service_id)
+        });
+    let reachability = read_lock(&state.compiled_load_balancer_reachability).clone();
+    let mut reachable_nodes = reachability
+        .as_ref()
+        .into_iter()
+        .flat_map(|snapshot| &snapshot.targets)
+        .filter(|target| target.owner.service_id == service_id)
+        .map(|target| target.node.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    reachable_nodes.sort();
+    let now = unix_time_millis();
+    let reports = read_lock(&state.agent_reports);
+    let converged_nodes = reachable_nodes
+        .iter()
+        .filter(|node| {
+            let Some(snapshot) = reachability.as_ref() else {
+                return false;
+            };
+            reports.get(*node).is_some_and(|stored| {
+                now.saturating_sub(stored.last_received_unix_ms) <= AGENT_STATUS_FRESHNESS_MILLIS
+                    && stored.report.ready
+                    && stored.report.bpf_loaded
+                    && stored.report.applied_load_balancer_epoch == snapshot.source_epoch
+                    && stored.report.applied_load_balancer_revision == snapshot.revision.get()
+                    && stored.report.applied_load_balancer_allocation_revision
+                        == snapshot.allocation_revision.get()
+                    && stored.report.load_balancer_last_error.is_none()
+            })
+        })
+        .cloned()
+        .collect();
+    LoadBalancerExplanation {
+        allocation,
+        provider: reachability
+            .as_ref()
+            .map(|snapshot| snapshot.provider.clone()),
+        reachability_revision: reachability.as_ref().map(|snapshot| snapshot.revision),
+        allocation_revision: reachability
+            .as_ref()
+            .map(|snapshot| snapshot.allocation_revision),
+        reachable_nodes,
+        converged_nodes,
+    }
 }
 
 async fn simulate_node_port(
@@ -4963,6 +5090,143 @@ async fn simulate_node_port(
         decision,
         note: "Read-only prediction from the current validated Service and Node snapshots; an existing connection may retain its revision-local backend until expiry.",
     }))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn simulate_load_balancer(
+    State(state): State<Arc<ControllerState>>,
+    Query(query): Query<LoadBalancerSimulationQuery>,
+) -> Result<Json<LoadBalancerSimulation>, ApiError> {
+    if query.node_name.is_empty()
+        || query.node_name.len() > 253
+        || query.port == 0
+        || query.address.is_ipv4() != query.source_address.is_ipv4()
+    {
+        return Err(ApiError::bad_request(
+            "node_name and port must be valid and source_address must match the VIP family",
+        ));
+    }
+    let protocol = node_port_simulation_protocol(&query.protocol)?;
+    let reachability = read_lock(&state.compiled_load_balancer_reachability)
+        .clone()
+        .ok_or_else(|| ApiError::not_found("LoadBalancer reachability state is unavailable"))?;
+    let mut targets = reachability
+        .targets
+        .iter()
+        .filter(|target| target.node.name == query.node_name && target.address == query.address);
+    let target = targets
+        .next()
+        .ok_or_else(|| ApiError::not_found("VIP is not reachable through the requested Node"))?;
+    if targets.next().is_some() {
+        return Err(ApiError::bad_request(
+            "VIP reachability ownership is ambiguous",
+        ));
+    }
+    let services = service_snapshot_for(&state)?;
+    let service = services
+        .services
+        .iter()
+        .find(|service| service.id == target.owner.service_id)
+        .ok_or_else(|| ApiError::not_found("VIP owner has no current compiled Service"))?;
+    let intent = service
+        .load_balancer
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("VIP owner has no LoadBalancer intent"))?;
+    let family = if query.address.is_ipv4() {
+        AddressFamily::Ipv4
+    } else {
+        AddressFamily::Ipv6
+    };
+    let frontend = intent
+        .frontends
+        .iter()
+        .find(|frontend| {
+            frontend.family == family
+                && frontend.service_port == query.port
+                && frontend.protocol == protocol
+        })
+        .ok_or_else(|| ApiError::not_found("VIP port and protocol have no admitted frontend"))?;
+    let source_allowed = intent.source_ranges.is_empty()
+        || intent
+            .source_ranges
+            .iter()
+            .copied()
+            .any(|prefix| service_prefix_contains(prefix, query.source_address));
+    let eligible_backends = frontend
+        .backend_ids
+        .iter()
+        .filter_map(|backend_id| {
+            service.backends.iter().find(|backend| {
+                backend.id == *backend_id
+                    && backend.ready
+                    && !backend.terminating
+                    && (intent.traffic_policy == ServiceTrafficPolicy::Cluster
+                        || backend.node_name.as_deref() == Some(query.node_name.as_str()))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let eligible_backend_ids = eligible_backends.iter().map(|backend| backend.id).collect();
+    let (frontend_kind, source_preserved) = match intent.traffic_policy {
+        ServiceTrafficPolicy::Cluster => (ServiceFrontendKind::LoadBalancerCluster, false),
+        ServiceTrafficPolicy::Local => (ServiceFrontendKind::LoadBalancerLocal, true),
+    };
+    let decision = if !source_allowed {
+        "drop_source_range"
+    } else if eligible_backends.is_empty() {
+        "drop_no_backend"
+    } else {
+        "translate"
+    };
+    let allocation = mutex_lock(&state.load_balancer_runtime)
+        .as_ref()
+        .and_then(|runtime| runtime.allocator.lease(&target.owner).cloned());
+    Ok(Json(LoadBalancerSimulation {
+        schema_version: 1,
+        node_name: query.node_name,
+        address: query.address,
+        source_address: query.source_address,
+        port: query.port,
+        protocol,
+        service_revision: services.revision,
+        reachability_revision: reachability.revision,
+        allocation_revision: reachability.allocation_revision,
+        provider: reachability.provider,
+        allocation,
+        service_id: service.id,
+        namespace: service.namespace.clone(),
+        name: service.name.clone(),
+        frontend_kind,
+        traffic_policy: intent.traffic_policy,
+        source_preserved,
+        source_allowed,
+        eligible_backend_ids,
+        eligible_backends,
+        decision,
+        note: "Read-only prediction from the exact current Service, allocation, reachability, source-range, and receiving-Node state; an existing connection may retain its revision-local backend until expiry.",
+    }))
+}
+
+fn service_prefix_contains(prefix: ServiceIpPrefix, address: IpAddr) -> bool {
+    match (prefix.address, address) {
+        (IpAddr::V4(network), IpAddr::V4(address)) => {
+            let mask = if prefix.prefix_length == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix.prefix_length)
+            };
+            u32::from(network) & mask == u32::from(address) & mask
+        }
+        (IpAddr::V6(network), IpAddr::V6(address)) => {
+            let mask = if prefix.prefix_length == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix.prefix_length)
+            };
+            u128::from(network) & mask == u128::from(address) & mask
+        }
+        _ => false,
+    }
 }
 
 fn node_port_simulation_protocol(value: &str) -> Result<Protocol, ApiError> {
@@ -7917,6 +8181,11 @@ mod tests {
             applied_load_balancer_revision: 0,
             applied_load_balancer_allocation_revision: 0,
             load_balancer_frontend_count: 0,
+            load_balancer_cluster_frontend_count: 0,
+            load_balancer_local_frontend_count: 0,
+            load_balancer_source_range_count: 0,
+            load_balancer_health_check_count: 0,
+            load_balancer_health_check_ready_count: 0,
             active_load_balancer_bank: 0,
             load_balancer_reconcile_errors: 0,
             load_balancer_last_error: None,
@@ -7929,6 +8198,10 @@ mod tests {
             node_port_cluster_translations: 0,
             node_port_local_translations: 0,
             node_port_no_backend_drops: 0,
+            load_balancer_cluster_translations: 0,
+            load_balancer_local_translations: 0,
+            load_balancer_no_backend_drops: 0,
+            load_balancer_source_range_drops: 0,
             invalid_service_events: 0,
             last_service_id: 0,
             last_backend_id: 0,
@@ -8820,6 +9093,12 @@ mod tests {
         report.applied_load_balancer_revision = desired.revision.get();
         report.desired_load_balancer_allocation_revision = desired.allocation_revision.get();
         report.applied_load_balancer_allocation_revision = desired.allocation_revision.get();
+        report.load_balancer_frontend_count = 2;
+        report.load_balancer_local_frontend_count = 2;
+        report.load_balancer_source_range_count = 2;
+        report.load_balancer_health_check_count = 1;
+        report.load_balancer_health_check_ready_count = 1;
+        validate_agent_status(&report).expect("bounded LoadBalancer operations status is valid");
         write_lock(&state.agent_reports).insert(
             "worker-a".to_owned(),
             StoredAgentReport {
@@ -8828,6 +9107,13 @@ mod tests {
             },
         );
         assert!(load_balancer_agents_converged(&state, &desired));
+
+        let mut malformed_counts = report.clone();
+        malformed_counts.load_balancer_cluster_frontend_count = 1;
+        assert!(validate_agent_status(&malformed_counts).is_err());
+        let mut malformed_health = report.clone();
+        malformed_health.load_balancer_health_check_ready_count = 2;
+        assert!(validate_agent_status(&malformed_health).is_err());
 
         report.load_balancer_reachability_schema_version = 0;
         write_lock(&state.agent_reports)
@@ -8907,6 +9193,107 @@ mod tests {
         assert_eq!(runtime.allocator.checkpoint().pools.len(), 1);
         assert!(runtime.allocator.checkpoint().leases.is_empty());
         assert_eq!(runtime.reachability_revision, Revision::INITIAL);
+    }
+
+    #[tokio::test]
+    async fn load_balancer_runtime_recovery_is_provider_exact_and_replayable() {
+        let configured = Args::try_parse_from([
+            "unf-controller",
+            "--offline",
+            "--load-balancer-pool-uid",
+            "recovery-pool-uid",
+            "--load-balancer-ipv4-pool",
+            "192.0.2.0/29",
+            "--load-balancer-ipv6-pool",
+            "2001:db8::/125",
+            "--load-balancer-provider-instance",
+            "provider-a",
+        ])
+        .unwrap();
+        let state = new_state(true);
+        configure_load_balancer_runtime(&state, &configured)
+            .await
+            .unwrap();
+        let mut runtime = mutex_lock(&state.load_balancer_runtime).clone().unwrap();
+        let owner = LoadBalancerOwner {
+            service_id: ServiceId::new(44),
+            namespace: "apps".to_owned(),
+            name: "api".to_owned(),
+            uid: "api-uid".to_owned(),
+        };
+        let lease = runtime
+            .allocator
+            .allocate(unf_loadbalancer::AllocationRequest {
+                owner: owner.clone(),
+                pool: runtime.pool_name.clone(),
+                families: vec![AddressFamily::Ipv4, AddressFamily::Ipv6],
+                requested_ips: Vec::new(),
+                intent_epoch: state.identity_epoch,
+                intent_revision: Revision::new(7),
+            })
+            .unwrap();
+        runtime.reachability_revision = Revision::new(5);
+        let durable = DurableLoadBalancerState {
+            schema_version: LOAD_BALANCER_STORE_SCHEMA_VERSION,
+            reachability_revision: runtime.reachability_revision,
+            allocation: runtime.allocator.checkpoint(),
+        };
+        let encoded = serde_json::to_vec(&durable).unwrap();
+        let restored: DurableLoadBalancerState = serde_json::from_slice(&encoded).unwrap();
+        let allocator = LoadBalancerAllocator::restore(restored.allocation.clone()).unwrap();
+        assert_eq!(allocator.lease(&owner), Some(&lease));
+        let reachability = compile_direct_node_reachability(
+            state.identity_epoch,
+            restored.reachability_revision,
+            restored.allocation.revision,
+            runtime.provider.clone(),
+            &restored.allocation.leases,
+            vec![ReachabilityNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(reachability.revision, Revision::new(5));
+        assert_eq!(reachability.targets.len(), 2);
+
+        let mut foreign = restored.allocation;
+        foreign.pools[0].provider.instance = "provider-b".to_owned();
+        assert!(LoadBalancerAllocator::restore(foreign).is_err());
+    }
+
+    #[test]
+    fn load_balancer_operations_fields_preserve_the_adjacent_compatibility_tuple() {
+        assert_eq!(AGENT_STATUS_SCHEMA_VERSION, 6);
+        assert_eq!(FLOW_EXPORT_SCHEMA_VERSION, 5);
+        let report = converged_agent_report(7);
+        let mut legacy = serde_json::to_value(&report).unwrap();
+        for field in [
+            "load_balancer_cluster_frontend_count",
+            "load_balancer_local_frontend_count",
+            "load_balancer_source_range_count",
+            "load_balancer_health_check_count",
+            "load_balancer_health_check_ready_count",
+            "load_balancer_cluster_translations",
+            "load_balancer_local_translations",
+            "load_balancer_no_backend_drops",
+            "load_balancer_source_range_drops",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let migrated: AgentStateReport = serde_json::from_value(legacy).unwrap();
+        assert_eq!(migrated.schema_version, AGENT_STATUS_SCHEMA_VERSION);
+        assert_eq!(migrated.load_balancer_local_translations, 0);
+        assert_eq!(migrated.load_balancer_health_check_count, 0);
+
+        let mut additive = serde_json::to_value(report).unwrap();
+        additive["future_bounded_load_balancer_field"] = serde_json::json!(1);
+        serde_json::from_value::<AgentStateReport>(additive)
+            .expect("adjacent readers ignore additive status fields");
+        assert_eq!(
+            serde_json::from_str::<ServiceFrontendKind>("\"load_balancer_local\"").unwrap(),
+            ServiceFrontendKind::LoadBalancerLocal
+        );
     }
 
     #[test]
@@ -9266,6 +9653,176 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn load_balancer_simulation_and_explanation_are_provenance_exact_and_read_only() {
+        let state = Arc::new(new_state(true));
+        apply_node_event(
+            &state,
+            Event::Apply(primary_node("worker-a", "10.42.0.0/24", "fd00:42::/64")),
+        );
+        apply_service_event(&state, Event::Apply(load_balancer_service()));
+        let endpoint: EndpointSlice = serde_json::from_value(serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "public-api-v4",
+                "namespace": "frontend",
+                "labels": {"kubernetes.io/service-name": "public-api"}
+            },
+            "addressType": "IPv4",
+            "ports": [{"name": "https", "protocol": "TCP", "port": 8443,
+                "appProtocol": "kubernetes.io/h2c"}],
+            "endpoints": [{
+                "addresses": ["10.42.0.30"],
+                "conditions": {"ready": true, "serving": true, "terminating": false},
+                "nodeName": "worker-a"
+            }]
+        }))
+        .unwrap();
+        apply_endpoint_slice_event(&state, Event::Apply(endpoint));
+        let services = service_snapshot_for(&state).unwrap();
+        let service = &services.services[0];
+        let provider = ReachabilityProviderRef {
+            name: "direct-node".to_owned(),
+            instance: "simulation".to_owned(),
+            mode: ReachabilityMode::DirectNode,
+        };
+        let owner = LoadBalancerOwner {
+            service_id: service.id,
+            namespace: service.namespace.clone(),
+            name: service.name.clone(),
+            uid: "public-api-uid".to_owned(),
+        };
+        let pool = LoadBalancerPool {
+            name: "public".to_owned(),
+            uid: "public-pool-uid".to_owned(),
+            provider: provider.clone(),
+            ipv4: Some("192.0.2.0/24".parse().unwrap()),
+            ipv6: Some("2001:db8::/64".parse().unwrap()),
+        };
+        let lease = LoadBalancerLease {
+            owner: owner.clone(),
+            pool: pool.name.clone(),
+            pool_uid: pool.uid.clone(),
+            provider: provider.clone(),
+            families: vec![AddressFamily::Ipv4, AddressFamily::Ipv6],
+            requested_ips: vec!["192.0.2.60".parse().unwrap()],
+            addresses: vec![
+                "192.0.2.60".parse().unwrap(),
+                "2001:db8::1".parse().unwrap(),
+            ],
+            intent_epoch: services.source_epoch,
+            intent_revision: services.revision,
+            allocation_revision: Revision::new(3),
+        };
+        let allocator = LoadBalancerAllocator::restore(AllocationCheckpoint {
+            schema_version: unf_loadbalancer::ALLOCATION_CHECKPOINT_SCHEMA_VERSION,
+            revision: Revision::new(3),
+            pools: vec![pool],
+            leases: vec![lease.clone()],
+        })
+        .unwrap();
+        *mutex_lock(&state.load_balancer_runtime) = Some(LoadBalancerRuntime {
+            pool_name: "public".to_owned(),
+            provider: provider.clone(),
+            allocator,
+            reachability_revision: Revision::new(4),
+        });
+        let reachability = compile_direct_node_reachability(
+            services.source_epoch,
+            Revision::new(4),
+            Revision::new(3),
+            provider.clone(),
+            &[lease],
+            vec![ReachabilityNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+            }],
+        )
+        .unwrap();
+        *write_lock(&state.compiled_load_balancer_reachability) = Some(reachability.clone());
+        let service_before = read_lock(&state.compiled_service_snapshot).clone();
+        let runtime_before = mutex_lock(&state.load_balancer_runtime)
+            .as_ref()
+            .unwrap()
+            .allocator
+            .checkpoint();
+
+        let Json(allowed) = simulate_load_balancer(
+            State(Arc::clone(&state)),
+            Query(LoadBalancerSimulationQuery {
+                node_name: "worker-a".to_owned(),
+                address: "192.0.2.60".parse().unwrap(),
+                source_address: "198.51.100.10".parse().unwrap(),
+                port: 443,
+                protocol: "tcp".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(allowed.decision, "translate");
+        assert_eq!(
+            allowed.frontend_kind,
+            ServiceFrontendKind::LoadBalancerLocal
+        );
+        assert!(allowed.source_allowed);
+        assert!(allowed.source_preserved);
+        assert_eq!(allowed.eligible_backends.len(), 1);
+        assert_eq!(allowed.provider, provider);
+        assert_eq!(
+            allowed.allocation.as_ref().unwrap().pool_uid,
+            "public-pool-uid"
+        );
+
+        let Json(denied) = simulate_load_balancer(
+            State(Arc::clone(&state)),
+            Query(LoadBalancerSimulationQuery {
+                node_name: "worker-a".to_owned(),
+                address: "192.0.2.60".parse().unwrap(),
+                source_address: "203.0.113.10".parse().unwrap(),
+                port: 443,
+                protocol: "TCP".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied.decision, "drop_source_range");
+        assert!(!denied.source_allowed);
+
+        let Json(explanation) = explain_service(
+            State(Arc::clone(&state)),
+            Query(ServiceExplainQuery {
+                service_id: service.id.get(),
+                frontend_kind: Some(ServiceFrontendKind::LoadBalancerLocal),
+                ..ServiceExplainQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let provenance = explanation.load_balancer.unwrap();
+        assert_eq!(provenance.provider, Some(provider));
+        assert_eq!(provenance.reachability_revision, Some(Revision::new(4)));
+        assert_eq!(provenance.allocation_revision, Some(Revision::new(3)));
+        assert_eq!(provenance.reachable_nodes, ["worker-a"]);
+        assert_eq!(
+            read_lock(&state.compiled_service_snapshot).clone(),
+            service_before
+        );
+        assert_eq!(
+            mutex_lock(&state.load_balancer_runtime)
+                .as_ref()
+                .unwrap()
+                .allocator
+                .checkpoint(),
+            runtime_before
+        );
+        assert_eq!(
+            read_lock(&state.compiled_load_balancer_reachability).clone(),
+            Some(reachability)
         );
     }
 

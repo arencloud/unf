@@ -152,6 +152,16 @@ pub struct AgentStateReport {
     #[serde(default)]
     pub load_balancer_frontend_count: u64,
     #[serde(default)]
+    pub load_balancer_cluster_frontend_count: u64,
+    #[serde(default)]
+    pub load_balancer_local_frontend_count: u64,
+    #[serde(default)]
+    pub load_balancer_source_range_count: u64,
+    #[serde(default)]
+    pub load_balancer_health_check_count: u64,
+    #[serde(default)]
+    pub load_balancer_health_check_ready_count: u64,
+    #[serde(default)]
     pub active_load_balancer_bank: u64,
     #[serde(default)]
     pub load_balancer_reconcile_errors: u64,
@@ -175,6 +185,14 @@ pub struct AgentStateReport {
     pub node_port_local_translations: u64,
     #[serde(default)]
     pub node_port_no_backend_drops: u64,
+    #[serde(default)]
+    pub load_balancer_cluster_translations: u64,
+    #[serde(default)]
+    pub load_balancer_local_translations: u64,
+    #[serde(default)]
+    pub load_balancer_no_backend_drops: u64,
+    #[serde(default)]
+    pub load_balancer_source_range_drops: u64,
     #[serde(default)]
     pub invalid_service_events: u64,
     #[serde(default)]
@@ -2092,6 +2110,57 @@ mod tests {
                 .service
                 .is_some_and(|outcome| outcome.action == 2 && outcome.reason == 3)
         }));
+    }
+
+    #[test]
+    fn flow_history_checkpoint_preserves_load_balancer_frontend_kinds() {
+        let mut record = flow_record(0, 0, 443, 1);
+        let service = ServiceFlowKey {
+            service_id: ServiceId::new(44),
+            backend_id: Some(BackendId::new(45)),
+            service_revision: Revision::new(9),
+            action: 1,
+            reason: 1,
+            frontend_kind: ServiceFrontendKind::LoadBalancerLocal,
+        };
+        record.key.service = Some(service.clone());
+        record.service = Some(ServiceFlowOutcome {
+            service_id: service.service_id,
+            backend_id: service.backend_id,
+            service_revision: service.service_revision,
+            backend_ipv4: Some(Ipv4Addr::new(10, 42, 0, 30)),
+            backend_ipv6: None,
+            frontend_port: 443,
+            backend_port: Some(8443),
+            action: service.action,
+            reason: service.reason,
+            frontend_kind: service.frontend_kind,
+        });
+        let mut store = FlowHistoryStore::with_capacity(1);
+        store.ingest(
+            FlowExportBatch {
+                schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                node_name: "worker-a".to_owned(),
+                dropped_events: 0,
+                entries: vec![record],
+            },
+            100,
+        );
+        let checkpoint = store.checkpoint(1);
+        assert_eq!(
+            checkpoint.schema_version,
+            FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION
+        );
+        let restored = FlowHistoryStore::from_checkpoint(checkpoint, 1).unwrap();
+        let entry = &restored.snapshot(101).entries[0];
+        assert_eq!(
+            entry.key.service.as_ref().unwrap().frontend_kind,
+            ServiceFrontendKind::LoadBalancerLocal
+        );
+        assert_eq!(
+            entry.service.unwrap().frontend_kind,
+            ServiceFrontendKind::LoadBalancerLocal
+        );
     }
 
     #[test]

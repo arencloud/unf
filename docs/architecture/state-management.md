@@ -122,7 +122,15 @@ coherent tuple; a crash after both pointers commits the prepared tuple. A fresh
 or incomplete map set must receive and
 commit identity, policy, and available service snapshots before any TC program is attached;
 failure leaves the new ABI state unattached for safe retry. A complete validated
-last-known-good set may restore service without the controller. On Linux 6.6+,
+last-known-good set may restore service without the controller.
+Phase 6.7 keeps the established compatibility tuple and makes LoadBalancer
+operations fields additive. Durable flow history retains explicit Cluster/Local
+frontend kinds, while controller replacement restores only leases whose pool
+UID and provider identity exactly match configured ownership. Explanation and
+simulation read snapshots of these revision domains without advancing or
+persisting any of them.
+
+On Linux 6.6+,
 per-interface TCX links
 are pinned and atomically updated to the replacement program; older kernels use
 stable legacy netlink filter identities for in-place replacement. Automatic mode

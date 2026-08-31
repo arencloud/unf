@@ -250,7 +250,7 @@ transactions. Status may publish a VIP only after the admitted provider and
 dataplane converge, direct delivery cannot depend on a traffic NodePort, and
 foreign controller/network state must survive reconciliation. The
 [Phase 6 LoadBalancer plan](docs/development/phase6-loadbalancer-plan.md) and
-ADRs 0093–0098 define the ordered schema, provider, dataplane, operations,
+ADRs 0093–0099 define the ordered schema, provider, dataplane, operations,
 Kind, and OpenShift gates. Milestone 6.2 is verified: schema v3 carries exact
 dual-stack class/family/policy/source-range/requested-VIP intent, projects safe
 v2/v1 views, retains last-valid Kubernetes compilation, and makes existing
@@ -275,8 +275,12 @@ source-range state reconstructs before attachment, and dual-stack
 `healthCheckNodePort` listeners follow local placement with HTTP 200/503. The
 release verifier and every Cluster/NodePort/ClusterIP regression pass
 `make loadbalancer-local-dataplane-test`. Kubernetes status publication remains
-gated by operations and platform qualification; 6.7 operations, simulation,
-upgrade, and recovery is next.
+Milestone 6.7 is verified: fixed-cardinality metrics and validated status,
+durable Cluster/Local history, lease/provider/reachability-aware explanation,
+source-aware read-only VIP simulation, exact recovery, and adjacent additive
+compatibility pass `make loadbalancer-operations-test`. Kubernetes status
+publication remains gated by platform qualification; 6.8 kube-proxy-free
+dual-stack Kind qualification is next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

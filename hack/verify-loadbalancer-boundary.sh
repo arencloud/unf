@@ -15,6 +15,7 @@ required_files=(
     docs/adr/0096-compatible-loadbalancer-host-state.md
     docs/adr/0097-enforce-loadbalancer-cluster-vips-in-tc.md
     docs/adr/0098-enforce-loadbalancer-local-source-ranges-and-health.md
+    docs/adr/0099-operate-simulate-and-recover-loadbalancers.md
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -86,6 +87,12 @@ require_text docs/development/phase6-loadbalancer-plan.md \
 require_text docs/project-status.md \
     '| LoadBalancer `Local`, source ranges, and health | **Verified** |' \
     "the authoritative tracker must identify milestone 6.6 as verified"
+require_text docs/development/phase6-loadbalancer-plan.md \
+    '| 6.7 | Operations, simulation, upgrade, and recovery | **Verified** |' \
+    "milestone 6.7 must remain verified"
+require_text docs/project-status.md \
+    '| Operations, simulation, upgrade, and recovery | **Verified** |' \
+    "the authoritative tracker must identify milestone 6.7 as verified"
 require_text docs/adr/0093-separate-loadbalancer-ownership-domains.md \
     '**Status:** Accepted and implemented for the Phase 6.1 architecture boundary' \
     "ADR 0093 must record the implemented architecture boundary"
@@ -95,6 +102,9 @@ require_text README.md \
 require_text README.md \
     'make loadbalancer-local-dataplane-test' \
     "the README must bind LoadBalancer Local support to its regression gate"
+require_text README.md \
+    'make loadbalancer-operations-test' \
+    "the README must bind LoadBalancer operations support to its regression gate"
 require_text docs/development/phase6-loadbalancer-plan.md \
     '`allocateLoadBalancerNodePorts: false` is preserved.' \
     "direct VIP delivery must not depend on traffic NodePorts"

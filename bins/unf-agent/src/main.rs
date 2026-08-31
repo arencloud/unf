@@ -36,8 +36,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_cni_state::AttachmentJournal;
 use unf_common::{IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, RuleId, Verdict};
-#[cfg(test)]
-use unf_ebpf_common::SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED;
 use unf_ebpf_common::{
     FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey,
     Ipv6IdentityKey, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
@@ -47,8 +45,8 @@ use unf_ebpf_common::{
     SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
     SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
     SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL, SERVICE_EVENT_REASON_NO_BACKEND,
-    SERVICE_MAP_ABI_VERSION, ServiceEvent, service_event_action_reason_is_valid,
-    service_event_frontend_kind_is_valid,
+    SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED, SERVICE_MAP_ABI_VERSION, ServiceEvent,
+    service_event_action_reason_is_valid, service_event_frontend_kind_is_valid,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -510,6 +508,17 @@ struct AgentMetrics {
     node_port_frontend_count: Gauge,
     node_port_cluster_frontend_count: Gauge,
     node_port_local_frontend_count: Gauge,
+    load_balancer_revision_desired: Gauge,
+    load_balancer_revision_applied: Gauge,
+    load_balancer_allocation_revision_desired: Gauge,
+    load_balancer_allocation_revision_applied: Gauge,
+    load_balancer_frontend_count: Gauge,
+    load_balancer_cluster_frontend_count: Gauge,
+    load_balancer_local_frontend_count: Gauge,
+    load_balancer_source_range_count: Gauge,
+    load_balancer_health_check_count: Gauge,
+    load_balancer_health_check_ready_count: Gauge,
+    load_balancer_reconcile_errors: Counter,
     service_dataplane_events: Counter,
     service_translations: Counter,
     service_drops: Counter,
@@ -517,6 +526,10 @@ struct AgentMetrics {
     node_port_cluster_translations: Counter,
     node_port_local_translations: Counter,
     node_port_no_backend_drops: Counter,
+    load_balancer_cluster_translations: Counter,
+    load_balancer_local_translations: Counter,
+    load_balancer_no_backend_drops: Counter,
+    load_balancer_source_range_drops: Counter,
     invalid_service_events: Counter,
     remote_route_sync_errors: Counter,
     desired_remote_route_revision: Gauge,
@@ -573,6 +586,11 @@ struct AgentState {
     applied_load_balancer_revision: AtomicU64,
     applied_load_balancer_allocation_revision: AtomicU64,
     load_balancer_frontend_count: AtomicU64,
+    load_balancer_cluster_frontend_count: AtomicU64,
+    load_balancer_local_frontend_count: AtomicU64,
+    load_balancer_source_range_count: AtomicU64,
+    load_balancer_health_check_count: AtomicU64,
+    load_balancer_health_check_ready_count: AtomicU64,
     active_load_balancer_bank: AtomicU64,
     load_balancer_reconcile_errors: AtomicU64,
     load_balancer_last_error: Mutex<Option<String>>,
@@ -585,6 +603,10 @@ struct AgentState {
     node_port_cluster_translations: AtomicU64,
     node_port_local_translations: AtomicU64,
     node_port_no_backend_drops: AtomicU64,
+    load_balancer_cluster_translations: AtomicU64,
+    load_balancer_local_translations: AtomicU64,
+    load_balancer_no_backend_drops: AtomicU64,
+    load_balancer_source_range_drops: AtomicU64,
     invalid_service_events: AtomicU64,
     last_service_id: AtomicU64,
     last_backend_id: AtomicU64,
@@ -2584,6 +2606,7 @@ async fn restore_or_populate_service_state(
         publish_desired_service_snapshot(state, &snapshot);
         activate_service_snapshot(synchronizer, &snapshot, node.as_ref(), false, state)?;
         synchronizer.health_checks.commit(&health, health_staged);
+        publish_load_balancer_health(state, &health);
         return Ok(());
     }
     if synchronizer.controller_url.is_some() {
@@ -2636,6 +2659,7 @@ async fn synchronize_services(
     )?;
     if !service_changed && !node_changed {
         synchronizer.health_checks.reconcile(&health)?;
+        publish_load_balancer_health(state, &health);
         return Ok(());
     }
     let health_staged = synchronizer.health_checks.prepare(&health)?;
@@ -2647,6 +2671,7 @@ async fn synchronize_services(
         state,
     )?;
     synchronizer.health_checks.commit(&health, health_staged);
+    publish_load_balancer_health(state, &health);
     Ok(())
 }
 
@@ -2806,6 +2831,14 @@ fn publish_desired_load_balancer(state: &AgentState, snapshot: &NodeReachability
     state
         .desired_load_balancer_allocation_revision
         .store(snapshot.allocation_revision.get(), Ordering::Release);
+    state
+        .metrics
+        .load_balancer_revision_desired
+        .set(metric_value(snapshot.revision.get()));
+    state
+        .metrics
+        .load_balancer_allocation_revision_desired
+        .set(metric_value(snapshot.allocation_revision.get()));
 }
 
 fn publish_applied_load_balancer(
@@ -2813,6 +2846,26 @@ fn publish_applied_load_balancer(
     snapshot: &NodeReachabilitySnapshot,
     dataplane: &LoadBalancerDataplaneState,
 ) {
+    let (cluster_frontends, local_frontends) = dataplane
+        .ipv4_frontends
+        .values()
+        .chain(dataplane.ipv6_frontends.values())
+        .fold((0_u64, 0_u64), |(cluster, local), value| {
+            let flags = u16::from_ne_bytes([value[14], value[15]]);
+            if flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL != 0 {
+                (cluster, local.saturating_add(1))
+            } else {
+                (cluster.saturating_add(1), local)
+            }
+        });
+    let frontend_count = cluster_frontends.saturating_add(local_frontends);
+    let source_range_count = u64::try_from(
+        dataplane
+            .ipv4_source_ranges
+            .len()
+            .saturating_add(dataplane.ipv6_source_ranges.len()),
+    )
+    .unwrap_or(u64::MAX);
     state
         .applied_load_balancer_epoch
         .store(snapshot.source_epoch, Ordering::Release);
@@ -2822,13 +2875,45 @@ fn publish_applied_load_balancer(
     state
         .applied_load_balancer_allocation_revision
         .store(snapshot.allocation_revision.get(), Ordering::Release);
-    state.load_balancer_frontend_count.store(
-        (dataplane.ipv4_frontends.len() + dataplane.ipv6_frontends.len()) as u64,
-        Ordering::Release,
-    );
+    state
+        .load_balancer_frontend_count
+        .store(frontend_count, Ordering::Release);
+    state
+        .load_balancer_cluster_frontend_count
+        .store(cluster_frontends, Ordering::Release);
+    state
+        .load_balancer_local_frontend_count
+        .store(local_frontends, Ordering::Release);
+    state
+        .load_balancer_source_range_count
+        .store(source_range_count, Ordering::Release);
     state
         .active_load_balancer_bank
         .store(u64::from(dataplane.bank), Ordering::Release);
+    state
+        .metrics
+        .load_balancer_revision_applied
+        .set(metric_value(snapshot.revision.get()));
+    state
+        .metrics
+        .load_balancer_allocation_revision_applied
+        .set(metric_value(snapshot.allocation_revision.get()));
+    state
+        .metrics
+        .load_balancer_frontend_count
+        .set(metric_value(frontend_count));
+    state
+        .metrics
+        .load_balancer_cluster_frontend_count
+        .set(metric_value(cluster_frontends));
+    state
+        .metrics
+        .load_balancer_local_frontend_count
+        .set(metric_value(local_frontends));
+    state
+        .metrics
+        .load_balancer_source_range_count
+        .set(metric_value(source_range_count));
     *mutex_lock(&state.load_balancer_last_error) = None;
 }
 
@@ -2836,6 +2921,7 @@ fn record_load_balancer_error(state: &AgentState, error: &anyhow::Error) {
     state
         .load_balancer_reconcile_errors
         .fetch_add(1, Ordering::AcqRel);
+    state.metrics.load_balancer_reconcile_errors.inc();
     let mut message = error.to_string();
     if message.len() > MAX_SERVICE_ERROR_BYTES {
         let boundary = message
@@ -2929,6 +3015,30 @@ fn load_balancer_health_check_plan(
         }
     }
     Ok(plan)
+}
+
+fn publish_load_balancer_health(state: &AgentState, plan: &BTreeMap<u16, HealthCheckPlan>) {
+    let listeners = u64::try_from(plan.len()).unwrap_or(u64::MAX);
+    let ready = u64::try_from(
+        plan.values()
+            .filter(|entry| entry.local_endpoints != 0)
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    state
+        .load_balancer_health_check_count
+        .store(listeners, Ordering::Release);
+    state
+        .load_balancer_health_check_ready_count
+        .store(ready, Ordering::Release);
+    state
+        .metrics
+        .load_balancer_health_check_count
+        .set(metric_value(listeners));
+    state
+        .metrics
+        .load_balancer_health_check_ready_count
+        .set(metric_value(ready));
 }
 
 #[derive(Serialize)]
@@ -4262,6 +4372,17 @@ fn new_state(
         node_port_frontend_count: Gauge::default(),
         node_port_cluster_frontend_count: Gauge::default(),
         node_port_local_frontend_count: Gauge::default(),
+        load_balancer_revision_desired: Gauge::default(),
+        load_balancer_revision_applied: Gauge::default(),
+        load_balancer_allocation_revision_desired: Gauge::default(),
+        load_balancer_allocation_revision_applied: Gauge::default(),
+        load_balancer_frontend_count: Gauge::default(),
+        load_balancer_cluster_frontend_count: Gauge::default(),
+        load_balancer_local_frontend_count: Gauge::default(),
+        load_balancer_source_range_count: Gauge::default(),
+        load_balancer_health_check_count: Gauge::default(),
+        load_balancer_health_check_ready_count: Gauge::default(),
+        load_balancer_reconcile_errors: Counter::default(),
         service_dataplane_events: Counter::default(),
         service_translations: Counter::default(),
         service_drops: Counter::default(),
@@ -4269,6 +4390,10 @@ fn new_state(
         node_port_cluster_translations: Counter::default(),
         node_port_local_translations: Counter::default(),
         node_port_no_backend_drops: Counter::default(),
+        load_balancer_cluster_translations: Counter::default(),
+        load_balancer_local_translations: Counter::default(),
+        load_balancer_no_backend_drops: Counter::default(),
+        load_balancer_source_range_drops: Counter::default(),
         invalid_service_events: Counter::default(),
         remote_route_sync_errors: Counter::default(),
         desired_remote_route_revision: Gauge::default(),
@@ -4326,6 +4451,11 @@ fn new_state(
         applied_load_balancer_revision: AtomicU64::new(0),
         applied_load_balancer_allocation_revision: AtomicU64::new(0),
         load_balancer_frontend_count: AtomicU64::new(0),
+        load_balancer_cluster_frontend_count: AtomicU64::new(0),
+        load_balancer_local_frontend_count: AtomicU64::new(0),
+        load_balancer_source_range_count: AtomicU64::new(0),
+        load_balancer_health_check_count: AtomicU64::new(0),
+        load_balancer_health_check_ready_count: AtomicU64::new(0),
         active_load_balancer_bank: AtomicU64::new(0),
         load_balancer_reconcile_errors: AtomicU64::new(0),
         load_balancer_last_error: Mutex::new(None),
@@ -4338,6 +4468,10 @@ fn new_state(
         node_port_cluster_translations: AtomicU64::new(0),
         node_port_local_translations: AtomicU64::new(0),
         node_port_no_backend_drops: AtomicU64::new(0),
+        load_balancer_cluster_translations: AtomicU64::new(0),
+        load_balancer_local_translations: AtomicU64::new(0),
+        load_balancer_no_backend_drops: AtomicU64::new(0),
+        load_balancer_source_range_drops: AtomicU64::new(0),
         invalid_service_events: AtomicU64::new(0),
         last_service_id: AtomicU64::new(0),
         last_backend_id: AtomicU64::new(0),
@@ -4499,6 +4633,7 @@ fn register_agent_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
     register_version_transition_metrics(registry, metrics);
 }
 
+#[allow(clippy::too_many_lines)]
 fn register_service_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
     registry.register(
         "unf_service_sync_errors",
@@ -4546,6 +4681,61 @@ fn register_service_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         metrics.node_port_local_frontend_count.clone(),
     );
     registry.register(
+        "unf_loadbalancer_revision_desired",
+        "Latest valid LoadBalancer reachability revision observed from the controller",
+        metrics.load_balancer_revision_desired.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_revision_applied",
+        "LoadBalancer reachability revision atomically activated in the VIP map set",
+        metrics.load_balancer_revision_applied.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_allocation_revision_desired",
+        "Latest LoadBalancer allocation revision referenced by desired reachability",
+        metrics.load_balancer_allocation_revision_desired.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_allocation_revision_applied",
+        "LoadBalancer allocation revision referenced by the active VIP map set",
+        metrics.load_balancer_allocation_revision_applied.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_frontend_count",
+        "LoadBalancer VIP frontends in the active transactional bank",
+        metrics.load_balancer_frontend_count.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_cluster_frontend_count",
+        "Cluster-traffic-policy LoadBalancer VIP frontends in the active bank",
+        metrics.load_balancer_cluster_frontend_count.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_local_frontend_count",
+        "Local-traffic-policy LoadBalancer VIP frontends in the active bank",
+        metrics.load_balancer_local_frontend_count.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_source_range_count",
+        "IPv4 and IPv6 LoadBalancer source prefixes in the active bank",
+        metrics.load_balancer_source_range_count.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_health_check_count",
+        "Owned LoadBalancer health-check listeners",
+        metrics.load_balancer_health_check_count.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_health_check_ready_count",
+        "Owned LoadBalancer health checks reporting local endpoints",
+        metrics.load_balancer_health_check_ready_count.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_reconcile_errors",
+        "LoadBalancer reachability or host-state reconciliation failures",
+        metrics.load_balancer_reconcile_errors.clone(),
+    );
+    registry.register(
         "unf_service_dataplane_events",
         "Validated service dataplane outcomes consumed from eBPF",
         metrics.service_dataplane_events.clone(),
@@ -4579,6 +4769,26 @@ fn register_service_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         "unf_nodeport_no_backend_drops",
         "NodePort packets dropped because the selected traffic policy had no eligible backend",
         metrics.node_port_no_backend_drops.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_cluster_translations",
+        "Successful forward and reverse Cluster-policy LoadBalancer translations",
+        metrics.load_balancer_cluster_translations.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_local_translations",
+        "Successful forward and reverse Local-policy LoadBalancer translations",
+        metrics.load_balancer_local_translations.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_no_backend_drops",
+        "LoadBalancer packets dropped because the selected policy had no eligible backend",
+        metrics.load_balancer_no_backend_drops.clone(),
+    );
+    registry.register(
+        "unf_loadbalancer_source_range_drops",
+        "LoadBalancer packets denied by source-range policy",
+        metrics.load_balancer_source_range_drops.clone(),
     );
     registry.register(
         "unf_service_invalid_events",
@@ -4699,6 +4909,7 @@ async fn run_dataplane(
     if let Some(snapshot) = services.applied.as_ref() {
         let health = load_balancer_health_check_plan(snapshot, &services.node_name)?;
         services.health_checks.reconcile(&health)?;
+        publish_load_balancer_health(&state, &health);
     }
     let mut attachments = attach_dataplane_programs(
         &mut ebpf,
@@ -7125,9 +7336,19 @@ fn record_service_event(state: &AgentState, event: &ServiceEvent) {
                         .fetch_add(1, Ordering::Relaxed);
                     state.metrics.node_port_local_translations.inc();
                 }
-                ServiceFrontendKind::ClusterIp
-                | ServiceFrontendKind::LoadBalancerCluster
-                | ServiceFrontendKind::LoadBalancerLocal => {}
+                ServiceFrontendKind::LoadBalancerCluster => {
+                    state
+                        .load_balancer_cluster_translations
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.metrics.load_balancer_cluster_translations.inc();
+                }
+                ServiceFrontendKind::LoadBalancerLocal => {
+                    state
+                        .load_balancer_local_translations
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.metrics.load_balancer_local_translations.inc();
+                }
+                ServiceFrontendKind::ClusterIp => {}
             }
         }
         SERVICE_EVENT_ACTION_DROP => {
@@ -7143,6 +7364,22 @@ fn record_service_event(state: &AgentState, event: &ServiceEvent) {
                     .node_port_no_backend_drops
                     .fetch_add(1, Ordering::Relaxed);
                 state.metrics.node_port_no_backend_drops.inc();
+            }
+            if matches!(
+                service_event_frontend_kind(event),
+                ServiceFrontendKind::LoadBalancerCluster | ServiceFrontendKind::LoadBalancerLocal
+            ) {
+                if event.reason == SERVICE_EVENT_REASON_NO_BACKEND {
+                    state
+                        .load_balancer_no_backend_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.metrics.load_balancer_no_backend_drops.inc();
+                } else if event.reason == SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED {
+                    state
+                        .load_balancer_source_range_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.metrics.load_balancer_source_range_drops.inc();
+                }
             }
         }
         SERVICE_EVENT_ACTION_EXPIRE => {
@@ -7343,6 +7580,7 @@ async fn report_agent_status(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn agent_state_report(state: &AgentState) -> AgentStateReport {
     AgentStateReport {
         schema_version: AGENT_STATUS_SCHEMA_VERSION,
@@ -7404,6 +7642,21 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
             .applied_load_balancer_allocation_revision
             .load(Ordering::Acquire),
         load_balancer_frontend_count: state.load_balancer_frontend_count.load(Ordering::Acquire),
+        load_balancer_cluster_frontend_count: state
+            .load_balancer_cluster_frontend_count
+            .load(Ordering::Acquire),
+        load_balancer_local_frontend_count: state
+            .load_balancer_local_frontend_count
+            .load(Ordering::Acquire),
+        load_balancer_source_range_count: state
+            .load_balancer_source_range_count
+            .load(Ordering::Acquire),
+        load_balancer_health_check_count: state
+            .load_balancer_health_check_count
+            .load(Ordering::Acquire),
+        load_balancer_health_check_ready_count: state
+            .load_balancer_health_check_ready_count
+            .load(Ordering::Acquire),
         active_load_balancer_bank: state.active_load_balancer_bank.load(Ordering::Acquire),
         load_balancer_reconcile_errors: state
             .load_balancer_reconcile_errors
@@ -7420,6 +7673,18 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
             .load(Ordering::Acquire),
         node_port_local_translations: state.node_port_local_translations.load(Ordering::Acquire),
         node_port_no_backend_drops: state.node_port_no_backend_drops.load(Ordering::Acquire),
+        load_balancer_cluster_translations: state
+            .load_balancer_cluster_translations
+            .load(Ordering::Acquire),
+        load_balancer_local_translations: state
+            .load_balancer_local_translations
+            .load(Ordering::Acquire),
+        load_balancer_no_backend_drops: state
+            .load_balancer_no_backend_drops
+            .load(Ordering::Acquire),
+        load_balancer_source_range_drops: state
+            .load_balancer_source_range_drops
+            .load(Ordering::Acquire),
         invalid_service_events: state.invalid_service_events.load(Ordering::Acquire),
         last_service_id: u32::try_from(state.last_service_id.load(Ordering::Acquire))
             .expect("stored service ID fits u32"),
@@ -10776,6 +11041,9 @@ mod tests {
         while let Some(item) = service_events.next() {
             events.push(decode_service_event(&item).expect("kernel service event is valid"));
         }
+        for event in &events {
+            record_service_event(&state, event);
+        }
         assert!(events.iter().any(|event| {
             event.action == SERVICE_EVENT_ACTION_TRANSLATE
                 && service_event_frontend_kind(event) == ServiceFrontendKind::LoadBalancerCluster
@@ -11005,6 +11273,9 @@ mod tests {
         while let Some(item) = service_events.next() {
             events.push(decode_service_event(&item).expect("kernel service event is valid"));
         }
+        for event in &events {
+            record_service_event(&state, event);
+        }
         assert!(events.iter().any(|event| {
             event.action == SERVICE_EVENT_ACTION_TRANSLATE
                 && service_event_frontend_kind(event) == ServiceFrontendKind::LoadBalancerLocal
@@ -11017,6 +11288,13 @@ mod tests {
             event.reason == SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED
                 && service_event_frontend_kind(event) == ServiceFrontendKind::LoadBalancerLocal
         }));
+        let report = agent_state_report(&state);
+        assert_eq!(report.load_balancer_cluster_frontend_count, 0);
+        assert_eq!(report.load_balancer_local_frontend_count, 4);
+        assert_eq!(report.load_balancer_source_range_count, 2);
+        assert!(report.load_balancer_local_translations > 0);
+        assert!(report.load_balancer_no_backend_drops > 0);
+        assert!(report.load_balancer_source_range_drops > 0);
     }
 
     #[tokio::test]
@@ -11055,6 +11333,11 @@ mod tests {
         let snapshot = snapshot.validate_and_normalize().unwrap();
         let ready = load_balancer_health_check_plan(&snapshot, "worker-a").unwrap();
         assert!(ready[&port].local_endpoints > 0);
+        let state = test_agent_state();
+        publish_load_balancer_health(&state, &ready);
+        let report = agent_state_report(&state);
+        assert_eq!(report.load_balancer_health_check_count, 1);
+        assert_eq!(report.load_balancer_health_check_ready_count, 1);
         let mut collision = snapshot.clone();
         let mut second = collision.services[0].clone();
         second.id = unf_common::ServiceId::new(second.id.get().saturating_add(1));
@@ -11086,6 +11369,11 @@ mod tests {
         let remote = remote.validate_and_normalize().unwrap();
         let unavailable = load_balancer_health_check_plan(&remote, "worker-a").unwrap();
         assert_eq!(unavailable[&port].local_endpoints, 0);
+        publish_load_balancer_health(&state, &unavailable);
+        assert_eq!(
+            agent_state_report(&state).load_balancer_health_check_ready_count,
+            0
+        );
         manager.reconcile(&unavailable).unwrap();
         let response = response(port, "127.0.0.1").await;
         assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
@@ -12348,6 +12636,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn service_event_decoder_and_status_preserve_bounded_provenance() {
         let mut bytes = [0_u8; size_of::<ServiceEvent>()];
         bytes[8..16].copy_from_slice(&7_u64.to_ne_bytes());
@@ -12409,7 +12698,11 @@ mod tests {
             service_event_frontend_kind(&load_balancer),
             ServiceFrontendKind::LoadBalancerCluster
         );
-
+        record_service_event(&state, &load_balancer);
+        assert_eq!(
+            agent_state_report(&state).load_balancer_cluster_translations,
+            1
+        );
         bytes[48..64].fill(0);
         bytes[68..72].fill(0);
         bytes[76..78].fill(0);
@@ -12421,6 +12714,30 @@ mod tests {
         let report = agent_state_report(&state);
         assert_eq!(report.service_drops, 1);
         assert_eq!(report.node_port_no_backend_drops, 1);
+
+        bytes[86] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL;
+        let no_backend = decode_service_event(&bytes).expect("LoadBalancer no-backend is valid");
+        record_service_event(&state, &no_backend);
+        assert_eq!(agent_state_report(&state).load_balancer_no_backend_drops, 1);
+        bytes[85] = SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED;
+        let denied = decode_service_event(&bytes).expect("source-range denial is valid");
+        record_service_event(&state, &denied);
+        let report = agent_state_report(&state);
+        assert_eq!(report.load_balancer_source_range_drops, 1);
+        assert_eq!(state.metrics.load_balancer_source_range_drops.get(), 1);
+        let mut exposition = String::new();
+        encode(&mut exposition, &mutex_lock(&state.registry)).unwrap();
+        for metric in [
+            "unf_loadbalancer_revision_desired",
+            "unf_loadbalancer_frontend_count",
+            "unf_loadbalancer_health_check_ready_count",
+            "unf_loadbalancer_cluster_translations_total",
+            "unf_loadbalancer_local_translations_total",
+            "unf_loadbalancer_no_backend_drops_total",
+            "unf_loadbalancer_source_range_drops_total",
+        ] {
+            assert!(exposition.contains(metric), "missing metric {metric}");
+        }
 
         bytes[84] = SERVICE_EVENT_ACTION_TRANSLATE;
         assert!(decode_service_event(&bytes).is_none());

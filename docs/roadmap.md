@@ -485,8 +485,12 @@ matrix is maintained in the
   tries from durable state, and serve placement-sensitive dual-stack
   `healthCheckNodePort` 200/503 responses. The inherited Cluster, NodePort, and
   ClusterIP regressions pass `make loadbalancer-local-dataplane-test`; ADR 0098.
-  Planned: operations/simulation/recovery; independent kube-proxy-free Kind and
-  digest-pinned OpenShift gates.
+- Verified operations, simulation, upgrade, and recovery: fixed-cardinality
+  metrics, validated status, durable Cluster/Local history, exact
+  allocation/provider/reachability explanation, source-aware read-only VIP
+  simulation, durable provider replay, agent reconstruction, and adjacent
+  compatibility pass `make loadbalancer-operations-test`; ADR 0099.
+  Planned: independent kube-proxy-free Kind and digest-pinned OpenShift gates.
 - Production BGP/cloud takeover, session affinity, internal traffic policy,
   topology-aware selection, Maglev, DSR, SCTP, Gateway API, multi-cluster, and
   production availability/scale remain independent future gates.

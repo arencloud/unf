@@ -106,6 +106,24 @@ enum Command {
         #[arg(long, value_enum, default_value = "tcp")]
         protocol: NodePortProtocol,
     },
+    /// Predict a `LoadBalancer` VIP outcome from current allocation, reachability, and Service state.
+    LoadBalancerSimulate {
+        /// Receiving Node name.
+        #[arg(long)]
+        node: String,
+        /// Exact allocated VIP.
+        #[arg(long)]
+        address: IpAddr,
+        /// External client address used for source-range evaluation.
+        #[arg(long)]
+        source_address: IpAddr,
+        /// Service port exposed by the VIP.
+        #[arg(long)]
+        port: u16,
+        /// Transport protocol.
+        #[arg(long, value_enum, default_value = "tcp")]
+        protocol: NodePortProtocol,
+    },
     /// Explain a policy decision using live controller state.
     Explain {
         /// Source pod as namespace/name.
@@ -200,6 +218,8 @@ enum ServiceFrontend {
     ClusterIp,
     NodePortCluster,
     NodePortLocal,
+    LoadBalancerCluster,
+    LoadBalancerLocal,
 }
 
 impl ServiceFrontend {
@@ -208,6 +228,8 @@ impl ServiceFrontend {
             Self::ClusterIp => "cluster_ip",
             Self::NodePortCluster => "node_port_cluster",
             Self::NodePortLocal => "node_port_local",
+            Self::LoadBalancerCluster => "load_balancer_cluster",
+            Self::LoadBalancerLocal => "load_balancer_local",
         }
     }
 }
@@ -344,6 +366,29 @@ async fn run() -> Result<()> {
             get_json(
                 &client,
                 &node_port_simulation_url(&cli.controller_url, node, *address, *port, *protocol),
+            )
+            .await?
+        }
+        Command::LoadBalancerSimulate {
+            node,
+            address,
+            source_address,
+            port,
+            protocol,
+        } => {
+            if *port == 0 {
+                bail!("port must be between 1 and 65535");
+            }
+            get_json(
+                &client,
+                &load_balancer_simulation_url(
+                    &cli.controller_url,
+                    node,
+                    *address,
+                    *source_address,
+                    *port,
+                    *protocol,
+                ),
             )
             .await?
         }
@@ -641,7 +686,11 @@ fn print_table(value: &Value) {
         && value.get("traffic_policy").is_some()
         && value.get("decision").is_some()
     {
-        print_node_port_simulation_table(value);
+        if value.get("source_address").is_some() {
+            print_load_balancer_simulation_table(value);
+        } else {
+            print_node_port_simulation_table(value);
+        }
         return;
     }
     if value.get("analysis").and_then(Value::as_str) == Some("shadow_impact") {
@@ -682,6 +731,22 @@ fn print_service_explanation_table(value: &Value) {
         );
     } else {
         println!("intent                   not present in current compiled revision");
+    }
+    if let Some(load_balancer) = value.get("load_balancer").filter(|value| !value.is_null()) {
+        println!(
+            "loadbalancer             allocation_revision={} reachability_revision={} provider={} reachable_nodes={} converged_nodes={}",
+            optional_number_field(load_balancer, "allocation_revision"),
+            optional_number_field(load_balancer, "reachability_revision"),
+            load_balancer
+                .get("provider")
+                .map_or_else(|| "-".to_owned(), Value::to_string),
+            load_balancer["reachable_nodes"]
+                .as_array()
+                .map_or(0, Vec::len),
+            load_balancer["converged_nodes"]
+                .as_array()
+                .map_or(0, Vec::len)
+        );
     }
     println!(
         "evidence                 outcomes={} observations={}",
@@ -738,6 +803,42 @@ fn print_node_port_simulation_table(value: &Value) {
     );
 }
 
+fn print_load_balancer_simulation_table(value: &Value) {
+    println!("LoadBalancer Simulation");
+    println!(
+        "frontend                 node={} vip={}:{} protocol={} kind={} policy={}",
+        text_field(value, "node_name"),
+        text_field(value, "address"),
+        number_field(value, "port"),
+        text_field(value, "protocol"),
+        text_field(value, "frontend_kind"),
+        text_field(value, "traffic_policy")
+    );
+    println!(
+        "provenance               service_revision={} reachability_revision={} allocation_revision={} provider={}",
+        number_field(value, "service_revision"),
+        number_field(value, "reachability_revision"),
+        number_field(value, "allocation_revision"),
+        value
+            .get("provider")
+            .map_or_else(|| "-".to_owned(), Value::to_string)
+    );
+    println!(
+        "prediction               source={} allowed={} decision={} source_preserved={} eligible_backends={}",
+        text_field(value, "source_address"),
+        value
+            .get("source_allowed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        text_field(value, "decision"),
+        value
+            .get("source_preserved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        value["eligible_backend_ids"].as_array().map_or(0, Vec::len)
+    );
+}
+
 fn flow_address<'value>(value: &'value Value, ipv4: &str, ipv6: &str) -> &'value str {
     value
         .get(ipv4)
@@ -768,6 +869,7 @@ const fn service_reason_label(reason: u64) -> &'static str {
         9 => "pair-insert-failed",
         10 => "rewrite-failed",
         11 => "expired-or-corrupt",
+        12 => "source-range-denied",
         _ => "unknown",
     }
 }
@@ -919,6 +1021,24 @@ fn print_controller_status_table(value: &Value) {
                 number_field(report, "node_port_cluster_translations"),
                 number_field(report, "node_port_local_translations"),
                 number_field(report, "node_port_no_backend_drops")
+            );
+            println!(
+                "  LoadBalancer           revision={}/{} allocation={}/{} frontends={}:{}+{} ranges={} health={}/{} translations={}/{} no_backend_drops={} source_range_drops={} errors={}",
+                number_field(report, "applied_load_balancer_revision"),
+                number_field(report, "desired_load_balancer_revision"),
+                number_field(report, "applied_load_balancer_allocation_revision"),
+                number_field(report, "desired_load_balancer_allocation_revision"),
+                number_field(report, "load_balancer_frontend_count"),
+                number_field(report, "load_balancer_cluster_frontend_count"),
+                number_field(report, "load_balancer_local_frontend_count"),
+                number_field(report, "load_balancer_source_range_count"),
+                number_field(report, "load_balancer_health_check_ready_count"),
+                number_field(report, "load_balancer_health_check_count"),
+                number_field(report, "load_balancer_cluster_translations"),
+                number_field(report, "load_balancer_local_translations"),
+                number_field(report, "load_balancer_no_backend_drops"),
+                number_field(report, "load_balancer_source_range_drops"),
+                number_field(report, "load_balancer_reconcile_errors")
             );
         }
     }
@@ -1201,6 +1321,23 @@ fn node_port_simulation_url(
     };
     format!(
         "{controller_url}/v1/services/nodeport/simulate?node_name={node}&address={address}&port={port}&protocol={protocol}"
+    )
+}
+
+fn load_balancer_simulation_url(
+    controller_url: &str,
+    node: &str,
+    address: IpAddr,
+    source_address: IpAddr,
+    port: u16,
+    protocol: NodePortProtocol,
+) -> String {
+    let protocol = match protocol {
+        NodePortProtocol::Tcp => "tcp",
+        NodePortProtocol::Udp => "udp",
+    };
+    format!(
+        "{controller_url}/v1/services/loadbalancer/simulate?node_name={node}&address={address}&source_address={source_address}&port={port}&protocol={protocol}"
     )
 }
 
@@ -1768,6 +1905,56 @@ mod tests {
                 NodePortProtocol::Tcp,
             ),
             "http://controller/v1/services/nodeport/simulate?node_name=worker-a&address=192.0.2.1&port=30443&protocol=tcp"
+        );
+    }
+
+    #[test]
+    fn load_balancer_simulation_and_explanation_build_exact_queries() {
+        let cli = Cli::try_parse_from([
+            "unfctl",
+            "load-balancer-simulate",
+            "--node",
+            "worker-a",
+            "--address",
+            "192.0.2.60",
+            "--source-address",
+            "198.51.100.10",
+            "--port",
+            "443",
+            "--protocol",
+            "tcp",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::LoadBalancerSimulate {
+                node,
+                address,
+                source_address,
+                port: 443,
+                protocol: NodePortProtocol::Tcp,
+            } if node == "worker-a"
+                && address == "192.0.2.60".parse::<IpAddr>().unwrap()
+                && source_address == "198.51.100.10".parse::<IpAddr>().unwrap()
+        ));
+        assert_eq!(
+            load_balancer_simulation_url(
+                "http://controller",
+                "worker-a",
+                "2001:db8::60".parse().unwrap(),
+                "2001:db8:100::10".parse().unwrap(),
+                443,
+                NodePortProtocol::Udp,
+            ),
+            "http://controller/v1/services/loadbalancer/simulate?node_name=worker-a&address=2001:db8::60&source_address=2001:db8:100::10&port=443&protocol=udp"
+        );
+        assert_eq!(
+            ServiceFrontend::LoadBalancerLocal.query_value(),
+            "load_balancer_local"
+        );
+        assert_eq!(
+            ServiceFrontend::LoadBalancerCluster.query_value(),
+            "load_balancer_cluster"
         );
     }
 
