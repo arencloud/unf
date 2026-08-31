@@ -4255,9 +4255,17 @@ fn validate_service_dataplane_status(report: &AgentStateReport) -> Result<(), Ap
         .saturating_add(report.node_port_local_translations)
         > report.service_translations
         || report.node_port_no_backend_drops > report.service_drops
+        || report
+            .load_balancer_cluster_translations
+            .saturating_add(report.load_balancer_local_translations)
+            > report.service_translations
+        || report
+            .load_balancer_no_backend_drops
+            .saturating_add(report.load_balancer_source_range_drops)
+            > report.service_drops
     {
         return Err(ApiError::bad_request(
-            "NodePort outcome counters must be bounded by service outcome counters",
+            "NodePort and LoadBalancer outcome counters must be bounded by service outcome counters",
         ));
     }
     let last_is_empty = report.last_service_id == 0
@@ -4265,10 +4273,8 @@ fn validate_service_dataplane_status(report: &AgentStateReport) -> Result<(), Ap
         && report.last_service_revision == 0
         && report.last_service_action == 0
         && report.last_service_reason == 0;
-    let last_action_reason_is_valid = matches!(
-        (report.last_service_action, report.last_service_reason),
-        (1, 1 | 2) | (2, 3..=10) | (3, 11)
-    );
+    let last_action_reason_is_valid =
+        service_action_reason_is_valid(report.last_service_action, report.last_service_reason);
     if (report.service_dataplane_events == 0 && !last_is_empty)
         || (report.service_dataplane_events != 0
             && (!last_action_reason_is_valid
@@ -4281,6 +4287,10 @@ fn validate_service_dataplane_status(report: &AgentStateReport) -> Result<(), Ap
         ));
     }
     Ok(())
+}
+
+const fn service_action_reason_is_valid(action: u8, reason: u8) -> bool {
+    matches!((action, reason), (1, 1 | 2) | (2, 3..=10 | 12) | (3, 11))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5494,10 +5504,7 @@ fn validate_service_flow_export(
     entry: &FlowExportRecord,
     service: unf_state::ServiceFlowOutcome,
 ) -> Result<(), ApiError> {
-    let action_reason_valid = matches!(
-        (service.action, service.reason),
-        (1, 1 | 2) | (2, 3..=10) | (3, 11)
-    );
+    let action_reason_valid = service_action_reason_is_valid(service.action, service.reason);
     let backend_address_valid = service.backend_ipv4.is_some() ^ service.backend_ipv6.is_some();
     let backend_family_matches = (service.backend_ipv4.is_some()
         && entry.key.source_ipv4.is_some())
@@ -9099,6 +9106,18 @@ mod tests {
         report.load_balancer_health_check_count = 1;
         report.load_balancer_health_check_ready_count = 1;
         validate_agent_status(&report).expect("bounded LoadBalancer operations status is valid");
+        report.service_dataplane_events = 1;
+        report.service_drops = 1;
+        report.load_balancer_source_range_drops = 1;
+        report.last_service_id = 44;
+        report.last_service_revision = 3;
+        report.last_service_action = 2;
+        report.last_service_reason = 12;
+        validate_agent_status(&report)
+            .expect("source-range denial remains valid bounded LoadBalancer status");
+        let mut malformed_outcomes = report.clone();
+        malformed_outcomes.load_balancer_no_backend_drops = 1;
+        assert!(validate_agent_status(&malformed_outcomes).is_err());
         write_lock(&state.agent_reports).insert(
             "worker-a".to_owned(),
             StoredAgentReport {
@@ -10086,6 +10105,41 @@ mod tests {
             .expect("service outcome")
             .backend_id = None;
         assert!(validate_flow_export_batch(&batch).is_err());
+
+        let mut source_denied = batch;
+        let entry = &mut source_denied.entries[0];
+        entry.decision.verdict = Verdict::Deny;
+        entry.decision.reason = 12;
+        entry.key.service = Some(unf_state::ServiceFlowKey {
+            service_id: ServiceId::new(11),
+            backend_id: None,
+            service_revision: Revision::new(7),
+            action: 2,
+            reason: 12,
+            frontend_kind: unf_state::ServiceFrontendKind::LoadBalancerLocal,
+        });
+        entry.service = Some(unf_state::ServiceFlowOutcome {
+            service_id: ServiceId::new(11),
+            backend_id: None,
+            service_revision: Revision::new(7),
+            backend_ipv4: None,
+            backend_ipv6: None,
+            frontend_port: 80,
+            backend_port: None,
+            action: 2,
+            reason: 12,
+            frontend_kind: unf_state::ServiceFrontendKind::LoadBalancerLocal,
+        });
+        validate_flow_export_batch(&source_denied)
+            .expect("LoadBalancer source-range denial provenance is accepted");
+        source_denied.entries[0].service.as_mut().unwrap().reason = 13;
+        source_denied.entries[0]
+            .key
+            .service
+            .as_mut()
+            .unwrap()
+            .reason = 13;
+        assert!(validate_flow_export_batch(&source_denied).is_err());
     }
 
     #[test]

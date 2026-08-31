@@ -4,6 +4,7 @@ set -Eeuo pipefail
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 required_files=(
+    Makefile
     README.md
     docs/project-status.md
     docs/roadmap.md
@@ -16,6 +17,9 @@ required_files=(
     docs/adr/0097-enforce-loadbalancer-cluster-vips-in-tc.md
     docs/adr/0098-enforce-loadbalancer-local-source-ranges-and-health.md
     docs/adr/0099-operate-simulate-and-recover-loadbalancers.md
+    deploy/kind-loadbalancer/kustomization.yaml
+    deploy/kind-loadbalancer/controller-loadbalancer-patch.yaml
+    hack/verify-kind-loadbalancer.sh
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -105,6 +109,12 @@ require_text README.md \
 require_text README.md \
     'make loadbalancer-operations-test' \
     "the README must bind LoadBalancer operations support to its regression gate"
+require_text Makefile \
+    'loadbalancer-kind-test:' \
+    "the build must expose an isolated LoadBalancer Kind qualification gate"
+require_text deploy/kind-loadbalancer/controller-loadbalancer-patch.yaml \
+    'kind-direct-node-v1' \
+    "the Kind provider identity must remain explicit and stable"
 require_text docs/development/phase6-loadbalancer-plan.md \
     '`allocateLoadBalancerNodePorts: false` is preserved.' \
     "direct VIP delivery must not depend on traffic NodePorts"
