@@ -11383,10 +11383,11 @@ mod tests {
         let vip_v6 = "2001:db8:ffff::60".parse::<Ipv6Addr>().unwrap();
         let backend_v4 = Ipv4Addr::new(10, 42, 0, 20);
         let backend_v6 = "fd00:42::20".parse::<Ipv6Addr>().unwrap();
+        let node = node_port_node_snapshot(1);
         let first = local_load_balancer_snapshot(dual_stack_service_snapshot_with_load_balancer(
             1, backend_v4, backend_v6, true, true,
         ));
-        activate_service_snapshot(&mut synchronizer, &first, None, true, &state)
+        activate_service_snapshot(&mut synchronizer, &first, Some(&node), true, &state)
             .expect("dual-stack Local LoadBalancer Service activates");
         let first_reachability = dual_stack_load_balancer_node_snapshot(&first, 1, vip_v4, vip_v6);
         activate_load_balancer_snapshot(&mut synchronizer, &first_reachability, &state)
@@ -11483,7 +11484,7 @@ mod tests {
             backend.node_name = Some("worker-b".to_owned());
         }
         let remote_only = remote_only.validate_and_normalize().unwrap();
-        activate_service_snapshot(&mut synchronizer, &remote_only, None, true, &state)
+        activate_service_snapshot(&mut synchronizer, &remote_only, Some(&node), true, &state)
             .expect("remote-only Local Service bank activates");
         let remote_reachability =
             dual_stack_load_balancer_node_snapshot(&remote_only, 2, vip_v4, vip_v6);
@@ -11502,7 +11503,7 @@ mod tests {
             backend.ready = false;
         }
         let unready = unready.validate_and_normalize().unwrap();
-        activate_service_snapshot(&mut synchronizer, &unready, None, true, &state)
+        activate_service_snapshot(&mut synchronizer, &unready, Some(&node), true, &state)
             .expect("unready Local Service bank activates");
         let unready_reachability =
             dual_stack_load_balancer_node_snapshot(&unready, 3, vip_v4, vip_v6);
@@ -11515,7 +11516,7 @@ mod tests {
         let recovered = local_load_balancer_snapshot(
             dual_stack_service_snapshot_with_load_balancer(4, backend_v4, backend_v6, true, true),
         );
-        activate_service_snapshot(&mut synchronizer, &recovered, None, true, &state)
+        activate_service_snapshot(&mut synchronizer, &recovered, Some(&node), true, &state)
             .expect("recovered Local Service bank activates");
         let recovered_reachability =
             dual_stack_load_balancer_node_snapshot(&recovered, 4, vip_v4, vip_v6);
