@@ -109,6 +109,7 @@ for node in "${nodes[@]}"; do
         state_dir=/var/lib/unf/cni/v1
         routes=${state_dir}/remote-routes.json
         services=${state_dir}/service-snapshot.json
+        load_balancers=${state_dir}/load-balancer-reachability.json
         marker=${state_dir}/install.env
         binary=/opt/cni/bin/unf
         config=/etc/cni/net.d/10-unf.conflist
@@ -179,6 +180,12 @@ for node in "${nodes[@]}"; do
             && [ ! -e "$binary" ] && [ ! -e "$config" ]; then
             test ! -e "${state_dir}/attachments.json"
             test ! -e "${state_dir}/node-block.json"
+            if [ -e "$load_balancers" ]; then
+                test -f "$load_balancers" && test ! -L "$load_balancers"
+                test "$(stat -c %a "$load_balancers")" = 600
+                jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and .applied.revision > 0 and .applied.allocationRevision > 0" "$load_balancers" >/dev/null
+                rm -f "$load_balancers"
+            fi
             cleanup_pending_deletes
             if [ -d "$state_dir" ]; then
                 test -z "$(find "$state_dir" -mindepth 1 -print -quit)"
@@ -233,11 +240,18 @@ EOF
         test "$(stat -c %a "$services")" = 600
         jq -e "if has(\"service\") then .schemaVersion == 1 and .service.schemaVersion == 2 and .service.revision > 0 and (.service.services | length) > 0 and .nodePortNode.schemaVersion == 1 else .schemaVersion == 1 and .revision > 0 and (.services | length) > 0 end" "$services" >/dev/null
 
+        if [ -e "$load_balancers" ]; then
+            test -f "$load_balancers" && test ! -L "$load_balancers"
+            test "$(stat -c %a "$load_balancers")" = 600
+            jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and .applied.revision > 0 and .applied.allocationRevision > 0" "$load_balancers" >/dev/null
+        fi
+
         for temporary in \
             "${state_dir}/attachments.json.tmp" \
             "${state_dir}/.node-block.json.tmp" \
             "${state_dir}/.remote-routes.json.tmp" \
-            "${state_dir}/.service-snapshot.json.tmp"; do
+            "${state_dir}/.service-snapshot.json.tmp" \
+            "${state_dir}/.load-balancer-reachability.json.tmp"; do
             if [ -e "$temporary" ]; then
                 test -f "$temporary" && test ! -L "$temporary"
                 test "$(stat -c %a "$temporary")" = 600
@@ -248,7 +262,7 @@ EOF
         rm -f /run/unf/cni.sock
         rm -f "$binary" "$config"
         rm -f "${state_dir}/attachments.json" "${state_dir}/node-block.json" \
-            "$routes" "$services" "$marker"
+            "$routes" "$services" "$load_balancers" "$marker"
         cleanup_pending_deletes
         rmdir "$state_dir"
         rmdir /var/lib/unf/cni
