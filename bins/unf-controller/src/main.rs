@@ -4323,15 +4323,9 @@ fn agent_convergence_snapshot(
             )
         })
         .unwrap_or_default();
-    let load_balancer_revision = read_lock(&state.compiled_load_balancer_reachability)
-        .as_ref()
-        .map(|snapshot| {
-            (
-                snapshot.source_epoch,
-                snapshot.revision,
-                snapshot.allocation_revision,
-            )
-        });
+    let load_balancer_revision = load_balancer_revision_requirement(
+        read_lock(&state.compiled_load_balancer_reachability).as_ref(),
+    );
     let unexpected_agents = reports
         .iter()
         .filter(|(node_name, stored)| {
@@ -4403,6 +4397,22 @@ fn agent_convergence_snapshot(
             && unexpected_agents == 0,
         nodes,
     }
+}
+
+fn load_balancer_revision_requirement(
+    snapshot: Option<&ReachabilitySnapshot>,
+) -> Option<(u64, Revision, Revision)> {
+    snapshot
+        .filter(|snapshot| {
+            snapshot.allocation_revision != Revision::INITIAL || !snapshot.targets.is_empty()
+        })
+        .map(|snapshot| {
+            (
+                snapshot.source_epoch,
+                snapshot.revision,
+                snapshot.allocation_revision,
+            )
+        })
 }
 
 fn validate_agent_node_selector(value: &str) -> std::result::Result<String, String> {
@@ -9067,6 +9077,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn load_balancer_convergence_is_capability_revision_and_error_exact() {
         let state = new_state(true);
         write_lock(&state.node_port_nodes).insert(
@@ -9093,6 +9104,32 @@ mod tests {
             }],
         )
         .unwrap();
+        let initial_empty = compile_direct_node_reachability(
+            state.identity_epoch,
+            Revision::new(1),
+            Revision::INITIAL,
+            desired.provider.clone(),
+            &[],
+            vec![ReachabilityNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            load_balancer_revision_requirement(Some(&initial_empty)),
+            None,
+            "a configured but unused pool does not make zero-state agents divergent"
+        );
+        assert_eq!(
+            load_balancer_revision_requirement(Some(&desired)),
+            Some((
+                desired.source_epoch,
+                desired.revision,
+                desired.allocation_revision
+            )),
+            "non-initial allocation state remains strictly revision fenced"
+        );
         let mut report = converged_agent_report(state.identity_epoch);
         report.desired_load_balancer_epoch = desired.source_epoch;
         report.applied_load_balancer_epoch = desired.source_epoch;
