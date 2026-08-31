@@ -5941,6 +5941,26 @@ fn empty_recovered_load_balancer_bank(bank: u8) -> LoadBalancerDataplaneState {
     }
 }
 
+fn reset_unlinked_recovered_load_balancer_state(services: &mut ServiceSynchronizer) -> Result<()> {
+    services
+        .load_balancer_config
+        .set(0, [0; 48], 0)
+        .context("deactivate unlinked persistent LoadBalancer config")?;
+    for bank in [0_u8, 1_u8] {
+        restore_load_balancer_bank(services, &empty_recovered_load_balancer_bank(bank))?;
+    }
+    discard_service_pending_state(&services.load_balancer_state_path)?;
+    restore_load_balancer_checkpoint(&services.load_balancer_state_path, None)?;
+    services.load_balancer_banks = [
+        empty_recovered_load_balancer_bank(0),
+        empty_recovered_load_balancer_bank(1),
+    ]
+    .map(Some);
+    services.active_load_balancer_bank = 0;
+    services.applied_load_balancer_reachability = None;
+    Ok(())
+}
+
 type RecoveredLoadBalancerConfig = (u64, u64, u64, u64, u32, u32, u8, u8);
 
 #[allow(clippy::too_many_lines)]
@@ -6009,7 +6029,16 @@ fn recover_load_balancer_state(services: &mut ServiceSynchronizer) -> Result<()>
         || service.revision.get() != service_revision
         || services.active_bank != service_bank
     {
-        bail!("persistent LoadBalancer config does not reference the active service tuple");
+        warn!(
+            load_balancer_epoch = epoch,
+            load_balancer_service_revision = service_revision,
+            load_balancer_service_bank = service_bank,
+            active_service_epoch = service.source_epoch,
+            active_service_revision = service.revision.get(),
+            active_service_bank = services.active_bank,
+            "discarding unlinked derived LoadBalancer state after interrupted cross-domain activation"
+        );
+        return reset_unlinked_recovered_load_balancer_state(services);
     }
     let current = load_optional_load_balancer_reachability(&services.load_balancer_state_path)?;
     let pending = load_optional_load_balancer_reachability(&pending_path)?;
@@ -10833,7 +10862,44 @@ mod tests {
         recover_load_balancer_state(&mut synchronizer)
             .expect("exact active VIP bank and checkpoint recover");
         assert_eq!(synchronizer.active_load_balancer_bank, 1);
-        assert_eq!(synchronizer.applied_load_balancer_reachability, Some(first));
+        assert_eq!(
+            synchronizer.applied_load_balancer_reachability,
+            Some(first.clone())
+        );
+
+        let advanced_services = load_balancer_service_test_snapshot(7, 6);
+        activate_service_snapshot(&mut synchronizer, &advanced_services, None, true, &state)
+            .expect("service domain can advance before LoadBalancer reconciliation");
+        assert_eq!(
+            synchronizer.load_balancer_config.get(&0, 0).unwrap(),
+            active_config
+        );
+
+        synchronizer.banks = [None, None];
+        synchronizer.applied = None;
+        recover_service_state(&mut synchronizer)
+            .expect("new active service tuple recovers after interrupted reconciliation");
+        synchronizer.load_balancer_banks = [None, None];
+        synchronizer.active_load_balancer_bank = 0;
+        synchronizer.applied_load_balancer_reachability = None;
+        recover_load_balancer_state(&mut synchronizer)
+            .expect("unlinked derived VIP state resets for authoritative replay");
+        assert_eq!(
+            synchronizer.load_balancer_config.get(&0, 0).unwrap(),
+            [0; 48]
+        );
+        assert!(
+            synchronizer
+                .load_balancer_banks
+                .iter()
+                .flatten()
+                .all(|bank| bank.ipv4_frontends.is_empty() && bank.ipv6_frontends.is_empty())
+        );
+        assert_eq!(
+            load_optional_load_balancer_reachability(&synchronizer.load_balancer_state_path)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
