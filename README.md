@@ -10,8 +10,10 @@ programs where another bounded provider is safer.
 
 Phase 1 established observation, Phase 2 added identity-aware L3/L4 enforcement,
 Phase 3 completed bounded Kubernetes compatibility and simulation, the full-CNI
-foundation owns dual-stack Pod networking, and Phase 4 adds a native eBPF
-dual-stack ClusterIP fabric on exact kube-proxy-free Kind and OpenShift tuples.
+foundation owns dual-stack Pod networking, and Phases 4–6 provide native eBPF
+dual-stack ClusterIP, NodePort, and explicit-class LoadBalancer fabrics on exact
+kube-proxy-free Kind and OpenShift tuples. Phase 7 is now extending that base
+with locality, affinity, scalable selection, and opt-in DSR contracts.
 UNF is **not production-ready**; these results are bounded development
 qualifications, not a general production support claim.
 
@@ -291,6 +293,16 @@ Workstation cross-worker dual-stack Cluster/Local traffic, source semantics,
 source ranges, health, lifecycle, operations, recovery, ABI-v7 reconstruction,
 exact owned-state cleanup, convergence, and unchanged unhealthy-operator
 baseline passed; ADR 0101 records the platform boundary.
+Phase 7 now begins advanced Service selection. Strict `internalTrafficPolicy`
+eligibility precedes topology preferences; `ClientIP` affinity may select only
+from the currently eligible set; existing connection persistence remains a
+separate, stronger per-flow contract. Selection tables are compiled in
+userspace and consumed through bounded eBPF lookups. Maglev must earn adoption
+through deterministic disruption, balance, memory, update-cost, and packet-cost
+measurements, while DSR remains opt-in until return routing, MTU, policy,
+source-range, telemetry, and cleanup invariants pass. The
+[Phase 7 service-selection plan](docs/development/phase7-service-selection-plan.md)
+and ADR 0102 define the ordered implementation and qualification gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -501,9 +513,9 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-Not implemented yet: advanced Service modes such as session affinity,
-internal traffic policy, topology-aware
-routing, Maglev, and DSR;
+In progress in Phase 7: session affinity, internal traffic policy,
+topology-aware routing, measured Maglev selection, and opt-in DSR. Not yet
+implemented:
 production-scale routing/CNI qualification;
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
 multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production

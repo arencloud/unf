@@ -10,7 +10,7 @@
 | `unf-ebpf-common` | Versioned fixed-layout flow and BPF map ABIs, including independently banked dual-stack NodePort and LoadBalancer frontend contracts | Variable strings or allocation |
 | `unf-api` | CRD schema and serialization | Policy evaluation |
 | `unf-policy` | Native and NetworkPolicy conversion, shared IR, deterministic evaluation, identity-tuple lowering | Kubernetes watches or BPF map mutation |
-| `unf-service` | Bounded revisioned service IR, typed ClusterIP and address-family-aware NodePort/frontend/backend intent, provider-neutral Service/EndpointSlice and authenticated local-Node inputs, stable collision-checked provisional IDs, deterministic normalization/validation, fixed dual-stack ClusterIP lowering, and node-scoped NodePort map compilation | Kubernetes watches, Node-address discovery, runtime backend selection, connection tracking, or BPF map mutation |
+| `unf-service` | Bounded revisioned service IR, typed ClusterIP and address-family-aware NodePort/frontend/backend intent, provider-neutral Service/EndpointSlice and authenticated local-Node inputs, stable collision-checked provisional IDs, deterministic normalization/validation, fixed dual-stack ClusterIP lowering, and node-scoped NodePort map compilation | Kubernetes watches, Node-address discovery, runtime connection tracking, or BPF map mutation |
 | `unf-state` | Revision snapshots, bounded flow-history contract, Service/backend topology schema, and identity metadata | Transport or controller loops |
 | `unf-controller` | Watches, EndpointSlice-aware desired-state/topology reconciliation, retained-last-valid service compilation, durable explicit-class LoadBalancer allocation/finalizer orchestration, TokenReview-scoped Node intent, authenticated snapshot distribution, explicit Node block and complete remote-route distribution, bounded durable agent-report and flow-history checkpointing, non-blocking external HTTP flow handoff, time-window flow queries, explanation, and read-only simulation orchestration | Packet parsing |
 | `unf-agent` | Capability detection, Aya lifecycle, events, non-blocking telemetry export, authenticated transactional service/NodePort/LoadBalancer maps and durable node-block/reachability adoption, exact service/NodePort/LoadBalancer/identity/policy recovery, remote-route reconciliation, and opt-in root-authenticated local CNI transaction service | Kubernetes policy semantics or CNI namespace mutation |
@@ -35,11 +35,21 @@ now owns coherent `Cluster`/`Local` VIP translation, paired reverse state, and
 exact source-range lookup. The agent owns transactional runtime trie
 reconstruction and dual-stack Node-local health listeners. Bounded metrics,
 status, history, provenance-aware explanation, exact read-only simulation, and
-durable recovery are now implemented. Live Kubernetes status publication,
-provider-owned external advertisement artifacts, and platform qualification
-remain separate ordered milestones. Allocation,
+durable recovery are now implemented and independently qualified on Kind and
+OpenShift. Allocation,
 advertisement, translation, health, and published readiness are not
-interchangeable. ADRs 0093–0099 define the implemented boundary.
+interchangeable. ADRs 0093–0101 define the implemented boundary.
+
+The accepted Phase 7 boundary assigns Kubernetes semantic conversion and
+bounded normalized affinity/locality/algorithm/forwarding intent to
+`unf-service`; the controller supplies authoritative Node placement and zone
+inputs. The agent will compile and transactionally own per-Node eligibility and
+selection state. `unf-ebpf-tc` may consume only fixed-width selected tiers,
+affinity records, and algorithm tables; it does not interpret Kubernetes
+strings or topology. DSR remains an explicit forwarding mode whose route, MTU,
+policy, return-path, and cleanup contracts must pass before activation. ADR
+0102 records the boundary; later milestones must not claim implementation from
+this ownership decision alone.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

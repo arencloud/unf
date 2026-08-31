@@ -504,3 +504,26 @@ matrix is maintained in the
 - Production BGP/cloud takeover, session affinity, internal traffic policy,
   topology-aware selection, Maglev, DSR, SCTP, Gateway API, multi-cluster, and
   production availability/scale remain independent future gates.
+
+## Phase 7 — advanced Service selection
+
+**Gate: In progress.** The ordered evidence matrix is maintained in the
+[Phase 7 service-selection plan](development/phase7-service-selection-plan.md).
+
+- Verified architecture boundary: strict `Local` eligibility takes precedence
+  over topology preferences; `ClientIP` affinity can reuse only a currently
+  eligible backend; connection persistence remains separately revisioned.
+- Per-Node eligibility and selection plans are compiled in userspace and must
+  activate transactionally. The eBPF path performs bounded lookups and does not
+  interpret Kubernetes topology or affinity configuration.
+- Maglev is a measured candidate, not a label-only claim. Adoption requires
+  deterministic balance/disruption, bounded memory and compile cost, stable
+  upgrades, and verifier-visible packet-cost evidence against the current hash.
+- DSR is opt-in and cannot bypass route/neighbor/MTU safety, backend VIP
+  ownership, policy, source ranges, health, reverse telemetry, or exact cleanup.
+- Schema/compiler, distribution/state, locality, affinity/draining, Maglev,
+  DSR, operations, Kind, and OpenShift remain ordered independent milestones;
+  ADR 0102 and `make service-selection-boundary-test` define the first gate.
+- Weighted traffic splitting, latency/load feedback, cross-cluster selection,
+  SCTP Services, fragments, generic NAT `RELATED`, and production scale remain
+  separate gates.
