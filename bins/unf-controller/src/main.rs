@@ -3815,7 +3815,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         limitations: [
             "desired state and identity allocations are currently in-memory only",
             "agent acknowledgements and the newest bounded flow history use separate single-controller ConfigMap checkpoints",
-            "service translation is bounded to primary-CNI Pod clients plus host-origin ClusterIP, IPv4/IPv6 TCP/UDP, and NodePort Cluster/Local traffic; LoadBalancer allocation/reachability/host state/packet translation, session affinity, DSR, SCTP, fragments, and host-origin NodePort clients remain unqualified",
+            "service translation is bounded to IPv4/IPv6 TCP/UDP ClusterIP, NodePort Cluster/Local, and explicit-class LoadBalancer Cluster/Local on qualified primary-CNI tuples; session affinity, internalTrafficPolicy, topology-aware selection, Maglev, DSR, SCTP, fragments, and host-origin NodePort remain unqualified",
         ],
     }))
 }
