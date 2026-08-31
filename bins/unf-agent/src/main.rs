@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -682,6 +682,7 @@ struct ServiceSynchronizer {
     load_balancer_ipv4_source_ranges: AyaLpmTrie<MapData, [u8; 12], [u8; 32]>,
     load_balancer_ipv6_source_ranges: AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
     load_balancer_config: AyaArray<MapData, [u8; 48]>,
+    load_balancer_node_source: AyaArray<MapData, [u8; 40]>,
     health_checks: HealthCheckManager,
     banks: [Option<ServiceDataplaneState>; SERVICE_BANK_COUNT as usize],
     node_port_banks:
@@ -781,6 +782,7 @@ type ServiceMaps = (
     AyaLpmTrie<MapData, [u8; 12], [u8; 32]>,
     AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
     AyaArray<MapData, [u8; 48]>,
+    AyaArray<MapData, [u8; 40]>,
 );
 type RecoveredServiceConfig = (u64, u64, u32, u32, u32, u8);
 type RecoveredNodePortConfig = (u64, u64, u64, u32, u32, u8);
@@ -2351,12 +2353,8 @@ fn load_optional_service_checkpoint(
                     if service.source_epoch != node.source_epoch {
                         bail!("durable service and local Node checkpoints have different epochs");
                     }
-                    if service
-                        .services
-                        .iter()
-                        .all(|service| service.node_ports.is_empty())
-                    {
-                        bail!("durable NodePort checkpoint has no NodePort service intent");
+                    if !service_requires_local_node(&service) {
+                        bail!("durable local Node checkpoint has no Service host intent");
                     }
                     Ok(Some((service, Some(node))))
                 }
@@ -2389,11 +2387,8 @@ fn persist_service_checkpoint(
     description: &str,
 ) -> Result<()> {
     let service = service.clone().validate_and_normalize()?;
-    let has_node_ports = service
-        .services
-        .iter()
-        .any(|candidate| !candidate.node_ports.is_empty());
-    match (has_node_ports, node_port_node) {
+    let requires_local_node = service_requires_local_node(&service);
+    match (requires_local_node, node_port_node) {
         (false, None) => persist_service_snapshot(path, &service, description),
         (true, Some(node)) => {
             let node = node.clone().validate_and_normalize()?;
@@ -2410,8 +2405,8 @@ fn persist_service_checkpoint(
                 description,
             )
         }
-        (true, None) => bail!("NodePort service checkpoint requires local Node state"),
-        (false, Some(_)) => bail!("local Node checkpoint requires NodePort service intent"),
+        (true, None) => bail!("Service host intent checkpoint requires local Node state"),
+        (false, Some(_)) => bail!("local Node checkpoint requires Service host intent"),
     }
 }
 
@@ -2630,7 +2625,7 @@ async fn synchronize_services(
     )
     .await?
     .validate_and_normalize()?;
-    let node_port_node = if service_has_node_ports(&candidate) {
+    let node_port_node = if service_requires_local_node(&candidate) {
         let node = fetch_node_port_node_snapshot(
             controller_url,
             &synchronizer.client,
@@ -2966,6 +2961,49 @@ fn service_has_node_ports(snapshot: &ServiceSnapshot) -> bool {
         .any(|service| !service.node_ports.is_empty())
 }
 
+fn service_requires_local_node(snapshot: &ServiceSnapshot) -> bool {
+    service_has_node_ports(snapshot)
+        || snapshot
+            .services
+            .iter()
+            .any(|service| service.load_balancer.is_some())
+}
+
+fn encode_load_balancer_node_source(node: Option<&NodePortNodeSnapshot>) -> [u8; 40] {
+    let Some(node) = node else {
+        return [0; 40];
+    };
+    let preferred = |ipv4: bool| {
+        node.addresses
+            .iter()
+            .find(|address| {
+                address.kind == unf_service::NodeAddressKind::Internal
+                    && address.address.is_ipv4() == ipv4
+            })
+            .or_else(|| {
+                node.addresses
+                    .iter()
+                    .find(|address| address.address.is_ipv4() == ipv4)
+            })
+            .map(|address| address.address)
+    };
+    let mut config = [0_u8; 40];
+    config[0..8].copy_from_slice(&node.revision.get().to_ne_bytes());
+    let mut flags = 0_u8;
+    if let Some(IpAddr::V4(address)) = preferred(true) {
+        config[8..12].copy_from_slice(&address.octets());
+        flags |= unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4;
+    }
+    if let Some(IpAddr::V6(address)) = preferred(false) {
+        config[12..28].copy_from_slice(&address.octets());
+        flags |= unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6;
+    }
+    config[28..30]
+        .copy_from_slice(&unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION.to_ne_bytes());
+    config[30] = flags;
+    config
+}
+
 fn load_balancer_health_check_plan(
     snapshot: &ServiceSnapshot,
     node_name: &str,
@@ -3220,20 +3258,24 @@ fn activate_service_snapshot(
         .cloned()
         .map(NodePortNodeSnapshot::validate_and_normalize)
         .transpose()?;
-    if service_has_node_ports(&candidate) != node_port_node.is_some() {
-        bail!("NodePort service intent and local Node state must be present together");
+    if service_has_node_ports(&candidate) && node_port_node.is_none() {
+        bail!("NodePort intent requires authenticated local Node state");
+    }
+    if !service_requires_local_node(&candidate) && node_port_node.is_some() {
+        bail!("local Node state was supplied without Service host intent");
     }
     if let Some(node) = &node_port_node {
         if node.node_name != synchronizer.node_name {
-            bail!("local NodePort state does not belong to this agent");
+            bail!("local Node state does not belong to this agent");
         }
         if node.source_epoch != candidate.source_epoch {
-            bail!("service and local NodePort state have different controller epochs");
+            bail!("service and local Node state have different controller epochs");
         }
     }
     let service_changed = synchronizer.applied.as_ref() != Some(&candidate);
-    let node_port_changed = synchronizer.applied_node_port_node.as_ref() != node_port_node.as_ref();
-    if !service_changed && !node_port_changed {
+    let local_node_changed =
+        synchronizer.applied_node_port_node.as_ref() != node_port_node.as_ref();
+    if !service_changed && !local_node_changed {
         return Ok(());
     }
 
@@ -3242,14 +3284,23 @@ fn activate_service_snapshot(
     } else {
         synchronizer.active_bank
     };
-    let node_port_must_change = node_port_changed || (service_changed && node_port_node.is_some());
+    let candidate_has_node_ports = service_has_node_ports(&candidate);
+    let applied_had_node_ports = synchronizer
+        .applied
+        .as_ref()
+        .is_some_and(service_has_node_ports);
+    let node_port_must_change = (candidate_has_node_ports && local_node_changed)
+        || (service_changed && (candidate_has_node_ports || applied_had_node_ports));
     let node_port_bank = if node_port_must_change {
         (synchronizer.active_node_port_bank + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT
     } else {
         synchronizer.active_node_port_bank
     };
 
-    let (desired_service, desired_node_port) = if let Some(node) = &node_port_node {
+    let (desired_service, desired_node_port) = if candidate_has_node_ports {
+        let node = node_port_node
+            .as_ref()
+            .expect("NodePort intent requires validated local Node state");
         let desired =
             compile_node_port_fabric_dataplane(&candidate, node, service_bank, node_port_bank)?;
         (
@@ -3282,6 +3333,10 @@ fn activate_service_snapshot(
         .node_port_config
         .get(&0, 0)
         .context("read NodePort activation pointer before staging")?;
+    let previous_load_balancer_node_source = synchronizer
+        .load_balancer_node_source
+        .get(&0, 0)
+        .context("read LoadBalancer Node source before activation")?;
     if let (Some(previous), Some(desired)) = (&previous_service_stage, &desired_service)
         && let Err(error) = stage_service_bank(synchronizer, previous, desired)
     {
@@ -3325,6 +3380,14 @@ fn activate_service_snapshot(
     };
 
     let activation = (|| -> Result<()> {
+        synchronizer
+            .load_balancer_node_source
+            .set(
+                0,
+                encode_load_balancer_node_source(node_port_node.as_ref()),
+                0,
+            )
+            .context("publish runtime LoadBalancer Node source addresses")?;
         if let Some(desired) = &desired_service {
             synchronizer
                 .config
@@ -3349,6 +3412,10 @@ fn activate_service_snapshot(
             synchronizer
                 .node_port_config
                 .set(0, previous_node_port_config, 0);
+        let load_balancer_node_source_rollback =
+            synchronizer
+                .load_balancer_node_source
+                .set(0, previous_load_balancer_node_source, 0);
         let service_stage_rollback = previous_service_stage
             .as_ref()
             .map_or(Ok(()), |bank| restore_service_bank(synchronizer, bank));
@@ -3362,7 +3429,7 @@ fn activate_service_snapshot(
         );
         let pending_cleanup = discard_service_pending_state(&synchronizer.state_path);
         bail!(
-            "NodePort service transaction failed: {error:#}; service config rollback: {service_config_rollback:?}; NodePort config rollback: {node_port_config_rollback:?}; service stage rollback: {service_stage_rollback:?}; NodePort stage rollback: {node_port_stage_rollback:?}; checkpoint rollback: {checkpoint_rollback:?}; pending cleanup: {pending_cleanup:?}"
+            "NodePort service transaction failed: {error:#}; service config rollback: {service_config_rollback:?}; NodePort config rollback: {node_port_config_rollback:?}; LoadBalancer Node source rollback: {load_balancer_node_source_rollback:?}; service stage rollback: {service_stage_rollback:?}; NodePort stage rollback: {node_port_stage_rollback:?}; checkpoint rollback: {checkpoint_rollback:?}; pending cleanup: {pending_cleanup:?}"
         );
     }
 
@@ -5104,6 +5171,7 @@ fn new_synchronizers(
         load_balancer_ipv4_source_ranges,
         load_balancer_ipv6_source_ranges,
         load_balancer_config,
+        load_balancer_node_source,
     ) = service_maps;
     (
         IdentitySynchronizer {
@@ -5155,6 +5223,7 @@ fn new_synchronizers(
             load_balancer_ipv4_source_ranges,
             load_balancer_ipv6_source_ranges,
             load_balancer_config,
+            load_balancer_node_source,
             health_checks: HealthCheckManager::default(),
             banks: [None, None],
             node_port_banks: [None, None],
@@ -5646,6 +5715,11 @@ fn recover_persistent_dataplane(
     validate_map_capacity(
         "LOAD_BALANCER_CONFIG",
         services.load_balancer_config.map(),
+        1,
+    )?;
+    validate_map_capacity(
+        "LOAD_BALANCER_NODE_SOURCE",
+        services.load_balancer_node_source.map(),
         1,
     )?;
 
@@ -6277,8 +6351,14 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
         }
         let node_matches = match (&node, decoded_node_port) {
             (None, None) => true,
+            (Some(node), None) => {
+                !service_has_node_ports(&durable)
+                    && service_requires_local_node(&durable)
+                    && node.source_epoch == durable.source_epoch
+            }
             (Some(node), Some((node_epoch, service_revision, node_revision, _, _, _))) => {
-                node.source_epoch == node_epoch
+                service_has_node_ports(&durable)
+                    && node.source_epoch == node_epoch
                     && revision == service_revision
                     && node.revision.get() == node_revision
             }
@@ -6301,7 +6381,10 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
         )
     {
         let previous_service_bank = (bank + 1) % SERVICE_BANK_COUNT;
-        let expected_current_service = if let Some(current_node) = &current_node {
+        let expected_current_service = if service_has_node_ports(&current_service) {
+            let current_node = current_node
+                .as_ref()
+                .context("current NodePort checkpoint lost its local Node snapshot")?;
             let (_, _, _, _, _, current_node_port_bank) = decoded_node_port
                 .context("current NodePort checkpoint lost its activation pointer")?;
             compile_node_port_host_fabric(
@@ -6314,7 +6397,10 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
         } else {
             compile_service_host_dataplane(&current_service, previous_service_bank)?
         };
-        let expected_pending_service = if let Some(pending_node) = &pending_node {
+        let expected_pending_service = if service_has_node_ports(&pending_service) {
+            let pending_node = pending_node
+                .as_ref()
+                .context("pending NodePort checkpoint lost its local Node snapshot")?;
             let pending_node_port_bank = decoded_node_port.map_or(1, |config| {
                 (config.5 + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT
             });
@@ -6343,7 +6429,10 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
         restore_service_bank(services, &empty_service_bank(bank))?;
         banks[usize::from(previous_service_bank)] = expected_current_service;
         banks[usize::from(bank)] = empty_service_bank(bank);
-        if let Some(pending_node) = &pending_node {
+        if service_has_node_ports(&pending_service) {
+            let pending_node = pending_node
+                .as_ref()
+                .context("pending NodePort checkpoint lost its local Node snapshot")?;
             let pending_node_port_bank = decoded_node_port.map_or(1, |config| {
                 (config.5 + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT
             });
@@ -6379,7 +6468,10 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
     if durable.source_epoch != epoch || durable.revision.get() != revision {
         bail!("repaired service config does not match selected durable checkpoint");
     }
-    let (expected, expected_node_port) = if let Some(node) = &node {
+    let (expected, expected_node_port) = if service_has_node_ports(&durable) {
+        let node = node
+            .as_ref()
+            .context("durable NodePort checkpoint has no local Node snapshot")?;
         let (_, _, _, _, _, node_port_bank) = decoded_node_port
             .context("durable NodePort checkpoint has no active NodePort config")?;
         let expected = compile_node_port_host_fabric(&durable, node, bank, node_port_bank)?;
@@ -6423,6 +6515,10 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
     services.node_port_banks = node_port_banks.map(Some);
     services.active_bank = active_service_bank;
     services.applied = Some(durable);
+    services
+        .load_balancer_node_source
+        .set(0, encode_load_balancer_node_source(node.as_ref()), 0)
+        .context("restore runtime LoadBalancer Node source addresses")?;
     services.applied_node_port_node = node;
     Ok((Some(epoch), Some(revision)))
 }
@@ -6504,6 +6600,11 @@ fn checkpoint_matches_node_port_config(
 ) -> bool {
     match (node, config) {
         (None, None) => !service_has_node_ports(service),
+        (Some(node), None) => {
+            !service_has_node_ports(service)
+                && service_requires_local_node(service)
+                && node.source_epoch == service.source_epoch
+        }
         (Some(node), Some((epoch, service_revision, node_revision, _, _, _))) => {
             service_has_node_ports(service)
                 && node.source_epoch == epoch
@@ -7022,6 +7123,11 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
             .context("eBPF object does not contain LOAD_BALANCER_CONFIG map")?,
     )
     .context("open LOAD_BALANCER_CONFIG map")?;
+    let load_balancer_node_source = AyaArray::<_, [u8; 40]>::try_from(
+        ebpf.take_map("LOAD_BALANCER_NODE_SOURCE")
+            .context("eBPF object does not contain LOAD_BALANCER_NODE_SOURCE map")?,
+    )
+    .context("open LOAD_BALANCER_NODE_SOURCE map")?;
     Ok((
         ipv4_frontends,
         ipv6_frontends,
@@ -7038,6 +7144,7 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
         load_balancer_ipv4_source_ranges,
         load_balancer_ipv6_source_ranges,
         load_balancer_config,
+        load_balancer_node_source,
     ))
 }
 
@@ -10169,6 +10276,7 @@ mod tests {
             load_balancer_ipv4_source_ranges,
             load_balancer_ipv6_source_ranges,
             load_balancer_config,
+            load_balancer_node_source,
         ) = take_service_maps(ebpf).expect("take service and NodePort maps");
         ServiceSynchronizer {
             ipv4_frontends,
@@ -10186,6 +10294,7 @@ mod tests {
             load_balancer_ipv4_source_ranges,
             load_balancer_ipv6_source_ranges,
             load_balancer_config,
+            load_balancer_node_source,
             health_checks: HealthCheckManager::default(),
             banks: [None, None],
             node_port_banks: [None, None],
@@ -10479,21 +10588,44 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("service-snapshot.json");
         let snapshot = load_balancer_service_test_snapshot(7, 4);
+        let node = node_port_node_snapshot(7);
 
-        persist_service_checkpoint(&path, &snapshot, None, "LoadBalancer service")
+        persist_service_checkpoint(&path, &snapshot, Some(&node), "LoadBalancer service")
             .expect("current LoadBalancer service checkpoint persists");
-        let persisted: ServiceSnapshot = load_secure_json(&path, "service").unwrap();
-        assert_eq!(persisted.schema_version, SERVICE_SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(
+            load_optional_service_checkpoint(&path).unwrap(),
+            Some((snapshot.clone(), Some(node)))
+        );
         assert!(
-            persisted
+            snapshot
                 .services
                 .iter()
                 .all(|service| service.load_balancer.is_some())
         );
+        assert!(persist_service_checkpoint(&path, &snapshot, None, "missing Node").is_err());
+    }
+
+    #[test]
+    fn load_balancer_node_source_prefers_internal_dual_stack_addresses() {
+        let node = node_port_node_snapshot(7);
+        let encoded = encode_load_balancer_node_source(Some(&node));
+        assert_eq!(u64::from_ne_bytes(encoded[0..8].try_into().unwrap()), 7);
+        assert_eq!(&encoded[8..12], &Ipv4Addr::new(192, 0, 2, 10).octets());
         assert_eq!(
-            load_optional_service_checkpoint(&path).unwrap(),
-            Some((snapshot, None))
+            &encoded[12..28],
+            &"fdff::10".parse::<Ipv6Addr>().unwrap().octets()
         );
+        assert_eq!(
+            u16::from_ne_bytes(encoded[28..30].try_into().unwrap()),
+            unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            encoded[30],
+            unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4
+                | unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6
+        );
+        assert_eq!(&encoded[31..40], &[0; 9]);
+        assert_eq!(encode_load_balancer_node_source(None), [0; 40]);
     }
 
     #[test]
@@ -10730,6 +10862,7 @@ mod tests {
             load_balancer_ipv4_source_ranges,
             load_balancer_ipv6_source_ranges,
             load_balancer_config,
+            load_balancer_node_source,
         ) = take_service_maps(&mut ebpf).expect("take service maps");
         let directory = tempdir().unwrap();
         let mut synchronizer = ServiceSynchronizer {
@@ -10748,6 +10881,7 @@ mod tests {
             load_balancer_ipv4_source_ranges,
             load_balancer_ipv6_source_ranges,
             load_balancer_config,
+            load_balancer_node_source,
             health_checks: HealthCheckManager::default(),
             banks: [None, None],
             node_port_banks: [None, None],
@@ -10995,9 +11129,12 @@ mod tests {
         let vip_v6 = "2001:db8:ffff::60".parse::<Ipv6Addr>().unwrap();
         let backend_v4 = Ipv4Addr::new(10, 42, 0, 20);
         let backend_v6 = "fd00:42::20".parse::<Ipv6Addr>().unwrap();
+        let node_v4 = Ipv4Addr::new(192, 0, 2, 10);
+        let node_v6 = "fdff::10".parse::<Ipv6Addr>().unwrap();
+        let node = node_port_node_snapshot(1);
         let first =
             dual_stack_service_snapshot_with_load_balancer(1, backend_v4, backend_v6, true, true);
-        activate_service_snapshot(&mut synchronizer, &first, None, true, &state)
+        activate_service_snapshot(&mut synchronizer, &first, Some(&node), true, &state)
             .expect("dual-stack LoadBalancer Service activates");
         let first_reachability = dual_stack_load_balancer_node_snapshot(&first, 1, vip_v4, vip_v6);
         activate_load_balancer_snapshot(&mut synchronizer, &first_reachability, &state)
@@ -11008,8 +11145,8 @@ mod tests {
         assert_eq!(action, TC_ACT_PIPE);
         let ipv4_tcp_snat = u16::from_be_bytes([translated[34], translated[35]]);
         assert!((32_768..=u16::MAX).contains(&ipv4_tcp_snat));
-        assert_ipv4_packet(&translated, 6, vip_v4, backend_v4, ipv4_tcp_snat, 8080);
-        let reverse = ipv4_packet(6, backend_v4, vip_v4, 8080, ipv4_tcp_snat);
+        assert_ipv4_packet(&translated, 6, node_v4, backend_v4, ipv4_tcp_snat, 8080);
+        let reverse = ipv4_packet(6, backend_v4, node_v4, 8080, ipv4_tcp_snat);
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
         assert_eq!(action, TC_ACT_PIPE);
         assert_ipv4_packet(&translated, 6, vip_v4, client_v4, 80, 40_000);
@@ -11024,8 +11161,8 @@ mod tests {
         let colliding_snat = u16::from_be_bytes([translated[34], translated[35]]);
         assert!((32_768..=u16::MAX).contains(&colliding_snat));
         assert_ne!(colliding_snat, ipv4_tcp_snat);
-        assert_ipv4_packet(&translated, 6, vip_v4, backend_v4, colliding_snat, 8080);
-        let reverse = ipv4_packet(6, backend_v4, vip_v4, 8080, colliding_snat);
+        assert_ipv4_packet(&translated, 6, node_v4, backend_v4, colliding_snat, 8080);
+        let reverse = ipv4_packet(6, backend_v4, node_v4, 8080, colliding_snat);
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
         assert_eq!(action, TC_ACT_PIPE);
         assert_ipv4_packet(&translated, 6, vip_v4, client_v4, 80, colliding_client_port);
@@ -11034,8 +11171,8 @@ mod tests {
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_udp);
         assert_eq!(action, TC_ACT_PIPE);
         let ipv4_udp_snat = u16::from_be_bytes([translated[34], translated[35]]);
-        assert_ipv4_packet(&translated, 17, vip_v4, backend_v4, ipv4_udp_snat, 5353);
-        let reverse = ipv4_packet(17, backend_v4, vip_v4, 5353, ipv4_udp_snat);
+        assert_ipv4_packet(&translated, 17, node_v4, backend_v4, ipv4_udp_snat, 5353);
+        let reverse = ipv4_packet(17, backend_v4, node_v4, 5353, ipv4_udp_snat);
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
         assert_eq!(action, TC_ACT_PIPE);
         assert_ipv4_packet(&translated, 17, vip_v4, client_v4, 53, 40_001);
@@ -11044,8 +11181,8 @@ mod tests {
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv6_tcp);
         assert_eq!(action, TC_ACT_PIPE);
         let ipv6_tcp_snat = u16::from_be_bytes([translated[54], translated[55]]);
-        assert_ipv6_packet(&translated, 6, vip_v6, backend_v6, ipv6_tcp_snat, 8080);
-        let reverse = ipv6_packet(6, backend_v6, vip_v6, 8080, ipv6_tcp_snat);
+        assert_ipv6_packet(&translated, 6, node_v6, backend_v6, ipv6_tcp_snat, 8080);
+        let reverse = ipv6_packet(6, backend_v6, node_v6, 8080, ipv6_tcp_snat);
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse);
         assert_eq!(action, TC_ACT_PIPE);
         assert_ipv6_packet(&translated, 6, vip_v6, client_v6, 80, 40_002);
@@ -11054,8 +11191,8 @@ mod tests {
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv6_udp);
         assert_eq!(action, TC_ACT_PIPE);
         let ipv6_udp_snat = u16::from_be_bytes([translated[54], translated[55]]);
-        assert_ipv6_packet(&translated, 17, vip_v6, backend_v6, ipv6_udp_snat, 5353);
-        let reverse = ipv6_packet(17, backend_v6, vip_v6, 5353, ipv6_udp_snat);
+        assert_ipv6_packet(&translated, 17, node_v6, backend_v6, ipv6_udp_snat, 5353);
+        let reverse = ipv6_packet(17, backend_v6, node_v6, 5353, ipv6_udp_snat);
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
         assert_eq!(action, TC_ACT_PIPE);
         assert_ipv6_packet(&translated, 17, vip_v6, client_v6, 53, 40_003);
@@ -11117,7 +11254,7 @@ mod tests {
             true,
             true,
         );
-        activate_service_snapshot(&mut synchronizer, &second, None, true, &state)
+        activate_service_snapshot(&mut synchronizer, &second, Some(&node), true, &state)
             .expect("replacement LoadBalancer backend activates");
         let second_reachability =
             dual_stack_load_balancer_node_snapshot(&second, 2, vip_v4, vip_v6);
@@ -11125,12 +11262,12 @@ mod tests {
             .expect("replacement VIP linkage activates");
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
         assert_eq!(action, TC_ACT_PIPE);
-        assert_ipv4_packet(&translated, 6, vip_v4, backend_v4, ipv4_tcp_snat, 8080);
+        assert_ipv4_packet(&translated, 6, node_v4, backend_v4, ipv4_tcp_snat, 8080);
         let new_flow = ipv4_packet(6, client_v4, vip_v4, 41_000, 80);
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &new_flow);
         assert_eq!(action, TC_ACT_PIPE);
         let new_snat = u16::from_be_bytes([translated[34], translated[35]]);
-        assert_ipv4_packet(&translated, 6, vip_v4, replacement_v4, new_snat, 8080);
+        assert_ipv4_packet(&translated, 6, node_v4, replacement_v4, new_snat, 8080);
 
         let backendless = dual_stack_service_snapshot_with_load_balancer(
             3,
@@ -11139,7 +11276,7 @@ mod tests {
             false,
             true,
         );
-        activate_service_snapshot(&mut synchronizer, &backendless, None, true, &state)
+        activate_service_snapshot(&mut synchronizer, &backendless, Some(&node), true, &state)
             .expect("backendless LoadBalancer Service activates");
         let backendless_reachability =
             dual_stack_load_balancer_node_snapshot(&backendless, 3, vip_v4, vip_v6);
@@ -11147,7 +11284,7 @@ mod tests {
             .expect("backendless VIP linkage activates");
         let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &new_flow);
         assert_eq!(action, TC_ACT_PIPE);
-        assert_ipv4_packet(&translated, 6, vip_v4, replacement_v4, new_snat, 8080);
+        assert_ipv4_packet(&translated, 6, node_v4, replacement_v4, new_snat, 8080);
         let no_backend = ipv4_packet(6, client_v4, vip_v4, 42_000, 80);
         let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &no_backend);
         assert_eq!(action, TC_ACT_SHOT);
@@ -11762,6 +11899,7 @@ mod tests {
             load_balancer_ipv4_source_ranges,
             load_balancer_ipv6_source_ranges,
             load_balancer_config,
+            load_balancer_node_source,
         ) = take_service_maps(&mut ebpf).expect("take service maps");
         let directory = tempdir().unwrap();
         let mut synchronizer = ServiceSynchronizer {
@@ -11780,6 +11918,7 @@ mod tests {
             load_balancer_ipv4_source_ranges,
             load_balancer_ipv6_source_ranges,
             load_balancer_config,
+            load_balancer_node_source,
             health_checks: HealthCheckManager::default(),
             banks: [None, None],
             node_port_banks: [None, None],

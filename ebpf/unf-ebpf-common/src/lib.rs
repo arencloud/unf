@@ -23,6 +23,9 @@ pub const NODE_PORT_MAP_ABI_VERSION: u16 = 1;
 pub const NODE_PORT_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const LOAD_BALANCER_MAP_ABI_VERSION: u16 = 1;
+pub const LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION: u16 = 1;
+pub const LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4: u8 = 1;
+pub const LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6: u8 = 1 << 1;
 pub const LOAD_BALANCER_BANK_COUNT: u8 = 2;
 pub const LOAD_BALANCER_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES: u16 = 1 << 1;
@@ -832,6 +835,20 @@ pub struct LoadBalancerMapConfig {
     pub reserved: [u8; 3],
 }
 
+/// Runtime-only local Node addresses used for Cluster `LoadBalancer` SNAT.
+/// Userspace rebuilds this map from the authenticated Node snapshot on every
+/// agent start, so it is deliberately independent from the persistent map ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct LoadBalancerNodeSourceConfig {
+    pub node_revision: u64,
+    pub ipv4_address: [u8; 4],
+    pub ipv6_address: [u8; 16],
+    pub schema_version: u16,
+    pub flags: u8,
+    pub reserved: [u8; 9],
+}
+
 /// Forward or reverse service-flow key. The role disambiguates identical
 /// tuples admitted in opposite translation directions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -929,6 +946,7 @@ const _: () = assert!(core::mem::size_of::<Ipv4LoadBalancerSourceRangeData>() ==
 const _: () = assert!(core::mem::size_of::<Ipv6LoadBalancerSourceRangeData>() == 24);
 const _: () = assert!(core::mem::size_of::<LoadBalancerSourceRangeValue>() == 32);
 const _: () = assert!(core::mem::size_of::<LoadBalancerMapConfig>() == 48);
+const _: () = assert!(core::mem::size_of::<LoadBalancerNodeSourceConfig>() == 40);
 const _: () = assert!(core::mem::size_of::<NodePortMapConfig>() == 40);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionKey>() == 40);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionValue>() == 104);
@@ -996,6 +1014,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<Ipv4LoadBalancerSourceRangeData>(), 12);
         assert_eq!(core::mem::size_of::<Ipv6LoadBalancerSourceRangeData>(), 24);
         assert_eq!(core::mem::size_of::<LoadBalancerSourceRangeValue>(), 32);
+        assert_eq!(core::mem::align_of::<LoadBalancerNodeSourceConfig>(), 8);
+        assert_eq!(core::mem::size_of::<LoadBalancerNodeSourceConfig>(), 40);
         assert_eq!(core::mem::align_of::<ServiceConnectionKey>(), 1);
         assert_eq!(core::mem::size_of::<ServiceConnectionKey>(), 40);
         assert_eq!(core::mem::align_of::<ServiceConnectionValue>(), 8);

@@ -21,7 +21,9 @@ use unf_ebpf_common::{
     Ipv4ServiceBackendValue, Ipv4ServiceFrontendKey, Ipv6ExtensionStep, Ipv6IdentityKey,
     Ipv6LoadBalancerFrontendKey, Ipv6NodePortFrontendKey, Ipv6PolicyMapData,
     Ipv6ServiceBackendValue, Ipv6ServiceFrontendKey, LoadBalancerFrontendValue,
-    LoadBalancerMapConfig, NodePortFrontendValue, NodePortMapConfig,
+    LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4, LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6,
+    LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION, LoadBalancerMapConfig,
+    LoadBalancerNodeSourceConfig, NodePortFrontendValue, NodePortMapConfig,
     NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG,
     NODE_PORT_MAP_ABI_VERSION, NODE_PORT_SNAT_PORT_PROBES,
     POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
@@ -215,6 +217,12 @@ static LOAD_BALANCER_SOURCE_RANGES_V6: LpmTrie<
 
 #[map]
 static LOAD_BALANCER_CONFIG: Array<LoadBalancerMapConfig> = Array::with_max_entries(1, 0);
+
+/// Runtime-only receiving-Node source addresses. The agent rebuilds this from
+/// its authenticated local Node snapshot before attaching the dataplane.
+#[map]
+static LOAD_BALANCER_NODE_SOURCE: Array<LoadBalancerNodeSourceConfig> =
+    Array::with_max_entries(1, 0);
 
 /// Bounded persistent flow translations owned by the Phase 4.5 source-side
 /// ClusterIP dataplane.
@@ -933,6 +941,32 @@ fn active_load_balancer_config(service: ServiceMapConfig) -> Option<LoadBalancer
     Some(config)
 }
 
+#[inline(always)]
+fn load_balancer_node_source(address_family: u8) -> Option<[u8; 16]> {
+    let config = LOAD_BALANCER_NODE_SOURCE.get(0).copied()?;
+    if config.schema_version != LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION
+        || config.node_revision == 0
+        || config.flags & !(LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4 | LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6)
+            != 0
+        || config.reserved != [0; 9]
+    {
+        return None;
+    }
+    if address_family == AddressFamily::Ipv4 as u8
+        && config.flags & LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4 != 0
+        && config.ipv4_address != [0; 4]
+    {
+        return Some(ipv4_address(config.ipv4_address));
+    }
+    if address_family == AddressFamily::Ipv6 as u8
+        && config.flags & LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6 != 0
+        && config.ipv6_address != [0; 16]
+    {
+        return Some(config.ipv6_address);
+    }
+    None
+}
+
 /// Returns the additional source translation for a Cluster NodePort forward
 /// packet, or the destination restoration for its reverse packet.
 #[inline(always)]
@@ -1391,10 +1425,12 @@ fn new_service_connection(
         value.translated_source_address = if frontend_kind
             == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
         {
-            LOAD_BALANCER_CLUSTER_SOURCE_SCRATCH
+            load_balancer_node_source(value.address_family).or_else(|| {
+                LOAD_BALANCER_CLUSTER_SOURCE_SCRATCH
                 .get(0)
                 .copied()
                 .filter(|address| *address != [0; 16])
+            })
                 .unwrap_or(value.frontend_address)
         } else {
             value.frontend_address
