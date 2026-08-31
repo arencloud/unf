@@ -29,12 +29,15 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_cni_state::AttachmentJournal;
 use unf_common::{IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, RuleId, Verdict};
+#[cfg(test)]
+use unf_ebpf_common::SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED;
 use unf_ebpf_common::{
     FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey,
     Ipv6IdentityKey, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
@@ -42,9 +45,10 @@ use unf_ebpf_common::{
     POLICY_MAP_ABI_VERSION, SERVICE_BANK_COUNT, SERVICE_EVENT_ABI_VERSION,
     SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
     SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
-    SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER, SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL,
-    SERVICE_EVENT_REASON_NO_BACKEND, SERVICE_MAP_ABI_VERSION, ServiceEvent,
-    service_event_action_reason_is_valid, service_event_frontend_kind_is_valid,
+    SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
+    SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL, SERVICE_EVENT_REASON_NO_BACKEND,
+    SERVICE_MAP_ABI_VERSION, ServiceEvent, service_event_action_reason_is_valid,
+    service_event_frontend_kind_is_valid,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -59,13 +63,15 @@ use unf_route::{
     NativeIpv4NextHop, NativeIpv6NextHop, NativeRemoteNode, NativeRemoteRoutePlan,
     NativeRemoteRoutingProvider, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION, RemoteRouteSnapshot,
 };
+#[cfg(test)]
+use unf_service::compile_service_dataplane;
 use unf_service::{
     LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, MAX_BACKENDS_PER_SERVICE,
     NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION, NodePortDataplaneState, NodePortNodeSnapshot,
     SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
     SERVICE_FRONTEND_BANK_CAPACITY, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceDataplaneState,
     ServiceSnapshot, ServiceTrafficPolicy, compile_node_port_fabric_dataplane,
-    compile_service_dataplane,
+    compile_service_load_balancer_fabric_dataplane,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
@@ -651,7 +657,10 @@ struct ServiceSynchronizer {
     node_port_config: AyaArray<MapData, [u8; 40]>,
     load_balancer_ipv4_frontends: AyaHashMap<MapData, [u8; 8], [u8; 48]>,
     load_balancer_ipv6_frontends: AyaHashMap<MapData, [u8; 20], [u8; 48]>,
+    load_balancer_ipv4_source_ranges: AyaLpmTrie<MapData, [u8; 12], [u8; 32]>,
+    load_balancer_ipv6_source_ranges: AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
     load_balancer_config: AyaArray<MapData, [u8; 48]>,
+    health_checks: HealthCheckManager,
     banks: [Option<ServiceDataplaneState>; SERVICE_BANK_COUNT as usize],
     node_port_banks:
         [Option<NodePortDataplaneState>; unf_ebpf_common::NODE_PORT_BANK_COUNT as usize],
@@ -670,6 +679,33 @@ struct ServiceSynchronizer {
     state_path: PathBuf,
     load_balancer_state_path: PathBuf,
     interval: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HealthCheckPlan {
+    port: u16,
+    service_id: unf_common::ServiceId,
+    local_endpoints: u64,
+}
+
+#[derive(Default)]
+struct HealthCheckManager {
+    listeners: BTreeMap<u16, HealthCheckListener>,
+}
+
+struct HealthCheckListener {
+    service_id: unf_common::ServiceId,
+    local_endpoints: Arc<AtomicU64>,
+    cancellation: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HealthCheckManager {
+    fn drop(&mut self) {
+        for listener in self.listeners.values() {
+            listener.cancellation.cancel();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -720,6 +756,8 @@ type ServiceMaps = (
     AyaArray<MapData, [u8; 40]>,
     AyaHashMap<MapData, [u8; 8], [u8; 48]>,
     AyaHashMap<MapData, [u8; 20], [u8; 48]>,
+    AyaLpmTrie<MapData, [u8; 12], [u8; 32]>,
+    AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
     AyaArray<MapData, [u8; 48]>,
 );
 type RecoveredServiceConfig = (u64, u64, u32, u32, u32, u8);
@@ -2541,8 +2579,11 @@ async fn restore_or_populate_service_state(
         return Ok(());
     }
     if let Some((snapshot, node)) = load_optional_service_checkpoint(&synchronizer.state_path)? {
+        let health = load_balancer_health_check_plan(&snapshot, &synchronizer.node_name)?;
+        let health_staged = synchronizer.health_checks.prepare(&health)?;
         publish_desired_service_snapshot(state, &snapshot);
         activate_service_snapshot(synchronizer, &snapshot, node.as_ref(), false, state)?;
+        synchronizer.health_checks.commit(&health, health_staged);
         return Ok(());
     }
     if synchronizer.controller_url.is_some() {
@@ -2585,6 +2626,7 @@ async fn synchronize_services(
     } else {
         None
     };
+    let health = load_balancer_health_check_plan(&candidate, &synchronizer.node_name)?;
     publish_desired_service_snapshot(state, &candidate);
     let service_changed =
         validate_service_snapshot_transition(&candidate, synchronizer.applied.as_ref())?;
@@ -2593,15 +2635,19 @@ async fn synchronize_services(
         synchronizer.applied_node_port_node.as_ref(),
     )?;
     if !service_changed && !node_changed {
+        synchronizer.health_checks.reconcile(&health)?;
         return Ok(());
     }
+    let health_staged = synchronizer.health_checks.prepare(&health)?;
     activate_service_snapshot(
         synchronizer,
         &candidate,
         node_port_node.as_ref(),
         true,
         state,
-    )
+    )?;
+    synchronizer.health_checks.commit(&health, health_staged);
+    Ok(())
 }
 
 async fn synchronize_load_balancer_maps(
@@ -2807,6 +2853,8 @@ fn empty_load_balancer_bank(desired: &LoadBalancerDataplaneState) -> LoadBalance
     let mut empty = desired.clone();
     empty.ipv4_frontends.clear();
     empty.ipv6_frontends.clear();
+    empty.ipv4_source_ranges.clear();
+    empty.ipv6_source_ranges.clear();
     empty.config = [0; 48];
     empty
 }
@@ -2835,18 +2883,170 @@ fn service_has_node_ports(snapshot: &ServiceSnapshot) -> bool {
         .any(|service| !service.node_ports.is_empty())
 }
 
-fn service_host_projection(snapshot: &ServiceSnapshot) -> Result<ServiceSnapshot> {
-    if snapshot
-        .services
-        .iter()
-        .any(|service| service.load_balancer.is_some())
-    {
-        snapshot
-            .clone()
-            .node_port_v2_projection()
-            .map_err(Into::into)
+fn load_balancer_health_check_plan(
+    snapshot: &ServiceSnapshot,
+    node_name: &str,
+) -> Result<BTreeMap<u16, HealthCheckPlan>> {
+    let mut plan = BTreeMap::new();
+    for service in &snapshot.services {
+        let Some(load_balancer) = service.load_balancer.as_ref() else {
+            continue;
+        };
+        let Some(port) = load_balancer.health_check_node_port else {
+            continue;
+        };
+        if load_balancer.traffic_policy != ServiceTrafficPolicy::Local {
+            bail!("healthCheckNodePort {port} belongs to a non-Local LoadBalancer");
+        }
+        let referenced = load_balancer
+            .frontends
+            .iter()
+            .flat_map(|frontend| frontend.backend_ids.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let local_endpoints = service
+            .backends
+            .iter()
+            .filter(|backend| {
+                referenced.contains(&backend.id)
+                    && backend.ready
+                    && !backend.terminating
+                    && backend.node_name.as_deref() == Some(node_name)
+            })
+            .count() as u64;
+        let candidate = HealthCheckPlan {
+            port,
+            service_id: service.id,
+            local_endpoints,
+        };
+        if let Some(existing) = plan.insert(port, candidate)
+            && existing.service_id != service.id
+        {
+            bail!(
+                "healthCheckNodePort {port} is claimed by services {:?} and {:?}",
+                existing.service_id,
+                service.id
+            );
+        }
+    }
+    Ok(plan)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HealthCheckResponse {
+    local_endpoints: u64,
+}
+
+async fn load_balancer_health_response(State(local_endpoints): State<Arc<AtomicU64>>) -> Response {
+    let local_endpoints = local_endpoints.load(Ordering::Acquire);
+    let status = if local_endpoints == 0 {
+        StatusCode::SERVICE_UNAVAILABLE
     } else {
-        Ok(snapshot.clone())
+        StatusCode::OK
+    };
+    (status, Json(HealthCheckResponse { local_endpoints })).into_response()
+}
+
+fn bind_health_check_listener(port: u16) -> Result<tokio::net::TcpListener> {
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(SocketProtocol::TCP))?;
+    socket.set_only_v6(false)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port).into())?;
+    socket.listen(128)?;
+    socket.set_nonblocking(true)?;
+    Ok(tokio::net::TcpListener::from_std(socket.into())?)
+}
+
+fn spawn_health_check_listener(
+    plan: &HealthCheckPlan,
+    listener: tokio::net::TcpListener,
+) -> HealthCheckListener {
+    let local_endpoints = Arc::new(AtomicU64::new(plan.local_endpoints));
+    let cancellation = CancellationToken::new();
+    let app = Router::new()
+        .route("/healthz", get(load_balancer_health_response))
+        .with_state(Arc::clone(&local_endpoints));
+    let shutdown = cancellation.clone();
+    let port = plan.port;
+    let task = tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+        {
+            warn!(%error, port, "LoadBalancer health-check listener stopped");
+        }
+    });
+    HealthCheckListener {
+        service_id: plan.service_id,
+        local_endpoints,
+        cancellation,
+        task,
+    }
+}
+
+impl HealthCheckManager {
+    fn prepare(
+        &self,
+        desired: &BTreeMap<u16, HealthCheckPlan>,
+    ) -> Result<Vec<(HealthCheckPlan, tokio::net::TcpListener)>> {
+        let mut staged = Vec::new();
+        for plan in desired.values() {
+            let needs_listener = self
+                .listeners
+                .get(&plan.port)
+                .is_none_or(|listener| listener.task.is_finished());
+            if needs_listener {
+                staged.push((plan.clone(), bind_health_check_listener(plan.port)?));
+            }
+        }
+        Ok(staged)
+    }
+
+    fn commit(
+        &mut self,
+        desired: &BTreeMap<u16, HealthCheckPlan>,
+        staged: Vec<(HealthCheckPlan, tokio::net::TcpListener)>,
+    ) {
+        let failed = self
+            .listeners
+            .iter()
+            .filter_map(|(port, listener)| listener.task.is_finished().then_some(*port))
+            .collect::<Vec<_>>();
+        for port in failed {
+            if let Some(listener) = self.listeners.remove(&port) {
+                listener.cancellation.cancel();
+            }
+        }
+
+        let stale = self
+            .listeners
+            .keys()
+            .filter(|port| !desired.contains_key(*port))
+            .copied()
+            .collect::<Vec<_>>();
+        for port in stale {
+            if let Some(listener) = self.listeners.remove(&port) {
+                listener.cancellation.cancel();
+            }
+        }
+        for (port, plan) in desired {
+            if let Some(listener) = self.listeners.get_mut(port) {
+                listener.service_id = plan.service_id;
+                listener
+                    .local_endpoints
+                    .store(plan.local_endpoints, Ordering::Release);
+            }
+        }
+        for (plan, listener) in staged {
+            self.listeners
+                .insert(plan.port, spawn_health_check_listener(&plan, listener));
+        }
+    }
+
+    fn reconcile(&mut self, desired: &BTreeMap<u16, HealthCheckPlan>) -> Result<()> {
+        let staged = self.prepare(desired)?;
+        self.commit(desired, staged);
+        Ok(())
     }
 }
 
@@ -2854,9 +3054,8 @@ fn compile_service_host_dataplane(
     snapshot: &ServiceSnapshot,
     bank: u8,
 ) -> Result<ServiceDataplaneState> {
-    Ok(compile_service_dataplane(
-        &service_host_projection(snapshot)?,
-        bank,
+    Ok(compile_service_load_balancer_fabric_dataplane(
+        snapshot, bank,
     )?)
 }
 
@@ -2867,7 +3066,7 @@ fn compile_node_port_host_fabric(
     node_port_bank: u8,
 ) -> Result<unf_service::NodePortFabricDataplaneState> {
     Ok(compile_node_port_fabric_dataplane(
-        &service_host_projection(snapshot)?,
+        snapshot,
         node,
         service_bank,
         node_port_bank,
@@ -2943,21 +3142,16 @@ fn activate_service_snapshot(
         synchronizer.active_node_port_bank
     };
 
-    let host_candidate = service_host_projection(&candidate)?;
     let (desired_service, desired_node_port) = if let Some(node) = &node_port_node {
-        let desired = compile_node_port_fabric_dataplane(
-            &host_candidate,
-            node,
-            service_bank,
-            node_port_bank,
-        )?;
+        let desired =
+            compile_node_port_fabric_dataplane(&candidate, node, service_bank, node_port_bank)?;
         (
             service_changed.then_some(desired.service),
             Some(desired.node_port),
         )
     } else {
         let desired_service = service_changed
-            .then(|| compile_service_dataplane(&host_candidate, service_bank))
+            .then(|| compile_service_load_balancer_fabric_dataplane(&candidate, service_bank))
             .transpose()?;
         let desired_node_port = node_port_must_change.then(|| empty_node_port_bank(node_port_bank));
         (desired_service, desired_node_port)
@@ -3269,6 +3463,22 @@ fn stage_load_balancer_bank(
         .context("stage IPv6 LoadBalancer frontends")
     })
     .and_then(|()| {
+        replace_lpm_entries(
+            &mut synchronizer.load_balancer_ipv4_source_ranges,
+            &previous.ipv4_source_ranges,
+            &desired.ipv4_source_ranges,
+        )
+        .context("stage IPv4 LoadBalancer source ranges")
+    })
+    .and_then(|()| {
+        replace_lpm_entries(
+            &mut synchronizer.load_balancer_ipv6_source_ranges,
+            &previous.ipv6_source_ranges,
+            &desired.ipv6_source_ranges,
+        )
+        .context("stage IPv6 LoadBalancer source ranges")
+    })
+    .and_then(|()| {
         validate_encoded_entries(
             &synchronizer.load_balancer_ipv4_frontends,
             &desired.ipv4_frontends,
@@ -3281,6 +3491,22 @@ fn stage_load_balancer_bank(
             &desired.ipv6_frontends,
             "IPv6 LoadBalancer frontend",
         )
+    })
+    .and_then(|()| {
+        validate_lpm_bank(
+            &synchronizer.load_balancer_ipv4_source_ranges,
+            &desired.ipv4_source_ranges,
+            desired.bank,
+        )
+        .context("validate IPv4 LoadBalancer source ranges")
+    })
+    .and_then(|()| {
+        validate_lpm_bank(
+            &synchronizer.load_balancer_ipv6_source_ranges,
+            &desired.ipv6_source_ranges,
+            desired.bank,
+        )
+        .context("validate IPv6 LoadBalancer source ranges")
     }) {
         return match restore_load_balancer_bank(synchronizer, previous) {
             Ok(()) => Err(error.context("LoadBalancer staging bank rolled back")),
@@ -3288,6 +3514,47 @@ fn stage_load_balancer_bank(
                 "LoadBalancer staging failed: {error:#}; rollback failed: {rollback:#}"
             )),
         };
+    }
+    Ok(())
+}
+
+fn replace_lpm_entries<const K: usize>(
+    map: &mut AyaLpmTrie<MapData, [u8; K], [u8; 32]>,
+    current: &BTreeMap<(u32, [u8; K]), [u8; 32]>,
+    desired: &BTreeMap<(u32, [u8; K]), [u8; 32]>,
+) -> Result<()>
+where
+    [u8; K]: aya::Pod,
+{
+    for (prefix, data) in current.keys().filter(|key| !desired.contains_key(*key)) {
+        map.remove(&LpmKey::new(*prefix, *data))?;
+    }
+    for ((prefix, data), value) in desired {
+        map.insert(&LpmKey::new(*prefix, *data), value, 0)?;
+    }
+    Ok(())
+}
+
+fn validate_lpm_bank<const K: usize>(
+    map: &AyaLpmTrie<MapData, [u8; K], [u8; 32]>,
+    desired: &BTreeMap<(u32, [u8; K]), [u8; 32]>,
+    bank: u8,
+) -> Result<()>
+where
+    [u8; K]: aya::Pod,
+{
+    let actual = map
+        .iter()
+        .filter_map(|entry| match entry {
+            Ok((key, value)) if key.data()[4] == bank => {
+                Some(Ok(((key.prefix_len(), key.data()), value)))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if &actual != desired {
+        bail!("LoadBalancer source-range bank readback differs from staged state");
     }
     Ok(())
 }
@@ -3437,6 +3704,16 @@ fn restore_load_balancer_bank(
             previous.bank,
             19,
         ),
+        restore_lpm_bank(
+            &mut synchronizer.load_balancer_ipv4_source_ranges,
+            &previous.ipv4_source_ranges,
+            previous.bank,
+        ),
+        restore_lpm_bank(
+            &mut synchronizer.load_balancer_ipv6_source_ranges,
+            &previous.ipv6_source_ranges,
+            previous.bank,
+        ),
     ];
     let failures = results
         .into_iter()
@@ -3447,6 +3724,24 @@ fn restore_load_balancer_bank(
     } else {
         bail!("restore LoadBalancer bank failed: {failures:?}")
     }
+}
+
+fn restore_lpm_bank<const K: usize>(
+    map: &mut AyaLpmTrie<MapData, [u8; K], [u8; 32]>,
+    previous: &BTreeMap<(u32, [u8; K]), [u8; 32]>,
+    bank: u8,
+) -> Result<()>
+where
+    [u8; K]: aya::Pod,
+{
+    let keys = map.keys().collect::<Result<Vec<_>, _>>()?;
+    for key in keys.into_iter().filter(|key| key.data()[4] == bank) {
+        map.remove(&key)?;
+    }
+    for ((prefix, data), value) in previous {
+        map.insert(&LpmKey::new(*prefix, *data), value, 0)?;
+    }
+    Ok(())
 }
 
 fn clear_load_balancer_bank(
@@ -4401,6 +4696,10 @@ async fn run_dataplane(
     } else if services.applied.is_none() {
         restore_or_populate_service_state(&mut services, &state).await?;
     }
+    if let Some(snapshot) = services.applied.as_ref() {
+        let health = load_balancer_health_check_plan(snapshot, &services.node_name)?;
+        services.health_checks.reconcile(&health)?;
+    }
     let mut attachments = attach_dataplane_programs(
         &mut ebpf,
         &config,
@@ -4594,6 +4893,8 @@ fn new_synchronizers(
         node_port_config,
         load_balancer_ipv4_frontends,
         load_balancer_ipv6_frontends,
+        load_balancer_ipv4_source_ranges,
+        load_balancer_ipv6_source_ranges,
         load_balancer_config,
     ) = service_maps;
     (
@@ -4643,7 +4944,10 @@ fn new_synchronizers(
             node_port_config,
             load_balancer_ipv4_frontends,
             load_balancer_ipv6_frontends,
+            load_balancer_ipv4_source_ranges,
+            load_balancer_ipv6_source_ranges,
             load_balancer_config,
+            health_checks: HealthCheckManager::default(),
             banks: [None, None],
             node_port_banks: [None, None],
             load_balancer_banks: [None, None],
@@ -5120,6 +5424,18 @@ fn recover_persistent_dataplane(
             .expect("LoadBalancer map capacity fits u32"),
     )?;
     validate_map_capacity(
+        "LOAD_BALANCER_SOURCE_RANGES_V4",
+        services.load_balancer_ipv4_source_ranges.map(),
+        u32::try_from(LOAD_BALANCER_FRONTEND_BANK_CAPACITY)
+            .expect("LoadBalancer map capacity fits u32"),
+    )?;
+    validate_map_capacity(
+        "LOAD_BALANCER_SOURCE_RANGES_V6",
+        services.load_balancer_ipv6_source_ranges.map(),
+        u32::try_from(LOAD_BALANCER_FRONTEND_BANK_CAPACITY)
+            .expect("LoadBalancer map capacity fits u32"),
+    )?;
+    validate_map_capacity(
         "LOAD_BALANCER_CONFIG",
         services.load_balancer_config.map(),
         1,
@@ -5408,6 +5724,8 @@ fn empty_recovered_load_balancer_bank(bank: u8) -> LoadBalancerDataplaneState {
         bank,
         ipv4_frontends: BTreeMap::new(),
         ipv6_frontends: BTreeMap::new(),
+        ipv4_source_ranges: BTreeMap::new(),
+        ipv6_source_ranges: BTreeMap::new(),
         config: [0; 48],
     }
 }
@@ -5515,6 +5833,28 @@ fn recover_load_balancer_state(services: &mut ServiceSynchronizer) -> Result<()>
     } else {
         discard_service_pending_state(&services.load_balancer_state_path)?;
     }
+    restore_lpm_bank(
+        &mut services.load_balancer_ipv4_source_ranges,
+        &expected.ipv4_source_ranges,
+        bank,
+    )?;
+    restore_lpm_bank(
+        &mut services.load_balancer_ipv6_source_ranges,
+        &expected.ipv6_source_ranges,
+        bank,
+    )?;
+    validate_lpm_bank(
+        &services.load_balancer_ipv4_source_ranges,
+        &expected.ipv4_source_ranges,
+        bank,
+    )
+    .context("validate recovered IPv4 LoadBalancer source ranges")?;
+    validate_lpm_bank(
+        &services.load_balancer_ipv6_source_ranges,
+        &expected.ipv6_source_ranges,
+        bank,
+    )
+    .context("validate recovered IPv6 LoadBalancer source ranges")?;
     let inactive = (bank + 1) % unf_ebpf_common::LOAD_BALANCER_BANK_COUNT;
     restore_load_balancer_bank(services, &empty_recovered_load_balancer_bank(inactive))?;
     banks[usize::from(bank)] = expected;
@@ -5550,7 +5890,8 @@ fn validate_load_balancer_frontend_entry<const K: usize>(
     let allocation_revision =
         u64::from_ne_bytes(value[32..40].try_into().expect("fixed allocation revision"));
     let service_bank = value[40];
-    let known_flags = unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL;
+    let known_flags = unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL
+        | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES;
     if service_id == 0
         || schema != unf_ebpf_common::LOAD_BALANCER_MAP_ABI_VERSION
         || flags & !known_flags != 0
@@ -6429,6 +6770,16 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
             .context("eBPF object does not contain LOAD_BALANCER_FRONTENDS_V6 map")?,
     )
     .context("open LOAD_BALANCER_FRONTENDS_V6 map")?;
+    let load_balancer_ipv4_source_ranges = AyaLpmTrie::<_, [u8; 12], [u8; 32]>::try_from(
+        ebpf.take_map("LOAD_BALANCER_SOURCE_RANGES_V4")
+            .context("eBPF object does not contain LOAD_BALANCER_SOURCE_RANGES_V4 map")?,
+    )
+    .context("open LOAD_BALANCER_SOURCE_RANGES_V4 map")?;
+    let load_balancer_ipv6_source_ranges = AyaLpmTrie::<_, [u8; 24], [u8; 32]>::try_from(
+        ebpf.take_map("LOAD_BALANCER_SOURCE_RANGES_V6")
+            .context("eBPF object does not contain LOAD_BALANCER_SOURCE_RANGES_V6 map")?,
+    )
+    .context("open LOAD_BALANCER_SOURCE_RANGES_V6 map")?;
     let load_balancer_config = AyaArray::<_, [u8; 48]>::try_from(
         ebpf.take_map("LOAD_BALANCER_CONFIG")
             .context("eBPF object does not contain LOAD_BALANCER_CONFIG map")?,
@@ -6447,6 +6798,8 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
         node_port_config,
         load_balancer_ipv4_frontends,
         load_balancer_ipv6_frontends,
+        load_balancer_ipv4_source_ranges,
+        load_balancer_ipv6_source_ranges,
         load_balancer_config,
     ))
 }
@@ -6719,6 +7072,7 @@ fn service_event_frontend_kind(event: &ServiceEvent) -> ServiceFrontendKind {
         SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER => ServiceFrontendKind::NodePortCluster,
         SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL => ServiceFrontendKind::NodePortLocal,
         SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER => ServiceFrontendKind::LoadBalancerCluster,
+        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL => ServiceFrontendKind::LoadBalancerLocal,
         _ => unreachable!("validated service event frontend kind"),
     }
 }
@@ -6771,7 +7125,9 @@ fn record_service_event(state: &AgentState, event: &ServiceEvent) {
                         .fetch_add(1, Ordering::Relaxed);
                     state.metrics.node_port_local_translations.inc();
                 }
-                ServiceFrontendKind::ClusterIp | ServiceFrontendKind::LoadBalancerCluster => {}
+                ServiceFrontendKind::ClusterIp
+                | ServiceFrontendKind::LoadBalancerCluster
+                | ServiceFrontendKind::LoadBalancerLocal => {}
             }
         }
         SERVICE_EVENT_ACTION_DROP => {
@@ -9416,6 +9772,21 @@ mod tests {
         .expect("dual-stack service snapshot compiles")
     }
 
+    fn local_load_balancer_snapshot(mut snapshot: ServiceSnapshot) -> ServiceSnapshot {
+        let load_balancer = snapshot.services[0]
+            .load_balancer
+            .as_mut()
+            .expect("test snapshot has LoadBalancer intent");
+        load_balancer.traffic_policy = unf_service::ServiceTrafficPolicy::Local;
+        load_balancer.source_ranges = vec![
+            "203.0.113.0/24".parse().unwrap(),
+            "2001:db8::/64".parse().unwrap(),
+        ];
+        snapshot
+            .validate_and_normalize()
+            .expect("Local LoadBalancer snapshot validates")
+    }
+
     fn dual_stack_node_port_snapshot(revision: u64) -> ServiceSnapshot {
         dual_stack_node_port_snapshot_with_backend(
             revision,
@@ -9504,6 +9875,8 @@ mod tests {
             node_port_config,
             load_balancer_ipv4_frontends,
             load_balancer_ipv6_frontends,
+            load_balancer_ipv4_source_ranges,
+            load_balancer_ipv6_source_ranges,
             load_balancer_config,
         ) = take_service_maps(ebpf).expect("take service and NodePort maps");
         ServiceSynchronizer {
@@ -9519,7 +9892,10 @@ mod tests {
             node_port_config,
             load_balancer_ipv4_frontends,
             load_balancer_ipv6_frontends,
+            load_balancer_ipv4_source_ranges,
+            load_balancer_ipv6_source_ranges,
             load_balancer_config,
+            health_checks: HealthCheckManager::default(),
             banks: [None, None],
             node_port_banks: [None, None],
             load_balancer_banks: [None, None],
@@ -10038,6 +10414,8 @@ mod tests {
             node_port_config,
             load_balancer_ipv4_frontends,
             load_balancer_ipv6_frontends,
+            load_balancer_ipv4_source_ranges,
+            load_balancer_ipv6_source_ranges,
             load_balancer_config,
         ) = take_service_maps(&mut ebpf).expect("take service maps");
         let directory = tempdir().unwrap();
@@ -10054,7 +10432,10 @@ mod tests {
             node_port_config,
             load_balancer_ipv4_frontends,
             load_balancer_ipv6_frontends,
+            load_balancer_ipv4_source_ranges,
+            load_balancer_ipv6_source_ranges,
             load_balancer_config,
+            health_checks: HealthCheckManager::default(),
             banks: [None, None],
             node_port_banks: [None, None],
             load_balancer_banks: [None, None],
@@ -10406,6 +10787,328 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
+    fn privileged_load_balancer_local_packets_preserve_source_and_follow_placement() {
+        const TC_ACT_SHOT: u32 = 2;
+        const TC_ACT_PIPE: u32 = 3;
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new()
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(program_name)
+                .expect("service TC program exists")
+                .try_into()
+                .expect("service program is a TC classifier");
+            program
+                .load()
+                .expect("kernel verifier accepts Local LoadBalancer TC program");
+        }
+        let mut service_events = RingBuf::try_from(
+            ebpf.take_map("SERVICE_EVENTS")
+                .expect("service event ring exists"),
+        )
+        .expect("service event ring opens");
+        let (mut identity_v4_maps, _identity_v6_maps, mut identity_config) =
+            take_identity_maps(&mut ebpf).expect("take identity maps");
+        let (
+            _identity_policy,
+            mut ipv4_policy,
+            _ipv6_policy,
+            _egress_ipv4_policy,
+            _egress_ipv6_policy,
+            mut policy_config,
+        ) = take_policy_maps(&mut ebpf).expect("take policy maps");
+        let directory = tempdir().unwrap();
+        let mut synchronizer =
+            test_service_synchronizer(&mut ebpf, directory.path().join("service.json"));
+        let state = test_agent_state();
+        let client_v4 = Ipv4Addr::new(203, 0, 113, 5);
+        let client_v6 = "2001:db8::5".parse::<Ipv6Addr>().unwrap();
+        let vip_v4 = Ipv4Addr::new(192, 0, 2, 60);
+        let vip_v6 = "2001:db8:ffff::60".parse::<Ipv6Addr>().unwrap();
+        let backend_v4 = Ipv4Addr::new(10, 42, 0, 20);
+        let backend_v6 = "fd00:42::20".parse::<Ipv6Addr>().unwrap();
+        let first = local_load_balancer_snapshot(dual_stack_service_snapshot_with_load_balancer(
+            1, backend_v4, backend_v6, true, true,
+        ));
+        activate_service_snapshot(&mut synchronizer, &first, None, true, &state)
+            .expect("dual-stack Local LoadBalancer Service activates");
+        let first_reachability = dual_stack_load_balancer_node_snapshot(&first, 1, vip_v4, vip_v6);
+        activate_load_balancer_snapshot(&mut synchronizer, &first_reachability, &state)
+            .expect("dual-stack Local VIP bank activates");
+
+        let ipv4_tcp = ipv4_packet(6, client_v4, vip_v4, 43_000, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, backend_v4, 43_000, 8080);
+        let reverse = ipv4_packet(6, backend_v4, client_v4, 8080, 43_000);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, vip_v4, client_v4, 80, 43_000);
+
+        let ipv4_udp = ipv4_packet(17, client_v4, vip_v4, 43_001, 53);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 17, client_v4, backend_v4, 43_001, 5353);
+        let reverse = ipv4_packet(17, backend_v4, client_v4, 5353, 43_001);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 17, vip_v4, client_v4, 53, 43_001);
+
+        let ipv6_tcp = ipv6_packet(6, client_v6, vip_v6, 43_002, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv6_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 6, client_v6, backend_v6, 43_002, 8080);
+        let reverse = ipv6_packet(6, backend_v6, client_v6, 8080, 43_002);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 6, vip_v6, client_v6, 80, 43_002);
+
+        let ipv6_udp = ipv6_packet(17, client_v6, vip_v6, 43_003, 53);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv6_udp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, client_v6, backend_v6, 43_003, 5353);
+        let reverse = ipv6_packet(17, backend_v6, client_v6, 5353, 43_003);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_egress", &reverse);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, vip_v6, client_v6, 53, 43_003);
+
+        let backend_identity = IdentityId::new(22);
+        identity_v4_maps[0]
+            .insert(
+                backend_v4.octets(),
+                encode_identity_value(IdentityMapValue::new(backend_identity, 9)),
+                0,
+            )
+            .expect("Local backend identity is staged");
+        identity_config
+            .set(0, encode_identity_config(7, 9, 1, 0).unwrap(), 0)
+            .expect("Local backend identity is activated");
+        let deny = Ipv4PolicyMapEntry {
+            key: unf_state::Ipv4PolicyMapKey {
+                source_address: Ipv4Addr::UNSPECIFIED,
+                destination_identity: backend_identity,
+                protocol: 6,
+                destination_port: 8080,
+            },
+            decision: PolicyDecisionRecord {
+                verdict: Verdict::Deny,
+                reason: PolicyReason::DefaultAction,
+                policy_id: Some(PolicyId::new(7)),
+                rule_id: None,
+            },
+            shadow: None,
+        };
+        ipv4_policy
+            .insert(
+                encode_ipv4_policy_key(&deny, 0),
+                encode_policy_decisions(&deny.decision, None, 9),
+                0,
+            )
+            .expect("Local external-source deny is staged");
+        policy_config
+            .set(0, encode_policy_config(7, 9, 1, 0).unwrap(), 0)
+            .expect("Local external-source deny is activated");
+        let denied = ipv4_packet(6, client_v4, vip_v4, 43_050, 80);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &denied);
+        assert_eq!(action, TC_ACT_SHOT);
+        identity_config.set(0, [0; 24], 0).unwrap();
+        policy_config.set(0, [0; 24], 0).unwrap();
+
+        let denied_source_v4 = ipv4_packet(6, Ipv4Addr::new(198, 51, 100, 5), vip_v4, 43_051, 80);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &denied_source_v4);
+        assert_eq!(action, TC_ACT_SHOT);
+        let denied_source_v6 = ipv6_packet(17, "2001:db9::5".parse().unwrap(), vip_v6, 43_052, 53);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &denied_source_v6);
+        assert_eq!(action, TC_ACT_SHOT);
+
+        let mut remote_only = first.clone();
+        remote_only.revision = Revision::new(2);
+        for backend in &mut remote_only.services[0].backends {
+            backend.node_name = Some("worker-b".to_owned());
+        }
+        let remote_only = remote_only.validate_and_normalize().unwrap();
+        activate_service_snapshot(&mut synchronizer, &remote_only, None, true, &state)
+            .expect("remote-only Local Service bank activates");
+        let remote_reachability =
+            dual_stack_load_balancer_node_snapshot(&remote_only, 2, vip_v4, vip_v6);
+        activate_load_balancer_snapshot(&mut synchronizer, &remote_reachability, &state)
+            .expect("remote-only Local VIP bank activates");
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4_tcp);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, backend_v4, 43_000, 8080);
+        let no_local = ipv4_packet(6, client_v4, vip_v4, 43_100, 80);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &no_local);
+        assert_eq!(action, TC_ACT_SHOT);
+
+        let mut unready = first.clone();
+        unready.revision = Revision::new(3);
+        for backend in &mut unready.services[0].backends {
+            backend.ready = false;
+        }
+        let unready = unready.validate_and_normalize().unwrap();
+        activate_service_snapshot(&mut synchronizer, &unready, None, true, &state)
+            .expect("unready Local Service bank activates");
+        let unready_reachability =
+            dual_stack_load_balancer_node_snapshot(&unready, 3, vip_v4, vip_v6);
+        activate_load_balancer_snapshot(&mut synchronizer, &unready_reachability, &state)
+            .expect("unready Local VIP bank activates");
+        let unready_flow = ipv4_packet(6, client_v4, vip_v4, 43_101, 80);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &unready_flow);
+        assert_eq!(action, TC_ACT_SHOT);
+
+        let recovered = local_load_balancer_snapshot(
+            dual_stack_service_snapshot_with_load_balancer(4, backend_v4, backend_v6, true, true),
+        );
+        activate_service_snapshot(&mut synchronizer, &recovered, None, true, &state)
+            .expect("recovered Local Service bank activates");
+        let recovered_reachability =
+            dual_stack_load_balancer_node_snapshot(&recovered, 4, vip_v4, vip_v6);
+        activate_load_balancer_snapshot(&mut synchronizer, &recovered_reachability, &state)
+            .expect("recovered Local VIP bank activates");
+        let recovered_flow = ipv4_packet(6, client_v4, vip_v4, 43_102, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &recovered_flow);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, backend_v4, 43_102, 8080);
+
+        let active_load_balancer_bank = synchronizer.active_load_balancer_bank;
+        restore_lpm_bank(
+            &mut synchronizer.load_balancer_ipv4_source_ranges,
+            &BTreeMap::new(),
+            active_load_balancer_bank,
+        )
+        .unwrap();
+        restore_lpm_bank(
+            &mut synchronizer.load_balancer_ipv6_source_ranges,
+            &BTreeMap::new(),
+            active_load_balancer_bank,
+        )
+        .unwrap();
+        synchronizer.load_balancer_banks = [None, None];
+        synchronizer.active_load_balancer_bank = 0;
+        synchronizer.applied_load_balancer_reachability = None;
+        recover_load_balancer_state(&mut synchronizer)
+            .expect("runtime source-range tries rebuild from durable VIP state");
+        let after_restart = ipv4_packet(6, client_v4, vip_v4, 43_103, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &after_restart);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, backend_v4, 43_103, 8080);
+        let denied_after_restart =
+            ipv4_packet(6, Ipv4Addr::new(198, 51, 100, 6), vip_v4, 43_104, 80);
+        let (action, _) = run_tc(&mut ebpf, "unf_observe_ingress", &denied_after_restart);
+        assert_eq!(action, TC_ACT_SHOT);
+
+        let mut events = Vec::new();
+        while let Some(item) = service_events.next() {
+            events.push(decode_service_event(&item).expect("kernel service event is valid"));
+        }
+        assert!(events.iter().any(|event| {
+            event.action == SERVICE_EVENT_ACTION_TRANSLATE
+                && service_event_frontend_kind(event) == ServiceFrontendKind::LoadBalancerLocal
+        }));
+        assert!(events.iter().any(|event| {
+            event.reason == SERVICE_EVENT_REASON_NO_BACKEND
+                && service_event_frontend_kind(event) == ServiceFrontendKind::LoadBalancerLocal
+        }));
+        assert!(events.iter().any(|event| {
+            event.reason == SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED
+                && service_event_frontend_kind(event) == ServiceFrontendKind::LoadBalancerLocal
+        }));
+    }
+
+    #[tokio::test]
+    async fn load_balancer_health_check_is_dual_stack_local_and_lifecycle_exact() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn response(port: u16, address: &str) -> String {
+            let mut stream = tokio::net::TcpStream::connect((address, port))
+                .await
+                .expect("health listener accepts the requested family");
+            stream
+                .write_all(b"GET /healthz HTTP/1.1\r\nHost: node\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        }
+
+        let reservation = std::net::TcpListener::bind("[::]:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let mut snapshot =
+            local_load_balancer_snapshot(dual_stack_service_snapshot_with_load_balancer(
+                1,
+                Ipv4Addr::new(10, 42, 0, 20),
+                "fd00:42::20".parse().unwrap(),
+                true,
+                true,
+            ));
+        snapshot.services[0]
+            .load_balancer
+            .as_mut()
+            .unwrap()
+            .health_check_node_port = Some(port);
+        let snapshot = snapshot.validate_and_normalize().unwrap();
+        let ready = load_balancer_health_check_plan(&snapshot, "worker-a").unwrap();
+        assert!(ready[&port].local_endpoints > 0);
+        let mut collision = snapshot.clone();
+        let mut second = collision.services[0].clone();
+        second.id = unf_common::ServiceId::new(second.id.get().saturating_add(1));
+        second.name = "collision".to_owned();
+        collision.services.push(second);
+        assert!(
+            load_balancer_health_check_plan(&collision, "worker-a")
+                .unwrap_err()
+                .to_string()
+                .contains("is claimed by services")
+        );
+
+        let mut manager = HealthCheckManager::default();
+        manager.reconcile(&ready).unwrap();
+        tokio::task::yield_now().await;
+        let ipv4 = response(port, "127.0.0.1").await;
+        assert!(ipv4.starts_with("HTTP/1.1 200 OK"));
+        assert!(ipv4.contains(&format!(
+            "\"localEndpoints\":{}",
+            ready[&port].local_endpoints
+        )));
+        let ipv6 = response(port, "::1").await;
+        assert!(ipv6.starts_with("HTTP/1.1 200 OK"));
+
+        let mut remote = snapshot.clone();
+        for backend in &mut remote.services[0].backends {
+            backend.node_name = Some("worker-b".to_owned());
+        }
+        let remote = remote.validate_and_normalize().unwrap();
+        let unavailable = load_balancer_health_check_plan(&remote, "worker-a").unwrap();
+        assert_eq!(unavailable[&port].local_endpoints, 0);
+        manager.reconcile(&unavailable).unwrap();
+        let response = response(port, "127.0.0.1").await;
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(response.contains("\"localEndpoints\":0"));
+
+        manager.reconcile(&BTreeMap::new()).unwrap();
+        assert!(manager.listeners.is_empty());
+
+        let conflict = std::net::TcpListener::bind("[::]:0").unwrap();
+        let conflict_port = conflict.local_addr().unwrap().port();
+        let rejected = BTreeMap::from([(
+            conflict_port,
+            HealthCheckPlan {
+                port: conflict_port,
+                service_id: snapshot.services[0].id,
+                local_endpoints: 1,
+            },
+        )]);
+        assert!(manager.prepare(&rejected).is_err());
+        assert!(manager.listeners.is_empty());
+    }
+
+    #[test]
     #[ignore = "requires root BPF map creation and UNF_EBPF_OBJECT"]
     fn privileged_node_port_partial_stage_rolls_back_service_and_host_banks() {
         let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
@@ -10623,6 +11326,8 @@ mod tests {
             node_port_config,
             load_balancer_ipv4_frontends,
             load_balancer_ipv6_frontends,
+            load_balancer_ipv4_source_ranges,
+            load_balancer_ipv6_source_ranges,
             load_balancer_config,
         ) = take_service_maps(&mut ebpf).expect("take service maps");
         let directory = tempdir().unwrap();
@@ -10639,7 +11344,10 @@ mod tests {
             node_port_config,
             load_balancer_ipv4_frontends,
             load_balancer_ipv6_frontends,
+            load_balancer_ipv4_source_ranges,
+            load_balancer_ipv6_source_ranges,
             load_balancer_config,
+            health_checks: HealthCheckManager::default(),
             banks: [None, None],
             node_port_banks: [None, None],
             load_balancer_banks: [None, None],

@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{BackendId, Protocol, Revision, ServiceId};
 use unf_ebpf_common::{
-    NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG,
-    NODE_PORT_MAP_ABI_VERSION, SERVICE_BACKEND_FLAG_READY, SERVICE_BACKEND_FLAG_SERVING,
-    SERVICE_BACKEND_FLAG_TERMINATING, SERVICE_BANK_COUNT, SERVICE_MAP_ABI_VERSION,
+    LOAD_BALANCER_LOCAL_FRONTEND_INDEX_BASE, NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL,
+    NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG, NODE_PORT_MAP_ABI_VERSION, SERVICE_BACKEND_FLAG_READY,
+    SERVICE_BACKEND_FLAG_SERVING, SERVICE_BACKEND_FLAG_TERMINATING, SERVICE_BANK_COUNT,
+    SERVICE_MAP_ABI_VERSION,
 };
 
 pub use unf_common::SERVICE_SNAPSHOT_SCHEMA_VERSION;
@@ -577,6 +578,10 @@ pub enum ServiceDataplaneError {
     UnsupportedNodePort { actual: usize },
     #[error("LoadBalancer intent contains {actual} frontends but VIP lowering is not implemented")]
     UnsupportedLoadBalancer { actual: usize },
+    #[error("Local LoadBalancer slot index overflow for service {service:?} on Node {node}")]
+    LocalLoadBalancerIndex { service: ServiceId, node: String },
+    #[error("Local LoadBalancer slot key collided with another service slot")]
+    LocalLoadBalancerSlotCollision,
     #[error("service map {map} requires {actual} entries; per-bank limit is {limit}")]
     Capacity {
         map: &'static str,
@@ -657,6 +662,29 @@ pub struct NodePortDataplaneState {
 pub struct NodePortFabricDataplaneState {
     pub service: ServiceDataplaneState,
     pub node_port: NodePortDataplaneState,
+}
+
+/// Returns the disjoint service-slot index for one Local `LoadBalancer` frontend
+/// on one Node. The fixed per-Service backend bound plus one no-local sentinel
+/// is the Node ordinal stride.
+#[must_use]
+pub fn load_balancer_local_frontend_index(
+    service: &ServiceIr,
+    frontend_index: usize,
+    node_name: &str,
+) -> Option<u32> {
+    let node_ordinal = service
+        .backends
+        .iter()
+        .filter_map(|backend| backend.node_name.as_deref())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .position(|candidate| candidate == node_name)
+        .unwrap_or(MAX_BACKENDS_PER_SERVICE);
+    let offset = frontend_index
+        .checked_mul(MAX_BACKENDS_PER_SERVICE + 1)?
+        .checked_add(node_ordinal)?;
+    LOAD_BALANCER_LOCAL_FRONTEND_INDEX_BASE.checked_add(u32::try_from(offset).ok()?)
 }
 
 struct CompiledNodePortFrontends {
@@ -2021,6 +2049,110 @@ pub fn compile_service_dataplane(
     })
 }
 
+/// Lowers `ClusterIP` state plus deterministic per-Node slots needed by Local
+/// `LoadBalancer` frontends into one transactional service bank.
+///
+/// # Errors
+///
+/// Rejects invalid intent, slot-index/capacity overflow, or any collision with
+/// the ordinary `ClusterIP` slot namespace.
+pub fn compile_service_load_balancer_fabric_dataplane(
+    snapshot: &ServiceSnapshot,
+    bank: u8,
+) -> Result<ServiceDataplaneState, ServiceDataplaneError> {
+    let snapshot = snapshot.clone().validate_and_normalize()?;
+    let mut cluster_ip = snapshot.clone();
+    for service in &mut cluster_ip.services {
+        service.node_ports.clear();
+        service.load_balancer = None;
+    }
+    let mut service = compile_service_dataplane(&cluster_ip, bank)?;
+    merge_load_balancer_local_slots(&snapshot, &mut service)?;
+    Ok(service)
+}
+
+fn merge_load_balancer_local_slots(
+    snapshot: &ServiceSnapshot,
+    state: &mut ServiceDataplaneState,
+) -> Result<(), ServiceDataplaneError> {
+    for service in &snapshot.services {
+        let Some(load_balancer) = service
+            .load_balancer
+            .as_ref()
+            .filter(|load_balancer| load_balancer.traffic_policy == ServiceTrafficPolicy::Local)
+        else {
+            continue;
+        };
+        let node_names = service
+            .backends
+            .iter()
+            .filter_map(|backend| backend.node_name.as_deref())
+            .collect::<BTreeSet<_>>();
+        for frontend in &load_balancer.frontends {
+            let frontend_index = service
+                .frontends
+                .iter()
+                .position(|candidate| {
+                    address_family(candidate.address) == frontend.family
+                        && candidate.port == frontend.service_port
+                        && candidate.protocol == frontend.protocol
+                        && candidate.name == frontend.name
+                        && candidate.app_protocol == frontend.app_protocol
+                        && candidate.backend_ids == frontend.backend_ids
+                })
+                .expect("validated LoadBalancer frontend has one ClusterIP link");
+            for node_name in &node_names {
+                let local_index =
+                    load_balancer_local_frontend_index(service, frontend_index, node_name)
+                        .ok_or_else(|| ServiceDataplaneError::LocalLoadBalancerIndex {
+                            service: service.id,
+                            node: (*node_name).to_owned(),
+                        })?;
+                let eligible = frontend.backend_ids.iter().filter(|backend_id| {
+                    service.backends.iter().any(|backend| {
+                        backend.id == **backend_id
+                            && backend.ready
+                            && !backend.terminating
+                            && backend.node_name.as_deref() == Some(*node_name)
+                    })
+                });
+                for (slot, backend_id) in eligible.enumerate() {
+                    let key = encode_service_backend_slot_key(
+                        service.id,
+                        local_index,
+                        bounded_u32(slot),
+                        state.bank,
+                    );
+                    if state
+                        .backend_slots
+                        .insert(
+                            key,
+                            encode_service_backend_slot_value(*backend_id, snapshot.revision.get()),
+                        )
+                        .is_some()
+                    {
+                        return Err(ServiceDataplaneError::LocalLoadBalancerSlotCollision);
+                    }
+                }
+            }
+        }
+    }
+    validate_dataplane_capacity(
+        "SERVICE_BACKEND_SLOTS",
+        state.backend_slots.len(),
+        SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+    )?;
+    state.config = encode_service_config(
+        state.source_epoch,
+        state.revision,
+        state.ipv4_frontends.len() + state.ipv6_frontends.len(),
+        state.ipv4_backends.len() + state.ipv6_backends.len(),
+        state.backend_slots.len(),
+        state.bank,
+    );
+    Ok(())
+}
+
 /// Lowers validated `NodePort` intent for one authenticated local Node. The
 /// resulting values reference an already staged `ClusterIP` service bank.
 ///
@@ -2090,6 +2222,7 @@ pub fn compile_node_port_fabric_dataplane(
         .map_err(ServiceDataplaneError::from)?;
     for service in &mut cluster_ip.services {
         service.node_ports.clear();
+        service.load_balancer = None;
     }
     let mut service = compile_service_dataplane(&cluster_ip, service_bank)?;
     for (key, value) in &node_port.service_backend_slots {
@@ -2097,6 +2230,7 @@ pub fn compile_node_port_fabric_dataplane(
             return Err(NodePortFabricDataplaneError::LocalSlotCollision);
         }
     }
+    merge_load_balancer_local_slots(snapshot, &mut service)?;
     validate_dataplane_capacity(
         "SERVICE_BACKEND_SLOTS",
         service.backend_slots.len(),

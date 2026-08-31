@@ -12,10 +12,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION, Revision, ServiceId};
 use unf_ebpf_common::{
-    LOAD_BALANCER_BANK_COUNT, LOAD_BALANCER_FRONTEND_FLAG_LOCAL, LOAD_BALANCER_MAP_ABI_VERSION,
-    SERVICE_BANK_COUNT,
+    LOAD_BALANCER_BANK_COUNT, LOAD_BALANCER_FRONTEND_FLAG_LOCAL,
+    LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES, LOAD_BALANCER_MAP_ABI_VERSION, SERVICE_BANK_COUNT,
 };
-use unf_service::{AddressFamily, ServiceIpPrefix, ServiceIr, UNF_LOAD_BALANCER_CLASS};
+use unf_service::{
+    AddressFamily, ServiceIpPrefix, ServiceIr, UNF_LOAD_BALANCER_CLASS,
+    load_balancer_local_frontend_index,
+};
 
 pub const ALLOCATION_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 pub const LEGACY_ALLOCATION_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -1269,6 +1272,8 @@ pub struct LoadBalancerDataplaneState {
     pub bank: u8,
     pub ipv4_frontends: BTreeMap<[u8; 8], [u8; 48]>,
     pub ipv6_frontends: BTreeMap<[u8; 20], [u8; 48]>,
+    pub ipv4_source_ranges: BTreeMap<(u32, [u8; 12]), [u8; 32]>,
+    pub ipv6_source_ranges: BTreeMap<(u32, [u8; 24]), [u8; 32]>,
     pub config: [u8; 48],
 }
 
@@ -1338,6 +1343,9 @@ pub fn compile_load_balancer_dataplane(
     let mut address_owners = BTreeMap::<IpAddr, ServiceId>::new();
     let mut ipv4_frontends = BTreeMap::new();
     let mut ipv6_frontends = BTreeMap::new();
+    let mut ipv4_source_ranges = BTreeMap::new();
+    let mut ipv6_source_ranges = BTreeMap::new();
+    let mut range_services = BTreeSet::new();
     for target in &reachability.targets {
         let service = by_id
             .get(&target.owner.service_id)
@@ -1356,6 +1364,43 @@ pub fn compile_load_balancer_dataplane(
             .load_balancer
             .as_ref()
             .ok_or_else(|| LoadBalancerDataplaneError::MissingService(target.owner.clone()))?;
+        if range_services.insert(service.id) {
+            for source_range in &load_balancer.source_ranges {
+                let value = encode_load_balancer_source_range_value(
+                    services.revision,
+                    reachability.revision,
+                    reachability.allocation_revision,
+                );
+                match source_range.address {
+                    IpAddr::V4(address) => {
+                        ipv4_source_ranges.insert(
+                            (
+                                64 + u32::from(source_range.prefix_length),
+                                encode_ipv4_load_balancer_source_range_key(
+                                    service.id,
+                                    bank,
+                                    address.octets(),
+                                ),
+                            ),
+                            value,
+                        );
+                    }
+                    IpAddr::V6(address) => {
+                        ipv6_source_ranges.insert(
+                            (
+                                64 + u32::from(source_range.prefix_length),
+                                encode_ipv6_load_balancer_source_range_key(
+                                    service.id,
+                                    bank,
+                                    address.octets(),
+                                ),
+                            ),
+                            value,
+                        );
+                    }
+                }
+            }
+        }
         for frontend in load_balancer
             .frontends
             .iter()
@@ -1377,19 +1422,47 @@ pub fn compile_load_balancer_dataplane(
             if matching.len() != 1 {
                 return Err(LoadBalancerDataplaneError::MissingFrontendLink);
             }
-            let (frontend_index, _) = matching[0];
-            let frontend_index = u32::try_from(frontend_index)
+            let (cluster_frontend_index, _) = matching[0];
+            let cluster_frontend_index = u32::try_from(cluster_frontend_index)
                 .map_err(|_| LoadBalancerDataplaneError::MissingFrontendLink)?;
-            let flags = if load_balancer.traffic_policy == unf_service::ServiceTrafficPolicy::Local
-            {
-                LOAD_BALANCER_FRONTEND_FLAG_LOCAL
-            } else {
-                0
+            let (frontend_index, backend_count, mut flags) = match load_balancer.traffic_policy {
+                unf_service::ServiceTrafficPolicy::Cluster => {
+                    (cluster_frontend_index, frontend.backend_ids.len(), 0)
+                }
+                unf_service::ServiceTrafficPolicy::Local => {
+                    let local_index = load_balancer_local_frontend_index(
+                        service,
+                        cluster_frontend_index as usize,
+                        &reachability.node.name,
+                    )
+                    .ok_or(LoadBalancerDataplaneError::MissingFrontendLink)?;
+                    let backend_count = frontend
+                        .backend_ids
+                        .iter()
+                        .filter(|backend_id| {
+                            service.backends.iter().any(|backend| {
+                                backend.id == **backend_id
+                                    && backend.ready
+                                    && !backend.terminating
+                                    && backend.node_name.as_deref()
+                                        == Some(reachability.node.name.as_str())
+                            })
+                        })
+                        .count();
+                    (
+                        local_index,
+                        backend_count,
+                        LOAD_BALANCER_FRONTEND_FLAG_LOCAL,
+                    )
+                }
             };
+            if !load_balancer.source_ranges.is_empty() {
+                flags |= LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES;
+            }
             let value = encode_load_balancer_frontend_value(
                 service.id,
                 frontend_index,
-                frontend.backend_ids.len(),
+                backend_count,
                 flags,
                 services.revision,
                 reachability.revision,
@@ -1427,6 +1500,8 @@ pub fn compile_load_balancer_dataplane(
     }
     validate_load_balancer_capacity("LOAD_BALANCER_FRONTENDS_V4", ipv4_frontends.len())?;
     validate_load_balancer_capacity("LOAD_BALANCER_FRONTENDS_V6", ipv6_frontends.len())?;
+    validate_load_balancer_capacity("LOAD_BALANCER_SOURCE_RANGES_V4", ipv4_source_ranges.len())?;
+    validate_load_balancer_capacity("LOAD_BALANCER_SOURCE_RANGES_V6", ipv6_source_ranges.len())?;
     let config = encode_load_balancer_config(
         services.source_epoch,
         services.revision,
@@ -1446,8 +1521,47 @@ pub fn compile_load_balancer_dataplane(
         bank,
         ipv4_frontends,
         ipv6_frontends,
+        ipv4_source_ranges,
+        ipv6_source_ranges,
         config,
     })
+}
+
+fn encode_ipv4_load_balancer_source_range_key(
+    service_id: ServiceId,
+    bank: u8,
+    address: [u8; 4],
+) -> [u8; 12] {
+    let mut key = [0_u8; 12];
+    key[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
+    key[4] = bank;
+    key[8..12].copy_from_slice(&address);
+    key
+}
+
+fn encode_ipv6_load_balancer_source_range_key(
+    service_id: ServiceId,
+    bank: u8,
+    address: [u8; 16],
+) -> [u8; 24] {
+    let mut key = [0_u8; 24];
+    key[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
+    key[4] = bank;
+    key[8..24].copy_from_slice(&address);
+    key
+}
+
+fn encode_load_balancer_source_range_value(
+    service_revision: Revision,
+    reachability_revision: Revision,
+    allocation_revision: Revision,
+) -> [u8; 32] {
+    let mut value = [0_u8; 32];
+    value[0..8].copy_from_slice(&service_revision.get().to_ne_bytes());
+    value[8..16].copy_from_slice(&reachability_revision.get().to_ne_bytes());
+    value[16..24].copy_from_slice(&allocation_revision.get().to_ne_bytes());
+    value[24..26].copy_from_slice(&LOAD_BALANCER_MAP_ABI_VERSION.to_ne_bytes());
+    value
 }
 
 fn encode_ipv4_load_balancer_key(
@@ -2041,8 +2155,11 @@ mod tests {
                     ip_families: vec![AddressFamily::Ipv4, AddressFamily::Ipv6],
                     ip_family_policy: unf_service::ServiceIpFamilyPolicy::RequireDualStack,
                     requested_ips: Vec::new(),
-                    traffic_policy: unf_service::ServiceTrafficPolicy::Cluster,
-                    source_ranges: Vec::new(),
+                    traffic_policy: unf_service::ServiceTrafficPolicy::Local,
+                    source_ranges: vec![
+                        "203.0.113.0/24".parse().unwrap(),
+                        "2001:db8::/64".parse().unwrap(),
+                    ],
                     allocate_node_ports: false,
                     health_check_node_port: None,
                     frontends: load_balancer_frontends,
@@ -2080,6 +2197,10 @@ mod tests {
         let state = compile_load_balancer_dataplane(&services, &reachability, 1, 0).unwrap();
         assert_eq!(state.ipv4_frontends.len(), 1);
         assert_eq!(state.ipv6_frontends.len(), 1);
+        assert_eq!(state.ipv4_source_ranges.len(), 1);
+        assert_eq!(state.ipv6_source_ranges.len(), 1);
+        assert_eq!(state.ipv4_source_ranges.keys().next().unwrap().0, 88);
+        assert_eq!(state.ipv6_source_ranges.keys().next().unwrap().0, 128);
         assert_eq!(state.config[42], 0);
         assert_eq!(state.config[43], 1);
         assert_eq!(
@@ -2089,6 +2210,10 @@ mod tests {
         let v4_value = state.ipv4_frontends.values().next().unwrap();
         assert_eq!(u32::from_ne_bytes(v4_value[0..4].try_into().unwrap()), 44);
         assert_eq!(v4_value[40], 1);
+        assert_eq!(
+            u16::from_ne_bytes(v4_value[14..16].try_into().unwrap()),
+            LOAD_BALANCER_FRONTEND_FLAG_LOCAL | LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES
+        );
 
         let mut wrong_epoch = reachability.clone();
         wrong_epoch.source_epoch = 8;

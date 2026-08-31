@@ -14,6 +14,7 @@ required_files=(
     docs/adr/0095-durable-loadbalancer-allocation-and-reachability.md
     docs/adr/0096-compatible-loadbalancer-host-state.md
     docs/adr/0097-enforce-loadbalancer-cluster-vips-in-tc.md
+    docs/adr/0098-enforce-loadbalancer-local-source-ranges-and-health.md
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -80,14 +81,20 @@ require_text docs/project-status.md \
     '| LoadBalancer `Cluster` dataplane | **Verified** |' \
     "the authoritative tracker must identify milestone 6.5 as verified"
 require_text docs/development/phase6-loadbalancer-plan.md \
-    '| 6.6 | `externalTrafficPolicy: Local`, source ranges, and health checks | **Planned** |' \
-    "milestone 6.6 must be the next packet-path slice"
+    '| 6.6 | `externalTrafficPolicy: Local`, source ranges, and health checks | **Verified** |' \
+    "milestone 6.6 must remain verified"
+require_text docs/project-status.md \
+    '| LoadBalancer `Local`, source ranges, and health | **Verified** |' \
+    "the authoritative tracker must identify milestone 6.6 as verified"
 require_text docs/adr/0093-separate-loadbalancer-ownership-domains.md \
     '**Status:** Accepted and implemented for the Phase 6.1 architecture boundary' \
     "ADR 0093 must record the implemented architecture boundary"
 require_text README.md \
     'make loadbalancer-cluster-dataplane-test' \
     "the README must bind LoadBalancer Cluster support to its regression gate"
+require_text README.md \
+    'make loadbalancer-local-dataplane-test' \
+    "the README must bind LoadBalancer Local support to its regression gate"
 require_text docs/development/phase6-loadbalancer-plan.md \
     '`allocateLoadBalancerNodePorts: false` is preserved.' \
     "direct VIP delivery must not depend on traffic NodePorts"

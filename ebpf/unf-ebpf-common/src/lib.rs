@@ -12,6 +12,7 @@ pub const SERVICE_EVENT_FRONTEND_CLUSTER_IP: u8 = 1;
 pub const SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER: u8 = 2;
 pub const SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL: u8 = 3;
 pub const SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER: u8 = 4;
+pub const SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL: u8 = 5;
 pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
@@ -24,7 +25,9 @@ pub const NODE_PORT_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const LOAD_BALANCER_MAP_ABI_VERSION: u16 = 1;
 pub const LOAD_BALANCER_BANK_COUNT: u8 = 2;
 pub const LOAD_BALANCER_FRONTEND_FLAG_LOCAL: u16 = 1;
+pub const LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES: u16 = 1 << 1;
 pub const NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG: u32 = 1 << 31;
+pub const LOAD_BALANCER_LOCAL_FRONTEND_INDEX_BASE: u32 = 3 << 30;
 pub const NODE_PORT_SNAT_PORT_BASE: u16 = 32_768;
 pub const NODE_PORT_SNAT_PORT_MASK: u32 = 32_767;
 pub const NODE_PORT_SNAT_PORT_PROBES: u32 = 16;
@@ -49,6 +52,7 @@ pub const SERVICE_EVENT_REASON_INVALID_BACKEND: u8 = 8;
 pub const SERVICE_EVENT_REASON_PAIR_INSERT_FAILED: u8 = 9;
 pub const SERVICE_EVENT_REASON_REWRITE_FAILED: u8 = 10;
 pub const SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT: u8 = 11;
+pub const SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED: u8 = 12;
 pub const POLICY_FLAG_HAS_POLICY: u16 = 1 << 0;
 pub const POLICY_FLAG_HAS_RULE: u16 = 1 << 1;
 pub const POLICY_FLAG_HAS_SHADOW: u16 = 1 << 2;
@@ -213,7 +217,10 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
         } else {
             state.reserved[0] == 0
                 && state.reserved[1] == 0
-                && state.reserved[2] == 0
+                && matches!(
+                    state.reserved[2],
+                    0 | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+                )
                 && state.reserved[3] == 0
         }
         && now_ns.saturating_sub(state.last_seen_ns) <= timeout_ns
@@ -236,6 +243,7 @@ pub const fn service_event_action_reason_is_valid(action: u8, reason: u8) -> boo
                 | SERVICE_EVENT_REASON_INVALID_BACKEND
                 | SERVICE_EVENT_REASON_PAIR_INSERT_FAILED
                 | SERVICE_EVENT_REASON_REWRITE_FAILED
+                | SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED
         ) | (
             SERVICE_EVENT_ACTION_EXPIRE,
             SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT
@@ -251,6 +259,7 @@ pub const fn service_event_frontend_kind_is_valid(kind: u8) -> bool {
             | SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER
             | SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL
             | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
+            | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
     )
 }
 
@@ -761,6 +770,38 @@ pub struct LoadBalancerFrontendValue {
     pub reserved: [u8; 7],
 }
 
+/// The first 64 bits are exact `LoadBalancer` dimensions; the final 32 bits are
+/// the external source address matched by an LPM trie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv4LoadBalancerSourceRangeData {
+    pub service_id: ServiceId,
+    pub bank: u8,
+    pub reserved: [u8; 3],
+    pub source_address: [u8; 4],
+}
+
+/// The first 64 bits are exact `LoadBalancer` dimensions; the final 128 bits are
+/// the external source address matched by an LPM trie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv6LoadBalancerSourceRangeData {
+    pub service_id: ServiceId,
+    pub bank: u8,
+    pub reserved: [u8; 3],
+    pub source_address: [u8; 16],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct LoadBalancerSourceRangeValue {
+    pub service_revision: u64,
+    pub reachability_revision: u64,
+    pub allocation_revision: u64,
+    pub schema_version: u16,
+    pub reserved: [u8; 6],
+}
+
 /// Atomic pointer for the complete local VIP frontend family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -870,6 +911,9 @@ const _: () = assert!(core::mem::size_of::<NodePortFrontendValue>() == 32);
 const _: () = assert!(core::mem::size_of::<Ipv4LoadBalancerFrontendKey>() == 8);
 const _: () = assert!(core::mem::size_of::<Ipv6LoadBalancerFrontendKey>() == 20);
 const _: () = assert!(core::mem::size_of::<LoadBalancerFrontendValue>() == 48);
+const _: () = assert!(core::mem::size_of::<Ipv4LoadBalancerSourceRangeData>() == 12);
+const _: () = assert!(core::mem::size_of::<Ipv6LoadBalancerSourceRangeData>() == 24);
+const _: () = assert!(core::mem::size_of::<LoadBalancerSourceRangeValue>() == 32);
 const _: () = assert!(core::mem::size_of::<LoadBalancerMapConfig>() == 48);
 const _: () = assert!(core::mem::size_of::<NodePortMapConfig>() == 40);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionKey>() == 40);
@@ -935,6 +979,9 @@ mod tests {
         assert_eq!(core::mem::size_of::<NodePortFrontendValue>(), 32);
         assert_eq!(core::mem::align_of::<NodePortMapConfig>(), 8);
         assert_eq!(core::mem::size_of::<NodePortMapConfig>(), 40);
+        assert_eq!(core::mem::size_of::<Ipv4LoadBalancerSourceRangeData>(), 12);
+        assert_eq!(core::mem::size_of::<Ipv6LoadBalancerSourceRangeData>(), 24);
+        assert_eq!(core::mem::size_of::<LoadBalancerSourceRangeValue>(), 32);
         assert_eq!(core::mem::align_of::<ServiceConnectionKey>(), 1);
         assert_eq!(core::mem::size_of::<ServiceConnectionKey>(), 40);
         assert_eq!(core::mem::align_of::<ServiceConnectionValue>(), 8);
@@ -1061,8 +1108,11 @@ mod tests {
         assert!(service_event_frontend_kind_is_valid(
             SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
         ));
+        assert!(service_event_frontend_kind_is_valid(
+            SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+        ));
         assert!(!service_event_frontend_kind_is_valid(0));
-        assert!(!service_event_frontend_kind_is_valid(5));
+        assert!(!service_event_frontend_kind_is_valid(6));
     }
 
     #[test]
@@ -1103,6 +1153,10 @@ mod tests {
         invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER;
         invalid.reserved[0..2].copy_from_slice(&32_768_u16.to_be_bytes());
         invalid.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER;
+        assert!(service_connection_is_active(&invalid, 11));
+        invalid = tcp;
+        invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL;
+        invalid.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL;
         assert!(service_connection_is_active(&invalid, 11));
     }
 

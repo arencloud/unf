@@ -479,8 +479,13 @@ matrix is maintained in the
   flow retention, backendless drop, ingress-policy ordering, and fresh-flow
   withdrawal. The verifier-loaded release object retains full NodePort and
   ClusterIP behavior under `make loadbalancer-cluster-dataplane-test`; ADR 0097.
-  Planned: `Local`, source ranges and `healthCheckNodePort`;
-  operations/simulation/recovery; independent kube-proxy-free Kind and
+- Verified `externalTrafficPolicy: Local`, source ranges, and health: exact
+  receiving-Node slots preserve client source, fail closed without a local
+  ready endpoint, enforce revision-bound dual-stack CIDRs, reconstruct runtime
+  tries from durable state, and serve placement-sensitive dual-stack
+  `healthCheckNodePort` 200/503 responses. The inherited Cluster, NodePort, and
+  ClusterIP regressions pass `make loadbalancer-local-dataplane-test`; ADR 0098.
+  Planned: operations/simulation/recovery; independent kube-proxy-free Kind and
   digest-pinned OpenShift gates.
 - Production BGP/cloud takeover, session affinity, internal traffic policy,
   topology-aware selection, Maglev, DSR, SCTP, Gateway API, multi-cluster, and

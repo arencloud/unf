@@ -31,17 +31,19 @@ use unf_ebpf_common::{
     SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_EVENT_ABI_VERSION,
     SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
     SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
-    SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER, SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL,
+    SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
+    SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL,
     SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT, SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
     SERVICE_EVENT_REASON_INVALID_BACKEND, SERVICE_EVENT_REASON_INVALID_FRONTEND,
     SERVICE_EVENT_REASON_INVALID_SLOT, SERVICE_EVENT_REASON_MISSING_BACKEND,
     SERVICE_EVENT_REASON_MISSING_SLOT, SERVICE_EVENT_REASON_NO_BACKEND,
     SERVICE_EVENT_REASON_PAIR_INSERT_FAILED, SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
-    SERVICE_EVENT_REASON_REWRITE_FAILED, SERVICE_MAP_ABI_VERSION, ServiceBackendKey,
-    ServiceBackendSlotKey, ServiceBackendSlotValue, ServiceConnectionKey, ServiceConnectionValue,
-    ServiceEvent, ServiceFrontendValue, ServiceMapConfig, connection_is_active,
-    ipv6_extension_step, packet_starts_connection, service_backend_is_eligible,
-    node_port_snat_candidate, service_connection_is_active, service_flow_hash,
+    SERVICE_EVENT_REASON_REWRITE_FAILED, SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED,
+    SERVICE_MAP_ABI_VERSION, ServiceBackendKey, ServiceBackendSlotKey, ServiceBackendSlotValue,
+    ServiceConnectionKey, ServiceConnectionValue, ServiceEvent, ServiceFrontendValue,
+    ServiceMapConfig, connection_is_active, ipv6_extension_step, node_port_snat_candidate,
+    packet_starts_connection, service_backend_is_eligible, service_connection_is_active,
+    service_flow_hash,
 };
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -198,6 +200,18 @@ static LOAD_BALANCER_FRONTENDS_V6: HashMap<
     Ipv6LoadBalancerFrontendKey,
     LoadBalancerFrontendValue,
 > = HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static LOAD_BALANCER_SOURCE_RANGES_V4: LpmTrie<
+    unf_ebpf_common::Ipv4LoadBalancerSourceRangeData,
+    unf_ebpf_common::LoadBalancerSourceRangeValue,
+> = LpmTrie::with_max_entries(SERVICE_FRONTEND_CAPACITY, 0);
+
+#[map]
+static LOAD_BALANCER_SOURCE_RANGES_V6: LpmTrie<
+    unf_ebpf_common::Ipv6LoadBalancerSourceRangeData,
+    unf_ebpf_common::LoadBalancerSourceRangeValue,
+> = LpmTrie::with_max_entries(SERVICE_FRONTEND_CAPACITY, 0);
 
 #[map]
 static LOAD_BALANCER_CONFIG: Array<LoadBalancerMapConfig> = Array::with_max_entries(1, 0);
@@ -950,7 +964,10 @@ fn validate_load_balancer_frontend(
         || frontend.service_id.get() == 0
         || frontend.service_bank != config.service_bank
         || frontend.service_bank != service.active_bank
-        || frontend.flags != 0
+        || frontend.flags
+            & !(unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL
+                | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES)
+            != 0
         || frontend.reserved != [0; 7]
     {
         emit_service_lookup_failure(
@@ -974,6 +991,66 @@ fn validate_load_balancer_frontend(
         revision: frontend.service_revision,
         reserved: [0; 8],
     })
+}
+
+#[inline(always)]
+fn load_balancer_source_allowed_v4(
+    forward_key: &ServiceConnectionKey,
+    frontend: LoadBalancerFrontendValue,
+    config: LoadBalancerMapConfig,
+) -> bool {
+    let data = unf_ebpf_common::Ipv4LoadBalancerSourceRangeData {
+        service_id: frontend.service_id,
+        bank: config.active_bank,
+        reserved: [0; 3],
+        source_address: [
+            forward_key.source_address[0],
+            forward_key.source_address[1],
+            forward_key.source_address[2],
+            forward_key.source_address[3],
+        ],
+    };
+    let key = LpmKey::new(96, data);
+    let Some(value) = LOAD_BALANCER_SOURCE_RANGES_V4.get(&key).copied() else {
+        return false;
+    };
+    value.schema_version == unf_ebpf_common::LOAD_BALANCER_MAP_ABI_VERSION
+        && value.service_revision == config.service_revision
+        && value.reachability_revision == config.reachability_revision
+        && value.allocation_revision == config.allocation_revision
+        && value.reserved == [0; 6]
+}
+
+#[inline(always)]
+fn load_balancer_source_allowed_v6(
+    forward_key: &ServiceConnectionKey,
+    frontend: LoadBalancerFrontendValue,
+    config: LoadBalancerMapConfig,
+) -> bool {
+    let data = unf_ebpf_common::Ipv6LoadBalancerSourceRangeData {
+        service_id: frontend.service_id,
+        bank: config.active_bank,
+        reserved: [0; 3],
+        source_address: forward_key.source_address,
+    };
+    let key = LpmKey::new(192, data);
+    let Some(value) = LOAD_BALANCER_SOURCE_RANGES_V6.get(&key).copied() else {
+        return false;
+    };
+    value.schema_version == unf_ebpf_common::LOAD_BALANCER_MAP_ABI_VERSION
+        && value.service_revision == config.service_revision
+        && value.reachability_revision == config.reachability_revision
+        && value.allocation_revision == config.allocation_revision
+        && value.reserved == [0; 6]
+}
+
+#[inline(always)]
+const fn load_balancer_event_frontend_kind(flags: u16) -> u8 {
+    if flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL != 0 {
+        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+    } else {
+        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
+    }
 }
 
 #[inline(always)]
@@ -1038,7 +1115,9 @@ const fn node_port_event_frontend_kind(flags: u16) -> u8 {
 
 #[inline(always)]
 const fn connection_event_frontend_kind(value: &ServiceConnectionValue) -> u8 {
-    if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL != 0 {
+    if value.reserved[2] == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL {
+        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+    } else if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL != 0 {
         SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL
     } else if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
         if value.reserved[2] == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER {
@@ -1294,10 +1373,14 @@ fn new_service_connection(
     now_ns: u64,
 ) -> Option<ServiceTranslation> {
     value.last_seen_ns = now_ns;
+    if matches!(
+        frontend_kind,
+        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
+            | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+    ) {
+        value.reserved[2] = frontend_kind;
+    }
     if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
-        if frontend_kind == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER {
-            value.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER;
-        }
         let hash = service_flow_hash(&service_forward_key(value), value.service_id);
         let mut probe = 0_u32;
         while probe < NODE_PORT_SNAT_PORT_PROBES {
@@ -1353,11 +1436,28 @@ fn lookup_load_balancer_frontend_v4(
     else {
         return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_DROP);
     };
+    let frontend_kind = load_balancer_event_frontend_kind(value.flags);
+    if value.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES != 0
+        && !load_balancer_source_allowed_v4(forward_key, value, config)
+    {
+        emit_service_lookup_failure(
+            forward_key,
+            value.service_id,
+            value.service_revision,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED, frontend_kind),
+            now_ns,
+        );
+        return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_DROP);
+    }
     ServiceFrontendSelection {
         frontend,
         service_bank: value.service_bank,
-        frontend_kind: SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
-        connection_flags: SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER,
+        frontend_kind,
+        connection_flags: if value.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL != 0 {
+            SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
+        } else {
+            SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
+        },
     }
 }
 
@@ -1387,11 +1487,28 @@ fn lookup_load_balancer_frontend_v6(
     else {
         return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_DROP);
     };
+    let frontend_kind = load_balancer_event_frontend_kind(value.flags);
+    if value.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES != 0
+        && !load_balancer_source_allowed_v6(forward_key, value, config)
+    {
+        emit_service_lookup_failure(
+            forward_key,
+            value.service_id,
+            value.service_revision,
+            service_event_failure_metadata(SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED, frontend_kind),
+            now_ns,
+        );
+        return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_DROP);
+    }
     ServiceFrontendSelection {
         frontend,
         service_bank: value.service_bank,
-        frontend_kind: SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
-        connection_flags: SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER,
+        frontend_kind,
+        connection_flags: if value.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL != 0 {
+            SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
+        } else {
+            SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
+        },
     }
 }
 

@@ -21,7 +21,7 @@ evidence and are not reinterpreted by this plan.
 | 6.3 | Address allocation and reachability-provider contract | **Verified** | `unf-loadbalancer` provides durable conflict-safe dual-stack leases, exact pool/provider/owner provenance, explicit-class Service translation, separately revisioned complete direct-Node reachability intent/acknowledgement, fail-closed finalizer/status ordering, exact withdrawal/replay/recovery, and foreign-state preservation; `make loadbalancer-control-plane-test`; ADR 0095 |
 | 6.4 | Compatible distribution and transactional host state | **Verified** | Explicit schema negotiation; durable epoch-fenced allocation production; exact finalizer-safe withdrawal; Pod-bound per-Node projection; capability-aware convergence; private last-known-good checkpoints; persistent ABI v6's exact 24-map boundary; independent inactive-bank staging/readback/activation, rollback, crash repair, restart recovery, and v4/v5/v6 cleanup; `make loadbalancer-host-state-test`; ADR 0096 |
 | 6.5 | `externalTrafficPolicy: Cluster` LoadBalancer dataplane | **Verified** | Exact coherent IPv4/IPv6 TCP/UDP VIP lookup; bounded collision-safe VIP source translation and paired reverse restoration; connection persistence through backend churn; backendless drop; policy and withdrawal ordering; bounded event provenance; verifier-loaded release execution plus ClusterIP/NodePort regression under `make loadbalancer-cluster-dataplane-test`; ADR 0097 |
-| 6.6 | `externalTrafficPolicy: Local`, source ranges, and health checks | **Planned** | Ready non-terminating local selection, client-source preservation, no-local-backend behavior, IPv4/IPv6 source-range enforcement, exact `healthCheckNodePort` semantics, placement/readiness recovery, and Cluster regression |
+| 6.6 | `externalTrafficPolicy: Local`, source ranges, and health checks | **Verified** | Receiving-Node-only ready/non-terminating selection, client-source preservation and reverse restoration, no-local-backend drop, transactional IPv4/IPv6 source-range LPM enforcement and restart reconstruction, exact dual-stack `healthCheckNodePort` 200/503 lifecycle, placement/readiness recovery, bounded provenance, and inherited Cluster/NodePort/ClusterIP regression under `make loadbalancer-local-dataplane-test`; ADR 0098 |
 | 6.7 | Operations, simulation, upgrade, and recovery | **Planned** | Fixed-cardinality metrics and events; status, history, explanation, allocation/advertisement provenance, read-only simulation, controller outage, agent/provider replacement, adjacent rollback, and actionable failures |
 | 6.8 | Kube-proxy-free Kind qualification | **Planned** | Disposable dual-stack external-client fixture; VIP reachability, host-origin and external TCP/UDP, Cluster/Local/source-range/health lifecycle, outage recovery, exact cleanup and rollback, immutable evidence |
 | 6.9 | OpenShift qualification | **Planned** | Digest-pinned five-Node dual-stack cl02 gate for RHCOS/SELinux/CRI-O, cross-worker VIP traffic, provider recovery, health/status convergence, exact cleanup, and no new unhealthy ClusterOperator |
@@ -77,9 +77,9 @@ Those capabilities require independent implementations and qualification gates.
 
 ## Immediate next slice
 
-Milestone 6.6 extends the verified `Cluster` path with
-`externalTrafficPolicy: Local`, exact IPv4/IPv6 `loadBalancerSourceRanges`, and
-`healthCheckNodePort`. It must prove receiving-Node-local backend selection,
-client-source preservation, no-local-backend behavior, source-range policy,
-health readiness, placement/readiness recovery, and unchanged Cluster behavior
-before operations and platform qualification can enable status publication.
+Milestone 6.7 adds bounded operations, simulation, upgrade, and recovery around
+the verified Cluster and Local packet paths. It must expose fixed-cardinality
+metrics and events, status/history/explanation, allocation and advertisement
+provenance, exact read-only simulation, controller/provider/agent replacement,
+adjacent rollback, and actionable failures before platform qualification can
+enable Kubernetes status publication.

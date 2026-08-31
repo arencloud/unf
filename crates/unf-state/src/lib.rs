@@ -235,6 +235,7 @@ pub enum ServiceFrontendKind {
     NodePortCluster,
     NodePortLocal,
     LoadBalancerCluster,
+    LoadBalancerLocal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
