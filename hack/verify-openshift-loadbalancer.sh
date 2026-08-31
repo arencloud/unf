@@ -328,6 +328,15 @@ external_source_probe() {
     if [[ ${family} == 6 ]]; then ip -6 route get "${observed}" | awk 'NR == 1 {print $1}'; else printf '%s\n' "${observed}"; fi
 }
 
+assert_external_source() {
+    local family=$1 address=$2 expected=$3 description=$4 observed
+    observed=$(external_source_probe "${family}" "${address}")
+    if [[ ${observed} != "${expected}" ]]; then
+        echo "${description} IPv${family} source mismatch: expected ${expected}, observed ${observed}" >&2
+        return 1
+    fi
+}
+
 expect_external_blocked() {
     local address_v4=$1 address_v6=$2 succeeded=false
     external_tcp_probe 4 "${address_v4}" >/dev/null 2>&1 && succeeded=true
@@ -560,12 +569,12 @@ wait_for_external_tcp 4 "${local_v4}"
 wait_for_external_tcp 6 "${local_v6}"
 wait_for_external_udp 4 "${local_v4}"
 wait_for_external_udp 6 "${local_v6}"
-[[ $(external_source_probe 4 "${cluster_v4}") == "${server_node_v4}" ]]
-[[ $(external_source_probe 6 "${cluster_v6}") == "${server_node_v6}" ]]
-[[ $(external_source_probe 4 "${peer_cluster_v4}") == "${client_node_v4}" ]]
-[[ $(external_source_probe 6 "${peer_cluster_v6}") == "${client_node_v6}" ]]
-[[ $(external_source_probe 4 "${local_v4}") == "${allowed_v4}" ]]
-[[ $(external_source_probe 6 "${local_v6}") == "${allowed_v6}" ]]
+assert_external_source 4 "${cluster_v4}" "${server_node_v4}" Cluster
+assert_external_source 6 "${cluster_v6}" "${server_node_v6}" Cluster
+assert_external_source 4 "${peer_cluster_v4}" "${client_node_v4}" peer-Cluster
+assert_external_source 6 "${peer_cluster_v6}" "${client_node_v6}" peer-Cluster
+assert_external_source 4 "${local_v4}" "${allowed_v4}" Local
+assert_external_source 6 "${local_v6}" "${allowed_v6}" Local
 [[ $(health_status 4 "${server_node_v4}") == 200 ]]
 [[ $(health_status 6 "${server_node_v6}") == 200 ]]
 [[ $(health_status 4 "${client_node_v4}") == 503 ]]
