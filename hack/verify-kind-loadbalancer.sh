@@ -260,10 +260,17 @@ external_udp_probe() {
 }
 
 external_source_probe() {
-    local container=$1 family=$2 address=$3 target
+    local container=$1 family=$2 address=$3 target observed
     if [[ ${family} == 4 ]]; then target="TCP4:${address}:8081"; else target="TCP6:[${address}]:8081"; fi
-    sudo "${container_runtime}" exec "${container}" sh -ec \
-        "printf probe | socat -T 4 - '${target}'" | tr -d '\r\n'
+    observed=$(sudo "${container_runtime}" exec "${container}" sh -ec \
+        "printf probe | socat -T 4 - '${target}'" | tr -d '\r\n')
+    if [[ ${family} == 6 ]]; then
+        observed=${observed#\[}
+        observed=${observed%\]}
+        ip -6 route get "${observed}" | awk 'NR == 1 {print $1}'
+    else
+        printf '%s\n' "${observed}"
+    fi
 }
 
 expect_external_blocked() {
@@ -834,7 +841,7 @@ qualification_stage=exact-platform-rollback
 KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" KIND_PROVIDER="${container_runtime}" \
     "${project_root}/hack/rollback-kind-primary-cni.sh"
 jq '.verified += [
-    "scoped ABI-v6 LoadBalancer and shared BPF cleanup",
+    "scoped ABI-v7 LoadBalancer and shared BPF cleanup",
     "exact remote-route deletion",
     "fingerprinted CNI artifact removal",
     "CoreDNS bootstrap restoration",
