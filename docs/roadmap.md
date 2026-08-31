@@ -490,7 +490,11 @@ matrix is maintained in the
   allocation/provider/reachability explanation, source-aware read-only VIP
   simulation, durable provider replay, agent reconstruction, and adjacent
   compatibility pass `make loadbalancer-operations-test`; ADR 0099.
-  Planned: independent kube-proxy-free Kind and digest-pinned OpenShift gates.
+- Verified kube-proxy-free Kind qualification: runtime `dd11ae3` and qualifier
+  `793273f` passed the 285-second three-Node Kubernetes v1.35.0 dual-stack
+  external-client matrix, controller/provider/agent recovery, exact ABI-v7/CNI
+  cleanup, and no-CNI rollback; `make loadbalancer-kind-test`; ADR 0100.
+  Planned: independent digest-pinned OpenShift qualification.
 - Production BGP/cloud takeover, session affinity, internal traffic policy,
   topology-aware selection, Maglev, DSR, SCTP, Gateway API, multi-cluster, and
   production availability/scale remain independent future gates.

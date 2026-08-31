@@ -250,7 +250,7 @@ transactions. Status may publish a VIP only after the admitted provider and
 dataplane converge, direct delivery cannot depend on a traffic NodePort, and
 foreign controller/network state must survive reconciliation. The
 [Phase 6 LoadBalancer plan](docs/development/phase6-loadbalancer-plan.md) and
-ADRs 0093–0099 define the ordered schema, provider, dataplane, operations,
+ADRs 0093–0100 define the ordered schema, provider, dataplane, operations,
 Kind, and OpenShift gates. Milestone 6.2 is verified: schema v3 carries exact
 dual-stack class/family/policy/source-range/requested-VIP intent, projects safe
 v2/v1 views, retains last-valid Kubernetes compilation, and makes existing
@@ -274,13 +274,18 @@ external client tuples, exact dual-stack source CIDRs fail closed, runtime
 source-range state reconstructs before attachment, and dual-stack
 `healthCheckNodePort` listeners follow local placement with HTTP 200/503. The
 release verifier and every Cluster/NodePort/ClusterIP regression pass
-`make loadbalancer-local-dataplane-test`. Kubernetes status publication remains
-Milestone 6.7 is verified: fixed-cardinality metrics and validated status,
+`make loadbalancer-local-dataplane-test`. Milestone 6.7 is verified:
+fixed-cardinality metrics and validated status,
 durable Cluster/Local history, lease/provider/reachability-aware explanation,
 source-aware read-only VIP simulation, exact recovery, and adjacent additive
 compatibility pass `make loadbalancer-operations-test`. Kubernetes status
-publication remains gated by platform qualification; 6.8 kube-proxy-free
-dual-stack Kind qualification is next.
+publication remains gated by platform qualification. Milestone 6.8 is verified:
+runtime `dd11ae3` and qualifier `793273f` passed the 285-second three-Node
+Kubernetes v1.35.0 dual-stack gate with kube-proxy absent. External and
+host-origin IPv4/IPv6 TCP/UDP Cluster/Local paths, source ranges, health,
+lifecycle, controller/provider/agent recovery, exact ABI-v7/CNI cleanup, and
+no-CNI rollback pass `make loadbalancer-kind-test`; ADR 0100 records the
+non-transitive evidence. Digest-pinned OpenShift qualification is next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
