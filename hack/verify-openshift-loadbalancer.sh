@@ -277,6 +277,16 @@ external_tcp_probe() {
     curl "-${family}" --fail --silent --connect-timeout 5 --max-time 10 "${target}" | grep -qx ok
 }
 
+wait_for_external_tcp() {
+    local family=$1 address=$2
+    for _ in $(seq 1 30); do
+        if external_tcp_probe "${family}" "${address}" >/dev/null 2>&1; then return 0; fi
+        sleep 1
+    done
+    echo "external IPv${family} VIP ${address} did not become reachable after advertisement" >&2
+    return 1
+}
+
 external_udp_probe() {
     local family=$1 address=$2 target
     if [[ ${family} == 4 ]]; then target="UDP4:${address}:5353"; else target="UDP6:[${address}]:5353"; fi
@@ -475,14 +485,14 @@ done
 stage=external-cluster-and-local-traffic
 for worker in "${workers[@]}"; do
     advertise_vips "${worker}"
-    external_tcp_probe 4 "${cluster_v4}"
-    external_tcp_probe 6 "${cluster_v6}"
+    wait_for_external_tcp 4 "${cluster_v4}"
+    wait_for_external_tcp 6 "${cluster_v6}"
     external_udp_probe 4 "${cluster_v4}"
     external_udp_probe 6 "${cluster_v6}"
 done
 advertise_vips "${server_node}"
-external_tcp_probe 4 "${local_v4}"
-external_tcp_probe 6 "${local_v6}"
+wait_for_external_tcp 4 "${local_v4}"
+wait_for_external_tcp 6 "${local_v6}"
 external_udp_probe 4 "${local_v4}"
 external_udp_probe 6 "${local_v6}"
 [[ $(external_source_probe 4 "${cluster_v4}") == "${server_node_v4}" ]]
@@ -505,8 +515,8 @@ expect_external_blocked "${local_v4}" "${local_v6}"
 "${kc[@]}" -n "${namespace}" patch service server-local --type=merge -p \
     "{\"spec\":{\"loadBalancerSourceRanges\":[\"${allowed_v4}/32\",\"${allowed_v6}/128\"]}}" >/dev/null
 wait_for_convergence >/dev/null
-external_tcp_probe 4 "${local_v4}"
-external_tcp_probe 6 "${local_v6}"
+wait_for_external_tcp 4 "${local_v4}"
+wait_for_external_tcp 6 "${local_v6}"
 
 stage=operations-and-simulation
 history=
@@ -568,8 +578,8 @@ expect_external_blocked "${local_v4}" "${local_v6}"
 "${kc[@]}" -n "${namespace}" exec server -- rm -f /tmp/unready
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/server --timeout=90s >/dev/null
 wait_for_convergence >/dev/null
-external_tcp_probe 4 "${cluster_v4}"
-external_tcp_probe 6 "${local_v6}"
+wait_for_external_tcp 4 "${cluster_v4}"
+wait_for_external_tcp 6 "${local_v6}"
 [[ $(health_status 4 "${server_node_v4}") == 200 ]]
 
 stage=controller-provider-and-agent-recovery
@@ -635,7 +645,7 @@ allocation_after=$(jq -er .allocation.revision <<<"${durable_after}")
 reachability_after=$(jq -er .reachabilityRevision <<<"${durable_after}")
 (( allocation_after >= allocation_before && reachability_after >= reachability_before ))
 [[ $(lease_address "${durable_after}" server-cluster 4) == "${cluster_v4}" ]]
-external_tcp_probe 4 "${cluster_v4}"
+wait_for_external_tcp 4 "${cluster_v4}"
 external_udp_probe 6 "${local_v6}"
 
 stage=exact-fixture-cleanup
