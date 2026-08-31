@@ -320,6 +320,16 @@ wait_for_external_udp() {
     return 1
 }
 
+probe_external_udp_bounded() {
+    local family=$1 address=$2
+    for _ in 1 2 3; do
+        if external_udp_probe "${family}" "${address}"; then return 0; fi
+        sleep 0.2
+    done
+    echo "external IPv${family} UDP VIP ${address} lost three consecutive recovery probes" >&2
+    return 1
+}
+
 external_source_probe() {
     local family=$1 address=$2 target observed
     if [[ ${family} == 4 ]]; then target="TCP4:${address}:8081"; else target="TCP6:[${address}]:8081"; fi
@@ -690,7 +700,7 @@ for replacement_node in "${client_node}" "${server_node}"; do
     (
         for _ in $(seq 1 120); do
             external_tcp_probe 4 "${recovery_cluster_v4}"
-            external_udp_probe 6 "${recovery_udp_v6}"
+            probe_external_udp_bounded 6 "${recovery_udp_v6}"
             sleep 1
         done
     ) >"${probe_log}" 2>&1 &
