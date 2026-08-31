@@ -332,8 +332,8 @@ spec:
       command: [sh, -ec]
       args:
         - |
-          socat UDP4-RECVFROM:5353,reuseaddr,fork EXEC:/bin/cat &
-          socat UDP6-RECVFROM:5353,reuseaddr,fork,ipv6-v6only=1 EXEC:/bin/cat &
+          /usr/local/bin/unf-udp-echo 4 5353 &
+          /usr/local/bin/unf-udp-echo 6 5353 &
           socat TCP4-LISTEN:8081,reuseaddr,fork 'SYSTEM:echo \$SOCAT_PEERADDR' &
           socat TCP6-LISTEN:8081,reuseaddr,fork,ipv6-v6only=1 'SYSTEM:echo \$SOCAT_PEERADDR' &
           exec /usr/local/bin/unf-flow-receiver 8080
