@@ -11,6 +11,7 @@ unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 namespace=unf-loadbalancer-qualification
 allowed_client=unf-loadbalancer-allowed-client
 denied_client=unf-loadbalancer-denied-client
+map_audit_label=qualification.unf.io/loadbalancer-map-audit
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
 temporary_dir=$(mktemp -d)
 forward_pid=
@@ -38,6 +39,8 @@ cleanup() {
         "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 \
             >/dev/null 2>&1 || true
     fi
+    "${kc[@]}" -n unf-system delete pod -l "${map_audit_label}=true" \
+        --ignore-not-found --wait=false >/dev/null 2>&1 || true
     remove_external_clients
     rm -rf "${temporary_dir}"
 }
@@ -767,15 +770,55 @@ done
 jq -e '(.allocation.leases | length) == 0' <<<"${cleanup_state}" >/dev/null
 for node in "${nodes[@]}"; do
     sudo "${container_runtime}" exec "${node}" sh -ec '
-        for map in LOAD_BALANCER_FRONTENDS_V4 LOAD_BALANCER_FRONTENDS_V6; do
-            test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v7/$map | jq length)" -eq 0
-        done
         test ! -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V4
         test ! -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V6
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
         test -f "$state" && jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and (.applied.targets | length) == 0" "$state" >/dev/null
     '
+    audit_pod="loadbalancer-map-audit-${node##*-}"
+    "${kc[@]}" -n unf-system apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${audit_pod}
+  labels:
+    ${map_audit_label}: "true"
+spec:
+  nodeName: ${node}
+  hostNetwork: true
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: audit
+      image: localhost/unf-test-tools:ipv6-ext-v1
+      imagePullPolicy: Never
+      command: [sh, -ec]
+      args:
+        - |
+          for map in LOAD_BALANCER_FRONTENDS_V4 LOAD_BALANCER_FRONTENDS_V6; do
+            test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v7/\$map | jq length)" -eq 0
+          done
+          echo loadbalancer-maps-empty
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: bpffs
+          mountPath: /sys/fs/bpf
+          readOnly: true
+  volumes:
+    - name: bpffs
+      hostPath:
+        path: /sys/fs/bpf
+        type: Directory
+EOF
+    "${kc[@]}" -n unf-system wait --for=jsonpath='{.status.phase}'=Succeeded \
+        "pod/${audit_pod}" --timeout=90s >/dev/null
+    grep -qx loadbalancer-maps-empty < <("${kc[@]}" -n unf-system logs "${audit_pod}")
 done
+"${kc[@]}" -n unf-system delete pod -l "${map_audit_label}=true" \
+    --wait=true --timeout=90s >/dev/null
 remove_external_clients
 for external_client in "${allowed_client}" "${denied_client}"; do
     ! sudo "${container_runtime}" container exists "${external_client}"
