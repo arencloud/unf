@@ -10,6 +10,8 @@ required_files=(
     docs/architecture/components.md
     docs/development/phase6-loadbalancer-plan.md
     docs/adr/0093-separate-loadbalancer-ownership-domains.md
+    docs/adr/0094-model-loadbalancer-intent-in-service-schema-v3.md
+    docs/adr/0095-durable-loadbalancer-allocation-and-reachability.md
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -58,11 +60,17 @@ require_text docs/project-status.md \
     '| LoadBalancer domain and Kubernetes compiler | **Verified** |' \
     "the authoritative tracker must identify milestone 6.2 as verified"
 require_text docs/development/phase6-loadbalancer-plan.md \
-    '| 6.3 | Address allocation and reachability-provider contract | **In progress** |' \
-    "milestone 6.3 must be the active implementation slice"
+    '| 6.3 | Address allocation and reachability-provider contract | **Verified** |' \
+    "milestone 6.3 must remain verified"
 require_text docs/project-status.md \
-    '| Address allocation and reachability-provider contract | **In progress** |' \
-    "the authoritative tracker must identify milestone 6.3 as active"
+    '| Address allocation and reachability-provider contract | **Verified** |' \
+    "the authoritative tracker must identify milestone 6.3 as verified"
+require_text docs/development/phase6-loadbalancer-plan.md \
+    '| 6.4 | Compatible distribution and transactional host state | **In progress** |' \
+    "milestone 6.4 must be the active implementation slice"
+require_text docs/project-status.md \
+    '| Compatible distribution and transactional host state | **In progress** |' \
+    "the authoritative tracker must identify milestone 6.4 as active"
 require_text docs/adr/0093-separate-loadbalancer-ownership-domains.md \
     '**Status:** Accepted and implemented for the Phase 6.1 architecture boundary' \
     "ADR 0093 must record the implemented architecture boundary"
@@ -90,4 +98,4 @@ for excluded_capability in \
         "the ${excluded_capability} exclusion must remain visible"
 done
 
-echo "Phase 6.1 LoadBalancer boundary passed: explicit ownership, three-domain convergence, compatibility path, milestone state, and exclusions agree"
+echo "Phase 6 LoadBalancer boundary passed: explicit ownership, three-domain convergence, compatibility path, milestone state, and exclusions agree"

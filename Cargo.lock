@@ -3001,6 +3001,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "unf-loadbalancer"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "unf-common",
+ "unf-service",
+]
+
+[[package]]
 name = "unf-policy"
 version = "0.1.0"
 dependencies = [

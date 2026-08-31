@@ -18,8 +18,8 @@ evidence and are not reinterpreted by this plan.
 |---|---|---|---|
 | 6.1 | Architecture, ownership, and acceptance boundary | **Verified** | ADR 0093 fixes explicit class ownership, distinct VIP intent, independent allocation/advertisement/translation revisions, fail-closed status publication, the ordered compatibility path, platform gates, and bounded exclusions; `make loadbalancer-boundary-test` prevents drift across the plan, ADR, trackers, README, and component boundary |
 | 6.2 | LoadBalancer domain and Kubernetes compiler | **Verified** | Service snapshot schema v3 carries typed dual-stack family/frontends, requested VIPs, exact Service-port/backend linkage, class/policy/source-range/NodePort-allocation semantics, deterministic validation and collision rejection; the controller preserves foreign/classless ownership and last-valid state; exact v2/v1 projections and fail-closed lowerers prevent false convergence; `make loadbalancer-ir-test`; ADR 0094 |
-| 6.3 | Address allocation and reachability-provider contract | **In progress** | Durable conflict-safe dual-stack allocation; explicit pool/provider ownership; finalizer and status transaction; revisioned advertisement intent/acknowledgement; first bounded qualification provider; withdrawal, replay, and foreign-state preservation tests |
-| 6.4 | Compatible distribution and transactional host state | **Planned** | Old/new controller-agent negotiation; rollback-safe projection; capability-aware convergence; authenticated provider state; inactive-bank staging/readback; crash repair, restart recovery, and exact cleanup without disturbing verified ClusterIP/NodePort state |
+| 6.3 | Address allocation and reachability-provider contract | **Verified** | `unf-loadbalancer` provides durable conflict-safe dual-stack leases, exact pool/provider/owner provenance, explicit-class Service translation, separately revisioned complete direct-Node reachability intent/acknowledgement, fail-closed finalizer/status ordering, exact withdrawal/replay/recovery, and foreign-state preservation; `make loadbalancer-control-plane-test`; ADR 0095 |
+| 6.4 | Compatible distribution and transactional host state | **In progress** | Next: old/new controller-agent negotiation; rollback-safe projection; capability-aware convergence; authenticated provider state; inactive-bank staging/readback; crash repair, restart recovery, and exact cleanup without disturbing verified ClusterIP/NodePort state |
 | 6.5 | `externalTrafficPolicy: Cluster` LoadBalancer dataplane | **Planned** | Exact IPv4/IPv6 TCP/UDP VIP lookup; bounded Node SNAT where required; paired reverse restoration; connection persistence; lifecycle and policy ordering; verifier-loaded packet execution |
 | 6.6 | `externalTrafficPolicy: Local`, source ranges, and health checks | **Planned** | Ready non-terminating local selection, client-source preservation, no-local-backend behavior, IPv4/IPv6 source-range enforcement, exact `healthCheckNodePort` semantics, placement/readiness recovery, and Cluster regression |
 | 6.7 | Operations, simulation, upgrade, and recovery | **Planned** | Fixed-cardinality metrics and events; status, history, explanation, allocation/advertisement provenance, read-only simulation, controller outage, agent/provider replacement, adjacent rollback, and actionable failures |
@@ -77,8 +77,8 @@ Those capabilities require independent implementations and qualification gates.
 
 ## Immediate next slice
 
-Milestone 6.3 introduces durable allocation and a provider-neutral reachability
-contract around the verified schema-v3 intent. Allocation leases, provider
-intent/acknowledgements, finalizer/status ordering, replay, withdrawal, and
-foreign-state preservation must be independently revisioned and tested before
-any host map or packet path is added.
+Milestone 6.4 now distributes the verified allocation and complete direct-Node
+reachability contract through the authenticated controller-agent channel. It
+must negotiate old/new peers, persist last-known-good state, stage and read back
+inactive owner-only host state, atomically activate it, and prove crash repair,
+restart recovery, and exact withdrawal without changing ClusterIP or NodePort.

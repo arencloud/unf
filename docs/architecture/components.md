@@ -15,6 +15,7 @@
 | `unf-controller` | Watches, EndpointSlice-aware desired-state/topology reconciliation, retained-last-valid service compilation, TokenReview-scoped local Node-address intent, authenticated snapshot distribution, explicit Node block and complete remote-route distribution, bounded durable agent-report and flow-history checkpointing, non-blocking external HTTP flow handoff, time-window flow queries, explanation, and read-only simulation orchestration | Packet parsing |
 | `unf-agent` | Capability detection, Aya lifecycle, events, non-blocking telemetry export, authenticated transactional service/NodePort-map and durable node-block adoption, exact service/NodePort/identity/policy recovery, remote-route reconciliation, and opt-in root-authenticated local CNI transaction service | Kubernetes policy semantics or CNI namespace mutation |
 | `unf-cni` | Bounded CNI protocol/socket handling and atomic durable-IPAM plus link/route ADD/CHECK/DEL orchestration | Kubernetes access, policy compilation, durable IPAM storage, routing protocols, or telemetry aggregation |
+| `unf-loadbalancer` | Deterministic dual-stack VIP allocation, exact pool/provider ownership, complete revisioned direct-Node reachability intent/acknowledgement, and fail-closed Kubernetes publication/withdrawal transactions | Kubernetes API calls, host-state mutation, routing protocols, or packet translation |
 | `unfctl` | Operator-facing status, topology, flow history, explanation, and simulation | Fabric state ownership |
 | `unf-ebpf-tc` | Bounded packet parsing, active-bank L3/L4 decisions, telemetry, source-side and host-origin dual-stack TCP/UDP ClusterIP translation, and `Cluster`/`Local` NodePort translation with paired persistent connection state | Selectors, enrichment strings, LoadBalancer translation, host-origin NodePort translation, or L7 processing |
 
@@ -26,11 +27,13 @@ The accepted Phase 6 extension keeps LoadBalancer ownership split across
 components. `unf-service` now owns bounded provider-neutral schema-v3 VIP
 intent, and `unf-controller` owns explicit-class Kubernetes admission plus
 retained-last-valid compilation. Existing service lowerers reject that intent.
-The controller's allocation/status/provider orchestration, authenticated agent
-host adoption and health state, provider-owned advertisement artifacts, and
+`unf-loadbalancer` now owns deterministic allocation, the provider-neutral
+reachability contract, and exact publication ordering. The controller's live
+status/provider orchestration, authenticated agent host adoption and health
+state, provider-owned advertisement artifacts, and
 `unf-ebpf-tc` VIP translation remain separate ordered milestones. Allocation,
 advertisement, translation, and published readiness are not interchangeable.
-ADRs 0093–0094 define the implemented boundary.
+ADRs 0093–0095 define the implemented boundary.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

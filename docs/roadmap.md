@@ -465,9 +465,12 @@ matrix is maintained in the
   requested-VIP/frontend/class/family/policy/source-range intent with exact
   backend linkage, safe v2/v1 projections, retained-last-valid Kubernetes
   compilation, and explicit rejection by pre-VIP lowerers; ADR 0094.
-- In progress: durable conflict-safe allocation, status/finalizer ordering, and
-  provider-neutral revisioned reachability intent/acknowledgement.
-- Planned: compatible distribution and transactional host state; dual-stack
+- Verified allocation/provider contract: deterministic conflict-safe dual-stack
+  leases, exact pool/provider/Service provenance, complete revisioned
+  direct-Node reachability and acknowledgements, fail-closed finalizer/status
+  ordering, recovery/withdrawal, and foreign-state preservation; ADR 0095.
+- In progress: compatible distribution and transactional host state. Planned:
+  dual-stack
   TCP/UDP `Cluster` and `Local` dataplanes; source ranges and
   `healthCheckNodePort`; operations/simulation/recovery; independent
   kube-proxy-free Kind and digest-pinned OpenShift gates.
