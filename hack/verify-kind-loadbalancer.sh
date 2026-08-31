@@ -297,7 +297,7 @@ health_status() {
     if [[ ${family} == 4 ]]; then target="http://${address}:32080/healthz"; else target="http://[${address}]:32080/healthz"; fi
     sudo "${container_runtime}" exec "${container}" sh -ec \
         "wget -T 4 -t 1 -S -O /dev/null '${target}' 2>&1 || true" \
-        | awk '/HTTP\// {print $2; exit}'
+        | awk '/HTTP\// && status == "" {status = $2} END {print status}'
 }
 
 apply_server() {

@@ -316,7 +316,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
 
     let service_protocol = protocol == PROTOCOL_TCP || protocol == PROTOCOL_UDP;
     let mut service_forward_translated = false;
-    let mut reroute_host_cluster_ip = false;
+    let mut reroute_host_service = false;
     if service_protocol && service_translatable {
         // SAFETY: this helper has no preconditions and returns monotonic kernel time.
         #[allow(unsafe_code)]
@@ -372,7 +372,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             match lookup_forward_service_v4(forward_key, now_ns) {
                 ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
-                ServiceLookup::Translation(translation, _) => {
+                ServiceLookup::Translation(translation) => {
                     service_forward_translated = true;
                     let backend_address = [
                         translation.address[0],
@@ -457,9 +457,9 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 match lookup_forward_service_v4(service_key, now_ns) {
                     ServiceLookup::Miss => {}
                     ServiceLookup::Drop => return TC_ACT_SHOT,
-                    ServiceLookup::Translation(translation, cluster_ip) => {
+                    ServiceLookup::Translation(translation) => {
                         service_forward_translated = true;
-                        reroute_host_cluster_ip = cluster_ip;
+                        reroute_host_service = true;
                         let backend_address = [
                             translation.address[0],
                             translation.address[1],
@@ -524,7 +524,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     }
     if service_forward_translated {
         seed_service_frontend_policy_connection(tcp_flags);
-        if !enforce && reroute_host_cluster_ip {
+        if !enforce && reroute_host_service {
             return reroute_host_service_v4(ctx, observation);
         }
     }
@@ -574,7 +574,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     };
     let service_protocol = protocol == PROTOCOL_TCP || protocol == PROTOCOL_UDP;
     let mut service_forward_translated = false;
-    let mut reroute_host_cluster_ip = false;
+    let mut reroute_host_service = false;
     if service_protocol && service_translatable {
         // SAFETY: this helper has no preconditions and returns monotonic kernel time.
         #[allow(unsafe_code)]
@@ -627,7 +627,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
             match lookup_forward_service_v6(forward_key, now_ns) {
                 ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
-                ServiceLookup::Translation(translation, _) => {
+                ServiceLookup::Translation(translation) => {
                     service_forward_translated = true;
                     if service_connection_translation(true).is_some_and(|source_translation| {
                         !rewrite_ipv6(
@@ -701,11 +701,11 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 set_load_balancer_cluster_source(observation.source_address);
                 match lookup_forward_service_v6(service_key, now_ns) {
                     ServiceLookup::Miss => {}
-                ServiceLookup::Drop => return TC_ACT_SHOT,
-                ServiceLookup::Translation(translation, cluster_ip) => {
-                    service_forward_translated = true;
-                    reroute_host_cluster_ip = cluster_ip;
-                    if service_connection_translation(true).is_some_and(
+                    ServiceLookup::Drop => return TC_ACT_SHOT,
+                    ServiceLookup::Translation(translation) => {
+                        service_forward_translated = true;
+                        reroute_host_service = true;
+                        if service_connection_translation(true).is_some_and(
                             |source_translation| {
                                 !rewrite_ipv6(
                                     ctx,
@@ -751,7 +751,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     }
     if service_forward_translated {
         seed_service_frontend_policy_connection(observation.tcp_flags);
-        if !enforce && reroute_host_cluster_ip {
+        if !enforce && reroute_host_service {
             return reroute_host_service_v6(ctx, observation);
         }
     }
@@ -864,7 +864,7 @@ const fn empty_service_frontend_selection(frontend_kind: u8) -> ServiceFrontendS
 enum ServiceLookup {
     Miss,
     Drop,
-    Translation(ServiceTranslation, bool),
+    Translation(ServiceTranslation),
 }
 
 #[inline(always)]
@@ -1317,7 +1317,7 @@ fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
 fn refresh_service_connection(
     key: &ServiceConnectionKey,
     now_ns: u64,
-) -> Option<(ServiceTranslation, bool)> {
+) -> Option<ServiceTranslation> {
     // SAFETY: the fixed-layout value is copied before any update and no map
     // reference escapes this lookup.
     #[allow(unsafe_code)]
@@ -1370,10 +1370,7 @@ fn refresh_service_connection(
         remove_service_pair(value, key);
         return None;
     }
-    let cluster_ip =
-        value.flags & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
-            == 0;
-    Some((translation, cluster_ip))
+    Some(translation)
 }
 
 #[inline(never)]
@@ -1770,7 +1767,7 @@ fn lookup_new_forward_service_v4(
         );
         return ServiceLookup::Drop;
     };
-    ServiceLookup::Translation(translation, connection_flags == 0)
+    ServiceLookup::Translation(translation)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1931,13 +1928,13 @@ fn lookup_new_forward_service_v6(
         );
         return ServiceLookup::Drop;
     };
-    ServiceLookup::Translation(translation, connection_flags == 0)
+    ServiceLookup::Translation(translation)
 }
 
 #[inline(always)]
 fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) -> ServiceLookup {
-    if let Some((translation, cluster_ip)) = refresh_service_connection(forward_key, now_ns) {
-        ServiceLookup::Translation(translation, cluster_ip)
+    if let Some(translation) = refresh_service_connection(forward_key, now_ns) {
+        ServiceLookup::Translation(translation)
     } else {
         lookup_new_forward_service_v4(forward_key, now_ns)
     }
@@ -1945,8 +1942,8 @@ fn lookup_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) ->
 
 #[inline(always)]
 fn lookup_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) -> ServiceLookup {
-    if let Some((translation, cluster_ip)) = refresh_service_connection(forward_key, now_ns) {
-        ServiceLookup::Translation(translation, cluster_ip)
+    if let Some(translation) = refresh_service_connection(forward_key, now_ns) {
+        ServiceLookup::Translation(translation)
     } else {
         lookup_new_forward_service_v6(forward_key, now_ns)
     }
@@ -1957,7 +1954,7 @@ fn lookup_reverse_service(
     reverse_key: &ServiceConnectionKey,
     now_ns: u64,
 ) -> Option<ServiceTranslation> {
-    refresh_service_connection(reverse_key, now_ns).map(|(translation, _)| translation)
+    refresh_service_connection(reverse_key, now_ns)
 }
 
 #[inline(always)]
