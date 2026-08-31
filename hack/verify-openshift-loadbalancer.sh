@@ -302,6 +302,16 @@ external_udp_probe() {
     printf lb-udp | socat -T 5 - "${target}" | grep -qx lb-udp
 }
 
+wait_for_external_udp() {
+    local family=$1 address=$2
+    for _ in $(seq 1 30); do
+        if external_udp_probe "${family}" "${address}" >/dev/null 2>&1; then return 0; fi
+        sleep 1
+    done
+    echo "external IPv${family} UDP VIP ${address} did not become reachable after advertisement" >&2
+    return 1
+}
+
 external_source_probe() {
     local family=$1 address=$2 target observed
     if [[ ${family} == 4 ]]; then target="TCP4:${address}:8081"; else target="TCP6:[${address}]:8081"; fi
@@ -499,14 +509,14 @@ for worker in "${workers[@]}"; do
     advertise_vips "${worker}"
     wait_for_external_tcp 4 "${cluster_v4}"
     wait_for_external_tcp 6 "${cluster_v6}"
-    external_udp_probe 4 "${cluster_v4}"
-    external_udp_probe 6 "${cluster_v6}"
+    wait_for_external_udp 4 "${cluster_v4}"
+    wait_for_external_udp 6 "${cluster_v6}"
 done
 advertise_vips "${server_node}"
 wait_for_external_tcp 4 "${local_v4}"
 wait_for_external_tcp 6 "${local_v6}"
-external_udp_probe 4 "${local_v4}"
-external_udp_probe 6 "${local_v6}"
+wait_for_external_udp 4 "${local_v4}"
+wait_for_external_udp 6 "${local_v6}"
 [[ $(external_source_probe 4 "${cluster_v4}") == "${server_node_v4}" ]]
 [[ $(external_source_probe 6 "${cluster_v6}") == "${server_node_v6}" ]]
 [[ $(external_source_probe 4 "${local_v4}") == "${allowed_v4}" ]]
@@ -658,7 +668,7 @@ reachability_after=$(jq -er .reachabilityRevision <<<"${durable_after}")
 (( allocation_after >= allocation_before && reachability_after >= reachability_before ))
 [[ $(lease_address "${durable_after}" server-cluster 4) == "${cluster_v4}" ]]
 wait_for_external_tcp 4 "${cluster_v4}"
-external_udp_probe 6 "${local_v6}"
+wait_for_external_udp 6 "${local_v6}"
 
 stage=exact-fixture-cleanup
 withdraw_vips
