@@ -24,6 +24,7 @@ required_files=(
     deploy/openshift-primary-cni/loadbalancer/controller-loadbalancer-patch.yaml
     deploy/openshift-primary-cni/loadbalancer/release.json
     hack/verify-kind-loadbalancer.sh
+    hack/verify-openshift-loadbalancer.sh
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -128,6 +129,9 @@ require_text Makefile \
 require_text Makefile \
     'loadbalancer-openshift-deploy:' \
     "the build must expose a guarded LoadBalancer OpenShift deployment gate"
+require_text Makefile \
+    'loadbalancer-openshift-test:' \
+    "the build must expose an independent LoadBalancer OpenShift qualification gate"
 require_text deploy/kind-loadbalancer/controller-loadbalancer-patch.yaml \
     'kind-direct-node-v1' \
     "the Kind provider identity must remain explicit and stable"
