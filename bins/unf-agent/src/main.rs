@@ -10952,7 +10952,8 @@ mod tests {
         let mut synchronizer = test_service_synchronizer(&mut ebpf, service_path);
         let state = test_agent_state();
         let services = load_balancer_service_test_snapshot(7, 5);
-        activate_service_snapshot(&mut synchronizer, &services, None, true, &state)
+        let node = node_port_node_snapshot(1);
+        activate_service_snapshot(&mut synchronizer, &services, Some(&node), true, &state)
             .expect("LoadBalancer Service keeps existing service maps exact");
 
         let first = load_balancer_node_snapshot(&services, 3, &["192.0.2.4"]);
@@ -11000,8 +11001,14 @@ mod tests {
         );
 
         let advanced_services = load_balancer_service_test_snapshot(7, 6);
-        activate_service_snapshot(&mut synchronizer, &advanced_services, None, true, &state)
-            .expect("service domain can advance before LoadBalancer reconciliation");
+        activate_service_snapshot(
+            &mut synchronizer,
+            &advanced_services,
+            Some(&node),
+            true,
+            &state,
+        )
+        .expect("service domain can advance before LoadBalancer reconciliation");
         assert_eq!(
             synchronizer.load_balancer_config.get(&0, 0).unwrap(),
             active_config
@@ -11011,6 +11018,10 @@ mod tests {
         synchronizer.applied = None;
         recover_service_state(&mut synchronizer)
             .expect("new active service tuple recovers after interrupted reconciliation");
+        assert_eq!(
+            synchronizer.load_balancer_node_source.get(&0, 0).unwrap(),
+            encode_load_balancer_node_source(Some(&node))
+        );
         synchronizer.load_balancer_banks = [None, None];
         synchronizer.active_load_balancer_bank = 0;
         synchronizer.applied_load_balancer_reachability = None;
