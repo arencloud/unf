@@ -2683,13 +2683,10 @@ async fn synchronize_load_balancer_maps(
         .applied
         .as_ref()
         .context("LoadBalancer synchronization requires active service state")?;
-    let has_load_balancer = services
-        .services
-        .iter()
-        .any(|service| service.load_balancer.is_some());
-    if !has_load_balancer && synchronizer.applied_load_balancer_reachability.is_none() {
-        return Ok(());
-    }
+    // Fetch even when no current Service carries LoadBalancer intent. The
+    // controller's allocation revision is a cluster-wide fence that can stay
+    // non-initial after the final LoadBalancer is deleted, and a recovery reset
+    // must replay that empty projection instead of remaining at revision 0/0.
     let controller_url = synchronizer
         .controller_url
         .as_deref()
@@ -10808,6 +10805,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires root BPF map creation and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
     fn privileged_load_balancer_bank_activation_rollback_and_recovery_are_exact() {
         let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
         let mut loader = EbpfLoader::new();
@@ -10899,6 +10897,56 @@ mod tests {
             load_optional_load_balancer_reachability(&synchronizer.load_balancer_state_path)
                 .unwrap(),
             None
+        );
+
+        // A controller can retain a non-initial allocation revision after the
+        // last LoadBalancer Service is deleted. Recovery must therefore fetch
+        // and activate its empty Node projection even though the authoritative
+        // Service snapshot no longer contains a LoadBalancer. Otherwise this
+        // node remains at 0/0 while already-converged peers retain the current
+        // allocation/reachability fence.
+        let services_without_load_balancer = service_test_snapshot_with_backend(7, 7);
+        activate_service_snapshot(
+            &mut synchronizer,
+            &services_without_load_balancer,
+            None,
+            true,
+            &state,
+        )
+        .expect("post-deletion Service state activates");
+        let empty_reachability = NodeReachabilitySnapshot {
+            schema_version: unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION,
+            source_epoch: services_without_load_balancer.source_epoch,
+            revision: Revision::new(5),
+            allocation_revision: Revision::new(9),
+            provider: unf_loadbalancer::ReachabilityProviderRef {
+                name: "direct-node".to_owned(),
+                instance: "qualification-a".to_owned(),
+                mode: unf_loadbalancer::ReachabilityMode::DirectNode,
+            },
+            node: unf_loadbalancer::ReachabilityNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+            },
+            targets: Vec::new(),
+        }
+        .validate()
+        .expect("empty non-initial reachability projection validates");
+        publish_desired_load_balancer(&state, &empty_reachability);
+        activate_load_balancer_snapshot(&mut synchronizer, &empty_reachability, &state)
+            .expect("empty post-deletion reachability fence replays after reset");
+        let report = agent_state_report(&state);
+        assert_eq!(report.desired_load_balancer_revision, 5);
+        assert_eq!(report.applied_load_balancer_revision, 5);
+        assert_eq!(report.desired_load_balancer_allocation_revision, 9);
+        assert_eq!(report.applied_load_balancer_allocation_revision, 9);
+        assert_eq!(report.load_balancer_frontend_count, 0);
+        assert_eq!(
+            synchronizer
+                .applied_load_balancer_reachability
+                .as_ref()
+                .map(|snapshot| snapshot.revision.get()),
+            Some(5)
         );
     }
 
