@@ -99,7 +99,7 @@ cleanup() {
             if [[ -n ${pressure_inactive_bank} ]]; then
                 "${kc[@]}" -n unf-system exec "${helper}" -- \
                     /usr/local/bin/unf-bpf-map-pressure clear \
-                    /sys/fs/bpf/unf/v6/POLICY_RULES "${pressure_inactive_bank}" \
+                    /sys/fs/bpf/unf/v7/POLICY_RULES "${pressure_inactive_bank}" \
                     >/dev/null 2>&1 || true
             fi
         done < <("${kc[@]}" -n unf-system get pods \
@@ -230,7 +230,7 @@ expected_attachment_mode() {
 prepare_fault_map_set() {
     local helper=$1 target=$2 omitted=$3
     "${kc[@]}" -n unf-system exec "${helper}" -- sh -eu -c '
-        source=/sys/fs/bpf/unf/v6
+        source=/sys/fs/bpf/unf/v7
         target=$1
         omitted=$2
         rm -rf "${target}"
@@ -734,7 +734,7 @@ for _ in {1..30}; do
         fi
         if [[ ${attachment_mode} == tcx_pinned ]] \
             && ! "${kc[@]}" -n unf-system exec "${pod}" -- sh -c \
-                'find /sys/fs/bpf/unf/v6/links -maxdepth 1 -type f -name "tcx-ingress-*" | grep -q .' \
+                'find /sys/fs/bpf/unf/v7/links -maxdepth 1 -type f -name "tcx-ingress-*" | grep -q .' \
                 >/dev/null 2>&1; then
             initial_synced=false
             break
@@ -2103,7 +2103,7 @@ map_pressure_helper=${fault_helper}
     rm -f /run/unf-test/pressure-ready /run/unf-test/pressure-stop
 "${kc[@]}" -n unf-system exec "${fault_helper}" -- \
     /usr/local/bin/unf-bpf-map-pressure hold \
-    /sys/fs/bpf/unf/v6/POLICY_RULES "${pressure_inactive_bank}" \
+    /sys/fs/bpf/unf/v7/POLICY_RULES "${pressure_inactive_bank}" \
     /run/unf-test/pressure-ready /run/unf-test/pressure-stop \
     >"${temporary_dir}/map-pressure.log" 2>&1 &
 map_pressure_pid=$!
@@ -2238,7 +2238,7 @@ fi
 if "${kc[@]}" -n unf-system exec "${fault_helper}" -- \
     test ! -e /sys/fs/bpf/unf/v1; then
     "${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
-        source=/sys/fs/bpf/unf/v6
+        source=/sys/fs/bpf/unf/v7
         target=/sys/fs/bpf/unf/v1
         mkdir "${target}"
         for map in \
@@ -2292,7 +2292,7 @@ if ! grep -q 'UNF cleanup completed' <<<"${cleanup_execution}"; then
 fi
 "${kc[@]}" -n unf-system exec "${fault_helper}" -- sh -eu -c '
     test ! -e /sys/fs/bpf/unf/v1
-    test "$(find /sys/fs/bpf/unf/v6 -maxdepth 1 -type f | wc -l)" -eq 24
+    test "$(find /sys/fs/bpf/unf/v7 -maxdepth 1 -type f | wc -l)" -eq 24
 '
 stale_abi_fixture_helper=
 
@@ -2312,7 +2312,7 @@ while read -r cleanup_helper; do
     [[ -n ${cleanup_helper} ]] || continue
     "${kc[@]}" -n unf-system exec "${cleanup_helper}" -- sh -eu -c '
         test ! -e /sys/fs/bpf/unf/v1
-        test "$(find /sys/fs/bpf/unf/v6 -maxdepth 1 -type f | wc -l)" -eq 24
+        test "$(find /sys/fs/bpf/unf/v7 -maxdepth 1 -type f | wc -l)" -eq 24
     '
 done < <("${kc[@]}" -n unf-system get pods \
     -l app.kubernetes.io/name=unf-bpf-fault-helper \

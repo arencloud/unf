@@ -3,7 +3,7 @@
 
 use aya_ebpf::bindings::{
     BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR,
-    BPF_FIB_LKUP_RET_NO_NEIGH, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT,
+    BPF_FIB_LOOKUP_SRC, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT,
     bpf_fib_lookup as BpfFibLookup,
 };
 use aya_ebpf::helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh};
@@ -232,13 +232,19 @@ static SERVICE_CONNECTION_SCRATCH: PerCpuArray<ServiceConnectionValue> =
 static SERVICE_KEY_SCRATCH: PerCpuArray<ServiceConnectionKey> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
+static FIB_LOOKUP_SCRATCH: PerCpuArray<BpfFibLookup> = PerCpuArray::with_max_entries(1, 0);
+
+#[map]
+static LOAD_BALANCER_CLUSTER_SOURCE_SCRATCH: PerCpuArray<[u8; 16]> =
+    PerCpuArray::with_max_entries(1, 0);
+
+#[map]
 static FLOW_OBSERVATION_SCRATCH: PerCpuArray<FlowObservation> = PerCpuArray::with_max_entries(1, 0);
 
 #[classifier]
 pub fn unf_observe_ingress(ctx: TcContext) -> i32 {
     observe(&ctx, Direction::Ingress, true)
 }
-
 #[classifier]
 pub fn unf_observe_egress(ctx: TcContext) -> i32 {
     observe(&ctx, Direction::Egress, false)
@@ -362,6 +368,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 return TC_ACT_PIPE;
             }
             forward_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
+            prepare_load_balancer_cluster_source_v4(ctx, source_ipv4);
             match lookup_forward_service_v4(forward_key, now_ns) {
                 ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
@@ -446,6 +453,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 // hook. Give an untranslated frontend the same bounded lookup
                 // and connection-pair transaction used for workload traffic.
                 service_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
+                set_load_balancer_cluster_source(ipv4_address(source_ipv4));
                 match lookup_forward_service_v4(service_key, now_ns) {
                     ServiceLookup::Miss => {}
                     ServiceLookup::Drop => return TC_ACT_SHOT,
@@ -615,6 +623,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 return TC_ACT_PIPE;
             }
             forward_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
+            prepare_load_balancer_cluster_source_v6(ctx, observation.source_address);
             match lookup_forward_service_v6(forward_key, now_ns) {
                 ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
@@ -689,6 +698,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 );
             } else {
                 service_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
+                set_load_balancer_cluster_source(observation.source_address);
                 match lookup_forward_service_v6(service_key, now_ns) {
                     ServiceLookup::Miss => {}
                 ServiceLookup::Drop => return TC_ACT_SHOT,
@@ -936,7 +946,7 @@ fn service_connection_translation(forward: bool) -> Option<ServiceTranslation> {
     }
     if forward {
         Some(ServiceTranslation {
-            address: value.frontend_address,
+            address: value.translated_source_address,
             port: node_port_snat_port(value),
         })
     } else {
@@ -1227,7 +1237,7 @@ fn service_reverse_key(value: &ServiceConnectionValue) -> ServiceConnectionKey {
     ServiceConnectionKey {
         source_address: value.backend_address,
         destination_address: if source_translated {
-            value.frontend_address
+            value.translated_source_address
         } else {
             value.client_address
         },
@@ -1381,6 +1391,17 @@ fn new_service_connection(
         value.reserved[2] = frontend_kind;
     }
     if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
+        value.translated_source_address = if frontend_kind
+            == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
+        {
+            LOAD_BALANCER_CLUSTER_SOURCE_SCRATCH
+                .get(0)
+                .copied()
+                .filter(|address| *address != [0; 16])
+                .unwrap_or(value.frontend_address)
+        } else {
+            value.frontend_address
+        };
         let hash = service_flow_hash(&service_forward_key(value), value.service_id);
         let mut probe = 0_u32;
         while probe < NODE_PORT_SNAT_PORT_PROBES {
@@ -1730,6 +1751,7 @@ fn lookup_new_forward_service_v4(
     value.client_address = forward_key.source_address;
     value.frontend_address = forward_key.destination_address;
     value.backend_address = backend_address;
+    value.translated_source_address = [0; 16];
     value.service_id = frontend.service_id;
     value.backend_id = slot.backend_id;
     value.client_port = forward_key.source_port;
@@ -1890,6 +1912,7 @@ fn lookup_new_forward_service_v6(
     value.client_address = forward_key.source_address;
     value.frontend_address = forward_key.destination_address;
     value.backend_address = backend.address;
+    value.translated_source_address = [0; 16];
     value.service_id = frontend.service_id;
     value.backend_id = slot.backend_id;
     value.client_port = forward_key.source_port;
@@ -1956,6 +1979,103 @@ const fn l4_checksum_flags(protocol: u8, size: u64, pseudo_header: bool) -> u64 
         flags |= BPF_F_MARK_MANGLED_0 as u64;
     }
     flags
+}
+
+#[inline(never)]
+fn prepare_load_balancer_cluster_source_v4(ctx: &TcContext, client_address: [u8; 4]) {
+    set_load_balancer_cluster_source([0; 16]);
+    // SAFETY: the TC context owns a valid `__sk_buff` for this invocation.
+    #[allow(unsafe_code)]
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    if ifindex <= 1 {
+        return;
+    }
+    let Some(lookup_ptr) = FIB_LOOKUP_SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    // SAFETY: this CPU owns the scratch slot and zero is a valid helper input.
+    #[allow(unsafe_code)]
+    unsafe { core::ptr::write_bytes(lookup_ptr, 0, 1) };
+    // SAFETY: the pointer remains valid for this non-preemptible invocation.
+    #[allow(unsafe_code)]
+    let lookup = unsafe { &mut *lookup_ptr };
+    lookup.family = ADDRESS_FAMILY_INET;
+    lookup.ifindex = ifindex;
+    lookup.__bindgen_anon_4.ipv4_dst = u32::from_ne_bytes(client_address);
+    // SAFETY: pointers and length exactly match the TC helper ABI.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        bpf_fib_lookup(
+            ctx.skb.skb.cast(),
+            lookup,
+            core::mem::size_of::<BpfFibLookup>() as i32,
+            BPF_FIB_LOOKUP_SRC,
+        )
+    };
+    if result == 0 || result == i64::from(BPF_FIB_LKUP_RET_NO_NEIGH) {
+        // SAFETY: a successful IPv4 source lookup initializes this union arm.
+        #[allow(unsafe_code)]
+        let address = unsafe { lookup.__bindgen_anon_3.ipv4_src.to_ne_bytes() };
+        if address != [0; 4] {
+            set_load_balancer_cluster_source(ipv4_address(address));
+        }
+    }
+}
+
+#[inline(never)]
+fn prepare_load_balancer_cluster_source_v6(ctx: &TcContext, client_address: [u8; 16]) {
+    set_load_balancer_cluster_source([0; 16]);
+    // SAFETY: the TC context owns a valid `__sk_buff` for this invocation.
+    #[allow(unsafe_code)]
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    if ifindex <= 1 {
+        return;
+    }
+    let Some(lookup_ptr) = FIB_LOOKUP_SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    // SAFETY: this CPU owns the scratch slot and zero is a valid helper input.
+    #[allow(unsafe_code)]
+    unsafe { core::ptr::write_bytes(lookup_ptr, 0, 1) };
+    // SAFETY: the pointer remains valid for this non-preemptible invocation.
+    #[allow(unsafe_code)]
+    let lookup = unsafe { &mut *lookup_ptr };
+    lookup.family = ADDRESS_FAMILY_INET6;
+    lookup.ifindex = ifindex;
+    lookup.__bindgen_anon_4.ipv6_dst = ipv6_fib_words(client_address);
+    // SAFETY: pointers and length exactly match the TC helper ABI.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        bpf_fib_lookup(
+            ctx.skb.skb.cast(),
+            lookup,
+            core::mem::size_of::<BpfFibLookup>() as i32,
+            BPF_FIB_LOOKUP_SRC,
+        )
+    };
+    if result == 0 || result == i64::from(BPF_FIB_LKUP_RET_NO_NEIGH) {
+        // SAFETY: a successful IPv6 source lookup initializes this union arm.
+        #[allow(unsafe_code)]
+        let words = unsafe { lookup.__bindgen_anon_3.ipv6_src };
+        let mut address = [0_u8; 16];
+        address[0..4].copy_from_slice(&words[0].to_ne_bytes());
+        address[4..8].copy_from_slice(&words[1].to_ne_bytes());
+        address[8..12].copy_from_slice(&words[2].to_ne_bytes());
+        address[12..16].copy_from_slice(&words[3].to_ne_bytes());
+        if address != [0; 16] {
+            set_load_balancer_cluster_source(address);
+        }
+    }
+}
+
+#[inline(always)]
+fn set_load_balancer_cluster_source(address: [u8; 16]) {
+    let Some(pointer) = LOAD_BALANCER_CLUSTER_SOURCE_SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    // SAFETY: this CPU owns the scratch slot for this invocation.
+    #[allow(unsafe_code)]
+    unsafe { pointer.write(address) };
 }
 
 /// Host-origin traffic reaches TC after the kernel selected a route for the

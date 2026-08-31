@@ -88,7 +88,7 @@ use cni_server::CniTransactionServer;
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v6";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v7";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
@@ -673,7 +673,7 @@ struct ServiceSynchronizer {
     ipv6_backends: AyaHashMap<MapData, [u8; 12], [u8; 32]>,
     backend_slots: AyaHashMap<MapData, [u8; 16], [u8; 16]>,
     config: AyaArray<MapData, [u8; 32]>,
-    connections: AyaHashMap<MapData, [u8; 40], [u8; 88]>,
+    connections: AyaHashMap<MapData, [u8; 40], [u8; 104]>,
     node_port_ipv4_frontends: AyaHashMap<MapData, [u8; 8], [u8; 32]>,
     node_port_ipv6_frontends: AyaHashMap<MapData, [u8; 20], [u8; 32]>,
     node_port_config: AyaArray<MapData, [u8; 40]>,
@@ -772,7 +772,7 @@ type ServiceMaps = (
     AyaHashMap<MapData, [u8; 12], [u8; 32]>,
     AyaHashMap<MapData, [u8; 16], [u8; 16]>,
     AyaArray<MapData, [u8; 32]>,
-    AyaHashMap<MapData, [u8; 40], [u8; 88]>,
+    AyaHashMap<MapData, [u8; 40], [u8; 104]>,
     AyaHashMap<MapData, [u8; 8], [u8; 32]>,
     AyaHashMap<MapData, [u8; 20], [u8; 32]>,
     AyaArray<MapData, [u8; 40]>,
@@ -6951,7 +6951,7 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
             .context("eBPF object does not contain SERVICE_CONFIG map")?,
     )
     .context("open SERVICE_CONFIG map")?;
-    let connections = AyaHashMap::<_, [u8; 40], [u8; 88]>::try_from(
+    let connections = AyaHashMap::<_, [u8; 40], [u8; 104]>::try_from(
         ebpf.take_map("SERVICE_CONNECTIONS")
             .context("eBPF object does not contain SERVICE_CONNECTIONS map")?,
     )
@@ -11774,7 +11774,7 @@ mod tests {
         let mut expired_pair_entries = 0;
         for key in connection_keys {
             let mut value = synchronizer.connections.get(&key, 0).unwrap();
-            if value[72..74] == 40_000_u16.to_be_bytes() {
+            if value[88..90] == 40_000_u16.to_be_bytes() {
                 value[0..8].copy_from_slice(&0_u64.to_ne_bytes());
                 synchronizer.connections.insert(key, value, 0).unwrap();
                 expired_pair_entries += 1;
@@ -11790,13 +11790,13 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
             .into_iter()
-            .filter(|(_, value)| value[72..74] == 40_000_u16.to_be_bytes())
+            .filter(|(_, value)| value[88..90] == 40_000_u16.to_be_bytes())
             .collect::<Vec<_>>();
         assert_eq!(refreshed_pair.len(), 2);
         assert!(refreshed_pair.iter().all(|(_, value)| {
             u64::from_ne_bytes(value[8..16].try_into().unwrap()) == 2
-                && u32::from_ne_bytes(value[64..68].try_into().unwrap()) != 0
-                && u32::from_ne_bytes(value[68..72].try_into().unwrap()) != 0
+                && u32::from_ne_bytes(value[80..84].try_into().unwrap()) != 0
+                && u32::from_ne_bytes(value[84..88].try_into().unwrap()) != 0
                 && value[48..52] == replacement_v4.octets()
                 && value[52..64] == [0; 12]
         }));
@@ -12562,12 +12562,13 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_distinguishes_complete_v4_v5_and_v6_map_ownership() {
+    fn cleanup_distinguishes_complete_v4_v5_v6_and_v7_map_ownership() {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("unf");
         for (version, names) in [
             (4_u16, ABI_V4_MAP_NAMES.as_slice()),
             (5_u16, ABI_V5_MAP_NAMES.as_slice()),
+            (6_u16, PERSISTENT_MAP_NAMES.as_slice()),
             (CURRENT_BPF_ABI_VERSION, PERSISTENT_MAP_NAMES.as_slice()),
         ] {
             let abi = root.join(format!("v{version}"));
@@ -12783,11 +12784,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v6/links"),
+                Path::new("/sys/fs/bpf/unf/v7/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v6/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v7/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -12903,16 +12904,16 @@ mod tests {
 
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v6")).is_ok());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v7")).is_ok());
         assert_eq!(
-            configured_abi_version(Path::new("/sys/fs/bpf/unf/v6")),
-            Some(6)
+            configured_abi_version(Path::new("/sys/fs/bpf/unf/v7")),
+            Some(7)
         );
         let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
             error.to_string().contains(
-                "incompatible with persistent BPF-state ABI v6; expected a /v6 directory"
+                "incompatible with persistent BPF-state ABI v7; expected a /v7 directory"
             )
         );
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v4")).is_err());

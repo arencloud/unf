@@ -77,7 +77,7 @@ loadbalancer-control-plane-test: loadbalancer-ir-test
 loadbalancer-host-state-test: loadbalancer-control-plane-test
 	cargo test -p unf-controller load_balancer
 	cargo test -p unf-agent load_balancer
-	cargo test -p unf-agent cleanup_distinguishes_complete_v4_v5_and_v6_map_ownership
+	cargo test -p unf-agent cleanup_distinguishes_complete_v4_v5_v6_and_v7_map_ownership
 	cargo test -p unf-state component_compatibility_fixes_the_upgrade_contract
 	cargo clippy -p unf-common -p unf-ebpf-common -p unf-loadbalancer -p unf-state -p unf-controller -p unf-agent --all-targets --all-features -- -D warnings
 	kubectl kustomize deploy >/dev/null
@@ -165,7 +165,7 @@ nodeport-host-state-test: service-distribution-test
 nodeport-transaction-test: nodeport-host-state-test
 	cargo test -p unf-service node_port
 	cargo test -p unf-agent node_port
-	cargo test -p unf-agent cleanup_distinguishes_complete_v4_v5_and_v6_map_ownership
+	cargo test -p unf-agent cleanup_distinguishes_complete_v4_v5_v6_and_v7_map_ownership
 	cargo test -p unf-state component_compatibility_fixes_the_upgrade_contract
 	cargo clippy -p unf-ebpf-common -p unf-service -p unf-state -p unf-agent --all-targets --all-features -- -D warnings
 	UNF_BPF_TOOLCHAIN=$(BPF_TOOLCHAIN) hack/verify-service-map-transaction.sh

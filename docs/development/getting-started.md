@@ -69,7 +69,7 @@ sudo target/debug/unf-agent \
 ```
 
 TC attachment changes host network state. On Linux 6.6+, the agent leaves its
-per-interface TCX links pinned below `/sys/fs/bpf/unf/v6/links` so a replacement
+per-interface TCX links pinned below `/sys/fs/bpf/unf/v7/links` so a replacement
 can update them atomically. On older kernels it leaves the clsact qdisc and its
 stable legacy filters in place for in-place replacement. Use a disposable
 environment for testing.
@@ -94,16 +94,16 @@ names. It refuses symbolic links, non-directory targets, and any unknown direct
 content instead of recursively deleting it. A missing target is an idempotent
 no-op.
 
-Removing current v4 state is an uninstall or controlled-reset operation. First
+Removing current v7 state is an uninstall or controlled-reset operation. First
 stop every agent using that node so no process is reading or recreating the maps
 or attachments, inspect the dry run, and provide the additional confirmation:
 
 ```bash
 sudo target/debug/unf-agent cleanup \
-  --abi-version 4 --allow-current-abi \
+  --abi-version 7 --allow-current-abi \
   --legacy-attachments --all-interfaces --legacy-direction both
 sudo target/debug/unf-agent cleanup \
-  --abi-version 4 --allow-current-abi \
+  --abi-version 7 --allow-current-abi \
   --legacy-attachments --all-interfaces --legacy-direction both --execute
 ```
 

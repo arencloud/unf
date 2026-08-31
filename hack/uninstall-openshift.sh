@@ -128,12 +128,15 @@ for index in "${!nodes[@]}"; do
     echo "node cleanup: ${node} via ${pod}"
     cleanup_plan=$("${kc[@]}" -n unf-system exec "${pod}" -- \
         /usr/local/bin/unf-component cleanup \
-        --abi-version 6 --allow-current-abi \
+        --abi-version 7 --allow-current-abi \
         --legacy-attachments --all-interfaces --legacy-direction both)
     grep -q 'UNF cleanup plan (dry-run)' <<<"${cleanup_plan}"
     grep -q 'dry run only' <<<"${cleanup_plan}"
-    grep -q 'ABI directory: /sys/fs/bpf/unf/v6' <<<"${cleanup_plan}"
-    [[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v6/' <<<"${cleanup_plan}") -eq 24 ]]
+    grep -q 'ABI directory: /sys/fs/bpf/unf/v7' <<<"${cleanup_plan}"
+    [[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v7/' <<<"${cleanup_plan}") -eq 24 ]]
+    legacy_v6_plan=$("${kc[@]}" -n unf-system exec "${pod}" -- \
+        /usr/local/bin/unf-component cleanup --abi-version 6)
+    grep -q 'ABI directory: /sys/fs/bpf/unf/v6' <<<"${legacy_v6_plan}"
     legacy_v5_plan=$("${kc[@]}" -n unf-system exec "${pod}" -- \
         /usr/local/bin/unf-component cleanup --abi-version 5)
     grep -q 'ABI directory: /sys/fs/bpf/unf/v5' <<<"${legacy_v5_plan}"
@@ -142,13 +145,14 @@ for index in "${!nodes[@]}"; do
     grep -q 'ABI directory: /sys/fs/bpf/unf/v4' <<<"${legacy_v4_plan}"
     sed 's/^/  /' <<<"${legacy_v4_plan}"
     sed 's/^/  /' <<<"${legacy_v5_plan}"
+    sed 's/^/  /' <<<"${legacy_v6_plan}"
     sed 's/^/  /' <<<"${cleanup_plan}"
 done
 
 echo "cluster cleanup:"
 echo "  stop DaemonSet unf-system/unf-agent before host mutation"
 echo "  run one constrained cleanup Job on each selected node"
-echo "  verify /sys/fs/bpf/unf/v4, /sys/fs/bpf/unf/v5, /sys/fs/bpf/unf/v6, and UNF legacy filters are absent"
+echo "  verify /sys/fs/bpf/unf/v4, /sys/fs/bpf/unf/v5, /sys/fs/bpf/unf/v6, /sys/fs/bpf/unf/v7, and UNF legacy filters are absent"
 if ${delete_namespace}; then
     echo "  delete dedicated Namespace unf-system"
 else
@@ -237,7 +241,7 @@ for index in "${!nodes[@]}"; do
                             imagePullPolicy: $image_pull_policy,
                             command: ["/bin/sh", "-eu", "-c"],
                             args: [
-                                "/usr/local/bin/unf-component cleanup --abi-version 6 --allow-current-abi --legacy-attachments --all-interfaces --legacy-direction both --execute; /usr/local/bin/unf-component cleanup --abi-version 5 --execute; /usr/local/bin/unf-component cleanup --abi-version 4 --execute"
+                                "/usr/local/bin/unf-component cleanup --abi-version 7 --allow-current-abi --legacy-attachments --all-interfaces --legacy-direction both --execute; /usr/local/bin/unf-component cleanup --abi-version 6 --execute; /usr/local/bin/unf-component cleanup --abi-version 5 --execute; /usr/local/bin/unf-component cleanup --abi-version 4 --execute"
                             ],
                             securityContext: $security_context,
                             volumeMounts: $volume_mounts
@@ -265,6 +269,7 @@ for node in "${nodes[@]}"; do
             test ! -e /sys/fs/bpf/unf/v4
             test ! -e /sys/fs/bpf/unf/v5
             test ! -e /sys/fs/bpf/unf/v6
+            test ! -e /sys/fs/bpf/unf/v7
             for path in /sys/class/net/*; do
                 interface=${path##*/}
                 [ "${interface}" = lo ] && continue

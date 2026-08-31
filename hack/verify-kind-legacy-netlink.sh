@@ -204,7 +204,7 @@ if [[ ${baseline_mode} == tcx_pinned ]]; then
     fi
     for helper in "${helper_pods[@]}"; do
         "${kc[@]}" -n unf-system exec "${helper}" -- sh -eu -c '
-            links=/sys/fs/bpf/unf/v6/links
+            links=/sys/fs/bpf/unf/v7/links
             if [ -d "${links}" ]; then
                 find "${links}" -maxdepth 1 -type f -name "tcx-ingress-*" -delete
                 ! find "${links}" -maxdepth 1 -type f -name "tcx-ingress-*" | grep -q .
@@ -345,7 +345,7 @@ if [[ ${legacy_override_applied} == true ]]; then
     fi
     for helper in "${helper_pods[@]}"; do
         if ! "${kc[@]}" -n unf-system exec "${helper}" -- sh -eu -c '
-            find /sys/fs/bpf/unf/v6/links -maxdepth 1 -type f \
+            find /sys/fs/bpf/unf/v7/links -maxdepth 1 -type f \
                 -name "tcx-ingress-*" | grep -q .
         '; then
             echo "TCX pins were not restored before legacy cleanup" >&2

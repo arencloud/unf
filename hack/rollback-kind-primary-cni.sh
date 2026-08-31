@@ -82,7 +82,7 @@ spec:
           args:
             - cleanup
             - --abi-version
-            - "5"
+            - "7"
             - --allow-current-abi
             - --legacy-attachments
             - --all-interfaces

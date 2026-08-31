@@ -177,11 +177,11 @@ assert_agent() {
     for _ in $(seq 1 60); do
         host_state=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
             test "$(getenforce)" = Enforcing
-            test -d /sys/fs/bpf/unf/v6
+            test -d /sys/fs/bpf/unf/v7
             for pin in SERVICE_CONFIG SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 \
                 SERVICE_BACKENDS_V4 SERVICE_BACKENDS_V6 SERVICE_CONNECTIONS \
                 NODE_PORT_CONFIG NODE_PORT_FRONTENDS_V4 NODE_PORT_FRONTENDS_V6; do
-                test -e "/sys/fs/bpf/unf/v6/$pin"
+                test -e "/sys/fs/bpf/unf/v7/$pin"
             done
             snapshot=/var/lib/unf/cni/v1/service-snapshot.json
             test -f "$snapshot" && test ! -L "$snapshot" && test "$(stat -c %a "$snapshot")" = 600
@@ -217,7 +217,7 @@ wait_for_convergence() {
         fi
         sleep 1
     done
-    echo "all agents did not converge on ABI v6" >&2
+    echo "all agents did not converge on ABI v7" >&2
     jq . <<<"${snapshot}" >&2 || true
     return 1
 }
@@ -279,7 +279,7 @@ transition_agent() {
     current_image=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.spec.containers[0].image}')
     if [[ ${current_image} != "${agent_image}" ]]; then
         old_uid=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.metadata.uid}')
-        echo "transitioning UNF agent on ${node} to persistent BPF ABI v6"
+        echo "transitioning UNF agent on ${node} to persistent BPF ABI v7"
         "${kc[@]}" -n unf-system delete pod "${pod}" --wait=false >/dev/null
         wait_for_agent_replacement "${node}" "${old_uid}"
     fi

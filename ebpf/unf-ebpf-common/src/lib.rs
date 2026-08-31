@@ -17,7 +17,7 @@ pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
 pub const POLICY_BANK_COUNT: u8 = 2;
-pub const SERVICE_MAP_ABI_VERSION: u16 = 1;
+pub const SERVICE_MAP_ABI_VERSION: u16 = 2;
 pub const SERVICE_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_MAP_ABI_VERSION: u16 = 1;
 pub const NODE_PORT_BANK_COUNT: u8 = 2;
@@ -208,14 +208,16 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
             0 | SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
         )
         && if state.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
-            u16::from_be_bytes([state.reserved[0], state.reserved[1]]) >= 32_768
+            !address_is_zero(state.translated_source_address)
+                && u16::from_be_bytes([state.reserved[0], state.reserved[1]]) >= 32_768
                 && matches!(
                     state.reserved[2],
                     0 | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
                 )
                 && state.reserved[3] == 0
         } else {
-            state.reserved[0] == 0
+            address_is_zero(state.translated_source_address)
+                && state.reserved[0] == 0
                 && state.reserved[1] == 0
                 && matches!(
                     state.reserved[2],
@@ -224,6 +226,17 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
                 && state.reserved[3] == 0
         }
         && now_ns.saturating_sub(state.last_seen_ns) <= timeout_ns
+}
+
+const fn address_is_zero(address: [u8; 16]) -> bool {
+    let mut index = 0;
+    while index < address.len() {
+        if address[index] != 0 {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 #[must_use]
@@ -845,6 +858,7 @@ pub struct ServiceConnectionValue {
     pub client_address: [u8; 16],
     pub frontend_address: [u8; 16],
     pub backend_address: [u8; 16],
+    pub translated_source_address: [u8; 16],
     pub service_id: ServiceId,
     pub backend_id: BackendId,
     pub client_port: [u8; 2],
@@ -917,7 +931,7 @@ const _: () = assert!(core::mem::size_of::<LoadBalancerSourceRangeValue>() == 32
 const _: () = assert!(core::mem::size_of::<LoadBalancerMapConfig>() == 48);
 const _: () = assert!(core::mem::size_of::<NodePortMapConfig>() == 40);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionKey>() == 40);
-const _: () = assert!(core::mem::size_of::<ServiceConnectionValue>() == 88);
+const _: () = assert!(core::mem::size_of::<ServiceConnectionValue>() == 104);
 const _: () = assert!(core::mem::size_of::<ServiceEvent>() == 96);
 
 #[cfg(test)]
@@ -985,7 +999,7 @@ mod tests {
         assert_eq!(core::mem::align_of::<ServiceConnectionKey>(), 1);
         assert_eq!(core::mem::size_of::<ServiceConnectionKey>(), 40);
         assert_eq!(core::mem::align_of::<ServiceConnectionValue>(), 8);
-        assert_eq!(core::mem::size_of::<ServiceConnectionValue>(), 88);
+        assert_eq!(core::mem::size_of::<ServiceConnectionValue>(), 104);
     }
 
     #[test]
@@ -1053,6 +1067,7 @@ mod tests {
             client_address: [1; 16],
             frontend_address: [2; 16],
             backend_address: [3; 16],
+            translated_source_address: [0; 16],
             service_id: ServiceId::new(4),
             backend_id: BackendId::new(5),
             client_port: 32_000_u16.to_be_bytes(),
@@ -1142,6 +1157,7 @@ mod tests {
         invalid = tcp;
         invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER;
         assert!(!service_connection_is_active(&invalid, 11));
+        invalid.translated_source_address = invalid.frontend_address;
         invalid.reserved[0..2].copy_from_slice(&32_768_u16.to_be_bytes());
         assert!(service_connection_is_active(&invalid, 11));
         invalid = tcp;
@@ -1151,6 +1167,7 @@ mod tests {
         assert!(!service_connection_is_active(&invalid, 11));
         invalid = tcp;
         invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER;
+        invalid.translated_source_address = invalid.frontend_address;
         invalid.reserved[0..2].copy_from_slice(&32_768_u16.to_be_bytes());
         invalid.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER;
         assert!(service_connection_is_active(&invalid, 11));

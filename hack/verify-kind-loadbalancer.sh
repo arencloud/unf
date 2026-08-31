@@ -527,8 +527,8 @@ external_tcp_probe "${allowed_client}" 4 "${local_v4}"
 external_tcp_probe "${allowed_client}" 6 "${local_v6}"
 external_udp_probe "${allowed_client}" 4 "${local_v4}"
 external_udp_probe "${allowed_client}" 6 "${local_v6}"
-[[ $(external_source_probe "${allowed_client}" 4 "${cluster_v4}") == "${cluster_v4}" ]]
-[[ $(external_source_probe "${allowed_client}" 6 "${cluster_v6}") == "${cluster_v6}" ]]
+[[ $(external_source_probe "${allowed_client}" 4 "${cluster_v4}") == "${server_node_v4}" ]]
+[[ $(external_source_probe "${allowed_client}" 6 "${cluster_v6}") == "${server_node_v6}" ]]
 [[ $(external_source_probe "${allowed_client}" 4 "${local_v4}") == "${allowed_v4}" ]]
 [[ $(external_source_probe "${allowed_client}" 6 "${local_v6}") == "${allowed_v6}" ]]
 
@@ -703,11 +703,11 @@ for replacement_node in "${client_node}" "${server_node}"; do
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
         test -f "$state" && test "$(stat -c %a "$state")" = 600
         jq -e ".schemaVersion == 1 and .revision > 0 and .allocationRevision > 0 and (.targets | length) > 0" "$state" >/dev/null
-        test -e /sys/fs/bpf/unf/v6/LOAD_BALANCER_CONFIG
-        test -e /sys/fs/bpf/unf/v6/LOAD_BALANCER_FRONTENDS_V4
-        test -e /sys/fs/bpf/unf/v6/LOAD_BALANCER_FRONTENDS_V6
-        test -e /sys/fs/bpf/unf/v6/LOAD_BALANCER_SOURCE_RANGES_V4
-        test -e /sys/fs/bpf/unf/v6/LOAD_BALANCER_SOURCE_RANGES_V6
+        test -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_CONFIG
+        test -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_FRONTENDS_V4
+        test -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_FRONTENDS_V6
+        test -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V4
+        test -e /sys/fs/bpf/unf/v7/LOAD_BALANCER_SOURCE_RANGES_V6
     '
 done
 "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 >/dev/null
@@ -743,7 +743,7 @@ jq -e '(.allocation.leases | length) == 0' <<<"${cleanup_state}" >/dev/null
 for node in "${nodes[@]}"; do
     sudo "${container_runtime}" exec "${node}" sh -ec '
         for map in LOAD_BALANCER_FRONTENDS_V4 LOAD_BALANCER_FRONTENDS_V6 LOAD_BALANCER_SOURCE_RANGES_V4 LOAD_BALANCER_SOURCE_RANGES_V6; do
-            test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v6/$map | jq length)" -eq 0
+            test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v7/$map | jq length)" -eq 0
         done
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
         test -f "$state" && jq -e ".schemaVersion == 1 and (.targets | length) == 0" "$state" >/dev/null
