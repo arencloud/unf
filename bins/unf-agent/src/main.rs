@@ -7674,13 +7674,8 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
         active_node_port_bank,
     )?;
     let mut matched = candidates.into_iter().filter(|candidate| {
-        let selection_bank_matches = candidate
-            .selection
-            .as_ref()
-            .is_none_or(|(_, checkpoint)| checkpoint.active_bank == bank);
         let active = &banks[usize::from(candidate.service.bank)];
-        selection_bank_matches
-            && service_bank_matches(active, &candidate.service)
+        service_bank_matches(active, &candidate.service)
             && recovered_config == candidate.service.config
             && match (&candidate.node_port, decoded_node_port) {
                 (Some(expected), Some((_, _, _, _, _, node_port_bank))) => {
@@ -14546,6 +14541,11 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut synchronizer =
             test_service_synchronizer(&mut ebpf, directory.path().join("service.json"));
+        // Service and selection banks are independent activation domains. A
+        // Phase 6 -> 7 migration can enter the first selection transaction
+        // with an already-active service bank, so exercise opposite parity
+        // instead of relying on a fresh-cluster coincidence.
+        synchronizer.active_bank = 1;
         let state = test_agent_state();
         let node = node_port_node_snapshot(1);
         let selection_node = local_selection_node(&node, Some("zone-a".to_owned()));
@@ -14748,6 +14748,7 @@ mod tests {
 
         let expected_service_bank = synchronizer.active_bank;
         let expected_selection_bank = synchronizer.active_selection_bank;
+        assert_ne!(expected_service_bank, expected_selection_bank);
         let expected_digest = zone_b_contract.contract_digest;
         synchronizer.banks = [None, None];
         synchronizer.node_port_banks = [None, None];
