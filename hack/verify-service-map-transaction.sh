@@ -38,6 +38,10 @@ sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
 
 sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
     --ignored --exact \
+    tests::privileged_load_balancer_relink_frees_the_next_service_bank
+
+sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
+    --ignored --exact \
     tests::privileged_service_packets_translate_dual_stack_and_survive_churn
 
 sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \

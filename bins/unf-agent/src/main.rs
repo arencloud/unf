@@ -8379,10 +8379,14 @@ async fn consume_events(
                 } else {
                     clear_service_snapshot_error(state);
                     refresh_controller_readiness(state);
-                    if let Err(error) = synchronize_load_balancer_maps(services, state).await {
-                        record_load_balancer_error(state, &error);
-                        warn!(%error, "LoadBalancer host-state synchronization failed; retaining active bank");
-                    }
+                }
+                // A failed Service activation can mean its inactive bank is still referenced by
+                // last-known-good LoadBalancer state. Reconcile that derived state against the
+                // currently applied Service tuple even after the Service attempt fails; otherwise
+                // the two-bank domains wait on each other forever after controller recovery.
+                if let Err(error) = synchronize_load_balancer_maps(services, state).await {
+                    record_load_balancer_error(state, &error);
+                    warn!(%error, "LoadBalancer host-state synchronization failed; retaining active bank");
                 }
             }
             _ = event_interval.tick() => {
@@ -12830,6 +12834,69 @@ mod tests {
                 .map(|snapshot| snapshot.revision.get()),
             Some(5)
         );
+    }
+
+    #[test]
+    #[ignore = "requires root BPF map creation and UNF_EBPF_OBJECT"]
+    fn privileged_load_balancer_relink_frees_the_next_service_bank() {
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new()
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        let directory = tempdir().unwrap();
+        let service_path = directory.path().join("service.json");
+        let mut synchronizer = test_service_synchronizer(&mut ebpf, service_path);
+        let state = test_agent_state();
+        let node = node_port_node_snapshot(1);
+
+        let first_services = load_balancer_service_test_snapshot(7, 5);
+        activate_service_snapshot(
+            &mut synchronizer,
+            &first_services,
+            Some(&node),
+            true,
+            &state,
+        )
+        .expect("initial Service state activates");
+        let old_reachability = load_balancer_node_snapshot(&first_services, 3, &["192.0.2.4"]);
+        activate_load_balancer_snapshot(&mut synchronizer, &old_reachability, &state)
+            .expect("initial LoadBalancer state activates");
+
+        let mut current_node = node.clone();
+        current_node.source_epoch = 8;
+        let current_services = load_balancer_service_test_snapshot(8, 6);
+        activate_service_snapshot(
+            &mut synchronizer,
+            &current_services,
+            Some(&current_node),
+            true,
+            &state,
+        )
+        .expect("new controller epoch activates while old LoadBalancer state is retained");
+        let next_services = load_balancer_service_test_snapshot(8, 7);
+        let error = activate_service_snapshot(
+            &mut synchronizer,
+            &next_services,
+            Some(&current_node),
+            true,
+            &state,
+        )
+        .expect_err("the old LoadBalancer link initially protects its referenced Service bank");
+        assert!(error.to_string().contains("still referenced"));
+
+        let current_reachability =
+            load_balancer_node_snapshot(&current_services, 4, &["192.0.2.4"]);
+        activate_load_balancer_snapshot(&mut synchronizer, &current_reachability, &state)
+            .expect("LoadBalancer retry relinks to the currently active Service bank");
+        activate_service_snapshot(
+            &mut synchronizer,
+            &next_services,
+            Some(&current_node),
+            true,
+            &state,
+        )
+        .expect("next Service revision activates after derived-state relink");
+        assert_eq!(synchronizer.applied.as_ref(), Some(&next_services));
     }
 
     #[test]
