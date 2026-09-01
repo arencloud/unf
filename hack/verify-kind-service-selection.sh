@@ -32,7 +32,8 @@ cleanup() {
         "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 >/dev/null 2>&1 || true
     fi
     sudo "${container_runtime}" rm -f "${external_client}" >/dev/null 2>&1 || true
-    "${kc[@]}" delete namespace "${namespace}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    "${kc[@]}" delete namespace "${namespace}" --ignore-not-found --wait=true \
+        --timeout=120s >/dev/null 2>&1 || true
     for node in "${nodes[@]:-}"; do
         "${kc[@]}" label node "${node}" topology.kubernetes.io/zone- >/dev/null 2>&1 || true
     done
@@ -45,6 +46,10 @@ if [[ ${context} != kind-* ]] || [[ $("${kc[@]}" config current-context) != "${c
     echo "refusing service-selection qualification outside exact Kind context ${context}" >&2
     exit 1
 fi
+
+qualification_stage=prior-fixture-cleanup
+"${kc[@]}" delete namespace "${namespace}" --ignore-not-found --wait=true \
+    --timeout=120s >/dev/null
 
 qualification_stage=phase6-regression-and-live-handoff
 KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" KIND_PROVIDER="${container_runtime}" \
