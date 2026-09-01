@@ -464,8 +464,8 @@ jq -e '.selection_tier == "cluster" and .selection_algorithm == "stableHash"
 for offset in $(seq 30 37); do udp_probe 6 "${selection_v6}" "$((probe_base + offset))"; done
 
 stage=acknowledged-cross-worker-dsr
-allowed_v4=$(ip -4 route get "$(node_address "${client_node}" 4)" | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
-allowed_v6=$(ip -6 route get "$(node_address "${client_node}" 6)" | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+allowed_v4=$(node_address "${same_zone_node}" 4)
+allowed_v6=$(node_address "${same_zone_node}" 6)
 [[ -n ${allowed_v4} && -n ${allowed_v6} ]]
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: v1
@@ -534,8 +534,25 @@ spec:
   volumes:
     - name: host
       hostPath: {path: /, type: Directory}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: selection-external, namespace: ${namespace}}
+spec:
+  serviceAccountName: selection-privileged
+  nodeName: ${same_zone_node}
+  hostNetwork: true
+  restartPolicy: Never
+  tolerations: [{operator: Exists}]
+  containers:
+    - name: client
+      image: ${test_tools_image}
+      imagePullPolicy: IfNotPresent
+      securityContext: {privileged: true}
+      command: [sh, -ec, "sleep infinity"]
 EOF
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/selection-advertiser --timeout=180s >/dev/null
+"${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/selection-external --timeout=180s >/dev/null
 advertiser_created=true
 "${kc[@]}" -n "${namespace}" exec selection-advertiser -- sh -euc '
     ip -4 address add "$1/32" dev br-ex
@@ -548,13 +565,12 @@ advertiser_created=true
     chroot /host arping -U -c 3 -I br-ex "$1" >/dev/null
     chroot /host arping -A -c 3 -I br-ex "$1" >/dev/null
 ' sh "${dsr_v4}" "${dsr_v6}"
-for family_and_target in "4 http://${dsr_v4}:8080/health" "6 http://[${dsr_v6}]:8080/health"; do
-    read -r family target <<<"${family_and_target}"
-    for _ in $(seq 1 60); do curl "-${family}" --noproxy '*' --fail --silent --connect-timeout 5 --max-time 10 "${target}" | grep -qx ok && break; sleep 1; done
-    curl "-${family}" --noproxy '*' --fail --silent --connect-timeout 5 --max-time 10 "${target}" | grep -qx ok
+for target in "http://${dsr_v4}:8080/health" "http://[${dsr_v6}]:8080/health"; do
+    for _ in $(seq 1 60); do "${kc[@]}" -n "${namespace}" exec selection-external -- wget -T 10 -t 1 -qO- "${target}" | grep -qx ok && break; sleep 1; done
+    "${kc[@]}" -n "${namespace}" exec selection-external -- wget -T 10 -t 1 -qO- "${target}" | grep -qx ok
 done
-observed_v4=$(printf probe | socat -T 10 - "TCP4:${dsr_v4}:8081" | tr -d '\r\n')
-observed_v6=$(printf probe | socat -T 10 - "TCP6:[${dsr_v6}]:8081" | tr -d '\r\n'); observed_v6=${observed_v6#[}; observed_v6=${observed_v6%]}
+observed_v4=$("${kc[@]}" -n "${namespace}" exec selection-external -- sh -ec "printf probe | socat -T 10 - TCP4:${dsr_v4}:8081" | tr -d '\r\n')
+observed_v6=$("${kc[@]}" -n "${namespace}" exec selection-external -- sh -ec "printf probe | socat -T 10 - 'TCP6:[${dsr_v6}]:8081'" | tr -d '\r\n'); observed_v6=${observed_v6#[}; observed_v6=${observed_v6%]}
 [[ ${observed_v4} == "${allowed_v4}" ]]
 [[ $(ip -6 route get "${observed_v6}" | awk 'NR == 1 {print ($1 == "local" ? $2 : $1)}') == "${allowed_v6}" ]]
 wait_for_history "${dsr_v4}" 'any(.entries[]; .key.destination_ipv4 == $address
@@ -562,12 +578,12 @@ wait_for_history "${dsr_v4}" 'any(.entries[]; .key.destination_ipv4 == $address
 "${kc[@]}" -n "${namespace}" patch service dsr --type=merge -p \
     '{"spec":{"loadBalancerSourceRanges":["192.0.2.1/32","2001:db8::1/128"]}}' >/dev/null
 wait_for_convergence >/dev/null
-! curl -4 --noproxy '*' --fail --silent --connect-timeout 3 --max-time 5 "http://${dsr_v4}:8080/health" >/dev/null 2>&1
-! curl -6 --noproxy '*' --fail --silent --connect-timeout 3 --max-time 5 "http://[${dsr_v6}]:8080/health" >/dev/null 2>&1
+! "${kc[@]}" -n "${namespace}" exec selection-external -- wget -T 5 -t 1 -qO- "http://${dsr_v4}:8080/health" >/dev/null 2>&1
+! "${kc[@]}" -n "${namespace}" exec selection-external -- wget -T 5 -t 1 -qO- "http://[${dsr_v6}]:8080/health" >/dev/null 2>&1
 "${kc[@]}" -n "${namespace}" patch service dsr --type=merge -p \
     "{\"spec\":{\"loadBalancerSourceRanges\":[\"${allowed_v4}/32\",\"${allowed_v6}/128\"]}}" >/dev/null
 wait_for_convergence >/dev/null
-curl -4 --noproxy '*' --fail --silent --connect-timeout 5 --max-time 10 "http://${dsr_v4}:8080/health" | grep -qx ok
+"${kc[@]}" -n "${namespace}" exec selection-external -- wget -T 10 -t 1 -qO- "http://${dsr_v4}:8080/health" | grep -qx ok
 
 stage=operations-and-controller-offline-recovery
 advanced_agents=$(wait_for_convergence)
@@ -621,7 +637,7 @@ for replacement_node in "${client_node}" "${remote_node}"; do
         for map in SERVICE_CONFIG SERVICE_AFFINITY SERVICE_BACKEND_SLOTS; do test -e "/sys/fs/bpf/unf/v11/$map"; done
     '
     tcp_probe "${selection_v4}"
-    curl -4 --noproxy '*' --fail --silent --connect-timeout 5 --max-time 10 "http://${dsr_v4}:8080/health" | grep -qx ok
+    "${kc[@]}" -n "${namespace}" exec selection-external -- wget -T 10 -t 1 -qO- "http://${dsr_v4}:8080/health" | grep -qx ok
 done
 "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 >/dev/null
 controller_scaled_down=false
