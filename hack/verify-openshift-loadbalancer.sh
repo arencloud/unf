@@ -80,19 +80,37 @@ if [[ -n $(git -C "${project_root}" status --porcelain) ]]; then
     exit 1
 fi
 if [[ ! -s ${release_record} || ! -s ${deploy_evidence} ]] || ! jq -e '
-    .schemaVersion == 1 and .phase == "6.9"
+    .schemaVersion == 1 and (.phase == "6.9" or .phase == "7.10")
     and (.sourceRevision | test("^[0-9a-f]{40}$"))
-    and .kindQualification.phase == "6.8" and .kindQualification.result == "passed"
-    and .contracts.persistentBpfStateAbiVersion == 7
-    and .contracts.serviceSnapshotSchemaVersion == 3
-    and .contracts.agentStatusSchemaVersion == 6
+    and .kindQualification.result == "passed"
+    and ((.phase == "6.9" and .kindQualification.phase == "6.8"
+          and .contracts.persistentBpfStateAbiVersion == 7
+          and .contracts.serviceSnapshotSchemaVersion == 3
+          and .contracts.agentStatusSchemaVersion == 6
+          and .contracts.flowExportSchemaVersion == 5)
+      or (.phase == "7.10" and .kindQualification.phase == "7.9"
+          and .contracts.persistentBpfStateAbiVersion == 11
+          and .contracts.serviceSnapshotSchemaVersion == 4
+          and .contracts.selectionContractSchemaVersion == 1
+          and .contracts.agentStatusSchemaVersion == 8
+          and .contracts.flowExportSchemaVersion == 6))
     and all(.images[]; test("^quay\\.io/arencloud/unf-[a-z-]+-dev@sha256:[0-9a-f]{64}$"))
 ' "${release_record}" >/dev/null; then
-    echo "Phase 6.9 release record or staged evidence is missing or invalid" >&2
+    echo "OpenShift LoadBalancer release record or staged evidence is missing or invalid" >&2
     exit 1
 fi
 
 source_revision=$(jq -er .sourceRevision "${release_record}")
+release_phase=$(jq -er .phase "${release_record}")
+persistent_abi=$(jq -er .contracts.persistentBpfStateAbiVersion "${release_record}")
+service_schema=$(jq -er .contracts.serviceSnapshotSchemaVersion "${release_record}")
+agent_status_schema=$(jq -er .contracts.agentStatusSchemaVersion "${release_record}")
+flow_export_schema=$(jq -er .contracts.flowExportSchemaVersion "${release_record}")
+if [[ ${release_phase} == 7.10 ]]; then
+    deploy_stage=abi-v11-service-selection-staged-deployment
+else
+    deploy_stage=abi-v7-loadbalancer-staged-deployment
+fi
 controller_image=$(jq -er .images.controller "${release_record}")
 agent_image=$(jq -er .images.agent "${release_record}")
 test_tools_image=$(jq -er .images.testTools "${release_record}")
@@ -108,13 +126,15 @@ if [[ -z ${expected_infrastructure} || ${expected_infrastructure} != "${infrastr
     exit 1
 fi
 jq -e --arg context "${context}" --arg infrastructure "${infrastructure}" \
-    --arg revision "${source_revision}" '
-    .schemaVersion == 1 and .phase == "6.9"
-    and .stage == "abi-v7-loadbalancer-staged-deployment"
+    --arg revision "${source_revision}" --arg phase "${release_phase}" \
+    --arg deploy_stage "${deploy_stage}" --argjson abi "${persistent_abi}" \
+    --argjson service_schema "${service_schema}" --argjson status_schema "${agent_status_schema}" '
+    .schemaVersion == 1 and .phase == $phase
+    and .stage == $deploy_stage
     and .context == $context and .infrastructure == $infrastructure
     and .sourceRevision == $revision and .kubeProxyPresent == false
-    and .persistentBpfAbi == 7 and .serviceSnapshotSchemaVersion == 3
-    and .agentStatusSchemaVersion == 6 and .agents.all_converged == true
+    and .persistentBpfAbi == $abi and .serviceSnapshotSchemaVersion == $service_schema
+    and .agentStatusSchemaVersion == $status_schema and .agents.all_converged == true
 ' "${deploy_evidence}" >/dev/null
 
 controller_pod() {
@@ -155,13 +175,14 @@ wait_for_convergence() {
     local snapshot=
     for _ in $(seq 1 900); do
         snapshot=$(controller_raw /v1/state/agents 2>/dev/null || true)
-        if jq -e --argjson expected "${#nodes[@]}" '
-            .schema_version == 6 and .expected_agents == $expected
+        if jq -e --argjson expected "${#nodes[@]}" --argjson status_schema "${agent_status_schema}" \
+            --argjson service_schema "${service_schema}" '
+            .schema_version == $status_schema and .expected_agents == $expected
             and .reporting_agents == $expected and .missing_agents == 0
             and .stale_agents == 0 and .converged_agents == $expected
             and .unexpected_agents == 0 and .all_converged == true
             and all(.nodes[]; .fresh and .converged and .report.ready and .report.bpf_loaded
-                and .report.service_snapshot_schema_version == 3
+                and .report.service_snapshot_schema_version == $service_schema
                 and .report.load_balancer_last_error == null)
         ' <<<"${snapshot}" >/dev/null 2>&1; then
             printf '%s\n' "${snapshot}"
@@ -178,9 +199,10 @@ wait_for_load_balancer_shape() {
     local frontends=$1 cluster=$2 local_count=$3 snapshot=
     for _ in $(seq 1 900); do
         snapshot=$(controller_raw /v1/state/agents 2>/dev/null || true)
-        if jq -e --argjson expected "${#nodes[@]}" --argjson frontends "${frontends}" \
+        if jq -e --argjson expected "${#nodes[@]}" --argjson status_schema "${agent_status_schema}" \
+            --argjson frontends "${frontends}" \
             --argjson cluster "${cluster}" --argjson local_count "${local_count}" '
-            .schema_version == 6 and .expected_agents == $expected
+            .schema_version == $status_schema and .expected_agents == $expected
             and .converged_agents == $expected and .all_converged == true
             and all(.nodes[]; .fresh and .converged
                 and .report.load_balancer_frontend_count == $frontends
@@ -634,8 +656,9 @@ stage=operations-and-simulation
 history=
 for _ in $(seq 1 300); do
     history=$(controller_raw /v1/flows 2>/dev/null || true)
-    if jq -e --arg cluster "${cluster_v4}" --arg local "${local_v4}" '
-        .schema_version == 6
+    if jq -e --arg cluster "${cluster_v4}" --arg local "${local_v4}" \
+        --argjson flow_schema "${flow_export_schema}" '
+        .schema_version == $flow_schema
         and any(.entries[]; .key.destination_ipv4 == $cluster and .service.frontend_kind == "load_balancer_cluster" and .service.action == 1)
         and any(.entries[]; .key.destination_ipv4 == $local and .service.frontend_kind == "load_balancer_local" and .service.action == 1)
         and any(.entries[]; .key.destination_ipv4 == $local and .service.frontend_kind == "load_balancer_local" and .service.action == 2)
@@ -735,7 +758,7 @@ for replacement_node in "${client_node}" "${server_node}"; do
     done
     [[ -n ${new_agent} && ${new_agent} != "${old_agent}" ]]
     recovered=$(agent_raw "${replacement_node}" /v1/status)
-    jq -e '.schema_version == 6 and .ready and .bpf_loaded
+    jq -e --argjson status_schema "${agent_status_schema}" '.schema_version == $status_schema and .ready and .bpf_loaded
         and .applied_service_revision == .desired_service_revision
         and .applied_load_balancer_revision == .desired_load_balancer_revision
         and .applied_load_balancer_allocation_revision == .desired_load_balancer_allocation_revision
@@ -747,12 +770,13 @@ for replacement_node in "${client_node}" "${server_node}"; do
         test -f "$state" && test "$(stat -c %a "$state")" = 600
         jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and .applied.revision > 0
           and .applied.allocationRevision > 0 and (.applied.targets | length) > 0" "$state" >/dev/null
-        test -e /sys/fs/bpf/unf/v11/LOAD_BALANCER_CONFIG
-        test -e /sys/fs/bpf/unf/v11/LOAD_BALANCER_FRONTENDS_V4
-        test -e /sys/fs/bpf/unf/v11/LOAD_BALANCER_FRONTENDS_V6
-        test ! -e /sys/fs/bpf/unf/v11/LOAD_BALANCER_SOURCE_RANGES_V4
-        test ! -e /sys/fs/bpf/unf/v11/LOAD_BALANCER_SOURCE_RANGES_V6
-    '
+        abi_directory="/sys/fs/bpf/unf/v$1"
+        test -e "$abi_directory/LOAD_BALANCER_CONFIG"
+        test -e "$abi_directory/LOAD_BALANCER_FRONTENDS_V4"
+        test -e "$abi_directory/LOAD_BALANCER_FRONTENDS_V6"
+        test ! -e "$abi_directory/LOAD_BALANCER_SOURCE_RANGES_V4"
+        test ! -e "$abi_directory/LOAD_BALANCER_SOURCE_RANGES_V6"
+    ' sh "${persistent_abi}"
     if ! wait "${probe_pid}"; then sed 's/^/probe: /' "${probe_log}" >&2; exit 1; fi
     probe_pid=
 done
@@ -794,20 +818,22 @@ jq -e '(.allocation.leases | length) == 0' <<<"${cleanup_state}" >/dev/null
 for node in "${nodes[@]}"; do
     pod=$(advertiser_pod_on_node "${node}")
     "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
-        test ! -e /sys/fs/bpf/unf/v11/LOAD_BALANCER_SOURCE_RANGES_V4
-        test ! -e /sys/fs/bpf/unf/v11/LOAD_BALANCER_SOURCE_RANGES_V6
+        abi_directory="/sys/fs/bpf/unf/v$1"
+        test ! -e "$abi_directory/LOAD_BALANCER_SOURCE_RANGES_V4"
+        test ! -e "$abi_directory/LOAD_BALANCER_SOURCE_RANGES_V6"
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
         test -f "$state"
         jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and (.applied.targets | length) == 0" "$state" >/dev/null
-    '
+    ' sh "${persistent_abi}"
 done
 for worker in "${workers[@]}"; do
     pod=$(advertiser_pod_on_node "${worker}")
     "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
+        abi_directory="/sys/fs/bpf/unf/v$1"
         for map in LOAD_BALANCER_FRONTENDS_V4 LOAD_BALANCER_FRONTENDS_V6; do
-            test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v11/$map | jq length)" -eq 0
+            test "$(bpftool -j map dump pinned "$abi_directory/$map" | jq length)" -eq 0
         done
-    '
+    ' sh "${persistent_abi}"
 done
 "${kc[@]}" -n unf-system delete pods -l "${advertiser_label}=true" --wait=true --timeout=180s >/dev/null
 advertisers_created=false
@@ -844,14 +870,15 @@ jq -n \
     --argjson reachabilityRevisionBefore "${reachability_before}" --argjson reachabilityRevisionAfter "${reachability_after}" \
     --argjson durationSeconds "$(( $(date +%s) - started_unix ))" --argjson nodes "${node_evidence}" \
     --argjson images "${image_evidence}" --argjson agents "${final_agents}" \
+    --arg releasePhase "${release_phase}" --argjson persistentAbi "${persistent_abi}" \
     --argjson baselineUnhealthy "${baseline_unhealthy}" --argjson finalUnhealthy "${final_unhealthy}" '
     {
-      schemaVersion:1,generatedAt:$generatedAt,phase:"6.9",result:"passed",
+      schemaVersion:1,generatedAt:$generatedAt,phase:$releasePhase,scope:"loadbalancer-regression",result:"passed",
       context:$context,infrastructure:$infrastructure,sourceRevision:$sourceRevision,
       qualificationRevision:$qualificationRevision,openshiftVersion:$openshiftVersion,
       kubernetesVersion:$kubernetesVersion,durationSeconds:$durationSeconds,
       images:{controller:$controllerImage,agent:$agentImage,testTools:$testToolsImage},
-      kubeProxyPresent:false,persistentBpfAbi:7,
+      kubeProxyPresent:false,persistentBpfAbi:$persistentAbi,
       baselineUnhealthyOperators:$baselineUnhealthy,finalUnhealthyOperators:$finalUnhealthy,
       provider:{name:"direct-node",instance:"openshift-direct-node-v1",pool:"qualification",poolUid:"openshift-loadbalancer-pool-v1",
         advertisementFixture:"exact temporary br-ex /32 and /128 ownership"},
@@ -877,7 +904,7 @@ jq -n \
         "metrics, validated status, durable history, explanation, and read-only simulation",
         "controller/provider restart with stable allocation identity and monotonic fencing",
         "controller-offline replacement of both worker agents from last-known-good state",
-        "current-schema checkpoint and exact ABI-v7 LoadBalancer map audit",
+        "current-schema checkpoint and exact current-ABI LoadBalancer map audit",
         "exact lease, frontend map, runtime source trie, health listener, address, Pod, and Namespace cleanup",
         "five-node final convergence and no new unhealthy ClusterOperators"],
       excluded:["production BGP, EVPN, ECMP, and BFD","cloud-provider adapters","classless ownership",
@@ -891,4 +918,4 @@ artifact_tmp=
 
 trap - ERR EXIT
 rm -rf -- "${temporary_dir}"
-echo "OpenShift cl02 kube-proxy-free dual-stack LoadBalancer qualification passed; evidence: ${artifact}"
+echo "OpenShift ${release_phase} kube-proxy-free dual-stack LoadBalancer regression passed; evidence: ${artifact}"
