@@ -14,10 +14,10 @@ use unf_common::{BackendId, Protocol, Revision, ServiceId};
 use unf_ebpf_common::{
     LOAD_BALANCER_LOCAL_FRONTEND_INDEX_BASE, NODE_PORT_BANK_COUNT,
     NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY, NODE_PORT_FRONTEND_FLAG_LOCAL,
-    NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG, NODE_PORT_MAP_ABI_VERSION, SERVICE_BACKEND_FLAG_READY,
-    SERVICE_BACKEND_FLAG_SERVING, SERVICE_BACKEND_FLAG_TERMINATING, SERVICE_BANK_COUNT,
-    SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY, SERVICE_MAP_ABI_VERSION,
-    SERVICE_SELECTION_TIER_CLUSTER, SERVICE_SELECTION_TIER_SAME_NODE,
+    NODE_PORT_FRONTEND_FLAG_MAGLEV, NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG, NODE_PORT_MAP_ABI_VERSION,
+    SERVICE_BACKEND_FLAG_READY, SERVICE_BACKEND_FLAG_SERVING, SERVICE_BACKEND_FLAG_TERMINATING,
+    SERVICE_BANK_COUNT, SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY, SERVICE_FRONTEND_FLAG_MAGLEV,
+    SERVICE_MAP_ABI_VERSION, SERVICE_SELECTION_TIER_CLUSTER, SERVICE_SELECTION_TIER_SAME_NODE,
     SERVICE_SELECTION_TIER_SAME_ZONE,
 };
 
@@ -46,6 +46,102 @@ pub const MAX_ENDPOINT_SLICE_PROVENANCE: usize = 128;
 pub const SERVICE_FRONTEND_BANK_CAPACITY: usize = MAX_SERVICE_FRONTENDS;
 pub const SERVICE_BACKEND_BANK_CAPACITY: usize = MAX_SERVICE_BACKENDS;
 pub const SERVICE_BACKEND_SLOT_BANK_CAPACITY: usize = MAX_SERVICE_BACKEND_REFERENCES;
+/// Maglev tables maintain at least sixteen lookup entries per admitted backend.
+pub const MAGLEV_MIN_SLOTS_PER_BACKEND: usize = 16;
+/// Largest measured fixed table. Larger or capacity-constrained plans use the
+/// explicit `StableHash` fallback and expose that choice in frontend provenance.
+pub const MAGLEV_MAX_TABLE_SIZE: usize = 65_537;
+const MAGLEV_TABLE_SIZES: [usize; 9] =
+    [251, 509, 1_021, 2_039, 4_093, 8_191, 16_381, 32_749, 65_537];
+
+/// Returns the fixed table size for a backend cardinality in the measured
+/// Maglev operating range.
+#[must_use]
+pub fn maglev_table_size(backend_count: usize) -> Option<usize> {
+    if !(2..=MAX_BACKENDS_PER_SERVICE).contains(&backend_count) {
+        return None;
+    }
+    let required = backend_count.checked_mul(MAGLEV_MIN_SLOTS_PER_BACKEND)?;
+    MAGLEV_TABLE_SIZES
+        .iter()
+        .copied()
+        .find(|size| *size >= required)
+}
+
+const fn maglev_mix(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// Builds one deterministic standard Maglev permutation table. Backend order
+/// is canonicalized by stable ID so input ordering cannot change the result.
+#[must_use]
+pub fn build_maglev_table(
+    service_id: ServiceId,
+    frontend_index: u32,
+    backend_ids: &[BackendId],
+) -> Option<Vec<BackendId>> {
+    let table_size = maglev_table_size(backend_ids.len())?;
+    let mut backends = backend_ids.to_vec();
+    backends.sort_unstable();
+    backends.dedup();
+    if backends.len() != backend_ids.len() {
+        return None;
+    }
+    let frontend_seed = (u64::from(service_id.get()) << 32) | u64::from(frontend_index);
+    let table_size_u64 = u64::try_from(table_size).ok()?;
+    let mut offsets = Vec::with_capacity(backends.len());
+    let mut skips = Vec::with_capacity(backends.len());
+    for backend in &backends {
+        let backend_seed = frontend_seed ^ u64::from(backend.get());
+        offsets.push(usize::try_from(maglev_mix(backend_seed) % table_size_u64).ok()?);
+        skips.push(
+            usize::try_from(
+                (maglev_mix(backend_seed ^ 0xd1b5_4a32_d192_ed03) % (table_size_u64 - 1)) + 1,
+            )
+            .ok()?,
+        );
+    }
+    let mut next = vec![0_usize; backends.len()];
+    let mut table = vec![None; table_size];
+    let mut populated = 0_usize;
+    while populated < table_size {
+        for backend_index in 0..backends.len() {
+            let mut candidate =
+                (offsets[backend_index] + next[backend_index] * skips[backend_index]) % table_size;
+            while table[candidate].is_some() {
+                next[backend_index] += 1;
+                candidate = (offsets[backend_index] + next[backend_index] * skips[backend_index])
+                    % table_size;
+            }
+            table[candidate] = Some(backends[backend_index]);
+            next[backend_index] += 1;
+            populated += 1;
+            if populated == table_size {
+                break;
+            }
+        }
+    }
+    table.into_iter().collect()
+}
+
+fn materialize_selection_slots(
+    algorithm: ServiceSelectionAlgorithm,
+    service_id: ServiceId,
+    frontend_index: u32,
+    stable_slots: &[BackendId],
+    available: usize,
+) -> (Vec<BackendId>, bool) {
+    if algorithm == ServiceSelectionAlgorithm::Maglev
+        && let Some(candidate) = build_maglev_table(service_id, frontend_index, stable_slots)
+        && candidate.len() <= available
+    {
+        return (candidate, true);
+    }
+    (stable_slots.to_vec(), false)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -2146,6 +2242,7 @@ pub fn compile_service_dataplane(
                 snapshot.revision.get(),
                 SERVICE_SELECTION_TIER_CLUSTER,
                 None,
+                false,
             );
             match frontend.address {
                 IpAddr::V4(address) => {
@@ -2267,10 +2364,11 @@ pub fn compile_service_selection_dataplane(
 fn reject_later_selection_behavior_service(
     contract: &NetworkBehaviorContract,
 ) -> Result<(), ServiceDataplaneError> {
-    if contract.plans.iter().any(|plan| {
-        plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
-            || plan.forwarding_mode != ServiceForwardingMode::Nat
-    }) {
+    if contract
+        .plans
+        .iter()
+        .any(|plan| plan.forwarding_mode != ServiceForwardingMode::Nat)
+    {
         return Err(ServiceDataplaneError::UnsupportedSelectionBehavior);
     }
     Ok(())
@@ -2366,7 +2464,17 @@ fn apply_selection_contract_slots(
         state
             .backend_slots
             .retain(|key, _| key[0..8] != prefix[0..8] || key[12] != state.bank);
-        for (slot, backend_id) in selected.backend_ids.iter().enumerate() {
+        let stable_slots = &selected.backend_ids;
+        let available =
+            SERVICE_BACKEND_SLOT_BANK_CAPACITY.saturating_sub(state.backend_slots.len());
+        let (slots, maglev_active) = materialize_selection_slots(
+            plan.selection_algorithm,
+            service.id,
+            frontend_index,
+            stable_slots,
+            available,
+        );
+        for (slot, backend_id) in slots.iter().enumerate() {
             state.backend_slots.insert(
                 encode_service_backend_slot_key(
                     service.id,
@@ -2386,10 +2494,11 @@ fn apply_selection_contract_slots(
             let value = encode_service_frontend_value(
                 service.id,
                 frontend_index,
-                selected.backend_ids.len(),
+                slots.len(),
                 snapshot.revision.get(),
                 selection_tier_code(selected.tier),
                 affinity_timeout(plan.session_affinity),
+                maglev_active,
             );
             match address {
                 IpAddr::V4(address) => {
@@ -2431,6 +2540,31 @@ fn apply_selection_contract_slots(
         state.bank,
     );
     Ok(())
+}
+
+/// Reports the table width and the actual algorithm materialized for an exact
+/// frontend. A requested Maglev plan can deterministically fall back when the
+/// global slot budget cannot admit its fixed table.
+#[must_use]
+pub fn compiled_slot_layout(
+    state: &ServiceDataplaneState,
+    service_id: ServiceId,
+    frontend_index: u32,
+    eligible_backend_count: usize,
+) -> (usize, bool) {
+    let prefix = encode_service_backend_slot_key(service_id, frontend_index, 0, state.bank);
+    let mut upper = prefix;
+    upper[8..16].fill(u8::MAX);
+    let slot_count = state
+        .backend_slots
+        .range(prefix..=upper)
+        .map(|(key, _)| key)
+        .filter(|key| key[0..8] == prefix[0..8] && key[12] == state.bank)
+        .count();
+    (
+        slot_count,
+        eligible_backend_count >= 2 && slot_count > eligible_backend_count,
+    )
 }
 
 /// Lowers `ClusterIP` state plus deterministic per-Node slots needed by Local
@@ -2668,13 +2802,14 @@ pub fn compile_node_port_selection_fabric_dataplane(
     contract
         .verify(&normalized, &contract.node)
         .map_err(|error| NodePortDataplaneError::InvalidSelectionContract(error.to_string()))?;
-    if contract.plans.iter().any(|plan| {
-        plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
-            || plan.forwarding_mode != ServiceForwardingMode::Nat
-    }) {
+    if contract
+        .plans
+        .iter()
+        .any(|plan| plan.forwarding_mode != ServiceForwardingMode::Nat)
+    {
         return Err(NodePortDataplaneError::UnsupportedSelectionBehavior.into());
     }
-    let service = compile_service_selection_dataplane(&normalized, contract, service_bank)?;
+    let service_state = compile_service_selection_dataplane(&normalized, contract, service_bank)?;
     let mut compatible = normalized.clone();
     for service in &mut compatible.services {
         service.internal_traffic_policy = ServiceTrafficPolicy::Cluster;
@@ -2721,10 +2856,19 @@ pub fn compile_node_port_selection_fabric_dataplane(
         if affinity_timeout.is_some() {
             flags |= NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY;
         }
-        let value = encode_node_port_frontend_value(
+        let (backend_count, maglev_active) = compiled_slot_layout(
+            &service_state,
             service.id,
             frontend_index,
             selected.backend_ids.len(),
+        );
+        if maglev_active {
+            flags |= NODE_PORT_FRONTEND_FLAG_MAGLEV;
+        }
+        let value = encode_node_port_frontend_value(
+            service.id,
+            frontend_index,
+            backend_count,
             flags,
             normalized.revision.get(),
             service_bank,
@@ -2770,7 +2914,10 @@ pub fn compile_node_port_selection_fabric_dataplane(
         node_port.ipv6_frontends.len(),
         node_port_bank,
     );
-    Ok(NodePortFabricDataplaneState { service, node_port })
+    Ok(NodePortFabricDataplaneState {
+        service: service_state,
+        node_port,
+    })
 }
 
 fn preflight_node_port_capacity(
@@ -2997,6 +3144,7 @@ fn encode_service_frontend_value(
     revision: u64,
     selection_tier: u8,
     affinity_timeout: Option<u32>,
+    maglev: bool,
 ) -> [u8; 32] {
     let mut value = [0_u8; 32];
     value[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
@@ -3005,10 +3153,16 @@ fn encode_service_frontend_value(
     value[12..14].copy_from_slice(&SERVICE_MAP_ABI_VERSION.to_ne_bytes());
     value[16..24].copy_from_slice(&revision.to_ne_bytes());
     value[24] = selection_tier;
+    let mut flags = if maglev {
+        SERVICE_FRONTEND_FLAG_MAGLEV
+    } else {
+        0
+    };
     if let Some(timeout) = affinity_timeout {
-        value[14..16].copy_from_slice(&SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY.to_ne_bytes());
+        flags |= SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY;
         value[25..29].copy_from_slice(&timeout.to_ne_bytes());
     }
+    value[14..16].copy_from_slice(&flags.to_ne_bytes());
     value
 }
 
@@ -4297,5 +4451,115 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(frontend[8..12].try_into().unwrap()), 1);
         assert_eq!(frontend[24], SERVICE_SELECTION_TIER_SAME_NODE);
         assert_eq!(compiled.backend_slots.len(), 1);
+    }
+
+    #[test]
+    fn maglev_table_is_deterministic_balanced_and_minimally_disruptive() {
+        let backends = (1..=17).map(BackendId::new).collect::<Vec<_>>();
+        let table = build_maglev_table(ServiceId::new(11), 7, &backends).unwrap();
+        let mut reordered = backends.clone();
+        reordered.reverse();
+        assert_eq!(
+            table,
+            build_maglev_table(ServiceId::new(11), 7, &reordered).unwrap()
+        );
+        assert_eq!(table.len(), 509);
+        let mut counts = BTreeMap::<BackendId, usize>::new();
+        for backend in &table {
+            *counts.entry(*backend).or_default() += 1;
+        }
+        assert_eq!(counts.len(), backends.len());
+        assert!(counts.values().max().unwrap() - counts.values().min().unwrap() <= 1);
+
+        let mut expanded = backends;
+        expanded.push(BackendId::new(18));
+        let expanded_table = build_maglev_table(ServiceId::new(11), 7, &expanded).unwrap();
+        let remapped = table
+            .iter()
+            .zip(expanded_table.iter())
+            .filter(|(before, after)| before != after)
+            .count();
+        assert!(remapped * 100 < table.len() * 15);
+
+        let (fallback, maglev_active) = materialize_selection_slots(
+            ServiceSelectionAlgorithm::Maglev,
+            ServiceId::new(11),
+            7,
+            &expanded,
+            250,
+        );
+        assert_eq!(fallback, expanded);
+        assert!(!maglev_active);
+    }
+
+    #[test]
+    fn selection_dataplane_materializes_maglev_with_exact_frontend_provenance() {
+        let mut selected = service(2, "maglev");
+        selected.selection_algorithm = ServiceSelectionAlgorithm::Maglev;
+        selected.backends.push(ServiceBackend {
+            id: BackendId::new(3),
+            address: "10.244.0.11".parse().unwrap(),
+            ..backend(3, "10.244.0.11", 8443)
+        });
+        selected.frontends[0].backend_ids.push(BackendId::new(3));
+        selected.node_ports.push(ServiceNodePort {
+            family: AddressFamily::Ipv4,
+            port: 30_443,
+            service_port: 443,
+            protocol: Protocol::Tcp,
+            name: Some("https".to_owned()),
+            app_protocol: Some("kubernetes.io/h2c".to_owned()),
+            traffic_policy: ServiceTrafficPolicy::Cluster,
+            backend_ids: vec![BackendId::new(2), BackendId::new(3)],
+        });
+        let snapshot = snapshot(vec![selected]);
+        let contract = NetworkBehaviorContract::compile(
+            &snapshot,
+            Revision::new(12),
+            Revision::new(13),
+            SelectionNode {
+                name: "worker-1".to_owned(),
+                uid: "uid-worker-1".to_owned(),
+                zone: Some("zone-a".to_owned()),
+                capabilities: BTreeSet::from([
+                    SelectionCapability::Maglev,
+                    SelectionCapability::Nat,
+                ]),
+            },
+        )
+        .unwrap();
+        let compiled = compile_service_selection_dataplane(&snapshot, &contract, 1).unwrap();
+        let frontend = compiled.ipv4_frontends.values().next().unwrap();
+        assert_eq!(u32::from_ne_bytes(frontend[8..12].try_into().unwrap()), 251);
+        assert_ne!(
+            u16::from_ne_bytes(frontend[14..16].try_into().unwrap()) & SERVICE_FRONTEND_FLAG_MAGLEV,
+            0
+        );
+        assert_eq!(compiled.backend_slots.len(), 502);
+
+        let node = NodePortNodeSnapshot {
+            schema_version: NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
+            source_epoch: snapshot.source_epoch,
+            revision: Revision::new(14),
+            node_name: "worker-1".to_owned(),
+            node_uid: "uid-worker-1".to_owned(),
+            addresses: vec![ServiceNodeAddress {
+                address: "192.0.2.10".parse().unwrap(),
+                kind: NodeAddressKind::Internal,
+            }],
+        };
+        let fabric =
+            compile_node_port_selection_fabric_dataplane(&snapshot, &node, &contract, 1, 0)
+                .unwrap();
+        let node_port = fabric.node_port.ipv4_frontends.values().next().unwrap();
+        assert_eq!(
+            u32::from_ne_bytes(node_port[8..12].try_into().unwrap()),
+            251
+        );
+        assert_ne!(
+            u16::from_ne_bytes(node_port[14..16].try_into().unwrap())
+                & NODE_PORT_FRONTEND_FLAG_MAGLEV,
+            0
+        );
     }
 }

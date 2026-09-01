@@ -25,16 +25,17 @@ use unf_ebpf_common::{
     LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION, LoadBalancerMapConfig,
     LoadBalancerNodeSourceConfig, NodePortFrontendValue, NodePortMapConfig,
     NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY,
-    NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG, NODE_PORT_MAP_ABI_VERSION,
-    NODE_PORT_SNAT_PORT_PROBES,
+    NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_FRONTEND_FLAG_MAGLEV,
+    NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG, NODE_PORT_MAP_ABI_VERSION, NODE_PORT_SNAT_PORT_PROBES,
     POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, SERVICE_BANK_COUNT,
     SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS, SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS,
     SERVICE_AFFINITY_OUTCOME_CREATED, SERVICE_AFFINITY_OUTCOME_NONE,
     SERVICE_AFFINITY_OUTCOME_RESELECTED, SERVICE_AFFINITY_OUTCOME_REUSED,
-    SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT, SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER,
-    SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL, SERVICE_CONNECTION_ROLE_AFFINITY,
+    SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT, SERVICE_CONNECTION_FLAG_MAGLEV,
+    SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER, SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL,
+    SERVICE_CONNECTION_ROLE_AFFINITY,
     SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE,
     SERVICE_CONNECTION_SELECTION_TIER_MASK, SERVICE_EVENT_ABI_VERSION,
     SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
@@ -47,9 +48,11 @@ use unf_ebpf_common::{
     SERVICE_EVENT_REASON_MISSING_SLOT, SERVICE_EVENT_REASON_NO_BACKEND,
     SERVICE_EVENT_REASON_PAIR_INSERT_FAILED, SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
     SERVICE_EVENT_REASON_REWRITE_FAILED, SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED,
-    SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY, SERVICE_MAP_ABI_VERSION, ServiceBackendKey,
-    ServiceAffinityValue, ServiceBackendSlotKey, ServiceBackendSlotValue, ServiceConnectionKey,
-    ServiceConnectionValue, ServiceEvent, ServiceFrontendValue, ServiceMapConfig, connection_is_active,
+    SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY, SERVICE_FRONTEND_FLAG_MAGLEV,
+    SERVICE_MAP_ABI_VERSION, SERVICE_SELECTION_ALGORITHM_MAGLEV,
+    SERVICE_SELECTION_ALGORITHM_STABLE_HASH, ServiceBackendKey, ServiceAffinityValue,
+    ServiceBackendSlotKey, ServiceBackendSlotValue, ServiceConnectionKey, ServiceConnectionValue,
+    ServiceEvent, ServiceFrontendValue, ServiceMapConfig, connection_is_active,
     ipv6_extension_step, node_port_snat_candidate,
     packet_starts_connection, service_backend_is_eligible, service_connection_is_active,
     service_flow_hash, service_selection_tier_is_valid,
@@ -1026,7 +1029,8 @@ fn validate_load_balancer_frontend(
         || frontend.flags
             & !(unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL
                 | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES
-                | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY)
+                | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+                | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_MAGLEV)
             != 0
         || !valid_selection_reserved(
             frontend.reserved,
@@ -1053,14 +1057,18 @@ fn validate_load_balancer_frontend(
         frontend_index: frontend.frontend_index,
         backend_count: frontend.backend_count,
         schema_version: SERVICE_MAP_ABI_VERSION,
-        flags: if frontend.flags
+        flags: (if frontend.flags
             & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY
             != 0
         {
             SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY
         } else {
             0
-        },
+        }) | (if frontend.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_MAGLEV != 0 {
+            SERVICE_FRONTEND_FLAG_MAGLEV
+        } else {
+            0
+        }),
         revision: frontend.service_revision,
         reserved: [
             frontend.reserved[0],
@@ -1149,7 +1157,9 @@ fn validate_node_port_frontend(
         || frontend.service_id.get() == 0
         || frontend.service_bank != service.active_bank
         || frontend.flags
-            & !(NODE_PORT_FRONTEND_FLAG_LOCAL | NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY)
+            & !(NODE_PORT_FRONTEND_FLAG_LOCAL
+                | NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+                | NODE_PORT_FRONTEND_FLAG_MAGLEV)
             != 0
         || (frontend.flags & NODE_PORT_FRONTEND_FLAG_LOCAL != 0
             && frontend.frontend_index & NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG == 0)
@@ -1171,22 +1181,29 @@ fn validate_node_port_frontend(
         );
         return Err(());
     }
-    let connection_flags = if frontend.flags & NODE_PORT_FRONTEND_FLAG_LOCAL != 0 {
+    let mut connection_flags = if frontend.flags & NODE_PORT_FRONTEND_FLAG_LOCAL != 0 {
         SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
     } else {
         SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
     };
+    if frontend.flags & NODE_PORT_FRONTEND_FLAG_MAGLEV != 0 {
+        connection_flags |= SERVICE_CONNECTION_FLAG_MAGLEV;
+    }
     Ok((
         ServiceFrontendValue {
             service_id: frontend.service_id,
             frontend_index: frontend.frontend_index,
             backend_count: frontend.backend_count,
             schema_version: SERVICE_MAP_ABI_VERSION,
-            flags: if frontend.flags & NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0 {
+            flags: (if frontend.flags & NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0 {
                 SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY
             } else {
                 0
-            },
+            }) | (if frontend.flags & NODE_PORT_FRONTEND_FLAG_MAGLEV != 0 {
+                SERVICE_FRONTEND_FLAG_MAGLEV
+            } else {
+                0
+            }),
             revision: frontend.service_revision,
             reserved: [
                 frontend.reserved[0],
@@ -1290,6 +1307,11 @@ fn emit_service_connection_event(action: u8, reason: u8, timestamp_ns: u64) {
     event.reserved[0] = connection_event_frontend_kind(value);
     event.reserved[1] = value.reserved[3] & SERVICE_CONNECTION_SELECTION_TIER_MASK;
     event.reserved[2] = value.reserved[3] >> SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT;
+    event.reserved[3] = if value.flags & SERVICE_CONNECTION_FLAG_MAGLEV != 0 {
+        SERVICE_SELECTION_ALGORITHM_MAGLEV
+    } else {
+        SERVICE_SELECTION_ALGORITHM_STABLE_HASH
+    };
     let _ = SERVICE_EVENTS.output::<ServiceEvent>(&*event, 0);
 }
 
@@ -1329,6 +1351,7 @@ fn emit_service_lookup_failure(
     event.reserved = [0; 10];
     event.reserved[0] = frontend_kind;
     event.reserved[1] = selection_tier;
+    event.reserved[3] = SERVICE_SELECTION_ALGORITHM_STABLE_HASH;
     let _ = SERVICE_EVENTS.output::<ServiceEvent>(&*event, 0);
 }
 
@@ -1890,7 +1913,7 @@ fn lookup_new_forward_service_v4(
     // the value is copied before any other map operation.
     #[allow(unsafe_code)]
     let cluster_frontend = unsafe { SERVICE_FRONTENDS_V4.get(&frontend_key).copied() };
-    let (frontend, service_bank, connection_flags, frontend_kind) = if let Some(frontend) =
+    let (frontend, service_bank, mut connection_flags, frontend_kind) = if let Some(frontend) =
         cluster_frontend
     {
         (frontend, config.active_bank, 0, SERVICE_EVENT_FRONTEND_CLUSTER_IP)
@@ -1912,7 +1935,9 @@ fn lookup_new_forward_service_v4(
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
         || frontend.revision != config.revision
         || frontend.service_id.get() == 0
-        || frontend.flags & !SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0
+        || frontend.flags
+            & !(SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY | SERVICE_FRONTEND_FLAG_MAGLEV)
+            != 0
         || !valid_selection_reserved(
             frontend.reserved,
             frontend.flags & SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0,
@@ -1930,6 +1955,9 @@ fn lookup_new_forward_service_v4(
             now_ns,
         );
         return ServiceLookup::Drop;
+    }
+    if frontend.flags & SERVICE_FRONTEND_FLAG_MAGLEV != 0 {
+        connection_flags |= SERVICE_CONNECTION_FLAG_MAGLEV;
     }
     if frontend.backend_count == 0 {
         emit_service_lookup_failure(
@@ -2099,7 +2127,7 @@ fn lookup_new_forward_service_v6(
     // the value is copied before any other map operation.
     #[allow(unsafe_code)]
     let cluster_frontend = unsafe { SERVICE_FRONTENDS_V6.get(&frontend_key).copied() };
-    let (frontend, service_bank, connection_flags, frontend_kind) = if let Some(frontend) =
+    let (frontend, service_bank, mut connection_flags, frontend_kind) = if let Some(frontend) =
         cluster_frontend
     {
         (frontend, config.active_bank, 0, SERVICE_EVENT_FRONTEND_CLUSTER_IP)
@@ -2121,7 +2149,9 @@ fn lookup_new_forward_service_v6(
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
         || frontend.revision != config.revision
         || frontend.service_id.get() == 0
-        || frontend.flags & !SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0
+        || frontend.flags
+            & !(SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY | SERVICE_FRONTEND_FLAG_MAGLEV)
+            != 0
         || !valid_selection_reserved(
             frontend.reserved,
             frontend.flags & SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0,
@@ -2139,6 +2169,9 @@ fn lookup_new_forward_service_v6(
             now_ns,
         );
         return ServiceLookup::Drop;
+    }
+    if frontend.flags & SERVICE_FRONTEND_FLAG_MAGLEV != 0 {
+        connection_flags |= SERVICE_CONNECTION_FLAG_MAGLEV;
     }
     if frontend.backend_count == 0 {
         emit_service_lookup_failure(

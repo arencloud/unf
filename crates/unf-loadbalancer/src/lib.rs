@@ -10,18 +10,21 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+#[cfg(test)]
+use unf_common::BackendId;
 use unf_common::{LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION, Revision, ServiceId};
 use unf_ebpf_common::{
     LOAD_BALANCER_BANK_COUNT, LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY,
-    LOAD_BALANCER_FRONTEND_FLAG_LOCAL, LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES,
-    LOAD_BALANCER_MAP_ABI_VERSION, SERVICE_BANK_COUNT, SERVICE_SELECTION_TIER_CLUSTER,
-    SERVICE_SELECTION_TIER_SAME_NODE, SERVICE_SELECTION_TIER_SAME_ZONE,
+    LOAD_BALANCER_FRONTEND_FLAG_LOCAL, LOAD_BALANCER_FRONTEND_FLAG_MAGLEV,
+    LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES, LOAD_BALANCER_MAP_ABI_VERSION, SERVICE_BANK_COUNT,
+    SERVICE_SELECTION_TIER_CLUSTER, SERVICE_SELECTION_TIER_SAME_NODE,
+    SERVICE_SELECTION_TIER_SAME_ZONE,
 };
 use unf_service::{
     AddressFamily, NetworkBehaviorContract, SelectionFrontend, SelectionPlanKey, SelectionTier,
-    ServiceForwardingMode, ServiceIpPrefix, ServiceIr, ServiceSelectionAlgorithm,
-    ServiceSessionAffinity, ServiceTrafficPolicy, UNF_LOAD_BALANCER_CLASS,
-    load_balancer_local_frontend_index,
+    ServiceForwardingMode, ServiceIpPrefix, ServiceIr, ServiceSessionAffinity,
+    ServiceTrafficPolicy, UNF_LOAD_BALANCER_CLASS, compile_service_selection_dataplane,
+    compiled_slot_layout, load_balancer_local_frontend_index,
 };
 
 pub const ALLOCATION_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
@@ -1287,6 +1290,8 @@ pub enum LoadBalancerDataplaneError {
     InvalidService(String),
     #[error("invalid selection contract: {0}")]
     InvalidSelectionContract(String),
+    #[error("cannot materialize selection state: {0}")]
+    InvalidSelectionDataplane(String),
     #[error("selection contract does not belong to the authenticated reachability Node")]
     SelectionNodeMismatch,
     #[error("selection contract contains behavior reserved for a later Phase 7 milestone")]
@@ -1382,10 +1387,11 @@ fn compile_load_balancer_dataplane_inner(
             .map_err(|error| {
                 LoadBalancerDataplaneError::InvalidSelectionContract(error.to_string())
             })?;
-        if contract.plans.iter().any(|plan| {
-            plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
-                || plan.forwarding_mode != ServiceForwardingMode::Nat
-        }) {
+        if contract
+            .plans
+            .iter()
+            .any(|plan| plan.forwarding_mode != ServiceForwardingMode::Nat)
+        {
             return Err(LoadBalancerDataplaneError::UnsupportedSelectionBehavior);
         }
     }
@@ -1398,6 +1404,12 @@ fn compile_load_balancer_dataplane_inner(
     if bank >= LOAD_BALANCER_BANK_COUNT {
         return Err(LoadBalancerDataplaneError::InvalidLoadBalancerBank(bank));
     }
+    let selection_state = contract
+        .map(|contract| compile_service_selection_dataplane(&services, contract, service_bank))
+        .transpose()
+        .map_err(|error| {
+            LoadBalancerDataplaneError::InvalidSelectionDataplane(error.to_string())
+        })?;
     let by_id = services
         .services
         .iter()
@@ -1510,16 +1522,23 @@ fn compile_load_balancer_dataplane_inner(
                         &reachability.node.name,
                     )
                     .ok_or(LoadBalancerDataplaneError::MissingFrontendLink)?;
-                    (
+                    let (slot_count, maglev_active) = compiled_slot_layout(
+                        selection_state
+                            .as_ref()
+                            .expect("selection state exists with a verified contract"),
+                        service.id,
                         index,
                         selected.backend_ids.len(),
-                        if plan.traffic_policy == ServiceTrafficPolicy::Local {
-                            LOAD_BALANCER_FRONTEND_FLAG_LOCAL
-                        } else {
-                            0
-                        },
-                        selection_tier_code(selected.tier),
-                    )
+                    );
+                    let mut flags = if plan.traffic_policy == ServiceTrafficPolicy::Local {
+                        LOAD_BALANCER_FRONTEND_FLAG_LOCAL
+                    } else {
+                        0
+                    };
+                    if maglev_active {
+                        flags |= LOAD_BALANCER_FRONTEND_FLAG_MAGLEV;
+                    }
+                    (index, slot_count, flags, selection_tier_code(selected.tier))
                 } else {
                     match load_balancer.traffic_policy {
                         unf_service::ServiceTrafficPolicy::Cluster => (
@@ -2240,7 +2259,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::default_trait_access, clippy::too_many_lines)]
-    fn load_balancer_host_bank_is_exact_banked_and_revision_bound() {
+    fn load_balancer_host_bank_is_exact_banked_revision_bound_and_maglev_aware() {
         let service_id = ServiceId::new(44);
         let frontends = vec![
             unf_service::ServiceFrontend {
@@ -2391,6 +2410,87 @@ mod tests {
                             != 0
                         && u32::from_ne_bytes(value[42..46].try_into().unwrap()) == 654
                 })
+        );
+
+        let mut maglev_services = services.clone();
+        maglev_services.services[0].selection_algorithm =
+            unf_service::ServiceSelectionAlgorithm::Maglev;
+        maglev_services.services[0].backends = vec![
+            unf_service::ServiceBackend {
+                id: BackendId::new(1),
+                address: "10.42.0.11".parse().unwrap(),
+                port: 8080,
+                protocol: unf_common::Protocol::Tcp,
+                port_name: Some("http".to_owned()),
+                app_protocol: None,
+                endpoint_slices: vec!["apps/api-v4".to_owned()],
+                target_workload: Some("apps/api-a".to_owned()),
+                node_name: Some("worker-a".to_owned()),
+                zone: Some("zone-a".to_owned()),
+                ready: true,
+                serving: true,
+                terminating: false,
+            },
+            unf_service::ServiceBackend {
+                id: BackendId::new(2),
+                address: "10.42.0.12".parse().unwrap(),
+                port: 8080,
+                protocol: unf_common::Protocol::Tcp,
+                port_name: Some("http".to_owned()),
+                app_protocol: None,
+                endpoint_slices: vec!["apps/api-v4".to_owned()],
+                target_workload: Some("apps/api-b".to_owned()),
+                node_name: Some("worker-a".to_owned()),
+                zone: Some("zone-a".to_owned()),
+                ready: true,
+                serving: true,
+                terminating: false,
+            },
+        ];
+        for frontend in &mut maglev_services.services[0].frontends {
+            if frontend.address.is_ipv4() {
+                frontend.backend_ids = vec![BackendId::new(1), BackendId::new(2)];
+            }
+        }
+        for frontend in &mut maglev_services.services[0]
+            .load_balancer
+            .as_mut()
+            .unwrap()
+            .frontends
+        {
+            if frontend.family == AddressFamily::Ipv4 {
+                frontend.backend_ids = vec![BackendId::new(1), BackendId::new(2)];
+            }
+        }
+        let maglev_contract = NetworkBehaviorContract::compile(
+            &maglev_services,
+            Revision::new(8),
+            Revision::new(9),
+            unf_service::SelectionNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+                zone: Some("zone-a".to_owned()),
+                capabilities: BTreeSet::from([
+                    unf_service::SelectionCapability::Maglev,
+                    unf_service::SelectionCapability::Nat,
+                ]),
+            },
+        )
+        .unwrap();
+        let maglev = compile_load_balancer_selection_dataplane(
+            &maglev_services,
+            &reachability,
+            &maglev_contract,
+            1,
+            1,
+        )
+        .unwrap();
+        let value = maglev.ipv4_frontends.values().next().unwrap();
+        assert_eq!(u32::from_ne_bytes(value[8..12].try_into().unwrap()), 251);
+        assert_ne!(
+            u16::from_ne_bytes(value[14..16].try_into().unwrap())
+                & LOAD_BALANCER_FRONTEND_FLAG_MAGLEV,
+            0
         );
 
         let mut wrong_epoch = reachability.clone();

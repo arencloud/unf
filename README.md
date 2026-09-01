@@ -297,9 +297,9 @@ Phase 7 now begins advanced Service selection. Strict `internalTrafficPolicy`
 eligibility precedes topology preferences; `ClientIP` affinity may select only
 from the currently eligible set; existing connection persistence remains a
 separate, stronger per-flow contract. Selection tables are compiled in
-userspace and consumed through bounded eBPF lookups. Maglev must earn adoption
-through deterministic disruption, balance, memory, update-cost, and packet-cost
-measurements, while DSR remains opt-in until return routing, MTU, policy,
+userspace and consumed through bounded eBPF lookups. Maglev has earned bounded
+adoption through deterministic disruption, balance, memory, update-cost, and
+packet-cost measurements, while DSR remains opt-in until return routing, MTU, policy,
 source-range, telemetry, and cleanup invariants pass. The
 [Phase 7 service-selection plan](docs/development/phase7-service-selection-plan.md)
 and ADR 0102 define the ordered implementation and qualification gates.
@@ -343,10 +343,14 @@ Ready non-terminating endpoints alone receive new sessions, while established
 connections survive termination until protocol expiry. Dual-stack real-kernel
 packets, timeout reselection, create/reuse/reselection provenance, ABI-v9
 recovery/cleanup ownership, inherited 7.4 gates, and strict Clippy pass `make
-service-affinity-dataplane-test`; ADR 0107 records the boundary. StableHash and
-NAT remain production defaults. Topology and ClientIP behavior are active when
-a Service requests them; Maglev and DSR remain gated until milestones 7.6 and
-7.7 prove their independent safety and performance contracts.
+service-affinity-dataplane-test`; ADR 0107 records the boundary. Milestone 7.6
+is verified: userspace materializes measured Maglev tables in the existing slot
+map, keeps the same one-map packet path, records actual algorithm/fallback, and
+advances persistent ownership to ABI v10. Enable it per Service with
+`network.unf.io/service-selection-algorithm: maglev`; the committed fixture,
+`make service-maglev-dataplane-test`, and ADR 0108 record the evidence.
+StableHash/NAT remain absence defaults for rolling compatibility. DSR remains
+gated by milestone 7.7.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -557,7 +561,7 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-In progress in Phase 7: measured Maglev selection, opt-in DSR, operations, and
+In progress in Phase 7: opt-in DSR, operations, and
 independent Kind/OpenShift qualification for the verified locality, topology,
 ClientIP affinity, and graceful-draining dataplanes. Not yet implemented:
 production-scale routing/CNI qualification;

@@ -16,6 +16,8 @@ required_files=(
     docs/adr/0105-distribute-and-transactionally-activate-selection-contracts.md
     docs/adr/0106-enforce-locality-and-topology-from-verified-contracts.md
     docs/adr/0107-enforce-client-ip-affinity-and-graceful-draining.md
+    docs/adr/0108-adopt-bounded-measured-maglev-selection.md
+    docs/benchmarks/phase7-maglev-measurement.md
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -80,6 +82,12 @@ require_text docs/development/phase7-service-selection-plan.md \
 require_text docs/project-status.md \
     '| ClientIP affinity and graceful draining | **Verified** |' \
     "the work breakdown must identify milestone 7.5 as verified"
+require_text docs/development/phase7-service-selection-plan.md \
+    '| 7.6 | Measured Maglev selection | **Verified** |' \
+    "milestone 7.6 must be verified"
+require_text docs/project-status.md \
+    '| Measured Maglev selection | **Verified** |' \
+    "the work breakdown must identify milestone 7.6 as verified"
 require_text Makefile \
     'service-selection-contract-test:' \
     "the build must expose an isolated Network Behavior Contract gate"
@@ -92,9 +100,18 @@ require_text Makefile \
 require_text Makefile \
     'service-affinity-dataplane-test:' \
     "the build must expose an isolated affinity/draining dataplane gate"
+require_text Makefile \
+    'service-maglev-dataplane-test:' \
+    "the build must expose an isolated measured Maglev gate"
 require_text docs/adr/0107-enforce-client-ip-affinity-and-graceful-draining.md \
     'Existing validated connections win before affinity lookup.' \
     "per-flow connection state must precede affinity"
+require_text docs/adr/0108-adopt-bounded-measured-maglev-selection.md \
+    'hash/modulo/one-slot-lookup path' \
+    "Maglev must retain the bounded one-map packet path"
+require_text docs/benchmarks/phase7-maglev-measurement.md \
+    'network.unf.io/service-selection-algorithm: maglev' \
+    "Maglev admission must be explicit and documented"
 require_text docs/adr/0104-verify-network-behavior-contracts-before-activation.md \
     'It does **not** mathematically prove the' \
     "the contract must not overclaim formal verification"

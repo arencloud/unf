@@ -19,7 +19,7 @@ and connection-state foundation. The authoritative feature state remains in
 | 7.3 | Compatible distribution and transactional selection state | **Verified** | Schema-v1 negotiation, authenticated exact-Node projection, capability fencing, independent agent replay, two-bank userspace staging/readback/activation, owner-only contract+Node checkpoints, rollback/crash repair/cold reconstruction, digest-exact convergence, and exact v1 state cleanup pass `make service-selection-state-test`; ADR 0105 |
 | 7.4 | Internal locality and topology-aware dataplane | **Verified** | `make service-selection-dataplane-test` proves fixed-width ABI-v8 SameNode/SameZone/Cluster state, first-nonempty userspace resolution, dual-stack TCP/UDP strict Local and ordered fallback across ClusterIP/NodePort/LoadBalancer, external-policy precedence, lifecycle filtering, tier event provenance, topology-only activation, exact recovery, inherited state tests, and strict Clippy; ADR 0106 |
 | 7.5 | ClientIP affinity and graceful draining | **Verified** | `make service-affinity-dataplane-test` proves exact original-client/frontend keys, 1–86,400 second timeout encoding, eligible bank+revision reuse, explicit create/reuse/reselection outcomes, connection-before-affinity precedence, ready/non-terminating new-flow slots, established-flow survival during termination, dual-stack ClusterIP packet behavior, bounded LRU recovery under persistent ABI v9, inherited 7.4 gates, real-kernel verifier acceptance, and strict Clippy; ADR 0107 |
-| 7.6 | Measured Maglev selection | **Planned** | Reproducible comparison with the existing selector for balance, disruption, memory, compile/update latency, and packet lookup cost; bounded deterministic table/fallback/upgrade contract only if evidence supports adoption |
+| 7.6 | Measured Maglev selection | **Verified** | `make service-maglev-dataplane-test` regenerates the 2–4,096-backend fixture; proves deterministic prime tables with at least 16 slots/backend, at most 6.25% intrinsic table error, materially lower same-table add disruption, bounded memory/writes/compile time, the same hash/modulo/one-map packet path, capacity fallback with actual-algorithm flags, ClusterIP/NodePort/LoadBalancer lowering, annotation admission, ABI-v10 recovery/cleanup, inherited real-kernel gates, and strict Clippy; ADR 0108 |
 | 7.7 | Opt-in DSR dataplane | **Planned** | Explicit non-default intent; dual-stack route/neighbor/MTU/backend-VIP contract; unchanged policy/source-range semantics; direct return and reverse provenance; lifecycle/recovery; exact cleanup; NAT path remains the safe fallback |
 | 7.8 | Operations, simulation, upgrade, and recovery | **Planned** | Fixed-cardinality outcomes, validated status, durable history, tier/algorithm/affinity/DSR explanation, exact read-only simulation, checkpoint recovery, and adjacent compatibility |
 | 7.9 | Kube-proxy-free Kind qualification | **Planned** | Three-Node dual-stack external/Pod/host lifecycle, strict locality and fallback, affinity/drain, measured algorithm behavior, DSR if enabled, operations, controller/agent recovery, exact cleanup, and no-CNI rollback |
@@ -104,7 +104,6 @@ production availability/scale. Those capabilities require independent gates.
 
 ## Immediate next slice
 
-Milestone 7.6 measures bounded Maglev candidates against the verified
-StableHash selector. The committed benchmark must compare balance, disruption,
-table memory, compile/update latency, map-write volume, and verifier-visible
-packet lookup cost before any operating range or default can be accepted.
+Milestone 7.7 implements opt-in DSR without weakening the verified NAT path.
+Route, neighbor, MTU, backend-VIP, policy, source-range, reverse-provenance,
+health, recovery, fallback, and exact cleanup invariants must all be explicit.

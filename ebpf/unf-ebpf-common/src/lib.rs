@@ -7,7 +7,7 @@ use unf_common::{BackendId, IdentityId, PolicyId, RuleId, ServiceId, Verdict};
 pub use unf_common::PolicyDirection as Direction;
 
 pub const FLOW_ABI_VERSION: u16 = 2;
-pub const SERVICE_EVENT_ABI_VERSION: u16 = 4;
+pub const SERVICE_EVENT_ABI_VERSION: u16 = 5;
 pub const SERVICE_EVENT_FRONTEND_CLUSTER_IP: u8 = 1;
 pub const SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER: u8 = 2;
 pub const SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL: u8 = 3;
@@ -17,13 +17,14 @@ pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
 pub const POLICY_BANK_COUNT: u8 = 2;
-pub const SERVICE_MAP_ABI_VERSION: u16 = 4;
+pub const SERVICE_MAP_ABI_VERSION: u16 = 5;
 pub const SERVICE_BANK_COUNT: u8 = 2;
-pub const NODE_PORT_MAP_ABI_VERSION: u16 = 3;
+pub const NODE_PORT_MAP_ABI_VERSION: u16 = 4;
 pub const NODE_PORT_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY: u16 = 1 << 1;
-pub const LOAD_BALANCER_MAP_ABI_VERSION: u16 = 3;
+pub const NODE_PORT_FRONTEND_FLAG_MAGLEV: u16 = 1 << 2;
+pub const LOAD_BALANCER_MAP_ABI_VERSION: u16 = 4;
 pub const LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION: u16 = 1;
 pub const LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4: u8 = 1;
 pub const LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6: u8 = 1 << 1;
@@ -31,6 +32,7 @@ pub const LOAD_BALANCER_BANK_COUNT: u8 = 2;
 pub const LOAD_BALANCER_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES: u16 = 1 << 1;
 pub const LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY: u16 = 1 << 2;
+pub const LOAD_BALANCER_FRONTEND_FLAG_MAGLEV: u16 = 1 << 3;
 pub const NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG: u32 = 1 << 31;
 pub const LOAD_BALANCER_LOCAL_FRONTEND_INDEX_BASE: u32 = 3 << 30;
 pub const NODE_PORT_SNAT_PORT_BASE: u16 = 32_768;
@@ -44,7 +46,11 @@ pub const SERVICE_CONNECTION_ROLE_REVERSE: u8 = 2;
 pub const SERVICE_CONNECTION_ROLE_AFFINITY: u8 = 3;
 pub const SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER: u16 = 1 << 0;
 pub const SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL: u16 = 1 << 1;
+pub const SERVICE_CONNECTION_FLAG_MAGLEV: u16 = 1 << 2;
 pub const SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY: u16 = 1;
+pub const SERVICE_FRONTEND_FLAG_MAGLEV: u16 = 1 << 1;
+pub const SERVICE_SELECTION_ALGORITHM_STABLE_HASH: u8 = 1;
+pub const SERVICE_SELECTION_ALGORITHM_MAGLEV: u8 = 2;
 pub const SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS: u32 = 1;
 pub const SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS: u32 = 86_400;
 pub const SERVICE_AFFINITY_OUTCOME_NONE: u8 = 0;
@@ -92,6 +98,15 @@ pub const fn service_selection_tier_is_valid(tier: u8) -> bool {
         SERVICE_SELECTION_TIER_SAME_NODE
             | SERVICE_SELECTION_TIER_SAME_ZONE
             | SERVICE_SELECTION_TIER_CLUSTER
+    )
+}
+
+/// Returns whether event provenance carries a known selection algorithm.
+#[must_use]
+pub const fn service_selection_algorithm_is_valid(algorithm: u8) -> bool {
+    matches!(
+        algorithm,
+        SERVICE_SELECTION_ALGORITHM_STABLE_HASH | SERVICE_SELECTION_ALGORITHM_MAGLEV
     )
 }
 
@@ -233,7 +248,9 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
         && state.service_id.get() != 0
         && state.backend_id.get() != 0
         && state.flags
-            & !(SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
+            & !(SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
+                | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
+                | SERVICE_CONNECTION_FLAG_MAGLEV)
             == 0
         && state.flags
             & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)

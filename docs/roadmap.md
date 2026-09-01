@@ -545,12 +545,14 @@ matrix is maintained in the
   flows. Persistent ABI-v9 recovery, event provenance, strict Clippy, and
   real-kernel IPv4/IPv6 packets pass `make service-affinity-dataplane-test`;
   ADR 0107.
-- Maglev is a measured candidate, not a label-only claim. Adoption requires
-  deterministic balance/disruption, bounded memory and compile cost, stable
-  upgrades, and verifier-visible packet-cost evidence against the current hash.
+- Measured Maglev is verified for 2–4,096 eligible backends through bounded
+  deterministic prime tables, actual-algorithm fallback/provenance, and the
+  existing one-map packet path. The committed fixture records balance,
+  disruption including table boundaries, memory, compile/update time, and map
+  writes; `make service-maglev-dataplane-test` and ADR 0108.
 - DSR is opt-in and cannot bypass route/neighbor/MTU safety, backend VIP
   ownership, policy, source ranges, health, reverse telemetry, or exact cleanup.
-- Maglev, DSR, operations, Kind, and OpenShift remain ordered
+- DSR, operations, Kind, and OpenShift remain ordered
   independent milestones;
   ADR 0102 and `make service-selection-boundary-test` define the first gate.
 - Weighted traffic splitting, latency/load feedback, cross-cluster selection,

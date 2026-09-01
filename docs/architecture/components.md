@@ -49,9 +49,10 @@ capabilities, revisions, bounded failure observations, and canonical digests.
 The agent transactionally owns verified per-Node contract state through
 authenticated projection, two userspace banks, independent readback, private
 contract+Node checkpoints, recovery, and exact digest acknowledgements. Phase
-7.4 lowers the first non-empty ordered tier into origin-specific slots, and 7.5
-adds ABI-v9 exact-client affinity plus graceful-draining lifecycle separation;
-topology and eligibility changes are dataplane transactions. `unf-ebpf-tc` may
+7.4 lowers the first non-empty ordered tier into origin-specific slots, 7.5
+adds ABI-v9 exact-client affinity plus graceful-draining lifecycle separation,
+and 7.6 adds bounded measured ABI-v10 Maglev tables with actual-algorithm
+fallback/provenance; topology and eligibility changes are dataplane transactions. `unf-ebpf-tc` may
 consume only fixed-width selected tiers, affinity records, algorithm tables,
 and compact decision witnesses; it does not interpret Kubernetes strings,
 topology, or contract logic. DSR remains an explicit forwarding mode whose

@@ -727,11 +727,11 @@ for replacement_node in "${client_node}" "${server_node}"; do
         test -f "$state" && test "$(stat -c %a "$state")" = 600
         jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and .applied.revision > 0
           and .applied.allocationRevision > 0 and (.applied.targets | length) > 0" "$state" >/dev/null
-        test -e /sys/fs/bpf/unf/v9/LOAD_BALANCER_CONFIG
-        test -e /sys/fs/bpf/unf/v9/LOAD_BALANCER_FRONTENDS_V4
-        test -e /sys/fs/bpf/unf/v9/LOAD_BALANCER_FRONTENDS_V6
-        test ! -e /sys/fs/bpf/unf/v9/LOAD_BALANCER_SOURCE_RANGES_V4
-        test ! -e /sys/fs/bpf/unf/v9/LOAD_BALANCER_SOURCE_RANGES_V6
+        test -e /sys/fs/bpf/unf/v10/LOAD_BALANCER_CONFIG
+        test -e /sys/fs/bpf/unf/v10/LOAD_BALANCER_FRONTENDS_V4
+        test -e /sys/fs/bpf/unf/v10/LOAD_BALANCER_FRONTENDS_V6
+        test ! -e /sys/fs/bpf/unf/v10/LOAD_BALANCER_SOURCE_RANGES_V4
+        test ! -e /sys/fs/bpf/unf/v10/LOAD_BALANCER_SOURCE_RANGES_V6
     '
     if ! wait "${probe_pid}"; then sed 's/^/probe: /' "${probe_log}" >&2; exit 1; fi
     probe_pid=
@@ -774,8 +774,8 @@ jq -e '(.allocation.leases | length) == 0' <<<"${cleanup_state}" >/dev/null
 for node in "${nodes[@]}"; do
     pod=$(advertiser_pod_on_node "${node}")
     "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
-        test ! -e /sys/fs/bpf/unf/v9/LOAD_BALANCER_SOURCE_RANGES_V4
-        test ! -e /sys/fs/bpf/unf/v9/LOAD_BALANCER_SOURCE_RANGES_V6
+        test ! -e /sys/fs/bpf/unf/v10/LOAD_BALANCER_SOURCE_RANGES_V4
+        test ! -e /sys/fs/bpf/unf/v10/LOAD_BALANCER_SOURCE_RANGES_V6
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
         test -f "$state"
         jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and (.applied.targets | length) == 0" "$state" >/dev/null
@@ -785,7 +785,7 @@ for worker in "${workers[@]}"; do
     pod=$(advertiser_pod_on_node "${worker}")
     "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
         for map in LOAD_BALANCER_FRONTENDS_V4 LOAD_BALANCER_FRONTENDS_V6; do
-            test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v9/$map | jq length)" -eq 0
+            test "$(bpftool -j map dump pinned /sys/fs/bpf/unf/v10/$map | jq length)" -eq 0
         done
     '
 done

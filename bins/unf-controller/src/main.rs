@@ -126,6 +126,7 @@ const LOAD_BALANCER_STORE_SCHEMA_VERSION: u16 = 1;
 const LOAD_BALANCER_STORE_DATA_LIMIT: usize = 900_000;
 const LOAD_BALANCER_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const PRIMARY_CNI_NODE_LABEL: &str = "network.unf.io/primary-cni";
+const SERVICE_SELECTION_ALGORITHM_ANNOTATION: &str = "network.unf.io/service-selection-algorithm";
 const PRIMARY_CNI_NODE_LABEL_VALUE: &str = "enabled";
 
 #[derive(Debug, Parser)]
@@ -3158,6 +3159,8 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
     compiler_ports.sort();
     let load_balancer =
         service_load_balancer_source(&namespace, &name, &service_type, spec, &cluster_ips)?;
+    let selection_algorithm =
+        service_selection_algorithm(&namespace, &name, service.metadata.annotations.as_ref())?;
     let compiler_source = ServiceSource {
         namespace: namespace.clone(),
         name: name.clone(),
@@ -3166,7 +3169,7 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
         internal_traffic_policy,
         session_affinity,
         traffic_distribution,
-        selection_algorithm: ServiceSelectionAlgorithm::StableHash,
+        selection_algorithm,
         forwarding_mode: ServiceForwardingMode::Nat,
         load_balancer,
         ports: compiler_ports,
@@ -3362,6 +3365,23 @@ fn service_traffic_distribution(
         Some("PreferSameNode") => Ok(ServiceTrafficDistribution::PreferSameNode),
         Some(distribution) => Err(anyhow!(
             "Service {namespace}/{name} has unsupported trafficDistribution {distribution:?}"
+        )),
+    }
+}
+
+fn service_selection_algorithm(
+    namespace: &str,
+    name: &str,
+    annotations: Option<&BTreeMap<String, String>>,
+) -> Result<ServiceSelectionAlgorithm> {
+    match annotations.and_then(|values| values.get(SERVICE_SELECTION_ALGORITHM_ANNOTATION)) {
+        None => Ok(ServiceSelectionAlgorithm::StableHash),
+        Some(value) if value == "maglev" => Ok(ServiceSelectionAlgorithm::Maglev),
+        Some(value) if matches!(value.as_str(), "stable-hash" | "stableHash") => {
+            Ok(ServiceSelectionAlgorithm::StableHash)
+        }
+        Some(value) => Err(anyhow!(
+            "Service {namespace}/{name} has unsupported {SERVICE_SELECTION_ALGORITHM_ANNOTATION} annotation {value:?}"
         )),
     }
 }
@@ -7573,6 +7593,27 @@ mod tests {
             service_traffic_distribution("apps", "api", None).unwrap(),
             ServiceTrafficDistribution::Any
         );
+        assert_eq!(
+            service_selection_algorithm("apps", "api", None).unwrap(),
+            ServiceSelectionAlgorithm::StableHash
+        );
+        let maglev = BTreeMap::from([(
+            SERVICE_SELECTION_ALGORITHM_ANNOTATION.to_owned(),
+            "maglev".to_owned(),
+        )]);
+        assert_eq!(
+            service_selection_algorithm("apps", "api", Some(&maglev)).unwrap(),
+            ServiceSelectionAlgorithm::Maglev
+        );
+        let mut annotated = service();
+        annotated.metadata.annotations = Some(maglev);
+        assert_eq!(
+            service_record(&annotated)
+                .unwrap()
+                .compiler_source
+                .selection_algorithm,
+            ServiceSelectionAlgorithm::Maglev
+        );
 
         let configured: ServiceSpec = serde_json::from_value(serde_json::json!({
             "internalTrafficPolicy": "Local",
@@ -7609,6 +7650,11 @@ mod tests {
         .unwrap();
         assert!(service_session_affinity("apps", "api", &invalid).is_err());
         assert!(service_traffic_distribution("apps", "api", Some("Random")).is_err());
+        let invalid_algorithm = BTreeMap::from([(
+            SERVICE_SELECTION_ALGORITHM_ANNOTATION.to_owned(),
+            "random".to_owned(),
+        )]);
+        assert!(service_selection_algorithm("apps", "api", Some(&invalid_algorithm)).is_err());
     }
 
     fn security_policy(name: &str, action: &str) -> SecurityPolicy {

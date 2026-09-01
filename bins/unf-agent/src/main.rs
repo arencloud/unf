@@ -50,7 +50,7 @@ use unf_ebpf_common::{
     SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL, SERVICE_EVENT_REASON_NO_BACKEND,
     SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED, SERVICE_MAP_ABI_VERSION, ServiceEvent,
     service_event_action_reason_is_valid, service_event_frontend_kind_is_valid,
-    service_selection_tier_is_valid,
+    service_selection_algorithm_is_valid, service_selection_tier_is_valid,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -70,14 +70,13 @@ use unf_route::{
 use unf_service::compile_service_dataplane;
 use unf_service::{
     LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION,
-    MAX_BACKENDS_PER_SERVICE, NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION, NetworkBehaviorContract,
-    NodePortDataplaneState, NodePortNodeSnapshot, SELECTION_CONTRACT_SCHEMA_VERSION,
-    SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
-    SERVICE_FRONTEND_BANK_CAPACITY, SERVICE_SNAPSHOT_SCHEMA_VERSION, SelectionCapability,
-    SelectionNode, ServiceDataplaneState, ServiceSnapshot, ServiceTrafficPolicy,
-    compile_node_port_fabric_dataplane, compile_node_port_selection_fabric_dataplane,
-    compile_service_load_balancer_fabric_dataplane, compile_service_selection_dataplane,
-    has_advanced_selection_intent,
+    NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION, NetworkBehaviorContract, NodePortDataplaneState,
+    NodePortNodeSnapshot, SELECTION_CONTRACT_SCHEMA_VERSION, SERVICE_BACKEND_BANK_CAPACITY,
+    SERVICE_BACKEND_SLOT_BANK_CAPACITY, SERVICE_FRONTEND_BANK_CAPACITY,
+    SERVICE_SNAPSHOT_SCHEMA_VERSION, SelectionCapability, SelectionNode, ServiceDataplaneState,
+    ServiceSnapshot, ServiceTrafficPolicy, compile_node_port_fabric_dataplane,
+    compile_node_port_selection_fabric_dataplane, compile_service_load_balancer_fabric_dataplane,
+    compile_service_selection_dataplane, has_advanced_selection_intent,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
@@ -97,7 +96,7 @@ use cni_server::CniTransactionServer;
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v9";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v10";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
@@ -2357,7 +2356,7 @@ async fn fetch_selection_contract(
     authenticated_get(
         client,
         format!(
-            "{controller_url}/v1/state/service-selection?selectionContractSchemaVersion={SELECTION_CONTRACT_SCHEMA_VERSION}&stableHash=true&nat=true"
+            "{controller_url}/v1/state/service-selection?selectionContractSchemaVersion={SELECTION_CONTRACT_SCHEMA_VERSION}&stableHash=true&maglev=true&nat=true"
         ),
         token_path,
     )?
@@ -7033,7 +7032,8 @@ fn validate_load_balancer_frontend_entry<const K: usize>(
     let service_bank = value[40];
     let known_flags = unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL
         | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES
-        | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY;
+        | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+        | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_MAGLEV;
     if service_id == 0
         || schema != unf_ebpf_common::LOAD_BALANCER_MAP_ABI_VERSION
         || flags & !known_flags != 0
@@ -7506,11 +7506,12 @@ fn validate_node_port_frontend_entry<const N: usize>(
         || port == 0
         || !matches!(protocol, 6 | 17)
         || service_id == 0
-        || backend_count > u32::try_from(MAX_BACKENDS_PER_SERVICE).unwrap_or(u32::MAX)
+        || backend_count > u32::try_from(SERVICE_BACKEND_SLOT_BANK_CAPACITY).unwrap_or(u32::MAX)
         || schema != unf_ebpf_common::NODE_PORT_MAP_ABI_VERSION
         || flags
             & !(unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL
-                | unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY)
+                | unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+                | unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_MAGLEV)
             != 0
         || (flags & unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL != 0
             && frontend_index & unf_ebpf_common::NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG == 0)
@@ -7546,9 +7547,12 @@ fn validate_service_frontend_entry<const N: usize>(
         || port == 0
         || !matches!(protocol, 6 | 17 | 132)
         || service_id == 0
-        || backend_count > u32::try_from(MAX_BACKENDS_PER_SERVICE).unwrap_or(u32::MAX)
+        || backend_count > u32::try_from(SERVICE_BACKEND_SLOT_BANK_CAPACITY).unwrap_or(u32::MAX)
         || schema != SERVICE_MAP_ABI_VERSION
-        || flags & !unf_ebpf_common::SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0
+        || flags
+            & !(unf_ebpf_common::SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+                | unf_ebpf_common::SERVICE_FRONTEND_FLAG_MAGLEV)
+            != 0
         || revision == 0
         || !service_selection_tier_is_valid(value[24])
         || !affinity_encoding_is_valid(
@@ -10389,7 +10393,8 @@ fn decode_service_event(bytes: &[u8]) -> Option<ServiceEvent> {
                 | SERVICE_AFFINITY_OUTCOME_CREATED
                 | SERVICE_AFFINITY_OUTCOME_RESELECTED
         )
-        || bytes[89..96] != [0; 7]
+        || !service_selection_algorithm_is_valid(bytes[89])
+        || bytes[90..96] != [0; 6]
     {
         return None;
     }
@@ -14591,6 +14596,7 @@ mod tests {
             (6_u16, ABI_V8_MAP_NAMES.as_slice()),
             (7_u16, ABI_V8_MAP_NAMES.as_slice()),
             (8_u16, ABI_V8_MAP_NAMES.as_slice()),
+            (9_u16, PERSISTENT_MAP_NAMES.as_slice()),
             (CURRENT_BPF_ABI_VERSION, PERSISTENT_MAP_NAMES.as_slice()),
         ] {
             let abi = root.join(format!("v{version}"));
@@ -14684,10 +14690,15 @@ mod tests {
         bytes[85] = unf_ebpf_common::SERVICE_EVENT_REASON_FORWARD_TRANSLATED;
         bytes[86] = SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER;
         bytes[87] = unf_ebpf_common::SERVICE_SELECTION_TIER_CLUSTER;
+        bytes[89] = unf_ebpf_common::SERVICE_SELECTION_ALGORITHM_MAGLEV;
         let event = decode_service_event(&bytes).expect("service event ABI is valid");
         assert_eq!(
             event.reserved[1],
             unf_ebpf_common::SERVICE_SELECTION_TIER_CLUSTER
+        );
+        assert_eq!(
+            event.reserved[3],
+            unf_ebpf_common::SERVICE_SELECTION_ALGORITHM_MAGLEV
         );
         let record = service_flow_export_record(&event);
         assert_eq!(record.key.source_ipv4, Some(Ipv4Addr::new(10, 42, 0, 10)));
@@ -14812,11 +14823,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v9/links"),
+                Path::new("/sys/fs/bpf/unf/v10/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v9/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v10/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -14952,16 +14963,16 @@ mod tests {
 
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v9")).is_ok());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v10")).is_ok());
         assert_eq!(
-            configured_abi_version(Path::new("/sys/fs/bpf/unf/v9")),
-            Some(9)
+            configured_abi_version(Path::new("/sys/fs/bpf/unf/v10")),
+            Some(10)
         );
         let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
             error.to_string().contains(
-                "incompatible with persistent BPF-state ABI v9; expected a /v9 directory"
+                "incompatible with persistent BPF-state ABI v10; expected a /v10 directory"
             )
         );
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v4")).is_err());
