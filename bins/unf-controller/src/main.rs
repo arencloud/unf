@@ -2304,7 +2304,7 @@ fn validate_flow_history_checkpoint(
         }
         let node_name = entry.reporting_nodes.first().cloned().unwrap_or_default();
         let batch = FlowExportBatch {
-            schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+            schema_version: checkpoint.schema_version.min(FLOW_EXPORT_SCHEMA_VERSION),
             node_name,
             dropped_events: 0,
             entries: vec![FlowExportRecord {
@@ -11663,6 +11663,15 @@ mod tests {
         let legacy: FlowExportBatch = serde_json::from_value(legacy).unwrap();
         validate_flow_export_batch(&legacy)
             .expect("schema-v5 service evidence migrates explicitly as unknown");
+        let mut history = FlowHistoryStore::with_capacity(1);
+        assert!(history.ingest(legacy.clone(), 1_000));
+        let mut legacy_checkpoint = history.checkpoint(1);
+        legacy_checkpoint.schema_version = unf_state::FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION - 1;
+        validate_flow_history_checkpoint(&legacy_checkpoint, 1_000)
+            .expect("schema-v5 durable service history validates under its recorded contract");
+        let mut mislabeled_checkpoint = legacy_checkpoint.clone();
+        mislabeled_checkpoint.schema_version = unf_state::FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION;
+        assert!(validate_flow_history_checkpoint(&mislabeled_checkpoint, 1_000).is_err());
         let mut mislabeled = legacy.clone();
         mislabeled.schema_version = FLOW_EXPORT_SCHEMA_VERSION;
         assert!(validate_flow_export_batch(&mislabeled).is_err());

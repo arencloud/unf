@@ -702,6 +702,8 @@ pub enum FlowHistoryCheckpointError {
     ZeroObservations,
     #[error("flow-history checkpoint entry has no reporting nodes")]
     MissingReportingNode,
+    #[error("legacy flow-history checkpoint contains advanced service-selection witnesses")]
+    InvalidLegacyServiceWitness,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -942,6 +944,8 @@ impl FlowHistoryStore {
         }
         let migrate_legacy_clock_regression =
             checkpoint.schema_version < FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION;
+        let migrate_legacy_service_witness =
+            checkpoint.schema_version < FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION;
         if checkpoint.entries.len() > capacity {
             return Err(FlowHistoryCheckpointError::CapacityExceeded {
                 actual: checkpoint.entries.len(),
@@ -950,6 +954,34 @@ impl FlowHistoryStore {
         }
         let mut entries = BTreeMap::new();
         for mut entry in checkpoint.entries {
+            if migrate_legacy_service_witness {
+                if let Some(service) = entry.key.service.as_mut() {
+                    if service.selection_tier != ServiceSelectionTier::Unknown
+                        || service.affinity_outcome != ServiceAffinityOutcome::Unknown
+                        || service.selection_algorithm != ServiceSelectionAlgorithmOutcome::Unknown
+                        || service.forwarding_mode != ServiceForwardingModeOutcome::Unknown
+                    {
+                        return Err(FlowHistoryCheckpointError::InvalidLegacyServiceWitness);
+                    }
+                    service.selection_tier = ServiceSelectionTier::Cluster;
+                    service.affinity_outcome = ServiceAffinityOutcome::None;
+                    service.selection_algorithm = ServiceSelectionAlgorithmOutcome::StableHash;
+                    service.forwarding_mode = ServiceForwardingModeOutcome::Nat;
+                }
+                if let Some(service) = entry.service.as_mut() {
+                    if service.selection_tier != ServiceSelectionTier::Unknown
+                        || service.affinity_outcome != ServiceAffinityOutcome::Unknown
+                        || service.selection_algorithm != ServiceSelectionAlgorithmOutcome::Unknown
+                        || service.forwarding_mode != ServiceForwardingModeOutcome::Unknown
+                    {
+                        return Err(FlowHistoryCheckpointError::InvalidLegacyServiceWitness);
+                    }
+                    service.selection_tier = ServiceSelectionTier::Cluster;
+                    service.affinity_outcome = ServiceAffinityOutcome::None;
+                    service.selection_algorithm = ServiceSelectionAlgorithmOutcome::StableHash;
+                    service.forwarding_mode = ServiceForwardingModeOutcome::Nat;
+                }
+            }
             if entry.first_received_unix_ms == 0 {
                 return Err(FlowHistoryCheckpointError::InvalidTimestamps);
             }
@@ -2136,8 +2168,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn flow_history_retains_service_outcome_provenance() {
+    fn service_history_checkpoint() -> FlowHistoryCheckpoint {
         let mut record = flow_record(0, 0, 80, 2);
         record.policy_revision = Revision::default();
         record.decision = FlowExportDecision {
@@ -2215,7 +2246,52 @@ mod tests {
             },
             100,
         );
-        let checkpoint = store.checkpoint(2);
+        store.checkpoint(2)
+    }
+
+    #[test]
+    fn flow_history_migrates_pre_selection_service_witnesses() {
+        let checkpoint = service_history_checkpoint();
+        let mut legacy = checkpoint.clone();
+        legacy.schema_version = FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION - 1;
+        for entry in &mut legacy.entries {
+            if let Some(service) = entry.key.service.as_mut() {
+                service.selection_tier = ServiceSelectionTier::Unknown;
+                service.affinity_outcome = ServiceAffinityOutcome::Unknown;
+                service.selection_algorithm = ServiceSelectionAlgorithmOutcome::Unknown;
+                service.forwarding_mode = ServiceForwardingModeOutcome::Unknown;
+            }
+            if let Some(service) = entry.service.as_mut() {
+                service.selection_tier = ServiceSelectionTier::Unknown;
+                service.affinity_outcome = ServiceAffinityOutcome::Unknown;
+                service.selection_algorithm = ServiceSelectionAlgorithmOutcome::Unknown;
+                service.forwarding_mode = ServiceForwardingModeOutcome::Unknown;
+            }
+        }
+        let migrated = FlowHistoryStore::from_checkpoint(legacy.clone(), 2)
+            .expect("pre-selection service history migrates to explicit Phase 6 semantics");
+        assert!(migrated.snapshot(17).entries.iter().all(|entry| {
+            entry.service.is_none_or(|service| {
+                service.selection_tier == ServiceSelectionTier::Cluster
+                    && service.affinity_outcome == ServiceAffinityOutcome::None
+                    && service.selection_algorithm == ServiceSelectionAlgorithmOutcome::StableHash
+                    && service.forwarding_mode == ServiceForwardingModeOutcome::Nat
+            })
+        }));
+        legacy.entries[0]
+            .service
+            .as_mut()
+            .expect("service outcome")
+            .selection_tier = ServiceSelectionTier::Cluster;
+        assert_eq!(
+            FlowHistoryStore::from_checkpoint(legacy, 2),
+            Err(FlowHistoryCheckpointError::InvalidLegacyServiceWitness)
+        );
+    }
+
+    #[test]
+    fn flow_history_retains_service_outcome_provenance() {
+        let checkpoint = service_history_checkpoint();
         let restored = FlowHistoryStore::from_checkpoint(checkpoint, 2)
             .expect("service history checkpoint is restorable");
         let snapshot = restored.snapshot(17);
@@ -2380,11 +2456,11 @@ mod tests {
         );
         assert_eq!(
             entry.service.unwrap().selection_algorithm,
-            ServiceSelectionAlgorithmOutcome::Unknown
+            ServiceSelectionAlgorithmOutcome::StableHash
         );
         assert_eq!(
             entry.key.service.as_ref().unwrap().forwarding_mode,
-            ServiceForwardingModeOutcome::Unknown
+            ServiceForwardingModeOutcome::Nat
         );
     }
 
