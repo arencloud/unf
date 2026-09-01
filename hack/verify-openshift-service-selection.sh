@@ -529,6 +529,11 @@ spec:
       imagePullPolicy: IfNotPresent
       securityContext: {privileged: true}
       command: [sh, -ec, "sleep infinity"]
+      volumeMounts:
+        - {name: host, mountPath: /host, readOnly: true}
+  volumes:
+    - name: host
+      hostPath: {path: /, type: Directory}
 EOF
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/selection-advertiser --timeout=180s >/dev/null
 advertiser_created=true
