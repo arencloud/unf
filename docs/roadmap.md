@@ -530,19 +530,21 @@ matrix is maintained in the
   StableHash/NAT capabilities; agents independently verify, stage, read back,
   activate, checkpoint, roll back, recover, and acknowledge the exact per-Node
   digest. Owner-only contract+Node state and exact rollback cleanup pass
-  `make service-selection-state-test`; ABI-v7 and packet behavior are unchanged;
+  `make service-selection-state-test`; that gate left ABI-v7 packet behavior unchanged;
   ADR 0105.
-- Per-Node eligibility and selection plans are compiled in userspace and must
-  pass contract verification before transactional activation. The eBPF path
-  performs bounded lookups and does not interpret Kubernetes topology,
-  affinity configuration, or verification logic.
+- Verified locality/topology dataplane: userspace resolves the first non-empty
+  verified SameNode/SameZone/Cluster tier and atomically activates fixed-width
+  ABI-v8 state. Strict internal/external Local, ordered preference fallback,
+  independent ClusterIP/NodePort/LoadBalancer origins, dual-stack TCP/UDP,
+  lifecycle filtering, tier provenance, topology-only changes, and exact
+  recovery pass `make service-selection-dataplane-test`; ADR 0106.
 - Maglev is a measured candidate, not a label-only claim. Adoption requires
   deterministic balance/disruption, bounded memory and compile cost, stable
   upgrades, and verifier-visible packet-cost evidence against the current hash.
 - DSR is opt-in and cannot bypass route/neighbor/MTU safety, backend VIP
   ownership, policy, source ranges, health, reverse telemetry, or exact cleanup.
-- Locality, affinity/draining, Maglev, DSR, operations, Kind, and OpenShift
-  remain ordered independent milestones;
+- Affinity/draining, Maglev, DSR, operations, Kind, and OpenShift remain ordered
+  independent milestones;
   ADR 0102 and `make service-selection-boundary-test` define the first gate.
 - Weighted traffic splitting, latency/load feedback, cross-cluster selection,
   SCTP Services, fragments, generic NAT `RELATED`, and production scale remain

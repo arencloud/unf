@@ -35,3 +35,7 @@ sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
 sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
     --ignored --exact \
     tests::privileged_service_packets_translate_dual_stack_and_survive_churn
+
+sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
+    --ignored --exact \
+    tests::privileged_selection_packets_enforce_local_and_topology_fallback_dual_stack

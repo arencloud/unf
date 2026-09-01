@@ -7,7 +7,7 @@ use unf_common::{BackendId, IdentityId, PolicyId, RuleId, ServiceId, Verdict};
 pub use unf_common::PolicyDirection as Direction;
 
 pub const FLOW_ABI_VERSION: u16 = 2;
-pub const SERVICE_EVENT_ABI_VERSION: u16 = 2;
+pub const SERVICE_EVENT_ABI_VERSION: u16 = 3;
 pub const SERVICE_EVENT_FRONTEND_CLUSTER_IP: u8 = 1;
 pub const SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER: u8 = 2;
 pub const SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL: u8 = 3;
@@ -17,12 +17,12 @@ pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
 pub const POLICY_BANK_COUNT: u8 = 2;
-pub const SERVICE_MAP_ABI_VERSION: u16 = 2;
+pub const SERVICE_MAP_ABI_VERSION: u16 = 3;
 pub const SERVICE_BANK_COUNT: u8 = 2;
-pub const NODE_PORT_MAP_ABI_VERSION: u16 = 1;
+pub const NODE_PORT_MAP_ABI_VERSION: u16 = 2;
 pub const NODE_PORT_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_FRONTEND_FLAG_LOCAL: u16 = 1;
-pub const LOAD_BALANCER_MAP_ABI_VERSION: u16 = 1;
+pub const LOAD_BALANCER_MAP_ABI_VERSION: u16 = 2;
 pub const LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION: u16 = 1;
 pub const LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4: u8 = 1;
 pub const LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6: u8 = 1 << 1;
@@ -41,6 +41,9 @@ pub const SERVICE_CONNECTION_ROLE_FORWARD: u8 = 1;
 pub const SERVICE_CONNECTION_ROLE_REVERSE: u8 = 2;
 pub const SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER: u16 = 1 << 0;
 pub const SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL: u16 = 1 << 1;
+pub const SERVICE_SELECTION_TIER_SAME_NODE: u8 = 1;
+pub const SERVICE_SELECTION_TIER_SAME_ZONE: u8 = 2;
+pub const SERVICE_SELECTION_TIER_CLUSTER: u8 = 3;
 pub const SERVICE_EVENT_ACTION_TRANSLATE: u8 = 1;
 pub const SERVICE_EVENT_ACTION_DROP: u8 = 2;
 pub const SERVICE_EVENT_ACTION_EXPIRE: u8 = 3;
@@ -68,6 +71,17 @@ pub const CONNECTION_UDP_TIMEOUT_NS: u64 = 30_000_000_000;
 pub const CONNECTION_SCTP_TIMEOUT_NS: u64 = 60_000_000_000;
 pub const TCP_FLAG_SYN: u8 = 0x02;
 pub const TCP_FLAG_ACK: u8 = 0x10;
+
+/// Returns whether a fixed-width frontend carries a known locality tier.
+#[must_use]
+pub const fn service_selection_tier_is_valid(tier: u8) -> bool {
+    matches!(
+        tier,
+        SERVICE_SELECTION_TIER_SAME_NODE
+            | SERVICE_SELECTION_TIER_SAME_ZONE
+            | SERVICE_SELECTION_TIER_CLUSTER
+    )
+}
 
 pub const IPV6_NEXT_HEADER_HOP_BY_HOP: u8 = 0;
 pub const IPV6_NEXT_HEADER_ROUTING: u8 = 43;
@@ -217,7 +231,7 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
                     state.reserved[2],
                     0 | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
                 )
-                && state.reserved[3] == 0
+                && service_selection_tier_is_valid(state.reserved[3])
         } else {
             address_is_zero(state.translated_source_address)
                 && state.reserved[0] == 0
@@ -226,7 +240,7 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
                     state.reserved[2],
                     0 | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
                 )
-                && state.reserved[3] == 0
+                && service_selection_tier_is_valid(state.reserved[3])
         }
         && now_ns.saturating_sub(state.last_seen_ns) <= timeout_ns
 }
@@ -1097,7 +1111,7 @@ mod tests {
             protocol,
             address_family: AddressFamily::Ipv6 as u8,
             flags: 0,
-            reserved: [0; 4],
+            reserved: [0, 0, 0, SERVICE_SELECTION_TIER_CLUSTER],
         }
     }
 

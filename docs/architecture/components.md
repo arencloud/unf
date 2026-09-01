@@ -46,15 +46,16 @@ bounded normalized affinity/locality/algorithm/forwarding intent to
 inputs. `unf-service` now also owns the Network Behavior Contract reference
 validator: it independently binds exact intent, per-Node eligibility tiers,
 capabilities, revisions, bounded failure observations, and canonical digests.
-The agent now transactionally owns verified per-Node contract state through
+The agent transactionally owns verified per-Node contract state through
 authenticated projection, two userspace banks, independent readback, private
-contract+Node checkpoints, recovery, and exact digest acknowledgements. It does
-not yet lower that state into packet maps. `unf-ebpf-tc`
-may consume only fixed-width selected tiers, affinity records, algorithm tables,
+contract+Node checkpoints, recovery, and exact digest acknowledgements. Phase
+7.4 lowers the first non-empty ordered tier into ABI-v8 origin-specific slots;
+topology-only contract changes are dataplane transactions. `unf-ebpf-tc` may
+consume only fixed-width selected tiers, affinity records, algorithm tables,
 and compact decision witnesses; it does not interpret Kubernetes strings,
 topology, or contract logic. DSR remains an explicit forwarding mode whose
 route, MTU, policy, return-path, and cleanup contracts must pass before
-activation. ADRs 0102, 0104, and 0105 record the boundary; later milestones must not
+activation. ADRs 0102 and 0104–0106 record the boundary; later milestones must not
 claim packet implementation from this ownership decision alone.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with

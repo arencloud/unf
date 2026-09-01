@@ -47,6 +47,7 @@ use unf_ebpf_common::{
     SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL, SERVICE_EVENT_REASON_NO_BACKEND,
     SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED, SERVICE_MAP_ABI_VERSION, ServiceEvent,
     service_event_action_reason_is_valid, service_event_frontend_kind_is_valid,
+    service_selection_tier_is_valid,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -56,6 +57,7 @@ use unf_loadbalancer::{
     LOAD_BALANCER_FRONTEND_BANK_CAPACITY, LoadBalancerDataplaneState,
     NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION, NodeReachabilityCheckpoint,
     NodeReachabilitySnapshot, compile_load_balancer_dataplane,
+    compile_load_balancer_selection_dataplane,
 };
 use unf_route::{
     NativeIpv4NextHop, NativeIpv6NextHop, NativeRemoteNode, NativeRemoteRoutePlan,
@@ -70,7 +72,8 @@ use unf_service::{
     SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
     SERVICE_FRONTEND_BANK_CAPACITY, SERVICE_SNAPSHOT_SCHEMA_VERSION, SelectionCapability,
     SelectionNode, ServiceDataplaneState, ServiceSnapshot, ServiceTrafficPolicy,
-    compile_node_port_fabric_dataplane, compile_service_load_balancer_fabric_dataplane,
+    compile_node_port_fabric_dataplane, compile_node_port_selection_fabric_dataplane,
+    compile_service_load_balancer_fabric_dataplane, compile_service_selection_dataplane,
     has_advanced_selection_intent,
 };
 use unf_state::{
@@ -91,7 +94,7 @@ use cni_server::CniTransactionServer;
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v7";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v8";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
@@ -2770,7 +2773,24 @@ fn recover_selection_contract_state(services: &mut ServiceSynchronizer) -> Resul
     let pending_path = selection_contract_pending_path(&services.state_path)?;
     let current = decode_optional_selection_checkpoint(&current_path)?;
     let pending = decode_optional_selection_checkpoint(&pending_path)?;
-    let selected = select_recovered_selection_checkpoint(applied, current, pending);
+    let preferred_digest = services
+        .applied_selection_contract
+        .as_ref()
+        .map(|contract| contract.contract_digest);
+    let selected = match preferred_digest {
+        Some(digest) => [(false, current.clone()), (true, pending.clone())]
+            .into_iter()
+            .find_map(|(is_pending, checkpoint)| {
+                checkpoint
+                    .filter(|checkpoint| {
+                        checkpoint.contract.source_epoch == applied.source_epoch
+                            && checkpoint.contract.service_revision == applied.revision
+                            && checkpoint.contract.contract_digest == digest
+                    })
+                    .map(|checkpoint| (is_pending, checkpoint))
+            }),
+        None => select_recovered_selection_checkpoint(applied, current, pending),
+    };
     let Some((selected_pending, checkpoint)) = selected else {
         remove_secure_optional_file(&pending_path, "stale pending selection checkpoint")?;
         if has_advanced_selection_intent(applied) {
@@ -3089,8 +3109,18 @@ fn activate_load_balancer_snapshot(
         .context("LoadBalancer activation requires active service state")?
         .clone();
     let bank = 1_u8.saturating_sub(synchronizer.active_load_balancer_bank);
-    let desired =
-        compile_load_balancer_dataplane(&services, candidate, synchronizer.active_bank, bank)?;
+    let desired = match synchronizer.applied_selection_contract.as_ref() {
+        Some(contract) => compile_load_balancer_selection_dataplane(
+            &services,
+            candidate,
+            contract,
+            synchronizer.active_bank,
+            bank,
+        )?,
+        None => {
+            compile_load_balancer_dataplane(&services, candidate, synchronizer.active_bank, bank)?
+        }
+    };
     let desired_index = usize::from(bank);
     let previous_stage = synchronizer.load_balancer_banks[desired_index]
         .clone()
@@ -3323,8 +3353,22 @@ fn service_has_node_ports(snapshot: &ServiceSnapshot) -> bool {
         .any(|service| !service.node_ports.is_empty())
 }
 
+fn active_load_balancer_references_service_bank(
+    synchronizer: &ServiceSynchronizer,
+    service_bank: u8,
+) -> bool {
+    synchronizer.load_balancer_banks[usize::from(synchronizer.active_load_balancer_bank)]
+        .as_ref()
+        .is_some_and(|load_balancer| {
+            load_balancer.service_bank == service_bank
+                && (!load_balancer.ipv4_frontends.is_empty()
+                    || !load_balancer.ipv6_frontends.is_empty())
+        })
+}
+
 fn service_requires_local_node(snapshot: &ServiceSnapshot) -> bool {
     service_has_node_ports(snapshot)
+        || has_advanced_selection_intent(snapshot)
         || snapshot
             .services
             .iter()
@@ -3580,6 +3624,104 @@ fn compile_node_port_host_fabric(
     )?)
 }
 
+struct RecoveredServiceFabric {
+    selection: Option<(bool, SelectionContractCheckpoint)>,
+    service: ServiceDataplaneState,
+    node_port: Option<NodePortDataplaneState>,
+}
+
+fn selection_checkpoint_candidates(
+    service_path: &Path,
+    snapshot: &ServiceSnapshot,
+) -> Result<Vec<(bool, SelectionContractCheckpoint)>> {
+    let current_path = selection_contract_state_path(service_path)?;
+    let pending_path = selection_contract_pending_path(service_path)?;
+    let mut candidates = Vec::new();
+    for (pending, checkpoint) in [
+        (false, decode_optional_selection_checkpoint(&current_path)?),
+        (true, decode_optional_selection_checkpoint(&pending_path)?),
+    ] {
+        let Some(checkpoint) = checkpoint else {
+            continue;
+        };
+        if checkpoint.contract.source_epoch == snapshot.source_epoch
+            && checkpoint.contract.service_revision == snapshot.revision
+        {
+            verify_selection_checkpoint(&checkpoint, snapshot)?;
+            candidates.push((pending, checkpoint));
+        }
+    }
+    Ok(candidates)
+}
+
+fn compile_recovered_service_fabrics(
+    service_path: &Path,
+    snapshot: &ServiceSnapshot,
+    checkpoint_node: Option<&NodePortNodeSnapshot>,
+    service_bank: u8,
+    node_port_bank: Option<u8>,
+) -> Result<Vec<RecoveredServiceFabric>> {
+    let candidates = selection_checkpoint_candidates(service_path, snapshot)?;
+    if candidates.is_empty() {
+        if has_advanced_selection_intent(snapshot) {
+            bail!("advanced Service selection intent has no matching durable contract");
+        }
+        let (service, node_port) = if service_has_node_ports(snapshot) {
+            let node = checkpoint_node
+                .context("durable NodePort checkpoint lost its local Node snapshot")?;
+            let node_port_bank = node_port_bank
+                .context("durable NodePort checkpoint lost its activation pointer")?;
+            let fabric =
+                compile_node_port_host_fabric(snapshot, node, service_bank, node_port_bank)?;
+            (fabric.service, Some(fabric.node_port))
+        } else {
+            (
+                compile_service_host_dataplane(snapshot, service_bank)?,
+                None,
+            )
+        };
+        return Ok(vec![RecoveredServiceFabric {
+            selection: None,
+            service,
+            node_port,
+        }]);
+    }
+    candidates
+        .into_iter()
+        .map(|(pending, checkpoint)| {
+            if checkpoint_node.is_some_and(|node| node != &checkpoint.node) {
+                bail!("service and selection checkpoints disagree on local Node state");
+            }
+            let (service, node_port) = if service_has_node_ports(snapshot) {
+                let node_port_bank = node_port_bank
+                    .context("durable NodePort checkpoint lost its activation pointer")?;
+                let fabric = compile_node_port_selection_fabric_dataplane(
+                    snapshot,
+                    &checkpoint.node,
+                    &checkpoint.contract,
+                    service_bank,
+                    node_port_bank,
+                )?;
+                (fabric.service, Some(fabric.node_port))
+            } else {
+                (
+                    compile_service_selection_dataplane(
+                        snapshot,
+                        &checkpoint.contract,
+                        service_bank,
+                    )?,
+                    None,
+                )
+            };
+            Ok(RecoveredServiceFabric {
+                selection: Some((pending, checkpoint)),
+                service,
+                node_port,
+            })
+        })
+        .collect()
+}
+
 fn validate_node_port_node_transition(
     candidate: Option<&NodePortNodeSnapshot>,
     applied: Option<&NodePortNodeSnapshot>,
@@ -3711,7 +3853,8 @@ fn activate_service_snapshot_with_contract(
     let mut previous_selection_stage = selection_changed
         .then(|| synchronizer.selection_banks[usize::from(selection_bank)].clone());
 
-    let service_bank = if service_changed {
+    let service_dataplane_changed = service_changed || selection_changed;
+    let service_bank = if service_dataplane_changed {
         (synchronizer.active_bank + 1) % SERVICE_BANK_COUNT
     } else {
         synchronizer.active_bank
@@ -3721,7 +3864,8 @@ fn activate_service_snapshot_with_contract(
         .applied
         .as_ref()
         .is_some_and(service_has_node_ports);
-    let node_port_must_change = (candidate_has_node_ports && local_node_changed)
+    let node_port_must_change = (candidate_has_node_ports
+        && (local_node_changed || selection_changed))
         || (service_changed && (candidate_has_node_ports || applied_had_node_ports));
     let node_port_bank = if node_port_must_change {
         (synchronizer.active_node_port_bank + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT
@@ -3733,15 +3877,29 @@ fn activate_service_snapshot_with_contract(
         let node = node_port_node
             .as_ref()
             .expect("NodePort intent requires validated local Node state");
-        let desired =
-            compile_node_port_fabric_dataplane(&candidate, node, service_bank, node_port_bank)?;
+        let desired = if let Some(contract) = selection_contract {
+            compile_node_port_selection_fabric_dataplane(
+                &candidate,
+                node,
+                contract,
+                service_bank,
+                node_port_bank,
+            )?
+        } else {
+            compile_node_port_fabric_dataplane(&candidate, node, service_bank, node_port_bank)?
+        };
         (
-            service_changed.then_some(desired.service),
+            service_dataplane_changed.then_some(desired.service),
             Some(desired.node_port),
         )
     } else {
-        let desired_service = service_changed
-            .then(|| compile_service_load_balancer_fabric_dataplane(&candidate, service_bank))
+        let desired_service = service_dataplane_changed
+            .then(|| match selection_contract {
+                Some(contract) => {
+                    compile_service_selection_dataplane(&candidate, contract, service_bank)
+                }
+                None => compile_service_load_balancer_fabric_dataplane(&candidate, service_bank),
+            })
             .transpose()?;
         let desired_node_port = node_port_must_change.then(|| empty_node_port_bank(node_port_bank));
         (desired_service, desired_node_port)
@@ -3769,6 +3927,13 @@ fn activate_service_snapshot_with_contract(
         .load_balancer_node_source
         .get(&0, 0)
         .context("read LoadBalancer Node source before activation")?;
+    if desired_service.is_some()
+        && active_load_balancer_references_service_bank(synchronizer, service_bank)
+    {
+        bail!(
+            "inactive service bank {service_bank} is still referenced by the active LoadBalancer bank; wait for LoadBalancer linkage reconciliation"
+        );
+    }
     if let (Some(previous), Some(desired)) = (&previous_service_stage, &desired_service)
         && let Err(error) = stage_service_bank(synchronizer, previous, desired)
     {
@@ -3982,6 +4147,18 @@ fn activate_service_snapshot_with_contract(
         synchronizer.active_selection_bank = selection_bank;
         synchronizer.applied_selection_contract = selection_contract.cloned();
     }
+    if service_dataplane_changed
+        && let Some(reachability) = synchronizer.applied_load_balancer_reachability.clone()
+        && active_load_balancer_references_service_bank(synchronizer, previous_active)
+        && let Err(error) = activate_load_balancer_snapshot(synchronizer, &reachability, state)
+    {
+        record_load_balancer_error(state, &error);
+        warn!(
+            %error,
+            retained_service_bank = previous_active,
+            "LoadBalancer linkage could not follow the Service activation immediately; prior packet state remains active and reconciliation will retry"
+        );
+    }
     publish_applied_service_snapshot(state, &candidate);
     publish_applied_selection_contract(
         state,
@@ -4005,13 +4182,20 @@ fn activate_service_snapshot_with_contract(
     if previous_active != synchronizer.active_bank {
         let previous_index = usize::from(previous_active);
         if let Some(old) = synchronizer.banks[previous_index].clone() {
-            match clear_service_bank(synchronizer, &old) {
-                Ok(()) => synchronizer.banks[previous_index] = None,
-                Err(error) => warn!(
-                    %error,
+            if active_load_balancer_references_service_bank(synchronizer, previous_active) {
+                warn!(
                     bank = previous_active,
-                    "could not garbage-collect old service bank; restored it for a later retry"
-                ),
+                    "retaining previous service bank while the active LoadBalancer bank references it"
+                );
+            } else {
+                match clear_service_bank(synchronizer, &old) {
+                    Ok(()) => synchronizer.banks[previous_index] = None,
+                    Err(error) => warn!(
+                        %error,
+                        bank = previous_active,
+                        "could not garbage-collect old service bank; restored it for a later retry"
+                    ),
+                }
             }
         }
     }
@@ -6725,7 +6909,16 @@ fn recover_load_balancer_state(services: &mut ServiceSynchronizer) -> Result<()>
     let (selected_pending, durable) = selected.context(
         "persistent LoadBalancer activation tuple has no matching durable or prepared checkpoint",
     )?;
-    let expected = compile_load_balancer_dataplane(service, &durable, service_bank, bank)?;
+    let expected = match services.applied_selection_contract.as_ref() {
+        Some(contract) => compile_load_balancer_selection_dataplane(
+            service,
+            &durable,
+            contract,
+            service_bank,
+            bank,
+        )?,
+        None => compile_load_balancer_dataplane(service, &durable, service_bank, bank)?,
+    };
     let active = &banks[usize::from(bank)];
     if active.ipv4_frontends != expected.ipv4_frontends
         || active.ipv6_frontends != expected.ipv6_frontends
@@ -6806,7 +6999,8 @@ fn validate_load_balancer_frontend_entry<const K: usize>(
         || reachability_revision == 0
         || allocation_revision == 0
         || service_bank >= SERVICE_BANK_COUNT
-        || value[41..48] != [0; 7]
+        || !service_selection_tier_is_valid(value[41])
+        || value[42..48] != [0; 6]
         || !matches!(key[bank_offset - 1], 6 | 17)
     {
         bail!("persistent LoadBalancer frontend contains an incompatible value");
@@ -6977,39 +7171,36 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
         )
     {
         let previous_service_bank = (bank + 1) % SERVICE_BANK_COUNT;
-        let expected_current_service = if service_has_node_ports(&current_service) {
-            let current_node = current_node
-                .as_ref()
-                .context("current NodePort checkpoint lost its local Node snapshot")?;
-            let (_, _, _, _, _, current_node_port_bank) = decoded_node_port
-                .context("current NodePort checkpoint lost its activation pointer")?;
-            compile_node_port_host_fabric(
-                &current_service,
-                current_node,
-                previous_service_bank,
-                current_node_port_bank,
-            )?
-            .service
-        } else {
-            compile_service_host_dataplane(&current_service, previous_service_bank)?
-        };
-        let expected_pending_service = if service_has_node_ports(&pending_service) {
-            let pending_node = pending_node
-                .as_ref()
-                .context("pending NodePort checkpoint lost its local Node snapshot")?;
-            let pending_node_port_bank = decoded_node_port.map_or(1, |config| {
-                (config.5 + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT
-            });
-            compile_node_port_host_fabric(
-                &pending_service,
-                pending_node,
-                bank,
-                pending_node_port_bank,
-            )?
-            .service
-        } else {
-            compile_service_host_dataplane(&pending_service, bank)?
-        };
+        let current_node_port_bank = decoded_node_port.map(|config| config.5);
+        let expected_current = compile_recovered_service_fabrics(
+            &services.state_path,
+            &current_service,
+            current_node.as_ref(),
+            previous_service_bank,
+            current_node_port_bank,
+        )?
+        .into_iter()
+        .find(|candidate| {
+            service_bank_matches(
+                &banks[usize::from(previous_service_bank)],
+                &candidate.service,
+            )
+        })
+        .context("current service checkpoint does not match its inactive recovery bank")?;
+        let pending_node_port_bank =
+            decoded_node_port.map(|config| (config.5 + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT);
+        let expected_pending = compile_recovered_service_fabrics(
+            &services.state_path,
+            &pending_service,
+            pending_node.as_ref(),
+            bank,
+            pending_node_port_bank,
+        )?
+        .into_iter()
+        .find(|candidate| service_bank_matches(&banks[usize::from(bank)], &candidate.service))
+        .context("pending service checkpoint does not match its active recovery bank")?;
+        let expected_current_service = expected_current.service;
+        let expected_pending_service = expected_pending.service;
         if !service_bank_matches(
             &banks[usize::from(previous_service_bank)],
             &expected_current_service,
@@ -7025,28 +7216,16 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
         restore_service_bank(services, &empty_service_bank(bank))?;
         banks[usize::from(previous_service_bank)] = expected_current_service;
         banks[usize::from(bank)] = empty_service_bank(bank);
-        if service_has_node_ports(&pending_service) {
-            let pending_node = pending_node
-                .as_ref()
-                .context("pending NodePort checkpoint lost its local Node snapshot")?;
-            let pending_node_port_bank = decoded_node_port.map_or(1, |config| {
-                (config.5 + 1) % unf_ebpf_common::NODE_PORT_BANK_COUNT
-            });
-            let pending_node_port = compile_node_port_host_fabric(
-                &pending_service,
-                pending_node,
-                bank,
-                pending_node_port_bank,
-            )?
-            .node_port;
-            if node_port_bank_matches(
+        if let (Some(pending_node_port), Some(pending_node_port_bank)) =
+            (expected_pending.node_port, pending_node_port_bank)
+            && node_port_bank_matches(
                 &node_port_banks[usize::from(pending_node_port_bank)],
                 &pending_node_port,
-            ) {
-                restore_node_port_bank(services, &empty_node_port_bank(pending_node_port_bank))?;
-                node_port_banks[usize::from(pending_node_port_bank)] =
-                    empty_node_port_bank(pending_node_port_bank);
-            }
+            )
+        {
+            restore_node_port_bank(services, &empty_node_port_bank(pending_node_port_bank))?;
+            node_port_banks[usize::from(pending_node_port_bank)] =
+                empty_node_port_bank(pending_node_port_bank);
         }
         discard_service_pending_state(&services.state_path)?;
         selected = Some((false, current_service, current_node));
@@ -7064,17 +7243,43 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
     if durable.source_epoch != epoch || durable.revision.get() != revision {
         bail!("repaired service config does not match selected durable checkpoint");
     }
-    let (expected, expected_node_port) = if service_has_node_ports(&durable) {
-        let node = node
+    let active_node_port_bank = decoded_node_port.map(|config| config.5);
+    let candidates = compile_recovered_service_fabrics(
+        &services.state_path,
+        &durable,
+        node.as_ref(),
+        bank,
+        active_node_port_bank,
+    )?;
+    let mut matched = candidates.into_iter().filter(|candidate| {
+        let selection_bank_matches = candidate
+            .selection
             .as_ref()
-            .context("durable NodePort checkpoint has no local Node snapshot")?;
-        let (_, _, _, _, _, node_port_bank) = decoded_node_port
-            .context("durable NodePort checkpoint has no active NodePort config")?;
-        let expected = compile_node_port_host_fabric(&durable, node, bank, node_port_bank)?;
-        (expected.service, Some(expected.node_port))
-    } else {
-        (compile_service_host_dataplane(&durable, bank)?, None)
-    };
+            .is_none_or(|(_, checkpoint)| checkpoint.active_bank == bank);
+        let active = &banks[usize::from(candidate.service.bank)];
+        selection_bank_matches
+            && service_bank_matches(active, &candidate.service)
+            && recovered_config == candidate.service.config
+            && match (&candidate.node_port, decoded_node_port) {
+                (Some(expected), Some((_, _, _, _, _, node_port_bank))) => {
+                    let active = &node_port_banks[usize::from(node_port_bank)];
+                    node_port_bank_matches(active, expected) && node_port_config == expected.config
+                }
+                (None, None) => true,
+                _ => false,
+            }
+    });
+    let selected_fabric = matched
+        .next()
+        .context("persistent active service bank does not match any durable selection contract")?;
+    if matched.next().is_some() {
+        bail!("persistent active service bank ambiguously matches multiple selection contracts");
+    }
+    let RecoveredServiceFabric {
+        selection: recovered_selection,
+        service: expected,
+        node_port: expected_node_port,
+    } = selected_fabric;
     let active_service_bank = expected.bank;
     let active = &banks[usize::from(active_service_bank)];
     if !service_bank_matches(active, &expected) || recovered_config != expected.config {
@@ -7116,6 +7321,9 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
         .set(0, encode_load_balancer_node_source(node.as_ref()), 0)
         .context("restore runtime LoadBalancer Node source addresses")?;
     services.applied_node_port_node = node;
+    if let Some((_, checkpoint)) = recovered_selection {
+        services.applied_selection_contract = Some(checkpoint.contract);
+    }
     Ok((Some(epoch), Some(revision)))
 }
 
@@ -7249,11 +7457,10 @@ fn validate_node_port_frontend_entry<const N: usize>(
         || flags & !unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL != 0
         || (flags & unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL != 0
             && frontend_index & unf_ebpf_common::NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG == 0)
-        || (flags & unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL == 0
-            && frontend_index & unf_ebpf_common::NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG != 0)
         || service_revision == 0
         || value[24] >= SERVICE_BANK_COUNT
-        || value[25..32] != [0; 7]
+        || !service_selection_tier_is_valid(value[25])
+        || value[26..32] != [0; 6]
     {
         bail!("persistent NodePort frontend map contains an incompatible entry");
     }
@@ -7281,7 +7488,8 @@ fn validate_service_frontend_entry<const N: usize>(
         || schema != SERVICE_MAP_ABI_VERSION
         || value[14..16] != [0; 2]
         || revision == 0
-        || value[24..32] != [0; 8]
+        || !service_selection_tier_is_valid(value[24])
+        || value[25..32] != [0; 7]
     {
         bail!("persistent service frontend map contains an incompatible entry");
     }
@@ -10097,7 +10305,8 @@ fn decode_service_event(bytes: &[u8]) -> Option<ServiceEvent> {
         || !matches!(address_family, 4 | 6)
         || !service_event_action_reason_is_valid(action, reason)
         || !service_event_frontend_kind_is_valid(bytes[86])
-        || bytes[87..96] != [0; 9]
+        || !service_selection_tier_is_valid(bytes[87])
+        || bytes[88..96] != [0; 8]
     {
         return None;
     }
@@ -11532,7 +11741,7 @@ mod tests {
         corrupt_config[28..30].copy_from_slice(&(SERVICE_MAP_ABI_VERSION + 1).to_ne_bytes());
         assert!(decode_recovered_service_config(corrupt_config).is_err());
         let mut corrupt_value = *value;
-        corrupt_value[24] = 1;
+        corrupt_value[24] = 0;
         assert!(validate_service_frontend_entry(key, &corrupt_value, 7).is_err());
         let mut corrupt_key = *key;
         corrupt_key[7] = SERVICE_BANK_COUNT;
@@ -11556,9 +11765,7 @@ mod tests {
         corrupt_value[24] = SERVICE_BANK_COUNT;
         assert!(validate_node_port_frontend_entry(key, &corrupt_value, 7).is_err());
         let mut corrupt_value = *value;
-        let frontend_index = u32::from_ne_bytes(corrupt_value[4..8].try_into().unwrap())
-            | unf_ebpf_common::NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG;
-        corrupt_value[4..8].copy_from_slice(&frontend_index.to_ne_bytes());
+        corrupt_value[25] = 0;
         assert!(validate_node_port_frontend_entry(key, &corrupt_value, 7).is_err());
         let mut corrupt_config = node_port.config;
         corrupt_config[35] = 1;
@@ -12035,6 +12242,16 @@ mod tests {
         );
         activate_service_snapshot(&mut synchronizer, &second, Some(&node), true, &state)
             .expect("replacement LoadBalancer backend activates");
+        let active_load_balancer = synchronizer.load_balancer_banks
+            [usize::from(synchronizer.active_load_balancer_bank)]
+        .as_ref()
+        .expect("active LoadBalancer bank remains materialized");
+        assert_eq!(active_load_balancer.service_bank, synchronizer.active_bank);
+        let eagerly_relinked = ipv4_packet(6, client_v4, vip_v4, 40_900, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &eagerly_relinked);
+        assert_eq!(action, TC_ACT_PIPE);
+        let eager_snat = u16::from_be_bytes([translated[34], translated[35]]);
+        assert_ipv4_packet(&translated, 6, node_v4, replacement_v4, eager_snat, 8080);
         let second_reachability =
             dual_stack_load_balancer_node_snapshot(&second, 2, vip_v4, vip_v6);
         activate_load_balancer_snapshot(&mut synchronizer, &second_reachability, &state)
@@ -12920,6 +13137,312 @@ mod tests {
     #[test]
     #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
     #[allow(clippy::too_many_lines)]
+    fn privileged_selection_packets_enforce_local_and_topology_fallback_dual_stack() {
+        const TC_ACT_SHOT: u32 = 2;
+        const TC_ACT_PIPE: u32 = 3;
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new()
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(program_name)
+                .expect("service TC program exists")
+                .try_into()
+                .expect("service program is a TC classifier");
+            program
+                .load()
+                .expect("kernel verifier accepts selection TC program");
+        }
+        let mut service_events = RingBuf::try_from(
+            ebpf.take_map("SERVICE_EVENTS")
+                .expect("service event ring exists"),
+        )
+        .expect("service event ring opens");
+        let mut flow_events = RingBuf::try_from(
+            ebpf.take_map("FLOW_EVENTS")
+                .expect("flow event ring exists"),
+        )
+        .expect("flow event ring opens");
+        let (mut identity_v4_maps, _identity_v6_maps, mut identity_config) =
+            take_identity_maps(&mut ebpf).expect("take identity maps");
+        let (
+            _identity_policy,
+            mut ipv4_policy,
+            _ipv6_policy,
+            _egress_ipv4_policy,
+            _egress_ipv6_policy,
+            mut policy_config,
+        ) = take_policy_maps(&mut ebpf).expect("take policy maps");
+        let directory = tempdir().unwrap();
+        let mut synchronizer =
+            test_service_synchronizer(&mut ebpf, directory.path().join("service.json"));
+        let state = test_agent_state();
+        let node = node_port_node_snapshot(1);
+        let selection_node = local_selection_node(&node, Some("zone-a".to_owned()));
+        let service_v4 = Ipv4Addr::new(10, 96, 0, 10);
+        let backend_v4 = Ipv4Addr::new(10, 42, 0, 20);
+        let client_v4 = Ipv4Addr::new(10, 42, 0, 5);
+        let service_v6 = "fd00:96::10".parse::<Ipv6Addr>().unwrap();
+        let backend_v6 = "fd00:42::20".parse::<Ipv6Addr>().unwrap();
+        let client_v6 = "fd00:42::5".parse::<Ipv6Addr>().unwrap();
+
+        let mut local = dual_stack_service_snapshot(1, backend_v4, backend_v6, true);
+        local.services[0].internal_traffic_policy = ServiceTrafficPolicy::Local;
+        for backend in &mut local.services[0].backends {
+            backend.node_name = Some("worker-a".to_owned());
+            backend.zone = Some("zone-a".to_owned());
+        }
+        local = local.validate_and_normalize().unwrap();
+        let local_contract = NetworkBehaviorContract::compile(
+            &local,
+            Revision::new(1),
+            Revision::new(1),
+            selection_node.clone(),
+        )
+        .unwrap();
+        activate_service_snapshot_with_contract(
+            &mut synchronizer,
+            &local,
+            Some(&node),
+            Some(&local_contract),
+            true,
+            &state,
+        )
+        .expect("strict-local selection activates");
+        let (action, translated) = run_tc(
+            &mut ebpf,
+            "unf_observe_ingress",
+            &ipv4_packet(6, client_v4, service_v4, 45_000, 80),
+        );
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, backend_v4, 45_000, 8080);
+        let (action, translated) = run_tc(
+            &mut ebpf,
+            "unf_observe_ingress",
+            &ipv6_packet(17, client_v6, service_v6, 45_001, 53),
+        );
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, client_v6, backend_v6, 45_001, 5353);
+
+        let mut remote = dual_stack_service_snapshot(2, backend_v4, backend_v6, true);
+        remote.services[0].internal_traffic_policy = ServiceTrafficPolicy::Local;
+        for backend in &mut remote.services[0].backends {
+            backend.node_name = Some("worker-b".to_owned());
+            backend.zone = Some("zone-b".to_owned());
+        }
+        remote = remote.validate_and_normalize().unwrap();
+        let remote_contract = NetworkBehaviorContract::compile(
+            &remote,
+            Revision::new(2),
+            Revision::new(2),
+            selection_node.clone(),
+        )
+        .unwrap();
+        activate_service_snapshot_with_contract(
+            &mut synchronizer,
+            &remote,
+            Some(&node),
+            Some(&remote_contract),
+            true,
+            &state,
+        )
+        .expect("remote-only strict-local selection activates");
+        let (action, _) = run_tc(
+            &mut ebpf,
+            "unf_observe_ingress",
+            &ipv4_packet(6, client_v4, service_v4, 45_010, 80),
+        );
+        assert_eq!(action, TC_ACT_SHOT);
+        let (action, _) = run_tc(
+            &mut ebpf,
+            "unf_observe_ingress",
+            &ipv6_packet(17, client_v6, service_v6, 45_011, 53),
+        );
+        assert_eq!(action, TC_ACT_SHOT);
+
+        let mut preferred = dual_stack_service_snapshot(3, backend_v4, backend_v6, true);
+        preferred.services[0].traffic_distribution =
+            unf_service::ServiceTrafficDistribution::PreferSameNode;
+        for backend in &mut preferred.services[0].backends {
+            backend.node_name = Some("worker-b".to_owned());
+            backend.zone = Some("zone-b".to_owned());
+        }
+        preferred = preferred.validate_and_normalize().unwrap();
+        let preferred_contract = NetworkBehaviorContract::compile(
+            &preferred,
+            Revision::new(3),
+            Revision::new(3),
+            selection_node.clone(),
+        )
+        .unwrap();
+        activate_service_snapshot_with_contract(
+            &mut synchronizer,
+            &preferred,
+            Some(&node),
+            Some(&preferred_contract),
+            true,
+            &state,
+        )
+        .expect("topology fallback selection activates");
+        let (action, translated) = run_tc(
+            &mut ebpf,
+            "unf_observe_ingress",
+            &ipv4_packet(6, client_v4, service_v4, 45_020, 80),
+        );
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, backend_v4, 45_020, 8080);
+
+        let prior_service_bank = synchronizer.active_bank;
+        let mut zone_b_node = selection_node;
+        zone_b_node.zone = Some("zone-b".to_owned());
+        let zone_b_contract = NetworkBehaviorContract::compile(
+            &preferred,
+            Revision::new(4),
+            Revision::new(4),
+            zone_b_node,
+        )
+        .unwrap();
+        activate_service_snapshot_with_contract(
+            &mut synchronizer,
+            &preferred,
+            Some(&node),
+            Some(&zone_b_contract),
+            true,
+            &state,
+        )
+        .expect("topology-only contract change activates");
+        assert_ne!(synchronizer.active_bank, prior_service_bank);
+        assert_eq!(synchronizer.applied.as_ref().unwrap().revision.get(), 3);
+        let (action, translated) = run_tc(
+            &mut ebpf,
+            "unf_observe_ingress",
+            &ipv6_packet(17, client_v6, service_v6, 45_022, 53),
+        );
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, client_v6, backend_v6, 45_022, 5353);
+
+        let backend_identity = IdentityId::new(22);
+        identity_v4_maps[0]
+            .insert(
+                backend_v4.octets(),
+                encode_identity_value(IdentityMapValue::new(backend_identity, 9)),
+                0,
+            )
+            .unwrap();
+        identity_config
+            .set(0, encode_identity_config(7, 9, 1, 0).unwrap(), 0)
+            .unwrap();
+        let deny = Ipv4PolicyMapEntry {
+            key: unf_state::Ipv4PolicyMapKey {
+                source_address: Ipv4Addr::UNSPECIFIED,
+                destination_identity: backend_identity,
+                protocol: 6,
+                destination_port: 8080,
+            },
+            decision: PolicyDecisionRecord {
+                verdict: Verdict::Deny,
+                reason: PolicyReason::DefaultAction,
+                policy_id: Some(PolicyId::new(7)),
+                rule_id: None,
+            },
+            shadow: None,
+        };
+        ipv4_policy
+            .insert(
+                encode_ipv4_policy_key(&deny, 0),
+                encode_policy_decisions(&deny.decision, None, 9),
+                0,
+            )
+            .unwrap();
+        policy_config
+            .set(0, encode_policy_config(7, 9, 1, 0).unwrap(), 0)
+            .unwrap();
+        let (action, _) = run_tc(
+            &mut ebpf,
+            "unf_observe_ingress",
+            &ipv4_packet(6, client_v4, service_v4, 45_030, 80),
+        );
+        assert_eq!(action, TC_ACT_SHOT);
+        let mut denied = None;
+        while let Some(item) = flow_events.next() {
+            let event = decode_event(&item).expect("policy event ABI is valid");
+            if event.verdict == Verdict::Deny {
+                denied = Some(event);
+            }
+        }
+        let denied = denied.expect("translated-backend policy denial is emitted");
+        assert_eq!(&denied.flow.destination_address[..4], &backend_v4.octets());
+        assert_eq!(denied.flow.destination_port, 8080_u16.to_be_bytes());
+        identity_config.set(0, [0; 24], 0).unwrap();
+        policy_config.set(0, [0; 24], 0).unwrap();
+
+        let expected_service_bank = synchronizer.active_bank;
+        let expected_selection_bank = synchronizer.active_selection_bank;
+        let expected_digest = zone_b_contract.contract_digest;
+        synchronizer.banks = [None, None];
+        synchronizer.node_port_banks = [None, None];
+        synchronizer.selection_banks = [None, None];
+        synchronizer.active_bank = 0;
+        synchronizer.active_node_port_bank = 0;
+        synchronizer.active_selection_bank = 0;
+        synchronizer.applied = None;
+        synchronizer.applied_node_port_node = None;
+        synchronizer.applied_selection_contract = None;
+        assert_eq!(
+            recover_service_state(&mut synchronizer).unwrap(),
+            (Some(7), Some(3))
+        );
+        recover_selection_contract_state(&mut synchronizer).unwrap();
+        assert_eq!(synchronizer.active_bank, expected_service_bank);
+        assert_eq!(synchronizer.active_selection_bank, expected_selection_bank);
+        assert_eq!(
+            synchronizer
+                .applied_selection_contract
+                .as_ref()
+                .unwrap()
+                .contract_digest,
+            expected_digest
+        );
+        let (action, translated) = run_tc(
+            &mut ebpf,
+            "unf_observe_ingress",
+            &ipv6_packet(17, client_v6, service_v6, 45_021, 53),
+        );
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 17, client_v6, backend_v6, 45_021, 5353);
+
+        let mut events = Vec::new();
+        while let Some(item) = service_events.next() {
+            events.push(decode_service_event(&item).expect("selection event ABI is valid"));
+        }
+        assert!(events.iter().any(|event| {
+            event.action == SERVICE_EVENT_ACTION_TRANSLATE
+                && event.reserved[1] == unf_ebpf_common::SERVICE_SELECTION_TIER_SAME_NODE
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.reason == SERVICE_EVENT_REASON_NO_BACKEND
+                        && event.reserved[1] == unf_ebpf_common::SERVICE_SELECTION_TIER_SAME_NODE
+                })
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|event| {
+            event.action == SERVICE_EVENT_ACTION_TRANSLATE
+                && event.reserved[1] == unf_ebpf_common::SERVICE_SELECTION_TIER_CLUSTER
+        }));
+        assert!(events.iter().any(|event| {
+            event.action == SERVICE_EVENT_ACTION_TRANSLATE
+                && event.reserved[1] == unf_ebpf_common::SERVICE_SELECTION_TIER_SAME_ZONE
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
     fn privileged_node_port_cluster_and_local_packets_translate_dual_stack_and_survive_churn() {
         const TC_ACT_SHOT: u32 = 2;
         const TC_ACT_PIPE: u32 = 3;
@@ -13629,13 +14152,14 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_distinguishes_complete_v4_v5_v6_and_v7_map_ownership() {
+    fn cleanup_distinguishes_complete_v4_v5_v6_v7_and_v8_map_ownership() {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("unf");
         for (version, names) in [
             (4_u16, ABI_V4_MAP_NAMES.as_slice()),
             (5_u16, ABI_V5_MAP_NAMES.as_slice()),
             (6_u16, PERSISTENT_MAP_NAMES.as_slice()),
+            (7_u16, PERSISTENT_MAP_NAMES.as_slice()),
             (CURRENT_BPF_ABI_VERSION, PERSISTENT_MAP_NAMES.as_slice()),
         ] {
             let abi = root.join(format!("v{version}"));
@@ -13727,7 +14251,12 @@ mod tests {
         bytes[84] = SERVICE_EVENT_ACTION_TRANSLATE;
         bytes[85] = unf_ebpf_common::SERVICE_EVENT_REASON_FORWARD_TRANSLATED;
         bytes[86] = SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER;
+        bytes[87] = unf_ebpf_common::SERVICE_SELECTION_TIER_CLUSTER;
         let event = decode_service_event(&bytes).expect("service event ABI is valid");
+        assert_eq!(
+            event.reserved[1],
+            unf_ebpf_common::SERVICE_SELECTION_TIER_CLUSTER
+        );
         let record = service_flow_export_record(&event);
         assert_eq!(record.key.source_ipv4, Some(Ipv4Addr::new(10, 42, 0, 10)));
         assert_eq!(
@@ -13851,11 +14380,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v7/links"),
+                Path::new("/sys/fs/bpf/unf/v8/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v7/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v8/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -13991,16 +14520,16 @@ mod tests {
 
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v7")).is_ok());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v8")).is_ok());
         assert_eq!(
-            configured_abi_version(Path::new("/sys/fs/bpf/unf/v7")),
-            Some(7)
+            configured_abi_version(Path::new("/sys/fs/bpf/unf/v8")),
+            Some(8)
         );
         let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
             error.to_string().contains(
-                "incompatible with persistent BPF-state ABI v7; expected a /v7 directory"
+                "incompatible with persistent BPF-state ABI v8; expected a /v8 directory"
             )
         );
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v4")).is_err());

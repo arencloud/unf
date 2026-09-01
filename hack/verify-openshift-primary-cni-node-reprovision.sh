@@ -83,7 +83,7 @@ host_snapshot() {
         caches=$(sudo find /var/lib/cni/results -maxdepth 1 -type f -name "unf-primary-*-eth0" | wc -l)
         links=$(sudo ip -o link show | grep -Ec "^[0-9]+: unf[0-9a-f]+")
         pending=$(sudo find /var/lib/unf/cni/v1/pending-deletes -type f -name "*.json" 2>/dev/null | wc -l)
-        maps=$(sudo find /sys/fs/bpf/unf/v7 -maxdepth 1 -type f 2>/dev/null | wc -l)
+        maps=$(sudo find /sys/fs/bpf/unf/v8 -maxdepth 1 -type f 2>/dev/null | wc -l)
         routes4=$(sudo ip -4 route show proto 196 | wc -l)
         routes6=$(sudo ip -6 route show proto 196 | wc -l)
         printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
@@ -248,10 +248,10 @@ agent_sandbox=$(crictl ps -o json | jq -r --arg id "$agent_container" '
     .containers[] | select(.id == $id) | .podSandboxId')
 test -n "$agent_container" && test -n "$agent_sandbox"
 crictl exec "$agent_container" /usr/local/bin/unf-component cleanup \
-    --abi-version 7 --allow-current-abi --legacy-attachments --all-interfaces \
+    --abi-version 8 --allow-current-abi --legacy-attachments --all-interfaces \
     --legacy-direction both --execute >/run/unf/node-reprovision-cleanup.log
 grep -q 'UNF cleanup completed' /run/unf/node-reprovision-cleanup.log
-test ! -e /sys/fs/bpf/unf/v7
+test ! -e /sys/fs/bpf/unf/v8
 crictl stopp "$agent_sandbox" >/dev/null
 crictl rmp "$agent_sandbox" >/dev/null
 

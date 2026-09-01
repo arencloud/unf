@@ -14,9 +14,13 @@ use unf_common::{LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION, Revision, ServiceId}
 use unf_ebpf_common::{
     LOAD_BALANCER_BANK_COUNT, LOAD_BALANCER_FRONTEND_FLAG_LOCAL,
     LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES, LOAD_BALANCER_MAP_ABI_VERSION, SERVICE_BANK_COUNT,
+    SERVICE_SELECTION_TIER_CLUSTER, SERVICE_SELECTION_TIER_SAME_NODE,
+    SERVICE_SELECTION_TIER_SAME_ZONE,
 };
 use unf_service::{
-    AddressFamily, ServiceIpPrefix, ServiceIr, UNF_LOAD_BALANCER_CLASS,
+    AddressFamily, NetworkBehaviorContract, SelectionFrontend, SelectionPlanKey, SelectionTier,
+    ServiceForwardingMode, ServiceIpPrefix, ServiceIr, ServiceSelectionAlgorithm,
+    ServiceSessionAffinity, ServiceTrafficPolicy, UNF_LOAD_BALANCER_CLASS,
     load_balancer_local_frontend_index,
 };
 
@@ -1281,6 +1285,14 @@ pub struct LoadBalancerDataplaneState {
 pub enum LoadBalancerDataplaneError {
     #[error("invalid service snapshot: {0}")]
     InvalidService(String),
+    #[error("invalid selection contract: {0}")]
+    InvalidSelectionContract(String),
+    #[error("selection contract does not belong to the authenticated reachability Node")]
+    SelectionNodeMismatch,
+    #[error("selection contract contains behavior reserved for a later Phase 7 milestone")]
+    UnsupportedSelectionBehavior,
+    #[error("selection contract has no exact LoadBalancer plan")]
+    MissingSelectionPlan,
     #[error(transparent)]
     InvalidReachability(#[from] ReachabilityError),
     #[error("service and reachability snapshots have different source epochs")]
@@ -1321,11 +1333,63 @@ pub fn compile_load_balancer_dataplane(
     service_bank: u8,
     bank: u8,
 ) -> Result<LoadBalancerDataplaneState, LoadBalancerDataplaneError> {
+    compile_load_balancer_dataplane_inner(services, reachability, None, service_bank, bank)
+}
+
+/// Lowers VIP frontends against one verified per-Node selection contract.
+///
+/// # Errors
+///
+/// Returns the ordinary `LoadBalancer` admission errors plus contract ownership,
+/// integrity, exact-plan, and later-milestone behavior failures.
+pub fn compile_load_balancer_selection_dataplane(
+    services: &unf_service::ServiceSnapshot,
+    reachability: &NodeReachabilitySnapshot,
+    contract: &NetworkBehaviorContract,
+    service_bank: u8,
+    bank: u8,
+) -> Result<LoadBalancerDataplaneState, LoadBalancerDataplaneError> {
+    compile_load_balancer_dataplane_inner(
+        services,
+        reachability,
+        Some(contract),
+        service_bank,
+        bank,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn compile_load_balancer_dataplane_inner(
+    services: &unf_service::ServiceSnapshot,
+    reachability: &NodeReachabilitySnapshot,
+    contract: Option<&NetworkBehaviorContract>,
+    service_bank: u8,
+    bank: u8,
+) -> Result<LoadBalancerDataplaneState, LoadBalancerDataplaneError> {
     let services = services
         .clone()
         .validate_and_normalize()
         .map_err(|error| LoadBalancerDataplaneError::InvalidService(error.to_string()))?;
     let reachability = reachability.clone().validate()?;
+    if let Some(contract) = contract {
+        if contract.node.name != reachability.node.name
+            || contract.node.uid != reachability.node.uid
+        {
+            return Err(LoadBalancerDataplaneError::SelectionNodeMismatch);
+        }
+        contract
+            .verify(&services, &contract.node)
+            .map_err(|error| {
+                LoadBalancerDataplaneError::InvalidSelectionContract(error.to_string())
+            })?;
+        if contract.plans.iter().any(|plan| {
+            plan.session_affinity != ServiceSessionAffinity::None
+                || plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
+                || plan.forwarding_mode != ServiceForwardingMode::Nat
+        }) {
+            return Err(LoadBalancerDataplaneError::UnsupportedSelectionBehavior);
+        }
+    }
     if services.source_epoch != reachability.source_epoch {
         return Err(LoadBalancerDataplaneError::SourceEpochMismatch);
     }
@@ -1425,37 +1489,75 @@ pub fn compile_load_balancer_dataplane(
             let (cluster_frontend_index, _) = matching[0];
             let cluster_frontend_index = u32::try_from(cluster_frontend_index)
                 .map_err(|_| LoadBalancerDataplaneError::MissingFrontendLink)?;
-            let (frontend_index, backend_count, mut flags) = match load_balancer.traffic_policy {
-                unf_service::ServiceTrafficPolicy::Cluster => {
-                    (cluster_frontend_index, frontend.backend_ids.len(), 0)
-                }
-                unf_service::ServiceTrafficPolicy::Local => {
-                    let local_index = load_balancer_local_frontend_index(
+            let (frontend_index, backend_count, mut flags, selection_tier) =
+                if let Some(contract) = contract {
+                    let key = SelectionPlanKey {
+                        service_id: service.id,
+                        frontend: SelectionFrontend::LoadBalancer {
+                            family: frontend.family,
+                            service_port: frontend.service_port,
+                            protocol: frontend.protocol,
+                        },
+                    };
+                    let plan = contract
+                        .plan(&key)
+                        .ok_or(LoadBalancerDataplaneError::MissingSelectionPlan)?;
+                    let selected = plan
+                        .selected_tier()
+                        .ok_or(LoadBalancerDataplaneError::MissingSelectionPlan)?;
+                    let index = load_balancer_local_frontend_index(
                         service,
                         cluster_frontend_index as usize,
                         &reachability.node.name,
                     )
                     .ok_or(LoadBalancerDataplaneError::MissingFrontendLink)?;
-                    let backend_count = frontend
-                        .backend_ids
-                        .iter()
-                        .filter(|backend_id| {
-                            service.backends.iter().any(|backend| {
-                                backend.id == **backend_id
-                                    && backend.ready
-                                    && !backend.terminating
-                                    && backend.node_name.as_deref()
-                                        == Some(reachability.node.name.as_str())
-                            })
-                        })
-                        .count();
                     (
-                        local_index,
-                        backend_count,
-                        LOAD_BALANCER_FRONTEND_FLAG_LOCAL,
+                        index,
+                        selected.backend_ids.len(),
+                        if plan.traffic_policy == ServiceTrafficPolicy::Local {
+                            LOAD_BALANCER_FRONTEND_FLAG_LOCAL
+                        } else {
+                            0
+                        },
+                        selection_tier_code(selected.tier),
                     )
-                }
-            };
+                } else {
+                    match load_balancer.traffic_policy {
+                        unf_service::ServiceTrafficPolicy::Cluster => (
+                            cluster_frontend_index,
+                            frontend.backend_ids.len(),
+                            0,
+                            SERVICE_SELECTION_TIER_CLUSTER,
+                        ),
+                        unf_service::ServiceTrafficPolicy::Local => {
+                            let local_index = load_balancer_local_frontend_index(
+                                service,
+                                cluster_frontend_index as usize,
+                                &reachability.node.name,
+                            )
+                            .ok_or(LoadBalancerDataplaneError::MissingFrontendLink)?;
+                            let backend_count = frontend
+                                .backend_ids
+                                .iter()
+                                .filter(|backend_id| {
+                                    service.backends.iter().any(|backend| {
+                                        backend.id == **backend_id
+                                            && backend.ready
+                                            && !backend.terminating
+                                            && backend.node_name.as_deref()
+                                                == Some(reachability.node.name.as_str())
+                                    })
+                                })
+                                .count();
+                            (
+                                local_index,
+                                backend_count,
+                                LOAD_BALANCER_FRONTEND_FLAG_LOCAL,
+                                SERVICE_SELECTION_TIER_SAME_NODE,
+                            )
+                        }
+                    }
+                };
             if !load_balancer.source_ranges.is_empty() {
                 flags |= LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES;
             }
@@ -1468,6 +1570,7 @@ pub fn compile_load_balancer_dataplane(
                 reachability.revision,
                 reachability.allocation_revision,
                 service_bank,
+                selection_tier,
             );
             let collision = match target.address {
                 IpAddr::V4(address) => ipv4_frontends
@@ -1592,6 +1695,14 @@ fn encode_ipv6_load_balancer_key(
     key
 }
 
+const fn selection_tier_code(tier: SelectionTier) -> u8 {
+    match tier {
+        SelectionTier::SameNode => SERVICE_SELECTION_TIER_SAME_NODE,
+        SelectionTier::SameZone => SERVICE_SELECTION_TIER_SAME_ZONE,
+        SelectionTier::Cluster => SERVICE_SELECTION_TIER_CLUSTER,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_load_balancer_frontend_value(
     service_id: ServiceId,
@@ -1602,6 +1713,7 @@ fn encode_load_balancer_frontend_value(
     reachability_revision: Revision,
     allocation_revision: Revision,
     service_bank: u8,
+    selection_tier: u8,
 ) -> [u8; 48] {
     let mut value = [0_u8; 48];
     value[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
@@ -1613,6 +1725,7 @@ fn encode_load_balancer_frontend_value(
     value[24..32].copy_from_slice(&reachability_revision.get().to_ne_bytes());
     value[32..40].copy_from_slice(&allocation_revision.get().to_ne_bytes());
     value[40] = service_bank;
+    value[41] = selection_tier;
     value
 }
 
@@ -2218,6 +2331,33 @@ mod tests {
         assert_eq!(
             u16::from_ne_bytes(v4_value[14..16].try_into().unwrap()),
             LOAD_BALANCER_FRONTEND_FLAG_LOCAL | LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES
+        );
+        assert_eq!(v4_value[41], SERVICE_SELECTION_TIER_SAME_NODE);
+
+        let contract = NetworkBehaviorContract::compile(
+            &services,
+            Revision::new(6),
+            Revision::new(7),
+            unf_service::SelectionNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+                zone: Some("zone-a".to_owned()),
+                capabilities: BTreeSet::from([
+                    unf_service::SelectionCapability::StableHash,
+                    unf_service::SelectionCapability::Nat,
+                ]),
+            },
+        )
+        .unwrap();
+        let selected =
+            compile_load_balancer_selection_dataplane(&services, &reachability, &contract, 1, 1)
+                .unwrap();
+        assert!(
+            selected
+                .ipv4_frontends
+                .values()
+                .chain(selected.ipv6_frontends.values())
+                .all(|value| value[41] == SERVICE_SELECTION_TIER_SAME_NODE)
         );
 
         let mut wrong_epoch = reachability.clone();

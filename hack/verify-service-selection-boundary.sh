@@ -14,6 +14,7 @@ required_files=(
     docs/adr/0103-model-advanced-service-selection-in-schema-v4.md
     docs/adr/0104-verify-network-behavior-contracts-before-activation.md
     docs/adr/0105-distribute-and-transactionally-activate-selection-contracts.md
+    docs/adr/0106-enforce-locality-and-topology-from-verified-contracts.md
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -66,12 +67,21 @@ require_text docs/development/phase7-service-selection-plan.md \
 require_text docs/project-status.md \
     '| Compatible distribution and transactional selection state | **Verified** |' \
     "the work breakdown must identify milestone 7.3 as verified"
+require_text docs/development/phase7-service-selection-plan.md \
+    '| 7.4 | Internal locality and topology-aware dataplane | **Verified** |' \
+    "milestone 7.4 must remain verified"
+require_text docs/project-status.md \
+    '| Internal locality and topology-aware dataplane | **Verified** |' \
+    "the work breakdown must identify milestone 7.4 as verified"
 require_text Makefile \
     'service-selection-contract-test:' \
     "the build must expose an isolated Network Behavior Contract gate"
 require_text Makefile \
     'service-selection-state-test:' \
     "the build must expose an isolated transactional selection-state gate"
+require_text Makefile \
+    'service-selection-dataplane-test:' \
+    "the build must expose an isolated locality/topology dataplane gate"
 require_text docs/adr/0104-verify-network-behavior-contracts-before-activation.md \
     'It does **not** mathematically prove the' \
     "the contract must not overclaim formal verification"
@@ -96,7 +106,7 @@ require_text docs/development/phase7-service-selection-plan.md \
     'DSR is never inferred from Service type or enabled cluster-wide by accident.' \
     "DSR must remain explicit and non-default"
 require_text docs/architecture/components.md \
-    'The agent now transactionally owns verified per-Node contract state through' \
+    'The agent transactionally owns verified per-Node contract state through' \
     "userspace selection ownership must remain explicit"
 require_text Makefile \
     'service-selection-boundary-test:' \

@@ -217,11 +217,11 @@ assert_agent() {
     for _ in $(seq 1 60); do
         host_state=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
             test "$(getenforce)" = Enforcing
-            test -d /sys/fs/bpf/unf/v7
+            test -d /sys/fs/bpf/unf/v8
             for pin in SERVICE_CONFIG SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 \
                 SERVICE_BACKENDS_V4 SERVICE_BACKENDS_V6 SERVICE_CONNECTIONS \
                 NODE_PORT_CONFIG NODE_PORT_FRONTENDS_V4 NODE_PORT_FRONTENDS_V6; do
-                test -e "/sys/fs/bpf/unf/v7/$pin"
+                test -e "/sys/fs/bpf/unf/v8/$pin"
             done
             snapshot=/var/lib/unf/cni/v1/service-snapshot.json
             test -f "$snapshot" && test ! -L "$snapshot" && test "$(stat -c %a "$snapshot")" = 600

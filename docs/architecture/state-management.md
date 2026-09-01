@@ -108,11 +108,11 @@ compile N+1 -> populate all staging maps -> read back and validate
 Existing applied state must remain usable if the controller or Kubernetes API is
 temporarily unavailable. New identity, policy, and service state never partially
 overwrites active maps; each prior bank remains selected through any pre-switch
-failure. Twenty-four maps are pinned under the `/sys/fs/bpf/unf/v7` ABI directory,
+failure. Twenty-four maps are pinned under the `/sys/fs/bpf/unf/v8` ABI directory,
 reopened with strict all-or-none validation, and reconstructed into userspace
-caches after restart. ABI v4, v5, and v6 remain explicitly recognized 18-map,
-21-map, and 24-map cleanup boundaries and are never interpreted as partial v7
-state. The active service, NodePort, and LoadBalancer banks must exactly recompile from
+caches after restart. ABI v4, v5, v6, and v7 remain explicitly recognized
+18-map, 21-map, and 24-map cleanup boundaries and are never interpreted as
+partial v8 state. The active service, NodePort, and LoadBalancer banks must exactly recompile from
 their owner-only durable checkpoints. A Service checkpoint retains the current
 schema whenever LoadBalancer intent is present; rollback-compatible legacy
 projection is limited to state with no NodePort or LoadBalancer intent.

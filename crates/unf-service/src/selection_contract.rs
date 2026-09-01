@@ -245,6 +245,19 @@ pub struct ServiceSelectionPlan {
     pub tiers: Vec<SelectionEligibilityTier>,
 }
 
+impl ServiceSelectionPlan {
+    /// Resolves the first non-empty eligibility tier. When every tier is empty,
+    /// the final tier is retained so a strict-local or exhausted fallback drop
+    /// still has exact provenance.
+    #[must_use]
+    pub fn selected_tier(&self) -> Option<&SelectionEligibilityTier> {
+        self.tiers
+            .iter()
+            .find(|tier| !tier.backend_ids.is_empty())
+            .or_else(|| self.tiers.last())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SelectionInvariant {
@@ -426,6 +439,15 @@ struct ResolvedFrontend<'a> {
 }
 
 impl NetworkBehaviorContract {
+    /// Returns the exact canonical plan for one frontend.
+    #[must_use]
+    pub fn plan(&self, key: &SelectionPlanKey) -> Option<&ServiceSelectionPlan> {
+        self.plans
+            .binary_search_by(|plan| plan.key.cmp(key))
+            .ok()
+            .map(|index| &self.plans[index])
+    }
+
     /// Compiles every exact frontend in a normalized Service snapshot into one
     /// canonical per-Node contract.
     ///

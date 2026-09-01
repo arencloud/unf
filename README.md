@@ -327,8 +327,18 @@ owner-only contract+Node state with the Service transaction, repairs crash
 boundaries, reconstructs cold state, and acknowledges the exact revision and
 digest required for convergence. Safe legacy fallback is restricted to default
 intent; advanced intent fails closed. `make service-selection-state-test` and
-ADR 0105 record the gate. Persistent BPF ABI v7 and packet behavior remain
-unchanged until milestone 7.4.
+ADR 0105 record the gate.
+Milestone 7.4 is verified: the agent lowers each verified contract to the first
+non-empty strict/topology tier and atomically activates fixed-width ABI-v8
+frontend and slot state. ClusterIP, NodePort, and LoadBalancer retain independent
+origin policy, strict internal/external `Local` never broadens, and
+`PreferSameNode`/`PreferSameZone` fall back in the contracted order. IPv4/IPv6
+TCP/UDP lowering, topology-only bank changes, lifecycle filtering, exact
+recovery, fail-closed validation, and tier-bearing event ABI v3 pass `make
+service-selection-dataplane-test`; ADR 0106 records the packet boundary.
+StableHash and NAT are the production defaults. Topology behavior is active by
+default when a Service requests it; Maglev and DSR remain gated until milestones
+7.6 and 7.7 prove their independent safety and performance contracts.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -15,7 +15,8 @@ use unf_ebpf_common::{
     LOAD_BALANCER_LOCAL_FRONTEND_INDEX_BASE, NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL,
     NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG, NODE_PORT_MAP_ABI_VERSION, SERVICE_BACKEND_FLAG_READY,
     SERVICE_BACKEND_FLAG_SERVING, SERVICE_BACKEND_FLAG_TERMINATING, SERVICE_BANK_COUNT,
-    SERVICE_MAP_ABI_VERSION,
+    SERVICE_MAP_ABI_VERSION, SERVICE_SELECTION_TIER_CLUSTER, SERVICE_SELECTION_TIER_SAME_NODE,
+    SERVICE_SELECTION_TIER_SAME_ZONE,
 };
 
 mod selection_contract;
@@ -666,6 +667,12 @@ pub enum ServiceDataplaneError {
     UnsupportedLoadBalancer { actual: usize },
     #[error("advanced Service selection intent requires the Phase 7 transactional lowerer")]
     UnsupportedAdvancedSelection,
+    #[error("invalid selection contract: {0}")]
+    InvalidSelectionContract(String),
+    #[error("selection contract contains behavior reserved for a later Phase 7 milestone")]
+    UnsupportedSelectionBehavior,
+    #[error("selection contract is missing an eligibility tier for {0:?}")]
+    MissingSelectionTier(String),
     #[error("Local LoadBalancer slot index overflow for service {service:?} on Node {node}")]
     LocalLoadBalancerIndex { service: ServiceId, node: String },
     #[error("Local LoadBalancer slot key collided with another service slot")]
@@ -713,6 +720,14 @@ pub enum NodePortDataplaneError {
     UnsupportedProtocol(Protocol),
     #[error("advanced Service selection intent requires the Phase 7 transactional lowerer")]
     UnsupportedAdvancedSelection,
+    #[error("invalid selection contract: {0}")]
+    InvalidSelectionContract(String),
+    #[error("selection contract contains behavior reserved for a later Phase 7 milestone")]
+    UnsupportedSelectionBehavior,
+    #[error("selection contract is missing an eligibility tier for {0:?}")]
+    MissingSelectionTier(String),
+    #[error("selection contract does not belong to the authenticated NodePort Node")]
+    SelectionNodeMismatch,
     #[error("NodePort map {map} requires {actual} entries; per-bank limit is {limit}")]
     Capacity {
         map: &'static str,
@@ -2127,6 +2142,7 @@ pub fn compile_service_dataplane(
                 frontend_index,
                 eligible_frontend_backends.len(),
                 snapshot.revision.get(),
+                SERVICE_SELECTION_TIER_CLUSTER,
             );
             match frontend.address {
                 IpAddr::V4(address) => {
@@ -2208,6 +2224,203 @@ pub fn compile_service_dataplane(
         backend_slots,
         config,
     })
+}
+
+/// Lowers one independently verified per-Node selection contract into the
+/// existing fixed-width service map family. Only the first non-empty ordered
+/// tier is materialized; an exhausted final tier is retained with zero slots so
+/// strict locality and preference exhaustion fail closed with exact provenance.
+///
+/// # Errors
+///
+/// Rejects a stale or mutated contract, behavior owned by later Phase 7
+/// milestones, invalid banks, missing tiers, index overflow, collisions, or
+/// fixed map-capacity overflow.
+pub fn compile_service_selection_dataplane(
+    snapshot: &ServiceSnapshot,
+    contract: &NetworkBehaviorContract,
+    bank: u8,
+) -> Result<ServiceDataplaneState, ServiceDataplaneError> {
+    contract
+        .verify(snapshot, &contract.node)
+        .map_err(|error| ServiceDataplaneError::InvalidSelectionContract(error.to_string()))?;
+    reject_later_selection_behavior_service(contract)?;
+    let normalized = snapshot.clone().validate_and_normalize()?;
+    let mut compatible = normalized.clone();
+    for service in &mut compatible.services {
+        service.node_ports.clear();
+        service.load_balancer = None;
+        service.internal_traffic_policy = ServiceTrafficPolicy::Cluster;
+        service.traffic_distribution = ServiceTrafficDistribution::Any;
+        service.session_affinity = ServiceSessionAffinity::None;
+        service.selection_algorithm = ServiceSelectionAlgorithm::StableHash;
+        service.forwarding_mode = ServiceForwardingMode::Nat;
+    }
+    let mut state = compile_service_dataplane(&compatible, bank)?;
+    apply_selection_contract_slots(&normalized, contract, &mut state)?;
+    Ok(state)
+}
+
+fn reject_later_selection_behavior_service(
+    contract: &NetworkBehaviorContract,
+) -> Result<(), ServiceDataplaneError> {
+    if contract.plans.iter().any(|plan| {
+        plan.session_affinity != ServiceSessionAffinity::None
+            || plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
+            || plan.forwarding_mode != ServiceForwardingMode::Nat
+    }) {
+        return Err(ServiceDataplaneError::UnsupportedSelectionBehavior);
+    }
+    Ok(())
+}
+
+fn selection_tier_code(tier: SelectionTier) -> u8 {
+    match tier {
+        SelectionTier::SameNode => SERVICE_SELECTION_TIER_SAME_NODE,
+        SelectionTier::SameZone => SERVICE_SELECTION_TIER_SAME_ZONE,
+        SelectionTier::Cluster => SERVICE_SELECTION_TIER_CLUSTER,
+    }
+}
+
+fn selection_frontend_index(
+    service: &ServiceIr,
+    frontend: &SelectionFrontend,
+    node_name: &str,
+) -> Option<u32> {
+    match frontend {
+        SelectionFrontend::ClusterIp {
+            address,
+            port,
+            protocol,
+        } => service
+            .frontends
+            .iter()
+            .position(|candidate| {
+                candidate.address == *address
+                    && candidate.port == *port
+                    && candidate.protocol == *protocol
+            })
+            .map(bounded_u32),
+        SelectionFrontend::NodePort {
+            family,
+            node_port,
+            service_port,
+            protocol,
+        } => service
+            .node_ports
+            .iter()
+            .position(|candidate| {
+                candidate.family == *family
+                    && candidate.port == *node_port
+                    && candidate.service_port == *service_port
+                    && candidate.protocol == *protocol
+            })
+            .map(|index| NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG + bounded_u32(index)),
+        SelectionFrontend::LoadBalancer {
+            family,
+            service_port,
+            protocol,
+        } => {
+            let frontend_index = service.frontends.iter().position(|candidate| {
+                address_family(candidate.address) == *family
+                    && candidate.port == *service_port
+                    && candidate.protocol == *protocol
+            })?;
+            load_balancer_local_frontend_index(service, frontend_index, node_name)
+        }
+    }
+}
+
+fn apply_selection_contract_slots(
+    snapshot: &ServiceSnapshot,
+    contract: &NetworkBehaviorContract,
+    state: &mut ServiceDataplaneState,
+) -> Result<(), ServiceDataplaneError> {
+    let services = snapshot
+        .services
+        .iter()
+        .map(|service| (service.id, service))
+        .collect::<BTreeMap<_, _>>();
+    for plan in &contract.plans {
+        let service = services.get(&plan.key.service_id).ok_or_else(|| {
+            ServiceDataplaneError::MissingSelectionTier(format!("{:?}", plan.key))
+        })?;
+        let frontend_index =
+            selection_frontend_index(service, &plan.key.frontend, contract.node.name.as_str())
+                .ok_or_else(|| {
+                    ServiceDataplaneError::MissingSelectionTier(format!("{:?}", plan.key))
+                })?;
+        let selected = plan.selected_tier().ok_or_else(|| {
+            ServiceDataplaneError::MissingSelectionTier(format!("{:?}", plan.key))
+        })?;
+        let prefix = encode_service_backend_slot_key(service.id, frontend_index, 0, state.bank);
+        state
+            .backend_slots
+            .retain(|key, _| key[0..8] != prefix[0..8] || key[12] != state.bank);
+        for (slot, backend_id) in selected.backend_ids.iter().enumerate() {
+            state.backend_slots.insert(
+                encode_service_backend_slot_key(
+                    service.id,
+                    frontend_index,
+                    bounded_u32(slot),
+                    state.bank,
+                ),
+                encode_service_backend_slot_value(*backend_id, snapshot.revision.get()),
+            );
+        }
+        if let SelectionFrontend::ClusterIp {
+            address,
+            port,
+            protocol,
+        } = plan.key.frontend
+        {
+            let value = encode_service_frontend_value(
+                service.id,
+                frontend_index,
+                selected.backend_ids.len(),
+                snapshot.revision.get(),
+                selection_tier_code(selected.tier),
+            );
+            match address {
+                IpAddr::V4(address) => {
+                    state.ipv4_frontends.insert(
+                        encode_ipv4_service_frontend_key(
+                            address.octets(),
+                            port,
+                            protocol,
+                            state.bank,
+                        ),
+                        value,
+                    );
+                }
+                IpAddr::V6(address) => {
+                    state.ipv6_frontends.insert(
+                        encode_ipv6_service_frontend_key(
+                            address.octets(),
+                            port,
+                            protocol,
+                            state.bank,
+                        ),
+                        value,
+                    );
+                }
+            }
+        }
+    }
+    validate_dataplane_capacity(
+        "SERVICE_BACKEND_SLOTS",
+        state.backend_slots.len(),
+        SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+    )?;
+    state.config = encode_service_config(
+        state.source_epoch,
+        state.revision,
+        state.ipv4_frontends.len() + state.ipv6_frontends.len(),
+        state.ipv4_backends.len() + state.ipv6_backends.len(),
+        state.backend_slots.len(),
+        state.bank,
+    );
+    Ok(())
 }
 
 /// Lowers `ClusterIP` state plus deterministic per-Node slots needed by Local
@@ -2414,6 +2627,138 @@ pub fn compile_node_port_fabric_dataplane(
     Ok(NodePortFabricDataplaneState { service, node_port })
 }
 
+/// Compiles the verified ordered selection contract into coherent service and
+/// `NodePort` banks for one authenticated Node. Every `NodePort` receives a
+/// dedicated slot namespace so external policy can never inherit a conflicting
+/// `ClusterIP` internal policy.
+///
+/// # Errors
+///
+/// Rejects stale/mutated contracts, Node ownership mismatch, later-milestone
+/// behavior, invalid source state, or any fixed-width map admission failure.
+#[allow(clippy::too_many_lines)]
+pub fn compile_node_port_selection_fabric_dataplane(
+    snapshot: &ServiceSnapshot,
+    node: &NodePortNodeSnapshot,
+    contract: &NetworkBehaviorContract,
+    service_bank: u8,
+    node_port_bank: u8,
+) -> Result<NodePortFabricDataplaneState, NodePortFabricDataplaneError> {
+    let normalized = snapshot
+        .clone()
+        .validate_and_normalize()
+        .map_err(NodePortDataplaneError::from)?;
+    let node = node
+        .clone()
+        .validate_and_normalize()
+        .map_err(NodePortDataplaneError::from)?;
+    if contract.node.name != node.node_name || contract.node.uid != node.node_uid {
+        return Err(NodePortDataplaneError::SelectionNodeMismatch.into());
+    }
+    contract
+        .verify(&normalized, &contract.node)
+        .map_err(|error| NodePortDataplaneError::InvalidSelectionContract(error.to_string()))?;
+    if contract.plans.iter().any(|plan| {
+        plan.session_affinity != ServiceSessionAffinity::None
+            || plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
+            || plan.forwarding_mode != ServiceForwardingMode::Nat
+    }) {
+        return Err(NodePortDataplaneError::UnsupportedSelectionBehavior.into());
+    }
+    let service = compile_service_selection_dataplane(&normalized, contract, service_bank)?;
+    let mut compatible = normalized.clone();
+    for service in &mut compatible.services {
+        service.internal_traffic_policy = ServiceTrafficPolicy::Cluster;
+        service.traffic_distribution = ServiceTrafficDistribution::Any;
+        service.session_affinity = ServiceSessionAffinity::None;
+        service.selection_algorithm = ServiceSelectionAlgorithm::StableHash;
+        service.forwarding_mode = ServiceForwardingMode::Nat;
+    }
+    let mut node_port =
+        compile_node_port_dataplane(&compatible, &node, service_bank, node_port_bank)?;
+    node_port.service_backend_slots.clear();
+    let services = normalized
+        .services
+        .iter()
+        .map(|service| (service.id, service))
+        .collect::<BTreeMap<_, _>>();
+    for plan in &contract.plans {
+        let SelectionFrontend::NodePort {
+            family,
+            node_port: port,
+            service_port: _,
+            protocol,
+        } = &plan.key.frontend
+        else {
+            continue;
+        };
+        let service = services.get(&plan.key.service_id).ok_or_else(|| {
+            NodePortDataplaneError::MissingSelectionTier(format!("{:?}", plan.key))
+        })?;
+        let frontend_index =
+            selection_frontend_index(service, &plan.key.frontend, contract.node.name.as_str())
+                .ok_or_else(|| {
+                    NodePortDataplaneError::MissingSelectionTier(format!("{:?}", plan.key))
+                })?;
+        let selected = plan.selected_tier().ok_or_else(|| {
+            NodePortDataplaneError::MissingSelectionTier(format!("{:?}", plan.key))
+        })?;
+        let flags = if plan.traffic_policy == ServiceTrafficPolicy::Local {
+            NODE_PORT_FRONTEND_FLAG_LOCAL
+        } else {
+            0
+        };
+        let value = encode_node_port_frontend_value(
+            service.id,
+            frontend_index,
+            selected.backend_ids.len(),
+            flags,
+            normalized.revision.get(),
+            service_bank,
+            selection_tier_code(selected.tier),
+        );
+        for address in node
+            .addresses
+            .iter()
+            .filter(|address| address.address.is_ipv4() == matches!(family, AddressFamily::Ipv4))
+        {
+            match address.address {
+                IpAddr::V4(address) => {
+                    node_port.ipv4_frontends.insert(
+                        encode_ipv4_service_frontend_key(
+                            address.octets(),
+                            *port,
+                            *protocol,
+                            node_port_bank,
+                        ),
+                        value,
+                    );
+                }
+                IpAddr::V6(address) => {
+                    node_port.ipv6_frontends.insert(
+                        encode_ipv6_service_frontend_key(
+                            address.octets(),
+                            *port,
+                            *protocol,
+                            node_port_bank,
+                        ),
+                        value,
+                    );
+                }
+            }
+        }
+    }
+    node_port.config = encode_node_port_config(
+        normalized.source_epoch,
+        normalized.revision.get(),
+        node.revision.get(),
+        node_port.ipv4_frontends.len(),
+        node_port.ipv6_frontends.len(),
+        node_port_bank,
+    );
+    Ok(NodePortFabricDataplaneState { service, node_port })
+}
+
 fn preflight_node_port_capacity(
     snapshot: &ServiceSnapshot,
     node: &NodePortNodeSnapshot,
@@ -2514,6 +2859,10 @@ fn compile_node_port_frontends(
                 flags,
                 snapshot.revision.get(),
                 service_bank,
+                match node_port.traffic_policy {
+                    ServiceTrafficPolicy::Local => SERVICE_SELECTION_TIER_SAME_NODE,
+                    ServiceTrafficPolicy::Cluster => SERVICE_SELECTION_TIER_CLUSTER,
+                },
             );
             for address in node.addresses.iter().filter(|address| {
                 address.address.is_ipv4() == matches!(node_port.family, AddressFamily::Ipv4)
@@ -2631,6 +2980,7 @@ fn encode_service_frontend_value(
     frontend_index: u32,
     backend_count: usize,
     revision: u64,
+    selection_tier: u8,
 ) -> [u8; 32] {
     let mut value = [0_u8; 32];
     value[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
@@ -2638,6 +2988,7 @@ fn encode_service_frontend_value(
     value[8..12].copy_from_slice(&bounded_u32(backend_count).to_ne_bytes());
     value[12..14].copy_from_slice(&SERVICE_MAP_ABI_VERSION.to_ne_bytes());
     value[16..24].copy_from_slice(&revision.to_ne_bytes());
+    value[24] = selection_tier;
     value
 }
 
@@ -2648,6 +2999,7 @@ fn encode_node_port_frontend_value(
     flags: u16,
     service_revision: u64,
     service_bank: u8,
+    selection_tier: u8,
 ) -> [u8; 32] {
     let mut value = [0_u8; 32];
     value[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
@@ -2657,6 +3009,7 @@ fn encode_node_port_frontend_value(
     value[14..16].copy_from_slice(&flags.to_ne_bytes());
     value[16..24].copy_from_slice(&service_revision.to_ne_bytes());
     value[24] = service_bank;
+    value[25] = selection_tier;
     value
 }
 
@@ -3808,5 +4161,99 @@ mod tests {
             admit_id(&mut registry, "service", 42, "second"),
             Err(ServiceCompileError::IdCollision { .. })
         ));
+    }
+
+    #[test]
+    fn selection_dataplane_enforces_topology_fallback_and_external_local_precedence() {
+        let mut selected = service(2, "locality");
+        selected.traffic_distribution = ServiceTrafficDistribution::PreferSameZone;
+        selected.backends.push(ServiceBackend {
+            id: BackendId::new(3),
+            address: "10.244.0.11".parse().unwrap(),
+            node_name: Some("worker-3".to_owned()),
+            ..backend(3, "10.244.0.11", 8443)
+        });
+        selected.frontends[0].backend_ids.push(BackendId::new(3));
+        selected.node_ports.push(ServiceNodePort {
+            family: AddressFamily::Ipv4,
+            port: 30_443,
+            service_port: 443,
+            protocol: Protocol::Tcp,
+            name: Some("https".to_owned()),
+            app_protocol: Some("kubernetes.io/h2c".to_owned()),
+            traffic_policy: ServiceTrafficPolicy::Local,
+            backend_ids: vec![BackendId::new(2), BackendId::new(3)],
+        });
+        let snapshot = snapshot(vec![selected]);
+        let node = SelectionNode {
+            name: "worker-1".to_owned(),
+            uid: "uid-worker-1".to_owned(),
+            zone: Some("zone-a".to_owned()),
+            capabilities: BTreeSet::from([
+                SelectionCapability::StableHash,
+                SelectionCapability::Nat,
+            ]),
+        };
+        let contract =
+            NetworkBehaviorContract::compile(&snapshot, Revision::new(12), Revision::new(13), node)
+                .unwrap();
+        let node_state = NodePortNodeSnapshot {
+            schema_version: NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
+            source_epoch: snapshot.source_epoch,
+            revision: Revision::new(14),
+            node_name: "worker-1".to_owned(),
+            node_uid: "uid-worker-1".to_owned(),
+            addresses: vec![ServiceNodeAddress {
+                address: "192.0.2.10".parse().unwrap(),
+                kind: NodeAddressKind::Internal,
+            }],
+        };
+        let compiled =
+            compile_node_port_selection_fabric_dataplane(&snapshot, &node_state, &contract, 1, 0)
+                .unwrap();
+
+        let cluster = compiled.service.ipv4_frontends.values().next().unwrap();
+        assert_eq!(u32::from_ne_bytes(cluster[8..12].try_into().unwrap()), 2);
+        assert_eq!(cluster[24], SERVICE_SELECTION_TIER_SAME_ZONE);
+        let node_port = compiled.node_port.ipv4_frontends.values().next().unwrap();
+        assert_eq!(u32::from_ne_bytes(node_port[8..12].try_into().unwrap()), 0);
+        assert_ne!(
+            u32::from_ne_bytes(node_port[4..8].try_into().unwrap())
+                & NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG,
+            0
+        );
+        assert_eq!(node_port[25], SERVICE_SELECTION_TIER_SAME_NODE);
+        assert!(compiled.node_port.service_backend_slots.is_empty());
+        assert_eq!(compiled.service.backend_slots.len(), 2);
+    }
+
+    #[test]
+    fn selection_dataplane_is_dual_stack_and_protocol_exact() {
+        let mut selected = service(1, "ipv6-local");
+        selected.internal_traffic_policy = ServiceTrafficPolicy::Local;
+        selected.frontends[0].protocol = Protocol::Udp;
+        selected.backends[0].protocol = Protocol::Udp;
+        selected.backends[0].node_name = Some("worker-1".to_owned());
+        let snapshot = snapshot(vec![selected]);
+        let contract = NetworkBehaviorContract::compile(
+            &snapshot,
+            Revision::new(12),
+            Revision::new(13),
+            SelectionNode {
+                name: "worker-1".to_owned(),
+                uid: "uid-worker-1".to_owned(),
+                zone: Some("zone-a".to_owned()),
+                capabilities: BTreeSet::from([
+                    SelectionCapability::StableHash,
+                    SelectionCapability::Nat,
+                ]),
+            },
+        )
+        .unwrap();
+        let compiled = compile_service_selection_dataplane(&snapshot, &contract, 0).unwrap();
+        let frontend = compiled.ipv6_frontends.values().next().unwrap();
+        assert_eq!(u32::from_ne_bytes(frontend[8..12].try_into().unwrap()), 1);
+        assert_eq!(frontend[24], SERVICE_SELECTION_TIER_SAME_NODE);
+        assert_eq!(compiled.backend_slots.len(), 1);
     }
 }
