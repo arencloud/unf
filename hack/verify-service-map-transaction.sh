@@ -18,6 +18,10 @@ test_binary=$(cargo test -p unf-agent --no-run --message-format=json \
 
 sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
     --ignored --exact \
+    tests::privileged_pinned_tail_call_map_survives_agent_owner_exit
+
+sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
+    --ignored --exact \
     tests::privileged_service_map_partial_capacity_failure_rolls_back_inactive_bank
 
 sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \

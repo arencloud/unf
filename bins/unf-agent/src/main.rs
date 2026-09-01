@@ -7,7 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::State;
@@ -120,6 +120,7 @@ const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
 const BLOCKED_TRANSITION_REPORTING_WINDOW: Duration = Duration::from_secs(30);
 const DATAPLANE_TAIL_PROGRAM_NAMES: [&str; 4] =
     ["unf_policy_v4", "unf_policy_v6", "unf_dsr_v4", "unf_dsr_v6"];
+const DATAPLANE_TAIL_CALL_MAP_NAME: &str = "SERVICE_DATAPLANE_TAIL_CALLS";
 const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
     Some(revision) => revision,
     None => "unknown",
@@ -5165,18 +5166,19 @@ fn inspect_cleanup_program_directory(
 }
 
 fn recognized_tail_program_pin_name(name: &str) -> bool {
-    DATAPLANE_TAIL_PROGRAM_NAMES.iter().any(|program| {
-        name == *program
-            || name
-                .strip_prefix(&format!("{program}-"))
-                .and_then(|generation| generation.split_once('-'))
-                .is_some_and(|(pid, timestamp)| {
-                    !pid.is_empty()
-                        && pid.bytes().all(|byte| byte.is_ascii_digit())
-                        && !timestamp.is_empty()
-                        && timestamp.bytes().all(|byte| byte.is_ascii_digit())
-                })
-    })
+    name == DATAPLANE_TAIL_CALL_MAP_NAME
+        || DATAPLANE_TAIL_PROGRAM_NAMES.iter().any(|program| {
+            name == *program
+                || name
+                    .strip_prefix(&format!("{program}-"))
+                    .and_then(|generation| generation.split_once('-'))
+                    .is_some_and(|(pid, timestamp)| {
+                        !pid.is_empty()
+                            && pid.bytes().all(|byte| byte.is_ascii_digit())
+                            && !timestamp.is_empty()
+                            && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+        })
 }
 
 fn validate_cleanup_root(root: &Path) -> Result<()> {
@@ -6040,7 +6042,7 @@ fn attach_dataplane_programs<'ebpf>(
     config: &DataplaneConfig,
     mode: TcAttachmentMode,
 ) -> Result<InterfaceAttachments<'ebpf>> {
-    load_dataplane_tail_programs(ebpf, Some(&config.bpf_pin_path))?;
+    load_dataplane_tail_programs(ebpf)?;
     if config.hook_coverage == HookCoverage::Both || config.direction == Direction::Ingress {
         load_dataplane_program(ebpf, Direction::Ingress)?;
     }
@@ -6065,26 +6067,8 @@ fn attach_dataplane_programs<'ebpf>(
     Ok(attachments)
 }
 
-// Every loaded generation is pinned before any program-array entry changes. Old generations are
-// collected only after all entries point at the new generation, so process death during either
-// staging or activation cannot leave the persistent root program with an unreferenced tail target.
-fn load_dataplane_tail_programs(ebpf: &mut Ebpf, bpf_pin_path: Option<&Path>) -> Result<()> {
-    let program_pin_root = bpf_pin_path.map(|path| path.join("programs"));
-    if let Some(program_pin_root) = &program_pin_root {
-        fs::create_dir_all(program_pin_root).with_context(|| {
-            format!(
-                "create dataplane tail program pin directory {}",
-                program_pin_root.display()
-            )
-        })?;
-        validate_tail_program_pin_directory(program_pin_root)?;
-    }
-    let pin_generation = program_pin_root
-        .as_ref()
-        .map(|_| tail_program_pin_generation())
-        .transpose()?;
+fn load_dataplane_tail_programs(ebpf: &mut Ebpf) -> Result<()> {
     let mut program_fds = Vec::with_capacity(4);
-    let mut active_pins = Vec::with_capacity(4);
     for program_name in DATAPLANE_TAIL_PROGRAM_NAMES {
         let program: &mut SchedClassifier = ebpf
             .program_mut(program_name)
@@ -6094,16 +6078,6 @@ fn load_dataplane_tail_programs(ebpf: &mut Ebpf, bpf_pin_path: Option<&Path>) ->
         program
             .load()
             .with_context(|| format!("load {program_name} TC classifier into kernel"))?;
-        if let Some(program_pin_root) = &program_pin_root {
-            let pin_generation = pin_generation
-                .as_deref()
-                .context("tail program pin generation is unavailable")?;
-            let active_pin = program_pin_root.join(format!("{program_name}-{pin_generation}"));
-            program.pin(&active_pin).with_context(|| {
-                format!("retain {program_name} program pin {}", active_pin.display())
-            })?;
-            active_pins.push(active_pin);
-        }
         program_fds.push(
             program
                 .fd()
@@ -6112,29 +6086,18 @@ fn load_dataplane_tail_programs(ebpf: &mut Ebpf, bpf_pin_path: Option<&Path>) ->
                 .with_context(|| format!("clone {program_name} program descriptor"))?,
         );
     }
-    let mut tail_calls = AyaProgramArray::try_from(
-        ebpf.map_mut("SERVICE_DATAPLANE_TAIL_CALLS")
-            .context("eBPF object does not contain SERVICE_DATAPLANE_TAIL_CALLS")?,
-    )
-    .context("open SERVICE_DATAPLANE_TAIL_CALLS program array")?;
+    let mut tail_calls =
+        AyaProgramArray::try_from(ebpf.map_mut(DATAPLANE_TAIL_CALL_MAP_NAME).with_context(
+            || format!("eBPF object does not contain {DATAPLANE_TAIL_CALL_MAP_NAME}"),
+        )?)
+        .with_context(|| format!("open {DATAPLANE_TAIL_CALL_MAP_NAME} program array"))?;
     for (index, program_fd) in program_fds.iter().enumerate() {
         let index = u32::try_from(index).context("dataplane tail program index exceeds u32")?;
         tail_calls
             .set(index, program_fd, 0)
             .with_context(|| format!("install dataplane tail program at index {index}"))?;
     }
-    if let Some(program_pin_root) = &program_pin_root {
-        remove_obsolete_tail_program_pins(program_pin_root, &active_pins)?;
-    }
     Ok(())
-}
-
-fn tail_program_pin_generation() -> Result<String> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_nanos();
-    Ok(format!("{}-{timestamp}", std::process::id()))
 }
 
 fn validate_tail_program_pin_directory(directory: &Path) -> Result<Vec<PathBuf>> {
@@ -6170,17 +6133,6 @@ fn validate_tail_program_pin_directory(directory: &Path) -> Result<Vec<PathBuf>>
     }
     pins.sort();
     Ok(pins)
-}
-
-fn remove_obsolete_tail_program_pins(directory: &Path, active_pins: &[PathBuf]) -> Result<()> {
-    let active_pins = active_pins.iter().collect::<HashSet<_>>();
-    for pin in validate_tail_program_pin_directory(directory)? {
-        if !active_pins.contains(&pin) {
-            fs::remove_file(&pin)
-                .with_context(|| format!("remove obsolete tail program pin {}", pin.display()))?;
-        }
-    }
-    Ok(())
 }
 
 fn load_dataplane_program(ebpf: &mut Ebpf, direction: Direction) -> Result<()> {
@@ -6722,10 +6674,27 @@ fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool)> {
         );
     }
 
+    // A root program reference keeps the program-array map object alive, but Linux clears its
+    // entries after the final userspace map descriptor closes unless the map itself is pinned.
+    // Keep this runtime dispatch state outside the durable 25-map ABI set: it is repopulated on
+    // every start, while the pin preserves last-known-good tail targets between agent processes.
+    let tail_program_pin_root = config.bpf_pin_path.join("programs");
+    fs::create_dir_all(&tail_program_pin_root).with_context(|| {
+        format!(
+            "create dataplane tail runtime pin directory {}",
+            tail_program_pin_root.display()
+        )
+    })?;
+    validate_tail_program_pin_directory(&tail_program_pin_root)?;
+
     let mut loader = EbpfLoader::new();
     for name in PERSISTENT_MAP_NAMES {
         loader.map_pin_path(name, config.bpf_pin_path.join(name));
     }
+    loader.map_pin_path(
+        DATAPLANE_TAIL_CALL_MAP_NAME,
+        tail_program_pin_root.join(DATAPLANE_TAIL_CALL_MAP_NAME),
+    );
     let ebpf = loader
         .load_file(&config.object)
         .with_context(|| format!("load eBPF object {}", config.object.display()))?;
@@ -12550,6 +12519,39 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires root bpffs access and UNF_EBPF_OBJECT"]
+    fn privileged_pinned_tail_call_map_survives_agent_owner_exit() {
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let root = PathBuf::from(format!(
+            "/sys/fs/bpf/unf-tail-map-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("isolated bpffs test directory is created");
+        let pin = root.join(DATAPLANE_TAIL_CALL_MAP_NAME);
+
+        let mut loader = EbpfLoader::new();
+        loader.map_pin_path(DATAPLANE_TAIL_CALL_MAP_NAME, &pin);
+        let mut ebpf = loader
+            .load_file(object)
+            .expect("load eBPF object with a pinned tail-call map");
+        load_dataplane_tail_programs(&mut ebpf).expect("populate all tail-call targets");
+        drop(ebpf);
+
+        let map = MapData::from_pin(&pin).expect("reopen tail-call map after owner exit");
+        let tail_calls = AyaProgramArray::try_from(aya::maps::Map::ProgramArray(map))
+            .expect("pinned map remains a program array");
+        let indices = tail_calls
+            .indices()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read retained tail-call indices");
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+        drop(tail_calls);
+
+        fs::remove_file(&pin).expect("remove isolated tail-call map pin");
+        fs::remove_dir(&root).expect("remove isolated bpffs test directory");
+    }
+
+    #[test]
     #[ignore = "requires root BPF map creation and UNF_EBPF_OBJECT"]
     #[allow(clippy::too_many_lines)]
     fn privileged_service_map_partial_capacity_failure_rolls_back_inactive_bank() {
@@ -12564,7 +12566,7 @@ mod tests {
         let mut ebpf = loader
             .load_file(object)
             .expect("load verifier-approved eBPF object");
-        load_dataplane_tail_programs(&mut ebpf, None)
+        load_dataplane_tail_programs(&mut ebpf)
             .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
@@ -12840,7 +12842,7 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
-        load_dataplane_tail_programs(&mut ebpf, None)
+        load_dataplane_tail_programs(&mut ebpf)
             .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
@@ -13095,7 +13097,7 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
-        load_dataplane_tail_programs(&mut ebpf, None)
+        load_dataplane_tail_programs(&mut ebpf)
             .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
@@ -13210,7 +13212,7 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
-        load_dataplane_tail_programs(&mut ebpf, None)
+        load_dataplane_tail_programs(&mut ebpf)
             .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
@@ -13744,7 +13746,7 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
-        load_dataplane_tail_programs(&mut ebpf, None)
+        load_dataplane_tail_programs(&mut ebpf)
             .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
@@ -14026,7 +14028,7 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
-        load_dataplane_tail_programs(&mut ebpf, None)
+        load_dataplane_tail_programs(&mut ebpf)
             .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
@@ -14275,7 +14277,7 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
-        load_dataplane_tail_programs(&mut ebpf, None)
+        load_dataplane_tail_programs(&mut ebpf)
             .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
@@ -14583,7 +14585,7 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
-        load_dataplane_tail_programs(&mut ebpf, None)
+        load_dataplane_tail_programs(&mut ebpf)
             .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
@@ -15203,6 +15205,9 @@ mod tests {
 
     #[test]
     fn cleanup_recognizes_only_owned_tail_program_pin_names() {
+        assert!(recognized_tail_program_pin_name(
+            DATAPLANE_TAIL_CALL_MAP_NAME
+        ));
         assert!(recognized_tail_program_pin_name("unf_policy_v4"));
         assert!(recognized_tail_program_pin_name("unf_policy_v6-123-456789"));
         assert!(!recognized_tail_program_pin_name("unf_policy_v6-next"));
@@ -15216,39 +15221,31 @@ mod tests {
     }
 
     #[test]
-    fn tail_program_pin_gc_keeps_only_the_active_generation() {
+    fn tail_runtime_pin_directory_refuses_unknown_content_without_mutation() {
         let temporary = tempdir().expect("temporary directory is created");
         let programs = temporary.path().join("programs");
         fs::create_dir(&programs).expect("program directory is created");
-        let active = programs.join("unf_policy_v4-123-456");
-        let obsolete = programs.join("unf_policy_v4-122-455");
-        fs::write(&active, []).expect("active pin fixture is created");
-        fs::write(&obsolete, []).expect("obsolete pin fixture is created");
-
-        remove_obsolete_tail_program_pins(&programs, std::slice::from_ref(&active))
-            .expect("owned obsolete pins are collected");
-
-        assert!(active.exists());
-        assert!(!obsolete.exists());
-    }
-
-    #[test]
-    fn tail_program_pin_gc_refuses_unknown_content_without_mutation() {
-        let temporary = tempdir().expect("temporary directory is created");
-        let programs = temporary.path().join("programs");
-        fs::create_dir(&programs).expect("program directory is created");
-        let active = programs.join("unf_policy_v4-123-456");
+        let dispatch = programs.join(DATAPLANE_TAIL_CALL_MAP_NAME);
+        let legacy_program = programs.join("unf_policy_v4-123-456");
         let unknown = programs.join("operator-owned-program");
-        fs::write(&active, []).expect("active pin fixture is created");
+        fs::write(&dispatch, []).expect("dispatch pin fixture is created");
+        fs::write(&legacy_program, []).expect("legacy program pin fixture is created");
+        assert_eq!(
+            validate_tail_program_pin_directory(&programs)
+                .expect("owned runtime pins are accepted")
+                .len(),
+            2
+        );
         fs::write(&unknown, []).expect("unknown fixture is created");
 
         assert!(
-            remove_obsolete_tail_program_pins(&programs, &[])
+            validate_tail_program_pin_directory(&programs)
                 .expect_err("unknown content is refused")
                 .to_string()
                 .contains("unrecognized tail program pin content")
         );
-        assert!(active.exists());
+        assert!(dispatch.exists());
+        assert!(legacy_program.exists());
         assert!(unknown.exists());
     }
 
@@ -15328,6 +15325,8 @@ mod tests {
         fs::write(abi.join("IDENTITY_V4"), []).expect("map fixture is created");
         fs::write(abi.join("POLICY_CONFIG"), []).expect("map fixture is created");
         fs::write(links.join("tcx-ingress-7"), []).expect("link fixture is created");
+        fs::write(programs.join(DATAPLANE_TAIL_CALL_MAP_NAME), [])
+            .expect("dispatch map fixture is created");
         fs::write(programs.join("unf_policy_v4"), []).expect("program fixture is created");
         fs::write(programs.join("unf_policy_v6-123-456789"), [])
             .expect("generation program fixture is created");
@@ -15336,7 +15335,7 @@ mod tests {
         let plan = plan_abi_cleanup(&root, 1, false).expect("known fixture has a safe plan");
         assert_eq!(plan.map_pins.len(), 2);
         assert_eq!(plan.link_pins.len(), 1);
-        assert_eq!(plan.program_pins.len(), 2);
+        assert_eq!(plan.program_pins.len(), 3);
         execute_abi_cleanup(&plan).expect("known fixture is removed");
 
         assert!(!abi.exists());
