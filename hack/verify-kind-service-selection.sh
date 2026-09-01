@@ -108,6 +108,44 @@ wait_for_convergence() {
     return 1
 }
 
+wait_for_operations_provenance() {
+    local snapshot=
+    for _ in $(seq 1 180); do
+        snapshot=$(controller_raw /v1/state/agents 2>/dev/null || true)
+        if jq -e --argjson expected "${#nodes[@]}" '
+            .schema_version == 8 and .expected_agents == $expected
+            and .reporting_agents == $expected and .missing_agents == 0
+            and .stale_agents == 0 and .converged_agents == $expected
+            and .unexpected_agents == 0 and .all_converged
+            and all(.nodes[];
+                .fresh and .converged and .report.ready and .report.bpf_loaded
+                and .report.schema_version == 8
+                and .report.invalid_service_events == 0
+                and .report.applied_selection_contract_revision > 0
+                and .report.applied_selection_contract_revision == .report.desired_selection_contract_revision
+                and .report.applied_selection_contract_digest != null
+                and .report.applied_selection_contract_digest == .report.desired_selection_contract_digest)
+            and any(.nodes[]; .report.service_same_node_selections > 0)
+            and any(.nodes[]; .report.service_same_zone_selections > 0)
+            and any(.nodes[]; .report.service_cluster_selections > 0)
+            and any(.nodes[]; .report.service_affinity_creations > 0)
+            and any(.nodes[]; .report.service_affinity_reuses > 0)
+            and any(.nodes[]; .report.service_affinity_reselections > 0)
+            and any(.nodes[]; .report.service_maglev_selections > 0)
+            and any(.nodes[]; .report.service_stable_hash_selections > 0)
+            and any(.nodes[]; .report.service_nat_forwards > 0)
+            and any(.nodes[]; .report.service_dsr_forwards > 0)
+        ' <<<"${snapshot}" >/dev/null 2>&1; then
+            printf '%s\n' "${snapshot}"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "service-selection operations provenance did not become complete" >&2
+    jq . <<<"${snapshot}" >&2 || true
+    return 1
+}
+
 wait_for_service() {
     local name=$1 address port protocol snapshot=
     address=$("${kc[@]}" -n "${namespace}" get service "${name}" -o json \
@@ -497,23 +535,7 @@ dsr_history=$(wait_for_history "${dsr_v4}" '
         and .service.forwarding_mode == "dsr" and .service.action == 1)')
 
 qualification_stage=operations-provenance
-advanced_agents=$(wait_for_convergence)
-jq -e '
-    all(.nodes[]; .report.schema_version == 8
-        and .report.invalid_service_events == 0
-        and .report.applied_selection_contract_revision > 0
-        and .report.applied_selection_contract_digest != null)
-    and any(.nodes[]; .report.service_same_node_selections > 0)
-    and any(.nodes[]; .report.service_same_zone_selections > 0)
-    and any(.nodes[]; .report.service_cluster_selections > 0)
-    and any(.nodes[]; .report.service_affinity_creations > 0)
-    and any(.nodes[]; .report.service_affinity_reuses > 0)
-    and any(.nodes[]; .report.service_affinity_reselections > 0)
-    and any(.nodes[]; .report.service_maglev_selections > 0)
-    and any(.nodes[]; .report.service_stable_hash_selections > 0)
-    and any(.nodes[]; .report.service_nat_forwards > 0)
-    and any(.nodes[]; .report.service_dsr_forwards > 0)
-' <<<"${advanced_agents}" >/dev/null
+advanced_agents=$(wait_for_operations_provenance)
 while read -r agent_pod; do
     metrics=$(agent_raw "${agent_pod}" /metrics)
     for metric in \
