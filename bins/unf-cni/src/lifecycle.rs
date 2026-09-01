@@ -117,12 +117,16 @@ pub(crate) async fn execute_validated<T: TransactionApi>(
                 TransactionOperation::Status,
             )
             .map_err(|error| {
-                CniError::new(
-                    &config.cni_version,
-                    50,
-                    "Plugin not available",
-                    error.details,
-                )
+                if error.is_agent_transport_failure() {
+                    CniError::plugin_unavailable_transport(&config.cni_version, error.details)
+                } else {
+                    CniError::new(
+                        &config.cni_version,
+                        50,
+                        "Plugin not available",
+                        error.details,
+                    )
+                }
             })?;
             Ok(Success::Empty)
         }

@@ -8,6 +8,8 @@
       "dataplane": "veth",
       "agentSocket": "/run/unf/cni.sock",
       "deferredDeleteDirectory": "/var/lib/unf/cni/v1/pending-deletes",
+      "statusLeasePath": "/run/unf/cni-status.lease",
+      "statusGracePeriodSeconds": 120,
       "mtu": 1500,
       "ipam": {
         "type": "unf"

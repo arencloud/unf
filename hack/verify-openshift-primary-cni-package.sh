@@ -138,6 +138,8 @@ jq -e '
   .plugins[0].mode == "primary" and
   .plugins[0].agentSocket == "/run/unf/cni.sock" and
   .plugins[0].deferredDeleteDirectory == "/var/lib/unf/cni/v1/pending-deletes" and
+  .plugins[0].statusLeasePath == "/run/unf/cni-status.lease" and
+  .plugins[0].statusGracePeriodSeconds == 120 and
   .plugins[0].mtu == 1500
 ' "${runtime}/10-unf.conflist" >/dev/null
 

@@ -708,6 +708,7 @@ for replacement_node in "${client_node}" "${server_node}"; do
     old_agent=$("${kc[@]}" -n unf-system get pod -l app.kubernetes.io/name=unf-agent \
         --field-selector spec.nodeName="${replacement_node}" -o jsonpath='{.items[0].metadata.name}')
     "${kc[@]}" -n unf-system delete pod "${old_agent}" --wait=false >/dev/null
+    "${kc[@]}" -n unf-system wait --for=delete pod "${old_agent}" --timeout=180s >/dev/null
     "${kc[@]}" -n unf-system rollout status daemonset/unf-agent --timeout=180s >/dev/null
     if ! wait "${probe_pid}"; then
         echo "continuous LoadBalancer probes failed while replacing the agent on ${replacement_node}" >&2

@@ -1,6 +1,10 @@
 use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +20,9 @@ pub const SUPPORTED_CNI_VERSIONS: [&str; 2] = ["1.0.0", CURRENT_CNI_VERSION];
 
 const DEFAULT_AGENT_SOCKET: &str = "/run/unf/cni.sock";
 const DEFAULT_DEFERRED_DELETE_DIRECTORY: &str = "/var/lib/unf/cni/v1/pending-deletes";
+const DEFAULT_STATUS_LEASE_PATH: &str = "/run/unf/cni-status.lease";
+const DEFAULT_STATUS_GRACE_PERIOD_SECONDS: u64 = 120;
+const MAX_STATUS_GRACE_PERIOD_SECONDS: u64 = 300;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 const MAX_HOST_PATH_BYTES: usize = 4_096;
 
@@ -87,6 +94,10 @@ struct NetworkConfig {
     agent_socket: Option<String>,
     #[serde(default)]
     deferred_delete_directory: Option<PathBuf>,
+    #[serde(default)]
+    status_lease_path: Option<PathBuf>,
+    #[serde(default = "default_status_grace_period_seconds")]
+    status_grace_period_seconds: u64,
     #[serde(default)]
     mtu: Option<u32>,
     ipam: IpamConfig,
@@ -203,6 +214,12 @@ impl CniError {
         error
     }
 
+    fn plugin_unavailable_transport(version: &str, details: impl Into<String>) -> Self {
+        let mut error = Self::new(version, 50, "Plugin not available", details);
+        error.agent_transport_failure = true;
+        error
+    }
+
     fn is_agent_transport_failure(&self) -> bool {
         self.agent_transport_failure
     }
@@ -309,6 +326,9 @@ pub fn execute(environment: &InvocationEnvironment, input: &[u8]) -> Result<Succ
         command,
         &mut transaction,
     ));
+    if command == Command::Status {
+        return status_with_bounded_grace(&config, result);
+    }
     if command != Command::Delete {
         return result;
     }
@@ -376,6 +396,86 @@ fn deferred_delete_directory(config: &NetworkConfig) -> &Path {
         .deferred_delete_directory
         .as_deref()
         .unwrap_or_else(|| Path::new(DEFAULT_DEFERRED_DELETE_DIRECTORY))
+}
+
+const fn default_status_grace_period_seconds() -> u64 {
+    DEFAULT_STATUS_GRACE_PERIOD_SECONDS
+}
+
+fn status_lease_path(config: &NetworkConfig) -> &Path {
+    config
+        .status_lease_path
+        .as_deref()
+        .unwrap_or_else(|| Path::new(DEFAULT_STATUS_LEASE_PATH))
+}
+
+fn status_with_bounded_grace(
+    config: &NetworkConfig,
+    result: Result<Success, CniError>,
+) -> Result<Success, CniError> {
+    match result {
+        Ok(success) => {
+            let _ = persist_status_lease(status_lease_path(config));
+            Ok(success)
+        }
+        Err(error)
+            if error.is_agent_transport_failure()
+                && status_lease_is_fresh(
+                    status_lease_path(config),
+                    config.status_grace_period_seconds,
+                ) =>
+        {
+            Ok(Success::Empty)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn persist_status_lease(path: &Path) -> std::io::Result<()> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_secs();
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("status lease path has no parent"))?;
+    let temporary = parent.join(format!(
+        ".{}.tmp.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("lease"),
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    writeln!(file, "{timestamp}")?;
+    file.sync_all()?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+fn status_lease_is_fresh(path: &Path, grace_period_seconds: u64) -> bool {
+    if grace_period_seconds == 0 {
+        return false;
+    }
+    let Ok(encoded) = fs::read_to_string(path) else {
+        return false;
+    };
+    if encoded.len() > 32 {
+        return false;
+    }
+    let Ok(timestamp) = encoded.trim().parse::<u64>() else {
+        return false;
+    };
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    timestamp <= now.as_secs() && now.as_secs() - timestamp <= grace_period_seconds
 }
 
 /// Validates and runs one invocation through a supplied durable transaction API.
@@ -482,6 +582,7 @@ fn validate_config(config: &NetworkConfig, command: Command) -> Result<(), CniEr
             ),
         ));
     }
+    validate_status_config(config)?;
     if let Some(mtu) = config.mtu
         && !(1280..=65_535).contains(&mtu)
     {
@@ -507,6 +608,26 @@ fn validate_config(config: &NetworkConfig, command: Command) -> Result<(), CniEr
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_status_config(config: &NetworkConfig) -> Result<(), CniError> {
+    if let Some(path) = &config.status_lease_path
+        && (!valid_absolute_path(path) || path.as_os_str().as_bytes().len() > MAX_HOST_PATH_BYTES)
+    {
+        return Err(CniError::invalid_config(
+            &config.cni_version,
+            format!(
+                "statusLeasePath must be an absolute non-NUL path no longer than {MAX_HOST_PATH_BYTES} bytes"
+            ),
+        ));
+    }
+    if config.status_grace_period_seconds > MAX_STATUS_GRACE_PERIOD_SECONDS {
+        return Err(CniError::invalid_config(
+            &config.cni_version,
+            format!("statusGracePeriodSeconds must not exceed {MAX_STATUS_GRACE_PERIOD_SECONDS}"),
+        ));
     }
     Ok(())
 }
@@ -711,6 +832,80 @@ mod tests {
     fn status_reports_not_available_until_agent_readiness_is_connected() {
         let error = execute(&environment("STATUS"), &config(""))
             .expect_err("STATUS must not claim readiness");
+        assert_eq!(error.code, 50);
+    }
+
+    #[test]
+    fn status_uses_only_a_fresh_owner_only_lease_for_transport_outages() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let socket = directory.path().join("agent.sock");
+        let lease = directory.path().join("status.lease");
+        let input = serde_json::to_vec(&serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "unf-test",
+            "type": "unf",
+            "agentSocket": socket,
+            "statusLeasePath": lease,
+            "statusGracePeriodSeconds": 120,
+            "ipam": {"type": "unf"}
+        }))
+        .expect("network config");
+        let listener = UnixListener::bind(&socket).expect("bind mock agent socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept STATUS request");
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).expect("read STATUS request");
+            let request: TransactionRequest =
+                serde_json::from_slice(&bytes).expect("decode STATUS request");
+            assert!(matches!(
+                request,
+                TransactionRequest::Status {
+                    schema_version: CNI_TRANSACTION_SCHEMA_VERSION
+                }
+            ));
+            let response = TransactionResponse {
+                schema_version: CNI_TRANSACTION_SCHEMA_VERSION,
+                outcome: TransactionOutcome::Ok {
+                    attachment: None,
+                    attachments: Vec::new(),
+                    attachment_count: 0,
+                },
+            };
+            stream
+                .write_all(&serde_json::to_vec(&response).expect("encode response"))
+                .expect("write response");
+        });
+
+        assert_eq!(
+            execute(&environment("STATUS"), &input).expect("connected STATUS"),
+            Success::Empty
+        );
+        server.join().expect("mock agent thread");
+        assert_eq!(
+            fs::metadata(&lease)
+                .expect("status lease metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            execute(&environment("STATUS"), &input).expect("bounded transport grace"),
+            Success::Empty
+        );
+
+        let no_grace = serde_json::to_vec(&serde_json::json!({
+            "cniVersion": "1.1.0",
+            "name": "unf-test",
+            "type": "unf",
+            "agentSocket": socket,
+            "statusLeasePath": lease,
+            "statusGracePeriodSeconds": 0,
+            "ipam": {"type": "unf"}
+        }))
+        .expect("network config without grace");
+        let error = execute(&environment("STATUS"), &no_grace)
+            .expect_err("disabled grace must fail closed");
         assert_eq!(error.code, 50);
     }
 
