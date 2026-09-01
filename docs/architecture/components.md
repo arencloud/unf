@@ -52,13 +52,17 @@ contract+Node checkpoints, recovery, and exact digest acknowledgements. Phase
 7.4 lowers the first non-empty ordered tier into origin-specific slots, 7.5
 adds ABI-v9 exact-client affinity plus graceful-draining lifecycle separation,
 and 7.6 adds bounded measured ABI-v10 Maglev tables with actual-algorithm
-fallback/provenance; topology and eligibility changes are dataplane transactions. `unf-ebpf-tc` may
+fallback/provenance. Phase 7.7 advances connection ownership to ABI v11 and
+admits DSR only for explicit acknowledged LoadBalancer VIPs with unchanged
+backend tuples. The agent loads verifier-isolated IPv4/IPv6 policy and DSR FIB
+tail stages before hook attachment; topology and eligibility changes remain
+dataplane transactions. `unf-ebpf-tc` may
 consume only fixed-width selected tiers, affinity records, algorithm tables,
 and compact decision witnesses; it does not interpret Kubernetes strings,
-topology, or contract logic. DSR remains an explicit forwarding mode whose
-route, MTU, policy, return-path, and cleanup contracts must pass before
-activation. ADRs 0102 and 0104–0107 record the boundary; later milestones must not
-claim packet implementation from this ownership decision alone.
+topology, or contract logic. DSR preserves the VIP tuple, retains existing
+selection/policy/source-range/lifecycle order, requires route/neighbor/MTU proof,
+and writes forward-only Service state for direct return. ADRs 0102 and 0104–0109
+record the boundary; Kind/OpenShift return-path claims remain independent.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

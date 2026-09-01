@@ -16,7 +16,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use aya::maps::lpm_trie::{Key as LpmKey, LpmTrie as AyaLpmTrie};
-use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, IterableMap, MapData, RingBuf};
+use aya::maps::{
+    Array as AyaArray, HashMap as AyaHashMap, IterableMap, MapData,
+    ProgramArray as AyaProgramArray, RingBuf,
+};
 use aya::programs::links::{FdLink, LinkError, PinnedLink};
 use aya::programs::tc::{NlOptions, SchedClassifierLink, TcAttachOptions, TcError, TcHandle};
 use aya::programs::{LinkOrder, SchedClassifier, TcAttachType, tc};
@@ -96,7 +99,7 @@ use cni_server::CniTransactionServer;
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v10";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v11";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
@@ -2356,7 +2359,7 @@ async fn fetch_selection_contract(
     authenticated_get(
         client,
         format!(
-            "{controller_url}/v1/state/service-selection?selectionContractSchemaVersion={SELECTION_CONTRACT_SCHEMA_VERSION}&stableHash=true&maglev=true&nat=true"
+            "{controller_url}/v1/state/service-selection?selectionContractSchemaVersion={SELECTION_CONTRACT_SCHEMA_VERSION}&stableHash=true&maglev=true&nat=true&dsrIpv4=true&dsrIpv6=true"
         ),
         token_path,
     )?
@@ -2594,7 +2597,13 @@ fn restore_service_fabric_checkpoint(
 }
 
 fn local_selection_capabilities() -> BTreeSet<SelectionCapability> {
-    BTreeSet::from([SelectionCapability::StableHash, SelectionCapability::Nat])
+    BTreeSet::from([
+        SelectionCapability::StableHash,
+        SelectionCapability::Maglev,
+        SelectionCapability::Nat,
+        SelectionCapability::DsrIpv4,
+        SelectionCapability::DsrIpv6,
+    ])
 }
 
 fn local_selection_node(node: &NodePortNodeSnapshot, zone: Option<String>) -> SelectionNode {
@@ -5836,6 +5845,7 @@ fn attach_dataplane_programs<'ebpf>(
     config: &DataplaneConfig,
     mode: TcAttachmentMode,
 ) -> Result<InterfaceAttachments<'ebpf>> {
+    load_dataplane_tail_programs(ebpf)?;
     if config.hook_coverage == HookCoverage::Both || config.direction == Direction::Ingress {
         load_dataplane_program(ebpf, Direction::Ingress)?;
     }
@@ -5858,6 +5868,39 @@ fn attach_dataplane_programs<'ebpf>(
         bail!("no non-loopback network interfaces are available");
     }
     Ok(attachments)
+}
+
+fn load_dataplane_tail_programs(ebpf: &mut Ebpf) -> Result<()> {
+    let mut program_fds = Vec::with_capacity(4);
+    for program_name in ["unf_policy_v4", "unf_policy_v6", "unf_dsr_v4", "unf_dsr_v6"] {
+        let program: &mut SchedClassifier = ebpf
+            .program_mut(program_name)
+            .with_context(|| format!("eBPF object does not contain program {program_name}"))?
+            .try_into()
+            .context("UNF dataplane tail program is not a TC classifier")?;
+        program
+            .load()
+            .with_context(|| format!("load {program_name} TC classifier into kernel"))?;
+        program_fds.push(
+            program
+                .fd()
+                .with_context(|| format!("obtain {program_name} program descriptor"))?
+                .try_clone()
+                .with_context(|| format!("clone {program_name} program descriptor"))?,
+        );
+    }
+    let mut tail_calls = AyaProgramArray::try_from(
+        ebpf.map_mut("SERVICE_DATAPLANE_TAIL_CALLS")
+            .context("eBPF object does not contain SERVICE_DATAPLANE_TAIL_CALLS")?,
+    )
+    .context("open SERVICE_DATAPLANE_TAIL_CALLS program array")?;
+    for (index, program_fd) in program_fds.iter().enumerate() {
+        let index = u32::try_from(index).context("dataplane tail program index exceeds u32")?;
+        tail_calls
+            .set(index, program_fd, 0)
+            .with_context(|| format!("install dataplane tail program at index {index}"))?;
+    }
+    Ok(())
 }
 
 fn load_dataplane_program(ebpf: &mut Ebpf, direction: Direction) -> Result<()> {
@@ -7033,7 +7076,8 @@ fn validate_load_balancer_frontend_entry<const K: usize>(
     let known_flags = unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL
         | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES
         | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY
-        | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_MAGLEV;
+        | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_MAGLEV
+        | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_DSR;
     if service_id == 0
         || schema != unf_ebpf_common::LOAD_BALANCER_MAP_ABI_VERSION
         || flags & !known_flags != 0
@@ -10394,7 +10438,12 @@ fn decode_service_event(bytes: &[u8]) -> Option<ServiceEvent> {
                 | SERVICE_AFFINITY_OUTCOME_RESELECTED
         )
         || !service_selection_algorithm_is_valid(bytes[89])
-        || bytes[90..96] != [0; 6]
+        || !matches!(
+            bytes[90],
+            unf_ebpf_common::SERVICE_EVENT_FORWARDING_NAT
+                | unf_ebpf_common::SERVICE_EVENT_FORWARDING_DSR
+        )
+        || bytes[91..96] != [0; 5]
     {
         return None;
     }
@@ -10989,6 +11038,40 @@ mod tests {
             include_backends,
             false,
         )
+    }
+
+    fn dual_stack_dsr_load_balancer_snapshot(
+        revision: u64,
+        ipv4_backend: Ipv4Addr,
+        ipv6_backend: Ipv6Addr,
+    ) -> ServiceSnapshot {
+        let mut snapshot = dual_stack_service_snapshot_with_load_balancer(
+            revision,
+            ipv4_backend,
+            ipv6_backend,
+            true,
+            true,
+        );
+        let service = snapshot.services.first_mut().expect("one test Service");
+        service.forwarding_mode = unf_service::ServiceForwardingMode::Dsr;
+        for backend in &mut service.backends {
+            backend.port = if backend.protocol == unf_common::Protocol::Tcp {
+                80
+            } else {
+                53
+            };
+        }
+        service
+            .load_balancer
+            .as_mut()
+            .expect("test Service has LoadBalancer intent")
+            .source_ranges = vec![
+            "203.0.113.0/24".parse().unwrap(),
+            "2001:db8::/64".parse().unwrap(),
+        ];
+        snapshot
+            .validate_and_normalize()
+            .expect("dual-stack DSR LoadBalancer snapshot validates")
     }
 
     fn dual_stack_affinity_snapshot(
@@ -11993,6 +12076,8 @@ mod tests {
         let mut ebpf = loader
             .load_file(object)
             .expect("load verifier-approved eBPF object");
+        load_dataplane_tail_programs(&mut ebpf)
+            .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
                 .program_mut(program_name)
@@ -12267,6 +12352,8 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
+        load_dataplane_tail_programs(&mut ebpf)
+            .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
                 .program_mut(program_name)
@@ -12513,6 +12600,121 @@ mod tests {
     #[test]
     #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
     #[allow(clippy::too_many_lines)]
+    fn privileged_load_balancer_dsr_preserves_dual_stack_vips_and_direct_return() {
+        const TC_ACT_SHOT: u32 = 2;
+        const TC_ACT_PIPE: u32 = 3;
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new()
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        load_dataplane_tail_programs(&mut ebpf)
+            .expect("kernel verifier accepts dataplane tail programs");
+        for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(program_name)
+                .expect("DSR TC program exists")
+                .try_into()
+                .expect("DSR program is a TC classifier");
+            program.load().expect("kernel verifier accepts DSR helpers");
+        }
+        let mut service_events = RingBuf::try_from(
+            ebpf.take_map("SERVICE_EVENTS")
+                .expect("service event ring exists"),
+        )
+        .expect("service event ring opens");
+        let directory = tempdir().unwrap();
+        let mut synchronizer =
+            test_service_synchronizer(&mut ebpf, directory.path().join("service.json"));
+        let state = test_agent_state();
+        let client_v4 = Ipv4Addr::new(203, 0, 113, 5);
+        let denied_v4 = Ipv4Addr::new(198, 51, 100, 5);
+        let client_v6 = "2001:db8::5".parse::<Ipv6Addr>().unwrap();
+        let vip_v4 = Ipv4Addr::new(192, 0, 2, 60);
+        let vip_v6 = "2001:db8:ffff::60".parse::<Ipv6Addr>().unwrap();
+        let backend_v4 = Ipv4Addr::new(10, 42, 0, 20);
+        let backend_v6 = "fd00:42::20".parse::<Ipv6Addr>().unwrap();
+        let service = dual_stack_dsr_load_balancer_snapshot(1, backend_v4, backend_v6);
+        let node = node_port_node_snapshot(1);
+        let contract = NetworkBehaviorContract::compile(
+            &service,
+            Revision::new(1),
+            Revision::new(1),
+            local_selection_node(&node, Some("zone-a".to_owned())),
+        )
+        .expect("dual-stack DSR selection contract compiles");
+        activate_service_snapshot_with_contract(
+            &mut synchronizer,
+            &service,
+            Some(&node),
+            Some(&contract),
+            true,
+            &state,
+        )
+        .expect("DSR selection contract and Service banks activate");
+        let reachability = dual_stack_load_balancer_node_snapshot(&service, 1, vip_v4, vip_v6);
+        activate_load_balancer_snapshot(&mut synchronizer, &reachability, &state)
+            .expect("DSR VIP bank activates");
+
+        let ipv4 = ipv4_packet(6, client_v4, vip_v4, 40_000, 80);
+        let (action, output) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_eq!(output, ipv4, "DSR must preserve the complete VIP tuple");
+        let ipv6 = ipv6_packet(17, client_v6, vip_v6, 40_001, 53);
+        let (action, output) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv6);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_eq!(
+            output, ipv6,
+            "IPv6 DSR must preserve the complete VIP tuple"
+        );
+
+        let denied = ipv4_packet(6, denied_v4, vip_v4, 40_002, 80);
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &denied).0,
+            TC_ACT_SHOT,
+            "source-range admission remains before DSR selection"
+        );
+        let direct_reply = ipv4_packet(6, vip_v4, client_v4, 80, 40_000);
+        let (action, output) = run_tc(&mut ebpf, "unf_observe_egress", &direct_reply);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_eq!(output, direct_reply, "direct return bypasses reverse NAT");
+
+        let connections = synchronizer
+            .connections
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(connections.len(), 2, "DSR stores forward state only");
+        assert!(connections.iter().all(|(key, value)| {
+            key[38] == unf_ebpf_common::SERVICE_CONNECTION_ROLE_FORWARD
+                && u16::from_ne_bytes(value[98..100].try_into().unwrap())
+                    & unf_ebpf_common::SERVICE_CONNECTION_FLAG_DSR
+                    != 0
+                && value[90..92] == value[92..94]
+        }));
+
+        let mut events = Vec::new();
+        while let Some(item) = service_events.next() {
+            events.push(decode_service_event(&item).expect("DSR event is ABI-valid"));
+        }
+        let dsr = events
+            .iter()
+            .filter(|event| event.reason == unf_ebpf_common::SERVICE_EVENT_REASON_FORWARD_DSR)
+            .collect::<Vec<_>>();
+        assert_eq!(dsr.len(), 2);
+        assert!(dsr.iter().all(|event| {
+            event.reserved[0] == unf_ebpf_common::SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
+                && event.reserved[4] == unf_ebpf_common::SERVICE_EVENT_FORWARDING_DSR
+                && event.backend_id.get() != 0
+                && event.frontend_port == event.backend_port
+        }));
+        assert!(events.iter().any(|event| {
+            event.reason == unf_ebpf_common::SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
     fn privileged_load_balancer_local_packets_preserve_source_and_follow_placement() {
         const TC_ACT_SHOT: u32 = 2;
         const TC_ACT_PIPE: u32 = 3;
@@ -12520,6 +12722,8 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
+        load_dataplane_tail_programs(&mut ebpf)
+            .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
                 .program_mut(program_name)
@@ -13052,6 +13256,8 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
+        load_dataplane_tail_programs(&mut ebpf)
+            .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
                 .program_mut(program_name)
@@ -13332,6 +13538,8 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
+        load_dataplane_tail_programs(&mut ebpf)
+            .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
                 .program_mut(program_name)
@@ -13579,6 +13787,8 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
+        load_dataplane_tail_programs(&mut ebpf)
+            .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
                 .program_mut(program_name)
@@ -13885,6 +14095,8 @@ mod tests {
         let mut ebpf = EbpfLoader::new()
             .load_file(object)
             .expect("load verifier-approved eBPF object");
+        load_dataplane_tail_programs(&mut ebpf)
+            .expect("kernel verifier accepts dataplane tail programs");
         for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
             let program: &mut SchedClassifier = ebpf
                 .program_mut(program_name)
@@ -14597,6 +14809,7 @@ mod tests {
             (7_u16, ABI_V8_MAP_NAMES.as_slice()),
             (8_u16, ABI_V8_MAP_NAMES.as_slice()),
             (9_u16, PERSISTENT_MAP_NAMES.as_slice()),
+            (10_u16, PERSISTENT_MAP_NAMES.as_slice()),
             (CURRENT_BPF_ABI_VERSION, PERSISTENT_MAP_NAMES.as_slice()),
         ] {
             let abi = root.join(format!("v{version}"));
@@ -14823,11 +15036,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v10/links"),
+                Path::new("/sys/fs/bpf/unf/v11/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v10/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v11/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -14963,16 +15176,16 @@ mod tests {
 
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v10")).is_ok());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v11")).is_ok());
         assert_eq!(
-            configured_abi_version(Path::new("/sys/fs/bpf/unf/v10")),
-            Some(10)
+            configured_abi_version(Path::new("/sys/fs/bpf/unf/v11")),
+            Some(11)
         );
         let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
             error.to_string().contains(
-                "incompatible with persistent BPF-state ABI v10; expected a /v10 directory"
+                "incompatible with persistent BPF-state ABI v11; expected a /v11 directory"
             )
         );
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v4")).is_err());

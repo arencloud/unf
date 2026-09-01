@@ -33,6 +33,7 @@ pub const LOAD_BALANCER_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES: u16 = 1 << 1;
 pub const LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY: u16 = 1 << 2;
 pub const LOAD_BALANCER_FRONTEND_FLAG_MAGLEV: u16 = 1 << 3;
+pub const LOAD_BALANCER_FRONTEND_FLAG_DSR: u16 = 1 << 4;
 pub const NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG: u32 = 1 << 31;
 pub const LOAD_BALANCER_LOCAL_FRONTEND_INDEX_BASE: u32 = 3 << 30;
 pub const NODE_PORT_SNAT_PORT_BASE: u16 = 32_768;
@@ -47,8 +48,10 @@ pub const SERVICE_CONNECTION_ROLE_AFFINITY: u8 = 3;
 pub const SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER: u16 = 1 << 0;
 pub const SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL: u16 = 1 << 1;
 pub const SERVICE_CONNECTION_FLAG_MAGLEV: u16 = 1 << 2;
+pub const SERVICE_CONNECTION_FLAG_DSR: u16 = 1 << 3;
 pub const SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY: u16 = 1;
 pub const SERVICE_FRONTEND_FLAG_MAGLEV: u16 = 1 << 1;
+pub const SERVICE_FRONTEND_FLAG_DSR: u16 = 1 << 2;
 pub const SERVICE_SELECTION_ALGORITHM_STABLE_HASH: u8 = 1;
 pub const SERVICE_SELECTION_ALGORITHM_MAGLEV: u8 = 2;
 pub const SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS: u32 = 1;
@@ -77,6 +80,10 @@ pub const SERVICE_EVENT_REASON_PAIR_INSERT_FAILED: u8 = 9;
 pub const SERVICE_EVENT_REASON_REWRITE_FAILED: u8 = 10;
 pub const SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT: u8 = 11;
 pub const SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED: u8 = 12;
+pub const SERVICE_EVENT_REASON_FORWARD_DSR: u8 = 13;
+pub const SERVICE_EVENT_REASON_DSR_ROUTE_FAILED: u8 = 14;
+pub const SERVICE_EVENT_FORWARDING_NAT: u8 = 0;
+pub const SERVICE_EVENT_FORWARDING_DSR: u8 = 1;
 pub const POLICY_FLAG_HAS_POLICY: u16 = 1 << 0;
 pub const POLICY_FLAG_HAS_RULE: u16 = 1 << 1;
 pub const POLICY_FLAG_HAS_SHADOW: u16 = 1 << 2;
@@ -250,14 +257,33 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
         && state.flags
             & !(SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
                 | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
-                | SERVICE_CONNECTION_FLAG_MAGLEV)
+                | SERVICE_CONNECTION_FLAG_MAGLEV
+                | SERVICE_CONNECTION_FLAG_DSR)
             == 0
         && state.flags
             & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
             != (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
         && state.reserved[3] >> SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT
             <= SERVICE_AFFINITY_OUTCOME_RESELECTED
-        && if state.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
+        && if state.flags & SERVICE_CONNECTION_FLAG_DSR != 0 {
+            state.flags
+                & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
+                    | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
+                == 0
+                && state.frontend_port[0] == state.backend_port[0]
+                && state.frontend_port[1] == state.backend_port[1]
+                && address_is_zero(state.translated_source_address)
+                && state.reserved[0] == 0
+                && state.reserved[1] == 0
+                && matches!(
+                    state.reserved[2],
+                    SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
+                        | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+                )
+                && service_selection_tier_is_valid(
+                    state.reserved[3] & SERVICE_CONNECTION_SELECTION_TIER_MASK,
+                )
+        } else if state.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
             !address_is_zero(state.translated_source_address)
                 && u16::from_be_bytes([state.reserved[0], state.reserved[1]]) >= 32_768
                 && matches!(
@@ -299,7 +325,9 @@ pub const fn service_event_action_reason_is_valid(action: u8, reason: u8) -> boo
         (action, reason),
         (
             SERVICE_EVENT_ACTION_TRANSLATE,
-            SERVICE_EVENT_REASON_FORWARD_TRANSLATED | SERVICE_EVENT_REASON_REVERSE_TRANSLATED
+            SERVICE_EVENT_REASON_FORWARD_TRANSLATED
+                | SERVICE_EVENT_REASON_REVERSE_TRANSLATED
+                | SERVICE_EVENT_REASON_FORWARD_DSR
         ) | (
             SERVICE_EVENT_ACTION_DROP,
             SERVICE_EVENT_REASON_NO_BACKEND
@@ -311,6 +339,7 @@ pub const fn service_event_action_reason_is_valid(action: u8, reason: u8) -> boo
                 | SERVICE_EVENT_REASON_PAIR_INSERT_FAILED
                 | SERVICE_EVENT_REASON_REWRITE_FAILED
                 | SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED
+                | SERVICE_EVENT_REASON_DSR_ROUTE_FAILED
         ) | (
             SERVICE_EVENT_ACTION_EXPIRE,
             SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT
@@ -1262,6 +1291,13 @@ mod tests {
         invalid.flags = SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL;
         invalid.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL;
         assert!(service_connection_is_active(&invalid, 11));
+        invalid = tcp;
+        invalid.flags = SERVICE_CONNECTION_FLAG_DSR;
+        invalid.backend_port = invalid.frontend_port;
+        invalid.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER;
+        assert!(service_connection_is_active(&invalid, 11));
+        invalid.flags |= SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER;
+        assert!(!service_connection_is_active(&invalid, 11));
     }
 
     #[test]

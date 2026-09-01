@@ -550,11 +550,15 @@ matrix is maintained in the
   existing one-map packet path. The committed fixture records balance,
   disruption including table boundaries, memory, compile/update time, and map
   writes; `make service-maglev-dataplane-test` and ADR 0108.
-- DSR is opt-in and cannot bypass route/neighbor/MTU safety, backend VIP
-  ownership, policy, source ranges, health, reverse telemetry, or exact cleanup.
-- DSR, operations, Kind, and OpenShift remain ordered
-  independent milestones;
-  ADR 0102 and `make service-selection-boundary-test` define the first gate.
+- Explicit LoadBalancer DSR is verified under persistent ABI v11. Dual
+  annotations acknowledge backend VIP ownership; equal Service/backend tuples,
+  per-family capabilities, existing selection/policy/source-range/lifecycle
+  order, FIB route/neighbor/MTU proof, VIP-preserving L2 redirect, forward-only
+  state/direct return, fail-closed verifier-isolated tail stages, provenance,
+  recovery, and cleanup pass `make service-dsr-dataplane-test`; ADR 0109.
+- Operations, Kind, and OpenShift remain ordered independent milestones. Kind
+  and OpenShift must independently prove actual backend VIP ownership and
+  cross-worker return routing; workstation evidence is not transitive.
 - Weighted traffic splitting, latency/load feedback, cross-cluster selection,
   SCTP Services, fragments, generic NAT `RELATED`, and production scale remain
   separate gates.

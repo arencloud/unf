@@ -1341,6 +1341,7 @@ impl ServiceSnapshot {
                     &cluster_ip_addresses,
                     &mut load_balancer_address_owners,
                 )?;
+            validate_dsr_contract(service)?;
             total_load_balancer_frontends =
                 total_load_balancer_frontends.saturating_add(load_balancer_frontends);
             total_backend_references =
@@ -1421,6 +1422,40 @@ impl ServiceSnapshot {
         projected.schema_version = LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION;
         Ok(projected)
     }
+}
+
+fn validate_dsr_contract(service: &ServiceIr) -> Result<(), ServiceIrError> {
+    if service.forwarding_mode != ServiceForwardingMode::Dsr {
+        return Ok(());
+    }
+    let Some(load_balancer) = &service.load_balancer else {
+        return Err(ServiceIrError::InvalidServiceField {
+            service: service.id,
+            field: "forwarding mode",
+            reason: "DSR requires an explicit UNF LoadBalancer",
+        });
+    };
+    for frontend in &load_balancer.frontends {
+        for backend_id in &frontend.backend_ids {
+            let backend = service
+                .backends
+                .iter()
+                .find(|backend| backend.id == *backend_id)
+                .ok_or(ServiceIrError::InvalidLoadBalancerFrontend {
+                    service: service.id,
+                    frontend: frontend.clone(),
+                    reason: "DSR frontend references an unknown backend",
+                })?;
+            if backend.port != frontend.service_port || backend.protocol != frontend.protocol {
+                return Err(ServiceIrError::InvalidLoadBalancerFrontend {
+                    service: service.id,
+                    frontend: frontend.clone(),
+                    reason: "DSR requires every backend to listen on the unchanged Service port and protocol",
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn migrate_service_snapshot_schema(snapshot: &mut ServiceSnapshot) -> Result<(), ServiceIrError> {
@@ -2344,7 +2379,6 @@ pub fn compile_service_selection_dataplane(
     contract
         .verify(snapshot, &contract.node)
         .map_err(|error| ServiceDataplaneError::InvalidSelectionContract(error.to_string()))?;
-    reject_later_selection_behavior_service(contract)?;
     let normalized = snapshot.clone().validate_and_normalize()?;
     let mut compatible = normalized.clone();
     for service in &mut compatible.services {
@@ -2359,19 +2393,6 @@ pub fn compile_service_selection_dataplane(
     let mut state = compile_service_dataplane(&compatible, bank)?;
     apply_selection_contract_slots(&normalized, contract, &mut state)?;
     Ok(state)
-}
-
-fn reject_later_selection_behavior_service(
-    contract: &NetworkBehaviorContract,
-) -> Result<(), ServiceDataplaneError> {
-    if contract
-        .plans
-        .iter()
-        .any(|plan| plan.forwarding_mode != ServiceForwardingMode::Nat)
-    {
-        return Err(ServiceDataplaneError::UnsupportedSelectionBehavior);
-    }
-    Ok(())
 }
 
 fn selection_tier_code(tier: SelectionTier) -> u8 {
@@ -2802,11 +2823,10 @@ pub fn compile_node_port_selection_fabric_dataplane(
     contract
         .verify(&normalized, &contract.node)
         .map_err(|error| NodePortDataplaneError::InvalidSelectionContract(error.to_string()))?;
-    if contract
-        .plans
-        .iter()
-        .any(|plan| plan.forwarding_mode != ServiceForwardingMode::Nat)
-    {
+    if contract.plans.iter().any(|plan| {
+        plan.forwarding_mode != ServiceForwardingMode::Nat
+            && !matches!(plan.key.frontend, SelectionFrontend::LoadBalancer { .. })
+    }) {
         return Err(NodePortDataplaneError::UnsupportedSelectionBehavior.into());
     }
     let service_state = compile_service_selection_dataplane(&normalized, contract, service_bank)?;
@@ -3684,6 +3704,8 @@ mod tests {
         source.traffic_distribution = ServiceTrafficDistribution::PreferSameNode;
         source.selection_algorithm = ServiceSelectionAlgorithm::Maglev;
         source.forwarding_mode = ServiceForwardingMode::Dsr;
+        source.external_traffic_policy = ServiceTrafficPolicy::Local;
+        source.load_balancer = Some(load_balancer_source());
         let snapshot = compile_service_snapshot(11, Revision::new(7), vec![source], Vec::new())
             .expect("advanced selection intent compiles");
         let service = &snapshot.services[0];
@@ -3722,6 +3744,53 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn dsr_requires_load_balancer_and_unchanged_backend_ports() {
+        let mut without_load_balancer = source_service();
+        without_load_balancer.forwarding_mode = ServiceForwardingMode::Dsr;
+        assert!(matches!(
+            compile_service_snapshot(
+                11,
+                Revision::new(8),
+                vec![without_load_balancer],
+                Vec::new()
+            ),
+            Err(ServiceCompileError::InvalidIr(
+                ServiceIrError::InvalidServiceField {
+                    field: "forwarding mode",
+                    ..
+                }
+            ))
+        ));
+
+        let mut source = source_service();
+        source.external_traffic_policy = ServiceTrafficPolicy::Local;
+        source.forwarding_mode = ServiceForwardingMode::Dsr;
+        source.load_balancer = Some(load_balancer_source());
+        let mismatched = source_slice(AddressFamily::Ipv4, "api-v4", "10.244.0.20");
+        assert!(matches!(
+            compile_service_snapshot(11, Revision::new(9), vec![source.clone()], vec![mismatched]),
+            Err(ServiceCompileError::InvalidIr(
+                ServiceIrError::InvalidLoadBalancerFrontend { .. }
+            ))
+        ));
+
+        let mut exact = source_slice(AddressFamily::Ipv4, "api-v4", "10.244.0.20");
+        for port in &mut exact.endpoints[0].ports {
+            port.port = Some(if port.protocol == Protocol::Tcp {
+                80
+            } else {
+                53
+            });
+        }
+        let admitted = compile_service_snapshot(11, Revision::new(10), vec![source], vec![exact])
+            .expect("DSR admits exact unchanged Service/backend ports");
+        assert_eq!(
+            admitted.services[0].forwarding_mode,
+            ServiceForwardingMode::Dsr
+        );
     }
 
     #[test]

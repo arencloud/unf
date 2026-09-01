@@ -299,8 +299,9 @@ from the currently eligible set; existing connection persistence remains a
 separate, stronger per-flow contract. Selection tables are compiled in
 userspace and consumed through bounded eBPF lookups. Maglev has earned bounded
 adoption through deterministic disruption, balance, memory, update-cost, and
-packet-cost measurements, while DSR remains opt-in until return routing, MTU, policy,
-source-range, telemetry, and cleanup invariants pass. The
+packet-cost measurements. DSR is now an explicit UNF LoadBalancer-only mode
+whose route, neighbor, MTU, backend-VIP ownership, policy, source-range,
+telemetry, recovery, and cleanup invariants pass a separate real-kernel gate. The
 [Phase 7 service-selection plan](docs/development/phase7-service-selection-plan.md)
 and ADR 0102 define the ordered implementation and qualification gates.
 Milestone 7.2 is verified: service schema v4 carries normalized internal policy,
@@ -350,7 +351,24 @@ advances persistent ownership to ABI v10. Enable it per Service with
 `network.unf.io/service-selection-algorithm: maglev`; the committed fixture,
 `make service-maglev-dataplane-test`, and ADR 0108 record the evidence.
 StableHash/NAT remain absence defaults for rolling compatibility. DSR remains
-gated by milestone 7.7.
+opt-in: set both annotations below only after every admitted backend is prepared
+to own every advertised VIP and listen on the unchanged Service port.
+
+```yaml
+network.unf.io/service-forwarding-mode: dsr
+network.unf.io/dsr-backend-vip-ownership: acknowledged
+```
+
+Milestone 7.7 is verified. The controller rejects DSR on non-LoadBalancer
+Services or changed backend ports, per-Node contracts require dual-stack DSR
+capabilities, and ClusterIP/NodePort frontends for the same Service stay NAT.
+The eBPF path retains the VIP tuple, applies the existing selection, lifecycle,
+source-range, and policy contracts, proves route/neighbor/MTU through a backend
+FIB lookup, rewrites only Ethernet addresses, and fails closed without per-flow
+NAT fallback. Forward-only connection state and a direct-return packet are
+real-kernel tested under persistent ABI v11. `make service-dsr-dataplane-test`
+and ADR 0109 record the workstation boundary; actual cross-worker backend-VIP
+ownership and return routing remain Phase 7.9/7.10 platform gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -561,9 +579,9 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-In progress in Phase 7: opt-in DSR, operations, and
+In progress in Phase 7: operations and
 independent Kind/OpenShift qualification for the verified locality, topology,
-ClientIP affinity, and graceful-draining dataplanes. Not yet implemented:
+ClientIP affinity, graceful-draining, Maglev, and DSR dataplanes. Not yet implemented:
 production-scale routing/CNI qualification;
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
 multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production

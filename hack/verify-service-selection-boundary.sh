@@ -17,6 +17,7 @@ required_files=(
     docs/adr/0106-enforce-locality-and-topology-from-verified-contracts.md
     docs/adr/0107-enforce-client-ip-affinity-and-graceful-draining.md
     docs/adr/0108-adopt-bounded-measured-maglev-selection.md
+    docs/adr/0109-enforce-explicit-loadbalancer-dsr.md
     docs/benchmarks/phase7-maglev-measurement.md
 )
 
@@ -88,6 +89,12 @@ require_text docs/development/phase7-service-selection-plan.md \
 require_text docs/project-status.md \
     '| Measured Maglev selection | **Verified** |' \
     "the work breakdown must identify milestone 7.6 as verified"
+require_text docs/development/phase7-service-selection-plan.md \
+    '| 7.7 | Opt-in DSR dataplane | **Verified** |' \
+    "milestone 7.7 must be verified"
+require_text docs/project-status.md \
+    '| Opt-in DSR dataplane | **Verified** |' \
+    "the work breakdown must identify milestone 7.7 as verified"
 require_text Makefile \
     'service-selection-contract-test:' \
     "the build must expose an isolated Network Behavior Contract gate"
@@ -103,6 +110,9 @@ require_text Makefile \
 require_text Makefile \
     'service-maglev-dataplane-test:' \
     "the build must expose an isolated measured Maglev gate"
+require_text Makefile \
+    'service-dsr-dataplane-test:' \
+    "the build must expose an isolated explicit DSR gate"
 require_text docs/adr/0107-enforce-client-ip-affinity-and-graceful-draining.md \
     'Existing validated connections win before affinity lookup.' \
     "per-flow connection state must precede affinity"
@@ -112,6 +122,12 @@ require_text docs/adr/0108-adopt-bounded-measured-maglev-selection.md \
 require_text docs/benchmarks/phase7-maglev-measurement.md \
     'network.unf.io/service-selection-algorithm: maglev' \
     "Maglev admission must be explicit and documented"
+require_text docs/adr/0109-enforce-explicit-loadbalancer-dsr.md \
+    'network.unf.io/dsr-backend-vip-ownership: acknowledged' \
+    "DSR backend VIP ownership must be explicitly acknowledged"
+require_text docs/adr/0109-enforce-explicit-loadbalancer-dsr.md \
+    'it never falls back per flow' \
+    "explicit DSR must not silently fall back to NAT"
 require_text docs/adr/0104-verify-network-behavior-contracts-before-activation.md \
     'It does **not** mathematically prove the' \
     "the contract must not overclaim formal verification"

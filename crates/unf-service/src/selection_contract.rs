@@ -508,12 +508,12 @@ impl NetworkBehaviorContract {
             .map(|key| {
                 let resolved = resolve_frontend(&snapshot, &key)?;
                 Ok(ServiceSelectionPlan {
+                    forwarding_mode: frontend_forwarding_mode(resolved.service, &key.frontend),
                     key,
                     traffic_policy: resolved.traffic_policy,
                     traffic_distribution: resolved.service.traffic_distribution,
                     session_affinity: resolved.service.session_affinity,
                     selection_algorithm: resolved.service.selection_algorithm,
-                    forwarding_mode: resolved.service.forwarding_mode,
                     tiers: expected_tiers(&resolved, &node),
                 })
             })
@@ -874,7 +874,7 @@ fn validate_intent(
             "selection algorithm",
         ),
         (
-            plan.forwarding_mode == service.forwarding_mode,
+            plan.forwarding_mode == frontend_forwarding_mode(service, &plan.key.frontend),
             "forwarding mode",
         ),
     ];
@@ -885,6 +885,20 @@ fn validate_intent(
         });
     }
     Ok(())
+}
+
+/// DSR is meaningful only for a stable `LoadBalancer` VIP. `ClusterIP` and
+/// `NodePort` retain the qualified NAT contract even when the same Service opts
+/// its `LoadBalancer` frontend into direct return.
+const fn frontend_forwarding_mode(
+    service: &ServiceIr,
+    frontend: &SelectionFrontend,
+) -> ServiceForwardingMode {
+    if matches!(frontend, SelectionFrontend::LoadBalancer { .. }) {
+        service.forwarding_mode
+    } else {
+        ServiceForwardingMode::Nat
+    }
 }
 
 fn validate_capabilities(

@@ -127,6 +127,8 @@ const LOAD_BALANCER_STORE_DATA_LIMIT: usize = 900_000;
 const LOAD_BALANCER_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const PRIMARY_CNI_NODE_LABEL: &str = "network.unf.io/primary-cni";
 const SERVICE_SELECTION_ALGORITHM_ANNOTATION: &str = "network.unf.io/service-selection-algorithm";
+const SERVICE_FORWARDING_MODE_ANNOTATION: &str = "network.unf.io/service-forwarding-mode";
+const DSR_BACKEND_VIP_OWNERSHIP_ANNOTATION: &str = "network.unf.io/dsr-backend-vip-ownership";
 const PRIMARY_CNI_NODE_LABEL_VALUE: &str = "enabled";
 
 #[derive(Debug, Parser)]
@@ -3161,6 +3163,12 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
         service_load_balancer_source(&namespace, &name, &service_type, spec, &cluster_ips)?;
     let selection_algorithm =
         service_selection_algorithm(&namespace, &name, service.metadata.annotations.as_ref())?;
+    let forwarding_mode = service_forwarding_mode(
+        &namespace,
+        &name,
+        load_balancer.is_some(),
+        service.metadata.annotations.as_ref(),
+    )?;
     let compiler_source = ServiceSource {
         namespace: namespace.clone(),
         name: name.clone(),
@@ -3170,7 +3178,7 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
         session_affinity,
         traffic_distribution,
         selection_algorithm,
-        forwarding_mode: ServiceForwardingMode::Nat,
+        forwarding_mode,
         load_balancer,
         ports: compiler_ports,
     };
@@ -3382,6 +3390,37 @@ fn service_selection_algorithm(
         }
         Some(value) => Err(anyhow!(
             "Service {namespace}/{name} has unsupported {SERVICE_SELECTION_ALGORITHM_ANNOTATION} annotation {value:?}"
+        )),
+    }
+}
+
+fn service_forwarding_mode(
+    namespace: &str,
+    name: &str,
+    is_unf_load_balancer: bool,
+    annotations: Option<&BTreeMap<String, String>>,
+) -> Result<ServiceForwardingMode> {
+    let mode = annotations.and_then(|values| values.get(SERVICE_FORWARDING_MODE_ANNOTATION));
+    match mode {
+        None => Ok(ServiceForwardingMode::Nat),
+        Some(value) if value == "nat" => Ok(ServiceForwardingMode::Nat),
+        Some(value) if value == "dsr" => {
+            if !is_unf_load_balancer {
+                return Err(anyhow!(
+                    "Service {namespace}/{name} can use {SERVICE_FORWARDING_MODE_ANNOTATION}=dsr only with the explicit UNF LoadBalancer class"
+                ));
+            }
+            let ownership =
+                annotations.and_then(|values| values.get(DSR_BACKEND_VIP_OWNERSHIP_ANNOTATION));
+            if ownership.map(String::as_str) != Some("acknowledged") {
+                return Err(anyhow!(
+                    "Service {namespace}/{name} DSR requires {DSR_BACKEND_VIP_OWNERSHIP_ANNOTATION}=acknowledged; the operator is asserting that every admitted backend owns every advertised VIP"
+                ));
+            }
+            Ok(ServiceForwardingMode::Dsr)
+        }
+        Some(value) => Err(anyhow!(
+            "Service {namespace}/{name} has unsupported {SERVICE_FORWARDING_MODE_ANNOTATION} annotation {value:?}"
         )),
     }
 }
@@ -7605,6 +7644,30 @@ mod tests {
             service_selection_algorithm("apps", "api", Some(&maglev)).unwrap(),
             ServiceSelectionAlgorithm::Maglev
         );
+        assert_eq!(
+            service_forwarding_mode("apps", "api", true, None).unwrap(),
+            ServiceForwardingMode::Nat
+        );
+        let dsr = BTreeMap::from([
+            (
+                SERVICE_FORWARDING_MODE_ANNOTATION.to_owned(),
+                "dsr".to_owned(),
+            ),
+            (
+                DSR_BACKEND_VIP_OWNERSHIP_ANNOTATION.to_owned(),
+                "acknowledged".to_owned(),
+            ),
+        ]);
+        assert_eq!(
+            service_forwarding_mode("apps", "api", true, Some(&dsr)).unwrap(),
+            ServiceForwardingMode::Dsr
+        );
+        assert!(service_forwarding_mode("apps", "api", false, Some(&dsr)).is_err());
+        let missing_ownership = BTreeMap::from([(
+            SERVICE_FORWARDING_MODE_ANNOTATION.to_owned(),
+            "dsr".to_owned(),
+        )]);
+        assert!(service_forwarding_mode("apps", "api", true, Some(&missing_ownership)).is_err());
         let mut annotated = service();
         annotated.metadata.annotations = Some(maglev);
         assert_eq!(

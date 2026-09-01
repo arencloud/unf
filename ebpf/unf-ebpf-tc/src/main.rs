@@ -9,7 +9,7 @@ use aya_ebpf::bindings::{
 use aya_ebpf::helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh};
 use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
-use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
+use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramArray, RingBuf};
 use aya_ebpf::programs::TcContext;
 use unf_common::{BackendId, IdentityId, PolicyId, PolicyReason, RuleId, ServiceId, Verdict};
 use unf_ebpf_common::{
@@ -33,7 +33,8 @@ use unf_ebpf_common::{
     SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS, SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS,
     SERVICE_AFFINITY_OUTCOME_CREATED, SERVICE_AFFINITY_OUTCOME_NONE,
     SERVICE_AFFINITY_OUTCOME_RESELECTED, SERVICE_AFFINITY_OUTCOME_REUSED,
-    SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT, SERVICE_CONNECTION_FLAG_MAGLEV,
+    SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT, SERVICE_CONNECTION_FLAG_DSR,
+    SERVICE_CONNECTION_FLAG_MAGLEV,
     SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER, SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL,
     SERVICE_CONNECTION_ROLE_AFFINITY,
     SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE,
@@ -42,7 +43,9 @@ use unf_ebpf_common::{
     SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
     SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
     SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL,
-    SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT, SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
+    SERVICE_EVENT_FORWARDING_DSR, SERVICE_EVENT_FORWARDING_NAT,
+    SERVICE_EVENT_REASON_DSR_ROUTE_FAILED, SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT,
+    SERVICE_EVENT_REASON_FORWARD_DSR, SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
     SERVICE_EVENT_REASON_INVALID_BACKEND, SERVICE_EVENT_REASON_INVALID_FRONTEND,
     SERVICE_EVENT_REASON_INVALID_SLOT, SERVICE_EVENT_REASON_MISSING_BACKEND,
     SERVICE_EVENT_REASON_MISSING_SLOT, SERVICE_EVENT_REASON_NO_BACKEND,
@@ -77,6 +80,14 @@ const TCP_CHECKSUM_OFFSET: usize = 16;
 const UDP_CHECKSUM_OFFSET: usize = 6;
 const ADDRESS_FAMILY_INET: u8 = 2;
 const ADDRESS_FAMILY_INET6: u8 = 10;
+const SERVICE_POLICY_TAIL_V4: u32 = 0;
+const SERVICE_POLICY_TAIL_V6: u32 = 1;
+const SERVICE_DSR_TAIL_V4: u32 = 2;
+const SERVICE_DSR_TAIL_V6: u32 = 3;
+const SERVICE_POLICY_DISPATCH_V4: i32 = -1_001;
+const SERVICE_POLICY_DISPATCH_V6: i32 = -1_002;
+const SERVICE_POST_LOOKUP_TRANSLATED: u8 = 1 << 0;
+const SERVICE_POST_LOOKUP_REROUTE_HOST: u8 = 1 << 1;
 
 #[map]
 static FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -267,13 +278,140 @@ static LOAD_BALANCER_CLUSTER_SOURCE_SCRATCH: PerCpuArray<[u8; 16]> =
 #[map]
 static FLOW_OBSERVATION_SCRATCH: PerCpuArray<FlowObservation> = PerCpuArray::with_max_entries(1, 0);
 
+#[map]
+static SERVICE_POST_LOOKUP_SCRATCH: PerCpuArray<u8> = PerCpuArray::with_max_entries(1, 0);
+
+/// Runtime-only jump table isolates policy evaluation and DSR FIB resolution
+/// from the bounded main classifiers. The agent loads all four targets before
+/// attaching either hook.
+#[map]
+static SERVICE_DATAPLANE_TAIL_CALLS: ProgramArray = ProgramArray::with_max_entries(4, 0);
+
 #[classifier]
 pub fn unf_observe_ingress(ctx: TcContext) -> i32 {
-    observe(&ctx, Direction::Ingress, true)
+    let action = observe(&ctx, Direction::Ingress, true);
+    if action == SERVICE_POLICY_DISPATCH_V4 {
+        // SAFETY: index 0 is a TC classifier over this exact context and the
+        // agent installs it before attaching the main hook.
+        #[allow(unsafe_code)]
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_POLICY_TAIL_V4) };
+        return TC_ACT_SHOT;
+    }
+    if action == SERVICE_POLICY_DISPATCH_V6 {
+        // SAFETY: index 1 is a TC classifier over this exact context and the
+        // agent installs it before attaching the main hook.
+        #[allow(unsafe_code)]
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_POLICY_TAIL_V6) };
+        return TC_ACT_SHOT;
+    }
+    action
 }
 #[classifier]
 pub fn unf_observe_egress(ctx: TcContext) -> i32 {
-    observe(&ctx, Direction::Egress, false)
+    let action = observe(&ctx, Direction::Egress, false);
+    if action == SERVICE_POLICY_DISPATCH_V4 {
+        // SAFETY: index 0 is a TC classifier over this exact context and the
+        // agent installs it before attaching the main hook.
+        #[allow(unsafe_code)]
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_POLICY_TAIL_V4) };
+        return TC_ACT_SHOT;
+    }
+    if action == SERVICE_POLICY_DISPATCH_V6 {
+        // SAFETY: index 1 is a TC classifier over this exact context and the
+        // agent installs it before attaching the main hook.
+        #[allow(unsafe_code)]
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_POLICY_TAIL_V6) };
+        return TC_ACT_SHOT;
+    }
+    action
+}
+
+#[classifier]
+pub fn unf_policy_v4(ctx: TcContext) -> i32 {
+    let Some(observation_ptr) = FLOW_OBSERVATION_SCRATCH.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: the originating classifier initialized this CPU's scratch slot
+    // immediately before its non-returning tail call.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &mut *observation_ptr };
+    let action = emit_flow(observation);
+    if action == TC_ACT_SHOT {
+        return action;
+    }
+    let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
+        return TC_ACT_SHOT;
+    };
+    if post_lookup & SERVICE_POST_LOOKUP_TRANSLATED != 0 {
+        seed_service_frontend_policy_connection(observation.tcp_flags);
+        if service_connection_is_dsr() {
+            // SAFETY: index 2 is a TC classifier over this exact context and
+            // the agent installs it before attaching the main hook.
+            #[allow(unsafe_code)]
+            unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_DSR_TAIL_V4) };
+            return dsr_route_failed();
+        }
+        if !observation.enforce && post_lookup & SERVICE_POST_LOOKUP_REROUTE_HOST != 0 {
+            return reroute_host_service_v4(&ctx, observation, false);
+        }
+    }
+    action
+}
+
+#[classifier]
+pub fn unf_policy_v6(ctx: TcContext) -> i32 {
+    let Some(observation_ptr) = FLOW_OBSERVATION_SCRATCH.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: the originating classifier initialized this CPU's scratch slot
+    // immediately before its non-returning tail call.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &mut *observation_ptr };
+    let action = emit_flow(observation);
+    if action == TC_ACT_SHOT {
+        return action;
+    }
+    let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
+        return TC_ACT_SHOT;
+    };
+    if post_lookup & SERVICE_POST_LOOKUP_TRANSLATED != 0 {
+        seed_service_frontend_policy_connection(observation.tcp_flags);
+        if service_connection_is_dsr() {
+            // SAFETY: index 3 is a TC classifier over this exact context and
+            // the agent installs it before attaching the main hook.
+            #[allow(unsafe_code)]
+            unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_DSR_TAIL_V6) };
+            return dsr_route_failed();
+        }
+        if !observation.enforce && post_lookup & SERVICE_POST_LOOKUP_REROUTE_HOST != 0 {
+            return reroute_host_service_v6(&ctx, observation, false);
+        }
+    }
+    action
+}
+
+#[classifier]
+pub fn unf_dsr_v4(ctx: TcContext) -> i32 {
+    let Some(observation_ptr) = FLOW_OBSERVATION_SCRATCH.get_ptr(0) else {
+        return dsr_route_failed();
+    };
+    // SAFETY: the originating classifier initialized this CPU's scratch slot
+    // immediately before its non-returning tail call.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &*observation_ptr };
+    reroute_host_service_v4(&ctx, observation, true)
+}
+
+#[classifier]
+pub fn unf_dsr_v6(ctx: TcContext) -> i32 {
+    let Some(observation_ptr) = FLOW_OBSERVATION_SCRATCH.get_ptr(0) else {
+        return dsr_route_failed();
+    };
+    // SAFETY: the originating classifier initialized this CPU's scratch slot
+    // immediately before its non-returning tail call.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &*observation_ptr };
+    reroute_host_service_v6(&ctx, observation, true)
 }
 
 #[inline(always)]
@@ -406,28 +544,38 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                         translation.address[2],
                         translation.address[3],
                     ];
-                    if service_connection_translation(true).is_some_and(|source_translation| {
-                        !rewrite_ipv4(
-                            ctx,
-                            transport_offset,
-                            protocol,
-                            &source_translation,
-                            true,
-                        )
-                    }) || !rewrite_ipv4(ctx, transport_offset, protocol, &translation, false)
-                    {
+                    if service_connection_is_dsr() {
                         emit_service_connection_event(
-                            SERVICE_EVENT_ACTION_DROP,
-                            SERVICE_EVENT_REASON_REWRITE_FAILED,
+                            SERVICE_EVENT_ACTION_TRANSLATE,
+                            SERVICE_EVENT_REASON_FORWARD_DSR,
                             now_ns,
                         );
-                        return TC_ACT_SHOT;
+                    } else {
+                        if service_connection_translation(true).is_some_and(
+                            |source_translation| {
+                                !rewrite_ipv4(
+                                    ctx,
+                                    transport_offset,
+                                    protocol,
+                                    &source_translation,
+                                    true,
+                                )
+                            },
+                        ) || !rewrite_ipv4(ctx, transport_offset, protocol, &translation, false)
+                        {
+                            emit_service_connection_event(
+                                SERVICE_EVENT_ACTION_DROP,
+                                SERVICE_EVENT_REASON_REWRITE_FAILED,
+                                now_ns,
+                            );
+                            return TC_ACT_SHOT;
+                        }
+                        emit_service_connection_event(
+                            SERVICE_EVENT_ACTION_TRANSLATE,
+                            SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
+                            now_ns,
+                        );
                     }
-                    emit_service_connection_event(
-                        SERVICE_EVENT_ACTION_TRANSLATE,
-                        SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
-                        now_ns,
-                    );
                     destination_ipv4 = backend_address;
                     destination_port = translation.port;
                 }
@@ -492,30 +640,39 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                             translation.address[2],
                             translation.address[3],
                         ];
-                        if service_connection_translation(true).is_some_and(
-                            |source_translation| {
-                                !rewrite_ipv4(
-                                    ctx,
-                                    transport_offset,
-                                    protocol,
-                                    &source_translation,
-                                    true,
-                                )
-                            },
-                        ) || !rewrite_ipv4(ctx, transport_offset, protocol, &translation, false)
-                        {
+                        if service_connection_is_dsr() {
+                            reroute_host_service = false;
                             emit_service_connection_event(
-                                SERVICE_EVENT_ACTION_DROP,
-                                SERVICE_EVENT_REASON_REWRITE_FAILED,
+                                SERVICE_EVENT_ACTION_TRANSLATE,
+                                SERVICE_EVENT_REASON_FORWARD_DSR,
                                 now_ns,
                             );
-                            return TC_ACT_SHOT;
+                        } else {
+                            if service_connection_translation(true).is_some_and(
+                                |source_translation| {
+                                    !rewrite_ipv4(
+                                        ctx,
+                                        transport_offset,
+                                        protocol,
+                                        &source_translation,
+                                        true,
+                                    )
+                                },
+                            ) || !rewrite_ipv4(ctx, transport_offset, protocol, &translation, false)
+                            {
+                                emit_service_connection_event(
+                                    SERVICE_EVENT_ACTION_DROP,
+                                    SERVICE_EVENT_REASON_REWRITE_FAILED,
+                                    now_ns,
+                                );
+                                return TC_ACT_SHOT;
+                            }
+                            emit_service_connection_event(
+                                SERVICE_EVENT_ACTION_TRANSLATE,
+                                SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
+                                now_ns,
+                            );
                         }
-                        emit_service_connection_event(
-                            SERVICE_EVENT_ACTION_TRANSLATE,
-                            SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
-                            now_ns,
-                        );
                         destination_ipv4 = backend_address;
                         destination_port = translation.port;
                     }
@@ -544,17 +701,22 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     observation.destination_identity = lookup_identity_v4(destination_ipv4, identity_config);
     observation.tcp_flags = tcp_flags;
     observation.enforce = enforce;
-    let action = emit_flow(observation);
-    if action == TC_ACT_SHOT {
-        return action;
-    }
-    if service_forward_translated {
-        seed_service_frontend_policy_connection(tcp_flags);
-        if !enforce && reroute_host_service {
-            return reroute_host_service_v4(ctx, observation);
-        }
-    }
-    action
+    let Some(post_lookup_ptr) = SERVICE_POST_LOOKUP_SCRATCH.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    let post_lookup = (if service_forward_translated {
+        SERVICE_POST_LOOKUP_TRANSLATED
+    } else {
+        0
+    }) | (if reroute_host_service {
+        SERVICE_POST_LOOKUP_REROUTE_HOST
+    } else {
+        0
+    });
+    // SAFETY: this CPU owns the post-lookup scratch slot for the invocation.
+    #[allow(unsafe_code)]
+    unsafe { *post_lookup_ptr = post_lookup };
+    SERVICE_POLICY_DISPATCH_V4
 }
 
 #[inline(never)]
@@ -655,28 +817,38 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                 ServiceLookup::Drop => return TC_ACT_SHOT,
                 ServiceLookup::Translation(translation) => {
                     service_forward_translated = true;
-                    if service_connection_translation(true).is_some_and(|source_translation| {
-                        !rewrite_ipv6(
-                            ctx,
-                            transport_offset,
-                            protocol,
-                            &source_translation,
-                            true,
-                        )
-                    }) || !rewrite_ipv6(ctx, transport_offset, protocol, &translation, false)
-                    {
+                    if service_connection_is_dsr() {
                         emit_service_connection_event(
-                            SERVICE_EVENT_ACTION_DROP,
-                            SERVICE_EVENT_REASON_REWRITE_FAILED,
+                            SERVICE_EVENT_ACTION_TRANSLATE,
+                            SERVICE_EVENT_REASON_FORWARD_DSR,
                             now_ns,
                         );
-                        return TC_ACT_SHOT;
+                    } else {
+                        if service_connection_translation(true).is_some_and(
+                            |source_translation| {
+                                !rewrite_ipv6(
+                                    ctx,
+                                    transport_offset,
+                                    protocol,
+                                    &source_translation,
+                                    true,
+                                )
+                            },
+                        ) || !rewrite_ipv6(ctx, transport_offset, protocol, &translation, false)
+                        {
+                            emit_service_connection_event(
+                                SERVICE_EVENT_ACTION_DROP,
+                                SERVICE_EVENT_REASON_REWRITE_FAILED,
+                                now_ns,
+                            );
+                            return TC_ACT_SHOT;
+                        }
+                        emit_service_connection_event(
+                            SERVICE_EVENT_ACTION_TRANSLATE,
+                            SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
+                            now_ns,
+                        );
                     }
-                    emit_service_connection_event(
-                        SERVICE_EVENT_ACTION_TRANSLATE,
-                        SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
-                        now_ns,
-                    );
                     observation.destination_address = translation.address;
                     observation.destination_port = translation.port;
                 }
@@ -731,30 +903,39 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                     ServiceLookup::Translation(translation) => {
                         service_forward_translated = true;
                         reroute_host_service = true;
-                        if service_connection_translation(true).is_some_and(
-                            |source_translation| {
-                                !rewrite_ipv6(
-                                    ctx,
-                                    transport_offset,
-                                    protocol,
-                                    &source_translation,
-                                    true,
-                                )
-                            },
-                        ) || !rewrite_ipv6(ctx, transport_offset, protocol, &translation, false)
-                        {
+                        if service_connection_is_dsr() {
+                            reroute_host_service = false;
                             emit_service_connection_event(
-                                SERVICE_EVENT_ACTION_DROP,
-                                SERVICE_EVENT_REASON_REWRITE_FAILED,
+                                SERVICE_EVENT_ACTION_TRANSLATE,
+                                SERVICE_EVENT_REASON_FORWARD_DSR,
                                 now_ns,
                             );
-                            return TC_ACT_SHOT;
+                        } else {
+                            if service_connection_translation(true).is_some_and(
+                                |source_translation| {
+                                    !rewrite_ipv6(
+                                        ctx,
+                                        transport_offset,
+                                        protocol,
+                                        &source_translation,
+                                        true,
+                                    )
+                                },
+                            ) || !rewrite_ipv6(ctx, transport_offset, protocol, &translation, false)
+                            {
+                                emit_service_connection_event(
+                                    SERVICE_EVENT_ACTION_DROP,
+                                    SERVICE_EVENT_REASON_REWRITE_FAILED,
+                                    now_ns,
+                                );
+                                return TC_ACT_SHOT;
+                            }
+                            emit_service_connection_event(
+                                SERVICE_EVENT_ACTION_TRANSLATE,
+                                SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
+                                now_ns,
+                            );
                         }
-                        emit_service_connection_event(
-                            SERVICE_EVENT_ACTION_TRANSLATE,
-                            SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
-                            now_ns,
-                        );
                         observation.destination_address = translation.address;
                         observation.destination_port = translation.port;
                     }
@@ -771,17 +952,22 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     observation.destination_identity =
         lookup_identity_v6(observation.destination_address, identity_config);
     observation.enforce = enforce;
-    let action = emit_flow(observation);
-    if action == TC_ACT_SHOT {
-        return action;
-    }
-    if service_forward_translated {
-        seed_service_frontend_policy_connection(observation.tcp_flags);
-        if !enforce && reroute_host_service {
-            return reroute_host_service_v6(ctx, observation);
-        }
-    }
-    action
+    let Some(post_lookup_ptr) = SERVICE_POST_LOOKUP_SCRATCH.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    let post_lookup = (if service_forward_translated {
+        SERVICE_POST_LOOKUP_TRANSLATED
+    } else {
+        0
+    }) | (if reroute_host_service {
+        SERVICE_POST_LOOKUP_REROUTE_HOST
+    } else {
+        0
+    });
+    // SAFETY: this CPU owns the post-lookup scratch slot for the invocation.
+    #[allow(unsafe_code)]
+    unsafe { *post_lookup_ptr = post_lookup };
+    SERVICE_POLICY_DISPATCH_V6
 }
 
 #[inline(always)]
@@ -1010,6 +1196,17 @@ fn service_connection_translation(forward: bool) -> Option<ServiceTranslation> {
 }
 
 #[inline(always)]
+fn service_connection_is_dsr() -> bool {
+    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
+        return false;
+    };
+    // SAFETY: an active Service lookup initialized this CPU's scratch value.
+    #[allow(unsafe_code)]
+    let value = unsafe { &*value_ptr };
+    value.flags & SERVICE_CONNECTION_FLAG_DSR != 0
+}
+
+#[inline(always)]
 fn validate_load_balancer_frontend(
     forward_key: &ServiceConnectionKey,
     frontend: LoadBalancerFrontendValue,
@@ -1030,7 +1227,8 @@ fn validate_load_balancer_frontend(
             & !(unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL
                 | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES
                 | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY
-                | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_MAGLEV)
+                | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_MAGLEV
+                | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_DSR)
             != 0
         || !valid_selection_reserved(
             frontend.reserved,
@@ -1066,6 +1264,10 @@ fn validate_load_balancer_frontend(
             0
         }) | (if frontend.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_MAGLEV != 0 {
             SERVICE_FRONTEND_FLAG_MAGLEV
+        } else {
+            0
+        }) | (if frontend.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_DSR != 0 {
+            unf_ebpf_common::SERVICE_FRONTEND_FLAG_DSR
         } else {
             0
         }),
@@ -1233,6 +1435,8 @@ const fn node_port_event_frontend_kind(flags: u16) -> u8 {
 const fn connection_event_frontend_kind(value: &ServiceConnectionValue) -> u8 {
     if value.reserved[2] == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL {
         SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+    } else if value.reserved[2] == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER {
+        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
     } else if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL != 0 {
         SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL
     } else if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
@@ -1311,6 +1515,11 @@ fn emit_service_connection_event(action: u8, reason: u8, timestamp_ns: u64) {
         SERVICE_SELECTION_ALGORITHM_MAGLEV
     } else {
         SERVICE_SELECTION_ALGORITHM_STABLE_HASH
+    };
+    event.reserved[4] = if value.flags & SERVICE_CONNECTION_FLAG_DSR != 0 {
+        SERVICE_EVENT_FORWARDING_DSR
+    } else {
+        SERVICE_EVENT_FORWARDING_NAT
     };
     let _ = SERVICE_EVENTS.output::<ServiceEvent>(&*event, 0);
 }
@@ -1412,7 +1621,9 @@ fn service_peer_key(
 #[inline(always)]
 fn remove_service_pair(value: &ServiceConnectionValue, current: &ServiceConnectionKey) {
     let _ = SERVICE_CONNECTIONS.remove(current);
-    let _ = SERVICE_CONNECTIONS.remove(&service_peer_key(value, current));
+    if value.flags & SERVICE_CONNECTION_FLAG_DSR == 0 {
+        let _ = SERVICE_CONNECTIONS.remove(&service_peer_key(value, current));
+    }
 }
 
 #[inline(always)]
@@ -1420,6 +1631,10 @@ fn store_service_pair(
     value: &ServiceConnectionValue,
     current: &ServiceConnectionKey,
 ) -> bool {
+    if value.flags & SERVICE_CONNECTION_FLAG_DSR != 0 {
+        return current.role == SERVICE_CONNECTION_ROLE_FORWARD
+            && SERVICE_CONNECTIONS.insert(current, value, 0).is_ok();
+    }
     let peer = service_peer_key(value, current);
     if SERVICE_CONNECTIONS.insert(&peer, value, 0).is_err() {
         return false;
@@ -1433,6 +1648,18 @@ fn store_service_pair(
 
 #[inline(never)]
 fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
+    if value.flags & SERVICE_CONNECTION_FLAG_DSR != 0 {
+        let Some(forward_ptr) = SERVICE_KEY_SCRATCH.get_ptr_mut(0) else {
+            return false;
+        };
+        // SAFETY: this CPU owns the key scratch value for the invocation.
+        #[allow(unsafe_code)]
+        let forward = unsafe { &mut *forward_ptr };
+        *forward = service_forward_key(value);
+        return SERVICE_CONNECTIONS
+            .insert(&*forward, value, BPF_NOEXIST as u64)
+            .is_ok();
+    }
     let Some(reverse_ptr) = SERVICE_AFFINITY_KEY_SCRATCH.get_ptr_mut(0) else {
         return false;
     };
@@ -1513,7 +1740,9 @@ fn refresh_service_connection(
     let value = unsafe { &mut *scratch };
     let expected = if key.role == SERVICE_CONNECTION_ROLE_FORWARD {
         service_forward_key(value)
-    } else if key.role == SERVICE_CONNECTION_ROLE_REVERSE {
+    } else if key.role == SERVICE_CONNECTION_ROLE_REVERSE
+        && value.flags & SERVICE_CONNECTION_FLAG_DSR == 0
+    {
         service_reverse_key(value)
     } else {
         let _ = SERVICE_CONNECTIONS.remove(key);
@@ -1656,7 +1885,9 @@ fn lookup_load_balancer_frontend_v4(
         frontend,
         service_bank: value.service_bank,
         frontend_kind,
-        connection_flags: if value.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL != 0 {
+        connection_flags: if value.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_DSR != 0 {
+            SERVICE_CONNECTION_FLAG_DSR
+        } else if value.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL != 0 {
             SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
         } else {
             SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
@@ -1711,7 +1942,9 @@ fn lookup_load_balancer_frontend_v6(
         frontend,
         service_bank: value.service_bank,
         frontend_kind,
-        connection_flags: if value.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL != 0 {
+        connection_flags: if value.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_DSR != 0 {
+            SERVICE_CONNECTION_FLAG_DSR
+        } else if value.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL != 0 {
             SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
         } else {
             SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
@@ -1936,7 +2169,9 @@ fn lookup_new_forward_service_v4(
         || frontend.revision != config.revision
         || frontend.service_id.get() == 0
         || frontend.flags
-            & !(SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY | SERVICE_FRONTEND_FLAG_MAGLEV)
+            & !(SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+                | SERVICE_FRONTEND_FLAG_MAGLEV
+                | unf_ebpf_common::SERVICE_FRONTEND_FLAG_DSR)
             != 0
         || !valid_selection_reserved(
             frontend.reserved,
@@ -2150,7 +2385,9 @@ fn lookup_new_forward_service_v6(
         || frontend.revision != config.revision
         || frontend.service_id.get() == 0
         || frontend.flags
-            & !(SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY | SERVICE_FRONTEND_FLAG_MAGLEV)
+            & !(SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+                | SERVICE_FRONTEND_FLAG_MAGLEV
+                | unf_ebpf_common::SERVICE_FRONTEND_FLAG_DSR)
             != 0
         || !valid_selection_reserved(
             frontend.reserved,
@@ -2465,12 +2702,29 @@ fn set_load_balancer_cluster_source(address: [u8; 16]) {
     unsafe { pointer.write(address) };
 }
 
+#[inline(always)]
+fn dsr_route_failed() -> i32 {
+    // SAFETY: this helper has no preconditions and returns monotonic kernel time.
+    #[allow(unsafe_code)]
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    emit_service_connection_event(
+        SERVICE_EVENT_ACTION_DROP,
+        SERVICE_EVENT_REASON_DSR_ROUTE_FAILED,
+        now_ns,
+    );
+    TC_ACT_SHOT
+}
+
 /// Host-origin traffic reaches TC after the kernel selected a route for the
 /// Service VIP. Once DNAT selects a Pod backend, repeat the bounded FIB lookup
 /// and neighbor resolution so the packet uses the backend route rather than
 /// the frontend route's stale L2 next hop.
 #[inline(never)]
-fn reroute_host_service_v4(ctx: &TcContext, observation: &FlowObservation) -> i32 {
+fn reroute_host_service_v4(
+    ctx: &TcContext,
+    observation: &FlowObservation,
+    dsr: bool,
+) -> i32 {
     // SAFETY: the TC context owns a valid `__sk_buff` for this invocation.
     #[allow(unsafe_code)]
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
@@ -2520,11 +2774,15 @@ fn reroute_host_service_v4(ctx: &TcContext, observation: &FlowObservation) -> i3
             0,
         )
     };
-    redirect_service_route(ctx, &lookup, result)
+    redirect_service_route(ctx, &lookup, result, dsr)
 }
 
 #[inline(never)]
-fn reroute_host_service_v6(ctx: &TcContext, observation: &FlowObservation) -> i32 {
+fn reroute_host_service_v6(
+    ctx: &TcContext,
+    observation: &FlowObservation,
+    dsr: bool,
+) -> i32 {
     // SAFETY: the TC context owns a valid `__sk_buff` for this invocation.
     #[allow(unsafe_code)]
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
@@ -2557,7 +2815,7 @@ fn reroute_host_service_v6(ctx: &TcContext, observation: &FlowObservation) -> i3
             0,
         )
     };
-    redirect_service_route(ctx, &lookup, result)
+    redirect_service_route(ctx, &lookup, result, dsr)
 }
 
 #[inline(always)]
@@ -2571,15 +2829,28 @@ fn ipv6_fib_words(address: [u8; 16]) -> [u32; 4] {
 }
 
 #[inline(always)]
-fn redirect_service_route(ctx: &TcContext, lookup: &BpfFibLookup, result: i64) -> i32 {
+fn redirect_service_route(
+    ctx: &TcContext,
+    lookup: &BpfFibLookup,
+    result: i64,
+    dsr: bool,
+) -> i32 {
     if lookup.ifindex == 0 {
-        return service_reroute_failed();
+        return if dsr {
+            dsr_route_failed()
+        } else {
+            service_reroute_failed()
+        };
     }
     if result == 0 {
         if ctx.store(0, &lookup.dmac, 0).is_err()
             || ctx.store(6, &lookup.smac, 0).is_err()
         {
-            return service_reroute_failed();
+            return if dsr {
+                dsr_route_failed()
+            } else {
+                service_reroute_failed()
+            };
         }
         // SAFETY: the successful FIB lookup returned a live output interface
         // and the Ethernet header now carries that route's exact addresses.
@@ -2588,11 +2859,19 @@ fn redirect_service_route(ctx: &TcContext, lookup: &BpfFibLookup, result: i64) -
         return if action == i64::from(TC_ACT_REDIRECT) {
             TC_ACT_REDIRECT
         } else {
-            service_reroute_failed()
+            if dsr {
+                dsr_route_failed()
+            } else {
+                service_reroute_failed()
+            }
         };
     }
-    if result != i64::from(BPF_FIB_LKUP_RET_NO_NEIGH) {
-        return service_reroute_failed();
+    if result != i64::from(BPF_FIB_LKUP_RET_NO_NEIGH) || dsr {
+        return if dsr {
+            dsr_route_failed()
+        } else {
+            service_reroute_failed()
+        };
     }
     // SAFETY: a null neighbor parameter requests the helper's documented FIB
     // resolution for a route whose first lookup reported only a missing

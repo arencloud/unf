@@ -15,10 +15,10 @@ use unf_common::BackendId;
 use unf_common::{LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION, Revision, ServiceId};
 use unf_ebpf_common::{
     LOAD_BALANCER_BANK_COUNT, LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY,
-    LOAD_BALANCER_FRONTEND_FLAG_LOCAL, LOAD_BALANCER_FRONTEND_FLAG_MAGLEV,
-    LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES, LOAD_BALANCER_MAP_ABI_VERSION, SERVICE_BANK_COUNT,
-    SERVICE_SELECTION_TIER_CLUSTER, SERVICE_SELECTION_TIER_SAME_NODE,
-    SERVICE_SELECTION_TIER_SAME_ZONE,
+    LOAD_BALANCER_FRONTEND_FLAG_DSR, LOAD_BALANCER_FRONTEND_FLAG_LOCAL,
+    LOAD_BALANCER_FRONTEND_FLAG_MAGLEV, LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES,
+    LOAD_BALANCER_MAP_ABI_VERSION, SERVICE_BANK_COUNT, SERVICE_SELECTION_TIER_CLUSTER,
+    SERVICE_SELECTION_TIER_SAME_NODE, SERVICE_SELECTION_TIER_SAME_ZONE,
 };
 use unf_service::{
     AddressFamily, NetworkBehaviorContract, SelectionFrontend, SelectionPlanKey, SelectionTier,
@@ -1387,11 +1387,10 @@ fn compile_load_balancer_dataplane_inner(
             .map_err(|error| {
                 LoadBalancerDataplaneError::InvalidSelectionContract(error.to_string())
             })?;
-        if contract
-            .plans
-            .iter()
-            .any(|plan| plan.forwarding_mode != ServiceForwardingMode::Nat)
-        {
+        if contract.plans.iter().any(|plan| {
+            plan.forwarding_mode != ServiceForwardingMode::Nat
+                && !matches!(plan.key.frontend, SelectionFrontend::LoadBalancer { .. })
+        }) {
             return Err(LoadBalancerDataplaneError::UnsupportedSelectionBehavior);
         }
     }
@@ -1537,6 +1536,9 @@ fn compile_load_balancer_dataplane_inner(
                     };
                     if maglev_active {
                         flags |= LOAD_BALANCER_FRONTEND_FLAG_MAGLEV;
+                    }
+                    if plan.forwarding_mode == ServiceForwardingMode::Dsr {
+                        flags |= LOAD_BALANCER_FRONTEND_FLAG_DSR;
                     }
                     (index, slot_count, flags, selection_tier_code(selected.tier))
                 } else {
@@ -2410,6 +2412,48 @@ mod tests {
                             != 0
                         && u32::from_ne_bytes(value[42..46].try_into().unwrap()) == 654
                 })
+        );
+
+        let mut dsr_services = services.clone();
+        dsr_services.services[0].forwarding_mode = ServiceForwardingMode::Dsr;
+        let dsr_contract = NetworkBehaviorContract::compile(
+            &dsr_services,
+            Revision::new(7),
+            Revision::new(8),
+            unf_service::SelectionNode {
+                name: "worker-a".to_owned(),
+                uid: "worker-a-uid".to_owned(),
+                zone: Some("zone-a".to_owned()),
+                capabilities: BTreeSet::from([
+                    unf_service::SelectionCapability::StableHash,
+                    unf_service::SelectionCapability::Nat,
+                    unf_service::SelectionCapability::DsrIpv4,
+                    unf_service::SelectionCapability::DsrIpv6,
+                ]),
+            },
+        )
+        .unwrap();
+        assert!(dsr_contract.plans.iter().all(|plan| {
+            matches!(plan.key.frontend, SelectionFrontend::LoadBalancer { .. })
+                == (plan.forwarding_mode == ServiceForwardingMode::Dsr)
+        }));
+        let dsr = compile_load_balancer_selection_dataplane(
+            &dsr_services,
+            &reachability,
+            &dsr_contract,
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(
+            dsr.ipv4_frontends
+                .values()
+                .chain(dsr.ipv6_frontends.values())
+                .all(
+                    |value| u16::from_ne_bytes(value[14..16].try_into().unwrap())
+                        & LOAD_BALANCER_FRONTEND_FLAG_DSR
+                        != 0
+                )
         );
 
         let mut maglev_services = services.clone();
