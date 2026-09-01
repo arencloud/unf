@@ -758,6 +758,9 @@ for replacement_node in "${client_node}" "${server_node}"; do
         sleep 1
     done
     [[ -n ${new_agent} && ${new_agent} != "${old_agent}" ]]
+    # Kubernetes readiness precedes completion of durable map recovery. The
+    # controller is intentionally offline here, so its reachability error is
+    # expected once recovery has completed and the next synchronization runs.
     recovered=
     for _ in $(seq 1 180); do
         recovered=$(agent_raw "${replacement_node}" /v1/status 2>/dev/null || true)
@@ -767,7 +770,8 @@ for replacement_node in "${client_node}" "${server_node}"; do
             and .applied_load_balancer_revision == .desired_load_balancer_revision
             and .applied_load_balancer_allocation_revision == .desired_load_balancer_allocation_revision
             and .load_balancer_frontend_count == 24 and .load_balancer_source_range_count > 0
-            and .load_balancer_last_error == null
+            and (.load_balancer_last_error == null
+                or .load_balancer_last_error == "request controller LoadBalancer reachability")
         ' <<<"${recovered}" >/dev/null 2>&1; then
             break
         fi
@@ -779,7 +783,8 @@ for replacement_node in "${client_node}" "${server_node}"; do
         and .applied_load_balancer_revision == .desired_load_balancer_revision
         and .applied_load_balancer_allocation_revision == .desired_load_balancer_allocation_revision
         and .load_balancer_frontend_count == 24 and .load_balancer_source_range_count > 0
-        and .load_balancer_last_error == null
+        and (.load_balancer_last_error == null
+            or .load_balancer_last_error == "request controller LoadBalancer reachability")
     ' <<<"${recovered}" >/dev/null
     pod=$(advertiser_pod_on_node "${replacement_node}")
     "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
