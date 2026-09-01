@@ -159,10 +159,18 @@ agent_pod_on_node() {
 }
 
 agent_raw() {
-    local node=$1 path=$2 pod
-    pod=$(agent_pod_on_node "${node}")
-    [[ -n ${pod} ]]
-    timeout 20 "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${pod}:9963/proxy${path}"
+    local node=$1 path=$2 pod response=
+    for _ in $(seq 1 10); do
+        pod=$(agent_pod_on_node "${node}" 2>/dev/null || true)
+        if [[ -n ${pod} ]] && response=$(timeout 20 "${kc[@]}" get --raw \
+            "/api/v1/namespaces/unf-system/pods/${pod}:9963/proxy${path}" 2>/dev/null); then
+            printf '%s\n' "${response}"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "agent proxy ${node}${path} did not recover from API transport errors" >&2
+    return 1
 }
 
 node_address() {
