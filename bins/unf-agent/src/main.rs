@@ -14322,7 +14322,7 @@ mod tests {
             counts[usize::from(*outcome)] += 1;
             counts
         });
-        assert_eq!(outcome_counts, [0, 2, 4, 4]);
+        assert_eq!(outcome_counts, [0, 2, 2, 6]);
         assert_eq!(
             synchronizer
                 .affinity
@@ -14330,7 +14330,7 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap()
                 .len(),
-            4
+            2
         );
     }
 

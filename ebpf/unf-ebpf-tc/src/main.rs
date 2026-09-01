@@ -2068,6 +2068,17 @@ fn select_affinity_slot(
     // operation, and no map reference escapes this block.
     #[allow(unsafe_code)]
     let Some(mut affinity) = (unsafe { SERVICE_AFFINITY.get(&*key).copied() }) else {
+        // Atomic Service updates alternate immutable banks. Preserve affinity
+        // lifecycle semantics across that switch by detecting and retiring the
+        // previous-bank binding instead of misreporting it as a first creation.
+        key.reserved = (service_bank + 1) % SERVICE_BANK_COUNT;
+        // SAFETY: only existence is observed and no map reference escapes the
+        // expression before the key is reused.
+        #[allow(unsafe_code)]
+        if unsafe { SERVICE_AFFINITY.get(&*key).is_some() } {
+            let _ = SERVICE_AFFINITY.remove(&*key);
+            return (fallback, SERVICE_AFFINITY_OUTCOME_RESELECTED);
+        }
         return (fallback, SERVICE_AFFINITY_OUTCOME_CREATED);
     };
     let structurally_valid = affinity.schema_version == SERVICE_MAP_ABI_VERSION
