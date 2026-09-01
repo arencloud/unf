@@ -44,6 +44,10 @@ spec:
             - /var/run/secrets/unf-internal-ca/ca.crt
             - --cni-socket
             - /run/unf/cni.sock
+            - --cni-status-lease-path
+            - /run/unf/cni-status.lease
+            - --cni-status-heartbeat-seconds
+            - "2"
             - --cni-native-ipv4-uplink
             - eth0
             - --cni-native-ipv6-uplink

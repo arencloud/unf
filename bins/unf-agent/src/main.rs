@@ -107,6 +107,7 @@ const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.cr
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
 const DEFAULT_CNI_NODE_BLOCK_STATE_PATH: &str = "/var/lib/unf/cni/v1/node-block.json";
 const DEFAULT_CNI_REMOTE_ROUTE_STATE_PATH: &str = "/var/lib/unf/cni/v1/remote-routes.json";
+const DEFAULT_CNI_STATUS_LEASE_PATH: &str = "/run/unf/cni-status.lease";
 const DEFAULT_SERVICE_STATE_PATH: &str = "/var/lib/unf/cni/v1/service-snapshot.json";
 const DEFAULT_LOAD_BALANCER_REACHABILITY_STATE_PATH: &str =
     "/var/lib/unf/cni/v1/load-balancer-reachability.json";
@@ -331,6 +332,16 @@ struct Args {
         default_value = DEFAULT_CNI_STATE_PATH
     )]
     cni_state_path: PathBuf,
+    /// Owner-only readiness heartbeat consumed by the primary-CNI STATUS grace path.
+    #[arg(
+        long,
+        env = "UNF_CNI_STATUS_LEASE_PATH",
+        default_value = DEFAULT_CNI_STATUS_LEASE_PATH
+    )]
+    cni_status_lease_path: PathBuf,
+    /// Refresh interval for the owner-only primary-CNI readiness heartbeat.
+    #[arg(long, env = "UNF_CNI_STATUS_HEARTBEAT_SECONDS", default_value_t = 2)]
+    cni_status_heartbeat_seconds: u64,
     /// Durable controller-issued node-block snapshot used by the CNI service.
     #[arg(
         long,
@@ -1996,12 +2007,21 @@ fn spawn_cni_transaction_server(
     };
     let resolved = resolved.context("CNI node-block provider was not resolved")?;
     let provider = resolved.provider;
-    let server = CniTransactionServer::bind(socket_path.clone(), &args.cni_state_path, provider)?;
+    let heartbeat = Duration::from_secs(args.cni_status_heartbeat_seconds);
+    let server = CniTransactionServer::bind(
+        socket_path.clone(),
+        &args.cni_state_path,
+        provider,
+        args.cni_status_lease_path.clone(),
+        heartbeat,
+    )?;
     let server_cancellation = cancellation.clone();
     let failure_tx = failure_tx.clone();
     info!(
         socket = %socket_path.display(),
         state = %args.cni_state_path.display(),
+        readiness_lease = %args.cni_status_lease_path.display(),
+        readiness_heartbeat_seconds = args.cni_status_heartbeat_seconds,
         ipv4_block = %provider.ipv4_block,
         ipv6_block = %provider.ipv6_block,
         "root-authenticated CNI transaction API enabled"

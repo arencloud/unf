@@ -1,9 +1,9 @@
-use std::fs;
-use std::io;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,12 +18,15 @@ use unf_ipam::{IpamError, NodeBlockProvider};
 
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
+const MAX_READINESS_LEASE_PATH_BYTES: usize = 4_096;
 
 pub struct CniTransactionServer {
     listener: UnixListener,
     socket_path: PathBuf,
     socket_device: u64,
     socket_inode: u64,
+    readiness_lease_path: PathBuf,
+    readiness_heartbeat: Duration,
     journal: Arc<Mutex<AttachmentJournal>>,
 }
 
@@ -38,8 +41,14 @@ impl CniTransactionServer {
         socket_path: PathBuf,
         state_path: &Path,
         provider: NodeBlockProvider,
+        readiness_lease_path: PathBuf,
+        readiness_heartbeat: Duration,
     ) -> Result<Self> {
         validate_socket_path(&socket_path)?;
+        validate_readiness_lease_path(&readiness_lease_path)?;
+        if readiness_heartbeat.is_zero() {
+            bail!("CNI readiness heartbeat must be greater than zero");
+        }
         let journal = AttachmentJournal::open(state_path, provider)
             .with_context(|| format!("open CNI attachment journal {}", state_path.display()))?;
         prepare_socket_path(&socket_path)?;
@@ -54,6 +63,8 @@ impl CniTransactionServer {
             socket_path,
             socket_device: metadata.dev(),
             socket_inode: metadata.ino(),
+            readiness_lease_path,
+            readiness_heartbeat,
             journal: Arc::new(Mutex::new(journal)),
         })
     }
@@ -65,9 +76,13 @@ impl CniTransactionServer {
     /// Returns an error if accepting a local connection fails. Per-connection
     /// protocol and I/O errors are contained to that connection.
     pub async fn run(self, cancellation: CancellationToken) -> Result<()> {
+        persist_readiness_lease(&self.readiness_lease_path)?;
+        let mut heartbeat = tokio::time::interval(self.readiness_heartbeat);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => break,
+                _ = heartbeat.tick() => persist_readiness_lease(&self.readiness_lease_path)?,
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted.context("accept CNI transaction connection")?;
                     let journal = Arc::clone(&self.journal);
@@ -82,6 +97,58 @@ impl CniTransactionServer {
         remove_owned_socket(&self.socket_path, self.socket_device, self.socket_inode)?;
         Ok(())
     }
+}
+
+fn validate_readiness_lease_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("CNI readiness lease path must be absolute");
+    }
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        bail!("CNI readiness lease path cannot contain NUL bytes");
+    }
+    if path.as_os_str().as_encoded_bytes().len() > MAX_READINESS_LEASE_PATH_BYTES {
+        bail!("CNI readiness lease path exceeds {MAX_READINESS_LEASE_PATH_BYTES} bytes");
+    }
+    let parent = path
+        .parent()
+        .context("CNI readiness lease must have a parent directory")?;
+    reject_symlink_components(parent)
+}
+
+fn persist_readiness_lease(path: &Path) -> Result<()> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes the UNIX epoch")?
+        .as_secs();
+    let parent = path
+        .parent()
+        .context("CNI readiness lease must have a parent directory")?;
+    let temporary = parent.join(format!(
+        ".{}.tmp.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("lease"),
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)
+        .with_context(|| format!("open CNI readiness lease {}", temporary.display()))?;
+    writeln!(file, "{timestamp}").context("write CNI readiness lease")?;
+    file.sync_all().context("sync CNI readiness lease")?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+        .context("secure CNI readiness lease")?;
+    fs::rename(&temporary, path).with_context(|| {
+        format!(
+            "activate CNI readiness lease {} -> {}",
+            temporary.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 async fn serve_connection(
@@ -270,6 +337,15 @@ mod tests {
 
     use super::*;
 
+    fn bind_server(socket: PathBuf, state: &Path) -> CniTransactionServer {
+        let lease = socket
+            .parent()
+            .expect("socket parent")
+            .join("cni-status.lease");
+        CniTransactionServer::bind(socket, state, provider(), lease, Duration::from_millis(10))
+            .expect("bind server")
+    }
+
     fn provider() -> NodeBlockProvider {
         NodeBlockProvider::new(
             "10.42.0.0/24".parse().expect("IPv4 node block"),
@@ -403,8 +479,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let socket = directory.path().join("cni.sock");
         let state = directory.path().join("attachments.json");
-        let server =
-            CniTransactionServer::bind(socket.clone(), &state, provider()).expect("bind server");
+        let server = bind_server(socket.clone(), &state);
         let mode = fs::metadata(&socket)
             .expect("socket metadata")
             .permissions()
@@ -415,6 +490,15 @@ mod tests {
         cancellation.cancel();
         server.run(cancellation).await.expect("stop server");
         assert!(!socket.exists());
+        let lease = directory.path().join("cni-status.lease");
+        assert_eq!(
+            fs::metadata(lease)
+                .expect("readiness lease metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]
@@ -422,8 +506,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let socket = directory.path().join("cni.sock");
         let state = directory.path().join("attachments.json");
-        let server =
-            CniTransactionServer::bind(socket.clone(), &state, provider()).expect("bind server");
+        let server = bind_server(socket.clone(), &state);
         let cancellation = CancellationToken::new();
         let shutdown = cancellation.clone();
         let task = tokio::spawn(server.run(shutdown));
@@ -461,12 +544,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_lease_is_refreshed_while_the_server_is_live() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let socket = directory.path().join("cni.sock");
+        let state = directory.path().join("attachments.json");
+        let lease = directory.path().join("cni-status.lease");
+        let server = bind_server(socket, &state);
+        let cancellation = CancellationToken::new();
+        let shutdown = cancellation.clone();
+        let task = tokio::spawn(server.run(shutdown));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let first = fs::read_to_string(&lease)
+            .expect("initial readiness lease")
+            .trim()
+            .parse::<u64>()
+            .expect("initial readiness timestamp");
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let second = fs::read_to_string(&lease)
+            .expect("refreshed readiness lease")
+            .trim()
+            .parse::<u64>()
+            .expect("refreshed readiness timestamp");
+        assert!(second > first);
+        cancellation.cancel();
+        task.await
+            .expect("join transaction server")
+            .expect("stop transaction server");
+    }
+
+    #[tokio::test]
     async fn shutdown_never_removes_a_replaced_socket_path() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let socket = directory.path().join("cni.sock");
         let state = directory.path().join("attachments.json");
-        let server =
-            CniTransactionServer::bind(socket.clone(), &state, provider()).expect("bind server");
+        let server = bind_server(socket.clone(), &state);
         fs::remove_file(&socket).expect("unlink original socket name");
         fs::write(&socket, b"replacement").expect("create replacement path");
         let cancellation = CancellationToken::new();
