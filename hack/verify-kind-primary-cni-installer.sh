@@ -20,6 +20,10 @@ bash -n "${project_root}/hack/configure-kind-primary-cni.sh"
 bash -n "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'nodeport-sysctls' "${project_root}/hack/configure-kind-primary-cni.sh"
 grep -q 'nodeport-sysctls' "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'PERSISTENT_BPF_STATE_ABI_VERSION' \
+    "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'delete job "${job_name}"' "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'cni-status.lease' "${project_root}/hack/rollback-kind-primary-cni.sh"
 for setting in rp_filter accept_local; do
     grep -q "/proc/sys/net/ipv4/conf/\*/${setting}" \
         "${project_root}/hack/configure-kind-primary-cni.sh"

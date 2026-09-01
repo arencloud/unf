@@ -6,6 +6,13 @@ kubeconfig=${KUBECONFIG:-"${project_root}/.tools/kind-unf-cni-dev.kubeconfig"}
 context=${KUBE_CONTEXT:-kind-unf-cni-dev}
 container_runtime=${KIND_PROVIDER:-podman}
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
+persistent_abi=$(sed -nE \
+    's/^pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = ([0-9]+);$/\1/p' \
+    "${project_root}/crates/unf-state/src/lib.rs")
+if [[ ! ${persistent_abi} =~ ^[1-9][0-9]*$ ]]; then
+    echo "could not resolve the current persistent BPF-state ABI" >&2
+    exit 1
+fi
 
 if [[ ${context} != kind-* ]] || [[ $("${kc[@]}" config current-context) != "${context}" ]]; then
     echo "refusing primary-CNI rollback outside the exact Kind context ${context}" >&2
@@ -58,6 +65,11 @@ fi
 # current-ABI TCX/map pins and exact legacy UNF filters.
 for node in "${nodes[@]}"; do
     job_name="unf-primary-cleanup-${node##*-}"
+    # A prior interrupted rollback can leave the exact bounded cleanup Job in
+    # Failed or Complete state. Jobs are immutable, so remove that owned
+    # execution record before starting the retry for this Node.
+    "${kc[@]}" -n unf-system delete job "${job_name}" --ignore-not-found \
+        --wait=true --timeout=120s >/dev/null
     "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: batch/v1
 kind: Job
@@ -82,7 +94,7 @@ spec:
           args:
             - cleanup
             - --abi-version
-            - "7"
+            - "${persistent_abi}"
             - --allow-current-abi
             - --legacy-attachments
             - --all-interfaces
@@ -114,6 +126,34 @@ for node in "${nodes[@]}"; do
         marker=${state_dir}/install.env
         binary=/opt/cni/bin/unf
         config=/etc/cni/net.d/10-unf.conflist
+
+        cleanup_runtime_state() {
+            runtime_dir=/run/unf
+            [ -e "$runtime_dir" ] || return 0
+            test -d "$runtime_dir" && test ! -L "$runtime_dir"
+            socket=${runtime_dir}/cni.sock
+            if [ -e "$socket" ] || [ -L "$socket" ]; then
+                test -S "$socket" && test ! -L "$socket"
+                rm -f "$socket"
+            fi
+            lease=${runtime_dir}/cni-status.lease
+            if [ -e "$lease" ] || [ -L "$lease" ]; then
+                test -f "$lease" && test ! -L "$lease"
+                test "$(stat -c %a "$lease")" = 600
+                test "$(wc -c <"$lease")" -le 32
+                grep -Eq "^[0-9]+$" "$lease"
+                rm -f "$lease"
+            fi
+            for temporary in "${runtime_dir}"/.cni-status.lease.tmp.*; do
+                [ -e "$temporary" ] || break
+                test -f "$temporary" && test ! -L "$temporary"
+                test "$(stat -c %a "$temporary")" = 600
+                printf "%s\n" "${temporary##*/}" \
+                    | grep -Eq "^\.cni-status\.lease\.tmp\.[0-9]+$"
+                rm -f "$temporary"
+            done
+            rmdir "$runtime_dir"
+        }
 
         for temporary_pattern in \
             "${marker}.tmp.*" \
@@ -193,8 +233,7 @@ for node in "${nodes[@]}"; do
                 rmdir "$state_dir"
             fi
             [ ! -d /var/lib/unf/cni ] || rmdir /var/lib/unf/cni
-            rm -f /run/unf/cni.sock
-            [ ! -d /run/unf ] || rmdir /run/unf
+            cleanup_runtime_state
             if [ -d /sys/fs/bpf/unf ]; then
                 test -z "$(find /sys/fs/bpf/unf -mindepth 1 -maxdepth 1 -print -quit)"
                 rmdir /sys/fs/bpf/unf
@@ -262,7 +301,6 @@ EOF
             fi
         done
 
-        rm -f /run/unf/cni.sock
         rm -f "$binary" "$config"
         rm -f "${state_dir}/attachments.json" "${state_dir}/node-block.json" \
             "$routes" "$services" "${services}.pending" "$selection" \
@@ -270,7 +308,7 @@ EOF
         cleanup_pending_deletes
         rmdir "$state_dir"
         rmdir /var/lib/unf/cni
-        rmdir /run/unf
+        cleanup_runtime_state
         if [ -d /sys/fs/bpf/unf ]; then
             test -z "$(find /sys/fs/bpf/unf -mindepth 1 -maxdepth 1 -print -quit)"
             rmdir /sys/fs/bpf/unf
