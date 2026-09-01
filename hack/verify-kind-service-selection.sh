@@ -14,6 +14,10 @@ temporary_dir=$(mktemp -d)
 controller_scaled_down=false
 qualification_stage=initialization
 started_unix_seconds=$(date +%s)
+# Reverse connection keys intentionally omit the frontend VIP. Use a bounded
+# per-run source-port window so repeated qualification against persistent maps
+# cannot collide with an unexpired flow from an earlier ClusterIP allocation.
+affinity_probe_port_base=$((40000 + started_unix_seconds % 20000))
 
 report_failure() {
     local status=$? line=${BASH_LINENO[0]:-unknown}
@@ -337,8 +341,8 @@ jq -e --arg backend "${node_v4}" '
     and any(.eligible_backends[]; .address == $backend)
 ' <<<"${same_node_simulation}" >/dev/null
 tcp_probe "${selection_v4}"; tcp_probe "${selection_v6}"
-udp_probe 4 "${selection_v4}" 41001
-udp_probe 4 "${selection_v4}" 41002
+udp_probe 4 "${selection_v4}" "$((affinity_probe_port_base + 1))"
+udp_probe 4 "${selection_v4}" "$((affinity_probe_port_base + 2))"
 same_node_history=$(wait_for_history "${selection_v4}" '
     any(.entries[]; .key.destination_ipv4 == $address and .service.selection_tier == "same_node"
         and .service.affinity_outcome == "created" and .service.forwarding_mode == "nat")
@@ -354,12 +358,12 @@ jq -e --arg backend "${zone_v4}" '
     .decision == "translate" and .selection_tier == "sameZone"
     and any(.eligible_backends[]; .address == $backend)
 ' <<<"${same_zone_simulation}" >/dev/null
-udp_probe 4 "${selection_v4}" 41003
+udp_probe 4 "${selection_v4}" "$((affinity_probe_port_base + 3))"
 wait_for_history "${selection_v4}" '
     any(.entries[]; .key.destination_ipv4 == $address and .service.selection_tier == "same_zone"
         and .service.affinity_outcome == "reselected")' >/dev/null
 sleep 4
-udp_probe 4 "${selection_v4}" 41004
+udp_probe 4 "${selection_v4}" "$((affinity_probe_port_base + 4))"
 replace_endpoint_condition selection-v4 "${zone_v4}" false false true
 replace_endpoint_condition selection-v6 "${zone_v6}" false false true
 wait_for_convergence >/dev/null
