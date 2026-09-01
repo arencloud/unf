@@ -106,6 +106,7 @@ persistent_abi=$(jq -er .contracts.persistentBpfStateAbiVersion "${release_recor
 service_schema=$(jq -er .contracts.serviceSnapshotSchemaVersion "${release_record}")
 agent_status_schema=$(jq -er .contracts.agentStatusSchemaVersion "${release_record}")
 flow_export_schema=$(jq -er .contracts.flowExportSchemaVersion "${release_record}")
+flow_history_schema=$((flow_export_schema + 1))
 if [[ ${release_phase} == 7.10 ]]; then
     deploy_stage=abi-v11-service-selection-staged-deployment
 else
@@ -657,8 +658,8 @@ history=
 for _ in $(seq 1 300); do
     history=$(controller_raw /v1/flows 2>/dev/null || true)
     if jq -e --arg cluster "${cluster_v4}" --arg local "${local_v4}" \
-        --argjson flow_schema "${flow_export_schema}" '
-        .schema_version == $flow_schema
+        --argjson history_schema "${flow_history_schema}" '
+        .schema_version == $history_schema
         and any(.entries[]; .key.destination_ipv4 == $cluster and .service.frontend_kind == "load_balancer_cluster" and .service.action == 1)
         and any(.entries[]; .key.destination_ipv4 == $local and .service.frontend_kind == "load_balancer_local" and .service.action == 1)
         and any(.entries[]; .key.destination_ipv4 == $local and .service.frontend_kind == "load_balancer_local" and .service.action == 2)
