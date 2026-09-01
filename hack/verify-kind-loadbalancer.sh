@@ -6,6 +6,11 @@ kubeconfig=${KUBECONFIG:-"${project_root}/.tools/kind-unf-service-dev.kubeconfig
 context=${KUBE_CONTEXT:-kind-unf-service-dev}
 container_runtime=${KIND_PROVIDER:-podman}
 artifact=${UNF_LOADBALANCER_KIND_EVIDENCE:-"${project_root}/.artifacts/phase6-loadbalancer-kind.json"}
+skip_rollback=${UNF_LOADBALANCER_SKIP_ROLLBACK:-false}
+if [[ ${skip_rollback} != true && ${skip_rollback} != false ]]; then
+    echo "UNF_LOADBALANCER_SKIP_ROLLBACK must be true or false" >&2
+    exit 1
+fi
 controller_port=${UNF_LOADBALANCER_KIND_CONTROLLER_PORT:-19967}
 unfctl=${UNFCTL:-"${project_root}/target/debug/unfctl"}
 namespace=unf-loadbalancer-qualification
@@ -101,7 +106,7 @@ wait_for_convergence() {
     for _ in $(seq 1 180); do
         snapshot=$(controller_raw /v1/state/agents 2>/dev/null || true)
         if jq -e --argjson expected "${#nodes[@]}" '
-            .schema_version == 6
+            .schema_version == 8
             and .expected_agents == $expected
             and .reporting_agents == $expected
             and .missing_agents == 0 and .stale_agents == 0
@@ -129,7 +134,7 @@ wait_for_load_balancer_shape() {
             --argjson frontends "${frontends}" \
             --argjson cluster "${cluster}" \
             --argjson local_count "${local_count}" '
-            .schema_version == 6 and .expected_agents == $expected
+            .schema_version == 8 and .expected_agents == $expected
             and .converged_agents == $expected and .all_converged == true
             and all(.nodes[];
                 .fresh and .converged
@@ -577,7 +582,7 @@ for _ in $(seq 1 120); do
     if jq -e \
         --arg cluster_v4 "${cluster_v4}" --arg cluster_v6 "${cluster_v6}" \
         --arg local_v4 "${local_v4}" --arg local_v6 "${local_v6}" '
-        .schema_version == 6
+        .schema_version == 7
         and any(.entries[]; .key.destination_ipv4 == $cluster_v4 and .service.frontend_kind == "load_balancer_cluster" and .service.action == 1)
         and any(.entries[]; .key.destination_ipv6 == $cluster_v6 and .service.frontend_kind == "load_balancer_cluster" and .service.action == 1)
         and any(.entries[]; .key.destination_ipv4 == $local_v4 and .service.frontend_kind == "load_balancer_local" and .service.action == 1)
@@ -714,7 +719,7 @@ for replacement_node in "${client_node}" "${server_node}"; do
     [[ ${new_agent} != "${old_agent}" ]]
     recovered_agent=$(agent_raw "${new_agent}" /v1/status)
     jq -e '
-        .schema_version == 6 and .ready and .bpf_loaded
+        .schema_version == 8 and .ready and .bpf_loaded
         and .applied_service_revision == .desired_service_revision
         and .applied_load_balancer_revision == .desired_load_balancer_revision
         and .applied_load_balancer_allocation_revision == .desired_load_balancer_allocation_revision
@@ -911,16 +916,24 @@ jq -n \
     }' >"${artifact}"
 
 qualification_stage=exact-platform-rollback
-KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" KIND_PROVIDER="${container_runtime}" \
-    "${project_root}/hack/rollback-kind-primary-cni.sh"
-jq '.verified += [
-    "scoped ABI-v7 LoadBalancer and shared BPF cleanup",
-    "exact remote-route deletion",
-    "fingerprinted CNI artifact removal",
-    "CoreDNS bootstrap restoration",
-    "no-CNI baseline restoration"
-]' "${artifact}" >"${artifact}.tmp"
-mv -f "${artifact}.tmp" "${artifact}"
+if [[ ${skip_rollback} == false ]]; then
+    KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" KIND_PROVIDER="${container_runtime}" \
+        "${project_root}/hack/rollback-kind-primary-cni.sh"
+    jq '.verified += [
+        "scoped ABI-v11 LoadBalancer and shared BPF cleanup",
+        "exact remote-route deletion",
+        "fingerprinted CNI artifact removal",
+        "CoreDNS bootstrap restoration",
+        "no-CNI baseline restoration"
+    ]' "${artifact}" >"${artifact}.tmp"
+    mv -f "${artifact}.tmp" "${artifact}"
+else
+    jq '.handoff = {
+        primaryCniActive:true,
+        reason:"Phase 7 qualification requested an explicit live-cluster handoff"
+    }' "${artifact}" >"${artifact}.tmp"
+    mv -f "${artifact}.tmp" "${artifact}"
+fi
 
 trap - ERR EXIT
 echo "kube-proxy-free dual-stack LoadBalancer qualification passed; evidence: ${artifact}"
