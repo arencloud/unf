@@ -88,6 +88,11 @@ const SERVICE_POLICY_DISPATCH_V4: i32 = -1_001;
 const SERVICE_POLICY_DISPATCH_V6: i32 = -1_002;
 const SERVICE_POST_LOOKUP_TRANSLATED: u8 = 1 << 0;
 const SERVICE_POST_LOOKUP_REROUTE_HOST: u8 = 1 << 1;
+// A DSR redirect preserves the frontend tuple. Reserve one skb mark bit so
+// the immediately following egress hook does not select the same VIP again.
+// The egress hook consumes it before the packet leaves this node, allowing
+// the backend node to perform its own ingress policy and local DSR routing.
+const SERVICE_DSR_HANDOFF_MARK: u32 = 1 << 31;
 
 #[map]
 static FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -308,6 +313,9 @@ pub fn unf_observe_ingress(ctx: TcContext) -> i32 {
 }
 #[classifier]
 pub fn unf_observe_egress(ctx: TcContext) -> i32 {
+    if consume_service_dsr_handoff(&ctx) {
+        return TC_ACT_PIPE;
+    }
     let action = observe(&ctx, Direction::Egress, false);
     if action == SERVICE_POLICY_DISPATCH_V4 {
         // SAFETY: index 0 is a TC classifier over this exact context and the
@@ -324,6 +332,28 @@ pub fn unf_observe_egress(ctx: TcContext) -> i32 {
         return TC_ACT_SHOT;
     }
     action
+}
+
+#[inline(always)]
+fn consume_service_dsr_handoff(ctx: &TcContext) -> bool {
+    // SAFETY: the TC context owns this skb for the current invocation. Only
+    // UNF's reserved bit is changed; every unrelated mark bit is preserved.
+    #[allow(unsafe_code)]
+    let skb = unsafe { &mut *ctx.skb.skb };
+    if skb.mark & SERVICE_DSR_HANDOFF_MARK == 0 {
+        return false;
+    }
+    skb.mark &= !SERVICE_DSR_HANDOFF_MARK;
+    true
+}
+
+#[inline(always)]
+fn mark_service_dsr_handoff(ctx: &TcContext) {
+    // SAFETY: as above, this invocation exclusively owns the skb metadata.
+    #[allow(unsafe_code)]
+    unsafe {
+        (*ctx.skb.skb).mark |= SERVICE_DSR_HANDOFF_MARK;
+    }
 }
 
 #[classifier]
@@ -2929,6 +2959,9 @@ fn redirect_service_route(
             } else {
                 service_reroute_failed()
             };
+        }
+        if dsr {
+            mark_service_dsr_handoff(ctx);
         }
         // SAFETY: the successful FIB lookup returned a live output interface
         // and the Ethernet header now carries that route's exact addresses.
