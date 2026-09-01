@@ -65,11 +65,13 @@ use unf_route::{
 use unf_service::compile_service_dataplane;
 use unf_service::{
     LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION,
-    MAX_BACKENDS_PER_SERVICE, NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION, NodePortDataplaneState,
-    NodePortNodeSnapshot, SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
-    SERVICE_FRONTEND_BANK_CAPACITY, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceDataplaneState,
-    ServiceSnapshot, ServiceTrafficPolicy, compile_node_port_fabric_dataplane,
-    compile_service_load_balancer_fabric_dataplane,
+    MAX_BACKENDS_PER_SERVICE, NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION, NetworkBehaviorContract,
+    NodePortDataplaneState, NodePortNodeSnapshot, SELECTION_CONTRACT_SCHEMA_VERSION,
+    SERVICE_BACKEND_BANK_CAPACITY, SERVICE_BACKEND_SLOT_BANK_CAPACITY,
+    SERVICE_FRONTEND_BANK_CAPACITY, SERVICE_SNAPSHOT_SCHEMA_VERSION, SelectionCapability,
+    SelectionNode, ServiceDataplaneState, ServiceSnapshot, ServiceTrafficPolicy,
+    compile_node_port_fabric_dataplane, compile_service_load_balancer_fabric_dataplane,
+    has_advanced_selection_intent,
 };
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
@@ -77,8 +79,9 @@ use unf_state::{
     FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowExportDecision, FlowExportRecord,
     FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
     Ipv4PolicyMapEntry, Ipv6IdentityMapping, Ipv6PolicyMapEntry, PERSISTENT_BPF_STATE_ABI_VERSION,
-    POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord,
-    PolicyMapEntry, PolicyStateSnapshot, ServiceFlowKey, ServiceFlowOutcome, ServiceFrontendKind,
+    POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION,
+    PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION, PolicyDecisionRecord, PolicyMapEntry,
+    PolicyStateSnapshot, ServiceFlowKey, ServiceFlowOutcome, ServiceFrontendKind,
     VersionTransition,
 };
 
@@ -100,6 +103,8 @@ const DEFAULT_LOAD_BALANCER_REACHABILITY_STATE_PATH: &str =
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
+const SELECTION_CONTRACT_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
+const SELECTION_BANK_COUNT: u8 = 2;
 const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
 const BLOCKED_TRANSITION_REPORTING_WINDOW: Duration = Duration::from_secs(30);
 const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
@@ -575,6 +580,11 @@ struct AgentState {
     service_count: AtomicU64,
     service_frontend_count: AtomicU64,
     service_backend_count: AtomicU64,
+    desired_selection_contract_revision: AtomicU64,
+    applied_selection_contract_revision: AtomicU64,
+    desired_selection_contract_digest: Mutex<Option<String>>,
+    applied_selection_contract_digest: Mutex<Option<String>>,
+    active_selection_bank: AtomicU64,
     desired_node_port_frontend_count: AtomicU64,
     applied_node_port_frontend_count: AtomicU64,
     node_port_cluster_frontend_count: AtomicU64,
@@ -689,12 +699,15 @@ struct ServiceSynchronizer {
         [Option<NodePortDataplaneState>; unf_ebpf_common::NODE_PORT_BANK_COUNT as usize],
     load_balancer_banks:
         [Option<LoadBalancerDataplaneState>; unf_ebpf_common::LOAD_BALANCER_BANK_COUNT as usize],
+    selection_banks: [Option<NetworkBehaviorContract>; SELECTION_BANK_COUNT as usize],
     active_bank: u8,
     active_node_port_bank: u8,
     active_load_balancer_bank: u8,
     applied: Option<ServiceSnapshot>,
     applied_node_port_node: Option<NodePortNodeSnapshot>,
     applied_load_balancer_reachability: Option<NodeReachabilitySnapshot>,
+    applied_selection_contract: Option<NetworkBehaviorContract>,
+    active_selection_bank: u8,
     node_name: String,
     controller_url: Option<String>,
     client: ReloadingControllerClient,
@@ -737,6 +750,15 @@ struct NodePortServiceCheckpoint {
     schema_version: u16,
     service: ServiceSnapshot,
     node_port_node: NodePortNodeSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SelectionContractCheckpoint {
+    schema_version: u16,
+    active_bank: u8,
+    node: NodePortNodeSnapshot,
+    contract: NetworkBehaviorContract,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2291,12 +2313,44 @@ async fn fetch_node_port_node_snapshot(
     .context("decode controller local NodePort Node snapshot")
 }
 
+async fn fetch_selection_contract(
+    controller_url: &str,
+    client: &ReloadingControllerClient,
+    token_path: &Path,
+) -> Result<NetworkBehaviorContract> {
+    authenticated_get(
+        client,
+        format!(
+            "{controller_url}/v1/state/service-selection?selectionContractSchemaVersion={SELECTION_CONTRACT_SCHEMA_VERSION}&stableHash=true&nat=true"
+        ),
+        token_path,
+    )?
+    .send()
+    .await
+    .context("request controller service selection contract")?
+    .error_for_status()
+    .context("controller rejected service selection contract request")?
+    .json()
+    .await
+    .context("decode controller service selection contract")
+}
+
 async fn ensure_service_controller_compatibility(
     client: &ReloadingControllerClient,
     controller_url: &str,
     token_path: &Path,
 ) -> Result<()> {
-    let compatibility: ComponentCompatibility =
+    let requested = authenticated_get(
+        client,
+        format!(
+            "{controller_url}/v1/version?serviceSnapshotSchemaVersion={SERVICE_SNAPSHOT_SCHEMA_VERSION}&selectionContractSchemaVersion={SELECTION_CONTRACT_SCHEMA_VERSION}"
+        ),
+        token_path,
+    )?
+    .send()
+    .await
+    .context("request controller compatibility for selection contracts")?;
+    let response = if requested.status() == reqwest::StatusCode::BAD_REQUEST {
         authenticated_get(
             client,
             format!(
@@ -2304,14 +2358,18 @@ async fn ensure_service_controller_compatibility(
             ),
             token_path,
         )?
-            .send()
-            .await
-            .context("request controller compatibility for service snapshots")?
-            .error_for_status()
-            .context("controller rejected service compatibility preflight")?
-            .json()
-            .await
-            .context("decode service compatibility preflight")?;
+        .send()
+        .await
+        .context("retry compatibility against a pre-selection controller")?
+    } else {
+        requested
+    };
+    let compatibility: ComponentCompatibility = response
+        .error_for_status()
+        .context("controller rejected service compatibility preflight")?
+        .json()
+        .await
+        .context("decode service compatibility preflight")?;
     ensure_controller_compatibility(&compatibility)
 }
 
@@ -2500,6 +2558,263 @@ fn restore_service_fabric_checkpoint(
     restore_service_checkpoint(path, None)
 }
 
+fn local_selection_capabilities() -> BTreeSet<SelectionCapability> {
+    BTreeSet::from([SelectionCapability::StableHash, SelectionCapability::Nat])
+}
+
+fn local_selection_node(node: &NodePortNodeSnapshot, zone: Option<String>) -> SelectionNode {
+    SelectionNode {
+        name: node.node_name.clone(),
+        uid: node.node_uid.clone(),
+        zone,
+        capabilities: local_selection_capabilities(),
+    }
+}
+
+fn selection_contract_state_path(service_path: &Path) -> Result<PathBuf> {
+    let file_name = service_path
+        .file_name()
+        .context("service state path must name a file")?
+        .to_string_lossy();
+    Ok(service_path.with_file_name(format!("{file_name}.selection")))
+}
+
+fn selection_contract_pending_path(service_path: &Path) -> Result<PathBuf> {
+    let path = selection_contract_state_path(service_path)?;
+    let file_name = path
+        .file_name()
+        .context("selection contract state path must name a file")?
+        .to_string_lossy();
+    Ok(path.with_file_name(format!("{file_name}.pending")))
+}
+
+fn load_optional_selection_checkpoint(path: &Path) -> Result<Option<SelectionContractCheckpoint>> {
+    let Some(checkpoint) = decode_optional_selection_checkpoint(path)? else {
+        return Ok(None);
+    };
+    let snapshot = load_optional_service_snapshot_for_contract(path, &checkpoint.contract)?;
+    verify_selection_checkpoint(&checkpoint, &snapshot)?;
+    Ok(Some(checkpoint))
+}
+
+fn decode_optional_selection_checkpoint(
+    path: &Path,
+) -> Result<Option<SelectionContractCheckpoint>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect selection checkpoint {}", path.display()))
+        }
+        Ok(_) => {
+            let checkpoint: SelectionContractCheckpoint =
+                load_secure_json(path, "service selection")?;
+            if checkpoint.schema_version != SELECTION_CONTRACT_CHECKPOINT_SCHEMA_VERSION {
+                bail!(
+                    "unsupported selection checkpoint schema {}; expected {}",
+                    checkpoint.schema_version,
+                    SELECTION_CONTRACT_CHECKPOINT_SCHEMA_VERSION
+                );
+            }
+            if checkpoint.active_bank >= SELECTION_BANK_COUNT {
+                bail!("selection checkpoint has invalid active bank");
+            }
+            let node = checkpoint.node.clone().validate_and_normalize()?;
+            Ok(Some(SelectionContractCheckpoint { node, ..checkpoint }))
+        }
+    }
+}
+
+fn verify_selection_checkpoint(
+    checkpoint: &SelectionContractCheckpoint,
+    snapshot: &ServiceSnapshot,
+) -> Result<()> {
+    checkpoint.contract.verify(
+        snapshot,
+        &local_selection_node(&checkpoint.node, checkpoint.contract.node.zone.clone()),
+    )?;
+    Ok(())
+}
+
+fn load_optional_service_snapshot_for_contract(
+    selection_path: &Path,
+    contract: &NetworkBehaviorContract,
+) -> Result<ServiceSnapshot> {
+    let file_name = selection_path
+        .file_name()
+        .context("selection checkpoint path must name a file")?
+        .to_string_lossy();
+    let service_name = file_name
+        .strip_suffix(".selection.pending")
+        .or_else(|| file_name.strip_suffix(".selection"))
+        .context("selection checkpoint path is not derived from service state")?;
+    let service_path = selection_path.with_file_name(service_name);
+    let pending_service_path = service_pending_state_path(&service_path)?;
+    for path in [&service_path, &pending_service_path] {
+        if let Some(snapshot) = load_optional_service_snapshot(path)?
+            && snapshot.source_epoch == contract.source_epoch
+            && snapshot.revision == contract.service_revision
+        {
+            return Ok(snapshot);
+        }
+    }
+    bail!("selection checkpoint has no matching durable or prepared service snapshot")
+}
+
+fn persist_selection_checkpoint(
+    path: &Path,
+    contract: &NetworkBehaviorContract,
+    node: &NodePortNodeSnapshot,
+    active_bank: u8,
+    description: &str,
+) -> Result<()> {
+    if active_bank >= SELECTION_BANK_COUNT {
+        bail!("selection checkpoint has invalid active bank");
+    }
+    let node = node.clone().validate_and_normalize()?;
+    if node.source_epoch != contract.source_epoch
+        || node.node_name != contract.node.name
+        || node.node_uid != contract.node.uid
+    {
+        bail!("selection checkpoint Node does not match its contract ownership tuple");
+    }
+    persist_secure_json(
+        path,
+        &SelectionContractCheckpoint {
+            schema_version: SELECTION_CONTRACT_CHECKPOINT_SCHEMA_VERSION,
+            active_bank,
+            node,
+            contract: contract.clone(),
+        },
+        description,
+    )
+}
+
+fn prepare_selection_checkpoint(
+    service_path: &Path,
+    contract: &NetworkBehaviorContract,
+    node: &NodePortNodeSnapshot,
+    active_bank: u8,
+) -> Result<PathBuf> {
+    let pending = selection_contract_pending_path(service_path)?;
+    remove_secure_optional_file(&pending, "pending selection checkpoint")?;
+    persist_selection_checkpoint(
+        &pending,
+        contract,
+        node,
+        active_bank,
+        "pending service selection",
+    )?;
+    Ok(pending)
+}
+
+fn commit_prepared_selection_checkpoint(service_path: &Path, pending: &Path) -> Result<()> {
+    let current = selection_contract_state_path(service_path)?;
+    reject_node_block_symlinks(&current)?;
+    reject_node_block_symlinks(pending)?;
+    fs::rename(pending, &current).with_context(|| {
+        format!(
+            "commit pending selection checkpoint {} to {}",
+            pending.display(),
+            current.display()
+        )
+    })?;
+    File::open(
+        current
+            .parent()
+            .context("selection state path has no parent")?,
+    )?
+    .sync_all()?;
+    Ok(())
+}
+
+fn restore_selection_checkpoint(
+    service_path: &Path,
+    contract: Option<&NetworkBehaviorContract>,
+    node: Option<&NodePortNodeSnapshot>,
+    active_bank: u8,
+) -> Result<()> {
+    let current = selection_contract_state_path(service_path)?;
+    match (contract, node) {
+        (Some(contract), Some(node)) => persist_selection_checkpoint(
+            &current,
+            contract,
+            node,
+            active_bank,
+            "service selection rollback",
+        ),
+        (None, None) => remove_secure_optional_file(&current, "selection rollback checkpoint"),
+        _ => bail!("selection rollback contract and Node checkpoint are incomplete"),
+    }
+}
+
+fn remove_secure_optional_file(path: &Path, description: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspect {description}")),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!("{description} is not a regular file: {}", path.display())
+        }
+        Ok(_) => {
+            fs::remove_file(path).with_context(|| format!("remove {description}"))?;
+            File::open(path.parent().context("owned state path has no parent")?)?.sync_all()?;
+            Ok(())
+        }
+    }
+}
+
+fn recover_selection_contract_state(services: &mut ServiceSynchronizer) -> Result<()> {
+    let Some(applied) = services.applied.as_ref() else {
+        return Ok(());
+    };
+    let current_path = selection_contract_state_path(&services.state_path)?;
+    let pending_path = selection_contract_pending_path(&services.state_path)?;
+    let current = decode_optional_selection_checkpoint(&current_path)?;
+    let pending = decode_optional_selection_checkpoint(&pending_path)?;
+    let selected = select_recovered_selection_checkpoint(applied, current, pending);
+    let Some((selected_pending, checkpoint)) = selected else {
+        remove_secure_optional_file(&pending_path, "stale pending selection checkpoint")?;
+        if has_advanced_selection_intent(applied) {
+            bail!("advanced Service selection intent has no matching durable contract");
+        }
+        return Ok(());
+    };
+    verify_selection_checkpoint(&checkpoint, applied)
+        .context("verify recovered selection checkpoint against active service state")?;
+    if selected_pending {
+        commit_prepared_selection_checkpoint(&services.state_path, &pending_path)?;
+    } else {
+        remove_secure_optional_file(&pending_path, "stale pending selection checkpoint")?;
+    }
+    let bank = usize::from(checkpoint.active_bank);
+    services.selection_banks = [None, None];
+    services.selection_banks[bank] = Some(checkpoint.contract.clone());
+    services.active_selection_bank = checkpoint.active_bank;
+    services.applied_selection_contract = Some(checkpoint.contract);
+    services.applied_node_port_node = Some(checkpoint.node);
+    Ok(())
+}
+
+fn select_recovered_selection_checkpoint(
+    applied: &ServiceSnapshot,
+    current: Option<SelectionContractCheckpoint>,
+    pending: Option<SelectionContractCheckpoint>,
+) -> Option<(bool, SelectionContractCheckpoint)> {
+    current
+        .filter(|checkpoint| {
+            checkpoint.contract.source_epoch == applied.source_epoch
+                && checkpoint.contract.service_revision == applied.revision
+        })
+        .map(|checkpoint| (false, checkpoint))
+        .or_else(|| {
+            pending
+                .filter(|checkpoint| {
+                    checkpoint.contract.source_epoch == applied.source_epoch
+                        && checkpoint.contract.service_revision == applied.revision
+                })
+                .map(|checkpoint| (true, checkpoint))
+        })
+}
+
 #[cfg(test)]
 fn load_service_snapshot_for_active(
     path: &Path,
@@ -2596,10 +2911,29 @@ async fn restore_or_populate_service_state(
         return Ok(());
     }
     if let Some((snapshot, node)) = load_optional_service_checkpoint(&synchronizer.state_path)? {
+        let selection_path = selection_contract_state_path(&synchronizer.state_path)?;
+        let selection = load_optional_selection_checkpoint(&selection_path)?.filter(|checkpoint| {
+            checkpoint.contract.source_epoch == snapshot.source_epoch
+                && checkpoint.contract.service_revision == snapshot.revision
+        });
         let health = load_balancer_health_check_plan(&snapshot, &synchronizer.node_name)?;
         let health_staged = synchronizer.health_checks.prepare(&health)?;
         publish_desired_service_snapshot(state, &snapshot);
-        activate_service_snapshot(synchronizer, &snapshot, node.as_ref(), false, state)?;
+        publish_desired_selection_contract(
+            state,
+            selection.as_ref().map(|checkpoint| &checkpoint.contract),
+        );
+        let restored_node = node
+            .as_ref()
+            .or_else(|| selection.as_ref().map(|checkpoint| &checkpoint.node));
+        activate_service_snapshot_with_contract(
+            synchronizer,
+            &snapshot,
+            restored_node,
+            selection.as_ref().map(|checkpoint| &checkpoint.contract),
+            false,
+            state,
+        )?;
         synchronizer.health_checks.commit(&health, health_staged);
         publish_load_balancer_health(state, &health);
         return Ok(());
@@ -2625,7 +2959,22 @@ async fn synchronize_services(
     )
     .await?
     .validate_and_normalize()?;
-    let node_port_node = if service_requires_local_node(&candidate) {
+    let selection_contract = match fetch_selection_contract(
+        controller_url,
+        &synchronizer.client,
+        &synchronizer.agent_token_path,
+    )
+    .await
+    {
+        Ok(contract) => Some(contract),
+        Err(error) if !has_advanced_selection_intent(&candidate) => {
+            warn!(%error, "controller has no selection-contract projection; using safe legacy selection for default intent");
+            None
+        }
+        Err(error) => return Err(error.context("advanced selection intent requires a contract")),
+    };
+    let node_port_node = if service_requires_local_node(&candidate) || selection_contract.is_some()
+    {
         let node = fetch_node_port_node_snapshot(
             controller_url,
             &synchronizer.client,
@@ -2644,24 +2993,37 @@ async fn synchronize_services(
     } else {
         None
     };
+    if let Some(contract) = &selection_contract {
+        let node = node_port_node
+            .as_ref()
+            .context("selection contract requires authenticated local Node identity")?;
+        let local_node = local_selection_node(node, contract.node.zone.clone());
+        contract
+            .verify(&candidate, &local_node)
+            .context("verify controller service selection contract")?;
+    }
     let health = load_balancer_health_check_plan(&candidate, &synchronizer.node_name)?;
     publish_desired_service_snapshot(state, &candidate);
+    publish_desired_selection_contract(state, selection_contract.as_ref());
     let service_changed =
         validate_service_snapshot_transition(&candidate, synchronizer.applied.as_ref())?;
     let node_changed = validate_node_port_node_transition(
         node_port_node.as_ref(),
         synchronizer.applied_node_port_node.as_ref(),
     )?;
-    if !service_changed && !node_changed {
+    let selection_changed =
+        synchronizer.applied_selection_contract.as_ref() != selection_contract.as_ref();
+    if !service_changed && !node_changed && !selection_changed {
         synchronizer.health_checks.reconcile(&health)?;
         publish_load_balancer_health(state, &health);
         return Ok(());
     }
     let health_staged = synchronizer.health_checks.prepare(&health)?;
-    activate_service_snapshot(
+    activate_service_snapshot_with_contract(
         synchronizer,
         &candidate,
         node_port_node.as_ref(),
+        selection_contract.as_ref(),
         true,
         state,
     )?;
@@ -3245,11 +3607,58 @@ fn validate_node_port_node_transition(
     Ok(true)
 }
 
+fn stage_selection_contract(
+    banks: &mut [Option<NetworkBehaviorContract>; SELECTION_BANK_COUNT as usize],
+    bank: u8,
+    contract: &NetworkBehaviorContract,
+    snapshot: &ServiceSnapshot,
+    node: &NodePortNodeSnapshot,
+) -> Result<Option<NetworkBehaviorContract>> {
+    if bank >= SELECTION_BANK_COUNT {
+        bail!("selection stage has invalid inactive bank");
+    }
+    let previous = banks[usize::from(bank)].clone();
+    banks[usize::from(bank)] = Some(contract.clone());
+    let verification = banks[usize::from(bank)]
+        .as_ref()
+        .context("staged selection contract disappeared before readback")?
+        .verify(
+            snapshot,
+            &local_selection_node(node, contract.node.zone.clone()),
+        )
+        .context("verify staged selection contract readback");
+    if let Err(error) = verification {
+        banks[usize::from(bank)] = previous;
+        return Err(error);
+    }
+    Ok(previous)
+}
+
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn activate_service_snapshot(
     synchronizer: &mut ServiceSynchronizer,
     candidate: &ServiceSnapshot,
     node_port_node: Option<&NodePortNodeSnapshot>,
+    persist: bool,
+    state: &AgentState,
+) -> Result<()> {
+    activate_service_snapshot_with_contract(
+        synchronizer,
+        candidate,
+        node_port_node,
+        None,
+        persist,
+        state,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn activate_service_snapshot_with_contract(
+    synchronizer: &mut ServiceSynchronizer,
+    candidate: &ServiceSnapshot,
+    node_port_node: Option<&NodePortNodeSnapshot>,
+    selection_contract: Option<&NetworkBehaviorContract>,
     persist: bool,
     state: &AgentState,
 ) -> Result<()> {
@@ -3261,7 +3670,10 @@ fn activate_service_snapshot(
     if service_has_node_ports(&candidate) && node_port_node.is_none() {
         bail!("NodePort intent requires authenticated local Node state");
     }
-    if !service_requires_local_node(&candidate) && node_port_node.is_some() {
+    if !service_requires_local_node(&candidate)
+        && node_port_node.is_some()
+        && selection_contract.is_none()
+    {
         bail!("local Node state was supplied without Service host intent");
     }
     if let Some(node) = &node_port_node {
@@ -3272,12 +3684,32 @@ fn activate_service_snapshot(
             bail!("service and local Node state have different controller epochs");
         }
     }
+    if let Some(contract) = selection_contract {
+        let node = node_port_node
+            .as_ref()
+            .context("selection contract requires authenticated local Node state")?;
+        contract.verify(
+            &candidate,
+            &local_selection_node(node, contract.node.zone.clone()),
+        )?;
+    } else if has_advanced_selection_intent(&candidate) {
+        bail!("advanced Service selection intent cannot activate without a verified contract");
+    }
     let service_changed = synchronizer.applied.as_ref() != Some(&candidate);
     let local_node_changed =
         synchronizer.applied_node_port_node.as_ref() != node_port_node.as_ref();
-    if !service_changed && !local_node_changed {
+    let selection_changed = synchronizer.applied_selection_contract.as_ref() != selection_contract;
+    if !service_changed && !local_node_changed && !selection_changed {
         return Ok(());
     }
+
+    let selection_bank = if selection_changed {
+        (synchronizer.active_selection_bank + 1) % SELECTION_BANK_COUNT
+    } else {
+        synchronizer.active_selection_bank
+    };
+    let mut previous_selection_stage = selection_changed
+        .then(|| synchronizer.selection_banks[usize::from(selection_bank)].clone());
 
     let service_bank = if service_changed {
         (synchronizer.active_bank + 1) % SERVICE_BANK_COUNT
@@ -3356,13 +3788,18 @@ fn activate_service_snapshot(
         };
     }
 
-    let prepared = if persist {
-        match prepare_service_checkpoint(
-            &synchronizer.state_path,
+    if let Some(contract) = selection_contract.filter(|_| selection_changed) {
+        let node = node_port_node
+            .as_ref()
+            .context("selection contract readback requires local Node state")?;
+        match stage_selection_contract(
+            &mut synchronizer.selection_banks,
+            selection_bank,
+            contract,
             &candidate,
-            node_port_node.as_ref(),
+            node,
         ) {
-            Ok(prepared) => Some(prepared),
+            Ok(previous) => previous_selection_stage = Some(previous),
             Err(error) => {
                 let service_rollback = previous_service_stage
                     .as_ref()
@@ -3371,7 +3808,69 @@ fn activate_service_snapshot(
                     .as_ref()
                     .map_or(Ok(()), |bank| restore_node_port_bank(synchronizer, bank));
                 bail!(
-                    "prepare NodePort service checkpoint failed: {error:#}; service staging rollback: {service_rollback:?}; NodePort staging rollback: {node_port_rollback:?}"
+                    "selection staging failed: {error:#}; service staging rollback: {service_rollback:?}; NodePort staging rollback: {node_port_rollback:?}"
+                );
+            }
+        }
+    }
+
+    let selection_prepared = if persist && selection_changed {
+        match selection_contract {
+            Some(contract) => match prepare_selection_checkpoint(
+                &synchronizer.state_path,
+                contract,
+                node_port_node
+                    .as_ref()
+                    .context("selection checkpoint requires local Node state")?,
+                selection_bank,
+            )
+            .context("prepare service selection checkpoint")
+            {
+                Ok(pending) => Some(pending),
+                Err(error) => {
+                    synchronizer.selection_banks[usize::from(selection_bank)] =
+                        previous_selection_stage.clone().flatten();
+                    let service_rollback = previous_service_stage
+                        .as_ref()
+                        .map_or(Ok(()), |bank| restore_service_bank(synchronizer, bank));
+                    let node_port_rollback = previous_node_port_stage
+                        .as_ref()
+                        .map_or(Ok(()), |bank| restore_node_port_bank(synchronizer, bank));
+                    bail!(
+                        "prepare selection checkpoint failed: {error:#}; service staging rollback: {service_rollback:?}; NodePort staging rollback: {node_port_rollback:?}"
+                    );
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    let prepared = if persist {
+        match prepare_service_checkpoint(
+            &synchronizer.state_path,
+            &candidate,
+            node_port_node
+                .as_ref()
+                .filter(|_| service_requires_local_node(&candidate)),
+        ) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                if selection_changed {
+                    synchronizer.selection_banks[usize::from(selection_bank)] =
+                        previous_selection_stage.clone().flatten();
+                }
+                let service_rollback = previous_service_stage
+                    .as_ref()
+                    .map_or(Ok(()), |bank| restore_service_bank(synchronizer, bank));
+                let node_port_rollback = previous_node_port_stage
+                    .as_ref()
+                    .map_or(Ok(()), |bank| restore_node_port_bank(synchronizer, bank));
+                let selection_cleanup = selection_prepared.as_ref().map_or(Ok(()), |path| {
+                    remove_secure_optional_file(path, "pending selection checkpoint")
+                });
+                bail!(
+                    "prepare NodePort service checkpoint failed: {error:#}; service staging rollback: {service_rollback:?}; NodePort staging rollback: {node_port_rollback:?}; selection staging cleanup: {selection_cleanup:?}"
                 );
             }
         }
@@ -3404,6 +3903,13 @@ fn activate_service_snapshot(
             commit_prepared_service_snapshot(&synchronizer.state_path, prepared)
                 .context("commit active NodePort service checkpoint")?;
         }
+        if let Some(prepared) = &selection_prepared {
+            commit_prepared_selection_checkpoint(&synchronizer.state_path, prepared)
+                .context("commit active service selection checkpoint")?;
+        } else if persist && selection_changed && selection_contract.is_none() {
+            let current = selection_contract_state_path(&synchronizer.state_path)?;
+            remove_secure_optional_file(&current, "obsolete selection checkpoint")?;
+        }
         Ok(())
     })();
     if let Err(error) = activation {
@@ -3422,19 +3928,42 @@ fn activate_service_snapshot(
         let node_port_stage_rollback = previous_node_port_stage
             .as_ref()
             .map_or(Ok(()), |bank| restore_node_port_bank(synchronizer, bank));
+        if selection_changed {
+            synchronizer.selection_banks[usize::from(selection_bank)] =
+                previous_selection_stage.clone().flatten();
+        }
         let checkpoint_rollback = restore_service_fabric_checkpoint(
             &synchronizer.state_path,
             synchronizer.applied.as_ref(),
-            synchronizer.applied_node_port_node.as_ref(),
+            synchronizer.applied_node_port_node.as_ref().filter(|_| {
+                synchronizer
+                    .applied
+                    .as_ref()
+                    .is_some_and(service_requires_local_node)
+            }),
         );
+        let selection_checkpoint_rollback = if persist && selection_changed {
+            restore_selection_checkpoint(
+                &synchronizer.state_path,
+                synchronizer.applied_selection_contract.as_ref(),
+                synchronizer.applied_node_port_node.as_ref(),
+                synchronizer.active_selection_bank,
+            )
+        } else {
+            Ok(())
+        };
         let pending_cleanup = discard_service_pending_state(&synchronizer.state_path);
+        let selection_pending_cleanup = selection_prepared.as_ref().map_or(Ok(()), |path| {
+            remove_secure_optional_file(path, "pending selection checkpoint")
+        });
         bail!(
-            "NodePort service transaction failed: {error:#}; service config rollback: {service_config_rollback:?}; NodePort config rollback: {node_port_config_rollback:?}; LoadBalancer Node source rollback: {load_balancer_node_source_rollback:?}; service stage rollback: {service_stage_rollback:?}; NodePort stage rollback: {node_port_stage_rollback:?}; checkpoint rollback: {checkpoint_rollback:?}; pending cleanup: {pending_cleanup:?}"
+            "NodePort service transaction failed: {error:#}; service config rollback: {service_config_rollback:?}; NodePort config rollback: {node_port_config_rollback:?}; LoadBalancer Node source rollback: {load_balancer_node_source_rollback:?}; service stage rollback: {service_stage_rollback:?}; NodePort stage rollback: {node_port_stage_rollback:?}; checkpoint rollback: {checkpoint_rollback:?}; selection checkpoint rollback: {selection_checkpoint_rollback:?}; pending cleanup: {pending_cleanup:?}; selection pending cleanup: {selection_pending_cleanup:?}"
         );
     }
 
     let previous_active = synchronizer.active_bank;
     let previous_node_port_active = synchronizer.active_node_port_bank;
+    let previous_selection_active = synchronizer.active_selection_bank;
     if let Some(desired) = desired_service {
         let desired_index = usize::from(desired.bank);
         synchronizer.banks[desired_index] = Some(desired);
@@ -3449,7 +3978,16 @@ fn activate_service_snapshot(
     synchronizer
         .applied_node_port_node
         .clone_from(&node_port_node);
+    if selection_changed {
+        synchronizer.active_selection_bank = selection_bank;
+        synchronizer.applied_selection_contract = selection_contract.cloned();
+    }
     publish_applied_service_snapshot(state, &candidate);
+    publish_applied_selection_contract(
+        state,
+        synchronizer.applied_selection_contract.as_ref(),
+        synchronizer.active_selection_bank,
+    );
     clear_service_snapshot_error(state);
     if previous_node_port_active != synchronizer.active_node_port_bank {
         let previous_index = usize::from(previous_node_port_active);
@@ -3477,12 +4015,20 @@ fn activate_service_snapshot(
             }
         }
     }
+    if previous_selection_active != synchronizer.active_selection_bank {
+        synchronizer.selection_banks[usize::from(previous_selection_active)] = None;
+    }
     info!(
         service_epoch = candidate.source_epoch,
         service_revision = candidate.revision.get(),
         active_bank = synchronizer.active_bank,
         node_port_revision = node_port_node.as_ref().map(|node| node.revision.get()),
         active_node_port_bank = synchronizer.active_node_port_bank,
+        selection_contract_revision =
+            selection_contract.map(|contract| contract.contract_revision.get()),
+        selection_contract_digest =
+            selection_contract.map(|contract| contract.contract_digest.to_string()),
+        active_selection_bank = synchronizer.active_selection_bank,
         services = candidate.services.len(),
         "service and NodePort snapshot activated in persistent BPF maps"
     );
@@ -4073,6 +4619,34 @@ fn publish_applied_service_snapshot(state: &AgentState, snapshot: &ServiceSnapsh
         .set(metric_value(local_node_ports));
 }
 
+fn publish_desired_selection_contract(
+    state: &AgentState,
+    contract: Option<&NetworkBehaviorContract>,
+) {
+    state.desired_selection_contract_revision.store(
+        contract.map_or(0, |contract| contract.contract_revision.get()),
+        Ordering::Release,
+    );
+    *mutex_lock(&state.desired_selection_contract_digest) =
+        contract.map(|contract| contract.contract_digest.to_string());
+}
+
+fn publish_applied_selection_contract(
+    state: &AgentState,
+    contract: Option<&NetworkBehaviorContract>,
+    active_bank: u8,
+) {
+    state.applied_selection_contract_revision.store(
+        contract.map_or(0, |contract| contract.contract_revision.get()),
+        Ordering::Release,
+    );
+    *mutex_lock(&state.applied_selection_contract_digest) =
+        contract.map(|contract| contract.contract_digest.to_string());
+    state
+        .active_selection_bank
+        .store(u64::from(active_bank), Ordering::Release);
+}
+
 fn record_service_snapshot_error(state: &AgentState, error: &anyhow::Error) {
     state
         .service_reconcile_errors
@@ -4504,6 +5078,11 @@ fn new_state(
         service_count: AtomicU64::new(0),
         service_frontend_count: AtomicU64::new(0),
         service_backend_count: AtomicU64::new(0),
+        desired_selection_contract_revision: AtomicU64::new(0),
+        applied_selection_contract_revision: AtomicU64::new(0),
+        desired_selection_contract_digest: Mutex::new(None),
+        applied_selection_contract_digest: Mutex::new(None),
+        active_selection_bank: AtomicU64::new(0),
         desired_node_port_frontend_count: AtomicU64::new(0),
         applied_node_port_frontend_count: AtomicU64::new(0),
         node_port_cluster_frontend_count: AtomicU64::new(0),
@@ -5228,12 +5807,15 @@ fn new_synchronizers(
             banks: [None, None],
             node_port_banks: [None, None],
             load_balancer_banks: [None, None],
+            selection_banks: [None, None],
             active_bank: 0,
             active_node_port_bank: 0,
             active_load_balancer_bank: 0,
             applied: None,
             applied_node_port_node: None,
             applied_load_balancer_reachability: None,
+            applied_selection_contract: None,
+            active_selection_bank: 0,
             node_name,
             controller_url,
             client,
@@ -5474,6 +6056,7 @@ async fn preflight_controller_compatibility(
         persistent_bpf_state_abi_version = compatibility.persistent_bpf_state_abi_version,
         policy_snapshot_schema_version = compatibility.policy_snapshot_schema_version,
         service_snapshot_schema_version = compatibility.service_snapshot_schema_version,
+        selection_contract_schema_version = compatibility.selection_contract_schema_version,
         "controller compatibility preflight passed before persistent BPF state access"
     );
     Ok(())
@@ -5503,11 +6086,6 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
             local.policy_snapshot_schema_version,
         ),
         (
-            "agent-status schema",
-            controller.agent_status_schema_version,
-            local.agent_status_schema_version,
-        ),
-        (
             "flow-export schema",
             controller.flow_export_schema_version,
             local.flow_export_schema_version,
@@ -5526,6 +6104,21 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
         mismatches.push(format!(
             "service snapshot schema controller={} agent={}",
             controller.service_snapshot_schema_version, local.service_snapshot_schema_version
+        ));
+    }
+    if !matches!(
+        controller.agent_status_schema_version,
+        PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION | AGENT_STATUS_SCHEMA_VERSION
+    ) {
+        mismatches.push(format!(
+            "agent-status schema controller={} agent={}",
+            controller.agent_status_schema_version, local.agent_status_schema_version
+        ));
+    }
+    if controller.selection_contract_schema_version > local.selection_contract_schema_version {
+        mismatches.push(format!(
+            "selection contract schema controller={} agent={}",
+            controller.selection_contract_schema_version, local.selection_contract_schema_version
         ));
     }
     if controller.load_balancer_reachability_schema_version
@@ -5768,6 +6361,7 @@ fn recover_persistent_dataplane(
         (None, None)
     };
     let (service_epoch, service_revision) = recover_service_state(services)?;
+    recover_selection_contract_state(services)?;
     recover_load_balancer_state(services)?;
 
     if pins_existed {
@@ -7748,6 +8342,17 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
         service_count: state.service_count.load(Ordering::Acquire),
         service_frontend_count: state.service_frontend_count.load(Ordering::Acquire),
         service_backend_count: state.service_backend_count.load(Ordering::Acquire),
+        desired_selection_contract_revision: state
+            .desired_selection_contract_revision
+            .load(Ordering::Acquire),
+        applied_selection_contract_revision: state
+            .applied_selection_contract_revision
+            .load(Ordering::Acquire),
+        desired_selection_contract_digest: mutex_lock(&state.desired_selection_contract_digest)
+            .clone(),
+        applied_selection_contract_digest: mutex_lock(&state.applied_selection_contract_digest)
+            .clone(),
+        active_selection_bank: state.active_selection_bank.load(Ordering::Acquire),
         desired_node_port_frontend_count: state
             .desired_node_port_frontend_count
             .load(Ordering::Acquire),
@@ -7762,6 +8367,7 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
             .load(Ordering::Acquire),
         load_balancer_reachability_schema_version:
             unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION,
+        selection_contract_schema_version: unf_service::SELECTION_CONTRACT_SCHEMA_VERSION,
         desired_load_balancer_epoch: state.desired_load_balancer_epoch.load(Ordering::Acquire),
         desired_load_balancer_revision: state
             .desired_load_balancer_revision
@@ -10325,12 +10931,15 @@ mod tests {
             banks: [None, None],
             node_port_banks: [None, None],
             load_balancer_banks: [None, None],
+            selection_banks: [None, None],
             active_bank: 0,
             active_node_port_bank: 0,
             active_load_balancer_bank: 0,
             applied: None,
             applied_node_port_node: None,
             applied_load_balancer_reachability: None,
+            applied_selection_contract: None,
+            active_selection_bank: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -10738,6 +11347,136 @@ mod tests {
     }
 
     #[test]
+    fn selection_checkpoint_is_digest_bound_private_and_crash_repairable() {
+        let directory = tempdir().unwrap();
+        let service_path = directory.path().join("service.json");
+        let service = service_test_snapshot_with_backend(7, 4);
+        persist_service_checkpoint(&service_path, &service, None, "test service").unwrap();
+        let node = node_port_node_snapshot(3);
+        let selection_node = local_selection_node(&node, Some("zone-a".to_owned()));
+        let contract = NetworkBehaviorContract::compile(
+            &service,
+            Revision::new(8),
+            Revision::new(8),
+            selection_node,
+        )
+        .expect("test selection contract compiles");
+        let pending = prepare_selection_checkpoint(&service_path, &contract, &node, 1)
+            .expect("selection contract is durably prepared");
+        assert_eq!(
+            fs::metadata(&pending).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let prepared = load_optional_selection_checkpoint(&pending)
+            .expect("prepared selection contract validates")
+            .expect("prepared selection contract exists");
+        assert_eq!(prepared.contract, contract);
+        assert_eq!(prepared.active_bank, 1);
+
+        commit_prepared_selection_checkpoint(&service_path, &pending)
+            .expect("prepared selection contract commits atomically");
+        let current = selection_contract_state_path(&service_path).unwrap();
+        assert!(!pending.exists());
+        assert_eq!(
+            load_optional_selection_checkpoint(&current)
+                .unwrap()
+                .unwrap()
+                .contract,
+            contract
+        );
+
+        let mut malformed = serde_json::to_value(SelectionContractCheckpoint {
+            schema_version: SELECTION_CONTRACT_CHECKPOINT_SCHEMA_VERSION,
+            active_bank: 1,
+            node,
+            contract,
+        })
+        .unwrap();
+        malformed["contract"]["contractDigest"] = serde_json::json!("00".repeat(32));
+        persist_secure_json(&current, &malformed, "mutated selection contract").unwrap();
+        assert!(load_optional_selection_checkpoint(&current).is_err());
+
+        malformed["unexpected"] = serde_json::json!(true);
+        persist_secure_json(&current, &malformed, "unknown selection state").unwrap();
+        assert!(load_optional_selection_checkpoint(&current).is_err());
+    }
+
+    #[test]
+    fn selection_recovery_chooses_pending_contract_for_committed_service_revision() {
+        let directory = tempdir().unwrap();
+        let service_path = directory.path().join("service.json");
+        let node = node_port_node_snapshot(3);
+        let old_service = service_test_snapshot_with_backend(7, 4);
+        persist_service_checkpoint(&service_path, &old_service, None, "old service").unwrap();
+        let old_contract = NetworkBehaviorContract::compile(
+            &old_service,
+            Revision::new(8),
+            Revision::new(8),
+            local_selection_node(&node, Some("zone-a".to_owned())),
+        )
+        .unwrap();
+        let old_pending =
+            prepare_selection_checkpoint(&service_path, &old_contract, &node, 1).unwrap();
+        commit_prepared_selection_checkpoint(&service_path, &old_pending).unwrap();
+
+        let new_service = service_test_snapshot_with_backend(7, 5);
+        persist_service_checkpoint(&service_path, &new_service, None, "committed new service")
+            .unwrap();
+        let new_contract = NetworkBehaviorContract::compile(
+            &new_service,
+            Revision::new(9),
+            Revision::new(9),
+            local_selection_node(&node, Some("zone-a".to_owned())),
+        )
+        .unwrap();
+        let pending = prepare_selection_checkpoint(&service_path, &new_contract, &node, 0).unwrap();
+        let current_path = selection_contract_state_path(&service_path).unwrap();
+        assert!(load_optional_selection_checkpoint(&current_path).is_err());
+        let current = decode_optional_selection_checkpoint(&current_path).unwrap();
+        let prepared = decode_optional_selection_checkpoint(&pending).unwrap();
+        let (selected_pending, selected) =
+            select_recovered_selection_checkpoint(&new_service, current, prepared)
+                .expect("the prepared contract matches the service revision that won");
+        assert!(selected_pending);
+        assert_eq!(selected.contract, new_contract);
+        verify_selection_checkpoint(&selected, &new_service).unwrap();
+        commit_prepared_selection_checkpoint(&service_path, &pending).unwrap();
+        assert_eq!(
+            load_optional_selection_checkpoint(&current_path)
+                .unwrap()
+                .unwrap()
+                .contract,
+            new_contract
+        );
+    }
+
+    #[test]
+    fn selection_inactive_stage_reads_back_and_restores_previous_content_on_rejection() {
+        let service = service_test_snapshot_with_backend(7, 4);
+        let node = node_port_node_snapshot(3);
+        let contract = NetworkBehaviorContract::compile(
+            &service,
+            Revision::new(8),
+            Revision::new(8),
+            local_selection_node(&node, Some("zone-a".to_owned())),
+        )
+        .unwrap();
+        let mut banks = [Some(contract.clone()), None];
+        let mut mutated = contract.clone();
+        mutated.contract_revision = mutated.contract_revision.next();
+        assert!(
+            stage_selection_contract(&mut banks, 0, &mutated, &service, &node).is_err(),
+            "readback rejects a staged contract whose digest no longer matches"
+        );
+        assert_eq!(banks, [Some(contract.clone()), None]);
+
+        let previous = stage_selection_contract(&mut banks, 1, &contract, &service, &node)
+            .expect("a verified contract stages in the inactive bank");
+        assert!(previous.is_none());
+        assert_eq!(banks[1], Some(contract));
+    }
+
+    #[test]
     fn service_schema_transition_reads_v1_without_breaking_rollback() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("service-snapshot.json");
@@ -10912,12 +11651,15 @@ mod tests {
             banks: [None, None],
             node_port_banks: [None, None],
             load_balancer_banks: [None, None],
+            selection_banks: [None, None],
             active_bank: 0,
             active_node_port_bank: 0,
             active_load_balancer_bank: 0,
             applied: None,
             applied_node_port_node: None,
             applied_load_balancer_reachability: None,
+            applied_selection_contract: None,
+            active_selection_bank: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -11961,12 +12703,15 @@ mod tests {
             banks: [None, None],
             node_port_banks: [None, None],
             load_balancer_banks: [None, None],
+            selection_banks: [None, None],
             active_bank: 0,
             active_node_port_bank: 0,
             active_load_balancer_bank: 0,
             applied: None,
             applied_node_port_node: None,
             applied_load_balancer_reachability: None,
+            applied_selection_contract: None,
+            active_selection_bank: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -13149,6 +13894,10 @@ mod tests {
             version.service_snapshot_schema_version,
             unf_service::SERVICE_SNAPSHOT_SCHEMA_VERSION
         );
+        assert_eq!(
+            version.selection_contract_schema_version,
+            SELECTION_CONTRACT_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -13167,6 +13916,11 @@ mod tests {
         controller.service_snapshot_schema_version = LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION;
         assert!(ensure_controller_compatibility(&controller).is_ok());
         controller.service_snapshot_schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        controller.selection_contract_schema_version = 0;
+        controller.agent_status_schema_version = PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION;
+        assert!(ensure_controller_compatibility(&controller).is_ok());
+        controller.agent_status_schema_version = AGENT_STATUS_SCHEMA_VERSION;
+        controller.selection_contract_schema_version = SELECTION_CONTRACT_SCHEMA_VERSION;
 
         controller.load_balancer_reachability_schema_version = 0;
         assert!(ensure_controller_compatibility(&controller).is_ok());
@@ -13203,6 +13957,15 @@ mod tests {
         )));
 
         controller.service_snapshot_schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        controller.selection_contract_schema_version = SELECTION_CONTRACT_SCHEMA_VERSION + 1;
+        let error = ensure_controller_compatibility(&controller)
+            .expect_err("a newer selection contract schema is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("selection contract schema controller=2 agent=1")
+        );
+        controller.selection_contract_schema_version = SELECTION_CONTRACT_SCHEMA_VERSION;
         controller.load_balancer_reachability_schema_version =
             unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION + 1;
         let error = ensure_controller_compatibility(&controller)

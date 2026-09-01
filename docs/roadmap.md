@@ -525,6 +525,13 @@ matrix is maintained in the
   endpoint/Node/zone failure outcomes; compact witnesses join later decisions
   to retained evidence. Mutation, property, golden, compatibility, and replay
   tests pass `make service-selection-contract-test`; ADR 0104.
+- Verified compatible distribution and transactional state: explicit schema
+  negotiation and authenticated UID/zone projection admit only advertised
+  StableHash/NAT capabilities; agents independently verify, stage, read back,
+  activate, checkpoint, roll back, recover, and acknowledge the exact per-Node
+  digest. Owner-only contract+Node state and exact rollback cleanup pass
+  `make service-selection-state-test`; ABI-v7 and packet behavior are unchanged;
+  ADR 0105.
 - Per-Node eligibility and selection plans are compiled in userspace and must
   pass contract verification before transactional activation. The eBPF path
   performs bounded lookups and does not interpret Kubernetes topology,
@@ -534,8 +541,8 @@ matrix is maintained in the
   upgrades, and verifier-visible packet-cost evidence against the current hash.
 - DSR is opt-in and cannot bypass route/neighbor/MTU safety, backend VIP
   ownership, policy, source ranges, health, reverse telemetry, or exact cleanup.
-- Distribution/state, locality, affinity/draining, Maglev, DSR, operations,
-  Kind, and OpenShift remain ordered independent milestones;
+- Locality, affinity/draining, Maglev, DSR, operations, Kind, and OpenShift
+  remain ordered independent milestones;
   ADR 0102 and `make service-selection-boundary-test` define the first gate.
 - Weighted traffic splitting, latency/load feedback, cross-cluster selection,
   SCTP Services, fragments, generic NAT `RELATED`, and production scale remain

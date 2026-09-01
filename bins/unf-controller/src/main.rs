@@ -60,11 +60,12 @@ use unf_service::{
     AddressFamily, EndpointPortSource, EndpointSliceSource, EndpointSource,
     LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION, LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION,
     NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION, NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION,
-    NodeAddressKind, NodePortNodeSnapshot, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceBackend,
-    ServiceForwardingMode, ServiceIpFamilyPolicy, ServiceIpPrefix, ServiceIr,
-    ServiceLoadBalancerSource, ServiceNodeAddress, ServiceNodePort, ServiceSelectionAlgorithm,
-    ServiceSessionAffinity, ServiceSnapshot, ServiceSource, ServiceSourcePort,
-    ServiceTrafficDistribution, ServiceTrafficPolicy, UNF_LOAD_BALANCER_CLASS,
+    NetworkBehaviorContract, NodeAddressKind, NodePortNodeSnapshot,
+    SELECTION_CONTRACT_SCHEMA_VERSION, SERVICE_SNAPSHOT_SCHEMA_VERSION, SelectionCapability,
+    SelectionNode, ServiceBackend, ServiceForwardingMode, ServiceIpFamilyPolicy, ServiceIpPrefix,
+    ServiceIr, ServiceLoadBalancerSource, ServiceNodeAddress, ServiceNodePort,
+    ServiceSelectionAlgorithm, ServiceSessionAffinity, ServiceSnapshot, ServiceSource,
+    ServiceSourcePort, ServiceTrafficDistribution, ServiceTrafficPolicy, UNF_LOAD_BALANCER_CLASS,
     compile_service_snapshot,
 };
 use unf_state::{
@@ -75,11 +76,12 @@ use unf_state::{
     FlowHistoryCheckpoint, FlowHistoryEntry, FlowHistoryQuerySummary, FlowHistorySnapshot,
     FlowHistoryStore, IdentityRegistry, IdentityStateSnapshot, Ipv4PolicyMapEntry,
     Ipv4PolicyMapKey, Ipv6PolicyMapEntry, Ipv6PolicyMapKey, NetworkIdentity,
-    POLICY_SNAPSHOT_SCHEMA_VERSION, PolicyDecisionRecord, PolicyStateSnapshot, RevisionSet,
-    ServiceFrontendKind, TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION,
-    TopologyHistoryCheckpoint, TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode,
-    TopologyService, TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort,
-    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
+    POLICY_SNAPSHOT_SCHEMA_VERSION, PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION,
+    PolicyDecisionRecord, PolicyStateSnapshot, RevisionSet, ServiceFrontendKind,
+    TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyHistoryCheckpoint,
+    TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode, TopologyService,
+    TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot,
+    TopologyWorkload, provisional_identity_id,
 };
 
 mod external_flow_export;
@@ -739,6 +741,18 @@ struct LoadBalancerSimulation {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ServiceSchemaQuery {
     service_snapshot_schema_version: Option<u16>,
+    selection_contract_schema_version: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SelectionContractQuery {
+    selection_contract_schema_version: Option<u16>,
+    stable_hash: Option<bool>,
+    maglev: Option<bool>,
+    nat: Option<bool>,
+    dsr_ipv4: Option<bool>,
+    dsr_ipv6: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -932,6 +946,10 @@ async fn spawn_internal_api(
         .route("/v1/state/identities", get(identity_snapshot))
         .route("/v1/state/policies", get(policy_snapshot))
         .route("/v1/state/services", get(service_snapshot))
+        .route(
+            "/v1/state/service-selection",
+            get(service_selection_contract),
+        )
         .route(
             "/v1/state/load-balancer-reachability",
             get(load_balancer_reachability_snapshot),
@@ -3750,7 +3768,11 @@ async fn metrics(State(state): State<Arc<ControllerState>>) -> Response {
 async fn version(
     Query(query): Query<ServiceSchemaQuery>,
 ) -> Result<Json<ComponentCompatibility>, ApiError> {
-    compatibility_for_service_schema(requested_service_schema(&query)?).map(Json)
+    compatibility_for_service_schemas(
+        requested_service_schema(&query)?,
+        requested_selection_contract_schema(&query)?,
+    )
+    .map(Json)
 }
 
 fn component_compatibility() -> ComponentCompatibility {
@@ -3776,15 +3798,47 @@ fn requested_service_schema(query: &ServiceSchemaQuery) -> Result<u16, ApiError>
     }
 }
 
+#[cfg(test)]
 fn compatibility_for_service_schema(
     requested_schema: u16,
 ) -> Result<ComponentCompatibility, ApiError> {
+    compatibility_for_service_schemas(requested_schema, 0)
+}
+
+fn compatibility_for_service_schemas(
+    requested_schema: u16,
+    requested_selection_schema: u16,
+) -> Result<ComponentCompatibility, ApiError> {
     requested_service_schema(&ServiceSchemaQuery {
         service_snapshot_schema_version: Some(requested_schema),
+        selection_contract_schema_version: Some(requested_selection_schema),
     })?;
+    if !matches!(
+        requested_selection_schema,
+        0 | SELECTION_CONTRACT_SCHEMA_VERSION
+    ) {
+        return Err(ApiError::bad_request(format!(
+            "unsupported requested selection contract schema {requested_selection_schema}; supported schemas are 0 and {SELECTION_CONTRACT_SCHEMA_VERSION}"
+        )));
+    }
     let mut compatibility = component_compatibility();
     compatibility.service_snapshot_schema_version = requested_schema;
+    compatibility.selection_contract_schema_version = requested_selection_schema;
+    if requested_selection_schema == 0 {
+        compatibility.agent_status_schema_version = PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION;
+    }
     Ok(compatibility)
+}
+
+fn requested_selection_contract_schema(query: &ServiceSchemaQuery) -> Result<u16, ApiError> {
+    let requested = query.selection_contract_schema_version.unwrap_or(0);
+    if matches!(requested, 0 | SELECTION_CONTRACT_SCHEMA_VERSION) {
+        Ok(requested)
+    } else {
+        Err(ApiError::bad_request(format!(
+            "unsupported requested selection contract schema {requested}; supported schemas are 0 and {SELECTION_CONTRACT_SCHEMA_VERSION}"
+        )))
+    }
 }
 
 async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<StatusBody>, ApiError> {
@@ -4133,10 +4187,15 @@ fn exact_extra_value<'value>(
 }
 
 fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
-    if report.schema_version != AGENT_STATUS_SCHEMA_VERSION {
+    if !matches!(
+        report.schema_version,
+        PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION | AGENT_STATUS_SCHEMA_VERSION
+    ) {
         return Err(ApiError::bad_request(format!(
-            "unsupported agent status schema {}; expected {}",
-            report.schema_version, AGENT_STATUS_SCHEMA_VERSION
+            "unsupported agent status schema {}; expected {} or {}",
+            report.schema_version,
+            PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION,
+            AGENT_STATUS_SCHEMA_VERSION
         )));
     }
     let valid_node_name = !report.node_name.is_empty()
@@ -4190,6 +4249,7 @@ fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
             "service_last_error must be nonempty and at most 1024 bytes when present",
         ));
     }
+    validate_selection_status(report)?;
     validate_service_dataplane_status(report)?;
     let service_revision_pairs = [
         (
@@ -4212,6 +4272,64 @@ fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
     }
     validate_service_status_counts(report)?;
     validate_load_balancer_status(report)
+}
+
+fn validate_selection_status(report: &AgentStateReport) -> Result<(), ApiError> {
+    if report.schema_version == PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION
+        && report.selection_contract_schema_version != 0
+    {
+        return Err(ApiError::bad_request(
+            "pre-selection agent status cannot carry a selection contract schema",
+        ));
+    }
+    if report.selection_contract_schema_version > SELECTION_CONTRACT_SCHEMA_VERSION {
+        return Err(ApiError::bad_request(format!(
+            "unsupported reported selection contract schema {}; controller supports at most {}",
+            report.selection_contract_schema_version, SELECTION_CONTRACT_SCHEMA_VERSION
+        )));
+    }
+    if report.active_selection_bank > 1 {
+        return Err(ApiError::bad_request(
+            "active_selection_bank must identify transactional bank 0 or 1",
+        ));
+    }
+    for (label, revision, digest) in [
+        (
+            "desired",
+            report.desired_selection_contract_revision,
+            report.desired_selection_contract_digest.as_deref(),
+        ),
+        (
+            "applied",
+            report.applied_selection_contract_revision,
+            report.applied_selection_contract_digest.as_deref(),
+        ),
+    ] {
+        if (revision == 0) != digest.is_none() {
+            return Err(ApiError::bad_request(format!(
+                "{label} selection contract revision and digest must both be absent or both be present"
+            )));
+        }
+        if digest.is_some_and(|digest| {
+            digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        }) {
+            return Err(ApiError::bad_request(format!(
+                "{label} selection contract digest must be 64 lowercase hexadecimal characters"
+            )));
+        }
+    }
+    if report.selection_contract_schema_version == 0
+        && (report.desired_selection_contract_revision != 0
+            || report.applied_selection_contract_revision != 0)
+    {
+        return Err(ApiError::bad_request(
+            "selection contract acknowledgements require a negotiated schema",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_load_balancer_status(report: &AgentStateReport) -> Result<(), ApiError> {
@@ -4384,6 +4502,9 @@ fn agent_convergence_snapshot(
             )
         })
         .unwrap_or_default();
+    let selection_required = read_lock(&state.compiled_service_snapshot)
+        .as_ref()
+        .is_some_and(|snapshot| !snapshot.services.is_empty());
     let load_balancer_revision = load_balancer_revision_requirement(
         read_lock(&state.compiled_load_balancer_reachability).as_ref(),
     );
@@ -4401,6 +4522,18 @@ fn agent_convergence_snapshot(
     let nodes = expected_nodes
         .iter()
         .map(|node_name| {
+            let selection_requirement = service_selection_contract_for(
+                state,
+                node_name,
+                BTreeSet::from([SelectionCapability::StableHash, SelectionCapability::Nat]),
+            )
+            .ok()
+            .map(|contract| {
+                (
+                    contract.contract_revision,
+                    contract.contract_digest.to_string(),
+                )
+            });
             let stored = reports.get(node_name);
             let fresh = stored.is_some_and(|stored| {
                 now_unix_ms.saturating_sub(stored.last_received_unix_ms)
@@ -4420,6 +4553,8 @@ fn agent_convergence_snapshot(
                         identity_revision,
                         policy_revision,
                         service_revision,
+                        selection_required,
+                        selection_requirement.as_ref(),
                         load_balancer_revision,
                         node_block_revisions
                             .get(node_name)
@@ -4539,6 +4674,8 @@ fn agent_report_matches(
     identity_revision: Revision,
     policy_revision: Revision,
     service_revision: (u64, Revision, bool),
+    selection_required: bool,
+    selection_requirement: Option<&(Revision, String)>,
     load_balancer_revision: Option<(u64, Revision, Revision)>,
     node_block_revision: Revision,
     remote_route_revision: (u64, Revision),
@@ -4560,6 +4697,14 @@ fn agent_report_matches(
         && (!service_revision.2
             || report.service_snapshot_schema_version
                 >= LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION)
+        && (!selection_required
+            || selection_requirement.is_some_and(|(revision, digest)| {
+                report.selection_contract_schema_version >= SELECTION_CONTRACT_SCHEMA_VERSION
+                    && report.desired_selection_contract_revision == revision.get()
+                    && report.applied_selection_contract_revision == revision.get()
+                    && report.desired_selection_contract_digest.as_ref() == Some(digest)
+                    && report.applied_selection_contract_digest.as_ref() == Some(digest)
+            }))
         && report.failed_service_epoch == 0
         && report.failed_service_revision == 0
         && report.service_last_error.is_none()
@@ -4618,6 +4763,72 @@ async fn service_snapshot(
 ) -> Result<Json<ServiceSnapshot>, ApiError> {
     authenticate_internal_agent(&state, &headers).await?;
     service_snapshot_for_schema(&state, requested_service_schema(&query)?).map(Json)
+}
+
+async fn service_selection_contract(
+    State(state): State<Arc<ControllerState>>,
+    Query(query): Query<SelectionContractQuery>,
+    headers: HeaderMap,
+) -> Result<Json<NetworkBehaviorContract>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    let schema = query
+        .selection_contract_schema_version
+        .unwrap_or(SELECTION_CONTRACT_SCHEMA_VERSION);
+    if schema != SELECTION_CONTRACT_SCHEMA_VERSION {
+        return Err(ApiError::bad_request(format!(
+            "unsupported requested selection contract schema {schema}; expected {SELECTION_CONTRACT_SCHEMA_VERSION}"
+        )));
+    }
+    let mut capabilities = BTreeSet::new();
+    for (enabled, capability) in [
+        (query.stable_hash, SelectionCapability::StableHash),
+        (query.maglev, SelectionCapability::Maglev),
+        (query.nat, SelectionCapability::Nat),
+        (query.dsr_ipv4, SelectionCapability::DsrIpv4),
+        (query.dsr_ipv6, SelectionCapability::DsrIpv6),
+    ] {
+        if enabled.unwrap_or(false) {
+            capabilities.insert(capability);
+        }
+    }
+    service_selection_contract_for(&state, &agent.node_name, capabilities).map(Json)
+}
+
+fn service_selection_contract_for(
+    state: &ControllerState,
+    node_name: &str,
+    capabilities: BTreeSet<SelectionCapability>,
+) -> Result<NetworkBehaviorContract, ApiError> {
+    let snapshot = service_snapshot_for(state)?;
+    let record = read_lock(&state.node_port_nodes)
+        .get(node_name)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::service_unavailable(format!(
+                "node {node_name} has no authoritative UID for service selection"
+            ))
+        })?;
+    let zone = read_lock(&state.nodes)
+        .get(node_name)
+        .and_then(|node| node.labels.get("topology.kubernetes.io/zone"))
+        .cloned();
+    let topology_revision = mutex_lock(&state.revisions).topology;
+    NetworkBehaviorContract::compile(
+        &snapshot,
+        topology_revision,
+        topology_revision,
+        SelectionNode {
+            name: node_name.to_owned(),
+            uid: record.node_uid,
+            zone,
+            capabilities,
+        },
+    )
+    .map_err(|error| {
+        ApiError::service_unavailable(format!(
+            "compile service selection contract for node {node_name}: {error}"
+        ))
+    })
 }
 
 fn service_snapshot_for(state: &ControllerState) -> Result<ServiceSnapshot, ApiError> {
@@ -7212,6 +7423,10 @@ mod tests {
             version.service_snapshot_schema_version,
             unf_service::SERVICE_SNAPSHOT_SCHEMA_VERSION
         );
+        assert_eq!(
+            version.selection_contract_schema_version,
+            SELECTION_CONTRACT_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -7232,6 +7447,10 @@ mod tests {
             legacy_compatibility.service_snapshot_schema_version,
             LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
         );
+        assert_eq!(
+            legacy_compatibility.agent_status_schema_version,
+            PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION
+        );
         let node_port_compatibility =
             compatibility_for_service_schema(NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION).unwrap();
         assert_eq!(
@@ -7246,6 +7465,26 @@ mod tests {
             LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION
         );
         assert!(compatibility_for_service_schema(SERVICE_SNAPSHOT_SCHEMA_VERSION + 1).is_err());
+        let selected = compatibility_for_service_schemas(
+            SERVICE_SNAPSHOT_SCHEMA_VERSION,
+            SELECTION_CONTRACT_SCHEMA_VERSION,
+        )
+        .expect("current selection schema negotiates");
+        assert_eq!(
+            selected.selection_contract_schema_version,
+            SELECTION_CONTRACT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            selected.agent_status_schema_version,
+            AGENT_STATUS_SCHEMA_VERSION
+        );
+        assert!(
+            compatibility_for_service_schemas(
+                SERVICE_SNAPSHOT_SCHEMA_VERSION,
+                SELECTION_CONTRACT_SCHEMA_VERSION + 1,
+            )
+            .is_err()
+        );
 
         let state = new_state(true);
         apply_service_event(&state, Event::Apply(node_port_service()));
@@ -7278,6 +7517,45 @@ mod tests {
         assert!(legacy.services[0].node_ports.is_empty());
         let encoded = serde_json::to_value(legacy).expect("legacy projection encodes");
         assert!(encoded["services"][0].get("nodePorts").is_none());
+    }
+
+    #[test]
+    fn service_selection_projection_is_exact_node_bound_and_capability_fenced() {
+        let state = new_state(true);
+        let mut worker = node(true);
+        worker.metadata.labels.get_or_insert_default().insert(
+            "topology.kubernetes.io/zone".to_owned(),
+            "zone-a".to_owned(),
+        );
+        apply_node_event(&state, Event::Apply(worker));
+        apply_service_event(&state, Event::Apply(service()));
+        let capabilities =
+            BTreeSet::from([SelectionCapability::StableHash, SelectionCapability::Nat]);
+        let first = service_selection_contract_for(&state, "worker-a", capabilities.clone())
+            .expect("per-Node selection contract compiles");
+        let second = service_selection_contract_for(&state, "worker-a", capabilities)
+            .expect("the same authoritative tuple compiles deterministically");
+        assert_eq!(first, second);
+        assert_eq!(first.node.uid, "worker-a-uid");
+        assert_eq!(first.node.zone.as_deref(), Some("zone-a"));
+        assert_eq!(first.plans.len(), 1);
+        assert_eq!(
+            first.service_revision,
+            service_snapshot_for(&state).unwrap().revision
+        );
+        assert!(
+            service_selection_contract_for(
+                &state,
+                "worker-a",
+                BTreeSet::from([SelectionCapability::StableHash]),
+            )
+            .is_err(),
+            "NAT intent is rejected when the agent omits the NAT capability"
+        );
+        assert!(
+            service_selection_contract_for(&state, "worker-b", BTreeSet::new()).is_err(),
+            "an authenticated Node without an authoritative UID is rejected"
+        );
     }
 
     #[test]
@@ -8324,12 +8602,18 @@ mod tests {
             service_count: 0,
             service_frontend_count: 0,
             service_backend_count: 0,
+            desired_selection_contract_revision: 0,
+            applied_selection_contract_revision: 0,
+            desired_selection_contract_digest: None,
+            applied_selection_contract_digest: None,
+            active_selection_bank: 0,
             desired_node_port_frontend_count: 0,
             applied_node_port_frontend_count: 0,
             node_port_cluster_frontend_count: 0,
             node_port_local_frontend_count: 0,
             load_balancer_reachability_schema_version:
                 unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION,
+            selection_contract_schema_version: SELECTION_CONTRACT_SCHEMA_VERSION,
             desired_load_balancer_epoch: 0,
             desired_load_balancer_revision: 0,
             desired_load_balancer_allocation_revision: 0,
@@ -8373,6 +8657,20 @@ mod tests {
             remote_route_entries: 0,
             remote_route_reconcile_errors: 0,
         }
+    }
+
+    fn acknowledge_current_selection(state: &ControllerState, report: &mut AgentStateReport) {
+        let contract = service_selection_contract_for(
+            state,
+            &report.node_name,
+            BTreeSet::from([SelectionCapability::StableHash, SelectionCapability::Nat]),
+        )
+        .expect("current per-Node selection contract compiles");
+        report.desired_selection_contract_revision = contract.contract_revision.get();
+        report.applied_selection_contract_revision = contract.contract_revision.get();
+        report.desired_selection_contract_digest = Some(contract.contract_digest.to_string());
+        report.applied_selection_contract_digest = Some(contract.contract_digest.to_string());
+        report.active_selection_bank = 1;
     }
 
     #[test]
@@ -8982,6 +9280,23 @@ mod tests {
         let mut invalid = report;
         invalid.active_policy_bank = 2;
         assert!(validate_agent_status(&invalid).is_err());
+        let mut invalid_selection = converged_agent_report(state.identity_epoch);
+        invalid_selection.desired_selection_contract_revision = 1;
+        assert!(validate_agent_status(&invalid_selection).is_err());
+        invalid_selection.desired_selection_contract_digest = Some("AB".repeat(32));
+        assert!(validate_agent_status(&invalid_selection).is_err());
+        invalid_selection.desired_selection_contract_digest = Some("ab".repeat(32));
+        invalid_selection.selection_contract_schema_version = 0;
+        assert!(validate_agent_status(&invalid_selection).is_err());
+        invalid_selection.selection_contract_schema_version = SELECTION_CONTRACT_SCHEMA_VERSION;
+        invalid_selection.active_selection_bank = 2;
+        assert!(validate_agent_status(&invalid_selection).is_err());
+        let mut legacy = converged_agent_report(state.identity_epoch);
+        legacy.schema_version = PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION;
+        legacy.selection_contract_schema_version = 0;
+        validate_agent_status(&legacy).expect("a live pre-selection report remains upgrade-safe");
+        legacy.selection_contract_schema_version = SELECTION_CONTRACT_SCHEMA_VERSION;
+        assert!(validate_agent_status(&legacy).is_err());
     }
 
     #[test]
@@ -9039,6 +9354,7 @@ mod tests {
         report.applied_service_revision = snapshot.revision.get();
         report.service_count = snapshot.services.len() as u64;
         report.service_frontend_count = snapshot.services[0].frontends.len() as u64;
+        acknowledge_current_selection(&state, &mut report);
         validate_agent_status(&report).expect("service acknowledgement is valid");
         write_lock(&state.agent_reports).insert(
             report.node_name.clone(),
@@ -9081,6 +9397,7 @@ mod tests {
             .iter()
             .map(|service| service.frontends.len() as u64)
             .sum();
+        acknowledge_current_selection(&state, &mut legacy_report);
         legacy_report.service_snapshot_schema_version = LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION;
         write_lock(&state.agent_reports).insert(
             legacy_report.node_name.clone(),
@@ -9459,7 +9776,7 @@ mod tests {
 
     #[test]
     fn load_balancer_operations_fields_preserve_the_adjacent_compatibility_tuple() {
-        assert_eq!(AGENT_STATUS_SCHEMA_VERSION, 6);
+        assert_eq!(AGENT_STATUS_SCHEMA_VERSION, 7);
         assert_eq!(FLOW_EXPORT_SCHEMA_VERSION, 5);
         let report = converged_agent_report(7);
         let mut legacy = serde_json::to_value(&report).unwrap();

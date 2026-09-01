@@ -16,13 +16,13 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unf_common::{BackendId, Protocol, Revision, ServiceId};
 
+pub use unf_common::SELECTION_CONTRACT_SCHEMA_VERSION;
+
 use crate::{
     AddressFamily, ServiceForwardingMode, ServiceIr, ServiceIrError, ServiceSelectionAlgorithm,
     ServiceSessionAffinity, ServiceSnapshot, ServiceTrafficDistribution, ServiceTrafficPolicy,
 };
 
-/// Wire schema for a UNF Network Behavior Contract.
-pub const SELECTION_CONTRACT_SCHEMA_VERSION: u16 = 1;
 /// Maximum number of exact frontend plans carried by one per-Node contract.
 pub const MAX_SELECTION_CONTRACT_PLANS: usize = 131_072;
 /// Maximum number of explicit observations retained in a failure envelope.
@@ -426,6 +426,79 @@ struct ResolvedFrontend<'a> {
 }
 
 impl NetworkBehaviorContract {
+    /// Compiles every exact frontend in a normalized Service snapshot into one
+    /// canonical per-Node contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::issue`] when source intent, Node
+    /// capabilities, or derived eligibility state cannot be admitted.
+    pub fn compile(
+        snapshot: &ServiceSnapshot,
+        topology_revision: Revision,
+        contract_revision: Revision,
+        node: SelectionNode,
+    ) -> Result<Self, SelectionContractError> {
+        let snapshot = snapshot.clone().validate_and_normalize()?;
+        let mut plans = Vec::new();
+        for service in &snapshot.services {
+            plans.extend(service.frontends.iter().map(|frontend| SelectionPlanKey {
+                service_id: service.id,
+                frontend: SelectionFrontend::ClusterIp {
+                    address: frontend.address,
+                    port: frontend.port,
+                    protocol: frontend.protocol,
+                },
+            }));
+            plans.extend(service.node_ports.iter().map(|frontend| SelectionPlanKey {
+                service_id: service.id,
+                frontend: SelectionFrontend::NodePort {
+                    family: frontend.family,
+                    node_port: frontend.port,
+                    service_port: frontend.service_port,
+                    protocol: frontend.protocol,
+                },
+            }));
+            if let Some(load_balancer) = &service.load_balancer {
+                plans.extend(
+                    load_balancer
+                        .frontends
+                        .iter()
+                        .map(|frontend| SelectionPlanKey {
+                            service_id: service.id,
+                            frontend: SelectionFrontend::LoadBalancer {
+                                family: frontend.family,
+                                service_port: frontend.service_port,
+                                protocol: frontend.protocol,
+                            },
+                        }),
+                );
+            }
+        }
+        if plans.len() > MAX_SELECTION_CONTRACT_PLANS {
+            return Err(SelectionContractError::TooManyPlans {
+                actual: plans.len(),
+                limit: MAX_SELECTION_CONTRACT_PLANS,
+            });
+        }
+        let plans = plans
+            .into_iter()
+            .map(|key| {
+                let resolved = resolve_frontend(&snapshot, &key)?;
+                Ok(ServiceSelectionPlan {
+                    key,
+                    traffic_policy: resolved.traffic_policy,
+                    traffic_distribution: resolved.service.traffic_distribution,
+                    session_affinity: resolved.service.session_affinity,
+                    selection_algorithm: resolved.service.selection_algorithm,
+                    forwarding_mode: resolved.service.forwarding_mode,
+                    tiers: expected_tiers(&resolved, &node),
+                })
+            })
+            .collect::<Result<Vec<_>, SelectionContractError>>()?;
+        Self::issue(&snapshot, topology_revision, contract_revision, node, plans)
+    }
+
     /// Issues a canonical contract after independently validating every plan.
     ///
     /// The failure envelope covers current state and deterministic single
@@ -1217,6 +1290,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn node_port_and_load_balancer_plans_bind_exact_external_frontends() {
         let mut source = snapshot(ServiceTrafficPolicy::Cluster);
         let service = &mut source.services[0];
@@ -1305,6 +1379,26 @@ mod tests {
                 vec![wrong_family]
             ),
             Err(SelectionContractError::UnknownFrontend(ServiceId::new(7)))
+        );
+
+        let compiled =
+            NetworkBehaviorContract::compile(&source, Revision::new(29), Revision::new(31), node())
+                .unwrap();
+        assert_eq!(compiled.plans.len(), 3);
+        assert_eq!(
+            compiled,
+            NetworkBehaviorContract::issue(
+                &source,
+                Revision::new(29),
+                Revision::new(31),
+                node(),
+                vec![
+                    plan(ServiceTrafficPolicy::Cluster),
+                    contract.plans[0].clone(),
+                    contract.plans[1].clone(),
+                ],
+            )
+            .unwrap()
         );
     }
 

@@ -319,6 +319,16 @@ decision provenance. Mutation, property, golden encoding, JSON replay, and
 strict Clippy pass `make service-selection-contract-test`; ADR 0104 records that
 this is a pre-activation control-plane contract, not packet behavior or a formal
 correctness proof.
+Milestone 7.3 is verified: the controller negotiates and serves an authenticated
+UID/zone-bound contract for the requesting Node and the agent advertises only
+its implemented StableHash/NAT capabilities. The agent independently verifies
+the source and digest, stages and reads back one of two userspace banks, commits
+owner-only contract+Node state with the Service transaction, repairs crash
+boundaries, reconstructs cold state, and acknowledges the exact revision and
+digest required for convergence. Safe legacy fallback is restricted to default
+intent; advanced intent fails closed. `make service-selection-state-test` and
+ADR 0105 record the gate. Persistent BPF ABI v7 and packet behavior remain
+unchanged until milestone 7.4.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

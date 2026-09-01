@@ -109,6 +109,7 @@ for node in "${nodes[@]}"; do
         state_dir=/var/lib/unf/cni/v1
         routes=${state_dir}/remote-routes.json
         services=${state_dir}/service-snapshot.json
+        selection=${services}.selection
         load_balancers=${state_dir}/load-balancer-reachability.json
         marker=${state_dir}/install.env
         binary=/opt/cni/bin/unf
@@ -251,6 +252,8 @@ EOF
             "${state_dir}/.node-block.json.tmp" \
             "${state_dir}/.remote-routes.json.tmp" \
             "${state_dir}/.service-snapshot.json.tmp" \
+            "${state_dir}/.service-snapshot.json.selection.tmp" \
+            "${state_dir}/.service-snapshot.json.selection.pending.tmp" \
             "${state_dir}/.load-balancer-reachability.json.tmp"; do
             if [ -e "$temporary" ]; then
                 test -f "$temporary" && test ! -L "$temporary"
@@ -262,7 +265,8 @@ EOF
         rm -f /run/unf/cni.sock
         rm -f "$binary" "$config"
         rm -f "${state_dir}/attachments.json" "${state_dir}/node-block.json" \
-            "$routes" "$services" "$load_balancers" "$marker"
+            "$routes" "$services" "${services}.pending" "$selection" \
+            "${selection}.pending" "$load_balancers" "$marker"
         cleanup_pending_deletes
         rmdir "$state_dir"
         rmdir /var/lib/unf/cni

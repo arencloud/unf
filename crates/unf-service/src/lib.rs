@@ -1358,7 +1358,8 @@ fn reject_legacy_advanced_selection_intent(
     Ok(())
 }
 
-fn has_advanced_selection_intent(snapshot: &ServiceSnapshot) -> bool {
+#[must_use]
+pub fn has_advanced_selection_intent(snapshot: &ServiceSnapshot) -> bool {
     snapshot.services.iter().any(|service| {
         service.internal_traffic_policy != ServiceTrafficPolicy::Cluster
             || service.session_affinity != ServiceSessionAffinity::None

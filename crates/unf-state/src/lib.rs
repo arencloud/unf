@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{
     BackendId, IdentityId, LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION, PolicyDirection, PolicyId,
-    PolicyReason, Revision, RuleId, SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceId, Verdict,
+    PolicyReason, Revision, RuleId, SELECTION_CONTRACT_SCHEMA_VERSION,
+    SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceId, Verdict,
 };
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
@@ -20,7 +21,8 @@ pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 5;
 pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 5;
 pub const SHADOW_IMPACT_SCHEMA_VERSION: u16 = 1;
-pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 6;
+pub const PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION: u16 = 6;
+pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 7;
 pub const COMPONENT_COMPATIBILITY_SCHEMA_VERSION: u16 = 2;
 pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 7;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
@@ -40,6 +42,8 @@ pub struct ComponentCompatibility {
     pub policy_snapshot_schema_version: u16,
     pub service_snapshot_schema_version: u16,
     #[serde(default)]
+    pub selection_contract_schema_version: u16,
+    #[serde(default)]
     pub load_balancer_reachability_schema_version: u16,
     pub agent_status_schema_version: u16,
     pub flow_export_schema_version: u16,
@@ -57,6 +61,7 @@ impl ComponentCompatibility {
             identity_snapshot_schema_version: IDENTITY_SNAPSHOT_SCHEMA_VERSION,
             policy_snapshot_schema_version: POLICY_SNAPSHOT_SCHEMA_VERSION,
             service_snapshot_schema_version: SERVICE_SNAPSHOT_SCHEMA_VERSION,
+            selection_contract_schema_version: SELECTION_CONTRACT_SCHEMA_VERSION,
             load_balancer_reachability_schema_version: LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION,
             agent_status_schema_version: AGENT_STATUS_SCHEMA_VERSION,
             flow_export_schema_version: FLOW_EXPORT_SCHEMA_VERSION,
@@ -118,6 +123,8 @@ pub struct AgentStateReport {
     #[serde(default)]
     pub service_snapshot_schema_version: u16,
     #[serde(default)]
+    pub selection_contract_schema_version: u16,
+    #[serde(default)]
     pub failed_service_epoch: u64,
     #[serde(default)]
     pub failed_service_revision: u64,
@@ -127,6 +134,16 @@ pub struct AgentStateReport {
     pub service_frontend_count: u64,
     #[serde(default)]
     pub service_backend_count: u64,
+    #[serde(default)]
+    pub desired_selection_contract_revision: u64,
+    #[serde(default)]
+    pub applied_selection_contract_revision: u64,
+    #[serde(default)]
+    pub desired_selection_contract_digest: Option<String>,
+    #[serde(default)]
+    pub applied_selection_contract_digest: Option<String>,
+    #[serde(default)]
+    pub active_selection_bank: u64,
     #[serde(default)]
     pub desired_node_port_frontend_count: u64,
     #[serde(default)]
@@ -1620,6 +1637,10 @@ mod tests {
         assert_eq!(
             compatibility.service_snapshot_schema_version,
             SERVICE_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            compatibility.selection_contract_schema_version,
+            SELECTION_CONTRACT_SCHEMA_VERSION
         );
         assert_eq!(
             compatibility.load_balancer_reachability_schema_version,
