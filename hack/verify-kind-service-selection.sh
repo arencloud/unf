@@ -546,7 +546,18 @@ for replacement_node in "${client_node}" "${remote_node}"; do
     new_agent=$("${kc[@]}" -n unf-system get pod -l app.kubernetes.io/name=unf-agent \
         --field-selector spec.nodeName="${replacement_node}" -o jsonpath='{.items[0].metadata.name}')
     [[ ${new_agent} != "${old_agent}" ]]
-    recovered=$(agent_raw "${new_agent}" /v1/status)
+    recovered=
+    for _ in $(seq 1 90); do
+        recovered=$(agent_raw "${new_agent}" /v1/status 2>/dev/null || true)
+        if jq -e '.schema_version == 8 and .ready and .bpf_loaded
+            and .applied_selection_contract_revision > 0
+            and .applied_selection_contract_revision == .desired_selection_contract_revision
+            and .applied_selection_contract_digest == .desired_selection_contract_digest' \
+            <<<"${recovered}" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
     jq -e '.schema_version == 8 and .ready and .bpf_loaded
         and .applied_selection_contract_revision > 0
         and .applied_selection_contract_revision == .desired_selection_contract_revision
