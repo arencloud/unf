@@ -561,8 +561,7 @@ for node in "${nodes[@]}"; do
 done
 
 qualification_stage=evidence
-release_revision=$("${kc[@]}" -n unf-system get deployment unf-controller -o json \
-    | jq -er '.spec.template.spec.containers[] | select(.name == "controller") | .env[] | select(.name == "UNF_BUILD_REVISION") | .value')
+release_revision=$(controller_raw /v1/version | jq -er '.build_revision')
 [[ ${release_revision} =~ ^[0-9a-f]{40}$ ]]
 git -C "${project_root}" merge-base --is-ancestor "${release_revision}" HEAD
 qualification_revision=$(git -C "${project_root}" rev-parse HEAD)
