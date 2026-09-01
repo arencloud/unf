@@ -1714,6 +1714,62 @@ fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
     true
 }
 
+#[inline(always)]
+fn current_load_balancer_frontend_owner(value: &ServiceConnectionValue) -> Option<ServiceId> {
+    if !matches!(
+        value.reserved[2],
+        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
+            | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+    ) {
+        return None;
+    }
+    let service = active_service_config()?;
+    let config = active_load_balancer_config(service)?;
+    let frontend = if value.address_family == AddressFamily::Ipv4 as u8 {
+        let key = Ipv4LoadBalancerFrontendKey {
+            address: [
+                value.frontend_address[0],
+                value.frontend_address[1],
+                value.frontend_address[2],
+                value.frontend_address[3],
+            ],
+            port: value.frontend_port,
+            protocol: value.protocol,
+            bank: config.active_bank,
+        };
+        // SAFETY: the exact fixed-layout key/value pair matches the map ABI and
+        // the value is copied before any subsequent map operation.
+        #[allow(unsafe_code)]
+        unsafe { LOAD_BALANCER_FRONTENDS_V4.get(&key).copied() }
+    } else if value.address_family == AddressFamily::Ipv6 as u8 {
+        let key = Ipv6LoadBalancerFrontendKey {
+            address: value.frontend_address,
+            port: value.frontend_port,
+            protocol: value.protocol,
+            bank: config.active_bank,
+        };
+        // SAFETY: the exact fixed-layout key/value pair matches the map ABI and
+        // the value is copied before any subsequent map operation.
+        #[allow(unsafe_code)]
+        unsafe { LOAD_BALANCER_FRONTENDS_V6.get(&key).copied() }
+    } else {
+        None
+    }?;
+    if frontend.schema_version != unf_ebpf_common::LOAD_BALANCER_MAP_ABI_VERSION
+        || frontend.service_revision != config.service_revision
+        || frontend.service_revision != service.revision
+        || frontend.reachability_revision != config.reachability_revision
+        || frontend.allocation_revision == 0
+        || frontend.allocation_revision != config.allocation_revision
+        || frontend.service_id.get() == 0
+        || frontend.service_bank != config.service_bank
+        || frontend.service_bank != service.active_bank
+    {
+        return None;
+    }
+    Some(frontend.service_id)
+}
+
 #[inline(never)]
 fn refresh_service_connection(
     key: &ServiceConnectionKey,
@@ -1738,6 +1794,17 @@ fn refresh_service_connection(
     // SAFETY: the pointer remains valid for this non-preemptible invocation.
     #[allow(unsafe_code)]
     let value = unsafe { &mut *scratch };
+    if let Some(owner) = current_load_balancer_frontend_owner(value)
+        && owner != value.service_id
+    {
+        emit_service_connection_event(
+            SERVICE_EVENT_ACTION_EXPIRE,
+            SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT,
+            now_ns,
+        );
+        remove_service_pair(value, key);
+        return None;
+    }
     let expected = if key.role == SERVICE_CONNECTION_ROLE_FORWARD {
         service_forward_key(value)
     } else if key.role == SERVICE_CONNECTION_ROLE_REVERSE

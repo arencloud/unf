@@ -3190,6 +3190,7 @@ async fn synchronize_load_balancer_maps(
     activate_load_balancer_snapshot(synchronizer, &candidate, state)
 }
 
+#[allow(clippy::too_many_lines)]
 fn activate_load_balancer_snapshot(
     synchronizer: &mut ServiceSynchronizer,
     candidate: &NodeReachabilitySnapshot,
@@ -3262,6 +3263,11 @@ fn activate_load_balancer_snapshot(
         );
     }
 
+    let purged_connections =
+        purge_stale_load_balancer_connections(&mut synchronizer.connections, &desired).context(
+            "purge connections that no longer belong to the active LoadBalancer frontend",
+        )?;
+
     let previous_active = synchronizer.active_load_balancer_bank;
     synchronizer.load_balancer_banks[desired_index] = Some(desired);
     synchronizer.active_load_balancer_bank = bank;
@@ -3292,6 +3298,7 @@ fn activate_load_balancer_snapshot(
         allocation_revision = candidate.allocation_revision.get(),
         active_bank = bank,
         targets = candidate.targets.len(),
+        purged_connections,
         "LoadBalancer host state activated in persistent BPF maps"
     );
     Ok(())
@@ -3419,6 +3426,64 @@ fn empty_load_balancer_bank(desired: &LoadBalancerDataplaneState) -> LoadBalance
     empty.ipv6_source_ranges.clear();
     empty.config = [0; 48];
     empty
+}
+
+fn load_balancer_connection_owner(
+    value: &[u8; 104],
+    desired: &LoadBalancerDataplaneState,
+) -> Option<u32> {
+    if !matches!(
+        value[102],
+        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+    ) {
+        return None;
+    }
+    let frontend = match value[97] {
+        4 => {
+            let mut key = [0_u8; 8];
+            key[0..4].copy_from_slice(&value[32..36]);
+            key[4..6].copy_from_slice(&value[90..92]);
+            key[6] = value[96];
+            key[7] = desired.bank;
+            desired.ipv4_frontends.get(&key)
+        }
+        6 => {
+            let mut key = [0_u8; 20];
+            key[0..16].copy_from_slice(&value[32..48]);
+            key[16..18].copy_from_slice(&value[90..92]);
+            key[18] = value[96];
+            key[19] = desired.bank;
+            desired.ipv6_frontends.get(&key)
+        }
+        _ => None,
+    }?;
+    Some(u32::from_ne_bytes(frontend[0..4].try_into().ok()?))
+}
+
+fn purge_stale_load_balancer_connections(
+    connections: &mut AyaHashMap<MapData, [u8; 40], [u8; 104]>,
+    desired: &LoadBalancerDataplaneState,
+) -> Result<usize> {
+    let stale = connections
+        .iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter_map(|(key, value)| {
+            if !matches!(
+                value[102],
+                SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
+                    | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+            ) {
+                return None;
+            }
+            let stored_owner = u32::from_ne_bytes(value[80..84].try_into().ok()?);
+            (load_balancer_connection_owner(&value, desired) != Some(stored_owner)).then_some(key)
+        })
+        .collect::<Vec<_>>();
+    for key in &stale {
+        connections.remove(key)?;
+    }
+    Ok(stale.len())
 }
 
 fn restore_load_balancer_checkpoint(
@@ -13267,6 +13332,53 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.reason == unf_ebpf_common::SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED
         }));
+
+        // A redirected DSR packet can land on a node whose persistent LRU map
+        // still owns the same tuple for a previously allocated VIP. The exact
+        // current frontend owner must fence that state before translation.
+        let (stale_key, mut stale_value) = synchronizer
+            .connections
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .find(|(key, _)| {
+                key[32..34] == 40_000_u16.to_be_bytes()
+                    && key[37] == 4
+                    && key[38] == unf_ebpf_common::SERVICE_CONNECTION_ROLE_FORWARD
+            })
+            .expect("one DSR forward connection exists");
+        stale_value[80..84].copy_from_slice(&u32::MAX.to_ne_bytes());
+        synchronizer
+            .connections
+            .insert(stale_key, stale_value, 0)
+            .expect("stale VIP owner is injected");
+        let (action, output) = run_tc(&mut ebpf, "unf_observe_ingress", &ipv4);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_eq!(output, ipv4, "current DSR owner replaces stale state");
+        let repaired = synchronizer
+            .connections
+            .get(&stale_key, 0)
+            .expect("current DSR connection is restored");
+        assert_eq!(
+            u32::from_ne_bytes(repaired[80..84].try_into().unwrap()),
+            service.services[0].id.get()
+        );
+
+        let mut withdrawn = reachability.clone();
+        withdrawn.revision = Revision::new(2);
+        withdrawn.allocation_revision = Revision::new(2);
+        withdrawn.targets.clear();
+        let withdrawn = withdrawn
+            .validate()
+            .expect("empty DSR reachability validates");
+        activate_load_balancer_snapshot(&mut synchronizer, &withdrawn, &state)
+            .expect("DSR withdrawal activates");
+        assert_eq!(
+            synchronizer.connections.iter().count(),
+            0,
+            "VIP withdrawal purges all forward ownership state"
+        );
     }
 
     #[test]
