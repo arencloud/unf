@@ -526,11 +526,27 @@ jq -e --arg server "${server_node}" '
 ' <<<"${active_agents}" >/dev/null
 
 for service_name in server-cluster server-local; do
-    service_json=$("${kc[@]}" -n "${namespace}" get service "${service_name}" -o json)
-    jq -e '
+    if [[ ${service_name} == server-cluster ]]; then
+        expected_v4=${cluster_v4}; expected_v6=${cluster_v6}
+    else
+        expected_v4=${local_v4}; expected_v6=${local_v6}
+    fi
+    service_json=
+    for _ in $(seq 1 180); do
+        service_json=$("${kc[@]}" -n "${namespace}" get service "${service_name}" -o json)
+        if jq -e --arg v4 "${expected_v4}" --arg v6 "${expected_v6}" '
+            ((.status.loadBalancer.ingress // []) | length) == 2
+            and any(.status.loadBalancer.ingress[]; .ip == $v4 and .ipMode == "VIP")
+            and any(.status.loadBalancer.ingress[]; .ip == $v6 and .ipMode == "VIP")
+        ' <<<"${service_json}" >/dev/null; then break; fi
+        sleep 1
+    done
+    jq -e --arg v4 "${expected_v4}" --arg v6 "${expected_v6}" '
         .spec.allocateLoadBalancerNodePorts == false
         and all(.spec.ports[]; (.nodePort // 0) == 0)
-        and ((.status.loadBalancer.ingress // []) | length) == 0
+        and ((.status.loadBalancer.ingress // []) | length) == 2
+        and any(.status.loadBalancer.ingress[]; .ip == $v4 and .ipMode == "VIP")
+        and any(.status.loadBalancer.ingress[]; .ip == $v6 and .ipMode == "VIP")
         and (.metadata.finalizers | index("network.unf.io/load-balancer-protection")) != null
     ' <<<"${service_json}" >/dev/null
 done

@@ -8,6 +8,7 @@ resources:
   - flow-history-store.yaml
   - topology-history-store.yaml
   - load-balancer-store.yaml
+  - load-balancer-status-store.yaml
   - controller.yaml
   - service.yaml
   - agent.yaml

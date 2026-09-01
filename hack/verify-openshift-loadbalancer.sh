@@ -520,10 +520,30 @@ done
 active_agents=$(wait_for_load_balancer_shape 24 12 12)
 active_service_revision=$(controller_raw /v1/status | jq -er .compiled_service_revision)
 for service in server-cluster server-local peer-cluster peer-local; do
-    "${kc[@]}" -n "${namespace}" get service "${service}" -o json | jq -e '
+    case ${service} in
+        server-cluster) expected_v4=${cluster_v4}; expected_v6=${cluster_v6} ;;
+        server-local) expected_v4=${local_v4}; expected_v6=${local_v6} ;;
+        peer-cluster) expected_v4=${peer_cluster_v4}; expected_v6=${peer_cluster_v6} ;;
+        peer-local) expected_v4=${peer_local_v4}; expected_v6=${peer_local_v6} ;;
+    esac
+    service_json=
+    for _ in $(seq 1 900); do
+        service_json=$("${kc[@]}" -n "${namespace}" get service "${service}" -o json)
+        if jq -e --arg v4 "${expected_v4}" --arg v6 "${expected_v6}" '
+            ((.status.loadBalancer.ingress // []) | length) == 2
+            and any(.status.loadBalancer.ingress[]; .ip == $v4 and .ipMode == "VIP")
+            and any(.status.loadBalancer.ingress[]; .ip == $v6 and .ipMode == "VIP")
+        ' <<<"${service_json}" >/dev/null; then break; fi
+        sleep 1
+    done
+    jq -e \
+        --arg v4 "${expected_v4}" --arg v6 "${expected_v6}" '
         .spec.allocateLoadBalancerNodePorts == false and all(.spec.ports[]; (.nodePort // 0) == 0)
-        and ((.status.loadBalancer.ingress // []) | length) == 0
-        and (.metadata.finalizers | index("network.unf.io/load-balancer-protection")) != null' >/dev/null
+        and ((.status.loadBalancer.ingress // []) | length) == 2
+        and any(.status.loadBalancer.ingress[]; .ip == $v4 and .ipMode == "VIP")
+        and any(.status.loadBalancer.ingress[]; .ip == $v6 and .ipMode == "VIP")
+        and (.metadata.finalizers | index("network.unf.io/load-balancer-protection")) != null' \
+        <<<"${service_json}" >/dev/null
 done
 
 stage=advertiser-creation

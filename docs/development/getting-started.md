@@ -673,10 +673,15 @@ At least one family prefix and the stable UID are required. The prefixes must
 be disjoint from every other configured pool and externally routed to the
 selected Nodes by the qualification environment. UNF persists allocation state
 in `unf-system/unf-load-balancer-control-plane`; changing the configured pool
-under an existing store is rejected rather than adopted. Milestones 6.5–6.7
-consume coherent Cluster/Local VIP state, enforce source ranges, serve local
-health, and expose bounded operations. Kubernetes
-`status.loadBalancer.ingress` remains withheld until platform qualification.
+under an existing store is rejected rather than adopted. Published-address
+ownership is independently checkpointed in
+`unf-system/unf-load-balancer-status-ownership`. UNF publishes canonical
+`status.loadBalancer.ingress` VIP entries only after allocation, reachability,
+service dataplane, and selection state have all converged; deletion clears that
+external promise before reachability withdrawal or lease release. Foreign
+status entries are preserved and never adopted. Milestones 6.5–6.7 consume
+coherent Cluster/Local VIP state, enforce source ranges, serve local health,
+and expose bounded operations.
 Run the complete local gate with:
 
 ```bash

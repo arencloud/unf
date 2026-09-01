@@ -16,7 +16,9 @@ use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Service, ServiceSpec};
+use k8s_openapi::api::core::v1::{
+    ConfigMap, LoadBalancerIngress, Namespace, Node, Pod, Service, ServiceSpec,
+};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -41,9 +43,11 @@ use unf_ipam::{
 };
 use unf_loadbalancer::{
     AllocationCheckpoint, LoadBalancerAllocator, LoadBalancerLease, LoadBalancerOwner,
-    LoadBalancerPool, NodeReachabilitySnapshot, ReachabilityMode, ReachabilityNode,
-    ReachabilityProviderRef, ReachabilitySnapshot, allocation_request_for_service,
-    compile_direct_node_reachability, reconcile_finalizers,
+    LoadBalancerPool, NodeReachabilitySnapshot, PublicationAction, PublicationLifecycle,
+    PublicationResourceState, PublicationState, ReachabilityMode, ReachabilityNode,
+    ReachabilityProviderRef, ReachabilitySnapshot, StatusIngress, allocation_request_for_service,
+    compile_direct_node_reachability, next_publication_action, reconcile_finalizers,
+    reconcile_status_ingress,
 };
 use unf_policy::{
     DestinationAddresses, DestinationPort, Endpoint, Flow, Ipv4Endpoint, Ipv6Endpoint, NamedPort,
@@ -125,7 +129,10 @@ const TOPOLOGY_HISTORY_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const TOPOLOGY_HISTORY_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
 const LOAD_BALANCER_STORE_NAME: &str = "unf-load-balancer-control-plane";
 const LOAD_BALANCER_STORE_KEY: &str = "state.json";
+const LOAD_BALANCER_STATUS_STORE_NAME: &str = "unf-load-balancer-status-ownership";
+const LOAD_BALANCER_STATUS_OWNERSHIP_KEY: &str = "status-ownership.json";
 const LOAD_BALANCER_STORE_SCHEMA_VERSION: u16 = 1;
+const LOAD_BALANCER_STATUS_OWNERSHIP_SCHEMA_VERSION: u16 = 1;
 const LOAD_BALANCER_STORE_DATA_LIMIT: usize = 900_000;
 const LOAD_BALANCER_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const PRIMARY_CNI_NODE_LABEL: &str = "network.unf.io/primary-cni";
@@ -391,7 +398,7 @@ type DataplanePolicyState = (
     Vec<unf_state::EgressIpv6PolicyMapEntry>,
 );
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ServiceRecord {
     namespace: String,
     name: String,
@@ -399,6 +406,7 @@ struct ServiceRecord {
     resource_version: String,
     finalizers: Vec<String>,
     deleting: bool,
+    load_balancer_status_ingress: Vec<LoadBalancerIngress>,
     service_type: String,
     cluster_ips: BTreeSet<IpAddr>,
     selector: BTreeMap<String, String>,
@@ -412,6 +420,7 @@ struct LoadBalancerRuntime {
     provider: ReachabilityProviderRef,
     allocator: LoadBalancerAllocator,
     reachability_revision: Revision,
+    published_status: BTreeMap<LoadBalancerOwner, Vec<IpAddr>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -420,6 +429,20 @@ struct DurableLoadBalancerState {
     schema_version: u16,
     reachability_revision: Revision,
     allocation: AllocationCheckpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DurableLoadBalancerStatusOwnership {
+    schema_version: u16,
+    entries: Vec<LoadBalancerStatusOwnershipEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LoadBalancerStatusOwnershipEntry {
+    owner: LoadBalancerOwner,
+    addresses: Vec<IpAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1401,10 +1424,11 @@ async fn configure_load_balancer_runtime(state: &ControllerState, args: &Args) -
         ipv4: args.load_balancer_ipv4_pool,
         ipv6: args.load_balancer_ipv6_pool,
     };
-    let (allocator, reachability_revision) = if state.offline {
+    let (allocator, reachability_revision, published_status) = if state.offline {
         (
             LoadBalancerAllocator::new(vec![pool.clone()])?,
             Revision::INITIAL,
+            BTreeMap::new(),
         )
     } else {
         restore_load_balancer_runtime(state, &pool).await?
@@ -1414,6 +1438,7 @@ async fn configure_load_balancer_runtime(state: &ControllerState, args: &Args) -
         provider,
         allocator,
         reachability_revision,
+        published_status,
     });
     info!("configured durable direct-Node LoadBalancer control plane");
     Ok(())
@@ -1422,7 +1447,11 @@ async fn configure_load_balancer_runtime(state: &ControllerState, args: &Args) -
 async fn restore_load_balancer_runtime(
     state: &ControllerState,
     configured_pool: &LoadBalancerPool,
-) -> Result<(LoadBalancerAllocator, Revision)> {
+) -> Result<(
+    LoadBalancerAllocator,
+    Revision,
+    BTreeMap<LoadBalancerOwner, Vec<IpAddr>>,
+)> {
     let api = state
         .load_balancer_store
         .as_ref()
@@ -1440,6 +1469,7 @@ async fn restore_load_balancer_runtime(
         return Ok((
             LoadBalancerAllocator::new(vec![configured_pool.clone()])?,
             Revision::INITIAL,
+            BTreeMap::new(),
         ));
     };
     let durable: DurableLoadBalancerState =
@@ -1457,13 +1487,80 @@ async fn restore_load_balancer_runtime(
             "configured LoadBalancer pool does not exactly match durable ownership"
         ));
     }
+    let status_store = api
+        .get_opt(LOAD_BALANCER_STATUS_STORE_NAME)
+        .await
+        .with_context(|| format!("read ConfigMap unf-system/{LOAD_BALANCER_STATUS_STORE_NAME}"))?;
+    let published_status = status_store
+        .as_ref()
+        .and_then(|config_map| config_map.data.as_ref())
+        .as_ref()
+        .and_then(|data| data.get(LOAD_BALANCER_STATUS_OWNERSHIP_KEY))
+        .map(|encoded| restore_load_balancer_status_ownership(encoded, &allocator))
+        .transpose()?
+        .unwrap_or_default();
     info!(
         leases = allocator.checkpoint().leases.len(),
+        published_services = published_status.len(),
         allocation_revision = allocator.checkpoint().revision.get(),
         reachability_revision = durable.reachability_revision.get(),
         "restored durable LoadBalancer control-plane state"
     );
-    Ok((allocator, durable.reachability_revision))
+    Ok((allocator, durable.reachability_revision, published_status))
+}
+
+fn restore_load_balancer_status_ownership(
+    encoded: &str,
+    allocator: &LoadBalancerAllocator,
+) -> Result<BTreeMap<LoadBalancerOwner, Vec<IpAddr>>> {
+    let durable: DurableLoadBalancerStatusOwnership =
+        serde_json::from_str(encoded).context("decode durable LoadBalancer status ownership")?;
+    if durable.schema_version != LOAD_BALANCER_STATUS_OWNERSHIP_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "unsupported durable LoadBalancer status-ownership schema {}; expected {}",
+            durable.schema_version,
+            LOAD_BALANCER_STATUS_OWNERSHIP_SCHEMA_VERSION
+        ));
+    }
+    let mut restored = BTreeMap::new();
+    for mut entry in durable.entries {
+        let address_count = entry.addresses.len();
+        entry.addresses.sort();
+        entry.addresses.dedup();
+        if entry.addresses.len() != address_count {
+            return Err(anyhow!(
+                "durable status ownership contains duplicate addresses for Service {}/{}",
+                entry.owner.namespace,
+                entry.owner.name
+            ));
+        }
+        let lease = allocator.lease(&entry.owner).with_context(|| {
+            format!(
+                "durable status ownership references unknown Service {}/{}",
+                entry.owner.namespace, entry.owner.name
+            )
+        })?;
+        let mut lease_addresses = lease.addresses.clone();
+        lease_addresses.sort();
+        if entry.addresses.is_empty() || entry.addresses != lease_addresses {
+            return Err(anyhow!(
+                "durable status ownership does not exactly match lease for Service {}/{}",
+                entry.owner.namespace,
+                entry.owner.name
+            ));
+        }
+        if restored
+            .insert(entry.owner.clone(), entry.addresses)
+            .is_some()
+        {
+            return Err(anyhow!(
+                "durable status ownership contains duplicate Service {}/{}",
+                entry.owner.namespace,
+                entry.owner.name
+            ));
+        }
+    }
+    Ok(restored)
 }
 
 fn spawn_load_balancer_reconciler(
@@ -1527,6 +1624,35 @@ async fn reconcile_load_balancer_control_plane(
             )
         })
         .collect::<BTreeMap<_, _>>();
+
+    // Status is an external promise. Clear only addresses durably recorded as
+    // UNF-owned before withdrawing reachability or releasing their lease.
+    for (owner, owned) in runtime.published_status.clone() {
+        let record = records.values().find(|record| {
+            record.namespace == owner.namespace
+                && record.name == owner.name
+                && record.uid == owner.uid
+        });
+        let remains_admitted = record.is_some_and(|record| {
+            !record.deleting
+                && active_services.contains_key(&format!("{}/{}", record.namespace, record.name))
+        });
+        if remains_admitted {
+            continue;
+        }
+        if let Some(record) = record {
+            let ingress =
+                load_balancer_status_ingress(&record.load_balancer_status_ingress, &owned, &[])?;
+            if ingress != record.load_balancer_status_ingress {
+                patch_load_balancer_status(client, record, &ingress).await?;
+                return Ok(());
+            }
+        }
+        runtime.published_status.remove(&owner);
+        persist_load_balancer_status_ownership(state, &runtime.published_status).await?;
+        *mutex_lock(&state.load_balancer_runtime) = Some(runtime);
+        return Ok(());
+    }
 
     let mut finalizer_updates = Vec::new();
     for (key, record) in &records {
@@ -1648,6 +1774,69 @@ async fn reconcile_load_balancer_control_plane(
     *mutex_lock(&state.load_balancer_runtime) = Some(runtime.clone());
     *write_lock(&state.compiled_load_balancer_reachability) = Some(desired.clone());
 
+    let reachability_ready = load_balancer_agents_converged(state, &desired);
+    let dataplane_ready = load_balancer_all_domains_converged(state);
+    for lease in runtime.allocator.checkpoint().leases {
+        if !retained_owners.contains(&lease.owner) {
+            continue;
+        }
+        let Some(record) = records.get(&format!("{}/{}", lease.owner.namespace, lease.owner.name))
+        else {
+            continue;
+        };
+        let previously_owned = runtime
+            .published_status
+            .get(&lease.owner)
+            .cloned()
+            .unwrap_or_default();
+        let action = next_publication_action(PublicationState {
+            owner: lease.owner.clone(),
+            lifecycle: PublicationLifecycle::Active,
+            finalizer_present: true,
+            lease_addresses: lease.addresses.clone(),
+            reachability: if reachability_ready {
+                PublicationResourceState::Ready
+            } else {
+                PublicationResourceState::Pending
+            },
+            dataplane: if dataplane_ready {
+                PublicationResourceState::Ready
+            } else {
+                PublicationResourceState::Pending
+            },
+            published_addresses: observed_owned_load_balancer_addresses(record, &previously_owned),
+        })?;
+        if let PublicationAction::PublishStatus { addresses } = action {
+            let ingress = load_balancer_status_ingress(
+                &record.load_balancer_status_ingress,
+                &previously_owned,
+                &addresses,
+            )?;
+            if previously_owned != addresses {
+                runtime
+                    .published_status
+                    .insert(lease.owner.clone(), addresses);
+                persist_load_balancer_status_ownership(state, &runtime.published_status).await?;
+                *mutex_lock(&state.load_balancer_runtime) = Some(runtime.clone());
+            }
+            if ingress != record.load_balancer_status_ingress {
+                patch_load_balancer_status(client, record, &ingress).await?;
+            }
+            return Ok(());
+        }
+        if action == PublicationAction::Stable {
+            let ingress = load_balancer_status_ingress(
+                &record.load_balancer_status_ingress,
+                &previously_owned,
+                &lease.addresses,
+            )?;
+            if ingress != record.load_balancer_status_ingress {
+                patch_load_balancer_status(client, record, &ingress).await?;
+                return Ok(());
+            }
+        }
+    }
+
     for record in records.values() {
         let owner_is_retained = retained_owners.iter().any(|owner| {
             owner.namespace == record.namespace
@@ -1699,6 +1888,18 @@ fn load_balancer_agents_converged(state: &ControllerState, desired: &Reachabilit
     })
 }
 
+fn load_balancer_all_domains_converged(state: &ControllerState) -> bool {
+    let identity_revision = mutex_lock(&state.identities).revision();
+    let policy_revision = mutex_lock(&state.revisions).policy;
+    agent_convergence_snapshot(
+        state,
+        identity_revision,
+        policy_revision,
+        unix_time_millis(),
+    )
+    .all_converged
+}
+
 async fn persist_load_balancer_runtime(
     state: &ControllerState,
     runtime: &LoadBalancerRuntime,
@@ -1726,10 +1927,58 @@ async fn persist_load_balancer_runtime(
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {
-            "name": LOAD_BALANCER_STORE_NAME,
+            "name": LOAD_BALANCER_STATUS_STORE_NAME,
             "namespace": "unf-system",
         },
         "data": data,
+    });
+    api.patch(
+        LOAD_BALANCER_STATUS_STORE_NAME,
+        &PatchParams::apply("unf-controller-load-balancer-status").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch ConfigMap unf-system/{LOAD_BALANCER_STORE_NAME}"))?;
+    Ok(())
+}
+
+async fn persist_load_balancer_status_ownership(
+    state: &ControllerState,
+    published_status: &BTreeMap<LoadBalancerOwner, Vec<IpAddr>>,
+) -> Result<()> {
+    let api = state
+        .load_balancer_store
+        .as_ref()
+        .context("durable LoadBalancer API is unavailable")?;
+    let durable = DurableLoadBalancerStatusOwnership {
+        schema_version: LOAD_BALANCER_STATUS_OWNERSHIP_SCHEMA_VERSION,
+        entries: published_status
+            .iter()
+            .map(|(owner, addresses)| LoadBalancerStatusOwnershipEntry {
+                owner: owner.clone(),
+                addresses: addresses.clone(),
+            })
+            .collect(),
+    };
+    let encoded =
+        serde_json::to_string(&durable).context("encode durable LoadBalancer status ownership")?;
+    if encoded.len() > LOAD_BALANCER_STORE_DATA_LIMIT {
+        return Err(anyhow!(
+            "durable LoadBalancer status ownership requires {} bytes; ConfigMap limit is {}",
+            encoded.len(),
+            LOAD_BALANCER_STORE_DATA_LIMIT
+        ));
+    }
+    let patch = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": LOAD_BALANCER_STORE_NAME,
+            "namespace": "unf-system",
+        },
+        "data": {
+            (LOAD_BALANCER_STATUS_OWNERSHIP_KEY): encoded,
+        },
     });
     api.patch(
         LOAD_BALANCER_STORE_NAME,
@@ -1737,7 +1986,87 @@ async fn persist_load_balancer_runtime(
         &Patch::Apply(&patch),
     )
     .await
-    .with_context(|| format!("patch ConfigMap unf-system/{LOAD_BALANCER_STORE_NAME}"))?;
+    .with_context(|| format!("patch ConfigMap unf-system/{LOAD_BALANCER_STATUS_STORE_NAME}"))?;
+    Ok(())
+}
+
+fn load_balancer_status_ingress(
+    existing: &[LoadBalancerIngress],
+    previously_owned: &[IpAddr],
+    desired_owned: &[IpAddr],
+) -> Result<Vec<LoadBalancerIngress>> {
+    let summarized = existing
+        .iter()
+        .map(|entry| StatusIngress {
+            ip: entry.ip.clone(),
+            hostname: entry.hostname.clone(),
+        })
+        .collect::<Vec<_>>();
+    reconcile_status_ingress(&summarized, previously_owned, desired_owned)?;
+
+    let previous = previously_owned.iter().copied().collect::<BTreeSet<_>>();
+    let mut reconciled = existing
+        .iter()
+        .filter(|entry| {
+            entry
+                .ip
+                .as_deref()
+                .and_then(|address| address.parse().ok())
+                .is_none_or(|address| !previous.contains(&address))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut desired = desired_owned.to_vec();
+    desired.sort();
+    reconciled.extend(desired.into_iter().map(|address| LoadBalancerIngress {
+        ip: Some(address.to_string()),
+        ip_mode: Some("VIP".to_owned()),
+        ..LoadBalancerIngress::default()
+    }));
+    Ok(reconciled)
+}
+
+fn observed_owned_load_balancer_addresses(record: &ServiceRecord, owned: &[IpAddr]) -> Vec<IpAddr> {
+    let owned = owned.iter().copied().collect::<BTreeSet<_>>();
+    let mut observed = record
+        .load_balancer_status_ingress
+        .iter()
+        .filter_map(|entry| entry.ip.as_deref()?.parse().ok())
+        .filter(|address| owned.contains(address))
+        .collect::<Vec<_>>();
+    observed.sort();
+    observed.dedup();
+    observed
+}
+
+async fn patch_load_balancer_status(
+    client: &Client,
+    record: &ServiceRecord,
+    ingress: &[LoadBalancerIngress],
+) -> Result<()> {
+    let patch = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": record.name,
+            "namespace": record.namespace,
+            "resourceVersion": record.resource_version,
+        },
+        "status": {
+            "loadBalancer": {
+                "ingress": ingress,
+            },
+        },
+    });
+    Api::<Service>::namespaced(client.clone(), &record.namespace)
+        .patch_status(&record.name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .with_context(|| {
+            format!(
+                "patch LoadBalancer status on Service {}/{}",
+                record.namespace, record.name
+            )
+        })?;
     Ok(())
 }
 
@@ -3170,6 +3499,12 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
         .resource_version
         .clone()
         .unwrap_or_default();
+    let load_balancer_status_ingress = service
+        .status
+        .as_ref()
+        .and_then(|status| status.load_balancer.as_ref())
+        .and_then(|load_balancer| load_balancer.ingress.clone())
+        .unwrap_or_default();
     let spec = service
         .spec
         .as_ref()
@@ -3271,6 +3606,7 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
         resource_version,
         finalizers: service.metadata.finalizers.clone().unwrap_or_default(),
         deleting: service.metadata.deletion_timestamp.is_some(),
+        load_balancer_status_ingress,
         service_type,
         cluster_ips,
         selector: spec
@@ -8768,6 +9104,7 @@ mod tests {
             resource_version: "1".to_owned(),
             finalizers: Vec::new(),
             deleting: false,
+            load_balancer_status_ingress: Vec::new(),
             service_type: "ClusterIP".to_owned(),
             cluster_ips: BTreeSet::new(),
             selector: BTreeMap::new(),
@@ -10255,6 +10592,49 @@ mod tests {
         assert_eq!(runtime.allocator.checkpoint().pools.len(), 1);
         assert!(runtime.allocator.checkpoint().leases.is_empty());
         assert_eq!(runtime.reachability_revision, Revision::INITIAL);
+        assert!(runtime.published_status.is_empty());
+    }
+
+    #[test]
+    fn load_balancer_status_publication_is_ownership_exact_and_foreign_safe() {
+        let old: IpAddr = "192.0.2.10".parse().unwrap();
+        let new_v4: IpAddr = "192.0.2.20".parse().unwrap();
+        let new_v6: IpAddr = "2001:db8::20".parse().unwrap();
+        let foreign = LoadBalancerIngress {
+            ip: Some("203.0.113.8".to_owned()),
+            ip_mode: Some("Proxy".to_owned()),
+            ..LoadBalancerIngress::default()
+        };
+        let hostname = LoadBalancerIngress {
+            hostname: Some("foreign.example.test".to_owned()),
+            ..LoadBalancerIngress::default()
+        };
+        let existing = vec![
+            foreign.clone(),
+            LoadBalancerIngress {
+                ip: Some(old.to_string()),
+                ip_mode: Some("VIP".to_owned()),
+                ..LoadBalancerIngress::default()
+            },
+            hostname.clone(),
+        ];
+
+        let reconciled =
+            load_balancer_status_ingress(&existing, &[old], &[new_v4, new_v6]).unwrap();
+        assert_eq!(&reconciled[..2], &[foreign, hostname]);
+        assert_eq!(reconciled[2].ip.as_deref(), Some("192.0.2.20"));
+        assert_eq!(reconciled[2].ip_mode.as_deref(), Some("VIP"));
+        assert_eq!(reconciled[3].ip.as_deref(), Some("2001:db8::20"));
+        assert_eq!(reconciled[3].ip_mode.as_deref(), Some("VIP"));
+
+        assert!(
+            load_balancer_status_ingress(&existing, &[], &[old]).is_err(),
+            "an unrecorded status address must never be adopted"
+        );
+        assert_eq!(
+            load_balancer_status_ingress(&existing, &[old], &[]).unwrap(),
+            reconciled[..2]
+        );
     }
 
     #[tokio::test]
@@ -10304,6 +10684,34 @@ mod tests {
         let restored: DurableLoadBalancerState = serde_json::from_slice(&encoded).unwrap();
         let allocator = LoadBalancerAllocator::restore(restored.allocation.clone()).unwrap();
         assert_eq!(allocator.lease(&owner), Some(&lease));
+        let ownership = DurableLoadBalancerStatusOwnership {
+            schema_version: LOAD_BALANCER_STATUS_OWNERSHIP_SCHEMA_VERSION,
+            entries: vec![LoadBalancerStatusOwnershipEntry {
+                owner: owner.clone(),
+                addresses: lease.addresses.clone(),
+            }],
+        };
+        let ownership = restore_load_balancer_status_ownership(
+            &serde_json::to_string(&ownership).unwrap(),
+            &allocator,
+        )
+        .unwrap();
+        assert_eq!(ownership.get(&owner), Some(&lease.addresses));
+
+        let malformed_ownership = DurableLoadBalancerStatusOwnership {
+            schema_version: LOAD_BALANCER_STATUS_OWNERSHIP_SCHEMA_VERSION,
+            entries: vec![LoadBalancerStatusOwnershipEntry {
+                owner: owner.clone(),
+                addresses: vec![lease.addresses[0], lease.addresses[0]],
+            }],
+        };
+        assert!(
+            restore_load_balancer_status_ownership(
+                &serde_json::to_string(&malformed_ownership).unwrap(),
+                &allocator,
+            )
+            .is_err()
+        );
         let reachability = compile_direct_node_reachability(
             state.identity_epoch,
             restored.reachability_revision,
@@ -10876,6 +11284,7 @@ mod tests {
             provider: provider.clone(),
             allocator,
             reachability_revision: Revision::new(4),
+            published_status: BTreeMap::new(),
         });
         let reachability = compile_direct_node_reachability(
             services.source_epoch,
