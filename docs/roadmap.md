@@ -538,12 +538,19 @@ matrix is maintained in the
   independent ClusterIP/NodePort/LoadBalancer origins, dual-stack TCP/UDP,
   lifecycle filtering, tier provenance, topology-only changes, and exact
   recovery pass `make service-selection-dataplane-test`; ADR 0106.
+- Verified ClientIP affinity and graceful draining: original-client/frontend
+  keys reuse only the same eligible immutable bank+revision, bounded timeout
+  expiry reselects through StableHash, established connections precede affinity,
+  and terminating endpoints leave new-flow slots without breaking existing
+  flows. Persistent ABI-v9 recovery, event provenance, strict Clippy, and
+  real-kernel IPv4/IPv6 packets pass `make service-affinity-dataplane-test`;
+  ADR 0107.
 - Maglev is a measured candidate, not a label-only claim. Adoption requires
   deterministic balance/disruption, bounded memory and compile cost, stable
   upgrades, and verifier-visible packet-cost evidence against the current hash.
 - DSR is opt-in and cannot bypass route/neighbor/MTU safety, backend VIP
   ownership, policy, source ranges, health, reverse telemetry, or exact cleanup.
-- Affinity/draining, Maglev, DSR, operations, Kind, and OpenShift remain ordered
+- Maglev, DSR, operations, Kind, and OpenShift remain ordered
   independent milestones;
   ADR 0102 and `make service-selection-boundary-test` define the first gate.
 - Weighted traffic splitting, latency/load feedback, cross-cluster selection,

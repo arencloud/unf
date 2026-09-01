@@ -12,10 +12,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{BackendId, Protocol, Revision, ServiceId};
 use unf_ebpf_common::{
-    LOAD_BALANCER_LOCAL_FRONTEND_INDEX_BASE, NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL,
+    LOAD_BALANCER_LOCAL_FRONTEND_INDEX_BASE, NODE_PORT_BANK_COUNT,
+    NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY, NODE_PORT_FRONTEND_FLAG_LOCAL,
     NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG, NODE_PORT_MAP_ABI_VERSION, SERVICE_BACKEND_FLAG_READY,
     SERVICE_BACKEND_FLAG_SERVING, SERVICE_BACKEND_FLAG_TERMINATING, SERVICE_BANK_COUNT,
-    SERVICE_MAP_ABI_VERSION, SERVICE_SELECTION_TIER_CLUSTER, SERVICE_SELECTION_TIER_SAME_NODE,
+    SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY, SERVICE_MAP_ABI_VERSION,
+    SERVICE_SELECTION_TIER_CLUSTER, SERVICE_SELECTION_TIER_SAME_NODE,
     SERVICE_SELECTION_TIER_SAME_ZONE,
 };
 
@@ -2143,6 +2145,7 @@ pub fn compile_service_dataplane(
                 eligible_frontend_backends.len(),
                 snapshot.revision.get(),
                 SERVICE_SELECTION_TIER_CLUSTER,
+                None,
             );
             match frontend.address {
                 IpAddr::V4(address) => {
@@ -2265,8 +2268,7 @@ fn reject_later_selection_behavior_service(
     contract: &NetworkBehaviorContract,
 ) -> Result<(), ServiceDataplaneError> {
     if contract.plans.iter().any(|plan| {
-        plan.session_affinity != ServiceSessionAffinity::None
-            || plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
+        plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
             || plan.forwarding_mode != ServiceForwardingMode::Nat
     }) {
         return Err(ServiceDataplaneError::UnsupportedSelectionBehavior);
@@ -2279,6 +2281,13 @@ fn selection_tier_code(tier: SelectionTier) -> u8 {
         SelectionTier::SameNode => SERVICE_SELECTION_TIER_SAME_NODE,
         SelectionTier::SameZone => SERVICE_SELECTION_TIER_SAME_ZONE,
         SelectionTier::Cluster => SERVICE_SELECTION_TIER_CLUSTER,
+    }
+}
+
+const fn affinity_timeout(affinity: ServiceSessionAffinity) -> Option<u32> {
+    match affinity {
+        ServiceSessionAffinity::None => None,
+        ServiceSessionAffinity::ClientIp { timeout_seconds } => Some(timeout_seconds),
     }
 }
 
@@ -2380,6 +2389,7 @@ fn apply_selection_contract_slots(
                 selected.backend_ids.len(),
                 snapshot.revision.get(),
                 selection_tier_code(selected.tier),
+                affinity_timeout(plan.session_affinity),
             );
             match address {
                 IpAddr::V4(address) => {
@@ -2659,8 +2669,7 @@ pub fn compile_node_port_selection_fabric_dataplane(
         .verify(&normalized, &contract.node)
         .map_err(|error| NodePortDataplaneError::InvalidSelectionContract(error.to_string()))?;
     if contract.plans.iter().any(|plan| {
-        plan.session_affinity != ServiceSessionAffinity::None
-            || plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
+        plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
             || plan.forwarding_mode != ServiceForwardingMode::Nat
     }) {
         return Err(NodePortDataplaneError::UnsupportedSelectionBehavior.into());
@@ -2703,11 +2712,15 @@ pub fn compile_node_port_selection_fabric_dataplane(
         let selected = plan.selected_tier().ok_or_else(|| {
             NodePortDataplaneError::MissingSelectionTier(format!("{:?}", plan.key))
         })?;
-        let flags = if plan.traffic_policy == ServiceTrafficPolicy::Local {
+        let mut flags = if plan.traffic_policy == ServiceTrafficPolicy::Local {
             NODE_PORT_FRONTEND_FLAG_LOCAL
         } else {
             0
         };
+        let affinity_timeout = affinity_timeout(plan.session_affinity);
+        if affinity_timeout.is_some() {
+            flags |= NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY;
+        }
         let value = encode_node_port_frontend_value(
             service.id,
             frontend_index,
@@ -2716,6 +2729,7 @@ pub fn compile_node_port_selection_fabric_dataplane(
             normalized.revision.get(),
             service_bank,
             selection_tier_code(selected.tier),
+            affinity_timeout,
         );
         for address in node
             .addresses
@@ -2863,6 +2877,7 @@ fn compile_node_port_frontends(
                     ServiceTrafficPolicy::Local => SERVICE_SELECTION_TIER_SAME_NODE,
                     ServiceTrafficPolicy::Cluster => SERVICE_SELECTION_TIER_CLUSTER,
                 },
+                None,
             );
             for address in node.addresses.iter().filter(|address| {
                 address.address.is_ipv4() == matches!(node_port.family, AddressFamily::Ipv4)
@@ -2981,6 +2996,7 @@ fn encode_service_frontend_value(
     backend_count: usize,
     revision: u64,
     selection_tier: u8,
+    affinity_timeout: Option<u32>,
 ) -> [u8; 32] {
     let mut value = [0_u8; 32];
     value[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
@@ -2989,9 +3005,14 @@ fn encode_service_frontend_value(
     value[12..14].copy_from_slice(&SERVICE_MAP_ABI_VERSION.to_ne_bytes());
     value[16..24].copy_from_slice(&revision.to_ne_bytes());
     value[24] = selection_tier;
+    if let Some(timeout) = affinity_timeout {
+        value[14..16].copy_from_slice(&SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY.to_ne_bytes());
+        value[25..29].copy_from_slice(&timeout.to_ne_bytes());
+    }
     value
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_node_port_frontend_value(
     service_id: ServiceId,
     frontend_index: u32,
@@ -3000,6 +3021,7 @@ fn encode_node_port_frontend_value(
     service_revision: u64,
     service_bank: u8,
     selection_tier: u8,
+    affinity_timeout: Option<u32>,
 ) -> [u8; 32] {
     let mut value = [0_u8; 32];
     value[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
@@ -3010,6 +3032,9 @@ fn encode_node_port_frontend_value(
     value[16..24].copy_from_slice(&service_revision.to_ne_bytes());
     value[24] = service_bank;
     value[25] = selection_tier;
+    if let Some(timeout) = affinity_timeout {
+        value[26..30].copy_from_slice(&timeout.to_ne_bytes());
+    }
     value
 }
 
@@ -4167,6 +4192,9 @@ mod tests {
     fn selection_dataplane_enforces_topology_fallback_and_external_local_precedence() {
         let mut selected = service(2, "locality");
         selected.traffic_distribution = ServiceTrafficDistribution::PreferSameZone;
+        selected.session_affinity = ServiceSessionAffinity::ClientIp {
+            timeout_seconds: 321,
+        };
         selected.backends.push(ServiceBackend {
             id: BackendId::new(3),
             address: "10.244.0.11".parse().unwrap(),
@@ -4215,6 +4243,11 @@ mod tests {
         let cluster = compiled.service.ipv4_frontends.values().next().unwrap();
         assert_eq!(u32::from_ne_bytes(cluster[8..12].try_into().unwrap()), 2);
         assert_eq!(cluster[24], SERVICE_SELECTION_TIER_SAME_ZONE);
+        assert_eq!(
+            u16::from_ne_bytes(cluster[14..16].try_into().unwrap()),
+            SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+        );
+        assert_eq!(u32::from_ne_bytes(cluster[25..29].try_into().unwrap()), 321);
         let node_port = compiled.node_port.ipv4_frontends.values().next().unwrap();
         assert_eq!(u32::from_ne_bytes(node_port[8..12].try_into().unwrap()), 0);
         assert_ne!(
@@ -4223,6 +4256,15 @@ mod tests {
             0
         );
         assert_eq!(node_port[25], SERVICE_SELECTION_TIER_SAME_NODE);
+        assert_ne!(
+            u16::from_ne_bytes(node_port[14..16].try_into().unwrap())
+                & NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY,
+            0
+        );
+        assert_eq!(
+            u32::from_ne_bytes(node_port[26..30].try_into().unwrap()),
+            321
+        );
         assert!(compiled.node_port.service_backend_slots.is_empty());
         assert_eq!(compiled.service.backend_slots.len(), 2);
     }

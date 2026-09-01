@@ -40,7 +40,10 @@ use unf_ebpf_common::{
     FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey,
     Ipv6IdentityKey, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
     POLICY_FLAG_HAS_SHADOW, POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE,
-    POLICY_MAP_ABI_VERSION, SERVICE_BANK_COUNT, SERVICE_EVENT_ABI_VERSION,
+    POLICY_MAP_ABI_VERSION, SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS,
+    SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS, SERVICE_AFFINITY_OUTCOME_CREATED,
+    SERVICE_AFFINITY_OUTCOME_NONE, SERVICE_AFFINITY_OUTCOME_RESELECTED,
+    SERVICE_AFFINITY_OUTCOME_REUSED, SERVICE_BANK_COUNT, SERVICE_EVENT_ABI_VERSION,
     SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
     SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
     SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
@@ -94,7 +97,7 @@ use cni_server::CniTransactionServer;
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v8";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v9";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
@@ -189,7 +192,7 @@ const ABI_V5_MAP_NAMES: [&str; 21] = [
     "NODE_PORT_FRONTENDS_V6",
     "NODE_PORT_CONFIG",
 ];
-const PERSISTENT_MAP_NAMES: [&str; 24] = [
+const ABI_V8_MAP_NAMES: [&str; 24] = [
     "IDENTITY_V4",
     "IDENTITY_V4_B",
     "IDENTITY_V6",
@@ -208,6 +211,33 @@ const PERSISTENT_MAP_NAMES: [&str; 24] = [
     "SERVICE_BACKEND_SLOTS",
     "SERVICE_CONFIG",
     "SERVICE_CONNECTIONS",
+    "NODE_PORT_FRONTENDS_V4",
+    "NODE_PORT_FRONTENDS_V6",
+    "NODE_PORT_CONFIG",
+    "LOAD_BALANCER_FRONTENDS_V4",
+    "LOAD_BALANCER_FRONTENDS_V6",
+    "LOAD_BALANCER_CONFIG",
+];
+const PERSISTENT_MAP_NAMES: [&str; 25] = [
+    "IDENTITY_V4",
+    "IDENTITY_V4_B",
+    "IDENTITY_V6",
+    "IDENTITY_V6_B",
+    "IDENTITY_CONFIG",
+    "POLICY_RULES",
+    "POLICY_IPV4",
+    "POLICY_IPV6",
+    "EGRESS_IPV4",
+    "EGRESS_IPV6",
+    "POLICY_CONFIG",
+    "SERVICE_FRONTENDS_V4",
+    "SERVICE_FRONTENDS_V6",
+    "SERVICE_BACKENDS_V4",
+    "SERVICE_BACKENDS_V6",
+    "SERVICE_BACKEND_SLOTS",
+    "SERVICE_CONFIG",
+    "SERVICE_CONNECTIONS",
+    "SERVICE_AFFINITY",
     "NODE_PORT_FRONTENDS_V4",
     "NODE_PORT_FRONTENDS_V6",
     "NODE_PORT_CONFIG",
@@ -687,6 +717,7 @@ struct ServiceSynchronizer {
     backend_slots: AyaHashMap<MapData, [u8; 16], [u8; 16]>,
     config: AyaArray<MapData, [u8; 32]>,
     connections: AyaHashMap<MapData, [u8; 40], [u8; 104]>,
+    affinity: AyaHashMap<MapData, [u8; 40], [u8; 32]>,
     node_port_ipv4_frontends: AyaHashMap<MapData, [u8; 8], [u8; 32]>,
     node_port_ipv6_frontends: AyaHashMap<MapData, [u8; 20], [u8; 32]>,
     node_port_config: AyaArray<MapData, [u8; 40]>,
@@ -799,6 +830,7 @@ type ServiceMaps = (
     AyaHashMap<MapData, [u8; 16], [u8; 16]>,
     AyaArray<MapData, [u8; 32]>,
     AyaHashMap<MapData, [u8; 40], [u8; 104]>,
+    AyaHashMap<MapData, [u8; 40], [u8; 32]>,
     AyaHashMap<MapData, [u8; 8], [u8; 32]>,
     AyaHashMap<MapData, [u8; 20], [u8; 32]>,
     AyaArray<MapData, [u8; 40]>,
@@ -809,6 +841,7 @@ type ServiceMaps = (
     AyaArray<MapData, [u8; 48]>,
     AyaArray<MapData, [u8; 40]>,
 );
+type ServiceAffinityMap = AyaHashMap<MapData, [u8; 40], [u8; 32]>;
 type RecoveredServiceConfig = (u64, u64, u32, u32, u32, u8);
 type RecoveredNodePortConfig = (u64, u64, u64, u32, u32, u8);
 
@@ -4995,6 +5028,7 @@ fn plan_abi_cleanup(
         3 => &ABI_V3_MAP_NAMES,
         4 => &ABI_V4_MAP_NAMES,
         5 => &ABI_V5_MAP_NAMES,
+        6..=8 => &ABI_V8_MAP_NAMES,
         _ => &PERSISTENT_MAP_NAMES,
     };
     let mut unknown = Vec::new();
@@ -5926,6 +5960,7 @@ fn new_synchronizers(
         backend_slots,
         service_config,
         connections,
+        affinity,
         node_port_ipv4_frontends,
         node_port_ipv6_frontends,
         node_port_config,
@@ -5978,6 +6013,7 @@ fn new_synchronizers(
             backend_slots,
             config: service_config,
             connections,
+            affinity,
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
@@ -6454,6 +6490,11 @@ fn recover_persistent_dataplane(
     validate_map_capacity(
         "SERVICE_CONNECTIONS",
         services.connections.map(),
+        SERVICE_CONNECTION_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "SERVICE_AFFINITY",
+        services.affinity.map(),
         SERVICE_CONNECTION_MAP_CAPACITY,
     )?;
     validate_map_capacity(
@@ -6991,7 +7032,8 @@ fn validate_load_balancer_frontend_entry<const K: usize>(
         u64::from_ne_bytes(value[32..40].try_into().expect("fixed allocation revision"));
     let service_bank = value[40];
     let known_flags = unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL
-        | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES;
+        | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES
+        | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY;
     if service_id == 0
         || schema != unf_ebpf_common::LOAD_BALANCER_MAP_ABI_VERSION
         || flags & !known_flags != 0
@@ -7000,7 +7042,11 @@ fn validate_load_balancer_frontend_entry<const K: usize>(
         || allocation_revision == 0
         || service_bank >= SERVICE_BANK_COUNT
         || !service_selection_tier_is_valid(value[41])
-        || value[42..48] != [0; 6]
+        || !affinity_encoding_is_valid(
+            flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0,
+            value[42..46].try_into().expect("fixed affinity timeout"),
+            &value[46..48],
+        )
         || !matches!(key[bank_offset - 1], 6 | 17)
     {
         bail!("persistent LoadBalancer frontend contains an incompatible value");
@@ -7433,6 +7479,14 @@ fn node_port_bank(bank: u8) -> Result<usize> {
     Ok(usize::from(bank))
 }
 
+fn affinity_encoding_is_valid(enabled: bool, timeout: [u8; 4], trailing: &[u8]) -> bool {
+    let timeout = u32::from_ne_bytes(timeout);
+    enabled
+        == (SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS..=SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS)
+            .contains(&timeout)
+        && trailing.iter().all(|byte| *byte == 0)
+}
+
 fn validate_node_port_frontend_entry<const N: usize>(
     key: &[u8; N],
     value: &[u8; 32],
@@ -7454,13 +7508,20 @@ fn validate_node_port_frontend_entry<const N: usize>(
         || service_id == 0
         || backend_count > u32::try_from(MAX_BACKENDS_PER_SERVICE).unwrap_or(u32::MAX)
         || schema != unf_ebpf_common::NODE_PORT_MAP_ABI_VERSION
-        || flags & !unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL != 0
+        || flags
+            & !(unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL
+                | unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY)
+            != 0
         || (flags & unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_LOCAL != 0
             && frontend_index & unf_ebpf_common::NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG == 0)
         || service_revision == 0
         || value[24] >= SERVICE_BANK_COUNT
         || !service_selection_tier_is_valid(value[25])
-        || value[26..32] != [0; 6]
+        || !affinity_encoding_is_valid(
+            flags & unf_ebpf_common::NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0,
+            value[26..30].try_into().expect("fixed affinity timeout"),
+            &value[30..32],
+        )
     {
         bail!("persistent NodePort frontend map contains an incompatible entry");
     }
@@ -7479,6 +7540,7 @@ fn validate_service_frontend_entry<const N: usize>(
     let service_id = u32::from_ne_bytes(value[0..4].try_into().unwrap());
     let backend_count = u32::from_ne_bytes(value[8..12].try_into().unwrap());
     let schema = u16::from_ne_bytes(value[12..14].try_into().unwrap());
+    let flags = u16::from_ne_bytes(value[14..16].try_into().unwrap());
     let revision = u64::from_ne_bytes(value[16..24].try_into().unwrap());
     if !recovered_service_address_is_valid(&key[..port_offset])
         || port == 0
@@ -7486,10 +7548,14 @@ fn validate_service_frontend_entry<const N: usize>(
         || service_id == 0
         || backend_count > u32::try_from(MAX_BACKENDS_PER_SERVICE).unwrap_or(u32::MAX)
         || schema != SERVICE_MAP_ABI_VERSION
-        || value[14..16] != [0; 2]
+        || flags & !unf_ebpf_common::SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0
         || revision == 0
         || !service_selection_tier_is_valid(value[24])
-        || value[25..32] != [0; 7]
+        || !affinity_encoding_is_valid(
+            flags & unf_ebpf_common::SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0,
+            value[25..29].try_into().expect("fixed affinity timeout"),
+            &value[29..32],
+        )
     {
         bail!("persistent service frontend map contains an incompatible entry");
     }
@@ -7851,6 +7917,14 @@ fn take_policy_maps(ebpf: &mut Ebpf) -> Result<PolicyMaps> {
     ))
 }
 
+fn take_service_affinity_map(ebpf: &mut Ebpf) -> Result<ServiceAffinityMap> {
+    AyaHashMap::<_, [u8; 40], [u8; 32]>::try_from(
+        ebpf.take_map("SERVICE_AFFINITY")
+            .context("eBPF object does not contain SERVICE_AFFINITY map")?,
+    )
+    .context("open SERVICE_AFFINITY map")
+}
+
 fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
     let ipv4_frontends = AyaHashMap::<_, [u8; 8], [u8; 32]>::try_from(
         ebpf.take_map("SERVICE_FRONTENDS_V4")
@@ -7887,6 +7961,7 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
             .context("eBPF object does not contain SERVICE_CONNECTIONS map")?,
     )
     .context("open SERVICE_CONNECTIONS map")?;
+    let affinity = take_service_affinity_map(ebpf)?;
     let node_port_ipv4_frontends = AyaHashMap::<_, [u8; 8], [u8; 32]>::try_from(
         ebpf.take_map("NODE_PORT_FRONTENDS_V4")
             .context("eBPF object does not contain NODE_PORT_FRONTENDS_V4 map")?,
@@ -7940,6 +8015,7 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
         backend_slots,
         config,
         connections,
+        affinity,
         node_port_ipv4_frontends,
         node_port_ipv6_frontends,
         node_port_config,
@@ -10306,7 +10382,14 @@ fn decode_service_event(bytes: &[u8]) -> Option<ServiceEvent> {
         || !service_event_action_reason_is_valid(action, reason)
         || !service_event_frontend_kind_is_valid(bytes[86])
         || !service_selection_tier_is_valid(bytes[87])
-        || bytes[88..96] != [0; 8]
+        || !matches!(
+            bytes[88],
+            SERVICE_AFFINITY_OUTCOME_NONE
+                | SERVICE_AFFINITY_OUTCOME_REUSED
+                | SERVICE_AFFINITY_OUTCOME_CREATED
+                | SERVICE_AFFINITY_OUTCOME_RESELECTED
+        )
+        || bytes[89..96] != [0; 7]
     {
         return None;
     }
@@ -10453,6 +10536,9 @@ mod tests {
     use super::*;
     use aya::programs::{TestRun, TestRunOptions};
     use tempfile::tempdir;
+    use unf_ebpf_common::{
+        SERVICE_CONNECTION_ROLE_FORWARD, ServiceConnectionKey, service_flow_hash,
+    };
     use unf_route::{RemoteNodeIntent, RemoteRouteSnapshotNode};
 
     #[test]
@@ -10900,6 +10986,57 @@ mod tests {
         )
     }
 
+    fn dual_stack_affinity_snapshot(
+        revision: u64,
+        primary_v4: Ipv4Addr,
+        secondary_v4: Ipv4Addr,
+        primary_v6: Ipv6Addr,
+        secondary_v6: Ipv6Addr,
+        drain_secondary: bool,
+    ) -> ServiceSnapshot {
+        let mut snapshot = dual_stack_service_snapshot(revision, primary_v4, primary_v6, true);
+        let service = snapshot
+            .services
+            .first_mut()
+            .expect("one test Service exists");
+        service.session_affinity = unf_service::ServiceSessionAffinity::ClientIp {
+            timeout_seconds: 300,
+        };
+        let primary_backends = service.backends.clone();
+        for primary in primary_backends {
+            let secondary_address = match primary.address {
+                IpAddr::V4(_) => IpAddr::V4(secondary_v4),
+                IpAddr::V6(_) => IpAddr::V6(secondary_v6),
+            };
+            let mut secondary = primary.clone();
+            secondary.id = unf_common::BackendId::new(
+                primary
+                    .id
+                    .get()
+                    .checked_add(10_000)
+                    .expect("test BackendId remains bounded"),
+            );
+            secondary.address = secondary_address;
+            secondary.target_workload = Some(match secondary_address {
+                IpAddr::V4(_) => "default/api-v4-secondary".to_owned(),
+                IpAddr::V6(_) => "default/api-v6-secondary".to_owned(),
+            });
+            secondary.terminating = drain_secondary;
+            for frontend in &mut service.frontends {
+                if frontend.protocol == primary.protocol
+                    && frontend.address.is_ipv4() == primary.address.is_ipv4()
+                    && frontend.backend_ids.contains(&primary.id)
+                {
+                    frontend.backend_ids.push(secondary.id);
+                }
+            }
+            service.backends.push(secondary);
+        }
+        snapshot
+            .validate_and_normalize()
+            .expect("dual-stack ClientIP affinity snapshot validates")
+    }
+
     #[allow(clippy::default_trait_access, clippy::too_many_lines)]
     fn dual_stack_service_snapshot_with_load_balancer(
         revision: u64,
@@ -11109,6 +11246,7 @@ mod tests {
             backend_slots,
             config,
             connections,
+            affinity,
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
@@ -11127,6 +11265,7 @@ mod tests {
             backend_slots,
             config,
             connections,
+            affinity,
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
@@ -11356,6 +11495,47 @@ mod tests {
         pseudo.extend_from_slice(&[0, 0, 0, protocol]);
         pseudo.extend_from_slice(&packet[54..]);
         assert_eq!(checksum(&pseudo), 0);
+    }
+
+    fn expected_service_backend(
+        snapshot: &ServiceSnapshot,
+        source_address: [u8; 16],
+        destination_address: [u8; 16],
+        address_family: u8,
+        source_port: u16,
+    ) -> IpAddr {
+        let service = snapshot.services.first().expect("one test Service exists");
+        let frontend = service
+            .frontends
+            .iter()
+            .find(|frontend| {
+                frontend.address.is_ipv4() == (address_family == 4)
+                    && frontend.protocol == unf_common::Protocol::Tcp
+                    && frontend.port == 80
+            })
+            .expect("test TCP frontend exists");
+        let key = ServiceConnectionKey {
+            source_address,
+            destination_address,
+            source_port: source_port.to_be_bytes(),
+            destination_port: 80_u16.to_be_bytes(),
+            protocol: 6,
+            address_family,
+            role: SERVICE_CONNECTION_ROLE_FORWARD,
+            reserved: 0,
+        };
+        let slot = usize::try_from(
+            service_flow_hash(&key, service.id)
+                % u32::try_from(frontend.backend_ids.len()).expect("test backend count fits u32"),
+        )
+        .expect("test slot fits usize");
+        let backend_id = frontend.backend_ids[slot];
+        service
+            .backends
+            .iter()
+            .find(|backend| backend.id == backend_id)
+            .expect("selected test backend exists")
+            .address
     }
 
     #[test]
@@ -11826,6 +12006,7 @@ mod tests {
             backend_slots,
             config,
             connections,
+            affinity,
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
@@ -11845,6 +12026,7 @@ mod tests {
             backend_slots,
             config,
             connections,
+            affinity,
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
@@ -12888,6 +13070,7 @@ mod tests {
             backend_slots,
             config,
             connections,
+            affinity,
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
@@ -12907,6 +13090,7 @@ mod tests {
             backend_slots,
             config,
             connections,
+            affinity,
             node_port_ipv4_frontends,
             node_port_ipv6_frontends,
             node_port_config,
@@ -13132,6 +13316,252 @@ mod tests {
         assert_ne!(no_backend.service_id.get(), 0);
         assert_eq!(no_backend.backend_id.get(), 0);
         assert_eq!(no_backend.service_revision, 3);
+    }
+
+    #[test]
+    #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
+    fn privileged_client_ip_affinity_expires_and_drains_dual_stack() {
+        const TC_ACT_PIPE: u32 = 3;
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new()
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(program_name)
+                .expect("service TC program exists")
+                .try_into()
+                .expect("service program is a TC classifier");
+            program
+                .load()
+                .expect("kernel verifier accepts ClientIP affinity TC program");
+        }
+        let mut service_events = RingBuf::try_from(
+            ebpf.take_map("SERVICE_EVENTS")
+                .expect("service event ring exists"),
+        )
+        .expect("service event ring opens");
+        let directory = tempdir().unwrap();
+        let mut synchronizer =
+            test_service_synchronizer(&mut ebpf, directory.path().join("service.json"));
+        let state = test_agent_state();
+        let service_v4 = Ipv4Addr::new(10, 96, 0, 10);
+        let primary_v4 = Ipv4Addr::new(10, 42, 0, 20);
+        let secondary_v4 = Ipv4Addr::new(10, 42, 0, 21);
+        let client_v4 = Ipv4Addr::new(10, 42, 0, 5);
+        let service_v6 = "fd00:96::10".parse::<Ipv6Addr>().unwrap();
+        let primary_v6 = "fd00:42::20".parse::<Ipv6Addr>().unwrap();
+        let secondary_v6 = "fd00:42::21".parse::<Ipv6Addr>().unwrap();
+        let client_v6 = "fd00:42::5".parse::<Ipv6Addr>().unwrap();
+        let initial = dual_stack_affinity_snapshot(
+            1,
+            primary_v4,
+            secondary_v4,
+            primary_v6,
+            secondary_v6,
+            false,
+        );
+        let node = node_port_node_snapshot(1);
+        let selection_node = local_selection_node(&node, Some("zone-a".to_owned()));
+        let initial_contract = NetworkBehaviorContract::compile(
+            &initial,
+            Revision::new(1),
+            Revision::new(1),
+            selection_node.clone(),
+        )
+        .expect("ClientIP affinity contract verifies");
+        activate_service_snapshot_with_contract(
+            &mut synchronizer,
+            &initial,
+            Some(&node),
+            Some(&initial_contract),
+            true,
+            &state,
+        )
+        .expect("ClientIP affinity Service activates");
+
+        let mut client_v4_key = [0; 16];
+        client_v4_key[..4].copy_from_slice(&client_v4.octets());
+        let mut service_v4_key = [0; 16];
+        service_v4_key[..4].copy_from_slice(&service_v4.octets());
+        let v4_primary_port = 45_000;
+        let v4_affinity_port = 45_001;
+        let v4_expired_port = 45_002;
+        let selected_v4 = match expected_service_backend(
+            &initial,
+            client_v4_key,
+            service_v4_key,
+            4,
+            v4_primary_port,
+        ) {
+            IpAddr::V4(address) => address,
+            IpAddr::V6(_) => panic!("IPv4 frontend selected an IPv6 backend"),
+        };
+        let v6_primary_port = 46_000;
+        let v6_affinity_port = 46_001;
+        let v6_expired_port = 46_002;
+        let selected_v6 = match expected_service_backend(
+            &initial,
+            client_v6.octets(),
+            service_v6.octets(),
+            6,
+            v6_primary_port,
+        ) {
+            IpAddr::V6(address) => address,
+            IpAddr::V4(_) => panic!("IPv6 frontend selected an IPv4 backend"),
+        };
+
+        for (port, expected) in [
+            (v4_primary_port, selected_v4),
+            (v4_affinity_port, selected_v4),
+        ] {
+            let packet = ipv4_packet(6, client_v4, service_v4, port, 80);
+            let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &packet);
+            assert_eq!(action, TC_ACT_PIPE);
+            assert_ipv4_packet(&translated, 6, client_v4, expected, port, 8080);
+        }
+        for (port, expected) in [
+            (v6_primary_port, selected_v6),
+            (v6_affinity_port, selected_v6),
+        ] {
+            let packet = ipv6_packet(6, client_v6, service_v6, port, 80);
+            let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &packet);
+            assert_eq!(action, TC_ACT_PIPE);
+            assert_ipv6_packet(&translated, 6, client_v6, expected, port, 8080);
+        }
+        let affinity_keys = synchronizer
+            .affinity
+            .keys()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(affinity_keys.len(), 2);
+        for key in affinity_keys {
+            let mut value = synchronizer.affinity.get(&key, 0).unwrap();
+            value[0..8].copy_from_slice(&0_u64.to_ne_bytes());
+            synchronizer.affinity.insert(key, value, 0).unwrap();
+        }
+
+        let v4_expired = ipv4_packet(6, client_v4, service_v4, v4_expired_port, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &v4_expired);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(
+            &translated,
+            6,
+            client_v4,
+            selected_v4,
+            v4_expired_port,
+            8080,
+        );
+        let v6_expired = ipv6_packet(6, client_v6, service_v6, v6_expired_port, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &v6_expired);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(
+            &translated,
+            6,
+            client_v6,
+            selected_v6,
+            v6_expired_port,
+            8080,
+        );
+
+        let mut draining = dual_stack_affinity_snapshot(
+            2,
+            primary_v4,
+            secondary_v4,
+            primary_v6,
+            secondary_v6,
+            false,
+        );
+        for backend in &mut draining.services[0].backends {
+            if backend.address == IpAddr::V4(selected_v4)
+                || backend.address == IpAddr::V6(selected_v6)
+            {
+                backend.terminating = true;
+            }
+        }
+        draining = draining
+            .validate_and_normalize()
+            .expect("selected backends can enter graceful draining");
+        let replacement_v4 = if selected_v4 == primary_v4 {
+            secondary_v4
+        } else {
+            primary_v4
+        };
+        let replacement_v6 = if selected_v6 == primary_v6 {
+            secondary_v6
+        } else {
+            primary_v6
+        };
+        let draining_contract = NetworkBehaviorContract::compile(
+            &draining,
+            Revision::new(2),
+            Revision::new(2),
+            selection_node,
+        )
+        .expect("draining affinity contract verifies");
+        activate_service_snapshot_with_contract(
+            &mut synchronizer,
+            &draining,
+            Some(&node),
+            Some(&draining_contract),
+            true,
+            &state,
+        )
+        .expect("terminating backends are withdrawn from new-flow slots");
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &v4_expired);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(
+            &translated,
+            6,
+            client_v4,
+            selected_v4,
+            v4_expired_port,
+            8080,
+        );
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &v6_expired);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(
+            &translated,
+            6,
+            client_v6,
+            selected_v6,
+            v6_expired_port,
+            8080,
+        );
+
+        let v4_new_port = v4_expired_port + 1;
+        let v4_new = ipv4_packet(6, client_v4, service_v4, v4_new_port, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &v4_new);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&translated, 6, client_v4, replacement_v4, v4_new_port, 8080);
+        let v6_new_port = v6_expired_port + 1;
+        let v6_new = ipv6_packet(6, client_v6, service_v6, v6_new_port, 80);
+        let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &v6_new);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&translated, 6, client_v6, replacement_v6, v6_new_port, 8080);
+
+        let mut outcomes = Vec::new();
+        while let Some(item) = service_events.next() {
+            let event = decode_service_event(&item).expect("kernel service event is valid");
+            assert_eq!(event.action, SERVICE_EVENT_ACTION_TRANSLATE);
+            outcomes.push(event.reserved[2]);
+        }
+        assert_eq!(outcomes.len(), 10);
+        let outcome_counts = outcomes.iter().fold([0_usize; 4], |mut counts, outcome| {
+            counts[usize::from(*outcome)] += 1;
+            counts
+        });
+        assert_eq!(outcome_counts, [0, 2, 4, 4]);
+        assert_eq!(
+            synchronizer
+                .affinity
+                .keys()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .len(),
+            4
+        );
     }
 
     #[test]
@@ -14152,14 +14582,15 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_distinguishes_complete_v4_v5_v6_v7_and_v8_map_ownership() {
+    fn cleanup_distinguishes_historical_and_current_map_ownership() {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("unf");
         for (version, names) in [
             (4_u16, ABI_V4_MAP_NAMES.as_slice()),
             (5_u16, ABI_V5_MAP_NAMES.as_slice()),
-            (6_u16, PERSISTENT_MAP_NAMES.as_slice()),
-            (7_u16, PERSISTENT_MAP_NAMES.as_slice()),
+            (6_u16, ABI_V8_MAP_NAMES.as_slice()),
+            (7_u16, ABI_V8_MAP_NAMES.as_slice()),
+            (8_u16, ABI_V8_MAP_NAMES.as_slice()),
             (CURRENT_BPF_ABI_VERSION, PERSISTENT_MAP_NAMES.as_slice()),
         ] {
             let abi = root.join(format!("v{version}"));
@@ -14173,7 +14604,8 @@ mod tests {
         }
         assert_eq!(ABI_V4_MAP_NAMES.len(), 18);
         assert_eq!(ABI_V5_MAP_NAMES.len(), 21);
-        assert_eq!(PERSISTENT_MAP_NAMES.len(), 24);
+        assert_eq!(ABI_V8_MAP_NAMES.len(), 24);
+        assert_eq!(PERSISTENT_MAP_NAMES.len(), 25);
     }
 
     #[test]
@@ -14380,11 +14812,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v8/links"),
+                Path::new("/sys/fs/bpf/unf/v9/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v8/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v9/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -14520,16 +14952,16 @@ mod tests {
 
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v8")).is_ok());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v9")).is_ok());
         assert_eq!(
-            configured_abi_version(Path::new("/sys/fs/bpf/unf/v8")),
-            Some(8)
+            configured_abi_version(Path::new("/sys/fs/bpf/unf/v9")),
+            Some(9)
         );
         let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
             error.to_string().contains(
-                "incompatible with persistent BPF-state ABI v8; expected a /v8 directory"
+                "incompatible with persistent BPF-state ABI v9; expected a /v9 directory"
             )
         );
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v4")).is_err());

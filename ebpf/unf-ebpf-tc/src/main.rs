@@ -24,13 +24,19 @@ use unf_ebpf_common::{
     LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4, LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6,
     LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION, LoadBalancerMapConfig,
     LoadBalancerNodeSourceConfig, NodePortFrontendValue, NodePortMapConfig,
-    NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG,
-    NODE_PORT_MAP_ABI_VERSION, NODE_PORT_SNAT_PORT_PROBES,
+    NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY,
+    NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG, NODE_PORT_MAP_ABI_VERSION,
+    NODE_PORT_SNAT_PORT_PROBES,
     POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, SERVICE_BANK_COUNT,
-    SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER, SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL,
-    SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_EVENT_ABI_VERSION,
+    SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS, SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS,
+    SERVICE_AFFINITY_OUTCOME_CREATED, SERVICE_AFFINITY_OUTCOME_NONE,
+    SERVICE_AFFINITY_OUTCOME_RESELECTED, SERVICE_AFFINITY_OUTCOME_REUSED,
+    SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT, SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER,
+    SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL, SERVICE_CONNECTION_ROLE_AFFINITY,
+    SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE,
+    SERVICE_CONNECTION_SELECTION_TIER_MASK, SERVICE_EVENT_ABI_VERSION,
     SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
     SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
     SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
@@ -41,9 +47,10 @@ use unf_ebpf_common::{
     SERVICE_EVENT_REASON_MISSING_SLOT, SERVICE_EVENT_REASON_NO_BACKEND,
     SERVICE_EVENT_REASON_PAIR_INSERT_FAILED, SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
     SERVICE_EVENT_REASON_REWRITE_FAILED, SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED,
-    SERVICE_MAP_ABI_VERSION, ServiceBackendKey, ServiceBackendSlotKey, ServiceBackendSlotValue,
-    ServiceConnectionKey, ServiceConnectionValue, ServiceEvent, ServiceFrontendValue,
-    ServiceMapConfig, connection_is_active, ipv6_extension_step, node_port_snat_candidate,
+    SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY, SERVICE_MAP_ABI_VERSION, ServiceBackendKey,
+    ServiceAffinityValue, ServiceBackendSlotKey, ServiceBackendSlotValue, ServiceConnectionKey,
+    ServiceConnectionValue, ServiceEvent, ServiceFrontendValue, ServiceMapConfig, connection_is_active,
+    ipv6_extension_step, node_port_snat_candidate,
     packet_starts_connection, service_backend_is_eligible, service_connection_is_active,
     service_flow_hash, service_selection_tier_is_valid,
 };
@@ -230,6 +237,10 @@ static LOAD_BALANCER_NODE_SOURCE: Array<LoadBalancerNodeSourceConfig> =
 static SERVICE_CONNECTIONS: LruHashMap<ServiceConnectionKey, ServiceConnectionValue> =
     LruHashMap::with_max_entries(SERVICE_CONNECTION_CAPACITY, 0);
 
+#[map]
+static SERVICE_AFFINITY: LruHashMap<ServiceConnectionKey, ServiceAffinityValue> =
+    LruHashMap::with_max_entries(SERVICE_CONNECTION_CAPACITY, 0);
+
 /// Runtime-only per-CPU workspace keeps the connection value off the bounded
 /// classifier stack. BPF execution is non-preemptible on one CPU.
 #[map]
@@ -238,6 +249,10 @@ static SERVICE_CONNECTION_SCRATCH: PerCpuArray<ServiceConnectionValue> =
 
 #[map]
 static SERVICE_KEY_SCRATCH: PerCpuArray<ServiceConnectionKey> = PerCpuArray::with_max_entries(1, 0);
+
+#[map]
+static SERVICE_AFFINITY_KEY_SCRATCH: PerCpuArray<ServiceConnectionKey> =
+    PerCpuArray::with_max_entries(1, 0);
 
 #[map]
 static FIB_LOOKUP_SCRATCH: PerCpuArray<BpfFibLookup> = PerCpuArray::with_max_entries(1, 0);
@@ -1010,9 +1025,15 @@ fn validate_load_balancer_frontend(
         || frontend.service_bank != service.active_bank
         || frontend.flags
             & !(unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_LOCAL
-                | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES)
+                | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES
+                | unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY)
             != 0
-        || !valid_selection_reserved(frontend.reserved)
+        || !valid_selection_reserved(
+            frontend.reserved,
+            frontend.flags
+                & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+                != 0,
+        )
     {
         emit_service_lookup_failure(
             forward_key,
@@ -1032,9 +1053,25 @@ fn validate_load_balancer_frontend(
         frontend_index: frontend.frontend_index,
         backend_count: frontend.backend_count,
         schema_version: SERVICE_MAP_ABI_VERSION,
-        flags: 0,
+        flags: if frontend.flags
+            & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+            != 0
+        {
+            SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+        } else {
+            0
+        },
         revision: frontend.service_revision,
-        reserved: [frontend.reserved[0], 0, 0, 0, 0, 0, 0, 0],
+        reserved: [
+            frontend.reserved[0],
+            frontend.reserved[1],
+            frontend.reserved[2],
+            frontend.reserved[3],
+            frontend.reserved[4],
+            frontend.reserved[5],
+            frontend.reserved[6],
+            0,
+        ],
     })
 }
 
@@ -1111,10 +1148,15 @@ fn validate_node_port_frontend(
         || frontend.service_revision != service.revision
         || frontend.service_id.get() == 0
         || frontend.service_bank != service.active_bank
-        || frontend.flags & !NODE_PORT_FRONTEND_FLAG_LOCAL != 0
+        || frontend.flags
+            & !(NODE_PORT_FRONTEND_FLAG_LOCAL | NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY)
+            != 0
         || (frontend.flags & NODE_PORT_FRONTEND_FLAG_LOCAL != 0
             && frontend.frontend_index & NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG == 0)
-        || !valid_selection_reserved(frontend.reserved)
+        || !valid_selection_reserved(
+            frontend.reserved,
+            frontend.flags & NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0,
+        )
     {
         emit_service_lookup_failure(
             forward_key,
@@ -1140,9 +1182,22 @@ fn validate_node_port_frontend(
             frontend_index: frontend.frontend_index,
             backend_count: frontend.backend_count,
             schema_version: SERVICE_MAP_ABI_VERSION,
-            flags: 0,
+            flags: if frontend.flags & NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0 {
+                SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+            } else {
+                0
+            },
             revision: frontend.service_revision,
-            reserved: [frontend.reserved[0], 0, 0, 0, 0, 0, 0, 0],
+            reserved: [
+                frontend.reserved[0],
+                frontend.reserved[1],
+                frontend.reserved[2],
+                frontend.reserved[3],
+                frontend.reserved[4],
+                frontend.reserved[5],
+                frontend.reserved[6],
+                0,
+            ],
         },
         connection_flags,
     ))
@@ -1175,11 +1230,18 @@ const fn connection_event_frontend_kind(value: &ServiceConnectionValue) -> u8 {
 }
 
 #[inline(always)]
-const fn valid_selection_reserved<const N: usize>(reserved: [u8; N]) -> bool {
+const fn valid_selection_reserved<const N: usize>(reserved: [u8; N], affinity: bool) -> bool {
     if !service_selection_tier_is_valid(reserved[0]) {
         return false;
     }
-    let mut index = 1;
+    let timeout = u32::from_ne_bytes([reserved[1], reserved[2], reserved[3], reserved[4]]);
+    if affinity
+        != (timeout >= SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS
+            && timeout <= SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS)
+    {
+        return false;
+    }
+    let mut index = 5;
     while index < N {
         if reserved[index] != 0 {
             return false;
@@ -1226,7 +1288,8 @@ fn emit_service_connection_event(action: u8, reason: u8, timestamp_ns: u64) {
     event.reason = reason;
     event.reserved = [0; 10];
     event.reserved[0] = connection_event_frontend_kind(value);
-    event.reserved[1] = value.reserved[3];
+    event.reserved[1] = value.reserved[3] & SERVICE_CONNECTION_SELECTION_TIER_MASK;
+    event.reserved[2] = value.reserved[3] >> SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT;
     let _ = SERVICE_EVENTS.output::<ServiceEvent>(&*event, 0);
 }
 
@@ -1347,19 +1410,55 @@ fn store_service_pair(
 
 #[inline(never)]
 fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
-    let reverse = service_reverse_key(value);
+    let Some(reverse_ptr) = SERVICE_AFFINITY_KEY_SCRATCH.get_ptr_mut(0) else {
+        return false;
+    };
+    // SAFETY: this CPU owns both key scratch values for the invocation.
+    #[allow(unsafe_code)]
+    let reverse = unsafe { &mut *reverse_ptr };
+    let source_translated = value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0;
+    reverse.source_address = value.backend_address;
+    reverse.destination_address = if source_translated {
+        value.translated_source_address
+    } else {
+        value.client_address
+    };
+    reverse.source_port = value.backend_port;
+    reverse.destination_port = if source_translated {
+        node_port_snat_port(value)
+    } else {
+        value.client_port
+    };
+    reverse.protocol = value.protocol;
+    reverse.address_family = value.address_family;
+    reverse.role = SERVICE_CONNECTION_ROLE_REVERSE;
+    reverse.reserved = 0;
     if SERVICE_CONNECTIONS
-        .insert(&reverse, value, BPF_NOEXIST as u64)
+        .insert(&*reverse, value, BPF_NOEXIST as u64)
         .is_err()
     {
         return false;
     }
-    let forward = service_forward_key(value);
+    let Some(forward_ptr) = SERVICE_KEY_SCRATCH.get_ptr_mut(0) else {
+        let _ = SERVICE_CONNECTIONS.remove(&*reverse);
+        return false;
+    };
+    // SAFETY: this CPU owns both key scratch values for the invocation.
+    #[allow(unsafe_code)]
+    let forward = unsafe { &mut *forward_ptr };
+    forward.source_address = value.client_address;
+    forward.destination_address = value.frontend_address;
+    forward.source_port = value.client_port;
+    forward.destination_port = value.frontend_port;
+    forward.protocol = value.protocol;
+    forward.address_family = value.address_family;
+    forward.role = SERVICE_CONNECTION_ROLE_FORWARD;
+    forward.reserved = 0;
     if SERVICE_CONNECTIONS
-        .insert(&forward, value, BPF_NOEXIST as u64)
+        .insert(&*forward, value, BPF_NOEXIST as u64)
         .is_err()
     {
-        let _ = SERVICE_CONNECTIONS.remove(&reverse);
+        let _ = SERVICE_CONNECTIONS.remove(&*reverse);
         return false;
     }
     true
@@ -1440,6 +1539,12 @@ fn new_service_connection(
         value.reserved[2] = frontend_kind;
     }
     if value.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
+        let hash = u32::from_ne_bytes([
+            value.translated_source_address[0],
+            value.translated_source_address[1],
+            value.translated_source_address[2],
+            value.translated_source_address[3],
+        ]);
         value.translated_source_address = if frontend_kind
             == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
         {
@@ -1453,7 +1558,6 @@ fn new_service_connection(
         } else {
             value.frontend_address
         };
-        let hash = service_flow_hash(&service_forward_key(value), value.service_id);
         let mut probe = 0_u32;
         while probe < NODE_PORT_SNAT_PORT_PROBES {
             let port = node_port_snat_candidate(hash, probe);
@@ -1661,6 +1765,107 @@ fn lookup_external_frontend_v6(
     lookup_load_balancer_frontend_v6(forward_key, service, now_ns)
 }
 
+#[inline(always)]
+fn write_service_affinity_key(
+    forward_key: &ServiceConnectionKey,
+    key: &mut ServiceConnectionKey,
+    service_bank: u8,
+) {
+    *key = *forward_key;
+    key.source_port = [0; 2];
+    key.role = SERVICE_CONNECTION_ROLE_AFFINITY;
+    key.reserved = service_bank;
+}
+
+#[inline(always)]
+fn affinity_timeout_ns(frontend: &ServiceFrontendValue) -> u64 {
+    u64::from(u32::from_ne_bytes([
+        frontend.reserved[1],
+        frontend.reserved[2],
+        frontend.reserved[3],
+        frontend.reserved[4],
+    ])) * 1_000_000_000
+}
+
+#[inline(never)]
+fn select_affinity_slot(
+    forward_key: &ServiceConnectionKey,
+    frontend: &ServiceFrontendValue,
+    service_bank: u8,
+    now_ns: u64,
+) -> (u32, u8) {
+    if frontend.backend_count == 0 {
+        return (0, 0);
+    }
+    let fallback = service_flow_hash(forward_key, frontend.service_id) % frontend.backend_count;
+    if frontend.flags & SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY == 0 {
+        return (fallback, SERVICE_AFFINITY_OUTCOME_NONE);
+    }
+    let Some(key_ptr) = SERVICE_AFFINITY_KEY_SCRATCH.get_ptr_mut(0) else {
+        return (fallback, SERVICE_AFFINITY_OUTCOME_CREATED);
+    };
+    // SAFETY: this CPU owns the affinity-key scratch value for the invocation.
+    #[allow(unsafe_code)]
+    let key = unsafe { &mut *key_ptr };
+    write_service_affinity_key(forward_key, key, service_bank);
+    // SAFETY: the compact fixed-layout value is copied before another map
+    // operation, and no map reference escapes this block.
+    #[allow(unsafe_code)]
+    let Some(mut affinity) = (unsafe { SERVICE_AFFINITY.get(&*key).copied() }) else {
+        return (fallback, SERVICE_AFFINITY_OUTCOME_CREATED);
+    };
+    let structurally_valid = affinity.schema_version == SERVICE_MAP_ABI_VERSION
+        && affinity.backend_id.get() != 0
+        && affinity.service_revision == frontend.revision
+        && affinity.tier == frontend.reserved[0]
+        && affinity.reserved == [0; 5]
+        && affinity.slot < frontend.backend_count
+        && affinity.last_seen_ns <= now_ns
+        && now_ns.saturating_sub(affinity.last_seen_ns) <= affinity_timeout_ns(frontend);
+    if structurally_valid {
+        // A service bank is immutable while active. Bank plus revision therefore
+        // proves that this slot was selected from the exact current eligible set;
+        // any lifecycle/topology change publishes another bank or revision.
+        affinity.last_seen_ns = now_ns;
+        let _ = SERVICE_AFFINITY.insert(&*key, &affinity, 0);
+        return (affinity.slot, SERVICE_AFFINITY_OUTCOME_REUSED);
+    }
+    let _ = SERVICE_AFFINITY.remove(&*key);
+    (fallback, SERVICE_AFFINITY_OUTCOME_RESELECTED)
+}
+
+#[inline(never)]
+fn store_service_affinity(
+    forward_key: &ServiceConnectionKey,
+    connection: &ServiceConnectionValue,
+    slot_index: u32,
+    service_bank: u8,
+    now_ns: u64,
+) {
+    if connection.reserved[3] >> SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT
+        == SERVICE_AFFINITY_OUTCOME_NONE
+    {
+        return;
+    }
+    let affinity = ServiceAffinityValue {
+        last_seen_ns: now_ns,
+        service_revision: connection.service_revision,
+        backend_id: connection.backend_id,
+        slot: slot_index,
+        schema_version: SERVICE_MAP_ABI_VERSION,
+        tier: connection.reserved[3] & SERVICE_CONNECTION_SELECTION_TIER_MASK,
+        reserved: [0; 5],
+    };
+    let Some(key_ptr) = SERVICE_AFFINITY_KEY_SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    // SAFETY: this CPU owns the affinity-key scratch value for the invocation.
+    #[allow(unsafe_code)]
+    let key = unsafe { &mut *key_ptr };
+    write_service_affinity_key(forward_key, key, service_bank);
+    let _ = SERVICE_AFFINITY.insert(&*key, &affinity, 0);
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn lookup_new_forward_service_v4(
@@ -1707,8 +1912,11 @@ fn lookup_new_forward_service_v4(
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
         || frontend.revision != config.revision
         || frontend.service_id.get() == 0
-        || frontend.flags != 0
-        || !valid_selection_reserved(frontend.reserved)
+        || frontend.flags & !SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0
+        || !valid_selection_reserved(
+            frontend.reserved,
+            frontend.flags & SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0,
+        )
     {
         emit_service_lookup_failure(
             forward_key,
@@ -1737,10 +1945,39 @@ fn lookup_new_forward_service_v4(
         );
         return ServiceLookup::Drop;
     }
+    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
+        return ServiceLookup::Drop;
+    };
+    // SAFETY: this CPU owns the connection scratch value for this invocation.
+    #[allow(unsafe_code)]
+    let value = unsafe { &mut *value_ptr };
+    value.service_revision = frontend.revision;
+    value.client_address = forward_key.source_address;
+    value.frontend_address = forward_key.destination_address;
+    value.backend_address = [0; 16];
+    value.translated_source_address = [0; 16];
+    value.service_id = frontend.service_id;
+    value.backend_id = BackendId::new(0);
+    value.client_port = forward_key.source_port;
+    value.frontend_port = forward_key.destination_port;
+    value.backend_port = [0; 2];
+    value.schema_version = SERVICE_MAP_ABI_VERSION;
+    value.protocol = forward_key.protocol;
+    value.address_family = AddressFamily::Ipv4 as u8;
+    value.flags = connection_flags;
+    value.reserved = [0; 4];
+    value.reserved[3] = frontend.reserved[0];
+    if connection_flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
+        value.translated_source_address[0..4]
+            .copy_from_slice(&service_flow_hash(forward_key, frontend.service_id).to_ne_bytes());
+    }
+    let (selected_slot, affinity_outcome) =
+        select_affinity_slot(forward_key, &frontend, service_bank, now_ns);
+    value.reserved[3] |= affinity_outcome << SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT;
     let slot_key = ServiceBackendSlotKey {
         service_id: frontend.service_id,
         frontend_index: frontend.frontend_index,
-        slot: service_flow_hash(forward_key, frontend.service_id) % frontend.backend_count,
+        slot: selected_slot,
         bank: service_bank,
         reserved: [0; 3],
     };
@@ -1778,6 +2015,7 @@ fn lookup_new_forward_service_v4(
         );
         return ServiceLookup::Drop;
     }
+    value.backend_id = slot.backend_id;
     let backend_key = ServiceBackendKey {
         service_id: frontend.service_id,
         backend_id: slot.backend_id,
@@ -1785,8 +2023,10 @@ fn lookup_new_forward_service_v4(
         reserved: [0; 3],
     };
     // SAFETY: the exact key and fixed-layout value match the declared map ABI.
+    // The backend map value remains valid while its active bank is immutable;
+    // fields are copied directly into per-CPU scratch before any map update.
     #[allow(unsafe_code)]
-    let Some(backend) = (unsafe { SERVICE_BACKENDS_V4.get(&backend_key).copied() }) else {
+    let Some(backend) = (unsafe { SERVICE_BACKENDS_V4.get(&backend_key) }) else {
         emit_service_lookup_failure(
             forward_key,
             frontend.service_id,
@@ -1819,33 +2059,16 @@ fn lookup_new_forward_service_v4(
         );
         return ServiceLookup::Drop;
     }
-    let mut backend_address = [0_u8; 16];
-    backend_address[0] = backend.address[0];
-    backend_address[1] = backend.address[1];
-    backend_address[2] = backend.address[2];
-    backend_address[3] = backend.address[3];
-    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
-        return ServiceLookup::Drop;
-    };
-    // SAFETY: this CPU owns the connection scratch value for this invocation.
-    #[allow(unsafe_code)]
-    let value = unsafe { &mut *value_ptr };
-    value.service_revision = frontend.revision;
-    value.client_address = forward_key.source_address;
-    value.frontend_address = forward_key.destination_address;
-    value.backend_address = backend_address;
-    value.translated_source_address = [0; 16];
-    value.service_id = frontend.service_id;
-    value.backend_id = slot.backend_id;
-    value.client_port = forward_key.source_port;
-    value.frontend_port = forward_key.destination_port;
+    value.backend_address[0] = backend.address[0];
+    value.backend_address[1] = backend.address[1];
+    value.backend_address[2] = backend.address[2];
+    value.backend_address[3] = backend.address[3];
     value.backend_port = backend.port;
-    value.schema_version = SERVICE_MAP_ABI_VERSION;
-    value.protocol = forward_key.protocol;
-    value.address_family = AddressFamily::Ipv4 as u8;
-    value.flags = connection_flags;
-    value.reserved = [0; 4];
-    value.reserved[3] = frontend.reserved[0];
+    // Affinity is a bounded selection cache, not connection state. Publishing
+    // the current eligible choice before pair insertion avoids retaining its
+    // metadata across the deeper connection-creation call chain; a failed pair
+    // insert can safely reuse the same still-current choice on retry.
+    store_service_affinity(forward_key, value, selected_slot, service_bank, now_ns);
     let Some(translation) = new_service_connection(value, frontend_kind, now_ns) else {
         emit_service_connection_event(
             SERVICE_EVENT_ACTION_DROP,
@@ -1898,8 +2121,11 @@ fn lookup_new_forward_service_v6(
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
         || frontend.revision != config.revision
         || frontend.service_id.get() == 0
-        || frontend.flags != 0
-        || !valid_selection_reserved(frontend.reserved)
+        || frontend.flags & !SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0
+        || !valid_selection_reserved(
+            frontend.reserved,
+            frontend.flags & SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0,
+        )
     {
         emit_service_lookup_failure(
             forward_key,
@@ -1928,10 +2154,39 @@ fn lookup_new_forward_service_v6(
         );
         return ServiceLookup::Drop;
     }
+    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
+        return ServiceLookup::Drop;
+    };
+    // SAFETY: this CPU owns the connection scratch value for this invocation.
+    #[allow(unsafe_code)]
+    let value = unsafe { &mut *value_ptr };
+    value.service_revision = frontend.revision;
+    value.client_address = forward_key.source_address;
+    value.frontend_address = forward_key.destination_address;
+    value.backend_address = [0; 16];
+    value.translated_source_address = [0; 16];
+    value.service_id = frontend.service_id;
+    value.backend_id = BackendId::new(0);
+    value.client_port = forward_key.source_port;
+    value.frontend_port = forward_key.destination_port;
+    value.backend_port = [0; 2];
+    value.schema_version = SERVICE_MAP_ABI_VERSION;
+    value.protocol = forward_key.protocol;
+    value.address_family = AddressFamily::Ipv6 as u8;
+    value.flags = connection_flags;
+    value.reserved = [0; 4];
+    value.reserved[3] = frontend.reserved[0];
+    if connection_flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
+        value.translated_source_address[0..4]
+            .copy_from_slice(&service_flow_hash(forward_key, frontend.service_id).to_ne_bytes());
+    }
+    let (selected_slot, affinity_outcome) =
+        select_affinity_slot(forward_key, &frontend, service_bank, now_ns);
+    value.reserved[3] |= affinity_outcome << SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT;
     let slot_key = ServiceBackendSlotKey {
         service_id: frontend.service_id,
         frontend_index: frontend.frontend_index,
-        slot: service_flow_hash(forward_key, frontend.service_id) % frontend.backend_count,
+        slot: selected_slot,
         bank: service_bank,
         reserved: [0; 3],
     };
@@ -1969,6 +2224,7 @@ fn lookup_new_forward_service_v6(
         );
         return ServiceLookup::Drop;
     }
+    value.backend_id = slot.backend_id;
     let backend_key = ServiceBackendKey {
         service_id: frontend.service_id,
         backend_id: slot.backend_id,
@@ -1976,8 +2232,10 @@ fn lookup_new_forward_service_v6(
         reserved: [0; 3],
     };
     // SAFETY: the exact key and fixed-layout value match the declared map ABI.
+    // The backend map value remains valid while its active bank is immutable;
+    // fields are copied directly into per-CPU scratch before any map update.
     #[allow(unsafe_code)]
-    let Some(backend) = (unsafe { SERVICE_BACKENDS_V6.get(&backend_key).copied() }) else {
+    let Some(backend) = (unsafe { SERVICE_BACKENDS_V6.get(&backend_key) }) else {
         emit_service_lookup_failure(
             forward_key,
             frontend.service_id,
@@ -2010,28 +2268,9 @@ fn lookup_new_forward_service_v6(
         );
         return ServiceLookup::Drop;
     }
-    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
-        return ServiceLookup::Drop;
-    };
-    // SAFETY: this CPU owns the connection scratch value for this invocation.
-    #[allow(unsafe_code)]
-    let value = unsafe { &mut *value_ptr };
-    value.service_revision = frontend.revision;
-    value.client_address = forward_key.source_address;
-    value.frontend_address = forward_key.destination_address;
     value.backend_address = backend.address;
-    value.translated_source_address = [0; 16];
-    value.service_id = frontend.service_id;
-    value.backend_id = slot.backend_id;
-    value.client_port = forward_key.source_port;
-    value.frontend_port = forward_key.destination_port;
     value.backend_port = backend.port;
-    value.schema_version = SERVICE_MAP_ABI_VERSION;
-    value.protocol = forward_key.protocol;
-    value.address_family = AddressFamily::Ipv6 as u8;
-    value.flags = connection_flags;
-    value.reserved = [0; 4];
-    value.reserved[3] = frontend.reserved[0];
+    store_service_affinity(forward_key, value, selected_slot, service_bank, now_ns);
     let Some(translation) = new_service_connection(value, frontend_kind, now_ns) else {
         emit_service_connection_event(
             SERVICE_EVENT_ACTION_DROP,

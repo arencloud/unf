@@ -18,7 +18,7 @@ and connection-state foundation. The authoritative feature state remains in
 | 7.2a | Network Behavior Contract and reference validator | **Verified** | Schema-v1 canonical per-Node contracts independently bind source/topology/contract revisions, exact frontend intent, strict-policy-first tiers, eligible family/protocol/placement sets, and Node capabilities. Domain-separated SHA-256 plan/contract digests, compact decision witnesses, bounded explicit single-failure envelopes, golden encoding, mutation/property/replay tests, and strict Clippy pass `make service-selection-contract-test`; ADR 0104 |
 | 7.3 | Compatible distribution and transactional selection state | **Verified** | Schema-v1 negotiation, authenticated exact-Node projection, capability fencing, independent agent replay, two-bank userspace staging/readback/activation, owner-only contract+Node checkpoints, rollback/crash repair/cold reconstruction, digest-exact convergence, and exact v1 state cleanup pass `make service-selection-state-test`; ADR 0105 |
 | 7.4 | Internal locality and topology-aware dataplane | **Verified** | `make service-selection-dataplane-test` proves fixed-width ABI-v8 SameNode/SameZone/Cluster state, first-nonempty userspace resolution, dual-stack TCP/UDP strict Local and ordered fallback across ClusterIP/NodePort/LoadBalancer, external-policy precedence, lifecycle filtering, tier event provenance, topology-only activation, exact recovery, inherited state tests, and strict Clippy; ADR 0106 |
-| 7.5 | ClientIP affinity and graceful draining | **Planned** | Original-client keyed bounded affinity, timeout/defaulting, current-eligibility revalidation, flow-versus-session precedence, ready/serving/terminating transitions, recovery, and exact retirement |
+| 7.5 | ClientIP affinity and graceful draining | **Verified** | `make service-affinity-dataplane-test` proves exact original-client/frontend keys, 1–86,400 second timeout encoding, eligible bank+revision reuse, explicit create/reuse/reselection outcomes, connection-before-affinity precedence, ready/non-terminating new-flow slots, established-flow survival during termination, dual-stack ClusterIP packet behavior, bounded LRU recovery under persistent ABI v9, inherited 7.4 gates, real-kernel verifier acceptance, and strict Clippy; ADR 0107 |
 | 7.6 | Measured Maglev selection | **Planned** | Reproducible comparison with the existing selector for balance, disruption, memory, compile/update latency, and packet lookup cost; bounded deterministic table/fallback/upgrade contract only if evidence supports adoption |
 | 7.7 | Opt-in DSR dataplane | **Planned** | Explicit non-default intent; dual-stack route/neighbor/MTU/backend-VIP contract; unchanged policy/source-range semantics; direct return and reverse provenance; lifecycle/recovery; exact cleanup; NAT path remains the safe fallback |
 | 7.8 | Operations, simulation, upgrade, and recovery | **Planned** | Fixed-cardinality outcomes, validated status, durable history, tier/algorithm/affinity/DSR explanation, exact read-only simulation, checkpoint recovery, and adjacent compatibility |
@@ -104,8 +104,7 @@ production availability/scale. Those capabilities require independent gates.
 
 ## Immediate next slice
 
-Milestone 7.5 adds bounded original-client `ClientIP` affinity and graceful
-draining on top of the verified 7.4 eligible tier. Affinity may reuse only a
-backend still present in the current selected tier; established-flow state,
-affinity state, and endpoint draining remain separate state machines with exact
-timeouts, recovery, provenance, and retirement.
+Milestone 7.6 measures bounded Maglev candidates against the verified
+StableHash selector. The committed benchmark must compare balance, disruption,
+table memory, compile/update latency, map-write volume, and verifier-visible
+packet lookup cost before any operating range or default can be accepted.

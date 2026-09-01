@@ -7,7 +7,7 @@ use unf_common::{BackendId, IdentityId, PolicyId, RuleId, ServiceId, Verdict};
 pub use unf_common::PolicyDirection as Direction;
 
 pub const FLOW_ABI_VERSION: u16 = 2;
-pub const SERVICE_EVENT_ABI_VERSION: u16 = 3;
+pub const SERVICE_EVENT_ABI_VERSION: u16 = 4;
 pub const SERVICE_EVENT_FRONTEND_CLUSTER_IP: u8 = 1;
 pub const SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER: u8 = 2;
 pub const SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL: u8 = 3;
@@ -17,18 +17,20 @@ pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
 pub const POLICY_BANK_COUNT: u8 = 2;
-pub const SERVICE_MAP_ABI_VERSION: u16 = 3;
+pub const SERVICE_MAP_ABI_VERSION: u16 = 4;
 pub const SERVICE_BANK_COUNT: u8 = 2;
-pub const NODE_PORT_MAP_ABI_VERSION: u16 = 2;
+pub const NODE_PORT_MAP_ABI_VERSION: u16 = 3;
 pub const NODE_PORT_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_FRONTEND_FLAG_LOCAL: u16 = 1;
-pub const LOAD_BALANCER_MAP_ABI_VERSION: u16 = 2;
+pub const NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY: u16 = 1 << 1;
+pub const LOAD_BALANCER_MAP_ABI_VERSION: u16 = 3;
 pub const LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION: u16 = 1;
 pub const LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4: u8 = 1;
 pub const LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6: u8 = 1 << 1;
 pub const LOAD_BALANCER_BANK_COUNT: u8 = 2;
 pub const LOAD_BALANCER_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES: u16 = 1 << 1;
+pub const LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY: u16 = 1 << 2;
 pub const NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG: u32 = 1 << 31;
 pub const LOAD_BALANCER_LOCAL_FRONTEND_INDEX_BASE: u32 = 3 << 30;
 pub const NODE_PORT_SNAT_PORT_BASE: u16 = 32_768;
@@ -39,8 +41,18 @@ pub const SERVICE_BACKEND_FLAG_SERVING: u8 = 1 << 1;
 pub const SERVICE_BACKEND_FLAG_TERMINATING: u8 = 1 << 2;
 pub const SERVICE_CONNECTION_ROLE_FORWARD: u8 = 1;
 pub const SERVICE_CONNECTION_ROLE_REVERSE: u8 = 2;
+pub const SERVICE_CONNECTION_ROLE_AFFINITY: u8 = 3;
 pub const SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER: u16 = 1 << 0;
 pub const SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL: u16 = 1 << 1;
+pub const SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY: u16 = 1;
+pub const SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS: u32 = 1;
+pub const SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS: u32 = 86_400;
+pub const SERVICE_AFFINITY_OUTCOME_NONE: u8 = 0;
+pub const SERVICE_AFFINITY_OUTCOME_REUSED: u8 = 1;
+pub const SERVICE_AFFINITY_OUTCOME_CREATED: u8 = 2;
+pub const SERVICE_AFFINITY_OUTCOME_RESELECTED: u8 = 3;
+pub const SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT: u8 = 6;
+pub const SERVICE_CONNECTION_SELECTION_TIER_MASK: u8 = 0x3f;
 pub const SERVICE_SELECTION_TIER_SAME_NODE: u8 = 1;
 pub const SERVICE_SELECTION_TIER_SAME_ZONE: u8 = 2;
 pub const SERVICE_SELECTION_TIER_CLUSTER: u8 = 3;
@@ -220,10 +232,14 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
         && state.service_revision != 0
         && state.service_id.get() != 0
         && state.backend_id.get() != 0
-        && matches!(
-            state.flags,
-            0 | SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
-        )
+        && state.flags
+            & !(SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
+            == 0
+        && state.flags
+            & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
+            != (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
+        && state.reserved[3] >> SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT
+            <= SERVICE_AFFINITY_OUTCOME_RESELECTED
         && if state.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0 {
             !address_is_zero(state.translated_source_address)
                 && u16::from_be_bytes([state.reserved[0], state.reserved[1]]) >= 32_768
@@ -231,7 +247,9 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
                     state.reserved[2],
                     0 | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
                 )
-                && service_selection_tier_is_valid(state.reserved[3])
+                && service_selection_tier_is_valid(
+                    state.reserved[3] & SERVICE_CONNECTION_SELECTION_TIER_MASK,
+                )
         } else {
             address_is_zero(state.translated_source_address)
                 && state.reserved[0] == 0
@@ -240,7 +258,9 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
                     state.reserved[2],
                     0 | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
                 )
-                && service_selection_tier_is_valid(state.reserved[3])
+                && service_selection_tier_is_valid(
+                    state.reserved[3] & SERVICE_CONNECTION_SELECTION_TIER_MASK,
+                )
         }
         && now_ns.saturating_sub(state.last_seen_ns) <= timeout_ns
 }
@@ -902,6 +922,21 @@ pub struct ServiceConnectionValue {
     pub reserved: [u8; 4],
 }
 
+/// Bounded `ClientIP` affinity state. The exact map key owns client/frontend
+/// dimensions; the value retains only the slot proof needed for current-tier
+/// revalidation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ServiceAffinityValue {
+    pub last_seen_ns: u64,
+    pub service_revision: u64,
+    pub backend_id: BackendId,
+    pub slot: u32,
+    pub schema_version: u16,
+    pub tier: u8,
+    pub reserved: [u8; 5],
+}
+
 /// Fixed machine-readable service dataplane outcome. Kubernetes strings remain
 /// in userspace; stable IDs and exact tuples are sufficient for enrichment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -965,6 +1000,7 @@ const _: () = assert!(core::mem::size_of::<NodePortMapConfig>() == 40);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionKey>() == 40);
 const _: () = assert!(core::mem::size_of::<ServiceConnectionValue>() == 104);
 const _: () = assert!(core::mem::size_of::<ServiceEvent>() == 96);
+const _: () = assert!(core::mem::size_of::<ServiceAffinityValue>() == 32);
 
 #[cfg(test)]
 mod tests {

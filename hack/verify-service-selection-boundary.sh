@@ -15,6 +15,7 @@ required_files=(
     docs/adr/0104-verify-network-behavior-contracts-before-activation.md
     docs/adr/0105-distribute-and-transactionally-activate-selection-contracts.md
     docs/adr/0106-enforce-locality-and-topology-from-verified-contracts.md
+    docs/adr/0107-enforce-client-ip-affinity-and-graceful-draining.md
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -73,6 +74,12 @@ require_text docs/development/phase7-service-selection-plan.md \
 require_text docs/project-status.md \
     '| Internal locality and topology-aware dataplane | **Verified** |' \
     "the work breakdown must identify milestone 7.4 as verified"
+require_text docs/development/phase7-service-selection-plan.md \
+    '| 7.5 | ClientIP affinity and graceful draining | **Verified** |' \
+    "milestone 7.5 must remain verified"
+require_text docs/project-status.md \
+    '| ClientIP affinity and graceful draining | **Verified** |' \
+    "the work breakdown must identify milestone 7.5 as verified"
 require_text Makefile \
     'service-selection-contract-test:' \
     "the build must expose an isolated Network Behavior Contract gate"
@@ -82,6 +89,12 @@ require_text Makefile \
 require_text Makefile \
     'service-selection-dataplane-test:' \
     "the build must expose an isolated locality/topology dataplane gate"
+require_text Makefile \
+    'service-affinity-dataplane-test:' \
+    "the build must expose an isolated affinity/draining dataplane gate"
+require_text docs/adr/0107-enforce-client-ip-affinity-and-graceful-draining.md \
+    'Existing validated connections win before affinity lookup.' \
+    "per-flow connection state must precede affinity"
 require_text docs/adr/0104-verify-network-behavior-contracts-before-activation.md \
     'It does **not** mathematically prove the' \
     "the contract must not overclaim formal verification"

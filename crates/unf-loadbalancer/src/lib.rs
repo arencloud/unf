@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION, Revision, ServiceId};
 use unf_ebpf_common::{
-    LOAD_BALANCER_BANK_COUNT, LOAD_BALANCER_FRONTEND_FLAG_LOCAL,
-    LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES, LOAD_BALANCER_MAP_ABI_VERSION, SERVICE_BANK_COUNT,
-    SERVICE_SELECTION_TIER_CLUSTER, SERVICE_SELECTION_TIER_SAME_NODE,
-    SERVICE_SELECTION_TIER_SAME_ZONE,
+    LOAD_BALANCER_BANK_COUNT, LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY,
+    LOAD_BALANCER_FRONTEND_FLAG_LOCAL, LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES,
+    LOAD_BALANCER_MAP_ABI_VERSION, SERVICE_BANK_COUNT, SERVICE_SELECTION_TIER_CLUSTER,
+    SERVICE_SELECTION_TIER_SAME_NODE, SERVICE_SELECTION_TIER_SAME_ZONE,
 };
 use unf_service::{
     AddressFamily, NetworkBehaviorContract, SelectionFrontend, SelectionPlanKey, SelectionTier,
@@ -1383,8 +1383,7 @@ fn compile_load_balancer_dataplane_inner(
                 LoadBalancerDataplaneError::InvalidSelectionContract(error.to_string())
             })?;
         if contract.plans.iter().any(|plan| {
-            plan.session_affinity != ServiceSessionAffinity::None
-                || plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
+            plan.selection_algorithm != ServiceSelectionAlgorithm::StableHash
                 || plan.forwarding_mode != ServiceForwardingMode::Nat
         }) {
             return Err(LoadBalancerDataplaneError::UnsupportedSelectionBehavior);
@@ -1561,6 +1560,27 @@ fn compile_load_balancer_dataplane_inner(
             if !load_balancer.source_ranges.is_empty() {
                 flags |= LOAD_BALANCER_FRONTEND_FLAG_SOURCE_RANGES;
             }
+            let affinity_timeout = contract.and_then(|contract| {
+                let key = SelectionPlanKey {
+                    service_id: service.id,
+                    frontend: SelectionFrontend::LoadBalancer {
+                        family: frontend.family,
+                        service_port: frontend.service_port,
+                        protocol: frontend.protocol,
+                    },
+                };
+                contract
+                    .plan(&key)
+                    .and_then(|plan| match plan.session_affinity {
+                        ServiceSessionAffinity::None => None,
+                        ServiceSessionAffinity::ClientIp { timeout_seconds } => {
+                            Some(timeout_seconds)
+                        }
+                    })
+            });
+            if affinity_timeout.is_some() {
+                flags |= LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY;
+            }
             let value = encode_load_balancer_frontend_value(
                 service.id,
                 frontend_index,
@@ -1571,6 +1591,7 @@ fn compile_load_balancer_dataplane_inner(
                 reachability.allocation_revision,
                 service_bank,
                 selection_tier,
+                affinity_timeout,
             );
             let collision = match target.address {
                 IpAddr::V4(address) => ipv4_frontends
@@ -1714,6 +1735,7 @@ fn encode_load_balancer_frontend_value(
     allocation_revision: Revision,
     service_bank: u8,
     selection_tier: u8,
+    affinity_timeout: Option<u32>,
 ) -> [u8; 48] {
     let mut value = [0_u8; 48];
     value[0..4].copy_from_slice(&service_id.get().to_ne_bytes());
@@ -1726,6 +1748,9 @@ fn encode_load_balancer_frontend_value(
     value[32..40].copy_from_slice(&allocation_revision.get().to_ne_bytes());
     value[40] = service_bank;
     value[41] = selection_tier;
+    if let Some(timeout) = affinity_timeout {
+        value[42..46].copy_from_slice(&timeout.to_ne_bytes());
+    }
     value
 }
 
@@ -2262,7 +2287,9 @@ mod tests {
                 namespace: "apps".to_owned(),
                 name: "api".to_owned(),
                 internal_traffic_policy: Default::default(),
-                session_affinity: Default::default(),
+                session_affinity: ServiceSessionAffinity::ClientIp {
+                    timeout_seconds: 654,
+                },
                 traffic_distribution: Default::default(),
                 selection_algorithm: Default::default(),
                 forwarding_mode: Default::default(),
@@ -2357,7 +2384,13 @@ mod tests {
                 .ipv4_frontends
                 .values()
                 .chain(selected.ipv6_frontends.values())
-                .all(|value| value[41] == SERVICE_SELECTION_TIER_SAME_NODE)
+                .all(|value| {
+                    value[41] == SERVICE_SELECTION_TIER_SAME_NODE
+                        && u16::from_ne_bytes(value[14..16].try_into().unwrap())
+                            & LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+                            != 0
+                        && u32::from_ne_bytes(value[42..46].try_into().unwrap()) == 654
+                })
         );
 
         let mut wrong_epoch = reachability.clone();

@@ -336,9 +336,17 @@ origin policy, strict internal/external `Local` never broadens, and
 TCP/UDP lowering, topology-only bank changes, lifecycle filtering, exact
 recovery, fail-closed validation, and tier-bearing event ABI v3 pass `make
 service-selection-dataplane-test`; ADR 0106 records the packet boundary.
-StableHash and NAT are the production defaults. Topology behavior is active by
-default when a Service requests it; Maglev and DSR remain gated until milestones
-7.6 and 7.7 prove their independent safety and performance contracts.
+Milestone 7.5 is verified: exact original-client/frontend `ClientIP` affinity
+uses a bounded persistent LRU, honors the Kubernetes timeout, reuses only the
+same immutable eligible bank+revision, and yields to existing per-flow state.
+Ready non-terminating endpoints alone receive new sessions, while established
+connections survive termination until protocol expiry. Dual-stack real-kernel
+packets, timeout reselection, create/reuse/reselection provenance, ABI-v9
+recovery/cleanup ownership, inherited 7.4 gates, and strict Clippy pass `make
+service-affinity-dataplane-test`; ADR 0107 records the boundary. StableHash and
+NAT remain production defaults. Topology and ClientIP behavior are active when
+a Service requests them; Maglev and DSR remain gated until milestones 7.6 and
+7.7 prove their independent safety and performance contracts.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -549,9 +557,9 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-In progress in Phase 7: session affinity, internal traffic policy,
-topology-aware routing, measured Maglev selection, and opt-in DSR. Not yet
-implemented:
+In progress in Phase 7: measured Maglev selection, opt-in DSR, operations, and
+independent Kind/OpenShift qualification for the verified locality, topology,
+ClientIP affinity, and graceful-draining dataplanes. Not yet implemented:
 production-scale routing/CNI qualification;
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
 multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production
