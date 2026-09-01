@@ -4988,6 +4988,18 @@ fn publish_applied_selection_contract(
         .store(u64::from(active_bank), Ordering::Release);
 }
 
+fn publish_recovered_selection_contract(
+    state: &AgentState,
+    contract: Option<&NetworkBehaviorContract>,
+    active_bank: u8,
+) {
+    // A recovered contract is both the last durable desired state and the
+    // exact contract verified against the active pinned Service bank. Publish
+    // both sides of the convergence contract before the agent becomes Ready.
+    publish_desired_selection_contract(state, contract);
+    publish_applied_selection_contract(state, contract, active_bank);
+}
+
 fn record_service_snapshot_error(state: &AgentState, error: &anyhow::Error) {
     state
         .service_reconcile_errors
@@ -8173,6 +8185,11 @@ fn apply_recovered_state(
     {
         publish_desired_service_snapshot(state, snapshot);
         publish_applied_service_snapshot(state, snapshot);
+        publish_recovered_selection_contract(
+            state,
+            services.applied_selection_contract.as_ref(),
+            services.active_selection_bank,
+        );
     }
     if let Some(snapshot) = &services.applied_load_balancer_reachability
         && let Some(dataplane) =
@@ -12451,6 +12468,44 @@ mod tests {
                 .contract,
             new_contract
         );
+    }
+
+    #[test]
+    fn recovered_selection_contract_is_published_as_converged() {
+        let service = service_test_snapshot_with_backend(7, 4);
+        let node = node_port_node_snapshot(3);
+        let contract = NetworkBehaviorContract::compile(
+            &service,
+            Revision::new(8),
+            Revision::new(8),
+            local_selection_node(&node, Some("zone-a".to_owned())),
+        )
+        .unwrap();
+        let state = test_agent_state();
+
+        publish_recovered_selection_contract(&state, Some(&contract), 1);
+
+        assert_eq!(
+            state
+                .desired_selection_contract_revision
+                .load(Ordering::Acquire),
+            contract.contract_revision.get()
+        );
+        assert_eq!(
+            state
+                .applied_selection_contract_revision
+                .load(Ordering::Acquire),
+            contract.contract_revision.get()
+        );
+        assert_eq!(
+            *mutex_lock(&state.desired_selection_contract_digest),
+            Some(contract.contract_digest.to_string())
+        );
+        assert_eq!(
+            *mutex_lock(&state.applied_selection_contract_digest),
+            Some(contract.contract_digest.to_string())
+        );
+        assert_eq!(state.active_selection_bank.load(Ordering::Acquire), 1);
     }
 
     #[test]
