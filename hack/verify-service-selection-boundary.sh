@@ -21,12 +21,17 @@ required_files=(
     docs/adr/0110-preserve-and-explain-service-selection-outcomes.md
     docs/adr/0111-qualify-advanced-service-selection-on-kind.md
     docs/benchmarks/phase7-maglev-measurement.md
+    deploy/openshift-primary-cni/service-selection/kustomization.yaml
+    deploy/openshift-primary-cni/service-selection/release.json
+    hack/deploy-openshift-service-fabric.sh
 )
 
-command -v rg >/dev/null 2>&1 || {
-    echo "rg is required to verify the Phase 7 service-selection boundary" >&2
-    exit 1
-}
+for command in jq rg; do
+    command -v "${command}" >/dev/null 2>&1 || {
+        echo "${command} is required to verify the Phase 7 service-selection boundary" >&2
+        exit 1
+    }
+done
 
 require_text() {
     local relative_file=$1
@@ -130,6 +135,38 @@ require_text Makefile \
 require_text Makefile \
     'service-dsr-dataplane-test:' \
     "the build must expose an isolated explicit DSR gate"
+require_text Makefile \
+    'service-selection-openshift-deploy:' \
+    "the build must expose a guarded Phase 7 OpenShift deployment gate"
+require_text hack/deploy-openshift-service-fabric.sh \
+    'abi-v11-service-selection-staged-deployment' \
+    "the OpenShift rollout must identify the ABI-v11 transition explicitly"
+require_text deploy/openshift-primary-cni/service-selection/kustomization.yaml \
+    'digest: sha256:96aaf589c03e25a7b73533eb84e2a30f77ccd2afeb763ea2c8e0e88e78df48f3' \
+    "the OpenShift controller image must remain digest pinned"
+require_text deploy/openshift-primary-cni/service-selection/kustomization.yaml \
+    'digest: sha256:552d307e58491538ecd853021504fe8493258bc22eeb81ba044db6780f806cfc' \
+    "the OpenShift agent image must remain digest pinned"
+jq -e '
+    .schemaVersion == 1 and .phase == "7.10"
+    and .sourceRevision == "481ee8899b903d049d0fa5859ff3fa3787b9adb7"
+    and .sourceRevision == .kindQualification.sourceRevision
+    and .kindQualification.phase == "7.9"
+    and .kindQualification.qualificationRevision == "1f25e1384fb92c5f9b81214b17ba42af41855340"
+    and .kindQualification.result == "passed"
+    and .kindQualification.kubeProxyPresent == false
+    and .contracts.compatibilitySchemaVersion == 2
+    and .contracts.persistentBpfStateAbiVersion == 11
+    and .contracts.serviceSnapshotSchemaVersion == 4
+    and .contracts.selectionContractSchemaVersion == 1
+    and .contracts.agentStatusSchemaVersion == 8
+    and .contracts.flowExportSchemaVersion == 6
+    and all(.images[];
+        test("^quay\\.io/arencloud/unf-[a-z-]+-dev@sha256:[0-9a-f]{64}$"))
+' "${project_root}/deploy/openshift-primary-cni/service-selection/release.json" >/dev/null || {
+    echo "Phase 7 boundary check failed: the immutable OpenShift release tuple drifted" >&2
+    exit 1
+}
 require_text docs/adr/0107-enforce-client-ip-affinity-and-graceful-draining.md \
     'Existing validated connections win before affinity lookup.' \
     "per-flow connection state must precede affinity"

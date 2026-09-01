@@ -38,7 +38,7 @@ if [[ ! -s ${kubeconfig} || $(stat -c '%a' "${kubeconfig}") != 600 ]]; then
 fi
 if [[ ! -s ${release_record} ]] || ! jq -e '
     .schemaVersion == 1
-    and (.phase == "5.8" or .phase == "6.9")
+    and (.phase == "5.8" or .phase == "6.9" or .phase == "7.10")
     and (.sourceRevision | test("^[0-9a-f]{40}$"))
     and ((.phase == "5.8"
           and .kindQualification.schemaVersion == 2
@@ -54,7 +54,22 @@ if [[ ! -s ${release_record} ]] || ! jq -e '
           and .contracts.policySnapshotSchemaVersion == 4
           and .contracts.serviceSnapshotSchemaVersion == 3
           and .contracts.agentStatusSchemaVersion == 6
-          and .contracts.flowExportSchemaVersion == 5))
+          and .contracts.flowExportSchemaVersion == 5)
+      or (.phase == "7.10"
+          and .kindQualification.schemaVersion == 1
+          and .kindQualification.phase == "7.9"
+          and .kindQualification.sourceRevision == .sourceRevision
+          and (.kindQualification.qualificationRevision | test("^[0-9a-f]{40}$"))
+          and .kindQualification.kubeProxyPresent == false
+          and (.contracts | type == "object")
+          and .contracts.compatibilitySchemaVersion == 2
+          and .contracts.persistentBpfStateAbiVersion == 11
+          and .contracts.identitySnapshotSchemaVersion == 2
+          and .contracts.policySnapshotSchemaVersion == 4
+          and .contracts.serviceSnapshotSchemaVersion == 4
+          and .contracts.selectionContractSchemaVersion == 1
+          and .contracts.agentStatusSchemaVersion == 8
+          and .contracts.flowExportSchemaVersion == 6))
     and .kindQualification.result == "passed"
     and all(.images[]; test("^quay\\.io/arencloud/unf-[a-z-]+-dev@sha256:[0-9a-f]{64}$"))
 ' "${release_record}" >/dev/null; then
@@ -70,7 +85,7 @@ source_revision=$(jq -er .sourceRevision "${release_record}")
 controller_image=$(jq -er .images.controller "${release_record}")
 agent_image=$(jq -er .images.agent "${release_record}")
 release_phase=$(jq -er .phase "${release_record}")
-if [[ ${release_phase} == 6.9 ]]; then
+if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 ]]; then
     compatibility_schema=$(jq -er .contracts.compatibilitySchemaVersion "${release_record}")
     persistent_abi=$(jq -er .contracts.persistentBpfStateAbiVersion "${release_record}")
     identity_schema=$(jq -er .contracts.identitySnapshotSchemaVersion "${release_record}")
@@ -78,7 +93,13 @@ if [[ ${release_phase} == 6.9 ]]; then
     service_schema=$(jq -er .contracts.serviceSnapshotSchemaVersion "${release_record}")
     agent_status_schema=$(jq -er .contracts.agentStatusSchemaVersion "${release_record}")
     flow_export_schema=$(jq -er .contracts.flowExportSchemaVersion "${release_record}")
-    deployment_stage=abi-v7-loadbalancer-staged-deployment
+    if [[ ${release_phase} == 7.10 ]]; then
+        selection_schema=$(jq -er .contracts.selectionContractSchemaVersion "${release_record}")
+        deployment_stage=abi-v11-service-selection-staged-deployment
+    else
+        selection_schema=0
+        deployment_stage=abi-v7-loadbalancer-staged-deployment
+    fi
 else
     compatibility_schema=2
     persistent_abi=5
@@ -87,8 +108,14 @@ else
     service_schema=2
     agent_status_schema=5
     flow_export_schema=5
+    selection_schema=0
     deployment_stage=abi-v5-nodeport-staged-deployment
 fi
+version_query="serviceSnapshotSchemaVersion=${service_schema}"
+if ((selection_schema > 0)); then
+    version_query="${version_query}&selectionContractSchemaVersion=${selection_schema}"
+fi
+compatibility_boundary="controller-first schema-v${service_schema} compatibility boundary"
 git -C "${project_root}" merge-base --is-ancestor "${source_revision}" HEAD
 
 if [[ -z ${context} ]]; then
@@ -137,7 +164,7 @@ assert_version() {
         --argjson persistent "${persistent_abi}" \
         --argjson identity "${identity_schema}" --argjson policy "${policy_schema}" \
         --argjson service "${service_schema}" --argjson agent "${agent_status_schema}" \
-        --argjson flow "${flow_export_schema}" '
+        --argjson flow "${flow_export_schema}" --argjson selection "${selection_schema}" '
         .schema_version == $compatibility and .component == $component and .build_revision == $revision
         and .persistent_bpf_state_abi_version == $persistent
         and .identity_snapshot_schema_version == $identity
@@ -145,13 +172,14 @@ assert_version() {
         and .service_snapshot_schema_version == $service
         and .agent_status_schema_version == $agent
         and .flow_export_schema_version == $flow
+        and ($selection == 0 or .selection_contract_schema_version == $selection)
     ' <<<"${json}" >/dev/null
 }
 
 wait_for_controller() {
     local version= status=
     for _ in $(seq 1 300); do
-        version=$(controller_raw "/v1/version?serviceSnapshotSchemaVersion=${service_schema}" 2>/dev/null || true)
+        version=$(controller_raw "/v1/version?${version_query}" 2>/dev/null || true)
         status=$(controller_raw /v1/status 2>/dev/null || true)
         if assert_version "${version}" unf-controller 2>/dev/null \
             && jq -e '.service_compilation_error == null' <<<"${status}" >/dev/null 2>&1; then
@@ -189,7 +217,8 @@ wait_for_agent_service_state() {
     for _ in $(seq 1 300); do
         status=$(agent_raw "${node}" /v1/status 2>/dev/null || true)
         if assert_version "$(agent_raw "${node}" /v1/version 2>/dev/null || true)" unf-agent 2>/dev/null \
-            && jq -e --argjson status_schema "${agent_status_schema}" '
+            && jq -e --argjson status_schema "${agent_status_schema}" \
+                --argjson selection_schema "${selection_schema}" '
                 .schema_version == $status_schema and .ready == true and .bpf_loaded == true
                 and .tc_attachment_mode == "legacy_netlink"
                 and .capabilities.btf == true and .capabilities.bpffs == true
@@ -201,6 +230,13 @@ wait_for_agent_service_state() {
                 and .service_count > 0 and .service_frontend_count > 0
                 and .service_backend_count > 0
                 and has("service_last_error") and .service_last_error == null
+                and ($selection_schema == 0 or
+                    (.selection_contract_schema_version == $selection_schema
+                     and .desired_selection_contract_revision > 0
+                     and .applied_selection_contract_revision == .desired_selection_contract_revision
+                     and .applied_selection_contract_digest == .desired_selection_contract_digest
+                     and (.applied_selection_contract_digest | length) == 64
+                     and .selection_contract_last_error == null))
             ' <<<"${status}" >/dev/null 2>&1; then
             return 0
         fi
@@ -217,15 +253,16 @@ assert_agent() {
     for _ in $(seq 1 60); do
         host_state=$("${kc[@]}" debug "node/${node}" --quiet -- chroot /host sh -euc '
             test "$(getenforce)" = Enforcing
-            test -d /sys/fs/bpf/unf/v11
+            abi_directory="/sys/fs/bpf/unf/v$1"
+            test -d "$abi_directory"
             for pin in SERVICE_CONFIG SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 \
-                SERVICE_BACKENDS_V4 SERVICE_BACKENDS_V6 SERVICE_CONNECTIONS SERVICE_AFFINITY \
+                SERVICE_BACKENDS_V4 SERVICE_BACKENDS_V6 SERVICE_CONNECTIONS \
                 NODE_PORT_CONFIG NODE_PORT_FRONTENDS_V4 NODE_PORT_FRONTENDS_V6; do
-                test -e "/sys/fs/bpf/unf/v11/$pin"
+                test -e "$abi_directory/$pin"
             done
             snapshot=/var/lib/unf/cni/v1/service-snapshot.json
             test -f "$snapshot" && test ! -L "$snapshot" && test "$(stat -c %a "$snapshot")" = 600
-            jq -e --argjson service_schema "$1" \
+            jq -e --argjson service_schema "$2" \
                 "if has(\"service\") then
                     .schemaVersion == 1 and .service.schemaVersion == \$service_schema
                     and .service.revision > 0 and (.service.services | length) > 0
@@ -233,8 +270,24 @@ assert_agent() {
                  else
                     .schemaVersion == 1 and .revision > 0 and (.services | length) > 0
                  end" "$snapshot" >/dev/null
+            if test "$3" -gt 0; then
+                for pin in IDENTITY_V4 IDENTITY_V4_B IDENTITY_V6 IDENTITY_V6_B IDENTITY_CONFIG \
+                    POLICY_RULES POLICY_IPV4 POLICY_IPV6 EGRESS_IPV4 EGRESS_IPV6 POLICY_CONFIG \
+                    SERVICE_FRONTENDS_V4 SERVICE_FRONTENDS_V6 SERVICE_BACKENDS_V4 SERVICE_BACKENDS_V6 \
+                    SERVICE_BACKEND_SLOTS SERVICE_CONFIG SERVICE_CONNECTIONS SERVICE_AFFINITY \
+                    NODE_PORT_FRONTENDS_V4 NODE_PORT_FRONTENDS_V6 NODE_PORT_CONFIG \
+                    LOAD_BALANCER_FRONTENDS_V4 LOAD_BALANCER_FRONTENDS_V6 LOAD_BALANCER_CONFIG; do
+                    test -e "$abi_directory/$pin"
+                done
+                selection="${snapshot}.selection"
+                test -f "$selection" && test ! -L "$selection" && test "$(stat -c %a "$selection")" = 600
+                jq -e --argjson selection_schema "$3" \
+                    ".schemaVersion == 1 and .contract.schemaVersion == \$selection_schema
+                     and .contract.contractRevision > 0
+                     and (.contract.contractDigest | length) == 64" "$selection" >/dev/null
+            fi
             echo service-state-ready
-        ' sh "${service_schema}" 2>&1 || true)
+        ' sh "${persistent_abi}" "${service_schema}" "${selection_schema}" 2>&1 || true)
         if grep -q '^service-state-ready$' <<<"${host_state}"; then
             return 0
         fi
@@ -251,7 +304,8 @@ wait_for_convergence() {
         snapshot=$(controller_raw /v1/state/agents 2>/dev/null || true)
         if jq -e --argjson expected "${#nodes[@]}" \
             --argjson status_schema "${agent_status_schema}" \
-            --argjson service_schema "${service_schema}" '
+            --argjson service_schema "${service_schema}" \
+            --argjson selection_schema "${selection_schema}" '
             .schema_version == $status_schema and .expected_agents == $expected
             and .reporting_agents == $expected and .missing_agents == 0
             and .stale_agents == 0 and .converged_agents == $expected
@@ -259,7 +313,12 @@ wait_for_convergence() {
             and all(.nodes[]; .fresh and .converged and .report.ready and .report.bpf_loaded
                 and .report.service_snapshot_schema_version == $service_schema
                 and .report.desired_service_revision > 0
-                and .report.applied_service_revision == .report.desired_service_revision)
+                and .report.applied_service_revision == .report.desired_service_revision
+                and ($selection_schema == 0 or
+                    (.report.selection_contract_schema_version == $selection_schema
+                     and .report.desired_selection_contract_revision > 0
+                     and .report.applied_selection_contract_revision == .report.desired_selection_contract_revision
+                     and .report.applied_selection_contract_digest == .report.desired_selection_contract_digest)))
         ' <<<"${snapshot}" >/dev/null 2>&1; then
             printf '%s\n' "${snapshot}"
             return 0
@@ -482,7 +541,7 @@ done
 stage=evidence
 mkdir -p "$(dirname "${artifact}")"
 artifact_tmp="${artifact}.tmp.$$"
-if [[ ${release_phase} == 6.9 ]]; then
+if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 ]]; then
     node_evidence=$("${kc[@]}" get nodes -o json | jq '[.items[] | {
         name:.metadata.name, osImage:.status.nodeInfo.osImage,
         kernelVersion:.status.nodeInfo.kernelVersion,
@@ -491,26 +550,30 @@ if [[ ${release_phase} == 6.9 ]]; then
         internalIPs:[.status.addresses[] | select(.type == "InternalIP") | .address]
     }]')
     jq -n \
-        --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg releasePhase "${release_phase}" \
         --arg context "${context}" --arg infrastructure "${infrastructure}" \
         --arg sourceRevision "${source_revision}" --arg controllerImage "${controller_image}" \
         --arg agentImage "${agent_image}" --arg stage "${deployment_stage}" \
+        --arg compatibilityBoundary "${compatibility_boundary}" \
         --argjson persistentAbi "${persistent_abi}" --argjson serviceSchema "${service_schema}" \
+        --argjson selectionSchema "${selection_schema}" \
         --argjson statusSchema "${agent_status_schema}" --argjson nodes "${node_evidence}" \
         --argjson agents "${agents}" '
         {
-          schemaVersion:1, generatedAt:$generatedAt, phase:"6.9", stage:$stage,
+          schemaVersion:1, generatedAt:$generatedAt, phase:$releasePhase, stage:$stage,
           context:$context, infrastructure:$infrastructure, sourceRevision:$sourceRevision,
           images:{controller:$controllerImage,agent:$agentImage},
           strategy:"controller-first-machineconfig-aware-agent-ondelete-node-serial",
           kubeProxyPresent:false, persistentBpfAbi:$persistentAbi,
-          serviceSnapshotSchemaVersion:$serviceSchema, agentStatusSchemaVersion:$statusSchema,
+          serviceSnapshotSchemaVersion:$serviceSchema,
+          selectionContractSchemaVersion:$selectionSchema,
+          agentStatusSchemaVersion:$statusSchema,
           nodes:$nodes, agents:$agents,
-          verified:["immutable public image digests","controller-first schema-v3 compatibility boundary",
+          verified:["immutable public image digests",$compatibilityBoundary,
             "MachineConfig-aware five-node serial agent replacement","RHCOS SELinux enforcing",
             "legacy-netlink TC attachment","persistent host forwarding contract",
             "current-schema durable composite service checkpoint","host-origin Kubernetes API Service reachability",
-            "no functional kube-proxy rule residue","exact ABI-v7 map ownership",
+            "no functional kube-proxy rule residue","exact current-ABI map ownership",
             "full five-node convergence","kube-proxy remains absent"]
         }
     ' >"${artifact_tmp}"
