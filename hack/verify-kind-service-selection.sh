@@ -98,11 +98,18 @@ wait_for_convergence() {
 }
 
 wait_for_service() {
-    local name=$1 snapshot=
+    local name=$1 address port protocol snapshot=
+    address=$("${kc[@]}" -n "${namespace}" get service "${name}" -o json \
+        | jq -er '[.spec.clusterIPs[] | select(contains("."))][0]')
+    port=$("${kc[@]}" -n "${namespace}" get service "${name}" -o json \
+        | jq -er '.spec.ports[0].port')
+    protocol=$("${kc[@]}" -n "${namespace}" get service "${name}" -o json \
+        | jq -er '.spec.ports[0].protocol | ascii_downcase')
     for _ in $(seq 1 180); do
-        snapshot=$(controller_raw /v1/state/services 2>/dev/null || true)
+        snapshot=$(cluster_simulation "${address}" "${protocol}" "${port}" 2>/dev/null || true)
         if jq -e --arg namespace "${namespace}" --arg name "${name}" '
-            any(.services[]; .namespace == $namespace and .name == $name)
+            .schema_version == 1 and .namespace == $namespace and .name == $name
+            and .selection_contract_revision > 0
         ' <<<"${snapshot}" >/dev/null 2>&1; then
             wait_for_convergence >/dev/null
             return 0
