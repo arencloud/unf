@@ -152,11 +152,19 @@ tcp_probe() {
 }
 
 udp_probe() {
-    local family=$1 address=$2 source_port=$3 target
+    local family=$1 address=$2 source_port=$3 target output=
     if [[ ${family} == 4 ]]; then target="UDP4:${address}:5353"; else target="UDP6:[${address}]:5353"; fi
-    "${kc[@]}" -n "${namespace}" exec client -- sh -ec \
-        "printf selection-${source_port} | socat -T 4 - '${target},sourceport=${source_port}'" \
-        | grep -qx "selection-${source_port}"
+    for _ in $(seq 1 10); do
+        output=$("${kc[@]}" -n "${namespace}" exec client -- sh -ec \
+            "printf selection-${source_port} | socat -T 2 - '${target},sourceport=${source_port}'" \
+            2>/dev/null || true)
+        if grep -qx "selection-${source_port}" <<<"${output}"; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "UDP probe to ${target} from source port ${source_port} did not echo" >&2
+    return 1
 }
 
 wait_for_history() {
