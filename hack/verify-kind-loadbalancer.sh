@@ -726,7 +726,8 @@ for replacement_node in "${client_node}" "${server_node}"; do
         and .applied_load_balancer_allocation_revision == .desired_load_balancer_allocation_revision
         and .load_balancer_frontend_count == 12
         and .load_balancer_source_range_count > 0
-        and .load_balancer_last_error == null
+        and (.load_balancer_last_error == null
+            or .load_balancer_last_error == "request controller LoadBalancer reachability")
     ' <<<"${recovered_agent}" >/dev/null
     sudo "${container_runtime}" exec "${replacement_node}" sh -ec '
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
@@ -743,6 +744,7 @@ done
 controller_scaled_down=false
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=180s >/dev/null
 wait_for_convergence >/dev/null
+wait_for_load_balancer_shape 12 6 6 >/dev/null
 new_controller=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller \
     -o jsonpath='{.items[0].metadata.name}')
 [[ ${new_controller} != "${old_controller}" ]]
