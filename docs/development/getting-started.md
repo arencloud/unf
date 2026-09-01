@@ -347,6 +347,8 @@ target/debug/unfctl --controller-url http://127.0.0.1:9962 flows \
   --since-unix-ms 1787688000000 --until-unix-ms 1787688900000
 target/debug/unfctl --controller-url http://127.0.0.1:9962 service-explain \
   --service-id 11 --frontend-kind node-port-local --last 15m --limit 50
+target/debug/unfctl --controller-url http://127.0.0.1:9962 cluster-ip-simulate \
+  --node worker-a --address 10.96.0.80 --port 443 --protocol tcp
 target/debug/unfctl --controller-url http://127.0.0.1:9962 service-simulate \
   --node worker-a --address 192.0.2.1 --port 30443 --protocol tcp
 target/debug/unfctl --controller-url http://127.0.0.1:9962 status
@@ -359,6 +361,18 @@ Ingress is the backward-compatible explanation default. For egress policy, pass
 `--direction egress`; on dual-stack Pods, pass `--ip-family ipv4` or `ipv6` so
 the reported `ipBlock` result is tied to the concrete address pair shown in the
 response.
+
+Phase 7.8 Service history and explanation include the observed locality tier,
+actual StableHash/Maglev choice, affinity result, NAT/DSR mode, backend, and
+Service revision. Simulations return the current per-Node selection-contract
+revision and digest plus its first non-empty ordered tier. They predict current
+eligibility and allow/drop behavior without changing state; they do not guess a
+private existing connection or ClientIP affinity entry. Run the complete local
+operations and adjacent-compatibility gate with:
+
+```bash
+make service-selection-operations-test
+```
 
 Topology history contains complete topology schema-v3 snapshots rather than
 object-level patches. The controller retains the newest 32 semantic revisions,

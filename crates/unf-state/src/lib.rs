@@ -17,12 +17,14 @@ pub const TOPOLOGY_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const TOPOLOGY_HISTORY_SCHEMA_VERSION: u16 = 1;
 pub const TOPOLOGY_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 pub const TOPOLOGY_HISTORY_CAPACITY: usize = 32;
-pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 5;
-pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 6;
-pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 5;
+pub const PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION: u16 = 5;
+pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 6;
+pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 7;
+pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 6;
 pub const SHADOW_IMPACT_SCHEMA_VERSION: u16 = 1;
 pub const PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION: u16 = 6;
-pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 7;
+pub const PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION: u16 = 7;
+pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 8;
 pub const COMPONENT_COMPATIBILITY_SCHEMA_VERSION: u16 = 2;
 pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 11;
 pub const FLOW_EXPORT_BATCH_LIMIT: usize = 512;
@@ -223,6 +225,34 @@ pub struct AgentStateReport {
     #[serde(default)]
     pub last_service_reason: u8,
     #[serde(default)]
+    pub service_same_node_selections: u64,
+    #[serde(default)]
+    pub service_same_zone_selections: u64,
+    #[serde(default)]
+    pub service_cluster_selections: u64,
+    #[serde(default)]
+    pub service_stable_hash_selections: u64,
+    #[serde(default)]
+    pub service_maglev_selections: u64,
+    #[serde(default)]
+    pub service_affinity_reuses: u64,
+    #[serde(default)]
+    pub service_affinity_creations: u64,
+    #[serde(default)]
+    pub service_affinity_reselections: u64,
+    #[serde(default)]
+    pub service_nat_forwards: u64,
+    #[serde(default)]
+    pub service_dsr_forwards: u64,
+    #[serde(default)]
+    pub last_service_selection_tier: Option<ServiceSelectionTier>,
+    #[serde(default)]
+    pub last_service_affinity_outcome: Option<ServiceAffinityOutcome>,
+    #[serde(default)]
+    pub last_service_selection_algorithm: Option<ServiceSelectionAlgorithmOutcome>,
+    #[serde(default)]
+    pub last_service_forwarding_mode: Option<ServiceForwardingModeOutcome>,
+    #[serde(default)]
     pub desired_node_block_revision: u64,
     #[serde(default)]
     pub applied_node_block_revision: u64,
@@ -273,6 +303,45 @@ pub enum ServiceFrontendKind {
     LoadBalancerLocal,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceSelectionTier {
+    #[default]
+    Unknown,
+    SameNode,
+    SameZone,
+    Cluster,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceAffinityOutcome {
+    #[default]
+    Unknown,
+    None,
+    Reused,
+    Created,
+    Reselected,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceSelectionAlgorithmOutcome {
+    #[default]
+    Unknown,
+    StableHash,
+    Maglev,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceForwardingModeOutcome {
+    #[default]
+    Unknown,
+    Nat,
+    Dsr,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ServiceFlowKey {
     pub service_id: ServiceId,
@@ -282,6 +351,14 @@ pub struct ServiceFlowKey {
     pub reason: u8,
     #[serde(default)]
     pub frontend_kind: ServiceFrontendKind,
+    #[serde(default)]
+    pub selection_tier: ServiceSelectionTier,
+    #[serde(default)]
+    pub affinity_outcome: ServiceAffinityOutcome,
+    #[serde(default)]
+    pub selection_algorithm: ServiceSelectionAlgorithmOutcome,
+    #[serde(default)]
+    pub forwarding_mode: ServiceForwardingModeOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -332,6 +409,14 @@ pub struct ServiceFlowOutcome {
     pub reason: u8,
     #[serde(default)]
     pub frontend_kind: ServiceFrontendKind,
+    #[serde(default)]
+    pub selection_tier: ServiceSelectionTier,
+    #[serde(default)]
+    pub affinity_outcome: ServiceAffinityOutcome,
+    #[serde(default)]
+    pub selection_algorithm: ServiceSelectionAlgorithmOutcome,
+    #[serde(default)]
+    pub forwarding_mode: ServiceForwardingModeOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2072,6 +2157,10 @@ mod tests {
             action: 1,
             reason: 1,
             frontend_kind: ServiceFrontendKind::NodePortCluster,
+            selection_tier: ServiceSelectionTier::Cluster,
+            affinity_outcome: ServiceAffinityOutcome::None,
+            selection_algorithm: ServiceSelectionAlgorithmOutcome::StableHash,
+            forwarding_mode: ServiceForwardingModeOutcome::Nat,
         });
         record.key.service = Some(ServiceFlowKey {
             service_id: ServiceId::new(11),
@@ -2080,6 +2169,10 @@ mod tests {
             action: 1,
             reason: 1,
             frontend_kind: ServiceFrontendKind::NodePortCluster,
+            selection_tier: ServiceSelectionTier::Cluster,
+            affinity_outcome: ServiceAffinityOutcome::None,
+            selection_algorithm: ServiceSelectionAlgorithmOutcome::StableHash,
+            forwarding_mode: ServiceForwardingModeOutcome::Nat,
         });
         let mut failure = record.clone();
         failure.key.service = Some(ServiceFlowKey {
@@ -2089,6 +2182,10 @@ mod tests {
             action: 2,
             reason: 3,
             frontend_kind: ServiceFrontendKind::NodePortLocal,
+            selection_tier: ServiceSelectionTier::SameNode,
+            affinity_outcome: ServiceAffinityOutcome::None,
+            selection_algorithm: ServiceSelectionAlgorithmOutcome::StableHash,
+            forwarding_mode: ServiceForwardingModeOutcome::Nat,
         });
         failure.decision.verdict = Verdict::Deny;
         failure.decision.reason = 3;
@@ -2103,6 +2200,10 @@ mod tests {
             action: 2,
             reason: 3,
             frontend_kind: ServiceFrontendKind::NodePortLocal,
+            selection_tier: ServiceSelectionTier::SameNode,
+            affinity_outcome: ServiceAffinityOutcome::None,
+            selection_algorithm: ServiceSelectionAlgorithmOutcome::StableHash,
+            forwarding_mode: ServiceForwardingModeOutcome::Nat,
         });
         let mut store = FlowHistoryStore::with_capacity(2);
         store.ingest(
@@ -2143,6 +2244,10 @@ mod tests {
             action: 1,
             reason: 1,
             frontend_kind: ServiceFrontendKind::LoadBalancerLocal,
+            selection_tier: ServiceSelectionTier::SameNode,
+            affinity_outcome: ServiceAffinityOutcome::None,
+            selection_algorithm: ServiceSelectionAlgorithmOutcome::StableHash,
+            forwarding_mode: ServiceForwardingModeOutcome::Nat,
         };
         record.key.service = Some(service.clone());
         record.service = Some(ServiceFlowOutcome {
@@ -2156,6 +2261,10 @@ mod tests {
             action: service.action,
             reason: service.reason,
             frontend_kind: service.frontend_kind,
+            selection_tier: service.selection_tier,
+            affinity_outcome: service.affinity_outcome,
+            selection_algorithm: service.selection_algorithm,
+            forwarding_mode: service.forwarding_mode,
         });
         let mut store = FlowHistoryStore::with_capacity(1);
         store.ingest(
@@ -2194,6 +2303,10 @@ mod tests {
             action: 2,
             reason: 3,
             frontend_kind: ServiceFrontendKind::NodePortLocal,
+            selection_tier: ServiceSelectionTier::Unknown,
+            affinity_outcome: ServiceAffinityOutcome::Unknown,
+            selection_algorithm: ServiceSelectionAlgorithmOutcome::Unknown,
+            forwarding_mode: ServiceForwardingModeOutcome::Unknown,
         });
         record.policy_revision = Revision::default();
         record.decision = FlowExportDecision {
@@ -2213,6 +2326,10 @@ mod tests {
             action: 2,
             reason: 3,
             frontend_kind: ServiceFrontendKind::NodePortLocal,
+            selection_tier: ServiceSelectionTier::Unknown,
+            affinity_outcome: ServiceAffinityOutcome::Unknown,
+            selection_algorithm: ServiceSelectionAlgorithmOutcome::Unknown,
+            forwarding_mode: ServiceForwardingModeOutcome::Unknown,
         });
         let mut store = FlowHistoryStore::with_capacity(1);
         store.ingest(
@@ -2234,6 +2351,21 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("frontend_kind");
+        for field in [
+            "selection_tier",
+            "affinity_outcome",
+            "selection_algorithm",
+            "forwarding_mode",
+        ] {
+            legacy["entries"][0]["key"]["service"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            legacy["entries"][0]["service"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
         let checkpoint: FlowHistoryCheckpoint = serde_json::from_value(legacy).unwrap();
         let restored = FlowHistoryStore::from_checkpoint(checkpoint, 1)
             .expect("schema-v4 ClusterIP history remains restart compatible");
@@ -2245,6 +2377,14 @@ mod tests {
         assert_eq!(
             entry.key.service.as_ref().unwrap().frontend_kind,
             ServiceFrontendKind::ClusterIp
+        );
+        assert_eq!(
+            entry.service.unwrap().selection_algorithm,
+            ServiceSelectionAlgorithmOutcome::Unknown
+        );
+        assert_eq!(
+            entry.key.service.as_ref().unwrap().forwarding_mode,
+            ServiceForwardingModeOutcome::Unknown
         );
     }
 

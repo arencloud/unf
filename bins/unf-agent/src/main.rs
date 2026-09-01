@@ -88,9 +88,11 @@ use unf_state::{
     FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
     Ipv4PolicyMapEntry, Ipv6IdentityMapping, Ipv6PolicyMapEntry, PERSISTENT_BPF_STATE_ABI_VERSION,
     POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION,
+    PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION, PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION,
     PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION, PolicyDecisionRecord, PolicyMapEntry,
-    PolicyStateSnapshot, ServiceFlowKey, ServiceFlowOutcome, ServiceFrontendKind,
-    VersionTransition,
+    PolicyStateSnapshot, ServiceAffinityOutcome, ServiceFlowKey, ServiceFlowOutcome,
+    ServiceForwardingModeOutcome, ServiceFrontendKind, ServiceSelectionAlgorithmOutcome,
+    ServiceSelectionTier, VersionTransition,
 };
 
 mod cni_server;
@@ -571,6 +573,16 @@ struct AgentMetrics {
     load_balancer_no_backend_drops: Counter,
     load_balancer_source_range_drops: Counter,
     invalid_service_events: Counter,
+    service_same_node_selections: Counter,
+    service_same_zone_selections: Counter,
+    service_cluster_selections: Counter,
+    service_stable_hash_selections: Counter,
+    service_maglev_selections: Counter,
+    service_affinity_reuses: Counter,
+    service_affinity_creations: Counter,
+    service_affinity_reselections: Counter,
+    service_nat_forwards: Counter,
+    service_dsr_forwards: Counter,
     remote_route_sync_errors: Counter,
     desired_remote_route_revision: Gauge,
     applied_remote_route_revision: Gauge,
@@ -658,6 +670,20 @@ struct AgentState {
     last_service_revision: AtomicU64,
     last_service_action: AtomicU64,
     last_service_reason: AtomicU64,
+    service_same_node_selections: AtomicU64,
+    service_same_zone_selections: AtomicU64,
+    service_cluster_selections: AtomicU64,
+    service_stable_hash_selections: AtomicU64,
+    service_maglev_selections: AtomicU64,
+    service_affinity_reuses: AtomicU64,
+    service_affinity_creations: AtomicU64,
+    service_affinity_reselections: AtomicU64,
+    service_nat_forwards: AtomicU64,
+    service_dsr_forwards: AtomicU64,
+    last_service_selection_tier: AtomicU64,
+    last_service_affinity_outcome: AtomicU64,
+    last_service_selection_algorithm: AtomicU64,
+    last_service_forwarding_mode: AtomicU64,
     desired_node_block_revision: AtomicU64,
     applied_node_block_revision: AtomicU64,
     desired_remote_route_epoch: AtomicU64,
@@ -5259,6 +5285,16 @@ fn new_state(
         load_balancer_no_backend_drops: Counter::default(),
         load_balancer_source_range_drops: Counter::default(),
         invalid_service_events: Counter::default(),
+        service_same_node_selections: Counter::default(),
+        service_same_zone_selections: Counter::default(),
+        service_cluster_selections: Counter::default(),
+        service_stable_hash_selections: Counter::default(),
+        service_maglev_selections: Counter::default(),
+        service_affinity_reuses: Counter::default(),
+        service_affinity_creations: Counter::default(),
+        service_affinity_reselections: Counter::default(),
+        service_nat_forwards: Counter::default(),
+        service_dsr_forwards: Counter::default(),
         remote_route_sync_errors: Counter::default(),
         desired_remote_route_revision: Gauge::default(),
         applied_remote_route_revision: Gauge::default(),
@@ -5347,6 +5383,20 @@ fn new_state(
         last_service_revision: AtomicU64::new(0),
         last_service_action: AtomicU64::new(0),
         last_service_reason: AtomicU64::new(0),
+        service_same_node_selections: AtomicU64::new(0),
+        service_same_zone_selections: AtomicU64::new(0),
+        service_cluster_selections: AtomicU64::new(0),
+        service_stable_hash_selections: AtomicU64::new(0),
+        service_maglev_selections: AtomicU64::new(0),
+        service_affinity_reuses: AtomicU64::new(0),
+        service_affinity_creations: AtomicU64::new(0),
+        service_affinity_reselections: AtomicU64::new(0),
+        service_nat_forwards: AtomicU64::new(0),
+        service_dsr_forwards: AtomicU64::new(0),
+        last_service_selection_tier: AtomicU64::new(0),
+        last_service_affinity_outcome: AtomicU64::new(0),
+        last_service_selection_algorithm: AtomicU64::new(0),
+        last_service_forwarding_mode: AtomicU64::new(0),
         desired_node_block_revision: AtomicU64::new(0),
         applied_node_block_revision: AtomicU64::new(0),
         desired_remote_route_epoch: AtomicU64::new(0),
@@ -5664,6 +5714,60 @@ fn register_service_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
         "Service event records rejected due to ABI or semantic mismatch",
         metrics.invalid_service_events.clone(),
     );
+    for (name, help, counter) in [
+        (
+            "unf_service_selection_same_node",
+            "Translated service packets selecting the same-Node tier",
+            &metrics.service_same_node_selections,
+        ),
+        (
+            "unf_service_selection_same_zone",
+            "Translated service packets selecting the same-zone tier",
+            &metrics.service_same_zone_selections,
+        ),
+        (
+            "unf_service_selection_cluster",
+            "Translated service packets selecting the cluster tier",
+            &metrics.service_cluster_selections,
+        ),
+        (
+            "unf_service_selection_stable_hash",
+            "Translated service packets using stable-hash selection",
+            &metrics.service_stable_hash_selections,
+        ),
+        (
+            "unf_service_selection_maglev",
+            "Translated service packets using measured Maglev selection",
+            &metrics.service_maglev_selections,
+        ),
+        (
+            "unf_service_affinity_reused",
+            "Translated service packets reusing ClientIP affinity",
+            &metrics.service_affinity_reuses,
+        ),
+        (
+            "unf_service_affinity_created",
+            "Translated service packets creating ClientIP affinity",
+            &metrics.service_affinity_creations,
+        ),
+        (
+            "unf_service_affinity_reselected",
+            "Translated service packets replacing ineligible or expired affinity",
+            &metrics.service_affinity_reselections,
+        ),
+        (
+            "unf_service_forwarding_nat",
+            "Translated service packets using NAT forwarding",
+            &metrics.service_nat_forwards,
+        ),
+        (
+            "unf_service_forwarding_dsr",
+            "Translated service packets using acknowledged DSR forwarding",
+            &metrics.service_dsr_forwards,
+        ),
+    ] {
+        registry.register(name, help, counter.clone());
+    }
 }
 
 fn register_remote_route_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
@@ -6347,16 +6451,20 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
             controller.policy_snapshot_schema_version,
             local.policy_snapshot_schema_version,
         ),
-        (
-            "flow-export schema",
-            controller.flow_export_schema_version,
-            local.flow_export_schema_version,
-        ),
     ]
     .into_iter()
     .filter(|(_, remote, expected)| remote != expected)
     .map(|(name, remote, expected)| format!("{name} controller={remote} agent={expected}"))
     .collect::<Vec<_>>();
+    if !matches!(
+        controller.flow_export_schema_version,
+        PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION | FLOW_EXPORT_SCHEMA_VERSION
+    ) {
+        mismatches.push(format!(
+            "flow-export schema controller={} agent={}",
+            controller.flow_export_schema_version, local.flow_export_schema_version
+        ));
+    }
     if controller.service_snapshot_schema_version != local.service_snapshot_schema_version
         && controller.service_snapshot_schema_version != LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION
         && controller.service_snapshot_schema_version != NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION
@@ -6370,7 +6478,9 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
     }
     if !matches!(
         controller.agent_status_schema_version,
-        PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION | AGENT_STATUS_SCHEMA_VERSION
+        PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION
+            | PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION
+            | AGENT_STATUS_SCHEMA_VERSION
     ) {
         mismatches.push(format!(
             "agent-status schema controller={} agent={}",
@@ -8307,6 +8417,10 @@ fn service_flow_export_record(event: &ServiceEvent) -> FlowExportRecord {
                 action: event.action,
                 reason: event.reason,
                 frontend_kind,
+                selection_tier: service_event_selection_tier(event),
+                affinity_outcome: service_event_affinity_outcome(event),
+                selection_algorithm: service_event_selection_algorithm(event),
+                forwarding_mode: service_event_forwarding_mode(event),
             }),
         },
         policy_revision: Revision::default(),
@@ -8333,6 +8447,10 @@ fn service_flow_export_record(event: &ServiceEvent) -> FlowExportRecord {
             action: event.action,
             reason: event.reason,
             frontend_kind,
+            selection_tier: service_event_selection_tier(event),
+            affinity_outcome: service_event_affinity_outcome(event),
+            selection_algorithm: service_event_selection_algorithm(event),
+            forwarding_mode: service_event_forwarding_mode(event),
         }),
         observed_events: 1,
     }
@@ -8346,6 +8464,45 @@ fn service_event_frontend_kind(event: &ServiceEvent) -> ServiceFrontendKind {
         SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER => ServiceFrontendKind::LoadBalancerCluster,
         SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL => ServiceFrontendKind::LoadBalancerLocal,
         _ => unreachable!("validated service event frontend kind"),
+    }
+}
+
+fn service_event_selection_tier(event: &ServiceEvent) -> ServiceSelectionTier {
+    match event.reserved[1] {
+        unf_ebpf_common::SERVICE_SELECTION_TIER_SAME_NODE => ServiceSelectionTier::SameNode,
+        unf_ebpf_common::SERVICE_SELECTION_TIER_SAME_ZONE => ServiceSelectionTier::SameZone,
+        unf_ebpf_common::SERVICE_SELECTION_TIER_CLUSTER => ServiceSelectionTier::Cluster,
+        _ => unreachable!("validated service selection tier"),
+    }
+}
+
+fn service_event_affinity_outcome(event: &ServiceEvent) -> ServiceAffinityOutcome {
+    match event.reserved[2] {
+        SERVICE_AFFINITY_OUTCOME_NONE => ServiceAffinityOutcome::None,
+        SERVICE_AFFINITY_OUTCOME_REUSED => ServiceAffinityOutcome::Reused,
+        SERVICE_AFFINITY_OUTCOME_CREATED => ServiceAffinityOutcome::Created,
+        SERVICE_AFFINITY_OUTCOME_RESELECTED => ServiceAffinityOutcome::Reselected,
+        _ => unreachable!("validated service affinity outcome"),
+    }
+}
+
+fn service_event_selection_algorithm(event: &ServiceEvent) -> ServiceSelectionAlgorithmOutcome {
+    match event.reserved[3] {
+        unf_ebpf_common::SERVICE_SELECTION_ALGORITHM_STABLE_HASH => {
+            ServiceSelectionAlgorithmOutcome::StableHash
+        }
+        unf_ebpf_common::SERVICE_SELECTION_ALGORITHM_MAGLEV => {
+            ServiceSelectionAlgorithmOutcome::Maglev
+        }
+        _ => unreachable!("validated service selection algorithm"),
+    }
+}
+
+fn service_event_forwarding_mode(event: &ServiceEvent) -> ServiceForwardingModeOutcome {
+    match event.reserved[4] {
+        unf_ebpf_common::SERVICE_EVENT_FORWARDING_NAT => ServiceForwardingModeOutcome::Nat,
+        unf_ebpf_common::SERVICE_EVENT_FORWARDING_DSR => ServiceForwardingModeOutcome::Dsr,
+        _ => unreachable!("validated service forwarding mode"),
     }
 }
 
@@ -8375,6 +8532,98 @@ fn event_has_selected_identity(event: &FlowEvent) -> bool {
     }
 }
 
+fn record_service_translation_selection(state: &AgentState, event: &ServiceEvent) {
+    match service_event_selection_tier(event) {
+        ServiceSelectionTier::SameNode => increment_outcome(
+            &state.service_same_node_selections,
+            &state.metrics.service_same_node_selections,
+        ),
+        ServiceSelectionTier::SameZone => increment_outcome(
+            &state.service_same_zone_selections,
+            &state.metrics.service_same_zone_selections,
+        ),
+        ServiceSelectionTier::Cluster => increment_outcome(
+            &state.service_cluster_selections,
+            &state.metrics.service_cluster_selections,
+        ),
+        ServiceSelectionTier::Unknown => unreachable!("validated selection tier"),
+    }
+    match service_event_selection_algorithm(event) {
+        ServiceSelectionAlgorithmOutcome::StableHash => increment_outcome(
+            &state.service_stable_hash_selections,
+            &state.metrics.service_stable_hash_selections,
+        ),
+        ServiceSelectionAlgorithmOutcome::Maglev => increment_outcome(
+            &state.service_maglev_selections,
+            &state.metrics.service_maglev_selections,
+        ),
+        ServiceSelectionAlgorithmOutcome::Unknown => {
+            unreachable!("validated selection algorithm")
+        }
+    }
+    match service_event_affinity_outcome(event) {
+        ServiceAffinityOutcome::Reused => increment_outcome(
+            &state.service_affinity_reuses,
+            &state.metrics.service_affinity_reuses,
+        ),
+        ServiceAffinityOutcome::Created => increment_outcome(
+            &state.service_affinity_creations,
+            &state.metrics.service_affinity_creations,
+        ),
+        ServiceAffinityOutcome::Reselected => increment_outcome(
+            &state.service_affinity_reselections,
+            &state.metrics.service_affinity_reselections,
+        ),
+        ServiceAffinityOutcome::None => {}
+        ServiceAffinityOutcome::Unknown => unreachable!("validated affinity outcome"),
+    }
+    match service_event_forwarding_mode(event) {
+        ServiceForwardingModeOutcome::Nat => increment_outcome(
+            &state.service_nat_forwards,
+            &state.metrics.service_nat_forwards,
+        ),
+        ServiceForwardingModeOutcome::Dsr => increment_outcome(
+            &state.service_dsr_forwards,
+            &state.metrics.service_dsr_forwards,
+        ),
+        ServiceForwardingModeOutcome::Unknown => {
+            unreachable!("validated forwarding mode")
+        }
+    }
+}
+
+fn record_last_service_witness(state: &AgentState, event: &ServiceEvent) {
+    state
+        .last_service_id
+        .store(u64::from(event.service_id.get()), Ordering::Release);
+    state
+        .last_backend_id
+        .store(u64::from(event.backend_id.get()), Ordering::Release);
+    state
+        .last_service_revision
+        .store(event.service_revision, Ordering::Release);
+    state
+        .last_service_action
+        .store(u64::from(event.action), Ordering::Release);
+    state
+        .last_service_reason
+        .store(u64::from(event.reason), Ordering::Release);
+    state
+        .last_service_selection_tier
+        .store(u64::from(event.reserved[1]), Ordering::Release);
+    state.last_service_affinity_outcome.store(
+        u64::from(event.reserved[2]).saturating_add(1),
+        Ordering::Release,
+    );
+    state
+        .last_service_selection_algorithm
+        .store(u64::from(event.reserved[3]), Ordering::Release);
+    state.last_service_forwarding_mode.store(
+        u64::from(event.reserved[4]).saturating_add(1),
+        Ordering::Release,
+    );
+}
+
 fn record_service_event(state: &AgentState, event: &ServiceEvent) {
     state
         .service_dataplane_events
@@ -8384,6 +8633,7 @@ fn record_service_event(state: &AgentState, event: &ServiceEvent) {
         SERVICE_EVENT_ACTION_TRANSLATE => {
             state.service_translations.fetch_add(1, Ordering::Relaxed);
             state.metrics.service_translations.inc();
+            record_service_translation_selection(state, event);
             match service_event_frontend_kind(event) {
                 ServiceFrontendKind::NodePortCluster => {
                     state
@@ -8449,21 +8699,12 @@ fn record_service_event(state: &AgentState, event: &ServiceEvent) {
         }
         _ => return,
     }
-    state
-        .last_service_id
-        .store(u64::from(event.service_id.get()), Ordering::Release);
-    state
-        .last_backend_id
-        .store(u64::from(event.backend_id.get()), Ordering::Release);
-    state
-        .last_service_revision
-        .store(event.service_revision, Ordering::Release);
-    state
-        .last_service_action
-        .store(u64::from(event.action), Ordering::Release);
-    state
-        .last_service_reason
-        .store(u64::from(event.reason), Ordering::Release);
+    record_last_service_witness(state, event);
+}
+
+fn increment_outcome(counter: &AtomicU64, metric: &Counter) {
+    counter.fetch_add(1, Ordering::Relaxed);
+    metric.inc();
 }
 
 fn event_ipv4(address_family: u8, address: [u8; 16]) -> Option<Ipv4Addr> {
@@ -8641,6 +8882,51 @@ async fn report_agent_status(
     }
 }
 
+fn reported_selection_tier(value: u64) -> Option<ServiceSelectionTier> {
+    match u8::try_from(value).ok()? {
+        unf_ebpf_common::SERVICE_SELECTION_TIER_SAME_NODE => Some(ServiceSelectionTier::SameNode),
+        unf_ebpf_common::SERVICE_SELECTION_TIER_SAME_ZONE => Some(ServiceSelectionTier::SameZone),
+        unf_ebpf_common::SERVICE_SELECTION_TIER_CLUSTER => Some(ServiceSelectionTier::Cluster),
+        _ => None,
+    }
+}
+
+fn reported_affinity_outcome(value: u64) -> Option<ServiceAffinityOutcome> {
+    match value
+        .checked_sub(1)
+        .and_then(|value| u8::try_from(value).ok())?
+    {
+        SERVICE_AFFINITY_OUTCOME_NONE => Some(ServiceAffinityOutcome::None),
+        SERVICE_AFFINITY_OUTCOME_REUSED => Some(ServiceAffinityOutcome::Reused),
+        SERVICE_AFFINITY_OUTCOME_CREATED => Some(ServiceAffinityOutcome::Created),
+        SERVICE_AFFINITY_OUTCOME_RESELECTED => Some(ServiceAffinityOutcome::Reselected),
+        _ => None,
+    }
+}
+
+fn reported_selection_algorithm(value: u64) -> Option<ServiceSelectionAlgorithmOutcome> {
+    match u8::try_from(value).ok()? {
+        unf_ebpf_common::SERVICE_SELECTION_ALGORITHM_STABLE_HASH => {
+            Some(ServiceSelectionAlgorithmOutcome::StableHash)
+        }
+        unf_ebpf_common::SERVICE_SELECTION_ALGORITHM_MAGLEV => {
+            Some(ServiceSelectionAlgorithmOutcome::Maglev)
+        }
+        _ => None,
+    }
+}
+
+fn reported_forwarding_mode(value: u64) -> Option<ServiceForwardingModeOutcome> {
+    match value
+        .checked_sub(1)
+        .and_then(|value| u8::try_from(value).ok())?
+    {
+        unf_ebpf_common::SERVICE_EVENT_FORWARDING_NAT => Some(ServiceForwardingModeOutcome::Nat),
+        unf_ebpf_common::SERVICE_EVENT_FORWARDING_DSR => Some(ServiceForwardingModeOutcome::Dsr),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn agent_state_report(state: &AgentState) -> AgentStateReport {
     AgentStateReport {
@@ -8768,6 +9054,32 @@ fn agent_state_report(state: &AgentState) -> AgentStateReport {
             .expect("stored service action fits u8"),
         last_service_reason: u8::try_from(state.last_service_reason.load(Ordering::Acquire))
             .expect("stored service reason fits u8"),
+        service_same_node_selections: state.service_same_node_selections.load(Ordering::Acquire),
+        service_same_zone_selections: state.service_same_zone_selections.load(Ordering::Acquire),
+        service_cluster_selections: state.service_cluster_selections.load(Ordering::Acquire),
+        service_stable_hash_selections: state
+            .service_stable_hash_selections
+            .load(Ordering::Acquire),
+        service_maglev_selections: state.service_maglev_selections.load(Ordering::Acquire),
+        service_affinity_reuses: state.service_affinity_reuses.load(Ordering::Acquire),
+        service_affinity_creations: state.service_affinity_creations.load(Ordering::Acquire),
+        service_affinity_reselections: state.service_affinity_reselections.load(Ordering::Acquire),
+        service_nat_forwards: state.service_nat_forwards.load(Ordering::Acquire),
+        service_dsr_forwards: state.service_dsr_forwards.load(Ordering::Acquire),
+        last_service_selection_tier: reported_selection_tier(
+            state.last_service_selection_tier.load(Ordering::Acquire),
+        ),
+        last_service_affinity_outcome: reported_affinity_outcome(
+            state.last_service_affinity_outcome.load(Ordering::Acquire),
+        ),
+        last_service_selection_algorithm: reported_selection_algorithm(
+            state
+                .last_service_selection_algorithm
+                .load(Ordering::Acquire),
+        ),
+        last_service_forwarding_mode: reported_forwarding_mode(
+            state.last_service_forwarding_mode.load(Ordering::Acquire),
+        ),
         desired_node_block_revision: state.desired_node_block_revision.load(Ordering::Acquire),
         applied_node_block_revision: state.applied_node_block_revision.load(Ordering::Acquire),
         desired_remote_route_epoch: state.desired_remote_route_epoch.load(Ordering::Acquire),
@@ -14927,6 +15239,13 @@ mod tests {
         assert_eq!(outcome.backend_ipv4, Some(Ipv4Addr::new(10, 42, 1, 20)));
         assert_eq!(outcome.backend_port, Some(8080));
         assert_eq!(outcome.frontend_kind, ServiceFrontendKind::NodePortCluster);
+        assert_eq!(outcome.selection_tier, ServiceSelectionTier::Cluster);
+        assert_eq!(outcome.affinity_outcome, ServiceAffinityOutcome::None);
+        assert_eq!(
+            outcome.selection_algorithm,
+            ServiceSelectionAlgorithmOutcome::Maglev
+        );
+        assert_eq!(outcome.forwarding_mode, ServiceForwardingModeOutcome::Nat);
         let state = test_agent_state();
         record_service_event(&state, &event);
         let report = agent_state_report(&state);
@@ -14939,6 +15258,21 @@ mod tests {
         assert_eq!(report.last_backend_id, 13);
         assert_eq!(report.last_service_revision, 7);
         assert_eq!(report.last_service_action, SERVICE_EVENT_ACTION_TRANSLATE);
+        assert_eq!(report.service_cluster_selections, 1);
+        assert_eq!(report.service_maglev_selections, 1);
+        assert_eq!(report.service_nat_forwards, 1);
+        assert_eq!(
+            report.last_service_selection_tier,
+            Some(ServiceSelectionTier::Cluster)
+        );
+        assert_eq!(
+            report.last_service_selection_algorithm,
+            Some(ServiceSelectionAlgorithmOutcome::Maglev)
+        );
+        assert_eq!(
+            report.last_service_forwarding_mode,
+            Some(ServiceForwardingModeOutcome::Nat)
+        );
         assert_eq!(
             report.last_service_reason,
             unf_ebpf_common::SERVICE_EVENT_REASON_FORWARD_TRANSLATED
@@ -14988,6 +15322,9 @@ mod tests {
             "unf_loadbalancer_local_translations_total",
             "unf_loadbalancer_no_backend_drops_total",
             "unf_loadbalancer_source_range_drops_total",
+            "unf_service_selection_cluster_total",
+            "unf_service_selection_maglev_total",
+            "unf_service_forwarding_nat_total",
         ] {
             assert!(exposition.contains(metric), "missing metric {metric}");
         }

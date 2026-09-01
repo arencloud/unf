@@ -91,6 +91,21 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Predict a `ClusterIP` outcome from the current digest-bound per-Node selection contract.
+    ClusterIpSimulate {
+        /// Receiving Node name.
+        #[arg(long)]
+        node: String,
+        /// Exact `ClusterIP` address.
+        #[arg(long)]
+        address: IpAddr,
+        /// Service frontend port.
+        #[arg(long)]
+        port: u16,
+        /// Transport protocol.
+        #[arg(long, value_enum, default_value = "tcp")]
+        protocol: NodePortProtocol,
+    },
     /// Predict a `NodePort` outcome from current validated Service and Node state.
     ServiceSimulate {
         /// Receiving Node name.
@@ -366,6 +381,21 @@ async fn run() -> Result<()> {
             get_json(
                 &client,
                 &node_port_simulation_url(&cli.controller_url, node, *address, *port, *protocol),
+            )
+            .await?
+        }
+        Command::ClusterIpSimulate {
+            node,
+            address,
+            port,
+            protocol,
+        } => {
+            if *port == 0 {
+                bail!("port must be between 1 and 65535");
+            }
+            get_json(
+                &client,
+                &cluster_ip_simulation_url(&cli.controller_url, node, *address, *port, *protocol),
             )
             .await?
         }
@@ -1324,6 +1354,22 @@ fn node_port_simulation_url(
     )
 }
 
+fn cluster_ip_simulation_url(
+    controller_url: &str,
+    node: &str,
+    address: IpAddr,
+    port: u16,
+    protocol: NodePortProtocol,
+) -> String {
+    let protocol = match protocol {
+        NodePortProtocol::Tcp => "tcp",
+        NodePortProtocol::Udp => "udp",
+    };
+    format!(
+        "{controller_url}/v1/services/clusterip/simulate?node_name={node}&address={address}&port={port}&protocol={protocol}"
+    )
+}
+
 fn load_balancer_simulation_url(
     controller_url: &str,
     node: &str,
@@ -1905,6 +1951,42 @@ mod tests {
                 NodePortProtocol::Tcp,
             ),
             "http://controller/v1/services/nodeport/simulate?node_name=worker-a&address=192.0.2.1&port=30443&protocol=tcp"
+        );
+    }
+
+    #[test]
+    fn cluster_ip_simulation_command_builds_exact_query() {
+        let cli = Cli::try_parse_from([
+            "unfctl",
+            "cluster-ip-simulate",
+            "--node",
+            "worker-a",
+            "--address",
+            "fd00:96::80",
+            "--port",
+            "443",
+            "--protocol",
+            "udp",
+        ])
+        .expect("ClusterIP simulation command parses");
+        assert!(matches!(
+            cli.command,
+            Command::ClusterIpSimulate {
+                node,
+                address,
+                port: 443,
+                protocol: NodePortProtocol::Udp,
+            } if node == "worker-a" && address == "fd00:96::80".parse::<IpAddr>().unwrap()
+        ));
+        assert_eq!(
+            cluster_ip_simulation_url(
+                "http://controller",
+                "worker-a",
+                "10.96.0.80".parse().unwrap(),
+                443,
+                NodePortProtocol::Tcp,
+            ),
+            "http://controller/v1/services/clusterip/simulate?node_name=worker-a&address=10.96.0.80&port=443&protocol=tcp"
         );
     }
 

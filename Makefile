@@ -1,4 +1,4 @@
-.PHONY: service-selection-boundary-test service-selection-ir-test service-selection-contract-test service-selection-state-test service-selection-dataplane-test service-affinity-dataplane-test service-maglev-dataplane-test service-dsr-dataplane-test
+.PHONY: service-selection-boundary-test service-selection-ir-test service-selection-contract-test service-selection-state-test service-selection-dataplane-test service-affinity-dataplane-test service-maglev-dataplane-test service-dsr-dataplane-test service-selection-operations-test
 .PHONY: build test lint fmt fmt-check support-matrix-check loadbalancer-boundary-test loadbalancer-ir-test loadbalancer-control-plane-test loadbalancer-host-state-test loadbalancer-cluster-dataplane-test loadbalancer-local-dataplane-test loadbalancer-operations-test loadbalancer-kind-up loadbalancer-kind-load loadbalancer-kind-deploy loadbalancer-kind-test loadbalancer-kind-down loadbalancer-openshift-deploy loadbalancer-openshift-test service-ir-test service-compiler-test service-distribution-test nodeport-host-state-test nodeport-transaction-test nodeport-cluster-dataplane-test nodeport-local-dataplane-test nodeport-operations-test nodeport-kind-test nodeport-openshift-deploy nodeport-openshift-test service-dataplane-test service-operations-test primary-cni-installer-test service-kind-up service-kind-load service-kind-deploy service-kind-test service-kind-down ebpf generate-crds controller agent cni cni-protocol-test cni-transaction-test cni-ipam-test cni-veth-test cni-routing-test cni-lifecycle-test cni-node-block-test cni-remote-routing-test cni-route-reconciliation-test cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-upgrade-images openshift-deploy openshift-test openshift-upgrade-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test openshift-primary-cni-audit openshift-primary-cni-preflight openshift-primary-cni-package-check openshift-primary-cni-runtime-fault-test openshift-primary-cni-node-reprovision-test openshift-primary-cni-deploy openshift-service-deploy openshift-service-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-platform-matrix-test kind-down primary-cni-kind-up primary-cni-kind-load primary-cni-kind-deploy primary-cni-kind-test primary-cni-kind-rollback primary-cni-kind-down
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
@@ -119,6 +119,18 @@ service-dsr-dataplane-test: service-maglev-dataplane-test ebpf
 	cargo test -p unf-agent cleanup_distinguishes_historical_and_current_map_ownership
 	cargo clippy -p unf-ebpf-common -p unf-service -p unf-loadbalancer -p unf-state -p unf-controller -p unf-agent --all-targets --all-features -- -D warnings
 	UNF_BPF_TOOLCHAIN=$(BPF_TOOLCHAIN) hack/verify-service-dsr.sh
+
+service-selection-operations-test: service-dsr-dataplane-test
+	cargo test -p unf-state flow_history_
+	cargo test -p unf-agent service_event_decoder_and_status_preserve_bounded_provenance
+	cargo test -p unf-controller advanced_service_status_is_fixed_cardinality_and_adjacent_compatible
+	cargo test -p unf-controller service_flow_ingestion_validates_bounded_dataplane_provenance
+	cargo test -p unf-controller node_port_simulation_is_node_local_read_only_and_fail_closed
+	cargo test -p unf-controller load_balancer_simulation_and_explanation_are_provenance_exact_and_read_only
+	cargo test -p unfctl cluster_ip_simulation_command_builds_exact_query
+	cargo test -p unfctl node_port_simulation_command_builds_exact_query
+	cargo test -p unfctl load_balancer_simulation_and_explanation_build_exact_queries
+	cargo clippy -p unf-ebpf-common -p unf-state -p unf-service -p unf-loadbalancer -p unf-agent -p unf-controller -p unfctl --all-targets --all-features -- -D warnings
 
 loadbalancer-boundary-test:
 	hack/verify-loadbalancer-boundary.sh

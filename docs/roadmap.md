@@ -556,7 +556,15 @@ matrix is maintained in the
   order, FIB route/neighbor/MTU proof, VIP-preserving L2 redirect, forward-only
   state/direct return, fail-closed verifier-isolated tail stages, provenance,
   recovery, and cleanup pass `make service-dsr-dataplane-test`; ADR 0109.
-- Operations, Kind, and OpenShift remain ordered independent milestones. Kind
+- Verified bounded operations preserve exact tier, actual StableHash/Maglev,
+  affinity reuse/create/reselection, backend, revision, and NAT/DSR outcomes in
+  fixed-name metrics, validated status-v8, export-v6, and durable
+  history-v7/checkpoint-v6. Explanation distinguishes current drain state from
+  observed decisions; digest-bound read-only simulation covers ClusterIP,
+  NodePort, and LoadBalancer. Explicit unknown migration, adjacent compatibility,
+  inherited ABI-v11 recovery, CLI queries, and strict Clippy pass
+  `make service-selection-operations-test`; ADR 0110.
+- Kind and OpenShift remain ordered independent milestones. Kind
   and OpenShift must independently prove actual backend VIP ownership and
   cross-worker return routing; workstation evidence is not transitive.
 - Weighted traffic splitting, latency/load feedback, cross-cluster selection,

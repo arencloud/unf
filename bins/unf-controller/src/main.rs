@@ -62,9 +62,10 @@ use unf_service::{
     NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION, NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION,
     NetworkBehaviorContract, NodeAddressKind, NodePortNodeSnapshot,
     SELECTION_CONTRACT_SCHEMA_VERSION, SERVICE_SNAPSHOT_SCHEMA_VERSION, SelectionCapability,
-    SelectionNode, ServiceBackend, ServiceForwardingMode, ServiceIpFamilyPolicy, ServiceIpPrefix,
-    ServiceIr, ServiceLoadBalancerSource, ServiceNodeAddress, ServiceNodePort,
-    ServiceSelectionAlgorithm, ServiceSessionAffinity, ServiceSnapshot, ServiceSource,
+    SelectionFrontend, SelectionNode, SelectionTier as ContractSelectionTier, ServiceBackend,
+    ServiceForwardingMode, ServiceIpFamilyPolicy, ServiceIpPrefix, ServiceIr,
+    ServiceLoadBalancerSource, ServiceNodeAddress, ServiceNodePort, ServiceSelectionAlgorithm,
+    ServiceSelectionPlan, ServiceSessionAffinity, ServiceSnapshot, ServiceSource,
     ServiceSourcePort, ServiceTrafficDistribution, ServiceTrafficPolicy, UNF_LOAD_BALANCER_CLASS,
     compile_service_snapshot,
 };
@@ -76,12 +77,14 @@ use unf_state::{
     FlowHistoryCheckpoint, FlowHistoryEntry, FlowHistoryQuerySummary, FlowHistorySnapshot,
     FlowHistoryStore, IdentityRegistry, IdentityStateSnapshot, Ipv4PolicyMapEntry,
     Ipv4PolicyMapKey, Ipv6PolicyMapEntry, Ipv6PolicyMapKey, NetworkIdentity,
-    POLICY_SNAPSHOT_SCHEMA_VERSION, PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION,
-    PolicyDecisionRecord, PolicyStateSnapshot, RevisionSet, ServiceFrontendKind,
-    TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyHistoryCheckpoint,
-    TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode, TopologyService,
-    TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot,
-    TopologyWorkload, provisional_identity_id,
+    POLICY_SNAPSHOT_SCHEMA_VERSION, PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION,
+    PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION, PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION,
+    PolicyDecisionRecord, PolicyStateSnapshot, RevisionSet, ServiceAffinityOutcome,
+    ServiceForwardingModeOutcome, ServiceFrontendKind, ServiceSelectionAlgorithmOutcome,
+    ServiceSelectionTier, TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION,
+    TopologyHistoryCheckpoint, TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode,
+    TopologyService, TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort,
+    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
 };
 
 mod external_flow_export;
@@ -660,11 +663,44 @@ struct ServiceExplanation {
     current_service_revision: Option<Revision>,
     current_service: Option<ServiceIr>,
     current_backend: Option<ServiceBackend>,
+    current_selection: Option<ServiceSelectionIntentExplanation>,
     load_balancer: Option<LoadBalancerExplanation>,
     matched_outcomes: usize,
     matched_observations: u64,
+    observed_selection: ServiceSelectionOutcomeSummary,
     outcomes: Vec<FlowHistoryEntry>,
     note: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceSelectionIntentExplanation {
+    internal_traffic_policy: ServiceTrafficPolicy,
+    traffic_distribution: ServiceTrafficDistribution,
+    session_affinity: ServiceSessionAffinity,
+    selection_algorithm: ServiceSelectionAlgorithm,
+    forwarding_mode: ServiceForwardingMode,
+    ready_new_flow_backends: usize,
+    draining_serving_backends: usize,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ServiceSelectionOutcomeSummary {
+    service_revisions: Vec<Revision>,
+    same_node_observations: u64,
+    same_zone_observations: u64,
+    cluster_observations: u64,
+    unknown_tier_observations: u64,
+    stable_hash_observations: u64,
+    maglev_observations: u64,
+    unknown_algorithm_observations: u64,
+    no_affinity_observations: u64,
+    affinity_reused_observations: u64,
+    affinity_created_observations: u64,
+    affinity_reselected_observations: u64,
+    unknown_affinity_observations: u64,
+    nat_observations: u64,
+    dsr_observations: u64,
+    unknown_forwarding_observations: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -685,6 +721,39 @@ struct NodePortSimulationQuery {
     protocol: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClusterIpSimulationQuery {
+    node_name: String,
+    address: IpAddr,
+    port: u16,
+    protocol: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ClusterIpSimulation {
+    schema_version: u16,
+    node_name: String,
+    address: IpAddr,
+    port: u16,
+    protocol: Protocol,
+    service_revision: Revision,
+    selection_contract_revision: Revision,
+    selection_contract_digest: String,
+    service_id: ServiceId,
+    namespace: String,
+    name: String,
+    frontend_kind: ServiceFrontendKind,
+    traffic_policy: ServiceTrafficPolicy,
+    selection_tier: ContractSelectionTier,
+    selection_algorithm: ServiceSelectionAlgorithm,
+    session_affinity: ServiceSessionAffinity,
+    forwarding_mode: ServiceForwardingMode,
+    eligible_backend_ids: Vec<BackendId>,
+    eligible_backends: Vec<ServiceBackend>,
+    decision: &'static str,
+    note: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct NodePortSimulation {
     schema_version: u16,
@@ -693,12 +762,18 @@ struct NodePortSimulation {
     port: u16,
     protocol: Protocol,
     service_revision: Revision,
+    selection_contract_revision: Revision,
+    selection_contract_digest: String,
     service_id: ServiceId,
     namespace: String,
     name: String,
     frontend_kind: ServiceFrontendKind,
     traffic_policy: ServiceTrafficPolicy,
     source_preserved: bool,
+    selection_tier: ContractSelectionTier,
+    selection_algorithm: ServiceSelectionAlgorithm,
+    session_affinity: ServiceSessionAffinity,
+    forwarding_mode: ServiceForwardingMode,
     eligible_backend_ids: Vec<BackendId>,
     eligible_backends: Vec<ServiceBackend>,
     decision: &'static str,
@@ -723,6 +798,8 @@ struct LoadBalancerSimulation {
     port: u16,
     protocol: Protocol,
     service_revision: Revision,
+    selection_contract_revision: Revision,
+    selection_contract_digest: String,
     reachability_revision: Revision,
     allocation_revision: Revision,
     provider: ReachabilityProviderRef,
@@ -734,6 +811,10 @@ struct LoadBalancerSimulation {
     traffic_policy: ServiceTrafficPolicy,
     source_preserved: bool,
     source_allowed: bool,
+    selection_tier: ContractSelectionTier,
+    selection_algorithm: ServiceSelectionAlgorithm,
+    session_affinity: ServiceSessionAffinity,
+    forwarding_mode: ServiceForwardingMode,
     eligible_backend_ids: Vec<BackendId>,
     eligible_backends: Vec<ServiceBackend>,
     decision: &'static str,
@@ -876,6 +957,7 @@ async fn main() -> Result<()> {
         .route("/v1/topology/history", get(topology_history))
         .route("/v1/flows", get(flow_history))
         .route("/v1/services/explain", get(explain_service))
+        .route("/v1/services/clusterip/simulate", get(simulate_cluster_ip))
         .route("/v1/services/nodeport/simulate", get(simulate_node_port))
         .route(
             "/v1/services/loadbalancer/simulate",
@@ -4248,12 +4330,15 @@ fn exact_extra_value<'value>(
 fn validate_agent_status(report: &AgentStateReport) -> Result<(), ApiError> {
     if !matches!(
         report.schema_version,
-        PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION | AGENT_STATUS_SCHEMA_VERSION
+        PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION
+            | PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION
+            | AGENT_STATUS_SCHEMA_VERSION
     ) {
         return Err(ApiError::bad_request(format!(
-            "unsupported agent status schema {}; expected {} or {}",
+            "unsupported agent status schema {}; expected {}, {}, or {}",
             report.schema_version,
             PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION,
+            PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION,
             AGENT_STATUS_SCHEMA_VERSION
         )));
     }
@@ -4524,11 +4609,87 @@ fn validate_service_dataplane_status(report: &AgentStateReport) -> Result<(), Ap
             "last service dataplane outcome is inconsistent with its event count",
         ));
     }
+    validate_advanced_service_dataplane_status(report)
+}
+
+fn validate_advanced_service_dataplane_status(report: &AgentStateReport) -> Result<(), ApiError> {
+    let advanced_counts = [
+        report.service_same_node_selections,
+        report.service_same_zone_selections,
+        report.service_cluster_selections,
+        report.service_stable_hash_selections,
+        report.service_maglev_selections,
+        report.service_affinity_reuses,
+        report.service_affinity_creations,
+        report.service_affinity_reselections,
+        report.service_nat_forwards,
+        report.service_dsr_forwards,
+    ];
+    let advanced_last = [
+        report.last_service_selection_tier.is_some(),
+        report.last_service_affinity_outcome.is_some(),
+        report.last_service_selection_algorithm.is_some(),
+        report.last_service_forwarding_mode.is_some(),
+    ];
+    let advanced_last_known = !matches!(
+        report.last_service_selection_tier,
+        Some(ServiceSelectionTier::Unknown)
+    ) && !matches!(
+        report.last_service_affinity_outcome,
+        Some(ServiceAffinityOutcome::Unknown)
+    ) && !matches!(
+        report.last_service_selection_algorithm,
+        Some(ServiceSelectionAlgorithmOutcome::Unknown)
+    ) && !matches!(
+        report.last_service_forwarding_mode,
+        Some(ServiceForwardingModeOutcome::Unknown)
+    );
+    if report.schema_version < AGENT_STATUS_SCHEMA_VERSION {
+        if advanced_counts.into_iter().any(|count| count != 0)
+            || advanced_last.into_iter().any(|present| present)
+        {
+            return Err(ApiError::bad_request(
+                "pre-operations agent status cannot carry advanced selection outcomes",
+            ));
+        }
+        return Ok(());
+    }
+    let tier_total = report
+        .service_same_node_selections
+        .saturating_add(report.service_same_zone_selections)
+        .saturating_add(report.service_cluster_selections);
+    let algorithm_total = report
+        .service_stable_hash_selections
+        .saturating_add(report.service_maglev_selections);
+    let forwarding_total = report
+        .service_nat_forwards
+        .saturating_add(report.service_dsr_forwards);
+    let affinity_total = report
+        .service_affinity_reuses
+        .saturating_add(report.service_affinity_creations)
+        .saturating_add(report.service_affinity_reselections);
+    if tier_total != report.service_translations
+        || algorithm_total != report.service_translations
+        || forwarding_total != report.service_translations
+        || affinity_total > report.service_translations
+        || !advanced_last_known
+        || (report.service_dataplane_events == 0
+            && advanced_last.into_iter().any(|present| present))
+        || (report.service_dataplane_events != 0
+            && advanced_last.into_iter().any(|present| !present))
+    {
+        return Err(ApiError::bad_request(
+            "advanced service outcome counters or last decision witness are inconsistent",
+        ));
+    }
     Ok(())
 }
 
 const fn service_action_reason_is_valid(action: u8, reason: u8) -> bool {
-    matches!((action, reason), (1, 1 | 2) | (2, 3..=10 | 12) | (3, 11))
+    matches!(
+        (action, reason),
+        (1, 1 | 2 | 13) | (2, 3..=10 | 12 | 14) | (3, 11)
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4888,6 +5049,29 @@ fn service_selection_contract_for(
             "compile service selection contract for node {node_name}: {error}"
         ))
     })
+}
+
+fn simulation_selection_plan(
+    state: &ControllerState,
+    node_name: &str,
+    service_id: ServiceId,
+    frontend: &SelectionFrontend,
+) -> Result<(NetworkBehaviorContract, ServiceSelectionPlan), ApiError> {
+    let capabilities = BTreeSet::from([
+        SelectionCapability::StableHash,
+        SelectionCapability::Maglev,
+        SelectionCapability::Nat,
+        SelectionCapability::DsrIpv4,
+        SelectionCapability::DsrIpv6,
+    ]);
+    let contract = service_selection_contract_for(state, node_name, capabilities)?;
+    let plan = contract
+        .plans
+        .iter()
+        .find(|plan| plan.key.service_id == service_id && &plan.key.frontend == frontend)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("frontend has no current selection plan"))?;
+    Ok((contract, plan))
 }
 
 fn service_snapshot_for(state: &ControllerState) -> Result<ServiceSnapshot, ApiError> {
@@ -5273,6 +5457,26 @@ async fn explain_service(
                 .cloned()
         })
     });
+    let current_selection =
+        current_service
+            .as_ref()
+            .map(|service| ServiceSelectionIntentExplanation {
+                internal_traffic_policy: service.internal_traffic_policy,
+                traffic_distribution: service.traffic_distribution,
+                session_affinity: service.session_affinity,
+                selection_algorithm: service.selection_algorithm,
+                forwarding_mode: service.forwarding_mode,
+                ready_new_flow_backends: service
+                    .backends
+                    .iter()
+                    .filter(|backend| backend.ready && !backend.terminating)
+                    .count(),
+                draining_serving_backends: service
+                    .backends
+                    .iter()
+                    .filter(|backend| backend.terminating && backend.serving)
+                    .count(),
+            });
     let load_balancer = current_service
         .as_ref()
         .and_then(|service| service.load_balancer.as_ref())
@@ -5298,6 +5502,7 @@ async fn explain_service(
         .iter()
         .map(|entry| entry.observed_events)
         .fold(0_u64, u64::saturating_add);
+    let observed_selection = summarize_service_selection_outcomes(&history.entries);
     history.entries.truncate(limit);
     if current_service.is_none() && history.entries.is_empty() {
         return Err(ApiError::not_found(format!(
@@ -5313,12 +5518,61 @@ async fn explain_service(
         current_service_revision,
         current_service,
         current_backend,
+        current_selection,
         load_balancer,
         matched_outcomes,
         matched_observations,
+        observed_selection,
         outcomes: history.entries,
         note: "Current compiled intent is correlated with bounded, durable dataplane outcomes; absence of an outcome is not proof that no traffic occurred.",
     }))
+}
+
+fn summarize_service_selection_outcomes(
+    entries: &[FlowHistoryEntry],
+) -> ServiceSelectionOutcomeSummary {
+    let mut summary = ServiceSelectionOutcomeSummary::default();
+    let mut revisions = BTreeSet::new();
+    for entry in entries {
+        let Some(outcome) = entry.service else {
+            continue;
+        };
+        let count = entry.observed_events;
+        revisions.insert(outcome.service_revision);
+        match outcome.selection_tier {
+            ServiceSelectionTier::SameNode => summary.same_node_observations += count,
+            ServiceSelectionTier::SameZone => summary.same_zone_observations += count,
+            ServiceSelectionTier::Cluster => summary.cluster_observations += count,
+            ServiceSelectionTier::Unknown => summary.unknown_tier_observations += count,
+        }
+        match outcome.selection_algorithm {
+            ServiceSelectionAlgorithmOutcome::StableHash => {
+                summary.stable_hash_observations += count;
+            }
+            ServiceSelectionAlgorithmOutcome::Maglev => summary.maglev_observations += count,
+            ServiceSelectionAlgorithmOutcome::Unknown => {
+                summary.unknown_algorithm_observations += count;
+            }
+        }
+        match outcome.affinity_outcome {
+            ServiceAffinityOutcome::None => summary.no_affinity_observations += count,
+            ServiceAffinityOutcome::Reused => summary.affinity_reused_observations += count,
+            ServiceAffinityOutcome::Created => summary.affinity_created_observations += count,
+            ServiceAffinityOutcome::Reselected => {
+                summary.affinity_reselected_observations += count;
+            }
+            ServiceAffinityOutcome::Unknown => summary.unknown_affinity_observations += count,
+        }
+        match outcome.forwarding_mode {
+            ServiceForwardingModeOutcome::Nat => summary.nat_observations += count,
+            ServiceForwardingModeOutcome::Dsr => summary.dsr_observations += count,
+            ServiceForwardingModeOutcome::Unknown => {
+                summary.unknown_forwarding_observations += count;
+            }
+        }
+    }
+    summary.service_revisions = revisions.into_iter().collect();
+    summary
 }
 
 fn load_balancer_explanation(
@@ -5381,6 +5635,90 @@ fn load_balancer_explanation(
     }
 }
 
+async fn simulate_cluster_ip(
+    State(state): State<Arc<ControllerState>>,
+    Query(query): Query<ClusterIpSimulationQuery>,
+) -> Result<Json<ClusterIpSimulation>, ApiError> {
+    if query.node_name.is_empty() || query.node_name.len() > 253 || query.port == 0 {
+        return Err(ApiError::bad_request(
+            "node_name must be nonempty and port must be nonzero",
+        ));
+    }
+    let protocol = node_port_simulation_protocol(&query.protocol)?;
+    let snapshot = service_snapshot_for(&state)?;
+    let mut owners = snapshot.services.iter().filter_map(|service| {
+        service
+            .frontends
+            .iter()
+            .find(|frontend| {
+                frontend.address == query.address
+                    && frontend.port == query.port
+                    && frontend.protocol == protocol
+            })
+            .map(|frontend| (service, frontend))
+    });
+    let (service, _frontend) = owners
+        .next()
+        .ok_or_else(|| ApiError::not_found("no ClusterIP owns the requested tuple"))?;
+    if owners.next().is_some() {
+        return Err(ApiError::internal(
+            "validated service state contains an ambiguous ClusterIP owner",
+        ));
+    }
+    let (contract, plan) = simulation_selection_plan(
+        &state,
+        &query.node_name,
+        service.id,
+        &SelectionFrontend::ClusterIp {
+            address: query.address,
+            port: query.port,
+            protocol,
+        },
+    )?;
+    let selected = plan
+        .selected_tier()
+        .ok_or_else(|| ApiError::internal("validated selection plan has no tier"))?;
+    let eligible_backend_ids = selected.backend_ids.clone();
+    let eligible_backends: Vec<ServiceBackend> = eligible_backend_ids
+        .iter()
+        .filter_map(|backend_id| {
+            service
+                .backends
+                .iter()
+                .find(|backend| backend.id == *backend_id)
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    let decision = if eligible_backend_ids.is_empty() {
+        "drop_no_backend"
+    } else {
+        "translate"
+    };
+    Ok(Json(ClusterIpSimulation {
+        schema_version: 1,
+        node_name: query.node_name,
+        address: query.address,
+        port: query.port,
+        protocol,
+        service_revision: snapshot.revision,
+        selection_contract_revision: contract.contract_revision,
+        selection_contract_digest: contract.contract_digest.to_string(),
+        service_id: service.id,
+        namespace: service.namespace.clone(),
+        name: service.name.clone(),
+        frontend_kind: ServiceFrontendKind::ClusterIp,
+        traffic_policy: service.internal_traffic_policy,
+        selection_tier: selected.tier,
+        selection_algorithm: plan.selection_algorithm,
+        session_affinity: plan.session_affinity,
+        forwarding_mode: plan.forwarding_mode,
+        eligible_backend_ids,
+        eligible_backends,
+        decision,
+        note: "Read-only prediction from the digest-bound per-Node selection contract; eligible order and decision are exact, while an existing connection or ClientIP affinity entry may retain its still-eligible revision-local backend.",
+    }))
+}
+
 async fn simulate_node_port(
     State(state): State<Arc<ControllerState>>,
     Query(query): Query<NodePortSimulationQuery>,
@@ -5418,8 +5756,31 @@ async fn simulate_node_port(
     };
     let (service, node_port) =
         find_node_port_owner(&snapshot, family, query.port, protocol, query.address)?;
-    let eligible_backends = eligible_node_port_backends(service, node_port, &query.node_name);
-    let eligible_backend_ids = eligible_backends.iter().map(|backend| backend.id).collect();
+    let (contract, plan) = simulation_selection_plan(
+        &state,
+        &query.node_name,
+        service.id,
+        &SelectionFrontend::NodePort {
+            family,
+            node_port: node_port.port,
+            service_port: node_port.service_port,
+            protocol,
+        },
+    )?;
+    let selected = plan
+        .selected_tier()
+        .ok_or_else(|| ApiError::internal("validated selection plan has no tier"))?;
+    let eligible_backend_ids = selected.backend_ids.clone();
+    let eligible_backends: Vec<ServiceBackend> = eligible_backend_ids
+        .iter()
+        .filter_map(|backend_id| {
+            service
+                .backends
+                .iter()
+                .find(|backend| backend.id == *backend_id)
+                .cloned()
+        })
+        .collect();
     let (frontend_kind, source_preserved) = match node_port.traffic_policy {
         ServiceTrafficPolicy::Cluster => (ServiceFrontendKind::NodePortCluster, false),
         ServiceTrafficPolicy::Local => (ServiceFrontendKind::NodePortLocal, true),
@@ -5436,16 +5797,22 @@ async fn simulate_node_port(
         port: query.port,
         protocol,
         service_revision: snapshot.revision,
+        selection_contract_revision: contract.contract_revision,
+        selection_contract_digest: contract.contract_digest.to_string(),
         service_id: service.id,
         namespace: service.namespace.clone(),
         name: service.name.clone(),
         frontend_kind,
         traffic_policy: node_port.traffic_policy,
         source_preserved,
+        selection_tier: selected.tier,
+        selection_algorithm: plan.selection_algorithm,
+        session_affinity: plan.session_affinity,
+        forwarding_mode: plan.forwarding_mode,
         eligible_backend_ids,
         eligible_backends,
         decision,
-        note: "Read-only prediction from the current validated Service and Node snapshots; an existing connection may retain its revision-local backend until expiry.",
+        note: "Read-only prediction from the digest-bound per-Node selection contract; eligible order and decision are exact, while an existing connection or ClientIP affinity entry may retain its still-eligible revision-local backend.",
     }))
 }
 
@@ -5509,21 +5876,30 @@ async fn simulate_load_balancer(
             .iter()
             .copied()
             .any(|prefix| service_prefix_contains(prefix, query.source_address));
-    let eligible_backends = frontend
-        .backend_ids
+    let (contract, plan) = simulation_selection_plan(
+        &state,
+        &query.node_name,
+        service.id,
+        &SelectionFrontend::LoadBalancer {
+            family,
+            service_port: frontend.service_port,
+            protocol,
+        },
+    )?;
+    let selected = plan
+        .selected_tier()
+        .ok_or_else(|| ApiError::internal("validated selection plan has no tier"))?;
+    let eligible_backend_ids = selected.backend_ids.clone();
+    let eligible_backends = eligible_backend_ids
         .iter()
         .filter_map(|backend_id| {
-            service.backends.iter().find(|backend| {
-                backend.id == *backend_id
-                    && backend.ready
-                    && !backend.terminating
-                    && (intent.traffic_policy == ServiceTrafficPolicy::Cluster
-                        || backend.node_name.as_deref() == Some(query.node_name.as_str()))
-            })
+            service
+                .backends
+                .iter()
+                .find(|backend| backend.id == *backend_id)
+                .cloned()
         })
-        .cloned()
         .collect::<Vec<_>>();
-    let eligible_backend_ids = eligible_backends.iter().map(|backend| backend.id).collect();
     let (frontend_kind, source_preserved) = match intent.traffic_policy {
         ServiceTrafficPolicy::Cluster => (ServiceFrontendKind::LoadBalancerCluster, false),
         ServiceTrafficPolicy::Local => (ServiceFrontendKind::LoadBalancerLocal, true),
@@ -5546,6 +5922,8 @@ async fn simulate_load_balancer(
         port: query.port,
         protocol,
         service_revision: services.revision,
+        selection_contract_revision: contract.contract_revision,
+        selection_contract_digest: contract.contract_digest.to_string(),
         reachability_revision: reachability.revision,
         allocation_revision: reachability.allocation_revision,
         provider: reachability.provider,
@@ -5557,10 +5935,14 @@ async fn simulate_load_balancer(
         traffic_policy: intent.traffic_policy,
         source_preserved,
         source_allowed,
+        selection_tier: selected.tier,
+        selection_algorithm: plan.selection_algorithm,
+        session_affinity: plan.session_affinity,
+        forwarding_mode: plan.forwarding_mode,
         eligible_backend_ids,
         eligible_backends,
         decision,
-        note: "Read-only prediction from the exact current Service, allocation, reachability, source-range, and receiving-Node state; an existing connection may retain its revision-local backend until expiry.",
+        note: "Read-only prediction from the exact allocation, reachability, source-range, and digest-bound per-Node selection contract; an existing connection or ClientIP affinity entry may retain its still-eligible revision-local backend.",
     }))
 }
 
@@ -5625,27 +6007,6 @@ fn find_node_port_owner(
         ));
     }
     Ok(owner)
-}
-
-fn eligible_node_port_backends(
-    service: &ServiceIr,
-    node_port: &ServiceNodePort,
-    node_name: &str,
-) -> Vec<ServiceBackend> {
-    node_port
-        .backend_ids
-        .iter()
-        .filter_map(|backend_id| {
-            service.backends.iter().find(|backend| {
-                backend.id == *backend_id
-                    && backend.ready
-                    && !backend.terminating
-                    && (node_port.traffic_policy == ServiceTrafficPolicy::Cluster
-                        || backend.node_name.as_deref() == Some(node_name))
-            })
-        })
-        .cloned()
-        .collect()
 }
 
 fn validate_flow_history_query(query: &FlowHistoryQuery) -> Result<usize, ApiError> {
@@ -5772,10 +6133,15 @@ fn ingest_flow_batch(
 }
 
 fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
-    if batch.schema_version != FLOW_EXPORT_SCHEMA_VERSION {
+    if !matches!(
+        batch.schema_version,
+        PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION | FLOW_EXPORT_SCHEMA_VERSION
+    ) {
         return Err(ApiError::bad_request(format!(
-            "unsupported flow export schema {}; expected {}",
-            batch.schema_version, FLOW_EXPORT_SCHEMA_VERSION
+            "unsupported flow export schema {}; expected {} or {}",
+            batch.schema_version,
+            PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION,
+            FLOW_EXPORT_SCHEMA_VERSION
         )));
     }
     if batch.node_name.is_empty()
@@ -5820,7 +6186,7 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
             ));
         }
         if let Some(service) = entry.service {
-            validate_service_flow_export(entry, service)?;
+            validate_service_flow_export(batch.schema_version, entry, service)?;
         } else {
             if entry.key.service.is_some() {
                 return Err(ApiError::bad_request(
@@ -5848,6 +6214,7 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
 }
 
 fn validate_service_flow_export(
+    schema_version: u16,
     entry: &FlowExportRecord,
     service: unf_state::ServiceFlowOutcome,
 ) -> Result<(), ApiError> {
@@ -5870,8 +6237,24 @@ fn validate_service_flow_export(
             && key.action == service.action
             && key.reason == service.reason
             && key.frontend_kind == service.frontend_kind
+            && key.selection_tier == service.selection_tier
+            && key.affinity_outcome == service.affinity_outcome
+            && key.selection_algorithm == service.selection_algorithm
+            && key.forwarding_mode == service.forwarding_mode
     });
+    let decision_witness_valid = if schema_version == FLOW_EXPORT_SCHEMA_VERSION {
+        service.selection_tier != ServiceSelectionTier::Unknown
+            && service.affinity_outcome != ServiceAffinityOutcome::Unknown
+            && service.selection_algorithm != ServiceSelectionAlgorithmOutcome::Unknown
+            && service.forwarding_mode != ServiceForwardingModeOutcome::Unknown
+    } else {
+        service.selection_tier == ServiceSelectionTier::Unknown
+            && service.affinity_outcome == ServiceAffinityOutcome::Unknown
+            && service.selection_algorithm == ServiceSelectionAlgorithmOutcome::Unknown
+            && service.forwarding_mode == ServiceForwardingModeOutcome::Unknown
+    };
     if !service_key_matches
+        || !decision_witness_valid
         || !action_reason_valid
         || service.service_id.get() == 0
         || service.service_revision.get() == 0
@@ -8757,6 +9140,20 @@ mod tests {
             last_service_revision: 0,
             last_service_action: 0,
             last_service_reason: 0,
+            service_same_node_selections: 0,
+            service_same_zone_selections: 0,
+            service_cluster_selections: 0,
+            service_stable_hash_selections: 0,
+            service_maglev_selections: 0,
+            service_affinity_reuses: 0,
+            service_affinity_creations: 0,
+            service_affinity_reselections: 0,
+            service_nat_forwards: 0,
+            service_dsr_forwards: 0,
+            last_service_selection_tier: None,
+            last_service_affinity_outcome: None,
+            last_service_selection_algorithm: None,
+            last_service_forwarding_mode: None,
             desired_node_block_revision: 0,
             applied_node_block_revision: 0,
             desired_remote_route_epoch: 0,
@@ -9715,6 +10112,11 @@ mod tests {
         report.last_service_revision = 3;
         report.last_service_action = 2;
         report.last_service_reason = 12;
+        report.last_service_selection_tier = Some(ServiceSelectionTier::SameNode);
+        report.last_service_affinity_outcome = Some(ServiceAffinityOutcome::None);
+        report.last_service_selection_algorithm =
+            Some(ServiceSelectionAlgorithmOutcome::StableHash);
+        report.last_service_forwarding_mode = Some(ServiceForwardingModeOutcome::Nat);
         validate_agent_status(&report)
             .expect("source-range denial remains valid bounded LoadBalancer status");
         let mut malformed_outcomes = report.clone();
@@ -9885,8 +10287,10 @@ mod tests {
 
     #[test]
     fn load_balancer_operations_fields_preserve_the_adjacent_compatibility_tuple() {
-        assert_eq!(AGENT_STATUS_SCHEMA_VERSION, 7);
-        assert_eq!(FLOW_EXPORT_SCHEMA_VERSION, 5);
+        assert_eq!(PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION, 7);
+        assert_eq!(AGENT_STATUS_SCHEMA_VERSION, 8);
+        assert_eq!(PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION, 5);
+        assert_eq!(FLOW_EXPORT_SCHEMA_VERSION, 6);
         let report = converged_agent_report(7);
         let mut legacy = serde_json::to_value(&report).unwrap();
         for field in [
@@ -9915,6 +10319,58 @@ mod tests {
             serde_json::from_str::<ServiceFrontendKind>("\"load_balancer_local\"").unwrap(),
             ServiceFrontendKind::LoadBalancerLocal
         );
+    }
+
+    #[test]
+    fn advanced_service_status_is_fixed_cardinality_and_adjacent_compatible() {
+        let mut report = converged_agent_report(7);
+        report.service_dataplane_events = 1;
+        report.service_translations = 1;
+        report.service_same_zone_selections = 1;
+        report.service_maglev_selections = 1;
+        report.service_affinity_reselections = 1;
+        report.service_dsr_forwards = 1;
+        report.last_service_id = 11;
+        report.last_backend_id = 13;
+        report.last_service_revision = 9;
+        report.last_service_action = 1;
+        report.last_service_reason = 13;
+        report.last_service_selection_tier = Some(ServiceSelectionTier::SameZone);
+        report.last_service_affinity_outcome = Some(ServiceAffinityOutcome::Reselected);
+        report.last_service_selection_algorithm = Some(ServiceSelectionAlgorithmOutcome::Maglev);
+        report.last_service_forwarding_mode = Some(ServiceForwardingModeOutcome::Dsr);
+        validate_agent_status(&report).expect("current advanced outcome status is coherent");
+
+        let mut malformed = report.clone();
+        malformed.service_cluster_selections = 1;
+        assert!(validate_agent_status(&malformed).is_err());
+        let mut unknown = report.clone();
+        unknown.last_service_selection_tier = Some(ServiceSelectionTier::Unknown);
+        assert!(validate_agent_status(&unknown).is_err());
+
+        let mut adjacent = serde_json::to_value(report).unwrap();
+        adjacent["schema_version"] = serde_json::json!(PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION);
+        for field in [
+            "service_same_node_selections",
+            "service_same_zone_selections",
+            "service_cluster_selections",
+            "service_stable_hash_selections",
+            "service_maglev_selections",
+            "service_affinity_reuses",
+            "service_affinity_creations",
+            "service_affinity_reselections",
+            "service_nat_forwards",
+            "service_dsr_forwards",
+            "last_service_selection_tier",
+            "last_service_affinity_outcome",
+            "last_service_selection_algorithm",
+            "last_service_forwarding_mode",
+        ] {
+            adjacent.as_object_mut().unwrap().remove(field);
+        }
+        let adjacent: AgentStateReport = serde_json::from_value(adjacent).unwrap();
+        validate_agent_status(&adjacent)
+            .expect("schema-v7 status remains accepted without fabricated advanced evidence");
     }
 
     #[test]
@@ -10243,6 +10699,35 @@ mod tests {
         assert!(allowed.source_preserved);
         assert_eq!(allowed.decision, "translate");
         assert_eq!(allowed.eligible_backends.len(), 1);
+        assert_eq!(allowed.selection_tier, ContractSelectionTier::SameNode);
+        assert_eq!(
+            allowed.selection_algorithm,
+            ServiceSelectionAlgorithm::StableHash
+        );
+        assert_eq!(allowed.forwarding_mode, ServiceForwardingMode::Nat);
+        assert_eq!(allowed.selection_contract_digest.len(), 64);
+
+        let cluster_ip = read_lock(&state.compiled_service_snapshot)
+            .as_ref()
+            .unwrap()
+            .services[0]
+            .frontends[0]
+            .address;
+        let Json(cluster_ip) = simulate_cluster_ip(
+            State(Arc::clone(&state)),
+            Query(ClusterIpSimulationQuery {
+                node_name: "worker-a".to_owned(),
+                address: cluster_ip,
+                port: 443,
+                protocol: "tcp".to_owned(),
+            }),
+        )
+        .await
+        .expect("ClusterIP simulation uses the same digest-bound selection plan");
+        assert_eq!(cluster_ip.frontend_kind, ServiceFrontendKind::ClusterIp);
+        assert_eq!(cluster_ip.selection_tier, ContractSelectionTier::Cluster);
+        assert_eq!(cluster_ip.decision, "translate");
+        assert_eq!(cluster_ip.eligible_backends.len(), 1);
 
         let mut remote_only = endpoint;
         remote_only.endpoints[0].node_name = Some("worker-b".to_owned());
@@ -10668,6 +11153,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn service_flow_ingestion_validates_bounded_dataplane_provenance() {
         let mut batch = flow_batch(1);
         let entry = &mut batch.entries[0];
@@ -10682,6 +11168,10 @@ mod tests {
             action: 1,
             reason: 1,
             frontend_kind: unf_state::ServiceFrontendKind::NodePortCluster,
+            selection_tier: ServiceSelectionTier::Cluster,
+            affinity_outcome: ServiceAffinityOutcome::Created,
+            selection_algorithm: ServiceSelectionAlgorithmOutcome::Maglev,
+            forwarding_mode: ServiceForwardingModeOutcome::Nat,
         });
         entry.policy_revision = Revision::default();
         entry.decision.reason = 1;
@@ -10698,9 +11188,36 @@ mod tests {
             action: 1,
             reason: 1,
             frontend_kind: unf_state::ServiceFrontendKind::NodePortCluster,
+            selection_tier: ServiceSelectionTier::Cluster,
+            affinity_outcome: ServiceAffinityOutcome::Created,
+            selection_algorithm: ServiceSelectionAlgorithmOutcome::Maglev,
+            forwarding_mode: ServiceForwardingModeOutcome::Nat,
         });
         validate_flow_export_batch(&batch)
             .expect("service outcomes use service provenance instead of identities");
+        let mut legacy = serde_json::to_value(&batch).unwrap();
+        legacy["schema_version"] = serde_json::json!(PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION);
+        for field in [
+            "selection_tier",
+            "affinity_outcome",
+            "selection_algorithm",
+            "forwarding_mode",
+        ] {
+            legacy["entries"][0]["key"]["service"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            legacy["entries"][0]["service"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        let legacy: FlowExportBatch = serde_json::from_value(legacy).unwrap();
+        validate_flow_export_batch(&legacy)
+            .expect("schema-v5 service evidence migrates explicitly as unknown");
+        let mut mislabeled = legacy.clone();
+        mislabeled.schema_version = FLOW_EXPORT_SCHEMA_VERSION;
+        assert!(validate_flow_export_batch(&mislabeled).is_err());
         batch.entries[0]
             .service
             .as_mut()
@@ -10719,6 +11236,10 @@ mod tests {
             action: 2,
             reason: 12,
             frontend_kind: unf_state::ServiceFrontendKind::LoadBalancerLocal,
+            selection_tier: ServiceSelectionTier::SameNode,
+            affinity_outcome: ServiceAffinityOutcome::None,
+            selection_algorithm: ServiceSelectionAlgorithmOutcome::StableHash,
+            forwarding_mode: ServiceForwardingModeOutcome::Nat,
         });
         entry.service = Some(unf_state::ServiceFlowOutcome {
             service_id: ServiceId::new(11),
@@ -10731,6 +11252,10 @@ mod tests {
             action: 2,
             reason: 12,
             frontend_kind: unf_state::ServiceFrontendKind::LoadBalancerLocal,
+            selection_tier: ServiceSelectionTier::SameNode,
+            affinity_outcome: ServiceAffinityOutcome::None,
+            selection_algorithm: ServiceSelectionAlgorithmOutcome::StableHash,
+            forwarding_mode: ServiceForwardingModeOutcome::Nat,
         });
         validate_flow_export_batch(&source_denied)
             .expect("LoadBalancer source-range denial provenance is accepted");

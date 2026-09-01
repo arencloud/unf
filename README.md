@@ -12,8 +12,9 @@ Phase 1 established observation, Phase 2 added identity-aware L3/L4 enforcement,
 Phase 3 completed bounded Kubernetes compatibility and simulation, the full-CNI
 foundation owns dual-stack Pod networking, and Phases 4–6 provide native eBPF
 dual-stack ClusterIP, NodePort, and explicit-class LoadBalancer fabrics on exact
-kube-proxy-free Kind and OpenShift tuples. Phase 7 is now extending that base
-with locality, affinity, scalable selection, and opt-in DSR contracts.
+kube-proxy-free Kind and OpenShift tuples. Phase 7 has verified locality,
+affinity, scalable selection, opt-in DSR, and their bounded operations contracts;
+independent advanced-Service Kind and OpenShift qualification remains.
 UNF is **not production-ready**; these results are bounded development
 qualifications, not a general production support claim.
 
@@ -369,6 +370,17 @@ NAT fallback. Forward-only connection state and a direct-return packet are
 real-kernel tested under persistent ABI v11. `make service-dsr-dataplane-test`
 and ADR 0109 record the workstation boundary; actual cross-worker backend-VIP
 ownership and return routing remain Phase 7.9/7.10 platform gates.
+Milestone 7.8 is verified by `make service-selection-operations-test` and ADR
+0110. Fixed-name metrics and validated status-v8 expose the selected tier,
+actual StableHash/Maglev algorithm, affinity reuse/create/reselection, and
+NAT/DSR mode without Service/backend labels. Flow export v6 and durable history
+v7/checkpoint v6 retain the same backend and revision witness; older evidence
+migrates explicitly as `unknown`. `unfctl service-explain` correlates current
+intent and drain state with observation-weighted revision history, while
+`unfctl cluster-ip-simulate`, `unfctl service-simulate`, and `unfctl
+load-balancer-simulate` return
+the digest-bound per-Node eligibility plan without mutating state or guessing
+private connection/affinity entries. Persistent eBPF ownership remains ABI v11.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -579,9 +591,9 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-In progress in Phase 7: operations and
-independent Kind/OpenShift qualification for the verified locality, topology,
-ClientIP affinity, graceful-draining, Maglev, and DSR dataplanes. Not yet implemented:
+In progress in Phase 7: independent Kind/OpenShift qualification for the
+verified locality, topology, ClientIP affinity, graceful-draining, Maglev, DSR,
+operations, and recovery tuple. Not yet implemented:
 production-scale routing/CNI qualification;
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
 multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production

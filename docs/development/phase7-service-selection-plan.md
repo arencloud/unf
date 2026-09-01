@@ -21,7 +21,7 @@ and connection-state foundation. The authoritative feature state remains in
 | 7.5 | ClientIP affinity and graceful draining | **Verified** | `make service-affinity-dataplane-test` proves exact original-client/frontend keys, 1–86,400 second timeout encoding, eligible bank+revision reuse, explicit create/reuse/reselection outcomes, connection-before-affinity precedence, ready/non-terminating new-flow slots, established-flow survival during termination, dual-stack ClusterIP packet behavior, bounded LRU recovery under persistent ABI v9, inherited 7.4 gates, real-kernel verifier acceptance, and strict Clippy; ADR 0107 |
 | 7.6 | Measured Maglev selection | **Verified** | `make service-maglev-dataplane-test` regenerates the 2–4,096-backend fixture; proves deterministic prime tables with at least 16 slots/backend, at most 6.25% intrinsic table error, materially lower same-table add disruption, bounded memory/writes/compile time, the same hash/modulo/one-map packet path, capacity fallback with actual-algorithm flags, ClusterIP/NodePort/LoadBalancer lowering, annotation admission, ABI-v10 recovery/cleanup, inherited real-kernel gates, and strict Clippy; ADR 0108 |
 | 7.7 | Opt-in DSR dataplane | **Verified** | `make service-dsr-dataplane-test` proves explicit acknowledged UNF LoadBalancer-only intent, equal Service/backend tuples, dual-stack capability fencing, unchanged policy/source-range/selection/lifecycle semantics, VIP-preserving L2 redirect after route/neighbor/MTU FIB proof, fail-closed verifier-isolated tail stages, forward-only connection state and direct return, bounded mode provenance, 25-map ABI-v11 recovery/cleanup, all inherited privileged NAT paths, and strict Clippy; ADR 0109 |
-| 7.8 | Operations, simulation, upgrade, and recovery | **Planned** | Fixed-cardinality outcomes, validated status, durable history, tier/algorithm/affinity/DSR explanation, exact read-only simulation, checkpoint recovery, and adjacent compatibility |
+| 7.8 | Operations, simulation, upgrade, and recovery | **Verified** | `make service-selection-operations-test` preserves exact tier/algorithm/affinity/NAT-or-DSR witnesses through fixed-cardinality metrics and status-v8, export-v6, durable history-v7/checkpoint-v6, revision-aware explanation, and digest-bound ClusterIP/NodePort/LoadBalancer simulation; explicit unknown migration, adjacent v7/v8 and v5/v6 compatibility, inherited ABI-v11 recovery/cleanup, and strict Clippy; ADR 0110 |
 | 7.9 | Kube-proxy-free Kind qualification | **Planned** | Three-Node dual-stack external/Pod/host lifecycle, strict locality and fallback, affinity/drain, measured algorithm behavior, DSR if enabled, operations, controller/agent recovery, exact cleanup, and no-CNI rollback |
 | 7.10 | OpenShift qualification | **Planned** | Independent digest-pinned five-Node cl02 RHCOS/SELinux/CRI-O gate for cross-worker/node/zone behavior, source/return tuples, recovery, exact cleanup, convergence, and ClusterOperator comparison |
 
@@ -104,7 +104,8 @@ production availability/scale. Those capabilities require independent gates.
 
 ## Immediate next slice
 
-Milestone 7.8 exposes the verified tier, algorithm, affinity, backend, and
-NAT/DSR mode through fixed-cardinality metrics, validated status and durable
-history, revision-exact explanation, and read-only simulation. It also proves
-adjacent schema/ABI transitions and recovery before either platform gate.
+Milestone 7.9 qualifies the exact committed Phase 7.8 tuple on a three-Node
+kube-proxy-free dual-stack Kind cluster. The lifecycle must exercise strict
+locality and topology fallback, affinity timeout and draining, measured
+StableHash/Maglev behavior, DSR only when backend VIP ownership is installed,
+operations, controller/agent recovery, exact cleanup, and no-CNI rollback.
