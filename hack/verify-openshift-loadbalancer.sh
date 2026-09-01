@@ -758,13 +758,29 @@ for replacement_node in "${client_node}" "${server_node}"; do
         sleep 1
     done
     [[ -n ${new_agent} && ${new_agent} != "${old_agent}" ]]
-    recovered=$(agent_raw "${replacement_node}" /v1/status)
-    jq -e --argjson status_schema "${agent_status_schema}" '.schema_version == $status_schema and .ready and .bpf_loaded
+    recovered=
+    for _ in $(seq 1 180); do
+        recovered=$(agent_raw "${replacement_node}" /v1/status 2>/dev/null || true)
+        if jq -e --argjson status_schema "${agent_status_schema}" '
+            .schema_version == $status_schema and .ready and .bpf_loaded
+            and .applied_service_revision == .desired_service_revision
+            and .applied_load_balancer_revision == .desired_load_balancer_revision
+            and .applied_load_balancer_allocation_revision == .desired_load_balancer_allocation_revision
+            and .load_balancer_frontend_count == 24 and .load_balancer_source_range_count > 0
+            and .load_balancer_last_error == null
+        ' <<<"${recovered}" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    jq -e --argjson status_schema "${agent_status_schema}" '
+        .schema_version == $status_schema and .ready and .bpf_loaded
         and .applied_service_revision == .desired_service_revision
         and .applied_load_balancer_revision == .desired_load_balancer_revision
         and .applied_load_balancer_allocation_revision == .desired_load_balancer_allocation_revision
         and .load_balancer_frontend_count == 24 and .load_balancer_source_range_count > 0
-        and .load_balancer_last_error == null' <<<"${recovered}" >/dev/null
+        and .load_balancer_last_error == null
+    ' <<<"${recovered}" >/dev/null
     pod=$(advertiser_pod_on_node "${replacement_node}")
     "${kc[@]}" -n unf-system exec "${pod}" -- sh -euc '
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
