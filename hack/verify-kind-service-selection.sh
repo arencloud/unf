@@ -18,6 +18,8 @@ started_unix_seconds=$(date +%s)
 # per-run source-port window so repeated qualification against persistent maps
 # cannot collide with an unexpired flow from an earlier ClusterIP allocation.
 affinity_probe_port_base=$((40000 + started_unix_seconds % 20000))
+maglev_probe_port_base=$((affinity_probe_port_base + 100))
+stable_hash_probe_port_base=$((affinity_probe_port_base + 200))
 
 report_failure() {
     local status=$? line=${BASH_LINENO[0]:-unknown}
@@ -390,7 +392,9 @@ wait_for_convergence >/dev/null
 maglev_simulation=$(cluster_simulation "${selection_v4}" udp 5353)
 jq -e '.selection_tier == "cluster" and .selection_algorithm == "maglev"
     and (.eligible_backend_ids | length) == 3' <<<"${maglev_simulation}" >/dev/null
-for source_port in $(seq 41100 41131); do udp_probe 4 "${selection_v4}" "${source_port}"; done
+for offset in $(seq 0 31); do
+    udp_probe 4 "${selection_v4}" "$((maglev_probe_port_base + offset))"
+done
 maglev_history=$(wait_for_history "${selection_v4}" '
     any(.entries[]; .key.destination_ipv4 == $address
         and .service.selection_algorithm == "maglev" and .service.affinity_outcome == "none")')
@@ -400,7 +404,9 @@ wait_for_convergence >/dev/null
 stable_simulation=$(cluster_simulation "${selection_v6}" udp 5353)
 jq -e '.selection_tier == "cluster" and .selection_algorithm == "stableHash"
     and (.eligible_backend_ids | length) == 3' <<<"${stable_simulation}" >/dev/null
-for source_port in $(seq 41200 41215); do udp_probe 6 "${selection_v6}" "${source_port}"; done
+for offset in $(seq 0 15); do
+    udp_probe 6 "${selection_v6}" "$((stable_hash_probe_port_base + offset))"
+done
 stable_history=$(wait_for_history "${selection_v6}" '
     any(.entries[]; .key.destination_ipv6 == $address
         and .service.selection_algorithm == "stable_hash")')
