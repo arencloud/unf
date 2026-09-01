@@ -146,17 +146,17 @@ require_text hack/deploy-openshift-service-fabric.sh \
     'abi-v11-service-selection-staged-deployment' \
     "the OpenShift rollout must identify the ABI-v11 transition explicitly"
 require_text deploy/openshift-primary-cni/service-selection/kustomization.yaml \
-    'digest: sha256:475da40ee03a8d6ace4f844a07706d8201584c05a4383ccccce02f0378798b17' \
+    'digest: sha256:a11d5993cfbc4324a19f336a2d31c576ecd90d0215b5a29a56ba4c3cb60b8054' \
     "the OpenShift controller image must remain digest pinned"
 require_text deploy/openshift-primary-cni/service-selection/kustomization.yaml \
-    'digest: sha256:133c7be92db4b590eb9d20a08d84bb53c1338e0b183add0b4d6531a7490b27f0' \
+    'digest: sha256:48abbb46ff00f3dbfb121c292c0bb4719ae37d56c5fa2f5963b92e0abf63a751' \
     "the OpenShift agent image must remain digest pinned"
 jq -e '
     .schemaVersion == 1 and .phase == "7.10"
-    and .sourceRevision == "9e00711bfad9fd232bc875aa912456607259cff3"
+    and .sourceRevision == "4947ca0e3198ab41dd23cb6e91fc1eed05643e16"
     and .sourceRevision == .kindQualification.sourceRevision
     and .kindQualification.phase == "7.9"
-    and .kindQualification.qualificationRevision == "9e00711bfad9fd232bc875aa912456607259cff3"
+    and .kindQualification.qualificationRevision == "c84c571c625dfc5f6b068a618a9e2ec3f8f3d23c"
     and .kindQualification.result == "passed"
     and .kindQualification.kubeProxyPresent == false
     and .contracts.compatibilitySchemaVersion == 2
