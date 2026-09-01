@@ -13164,8 +13164,7 @@ mod tests {
         assert!(ensure_controller_compatibility(&controller).is_ok());
         controller.service_snapshot_schema_version = NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION;
         assert!(ensure_controller_compatibility(&controller).is_ok());
-        controller.service_snapshot_schema_version =
-            LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION;
+        controller.service_snapshot_schema_version = LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION;
         assert!(ensure_controller_compatibility(&controller).is_ok());
         controller.service_snapshot_schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
 

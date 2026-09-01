@@ -18,6 +18,10 @@ use unf_ebpf_common::{
     SERVICE_MAP_ABI_VERSION,
 };
 
+mod selection_contract;
+
+pub use selection_contract::*;
+
 pub use unf_common::SERVICE_SNAPSHOT_SCHEMA_VERSION;
 
 pub const LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;

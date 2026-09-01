@@ -15,7 +15,8 @@ and connection-state foundation. The authoritative feature state remains in
 |---|---|---|---|
 | 7.1 | Architecture and acceptance boundary | **Verified** | ADR 0102 fixes semantic precedence, ownership, compatibility, transactional state, measurement, operations, platform gates, cleanup, and exclusions; `make service-selection-boundary-test` prevents drift across the plan, tracker, roadmap, README, and component boundary |
 | 7.2 | Service schema v4 and Kubernetes compiler | **Verified** | Schema v4 carries typed/defaulted `internalTrafficPolicy`, ClientIP timeout, canonical traffic distribution, algorithm, and forwarding intent. Exact timeout/enum validation, v1/v2/v3 migration and safe projection, legacy fencing, Kubernetes conversion, unchanged default lowering, and explicit pre-transaction rejection pass `make service-selection-ir-test`; ADR 0103 |
-| 7.3 | Compatible distribution and transactional selection state | **Planned** | Explicit old/new negotiation, per-Node eligibility plans, owner-only checkpoints, inactive staging/readback/activation, rollback/crash repair/restart reconstruction, and exact versioned cleanup |
+| 7.2a | Network Behavior Contract and reference validator | **Verified** | Schema-v1 canonical per-Node contracts independently bind source/topology/contract revisions, exact frontend intent, strict-policy-first tiers, eligible family/protocol/placement sets, and Node capabilities. Domain-separated SHA-256 plan/contract digests, compact decision witnesses, bounded explicit single-failure envelopes, golden encoding, mutation/property/replay tests, and strict Clippy pass `make service-selection-contract-test`; ADR 0104 |
+| 7.3 | Compatible distribution and transactional selection state | **Planned** | Explicit old/new negotiation, per-Node verified contracts, owner-only digest-bound checkpoints, inactive staging/readback/activation, rollback/crash repair/restart reconstruction, and exact versioned cleanup |
 | 7.4 | Internal locality and topology-aware dataplane | **Planned** | Dual-stack TCP/UDP strict internal Local plus ordered same-Node/same-zone/cluster fallback across applicable frontends, external-policy precedence, lifecycle, policy ordering, provenance, and inherited regressions |
 | 7.5 | ClientIP affinity and graceful draining | **Planned** | Original-client keyed bounded affinity, timeout/defaulting, current-eligibility revalidation, flow-versus-session precedence, ready/serving/terminating transitions, recovery, and exact retirement |
 | 7.6 | Measured Maglev selection | **Planned** | Reproducible comparison with the existing selector for balance, disruption, memory, compile/update latency, and packet lookup cost; bounded deterministic table/fallback/upgrade contract only if evidence supports adoption |
@@ -39,7 +40,8 @@ OpenShift with kube-proxy absent and demonstrates:
 - established-flow persistence, new-session affinity, and backend draining as
   distinct observable state machines;
 - userspace compilation and transactional activation of all per-Node selection
-  state, with bounded verifier-friendly eBPF lookups;
+  state only after Network Behavior Contract verification, with bounded
+  verifier-friendly eBPF lookups and compact decision witnesses;
 - measured algorithm evidence and no unsupported Maglev performance claim;
 - opt-in DSR only after route, neighbor, MTU, backend VIP, policy, source-range,
   return-path telemetry, lifecycle, recovery, and cleanup proofs;
@@ -102,9 +104,10 @@ production availability/scale. Those capabilities require independent gates.
 
 ## Immediate next slice
 
-Milestone 7.3 introduces per-Node eligibility and selection state. It must
-negotiate schema capability, preserve safe schema-v3 rollback while advanced
-intent is absent, reject false legacy convergence when it is present, and stage,
-read back, activate, checkpoint, recover, and clean exact owner-only state. No
-advanced packet behavior is considered implemented until its later real-packet
-gates pass.
+Milestone 7.3 introduces distribution and transactions for the verified per-Node
+contracts established by 7.2a. It must negotiate schema and contract capability,
+preserve safe schema-v3 rollback while advanced intent is absent, reject false
+legacy convergence when it is present, independently verify the contract before
+staging, bind inactive/readback/active/checkpoint state to its digest, and recover
+and clean exact owner-only state. No advanced packet behavior is considered
+implemented until its later real-packet gates pass.

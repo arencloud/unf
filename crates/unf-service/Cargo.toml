@@ -8,11 +8,14 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 unf-common = { path = "../unf-common" }
 unf-ebpf-common = { path = "../../ebpf/unf-ebpf-common" }
 
 [dev-dependencies]
+proptest.workspace = true
 serde_json.workspace = true
 
 [lints]

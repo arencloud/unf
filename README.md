@@ -310,6 +310,15 @@ unknown values fail closed, schemas v1/v2/v3 migrate only default state, and
 legacy projection refuses advanced intent. Existing lowerers explicitly reject
 advanced behavior until transactional state exists; `make
 service-selection-ir-test` and ADR 0103 record this non-dataplane boundary.
+Milestone 7.2a is verified: every future per-Node selection plan can be wrapped
+in a canonical Network Behavior Contract that binds its exact source, topology,
+Node, frontend, intent, eligibility tiers, and capabilities. Independent replay
+reproduces domain-separated SHA-256 plan/contract digests and bounded explicit
+endpoint/Node/zone failure outcomes; compact witnesses provide revision-exact
+decision provenance. Mutation, property, golden encoding, JSON replay, and
+strict Clippy pass `make service-selection-contract-test`; ADR 0104 records that
+this is a pre-activation control-plane contract, not packet behavior or a formal
+correctness proof.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

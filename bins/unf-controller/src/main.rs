@@ -7262,11 +7262,9 @@ mod tests {
         );
         assert!(!node_port.services[0].node_ports.is_empty());
         assert!(node_port.services[0].load_balancer.is_none());
-        let load_balancer = service_snapshot_for_schema(
-            &state,
-            LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION,
-        )
-        .expect("schema-v3 projection is available");
+        let load_balancer =
+            service_snapshot_for_schema(&state, LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION)
+                .expect("schema-v3 projection is available");
         assert_eq!(
             load_balancer.schema_version,
             LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION

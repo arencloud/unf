@@ -12,6 +12,7 @@ required_files=(
     docs/development/phase7-service-selection-plan.md
     docs/adr/0102-bound-advanced-service-selection.md
     docs/adr/0103-model-advanced-service-selection-in-schema-v4.md
+    docs/adr/0104-verify-network-behavior-contracts-before-activation.md
 )
 
 command -v rg >/dev/null 2>&1 || {
@@ -52,6 +53,18 @@ require_text docs/development/phase7-service-selection-plan.md \
 require_text docs/project-status.md \
     '| Service schema v4 and Kubernetes compiler | **Verified** |' \
     "the work breakdown must identify milestone 7.2 as verified"
+require_text docs/development/phase7-service-selection-plan.md \
+    '| 7.2a | Network Behavior Contract and reference validator | **Verified** |' \
+    "milestone 7.2a must remain verified"
+require_text docs/project-status.md \
+    '| Network Behavior Contract and reference validator | **Verified** |' \
+    "the work breakdown must identify milestone 7.2a as verified"
+require_text Makefile \
+    'service-selection-contract-test:' \
+    "the build must expose an isolated Network Behavior Contract gate"
+require_text docs/adr/0104-verify-network-behavior-contracts-before-activation.md \
+    'It does **not** mathematically prove the' \
+    "the contract must not overclaim formal verification"
 
 for relative_file in \
     README.md \

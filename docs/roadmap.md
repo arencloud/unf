@@ -518,16 +518,24 @@ matrix is maintained in the
   Kubernetes defaulting, v1/v2/v3 migration/projection, legacy fencing, and
   explicit pre-transaction lowerer rejection pass
   `make service-selection-ir-test`; ADR 0103.
+- Verified Network Behavior Contract boundary: canonical schema-v1 per-Node
+  plans bind source/topology/contract revisions, exact intent, strict-policy-first
+  eligibility, backend placement, and advertised capabilities. Independent
+  validation reproduces domain-separated SHA-256 digests and bounded explicit
+  endpoint/Node/zone failure outcomes; compact witnesses join later decisions
+  to retained evidence. Mutation, property, golden, compatibility, and replay
+  tests pass `make service-selection-contract-test`; ADR 0104.
 - Per-Node eligibility and selection plans are compiled in userspace and must
-  activate transactionally. The eBPF path performs bounded lookups and does not
-  interpret Kubernetes topology or affinity configuration.
+  pass contract verification before transactional activation. The eBPF path
+  performs bounded lookups and does not interpret Kubernetes topology,
+  affinity configuration, or verification logic.
 - Maglev is a measured candidate, not a label-only claim. Adoption requires
   deterministic balance/disruption, bounded memory and compile cost, stable
   upgrades, and verifier-visible packet-cost evidence against the current hash.
 - DSR is opt-in and cannot bypass route/neighbor/MTU safety, backend VIP
   ownership, policy, source ranges, health, reverse telemetry, or exact cleanup.
-- Schema/compiler, distribution/state, locality, affinity/draining, Maglev,
-  DSR, operations, Kind, and OpenShift remain ordered independent milestones;
+- Distribution/state, locality, affinity/draining, Maglev, DSR, operations,
+  Kind, and OpenShift remain ordered independent milestones;
   ADR 0102 and `make service-selection-boundary-test` define the first gate.
 - Weighted traffic splitting, latency/load feedback, cross-cluster selection,
   SCTP Services, fragments, generic NAT `RELATED`, and production scale remain

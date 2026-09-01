@@ -43,13 +43,17 @@ interchangeable. ADRs 0093–0101 define the implemented boundary.
 The accepted Phase 7 boundary assigns Kubernetes semantic conversion and
 bounded normalized affinity/locality/algorithm/forwarding intent to
 `unf-service`; the controller supplies authoritative Node placement and zone
-inputs. The agent will compile and transactionally own per-Node eligibility and
-selection state. `unf-ebpf-tc` may consume only fixed-width selected tiers,
-affinity records, and algorithm tables; it does not interpret Kubernetes
-strings or topology. DSR remains an explicit forwarding mode whose route, MTU,
-policy, return-path, and cleanup contracts must pass before activation. ADR
-0102 records the boundary; later milestones must not claim implementation from
-this ownership decision alone.
+inputs. `unf-service` now also owns the Network Behavior Contract reference
+validator: it independently binds exact intent, per-Node eligibility tiers,
+capabilities, revisions, bounded failure observations, and canonical digests.
+The agent will compile and transactionally own per-Node eligibility and
+selection state, but must verify its contract before activation. `unf-ebpf-tc`
+may consume only fixed-width selected tiers, affinity records, algorithm tables,
+and compact decision witnesses; it does not interpret Kubernetes strings,
+topology, or contract logic. DSR remains an explicit forwarding mode whose
+route, MTU, policy, return-path, and cleanup contracts must pass before
+activation. ADRs 0102 and 0104 record the boundary; later milestones must not
+claim packet implementation from this ownership decision alone.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,
