@@ -18,6 +18,7 @@ refreshing the old result.
 |---|---|---|---|---|---|
 | Kind | Kubernetes 1.35.0 | Debian 12 node / Fedora host, Linux 7.1.4, amd64 | kindnetd, IPv4/IPv6 | TCX and legacy netlink | `9dc6023`, Kind endpoint/scale/recovery/upgrade gates |
 | Kind matrix | Kubernetes 1.34.8 | Debian 13 node / Fedora host, Linux 7.1.4, amd64 | kindnetd, IPv4/IPv6 | TCX and legacy netlink | `da73359`, isolated endpoint/recovery/upgrade gate; ADR 0055 |
+| Kind service selection | Kubernetes 1.35.0 | Debian 12 node / Fedora host, Linux 7.1.4, amd64 | UNF primary CNI `481ee88`, IPv4/IPv6 | pinned TCX | `1f25e13`, kube-proxy-free locality/affinity/Maglev/DSR/recovery/rollback gate; ADR 0111 |
 | cl01 | OpenShift 4.22.9 / Kubernetes 1.35.6 | RHCOS 9.8, Linux 5.14, amd64 | OVN-Kubernetes, IPv4 | legacy netlink | `4f213c7`, adaptive OpenShift endpoint gate |
 | cl02 | OpenShift 4.22.9 / Kubernetes 1.35.6 | RHCOS 9.8, Linux 5.14, amd64 | OVN-Kubernetes, IPv4/IPv6 | legacy netlink | `9a376ae`, endpoint and digest-pinned transition gates |
 | cl02 primary CNI | OpenShift 4.22.10 / Kubernetes 1.35.6 | RHCOS 9.8.20260812-0, Linux 5.14.0-687.39.1, amd64 | UNF `f721f9a`, IPv4/IPv6 | legacy netlink | `a0ab2e5`, bootstrap/recovery plus kube-proxy-free service lifecycle and outage gates; ADRs 0073 and 0081 |
@@ -28,8 +29,10 @@ commands, result/ADR references, and scope for every row. Its explicit
 releases, kernels, architectures, CNIs, cluster shapes, and production artifact
 paths remain unqualified.
 
-The fifth row adds the exact installer-time UNF primary-CNI development tuple;
-it does not broaden the earlier OVN-Kubernetes cl02 claim. The fourth row
+The service-selection row adds the exact three-Node kube-proxy-free Kind tuple;
+it does not broaden the Kind kernel, cluster shape, OpenShift, or production
+claim. The sixth row adds the exact installer-time UNF primary-CNI development
+tuple; it does not broaden the earlier OVN-Kubernetes cl02 claim. The second row
 satisfies the multi-version exit requirement through the
 isolated `make kind-platform-matrix-test` gate. Future rows must independently
 pass enforcement, recovery, and upgrade on their actual kernel/attachment tuple;

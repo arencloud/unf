@@ -564,9 +564,15 @@ matrix is maintained in the
   NodePort, and LoadBalancer. Explicit unknown migration, adjacent compatibility,
   inherited ABI-v11 recovery, CLI queries, and strict Clippy pass
   `make service-selection-operations-test`; ADR 0110.
-- Kind and OpenShift remain ordered independent milestones. Kind
-  and OpenShift must independently prove actual backend VIP ownership and
-  cross-worker return routing; workstation evidence is not transitive.
+- Kube-proxy-free Kind qualification is verified. Runtime `481ee88` and
+  qualifier `1f25e13` passed the 467-second three-Node Kubernetes v1.35.0
+  dual-stack gate: strict locality/fallback, affinity/drain, measured
+  StableHash/Maglev provenance, acknowledged cross-worker DSR, operations,
+  controller-offline agent replacement, exact ABI-v11/CNI cleanup, and no-CNI
+  rollback; `hack/verify-kind-service-selection.sh`; ADR 0111.
+- OpenShift remains an independent Phase 7.10 milestone and must separately
+  prove actual backend VIP ownership and cross-worker return routing on the
+  digest-pinned RHCOS/SELinux/CRI-O tuple; Kind evidence is not transitive.
 - Weighted traffic splitting, latency/load feedback, cross-cluster selection,
   SCTP Services, fragments, generic NAT `RELATED`, and production scale remain
   separate gates.

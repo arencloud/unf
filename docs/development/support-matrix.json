@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "last_reviewed": "2026-08-31",
+  "last_reviewed": "2026-09-01",
   "qualification_semantics": {
     "qualified": "The exact row passed every listed gate at the recorded evidence revision.",
     "non_transitive": true,
@@ -117,6 +117,63 @@
         "controller, agent, persistent-state, and export recovery",
         "adjacent committed-revision upgrade and rollback",
         "exact platform provenance and bounded host-prerequisite restoration"
+      ]
+    },
+    {
+      "id": "kind-kubernetes-1.35-dual-unf-selection-amd64",
+      "state": "qualified",
+      "platform": {
+        "distribution": "Kubernetes",
+        "environment": "Kind v0.32.0 service-selection fixture",
+        "kubernetes_version": "v1.35.0",
+        "openshift_version": null
+      },
+      "nodes": {
+        "count": 3,
+        "os": "Debian GNU/Linux 12 (bookworm) Kind node on Fedora host",
+        "kernels": [
+          "7.1.4-204.fc44.x86_64"
+        ],
+        "architecture": "amd64",
+        "container_runtime": "containerd 2.2.0"
+      },
+      "networking": {
+        "cni": "UNF primary CNI and advanced Service-selection runtime revision 481ee8899b903d049d0fa5859ff3fa3787b9adb7",
+        "address_families": [
+          "ipv4",
+          "ipv6"
+        ]
+      },
+      "dataplane": {
+        "attachment_modes": [
+          "tcx_pinned"
+        ]
+      },
+      "evidence": {
+        "outcome": "passed",
+        "verified_at": "2026-09-01",
+        "revision": "1f25e1384fb92c5f9b81214b17ba42af41855340",
+        "commands": [
+          "make service-selection-operations-test",
+          "make primary-cni-installer-test",
+          "hack/verify-kind-service-selection.sh"
+        ],
+        "records": [
+          ".artifacts/phase6-loadbalancer-kind.json",
+          ".artifacts/phase7-service-selection-kind.json"
+        ],
+        "decisions": [
+          "docs/adr/0111-qualify-advanced-service-selection-on-kind.md"
+        ]
+      },
+      "qualified_scope": [
+        "kube-proxy-free three-node UNF primary-CNI lifecycle and exact no-CNI rollback",
+        "dual-stack SameNode, SameZone, and Cluster service-selection fallback",
+        "ClientIP affinity creation, reuse, timeout, reselection, and graceful endpoint withdrawal",
+        "measured Maglev and StableHash packet-path provenance",
+        "acknowledged cross-worker dual-stack LoadBalancer DSR with direct return",
+        "controller-offline worker-agent replacement with recovered selection contracts",
+        "status, history, simulation, ABI-v11 cleanup, and exact owned-state removal"
       ]
     },
     {
@@ -391,6 +448,7 @@
       "qualified_values": [
         "kindnetd",
         "OVN-Kubernetes",
+        "UNF primary CNI and advanced Service-selection runtime revision 481ee8899b903d049d0fa5859ff3fa3787b9adb7",
         "UNF primary CNI runtime revision f721f9a7a0084e908bfa3eda2896ec2c3521ebbb",
         "UNF primary CNI and LoadBalancer runtime revision 830771c87f52be2d41ce7d700a6c670690e7e516"
       ],
@@ -400,6 +458,7 @@
       "dimension": "Cluster shape",
       "qualified_values": [
         "two selected nodes",
+        "three-node Kind primary-CNI service-selection cluster with one control-plane and two workers",
         "five-node OpenShift primary-CNI cluster with three control-plane and two worker nodes"
       ],
       "boundary": "Larger clusters, multiple controller replicas, mixed kernels, and mixed attachment modes are unqualified."

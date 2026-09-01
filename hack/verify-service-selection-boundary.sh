@@ -18,6 +18,8 @@ required_files=(
     docs/adr/0107-enforce-client-ip-affinity-and-graceful-draining.md
     docs/adr/0108-adopt-bounded-measured-maglev-selection.md
     docs/adr/0109-enforce-explicit-loadbalancer-dsr.md
+    docs/adr/0110-preserve-and-explain-service-selection-outcomes.md
+    docs/adr/0111-qualify-advanced-service-selection-on-kind.md
     docs/benchmarks/phase7-maglev-measurement.md
 )
 
@@ -95,6 +97,21 @@ require_text docs/development/phase7-service-selection-plan.md \
 require_text docs/project-status.md \
     '| Opt-in DSR dataplane | **Verified** |' \
     "the work breakdown must identify milestone 7.7 as verified"
+require_text docs/development/phase7-service-selection-plan.md \
+    '| 7.8 | Operations, simulation, upgrade, and recovery | **Verified** |' \
+    "milestone 7.8 must remain verified"
+require_text docs/project-status.md \
+    '| Operations, simulation, upgrade, and recovery | **Verified** |' \
+    "the work breakdown must identify milestone 7.8 as verified"
+require_text docs/development/phase7-service-selection-plan.md \
+    '| 7.9 | Kube-proxy-free Kind qualification | **Verified** |' \
+    "milestone 7.9 must be verified"
+require_text docs/project-status.md \
+    '| Kube-proxy-free Kind qualification | **Verified** |' \
+    "the work breakdown must identify milestone 7.9 as verified"
+require_text docs/adr/0111-qualify-advanced-service-selection-on-kind.md \
+    'This promotes no OpenShift' \
+    "the Kind result must remain explicitly non-transitive"
 require_text Makefile \
     'service-selection-contract-test:' \
     "the build must expose an isolated Network Behavior Contract gate"
