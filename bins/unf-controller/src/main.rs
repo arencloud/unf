@@ -4742,18 +4742,7 @@ fn agent_convergence_snapshot(
     let nodes = expected_nodes
         .iter()
         .map(|node_name| {
-            let selection_requirement = service_selection_contract_for(
-                state,
-                node_name,
-                BTreeSet::from([SelectionCapability::StableHash, SelectionCapability::Nat]),
-            )
-            .ok()
-            .map(|contract| {
-                (
-                    contract.contract_revision,
-                    contract.contract_digest.to_string(),
-                )
-            });
+            let selection_requirements = service_selection_contract_requirements(state, node_name);
             let stored = reports.get(node_name);
             let fresh = stored.is_some_and(|stored| {
                 now_unix_ms.saturating_sub(stored.last_received_unix_ms)
@@ -4774,7 +4763,7 @@ fn agent_convergence_snapshot(
                         policy_revision,
                         service_revision,
                         selection_required,
-                        selection_requirement.as_ref(),
+                        &selection_requirements,
                         load_balancer_revision,
                         node_block_revisions
                             .get(node_name)
@@ -4895,7 +4884,7 @@ fn agent_report_matches(
     policy_revision: Revision,
     service_revision: (u64, Revision, bool),
     selection_required: bool,
-    selection_requirement: Option<&(Revision, String)>,
+    selection_requirements: &BTreeSet<(Revision, String)>,
     load_balancer_revision: Option<(u64, Revision, Revision)>,
     node_block_revision: Revision,
     remote_route_revision: (u64, Revision),
@@ -4917,14 +4906,22 @@ fn agent_report_matches(
         && (!service_revision.2
             || report.service_snapshot_schema_version
                 >= LOAD_BALANCER_SERVICE_SNAPSHOT_SCHEMA_VERSION)
-        && (!selection_required
-            || selection_requirement.is_some_and(|(revision, digest)| {
-                report.selection_contract_schema_version >= SELECTION_CONTRACT_SCHEMA_VERSION
-                    && report.desired_selection_contract_revision == revision.get()
-                    && report.applied_selection_contract_revision == revision.get()
-                    && report.desired_selection_contract_digest.as_ref() == Some(digest)
-                    && report.applied_selection_contract_digest.as_ref() == Some(digest)
-            }))
+        && (!selection_required || {
+            report.selection_contract_schema_version >= SELECTION_CONTRACT_SCHEMA_VERSION
+                && report.desired_selection_contract_revision
+                    == report.applied_selection_contract_revision
+                && report.desired_selection_contract_digest
+                    == report.applied_selection_contract_digest
+                && report
+                    .desired_selection_contract_digest
+                    .as_ref()
+                    .is_some_and(|digest| {
+                        selection_requirements.contains(&(
+                            Revision::new(report.desired_selection_contract_revision),
+                            digest.clone(),
+                        ))
+                    })
+        })
         && report.failed_service_epoch == 0
         && report.failed_service_revision == 0
         && report.service_last_error.is_none()
@@ -5049,6 +5046,41 @@ fn service_selection_contract_for(
             "compile service selection contract for node {node_name}: {error}"
         ))
     })
+}
+
+/// Enumerate the bounded set of contracts that this controller can issue to
+/// agents with the mandatory selector/NAT baseline and any supported optional
+/// Maglev/DSR capability combination. Agent capabilities are request-scoped,
+/// so convergence must validate the reported digest against an issuable
+/// contract rather than silently assuming one capability tuple.
+fn service_selection_contract_requirements(
+    state: &ControllerState,
+    node_name: &str,
+) -> BTreeSet<(Revision, String)> {
+    let optional = [
+        SelectionCapability::Maglev,
+        SelectionCapability::DsrIpv4,
+        SelectionCapability::DsrIpv6,
+    ];
+    (0_u8..8)
+        .filter_map(|mask| {
+            let mut capabilities =
+                BTreeSet::from([SelectionCapability::StableHash, SelectionCapability::Nat]);
+            for (bit, capability) in optional.iter().copied().enumerate() {
+                if mask & (1 << bit) != 0 {
+                    capabilities.insert(capability);
+                }
+            }
+            service_selection_contract_for(state, node_name, capabilities)
+                .ok()
+                .map(|contract| {
+                    (
+                        contract.contract_revision,
+                        contract.contract_digest.to_string(),
+                    )
+                })
+        })
+        .collect()
 }
 
 fn simulation_selection_plan(
@@ -9165,18 +9197,42 @@ mod tests {
         }
     }
 
-    fn acknowledge_current_selection(state: &ControllerState, report: &mut AgentStateReport) {
-        let contract = service_selection_contract_for(
-            state,
-            &report.node_name,
-            BTreeSet::from([SelectionCapability::StableHash, SelectionCapability::Nat]),
-        )
-        .expect("current per-Node selection contract compiles");
+    fn acknowledge_selection_with_capabilities(
+        state: &ControllerState,
+        report: &mut AgentStateReport,
+        capabilities: BTreeSet<SelectionCapability>,
+    ) {
+        let contract = service_selection_contract_for(state, &report.node_name, capabilities)
+            .expect("current per-Node selection contract compiles");
         report.desired_selection_contract_revision = contract.contract_revision.get();
         report.applied_selection_contract_revision = contract.contract_revision.get();
         report.desired_selection_contract_digest = Some(contract.contract_digest.to_string());
         report.applied_selection_contract_digest = Some(contract.contract_digest.to_string());
         report.active_selection_bank = 1;
+    }
+
+    fn acknowledge_current_selection(state: &ControllerState, report: &mut AgentStateReport) {
+        acknowledge_selection_with_capabilities(
+            state,
+            report,
+            BTreeSet::from([
+                SelectionCapability::StableHash,
+                SelectionCapability::Maglev,
+                SelectionCapability::Nat,
+                SelectionCapability::DsrIpv4,
+                SelectionCapability::DsrIpv6,
+            ]),
+        );
+    }
+
+    fn store_agent_report(state: &ControllerState, report: &AgentStateReport) {
+        write_lock(&state.agent_reports).insert(
+            report.node_name.clone(),
+            StoredAgentReport {
+                report: report.clone(),
+                last_received_unix_ms: 100,
+            },
+        );
     }
 
     #[test]
@@ -9729,13 +9785,7 @@ mod tests {
         assert_eq!(missing.expected_agents, 1);
         assert_eq!(missing.missing_agents, 1);
         assert!(!missing.all_converged);
-        write_lock(&state.agent_reports).insert(
-            report.node_name.clone(),
-            StoredAgentReport {
-                report: report.clone(),
-                last_received_unix_ms: 100,
-            },
-        );
+        store_agent_report(&state, &report);
 
         let converged =
             agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100);
@@ -9862,6 +9912,17 @@ mod tests {
         report.service_frontend_count = snapshot.services[0].frontends.len() as u64;
         acknowledge_current_selection(&state, &mut report);
         validate_agent_status(&report).expect("service acknowledgement is valid");
+        store_agent_report(&state, &report);
+        assert!(
+            agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
+                .all_converged
+        );
+
+        acknowledge_selection_with_capabilities(
+            &state,
+            &mut report,
+            BTreeSet::from([SelectionCapability::StableHash, SelectionCapability::Nat]),
+        );
         write_lock(&state.agent_reports).insert(
             report.node_name.clone(),
             StoredAgentReport {
@@ -9871,20 +9932,16 @@ mod tests {
         );
         assert!(
             agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
-                .all_converged
+                .all_converged,
+            "a controller-issued bounded capability subset remains converged"
         );
+        acknowledge_current_selection(&state, &mut report);
 
         report.applied_service_epoch = 0;
         report.applied_service_revision = 0;
         report.service_count = 0;
         report.service_frontend_count = 0;
-        write_lock(&state.agent_reports).insert(
-            report.node_name.clone(),
-            StoredAgentReport {
-                report,
-                last_received_unix_ms: 100,
-            },
-        );
+        store_agent_report(&state, &report);
         assert!(
             !agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
                 .all_converged
@@ -9905,26 +9962,14 @@ mod tests {
             .sum();
         acknowledge_current_selection(&state, &mut legacy_report);
         legacy_report.service_snapshot_schema_version = LEGACY_SERVICE_SNAPSHOT_SCHEMA_VERSION;
-        write_lock(&state.agent_reports).insert(
-            legacy_report.node_name.clone(),
-            StoredAgentReport {
-                report: legacy_report.clone(),
-                last_received_unix_ms: 100,
-            },
-        );
+        store_agent_report(&state, &legacy_report);
         assert!(
             !agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
                 .all_converged
         );
 
         legacy_report.service_snapshot_schema_version = SERVICE_SNAPSHOT_SCHEMA_VERSION;
-        write_lock(&state.agent_reports).insert(
-            legacy_report.node_name.clone(),
-            StoredAgentReport {
-                report: legacy_report,
-                last_received_unix_ms: 100,
-            },
-        );
+        store_agent_report(&state, &legacy_report);
         assert!(
             agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
                 .all_converged
@@ -9939,13 +9984,7 @@ mod tests {
         node_port_report.applied_service_revision = snapshot.revision.get();
         node_port_report.service_snapshot_schema_version =
             NODE_PORT_SERVICE_SNAPSHOT_SCHEMA_VERSION;
-        write_lock(&state.agent_reports).insert(
-            node_port_report.node_name.clone(),
-            StoredAgentReport {
-                report: node_port_report,
-                last_received_unix_ms: 100,
-            },
-        );
+        store_agent_report(&state, &node_port_report);
         assert!(
             !agent_convergence_snapshot(&state, Revision::default(), Revision::default(), 100)
                 .all_converged
