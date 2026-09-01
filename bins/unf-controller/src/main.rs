@@ -1927,14 +1927,14 @@ async fn persist_load_balancer_runtime(
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {
-            "name": LOAD_BALANCER_STATUS_STORE_NAME,
+            "name": LOAD_BALANCER_STORE_NAME,
             "namespace": "unf-system",
         },
         "data": data,
     });
     api.patch(
-        LOAD_BALANCER_STATUS_STORE_NAME,
-        &PatchParams::apply("unf-controller-load-balancer-status").force(),
+        LOAD_BALANCER_STORE_NAME,
+        &PatchParams::apply("unf-controller-load-balancer").force(),
         &Patch::Apply(&patch),
     )
     .await
@@ -1973,7 +1973,7 @@ async fn persist_load_balancer_status_ownership(
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {
-            "name": LOAD_BALANCER_STORE_NAME,
+            "name": LOAD_BALANCER_STATUS_STORE_NAME,
             "namespace": "unf-system",
         },
         "data": {
@@ -1981,8 +1981,8 @@ async fn persist_load_balancer_status_ownership(
         },
     });
     api.patch(
-        LOAD_BALANCER_STORE_NAME,
-        &PatchParams::apply("unf-controller-load-balancer").force(),
+        LOAD_BALANCER_STATUS_STORE_NAME,
+        &PatchParams::apply("unf-controller-load-balancer-status").force(),
         &Patch::Apply(&patch),
     )
     .await
