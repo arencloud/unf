@@ -106,7 +106,7 @@ const SERVICE_DSR_HANDOFF_MARK: u32 = 1 << 31;
 // is deliberately independent from the persistent map ABI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-static SERVICE_DSR_TRANSPORT_INTERFACES: [u32; 4] = [0; 4];
+static mut SERVICE_DSR_TRANSPORT_INTERFACES: [u32; 4] = [0; 4];
 
 #[map]
 static FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -404,16 +404,11 @@ fn normalize_service_dsr_vlan(ctx: &TcContext, lookup: &BpfFibLookup) -> bool {
 
 #[inline(always)]
 fn service_dsr_transport_interface(lookup: &BpfFibLookup) -> bool {
+    let configured = service_dsr_transport_interfaces();
     let interfaces = if lookup.family == ADDRESS_FAMILY_INET {
-        [
-            SERVICE_DSR_TRANSPORT_INTERFACES[0],
-            SERVICE_DSR_TRANSPORT_INTERFACES[1],
-        ]
+        [configured[0], configured[1]]
     } else if lookup.family == ADDRESS_FAMILY_INET6 {
-        [
-            SERVICE_DSR_TRANSPORT_INTERFACES[2],
-            SERVICE_DSR_TRANSPORT_INTERFACES[3],
-        ]
+        [configured[2], configured[3]]
     } else {
         return false;
     };
@@ -423,11 +418,27 @@ fn service_dsr_transport_interface(lookup: &BpfFibLookup) -> bool {
 
 #[inline(always)]
 fn service_dsr_transport_ifindex(ifindex: u32) -> bool {
+    let interfaces = service_dsr_transport_interfaces();
     ifindex > 1
-        && (ifindex == SERVICE_DSR_TRANSPORT_INTERFACES[0]
-            || ifindex == SERVICE_DSR_TRANSPORT_INTERFACES[1]
-            || ifindex == SERVICE_DSR_TRANSPORT_INTERFACES[2]
-            || ifindex == SERVICE_DSR_TRANSPORT_INTERFACES[3])
+        && (ifindex == interfaces[0]
+            || ifindex == interfaces[1]
+            || ifindex == interfaces[2]
+            || ifindex == interfaces[3])
+}
+
+#[inline(always)]
+fn service_dsr_transport_interfaces() -> [u32; 4] {
+    // The agent rewrites this global while loading the object. A volatile read
+    // is required so LLVM cannot replace the externally supplied value with
+    // the all-zero object initializer and remove the transport-only branches.
+    // SAFETY: the loader completes the write before any classifier can run;
+    // classifiers only read the fixed-size value afterward.
+    #[allow(unsafe_code)]
+    unsafe {
+        core::ptr::read_volatile(core::ptr::addr_of!(
+            SERVICE_DSR_TRANSPORT_INTERFACES
+        ))
+    }
 }
 
 #[inline(always)]
