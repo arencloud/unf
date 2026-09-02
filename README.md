@@ -403,15 +403,17 @@ cross-worker DSR source/return tuples and source ranges, controller-offline
 worker-agent replacement, exact cleanup, five-agent convergence, and unchanged
 `insights`/`network` unhealthy baseline passed
 `hack/verify-openshift-service-selection.sh`; ADR 0112.
-Phase 8 begins an identity-aware enterprise egress fabric. Milestone 8.1 is an
-architecture-only boundary: source-side security policy precedes steering and
-NAT; explicit pools, lease-fenced gateways, reachability providers, and
-dataplane publication have separate revisions; and agents must independently
-verify an Egress Behavior Contract before activation. Native egress remains the
-safe default until explicit intent is admitted. The
-[Phase 8 plan](docs/development/phase8-egress-fabric-plan.md), ADR 0113, and
-`make egress-fabric-boundary-test` track the work; no egress-gateway packet-path
-or platform claim is made yet.
+Phase 8 begins an identity-aware enterprise egress fabric. Milestones 8.1 and
+8.2 are verified. Source-side security policy precedes steering and NAT, while
+`unf-egress` now canonically validates bounded Namespace, workload, and
+ServiceAccount selectors, destinations, non-overlapping dual-stack pools, and
+pool or explicit multiple-address intent. The controller strictly translates
+OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
+status ownership. Native egress remains the safe default until explicit intent
+is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md),
+ADRs 0113–0114, and `make egress-intent-test` track the work. Milestone 8.2a
+behavior contracts are next; no egress-gateway packet-path or platform claim is
+made yet.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

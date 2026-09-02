@@ -606,8 +606,13 @@ matrix is maintained in the
   unchanged unless explicit admitted intent owns the flow.
 - FQDN controls use bounded TTL/staleness/provenance-aware address sets; DNS
   names and answers never become workload identity.
-- Milestone 8.1 changes no BPF ABI, host routing, address ownership, packet
-  behavior, or platform claim. Milestone 8.2 defines typed intent and pools.
+- Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
+  ServiceAccount selectors; canonical destinations and non-overlapping
+  dual-stack pools; pool-family/multiple-address intent; strict OpenShift
+  EgressIP translation/defaulting; and foreign status preservation pass
+  `make egress-intent-test`; ADR 0114. It changes no BPF ABI, host routing,
+  address ownership, watcher/RBAC behavior, packet behavior, or platform claim.
+- Milestone 8.2a defines the independently replayed Egress Behavior Contract.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

@@ -3025,12 +3025,14 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "unf-api",
  "unf-common",
+ "unf-egress",
  "unf-ipam",
  "unf-loadbalancer",
  "unf-policy",
@@ -3044,6 +3046,15 @@ name = "unf-ebpf-common"
 version = "0.1.0"
 dependencies = [
  "unf-common",
+]
+
+[[package]]
+name = "unf-egress"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

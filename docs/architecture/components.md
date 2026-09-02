@@ -74,7 +74,11 @@ agent will independently verify exact-Node plans and transactionally own host
 steering/NAT state; `unf-ebpf-tc` may consume only fixed-width decisions after
 source-side policy. Static, BGP, cloud, and cross-cluster reachability providers
 must not fork policy or NAT semantics. ADR 0113 defines this architecture-only
-boundary; Phase 8.1 changes no current component ABI or packet behavior.
+boundary. Milestone 8.2 now implements the `unf-egress` model with canonical
+bounded selectors, destinations, pools, and address requests. The controller's
+strict OpenShift EgressIP adapter feeds that same model and exposes a
+foreign-preserving status merge without watching or mutating cluster state yet;
+ADR 0114. Phase 8.2 changes no current BPF ABI, host state, or packet behavior.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

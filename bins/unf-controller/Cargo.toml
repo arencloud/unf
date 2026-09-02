@@ -19,12 +19,14 @@ reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 unf-api = { path = "../../crates/unf-api" }
 unf-common = { path = "../../crates/unf-common" }
+unf-egress = { path = "../../crates/unf-egress" }
 unf-ipam = { path = "../../crates/unf-ipam" }
 unf-loadbalancer = { path = "../../crates/unf-loadbalancer" }
 unf-policy = { path = "../../crates/unf-policy" }

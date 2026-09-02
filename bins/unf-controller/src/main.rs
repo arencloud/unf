@@ -92,6 +92,7 @@ use unf_state::{
 };
 
 mod external_flow_export;
+pub mod openshift_egress_ip;
 
 const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
     Some(revision) => revision,
