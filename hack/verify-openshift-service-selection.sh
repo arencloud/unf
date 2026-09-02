@@ -495,8 +495,24 @@ jq -e '.selection_tier == "cluster" and .selection_algorithm == "stableHash"
 for offset in $(seq 30 37); do udp_probe 6 "${selection_v6}" "$((probe_base + offset))"; done
 
 stage=acknowledged-cross-worker-dsr
-allowed_v4=$(node_address "${same_zone_node}" 4)
-allowed_v6=$(node_address "${same_zone_node}" 6)
+"${kc[@]}" -n "${namespace}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: selection-external, namespace: ${namespace}}
+spec:
+  nodeName: ${same_zone_node}
+  restartPolicy: Never
+  tolerations: [{operator: Exists}]
+  containers:
+    - name: client
+      image: ${test_tools_image}
+      imagePullPolicy: IfNotPresent
+      command: [sh, -ec, "sleep infinity"]
+EOF
+"${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/selection-external --timeout=180s >/dev/null
+mapfile -t external_ips < <(pod_addresses selection-external)
+allowed_v4=$(printf '%s\n' "${external_ips[@]}" | grep -F '.')
+allowed_v6=$(printf '%s\n' "${external_ips[@]}" | grep -F ':')
 [[ -n ${allowed_v4} && -n ${allowed_v6} ]]
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: v1
@@ -565,25 +581,8 @@ spec:
   volumes:
     - name: host
       hostPath: {path: /, type: Directory}
----
-apiVersion: v1
-kind: Pod
-metadata: {name: selection-external, namespace: ${namespace}}
-spec:
-  serviceAccountName: selection-privileged
-  nodeName: ${same_zone_node}
-  hostNetwork: true
-  restartPolicy: Never
-  tolerations: [{operator: Exists}]
-  containers:
-    - name: client
-      image: ${test_tools_image}
-      imagePullPolicy: IfNotPresent
-      securityContext: {privileged: true}
-      command: [sh, -ec, "sleep infinity"]
 EOF
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/selection-advertiser --timeout=180s >/dev/null
-"${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/selection-external --timeout=180s >/dev/null
 advertiser_created=true
 "${kc[@]}" -n "${namespace}" exec selection-advertiser -- sh -euc '
     ip -4 address add "$1/32" dev br-ex
@@ -603,7 +602,7 @@ done
 observed_v4=$("${kc[@]}" -n "${namespace}" exec selection-external -- sh -ec "printf probe | socat -T 10 - TCP4:${dsr_v4}:8081" | tr -d '\r\n')
 observed_v6=$("${kc[@]}" -n "${namespace}" exec selection-external -- sh -ec "printf probe | socat -T 10 - 'TCP6:[${dsr_v6}]:8081'" | tr -d '\r\n'); observed_v6=${observed_v6#[}; observed_v6=${observed_v6%]}
 [[ ${observed_v4} == "${allowed_v4}" ]]
-[[ $(ip -6 route get "${observed_v6}" | awk 'NR == 1 {print ($1 == "local" ? $2 : $1)}') == "${allowed_v6}" ]]
+[[ ${observed_v6} == "${allowed_v6}" ]]
 wait_for_dsr_history "${dsr_v4}" >/dev/null
 "${kc[@]}" -n "${namespace}" patch service dsr --type=merge -p \
     '{"spec":{"loadBalancerSourceRanges":["192.0.2.1/32","2001:db8::1/128"]}}' >/dev/null
@@ -722,7 +721,8 @@ jq -n --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg context "${contex
     --arg kubernetesVersion "$("${kc[@]}" version -o json | jq -r .serverVersion.gitVersion)" \
     --arg controllerImage "${controller_image}" --arg agentImage "${agent_image}" --arg testToolsImage "${test_tools_image}" \
     --arg regressionEvidence "${regression_evidence}" --arg selectionIPv4 "${selection_v4}" --arg selectionIPv6 "${selection_v6}" \
-    --arg dsrIPv4 "${dsr_v4}" --arg dsrIPv6 "${dsr_v6}" --arg allowedIPv4 "${allowed_v4}" --arg allowedIPv6 "${allowed_v6}" \
+    --arg dsrIPv4 "${dsr_v4}" --arg dsrIPv6 "${dsr_v6}" --arg dsrClientNode "${same_zone_node}" \
+    --arg allowedIPv4 "${allowed_v4}" --arg allowedIPv6 "${allowed_v6}" \
     --argjson durationSeconds "$(( $(date +%s) - started_unix ))" --argjson nodes "${node_evidence}" \
     --argjson images "${image_evidence}" --argjson agents "${final_agents}" \
     --argjson sameNode "${same_node_simulation}" --argjson sameZone "${same_zone_simulation}" \
@@ -738,7 +738,8 @@ jq -n --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg context "${contex
       selectionContractSchemaVersion:1,agentStatusSchemaVersion:8,
       loadBalancerRegressionEvidence:$regressionEvidence,
       services:{selection:{ipv4:$selectionIPv4,ipv6:$selectionIPv6},
-        dsr:{ipv4:$dsrIPv4,ipv6:$dsrIPv6}},externalClient:{ipv4:$allowedIPv4,ipv6:$allowedIPv6},
+        dsr:{ipv4:$dsrIPv4,ipv6:$dsrIPv6}},
+      dsrClient:{scope:"podNetwork",node:$dsrClientNode,ipv4:$allowedIPv4,ipv6:$allowedIPv6},
       simulations:{sameNode:$sameNode,sameZone:$sameZone,clusterFallback:$cluster,
         maglev:$maglev,stableHash:$stableHash,dsr:$dsr},
       baselineUnhealthyOperators:$baselineUnhealthy,finalUnhealthyOperators:$finalUnhealthy,
@@ -749,7 +750,7 @@ jq -n --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg context "${contex
         "cross-worker and cross-zone IPv4/IPv6 SameNode, SameZone, and Cluster fallback",
         "ClientIP affinity creation, reuse, timeout, ineligible-backend reselection, and graceful draining",
         "Maglev and stable-hash packet-path provenance with three eligible backends",
-        "acknowledged cross-worker dual-stack DSR with explicit backend VIP ownership",
+        "acknowledged cross-worker dual-stack DSR from a third-Node Pod client with explicit backend VIP ownership",
         "DSR original-source preservation, VIP return tuple, source-range denial, and recovery",
         "status-v8, history-v7, fixed-cardinality metrics, and digest-bound simulations",
         "controller-offline replacement of both worker agents from ABI-v11 private checkpoints",
