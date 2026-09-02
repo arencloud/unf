@@ -279,6 +279,28 @@ wait_for_history() {
     return 1
 }
 
+wait_for_algorithm_history() {
+    local address=$1 family=$2 algorithm=$3 source_port=$4 history=
+    local since_ms=$((started_unix * 1000)) attempt
+    for attempt in $(seq 1 120); do
+        # A busy OpenShift cluster can evict a one-shot selection event before
+        # the API proxy returns it. Use a new tuple immediately before each
+        # bounded query so the dataplane algorithm is observed directly.
+        udp_probe "${family}" "${address}" "$((source_port + attempt))"
+        history=$(controller_raw "/v1/flows?since_unix_ms=${since_ms}&limit=4096" 2>/dev/null || true)
+        if jq -e --arg address "${address}" --arg algorithm "${algorithm}" '
+            .schema_version == 7
+            and any(.entries[]; .key.destination_ipv4 == $address
+                and .service.selection_algorithm == $algorithm)
+        ' <<<"${history}" >/dev/null 2>&1; then
+            printf '%s\n' "${history}"
+            return 0
+        fi
+    done
+    echo "advanced service algorithm history assertion timed out: ${algorithm}" >&2
+    return 1
+}
+
 wait_for_dsr_history() {
     local address=$1 history= since_ms=$((started_unix * 1000))
     for _ in $(seq 1 120); do
@@ -491,8 +513,7 @@ maglev_simulation=$(cluster_simulation "${selection_v4}" udp 5353)
 jq -e '.selection_tier == "cluster" and .selection_algorithm == "maglev"
     and (.eligible_backend_ids | length) == 3' <<<"${maglev_simulation}" >/dev/null
 for offset in $(seq 10 25); do udp_probe 4 "${selection_v4}" "$((probe_base + offset))"; done
-wait_for_history "${selection_v4}" 'any(.entries[]; .key.destination_ipv4 == $address
-    and .service.selection_algorithm == "maglev")' >/dev/null
+wait_for_algorithm_history "${selection_v4}" 4 maglev "$((probe_base + 100))" >/dev/null
 "${kc[@]}" -n "${namespace}" annotate service selection \
     network.unf.io/service-selection-algorithm=stable-hash --overwrite >/dev/null
 wait_for_convergence >/dev/null
