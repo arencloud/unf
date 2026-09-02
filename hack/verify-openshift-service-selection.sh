@@ -555,8 +555,10 @@ addressType: IPv6
 ports: [{name: http, protocol: TCP, port: 8080}, {name: source, protocol: TCP, port: 8081}]
 endpoints: [{addresses: [${remote_v6}], nodeName: ${remote_node}, zone: zone-b, conditions: {ready: true, serving: true, terminating: false}}]
 EOF
+dsr_service=
 for _ in $(seq 1 900); do
-    mapfile -t dsr_vips < <("${kc[@]}" -n "${namespace}" get service dsr -o json | jq -r '.status.loadBalancer.ingress[]?.ip')
+    dsr_service=$("${kc[@]}" -n "${namespace}" get service dsr -o json 2>/dev/null || true)
+    mapfile -t dsr_vips < <(jq -r '.status.loadBalancer.ingress[]?.ip' <<<"${dsr_service}" 2>/dev/null || true)
     (( ${#dsr_vips[@]} == 2 )) && break
     sleep 1
 done
