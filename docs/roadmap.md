@@ -507,7 +507,7 @@ matrix is maintained in the
 
 ## Phase 7 — advanced Service selection
 
-**Gate: In progress.** The ordered evidence matrix is maintained in the
+**Gate: verified.** The ordered evidence matrix is maintained in the
 [Phase 7 service-selection plan](development/phase7-service-selection-plan.md).
 
 - Verified architecture boundary: strict `Local` eligibility takes precedence
@@ -553,9 +553,10 @@ matrix is maintained in the
 - Explicit LoadBalancer DSR is verified under persistent ABI v11. Dual
   annotations acknowledge backend VIP ownership; equal Service/backend tuples,
   per-family capabilities, existing selection/policy/source-range/lifecycle
-  order, FIB route/neighbor/MTU proof, VIP-preserving L2 redirect, forward-only
-  state/direct return, fail-closed verifier-isolated tail stages, provenance,
-  recovery, and cleanup pass `make service-dsr-dataplane-test`; ADR 0109.
+  order, FIB route/neighbor/MTU proof, VIP-preserving direct or neighbor output,
+  runtime-bound transport topology, forward-only state/direct return,
+  fail-closed verifier-isolated tail stages, provenance, recovery, and cleanup
+  pass `make service-dsr-dataplane-test`; ADR 0109.
 - Verified bounded operations preserve exact tier, actual StableHash/Maglev,
   affinity reuse/create/reselection, backend, revision, and NAT/DSR outcomes in
   fixed-name metrics, validated status-v8, export-v6, and durable
@@ -564,15 +565,21 @@ matrix is maintained in the
   NodePort, and LoadBalancer. Explicit unknown migration, adjacent compatibility,
   inherited ABI-v11 recovery, CLI queries, and strict Clippy pass
   `make service-selection-operations-test`; ADR 0110.
-- Kube-proxy-free Kind qualification is verified. Runtime `481ee88` and
-  qualifier `1f25e13` passed the 467-second three-Node Kubernetes v1.35.0
+- Kube-proxy-free Kind qualification is verified. Runtime/qualifier `06fc937`
+  passed the 463-second three-Node Kubernetes v1.35.0
   dual-stack gate: strict locality/fallback, affinity/drain, measured
   StableHash/Maglev provenance, acknowledged cross-worker DSR, operations,
   controller-offline agent replacement, exact ABI-v11/CNI cleanup, and no-CNI
   rollback; `hack/verify-kind-service-selection.sh`; ADR 0111.
-- OpenShift remains an independent Phase 7.10 milestone and must separately
-  prove actual backend VIP ownership and cross-worker return routing on the
-  digest-pinned RHCOS/SELinux/CRI-O tuple; Kind evidence is not transitive.
+- OpenShift qualification is independently verified. Runtime `06fc937`,
+  qualifier `018f14c`, and three immutable public Quay digests passed the
+  1,670-second five-Node OpenShift 4.22.10/Kubernetes 1.35.6 cl02 gate. The
+  complete Phase 6 regression, RHCOS/SELinux/CRI-O and kube-proxy absence,
+  cross-worker/node/zone dual-stack selection, affinity/draining,
+  Maglev/StableHash provenance, acknowledged DSR source/return semantics and
+  source ranges, controller-offline worker-agent replacement, exact cleanup,
+  five-agent convergence, and unchanged unhealthy-operator baseline passed;
+  ADR 0112. Kind and OpenShift evidence remain non-transitive.
 - Weighted traffic splitting, latency/load feedback, cross-cluster selection,
   SCTP Services, fragments, generic NAT `RELATED`, and production scale remain
   separate gates.

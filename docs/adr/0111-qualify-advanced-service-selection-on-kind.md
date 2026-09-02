@@ -1,6 +1,6 @@
 # ADR 0111: Qualify advanced Service selection on kube-proxy-free Kind
 
-**Status:** Accepted and live verified for Phase 7.9 (2026-09-01)
+**Status:** Accepted and live verified for Phase 7.9 (2026-09-02)
 
 ## Context
 
@@ -57,17 +57,17 @@ before rollback and extended only after rollback succeeds.
 
 ## Verification
 
-Runtime revision `481ee8899b903d049d0fa5859ff3fa3787b9adb7` and qualification
-revision `1f25e1384fb92c5f9b81214b17ba42af41855340` passed the complete live gate
-in 467 seconds. The controller image ID was
-`sha256:35701d8bec6431bf4670c875ea8caf85fe34b6b0baf27b6ec3c463cede5b039e`;
+Runtime and qualification revision
+`06fc937987fcfacc2809003381782f905e203d16` passed the complete live gate in
+463 seconds. The controller image ID was
+`sha256:49ee023367fbbb53b38ca985e42ba6dc3d041b68b6f4e7b595fabb06ac46e85c`;
 all three agents used
-`sha256:a7906d555d4073d48031940d21b06e5593da1040372da51c26cb2470711ee190`.
+`sha256:f717a9889e257bb807588c0fa818fbaf969b0b4e7a5645e84d39d1bbbd0ebfc9`.
 
 The fixture ran Kubernetes v1.35.0 on three Debian 12 Nodes with Linux
 7.1.4-204.fc44.x86_64. Evidence was written to
 `.artifacts/phase7-service-selection-kind.json`; its SHA-256 was
-`b4aa51c99987bfd1ee82737c8fcaf60209a85d5c485007c7c01461bdaa59de4d`
+`adb4d6ed663b0e2cb97d99fc8625e6a14ede08f06d35fa2adb53ff9ffe7fa45c`
 immediately after the successful run.
 
 The final rollback completed all three ABI-v11 cleanup Jobs and independently
@@ -78,10 +78,8 @@ restored to the intentional NotReady no-CNI baseline.
 ## Consequences
 
 Milestone 7.9 is Verified for this exact Kind tuple. This promotes no OpenShift
-or production claim. Phase 7 remains In progress until the independent 7.10
-digest-pinned five-Node cl02 gate proves cross-worker and cross-zone behavior,
-source and return tuples, acknowledged backend VIP ownership, recovery, exact
-cleanup, convergence, and ClusterOperator health on RHCOS/SELinux/CRI-O.
+or production claim; the independent five-Node cl02 result is recorded by ADR
+0112. Neither platform result promotes a production claim.
 
 Weighted traffic splitting, load- or latency-feedback routing, cross-cluster
 selection, SCTP Service forwarding, fragments, generic NAT `RELATED`, Gateway

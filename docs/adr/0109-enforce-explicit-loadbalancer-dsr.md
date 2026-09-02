@@ -41,9 +41,14 @@ The TC path selects and policy-checks the backend exactly as NAT does, including
 strict locality/topology, ClientIP affinity, Maglev, source ranges, endpoint
 lifecycle, and backend identity. DSR retains the packet's VIP and Service port.
 A synthetic FIB lookup against the selected backend proves route, effective MTU,
-output interface, and resolved neighbor; only source/destination Ethernet
-addresses are rewritten before redirect. Any FIB, neighbor, MTU, redirect, or
-jump-table failure drops with bounded DSR provenance.
+output interface, and resolved neighbor. Direct workload output rewrites the
+source/destination Ethernet addresses before redirect; configured transport
+interfaces use kernel neighbor output with the FIB-selected next hop so stacked
+VLAN encapsulation and checksum completion remain device-owned. The agent binds
+that per-Node transport topology into a mutable load-time symbol, and eBPF reads
+it as volatile state so optimization cannot remove the transport branch. Any
+FIB, neighbor, MTU, redirect, or jump-table failure drops with bounded DSR
+provenance.
 
 Policy evaluation and DSR FIB resolution run in verifier-isolated TC tail
 programs. A runtime-only four-entry program array connects IPv4/IPv6 parse and
@@ -64,12 +69,14 @@ recovery and cleanup ownership, strict Clippy, eBPF compilation, kernel verifier
 acceptance, and a privileged dual-stack packet test. The packet test proves VIP
 and port preservation, source-range rejection before selection, forward-only
 connection state, DSR event provenance, and an unchanged direct-return reply.
-The same real-kernel suite re-runs the existing ClusterIP, NodePort, affinity,
-topology, and LoadBalancer NAT packet paths after the pipeline split.
+The same 13-test real-kernel suite re-runs the existing ClusterIP, NodePort,
+affinity, topology, and LoadBalancer NAT packet paths after the pipeline split.
+The focused script also inspects the optimized object and rejects a build that
+does not retain `bpf_redirect_neigh`.
 
-Kind and OpenShift cross-worker qualification remain the independent Phase
-7.9 and 7.10 gates. They must configure backend VIP ownership and prove actual
-route/neighbor/MTU and return-path behavior on their recorded platforms.
+Independent Phase 7.9 Kind and 7.10 OpenShift gates configure backend VIP
+ownership and prove actual route/neighbor/MTU and return-path behavior on their
+recorded platforms. ADRs 0111 and 0112 record those non-transitive results.
 
 ## Consequences
 
@@ -80,10 +87,10 @@ route/neighbor/MTU and return-path behavior on their recorded platforms.
 - Backend VIP ownership is intentionally an external host-configuration
   contract; this milestone validates the acknowledgement but does not configure
   addresses inside workload network namespaces.
-- This is L2 DSR: the synthetic backend route must resolve to the backend or its
-  owning Node as the effective Ethernet next hop. Arbitrary routed gateways,
-  tunnels that cannot preserve the VIP, and asymmetric external fabrics remain
-  unqualified until their own platform evidence exists.
+- This is direct or neighbor-routed DSR: the synthetic backend route must resolve
+  to the backend or an owning-Node next hop. Kind qualifies direct transport and
+  cl02 qualifies its stacked-VLAN routed transport. Other gateways, tunnels, and
+  asymmetric external fabrics remain unqualified until their own evidence exists.
 - Runtime tail-call maps are recreated before hook attachment and cannot be
   mistaken for recoverable persistent state.
 - Operations and simulation consume the new forwarding provenance in milestone

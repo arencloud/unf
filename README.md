@@ -14,8 +14,8 @@ foundation owns dual-stack Pod networking, and Phases 4–6 provide native eBPF
 dual-stack ClusterIP, NodePort, and explicit-class LoadBalancer fabrics on exact
 kube-proxy-free Kind and OpenShift tuples. Phase 7 has verified locality,
 affinity, scalable selection, opt-in DSR, and their bounded operations contracts;
-the kube-proxy-free Kind tuple is live-qualified, while independent
-advanced-Service OpenShift qualification remains.
+the exact kube-proxy-free Kind and OpenShift tuples are independently
+live-qualified.
 UNF is **not production-ready**; these results are bounded development
 qualifications, not a general production support claim.
 
@@ -366,12 +366,14 @@ Services or changed backend ports, per-Node contracts require dual-stack DSR
 capabilities, and ClusterIP/NodePort frontends for the same Service stay NAT.
 The eBPF path retains the VIP tuple, applies the existing selection, lifecycle,
 source-range, and policy contracts, proves route/neighbor/MTU through a backend
-FIB lookup, rewrites only Ethernet addresses, and fails closed without per-flow
-NAT fallback. Forward-only connection state and a direct-return packet are
+FIB lookup, and uses direct or kernel neighbor output without changing the VIP
+tuple. Runtime-bound transport topology keeps stacked VLAN and checksum work in
+the device path and fails closed without per-flow NAT fallback. Forward-only
+connection state and a direct-return packet are
 real-kernel tested under persistent ABI v11. `make service-dsr-dataplane-test`
-and ADR 0109 record the workstation boundary; actual cross-worker backend-VIP
-ownership and return routing are verified on Kind and remain an independent
-Phase 7.10 OpenShift gate.
+and ADR 0109 record the focused boundary. Actual cross-worker backend-VIP
+ownership, original-source preservation, and return routing are independently
+verified on Kind and stacked-VLAN RHCOS OpenShift.
 Milestone 7.8 is verified by `make service-selection-operations-test` and ADR
 0110. Fixed-name metrics and validated status-v8 expose the selected tier,
 actual StableHash/Maglev algorithm, affinity reuse/create/reselection, and
@@ -383,16 +385,24 @@ intent and drain state with observation-weighted revision history, while
 load-balancer-simulate` return
 the digest-bound per-Node eligibility plan without mutating state or guessing
 private connection/affinity entries. Persistent eBPF ownership remains ABI v11.
-Milestone 7.9 is verified. Runtime `481ee88` and qualifier `1f25e13` passed the
-467-second three-Node Kubernetes v1.35.0 dual-stack gate with kube-proxy absent.
+Milestone 7.9 is verified. Runtime/qualifier `06fc937` passed the 463-second
+three-Node Kubernetes v1.35.0 dual-stack gate with kube-proxy absent.
 Real traffic proved strict SameNode/SameZone/Cluster fallback, ClientIP
 creation/reuse/timeout/reselection, graceful endpoint withdrawal, measured
 Maglev and StableHash provenance, and acknowledged cross-worker IPv4/IPv6
 LoadBalancer DSR with direct return. Controller-offline agent replacement,
 status/history/simulation, exact fixture cleanup, scoped ABI-v11 cleanup,
 fingerprinted CNI removal, CoreDNS restoration, and no-CNI rollback passed
-`hack/verify-kind-service-selection.sh`; ADR 0111. OpenShift Phase 7.10 remains
-independent and must use digest-pinned images on cl02.
+`hack/verify-kind-service-selection.sh`; ADR 0111.
+Milestone 7.10 is verified independently. Runtime `06fc937` and qualifier
+`018f14c` passed the 1,670-second digest-pinned five-Node OpenShift 4.22.10 /
+Kubernetes 1.35.6 cl02 gate on RHCOS, Enforcing SELinux, and CRI-O without
+kube-proxy. The complete Phase 6 regression, dual-stack node/zone/cluster
+fallback, affinity/draining, Maglev/StableHash provenance, acknowledged
+cross-worker DSR source/return tuples and source ranges, controller-offline
+worker-agent replacement, exact cleanup, five-agent convergence, and unchanged
+`insights`/`network` unhealthy baseline passed
+`hack/verify-openshift-service-selection.sh`; ADR 0112.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -603,10 +613,8 @@ Implemented in the repository:
   isolation, selector/named-port/protocol forms, IPv4/IPv6 blocks and exceptions,
   direction-correct provenance, deletion recovery, and exact cleanup.
 
-In progress in Phase 7: independent OpenShift qualification for the
-Kind-verified locality, topology, ClientIP affinity, graceful-draining, Maglev,
-DSR, operations, and recovery tuple. Not yet implemented:
-production-scale routing/CNI qualification;
+Phase 7 is complete for its exact recorded Kind and OpenShift development
+tuples. Not yet implemented: production-scale routing/CNI qualification;
 workload/data-plane encryption, generic related-flow/ICMP/NAT tracking,
 multi-cluster transport, IPv6 jumbograms/ESP/reassembly, or production
 fail-closed recovery. Bounded TCP/UDP/SCTP reply state survives unrelated policy

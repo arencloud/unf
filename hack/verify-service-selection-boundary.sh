@@ -20,6 +20,7 @@ required_files=(
     docs/adr/0109-enforce-explicit-loadbalancer-dsr.md
     docs/adr/0110-preserve-and-explain-service-selection-outcomes.md
     docs/adr/0111-qualify-advanced-service-selection-on-kind.md
+    docs/adr/0112-qualify-advanced-service-selection-on-openshift.md
     docs/benchmarks/phase7-maglev-measurement.md
     deploy/openshift-primary-cni/service-selection/kustomization.yaml
     deploy/openshift-primary-cni/service-selection/release.json
@@ -53,8 +54,8 @@ for relative_file in "${required_files[@]}"; do
 done
 
 require_text docs/project-status.md \
-    '| Phase 7 — advanced Service selection | **In progress** |' \
-    "the authoritative phase state must be in progress"
+    '| Phase 7 — advanced Service selection | **Verified** |' \
+    "the authoritative phase state must be verified"
 require_text docs/development/phase7-service-selection-plan.md \
     '| 7.1 | Architecture and acceptance boundary | **Verified** |' \
     "milestone 7.1 must remain verified"
@@ -115,9 +116,18 @@ require_text docs/development/phase7-service-selection-plan.md \
 require_text docs/project-status.md \
     '| Kube-proxy-free Kind qualification | **Verified** |' \
     "the work breakdown must identify milestone 7.9 as verified"
+require_text docs/development/phase7-service-selection-plan.md \
+    '| 7.10 | OpenShift qualification | **Verified** |' \
+    "milestone 7.10 must be verified"
+require_text docs/project-status.md \
+    '| OpenShift qualification | **Verified** |' \
+    "the work breakdown must identify milestone 7.10 as verified"
 require_text docs/adr/0111-qualify-advanced-service-selection-on-kind.md \
     'This promotes no OpenShift' \
     "the Kind result must remain explicitly non-transitive"
+require_text docs/adr/0112-qualify-advanced-service-selection-on-openshift.md \
+    'The result is non-transitive' \
+    "the OpenShift result must remain explicitly non-transitive"
 require_text Makefile \
     'service-selection-contract-test:' \
     "the build must expose an isolated Network Behavior Contract gate"

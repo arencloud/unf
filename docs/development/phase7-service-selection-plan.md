@@ -1,6 +1,6 @@
 # Phase 7 advanced Service-selection execution plan
 
-Last reviewed: **2026-09-01**
+Last reviewed: **2026-09-02**
 
 Phase 7 completes the remaining bounded Service behavior in master-prompt §§20,
 21, and 30: internal locality, session affinity, topology preference, graceful
@@ -20,10 +20,10 @@ and connection-state foundation. The authoritative feature state remains in
 | 7.4 | Internal locality and topology-aware dataplane | **Verified** | `make service-selection-dataplane-test` proves fixed-width ABI-v8 SameNode/SameZone/Cluster state, first-nonempty userspace resolution, dual-stack TCP/UDP strict Local and ordered fallback across ClusterIP/NodePort/LoadBalancer, external-policy precedence, lifecycle filtering, tier event provenance, topology-only activation, exact recovery, inherited state tests, and strict Clippy; ADR 0106 |
 | 7.5 | ClientIP affinity and graceful draining | **Verified** | `make service-affinity-dataplane-test` proves exact original-client/frontend keys, 1–86,400 second timeout encoding, eligible bank+revision reuse, explicit create/reuse/reselection outcomes, connection-before-affinity precedence, ready/non-terminating new-flow slots, established-flow survival during termination, dual-stack ClusterIP packet behavior, bounded LRU recovery under persistent ABI v9, inherited 7.4 gates, real-kernel verifier acceptance, and strict Clippy; ADR 0107 |
 | 7.6 | Measured Maglev selection | **Verified** | `make service-maglev-dataplane-test` regenerates the 2–4,096-backend fixture; proves deterministic prime tables with at least 16 slots/backend, at most 6.25% intrinsic table error, materially lower same-table add disruption, bounded memory/writes/compile time, the same hash/modulo/one-map packet path, capacity fallback with actual-algorithm flags, ClusterIP/NodePort/LoadBalancer lowering, annotation admission, ABI-v10 recovery/cleanup, inherited real-kernel gates, and strict Clippy; ADR 0108 |
-| 7.7 | Opt-in DSR dataplane | **Verified** | `make service-dsr-dataplane-test` proves explicit acknowledged UNF LoadBalancer-only intent, equal Service/backend tuples, dual-stack capability fencing, unchanged policy/source-range/selection/lifecycle semantics, VIP-preserving L2 redirect after route/neighbor/MTU FIB proof, fail-closed verifier-isolated tail stages, forward-only connection state and direct return, bounded mode provenance, 25-map ABI-v11 recovery/cleanup, all inherited privileged NAT paths, and strict Clippy; ADR 0109 |
+| 7.7 | Opt-in DSR dataplane | **Verified** | `make service-dsr-dataplane-test` proves explicit acknowledged UNF LoadBalancer-only intent, equal Service/backend tuples, dual-stack capability fencing, unchanged policy/source-range/selection/lifecycle semantics, VIP-preserving direct or neighbor-routed output after route/neighbor/MTU FIB proof, runtime-bound transport topology retained in optimized bytecode, fail-closed verifier-isolated tail stages, forward-only connection state and direct return, bounded mode provenance, 25-map ABI-v11 recovery/cleanup, all 13 inherited privileged packet paths, and strict Clippy; ADR 0109 |
 | 7.8 | Operations, simulation, upgrade, and recovery | **Verified** | `make service-selection-operations-test` preserves exact tier/algorithm/affinity/NAT-or-DSR witnesses through fixed-cardinality metrics and status-v8, export-v6, durable history-v7/checkpoint-v6, revision-aware explanation, and digest-bound ClusterIP/NodePort/LoadBalancer simulation; explicit unknown migration, adjacent v7/v8 and v5/v6 compatibility, inherited ABI-v11 recovery/cleanup, and strict Clippy; ADR 0110 |
-| 7.9 | Kube-proxy-free Kind qualification | **Verified** | Runtime `481ee88` and qualifier `1f25e13` passed the 467-second three-Node Kubernetes v1.35.0 dual-stack gate with kube-proxy absent: complete Phase 6 regression, strict SameNode/SameZone/Cluster fallback, ClientIP lifecycle, measured Maglev/StableHash provenance, acknowledged cross-worker IPv4/IPv6 DSR, operations, controller-offline agent replacement, ABI-v11/CNI cleanup, and exact no-CNI rollback; schema-v1 evidence is `.artifacts/phase7-service-selection-kind.json`; ADR 0111 |
-| 7.10 | OpenShift qualification | **Planned** | Independent digest-pinned five-Node cl02 RHCOS/SELinux/CRI-O gate for cross-worker/node/zone behavior, source/return tuples, recovery, exact cleanup, convergence, and ClusterOperator comparison |
+| 7.9 | Kube-proxy-free Kind qualification | **Verified** | Runtime/qualifier `06fc937` passed the 463-second three-Node Kubernetes v1.35.0 dual-stack gate with kube-proxy absent: complete Phase 6 regression, strict SameNode/SameZone/Cluster fallback, ClientIP lifecycle, measured Maglev/StableHash provenance, acknowledged cross-worker IPv4/IPv6 DSR, operations, controller-offline agent replacement, ABI-v11/CNI cleanup, and exact no-CNI rollback; schema-v1 evidence is `.artifacts/phase7-service-selection-kind.json`; ADR 0111 |
+| 7.10 | OpenShift qualification | **Verified** | Runtime `06fc937` and qualifier `018f14c` passed the 1,670-second digest-pinned five-Node OpenShift 4.22.10/Kubernetes 1.35.6 cl02 RHCOS/SELinux/CRI-O gate: complete Phase 6 regression, cross-worker/node/zone dual-stack behavior, acknowledged DSR source/return tuples and source ranges, operations, controller-offline agent recovery, exact cleanup, five-agent convergence, and unchanged `insights`/`network` unhealthy baseline; schema-v1 evidence is `.artifacts/phase7-service-selection-openshift.json`; ADR 0112 |
 
 ## Accepted Phase 7 gate
 
@@ -102,11 +102,9 @@ production BGP/EVPN/ECMP/BFD, cloud adapters, SCTP Service forwarding,
 fragments, generic NAT `RELATED`, Gateway API, L7 proxying, production HA, or
 production availability/scale. Those capabilities require independent gates.
 
-## Immediate next slice
+## Phase closure
 
-Milestone 7.10 independently qualifies the digest-pinned Phase 7.9 runtime on
-the five-Node dual-stack OpenShift cl02 cluster. It must prove RHCOS, Enforcing
-SELinux, and CRI-O behavior; cross-worker and cross-zone IPv4/IPv6 selection;
-source and return tuples; acknowledged DSR backend VIP ownership; operations;
-controller and agent recovery; exact cleanup; final convergence; and no newly
-unhealthy ClusterOperator beyond the recorded baseline.
+Milestones 7.1–7.10 are Verified. The exact runtime passed both non-transitive
+kube-proxy-free Kind and OpenShift gates, including cross-worker dual-stack DSR
+on cl02's stacked VLAN host network. No subsequent phase is implied by this
+closure; the next architecture slice must be accepted and tracked separately.
