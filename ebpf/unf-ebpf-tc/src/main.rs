@@ -7,7 +7,7 @@ use aya_ebpf::bindings::{
     TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT, bpf_fib_lookup as BpfFibLookup,
 };
 use aya_ebpf::helpers::{
-    bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh,
+    bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh, bpf_skb_vlan_pop,
 };
 use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
@@ -358,6 +358,25 @@ fn mark_service_dsr_handoff(ctx: &TcContext) {
     #[allow(unsafe_code)]
     unsafe {
         (*ctx.skb.skb).mark |= SERVICE_DSR_HANDOFF_MARK;
+    }
+}
+
+#[inline(always)]
+fn normalize_service_dsr_vlan(ctx: &TcContext) -> bool {
+    // A VLAN device can deliver an accelerated tag in skb metadata while the
+    // packet bytes already expose the inner EtherType. TC redirect preserves
+    // that metadata across devices, so redirecting the skb into a remote pod
+    // veth would make the pod-side receive path classify an inline IPv4/IPv6
+    // frame as 802.1Q. Pop only accelerated metadata; untagged packets and
+    // inline VLAN frames are intentionally left unchanged.
+    // SAFETY: the TC context owns this skb for the current invocation and the
+    // helper is called only when the verifier-visible VLAN-present bit is set.
+    #[allow(unsafe_code)]
+    unsafe {
+        if (*ctx.skb.skb).vlan_present == 0 {
+            return true;
+        }
+        bpf_skb_vlan_pop(ctx.skb.skb.cast()) == 0
     }
 }
 
@@ -2956,6 +2975,9 @@ fn redirect_service_route(
         };
     }
     if result == 0 {
+        if dsr && !normalize_service_dsr_vlan(ctx) {
+            return dsr_route_failed();
+        }
         if ctx.store(0, &lookup.dmac, 0).is_err()
             || ctx.store(6, &lookup.smac, 0).is_err()
         {

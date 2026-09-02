@@ -11,6 +11,8 @@ sudo -n true
 
 dataplane=${project_root}/ebpf/unf-ebpf-tc/src/main.rs
 rg --fixed-strings --quiet 'let redirect_ifindex = lookup.ifindex;' "${dataplane}"
+rg --fixed-strings --quiet 'if dsr && !normalize_service_dsr_vlan(ctx)' "${dataplane}"
+rg --fixed-strings --quiet 'bpf_skb_vlan_pop(ctx.skb.skb.cast()) == 0' "${dataplane}"
 if rg --fixed-strings --quiet 'bpf_skb_vlan_push' "${dataplane}"; then
     echo "DSR must preserve the FIB route-device egress and its checksum/VLAN contract" >&2
     exit 1
