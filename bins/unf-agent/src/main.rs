@@ -784,6 +784,8 @@ struct ServiceSynchronizer {
     applied_load_balancer_reachability: Option<NodeReachabilitySnapshot>,
     applied_selection_contract: Option<NetworkBehaviorContract>,
     active_selection_bank: u8,
+    ipv4_output_interface: u32,
+    ipv6_output_interface: u32,
     node_name: String,
     controller_url: Option<String>,
     client: ReloadingControllerClient,
@@ -904,6 +906,8 @@ struct DataplaneConfig {
     flow_export_interval: Duration,
     bpf_pin_path: PathBuf,
     tc_attachment_preference: TcAttachmentPreference,
+    ipv4_output_interface: u32,
+    ipv6_output_interface: u32,
 }
 
 struct FlowExporterConfig {
@@ -1115,6 +1119,10 @@ async fn main() -> Result<()> {
 
     let cni_provider = resolve_cni_provider(&args, &state).await?;
     let remote_routes = initialize_remote_routes(&args, cni_provider.as_ref(), &state).await?;
+    let (ipv4_output_interface, ipv6_output_interface) =
+        remote_routes.as_ref().map_or((0, 0), |runtime| {
+            (runtime.ipv4_output_interface, runtime.ipv6_output_interface)
+        });
     supervised_service_configured |= spawn_cni_transaction_server(
         &args,
         cni_provider,
@@ -1166,6 +1174,8 @@ async fn main() -> Result<()> {
                     flow_export_interval,
                     bpf_pin_path,
                     tc_attachment_preference,
+                    ipv4_output_interface,
+                    ipv6_output_interface,
                 };
                 if let Err(error) = run_dataplane(config, Arc::clone(&state), cancellation).await {
                     error!(?error, "eBPF dataplane stopped");
@@ -3532,7 +3542,11 @@ fn service_requires_local_node(snapshot: &ServiceSnapshot) -> bool {
             .any(|service| service.load_balancer.is_some())
 }
 
-fn encode_load_balancer_node_source(node: Option<&NodePortNodeSnapshot>) -> [u8; 40] {
+fn encode_load_balancer_node_source(
+    node: Option<&NodePortNodeSnapshot>,
+    ipv4_output_interface: u32,
+    ipv6_output_interface: u32,
+) -> [u8; 40] {
     let Some(node) = node else {
         return [0; 40];
     };
@@ -3561,9 +3575,11 @@ fn encode_load_balancer_node_source(node: Option<&NodePortNodeSnapshot>) -> [u8;
         config[12..28].copy_from_slice(&address.octets());
         flags |= unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6;
     }
-    config[28..30]
+    config[28..32].copy_from_slice(&ipv4_output_interface.to_ne_bytes());
+    config[32..36].copy_from_slice(&ipv6_output_interface.to_ne_bytes());
+    config[36..38]
         .copy_from_slice(&unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION.to_ne_bytes());
-    config[30] = flags;
+    config[38] = flags;
     config
 }
 
@@ -4205,7 +4221,11 @@ fn activate_service_snapshot_with_contract(
             .load_balancer_node_source
             .set(
                 0,
-                encode_load_balancer_node_source(node_port_node.as_ref()),
+                encode_load_balancer_node_source(
+                    node_port_node.as_ref(),
+                    synchronizer.ipv4_output_interface,
+                    synchronizer.ipv6_output_interface,
+                ),
                 0,
             )
             .context("publish runtime LoadBalancer Node source addresses")?;
@@ -6038,6 +6058,8 @@ async fn run_dataplane(
         config.service_state_path.clone(),
         config.load_balancer_reachability_state_path.clone(),
         config.node_name.clone(),
+        config.ipv4_output_interface,
+        config.ipv6_output_interface,
     );
     let recovered =
         recover_persistent_dataplane(&mut identities, &mut policies, &mut services, pins_existed)?;
@@ -6295,6 +6317,8 @@ fn new_synchronizers(
     service_state_path: PathBuf,
     load_balancer_state_path: PathBuf,
     node_name: String,
+    ipv4_output_interface: u32,
+    ipv6_output_interface: u32,
 ) -> (
     IdentitySynchronizer,
     PolicySynchronizer,
@@ -6387,6 +6411,8 @@ fn new_synchronizers(
             applied_load_balancer_reachability: None,
             applied_selection_contract: None,
             active_selection_bank: 0,
+            ipv4_output_interface,
+            ipv6_output_interface,
             node_name,
             controller_url,
             client,
@@ -7735,7 +7761,15 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
     services.applied = Some(durable);
     services
         .load_balancer_node_source
-        .set(0, encode_load_balancer_node_source(node.as_ref()), 0)
+        .set(
+            0,
+            encode_load_balancer_node_source(
+                node.as_ref(),
+                services.ipv4_output_interface,
+                services.ipv6_output_interface,
+            ),
+            0,
+        )
         .context("restore runtime LoadBalancer Node source addresses")?;
     services.applied_node_port_node = node;
     if let Some((_, checkpoint)) = recovered_selection {
@@ -11918,6 +11952,8 @@ mod tests {
             applied_load_balancer_reachability: None,
             applied_selection_contract: None,
             active_selection_bank: 0,
+            ipv4_output_interface: 0,
+            ipv6_output_interface: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -12262,24 +12298,26 @@ mod tests {
     #[test]
     fn load_balancer_node_source_prefers_internal_dual_stack_addresses() {
         let node = node_port_node_snapshot(7);
-        let encoded = encode_load_balancer_node_source(Some(&node));
+        let encoded = encode_load_balancer_node_source(Some(&node), 3, 4);
         assert_eq!(u64::from_ne_bytes(encoded[0..8].try_into().unwrap()), 7);
         assert_eq!(&encoded[8..12], &Ipv4Addr::new(192, 0, 2, 10).octets());
         assert_eq!(
             &encoded[12..28],
             &"fdff::10".parse::<Ipv6Addr>().unwrap().octets()
         );
+        assert_eq!(u32::from_ne_bytes(encoded[28..32].try_into().unwrap()), 3);
+        assert_eq!(u32::from_ne_bytes(encoded[32..36].try_into().unwrap()), 4);
         assert_eq!(
-            u16::from_ne_bytes(encoded[28..30].try_into().unwrap()),
+            u16::from_ne_bytes(encoded[36..38].try_into().unwrap()),
             unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION
         );
         assert_eq!(
-            encoded[30],
+            encoded[38],
             unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4
                 | unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6
         );
-        assert_eq!(&encoded[31..40], &[0; 9]);
-        assert_eq!(encode_load_balancer_node_source(None), [0; 40]);
+        assert_eq!(encoded[39], 0);
+        assert_eq!(encode_load_balancer_node_source(None, 3, 4), [0; 40]);
     }
 
     #[test]
@@ -12752,6 +12790,8 @@ mod tests {
             applied_load_balancer_reachability: None,
             applied_selection_contract: None,
             active_selection_bank: 0,
+            ipv4_output_interface: 0,
+            ipv6_output_interface: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -12880,7 +12920,7 @@ mod tests {
             .expect("new active service tuple recovers after interrupted reconciliation");
         assert_eq!(
             synchronizer.load_balancer_node_source.get(&0, 0).unwrap(),
-            encode_load_balancer_node_source(Some(&node))
+            encode_load_balancer_node_source(Some(&node), 0, 0)
         );
         synchronizer.load_balancer_banks = [None, None];
         synchronizer.active_load_balancer_bank = 0;
@@ -14047,6 +14087,8 @@ mod tests {
             applied_load_balancer_reachability: None,
             applied_selection_contract: None,
             active_selection_bank: 0,
+            ipv4_output_interface: 0,
+            ipv6_output_interface: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(

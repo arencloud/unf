@@ -25,7 +25,7 @@ pub const NODE_PORT_FRONTEND_FLAG_LOCAL: u16 = 1;
 pub const NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY: u16 = 1 << 1;
 pub const NODE_PORT_FRONTEND_FLAG_MAGLEV: u16 = 1 << 2;
 pub const LOAD_BALANCER_MAP_ABI_VERSION: u16 = 4;
-pub const LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION: u16 = 1;
+pub const LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION: u16 = 2;
 pub const LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4: u8 = 1;
 pub const LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6: u8 = 1 << 1;
 pub const LOAD_BALANCER_BANK_COUNT: u8 = 2;
@@ -924,9 +924,11 @@ pub struct LoadBalancerNodeSourceConfig {
     pub node_revision: u64,
     pub ipv4_address: [u8; 4],
     pub ipv6_address: [u8; 16],
+    pub ipv4_output_interface: u32,
+    pub ipv6_output_interface: u32,
     pub schema_version: u16,
     pub flags: u8,
-    pub reserved: [u8; 9],
+    pub reserved: [u8; 1],
 }
 
 /// Forward or reverse service-flow key. The role disambiguates identical

@@ -362,18 +362,21 @@ fn mark_service_dsr_handoff(ctx: &TcContext) {
 }
 
 #[inline(always)]
-fn normalize_service_dsr_vlan(ctx: &TcContext) -> bool {
+fn normalize_service_dsr_vlan(ctx: &TcContext, lookup: &BpfFibLookup) -> bool {
     // A VLAN device can deliver an accelerated tag in skb metadata while the
     // packet bytes already expose the inner EtherType. TC redirect preserves
     // that metadata across devices, so redirecting the skb into a remote pod
     // veth would make the pod-side receive path classify an inline IPv4/IPv6
-    // frame as 802.1Q. Pop only accelerated metadata; untagged packets and
-    // inline VLAN frames are intentionally left unchanged.
+    // frame as 802.1Q. The configured native uplink must retain that metadata
+    // for inter-node transport, so normalize only the final non-uplink FIB
+    // redirect. Untagged packets and inline VLAN frames remain unchanged.
     // SAFETY: the TC context owns this skb for the current invocation and the
     // helper is called only when the verifier-visible VLAN-present bit is set.
     #[allow(unsafe_code)]
     unsafe {
-        if (*ctx.skb.skb).vlan_present == 0 {
+        if load_balancer_output_interface(lookup.family) == Some(lookup.ifindex)
+            || (*ctx.skb.skb).vlan_present == 0
+        {
             return true;
         }
         bpf_skb_vlan_pop(ctx.skb.skb.cast()) == 0
@@ -1206,7 +1209,7 @@ fn load_balancer_node_source(address_family: u8) -> Option<[u8; 16]> {
         || config.node_revision == 0
         || config.flags & !(LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4 | LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6)
             != 0
-        || config.reserved != [0; 9]
+        || config.reserved != [0; 1]
     {
         return None;
     }
@@ -1223,6 +1226,27 @@ fn load_balancer_node_source(address_family: u8) -> Option<[u8; 16]> {
         return Some(config.ipv6_address);
     }
     None
+}
+
+#[inline(always)]
+fn load_balancer_output_interface(address_family: u8) -> Option<u32> {
+    let config = LOAD_BALANCER_NODE_SOURCE.get(0).copied()?;
+    if config.schema_version != LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION
+        || config.node_revision == 0
+        || config.flags & !(LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4 | LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6)
+            != 0
+        || config.reserved != [0; 1]
+    {
+        return None;
+    }
+    let ifindex = if address_family == AddressFamily::Ipv4 as u8 {
+        config.ipv4_output_interface
+    } else if address_family == AddressFamily::Ipv6 as u8 {
+        config.ipv6_output_interface
+    } else {
+        return None;
+    };
+    (ifindex > 1).then_some(ifindex)
 }
 
 /// Returns the additional source translation for a Cluster NodePort forward
@@ -2975,7 +2999,7 @@ fn redirect_service_route(
         };
     }
     if result == 0 {
-        if dsr && !normalize_service_dsr_vlan(ctx) {
+        if dsr && !normalize_service_dsr_vlan(ctx, lookup) {
             return dsr_route_failed();
         }
         if ctx.store(0, &lookup.dmac, 0).is_err()
