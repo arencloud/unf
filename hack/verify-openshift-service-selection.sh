@@ -17,6 +17,7 @@ started_unix=$(date +%s)
 controller_scaled_down=false
 namespace_created=false
 advertiser_created=false
+dsr_routes_created=false
 zones_changed=false
 artifact_tmp=
 probe_pid=
@@ -55,6 +56,12 @@ cleanup() {
                 ip -6 address del "$2/128" dev br-ex >/dev/null 2>&1 || true
             ' sh "${dsr_v4:-}" "${dsr_v6:-}" >/dev/null 2>&1 || true
         fi
+    fi
+    if [[ ${dsr_routes_created} == true ]]; then
+        "${kc[@]}" debug "node/${remote_node}" --quiet -- chroot /host sh -euc '
+            ip -4 route del "$1/32" via "$2" >/dev/null 2>&1 || true
+            ip -6 route del "$3/128" via "$4" >/dev/null 2>&1 || true
+        ' sh "${dsr_v4:-}" "${remote_v4:-}" "${dsr_v6:-}" "${remote_v6:-}" >/dev/null 2>&1 || true
     fi
     if [[ ${namespace_created} == true ]]; then
         "${kc[@]}" delete namespace "${namespace}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -560,6 +567,11 @@ jq -e '.decision == "translate" and .forwarding_mode == "dsr"
     and .frontend_kind == "load_balancer_cluster"' <<<"${dsr_simulation}" >/dev/null
 "${kc[@]}" -n "${namespace}" exec backend-remote -- ip -4 address add "${dsr_v4}/32" dev lo
 "${kc[@]}" -n "${namespace}" exec backend-remote -- ip -6 address add "${dsr_v6}/128" dev lo
+"${kc[@]}" debug "node/${remote_node}" --quiet -- chroot /host sh -euc '
+    ip -4 route replace "$1/32" via "$2"
+    ip -6 route replace "$3/128" via "$4"
+' sh "${dsr_v4}" "${remote_v4}" "${dsr_v6}" "${remote_v6}" >/dev/null
+dsr_routes_created=true
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -675,6 +687,11 @@ wait_for_convergence >/dev/null
 new_controller=$(controller_pod); [[ ${new_controller} != "${old_controller}" ]]
 
 stage=exact-fixture-and-state-cleanup
+"${kc[@]}" debug "node/${remote_node}" --quiet -- chroot /host sh -euc '
+    ip -4 route del "$1/32" via "$2"
+    ip -6 route del "$3/128" via "$4"
+' sh "${dsr_v4}" "${remote_v4}" "${dsr_v6}" "${remote_v6}" >/dev/null
+dsr_routes_created=false
 "${kc[@]}" -n "${namespace}" exec backend-remote -- ip -4 address del "${dsr_v4}/32" dev lo
 "${kc[@]}" -n "${namespace}" exec backend-remote -- ip -6 address del "${dsr_v6}/128" dev lo
 "${kc[@]}" -n "${namespace}" exec selection-advertiser -- sh -euc '
