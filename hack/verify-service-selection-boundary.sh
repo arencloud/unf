@@ -149,7 +149,7 @@ require_text deploy/openshift-primary-cni/service-selection/kustomization.yaml \
     'digest: sha256:fb0cf375ec1a3f7fcc2af8813b1b474a8a090d9e645f82ebe91b35bc5d781d09' \
     "the OpenShift controller image must remain digest pinned"
 require_text deploy/openshift-primary-cni/service-selection/kustomization.yaml \
-    'digest: sha256:572c756502486474fbc65fec3118f8c88302e833ef6df56357fe04493194ef3a2' \
+    'digest: sha256:572c756502486474fbc65fec3118f8c88302e833ef6df56357fe04493194ef3a' \
     "the OpenShift agent image must remain digest pinned"
 jq -e '
     .schemaVersion == 1 and .phase == "7.10"
