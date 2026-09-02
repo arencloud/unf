@@ -5,6 +5,8 @@ use aya_ebpf::bindings::{
     BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR,
     BPF_FIB_LOOKUP_OUTPUT, BPF_FIB_LOOKUP_SRC, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_NOEXIST,
     TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT, bpf_fib_lookup as BpfFibLookup,
+    bpf_redir_neigh as BpfRedirNeigh,
+    bpf_redir_neigh__bindgen_ty_1 as BpfRedirNeighAddress,
 };
 use aya_ebpf::helpers::{
     bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh, bpf_skb_vlan_pop,
@@ -426,6 +428,46 @@ fn service_dsr_transport_ifindex(ifindex: u32) -> bool {
             || ifindex == SERVICE_DSR_TRANSPORT_INTERFACES[1]
             || ifindex == SERVICE_DSR_TRANSPORT_INTERFACES[2]
             || ifindex == SERVICE_DSR_TRANSPORT_INTERFACES[3])
+}
+
+#[inline(always)]
+fn redirect_service_dsr_neighbor(lookup: &BpfFibLookup) -> i64 {
+    // A successful FIB lookup replaces the destination field with the exact
+    // next-hop address when the backend route uses a gateway. Preserve the
+    // Service VIP in the packet and give that next hop to the kernel neighbor
+    // subsystem explicitly. Unlike a direct redirect into a stacked VLAN
+    // device, neighbor output owns the route-device recursion, L2 header,
+    // checksum completion, and VLAN encapsulation as one transaction.
+    let address = if lookup.family == ADDRESS_FAMILY_INET {
+        // SAFETY: family selects the IPv4 member of the FIB lookup union.
+        #[allow(unsafe_code)]
+        BpfRedirNeighAddress {
+            ipv4_nh: unsafe { lookup.__bindgen_anon_4.ipv4_dst },
+        }
+    } else if lookup.family == ADDRESS_FAMILY_INET6 {
+        // SAFETY: family selects the IPv6 member of the FIB lookup union.
+        #[allow(unsafe_code)]
+        BpfRedirNeighAddress {
+            ipv6_nh: unsafe { lookup.__bindgen_anon_4.ipv6_dst },
+        }
+    } else {
+        return i64::from(TC_ACT_SHOT);
+    };
+    let mut neighbor = BpfRedirNeigh {
+        nh_family: u32::from(lookup.family),
+        __bindgen_anon_1: address,
+    };
+    // SAFETY: `neighbor` has the helper ABI's exact size and remains live for
+    // the call; the helper copies it into per-CPU redirect state before return.
+    #[allow(unsafe_code)]
+    unsafe {
+        bpf_redirect_neigh(
+            lookup.ifindex,
+            &mut neighbor,
+            core::mem::size_of::<BpfRedirNeigh>() as i32,
+            0,
+        )
+    }
 }
 
 #[classifier]
@@ -3055,7 +3097,11 @@ fn redirect_service_route(
         // SAFETY: the successful FIB lookup returned a live output interface
         // and the Ethernet header now carries that route's exact addresses.
         #[allow(unsafe_code)]
-        let action = unsafe { bpf_redirect(redirect_ifindex, 0) };
+        let action = if dsr && service_dsr_transport_interface(lookup) {
+            redirect_service_dsr_neighbor(lookup)
+        } else {
+            unsafe { bpf_redirect(redirect_ifindex, 0) }
+        };
         return if action == i64::from(TC_ACT_REDIRECT) {
             TC_ACT_REDIRECT
         } else {

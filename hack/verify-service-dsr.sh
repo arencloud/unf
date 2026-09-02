@@ -17,6 +17,10 @@ rg --fixed-strings --quiet \
     'static SERVICE_DSR_TRANSPORT_INTERFACES: [u32; 4] = [0; 4];' "${dataplane}"
 rg --fixed-strings --quiet 'service_dsr_transport_interface(lookup)' "${dataplane}"
 rg --fixed-strings --quiet \
+    'redirect_service_dsr_neighbor(lookup)' "${dataplane}"
+rg --fixed-strings --quiet \
+    'bpf_redirect_neigh(' "${dataplane}"
+rg --fixed-strings --quiet \
     'if !service_dsr_transport_ifindex(skb.ifindex)' "${dataplane}"
 rg --fixed-strings --quiet 'bpf_skb_vlan_pop(ctx.skb.skb.cast()) == 0' "${dataplane}"
 rg --fixed-strings --quiet \
