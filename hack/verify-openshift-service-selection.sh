@@ -272,6 +272,28 @@ wait_for_history() {
     return 1
 }
 
+wait_for_dsr_history() {
+    local address=$1 history= since_ms=$((started_unix * 1000))
+    for _ in $(seq 1 120); do
+        # cl02 has enough background Service traffic to evict a one-shot event
+        # quickly. Generate a fresh DSR flow immediately before the bounded
+        # time-window query so history integration is observed, not inferred.
+        "${kc[@]}" -n "${namespace}" exec selection-external -- \
+            wget -T 10 -t 1 -qO- "http://${address}:8080/health" >/dev/null 2>&1 || true
+        history=$(controller_raw "/v1/flows?since_unix_ms=${since_ms}&limit=4096" 2>/dev/null || true)
+        if jq -e --arg address "${address}" '
+            any(.entries[]; .key.destination_ipv4 == $address
+                and .service.forwarding_mode == "dsr" and .service.action == 1)
+        ' <<<"${history}" >/dev/null 2>&1; then
+            printf '%s\n' "${history}"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "fresh DSR flow did not appear in bounded history" >&2
+    return 1
+}
+
 replace_endpoint_condition() {
     local slice=$1 address=$2 ready=$3 serving=$4 terminating=$5
     "${kc[@]}" -n "${namespace}" get endpointslice "${slice}" -o json \
@@ -582,8 +604,7 @@ observed_v4=$("${kc[@]}" -n "${namespace}" exec selection-external -- sh -ec "pr
 observed_v6=$("${kc[@]}" -n "${namespace}" exec selection-external -- sh -ec "printf probe | socat -T 10 - 'TCP6:[${dsr_v6}]:8081'" | tr -d '\r\n'); observed_v6=${observed_v6#[}; observed_v6=${observed_v6%]}
 [[ ${observed_v4} == "${allowed_v4}" ]]
 [[ $(ip -6 route get "${observed_v6}" | awk 'NR == 1 {print ($1 == "local" ? $2 : $1)}') == "${allowed_v6}" ]]
-wait_for_history "${dsr_v4}" 'any(.entries[]; .key.destination_ipv4 == $address
-    and .service.forwarding_mode == "dsr" and .service.action == 1)' >/dev/null
+wait_for_dsr_history "${dsr_v4}" >/dev/null
 "${kc[@]}" -n "${namespace}" patch service dsr --type=merge -p \
     '{"spec":{"loadBalancerSourceRanges":["192.0.2.1/32","2001:db8::1/128"]}}' >/dev/null
 wait_for_convergence >/dev/null
