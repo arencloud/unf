@@ -75,7 +75,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for command in curl git ip jq oc sed socat stat timeout; do
+for command in curl git ip jq oc python3 sed socat stat timeout; do
     command -v "${command}" >/dev/null || {
         echo "OpenShift service-selection prerequisite is missing: ${command}" >&2
         exit 1
@@ -220,6 +220,10 @@ service_addresses() {
 
 pod_addresses() {
     "${kc[@]}" -n "${namespace}" get pod "$1" -o json | jq -r '.status.podIPs[].ip'
+}
+
+canonical_ip() {
+    python3 -c 'import ipaddress,sys; print(ipaddress.ip_address(sys.argv[1].strip("[]")))' "$1"
 }
 
 cluster_simulation() {
@@ -642,8 +646,14 @@ for target in "http://${dsr_v4}:8080/health" "http://[${dsr_v6}]:8080/health"; d
 done
 observed_v4=$("${kc[@]}" -n "${namespace}" exec selection-external -- sh -ec "printf probe | socat -T 10 - TCP4:${dsr_v4}:8081" | tr -d '\r\n')
 observed_v6=$("${kc[@]}" -n "${namespace}" exec selection-external -- sh -ec "printf probe | socat -T 10 - 'TCP6:[${dsr_v6}]:8081'" | tr -d '\r\n'); observed_v6=${observed_v6#[}; observed_v6=${observed_v6%]}
-[[ ${observed_v4} == "${allowed_v4}" ]]
-[[ ${observed_v6} == "${allowed_v6}" ]]
+[[ $(canonical_ip "${observed_v4}") == $(canonical_ip "${allowed_v4}") ]] || {
+    echo "DSR changed the IPv4 source tuple: expected ${allowed_v4}, observed ${observed_v4}" >&2
+    exit 1
+}
+[[ $(canonical_ip "${observed_v6}") == $(canonical_ip "${allowed_v6}") ]] || {
+    echo "DSR changed the IPv6 source tuple: expected ${allowed_v6}, observed ${observed_v6}" >&2
+    exit 1
+}
 wait_for_dsr_history "${dsr_v4}" >/dev/null
 "${kc[@]}" -n "${namespace}" patch service dsr --type=merge -p \
     '{"spec":{"loadBalancerSourceRanges":["192.0.2.1/32","2001:db8::1/128"]}}' >/dev/null
