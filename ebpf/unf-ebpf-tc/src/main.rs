@@ -2,11 +2,13 @@
 #![no_main]
 
 use aya_ebpf::bindings::{
-    BPF_F_INGRESS, BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR,
+    BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR,
     BPF_FIB_LOOKUP_OUTPUT, BPF_FIB_LOOKUP_SRC, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_NOEXIST,
     TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT, bpf_fib_lookup as BpfFibLookup,
 };
-use aya_ebpf::helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh};
+use aya_ebpf::helpers::{
+    bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh, bpf_skb_vlan_push,
+};
 use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramArray, RingBuf};
@@ -88,21 +90,21 @@ const SERVICE_POLICY_DISPATCH_V4: i32 = -1_001;
 const SERVICE_POLICY_DISPATCH_V6: i32 = -1_002;
 const SERVICE_POST_LOOKUP_TRANSLATED: u8 = 1 << 0;
 const SERVICE_POST_LOOKUP_REROUTE_HOST: u8 = 1 << 1;
-// A DSR redirect preserves the frontend tuple. Reserve one skb mark bit so
-// the immediately following hook does not select the same VIP again. Virtual
-// uplinks are reinjected at ingress, while direct uplinks continue at egress;
-// either hook consumes the mark before ordinary forwarding continues.
+// A DSR redirect preserves the frontend tuple. Reserve one skb mark bit so a
+// subsequent local hook does not select the same VIP again. Both classifier
+// directions consume it because the exact next hook depends on the route
+// device; the metadata is deliberately node-local and is not sent on wire.
 const SERVICE_DSR_HANDOFF_MARK: u32 = 1 << 31;
 
 // Per-node, load-time-only route-device to physical-device remaps for IPv4
 // and IPv6. This is deliberately global object data rather than persistent
 // map state: it describes the current network namespace, not durable policy.
-// Each pair is `[FIB output ifindex, physical lower ifindex]`. A differing
-// lower index identifies a virtual uplink whose route-derived DSR frame must
-// be injected into that virtual device's ingress forwarding datapath.
+// Each family uses `[FIB output ifindex, physical lower ifindex, VLAN ID]`.
+// A non-zero VLAN ID identifies an 802.1Q route device whose route-derived DSR
+// frame must be tagged before bypassing to its physical lower link.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-static SERVICE_DSR_EGRESS_REMAP: [u32; 4] = [0; 4];
+static SERVICE_DSR_EGRESS_REMAP: [u32; 6] = [0; 6];
 
 #[map]
 static FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -2973,22 +2975,28 @@ fn redirect_service_route(
                 service_reroute_failed()
             };
         }
-        let redirect_flags = if dsr && dsr_uses_virtual_uplink(lookup) {
-            // DSR preserves the frontend IP, so normal host routing would
-            // classify an advertised VIP as local. Reinject the FIB-derived
-            // Ethernet frame at the virtual uplink's ingress side instead.
-            // This enters OVS exactly as a host-originated frame; the ingress
-            // classifier consumes the handoff mark to prevent reselection.
-            u64::from(BPF_F_INGRESS)
+        let (redirect_ifindex, vlan_id) = if dsr {
+            dsr_redirect_target(lookup)
         } else {
-            0
+            (lookup.ifindex, 0)
         };
-        let redirect_ifindex = if dsr {
+        if vlan_id != 0 {
+            // The FIB lookup ran against a VLAN route device and returned its
+            // correct next-hop MACs. Preserve that route while transmitting on
+            // the physical lower link by restoring the stripped 802.1Q tag.
+            // SAFETY: the TC context owns this skb and the configured VLAN ID
+            // was bounded to the valid 1..=4094 range before object loading.
+            #[allow(unsafe_code)]
+            let result = unsafe {
+                bpf_skb_vlan_push(ctx.skb.skb.cast(), u16::to_be(0x8100), vlan_id)
+            };
+            if result != 0 {
+                return dsr_route_failed();
+            }
+        }
+        if dsr {
             mark_service_dsr_handoff(ctx);
-            lookup.ifindex
-        } else {
-            lookup.ifindex
-        };
+        }
         if redirect_ifindex == 0 {
             return if dsr {
                 dsr_route_failed()
@@ -2999,7 +3007,7 @@ fn redirect_service_route(
         // SAFETY: the successful FIB lookup returned a live output interface
         // and the Ethernet header now carries that route's exact addresses.
         #[allow(unsafe_code)]
-        let action = unsafe { bpf_redirect(redirect_ifindex, redirect_flags) };
+        let action = unsafe { bpf_redirect(redirect_ifindex, 0) };
         return if action == i64::from(TC_ACT_REDIRECT) {
             TC_ACT_REDIRECT
         } else {
@@ -3030,15 +3038,31 @@ fn redirect_service_route(
 }
 
 #[inline(always)]
-fn dsr_uses_virtual_uplink(lookup: &BpfFibLookup) -> bool {
-    let pair = if lookup.family == ADDRESS_FAMILY_INET {
-        [SERVICE_DSR_EGRESS_REMAP[0], SERVICE_DSR_EGRESS_REMAP[1]]
+fn dsr_redirect_target(lookup: &BpfFibLookup) -> (u32, u16) {
+    let route = if lookup.family == ADDRESS_FAMILY_INET {
+        [
+            SERVICE_DSR_EGRESS_REMAP[0],
+            SERVICE_DSR_EGRESS_REMAP[1],
+            SERVICE_DSR_EGRESS_REMAP[2],
+        ]
     } else if lookup.family == ADDRESS_FAMILY_INET6 {
-        [SERVICE_DSR_EGRESS_REMAP[2], SERVICE_DSR_EGRESS_REMAP[3]]
+        [
+            SERVICE_DSR_EGRESS_REMAP[3],
+            SERVICE_DSR_EGRESS_REMAP[4],
+            SERVICE_DSR_EGRESS_REMAP[5],
+        ]
     } else {
-        return false;
+        return (0, 0);
     };
-    pair[0] == lookup.ifindex && pair[1] != 0 && pair[1] != pair[0]
+    if route[0] == lookup.ifindex
+        && route[1] != 0
+        && route[1] != route[0]
+        && (1..=4094).contains(&route[2])
+    {
+        (route[1], route[2] as u16)
+    } else {
+        (lookup.ifindex, 0)
+    }
 }
 
 #[inline(always)]

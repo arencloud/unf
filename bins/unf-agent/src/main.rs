@@ -904,7 +904,7 @@ struct DataplaneConfig {
     flow_export_interval: Duration,
     bpf_pin_path: PathBuf,
     tc_attachment_preference: TcAttachmentPreference,
-    service_dsr_egress_remap: [u32; 4],
+    service_dsr_egress_remap: [u32; 6],
 }
 
 struct FlowExporterConfig {
@@ -10726,23 +10726,33 @@ fn interface_index_at(sys_class_net: &Path, interface: &str) -> Result<u32> {
 fn service_dsr_egress_remap(
     ipv4_uplink: Option<&str>,
     ipv6_uplink: Option<&str>,
-) -> Result<[u32; 4]> {
-    service_dsr_egress_remap_at(Path::new("/sys/class/net"), ipv4_uplink, ipv6_uplink)
+) -> Result<[u32; 6]> {
+    service_dsr_egress_remap_at(
+        Path::new("/sys/class/net"),
+        Path::new("/proc/net/vlan"),
+        ipv4_uplink,
+        ipv6_uplink,
+    )
 }
 
 fn service_dsr_egress_remap_at(
     sys_class_net: &Path,
+    proc_net_vlan: &Path,
     ipv4_uplink: Option<&str>,
     ipv6_uplink: Option<&str>,
-) -> Result<[u32; 4]> {
-    let ipv4 = dsr_egress_pair(sys_class_net, ipv4_uplink)?;
-    let ipv6 = dsr_egress_pair(sys_class_net, ipv6_uplink)?;
-    Ok([ipv4.0, ipv4.1, ipv6.0, ipv6.1])
+) -> Result<[u32; 6]> {
+    let ipv4 = dsr_egress_route(sys_class_net, proc_net_vlan, ipv4_uplink)?;
+    let ipv6 = dsr_egress_route(sys_class_net, proc_net_vlan, ipv6_uplink)?;
+    Ok([ipv4.0, ipv4.1, ipv4.2, ipv6.0, ipv6.1, ipv6.2])
 }
 
-fn dsr_egress_pair(sys_class_net: &Path, uplink: Option<&str>) -> Result<(u32, u32)> {
+fn dsr_egress_route(
+    sys_class_net: &Path,
+    proc_net_vlan: &Path,
+    uplink: Option<&str>,
+) -> Result<(u32, u32, u32)> {
     let Some(uplink) = uplink else {
-        return Ok((0, 0));
+        return Ok((0, 0, 0));
     };
     let route_ifindex = interface_index_at(sys_class_net, uplink)?;
     let iflink = fs::read_to_string(sys_class_net.join(uplink).join("iflink"))
@@ -10751,8 +10761,11 @@ fn dsr_egress_pair(sys_class_net: &Path, uplink: Option<&str>) -> Result<(u32, u
         .parse::<u32>()
         .with_context(|| format!("parse interface link index for {uplink}"))?;
     if iflink == route_ifindex {
-        return Ok((route_ifindex, route_ifindex));
+        return Ok((route_ifindex, route_ifindex, 0));
     }
+    let Some(vlan_id) = interface_vlan_id_at(proc_net_vlan, uplink)? else {
+        return Ok((route_ifindex, route_ifindex, 0));
+    };
     for entry in fs::read_dir(sys_class_net).context("enumerate DSR egress interfaces")? {
         let entry = entry.context("read DSR egress interface directory entry")?;
         let Some(candidate) = entry.file_name().into_string().ok() else {
@@ -10761,10 +10774,34 @@ fn dsr_egress_pair(sys_class_net: &Path, uplink: Option<&str>) -> Result<(u32, u
         if interface_index_at(sys_class_net, &candidate)? == iflink
             && entry.path().join("device").exists()
         {
-            return Ok((route_ifindex, iflink));
+            return Ok((route_ifindex, iflink, u32::from(vlan_id)));
         }
     }
-    Ok((route_ifindex, route_ifindex))
+    Ok((route_ifindex, route_ifindex, 0))
+}
+
+fn interface_vlan_id_at(proc_net_vlan: &Path, interface: &str) -> Result<Option<u16>> {
+    let path = proc_net_vlan.join(interface);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read VLAN state for {interface}"));
+        }
+    };
+    let fields = contents.split_whitespace().collect::<Vec<_>>();
+    let Some(position) = fields.iter().position(|field| *field == "VID:") else {
+        bail!("VLAN state for {interface} omitted VID");
+    };
+    let vlan_id = fields
+        .get(position + 1)
+        .context("VLAN state omitted value after VID")?
+        .parse::<u16>()
+        .with_context(|| format!("parse VLAN ID for {interface}"))?;
+    if !(1..=4094).contains(&vlan_id) {
+        bail!("VLAN ID for {interface} is outside 1..=4094");
+    }
+    Ok(Some(vlan_id))
 }
 
 fn attach_interface(
@@ -11267,9 +11304,12 @@ mod tests {
     fn dsr_egress_remap_uses_only_a_same_namespace_physical_lower_link() {
         let directory = tempdir().unwrap();
         let sys_class_net = directory.path();
+        let proc_net_vlan = directory.path().join("vlan");
+        fs::create_dir(&proc_net_vlan).unwrap();
         for (name, ifindex, iflink, physical) in [
             ("br-ex", 7_u32, 9_u32, false),
             ("ens18", 9, 9, true),
+            ("mac0", 8, 9, false),
             ("eth0", 4, 55, false),
             ("veth-peer", 55, 4, false),
         ] {
@@ -11281,20 +11321,50 @@ mod tests {
                 fs::create_dir(interface.join("device")).unwrap();
             }
         }
+        fs::write(
+            proc_net_vlan.join("br-ex"),
+            "br-ex  VID: 600\t REORDER_HDR: 1  dev->priv_flags: 81021\n",
+        )
+        .unwrap();
 
         assert_eq!(
-            service_dsr_egress_remap_at(sys_class_net, Some("br-ex"), Some("br-ex")).unwrap(),
-            [7, 9, 7, 9],
-            "an OVS-style internal port remaps to its physical lower link"
+            service_dsr_egress_remap_at(
+                sys_class_net,
+                &proc_net_vlan,
+                Some("br-ex"),
+                Some("br-ex"),
+            )
+            .unwrap(),
+            [7, 9, 600, 7, 9, 600],
+            "a VLAN route remaps to its tagged physical lower link"
         );
         assert_eq!(
-            service_dsr_egress_remap_at(sys_class_net, Some("eth0"), Some("eth0")).unwrap(),
-            [4, 4, 4, 4],
+            service_dsr_egress_remap_at(sys_class_net, &proc_net_vlan, Some("eth0"), Some("eth0"),)
+                .unwrap(),
+            [4, 4, 0, 4, 4, 0],
             "a veth peer is never mistaken for a physical egress"
         );
         assert_eq!(
-            service_dsr_egress_remap_at(sys_class_net, None, None).unwrap(),
-            [0; 4]
+            service_dsr_egress_remap_at(sys_class_net, &proc_net_vlan, Some("mac0"), Some("mac0"),)
+                .unwrap(),
+            [8, 8, 0, 8, 8, 0],
+            "a non-VLAN virtual uplink is not bypassed"
+        );
+        assert_eq!(
+            service_dsr_egress_remap_at(sys_class_net, &proc_net_vlan, None, None).unwrap(),
+            [0; 6]
+        );
+
+        fs::write(proc_net_vlan.join("br-ex"), "br-ex VID: 4095\n").unwrap();
+        assert!(
+            service_dsr_egress_remap_at(
+                sys_class_net,
+                &proc_net_vlan,
+                Some("br-ex"),
+                Some("br-ex"),
+            )
+            .is_err(),
+            "an out-of-range VLAN ID must fail closed"
         );
     }
 
