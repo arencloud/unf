@@ -78,7 +78,13 @@ boundary. Milestone 8.2 now implements the `unf-egress` model with canonical
 bounded selectors, destinations, pools, and address requests. The controller's
 strict OpenShift EgressIP adapter feeds that same model and exposes a
 foreign-preserving status merge without watching or mutating cluster state yet;
-ADR 0114. Phase 8.2 changes no current BPF ABI, host state, or packet behavior.
+ADR 0114. Schema-v1 Egress Behavior Contracts then compile exact-Node plans
+only for intent-selected identities with source-policy allow, binding original
+destinations, exact allocation, lease-fenced acknowledged gateways,
+capabilities, and independent revisions. Agents can replay those facts before a
+future staging path; compact witnesses and bounded failure envelopes are
+provenance, not authority; ADR 0115. Phase 8.2a changes no current BPF ABI, host
+state, or packet behavior.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

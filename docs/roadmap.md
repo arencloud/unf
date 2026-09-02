@@ -612,7 +612,13 @@ matrix is maintained in the
   EgressIP translation/defaulting; and foreign status preservation pass
   `make egress-intent-test`; ADR 0114. It changes no BPF ABI, host routing,
   address ownership, watcher/RBAC behavior, packet behavior, or platform claim.
-- Milestone 8.2a defines the independently replayed Egress Behavior Contract.
+- Milestone 8.2a is verified. Schema-v1 exact-Node Egress Behavior Contracts
+  independently replay identity/intent selection, source-policy allow, exact
+  allocation and lease epoch, ready/reachable gateway ranking, capabilities,
+  and six revision domains. Domain-separated SHA-256 commitments, compact
+  witnesses, mutation rejection, and bounded single-gateway failure outcomes
+  pass `make egress-contract-test`; ADR 0115.
+- Milestone 8.3 implements durable allocation and gateway-provider ownership.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

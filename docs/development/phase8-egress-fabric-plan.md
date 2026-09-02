@@ -14,7 +14,7 @@ authoritative state remains in [project-status.md](../project-status.md).
 |---|---|---|---|
 | 8.1 | Architecture and acceptance boundary | **Verified** | ADR 0113 fixes explicit ownership, policy-before-steering precedence, an independently verified Egress Behavior Contract, lease-fenced gateway epochs, deterministic placement/failover, provider boundaries, compatibility, recovery, platform gates, and exclusions; `make egress-fabric-boundary-test` prevents drift |
 | 8.2 | Egress intent, pool, and compatibility model | **Verified** | `unf-egress` provides bounded canonical Namespace/workload/ServiceAccount selectors, destinations, dual-stack non-overlapping pools, pool or explicit-address requests, deterministic complete-model validation, and strict ownership. The controller translates OpenShift `k8s.ovn.org/v1` EgressIP into the same intent, defaults/intersects selectors exactly, and preserves foreign status; `make egress-intent-test`; ADR 0114 |
-| 8.2a | Egress Behavior Contract and reference validator | **Planned** | Canonical per-source/per-Node plans bind identity, destination, policy, pool, gateway candidates, capabilities, and revisions; independent replay produces compact decision witnesses and bounded failure envelopes |
+| 8.2a | Egress Behavior Contract and reference validator | **Verified** | Schema-v1 exact-Node plans bind selected source identity, original destinations, policy allow, exact pool/explicit allocation, lease-fenced ready/reachable ranked gateways, derived capabilities, and six independent revision domains. Independent replay, domain-separated SHA-256 digests, 16-byte witnesses, and bounded explicit single-gateway failure envelopes pass `make egress-contract-test`; ADR 0115 |
 | 8.3 | Durable allocation and gateway-provider contract | **Planned** | Conflict-safe dual-stack leases, multiple addresses, exact owner/pool/provider provenance, separately revisioned gateway readiness and reachability, safe withdrawal, checkpoint replay, and no status before complete acknowledgement |
 | 8.4 | Transactional distribution and gateway host state | **Planned** | Authenticated exact-Node projection, capability negotiation, inactive staging/readback/activation, last-known-good checkpoints, epoch fencing, rollback/crash repair, and exact versioned cleanup |
 | 8.5 | Source steering and gateway NAT dataplane | **Planned** | Policy-first IPv4/IPv6 TCP/UDP steering, original identity/source witness, collision-safe SNAT/reverse state, fragments and unsupported protocols fail closed, and bounded event provenance without Linux-conntrack duplication by assumption |
@@ -102,7 +102,6 @@ HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.2a defines the canonical per-source/per-Node Egress Behavior
-Contract and independent reference validator. Milestone 8.2 changed no BPF ABI,
-host routing, address ownership, watcher/RBAC behavior, packet behavior, or
-platform claim.
+Milestone 8.3 implements durable conflict-safe allocation and the gateway-provider
+contract. Milestones 8.2–8.2a changed no BPF ABI, host routing, address
+ownership, watcher/RBAC behavior, packet behavior, or platform claim.
