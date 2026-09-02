@@ -7,7 +7,7 @@ use aya_ebpf::bindings::{
     TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT, bpf_fib_lookup as BpfFibLookup,
 };
 use aya_ebpf::helpers::{
-    bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh, bpf_skb_vlan_push,
+    bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_neigh,
 };
 use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
@@ -95,16 +95,6 @@ const SERVICE_POST_LOOKUP_REROUTE_HOST: u8 = 1 << 1;
 // directions consume it because the exact next hook depends on the route
 // device; the metadata is deliberately node-local and is not sent on wire.
 const SERVICE_DSR_HANDOFF_MARK: u32 = 1 << 31;
-
-// Per-node, load-time-only route-device to physical-device remaps for IPv4
-// and IPv6. This is deliberately global object data rather than persistent
-// map state: it describes the current network namespace, not durable policy.
-// Each family uses `[FIB output ifindex, physical lower ifindex, VLAN ID]`.
-// A non-zero VLAN ID identifies an 802.1Q route device whose route-derived DSR
-// frame must be tagged before bypassing to its physical lower link.
-#[allow(unsafe_code)]
-#[unsafe(no_mangle)]
-static SERVICE_DSR_EGRESS_REMAP: [u32; 6] = [0; 6];
 
 #[map]
 static FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -2975,25 +2965,13 @@ fn redirect_service_route(
                 service_reroute_failed()
             };
         }
-        let (redirect_ifindex, vlan_id) = if dsr {
-            dsr_redirect_target(lookup)
-        } else {
-            (lookup.ifindex, 0)
-        };
-        if vlan_id != 0 {
-            // The FIB lookup ran against a VLAN route device and returned its
-            // correct next-hop MACs. Preserve that route while transmitting on
-            // the physical lower link by restoring the stripped 802.1Q tag.
-            // SAFETY: the TC context owns this skb and the configured VLAN ID
-            // was bounded to the valid 1..=4094 range before object loading.
-            #[allow(unsafe_code)]
-            let result = unsafe {
-                bpf_skb_vlan_push(ctx.skb.skb.cast(), u16::to_be(0x8100), vlan_id)
-            };
-            if result != 0 {
-                return dsr_route_failed();
-            }
-        }
+        // Redirect through the FIB-selected route device, including VLAN
+        // devices. Bypassing a VLAN device for its physical lower link loses
+        // the route device's checksum-offload contract: virtio can deliver an
+        // incomplete transport checksum to the remote workload even when an
+        // 802.1Q tag is restored manually. The normal device egress path owns
+        // both link-layer encapsulation and checksum completion.
+        let redirect_ifindex = lookup.ifindex;
         if dsr {
             mark_service_dsr_handoff(ctx);
         }
@@ -3034,34 +3012,6 @@ fn redirect_service_route(
         TC_ACT_REDIRECT
     } else {
         service_reroute_failed()
-    }
-}
-
-#[inline(always)]
-fn dsr_redirect_target(lookup: &BpfFibLookup) -> (u32, u16) {
-    let route = if lookup.family == ADDRESS_FAMILY_INET {
-        [
-            SERVICE_DSR_EGRESS_REMAP[0],
-            SERVICE_DSR_EGRESS_REMAP[1],
-            SERVICE_DSR_EGRESS_REMAP[2],
-        ]
-    } else if lookup.family == ADDRESS_FAMILY_INET6 {
-        [
-            SERVICE_DSR_EGRESS_REMAP[3],
-            SERVICE_DSR_EGRESS_REMAP[4],
-            SERVICE_DSR_EGRESS_REMAP[5],
-        ]
-    } else {
-        return (0, 0);
-    };
-    if route[0] == lookup.ifindex
-        && route[1] != 0
-        && route[1] != route[0]
-        && (1..=4094).contains(&route[2])
-    {
-        (route[1], route[2] as u16)
-    } else {
-        (lookup.ifindex, 0)
     }
 }
 
