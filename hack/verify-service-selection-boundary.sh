@@ -142,6 +142,13 @@ require_text Makefile \
 require_text Makefile \
     'service-selection-openshift-test:' \
     "the build must expose an independent Phase 7 OpenShift qualification gate"
+history_window_count=$(rg --fixed-strings --count \
+    'controller_raw "/v1/flows?since_unix_ms=${since_ms}&limit=4096"' \
+    "${project_root}/hack/verify-openshift-service-selection.sh")
+[[ ${history_window_count} -eq 3 ]] || {
+    echo "Phase 7 boundary check failed: every OpenShift history gate must use the bounded qualification window" >&2
+    exit 1
+}
 require_text hack/deploy-openshift-service-fabric.sh \
     'abi-v11-service-selection-staged-deployment' \
     "the OpenShift rollout must identify the ABI-v11 transition explicitly"

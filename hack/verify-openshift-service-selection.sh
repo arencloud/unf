@@ -266,8 +266,14 @@ udp_probe() {
 
 wait_for_history() {
     local address=$1 assertion=$2 history=
+    local since_ms=$((started_unix * 1000))
     for _ in $(seq 1 300); do
-        history=$(controller_raw /v1/flows 2>/dev/null || true)
+        # cl02 produces enough background Service traffic to evict a
+        # qualification flow from the API's default history window before
+        # the proxied request completes. Query the full bounded run window so
+        # locality and affinity evidence is retained without accepting stale
+        # entries from an earlier qualification.
+        history=$(controller_raw "/v1/flows?since_unix_ms=${since_ms}&limit=4096" 2>/dev/null || true)
         if jq -e --arg address "${address}" ".schema_version == 7 and (${assertion})" \
             <<<"${history}" >/dev/null 2>&1; then
             printf '%s\n' "${history}"
