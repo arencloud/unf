@@ -353,12 +353,18 @@ pub fn unf_observe_egress(ctx: TcContext) -> i32 {
 fn consume_service_dsr_handoff(ctx: &TcContext) -> bool {
     // SAFETY: the TC context owns this skb for the current invocation. Only
     // UNF's reserved bit is changed; every unrelated mark bit is preserved.
+    // A VLAN route traverses both its logical route device and physical lower
+    // link. Keep the handoff bit through every declared transport hook so the
+    // still-VIP packet cannot re-enter DSR and loop back to the route device.
+    // Clear it at the final workload-veth hook; marks are not carried on wire.
     #[allow(unsafe_code)]
     let skb = unsafe { &mut *ctx.skb.skb };
     if skb.mark & SERVICE_DSR_HANDOFF_MARK == 0 {
         return false;
     }
-    skb.mark &= !SERVICE_DSR_HANDOFF_MARK;
+    if !service_dsr_transport_ifindex(skb.ifindex) {
+        skb.mark &= !SERVICE_DSR_HANDOFF_MARK;
+    }
     true
 }
 
@@ -409,8 +415,17 @@ fn service_dsr_transport_interface(lookup: &BpfFibLookup) -> bool {
     } else {
         return false;
     };
-    (interfaces[0] > 1 && lookup.ifindex == interfaces[0])
-        || (interfaces[1] > 1 && lookup.ifindex == interfaces[1])
+    service_dsr_transport_ifindex(lookup.ifindex)
+        && (lookup.ifindex == interfaces[0] || lookup.ifindex == interfaces[1])
+}
+
+#[inline(always)]
+fn service_dsr_transport_ifindex(ifindex: u32) -> bool {
+    ifindex > 1
+        && (ifindex == SERVICE_DSR_TRANSPORT_INTERFACES[0]
+            || ifindex == SERVICE_DSR_TRANSPORT_INTERFACES[1]
+            || ifindex == SERVICE_DSR_TRANSPORT_INTERFACES[2]
+            || ifindex == SERVICE_DSR_TRANSPORT_INTERFACES[3])
 }
 
 #[classifier]
