@@ -375,11 +375,13 @@ external_source_probe() {
 
 assert_external_source() {
     local family=$1 address=$2 expected=$3 description=$4 observed
-    observed=$(external_source_probe "${family}" "${address}")
-    if [[ ${observed} != "${expected}" ]]; then
-        echo "${description} IPv${family} source mismatch: expected ${expected}, observed ${observed}" >&2
-        return 1
-    fi
+    for _ in $(seq 1 30); do
+        observed=$(external_source_probe "${family}" "${address}" 2>/dev/null || true)
+        [[ ${observed} == "${expected}" ]] && return 0
+        sleep 1
+    done
+    echo "${description} IPv${family} source mismatch: expected ${expected}, observed ${observed}" >&2
+    return 1
 }
 
 expect_external_blocked() {
