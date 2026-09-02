@@ -2,7 +2,7 @@
 #![no_main]
 
 use aya_ebpf::bindings::{
-    BPF_F_INGRESS, BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR,
+    BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR,
     BPF_FIB_LOOKUP_OUTPUT, BPF_FIB_LOOKUP_SRC, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_NOEXIST,
     TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT, bpf_fib_lookup as BpfFibLookup,
 };
@@ -98,8 +98,9 @@ const SERVICE_DSR_HANDOFF_MARK: u32 = 1 << 31;
 // and IPv6. This is deliberately global object data rather than persistent
 // map state: it describes the current network namespace, not durable policy.
 // Each pair is `[FIB output ifindex, physical lower ifindex]`. A differing
-// lower index identifies a virtual uplink whose ingress side must receive the
-// rewritten frame so its forwarding datapath can transmit it.
+// lower index identifies a virtual uplink whose rewritten DSR frame must be
+// returned to host routing so that virtual device's forwarding datapath can
+// transmit it.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 static SERVICE_DSR_EGRESS_REMAP: [u32; 4] = [0; 4];
@@ -2961,6 +2962,17 @@ fn redirect_service_route(
         };
     }
     if result == 0 {
+        if dsr && dsr_uses_virtual_uplink(lookup) {
+            // The FIB lookup above already proved route, neighbor, and MTU.
+            // Keep its L2 result out of the skb and return the rewritten L3
+            // packet to normal host forwarding. OVS internal ports and their
+            // enslaved physical devices do not transmit frames injected with
+            // TC redirect helpers, while the ordinary routed path enters OVS
+            // exactly like every other pod packet. The egress hook consumes
+            // this handoff mark before the packet leaves the node.
+            mark_service_dsr_handoff(ctx);
+            return TC_ACT_PIPE;
+        }
         if ctx.store(0, &lookup.dmac, 0).is_err()
             || ctx.store(6, &lookup.smac, 0).is_err()
         {
@@ -2970,11 +2982,11 @@ fn redirect_service_route(
                 service_reroute_failed()
             };
         }
-        let (redirect_ifindex, redirect_flags) = if dsr {
+        let redirect_ifindex = if dsr {
             mark_service_dsr_handoff(ctx);
-            dsr_redirect_target(lookup)
+            lookup.ifindex
         } else {
-            (lookup.ifindex, 0)
+            lookup.ifindex
         };
         if redirect_ifindex == 0 {
             return if dsr {
@@ -2985,12 +2997,8 @@ fn redirect_service_route(
         }
         // SAFETY: the successful FIB lookup returned a live output interface
         // and the Ethernet header now carries that route's exact addresses.
-        // A virtual DSR uplink receives the route-derived frame on its ingress
-        // side. For an OVS internal port this enters the switching datapath;
-        // redirecting to either its egress side or its enslaved physical lower
-        // device bypasses that datapath and never transmits the frame.
         #[allow(unsafe_code)]
-        let action = unsafe { bpf_redirect(redirect_ifindex, redirect_flags) };
+        let action = unsafe { bpf_redirect(redirect_ifindex, 0) };
         return if action == i64::from(TC_ACT_REDIRECT) {
             TC_ACT_REDIRECT
         } else {
@@ -3021,19 +3029,15 @@ fn redirect_service_route(
 }
 
 #[inline(always)]
-fn dsr_redirect_target(lookup: &BpfFibLookup) -> (u32, u64) {
+fn dsr_uses_virtual_uplink(lookup: &BpfFibLookup) -> bool {
     let pair = if lookup.family == ADDRESS_FAMILY_INET {
         [SERVICE_DSR_EGRESS_REMAP[0], SERVICE_DSR_EGRESS_REMAP[1]]
     } else if lookup.family == ADDRESS_FAMILY_INET6 {
         [SERVICE_DSR_EGRESS_REMAP[2], SERVICE_DSR_EGRESS_REMAP[3]]
     } else {
-        return (0, 0);
+        return false;
     };
-    if pair[0] == lookup.ifindex && pair[1] != 0 && pair[1] != pair[0] {
-        (pair[0], u64::from(BPF_F_INGRESS))
-    } else {
-        (lookup.ifindex, 0)
-    }
+    pair[0] == lookup.ifindex && pair[1] != 0 && pair[1] != pair[0]
 }
 
 #[inline(always)]
