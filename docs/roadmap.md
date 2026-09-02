@@ -583,3 +583,32 @@ matrix is maintained in the
 - Weighted traffic splitting, latency/load feedback, cross-cluster selection,
   SCTP Services, fragments, generic NAT `RELATED`, and production scale remain
   separate gates.
+
+## Phase 8 — identity-aware egress fabric
+
+**Gate: in progress.** The ordered evidence matrix is maintained in the
+[Phase 8 egress-fabric plan](development/phase8-egress-fabric-plan.md).
+
+- Verified architecture boundary: source identity and security policy precede
+  explicit egress intent, address allocation, gateway placement, steering, and
+  NAT. A gateway or address lease never grants permission.
+- The controller will translate Kubernetes/OpenShift inputs into one
+  provider-neutral domain. OpenShift EgressIP compatibility does not create a
+  second policy, allocation, or dataplane engine.
+- Canonical per-source/per-Node Egress Behavior Contracts bind identity,
+  destination constraints, policy, allocation, gateway candidates,
+  capabilities, and revisions and require independent agent replay before
+  activation.
+- Gateway ownership is lease- and epoch-fenced. Placement/failover algorithms
+  require committed disruption and convergence measurements before adoption.
+- Allocation, gateway readiness, reachability, dataplane state, and publication
+  have independent revisions and last-known-good recovery. Native egress remains
+  unchanged unless explicit admitted intent owns the flow.
+- FQDN controls use bounded TTL/staleness/provenance-aware address sets; DNS
+  names and answers never become workload identity.
+- Milestone 8.1 changes no BPF ABI, host routing, address ownership, packet
+  behavior, or platform claim. Milestone 8.2 defines typed intent and pools.
+- Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
+  overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
+  generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale
+  remain independent gates; ADR 0113.

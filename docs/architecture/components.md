@@ -64,6 +64,18 @@ selection/policy/source-range/lifecycle order, requires route/neighbor/MTU proof
 and writes forward-only Service state for direct return. ADRs 0102 and 0104–0109
 record the boundary; Kind/OpenShift return-path claims remain independent.
 
+The accepted Phase 8 boundary keeps egress policy, allocation, gateway
+placement, reachability, NAT, and publication as separate coherent
+transactions. Normalized identity-aware intent and the Egress Behavior Contract
+belong in domain libraries; Kubernetes and OpenShift EgressIP conversion remains
+in the controller adapter. A dedicated egress domain will own conflict-safe
+pools/leases, provider-neutral gateway candidates, and readiness contracts. The
+agent will independently verify exact-Node plans and transactionally own host
+steering/NAT state; `unf-ebpf-tc` may consume only fixed-width decisions after
+source-side policy. Static, BGP, cloud, and cross-cluster reachability providers
+must not fork policy or NAT semantics. ADR 0113 defines this architecture-only
+boundary; Phase 8.1 changes no current component ABI or packet behavior.
+
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,
 control-plane-only collections; packet processing and event records do not
