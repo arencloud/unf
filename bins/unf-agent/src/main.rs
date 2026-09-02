@@ -904,6 +904,7 @@ struct DataplaneConfig {
     flow_export_interval: Duration,
     bpf_pin_path: PathBuf,
     tc_attachment_preference: TcAttachmentPreference,
+    service_dsr_egress_remap: [u32; 4],
 }
 
 struct FlowExporterConfig {
@@ -1148,6 +1149,10 @@ async fn main() -> Result<()> {
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
             let bpf_pin_path = args.bpf_pin_path.clone();
             let tc_attachment_preference = args.tc_attachment_mode;
+            let service_dsr_egress_remap = service_dsr_egress_remap(
+                args.cni_native_ipv4_uplink.as_deref(),
+                args.cni_native_ipv6_uplink.as_deref(),
+            )?;
             tasks.spawn(async move {
                 let config = DataplaneConfig {
                     object,
@@ -1166,6 +1171,7 @@ async fn main() -> Result<()> {
                     flow_export_interval,
                     bpf_pin_path,
                     tc_attachment_preference,
+                    service_dsr_egress_remap,
                 };
                 if let Err(error) = run_dataplane(config, Arc::clone(&state), cancellation).await {
                     error!(?error, "eBPF dataplane stopped");
@@ -6765,6 +6771,11 @@ fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool)> {
     validate_tail_program_pin_directory(&tail_program_pin_root)?;
 
     let mut loader = EbpfLoader::new();
+    loader.override_global(
+        "SERVICE_DSR_EGRESS_REMAP",
+        &config.service_dsr_egress_remap,
+        true,
+    );
     for name in PERSISTENT_MAP_NAMES {
         loader.map_pin_path(name, config.bpf_pin_path.join(name));
     }
@@ -10700,12 +10711,60 @@ fn discover_interfaces() -> Result<HashMap<String, u32>> {
 }
 
 fn interface_index(interface: &str) -> Result<u32> {
-    let value = fs::read_to_string(Path::new("/sys/class/net").join(interface).join("ifindex"))
+    interface_index_at(Path::new("/sys/class/net"), interface)
+}
+
+fn interface_index_at(sys_class_net: &Path, interface: &str) -> Result<u32> {
+    let value = fs::read_to_string(sys_class_net.join(interface).join("ifindex"))
         .with_context(|| format!("read interface index for {interface}"))?;
     value
         .trim()
         .parse()
         .with_context(|| format!("parse interface index for {interface}"))
+}
+
+fn service_dsr_egress_remap(
+    ipv4_uplink: Option<&str>,
+    ipv6_uplink: Option<&str>,
+) -> Result<[u32; 4]> {
+    service_dsr_egress_remap_at(Path::new("/sys/class/net"), ipv4_uplink, ipv6_uplink)
+}
+
+fn service_dsr_egress_remap_at(
+    sys_class_net: &Path,
+    ipv4_uplink: Option<&str>,
+    ipv6_uplink: Option<&str>,
+) -> Result<[u32; 4]> {
+    let ipv4 = dsr_egress_pair(sys_class_net, ipv4_uplink)?;
+    let ipv6 = dsr_egress_pair(sys_class_net, ipv6_uplink)?;
+    Ok([ipv4.0, ipv4.1, ipv6.0, ipv6.1])
+}
+
+fn dsr_egress_pair(sys_class_net: &Path, uplink: Option<&str>) -> Result<(u32, u32)> {
+    let Some(uplink) = uplink else {
+        return Ok((0, 0));
+    };
+    let route_ifindex = interface_index_at(sys_class_net, uplink)?;
+    let iflink = fs::read_to_string(sys_class_net.join(uplink).join("iflink"))
+        .with_context(|| format!("read interface link index for {uplink}"))?
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("parse interface link index for {uplink}"))?;
+    if iflink == route_ifindex {
+        return Ok((route_ifindex, route_ifindex));
+    }
+    for entry in fs::read_dir(sys_class_net).context("enumerate DSR egress interfaces")? {
+        let entry = entry.context("read DSR egress interface directory entry")?;
+        let Some(candidate) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        if interface_index_at(sys_class_net, &candidate)? == iflink
+            && entry.path().join("device").exists()
+        {
+            return Ok((route_ifindex, iflink));
+        }
+    }
+    Ok((route_ifindex, route_ifindex))
 }
 
 fn attach_interface(
@@ -11202,6 +11261,41 @@ mod tests {
         assert_eq!(native.cni_native_ipv6_uplink.as_deref(), Some("eth1"));
         assert!(native.cni_native_ipv4_onlink);
         assert!(!native.cni_native_ipv6_onlink);
+    }
+
+    #[test]
+    fn dsr_egress_remap_uses_only_a_same_namespace_physical_lower_link() {
+        let directory = tempdir().unwrap();
+        let sys_class_net = directory.path();
+        for (name, ifindex, iflink, physical) in [
+            ("br-ex", 7_u32, 9_u32, false),
+            ("ens18", 9, 9, true),
+            ("eth0", 4, 55, false),
+            ("veth-peer", 55, 4, false),
+        ] {
+            let interface = sys_class_net.join(name);
+            fs::create_dir_all(&interface).unwrap();
+            fs::write(interface.join("ifindex"), format!("{ifindex}\n")).unwrap();
+            fs::write(interface.join("iflink"), format!("{iflink}\n")).unwrap();
+            if physical {
+                fs::create_dir(interface.join("device")).unwrap();
+            }
+        }
+
+        assert_eq!(
+            service_dsr_egress_remap_at(sys_class_net, Some("br-ex"), Some("br-ex")).unwrap(),
+            [7, 9, 7, 9],
+            "an OVS-style internal port remaps to its physical lower link"
+        );
+        assert_eq!(
+            service_dsr_egress_remap_at(sys_class_net, Some("eth0"), Some("eth0")).unwrap(),
+            [4, 4, 4, 4],
+            "a veth peer is never mistaken for a physical egress"
+        );
+        assert_eq!(
+            service_dsr_egress_remap_at(sys_class_net, None, None).unwrap(),
+            [0; 4]
+        );
     }
 
     #[test]

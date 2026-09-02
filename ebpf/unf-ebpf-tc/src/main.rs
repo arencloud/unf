@@ -94,15 +94,13 @@ const SERVICE_POST_LOOKUP_REROUTE_HOST: u8 = 1 << 1;
 // the backend node to perform its own ingress policy and local DSR routing.
 const SERVICE_DSR_HANDOFF_MARK: u32 = 1 << 31;
 
-// Kernel `struct bpf_redir_neigh`. Supplying the selected backend as the
-// explicit next hop is essential for DSR: the packet still carries the
-// frontend VIP, so a helper-side lookup of the packet header would resolve
-// the advertised VIP instead of the backend route.
-#[repr(C)]
-struct BpfRedirectNeighbor {
-    next_hop_family: u32,
-    next_hop: [u32; 4],
-}
+// Per-node, load-time-only route-device to physical-device remaps for IPv4
+// and IPv6. This is deliberately global object data rather than persistent
+// map state: it describes the current network namespace, not durable policy.
+// Each pair is `[FIB output ifindex, direct redirect ifindex]`.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+static SERVICE_DSR_EGRESS_REMAP: [u32; 4] = [0; 4];
 
 #[map]
 static FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -2961,60 +2959,43 @@ fn redirect_service_route(
         };
     }
     if result == 0 {
-        if dsr {
-            let mut neighbor = BpfRedirectNeighbor {
-                next_hop_family: u32::from(lookup.family),
-                next_hop: [0; 4],
-            };
-            if lookup.family == ADDRESS_FAMILY_INET {
-                // SAFETY: an IPv4 FIB lookup initialized this union arm.
-                #[allow(unsafe_code)]
-                unsafe {
-                    neighbor.next_hop[0] = lookup.__bindgen_anon_4.ipv4_dst;
-                }
-            } else if lookup.family == ADDRESS_FAMILY_INET6 {
-                // SAFETY: an IPv6 FIB lookup initialized this union arm.
-                #[allow(unsafe_code)]
-                unsafe {
-                    neighbor.next_hop = lookup.__bindgen_anon_4.ipv6_dst;
-                }
-            } else {
-                return dsr_route_failed();
-            }
-            mark_service_dsr_handoff(ctx);
-            // SAFETY: `BpfRedirectNeighbor` exactly matches the kernel helper
-            // ABI and the successful FIB lookup supplied a live output
-            // interface. Neighbor-aware redirection is required for virtual
-            // uplinks such as OpenShift's OVS `br-ex`; a direct redirect to
-            // the bridge netdevice does not enter its forwarding datapath.
-            #[allow(unsafe_code)]
-            let action = unsafe {
-                bpf_redirect_neigh(
-                    lookup.ifindex,
-                    (&raw mut neighbor).cast(),
-                    core::mem::size_of::<BpfRedirectNeighbor>() as i32,
-                    0,
-                )
-            };
-            return if action == i64::from(TC_ACT_REDIRECT) {
-                TC_ACT_REDIRECT
-            } else {
-                dsr_route_failed()
-            };
-        }
         if ctx.store(0, &lookup.dmac, 0).is_err()
             || ctx.store(6, &lookup.smac, 0).is_err()
         {
-            return service_reroute_failed();
+            return if dsr {
+                dsr_route_failed()
+            } else {
+                service_reroute_failed()
+            };
+        }
+        let redirect_ifindex = if dsr {
+            mark_service_dsr_handoff(ctx);
+            dsr_redirect_ifindex(lookup)
+        } else {
+            lookup.ifindex
+        };
+        if redirect_ifindex == 0 {
+            return if dsr {
+                dsr_route_failed()
+            } else {
+                service_reroute_failed()
+            };
         }
         // SAFETY: the successful FIB lookup returned a live output interface
         // and the Ethernet header now carries that route's exact addresses.
+        // A DSR remap may select the physical lower link of a virtual FIB
+        // device, preserving those route-derived MACs while bypassing an OVS
+        // internal port that cannot accept direct TC redirects.
         #[allow(unsafe_code)]
-        let action = unsafe { bpf_redirect(lookup.ifindex, 0) };
+        let action = unsafe { bpf_redirect(redirect_ifindex, 0) };
         return if action == i64::from(TC_ACT_REDIRECT) {
             TC_ACT_REDIRECT
         } else {
-            service_reroute_failed()
+            if dsr {
+                dsr_route_failed()
+            } else {
+                service_reroute_failed()
+            }
         };
     }
     if result != i64::from(BPF_FIB_LKUP_RET_NO_NEIGH) || dsr {
@@ -3033,6 +3014,22 @@ fn redirect_service_route(
         TC_ACT_REDIRECT
     } else {
         service_reroute_failed()
+    }
+}
+
+#[inline(always)]
+fn dsr_redirect_ifindex(lookup: &BpfFibLookup) -> u32 {
+    let pair = if lookup.family == ADDRESS_FAMILY_INET {
+        [SERVICE_DSR_EGRESS_REMAP[0], SERVICE_DSR_EGRESS_REMAP[1]]
+    } else if lookup.family == ADDRESS_FAMILY_INET6 {
+        [SERVICE_DSR_EGRESS_REMAP[2], SERVICE_DSR_EGRESS_REMAP[3]]
+    } else {
+        return 0;
+    };
+    if pair[0] == lookup.ifindex && pair[1] != 0 {
+        pair[1]
+    } else {
+        lookup.ifindex
     }
 }
 
