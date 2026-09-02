@@ -2,7 +2,7 @@
 #![no_main]
 
 use aya_ebpf::bindings::{
-    BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR,
+    BPF_F_INGRESS, BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR,
     BPF_FIB_LOOKUP_OUTPUT, BPF_FIB_LOOKUP_SRC, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_NOEXIST,
     TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT, bpf_fib_lookup as BpfFibLookup,
 };
@@ -89,18 +89,17 @@ const SERVICE_POLICY_DISPATCH_V6: i32 = -1_002;
 const SERVICE_POST_LOOKUP_TRANSLATED: u8 = 1 << 0;
 const SERVICE_POST_LOOKUP_REROUTE_HOST: u8 = 1 << 1;
 // A DSR redirect preserves the frontend tuple. Reserve one skb mark bit so
-// the immediately following egress hook does not select the same VIP again.
-// The egress hook consumes it before the packet leaves this node, allowing
-// the backend node to perform its own ingress policy and local DSR routing.
+// the immediately following hook does not select the same VIP again. Virtual
+// uplinks are reinjected at ingress, while direct uplinks continue at egress;
+// either hook consumes the mark before ordinary forwarding continues.
 const SERVICE_DSR_HANDOFF_MARK: u32 = 1 << 31;
 
 // Per-node, load-time-only route-device to physical-device remaps for IPv4
 // and IPv6. This is deliberately global object data rather than persistent
 // map state: it describes the current network namespace, not durable policy.
 // Each pair is `[FIB output ifindex, physical lower ifindex]`. A differing
-// lower index identifies a virtual uplink whose rewritten DSR frame must be
-// returned to host routing so that virtual device's forwarding datapath can
-// transmit it.
+// lower index identifies a virtual uplink whose route-derived DSR frame must
+// be injected into that virtual device's ingress forwarding datapath.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 static SERVICE_DSR_EGRESS_REMAP: [u32; 4] = [0; 4];
@@ -305,6 +304,9 @@ static SERVICE_DATAPLANE_TAIL_CALLS: ProgramArray = ProgramArray::with_max_entri
 
 #[classifier]
 pub fn unf_observe_ingress(ctx: TcContext) -> i32 {
+    if consume_service_dsr_handoff(&ctx) {
+        return TC_ACT_PIPE;
+    }
     let action = observe(&ctx, Direction::Ingress, true);
     if action == SERVICE_POLICY_DISPATCH_V4 {
         // SAFETY: index 0 is a TC classifier over this exact context and the
@@ -2962,17 +2964,6 @@ fn redirect_service_route(
         };
     }
     if result == 0 {
-        if dsr && dsr_uses_virtual_uplink(lookup) {
-            // The FIB lookup above already proved route, neighbor, and MTU.
-            // Keep its L2 result out of the skb and return the rewritten L3
-            // packet to normal host forwarding. OVS internal ports and their
-            // enslaved physical devices do not transmit frames injected with
-            // TC redirect helpers, while the ordinary routed path enters OVS
-            // exactly like every other pod packet. The egress hook consumes
-            // this handoff mark before the packet leaves the node.
-            mark_service_dsr_handoff(ctx);
-            return TC_ACT_PIPE;
-        }
         if ctx.store(0, &lookup.dmac, 0).is_err()
             || ctx.store(6, &lookup.smac, 0).is_err()
         {
@@ -2982,6 +2973,16 @@ fn redirect_service_route(
                 service_reroute_failed()
             };
         }
+        let redirect_flags = if dsr && dsr_uses_virtual_uplink(lookup) {
+            // DSR preserves the frontend IP, so normal host routing would
+            // classify an advertised VIP as local. Reinject the FIB-derived
+            // Ethernet frame at the virtual uplink's ingress side instead.
+            // This enters OVS exactly as a host-originated frame; the ingress
+            // classifier consumes the handoff mark to prevent reselection.
+            u64::from(BPF_F_INGRESS)
+        } else {
+            0
+        };
         let redirect_ifindex = if dsr {
             mark_service_dsr_handoff(ctx);
             lookup.ifindex
@@ -2998,7 +2999,7 @@ fn redirect_service_route(
         // SAFETY: the successful FIB lookup returned a live output interface
         // and the Ethernet header now carries that route's exact addresses.
         #[allow(unsafe_code)]
-        let action = unsafe { bpf_redirect(redirect_ifindex, 0) };
+        let action = unsafe { bpf_redirect(redirect_ifindex, redirect_flags) };
         return if action == i64::from(TC_ACT_REDIRECT) {
             TC_ACT_REDIRECT
         } else {
