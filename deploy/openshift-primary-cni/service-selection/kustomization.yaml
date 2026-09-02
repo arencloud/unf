@@ -5,7 +5,7 @@ resources:
 images:
   - name: quay.io/arencloud/unf-controller-dev
     newName: quay.io/arencloud/unf-controller-dev
-    digest: sha256:9e753a74eb93bc0d46fed0aa1d68e234d2a85fdcceced508e11946ed27630219
+    digest: sha256:a23c397bbb6294c5c10625c1d0772509144cd476193084c5643f15250ea28a80
   - name: quay.io/arencloud/unf-agent-dev
     newName: quay.io/arencloud/unf-agent-dev
-    digest: sha256:0048e33a5dc8490189d90b72aa8e3e90d0b5c9962934c195a7d237331842cb3d
+    digest: sha256:3d413cea8dad7dc1a146962023a95e5c13dbe3bf759b3fcf681abf4b1a28440f
