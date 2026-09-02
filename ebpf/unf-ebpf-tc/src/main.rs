@@ -96,6 +96,16 @@ const SERVICE_POST_LOOKUP_REROUTE_HOST: u8 = 1 << 1;
 // device; the metadata is deliberately node-local and is not sent on wire.
 const SERVICE_DSR_HANDOFF_MARK: u32 = 1 << 31;
 
+// Per-node, load-time-only transport interfaces for IPv4 and IPv6 DSR.
+// Each family stores `[route device, physical lower device]`. A VLAN route
+// can traverse both interfaces before the remote node performs its final
+// workload-veth redirect, so accelerated VLAN metadata must survive either
+// transport hop. This topology belongs to the current network namespace and
+// is deliberately independent from the persistent map ABI.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+static SERVICE_DSR_TRANSPORT_INTERFACES: [u32; 4] = [0; 4];
+
 #[map]
 static FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
@@ -367,20 +377,40 @@ fn normalize_service_dsr_vlan(ctx: &TcContext, lookup: &BpfFibLookup) -> bool {
     // packet bytes already expose the inner EtherType. TC redirect preserves
     // that metadata across devices, so redirecting the skb into a remote pod
     // veth would make the pod-side receive path classify an inline IPv4/IPv6
-    // frame as 802.1Q. The configured native uplink must retain that metadata
-    // for inter-node transport, so normalize only the final non-uplink FIB
-    // redirect. Untagged packets and inline VLAN frames remain unchanged.
+    // frame as 802.1Q. Both a configured VLAN route device and its physical
+    // lower link are transport hops and must retain the metadata. Normalize
+    // only the final workload redirect. Untagged and inline VLAN frames remain
+    // unchanged.
     // SAFETY: the TC context owns this skb for the current invocation and the
     // helper is called only when the verifier-visible VLAN-present bit is set.
     #[allow(unsafe_code)]
     unsafe {
-        if load_balancer_output_interface(lookup.family) == Some(lookup.ifindex)
+        if service_dsr_transport_interface(lookup)
             || (*ctx.skb.skb).vlan_present == 0
         {
             return true;
         }
         bpf_skb_vlan_pop(ctx.skb.skb.cast()) == 0
     }
+}
+
+#[inline(always)]
+fn service_dsr_transport_interface(lookup: &BpfFibLookup) -> bool {
+    let interfaces = if lookup.family == ADDRESS_FAMILY_INET {
+        [
+            SERVICE_DSR_TRANSPORT_INTERFACES[0],
+            SERVICE_DSR_TRANSPORT_INTERFACES[1],
+        ]
+    } else if lookup.family == ADDRESS_FAMILY_INET6 {
+        [
+            SERVICE_DSR_TRANSPORT_INTERFACES[2],
+            SERVICE_DSR_TRANSPORT_INTERFACES[3],
+        ]
+    } else {
+        return false;
+    };
+    (interfaces[0] > 1 && lookup.ifindex == interfaces[0])
+        || (interfaces[1] > 1 && lookup.ifindex == interfaces[1])
 }
 
 #[classifier]
@@ -1209,7 +1239,7 @@ fn load_balancer_node_source(address_family: u8) -> Option<[u8; 16]> {
         || config.node_revision == 0
         || config.flags & !(LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4 | LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6)
             != 0
-        || config.reserved != [0; 1]
+        || config.reserved != [0; 9]
     {
         return None;
     }
@@ -1226,27 +1256,6 @@ fn load_balancer_node_source(address_family: u8) -> Option<[u8; 16]> {
         return Some(config.ipv6_address);
     }
     None
-}
-
-#[inline(always)]
-fn load_balancer_output_interface(address_family: u8) -> Option<u32> {
-    let config = LOAD_BALANCER_NODE_SOURCE.get(0).copied()?;
-    if config.schema_version != LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION
-        || config.node_revision == 0
-        || config.flags & !(LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4 | LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6)
-            != 0
-        || config.reserved != [0; 1]
-    {
-        return None;
-    }
-    let ifindex = if address_family == AddressFamily::Ipv4 as u8 {
-        config.ipv4_output_interface
-    } else if address_family == AddressFamily::Ipv6 as u8 {
-        config.ipv6_output_interface
-    } else {
-        return None;
-    };
-    (ifindex > 1).then_some(ifindex)
 }
 
 /// Returns the additional source translation for a Cluster NodePort forward

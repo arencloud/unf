@@ -784,8 +784,6 @@ struct ServiceSynchronizer {
     applied_load_balancer_reachability: Option<NodeReachabilitySnapshot>,
     applied_selection_contract: Option<NetworkBehaviorContract>,
     active_selection_bank: u8,
-    ipv4_output_interface: u32,
-    ipv6_output_interface: u32,
     node_name: String,
     controller_url: Option<String>,
     client: ReloadingControllerClient,
@@ -906,8 +904,7 @@ struct DataplaneConfig {
     flow_export_interval: Duration,
     bpf_pin_path: PathBuf,
     tc_attachment_preference: TcAttachmentPreference,
-    ipv4_output_interface: u32,
-    ipv6_output_interface: u32,
+    service_dsr_transport_interfaces: [u32; 4],
 }
 
 struct FlowExporterConfig {
@@ -1119,10 +1116,10 @@ async fn main() -> Result<()> {
 
     let cni_provider = resolve_cni_provider(&args, &state).await?;
     let remote_routes = initialize_remote_routes(&args, cni_provider.as_ref(), &state).await?;
-    let (ipv4_output_interface, ipv6_output_interface) =
-        remote_routes.as_ref().map_or((0, 0), |runtime| {
-            (runtime.ipv4_output_interface, runtime.ipv6_output_interface)
-        });
+    let service_dsr_transport_interfaces = service_dsr_transport_interfaces(
+        args.cni_native_ipv4_uplink.as_deref(),
+        args.cni_native_ipv6_uplink.as_deref(),
+    )?;
     supervised_service_configured |= spawn_cni_transaction_server(
         &args,
         cni_provider,
@@ -1174,8 +1171,7 @@ async fn main() -> Result<()> {
                     flow_export_interval,
                     bpf_pin_path,
                     tc_attachment_preference,
-                    ipv4_output_interface,
-                    ipv6_output_interface,
+                    service_dsr_transport_interfaces,
                 };
                 if let Err(error) = run_dataplane(config, Arc::clone(&state), cancellation).await {
                     error!(?error, "eBPF dataplane stopped");
@@ -3542,11 +3538,7 @@ fn service_requires_local_node(snapshot: &ServiceSnapshot) -> bool {
             .any(|service| service.load_balancer.is_some())
 }
 
-fn encode_load_balancer_node_source(
-    node: Option<&NodePortNodeSnapshot>,
-    ipv4_output_interface: u32,
-    ipv6_output_interface: u32,
-) -> [u8; 40] {
+fn encode_load_balancer_node_source(node: Option<&NodePortNodeSnapshot>) -> [u8; 40] {
     let Some(node) = node else {
         return [0; 40];
     };
@@ -3575,11 +3567,9 @@ fn encode_load_balancer_node_source(
         config[12..28].copy_from_slice(&address.octets());
         flags |= unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6;
     }
-    config[28..32].copy_from_slice(&ipv4_output_interface.to_ne_bytes());
-    config[32..36].copy_from_slice(&ipv6_output_interface.to_ne_bytes());
-    config[36..38]
+    config[28..30]
         .copy_from_slice(&unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION.to_ne_bytes());
-    config[38] = flags;
+    config[30] = flags;
     config
 }
 
@@ -4221,11 +4211,7 @@ fn activate_service_snapshot_with_contract(
             .load_balancer_node_source
             .set(
                 0,
-                encode_load_balancer_node_source(
-                    node_port_node.as_ref(),
-                    synchronizer.ipv4_output_interface,
-                    synchronizer.ipv6_output_interface,
-                ),
+                encode_load_balancer_node_source(node_port_node.as_ref()),
                 0,
             )
             .context("publish runtime LoadBalancer Node source addresses")?;
@@ -6058,8 +6044,6 @@ async fn run_dataplane(
         config.service_state_path.clone(),
         config.load_balancer_reachability_state_path.clone(),
         config.node_name.clone(),
-        config.ipv4_output_interface,
-        config.ipv6_output_interface,
     );
     let recovered =
         recover_persistent_dataplane(&mut identities, &mut policies, &mut services, pins_existed)?;
@@ -6317,8 +6301,6 @@ fn new_synchronizers(
     service_state_path: PathBuf,
     load_balancer_state_path: PathBuf,
     node_name: String,
-    ipv4_output_interface: u32,
-    ipv6_output_interface: u32,
 ) -> (
     IdentitySynchronizer,
     PolicySynchronizer,
@@ -6411,8 +6393,6 @@ fn new_synchronizers(
             applied_load_balancer_reachability: None,
             applied_selection_contract: None,
             active_selection_bank: 0,
-            ipv4_output_interface,
-            ipv6_output_interface,
             node_name,
             controller_url,
             client,
@@ -6791,6 +6771,11 @@ fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool)> {
     validate_tail_program_pin_directory(&tail_program_pin_root)?;
 
     let mut loader = EbpfLoader::new();
+    loader.override_global(
+        "SERVICE_DSR_TRANSPORT_INTERFACES",
+        &config.service_dsr_transport_interfaces,
+        true,
+    );
     for name in PERSISTENT_MAP_NAMES {
         loader.map_pin_path(name, config.bpf_pin_path.join(name));
     }
@@ -7761,15 +7746,7 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
     services.applied = Some(durable);
     services
         .load_balancer_node_source
-        .set(
-            0,
-            encode_load_balancer_node_source(
-                node.as_ref(),
-                services.ipv4_output_interface,
-                services.ipv6_output_interface,
-            ),
-            0,
-        )
+        .set(0, encode_load_balancer_node_source(node.as_ref()), 0)
         .context("restore runtime LoadBalancer Node source addresses")?;
     services.applied_node_port_node = node;
     if let Some((_, checkpoint)) = recovered_selection {
@@ -10746,6 +10723,86 @@ fn interface_index_at(sys_class_net: &Path, interface: &str) -> Result<u32> {
         .with_context(|| format!("parse interface index for {interface}"))
 }
 
+fn service_dsr_transport_interfaces(
+    ipv4_uplink: Option<&str>,
+    ipv6_uplink: Option<&str>,
+) -> Result<[u32; 4]> {
+    service_dsr_transport_interfaces_at(
+        Path::new("/sys/class/net"),
+        Path::new("/proc/net/vlan"),
+        ipv4_uplink,
+        ipv6_uplink,
+    )
+}
+
+fn service_dsr_transport_interfaces_at(
+    sys_class_net: &Path,
+    proc_net_vlan: &Path,
+    ipv4_uplink: Option<&str>,
+    ipv6_uplink: Option<&str>,
+) -> Result<[u32; 4]> {
+    let ipv4 = dsr_transport_interfaces(sys_class_net, proc_net_vlan, ipv4_uplink)?;
+    let ipv6 = dsr_transport_interfaces(sys_class_net, proc_net_vlan, ipv6_uplink)?;
+    Ok([ipv4.0, ipv4.1, ipv6.0, ipv6.1])
+}
+
+fn dsr_transport_interfaces(
+    sys_class_net: &Path,
+    proc_net_vlan: &Path,
+    uplink: Option<&str>,
+) -> Result<(u32, u32)> {
+    let Some(uplink) = uplink else {
+        return Ok((0, 0));
+    };
+    let route_ifindex = interface_index_at(sys_class_net, uplink)?;
+    let iflink = fs::read_to_string(sys_class_net.join(uplink).join("iflink"))
+        .with_context(|| format!("read interface link index for {uplink}"))?
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("parse interface link index for {uplink}"))?;
+    if iflink == route_ifindex || interface_vlan_id_at(proc_net_vlan, uplink)?.is_none() {
+        return Ok((route_ifindex, route_ifindex));
+    }
+    let lower_exists = fs::read_dir(sys_class_net)
+        .context("enumerate DSR transport interfaces")?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .any(|candidate| {
+            interface_index_at(sys_class_net, &candidate)
+                .is_ok_and(|candidate_ifindex| candidate_ifindex == iflink)
+        });
+    if !lower_exists {
+        bail!(
+            "VLAN route interface {uplink} references unavailable lower interface index {iflink}"
+        );
+    }
+    Ok((route_ifindex, iflink))
+}
+
+fn interface_vlan_id_at(proc_net_vlan: &Path, interface: &str) -> Result<Option<u16>> {
+    let path = proc_net_vlan.join(interface);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read VLAN state for {interface}"));
+        }
+    };
+    let fields = contents.split_whitespace().collect::<Vec<_>>();
+    let Some(position) = fields.iter().position(|field| *field == "VID:") else {
+        bail!("VLAN state for {interface} omitted VID");
+    };
+    let vlan_id = fields
+        .get(position + 1)
+        .context("VLAN state omitted value after VID")?
+        .parse::<u16>()
+        .with_context(|| format!("parse VLAN ID for {interface}"))?;
+    if !(1..=4094).contains(&vlan_id) {
+        bail!("VLAN ID for {interface} is outside 1..=4094");
+    }
+    Ok(Some(vlan_id))
+}
+
 fn attach_interface(
     program: &mut SchedClassifier,
     interface: &str,
@@ -11240,6 +11297,93 @@ mod tests {
         assert_eq!(native.cni_native_ipv6_uplink.as_deref(), Some("eth1"));
         assert!(native.cni_native_ipv4_onlink);
         assert!(!native.cni_native_ipv6_onlink);
+    }
+
+    #[test]
+    fn dsr_transport_interfaces_include_only_a_confirmed_vlan_lower_link() {
+        let directory = tempdir().unwrap();
+        let sys_class_net = directory.path();
+        let proc_net_vlan = directory.path().join("vlan");
+        fs::create_dir(&proc_net_vlan).unwrap();
+        for (name, ifindex, iflink) in [
+            ("br-ex", 7_u32, 9_u32),
+            ("ens18", 9, 9),
+            ("mac0", 8, 9),
+            ("eth0", 4, 55),
+            ("veth-peer", 55, 4),
+        ] {
+            let interface = sys_class_net.join(name);
+            fs::create_dir_all(&interface).unwrap();
+            fs::write(interface.join("ifindex"), format!("{ifindex}\n")).unwrap();
+            fs::write(interface.join("iflink"), format!("{iflink}\n")).unwrap();
+        }
+        fs::write(
+            proc_net_vlan.join("br-ex"),
+            "br-ex  VID: 600\t REORDER_HDR: 1  dev->priv_flags: 81021\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            service_dsr_transport_interfaces_at(
+                sys_class_net,
+                &proc_net_vlan,
+                Some("br-ex"),
+                Some("br-ex"),
+            )
+            .unwrap(),
+            [7, 9, 7, 9],
+            "a VLAN route preserves metadata across its route and lower links"
+        );
+        assert_eq!(
+            service_dsr_transport_interfaces_at(
+                sys_class_net,
+                &proc_net_vlan,
+                Some("eth0"),
+                Some("eth0"),
+            )
+            .unwrap(),
+            [4, 4, 4, 4],
+            "a non-VLAN veth never contributes its peer as a transport link"
+        );
+        assert_eq!(
+            service_dsr_transport_interfaces_at(
+                sys_class_net,
+                &proc_net_vlan,
+                Some("mac0"),
+                Some("mac0"),
+            )
+            .unwrap(),
+            [8, 8, 8, 8],
+            "a non-VLAN virtual uplink remains scoped to its route device"
+        );
+        assert_eq!(
+            service_dsr_transport_interfaces_at(sys_class_net, &proc_net_vlan, None, None).unwrap(),
+            [0; 4]
+        );
+
+        fs::write(proc_net_vlan.join("br-ex"), "br-ex VID: 4095\n").unwrap();
+        assert!(
+            service_dsr_transport_interfaces_at(
+                sys_class_net,
+                &proc_net_vlan,
+                Some("br-ex"),
+                Some("br-ex"),
+            )
+            .is_err(),
+            "an out-of-range VLAN ID must fail closed"
+        );
+        fs::write(proc_net_vlan.join("br-ex"), "br-ex VID: 600\n").unwrap();
+        fs::remove_dir_all(sys_class_net.join("ens18")).unwrap();
+        assert!(
+            service_dsr_transport_interfaces_at(
+                sys_class_net,
+                &proc_net_vlan,
+                Some("br-ex"),
+                Some("br-ex"),
+            )
+            .is_err(),
+            "a VLAN lower link outside the namespace must fail closed"
+        );
     }
 
     #[test]
@@ -11952,8 +12096,6 @@ mod tests {
             applied_load_balancer_reachability: None,
             applied_selection_contract: None,
             active_selection_bank: 0,
-            ipv4_output_interface: 0,
-            ipv6_output_interface: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -12298,26 +12440,24 @@ mod tests {
     #[test]
     fn load_balancer_node_source_prefers_internal_dual_stack_addresses() {
         let node = node_port_node_snapshot(7);
-        let encoded = encode_load_balancer_node_source(Some(&node), 3, 4);
+        let encoded = encode_load_balancer_node_source(Some(&node));
         assert_eq!(u64::from_ne_bytes(encoded[0..8].try_into().unwrap()), 7);
         assert_eq!(&encoded[8..12], &Ipv4Addr::new(192, 0, 2, 10).octets());
         assert_eq!(
             &encoded[12..28],
             &"fdff::10".parse::<Ipv6Addr>().unwrap().octets()
         );
-        assert_eq!(u32::from_ne_bytes(encoded[28..32].try_into().unwrap()), 3);
-        assert_eq!(u32::from_ne_bytes(encoded[32..36].try_into().unwrap()), 4);
         assert_eq!(
-            u16::from_ne_bytes(encoded[36..38].try_into().unwrap()),
+            u16::from_ne_bytes(encoded[28..30].try_into().unwrap()),
             unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION
         );
         assert_eq!(
-            encoded[38],
+            encoded[30],
             unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4
                 | unf_ebpf_common::LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6
         );
-        assert_eq!(encoded[39], 0);
-        assert_eq!(encode_load_balancer_node_source(None, 3, 4), [0; 40]);
+        assert_eq!(&encoded[31..40], &[0; 9]);
+        assert_eq!(encode_load_balancer_node_source(None), [0; 40]);
     }
 
     #[test]
@@ -12790,8 +12930,6 @@ mod tests {
             applied_load_balancer_reachability: None,
             applied_selection_contract: None,
             active_selection_bank: 0,
-            ipv4_output_interface: 0,
-            ipv6_output_interface: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -12920,7 +13058,7 @@ mod tests {
             .expect("new active service tuple recovers after interrupted reconciliation");
         assert_eq!(
             synchronizer.load_balancer_node_source.get(&0, 0).unwrap(),
-            encode_load_balancer_node_source(Some(&node), 0, 0)
+            encode_load_balancer_node_source(Some(&node))
         );
         synchronizer.load_balancer_banks = [None, None];
         synchronizer.active_load_balancer_bank = 0;
@@ -14087,8 +14225,6 @@ mod tests {
             applied_load_balancer_reachability: None,
             applied_selection_contract: None,
             active_selection_bank: 0,
-            ipv4_output_interface: 0,
-            ipv6_output_interface: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
