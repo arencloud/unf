@@ -234,7 +234,7 @@ fence. A separate authenticated projection now drives Node-UID-bound `/32` and
 `/128` ownership on `unf-egress0`; exact proxy-NDP ownership on the configured
 IPv6 uplink, whole-host collision preflight, exact kernel readback, and
 all-selected-gateway quorum precede readiness. Withdrawal
-quarantines those addresses until a checkpoint-v3 retirement manifest has
+quarantines those addresses until a checkpoint-v4 retirement manifest has
 frozen the exact source/gateway/lease set and a schema-v1 Proof of Safe
 Forgetting joins complete source fences, zero-flow gateway drains, and the exact
 reachability withdrawal. Reconciliation, time, and leadership cannot infer

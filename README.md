@@ -462,7 +462,7 @@ Pod-bound authentication, publishes only controller-admitted contracts that
 name that ready/reachable lease-fenced candidate, and sends a monotonic empty
 projection for explicit withdrawal. The gateway agent independently validates
 and fences that state under `make egress-gateway-distribution-test`; ADR 0123.
-The watched revision now drives a separate schema-v3 durable control-plane
+The watched revision now drives a separate schema-v4 durable control-plane
 checkpoint that atomically allocates bounded addresses and emits deterministic
 lease-fenced gateway Ensure/Withdraw intent over Ready primary-CNI Nodes with
 authoritative UIDs. Pool tombstones and dual-provider withdrawal retain an
@@ -504,7 +504,7 @@ state survives projection churn until protocol timeout, and family-specific
 tail programs perform checksum-safe IPv4/IPv6 SNAT and exact reverse restore.
 Privileged restart, packet, collision, and first-flow-preservation evidence
 passes `make egress-gateway-nat-test`; ADR 0129. The release barrier now has a
-verified **Proof of Safe Forgetting** contract: checkpoint-v3 retirement
+verified **Proof of Safe Forgetting** contract: checkpoint-v4 retirement
 manifests freeze the exact source/gateway/lease set, and address reuse requires
 complete source-fence, zero-flow gateway-drain, and exact
 withdrawn-reachability evidence. Provider acknowledgements, elapsed time,
@@ -572,7 +572,12 @@ selection consume the same plan. Prior acknowledged ownership makes empty,
 subset, and superset address transitions readback-safe, while new connections
 cannot claim a flow twin was certified before standby acknowledgement. The
 complete domain/controller/agent gate passes `make
-egress-ha-live-ownership-test`; ADR 0139. Transactional promotion transport and
+egress-ha-live-ownership-test`; ADR 0139. Checkpoint-v4 then composes the prior
+plan, source/old-owner fences, staged survivor placement, replacement readback,
+reachability CAS, acknowledged flow twins, and source-specific inactive-bank
+cutovers into one restart-replayable ordered transaction. Kubernetes health
+cannot advance it, and the three-gateway adversarial gate passes `make
+egress-ha-transaction-test`; ADR 0140. Authenticated promotion transport and
 measured failover remain before 8.6 can claim availability.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

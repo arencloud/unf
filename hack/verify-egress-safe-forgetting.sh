@@ -9,7 +9,7 @@ rg --fixed-strings --quiet \
     'pub const EGRESS_SAFE_FORGETTING_SCHEMA_VERSION: u16 = 1;' \
     "${project_root}/crates/unf-egress/src/safe_forgetting.rs"
 rg --fixed-strings --quiet \
-    'pub const EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION: u16 = 3;' \
+    'pub const EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION: u16 = 4;' \
     "${project_root}/crates/unf-egress/src/control_plane.rs"
 if rg --fixed-strings --quiet 'finalize_withdrawals' \
     "${project_root}/crates/unf-egress/src/control_plane.rs"; then

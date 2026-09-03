@@ -143,6 +143,19 @@ pub struct EgressHaActivationAuthority {
     pub authority_digest: EgressHaPromotionDigest,
 }
 
+/// Durable, replayable coordinator state. Evidence is stored canonically and
+/// restored only by re-admitting every transition against the original plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressHaPromotionCheckpoint {
+    pub schema_version: u16,
+    pub manifest: EgressHaPromotionManifest,
+    pub source_fences: Vec<EgressHaSourceFenceEvidence>,
+    pub old_owner_fence: Option<EgressHaOldOwnerFenceEvidence>,
+    pub acquisitions: Vec<EgressHaGatewayAcquisitionEvidence>,
+    pub reachability: Option<EgressHaReachabilityHandoffEvidence>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressHaPromotionPhase {
     FencingSources,
@@ -271,6 +284,64 @@ impl EgressHaPromotionCoordinator {
             old_owner_fence: None,
             acquisitions: BTreeMap::new(),
             reachability: None,
+        }
+    }
+
+    /// Restores a promotion by replaying its exact evidence order.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a foreign plan, malformed checkpoint, or evidence that could
+    /// not have been admitted by the live coordinator.
+    pub fn restore(
+        plan: &EgressHaPlan,
+        checkpoint: EgressHaPromotionCheckpoint,
+    ) -> Result<Self, EgressHaPromotionError> {
+        checkpoint.manifest.verify(plan)?;
+        if checkpoint.schema_version != EGRESS_HA_PROMOTION_SCHEMA_VERSION
+            || checkpoint
+                .source_fences
+                .windows(2)
+                .any(|pair| pair[0].recipient >= pair[1].recipient)
+            || checkpoint
+                .acquisitions
+                .windows(2)
+                .any(|pair| pair[0].gateway >= pair[1].gateway)
+        {
+            return Err(EgressHaPromotionError::InvalidAuthority);
+        }
+        let mut coordinator = Self::new(checkpoint.manifest);
+        for evidence in checkpoint.source_fences {
+            coordinator.admit_source_fence(evidence)?;
+        }
+        if let Some(evidence) = checkpoint.old_owner_fence {
+            match evidence {
+                EgressHaOldOwnerFenceEvidence::Revocation(evidence) => {
+                    coordinator.admit_old_owner_revocation(evidence)?;
+                }
+                EgressHaOldOwnerFenceEvidence::Infrastructure(evidence) => {
+                    coordinator.admit_infrastructure_fence(evidence)?;
+                }
+            }
+        }
+        for evidence in checkpoint.acquisitions {
+            coordinator.admit_gateway_acquisition(evidence)?;
+        }
+        if let Some(evidence) = checkpoint.reachability {
+            coordinator.admit_reachability_handoff(evidence)?;
+        }
+        Ok(coordinator)
+    }
+
+    #[must_use]
+    pub fn checkpoint(&self) -> EgressHaPromotionCheckpoint {
+        EgressHaPromotionCheckpoint {
+            schema_version: EGRESS_HA_PROMOTION_SCHEMA_VERSION,
+            manifest: self.manifest.clone(),
+            source_fences: self.source_fences.values().cloned().collect(),
+            old_owner_fence: self.old_owner_fence.clone(),
+            acquisitions: self.acquisitions.values().cloned().collect(),
+            reachability: self.reachability.clone(),
         }
     }
 
@@ -946,6 +1017,9 @@ mod tests {
         );
         fence_sources(&mut coordinator);
         coordinator.admit_old_owner_revocation(revocation).unwrap();
+        let checkpoint = coordinator.checkpoint();
+        coordinator = EgressHaPromotionCoordinator::restore(&plan, checkpoint.clone()).unwrap();
+        assert_eq!(coordinator.checkpoint(), checkpoint);
         let authority = finish(coordinator);
         authority.verify().unwrap();
     }

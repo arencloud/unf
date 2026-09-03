@@ -4,6 +4,7 @@
 .PHONY: egress-ha-promotion-test
 .PHONY: egress-ha-continuity-test
 .PHONY: egress-ha-live-ownership-test
+.PHONY: egress-ha-transaction-test
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -210,6 +211,12 @@ egress-ha-live-ownership-test: egress-ha-continuity-test
 	cargo test -p unf-controller --no-fail-fast
 	cargo test -p unf-agent --no-fail-fast
 	cargo clippy -p unf-agent -p unf-controller -p unf-ebpf-common -p unf-egress -p unf-link --all-targets --all-features -- -D warnings
+
+egress-ha-transaction-test: egress-ha-live-ownership-test
+	hack/verify-egress-ha-transaction.sh
+	cargo test -p unf-egress ha_promotion_is_durable_ordered_and_never_health_authorized
+	cargo test -p unf-egress graceful_promotion_requires_source_fence_before_exact_revocation
+	cargo clippy -p unf-egress --all-targets --all-features -- -D warnings
 
 test:
 	cargo test --workspace

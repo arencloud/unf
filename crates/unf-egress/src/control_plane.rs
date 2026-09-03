@@ -9,14 +9,20 @@ use unf_common::Revision;
 use crate::{
     AdmittedEgressProjection, EgressAllocationCheckpoint, EgressAllocationError,
     EgressAllocationRequest, EgressAllocator, EgressGatewayAcknowledgement,
-    EgressGatewayCheckpoint, EgressGatewayError, EgressGatewayRegistry, EgressHaCandidate,
-    EgressHaError, EgressHaPlan, EgressIntentOwner, EgressModel, EgressModelError, EgressNode,
-    EgressProviderRef, EgressReachabilityAcknowledgement, EgressRetirementManifest,
-    EgressSafeForgettingError, EgressSafeReleaseAuthority, MAX_EGRESS_GATEWAY_NODES,
-    MAX_EGRESS_INTENTS, compile_egress_ha_plan, normalize_model,
+    EgressGatewayCheckpoint, EgressGatewayError, EgressGatewayRegistry,
+    EgressHaActivationAuthority, EgressHaCandidate, EgressHaContinuityCutover,
+    EgressHaContinuityError, EgressHaError, EgressHaFlowTwinAcknowledgement,
+    EgressHaFlowTwinStream, EgressHaGatewayAcquisitionEvidence,
+    EgressHaInfrastructureFenceEvidence, EgressHaOldOwnerRevocationEvidence, EgressHaPlan,
+    EgressHaPromotionCheckpoint, EgressHaPromotionCoordinator, EgressHaPromotionError,
+    EgressHaPromotionManifest, EgressHaPromotionPhase, EgressHaReachabilityHandoffEvidence,
+    EgressHaSourceFenceEvidence, EgressIntentOwner, EgressModel, EgressModelError, EgressNode,
+    EgressProjectionRecipient, EgressProviderRef, EgressReachabilityAcknowledgement,
+    EgressRetirementManifest, EgressSafeForgettingError, EgressSafeReleaseAuthority,
+    MAX_EGRESS_GATEWAY_NODES, MAX_EGRESS_INTENTS, compile_egress_ha_plan, normalize_model,
 };
 
-pub const EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION: u16 = 3;
+pub const EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -27,7 +33,20 @@ pub struct EgressControlPlaneCheckpoint {
     pub allocation: EgressAllocationCheckpoint,
     pub gateways: EgressGatewayCheckpoint,
     pub ha_plans: Vec<EgressHaPlan>,
+    #[serde(default)]
+    pub ha_promotions: Vec<EgressHaControlPlanePromotion>,
     pub retirements: Vec<EgressRetirementManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressHaControlPlanePromotion {
+    pub previous_plan: EgressHaPlan,
+    pub coordinator: EgressHaPromotionCheckpoint,
+    pub replacement_staged: bool,
+    pub flow_streams: Vec<EgressHaFlowTwinStream>,
+    pub flow_acknowledgements: Vec<EgressHaFlowTwinAcknowledgement>,
+    pub cutovers: BTreeMap<EgressProjectionRecipient, EgressHaContinuityCutover>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,6 +79,10 @@ pub enum EgressControlPlaneError {
     Gateway(#[from] EgressGatewayError),
     #[error(transparent)]
     Ha(#[from] EgressHaError),
+    #[error(transparent)]
+    HaPromotion(#[from] EgressHaPromotionError),
+    #[error(transparent)]
+    HaContinuity(#[from] EgressHaContinuityError),
     #[error("durable HA plan set is missing, duplicated, or cross-domain incoherent")]
     InvalidHaCheckpoint,
     #[error(transparent)]
@@ -79,6 +102,7 @@ pub struct EgressControlPlane {
     allocator: EgressAllocator,
     gateways: EgressGatewayRegistry,
     ha_plans: BTreeMap<EgressIntentOwner, EgressHaPlan>,
+    ha_promotions: BTreeMap<EgressIntentOwner, EgressHaControlPlanePromotion>,
     retirements: BTreeMap<EgressIntentOwner, EgressRetirementManifest>,
 }
 
@@ -93,6 +117,7 @@ impl Default for EgressControlPlane {
             allocator: EgressAllocator::new(Vec::new()).expect("empty pool model is valid"),
             gateways: EgressGatewayRegistry::default(),
             ha_plans: BTreeMap::new(),
+            ha_promotions: BTreeMap::new(),
             retirements: BTreeMap::new(),
         }
     }
@@ -105,10 +130,15 @@ impl EgressControlPlane {
     /// # Errors
     ///
     /// Rejects unsupported, noncanonical, or cross-domain-incoherent state.
+    #[allow(clippy::too_many_lines)]
     pub fn restore(
         checkpoint: EgressControlPlaneCheckpoint,
     ) -> Result<Self, EgressControlPlaneError> {
-        if checkpoint.schema_version != EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION {
+        if !matches!(
+            checkpoint.schema_version,
+            3 | EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION
+        ) || checkpoint.schema_version == 3 && !checkpoint.ha_promotions.is_empty()
+        {
             return Err(EgressControlPlaneError::UnsupportedSchema {
                 actual: checkpoint.schema_version,
                 expected: EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -150,6 +180,34 @@ impl EgressControlPlane {
         if ha_plans.keys().cloned().collect::<BTreeSet<_>>() != expected_ha {
             return Err(EgressControlPlaneError::InvalidHaCheckpoint);
         }
+        if checkpoint.ha_promotions.len() > MAX_EGRESS_INTENTS
+            || checkpoint.ha_promotions.windows(2).any(|pair| {
+                pair[0].coordinator.manifest.owner >= pair[1].coordinator.manifest.owner
+            })
+        {
+            return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+        }
+        let mut ha_promotions = BTreeMap::new();
+        for promotion in checkpoint.ha_promotions {
+            let owner = promotion.coordinator.manifest.owner.clone();
+            promotion.previous_plan.verify_integrity()?;
+            if promotion.previous_plan.owner != owner {
+                return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+            }
+            EgressHaPromotionCoordinator::restore(
+                &promotion.previous_plan,
+                promotion.coordinator.clone(),
+            )?;
+            validate_promotion_continuity(&promotion)?;
+            if !promotion.replacement_staged
+                && ha_plans.get(&owner) != Some(&promotion.previous_plan)
+            {
+                return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+            }
+            if ha_promotions.insert(owner, promotion).is_some() {
+                return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+            }
+        }
         if checkpoint.retirements.len() > MAX_EGRESS_INTENTS
             || checkpoint
                 .retirements
@@ -176,6 +234,7 @@ impl EgressControlPlane {
             allocator,
             gateways,
             ha_plans,
+            ha_promotions,
             retirements,
         })
     }
@@ -361,6 +420,407 @@ impl EgressControlPlane {
         Ok(result)
     }
 
+    /// Persists one exact promotion investigation without changing ownership.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown ownership, duplicate promotion, foreign failure, or an
+    /// invalid source/epoch challenge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_ha_promotion(
+        &mut self,
+        owner: &EgressIntentOwner,
+        failed_gateway_uid: &str,
+        sources: Vec<EgressProjectionRecipient>,
+        controller_epoch: u64,
+        promotion_epoch: u64,
+        authority_revision: Revision,
+    ) -> Result<EgressHaPromotionManifest, EgressControlPlaneError> {
+        if self.ha_promotions.contains_key(owner) {
+            return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+        }
+        let plan = self
+            .ha_plans
+            .get(owner)
+            .cloned()
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        let manifest = EgressHaPromotionManifest::issue(
+            &plan,
+            failed_gateway_uid,
+            sources,
+            controller_epoch,
+            promotion_epoch,
+            authority_revision,
+        )?;
+        let coordinator = EgressHaPromotionCoordinator::new(manifest.clone()).checkpoint();
+        self.ha_promotions.insert(
+            owner.clone(),
+            EgressHaControlPlanePromotion {
+                previous_plan: plan,
+                coordinator,
+                replacement_staged: false,
+                flow_streams: Vec::new(),
+                flow_acknowledgements: Vec::new(),
+                cutovers: BTreeMap::new(),
+            },
+        );
+        Ok(manifest)
+    }
+
+    /// Returns the durable transaction for status and exact agent challenges.
+    #[must_use]
+    pub fn ha_promotion(
+        &self,
+        owner: &EgressIntentOwner,
+    ) -> Option<&EgressHaControlPlanePromotion> {
+        self.ha_promotions.get(owner)
+    }
+
+    /// Admits one source fence and checkpoints the monotonic transition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown, stale, duplicate, reordered, or partial evidence.
+    pub fn admit_ha_source_fence(
+        &mut self,
+        evidence: EgressHaSourceFenceEvidence,
+    ) -> Result<(), EgressControlPlaneError> {
+        let owner = self.promotion_owner(evidence.manifest_digest)?;
+        self.update_promotion(&owner, |coordinator| {
+            coordinator.admit_source_fence(evidence)
+        })
+    }
+
+    /// Admits graceful old-owner kernel revocation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects evidence before all sources fence or any inexact readback.
+    pub fn admit_ha_old_owner_revocation(
+        &mut self,
+        evidence: EgressHaOldOwnerRevocationEvidence,
+    ) -> Result<(), EgressControlPlaneError> {
+        let owner = self.promotion_owner(evidence.manifest_digest)?;
+        self.update_promotion(&owner, |coordinator| {
+            coordinator.admit_old_owner_revocation(evidence)
+        })
+    }
+
+    /// Admits an independent non-Kubernetes infrastructure fence.
+    ///
+    /// # Errors
+    ///
+    /// Rejects health/Lease claims, unsafe ordering, or foreign evidence.
+    pub fn admit_ha_infrastructure_fence(
+        &mut self,
+        evidence: EgressHaInfrastructureFenceEvidence,
+    ) -> Result<(), EgressControlPlaneError> {
+        let owner = self.promotion_owner(evidence.manifest_digest)?;
+        self.update_promotion(&owner, |coordinator| {
+            coordinator.admit_infrastructure_fence(evidence)
+        })
+    }
+
+    /// After the old owner is fenced, stages the pre-certified survivor set.
+    /// Sources remain fenced and cannot activate from this operation alone.
+    ///
+    /// # Errors
+    ///
+    /// Rejects premature staging, missing allocation, or invalid CCR output.
+    pub fn stage_ha_replacement(
+        &mut self,
+        owner: &EgressIntentOwner,
+    ) -> Result<bool, EgressControlPlaneError> {
+        let promotion = self
+            .ha_promotions
+            .get(owner)
+            .cloned()
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        if promotion.replacement_staged {
+            return Ok(false);
+        }
+        let coordinator = EgressHaPromotionCoordinator::restore(
+            &promotion.previous_plan,
+            promotion.coordinator.clone(),
+        )?;
+        if coordinator.phase() != EgressHaPromotionPhase::AcquiringNewOwners {
+            return Err(EgressHaPromotionError::EvidenceOrder.into());
+        }
+        let lease = self
+            .allocator
+            .lease(owner)
+            .cloned()
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        let survivors = promotion
+            .previous_plan
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.node != promotion.coordinator.manifest.failed_gateway)
+            .cloned()
+            .collect::<Vec<_>>();
+        if survivors.is_empty() {
+            return Err(EgressControlPlaneError::InvalidGatewayCandidates);
+        }
+        let desired = self.gateways.ensure(
+            &lease,
+            survivors
+                .iter()
+                .map(|candidate| candidate.node.clone())
+                .collect(),
+        )?;
+        if survivors.len() > 1 {
+            let plan = compile_egress_ha_plan(
+                &lease,
+                survivors,
+                Some(&promotion.previous_plan),
+                desired.revision,
+            )?;
+            self.ha_plans.insert(owner.clone(), plan);
+        } else {
+            self.ha_plans.remove(owner);
+        }
+        self.ha_promotions
+            .get_mut(owner)
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?
+            .replacement_staged = true;
+        validate_cross_state(&self.allocator, &self.gateways)?;
+        Ok(true)
+    }
+
+    /// Admits exact replacement kernel acquisition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects acquisition before fencing or any address/identity mismatch.
+    pub fn admit_ha_gateway_acquisition(
+        &mut self,
+        evidence: EgressHaGatewayAcquisitionEvidence,
+    ) -> Result<(), EgressControlPlaneError> {
+        let owner = self.promotion_owner(evidence.manifest_digest)?;
+        if !self
+            .ha_promotions
+            .get(&owner)
+            .is_some_and(|promotion| promotion.replacement_staged)
+        {
+            return Err(EgressHaPromotionError::EvidenceOrder.into());
+        }
+        self.update_promotion(&owner, |coordinator| {
+            coordinator.admit_gateway_acquisition(evidence)
+        })
+    }
+
+    /// Admits the independent reachability compare-and-swap readback.
+    ///
+    /// # Errors
+    ///
+    /// Rejects premature, foreign, stale, or non-CAS evidence.
+    pub fn admit_ha_reachability_handoff(
+        &mut self,
+        evidence: EgressHaReachabilityHandoffEvidence,
+    ) -> Result<(), EgressControlPlaneError> {
+        let owner = self.promotion_owner(evidence.manifest_digest)?;
+        self.update_promotion(&owner, |coordinator| {
+            coordinator.admit_reachability_handoff(evidence)
+        })
+    }
+
+    /// Stores one primary snapshot only after every source is fenced.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a foreign handoff, duplicate stream, or premature snapshot.
+    pub fn admit_ha_flow_twin_stream(
+        &mut self,
+        stream: EgressHaFlowTwinStream,
+    ) -> Result<(), EgressControlPlaneError> {
+        let owner = self
+            .ha_promotions
+            .iter()
+            .find(|(_, promotion)| promotion.previous_plan.plan_digest == stream.owner_plan_digest)
+            .map(|(owner, _)| owner.clone())
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        let promotion = self
+            .ha_promotions
+            .get_mut(&owner)
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        let coordinator = EgressHaPromotionCoordinator::restore(
+            &promotion.previous_plan,
+            promotion.coordinator.clone(),
+        )?;
+        if coordinator.phase() == EgressHaPromotionPhase::FencingSources {
+            return Err(EgressHaPromotionError::EvidenceOrder.into());
+        }
+        stream.verify(&promotion.coordinator.manifest)?;
+        if promotion.flow_streams.iter().any(|current| {
+            current.primary_gateway == stream.primary_gateway
+                && current.standby_gateway == stream.standby_gateway
+        }) {
+            return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+        }
+        promotion.flow_streams.push(stream);
+        promotion.flow_streams.sort_by(|left, right| {
+            (&left.primary_gateway, &left.standby_gateway)
+                .cmp(&(&right.primary_gateway, &right.standby_gateway))
+        });
+        Ok(())
+    }
+
+    /// Stores exact standby readback for one admitted flow-twin stream.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing stream state, duplicate acknowledgement, or mismatch.
+    pub fn admit_ha_flow_twin_acknowledgement(
+        &mut self,
+        acknowledgement: EgressHaFlowTwinAcknowledgement,
+    ) -> Result<(), EgressControlPlaneError> {
+        let promotion = self
+            .ha_promotions
+            .values_mut()
+            .find(|promotion| {
+                promotion.previous_plan.plan_digest == acknowledgement.owner_plan_digest
+            })
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        let stream = promotion
+            .flow_streams
+            .iter()
+            .find(|stream| {
+                stream.primary_gateway == acknowledgement.primary_gateway
+                    && stream.standby_gateway == acknowledgement.standby_gateway
+            })
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        acknowledgement.verify(stream, &promotion.coordinator.manifest)?;
+        if promotion.flow_acknowledgements.iter().any(|current| {
+            current.primary_gateway == acknowledgement.primary_gateway
+                && current.standby_gateway == acknowledgement.standby_gateway
+        }) {
+            return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+        }
+        promotion.flow_acknowledgements.push(acknowledgement);
+        promotion.flow_acknowledgements.sort_by(|left, right| {
+            (&left.primary_gateway, &left.standby_gateway)
+                .cmp(&(&right.primary_gateway, &right.standby_gateway))
+        });
+        Ok(())
+    }
+
+    /// Seals one source-specific atomic cutover using its acknowledged target
+    /// inactive bank.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incomplete promotion/replication evidence or a foreign source.
+    pub fn seal_ha_source_cutover(
+        &mut self,
+        owner: &EgressIntentOwner,
+        source: &EgressProjectionRecipient,
+        cutoff_ns: u64,
+    ) -> Result<EgressHaContinuityCutover, EgressControlPlaneError> {
+        let authority = self.ha_activation_authority(owner)?;
+        let promotion = self
+            .ha_promotions
+            .get_mut(owner)
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        if let Some(cutover) = promotion.cutovers.get(source) {
+            return Ok(cutover.clone());
+        }
+        let target_bank = promotion
+            .coordinator
+            .source_fences
+            .iter()
+            .find(|fence| &fence.recipient == source)
+            .map(|fence| fence.inactive_bank)
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        let cutover = EgressHaContinuityCutover::issue(
+            &authority,
+            promotion.flow_streams.clone(),
+            promotion.flow_acknowledgements.clone(),
+            cutoff_ns,
+            target_bank,
+        )?;
+        promotion.cutovers.insert(source.clone(), cutover.clone());
+        Ok(cutover)
+    }
+
+    /// Returns the complete source-specific activation proof bundle.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incomplete authority or a source without a sealed cutover.
+    pub fn ha_activation_bundle(
+        &self,
+        owner: &EgressIntentOwner,
+        source: &EgressProjectionRecipient,
+    ) -> Result<(EgressHaActivationAuthority, EgressHaContinuityCutover), EgressControlPlaneError>
+    {
+        let authority = self.ha_activation_authority(owner)?;
+        let cutover = self
+            .ha_promotions
+            .get(owner)
+            .and_then(|promotion| promotion.cutovers.get(source))
+            .cloned()
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        cutover.verify(&authority)?;
+        Ok((authority, cutover))
+    }
+
+    /// Seals the activation capability only after every persisted witness.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown or incomplete transaction.
+    pub fn ha_activation_authority(
+        &self,
+        owner: &EgressIntentOwner,
+    ) -> Result<crate::EgressHaActivationAuthority, EgressControlPlaneError> {
+        let promotion = self
+            .ha_promotions
+            .get(owner)
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        if !promotion.replacement_staged {
+            return Err(EgressHaPromotionError::EvidenceOrder.into());
+        }
+        Ok(EgressHaPromotionCoordinator::restore(
+            &promotion.previous_plan,
+            promotion.coordinator.clone(),
+        )?
+        .activation_authority()?)
+    }
+
+    fn promotion_owner(
+        &self,
+        digest: crate::EgressHaPromotionDigest,
+    ) -> Result<EgressIntentOwner, EgressControlPlaneError> {
+        self.ha_promotions
+            .iter()
+            .find(|(_, promotion)| promotion.coordinator.manifest.manifest_digest == digest)
+            .map(|(owner, _)| owner.clone())
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)
+    }
+
+    fn update_promotion<F>(
+        &mut self,
+        owner: &EgressIntentOwner,
+        apply: F,
+    ) -> Result<(), EgressControlPlaneError>
+    where
+        F: FnOnce(&mut EgressHaPromotionCoordinator) -> Result<(), EgressHaPromotionError>,
+    {
+        let promotion = self
+            .ha_promotions
+            .get(owner)
+            .cloned()
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        let mut coordinator =
+            EgressHaPromotionCoordinator::restore(&promotion.previous_plan, promotion.coordinator)?;
+        apply(&mut coordinator)?;
+        self.ha_promotions
+            .get_mut(owner)
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?
+            .coordinator = coordinator.checkpoint();
+        Ok(())
+    }
+
     /// Applies one exact gateway-host result without changing other domains.
     ///
     /// # Errors
@@ -443,6 +903,7 @@ impl EgressControlPlane {
         next.gateways.complete_withdrawal(&owner)?;
         next.allocator.release(&owner)?;
         next.ha_plans.remove(&owner);
+        next.ha_promotions.remove(&owner);
         next.retirements.remove(&owner);
         validate_cross_state(&next.allocator, &next.gateways)?;
         *self = next;
@@ -458,6 +919,7 @@ impl EgressControlPlane {
             allocation: self.allocator.checkpoint(),
             gateways: self.gateways.checkpoint(),
             ha_plans: self.ha_plans.values().cloned().collect(),
+            ha_promotions: self.ha_promotions.values().cloned().collect(),
             retirements: self.retirements.values().cloned().collect(),
         }
     }
@@ -571,6 +1033,48 @@ fn validate_ha_plan_checkpoint(
         || plan_addresses != lease.addresses.iter().copied().collect()
     {
         return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+    }
+    Ok(())
+}
+
+fn validate_promotion_continuity(
+    promotion: &EgressHaControlPlanePromotion,
+) -> Result<(), EgressControlPlaneError> {
+    if promotion.flow_streams.windows(2).any(|pair| {
+        (&pair[0].primary_gateway, &pair[0].standby_gateway)
+            >= (&pair[1].primary_gateway, &pair[1].standby_gateway)
+    }) || promotion.flow_acknowledgements.windows(2).any(|pair| {
+        (&pair[0].primary_gateway, &pair[0].standby_gateway)
+            >= (&pair[1].primary_gateway, &pair[1].standby_gateway)
+    }) {
+        return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+    }
+    for stream in &promotion.flow_streams {
+        stream.verify(&promotion.coordinator.manifest)?;
+    }
+    for acknowledgement in &promotion.flow_acknowledgements {
+        let stream = promotion
+            .flow_streams
+            .iter()
+            .find(|stream| {
+                stream.primary_gateway == acknowledgement.primary_gateway
+                    && stream.standby_gateway == acknowledgement.standby_gateway
+            })
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        acknowledgement.verify(stream, &promotion.coordinator.manifest)?;
+    }
+    if !promotion.cutovers.is_empty() {
+        let authority = EgressHaPromotionCoordinator::restore(
+            &promotion.previous_plan,
+            promotion.coordinator.clone(),
+        )?
+        .activation_authority()?;
+        for (source, cutover) in &promotion.cutovers {
+            if !promotion.coordinator.manifest.sources.contains(source) {
+                return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+            }
+            cutover.verify(&authority)?;
+        }
     }
     Ok(())
 }
@@ -735,12 +1239,167 @@ mod tests {
                 .changed
         );
 
+        let mut v3 = serde_json::to_value(&checkpoint).unwrap();
+        v3["schemaVersion"] = serde_json::json!(3);
+        v3.as_object_mut().unwrap().remove("haPromotions");
+        let migrated = EgressControlPlane::restore(serde_json::from_value(v3).unwrap()).unwrap();
+        assert_eq!(
+            migrated.checkpoint().schema_version,
+            EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION
+        );
+
         let mut mutated = checkpoint;
         mutated.ha_plans[0].assignments[0].gateway = node("foreign");
         assert!(matches!(
             EgressControlPlane::restore(mutated),
             Err(EgressControlPlaneError::Ha(_) | EgressControlPlaneError::InvalidHaCheckpoint)
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ha_promotion_is_durable_ordered_and_never_health_authorized() {
+        let mut payments = intent("payments");
+        payments.addresses = EgressAddressRequest::Pool {
+            name: "public".to_owned(),
+            families: vec![AddressFamily::Ipv4],
+            addresses_per_family: 4,
+        };
+        let mut control = EgressControlPlane::default();
+        control
+            .reconcile(
+                Revision::new(1),
+                model(vec![payments]),
+                &providers(),
+                vec![node("gateway-a"), node("gateway-b"), node("gateway-c")],
+            )
+            .unwrap();
+        let checkpoint = control.checkpoint();
+        let plan = checkpoint.ha_plans[0].clone();
+        let failed = plan.assignments[0].gateway.clone();
+        let source = recipient(&node("worker-a"));
+        let manifest = control
+            .begin_ha_promotion(
+                &plan.owner,
+                &failed.uid,
+                vec![source.clone()],
+                41,
+                9,
+                Revision::new(20),
+            )
+            .unwrap();
+        assert_eq!(control.checkpoint().ha_plans, vec![plan.clone()]);
+        assert!(control.stage_ha_replacement(&plan.owner).is_err());
+
+        control
+            .admit_ha_source_fence(EgressHaSourceFenceEvidence {
+                schema_version: crate::EGRESS_HA_PROMOTION_SCHEMA_VERSION,
+                controller_epoch: 41,
+                promotion_epoch: 9,
+                recipient: source,
+                manifest_digest: manifest.manifest_digest,
+                active_plan_digest: plan.plan_digest,
+                fenced_shards: manifest
+                    .handoffs
+                    .iter()
+                    .map(|handoff| handoff.shard_index)
+                    .collect(),
+                inactive_bank: 1,
+            })
+            .unwrap();
+        let mut unsafe_fence = EgressHaInfrastructureFenceEvidence {
+            schema_version: crate::EGRESS_HA_PROMOTION_SCHEMA_VERSION,
+            controller_epoch: 41,
+            promotion_epoch: 9,
+            gateway: failed.clone(),
+            manifest_digest: manifest.manifest_digest,
+            provider: "kubernetes-node-ready".to_owned(),
+            fence_token: "not-authority".to_owned(),
+            provider_revision: 1,
+            isolated: true,
+        };
+        assert!(
+            control
+                .admit_ha_infrastructure_fence(unsafe_fence.clone())
+                .is_err()
+        );
+        unsafe_fence.provider = "redfish-bmc".to_owned();
+        unsafe_fence.fence_token = "power-off-991".to_owned();
+        control.admit_ha_infrastructure_fence(unsafe_fence).unwrap();
+        assert!(control.stage_ha_replacement(&plan.owner).unwrap());
+        assert!(!control.stage_ha_replacement(&plan.owner).unwrap());
+        let staged = control.checkpoint();
+        assert!(!staged.gateways.records[0].desired.nodes.contains(&failed));
+        assert_eq!(
+            EgressControlPlane::restore(staged.clone())
+                .unwrap()
+                .checkpoint(),
+            staged
+        );
+
+        let mut acquisitions = BTreeMap::<EgressNode, BTreeSet<IpAddr>>::new();
+        for handoff in &manifest.handoffs {
+            acquisitions
+                .entry(handoff.new_gateway.clone())
+                .or_default()
+                .extend(handoff.addresses.iter().copied());
+        }
+        for (gateway, addresses) in acquisitions {
+            control
+                .admit_ha_gateway_acquisition(EgressHaGatewayAcquisitionEvidence {
+                    schema_version: crate::EGRESS_HA_PROMOTION_SCHEMA_VERSION,
+                    controller_epoch: 41,
+                    promotion_epoch: 9,
+                    gateway,
+                    manifest_digest: manifest.manifest_digest,
+                    owned_addresses: addresses.into_iter().collect(),
+                    kernel_revision: Revision::new(21),
+                })
+                .unwrap();
+        }
+        control
+            .admit_ha_reachability_handoff(EgressHaReachabilityHandoffEvidence {
+                schema_version: crate::EGRESS_HA_PROMOTION_SCHEMA_VERSION,
+                controller_epoch: 41,
+                promotion_epoch: 9,
+                manifest_digest: manifest.manifest_digest,
+                expected_plan_digest: manifest.active_plan_digest,
+                installed_plan_digest: manifest.contingency_digest,
+                handoffs: manifest.handoffs.clone(),
+                provider: "static-l2-cas".to_owned(),
+                provider_revision: 3,
+                compare_and_swap_applied: true,
+            })
+            .unwrap();
+        let mut pairs = BTreeMap::<(EgressNode, EgressNode), Vec<u16>>::new();
+        for handoff in &manifest.handoffs {
+            pairs
+                .entry((handoff.old_gateway.clone(), handoff.new_gateway.clone()))
+                .or_default()
+                .push(handoff.shard_index);
+        }
+        for ((primary, standby), shards) in pairs {
+            let stream =
+                EgressHaFlowTwinStream::issue(&manifest, primary, standby, shards, 11).unwrap();
+            let acknowledgement = stream.acknowledge(&manifest, Revision::new(22)).unwrap();
+            control.admit_ha_flow_twin_stream(stream).unwrap();
+            control
+                .admit_ha_flow_twin_acknowledgement(acknowledgement)
+                .unwrap();
+        }
+        let authority = control.ha_activation_authority(&plan.owner).unwrap();
+        authority.verify().unwrap();
+        let cutover = control
+            .seal_ha_source_cutover(&plan.owner, &recipient(&node("worker-a")), 1_000_000)
+            .unwrap();
+        cutover.verify(&authority).unwrap();
+        let final_checkpoint = control.checkpoint();
+        assert_eq!(
+            EgressControlPlane::restore(final_checkpoint.clone())
+                .unwrap()
+                .checkpoint(),
+            final_checkpoint
+        );
     }
 
     #[test]
