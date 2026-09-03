@@ -68,7 +68,7 @@ The accepted Phase 8 boundary keeps egress policy, allocation, gateway
 placement, reachability, NAT, and publication as separate coherent
 transactions. Normalized identity-aware intent and the Egress Behavior Contract
 belong in domain libraries; Kubernetes and OpenShift EgressIP conversion remains
-in the controller adapter. A dedicated egress domain will own conflict-safe
+in the controller adapter. The dedicated egress domain owns conflict-safe
 pools/leases, provider-neutral gateway candidates, and readiness contracts. The
 agent will independently verify exact-Node plans and transactionally own host
 steering/NAT state; `unf-ebpf-tc` may consume only fixed-width decisions after
@@ -84,7 +84,13 @@ destinations, exact allocation, lease-fenced acknowledged gateways,
 capabilities, and independent revisions. Agents can replay those facts before a
 future staging path; compact witnesses and bounded failure envelopes are
 provenance, not authority; ADR 0115. Phase 8.2a changes no current BPF ABI, host
-state, or packet behavior.
+state, or packet behavior. Schema-v1 egress allocation checkpoints now own
+atomic multiple-address leases with pool/provider provenance and monotonic
+epochs. A separate gateway registry versions desired state, gateway readiness,
+and external reachability independently, retains address fences through
+dual-acknowledged withdrawal, and projects only completely acknowledged facts
+into behavior contracts. These are durable domain records; controller storage
+and host-state integration begin in milestone 8.4; ADR 0116.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

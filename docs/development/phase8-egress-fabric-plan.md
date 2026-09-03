@@ -1,6 +1,6 @@
 # Phase 8 identity-aware egress-fabric execution plan
 
-Last reviewed: **2026-09-02**
+Last reviewed: **2026-09-03**
 
 Phase 8 implements master-prompt §24 as a provider-neutral enterprise egress
 fabric. It builds on the verified source-side NetworkPolicy egress engine and
@@ -15,7 +15,7 @@ authoritative state remains in [project-status.md](../project-status.md).
 | 8.1 | Architecture and acceptance boundary | **Verified** | ADR 0113 fixes explicit ownership, policy-before-steering precedence, an independently verified Egress Behavior Contract, lease-fenced gateway epochs, deterministic placement/failover, provider boundaries, compatibility, recovery, platform gates, and exclusions; `make egress-fabric-boundary-test` prevents drift |
 | 8.2 | Egress intent, pool, and compatibility model | **Verified** | `unf-egress` provides bounded canonical Namespace/workload/ServiceAccount selectors, destinations, dual-stack non-overlapping pools, pool or explicit-address requests, deterministic complete-model validation, and strict ownership. The controller translates OpenShift `k8s.ovn.org/v1` EgressIP into the same intent, defaults/intersects selectors exactly, and preserves foreign status; `make egress-intent-test`; ADR 0114 |
 | 8.2a | Egress Behavior Contract and reference validator | **Verified** | Schema-v1 exact-Node plans bind selected source identity, original destinations, policy allow, exact pool/explicit allocation, lease-fenced ready/reachable ranked gateways, derived capabilities, and six independent revision domains. Independent replay, domain-separated SHA-256 digests, 16-byte witnesses, and bounded explicit single-gateway failure envelopes pass `make egress-contract-test`; ADR 0115 |
-| 8.3 | Durable allocation and gateway-provider contract | **Planned** | Conflict-safe dual-stack leases, multiple addresses, exact owner/pool/provider provenance, separately revisioned gateway readiness and reachability, safe withdrawal, checkpoint replay, and no status before complete acknowledgement |
+| 8.3 | Durable allocation and gateway-provider contract | **Verified** | Schema-v1 allocation atomically assigns conflict-safe multiple IPv4/IPv6 addresses with exact owner/pool/provider provenance, bounded exhaustion, monotonic revisions/lease epochs, release/reuse, and strict checkpoint replay. Separate gateway/reachability provider interfaces, desired/ack revisions, epoch/address fencing, dual acknowledgement, safe withdrawal, and direct contract-fact projection pass `make egress-allocation-test`; ADR 0116 |
 | 8.4 | Transactional distribution and gateway host state | **Planned** | Authenticated exact-Node projection, capability negotiation, inactive staging/readback/activation, last-known-good checkpoints, epoch fencing, rollback/crash repair, and exact versioned cleanup |
 | 8.5 | Source steering and gateway NAT dataplane | **Planned** | Policy-first IPv4/IPv6 TCP/UDP steering, original identity/source witness, collision-safe SNAT/reverse state, fragments and unsupported protocols fail closed, and bounded event provenance without Linux-conntrack duplication by assumption |
 | 8.6 | Deterministic HA, failover, and multiple addresses | **Planned** | Lease-fenced gateway ownership, deterministic placement and failover, established-flow contract, bounded convergence, split-brain rejection, node drain/recovery, and measured disruption |
@@ -102,6 +102,7 @@ HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.3 implements durable conflict-safe allocation and the gateway-provider
-contract. Milestones 8.2–8.2a changed no BPF ABI, host routing, address
-ownership, watcher/RBAC behavior, packet behavior, or platform claim.
+Milestone 8.4 implements authenticated exact-Node distribution, capability
+negotiation, transactional gateway host state, and crash recovery. Milestones
+8.2–8.3 changed no BPF ABI, host routing, live address ownership, watcher/RBAC
+behavior, packet behavior, or platform claim.

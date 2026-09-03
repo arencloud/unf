@@ -416,8 +416,13 @@ Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
 compact witnesses, and bounded failure outcomes. `make egress-contract-test`
-passes; milestone 8.3 durable allocation/provider ownership is next. No
-egress-gateway packet-path or platform claim is made yet.
+passes. Milestone 8.3 now adds schema-v1 durable atomic multi-address
+allocation, exact pool/provider provenance, monotonic lease epochs, checkpoint
+replay, separate gateway/readiness and reachability acknowledgements, safe
+withdrawal, and publication only after both providers acknowledge the exact
+revision. `make egress-allocation-test` passes; milestone 8.4 transactional
+distribution and gateway host state is next. No live egress address, packet-path,
+or platform claim is made yet.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

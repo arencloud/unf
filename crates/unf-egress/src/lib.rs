@@ -12,9 +12,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod allocation;
 mod contract;
+mod gateway;
 
+pub use allocation::*;
 pub use contract::*;
+pub use gateway::*;
 
 pub const DEFAULT_EGRESS_INTENT_PRIORITY: u32 = 1_000;
 pub const MAX_EGRESS_POOLS: usize = 64;

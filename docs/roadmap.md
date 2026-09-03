@@ -618,7 +618,14 @@ matrix is maintained in the
   and six revision domains. Domain-separated SHA-256 commitments, compact
   witnesses, mutation rejection, and bounded single-gateway failure outcomes
   pass `make egress-contract-test`; ADR 0115.
-- Milestone 8.3 implements durable allocation and gateway-provider ownership.
+- Milestone 8.3 is verified. Schema-v1 checkpoints replay atomic deterministic
+  multiple-address dual-stack allocation, provider/pool ownership, monotonic
+  lease epochs, release/reuse, and collision/exhaustion failure. Independent
+  gateway/readiness and reachability provider acknowledgements fence epochs and
+  revisions, retain addresses through safe withdrawal, and gate contract/status
+  publication; `make egress-allocation-test`; ADR 0116.
+- Milestone 8.4 implements authenticated transactional distribution and gateway
+  host state.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale
