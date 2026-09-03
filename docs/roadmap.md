@@ -694,8 +694,14 @@ matrix is maintained in the
   release under `make egress-safe-forgetting-test`; ADR 0130. Live evidence
   transport now captures admitted membership before invalidation and accepts
   source fences only from exact current Pod/Node/epoch challenges under `make
-  egress-source-retirement-test`; ADR 0131. Gateway-drain/reachability evidence,
-  NAT events, HA failover, and end-to-end platform packets remain.
+  egress-source-retirement-test`; ADR 0131. Exact gateway drain challenges,
+  explicit static reachability withdrawal, release-authorized host subsets, and
+  atomic final lease retirement pass the gateway-retirement and
+  `egress-release-authority-test` gates; ADRs 0132–0133. A fixed proof-bound
+  first-flow NAT event ABI, strict agent decoding, fixed-cardinality metrics,
+  and exact non-blocking ring-loss accounting pass `make
+  egress-nat-observability-test`; ADR 0134. HA failover and end-to-end platform
+  packets remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

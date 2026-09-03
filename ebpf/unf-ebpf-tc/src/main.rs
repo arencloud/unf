@@ -20,9 +20,13 @@ use unf_ebpf_common::{
     AddressFamily, ConnectionKey, ConnectionState, Direction, EgressIpv4PolicyMapKey,
     EgressIpv6PolicyMapData, EgressAddressValue, EgressCandidateKey, EgressConnectionKey,
     EgressConnectionValue, EgressDestinationValue, EgressGatewayValue,
-    EgressIpv4DestinationData, EgressIpv6DestinationData, EgressMapConfig, EgressSelectionKey,
+    EgressEvent, EgressIpv4DestinationData, EgressIpv6DestinationData, EgressMapConfig, EgressSelectionKey,
     EgressSelectionValue, EgressSourceKey, EgressSourceValue, EGRESS_ADMISSION_ACTIVE,
     EGRESS_ADMISSION_FENCED, EGRESS_BANK_COUNT, EGRESS_CONFIG_FLAG_GATEWAY_NAT,
+    EGRESS_EVENT_ABI_VERSION, EGRESS_EVENT_ACTION_CREATE, EGRESS_EVENT_ACTION_DROP,
+    EGRESS_EVENT_ACTION_EXPIRE, EGRESS_EVENT_REASON_EXPIRED_OR_CORRUPT,
+    EGRESS_EVENT_REASON_PAIR_STORE_FAILED, EGRESS_EVENT_REASON_PORT_EXHAUSTED,
+    EGRESS_EVENT_REASON_REWRITE_FAILED, EGRESS_EVENT_REASON_TRANSLATION_CREATED,
     EGRESS_MAP_ABI_VERSION,
     EGRESS_PATH_DIRECT_NEIGHBOR, FLOW_ABI_VERSION, FlowEvent,
     IDENTITY_BANK_COUNT,
@@ -158,6 +162,21 @@ static EGRESS_CONNECTION_KEY_SCRATCH: PerCpuArray<EgressConnectionKey> =
 #[map]
 static EGRESS_CONNECTION_VALUE_SCRATCH: PerCpuArray<EgressConnectionValue> =
     PerCpuArray::with_max_entries(1, 0);
+
+/// Sparse lifecycle witnesses only: one successful create and exceptional
+/// retirement/drop outcomes. Established packets never emit per-packet NAT
+/// telemetry, so a slow reader cannot amplify packet-path work.
+#[map]
+static EGRESS_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+#[map]
+static EGRESS_EVENT_SCRATCH: PerCpuArray<EgressEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Index 0 counts attempted lifecycle witnesses and index 1 counts ring-full
+/// losses. Per-CPU ownership avoids packet-path atomics while userspace sums
+/// the bounded two-entry map.
+#[map]
+static EGRESS_EVENT_COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -4293,6 +4312,63 @@ fn valid_egress_connection_key(key: &EgressConnectionKey, value: &EgressConnecti
         && value.reserved == [0; 2]
 }
 
+/// Emits one compact, proof-bound lifecycle witness without making forwarding
+/// depend on ring capacity. A full ring deliberately loses telemetry, never
+/// packets; userspace exposes its independently bounded invalid/drop counters.
+#[inline(always)]
+fn emit_egress_event(value: &EgressConnectionValue, now_ns: u64, action: u8, reason: u8) {
+    increment_egress_event_counter(unf_ebpf_common::EGRESS_EVENT_COUNTER_ATTEMPTED);
+    let Some(event_ptr) = EGRESS_EVENT_SCRATCH.get_ptr_mut(0) else {
+        increment_egress_event_counter(unf_ebpf_common::EGRESS_EVENT_COUNTER_DROPPED);
+        return;
+    };
+    // SAFETY: the current CPU owns this scratch slot. Zeroing first guarantees
+    // deterministic padding and reserved bytes in the stable wire record.
+    #[allow(unsafe_code)]
+    unsafe { core::ptr::write_bytes(event_ptr, 0, 1) };
+    // SAFETY: the pointer remains valid for this non-preemptible invocation.
+    #[allow(unsafe_code)]
+    let event = unsafe { &mut *event_ptr };
+    event.timestamp_ns = now_ns;
+    event.contract_revision = value.contract_revision;
+    event.lease_epoch = value.lease_epoch;
+    event.original_source_address = value.original_source_address;
+    event.original_destination_address = value.original_destination_address;
+    event.egress_address = value.egress_address;
+    event.gateway_digest = value.primary_gateway_digest;
+    event.standby_gateway_digest = value.standby_gateway_digest;
+    event.proof_witness = value.proof_witness;
+    event.source_identity = value.source_identity;
+    event.original_source_port = value.original_source_port;
+    event.original_destination_port = value.original_destination_port;
+    event.translated_source_port = value.translated_source_port;
+    event.version = EGRESS_EVENT_ABI_VERSION;
+    event.size = core::mem::size_of::<EgressEvent>() as u16;
+    event.address_index = value.address_index;
+    event.primary_gateway_index = value.primary_gateway_index;
+    event.standby_gateway_index = value.standby_gateway_index;
+    event.protocol = value.protocol;
+    event.address_family = value.address_family;
+    event.action = action;
+    event.reason = reason;
+    event.flags = value.flags;
+    if EGRESS_EVENTS.output::<EgressEvent>(&*event, 0).is_err() {
+        increment_egress_event_counter(unf_ebpf_common::EGRESS_EVENT_COUNTER_DROPPED);
+    }
+}
+
+#[inline(always)]
+fn increment_egress_event_counter(index: u32) {
+    let Some(counter) = EGRESS_EVENT_COUNTERS.get_ptr_mut(index) else {
+        return;
+    };
+    // SAFETY: a per-CPU value is exclusively owned by this invocation's CPU.
+    #[allow(unsafe_code)]
+    unsafe {
+        *counter = (*counter).wrapping_add(1);
+    }
+}
+
 #[inline(never)]
 fn apply_gateway_connection<const IPV6: bool>(
     ctx: &TcContext,
@@ -4313,6 +4389,12 @@ fn apply_gateway_connection<const IPV6: bool>(
     if !valid_egress_connection_key(key, value)
         || !egress_connection_is_active(value, now_ns)
     {
+        emit_egress_event(
+            value,
+            now_ns,
+            EGRESS_EVENT_ACTION_EXPIRE,
+            EGRESS_EVENT_REASON_EXPIRED_OR_CORRUPT,
+        );
         remove_egress_pair(value);
         return TC_ACT_SHOT;
     }
@@ -4334,10 +4416,22 @@ fn apply_gateway_connection<const IPV6: bool>(
         rewrite_ipv4(ctx, transport_offset, key.protocol, &translation, source)
     };
     if !rewritten {
+        emit_egress_event(
+            value,
+            now_ns,
+            EGRESS_EVENT_ACTION_DROP,
+            EGRESS_EVENT_REASON_REWRITE_FAILED,
+        );
         return TC_ACT_SHOT;
     }
     value.last_seen_ns = now_ns;
     if !store_egress_pair(value) {
+        emit_egress_event(
+            value,
+            now_ns,
+            EGRESS_EVENT_ACTION_DROP,
+            EGRESS_EVENT_REASON_PAIR_STORE_FAILED,
+        );
         remove_egress_pair(value);
         return TC_ACT_SHOT;
     }
@@ -4579,13 +4673,31 @@ fn create_gateway_connection<const IPV6: bool>(
                 rewrite_ipv4(ctx, transport_offset, observation.protocol, &translation, true)
             };
             if rewritten {
+                emit_egress_event(
+                    value,
+                    now_ns,
+                    EGRESS_EVENT_ACTION_CREATE,
+                    EGRESS_EVENT_REASON_TRANSLATION_CREATED,
+                );
                 return TC_ACT_PIPE;
             }
+            emit_egress_event(
+                value,
+                now_ns,
+                EGRESS_EVENT_ACTION_DROP,
+                EGRESS_EVENT_REASON_REWRITE_FAILED,
+            );
             remove_egress_pair(value);
             return TC_ACT_SHOT;
         }
         probe += 1;
     }
+    emit_egress_event(
+        value,
+        now_ns,
+        EGRESS_EVENT_ACTION_DROP,
+        EGRESS_EVENT_REASON_PORT_EXHAUSTED,
+    );
     TC_ACT_SHOT
 }
 

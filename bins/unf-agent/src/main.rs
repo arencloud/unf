@@ -17,7 +17,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use aya::maps::lpm_trie::{Key as LpmKey, LpmTrie as AyaLpmTrie};
 use aya::maps::{
-    Array as AyaArray, HashMap as AyaHashMap, IterableMap, MapData,
+    Array as AyaArray, HashMap as AyaHashMap, IterableMap, MapData, PerCpuArray as AyaPerCpuArray,
     ProgramArray as AyaProgramArray, RingBuf,
 };
 use aya::programs::links::{FdLink, LinkError, PinnedLink};
@@ -41,9 +41,11 @@ use tracing::{error, info, warn};
 use unf_cni_state::AttachmentJournal;
 use unf_common::{IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, RuleId, Verdict};
 use unf_ebpf_common::{
-    EGRESS_BANK_COUNT, EGRESS_MAP_ABI_VERSION, FLOW_ABI_VERSION, FlowEvent, FlowKey,
-    IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey, Ipv6IdentityKey, POLICY_BANK_COUNT,
-    POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
+    EGRESS_BANK_COUNT, EGRESS_EVENT_ABI_VERSION, EGRESS_EVENT_ACTION_CREATE,
+    EGRESS_EVENT_ACTION_DROP, EGRESS_EVENT_ACTION_EXPIRE, EGRESS_EVENT_COUNTER_ATTEMPTED,
+    EGRESS_EVENT_COUNTER_DROPPED, EGRESS_MAP_ABI_VERSION, EgressEvent, FLOW_ABI_VERSION, FlowEvent,
+    FlowKey, IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey, Ipv6IdentityKey,
+    POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS, SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS,
     SERVICE_AFFINITY_OUTCOME_CREATED, SERVICE_AFFINITY_OUTCOME_NONE,
@@ -53,9 +55,9 @@ use unf_ebpf_common::{
     SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL,
     SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER, SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL,
     SERVICE_EVENT_REASON_NO_BACKEND, SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED,
-    SERVICE_MAP_ABI_VERSION, ServiceEvent, service_event_action_reason_is_valid,
-    service_event_frontend_kind_is_valid, service_selection_algorithm_is_valid,
-    service_selection_tier_is_valid,
+    SERVICE_MAP_ABI_VERSION, ServiceEvent, egress_event_action_reason_is_valid,
+    service_event_action_reason_is_valid, service_event_frontend_kind_is_valid,
+    service_selection_algorithm_is_valid, service_selection_tier_is_valid,
 };
 use unf_egress::{
     AddressFamily as EgressAddressFamily, AdmittedEgressGatewayAddressProjection,
@@ -724,6 +726,13 @@ struct AgentMetrics {
     load_balancer_no_backend_drops: Counter,
     load_balancer_source_range_drops: Counter,
     invalid_service_events: Counter,
+    egress_dataplane_events: Counter,
+    egress_nat_creations: Counter,
+    egress_nat_drops: Counter,
+    egress_nat_expirations: Counter,
+    invalid_egress_events: Counter,
+    egress_event_attempts: Counter,
+    egress_event_ring_drops: Counter,
     service_same_node_selections: Counter,
     service_same_zone_selections: Counter,
     service_cluster_selections: Counter,
@@ -1543,7 +1552,9 @@ async fn main() -> Result<()> {
                     service_dsr_transport_interfaces,
                     egress_path_provider,
                 };
-                if let Err(error) = run_dataplane(config, Arc::clone(&state), cancellation).await {
+                if let Err(error) =
+                    Box::pin(run_dataplane(config, Arc::clone(&state), cancellation)).await
+                {
                     error!(?error, "eBPF dataplane stopped");
                     state.ready.store(false, Ordering::Release);
                     let _ = failure_tx.send(SupervisedFailure::Dataplane(error)).await;
@@ -5836,6 +5847,13 @@ fn new_state(
         load_balancer_no_backend_drops: Counter::default(),
         load_balancer_source_range_drops: Counter::default(),
         invalid_service_events: Counter::default(),
+        egress_dataplane_events: Counter::default(),
+        egress_nat_creations: Counter::default(),
+        egress_nat_drops: Counter::default(),
+        egress_nat_expirations: Counter::default(),
+        invalid_egress_events: Counter::default(),
+        egress_event_attempts: Counter::default(),
+        egress_event_ring_drops: Counter::default(),
         service_same_node_selections: Counter::default(),
         service_same_zone_selections: Counter::default(),
         service_cluster_selections: Counter::default(),
@@ -6268,6 +6286,45 @@ fn register_service_metrics(registry: &mut Registry, metrics: &AgentMetrics) {
     );
     for (name, help, counter) in [
         (
+            "unf_egress_dataplane_events",
+            "Validated sparse egress NAT lifecycle witnesses consumed from eBPF",
+            &metrics.egress_dataplane_events,
+        ),
+        (
+            "unf_egress_nat_creations",
+            "New proof-bound egress NAT flow pairs created",
+            &metrics.egress_nat_creations,
+        ),
+        (
+            "unf_egress_nat_drops",
+            "Egress NAT lifecycle operations dropped with a machine-readable reason",
+            &metrics.egress_nat_drops,
+        ),
+        (
+            "unf_egress_nat_expirations",
+            "Expired or corrupt egress NAT pairs retired",
+            &metrics.egress_nat_expirations,
+        ),
+        (
+            "unf_egress_invalid_events",
+            "Egress event records rejected due to ABI or semantic mismatch",
+            &metrics.invalid_egress_events,
+        ),
+        (
+            "unf_egress_event_attempts",
+            "Sparse egress NAT lifecycle witnesses attempted by eBPF",
+            &metrics.egress_event_attempts,
+        ),
+        (
+            "unf_egress_event_ring_drops",
+            "Egress NAT lifecycle witnesses dropped because telemetry capacity was unavailable",
+            &metrics.egress_event_ring_drops,
+        ),
+    ] {
+        registry.register(name, help, counter.clone());
+    }
+    for (name, help, counter) in [
+        (
             "unf_service_selection_same_node",
             "Translated service packets selecting the same-Node tier",
             &metrics.service_same_node_selections,
@@ -6403,6 +6460,16 @@ async fn run_dataplane(
             .context("eBPF object does not contain SERVICE_EVENTS ring buffer")?,
     )
     .context("open SERVICE_EVENTS ring buffer")?;
+    let egress_ring = RingBuf::try_from(
+        ebpf.take_map("EGRESS_EVENTS")
+            .context("eBPF object does not contain EGRESS_EVENTS ring buffer")?,
+    )
+    .context("open EGRESS_EVENTS ring buffer")?;
+    let egress_event_counters = AyaPerCpuArray::<_, u64>::try_from(
+        ebpf.take_map("EGRESS_EVENT_COUNTERS")
+            .context("eBPF object does not contain EGRESS_EVENT_COUNTERS map")?,
+    )
+    .context("open EGRESS_EVENT_COUNTERS map")?;
     let identity_maps = take_identity_maps(&mut ebpf)?;
     let policy_maps = take_policy_maps(&mut ebpf)?;
     let service_maps = take_service_maps(&mut ebpf)?;
@@ -6487,6 +6554,8 @@ async fn run_dataplane(
     consume_events(
         flow_ring,
         service_ring,
+        egress_ring,
+        egress_event_counters,
         &mut attachments,
         &mut identities,
         &mut policies,
@@ -11072,10 +11141,12 @@ fn take_service_maps(ebpf: &mut Ebpf) -> Result<ServiceMaps> {
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn consume_events(
     mut flow_ring: RingBuf<aya::maps::MapData>,
     mut service_ring: RingBuf<aya::maps::MapData>,
+    mut egress_ring: RingBuf<aya::maps::MapData>,
+    egress_event_counters: AyaPerCpuArray<aya::maps::MapData, u64>,
     attachments: &mut InterfaceAttachments<'_>,
     identities: &mut IdentitySynchronizer,
     policies: &mut PolicySynchronizer,
@@ -11085,7 +11156,10 @@ async fn consume_events(
     flow_export_sender: Option<&mpsc::Sender<FlowExportRecord>>,
     cancellation: CancellationToken,
 ) {
+    let mut observed_egress_attempts = 0_u64;
+    let mut observed_egress_ring_drops = 0_u64;
     let mut event_interval = tokio::time::interval(Duration::from_millis(25));
+    let mut egress_loss_interval = tokio::time::interval(Duration::from_secs(1));
     let mut interface_interval = tokio::time::interval(Duration::from_secs(1));
     let mut identity_interval = tokio::time::interval(identities.interval);
     let mut policy_interval = tokio::time::interval(policies.interval);
@@ -11137,6 +11211,14 @@ async fn consume_events(
                     warn!(%error, "egress synchronization failed; active source state was fenced when possible");
                 }
             }
+            _ = egress_loss_interval.tick() => {
+                refresh_egress_event_loss(
+                    &egress_event_counters,
+                    state,
+                    &mut observed_egress_attempts,
+                    &mut observed_egress_ring_drops,
+                );
+            }
             _ = event_interval.tick() => {
                 while let Some(item) = flow_ring.next() {
                     if item.len() != size_of::<FlowEvent>() {
@@ -11184,6 +11266,7 @@ async fn consume_events(
                     );
                 }
                 drain_service_events(&mut service_ring, state, flow_export_sender);
+                drain_egress_events(&mut egress_ring, state);
             }
         }
     }
@@ -11222,6 +11305,79 @@ fn drain_service_events(
             "service dataplane outcome"
         );
     }
+}
+
+fn drain_egress_events(ring: &mut RingBuf<MapData>, state: &AgentState) {
+    while let Some(item) = ring.next() {
+        let Some(event) = decode_egress_event(&item) else {
+            state.metrics.invalid_egress_events.inc();
+            continue;
+        };
+        state.metrics.egress_dataplane_events.inc();
+        match event.action {
+            EGRESS_EVENT_ACTION_CREATE => {
+                state.metrics.egress_nat_creations.inc();
+            }
+            EGRESS_EVENT_ACTION_DROP => {
+                state.metrics.egress_nat_drops.inc();
+            }
+            EGRESS_EVENT_ACTION_EXPIRE => {
+                state.metrics.egress_nat_expirations.inc();
+            }
+            _ => unreachable!("validated egress event action"),
+        }
+        info!(
+            source_identity = event.source_identity.get(),
+            contract_revision = event.contract_revision,
+            lease_epoch = event.lease_epoch,
+            source = ?event.original_source_address,
+            destination = ?event.original_destination_address,
+            egress_address = ?event.egress_address,
+            source_port = u16::from_be_bytes(event.original_source_port),
+            destination_port = u16::from_be_bytes(event.original_destination_port),
+            translated_source_port = u16::from_be_bytes(event.translated_source_port),
+            protocol = event.protocol,
+            address_family = event.address_family,
+            address_index = event.address_index,
+            primary_gateway_index = event.primary_gateway_index,
+            standby_gateway_index = event.standby_gateway_index,
+            gateway_digest = ?event.gateway_digest,
+            standby_gateway_digest = ?event.standby_gateway_digest,
+            proof_witness = ?event.proof_witness,
+            action = event.action,
+            reason = event.reason,
+            "egress NAT lifecycle outcome"
+        );
+    }
+}
+
+fn refresh_egress_event_loss(
+    counters: &AyaPerCpuArray<MapData, u64>,
+    state: &AgentState,
+    observed_attempts: &mut u64,
+    observed_drops: &mut u64,
+) {
+    let read_total = |index| {
+        counters
+            .get(&index, 0)
+            .map(|values| values.iter().copied().fold(0_u64, u64::saturating_add))
+    };
+    let Ok(attempts) = read_total(EGRESS_EVENT_COUNTER_ATTEMPTED) else {
+        return;
+    };
+    let Ok(drops) = read_total(EGRESS_EVENT_COUNTER_DROPPED) else {
+        return;
+    };
+    state
+        .metrics
+        .egress_event_attempts
+        .inc_by(attempts.saturating_sub(*observed_attempts));
+    state
+        .metrics
+        .egress_event_ring_drops
+        .inc_by(drops.saturating_sub(*observed_drops));
+    *observed_attempts = attempts;
+    *observed_drops = drops;
 }
 
 fn is_controller_management_flow(event: &FlowEvent, port: u16) -> bool {
@@ -13791,6 +13947,72 @@ fn decode_service_event(bytes: &[u8]) -> Option<ServiceEvent> {
     })
 }
 
+fn decode_egress_event(bytes: &[u8]) -> Option<EgressEvent> {
+    if bytes.len() != size_of::<EgressEvent>() {
+        return None;
+    }
+    let version = u16::from_ne_bytes(copy_bytes(bytes, 130)?);
+    let size = u16::from_ne_bytes(copy_bytes(bytes, 132)?);
+    let protocol = bytes[140];
+    let address_family = bytes[141];
+    let action = bytes[142];
+    let reason = bytes[143];
+    let flags = u16::from_ne_bytes(copy_bytes(bytes, 144)?);
+    let source_identity = IdentityId::new(u32::from_ne_bytes(copy_bytes(bytes, 120)?));
+    let contract_revision = u64::from_ne_bytes(copy_bytes(bytes, 8)?);
+    let lease_epoch = u64::from_ne_bytes(copy_bytes(bytes, 16)?);
+    let egress_address: [u8; 16] = copy_bytes(bytes, 56)?;
+    let gateway_digest: [u8; 16] = copy_bytes(bytes, 72)?;
+    let proof_witness: [u8; 16] = copy_bytes(bytes, 104)?;
+    if version != EGRESS_EVENT_ABI_VERSION
+        || usize::from(size) != size_of::<EgressEvent>()
+        || !matches!(protocol, 6 | 17)
+        || !matches!(address_family, 4 | 6)
+        || !egress_event_action_reason_is_valid(action, reason)
+        || source_identity.get() == 0
+        || contract_revision == 0
+        || lease_epoch == 0
+        || egress_address == [0; 16]
+        || gateway_digest == [0; 16]
+        || proof_witness == [0; 16]
+        || flags
+            & !(unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_CERTIFIED
+                | unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_ACTIVE)
+            != 0
+        || bytes[146..152] != [0; 6]
+        || (address_family == 4
+            && (egress_address[..4] == [0; 4] || egress_address[4..] != [0; 12]))
+    {
+        return None;
+    }
+    Some(EgressEvent {
+        timestamp_ns: u64::from_ne_bytes(copy_bytes(bytes, 0)?),
+        contract_revision,
+        lease_epoch,
+        original_source_address: copy_bytes(bytes, 24)?,
+        original_destination_address: copy_bytes(bytes, 40)?,
+        egress_address,
+        gateway_digest,
+        standby_gateway_digest: copy_bytes(bytes, 88)?,
+        proof_witness,
+        source_identity,
+        original_source_port: copy_bytes(bytes, 124)?,
+        original_destination_port: copy_bytes(bytes, 126)?,
+        translated_source_port: copy_bytes(bytes, 128)?,
+        version,
+        size,
+        address_index: u16::from_ne_bytes(copy_bytes(bytes, 134)?),
+        primary_gateway_index: u16::from_ne_bytes(copy_bytes(bytes, 136)?),
+        standby_gateway_index: u16::from_ne_bytes(copy_bytes(bytes, 138)?),
+        protocol,
+        address_family,
+        action,
+        reason,
+        flags,
+        reserved: copy_bytes(bytes, 146)?,
+    })
+}
+
 fn copy_bytes<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
     bytes.get(offset..offset + N)?.try_into().ok()
 }
@@ -15959,7 +16181,9 @@ mod tests {
         const BANK: u8 = 1;
 
         let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
-        let mut ebpf = EbpfLoader::new()
+        let mut loader = EbpfLoader::new();
+        loader.map_max_entries("EGRESS_EVENTS", 4_096);
+        let mut ebpf = loader
             .load_file(object)
             .expect("load verifier-approved eBPF object");
         load_dataplane_tail_programs(&mut ebpf)
@@ -15974,6 +16198,16 @@ mod tests {
                 .load()
                 .expect("kernel verifier accepts UNF TC program");
         }
+        let mut egress_events = RingBuf::try_from(
+            ebpf.take_map("EGRESS_EVENTS")
+                .expect("egress event ring exists"),
+        )
+        .expect("egress event ring opens");
+        let egress_event_counters = AyaPerCpuArray::<_, u64>::try_from(
+            ebpf.take_map("EGRESS_EVENT_COUNTERS")
+                .expect("egress event counters exist"),
+        )
+        .expect("egress event counters open");
 
         let source_v4 = Ipv4Addr::new(10, 244, 0, 20);
         let destination_v4 = Ipv4Addr::new(203, 0, 113, 9);
@@ -16487,6 +16721,67 @@ mod tests {
             443,
             40_000,
         );
+
+        let mut nat_events = Vec::new();
+        while let Some(item) = egress_events.next() {
+            nat_events.push(decode_egress_event(&item).expect("kernel egress event is valid"));
+        }
+        assert_eq!(nat_events.len(), 3, "only new NAT flows emit witnesses");
+        assert!(nat_events.iter().all(|event| {
+            event.action == EGRESS_EVENT_ACTION_CREATE
+                && event.reason == unf_ebpf_common::EGRESS_EVENT_REASON_TRANSLATION_CREATED
+                && event.contract_revision == CONTRACT_REVISION
+                && event.lease_epoch == 17
+                && event.gateway_digest == [0x22; 16]
+                && event.proof_witness == [0x33; 16]
+                && event.translated_source_port != [0; 2]
+        }));
+        assert_eq!(
+            nat_events
+                .iter()
+                .filter(|event| event.address_family == 4)
+                .count(),
+            2
+        );
+        assert_eq!(
+            nat_events
+                .iter()
+                .filter(|event| event.address_family == 6)
+                .count(),
+            1
+        );
+        let counter_total = |index| {
+            egress_event_counters
+                .get(&index, 0)
+                .expect("egress event counter reads")
+                .iter()
+                .copied()
+                .sum::<u64>()
+        };
+        assert_eq!(counter_total(EGRESS_EVENT_COUNTER_ATTEMPTED), 3);
+        assert_eq!(counter_total(EGRESS_EVENT_COUNTER_DROPPED), 0);
+
+        for source_port in 41_000_u16..41_064 {
+            let packet = ipv4_packet(6, source_v4, destination_v4, source_port, 443);
+            assert_eq!(
+                run_tc(&mut ebpf, "unf_observe_ingress", &packet).0,
+                TC_ACT_PIPE,
+                "full telemetry ring must never stop NAT forwarding"
+            );
+        }
+        let attempts_after_pressure = counter_total(EGRESS_EVENT_COUNTER_ATTEMPTED);
+        let drops_after_pressure = counter_total(EGRESS_EVENT_COUNTER_DROPPED);
+        assert_eq!(attempts_after_pressure, 67);
+        assert!(
+            drops_after_pressure > 0,
+            "small ring must expose event loss"
+        );
+        let mut retained_after_pressure = 0_u64;
+        while let Some(item) = egress_events.next() {
+            decode_egress_event(&item).expect("retained pressure event remains valid");
+            retained_after_pressure += 1;
+        }
+        assert_eq!(retained_after_pressure + drops_after_pressure, 64);
 
         let mut deny_key = [0_u8; 12];
         deny_key[0..4].copy_from_slice(&destination_v4.octets());
@@ -19765,6 +20060,57 @@ mod tests {
     fn event_decoder_rejects_an_unknown_abi() {
         let bytes = [0_u8; size_of::<FlowEvent>()];
         assert!(decode_event(&bytes).is_none());
+    }
+
+    #[test]
+    fn egress_event_decoder_requires_exact_proof_bound_nat_evidence() {
+        let mut bytes = [0_u8; size_of::<EgressEvent>()];
+        bytes[0..8].copy_from_slice(&19_u64.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&23_u64.to_ne_bytes());
+        bytes[16..24].copy_from_slice(&29_u64.to_ne_bytes());
+        bytes[24..28].copy_from_slice(&[10, 42, 0, 7]);
+        bytes[40..44].copy_from_slice(&[198, 51, 100, 9]);
+        bytes[56..60].copy_from_slice(&[192, 0, 2, 10]);
+        bytes[72..88].fill(0x11);
+        bytes[88..104].fill(0x22);
+        bytes[104..120].fill(0x33);
+        bytes[120..124].copy_from_slice(&37_u32.to_ne_bytes());
+        bytes[124..126].copy_from_slice(&40_000_u16.to_be_bytes());
+        bytes[126..128].copy_from_slice(&443_u16.to_be_bytes());
+        bytes[128..130].copy_from_slice(&50_000_u16.to_be_bytes());
+        bytes[130..132].copy_from_slice(&EGRESS_EVENT_ABI_VERSION.to_ne_bytes());
+        bytes[132..134].copy_from_slice(
+            &u16::try_from(size_of::<EgressEvent>())
+                .expect("egress event size fits u16")
+                .to_ne_bytes(),
+        );
+        bytes[134..136].copy_from_slice(&2_u16.to_ne_bytes());
+        bytes[136..138].copy_from_slice(&3_u16.to_ne_bytes());
+        bytes[138..140].copy_from_slice(&4_u16.to_ne_bytes());
+        bytes[140] = 6;
+        bytes[141] = 4;
+        bytes[142] = EGRESS_EVENT_ACTION_CREATE;
+        bytes[143] = unf_ebpf_common::EGRESS_EVENT_REASON_TRANSLATION_CREATED;
+
+        let event = decode_egress_event(&bytes).expect("egress event ABI is valid");
+        assert_eq!(event.contract_revision, 23);
+        assert_eq!(event.lease_epoch, 29);
+        assert_eq!(event.source_identity.get(), 37);
+        assert_eq!(event.egress_address[..4], [192, 0, 2, 10]);
+        assert_eq!(u16::from_be_bytes(event.translated_source_port), 50_000);
+
+        let mut invalid = bytes;
+        invalid[143] = unf_ebpf_common::EGRESS_EVENT_REASON_REWRITE_FAILED;
+        assert!(decode_egress_event(&invalid).is_none());
+        let mut invalid = bytes;
+        invalid[104..120].fill(0);
+        assert!(decode_egress_event(&invalid).is_none());
+        let mut invalid = bytes;
+        invalid[60] = 1;
+        assert!(decode_egress_event(&invalid).is_none());
+        let mut invalid = bytes;
+        invalid[151] = 1;
+        assert!(decode_egress_event(&invalid).is_none());
     }
 
     #[test]

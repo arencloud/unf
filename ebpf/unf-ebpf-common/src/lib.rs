@@ -18,6 +18,7 @@ pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
 pub const POLICY_BANK_COUNT: u8 = 2;
 pub const EGRESS_MAP_ABI_VERSION: u16 = 3;
+pub const EGRESS_EVENT_ABI_VERSION: u16 = 1;
 pub const EGRESS_BANK_COUNT: u8 = 2;
 /// LPM keys begin with an exact intent-and-bank discriminator before the
 /// destination network bits. A `/0` intent destination is therefore a
@@ -43,6 +44,16 @@ pub const EGRESS_CONNECTION_FLAG_STANDBY_ACTIVE: u16 = 1 << 1;
 pub const EGRESS_SNAT_PORT_BASE: u16 = 32_768;
 pub const EGRESS_SNAT_PORT_MASK: u32 = 32_767;
 pub const EGRESS_SNAT_PORT_PROBES: u32 = 32;
+pub const EGRESS_EVENT_ACTION_CREATE: u8 = 1;
+pub const EGRESS_EVENT_ACTION_DROP: u8 = 2;
+pub const EGRESS_EVENT_ACTION_EXPIRE: u8 = 3;
+pub const EGRESS_EVENT_REASON_TRANSLATION_CREATED: u8 = 1;
+pub const EGRESS_EVENT_REASON_EXPIRED_OR_CORRUPT: u8 = 2;
+pub const EGRESS_EVENT_REASON_REWRITE_FAILED: u8 = 3;
+pub const EGRESS_EVENT_REASON_PAIR_STORE_FAILED: u8 = 4;
+pub const EGRESS_EVENT_REASON_PORT_EXHAUSTED: u8 = 5;
+pub const EGRESS_EVENT_COUNTER_ATTEMPTED: u32 = 0;
+pub const EGRESS_EVENT_COUNTER_DROPPED: u32 = 1;
 pub const SERVICE_MAP_ABI_VERSION: u16 = 5;
 pub const SERVICE_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_MAP_ABI_VERSION: u16 = 4;
@@ -961,6 +972,27 @@ pub const fn egress_path_mode_is_valid(mode: u8) -> bool {
     matches!(mode, EGRESS_PATH_DIRECT_NEIGHBOR | EGRESS_PATH_TUNNEL)
 }
 
+/// Keeps the egress event vocabulary closed so userspace cannot interpret an
+/// unknown action/reason pair as trustworthy NAT evidence.
+#[must_use]
+pub const fn egress_event_action_reason_is_valid(action: u8, reason: u8) -> bool {
+    matches!(
+        (action, reason),
+        (
+            EGRESS_EVENT_ACTION_CREATE,
+            EGRESS_EVENT_REASON_TRANSLATION_CREATED
+        ) | (
+            EGRESS_EVENT_ACTION_DROP,
+            EGRESS_EVENT_REASON_REWRITE_FAILED
+                | EGRESS_EVENT_REASON_PAIR_STORE_FAILED
+                | EGRESS_EVENT_REASON_PORT_EXHAUSTED
+        ) | (
+            EGRESS_EVENT_ACTION_EXPIRE,
+            EGRESS_EVENT_REASON_EXPIRED_OR_CORRUPT
+        )
+    )
+}
+
 /// Stable verifier-friendly hash selecting a compiler-built rendezvous bucket.
 /// Cryptographic contract/proof commitments remain userspace SHA-256; the
 /// packet path only chooses one immutable bucket and cannot invent candidates.
@@ -1798,6 +1830,35 @@ mod tests {
         assert_eq!(first_window.len(), EGRESS_SNAT_PORT_PROBES as usize);
         assert_eq!(second_window.len(), EGRESS_SNAT_PORT_PROBES as usize);
         assert_ne!(first_window, second_window);
+    }
+
+    #[test]
+    fn egress_event_vocabulary_is_closed() {
+        assert!(egress_event_action_reason_is_valid(
+            EGRESS_EVENT_ACTION_CREATE,
+            EGRESS_EVENT_REASON_TRANSLATION_CREATED,
+        ));
+        assert!(egress_event_action_reason_is_valid(
+            EGRESS_EVENT_ACTION_DROP,
+            EGRESS_EVENT_REASON_REWRITE_FAILED,
+        ));
+        assert!(egress_event_action_reason_is_valid(
+            EGRESS_EVENT_ACTION_DROP,
+            EGRESS_EVENT_REASON_PAIR_STORE_FAILED,
+        ));
+        assert!(egress_event_action_reason_is_valid(
+            EGRESS_EVENT_ACTION_DROP,
+            EGRESS_EVENT_REASON_PORT_EXHAUSTED,
+        ));
+        assert!(egress_event_action_reason_is_valid(
+            EGRESS_EVENT_ACTION_EXPIRE,
+            EGRESS_EVENT_REASON_EXPIRED_OR_CORRUPT,
+        ));
+        assert!(!egress_event_action_reason_is_valid(
+            EGRESS_EVENT_ACTION_CREATE,
+            EGRESS_EVENT_REASON_REWRITE_FAILED,
+        ));
+        assert!(!egress_event_action_reason_is_valid(0, 0));
     }
 
     #[test]

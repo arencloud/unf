@@ -18,7 +18,7 @@ authoritative state remains in [project-status.md](../project-status.md).
 | 8.3 | Durable allocation and gateway-provider contract | **Verified** | Schema-v1 allocation atomically assigns conflict-safe multiple IPv4/IPv6 addresses with exact owner/pool/provider provenance, bounded exhaustion, monotonic revisions/lease epochs, release/reuse, and strict checkpoint replay. Separate gateway/reachability provider interfaces, desired/ack revisions, epoch/address fencing, dual acknowledgement, safe withdrawal, and direct contract-fact projection pass `make egress-allocation-test`; ADR 0116 |
 | 8.4 | Transactional distribution and gateway host state | **Verified** | Schema-v1 projection binds the existing authenticated Pod/Node principal, negotiates exact contract/host capabilities, independently replays all facts, and fences last-known-good epochs/revisions. Separate userspace ABI-v1 host banks commit through stage/readback/prepare/activate, pointer rollback, exact current/pending recovery, cold reconstruction, and version-scoped cleanup; `make egress-host-state-test`; ADR 0117 |
 | 8.4a | Egress Proof Chain and zero-leak admission | **Verified** | Default `Native -> Fenced -> Active` admission prevents explicit-intent convergence/withdrawal leaks. Domain-separated rendezvous hashing deterministically selects same-family multiple addresses and ready gateways; a versioned proof binds the authoritative identity, original tuple, exact contract/revisions, lease, choice, and witness for independent selected-gateway replay. Ten adversarial tests and strict Clippy pass `make egress-proof-test`; ADR 0118 |
-| 8.5 | Live distribution, source steering, and gateway NAT dataplane | **In progress** | Egress ABI v3 and exact 40-pin persistent ABI v14 provide destination-exact policy-first steering plus collision-safe dual-stack gateway SNAT/reverse state. Heterogeneous identity-namespaced gateway banks bind contract, lease, destination, local-primary gateway, digest, and proof witness; reverse-first `BPF_NOEXIST` insertion and a proof-salted full-cycle port permutation preserve existing flows. A digest-bound controller grant plus native route proof controls source activation, while Node-UID-bound `unf-egress0` ownership requires whole-host collision preflight and exact all-gateway readback quorum. The live Proof of Safe Forgetting pipeline now joins source fences, lease-specific NAT drains, explicit static reachability withdrawal, authorized host subset removal, and atomic allocation retirement without coupling unrelated tenants. `make egress-source-steering-test`, `make egress-path-activation-test`, `make egress-gateway-address-test`, `make egress-gateway-nat-test`, `make egress-safe-forgetting-test`, `make egress-source-retirement-test`, `make egress-gateway-retirement-test`, and `make egress-release-authority-test`; ADRs 0126–0133. NAT events and end-to-end traffic remain |
+| 8.5 | Live distribution, source steering, and gateway NAT dataplane | **In progress** | Egress ABI v3 and exact 40-pin persistent ABI v14 provide destination-exact policy-first steering plus collision-safe dual-stack gateway SNAT/reverse state. Heterogeneous identity-namespaced gateway banks bind contract, lease, destination, local-primary gateway, digest, and proof witness; reverse-first `BPF_NOEXIST` insertion and a proof-salted full-cycle port permutation preserve existing flows. A digest-bound controller grant plus native route proof controls source activation, while Node-UID-bound `unf-egress0` ownership requires whole-host collision preflight and exact all-gateway readback quorum. The live Proof of Safe Forgetting pipeline joins source fences, lease-specific NAT drains, explicit static reachability withdrawal, authorized host subset removal, and atomic allocation retirement. Sparse event ABI v1 adds proof-bound first-flow/exception witnesses with explicit non-blocking ring-loss accounting. `make egress-source-steering-test`, `make egress-path-activation-test`, `make egress-gateway-address-test`, `make egress-gateway-nat-test`, `make egress-safe-forgetting-test`, `make egress-source-retirement-test`, `make egress-gateway-retirement-test`, `make egress-release-authority-test`, and `make egress-nat-observability-test`; ADRs 0126–0134. End-to-end traffic remains |
 | 8.6 | Deterministic HA, failover, and multiple addresses | **Planned** | Lease-fenced gateway ownership, deterministic placement and failover, established-flow contract, bounded convergence, split-brain rejection, node drain/recovery, and measured disruption |
 | 8.7 | FQDN and internet-access controls | **Planned** | DNS-derived destination sets with bounded TTL/staleness/provenance, explicit wildcard semantics, fail-closed capacity behavior, IP fallback visibility, and no use of DNS names as workload identity |
 | 8.8 | Reachability and advertisement providers | **Planned** | Static/native development provider first; BGP advertisement remains a replaceable provider with independent route-policy, ECMP, graceful-restart, BFD, and production qualification gates |
@@ -33,8 +33,9 @@ egress-source-retirement-test`. ADR 0132 adds independently authenticated,
 lease-specific gateway projection and NAT-LRU drain evidence under `make
 egress-gateway-retirement-test`. ADR 0133 adds explicit static reachability,
 schema-v2 release projections, exact kernel subset readback, and atomic final
-authority consumption under `make egress-release-authority-test`. NAT events
-and end-to-end traffic remain.
+authority consumption under `make egress-release-authority-test`. ADR 0134 adds
+proof-bound sparse NAT lifecycle witnesses and exact non-blocking loss evidence
+under `make egress-nat-observability-test`. End-to-end traffic remains.
 
 ## Accepted Phase 8 gate
 
@@ -115,10 +116,10 @@ HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.5 next completes safe-forgetting transport on gateways: each gateway
-must apply and acknowledge its explicit empty projection, scan lease-bound NAT
-state, and publish a zero-connection drain through its current Pod/Node identity.
-The independent reachability withdrawal then lets the controller assemble and
-atomically consume the registered authority. Until every producer agrees, the
-lease remains quarantined. NAT events and an end-to-end dual-stack packet
-lifecycle follow.
+Milestone 8.5 next closes its end-to-end lifecycle. One committed dual-stack
+environment must exercise watched intent through allocation, address ownership,
+bilateral source/gateway activation, policy-first steering, real gateway NAT and
+reverse traffic, sparse NAT evidence, withdrawal, drain, host-address removal,
+and safe reuse. The gate must retain immutable diagnostics and prove unrelated
+native egress stays native throughout. Synthetic map tests alone cannot close
+this slice.

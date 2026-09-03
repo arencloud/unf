@@ -526,9 +526,18 @@ assembles the exact proof union. Schema-v2 address projections authorize only
 a monotonic host-address subset; all selected gateways must remove and read
 back the lease as absent before one atomic transaction releases gateway,
 allocation, and retirement state. The privileged gate passes `make
-egress-release-authority-test`; ADR 0133. Other reachability providers, NAT
-events, HA failover, and platform dual-stack traffic remain explicit later
+egress-release-authority-test`; ADR 0133. Other reachability providers, HA
+failover, and platform dual-stack traffic remain explicit later
 gates, so missing proof still quarantines rather than releasing optimistically.
+Gateway NAT events are now a loss-explicit first-flow channel rather than a
+per-packet stream. ABI-v1 witnesses bind the original/translated tuple,
+identity, contract, lease, selected address/gateways, and proof; closed semantic
+validation rejects ambiguous records. Per-CPU attempted/drop counters make ring
+pressure measurable, and a real-kernel undersized-ring test proves telemetry
+loss cannot change forwarding. Fixed-cardinality agent metrics and the focused
+`make egress-nat-observability-test` gate verify this boundary; ADR 0134.
+Durable NAT history, HA failover, and platform dual-stack traffic remain later
+gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
