@@ -56,7 +56,12 @@ use unf_ebpf_common::{
     service_event_frontend_kind_is_valid, service_selection_algorithm_is_valid,
     service_selection_tier_is_valid,
 };
-use unf_egress::EgressDataplaneState;
+use unf_egress::{
+    AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
+    EGRESS_DISTRIBUTION_SCHEMA_VERSION, EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard,
+    EgressAgentAdvertisement, EgressCapability, EgressDataplaneState, EgressGatewayHostBank,
+    EgressNodeProjectionEnvelope, EgressProjectionLedger, compile_egress_dataplane,
+};
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
     NodeBlockSnapshot,
@@ -800,6 +805,21 @@ struct EgressSynchronizer {
     connections: AyaHashMap<MapData, [u8; 44], [u8; 144]>,
     banks: [EncodedEgressBank; EGRESS_BANK_COUNT as usize],
     active_bank: u8,
+    ledger: EgressProjectionLedger,
+    applied_authority: Option<EgressAppliedAuthority>,
+    node_name: String,
+    controller_url: Option<String>,
+    client: ReloadingControllerClient,
+    agent_token_path: PathBuf,
+    interval: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EgressAppliedAuthority {
+    controller_epoch: u64,
+    projection_revision: u64,
+    contract_revision: u64,
+    contract_digest: Option<[u8; 32]>,
 }
 
 struct ServiceSynchronizer {
@@ -6491,10 +6511,10 @@ fn new_synchronizers(
             applied_load_balancer_reachability: None,
             applied_selection_contract: None,
             active_selection_bank: 0,
-            node_name,
-            controller_url,
-            client,
-            agent_token_path,
+            node_name: node_name.clone(),
+            controller_url: controller_url.clone(),
+            client: client.clone(),
+            agent_token_path: agent_token_path.clone(),
             state_path: service_state_path,
             load_balancer_state_path,
             interval: service_interval,
@@ -6508,6 +6528,13 @@ fn new_synchronizers(
             connections: egress_connections,
             banks: [EncodedEgressBank::default(), EncodedEgressBank::default()],
             active_bank: 0,
+            ledger: EgressProjectionLedger::default(),
+            applied_authority: None,
+            node_name,
+            controller_url,
+            client,
+            agent_token_path,
+            interval: service_interval,
         },
     )
 }
@@ -7289,6 +7316,7 @@ fn recover_egress_state(egress: &mut EgressSynchronizer) -> Result<()> {
         .context("read persistent egress config")?;
     if config == [0; 56] {
         clear_all_egress_banks(egress)?;
+        egress.applied_authority = None;
         return Ok(());
     }
     let schema = u16::from_ne_bytes(config[48..50].try_into().expect("fixed egress schema"));
@@ -7326,11 +7354,44 @@ fn recover_egress_state(egress: &mut EgressSynchronizer) -> Result<()> {
         bail!("persistent egress config contains a zero authority revision");
     }
 
+    let applied_authority = recovered_egress_authority(active, config)?;
     egress.banks[usize::from(active_bank)].config = config;
     egress.active_bank = active_bank;
+    egress.applied_authority = Some(applied_authority);
     let inactive_bank = active_bank ^ 1;
     clear_egress_bank(egress, inactive_bank)?;
     Ok(())
+}
+
+fn recovered_egress_authority(
+    active: &EncodedEgressBank,
+    config: [u8; 56],
+) -> Result<EgressAppliedAuthority> {
+    let contract_digest = active
+        .sources
+        .values()
+        .next()
+        .map(|source| source[64..96].try_into().expect("fixed contract digest"));
+    if contract_digest.is_some_and(|digest| {
+        active
+            .sources
+            .values()
+            .any(|source| source[64..96] != digest)
+    }) {
+        bail!("persistent egress sources disagree on their contract digest");
+    }
+    Ok(EgressAppliedAuthority {
+        controller_epoch: u64::from_ne_bytes(
+            config[0..8].try_into().expect("fixed controller epoch"),
+        ),
+        projection_revision: u64::from_ne_bytes(
+            config[8..16].try_into().expect("fixed projection revision"),
+        ),
+        contract_revision: u64::from_ne_bytes(
+            config[16..24].try_into().expect("fixed contract revision"),
+        ),
+        contract_digest,
+    })
 }
 
 fn egress_bank(bank: u8) -> Result<usize> {
@@ -7545,9 +7606,149 @@ fn encode_egress_dataplane(state: &EgressDataplaneState) -> Result<EncodedEgress
     Ok(encoded)
 }
 
-// The authenticated egress snapshot endpoint is the next Phase 8.5 slice; keep
-// the fully tested transaction ready without claiming live distribution yet.
-#[allow(dead_code)]
+fn egress_agent_advertisement() -> EgressAgentAdvertisement {
+    EgressAgentAdvertisement {
+        distribution_schemas: BTreeSet::from([EGRESS_DISTRIBUTION_SCHEMA_VERSION]),
+        host_state_schemas: BTreeSet::from([EGRESS_HOST_STATE_SCHEMA_VERSION]),
+        capabilities: BTreeSet::from([
+            EgressCapability::IdentitySourceSteering,
+            EgressCapability::LeaseEpochFencing,
+            EgressCapability::OriginalTupleWitness,
+            EgressCapability::Ipv4TcpUdpNat,
+            EgressCapability::Ipv6TcpUdpNat,
+        ]),
+    }
+}
+
+async fn synchronize_egress(
+    synchronizer: &mut EgressSynchronizer,
+    state: &AgentState,
+) -> Result<bool> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("egress synchronization requires a controller URL")?;
+    let advertisement = egress_agent_advertisement();
+    let response = synchronizer
+        .client
+        .current()
+        .post(format!("{controller_url}/v1/state/egress-source"))
+        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+        .json(&advertisement)
+        .send()
+        .await
+        .context("request authenticated egress source projection")?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(false);
+    }
+    let envelope: EgressNodeProjectionEnvelope = response
+        .error_for_status()
+        .context("controller rejected egress source projection request")?
+        .json()
+        .await
+        .context("decode egress source projection envelope")?;
+    let node = fetch_node_port_node_snapshot(
+        controller_url,
+        &synchronizer.client,
+        &synchronizer.agent_token_path,
+    )
+    .await?
+    .validate_and_normalize()
+    .context("validate authoritative local Node identity for egress")?;
+    if node.node_name != synchronizer.node_name {
+        bail!(
+            "controller returned Node identity for {}; authenticated egress agent owns {}",
+            node.node_name,
+            synchronizer.node_name
+        );
+    }
+    let principal = AuthenticatedEgressAgent {
+        namespace: "unf-system".to_owned(),
+        service_account: EGRESS_AGENT_SERVICE_ACCOUNT.to_owned(),
+        pod_name: state.pod_name.clone(),
+        pod_uid: state.pod_uid.clone(),
+        node_name: synchronizer.node_name.clone(),
+        node_uid: node.node_uid,
+        audience: EGRESS_AGENT_TOKEN_AUDIENCE.to_owned(),
+    };
+    let admitted = envelope
+        .admit(&principal, &advertisement)
+        .context("independently replay egress source projection")?;
+    let projection = admitted.projection();
+    let candidate_authority = EgressAppliedAuthority {
+        controller_epoch: projection.controller_epoch,
+        projection_revision: projection.revision.get(),
+        contract_revision: projection.contract.contract_revision.get(),
+        contract_digest: Some(projection.contract.contract_digest.0),
+    };
+    if egress_authority_is_current(synchronizer.applied_authority, candidate_authority)? {
+        return Ok(false);
+    }
+    let mut next_ledger = synchronizer.ledger.clone();
+    next_ledger
+        .adopt(admitted.clone())
+        .context("fence egress projection revision")?;
+    if synchronizer.ledger.current() == next_ledger.current() {
+        return Ok(false);
+    }
+
+    let host =
+        EgressGatewayHostBank::compile(&admitted).context("compile admitted egress host bank")?;
+    let mut guard = EgressAdmissionGuard::default();
+    for plan in &host.contract.plans {
+        guard
+            .fence(
+                plan.source.identity,
+                plan.intent.clone(),
+                plan.revisions.intent,
+            )
+            .context("install fail-closed egress source admission")?;
+    }
+    let bank = synchronizer.active_bank ^ 1;
+    let candidate = compile_egress_dataplane(&host, &guard, &[], bank)
+        .context("compile fenced egress dataplane candidate")?;
+    apply_egress_dataplane(synchronizer, &candidate)?;
+    synchronizer.ledger = next_ledger;
+    synchronizer.applied_authority = Some(candidate_authority);
+    info!(
+        controller_epoch = host.controller_epoch,
+        projection_revision = host.projection_revision.get(),
+        contract_revision = host.contract.contract_revision.get(),
+        sources = candidate.sources.len(),
+        active_bank = synchronizer.active_bank,
+        "authenticated egress intent staged as fail-closed source fences"
+    );
+    Ok(true)
+}
+
+fn egress_authority_is_current(
+    applied: Option<EgressAppliedAuthority>,
+    candidate: EgressAppliedAuthority,
+) -> Result<bool> {
+    let Some(applied) = applied else {
+        return Ok(false);
+    };
+    if candidate.controller_epoch < applied.controller_epoch
+        || (candidate.controller_epoch == applied.controller_epoch
+            && candidate.projection_revision < applied.projection_revision)
+    {
+        bail!("egress projection epoch or revision regressed from persistent state");
+    }
+    if candidate.controller_epoch == applied.controller_epoch
+        && candidate.projection_revision == applied.projection_revision
+    {
+        if candidate.contract_revision != applied.contract_revision
+            || applied
+                .contract_digest
+                .is_some_and(|digest| Some(digest) != candidate.contract_digest)
+        {
+            bail!("egress projection mutated at the persistent epoch and revision");
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn apply_egress_dataplane(
     egress: &mut EgressSynchronizer,
     state: &EgressDataplaneState,
@@ -9128,7 +9329,7 @@ async fn consume_events(
     identities: &mut IdentitySynchronizer,
     policies: &mut PolicySynchronizer,
     services: &mut ServiceSynchronizer,
-    _egress: &mut EgressSynchronizer,
+    egress: &mut EgressSynchronizer,
     state: &AgentState,
     flow_export_sender: Option<&mpsc::Sender<FlowExportRecord>>,
     cancellation: CancellationToken,
@@ -9138,6 +9339,7 @@ async fn consume_events(
     let mut identity_interval = tokio::time::interval(identities.interval);
     let mut policy_interval = tokio::time::interval(policies.interval);
     let mut service_interval = tokio::time::interval(services.interval);
+    let mut egress_interval = tokio::time::interval(egress.interval);
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
@@ -9177,6 +9379,11 @@ async fn consume_events(
                 if let Err(error) = synchronize_load_balancer_maps(services, state).await {
                     record_load_balancer_error(state, &error);
                     warn!(%error, "LoadBalancer host-state synchronization failed; retaining active bank");
+                }
+            }
+            _ = egress_interval.tick(), if egress.controller_url.is_some() => {
+                if let Err(error) = synchronize_egress(egress, state).await {
+                    warn!(%error, "egress source synchronization failed; retaining last-known-good bank");
                 }
             }
             _ = event_interval.tick() => {
@@ -13574,6 +13781,16 @@ mod tests {
             connections,
             banks: [EncodedEgressBank::default(), EncodedEgressBank::default()],
             active_bank: 0,
+            ledger: EgressProjectionLedger::default(),
+            applied_authority: None,
+            node_name: "worker-a".to_owned(),
+            controller_url: None,
+            client: ReloadingControllerClient::without_custom_trust(
+                Counter::default(),
+                Counter::default(),
+            ),
+            agent_token_path: PathBuf::new(),
+            interval: Duration::from_secs(1),
         };
         let make_state = |bank: u8, identities: &[u32]| EgressDataplaneState {
             config: unf_ebpf_common::EgressMapConfig {
@@ -16582,6 +16799,57 @@ mod tests {
         assert_eq!(ABI_V8_MAP_NAMES.len(), 24);
         assert_eq!(ABI_V11_MAP_NAMES.len(), 25);
         assert_eq!(PERSISTENT_MAP_NAMES.len(), 31);
+    }
+
+    #[test]
+    fn egress_agent_advertisement_is_exact_and_current() {
+        let advertisement = egress_agent_advertisement();
+        assert_eq!(
+            advertisement.distribution_schemas,
+            BTreeSet::from([EGRESS_DISTRIBUTION_SCHEMA_VERSION])
+        );
+        assert_eq!(
+            advertisement.host_state_schemas,
+            BTreeSet::from([EGRESS_HOST_STATE_SCHEMA_VERSION])
+        );
+        assert_eq!(advertisement.capabilities.len(), 5);
+        assert!(
+            advertisement
+                .capabilities
+                .contains(&EgressCapability::LeaseEpochFencing)
+        );
+        assert!(
+            advertisement
+                .capabilities
+                .contains(&EgressCapability::Ipv6TcpUdpNat)
+        );
+    }
+
+    #[test]
+    fn egress_persistent_authority_rejects_regression_and_same_revision_mutation() {
+        let applied = EgressAppliedAuthority {
+            controller_epoch: 7,
+            projection_revision: 11,
+            contract_revision: 13,
+            contract_digest: Some([0xA5; 32]),
+        };
+        assert!(egress_authority_is_current(Some(applied), applied).unwrap());
+
+        let regression = EgressAppliedAuthority {
+            projection_revision: 10,
+            ..applied
+        };
+        assert!(egress_authority_is_current(Some(applied), regression).is_err());
+        let mutation = EgressAppliedAuthority {
+            contract_digest: Some([0x5A; 32]),
+            ..applied
+        };
+        assert!(egress_authority_is_current(Some(applied), mutation).is_err());
+        let advance = EgressAppliedAuthority {
+            projection_revision: 12,
+            ..applied
+        };
+        assert!(!egress_authority_is_current(Some(applied), advance).unwrap());
     }
 
     #[test]

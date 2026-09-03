@@ -215,5 +215,9 @@ foreign, missing, or duplicate evidence is rejected. Connection and event
 layouts reserve exact original/translated tuples plus primary/standby proof
 provenance. Persistent ABI v12 now owns these tables. The agent explicitly
 encodes, stages, reads back, activates, reconstructs, and garbage-collects them
-as one pointer-selected transaction; live distribution and packet consumption
-remain separate Phase 8.5 gates. See ADRs 0119–0120.
+as one pointer-selected transaction. A live authenticated source endpoint now
+carries the exact normalized model/facts/contract envelope; the agent resolves
+its Node UID independently, replays it, applies monotonic projection fencing,
+and lowers every selected source as `Fenced` without path candidates. Watched
+desired-state population, gateway distribution, and packet consumption remain
+separate Phase 8.5 gates. See ADRs 0119–0121.

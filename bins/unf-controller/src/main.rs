@@ -37,6 +37,11 @@ use unf_common::{
     BackendId, IdentityId, PolicyAction, PolicyDirection, PolicyId, PolicyReason, Protocol,
     Revision, ServiceId, Verdict,
 };
+use unf_egress::{
+    AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
+    EgressAgentAdvertisement, EgressBehaviorContract, EgressContractFacts, EgressDistributionError,
+    EgressModel, EgressNodeProjectionEnvelope,
+};
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
     NodeBlockSnapshot,
@@ -270,6 +275,7 @@ struct ControllerState {
     agent_node_selector: Option<String>,
     pods: RwLock<BTreeMap<String, PodRecord>>,
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
+    egress_source_distributions: RwLock<BTreeMap<String, EgressSourceDistribution>>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -367,9 +373,20 @@ struct DurableAgentReportStore {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthenticatedAgent {
+    namespace: String,
+    service_account: String,
     node_name: String,
     pod_name: String,
     pod_uid: String,
+    audience: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EgressSourceDistribution {
+    revision: Revision,
+    model: EgressModel,
+    facts: EgressContractFacts,
+    contract: EgressBehaviorContract,
 }
 
 #[derive(Debug, Clone)]
@@ -1066,6 +1083,7 @@ async fn spawn_internal_api(
         .route("/v1/state/node-port-node", get(node_port_node_snapshot))
         .route("/v1/state/node-block", get(node_block_snapshot))
         .route("/v1/state/remote-routes", get(remote_route_snapshot))
+        .route("/v1/state/egress-source", post(egress_source_projection))
         .route("/v1/state/agents", post(ingest_agent_status))
         .route("/v1/telemetry/flows", post(ingest_flows))
         .with_state(state);
@@ -1346,6 +1364,7 @@ fn new_state_with_client_and_selector(
         agent_node_selector,
         pods: RwLock::new(BTreeMap::new()),
         nodes: RwLock::new(BTreeMap::new()),
+        egress_source_distributions: RwLock::new(BTreeMap::new()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -4617,9 +4636,12 @@ fn validate_agent_token_identity(
         .clone()
         .ok_or_else(|| ApiError::forbidden("agent Pod has no authoritative Node placement"))?;
     Ok(AuthenticatedAgent {
+        namespace: pod.namespace.clone(),
+        service_account: pod.endpoint.service_account.clone(),
         node_name,
         pod_name: pod_name.to_owned(),
         pod_uid: pod_uid.to_owned(),
+        audience: AGENT_TOKEN_AUDIENCE.to_owned(),
     })
 }
 
@@ -4641,12 +4663,15 @@ fn validate_authoritative_agent(
     agent: &AuthenticatedAgent,
     pods: &BTreeMap<String, PodRecord>,
 ) -> Result<(), ApiError> {
-    let pod_key = format!("unf-system/{}", agent.pod_name);
+    let pod_key = format!("{}/{}", agent.namespace, agent.pod_name);
     let pod = pods
         .get(&pod_key)
         .ok_or_else(|| ApiError::forbidden("agent Pod is not present in watched state"))?;
     if pod.uid != agent.pod_uid
-        || pod.endpoint.service_account != "unf-agent"
+        || pod.namespace != agent.namespace
+        || pod.endpoint.service_account != agent.service_account
+        || agent.service_account != EGRESS_AGENT_SERVICE_ACCOUNT
+        || agent.audience != EGRESS_AGENT_TOKEN_AUDIENCE
         || pod.node_name.as_deref() != Some(agent.node_name.as_str())
     {
         return Err(ApiError::forbidden(
@@ -5493,6 +5518,74 @@ async fn node_port_node_snapshot(
 ) -> Result<Json<NodePortNodeSnapshot>, ApiError> {
     let agent = authenticate_internal_agent(&state, &headers).await?;
     node_port_node_snapshot_for(&state, &agent.node_name).map(Json)
+}
+
+async fn egress_source_projection(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(advertisement): Json<EgressAgentAdvertisement>,
+) -> Result<Response, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    match egress_source_projection_for(&state, &agent, &advertisement)? {
+        Some(envelope) => Ok(Json(envelope).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+fn egress_source_projection_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    advertisement: &EgressAgentAdvertisement,
+) -> Result<Option<EgressNodeProjectionEnvelope>, ApiError> {
+    let desired = read_lock(&state.egress_source_distributions)
+        .get(&agent.node_name)
+        .cloned();
+    let Some(desired) = desired else {
+        return Ok(None);
+    };
+    let node_uid = read_lock(&state.node_port_nodes)
+        .get(&agent.node_name)
+        .map(|record| record.node_uid.clone())
+        .ok_or_else(|| {
+            ApiError::service_unavailable(format!(
+                "node {} has no authoritative UID for egress distribution",
+                agent.node_name
+            ))
+        })?;
+    let principal = AuthenticatedEgressAgent {
+        namespace: agent.namespace.clone(),
+        service_account: agent.service_account.clone(),
+        pod_name: agent.pod_name.clone(),
+        pod_uid: agent.pod_uid.clone(),
+        node_name: agent.node_name.clone(),
+        node_uid,
+        audience: agent.audience.clone(),
+    };
+    EgressNodeProjectionEnvelope::issue(
+        &principal,
+        advertisement,
+        state.identity_epoch,
+        desired.revision,
+        desired.model,
+        desired.facts,
+        desired.contract,
+    )
+    .map(Some)
+    .map_err(|error| egress_distribution_api_error(&error))
+}
+
+fn egress_distribution_api_error(error: &EgressDistributionError) -> ApiError {
+    match error {
+        EgressDistributionError::AdvertisementTooLarge
+        | EgressDistributionError::NoCompatibleSchema { .. }
+        | EgressDistributionError::CapabilityMismatch
+        | EgressDistributionError::MissingCapability(_) => {
+            ApiError::bad_request(format!("incompatible egress advertisement: {error}"))
+        }
+        _ => ApiError::service_unavailable(format!(
+            "authoritative egress projection is unavailable: {error}"
+        )),
+    }
 }
 
 async fn load_balancer_reachability_snapshot(
@@ -8215,6 +8308,109 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn egress_advertisement() -> EgressAgentAdvertisement {
+        EgressAgentAdvertisement {
+            distribution_schemas: BTreeSet::from([unf_egress::EGRESS_DISTRIBUTION_SCHEMA_VERSION]),
+            host_state_schemas: BTreeSet::from([unf_egress::EGRESS_HOST_STATE_SCHEMA_VERSION]),
+            capabilities: BTreeSet::from([
+                unf_egress::EgressCapability::IdentitySourceSteering,
+                unf_egress::EgressCapability::LeaseEpochFencing,
+                unf_egress::EgressCapability::OriginalTupleWitness,
+                unf_egress::EgressCapability::Ipv4TcpUdpNat,
+                unf_egress::EgressCapability::Ipv6TcpUdpNat,
+            ]),
+        }
+    }
+
+    #[test]
+    fn egress_distribution_is_exact_node_scoped_replayable_and_fail_closed() {
+        let state = new_state(true);
+        write_lock(&state.node_port_nodes).insert(
+            "worker-a".to_owned(),
+            NodePortNodeRecord {
+                node_uid: "worker-a-uid".to_owned(),
+                revision: Revision::new(1),
+                addresses: Vec::new(),
+            },
+        );
+        let advertisement = egress_advertisement();
+        let model = unf_egress::normalize_model(Vec::new(), Vec::new())
+            .expect("empty authoritative model is canonical");
+        let facts = unf_egress::EgressContractFacts {
+            revisions: unf_egress::EgressContractRevisions {
+                intent: Revision::new(1),
+                identity: Revision::new(1),
+                policy: Revision::new(1),
+                allocation: Revision::new(1),
+                gateway: Revision::new(1),
+                reachability: Revision::new(1),
+            },
+            sources: Vec::new(),
+            policies: Vec::new(),
+            allocations: Vec::new(),
+            gateways: Vec::new(),
+        };
+        let node = unf_egress::EgressNode {
+            name: "worker-a".to_owned(),
+            uid: "worker-a-uid".to_owned(),
+            capabilities: advertisement.capabilities.clone(),
+        };
+        let contract = EgressBehaviorContract::issue(&model, &facts, node, Revision::new(2))
+            .expect("empty contract remains an exact Node commitment");
+        write_lock(&state.egress_source_distributions).insert(
+            "worker-a".to_owned(),
+            EgressSourceDistribution {
+                revision: Revision::new(3),
+                model,
+                facts,
+                contract,
+            },
+        );
+        let agent = AuthenticatedAgent {
+            namespace: "unf-system".to_owned(),
+            service_account: EGRESS_AGENT_SERVICE_ACCOUNT.to_owned(),
+            node_name: "worker-a".to_owned(),
+            pod_name: "unf-agent-a".to_owned(),
+            pod_uid: "unf-agent-a-uid".to_owned(),
+            audience: EGRESS_AGENT_TOKEN_AUDIENCE.to_owned(),
+        };
+
+        let envelope = egress_source_projection_for(&state, &agent, &advertisement)
+            .expect("issue exact Node projection")
+            .expect("desired projection exists");
+        assert_eq!(envelope.projection.recipient.node_name, "worker-a");
+        envelope
+            .admit(
+                &AuthenticatedEgressAgent {
+                    namespace: agent.namespace.clone(),
+                    service_account: agent.service_account.clone(),
+                    pod_name: agent.pod_name.clone(),
+                    pod_uid: agent.pod_uid.clone(),
+                    node_name: agent.node_name.clone(),
+                    node_uid: "worker-a-uid".to_owned(),
+                    audience: agent.audience.clone(),
+                },
+                &advertisement,
+            )
+            .expect("agent independently replays distributed material");
+
+        let mut other = agent.clone();
+        other.node_name = "worker-b".to_owned();
+        assert!(
+            egress_source_projection_for(&state, &other, &advertisement)
+                .expect("absent foreign projection is not an error")
+                .is_none()
+        );
+        let mut incompatible = advertisement;
+        incompatible.host_state_schemas.clear();
+        assert_eq!(
+            egress_source_projection_for(&state, &agent, &incompatible)
+                .expect_err("unsupported schema fails closed")
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+    }
 
     #[test]
     fn component_version_exposes_the_controller_compatibility_tuple() {

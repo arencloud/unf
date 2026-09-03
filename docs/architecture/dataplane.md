@@ -216,9 +216,12 @@ store a primary plus pre-certified standby when available. Fixed connection and
 event layouts retain the original/translated tuple and bilateral proof
 provenance. Inactive-bank replacement/readback, atomic activation, capacity
 rollback, pointer-authoritative recovery, and exact cleanup now pass agent,
-eBPF, and privileged real-kernel tests. The next dataplane change must feed the
-maps from authenticated live endpoints and place source/gateway TC steering
-after existing egress policy enforcement; ADRs 0119–0120.
+eBPF, and privileged real-kernel tests. An authenticated exact-Node source
+endpoint now feeds independently replayed contracts into fenced map banks; it
+cannot produce active paths. The next dataplane change must populate that
+endpoint from watched desired state, distribute selected-gateway state, and
+place source/gateway TC steering after existing egress policy enforcement;
+ADRs 0119–0121.
 
 The legacy netlink path, encrypted internal transport, and IPv4/IPv6 policy
 provenance now have repeatable evidence on separate OpenShift 4.22 IPv4-only and

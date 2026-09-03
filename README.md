@@ -442,8 +442,13 @@ default when two gateways exist; packets will need only one stable hash and map
 lookup. The contract gate passes `make egress-dataplane-contract-test`; ADR
 0119. Persistent ABI v12 now owns and transactionally recovers the four banked
 tables, atomic config pointer, and future connection LRU; capacity rollback is
-proven on real kernel maps (ADR 0120). Live endpoint distribution and
-source/gateway steering/NAT are next. No live
+proven on real kernel maps (ADR 0120). The internal TLS API now distributes a
+self-contained source envelope only after Pod-bound TokenReview authentication
+and authoritative Node-UID binding. The agent independently replays it and
+atomically stages explicit intent only as `Fenced`; absence or any validation /
+transaction failure retains last-known-good state. This passes `make
+egress-live-distribution-test`; ADR 0121. Watched desired-state population,
+gateway distribution, and source/gateway steering/NAT are next. No live
 egress address, packet-path, or platform claim is made yet.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

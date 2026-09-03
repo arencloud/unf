@@ -649,8 +649,13 @@ matrix is maintained in the
   persistent state to exact 31-pin ABI v12: the agent owns four banked tables,
   one activation pointer, and the connection LRU, with inactive readback,
   capacity rollback, pointer-authoritative recovery, and historical-v11 cleanup
-  separation proven by `make egress-dataplane-map-test`; ADR 0120. Live
-  endpoints and TC steering/NAT remain.
+  separation proven by `make egress-dataplane-map-test`; ADR 0120. Authenticated
+  live source distribution now derives the recipient from Pod-bound TokenReview
+  plus authoritative Node UID, carries complete replay material, and stages
+  only fail-closed source fences through the owned maps. Absence and every
+  validation/transaction failure retain last-known-good state under `make
+  egress-live-distribution-test`; ADR 0121. Watched desired-state population,
+  gateway distribution, and TC steering/NAT remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

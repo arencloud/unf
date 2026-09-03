@@ -73,6 +73,18 @@ pub struct EgressNodeProjection {
     pub contract: EgressBehaviorContract,
 }
 
+/// Self-contained source projection wire envelope. The model and independently
+/// observed contract facts are carried alongside the controller-issued
+/// commitment so the receiving agent can replay the contract instead of
+/// trusting precompiled map bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressNodeProjectionEnvelope {
+    pub projection: EgressNodeProjection,
+    pub model: EgressModel,
+    pub facts: EgressContractFacts,
+}
+
 /// A projection that has passed authenticated recipient checks and independent
 /// contract replay. Host-state code accepts this type instead of an unchecked
 /// wire object.
@@ -266,6 +278,55 @@ impl EgressNodeProjection {
         validate_capabilities(&self.contract, &self.negotiated)?;
         self.contract.verify(model, facts, &self.contract.node)?;
         Ok(AdmittedEgressProjection(self))
+    }
+}
+
+impl EgressNodeProjectionEnvelope {
+    /// Issues one self-contained response for the exact authenticated Node.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid model/facts, recipient, schema, capability, or contract
+    /// material before any bytes cross the distribution boundary.
+    pub fn issue(
+        principal: &AuthenticatedEgressAgent,
+        advertisement: &EgressAgentAdvertisement,
+        controller_epoch: u64,
+        revision: Revision,
+        model: EgressModel,
+        facts: EgressContractFacts,
+        contract: EgressBehaviorContract,
+    ) -> Result<Self, EgressDistributionError> {
+        let projection = EgressNodeProjection::issue(
+            principal,
+            advertisement,
+            controller_epoch,
+            revision,
+            contract,
+        )?;
+        projection
+            .contract
+            .verify(&model, &facts, &projection.contract.node)?;
+        Ok(Self {
+            projection,
+            model,
+            facts,
+        })
+    }
+
+    /// Independently replays all material and binds it to the local agent.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any envelope or replay mismatch without producing admitted
+    /// host state.
+    pub fn admit(
+        self,
+        principal: &AuthenticatedEgressAgent,
+        advertisement: &EgressAgentAdvertisement,
+    ) -> Result<AdmittedEgressProjection, EgressDistributionError> {
+        self.projection
+            .admit(principal, advertisement, &self.model, &self.facts)
     }
 }
 
@@ -818,6 +879,32 @@ mod tests {
     }
 
     #[test]
+    fn self_contained_envelope_replays_and_rejects_fact_mutation() {
+        let (model, facts, contract) = fixture();
+        let envelope = EgressNodeProjectionEnvelope::issue(
+            &principal("worker-a"),
+            &advertisement(),
+            9,
+            Revision::new(4),
+            model,
+            facts,
+            contract,
+        )
+        .expect("issue replayable envelope");
+        envelope
+            .clone()
+            .admit(&principal("worker-a"), &advertisement())
+            .expect("agent independently replays the envelope");
+
+        let mut mutation = envelope;
+        mutation.facts.policies[0].allowed = false;
+        assert!(matches!(
+            mutation.admit(&principal("worker-a"), &advertisement()),
+            Err(EgressDistributionError::Contract(_))
+        ));
+    }
+
+    #[test]
     fn projection_ledger_fences_regression_and_same_revision_mutation() {
         let first = admitted(4);
         let mut ledger = EgressProjectionLedger::default();
@@ -852,6 +939,27 @@ mod tests {
             .expect("object")
             .insert("foreign".to_owned(), serde_json::json!(true));
         assert!(serde_json::from_value::<EgressNodeProjection>(value).is_err());
+    }
+
+    #[test]
+    fn wire_envelope_rejects_unknown_fields() {
+        let (model, facts, contract) = fixture();
+        let envelope = EgressNodeProjectionEnvelope::issue(
+            &principal("worker-a"),
+            &advertisement(),
+            9,
+            Revision::new(4),
+            model,
+            facts,
+            contract,
+        )
+        .expect("issue envelope");
+        let mut value = serde_json::to_value(envelope).expect("encode envelope");
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("foreign".to_owned(), serde_json::json!(true));
+        assert!(serde_json::from_value::<EgressNodeProjectionEnvelope>(value).is_err());
     }
 
     #[test]

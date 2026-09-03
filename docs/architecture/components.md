@@ -111,8 +111,11 @@ gateway is their exact ready/reachable lease-fenced candidate. Source-local path
 certificates bind route, interface, next hop, transport, MTU, mode, revision,
 and lease before a pure compiler can emit fixed-width ABI-v1 state. Candidate
 and 251-bucket primary/pre-certified-standby selection tables are shared per
-intent rather than duplicated per identity. ADR 0119 records this contract;
-live endpoint, persistent-map, and TC ownership remain next.
+intent rather than duplicated per identity. Persistent ABI v12 owns those maps,
+and the authenticated live source endpoint now transports complete replay
+material to exact-Node agents. Agents stage only fail-closed source fences until
+path and packet readiness exist. ADRs 0119–0121 record these boundaries;
+watched desired-state, gateway distribution, and TC packet ownership remain.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,
