@@ -12,6 +12,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 unf-common = { path = "../unf-common" }
+unf-ebpf-common = { path = "../../ebpf/unf-ebpf-common" }
 
 [lints]
 workspace = true

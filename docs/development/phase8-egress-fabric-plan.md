@@ -18,7 +18,7 @@ authoritative state remains in [project-status.md](../project-status.md).
 | 8.3 | Durable allocation and gateway-provider contract | **Verified** | Schema-v1 allocation atomically assigns conflict-safe multiple IPv4/IPv6 addresses with exact owner/pool/provider provenance, bounded exhaustion, monotonic revisions/lease epochs, release/reuse, and strict checkpoint replay. Separate gateway/reachability provider interfaces, desired/ack revisions, epoch/address fencing, dual acknowledgement, safe withdrawal, and direct contract-fact projection pass `make egress-allocation-test`; ADR 0116 |
 | 8.4 | Transactional distribution and gateway host state | **Verified** | Schema-v1 projection binds the existing authenticated Pod/Node principal, negotiates exact contract/host capabilities, independently replays all facts, and fences last-known-good epochs/revisions. Separate userspace ABI-v1 host banks commit through stage/readback/prepare/activate, pointer rollback, exact current/pending recovery, cold reconstruction, and version-scoped cleanup; `make egress-host-state-test`; ADR 0117 |
 | 8.4a | Egress Proof Chain and zero-leak admission | **Verified** | Default `Native -> Fenced -> Active` admission prevents explicit-intent convergence/withdrawal leaks. Domain-separated rendezvous hashing deterministically selects same-family multiple addresses and ready gateways; a versioned proof binds the authoritative identity, original tuple, exact contract/revisions, lease, choice, and witness for independent selected-gateway replay. Ten adversarial tests and strict Clippy pass `make egress-proof-test`; ADR 0118 |
-| 8.5 | Live distribution, source steering, and gateway NAT dataplane | **Planned** | Controller/agent adapters and convergence first; then policy-first IPv4/IPv6 TCP/UDP steering, original identity/source witness, collision-safe SNAT/reverse state, fragments and unsupported protocols fail closed, and bounded event provenance without Linux-conntrack duplication by assumption |
+| 8.5 | Live distribution, source steering, and gateway NAT dataplane | **In progress** | The verified contract slice now aggregates already admitted source contracts for each authenticated selected gateway and reproduces proofs there. Exact source-local path certificates lower admission, addresses, primary/pre-certified-standby gateway paths, 251-bucket userspace rendezvous tables, future connection state, and events into asserted fixed-width ABI-v1 layouts shared per intent; `make egress-dataplane-contract-test`; ADR 0119. Live endpoint, map transaction, TC steering/NAT, and kernel packet gates remain |
 | 8.6 | Deterministic HA, failover, and multiple addresses | **Planned** | Lease-fenced gateway ownership, deterministic placement and failover, established-flow contract, bounded convergence, split-brain rejection, node drain/recovery, and measured disruption |
 | 8.7 | FQDN and internet-access controls | **Planned** | DNS-derived destination sets with bounded TTL/staleness/provenance, explicit wildcard semantics, fail-closed capacity behavior, IP fallback visibility, and no use of DNS names as workload identity |
 | 8.8 | Reachability and advertisement providers | **Planned** | Static/native development provider first; BGP advertisement remains a replaceable provider with independent route-policy, ECMP, graceful-restart, BFD, and production qualification gates |
@@ -105,9 +105,9 @@ HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.5 lowers the verified proof-chain semantics into bounded fixed-width
-BPF maps/tables, wires the admitted projection and host-state store into the live
-controller/agent path, and implements policy-first dual-stack TCP/UDP source
-steering plus collision-safe gateway NAT/reverse state. Milestones 8.2–8.4a
-changed no current BPF ABI, host routing, live address ownership, watcher/RBAC
-behavior, packet behavior, or platform claim.
+Milestone 8.5 next implements transactional agent ownership for the verified
+ABI-v1 state and attaches its source/gateway TC stages after the existing egress
+policy decision. It then adds collision-safe dual-stack TCP/UDP SNAT/reverse
+state and kernel packet gates. The contract slice changes no current persistent
+BPF pin set, host routing, live address ownership, watcher/RBAC behavior, packet
+behavior, or platform claim.

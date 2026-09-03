@@ -35,10 +35,10 @@ require_text crates/unf-egress/src/proof.rs \
     'pub fn verify_at_gateway(' \
     "the selected gateway must independently reproduce each proof"
 require_text crates/unf-egress/src/proof.rs \
-    'unf.egress-address-rendezvous.v1' \
+    'unf.egress-address-bucket-rendezvous.v2' \
     "multiple-address selection must be deterministic and domain separated"
 require_text crates/unf-egress/src/proof.rs \
-    'unf.egress-gateway-rendezvous.v1' \
+    'unf.egress-gateway-bucket-rendezvous.v2' \
     "gateway selection must be deterministic and domain separated"
 require_text crates/unf-egress/src/proof.rs \
     'fragments are unsupported' \

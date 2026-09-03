@@ -17,6 +17,21 @@ pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
 pub const POLICY_BANK_COUNT: u8 = 2;
+pub const EGRESS_MAP_ABI_VERSION: u16 = 1;
+pub const EGRESS_BANK_COUNT: u8 = 2;
+pub const EGRESS_SELECTION_TABLE_SIZE: u16 = 251;
+pub const EGRESS_ADMISSION_FENCED: u8 = 1;
+pub const EGRESS_ADMISSION_ACTIVE: u8 = 2;
+pub const EGRESS_PATH_DIRECT_NEIGHBOR: u8 = 1;
+pub const EGRESS_PATH_TUNNEL: u8 = 2;
+pub const EGRESS_SOURCE_FLAG_IPV4: u8 = 1;
+pub const EGRESS_SOURCE_FLAG_IPV6: u8 = 1 << 1;
+pub const EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY: u8 = 1 << 2;
+pub const EGRESS_SELECTION_FLAG_STANDBY: u16 = 1;
+pub const EGRESS_CONNECTION_ROLE_FORWARD: u8 = 1;
+pub const EGRESS_CONNECTION_ROLE_REVERSE: u8 = 2;
+pub const EGRESS_CONNECTION_FLAG_STANDBY_CERTIFIED: u16 = 1;
+pub const EGRESS_CONNECTION_FLAG_STANDBY_ACTIVE: u16 = 1 << 1;
 pub const SERVICE_MAP_ABI_VERSION: u16 = 5;
 pub const SERVICE_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_MAP_ABI_VERSION: u16 = 4;
@@ -679,6 +694,263 @@ pub struct PolicyMapConfig {
     pub flags: u8,
 }
 
+/// Identity-selected egress state. Absence means native egress; an explicit
+/// entry is always either fenced or active and therefore never fails open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressSourceKey {
+    pub source_identity: IdentityId,
+    pub bank: u8,
+    pub reserved: [u8; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressSourceValue {
+    pub lease_epoch: u64,
+    pub contract_revision: u64,
+    pub intent_revision: u64,
+    pub identity_revision: u64,
+    pub policy_revision: u64,
+    pub allocation_revision: u64,
+    pub gateway_revision: u64,
+    pub reachability_revision: u64,
+    pub contract_digest: [u8; 32],
+    pub intent_digest: [u8; 16],
+    pub intent_index: u32,
+    pub address_count: u16,
+    pub gateway_count: u16,
+    pub schema_version: u16,
+    pub admission: u8,
+    pub flags: u8,
+    pub reserved: [u8; 4],
+}
+
+/// Per-family candidate indexes are local to one source identity and bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressCandidateKey {
+    pub intent_index: u32,
+    pub candidate_index: u16,
+    pub address_family: u8,
+    pub bank: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressAddressValue {
+    pub lease_epoch: u64,
+    pub contract_revision: u64,
+    pub address: [u8; 16],
+    pub candidate_witness: [u8; 16],
+    pub schema_version: u16,
+    pub flags: u16,
+    pub reserved: [u8; 4],
+}
+
+/// A source-local, prevalidated path to one gateway. Userspace resolves route,
+/// interface, neighbor/tunnel and MTU state before this entry can be activated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressGatewayValue {
+    pub lease_epoch: u64,
+    pub contract_revision: u64,
+    pub path_revision: u64,
+    pub transport_address: [u8; 16],
+    pub next_hop_address: [u8; 16],
+    pub gateway_digest: [u8; 16],
+    pub output_interface: u32,
+    pub mtu: u32,
+    pub schema_version: u16,
+    pub path_mode: u8,
+    pub flags: u8,
+    pub reserved: [u8; 4],
+}
+
+/// A compiler-built bucket makes the expensive rendezvous decision userspace
+/// work. The packet path performs one bounded flow hash and one map lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressSelectionKey {
+    pub intent_index: u32,
+    pub bucket: u16,
+    pub address_family: u8,
+    pub bank: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressSelectionValue {
+    pub selection_witness: [u8; 16],
+    pub address_index: u16,
+    pub primary_gateway_index: u16,
+    pub standby_gateway_index: u16,
+    pub schema_version: u16,
+    pub flags: u16,
+    pub reserved: [u8; 6],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressMapConfig {
+    pub controller_epoch: u64,
+    pub projection_revision: u64,
+    pub contract_revision: u64,
+    pub path_revision: u64,
+    pub source_count: u32,
+    pub address_count: u32,
+    pub gateway_count: u32,
+    pub selection_count: u32,
+    pub schema_version: u16,
+    pub active_bank: u8,
+    pub flags: u8,
+    pub reserved: [u8; 4],
+}
+
+/// Forward and reverse keys both point at the same immutable translation and
+/// pre-certified standby decision for one established flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressConnectionKey {
+    pub source_address: [u8; 16],
+    pub destination_address: [u8; 16],
+    pub source_port: [u8; 2],
+    pub destination_port: [u8; 2],
+    pub source_identity: IdentityId,
+    pub protocol: u8,
+    pub address_family: u8,
+    pub role: u8,
+    pub reserved: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressConnectionValue {
+    pub last_seen_ns: u64,
+    pub contract_revision: u64,
+    pub lease_epoch: u64,
+    pub original_source_address: [u8; 16],
+    pub original_destination_address: [u8; 16],
+    pub egress_address: [u8; 16],
+    pub primary_transport_address: [u8; 16],
+    pub standby_transport_address: [u8; 16],
+    pub proof_witness: [u8; 16],
+    pub source_identity: IdentityId,
+    pub original_source_port: [u8; 2],
+    pub original_destination_port: [u8; 2],
+    pub translated_source_port: [u8; 2],
+    pub address_index: u16,
+    pub primary_gateway_index: u16,
+    pub standby_gateway_index: u16,
+    pub schema_version: u16,
+    pub protocol: u8,
+    pub address_family: u8,
+    pub flags: u16,
+    pub reserved: [u8; 2],
+}
+
+/// Fixed event data; Kubernetes strings and full proofs are joined in
+/// userspace from the retained contract and compact witnesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressEvent {
+    pub timestamp_ns: u64,
+    pub contract_revision: u64,
+    pub lease_epoch: u64,
+    pub original_source_address: [u8; 16],
+    pub original_destination_address: [u8; 16],
+    pub egress_address: [u8; 16],
+    pub gateway_digest: [u8; 16],
+    pub standby_gateway_digest: [u8; 16],
+    pub proof_witness: [u8; 16],
+    pub source_identity: IdentityId,
+    pub original_source_port: [u8; 2],
+    pub original_destination_port: [u8; 2],
+    pub translated_source_port: [u8; 2],
+    pub version: u16,
+    pub size: u16,
+    pub address_index: u16,
+    pub primary_gateway_index: u16,
+    pub standby_gateway_index: u16,
+    pub protocol: u8,
+    pub address_family: u8,
+    pub action: u8,
+    pub reason: u8,
+    pub flags: u16,
+    pub reserved: [u8; 6],
+}
+
+#[must_use]
+pub const fn egress_admission_is_valid(admission: u8) -> bool {
+    matches!(admission, EGRESS_ADMISSION_FENCED | EGRESS_ADMISSION_ACTIVE)
+}
+
+#[must_use]
+pub const fn egress_path_mode_is_valid(mode: u8) -> bool {
+    matches!(mode, EGRESS_PATH_DIRECT_NEIGHBOR | EGRESS_PATH_TUNNEL)
+}
+
+/// Stable verifier-friendly hash selecting a compiler-built rendezvous bucket.
+/// Cryptographic contract/proof commitments remain userspace SHA-256; the
+/// packet path only chooses one immutable bucket and cannot invent candidates.
+#[must_use]
+pub const fn egress_flow_hash(key: &EgressConnectionKey) -> u32 {
+    const OFFSET: u32 = 2_166_136_261;
+    const PRIME: u32 = 16_777_619;
+
+    const fn mix(hash: u32, value: u32) -> u32 {
+        (hash ^ value).wrapping_mul(PRIME)
+    }
+
+    let mut hash = mix(OFFSET, key.source_identity.get());
+    let mut index = 0;
+    while index < 16 {
+        hash = mix(
+            hash,
+            u32::from_be_bytes([
+                key.source_address[index],
+                key.source_address[index + 1],
+                key.source_address[index + 2],
+                key.source_address[index + 3],
+            ]),
+        );
+        hash = mix(
+            hash,
+            u32::from_be_bytes([
+                key.destination_address[index],
+                key.destination_address[index + 1],
+                key.destination_address[index + 2],
+                key.destination_address[index + 3],
+            ]),
+        );
+        index += 4;
+    }
+    hash = mix(
+        hash,
+        u32::from_be_bytes([
+            key.source_port[0],
+            key.source_port[1],
+            key.destination_port[0],
+            key.destination_port[1],
+        ]),
+    );
+    hash = mix(
+        hash,
+        u32::from_be_bytes([key.protocol, key.address_family, 0, 0]),
+    );
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x7feb_352d);
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(0x846c_a68b);
+    hash ^ (hash >> 16)
+}
+
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub const fn egress_selection_bucket(key: &EgressConnectionKey) -> u16 {
+    (egress_flow_hash(key) % EGRESS_SELECTION_TABLE_SIZE as u32) as u16
+}
+
 /// Exact IPv4 `ClusterIP` frontend. Ports are stored in network byte order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -1022,6 +1294,17 @@ const _: () = assert!(core::mem::size_of::<EgressIpv4PolicyMapKey>() == 12);
 const _: () = assert!(core::mem::size_of::<EgressIpv6PolicyMapData>() == 24);
 const _: () = assert!(core::mem::size_of::<PolicyMapValue>() == 32);
 const _: () = assert!(core::mem::size_of::<PolicyMapConfig>() == 24);
+const _: () = assert!(core::mem::size_of::<EgressSourceKey>() == 8);
+const _: () = assert!(core::mem::size_of::<EgressSourceValue>() == 128);
+const _: () = assert!(core::mem::size_of::<EgressCandidateKey>() == 8);
+const _: () = assert!(core::mem::size_of::<EgressAddressValue>() == 56);
+const _: () = assert!(core::mem::size_of::<EgressGatewayValue>() == 88);
+const _: () = assert!(core::mem::size_of::<EgressSelectionKey>() == 8);
+const _: () = assert!(core::mem::size_of::<EgressSelectionValue>() == 32);
+const _: () = assert!(core::mem::size_of::<EgressMapConfig>() == 56);
+const _: () = assert!(core::mem::size_of::<EgressConnectionKey>() == 44);
+const _: () = assert!(core::mem::size_of::<EgressConnectionValue>() == 144);
+const _: () = assert!(core::mem::size_of::<EgressEvent>() == 152);
 const _: () = assert!(core::mem::size_of::<Ipv4ServiceFrontendKey>() == 8);
 const _: () = assert!(core::mem::size_of::<Ipv6ServiceFrontendKey>() == 20);
 const _: () = assert!(core::mem::size_of::<ServiceFrontendValue>() == 32);
@@ -1051,6 +1334,8 @@ const _: () = assert!(core::mem::size_of::<ServiceAffinityValue>() == 32);
 #[cfg(test)]
 mod tests {
     extern crate std;
+
+    use std::collections::BTreeSet;
 
     use super::*;
 
@@ -1083,6 +1368,28 @@ mod tests {
         assert_eq!(core::mem::size_of::<PolicyMapValue>(), 32);
         assert_eq!(core::mem::align_of::<PolicyMapConfig>(), 8);
         assert_eq!(core::mem::size_of::<PolicyMapConfig>(), 24);
+        assert_eq!(core::mem::align_of::<EgressSourceKey>(), 4);
+        assert_eq!(core::mem::size_of::<EgressSourceKey>(), 8);
+        assert_eq!(core::mem::align_of::<EgressSourceValue>(), 8);
+        assert_eq!(core::mem::size_of::<EgressSourceValue>(), 128);
+        assert_eq!(core::mem::align_of::<EgressCandidateKey>(), 4);
+        assert_eq!(core::mem::size_of::<EgressCandidateKey>(), 8);
+        assert_eq!(core::mem::align_of::<EgressAddressValue>(), 8);
+        assert_eq!(core::mem::size_of::<EgressAddressValue>(), 56);
+        assert_eq!(core::mem::align_of::<EgressGatewayValue>(), 8);
+        assert_eq!(core::mem::size_of::<EgressGatewayValue>(), 88);
+        assert_eq!(core::mem::align_of::<EgressSelectionKey>(), 4);
+        assert_eq!(core::mem::size_of::<EgressSelectionKey>(), 8);
+        assert_eq!(core::mem::align_of::<EgressSelectionValue>(), 2);
+        assert_eq!(core::mem::size_of::<EgressSelectionValue>(), 32);
+        assert_eq!(core::mem::align_of::<EgressMapConfig>(), 8);
+        assert_eq!(core::mem::size_of::<EgressMapConfig>(), 56);
+        assert_eq!(core::mem::align_of::<EgressConnectionKey>(), 4);
+        assert_eq!(core::mem::size_of::<EgressConnectionKey>(), 44);
+        assert_eq!(core::mem::align_of::<EgressConnectionValue>(), 8);
+        assert_eq!(core::mem::size_of::<EgressConnectionValue>(), 144);
+        assert_eq!(core::mem::align_of::<EgressEvent>(), 8);
+        assert_eq!(core::mem::size_of::<EgressEvent>(), 152);
         assert_eq!(core::mem::align_of::<Ipv4ServiceFrontendKey>(), 1);
         assert_eq!(core::mem::size_of::<Ipv4ServiceFrontendKey>(), 8);
         assert_eq!(core::mem::align_of::<Ipv6ServiceFrontendKey>(), 1);
@@ -1116,6 +1423,39 @@ mod tests {
         assert_eq!(core::mem::size_of::<ServiceConnectionKey>(), 40);
         assert_eq!(core::mem::align_of::<ServiceConnectionValue>(), 8);
         assert_eq!(core::mem::size_of::<ServiceConnectionValue>(), 104);
+    }
+
+    #[test]
+    fn egress_bucket_hash_is_stable_role_independent_and_dispersed() {
+        let base = EgressConnectionKey {
+            source_address: [10, 244, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            destination_address: [198, 51, 100, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            source_port: 30_000_u16.to_be_bytes(),
+            destination_port: 443_u16.to_be_bytes(),
+            source_identity: IdentityId::new(42),
+            protocol: 6,
+            address_family: AddressFamily::Ipv4 as u8,
+            role: EGRESS_CONNECTION_ROLE_FORWARD,
+            reserved: 0,
+        };
+        let mut reverse_role = base;
+        reverse_role.role = EGRESS_CONNECTION_ROLE_REVERSE;
+        reverse_role.reserved = u8::MAX;
+        assert_eq!(egress_flow_hash(&base), egress_flow_hash(&reverse_role));
+        assert_eq!(egress_selection_bucket(&base), 123);
+
+        let mut buckets = BTreeSet::new();
+        for port in 30_000_u16..30_251 {
+            let mut flow = base;
+            flow.source_port = port.to_be_bytes();
+            buckets.insert(egress_selection_bucket(&flow));
+        }
+        assert!(buckets.len() > 140);
+        assert!(
+            buckets
+                .iter()
+                .all(|bucket| *bucket < EGRESS_SELECTION_TABLE_SIZE)
+        );
     }
 
     #[test]

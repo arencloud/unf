@@ -202,3 +202,14 @@ revisions, contract digest, and lease epoch. The accompanying flow proof is a
 deterministic commitment independently reproduced at the selected gateway, not
 stored authority or a bearer credential. Phase 8.5 must lower these semantics
 into bounded fixed-width state without weakening this ordering; ADR 0118.
+
+The Phase 8.5 contract slice defines that fixed state as an independent egress
+ABI v1. Identity-keyed source entries retain all contract revision domains,
+lease, digest, admission, intent index, candidate counts, and family/standby
+flags. Address, gateway-path, and 251-bucket selection entries are keyed by the
+shared intent index; this avoids multiplying candidates for every selected
+workload. Path certificates must form one coherent path revision and unused,
+foreign, missing, or duplicate evidence is rejected. Connection and event
+layouts reserve exact original/translated tuples plus primary/standby proof
+provenance. These types and the pure compiler do not yet create persistent maps;
+transactional agent ownership is the next Phase 8.5 gate. See ADR 0119.

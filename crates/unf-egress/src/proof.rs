@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unf_common::{IdentityId, Revision};
+use unf_ebpf_common::{
+    AddressFamily as BpfAddressFamily, EGRESS_CONNECTION_ROLE_FORWARD, EgressConnectionKey,
+    egress_selection_bucket,
+};
 
 use crate::{
     AddressFamily, AdmittedEgressProjection, EgressBehaviorContract, EgressBehaviorPlan,
@@ -19,7 +23,7 @@ use crate::{
 };
 
 pub const EGRESS_FLOW_PROOF_SCHEMA_VERSION: u16 = 1;
-pub const EGRESS_SELECTION_ALGORITHM_RENDEZVOUS_SHA256_V1: u16 = 1;
+pub const EGRESS_SELECTION_ALGORITHM_COMPILED_RENDEZVOUS_SHA256_V2: u16 = 2;
 pub const EGRESS_PROTOCOL_TCP: u8 = 6;
 pub const EGRESS_PROTOCOL_UDP: u8 = 17;
 
@@ -339,7 +343,7 @@ impl EgressFlowProof {
     ) -> Result<(), EgressProofError> {
         contract.verify_integrity()?;
         if self.schema_version != EGRESS_FLOW_PROOF_SCHEMA_VERSION
-            || self.selection_algorithm != EGRESS_SELECTION_ALGORITHM_RENDEZVOUS_SHA256_V1
+            || self.selection_algorithm != EGRESS_SELECTION_ALGORITHM_COMPILED_RENDEZVOUS_SHA256_V2
             || self.gateway != *gateway
         {
             return Err(EgressProofError::GatewayMismatch);
@@ -406,15 +410,11 @@ fn derive(
 ) -> Result<EgressFlowProof, EgressProofError> {
     validate_flow(plan, flow)?;
     let address_family = family(flow.source_address);
-    let addresses = plan
-        .allocation
-        .addresses
-        .iter()
-        .enumerate()
-        .filter(|(_, address)| family(**address) == address_family)
-        .collect::<Vec<_>>();
-    let (address_index, egress_address) = rendezvous_address(plan, flow, &addresses)?;
-    let (gateway_index, gateway) = rendezvous_gateway(plan, flow)?;
+    let selection = select_bucket(plan, address_family, flow_bucket(flow))?;
+    let address_index = selection.address_index;
+    let egress_address = selection.address;
+    let gateway_index = selection.primary_gateway_index;
+    let gateway = selection.primary_gateway;
     let decision_witness = contract.decision_witness(
         address_plan_index(contract, flow.identity)?,
         address_index,
@@ -423,7 +423,7 @@ fn derive(
     let original_tuple_digest = tuple_digest(flow);
     let mut proof = EgressFlowProof {
         schema_version: EGRESS_FLOW_PROOF_SCHEMA_VERSION,
-        selection_algorithm: EGRESS_SELECTION_ALGORITHM_RENDEZVOUS_SHA256_V1,
+        selection_algorithm: EGRESS_SELECTION_ALGORITHM_COMPILED_RENDEZVOUS_SHA256_V2,
         identity: flow.identity,
         intent_uid: plan.intent.uid.clone(),
         contract_revision: contract.contract_revision,
@@ -475,68 +475,106 @@ fn validate_flow(
     Ok(())
 }
 
-fn rendezvous_address(
+pub(crate) struct EgressBucketSelection<'a> {
+    pub address_index: usize,
+    pub address: IpAddr,
+    pub primary_gateway_index: usize,
+    pub primary_gateway: &'a crate::EgressGatewayFact,
+    pub standby_gateway_index: Option<usize>,
+}
+
+pub(crate) fn select_bucket(
     plan: &EgressBehaviorPlan,
-    flow: EgressOriginalFlow,
-    addresses: &[(usize, &IpAddr)],
-) -> Result<(usize, IpAddr), EgressProofError> {
-    addresses
+    address_family: AddressFamily,
+    bucket: u16,
+) -> Result<EgressBucketSelection<'_>, EgressProofError> {
+    let mut addresses = plan
+        .allocation
+        .addresses
         .iter()
+        .enumerate()
+        .filter(|(_, address)| family(**address) == address_family)
         .map(|(index, address)| {
             (
                 rendezvous_score(
-                    b"unf.egress-address-rendezvous.v1\0",
+                    b"unf.egress-address-bucket-rendezvous.v2\0",
                     plan,
-                    flow,
-                    &address_bytes(**address),
+                    bucket,
+                    &address_bytes(*address),
                 ),
-                *index,
-                **address,
+                index,
+                *address,
             )
         })
-        .max_by(std::cmp::Ord::cmp)
-        .map(|(_, index, address)| (index, address))
-        .ok_or(EgressProofError::AddressFamilyUnavailable)
-}
+        .collect::<Vec<_>>();
+    addresses.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let Some((_, address_index, address)) = addresses.first().copied() else {
+        return Err(EgressProofError::AddressFamilyUnavailable);
+    };
 
-fn rendezvous_gateway(
-    plan: &EgressBehaviorPlan,
-    flow: EgressOriginalFlow,
-) -> Result<(usize, &crate::EgressGatewayFact), EgressProofError> {
-    plan.gateways
+    let mut gateways = plan
+        .gateways
         .iter()
         .enumerate()
         .filter(|(_, gateway)| gateway.ready && gateway.reachable)
         .map(|(index, gateway)| {
             (
                 rendezvous_score(
-                    b"unf.egress-gateway-rendezvous.v1\0",
+                    b"unf.egress-gateway-bucket-rendezvous.v2\0",
                     plan,
-                    flow,
+                    bucket,
                     gateway.node.uid.as_bytes(),
                 ),
                 index,
                 gateway,
             )
         })
-        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
-        .map(|(_, index, gateway)| (index, gateway))
-        .ok_or(EgressProofError::GatewayUnavailable)
+        .collect::<Vec<_>>();
+    gateways.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let Some((_, primary_gateway_index, primary_gateway)) = gateways.first().copied() else {
+        return Err(EgressProofError::GatewayUnavailable);
+    };
+    let standby_gateway_index = gateways.get(1).map(|(_, index, _)| *index);
+    Ok(EgressBucketSelection {
+        address_index,
+        address,
+        primary_gateway_index,
+        primary_gateway,
+        standby_gateway_index,
+    })
 }
 
 fn rendezvous_score(
     domain: &[u8],
     plan: &EgressBehaviorPlan,
-    flow: EgressOriginalFlow,
+    bucket: u16,
     candidate: &[u8],
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update(plan.intent.uid.as_bytes());
     hasher.update(plan.allocation.lease_epoch.to_be_bytes());
-    hasher.update(flow_bytes(flow));
+    hasher.update(bucket.to_be_bytes());
     hasher.update(candidate);
     hasher.finalize().into()
+}
+
+pub(crate) fn flow_bucket(flow: EgressOriginalFlow) -> u16 {
+    let key = EgressConnectionKey {
+        source_address: address_bytes(flow.source_address),
+        destination_address: address_bytes(flow.destination_address),
+        source_port: flow.source_port.to_be_bytes(),
+        destination_port: flow.destination_port.to_be_bytes(),
+        source_identity: flow.identity,
+        protocol: flow.protocol,
+        address_family: match family(flow.source_address) {
+            AddressFamily::Ipv4 => BpfAddressFamily::Ipv4 as u8,
+            AddressFamily::Ipv6 => BpfAddressFamily::Ipv6 as u8,
+        },
+        role: EGRESS_CONNECTION_ROLE_FORWARD,
+        reserved: 0,
+    };
+    egress_selection_bucket(&key)
 }
 
 fn tuple_digest(flow: EgressOriginalFlow) -> EgressOriginalTupleDigest {
@@ -919,7 +957,9 @@ mod tests {
         let identity = plan.source.identity;
         for source_port in 30_000..30_128 {
             let original = flow(identity, source_port);
-            let (_, selected) = rendezvous_gateway(plan, original).expect("select gateway");
+            let selected = select_bucket(plan, AddressFamily::Ipv4, flow_bucket(original))
+                .expect("select gateway")
+                .primary_gateway;
             let mut remaining = plan.clone();
             let removed_uid = remaining
                 .gateways
@@ -932,7 +972,9 @@ mod tests {
             remaining
                 .gateways
                 .retain(|gateway| gateway.node.uid != removed_uid);
-            let (_, after) = rendezvous_gateway(&remaining, original).expect("select remaining");
+            let after = select_bucket(&remaining, AddressFamily::Ipv4, flow_bucket(original))
+                .expect("select remaining")
+                .primary_gateway;
             assert_eq!(after.node.uid, selected.node.uid);
         }
     }
@@ -943,6 +985,10 @@ mod tests {
         let (guard, identity) = guarded(&projection);
         let proof =
             EgressFlowProof::issue(&projection, &guard, flow(identity, 30_000)).expect("proof");
+        assert_eq!(
+            proof.selection_algorithm,
+            EGRESS_SELECTION_ALGORITHM_COMPILED_RENDEZVOUS_SHA256_V2
+        );
         let mut value = serde_json::to_value(&proof).expect("encode proof");
         value
             .as_object_mut()

@@ -431,9 +431,16 @@ identities transition through a fail-closed fence, the original flow
 deterministically chooses a same-family address and ready gateway, and that
 gateway independently reproduces a strict contract-, lease-, identity-, and
 tuple-bound proof. Ten adversarial tests pass `make egress-proof-test`; ADR
-0118. The proof is provenance, never an identity credential. Milestone 8.5 live
-distribution and dual-stack steering/NAT is next. No live egress address,
-packet-path, or platform claim is made yet.
+0118. The proof is provenance, never an identity credential. Milestone 8.5 is
+now in progress: authenticated gateway projections aggregate only admitted
+source contracts selecting that gateway, and exact route/interface/next-hop/
+transport/MTU certificates lower into asserted fixed-width ABI-v1 source,
+candidate, selection, connection, and event state. Userspace compiles 251
+rendezvous buckets shared per intent, including a pre-certified standby by
+default when two gateways exist; packets will need only one stable hash and map
+lookup. The contract gate passes `make egress-dataplane-contract-test`; ADR
+0119. Live map ownership and source/gateway steering/NAT are next. No live
+egress address, packet-path, or platform claim is made yet.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

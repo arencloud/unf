@@ -8,17 +8,20 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unf_common::Revision;
 
 use crate::{
     EGRESS_BEHAVIOR_CONTRACT_SCHEMA_VERSION, EgressBehaviorContract, EgressCapability,
-    EgressContractError, EgressContractFacts, EgressModel,
+    EgressContractError, EgressContractFacts, EgressFlowProof, EgressModel, EgressNode,
+    EgressOriginalFlow, EgressProofError, MAX_EGRESS_CONTRACT_PLANS,
 };
 
 pub const EGRESS_DISTRIBUTION_SCHEMA_VERSION: u16 = 1;
 pub const EGRESS_HOST_STATE_SCHEMA_VERSION: u16 = 1;
 pub const MAX_EGRESS_ADVERTISED_SCHEMAS: usize = 8;
+pub const MAX_EGRESS_GATEWAY_SOURCE_CONTRACTS: usize = MAX_EGRESS_CONTRACT_PLANS;
 pub const EGRESS_AGENT_SERVICE_ACCOUNT: &str = "unf-agent";
 pub const EGRESS_AGENT_TOKEN_AUDIENCE: &str = "unf-controller.unf-system.svc";
 
@@ -88,6 +91,72 @@ impl AdmittedEgressProjection {
     }
 }
 
+/// Controller-authenticated aggregation of already admitted source contracts
+/// for one exact gateway Node. Complete source contracts preserve the indexes
+/// required to reproduce their decision witnesses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressGatewayProjection {
+    pub schema_version: u16,
+    pub controller_epoch: u64,
+    pub revision: Revision,
+    pub recipient: EgressProjectionRecipient,
+    pub negotiated: EgressNegotiatedCapabilities,
+    pub gateway: EgressNode,
+    pub source_contracts: Vec<EgressBehaviorContract>,
+    pub projection_digest: EgressGatewayProjectionDigest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EgressGatewayProjectionDigest(pub [u8; 32]);
+
+/// Gateway projection admitted only after recipient, capability, contract,
+/// ordering, gateway-membership, and envelope checks all agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedEgressGatewayProjection(EgressGatewayProjection);
+
+impl AdmittedEgressGatewayProjection {
+    #[must_use]
+    pub const fn projection(&self) -> &EgressGatewayProjection {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_projection(self) -> EgressGatewayProjection {
+        self.0
+    }
+
+    /// Reproduces a source-issued proof using its one exact retained contract.
+    /// The caller obtains `flow.identity` from authoritative gateway metadata;
+    /// proof bytes are never an identity credential.
+    ///
+    /// # Errors
+    ///
+    /// Rejects absent/ambiguous contract ownership or any proof mismatch.
+    pub fn verify_flow(
+        &self,
+        proof: &EgressFlowProof,
+        flow: EgressOriginalFlow,
+    ) -> Result<(), EgressProofError> {
+        let mut contracts = self.0.source_contracts.iter().filter(|contract| {
+            contract.contract_revision == proof.contract_revision
+                && contract.contract_digest == proof.contract_digest
+                && contract
+                    .plans
+                    .iter()
+                    .any(|plan| plan.source.identity == flow.identity)
+        });
+        let Some(contract) = contracts.next() else {
+            return Err(EgressProofError::ProofMismatch);
+        };
+        if contracts.next().is_some() {
+            return Err(EgressProofError::ProofMismatch);
+        }
+        proof.verify_at_gateway(contract, &self.0.gateway, flow)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EgressDistributionError {
     #[error("invalid authenticated egress agent: {0}")]
@@ -108,6 +177,18 @@ pub enum EgressDistributionError {
     RevisionRegression,
     #[error("egress projection mutated at the same epoch and revision")]
     SameRevisionMutation,
+    #[error("egress gateway projection contains no usable source contract")]
+    EmptyGatewayProjection,
+    #[error("egress gateway projection exceeds the source-contract bound")]
+    GatewayProjectionTooLarge,
+    #[error("egress gateway projection source contracts are duplicated or noncanonical")]
+    InvalidGatewayContractOrder,
+    #[error("egress gateway projection contains a duplicate source identity")]
+    DuplicateGatewayIdentity,
+    #[error("egress gateway is not a ready, reachable candidate for every projected contract")]
+    GatewayNotSelected,
+    #[error("egress gateway projection digest does not match its content")]
+    GatewayProjectionDigestMismatch,
     #[error(transparent)]
     Contract(#[from] EgressContractError),
 }
@@ -185,6 +266,159 @@ impl EgressNodeProjection {
         validate_capabilities(&self.contract, &self.negotiated)?;
         self.contract.verify(model, facts, &self.contract.node)?;
         Ok(AdmittedEgressProjection(self))
+    }
+}
+
+impl EgressGatewayProjection {
+    /// Aggregates contracts only from independently admitted source projections
+    /// and targets one authenticated gateway agent.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid authentication, bounds, capabilities, contract
+    /// integrity, duplicate source Nodes, or a gateway absent from a contract.
+    pub fn issue(
+        principal: &AuthenticatedEgressAgent,
+        advertisement: &EgressAgentAdvertisement,
+        controller_epoch: u64,
+        revision: Revision,
+        sources: &[AdmittedEgressProjection],
+    ) -> Result<Self, EgressDistributionError> {
+        validate_principal(principal)?;
+        let negotiated = negotiate(advertisement)?;
+        if controller_epoch == 0 || revision == Revision::INITIAL {
+            return Err(EgressDistributionError::InvalidRevision);
+        }
+        let mut source_contracts = sources
+            .iter()
+            .map(|source| source.projection().contract.clone())
+            .collect::<Vec<_>>();
+        source_contracts.sort_by(|left, right| {
+            (&left.node.uid, &left.node.name).cmp(&(&right.node.uid, &right.node.name))
+        });
+        let mut projection = Self {
+            schema_version: EGRESS_DISTRIBUTION_SCHEMA_VERSION,
+            controller_epoch,
+            revision,
+            recipient: EgressProjectionRecipient {
+                node_name: principal.node_name.clone(),
+                node_uid: principal.node_uid.clone(),
+            },
+            negotiated,
+            gateway: EgressNode {
+                name: principal.node_name.clone(),
+                uid: principal.node_uid.clone(),
+                capabilities: advertisement.capabilities.clone(),
+            },
+            source_contracts,
+            projection_digest: EgressGatewayProjectionDigest([0; 32]),
+        };
+        projection.validate_structure()?;
+        projection.projection_digest = projection.digest()?;
+        Ok(projection)
+    }
+
+    /// Admits a wire projection on the exact gateway Node. The authenticated
+    /// controller envelope contains complete contracts previously admitted by
+    /// their source agents; the gateway verifies each immutable commitment and
+    /// its own lease-fenced membership again.
+    ///
+    /// # Errors
+    ///
+    /// Rejects recipient/schema/capability mismatch, corrupt contracts,
+    /// noncanonical aggregation, or an invalid envelope digest.
+    pub fn admit(
+        self,
+        principal: &AuthenticatedEgressAgent,
+        advertisement: &EgressAgentAdvertisement,
+    ) -> Result<AdmittedEgressGatewayProjection, EgressDistributionError> {
+        validate_principal(principal)?;
+        if self.schema_version != EGRESS_DISTRIBUTION_SCHEMA_VERSION
+            || self.controller_epoch == 0
+            || self.revision == Revision::INITIAL
+        {
+            return Err(EgressDistributionError::InvalidRevision);
+        }
+        if self.recipient.node_name != principal.node_name
+            || self.recipient.node_uid != principal.node_uid
+            || self.gateway.name != principal.node_name
+            || self.gateway.uid != principal.node_uid
+        {
+            return Err(EgressDistributionError::RecipientMismatch);
+        }
+        let expected = negotiate(advertisement)?;
+        if self.negotiated != expected || self.gateway.capabilities != expected.capabilities {
+            return Err(EgressDistributionError::CapabilityMismatch);
+        }
+        self.validate_structure()?;
+        if self.projection_digest != self.digest()? {
+            return Err(EgressDistributionError::GatewayProjectionDigestMismatch);
+        }
+        Ok(AdmittedEgressGatewayProjection(self))
+    }
+
+    fn validate_structure(&self) -> Result<(), EgressDistributionError> {
+        if self.source_contracts.is_empty() {
+            return Err(EgressDistributionError::EmptyGatewayProjection);
+        }
+        if self.source_contracts.len() > MAX_EGRESS_GATEWAY_SOURCE_CONTRACTS {
+            return Err(EgressDistributionError::GatewayProjectionTooLarge);
+        }
+        let mut previous_node: Option<&str> = None;
+        let mut total_plans = 0_usize;
+        let mut identities = BTreeSet::new();
+        for contract in &self.source_contracts {
+            contract.verify_integrity()?;
+            if contract.schema_version != self.negotiated.contract_schema
+                || previous_node.is_some_and(|uid| uid >= contract.node.uid.as_str())
+            {
+                return Err(EgressDistributionError::InvalidGatewayContractOrder);
+            }
+            previous_node = Some(contract.node.uid.as_str());
+            total_plans = total_plans
+                .checked_add(contract.plans.len())
+                .ok_or(EgressDistributionError::GatewayProjectionTooLarge)?;
+            if total_plans > MAX_EGRESS_CONTRACT_PLANS {
+                return Err(EgressDistributionError::GatewayProjectionTooLarge);
+            }
+            for plan in &contract.plans {
+                if !identities.insert(plan.source.identity) {
+                    return Err(EgressDistributionError::DuplicateGatewayIdentity);
+                }
+            }
+            let selected = contract.plans.iter().any(|plan| {
+                plan.gateways.iter().any(|candidate| {
+                    candidate.node == self.gateway
+                        && candidate.ready
+                        && candidate.reachable
+                        && candidate.lease_epoch == plan.allocation.lease_epoch
+                        && plan
+                            .required_capabilities
+                            .is_subset(&self.gateway.capabilities)
+                })
+            });
+            if !selected {
+                return Err(EgressDistributionError::GatewayNotSelected);
+            }
+        }
+        Ok(())
+    }
+
+    fn digest(&self) -> Result<EgressGatewayProjectionDigest, EgressDistributionError> {
+        let material = serde_json::to_vec(&(
+            self.schema_version,
+            self.controller_epoch,
+            self.revision,
+            &self.recipient,
+            &self.negotiated,
+            &self.gateway,
+            &self.source_contracts,
+        ))
+        .map_err(|error| EgressContractError::CanonicalEncoding(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"unf.egress-gateway-projection.v1\0");
+        hasher.update(material);
+        Ok(EgressGatewayProjectionDigest(hasher.finalize().into()))
     }
 }
 
@@ -618,5 +852,131 @@ mod tests {
             .expect("object")
             .insert("foreign".to_owned(), serde_json::json!(true));
         assert!(serde_json::from_value::<EgressNodeProjection>(value).is_err());
+    }
+
+    #[test]
+    fn gateway_projection_aggregates_only_admitted_selected_source_contracts() {
+        let source = admitted(4);
+        let projection = EgressGatewayProjection::issue(
+            &principal("gateway-a"),
+            &advertisement(),
+            10,
+            Revision::new(5),
+            std::slice::from_ref(&source),
+        )
+        .expect("issue gateway projection");
+        assert_eq!(projection.gateway.uid, "uid-gateway-a");
+        assert_eq!(projection.source_contracts.len(), 1);
+        projection
+            .clone()
+            .admit(&principal("gateway-a"), &advertisement())
+            .expect("admit exact gateway");
+        assert_eq!(
+            projection.admit(&principal("gateway-b"), &advertisement()),
+            Err(EgressDistributionError::RecipientMismatch)
+        );
+
+        assert_eq!(
+            EgressGatewayProjection::issue(
+                &principal("gateway-a"),
+                &advertisement(),
+                10,
+                Revision::new(5),
+                &[],
+            ),
+            Err(EgressDistributionError::EmptyGatewayProjection)
+        );
+        assert_eq!(
+            EgressGatewayProjection::issue(
+                &principal("gateway-b"),
+                &advertisement(),
+                10,
+                Revision::new(5),
+                std::slice::from_ref(&source),
+            ),
+            Err(EgressDistributionError::GatewayNotSelected)
+        );
+        assert_eq!(
+            EgressGatewayProjection::issue(
+                &principal("gateway-a"),
+                &advertisement(),
+                10,
+                Revision::new(5),
+                &[source.clone(), source],
+            ),
+            Err(EgressDistributionError::InvalidGatewayContractOrder)
+        );
+    }
+
+    #[test]
+    fn admitted_gateway_independently_reproduces_source_flow_proof() {
+        let source = admitted(4);
+        let plan = &source.projection().contract.plans[0];
+        let identity = plan.source.identity;
+        let mut guard = crate::EgressAdmissionGuard::default();
+        guard
+            .fence(identity, plan.intent.clone(), plan.revisions.intent)
+            .expect("fence explicit intent");
+        guard
+            .activate(identity, &source)
+            .expect("activate source contract");
+        let flow = EgressOriginalFlow {
+            identity,
+            source_address: "10.244.0.20".parse().expect("source"),
+            destination_address: "198.51.100.30".parse().expect("destination"),
+            source_port: 30_000,
+            destination_port: 443,
+            protocol: crate::EGRESS_PROTOCOL_TCP,
+            fragmented: false,
+        };
+        let proof = EgressFlowProof::issue(&source, &guard, flow).expect("source proof");
+        let gateway = EgressGatewayProjection::issue(
+            &principal("gateway-a"),
+            &advertisement(),
+            10,
+            Revision::new(5),
+            &[source],
+        )
+        .expect("issue gateway projection")
+        .admit(&principal("gateway-a"), &advertisement())
+        .expect("admit gateway projection");
+        gateway
+            .verify_flow(&proof, flow)
+            .expect("bilateral reproduction");
+
+        let mutated = EgressOriginalFlow {
+            destination_port: 8443,
+            ..flow
+        };
+        assert_eq!(
+            gateway.verify_flow(&proof, mutated),
+            Err(EgressProofError::ProofMismatch)
+        );
+    }
+
+    #[test]
+    fn gateway_projection_wire_and_digest_mutation_fail_closed() {
+        let source = admitted(4);
+        let mut projection = EgressGatewayProjection::issue(
+            &principal("gateway-a"),
+            &advertisement(),
+            10,
+            Revision::new(5),
+            &[source],
+        )
+        .expect("issue gateway projection");
+        projection.projection_digest.0[0] ^= 1;
+        assert_eq!(
+            projection
+                .clone()
+                .admit(&principal("gateway-a"), &advertisement()),
+            Err(EgressDistributionError::GatewayProjectionDigestMismatch)
+        );
+        let mut value = serde_json::to_value(projection).expect("encode projection");
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("trusted".to_owned(), serde_json::json!(true));
+        assert!(serde_json::from_value::<EgressGatewayProjection>(value).is_err());
     }
 }

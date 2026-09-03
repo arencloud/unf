@@ -3057,6 +3057,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "unf-common",
+ "unf-ebpf-common",
 ]
 
 [[package]]

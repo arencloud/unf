@@ -639,6 +639,13 @@ matrix is maintained in the
   choice, and witness for independent selected-gateway replay. Mutation and
   unsupported inputs fail closed under `make egress-proof-test`; ADR 0118. It
   defines reference/control semantics and makes no live packet-path claim.
+- Milestone 8.5 is in progress. Its first verified slice distributes complete
+  admitted source contracts to each authenticated selected gateway, certifies
+  source-local route/interface/next-hop/transport/MTU paths before activation,
+  and lowers identity admission plus shared per-intent address, primary/
+  standby, 251-bucket rendezvous, connection, and event state into asserted
+  fixed-width ABI-v1 layouts. Proof and table selection are identical under
+  `make egress-dataplane-contract-test`; ADR 0119. Live maps and TC NAT remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

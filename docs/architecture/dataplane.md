@@ -202,6 +202,17 @@ tests still run on stable in the host workspace. See ADR 0002.
 
 ## Next dataplane milestone
 
+Phase 8.5 now has a verified fixed-width egress ABI contract but has not added
+its maps to the persistent v11 pin set. Explicit source entries are only fenced
+or active; absence remains native. Source-local path certificates bind gateway
+transport, next hop, interface, MTU, mode, revision, and lease before active
+lowering. Candidate and 251-bucket rendezvous tables are shared per intent and
+store a primary plus pre-certified standby when available. Fixed connection and
+event layouts retain the original/translated tuple and bilateral proof
+provenance. The next dataplane change must transactionally own these maps and
+place source/gateway TC steering after existing egress policy enforcement;
+ADR 0119.
+
 The legacy netlink path, encrypted internal transport, and IPv4/IPv6 policy
 provenance now have repeatable evidence on separate OpenShift 4.22 IPv4-only and
 dual-stack clusters running RHCOS 9.8 kernel 5.14. Path-specific admission,

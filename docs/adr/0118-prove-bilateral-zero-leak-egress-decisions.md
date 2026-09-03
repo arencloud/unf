@@ -37,8 +37,8 @@ egress intent selects an identity. It has three inseparable invariants.
    to `Native` only through an explicit, owner-matched release. No error path
    silently changes an explicitly managed flow back to native egress.
 2. The exact original IPv4 or IPv6 TCP/UDP tuple selects a same-family egress
-   address and ready/reachable gateway with domain-separated SHA-256 rendezvous
-   hashing. Inputs include intent UID and lease epoch. Selection is deterministic
+   address and ready/reachable gateway through a domain-separated rendezvous
+   decision. Inputs include intent UID and lease epoch. Selection is deterministic
    across source and gateway, distributes flows across multiple candidates, and
    removing a non-selected candidate does not remap the flow.
 3. The source issues a versioned flow proof only from an `Active` admission.
@@ -54,9 +54,12 @@ bytes never establish workload identity and cannot authorize traffic. Existing
 authenticated distribution, exact-Node contract replay, lease ownership, and
 gateway identity lookup remain the authority.
 
-SHA-256 rendezvous is the canonical userspace reference algorithm. Phase 8.5
-will lower its decision inputs into bounded fixed-width maps/tables; it must not
-assume that arbitrary JSON or per-packet SHA-256 belongs in eBPF. Fragmented,
+Phase 8.5 refines this into selection algorithm v2: a verifier-friendly hash of
+the authoritative identity and original tuple chooses one of 251 buckets, while
+userspace SHA-256 rendezvous compilation ranks each bucket's address, primary
+gateway, and standby gateway. The full proof remains SHA-256 committed. This
+keeps the source, gateway, simulation, and one-lookup eBPF decision identical;
+ADR 0119 records the lowering. Fragmented,
 mixed-family, zero-port, and non-TCP/UDP flows fail closed until separately
 designed and qualified.
 

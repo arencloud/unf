@@ -105,6 +105,14 @@ from the admitted contract and commits the authoritative identity, original
 tuple, contract/revisions, lease, selection, and witness. The selected gateway
 must independently reproduce the exact proof; proof bytes never establish
 identity. This reference/control contract changes no packet path; ADR 0118.
+The first Phase 8.5 slice closes the other half of that path: an authenticated
+gateway projection aggregates complete admitted source contracts only when the
+gateway is their exact ready/reachable lease-fenced candidate. Source-local path
+certificates bind route, interface, next hop, transport, MTU, mode, revision,
+and lease before a pure compiler can emit fixed-width ABI-v1 state. Candidate
+and 251-bucket primary/pre-certified-standby selection tables are shared per
+intent rather than duplicated per identity. ADR 0119 records this contract;
+live endpoint, persistent-map, and TC ownership remain next.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

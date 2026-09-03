@@ -14,6 +14,7 @@ use thiserror::Error;
 
 mod allocation;
 mod contract;
+mod dataplane;
 mod distribution;
 mod gateway;
 mod host_state;
@@ -21,6 +22,7 @@ mod proof;
 
 pub use allocation::*;
 pub use contract::*;
+pub use dataplane::*;
 pub use distribution::*;
 pub use gateway::*;
 pub use host_state::*;
