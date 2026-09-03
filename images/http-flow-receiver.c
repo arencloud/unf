@@ -205,6 +205,29 @@ static int read_request(int socket_fd, char **request_out, char **body_out,
     return 0;
 }
 
+static int peer_address(int socket_fd, char *address, size_t capacity)
+{
+    struct sockaddr_storage peer = {0};
+    socklen_t peer_length = sizeof(peer);
+    if (getpeername(socket_fd, (struct sockaddr *)&peer, &peer_length) != 0) {
+        return -1;
+    }
+    if (peer.ss_family == AF_INET) {
+        const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)&peer;
+        return inet_ntop(AF_INET, &ipv4->sin_addr, address, capacity) == NULL ? -1 : 0;
+    }
+    if (peer.ss_family == AF_INET6) {
+        const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)&peer;
+        if (IN6_IS_ADDR_V4MAPPED(&ipv6->sin6_addr)) {
+            struct in_addr ipv4 = {0};
+            memcpy(&ipv4, &ipv6->sin6_addr.s6_addr[12], sizeof(ipv4));
+            return inet_ntop(AF_INET, &ipv4, address, capacity) == NULL ? -1 : 0;
+        }
+        return inet_ntop(AF_INET6, &ipv6->sin6_addr, address, capacity) == NULL ? -1 : 0;
+    }
+    return -1;
+}
+
 static bool authorized(char *request, const struct receiver_state *state)
 {
     if (state->expected_token == NULL || state->expected_token[0] == '\0') {
@@ -237,6 +260,17 @@ static void handle_connection(int socket_fd, struct receiver_state *state)
     }
     if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
         (void)respond(socket_fd, 200, "OK", "text/plain", "ok\n", 3);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/peer") == 0) {
+        char peer[INET6_ADDRSTRLEN + 2];
+        if (peer_address(socket_fd, peer, sizeof(peer) - 1) != 0) {
+            (void)respond(socket_fd, 500, "Internal Server Error", "text/plain",
+                          "peer unavailable\n", 17);
+        } else {
+            size_t length = strlen(peer);
+            peer[length++] = '\n';
+            peer[length] = '\0';
+            (void)respond(socket_fd, 200, "OK", "text/plain", peer, length);
+        }
     } else if (strcmp(method, "GET") == 0 && strcmp(path, "/last") == 0) {
         if (state->last_body == NULL) {
             (void)respond(socket_fd, 404, "Not Found", "text/plain", "none\n", 5);

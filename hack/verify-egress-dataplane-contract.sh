@@ -20,8 +20,8 @@ require_text docs/project-status.md \
     '| Bilateral distribution and fixed-width dataplane contract | **Verified** |' \
     "the authoritative tracker must verify the Phase 8.5 contract slice"
 require_text docs/development/phase8-egress-fabric-plan.md \
-    '| 8.5 | Live distribution, source steering, and gateway NAT dataplane | **In progress** |' \
-    "the execution plan must keep the live Phase 8.5 milestone in progress"
+    '| 8.5 | Live distribution, source steering, and gateway NAT dataplane | **Verified** |' \
+    "the execution plan must record the verified Phase 8.5 milestone"
 require_text docs/adr/0119-lower-bilateral-egress-to-precertified-dataplane-state.md \
     '**Status:** Accepted and implemented for the Phase 8.5 contract slice' \
     "ADR 0119 must record the accepted lowering contract"

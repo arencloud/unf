@@ -29,6 +29,12 @@ require_text crates/unf-link/src/lib.rs \
 require_text crates/unf-link/src/lib.rs \
     'unf:egress-address:v1:' \
     "kernel ownership must be versioned and Node-UID-bound"
+require_text crates/unf-link/src/lib.rs \
+    'apply_ipv6_proxy_ownership' \
+    "IPv6 ownership must publish exact proxy-NDP state"
+require_text crates/unf-link/src/lib.rs \
+    'withdraw IPv6 gateway proxy' \
+    "IPv6 proxy ownership must be withdrawn before address release"
 require_text bins/unf-controller/src/main.rs \
     'acknowledge_ready_gateway_address_quorums' \
     "provider readiness must wait for all selected gateways"
@@ -42,4 +48,4 @@ require_text docs/adr/0128-lease-fenced-gateway-address-ownership.md \
     '**Status:** Accepted and implemented for the Phase 8.5 gateway-address slice' \
     "the quorum and quarantine protocol must be recorded"
 
-echo "Phase 8.5 gateway address ownership passed: exact Node authority, collision preflight, kernel readback, all-gateway quorum, and withdrawal quarantine agree"
+echo "Phase 8.5 gateway address ownership passed: exact Node authority, collision preflight, IPv6 proxy-NDP publication, kernel readback, all-gateway quorum, and withdrawal quarantine agree"

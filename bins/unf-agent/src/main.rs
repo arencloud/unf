@@ -8498,7 +8498,15 @@ async fn synchronize_egress_gateway_addresses(
     let admitted = projection
         .admit(&principal)
         .context("admit exact gateway-address projection")?;
-    let acknowledgement = apply_egress_gateway_address_projection(&admitted, node.node_uid).await?;
+    let ipv6_proxy_uplink = synchronizer.path_provider.as_ref().map(|provider| {
+        (
+            provider.ipv6_interface.clone(),
+            provider.ipv6_output_interface,
+        )
+    });
+    let acknowledgement =
+        apply_egress_gateway_address_projection(&admitted, node.node_uid, ipv6_proxy_uplink)
+            .await?;
     synchronizer
         .client
         .current()
@@ -8527,6 +8535,7 @@ async fn synchronize_egress_gateway_addresses(
 async fn apply_egress_gateway_address_projection(
     admitted: &AdmittedEgressGatewayAddressProjection,
     node_uid: String,
+    ipv6_proxy_uplink: Option<(String, u32)>,
 ) -> Result<EgressGatewayAddressAcknowledgement> {
     let all_addresses = admitted
         .projection()
@@ -8550,18 +8559,26 @@ async fn apply_egress_gateway_address_projection(
         })
         .flat_map(|lease| lease.addresses.iter().copied())
         .collect::<BTreeSet<_>>();
-    let previous_plan = GatewayAddressPlan::new(
+    let mut previous_plan = GatewayAddressPlan::new(
         node_uid.clone(),
         1_500,
         all_addresses.iter().copied().collect(),
     )
     .context("compile complete Node-UID-bound gateway-address plan")?;
-    let plan = GatewayAddressPlan::new(
+    let mut plan = GatewayAddressPlan::new(
         node_uid,
         1_500,
         retained_addresses.iter().copied().collect(),
     )
     .context("compile release-authorized gateway-address plan")?;
+    if let Some((interface_name, interface_index)) = ipv6_proxy_uplink {
+        previous_plan = previous_plan
+            .with_ipv6_proxy_uplink(interface_name.clone(), interface_index)
+            .context("bind complete gateway-address plan to IPv6 proxy uplink")?;
+        plan = plan
+            .with_ipv6_proxy_uplink(interface_name, interface_index)
+            .context("bind retained gateway-address plan to IPv6 proxy uplink")?;
+    }
     let readback = if retained_addresses == all_addresses {
         plan.apply()
             .await
@@ -11333,6 +11350,8 @@ fn drain_egress_events(ring: &mut RingBuf<MapData>, state: &AgentState) {
             source = ?event.original_source_address,
             destination = ?event.original_destination_address,
             egress_address = ?event.egress_address,
+            egress_ipv4 = ?event_ipv4(event.address_family, event.egress_address),
+            egress_ipv6 = ?event_ipv6(event.address_family, event.egress_address),
             source_port = u16::from_be_bytes(event.original_source_port),
             destination_port = u16::from_be_bytes(event.original_destination_port),
             translated_source_port = u16::from_be_bytes(event.translated_source_port),

@@ -699,7 +699,7 @@ fn validate_facts(facts: &EgressContractFacts) -> Result<(), EgressContractError
     let mut identities = BTreeSet::new();
     for source in &facts.sources {
         validate_source(source)?;
-        if !identities.insert(source.identity) {
+        if !identities.insert((source.identity, source.node.uid.as_str())) {
             return Err(EgressContractError::InvalidSource(source.identity));
         }
     }
@@ -933,6 +933,39 @@ mod tests {
         assert_eq!(plan.gateways[0].node.name, "gateway-a");
         assert_eq!(plan.revisions, facts.revisions);
         assert_eq!(contract.verified_invariants.len(), 11);
+    }
+
+    #[test]
+    fn shared_workload_identity_can_be_projected_once_per_source_node() {
+        let (model, mut facts, source_node) = fixture();
+        let second_node = node("worker-b");
+        let mut second_source = facts.sources[0].clone();
+        second_source.node = second_node.clone();
+        second_source.workload_uid = "uid-ledger-replica".to_owned();
+        facts.sources.push(second_source);
+
+        let first = EgressBehaviorContract::issue(&model, &facts, source_node, Revision::new(20))
+            .expect("shared identity is valid on the first exact source Node");
+        let second = EgressBehaviorContract::issue(&model, &facts, second_node, Revision::new(20))
+            .expect("shared identity is valid on the second exact source Node");
+        assert_eq!(first.plans.len(), 1);
+        assert_eq!(second.plans.len(), 1);
+        assert_eq!(
+            first.plans[0].source.identity,
+            second.plans[0].source.identity
+        );
+        assert_ne!(first.plans[0].source.node, second.plans[0].source.node);
+
+        facts.sources[1].node = facts.sources[0].node.clone();
+        assert!(matches!(
+            EgressBehaviorContract::issue(
+                &model,
+                &facts,
+                facts.sources[0].node.clone(),
+                Revision::new(21)
+            ),
+            Err(EgressContractError::InvalidSource(IdentityId(42)))
+        ));
     }
 
     #[test]

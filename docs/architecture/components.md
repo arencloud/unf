@@ -127,7 +127,14 @@ agent independently validates and fences that projection. Exact Pod-bound
 bilateral acknowledgements then separate application from delivery. Egress ABI
 v2 adds intent-and-bank-prefixed destination LPM state, and the source TC reader
 now enforces NetworkPolicy before an unchanged-tuple certified-neighbor handoff.
-Live path activation and gateway NAT remain. ADRs 0123–0126 record the boundary.
+Digest-bound bilateral application evidence and native route certificates now
+activate policy-first source steering. Selected gateways transactionally own
+the exact `/32` and `/128`, including lease-fenced proxy NDP for IPv6, before
+collision-safe dual-stack SNAT/reverse state may serve traffic. The production
+reconciler joins watched cluster facts into per-source-Node contracts and the
+repeatable Kind lifecycle proves restart, withdrawal, drain, monotonic safe
+reuse, and final release. ADRs 0123–0135 record the verified Phase 8.5 boundary;
+measured multi-gateway HA begins in milestone 8.6.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

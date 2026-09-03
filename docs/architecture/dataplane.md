@@ -208,7 +208,7 @@ The TC package is excluded from the host workspace and built for
 `bpfel-unknown-none` with an isolated nightly `build-std=core` command. Shared ABI
 tests still run on stable in the host workspace. See ADR 0002.
 
-## Next dataplane milestone
+## Egress dataplane state
 
 Phase 8.5 now has a verified fixed-width egress ABI contract. Persistent ABI
 v14 owns its source, destination, candidate and selection banks, source config,
@@ -231,8 +231,9 @@ reads back the exact native route set, Node identity, transport, interface
 index, MTU, and stable dual-stack route revision before atomically entering
 `Active`. Loss of either proof and restart return through a destination-preserving
 fence. A separate authenticated projection now drives Node-UID-bound `/32` and
-`/128` ownership on `unf-egress0`; whole-host collision preflight, exact kernel
-readback, and all-selected-gateway quorum precede readiness. Withdrawal
+`/128` ownership on `unf-egress0`; exact proxy-NDP ownership on the configured
+IPv6 uplink, whole-host collision preflight, exact kernel readback, and
+all-selected-gateway quorum precede readiness. Withdrawal
 quarantines those addresses until a checkpoint-v2 retirement manifest has
 frozen the exact source/gateway/lease set and a schema-v1 Proof of Safe
 Forgetting joins complete source fences, zero-flow gateway drains, and the exact
@@ -240,8 +241,9 @@ reachability withdrawal. Reconciliation, time, and leadership cannot infer
 release. Collision-safe dual-stack SNAT/reverse processing now validates the
 full contract/lease/digest/witness chain, reserves reverse then forward state
 without overwrite, and performs checksum-safe family-specific translation.
-Live release-evidence transport and NAT events follow. ADRs 0119–0130 record the
-verified boundary.
+Production watched-state joining, live release-evidence transport, sparse NAT
+events, and a complete dual-stack Kind lifecycle now close milestone 8.5.
+ADRs 0119–0135 record the verified boundary; measured HA/failover begins 8.6.
 
 The legacy netlink path, encrypted internal transport, and IPv4/IPv6 policy
 provenance now have repeatable evidence on separate OpenShift 4.22 IPv4-only and

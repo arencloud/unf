@@ -11,6 +11,9 @@ use rtnetlink::packet_route::address::AddressAttribute;
 use rtnetlink::packet_route::link::{
     InfoData, InfoKind, InfoVeth, LinkAttribute, LinkFlags, LinkInfo, LinkMessage,
 };
+use rtnetlink::packet_route::neighbour::{
+    NeighbourAddress, NeighbourAttribute, NeighbourFlags, NeighbourMessage,
+};
 use rtnetlink::{Handle, LinkDummy, LinkMessageBuilder, LinkUnspec, LinkVeth, new_connection};
 use rustix::fs::{Mode, OFlags, open};
 use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
@@ -67,6 +70,13 @@ pub struct GatewayAddressPlan {
     owner_alias: String,
     mtu: u32,
     addresses: BTreeSet<AssignedAddress>,
+    ipv6_proxy_uplink: Option<GatewayProxyUplink>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayProxyUplink {
+    interface_name: String,
+    interface_index: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,6 +115,12 @@ pub enum LinkError {
     #[error("netlink {operation} failed: {source}")]
     OpenNetlink {
         operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not configure IPv6 proxy ownership through {path:?}: {source}")]
+    ConfigureIpv6Proxy {
+        path: PathBuf,
         #[source]
         source: std::io::Error,
     },
@@ -678,7 +694,34 @@ impl GatewayAddressPlan {
             interface_name: EGRESS_GATEWAY_INTERFACE.to_string(),
             mtu,
             addresses,
+            ipv6_proxy_uplink: None,
         })
+    }
+
+    /// Publishes owned IPv6 host addresses through an exact proxy-NDP set on
+    /// the provider uplink. IPv4 ownership is announced by Linux ARP directly;
+    /// IPv6 addresses held on a dummy link require an explicit neighbour proxy
+    /// when the address pool is reachable on-link.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsafe interface names or a zero interface index.
+    pub fn with_ipv6_proxy_uplink(
+        mut self,
+        interface_name: String,
+        interface_index: u32,
+    ) -> Result<Self, LinkError> {
+        validate_interface_name(&interface_name, "IPv6 proxy uplink")?;
+        if interface_name == "lo" || interface_index == 0 {
+            return Err(LinkError::InvalidPlan(
+                "IPv6 proxy uplink must identify a non-loopback interface".to_string(),
+            ));
+        }
+        self.ipv6_proxy_uplink = Some(GatewayProxyUplink {
+            interface_name,
+            interface_index,
+        });
+        Ok(self)
     }
 
     #[must_use]
@@ -762,9 +805,20 @@ impl GatewayAddressPlan {
             }
             added.push(assigned);
         }
+        let added_proxies = match self.apply_ipv6_proxy_ownership(&handle).await {
+            Ok(added) => added,
+            Err(error) => {
+                rollback_gateway_addresses(&handle, link.header.index, &added).await;
+                if created {
+                    let _ = handle.link().del(link.header.index).execute().await;
+                }
+                return Err(error);
+            }
+        };
         match self.readback_with_handle(&handle).await {
             Ok(readback) => Ok(readback),
             Err(error) => {
+                rollback_gateway_proxies(&handle, &added_proxies).await;
                 rollback_gateway_addresses(&handle, link.header.index, &added).await;
                 if created {
                     let _ = handle.link().del(link.header.index).execute().await;
@@ -772,6 +826,86 @@ impl GatewayAddressPlan {
                 Err(error)
             }
         }
+    }
+
+    async fn apply_ipv6_proxy_ownership(
+        &self,
+        handle: &Handle,
+    ) -> Result<Vec<NeighbourMessage>, LinkError> {
+        let desired = self.ipv6_proxy_addresses();
+        if desired.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uplink = self.ipv6_proxy_uplink.as_ref().ok_or_else(|| {
+            LinkError::InvalidPlan(
+                "IPv6 gateway addresses require an explicit proxy-NDP uplink".to_string(),
+            )
+        })?;
+        validate_gateway_proxy_uplink(handle, uplink).await?;
+        enable_ipv6_proxy_ndp(&uplink.interface_name)?;
+        let existing = gateway_proxy_entries(handle, &desired).await?;
+        if let Some(entry) = existing
+            .iter()
+            .find(|entry| entry.header.ifindex != uplink.interface_index)
+        {
+            return Err(LinkError::LinkConflict {
+                name: uplink.interface_name.clone(),
+                reason: format!(
+                    "IPv6 gateway proxy {:?} already exists on foreign interface index {}",
+                    neighbour_address(entry),
+                    entry.header.ifindex
+                ),
+            });
+        }
+        let present = existing
+            .iter()
+            .filter_map(neighbour_address)
+            .collect::<BTreeSet<_>>();
+        let mut added = Vec::new();
+        for address in desired.difference(&present).copied() {
+            if let Err(source) = handle
+                .neighbours()
+                .add(uplink.interface_index, address)
+                .flags(NeighbourFlags::Proxy)
+                .execute()
+                .await
+            {
+                rollback_gateway_proxies(handle, &added).await;
+                return Err(LinkError::Netlink {
+                    operation: "publish IPv6 gateway proxy",
+                    source,
+                });
+            }
+            let entry = match gateway_proxy_entries(handle, &BTreeSet::from([address])).await {
+                Ok(entries) => entries
+                    .into_iter()
+                    .find(|entry| entry.header.ifindex == uplink.interface_index),
+                Err(error) => {
+                    let _ =
+                        remove_gateway_proxies(handle, &BTreeSet::from([address]), Some(uplink))
+                            .await;
+                    rollback_gateway_proxies(handle, &added).await;
+                    return Err(error);
+                }
+            };
+            let Some(entry) = entry else {
+                let _ =
+                    remove_gateway_proxies(handle, &BTreeSet::from([address]), Some(uplink)).await;
+                rollback_gateway_proxies(handle, &added).await;
+                return Err(LinkError::Readback(format!(
+                    "IPv6 gateway proxy {address} was not readable after publication"
+                )));
+            };
+            added.push(entry);
+        }
+        Ok(added)
+    }
+
+    fn ipv6_proxy_addresses(&self) -> BTreeSet<IpAddr> {
+        self.addresses
+            .iter()
+            .filter_map(|assigned| assigned.address.is_ipv6().then_some(assigned.address))
+            .collect()
     }
 
     async fn configure_gateway_link(
@@ -846,6 +980,7 @@ impl GatewayAddressPlan {
             || self.interface_name != previous.interface_name
             || self.owner_alias != previous.owner_alias
             || self.mtu != previous.mtu
+            || self.ipv6_proxy_uplink != previous.ipv6_proxy_uplink
             || !self.addresses.is_subset(&previous.addresses)
         {
             return Err(LinkError::InvalidPlan(
@@ -867,6 +1002,15 @@ impl GatewayAddressPlan {
             .difference(&self.addresses)
             .copied()
             .collect::<BTreeSet<_>>();
+        let removed_proxies = remove_gateway_proxies(
+            &handle,
+            &removing
+                .iter()
+                .filter_map(|assigned| assigned.address.is_ipv6().then_some(assigned.address))
+                .collect(),
+            previous.ipv6_proxy_uplink.as_ref(),
+        )
+        .await?;
         let mut removed = Vec::new();
         let mut stream = handle
             .address()
@@ -893,6 +1037,7 @@ impl GatewayAddressPlan {
             }
             if let Err(source) = handle.address().del(message).execute().await {
                 restore_gateway_addresses(&handle, prior.interface_index, &removed).await;
+                restore_gateway_proxies(&handle, &removed_proxies).await;
                 return Err(LinkError::Netlink {
                     operation: "remove authorized gateway address",
                     source,
@@ -904,6 +1049,7 @@ impl GatewayAddressPlan {
             Ok(readback) => Ok(readback),
             Err(error) => {
                 restore_gateway_addresses(&handle, prior.interface_index, &removed).await;
+                restore_gateway_proxies(&handle, &removed_proxies).await;
                 Err(error)
             }
         }
@@ -927,15 +1073,19 @@ impl GatewayAddressPlan {
             return Ok(DeleteOutcome::AlreadyAbsent);
         };
         self.readback_with_handle(&handle).await?;
-        handle
-            .link()
-            .del(link.header.index)
-            .execute()
-            .await
-            .map_err(|source| LinkError::Netlink {
+        let removed_proxies = remove_gateway_proxies(
+            &handle,
+            &self.ipv6_proxy_addresses(),
+            self.ipv6_proxy_uplink.as_ref(),
+        )
+        .await?;
+        if let Err(source) = handle.link().del(link.header.index).execute().await {
+            restore_gateway_proxies(&handle, &removed_proxies).await;
+            return Err(LinkError::Netlink {
                 operation: "release gateway-address interface",
                 source,
-            })?;
+            });
+        }
         Ok(DeleteOutcome::Deleted)
     }
 
@@ -962,6 +1112,7 @@ impl GatewayAddressPlan {
                 self.interface_name, self.addresses, managed
             )));
         }
+        self.readback_ipv6_proxy_ownership(handle).await?;
         Ok(GatewayAddressReadback {
             node_uid: self.node_uid.clone(),
             interface_name: self.interface_name.clone(),
@@ -969,6 +1120,39 @@ impl GatewayAddressPlan {
             mtu: self.mtu,
             addresses: managed,
         })
+    }
+
+    async fn readback_ipv6_proxy_ownership(&self, handle: &Handle) -> Result<(), LinkError> {
+        let desired = self.ipv6_proxy_addresses();
+        if desired.is_empty() {
+            return Ok(());
+        }
+        let uplink = self.ipv6_proxy_uplink.as_ref().ok_or_else(|| {
+            LinkError::Readback(
+                "IPv6 gateway addresses have no proxy-NDP uplink ownership".to_string(),
+            )
+        })?;
+        validate_gateway_proxy_uplink(handle, uplink).await?;
+        let proxy_ndp = ipv6_proxy_ndp_enabled(&uplink.interface_name)?;
+        if !proxy_ndp {
+            return Err(LinkError::Readback(format!(
+                "IPv6 proxy NDP is disabled on {:?}",
+                uplink.interface_name
+            )));
+        }
+        let observed = gateway_proxy_entries(handle, &desired)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.header.ifindex == uplink.interface_index)
+            .filter_map(|entry| neighbour_address(&entry))
+            .collect::<BTreeSet<_>>();
+        if observed != desired {
+            return Err(LinkError::Readback(format!(
+                "IPv6 gateway proxy mismatch on {:?}; expected {desired:?}, observed {observed:?}",
+                uplink.interface_name
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1126,6 +1310,155 @@ async fn restore_gateway_addresses(
             .add(interface_index, assigned.address, assigned.prefix_len)
             .execute()
             .await;
+    }
+}
+
+fn ipv6_proxy_ndp_path(interface_name: &str) -> PathBuf {
+    Path::new("/proc/sys/net/ipv6/conf")
+        .join(interface_name)
+        .join("proxy_ndp")
+}
+
+fn enable_ipv6_proxy_ndp(interface_name: &str) -> Result<(), LinkError> {
+    let path = ipv6_proxy_ndp_path(interface_name);
+    if ipv6_proxy_ndp_enabled(interface_name)? {
+        return Ok(());
+    }
+    std::fs::write(&path, b"1\n").map_err(|source| LinkError::ConfigureIpv6Proxy {
+        path: path.clone(),
+        source,
+    })?;
+    if !ipv6_proxy_ndp_enabled(interface_name)? {
+        return Err(LinkError::Readback(format!(
+            "IPv6 proxy NDP remained disabled after writing {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ipv6_proxy_ndp_enabled(interface_name: &str) -> Result<bool, LinkError> {
+    let path = ipv6_proxy_ndp_path(interface_name);
+    let value = std::fs::read_to_string(&path).map_err(|source| LinkError::ConfigureIpv6Proxy {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(value.trim() == "1")
+}
+
+async fn validate_gateway_proxy_uplink(
+    handle: &Handle,
+    uplink: &GatewayProxyUplink,
+) -> Result<(), LinkError> {
+    let link = require_link(handle, &uplink.interface_name).await?;
+    if link.header.index != uplink.interface_index {
+        return Err(LinkError::LinkConflict {
+            name: uplink.interface_name.clone(),
+            reason: format!(
+                "IPv6 proxy uplink index changed from {} to {}",
+                uplink.interface_index, link.header.index
+            ),
+        });
+    }
+    if !link.header.flags.contains(LinkFlags::Up) {
+        return Err(conflict(
+            &uplink.interface_name,
+            "IPv6 proxy uplink is not administratively up",
+        ));
+    }
+    Ok(())
+}
+
+async fn gateway_proxy_entries(
+    handle: &Handle,
+    addresses: &BTreeSet<IpAddr>,
+) -> Result<Vec<NeighbourMessage>, LinkError> {
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stream = handle.neighbours().get().proxies().execute();
+    let mut entries = Vec::new();
+    while let Some(message) = stream
+        .try_next()
+        .await
+        .map_err(|source| LinkError::Netlink {
+            operation: "read IPv6 gateway proxies",
+            source,
+        })?
+    {
+        if message.header.flags.contains(NeighbourFlags::Proxy)
+            && neighbour_address(&message).is_some_and(|address| addresses.contains(&address))
+        {
+            entries.push(message);
+        }
+    }
+    Ok(entries)
+}
+
+fn neighbour_address(message: &NeighbourMessage) -> Option<IpAddr> {
+    message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            NeighbourAttribute::Destination(NeighbourAddress::Inet(address)) => {
+                Some(IpAddr::V4(*address))
+            }
+            NeighbourAttribute::Destination(NeighbourAddress::Inet6(address)) => {
+                Some(IpAddr::V6(*address))
+            }
+            _ => None,
+        })
+}
+
+async fn remove_gateway_proxies(
+    handle: &Handle,
+    addresses: &BTreeSet<IpAddr>,
+    uplink: Option<&GatewayProxyUplink>,
+) -> Result<Vec<NeighbourMessage>, LinkError> {
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let uplink = uplink.ok_or_else(|| {
+        LinkError::InvalidPlan(
+            "cannot remove IPv6 gateway ownership without a proxy-NDP uplink".to_string(),
+        )
+    })?;
+    validate_gateway_proxy_uplink(handle, uplink).await?;
+    let entries = gateway_proxy_entries(handle, addresses)
+        .await?
+        .into_iter()
+        .filter(|entry| entry.header.ifindex == uplink.interface_index)
+        .collect::<Vec<_>>();
+    let mut removed = Vec::new();
+    for entry in entries {
+        if let Err(source) = handle.neighbours().del(entry.clone()).execute().await {
+            restore_gateway_proxies(handle, &removed).await;
+            return Err(LinkError::Netlink {
+                operation: "withdraw IPv6 gateway proxy",
+                source,
+            });
+        }
+        removed.push(entry);
+    }
+    Ok(removed)
+}
+
+async fn rollback_gateway_proxies(handle: &Handle, entries: &[NeighbourMessage]) {
+    for entry in entries.iter().rev() {
+        let _ = handle.neighbours().del(entry.clone()).execute().await;
+    }
+}
+
+async fn restore_gateway_proxies(handle: &Handle, entries: &[NeighbourMessage]) {
+    for entry in entries {
+        if let Some(address) = neighbour_address(entry) {
+            let _ = handle
+                .neighbours()
+                .add(entry.header.ifindex, address)
+                .flags(NeighbourFlags::Proxy)
+                .execute()
+                .await;
+        }
     }
 }
 
@@ -1611,9 +1944,18 @@ mod tests {
                 IpAddr::V4("192.0.2.20".parse().unwrap()),
             ],
         )
-        .expect("valid gateway address plan");
+        .expect("valid gateway address plan")
+        .with_ipv6_proxy_uplink("eth0".to_string(), 2)
+        .expect("valid IPv6 proxy uplink");
         assert_eq!(plan.interface_name, EGRESS_GATEWAY_INTERFACE);
         assert_eq!(plan.owner_alias, "unf:egress-address:v1:node-uid-a");
+        assert_eq!(
+            plan.ipv6_proxy_uplink,
+            Some(GatewayProxyUplink {
+                interface_name: "eth0".to_string(),
+                interface_index: 2,
+            })
+        );
         assert_eq!(
             plan.addresses,
             BTreeSet::from([
@@ -1652,16 +1994,38 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            GatewayAddressPlan::new(
+                "node-uid-a".to_string(),
+                1_500,
+                vec!["2001:db8:100::20".parse().unwrap()]
+            )
+            .unwrap()
+            .with_ipv6_proxy_uplink("../eth0".to_string(), 2)
+            .is_err()
+        );
     }
 
     #[tokio::test]
     #[ignore = "requires an isolated network namespace with CAP_NET_ADMIN"]
     async fn privileged_gateway_address_transaction_is_exact_and_collision_safe() {
+        let (connection, handle, _) = new_connection().unwrap();
+        tokio::spawn(connection);
+        handle
+            .link()
+            .add(LinkDummy::new("uplink0").up().build())
+            .execute()
+            .await
+            .unwrap();
+        let uplink = require_link(&handle, "uplink0").await.unwrap();
         let addresses = vec![
             "192.0.2.20".parse().unwrap(),
             "2001:db8:100::20".parse().unwrap(),
         ];
-        let plan = GatewayAddressPlan::new("node-uid-a".to_string(), 1_500, addresses).unwrap();
+        let plan = GatewayAddressPlan::new("node-uid-a".to_string(), 1_500, addresses)
+            .unwrap()
+            .with_ipv6_proxy_uplink("uplink0".to_string(), uplink.header.index)
+            .unwrap();
         let applied = plan.apply().await.expect("apply gateway addresses");
         assert_eq!(
             applied,
@@ -1677,6 +2041,8 @@ mod tests {
             1_500,
             vec!["192.0.2.20".parse().unwrap()],
         )
+        .unwrap()
+        .with_ipv6_proxy_uplink("uplink0".to_string(), uplink.header.index)
         .unwrap();
         assert_eq!(
             retained
@@ -1688,8 +2054,6 @@ mod tests {
         );
         plan.apply().await.expect("restore full desired ownership");
 
-        let (connection, handle, _) = new_connection().unwrap();
-        tokio::spawn(connection);
         handle
             .link()
             .add(LinkDummy::new("foreign0").up().build())
@@ -1713,7 +2077,10 @@ mod tests {
         .await
         .expect_err("foreign address collision must fail before mutation");
         assert!(matches!(conflict, LinkError::LinkConflict { .. }));
-        let empty = GatewayAddressPlan::new("node-uid-a".to_string(), 1_500, Vec::new()).unwrap();
+        let empty = GatewayAddressPlan::new("node-uid-a".to_string(), 1_500, Vec::new())
+            .unwrap()
+            .with_ipv6_proxy_uplink("uplink0".to_string(), uplink.header.index)
+            .unwrap();
         assert!(
             empty
                 .transition_from(&plan)

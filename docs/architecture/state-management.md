@@ -243,10 +243,14 @@ index, and MTU before activating direct-neighbor state. Grant/path loss,
 withdrawal, synchronization failure, and restart atomically restore fences and
 purge egress connections. Gateway address projections are separately sealed to
 the exact Node UID and gateway-registry revision. Agents apply them to a
-versioned owned dummy link, read back the complete host-prefix set, and the
-controller requires every selected gateway acknowledgement before recording
+versioned owned dummy link and, for IPv6, exact proxy-NDP entries on the
+configured native uplink; both address and proxy state are read back before the
+controller accepts every selected gateway acknowledgement and records
 readiness. Withdraw state is quarantined and allocator-fenced. A durable
 retirement manifest plus Proof of Safe Forgetting now defines the only release
 authority: the exact source set must be fenced, every gateway explicitly
 withdrawn and zero-flow drained, and reachability withdrawn. Live evidence
-transport remains separate. See ADRs 0119–0130.
+transport consumes that authority to remove the exact address/proxy subset and
+reconciles unchanged watched desired state only after atomic release. The
+three-Node dual-stack lifecycle proves recovery, monotonic safe reuse, and final
+cleanup. See ADRs 0119–0135.

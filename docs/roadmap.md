@@ -639,7 +639,7 @@ matrix is maintained in the
   choice, and witness for independent selected-gateway replay. Mutation and
   unsupported inputs fail closed under `make egress-proof-test`; ADR 0118. It
   defines reference/control semantics and makes no live packet-path claim.
-- Milestone 8.5 is in progress. Its first verified slice distributes complete
+- Milestone 8.5 is verified. Its first slice distributes complete
   admitted source contracts to each authenticated selected gateway, certifies
   source-local route/interface/next-hop/transport/MTU paths before activation,
   and lowers identity admission plus shared per-intent address, primary/
@@ -700,8 +700,17 @@ matrix is maintained in the
   `egress-release-authority-test` gates; ADRs 0132–0133. A fixed proof-bound
   first-flow NAT event ABI, strict agent decoding, fixed-cardinality metrics,
   and exact non-blocking ring-loss accounting pass `make
-  egress-nat-observability-test`; ADR 0134. HA failover and end-to-end platform
-  packets remain.
+  egress-nat-observability-test`; ADR 0134. The closing production join derives
+  exact per-source-Node contracts from watched Pods, identities, egress policy,
+  intent, allocation, explicitly eligible gateways, and reachability; stale
+  revisions invalidate both sides. Exact proxy-NDP ownership makes leased IPv6
+  host addresses reachable without weakening Node-UID/address fencing. The
+  repeatable three-Node kube-proxy-free Kind gate exercises dual-stack UDP NAT
+  and reverse traffic, exact sparse witnesses, unaffected native sources,
+  controller/agent restart, withdrawal/drain/removal, monotonic same-address
+  reuse, final release, and retained diagnostics under `make
+  egress-kind-lifecycle-test`; ADR 0135. Measured HA/failover and the later
+  Phase 8 platform milestones remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

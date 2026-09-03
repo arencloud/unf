@@ -43,8 +43,9 @@ use unf_egress::{
     AdmittedEgressProjection, AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT,
     EGRESS_AGENT_TOKEN_AUDIENCE, EGRESS_GATEWAY_ACK_SCHEMA_VERSION, EgressAddressPool,
     EgressAgentAdvertisement, EgressBehaviorContract, EgressCapability, EgressContractFacts,
-    EgressControlPlane, EgressControlPlaneCheckpoint, EgressDesiredCheckpoint, EgressDesiredStore,
-    EgressDistributionError, EgressGatewayAcknowledgement, EgressGatewayAddressAcknowledgement,
+    EgressContractRevisions, EgressControlPlane, EgressControlPlaneCheckpoint,
+    EgressDesiredCheckpoint, EgressDesiredStore, EgressDistributionError,
+    EgressGatewayAcknowledgement, EgressGatewayAddressAcknowledgement,
     EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
     EgressGatewayDrainEvidence, EgressGatewayProjection, EgressGatewayRetirementChallenges,
     EgressIntent, EgressIntentOwner, EgressModel, EgressNode, EgressNodeProjectionEnvelope,
@@ -164,10 +165,12 @@ const LOAD_BALANCER_STATUS_OWNERSHIP_SCHEMA_VERSION: u16 = 1;
 const LOAD_BALANCER_STORE_DATA_LIMIT: usize = 900_000;
 const LOAD_BALANCER_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const PRIMARY_CNI_NODE_LABEL: &str = "network.unf.io/primary-cni";
+const EGRESS_GATEWAY_NODE_LABEL: &str = "network.unf.io/egress-gateway";
 const SERVICE_SELECTION_ALGORITHM_ANNOTATION: &str = "network.unf.io/service-selection-algorithm";
 const SERVICE_FORWARDING_MODE_ANNOTATION: &str = "network.unf.io/service-forwarding-mode";
 const DSR_BACKEND_VIP_OWNERSHIP_ANNOTATION: &str = "network.unf.io/dsr-backend-vip-ownership";
 const PRIMARY_CNI_NODE_LABEL_VALUE: &str = "enabled";
+const EGRESS_GATEWAY_NODE_LABEL_VALUE: &str = "enabled";
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF Kubernetes desired-state controller")]
@@ -314,6 +317,7 @@ struct ControllerState {
     openshift_egress_ip_initialization_failed: AtomicBool,
     rejected_openshift_egress_ips: RwLock<BTreeMap<String, String>>,
     egress_distribution_guard: Mutex<()>,
+    egress_source_distribution_revision: Mutex<Revision>,
     egress_source_distributions: RwLock<BTreeMap<String, EgressSourceDistribution>>,
     egress_pending_source_applications: RwLock<BTreeMap<String, PendingEgressSourceApplication>>,
     egress_source_fences: RwLock<BTreeMap<(EgressIntentOwner, String), AppliedEgressSourceFence>>,
@@ -1085,8 +1089,6 @@ async fn main() -> Result<()> {
         spawn_agent_report_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_flow_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_topology_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
-        reconcile_egress_control_plane(&state)
-            .context("reconcile restored egress desired state")?;
         spawn_egress_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         let client = client.context("Kubernetes client is required in connected mode")?;
         spawn_load_balancer_reconciler(
@@ -1531,6 +1533,7 @@ fn new_state_with_client_and_selector(
         openshift_egress_ip_initialization_failed: AtomicBool::new(false),
         rejected_openshift_egress_ips: RwLock::new(BTreeMap::new()),
         egress_distribution_guard: Mutex::new(()),
+        egress_source_distribution_revision: Mutex::new(Revision::INITIAL),
         egress_source_distributions: RwLock::new(BTreeMap::new()),
         egress_pending_source_applications: RwLock::new(BTreeMap::new()),
         egress_source_fences: RwLock::new(BTreeMap::new()),
@@ -2282,6 +2285,9 @@ async fn restore_egress_control_plane(state: &ControllerState) -> Result<()> {
         gateways = checkpoint.gateways.records.len(),
         "restored durable egress control plane"
     );
+    if !checkpoint.gateways.records.is_empty() {
+        mutex_lock(&state.egress_gateway_distributions).revision = Revision::new(1);
+    }
     *mutex_lock(&state.egress_control_plane) = restored;
     Ok(())
 }
@@ -3628,6 +3634,11 @@ fn record_egress_desired_change(state: &ControllerState, changed: bool) {
 }
 
 fn reconcile_egress_control_plane(state: &ControllerState) -> Result<()> {
+    let _distribution_guard = mutex_lock(&state.egress_distribution_guard);
+    reconcile_egress_control_plane_locked(state)
+}
+
+fn reconcile_egress_control_plane_locked(state: &ControllerState) -> Result<()> {
     let admitted_sources = mutex_lock(&state.egress_gateway_distributions)
         .admitted_sources
         .values()
@@ -3663,6 +3674,11 @@ fn reconcile_egress_control_plane(state: &ControllerState) -> Result<()> {
             node.ready
                 && node.labels.get(PRIMARY_CNI_NODE_LABEL).map(String::as_str)
                     == Some(PRIMARY_CNI_NODE_LABEL_VALUE)
+                && node
+                    .labels
+                    .get(EGRESS_GATEWAY_NODE_LABEL)
+                    .map(String::as_str)
+                    == Some(EGRESS_GATEWAY_NODE_LABEL_VALUE)
         })
         .filter_map(|node| {
             node_uids.get(&node.name).map(|record| EgressNode {
@@ -3708,7 +3724,7 @@ fn reconcile_egress_control_plane(state: &ControllerState) -> Result<()> {
         state
             .egress_control_plane_dirty
             .store(true, Ordering::Release);
-        invalidate_egress_distributions(state);
+        invalidate_egress_distributions_locked(state);
         info!(
             desired_revision = revision.get(),
             allocated = result.allocated,
@@ -3750,8 +3766,280 @@ fn acknowledge_static_egress_reachability(control_plane: &mut EgressControlPlane
     Ok(changed)
 }
 
+#[allow(clippy::too_many_lines)]
+fn reconcile_egress_source_distributions(state: &ControllerState) -> Result<bool> {
+    let _policy_guard = read_lock(&state.policy_state_guard);
+    let _distribution_guard = mutex_lock(&state.egress_distribution_guard);
+    let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
+    let model = checkpoint.desired_model.clone();
+    let identity_revision = mutex_lock(&state.identities).revision();
+    let policy_revision = mutex_lock(&state.revisions).policy;
+
+    let ready_records = checkpoint
+        .gateways
+        .records
+        .iter()
+        .filter(|record| {
+            record.desired.action == unf_egress::EgressGatewayAction::Ensure
+                && record.gateway.as_ref().is_some_and(|acknowledgement| {
+                    acknowledgement.outcome == EgressProviderOutcome::Ready
+                })
+                && record.reachability.as_ref().is_some_and(|acknowledgement| {
+                    acknowledgement.outcome == EgressProviderOutcome::Ready
+                })
+        })
+        .map(|record| (record.desired.owner.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let ready_leases = checkpoint
+        .allocation
+        .leases
+        .iter()
+        .filter(|lease| ready_records.contains_key(&lease.intent.owner))
+        .map(|lease| (lease.intent.owner.clone(), lease))
+        .collect::<BTreeMap<_, _>>();
+
+    let reachability_revision = ready_records
+        .values()
+        .filter_map(|record| record.reachability.as_ref().map(|ack| ack.revision))
+        .max()
+        .unwrap_or(Revision::INITIAL);
+    let revisions = EgressContractRevisions {
+        intent: checkpoint.desired_revision,
+        identity: identity_revision,
+        policy: policy_revision,
+        allocation: checkpoint.allocation.revision,
+        gateway: checkpoint.gateways.revision,
+        reachability: reachability_revision,
+    };
+    let revisions_ready = [
+        revisions.intent,
+        revisions.identity,
+        revisions.policy,
+        revisions.allocation,
+        revisions.gateway,
+        revisions.reachability,
+    ]
+    .into_iter()
+    .all(|revision| revision != Revision::INITIAL);
+
+    let capabilities = BTreeSet::from([
+        EgressCapability::IdentitySourceSteering,
+        EgressCapability::LeaseEpochFencing,
+        EgressCapability::OriginalTupleWitness,
+        EgressCapability::Ipv4TcpUdpNat,
+        EgressCapability::Ipv6TcpUdpNat,
+    ]);
+    let namespaces = read_lock(&state.namespaces);
+    let pods = read_lock(&state.pods);
+    let nodes = read_lock(&state.nodes);
+    let node_uids = read_lock(&state.node_port_nodes);
+    let policies = compiled_policies(state);
+    let mut sources = BTreeMap::new();
+    let mut policy_facts = BTreeMap::new();
+    let mut source_nodes = BTreeMap::new();
+    if revisions_ready {
+        for pod in pods.values().filter(|pod| {
+            !pod.host_network
+                && !pod.uid.is_empty()
+                && (!pod.ipv4_addresses.is_empty() || !pod.ipv6_addresses.is_empty())
+        }) {
+            let Some(node_name) = pod.node_name.as_ref() else {
+                continue;
+            };
+            let Some(topology_node) = nodes.get(node_name) else {
+                continue;
+            };
+            if !topology_node.ready
+                || topology_node
+                    .labels
+                    .get(PRIMARY_CNI_NODE_LABEL)
+                    .map(String::as_str)
+                    != Some(PRIMARY_CNI_NODE_LABEL_VALUE)
+            {
+                continue;
+            }
+            let Some(node_record) = node_uids.get(node_name) else {
+                continue;
+            };
+            let namespace_labels = namespaces.get(&pod.namespace).cloned().unwrap_or_else(|| {
+                BTreeMap::from([(
+                    "kubernetes.io/metadata.name".to_owned(),
+                    pod.namespace.clone(),
+                )])
+            });
+            let Some(intent) = model.intents.iter().find(|intent| {
+                let scope_matches = match &intent.owner.scope {
+                    unf_egress::EgressIntentScope::Cluster => true,
+                    unf_egress::EgressIntentScope::Namespace(namespace) => {
+                        namespace == &pod.namespace
+                    }
+                };
+                scope_matches
+                    && intent.source.matches(
+                        &namespace_labels,
+                        &pod.endpoint.labels,
+                        &pod.endpoint.service_account,
+                    )
+            }) else {
+                continue;
+            };
+            if !ready_leases.contains_key(&intent.owner) {
+                continue;
+            }
+            let endpoint = endpoint_with_namespace_labels(&pod.endpoint, &namespaces);
+            let applicable = policies
+                .iter()
+                .filter(|policy| {
+                    policy.direction == PolicyDirection::Egress
+                        && policy.enforcement_mode == unf_policy::PolicyEnforcementMode::Enforce
+                        && policy.target.matches(&endpoint)
+                })
+                .collect::<Vec<_>>();
+            let policy_allows_some_egress = applicable.is_empty()
+                || applicable.iter().any(|policy| {
+                    policy.default_action == PolicyAction::Allow
+                        || policy
+                            .rules
+                            .iter()
+                            .any(|rule| rule.action == PolicyAction::Allow)
+                });
+            if !policy_allows_some_egress {
+                continue;
+            }
+            let mut policy_ids = applicable
+                .iter()
+                .map(|policy| policy.id)
+                .collect::<Vec<_>>();
+            if policy_ids.is_empty() {
+                policy_ids.push(stable_policy_id("unf.internal/egress-default-allow-v1"));
+            }
+            policy_ids.sort_unstable();
+            policy_ids.dedup();
+            let source_node = EgressNode {
+                name: node_name.clone(),
+                uid: node_record.node_uid.clone(),
+                capabilities: capabilities.clone(),
+            };
+            source_nodes.insert(node_name.clone(), source_node.clone());
+            let source = unf_egress::EgressSourceFact {
+                identity: pod.endpoint.identity,
+                namespace: pod.namespace.clone(),
+                workload: pod
+                    .endpoint
+                    .application
+                    .clone()
+                    .unwrap_or_else(|| pod.name.clone()),
+                workload_uid: pod.uid.clone(),
+                service_account: pod.endpoint.service_account.clone(),
+                namespace_labels,
+                workload_labels: pod.endpoint.labels.clone(),
+                node: source_node,
+                intent_uid: intent.owner.uid.clone(),
+            };
+            sources
+                .entry((source.identity, node_name.clone()))
+                .or_insert(source);
+            policy_facts
+                .entry((pod.endpoint.identity, intent.owner.uid.clone()))
+                .or_insert(unf_egress::EgressPolicyFact {
+                    identity: pod.endpoint.identity,
+                    intent_uid: intent.owner.uid.clone(),
+                    allowed: true,
+                    policy_ids,
+                });
+        }
+    }
+    drop(node_uids);
+    drop(nodes);
+    drop(pods);
+    drop(namespaces);
+
+    let sources = sources.into_values().collect();
+    let policy_facts = policy_facts.into_values().collect();
+    let allocations = ready_leases
+        .values()
+        .map(|lease| unf_egress::EgressAllocationFact {
+            intent_uid: lease.intent.owner.uid.clone(),
+            pool_name: lease.pool.as_ref().map(|pool| pool.name.clone()),
+            pool_uid: lease.pool.as_ref().map(|pool| pool.uid.clone()),
+            addresses: lease.addresses.clone(),
+            lease_epoch: lease.lease_epoch,
+        })
+        .collect::<Vec<_>>();
+    let gateways = ready_records
+        .values()
+        .flat_map(|record| {
+            record.desired.nodes.iter().enumerate().map(|(rank, node)| {
+                unf_egress::EgressGatewayFact {
+                    intent_uid: record.desired.owner.uid.clone(),
+                    rank: u16::try_from(rank).unwrap_or(u16::MAX),
+                    node: node.clone(),
+                    lease_epoch: record.desired.lease_epoch,
+                    ready: true,
+                    reachable: true,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let facts = EgressContractFacts {
+        revisions,
+        sources,
+        policies: policy_facts,
+        allocations,
+        gateways,
+    };
+
+    let current = read_lock(&state.egress_source_distributions);
+    let unchanged = current.len() == source_nodes.len()
+        && source_nodes.iter().all(|(node_name, node)| {
+            current.get(node_name).is_some_and(|distribution| {
+                distribution.model == model
+                    && distribution.facts == facts
+                    && distribution.contract.node == *node
+            })
+        });
+    drop(current);
+    if unchanged {
+        return Ok(false);
+    }
+
+    let revision = {
+        let mut current = mutex_lock(&state.egress_source_distribution_revision);
+        *current = current.next();
+        *current
+    };
+    let mut distributions = BTreeMap::new();
+    for (node_name, node) in source_nodes {
+        let contract = EgressBehaviorContract::issue(&model, &facts, node, revision)
+            .context("issue watched-state egress behavior contract")?;
+        distributions.insert(
+            node_name,
+            EgressSourceDistribution {
+                revision,
+                model: model.clone(),
+                facts: facts.clone(),
+                contract,
+            },
+        );
+    }
+    reset_egress_contract_distributions_locked(state);
+    *write_lock(&state.egress_source_distributions) = distributions;
+    Ok(true)
+}
+
+fn reset_egress_contract_distributions_locked(state: &ControllerState) {
+    write_lock(&state.egress_pending_source_applications).clear();
+    write_lock(&state.egress_pending_gateway_applications).clear();
+    write_lock(&state.egress_gateway_applications).clear();
+    withdraw_all_admitted_egress_sources_locked(state);
+}
+
 fn invalidate_egress_distributions(state: &ControllerState) {
     let _guard = mutex_lock(&state.egress_distribution_guard);
+    invalidate_egress_distributions_locked(state);
+}
+
+fn invalidate_egress_distributions_locked(state: &ControllerState) {
     write_lock(&state.egress_source_distributions).clear();
     write_lock(&state.egress_pending_source_applications).clear();
     write_lock(&state.egress_pending_gateway_applications).clear();
@@ -6665,6 +6953,11 @@ async fn egress_source_projection(
     Json(advertisement): Json<EgressAgentAdvertisement>,
 ) -> Result<Response, ApiError> {
     let agent = authenticate_internal_agent(&state, &headers).await?;
+    reconcile_egress_source_distributions(&state).map_err(|error| {
+        ApiError::internal(format!(
+            "derive watched-state egress source distributions: {error}"
+        ))
+    })?;
     match egress_source_projection_for(&state, &agent, &advertisement)? {
         Some(envelope) => Ok(Json(envelope).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
@@ -7077,6 +7370,17 @@ fn consume_egress_release_authorities(state: &ControllerState) -> Result<(), Api
     state
         .egress_control_plane_dirty
         .store(true, Ordering::Release);
+    let resume_current_desired = {
+        let desired = mutex_lock(&state.egress_desired);
+        let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
+        desired.revision() == checkpoint.desired_revision
+            && desired.model() == &checkpoint.desired_model
+    };
+    if resume_current_desired {
+        reconcile_egress_control_plane_locked(state).map_err(|error| {
+            ApiError::internal(format!("resume desired egress after release: {error}"))
+        })?;
+    }
     Ok(())
 }
 
@@ -10926,6 +11230,148 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn watched_identity_allocation_and_ready_gateway_publish_exact_source_contract() {
+        let state = new_state(true);
+        write_lock(&state.namespaces).insert(
+            "payments".to_owned(),
+            BTreeMap::from([
+                (
+                    "kubernetes.io/metadata.name".to_owned(),
+                    "payments".to_owned(),
+                ),
+                ("team".to_owned(), "finance".to_owned()),
+            ]),
+        );
+        let identity = IdentityId::new(42);
+        let source = PodRecord {
+            namespace: "payments".to_owned(),
+            name: "ledger-0".to_owned(),
+            uid: "ledger-0-uid".to_owned(),
+            node_name: Some("worker-source".to_owned()),
+            host_network: false,
+            endpoint: Endpoint {
+                identity,
+                namespace: "payments".to_owned(),
+                namespace_labels: BTreeMap::new(),
+                service_account: "settlement".to_owned(),
+                application: Some("ledger".to_owned()),
+                labels: BTreeMap::from([("app".to_owned(), "ledger".to_owned())]),
+                named_ports: BTreeMap::new(),
+            },
+            ipv4_addresses: BTreeSet::from(["10.244.0.10".parse().unwrap()]),
+            ipv6_addresses: BTreeSet::new(),
+        };
+        write_lock(&state.pods).insert("payments/ledger-0".to_owned(), source);
+        mutex_lock(&state.identities)
+            .admit_pod(
+                "payments/ledger-0".to_owned(),
+                "payments-ledger".to_owned(),
+                &NetworkIdentity {
+                    id: identity,
+                    cluster: "local".to_owned(),
+                    namespace: "payments".to_owned(),
+                    workload: "ledger".to_owned(),
+                    service_account: "settlement".to_owned(),
+                    application: Some("ledger".to_owned()),
+                    labels: BTreeMap::from([("app".to_owned(), "ledger".to_owned())]),
+                },
+                ["10.244.0.10".parse().unwrap()],
+            )
+            .expect("admit source identity");
+        mutex_lock(&state.revisions).policy = Revision::new(1);
+        write_lock(&state.nodes).insert(
+            "worker-source".to_owned(),
+            TopologyNode {
+                name: "worker-source".to_owned(),
+                ready: true,
+                labels: BTreeMap::from([(
+                    PRIMARY_CNI_NODE_LABEL.to_owned(),
+                    PRIMARY_CNI_NODE_LABEL_VALUE.to_owned(),
+                )]),
+            },
+        );
+        write_lock(&state.node_port_nodes).insert(
+            "worker-source".to_owned(),
+            NodePortNodeRecord {
+                node_uid: "worker-source-uid".to_owned(),
+                revision: Revision::new(1),
+                addresses: Vec::new(),
+            },
+        );
+
+        apply_egress_pool_event(&state, Event::Apply(native_egress_pool("192.0.2.0/24")));
+        apply_egress_policy_event(&state, Event::Apply(native_egress_policy()));
+        let mut gateway = node(true);
+        gateway.metadata.labels.get_or_insert_default().extend([
+            (
+                PRIMARY_CNI_NODE_LABEL.to_owned(),
+                PRIMARY_CNI_NODE_LABEL_VALUE.to_owned(),
+            ),
+            (
+                EGRESS_GATEWAY_NODE_LABEL.to_owned(),
+                EGRESS_GATEWAY_NODE_LABEL_VALUE.to_owned(),
+            ),
+        ]);
+        apply_node_event(&state, Event::Apply(gateway));
+        let desired = mutex_lock(&state.egress_control_plane)
+            .checkpoint()
+            .gateways
+            .records[0]
+            .desired
+            .clone();
+        mutex_lock(&state.egress_control_plane)
+            .acknowledge_gateway(EgressGatewayAcknowledgement {
+                schema_version: EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
+                revision: desired.revision,
+                desired_revision: desired.revision,
+                allocation_revision: desired.allocation_revision,
+                owner: desired.owner.clone(),
+                provider: desired.provider.clone(),
+                lease_epoch: desired.lease_epoch,
+                outcome: EgressProviderOutcome::Ready,
+                nodes: desired.nodes.clone(),
+                error: None,
+            })
+            .expect("acknowledge gateway ownership");
+
+        assert!(reconcile_egress_source_distributions(&state).unwrap());
+        let distribution = read_lock(&state.egress_source_distributions)
+            .get("worker-source")
+            .cloned()
+            .expect("source Node receives a watched-state contract");
+        assert_eq!(distribution.contract.plans.len(), 1);
+        assert_eq!(distribution.contract.plans[0].source.identity, identity);
+        assert_eq!(
+            distribution.contract.plans[0].gateways[0].node.name,
+            "worker-a"
+        );
+        assert_eq!(distribution.contract.plans[0].allocation.addresses.len(), 2);
+        distribution
+            .contract
+            .verify(
+                &distribution.model,
+                &distribution.facts,
+                &distribution.contract.node,
+            )
+            .expect("published contract independently replays");
+        let revision = distribution.revision;
+        assert!(!reconcile_egress_source_distributions(&state).unwrap());
+        assert_eq!(
+            read_lock(&state.egress_source_distributions)["worker-source"].revision,
+            revision,
+            "an unchanged watched-state join is revision stable"
+        );
+
+        let mut not_ready = mutex_lock(&state.egress_control_plane).checkpoint();
+        not_ready.gateways.records[0].gateway = None;
+        *mutex_lock(&state.egress_control_plane) =
+            EgressControlPlane::restore(not_ready).expect("restore incomplete gateway evidence");
+        assert!(reconcile_egress_source_distributions(&state).unwrap());
+        assert!(read_lock(&state.egress_source_distributions).is_empty());
+    }
+
+    #[test]
     fn native_egress_watch_is_atomic_revisioned_relist_safe_and_durable() {
         let state = new_state(true);
         let pool = native_egress_pool("192.0.2.0/24");
@@ -11002,6 +11448,19 @@ mod tests {
         gateway.metadata.labels.get_or_insert_default().insert(
             PRIMARY_CNI_NODE_LABEL.to_owned(),
             PRIMARY_CNI_NODE_LABEL_VALUE.to_owned(),
+        );
+        apply_node_event(&state, Event::Apply(gateway.clone()));
+        assert!(
+            mutex_lock(&state.egress_control_plane)
+                .checkpoint()
+                .gateways
+                .records
+                .is_empty(),
+            "primary-CNI membership alone must not grant gateway authority"
+        );
+        gateway.metadata.labels.get_or_insert_default().insert(
+            EGRESS_GATEWAY_NODE_LABEL.to_owned(),
+            EGRESS_GATEWAY_NODE_LABEL_VALUE.to_owned(),
         );
         apply_node_event(&state, Event::Apply(gateway));
         let ensured = mutex_lock(&state.egress_control_plane).checkpoint();

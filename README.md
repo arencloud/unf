@@ -406,7 +406,7 @@ worker-agent replacement, exact cleanup, five-agent convergence, and unchanged
 `insights`/`network` unhealthy baseline passed
 `hack/verify-openshift-service-selection.sh`; ADR 0112.
 Phase 8 begins an identity-aware enterprise egress fabric. Milestones 8.1
-through 8.4a are verified. Source-side security policy precedes steering and NAT, while
+through 8.5 are verified. Source-side security policy precedes steering and NAT, while
 `unf-egress` now canonically validates bounded Namespace, workload, and
 ServiceAccount selectors, destinations, non-overlapping dual-stack pools, and
 pool or explicit multiple-address intent. The controller strictly translates
@@ -433,8 +433,8 @@ identities transition through a fail-closed fence, the original flow
 deterministically chooses a same-family address and ready gateway, and that
 gateway independently reproduces a strict contract-, lease-, identity-, and
 tuple-bound proof. Ten adversarial tests pass `make egress-proof-test`; ADR
-0118. The proof is provenance, never an identity credential. Milestone 8.5 is
-now in progress: authenticated gateway projections aggregate only admitted
+0118. The proof is provenance, never an identity credential. Milestone 8.5
+adds authenticated gateway projections that aggregate only admitted
 source contracts selecting that gateway, and exact route/interface/next-hop/
 transport/MTU certificates lower into asserted fixed-width ABI-v1 source,
 candidate, selection, connection, and event state. Userspace compiles 251
@@ -526,18 +526,27 @@ assembles the exact proof union. Schema-v2 address projections authorize only
 a monotonic host-address subset; all selected gateways must remove and read
 back the lease as absent before one atomic transaction releases gateway,
 allocation, and retirement state. The privileged gate passes `make
-egress-release-authority-test`; ADR 0133. Other reachability providers, HA
-failover, and platform dual-stack traffic remain explicit later
-gates, so missing proof still quarantines rather than releasing optimistically.
+egress-release-authority-test`; ADR 0133. Other reachability providers and HA
+failover remain explicit later gates, so missing proof still quarantines rather
+than releasing optimistically.
 Gateway NAT events are now a loss-explicit first-flow channel rather than a
 per-packet stream. ABI-v1 witnesses bind the original/translated tuple,
 identity, contract, lease, selected address/gateways, and proof; closed semantic
 validation rejects ambiguous records. Per-CPU attempted/drop counters make ring
 pressure measurable, and a real-kernel undersized-ring test proves telemetry
 loss cannot change forwarding. Fixed-cardinality agent metrics and the focused
-`make egress-nat-observability-test` gate verify this boundary; ADR 0134.
-Durable NAT history, HA failover, and platform dual-stack traffic remain later
-gates.
+`make egress-nat-observability-test` gate verifies this boundary; ADR 0134.
+The production reconciler now joins watched Pod/Namespace/ServiceAccount,
+identity, policy, allocation, gateway, and reachability facts into exact
+source-Node contracts. Explicit gateway labels prevent accidental scheduling,
+and leased IPv6 `/128`s gain lease-fenced proxy-NDP ownership on the native
+uplink. `make egress-kind-lifecycle-test` proves dual-stack UDP NAT and reverse
+traffic, exact translated witnesses, unrelated native source preservation,
+controller/agent recovery, complete withdrawal/drain, monotonic same-address
+reuse, and final cleanup on three-Node kube-proxy-free Kind. ADR 0135 closes
+milestone 8.5; durable enriched history, measured HA/failover, FQDN controls,
+production reachability providers, the full Phase 8 platform matrix, and
+OpenShift qualification remain later milestones.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
