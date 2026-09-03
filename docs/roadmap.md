@@ -632,6 +632,13 @@ matrix is maintained in the
   crash repair, cold reconstruction, strict checkpoints, and version-scoped
   cleanup pass `make egress-host-state-test`; ADR 0117. Live endpoint/storage
   integration and packet behavior begin in milestone 8.5.
+- Milestone 8.4a is verified. The default Egress Proof Chain fences explicit
+  intent before activation and during withdrawal, deterministically selects a
+  same-family address and ready gateway with rendezvous hashing, and commits the
+  authoritative identity, original tuple, full contract/revisions, lease,
+  choice, and witness for independent selected-gateway replay. Mutation and
+  unsupported inputs fail closed under `make egress-proof-test`; ADR 0118. It
+  defines reference/control semantics and makes no live packet-path claim.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

@@ -17,6 +17,7 @@ authoritative state remains in [project-status.md](../project-status.md).
 | 8.2a | Egress Behavior Contract and reference validator | **Verified** | Schema-v1 exact-Node plans bind selected source identity, original destinations, policy allow, exact pool/explicit allocation, lease-fenced ready/reachable ranked gateways, derived capabilities, and six independent revision domains. Independent replay, domain-separated SHA-256 digests, 16-byte witnesses, and bounded explicit single-gateway failure envelopes pass `make egress-contract-test`; ADR 0115 |
 | 8.3 | Durable allocation and gateway-provider contract | **Verified** | Schema-v1 allocation atomically assigns conflict-safe multiple IPv4/IPv6 addresses with exact owner/pool/provider provenance, bounded exhaustion, monotonic revisions/lease epochs, release/reuse, and strict checkpoint replay. Separate gateway/reachability provider interfaces, desired/ack revisions, epoch/address fencing, dual acknowledgement, safe withdrawal, and direct contract-fact projection pass `make egress-allocation-test`; ADR 0116 |
 | 8.4 | Transactional distribution and gateway host state | **Verified** | Schema-v1 projection binds the existing authenticated Pod/Node principal, negotiates exact contract/host capabilities, independently replays all facts, and fences last-known-good epochs/revisions. Separate userspace ABI-v1 host banks commit through stage/readback/prepare/activate, pointer rollback, exact current/pending recovery, cold reconstruction, and version-scoped cleanup; `make egress-host-state-test`; ADR 0117 |
+| 8.4a | Egress Proof Chain and zero-leak admission | **Verified** | Default `Native -> Fenced -> Active` admission prevents explicit-intent convergence/withdrawal leaks. Domain-separated rendezvous hashing deterministically selects same-family multiple addresses and ready gateways; a versioned proof binds the authoritative identity, original tuple, exact contract/revisions, lease, choice, and witness for independent selected-gateway replay. Ten adversarial tests and strict Clippy pass `make egress-proof-test`; ADR 0118 |
 | 8.5 | Live distribution, source steering, and gateway NAT dataplane | **Planned** | Controller/agent adapters and convergence first; then policy-first IPv4/IPv6 TCP/UDP steering, original identity/source witness, collision-safe SNAT/reverse state, fragments and unsupported protocols fail closed, and bounded event provenance without Linux-conntrack duplication by assumption |
 | 8.6 | Deterministic HA, failover, and multiple addresses | **Planned** | Lease-fenced gateway ownership, deterministic placement and failover, established-flow contract, bounded convergence, split-brain rejection, node drain/recovery, and measured disruption |
 | 8.7 | FQDN and internet-access controls | **Planned** | DNS-derived destination sets with bounded TTL/staleness/provenance, explicit wildcard semantics, fail-closed capacity behavior, IP fallback visibility, and no use of DNS names as workload identity |
@@ -58,10 +59,11 @@ For a new egress flow the order is fixed:
 1. resolve the source workload identity and direction;
 2. enforce source-side security policy against the original destination;
 3. match explicit egress intent and destination constraints;
-4. select a current owned address and lease-fenced ready gateway from a verified
-   contract;
-5. create bounded flow/NAT state and steer to that gateway; and
-6. publish the translated source only through an acknowledged reachability
+4. fence the identity until an exact admitted contract is active;
+5. deterministically select a current owned address and lease-fenced ready
+   gateway and derive the bilateral flow proof;
+6. create bounded flow/NAT state and steer to that gateway; and
+7. publish the translated source only through an acknowledged reachability
    provider.
 
 An existing validated flow follows its documented failover contract. A gateway
@@ -89,8 +91,9 @@ destination constraint with provenance and expiry, not a workload identity.
 Safe features are enabled by default only after their milestone is verified.
 Unowned traffic remains on native routing; no egress address, gateway, FQDN
 rule, BGP advertisement, or cross-cluster route is inferred. Explicit intent
-that cannot satisfy its contract fails closed without silently reverting to a
-different source address.
+is fenced by default before activation and whenever safe withdrawal begins.
+Intent that cannot satisfy its contract fails closed without silently reverting
+to native routing or a different source address.
 
 ## Explicit exclusions
 
@@ -102,8 +105,9 @@ HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.5 wires the admitted projection and host-state store into the live
-controller/agent path, defines a fixed-width BPF ABI, and implements policy-first
-dual-stack TCP/UDP source steering plus collision-safe gateway NAT/reverse state.
-Milestones 8.2–8.4 changed no current BPF ABI, host routing, live address
-ownership, watcher/RBAC behavior, packet behavior, or platform claim.
+Milestone 8.5 lowers the verified proof-chain semantics into bounded fixed-width
+BPF maps/tables, wires the admitted projection and host-state store into the live
+controller/agent path, and implements policy-first dual-stack TCP/UDP source
+steering plus collision-safe gateway NAT/reverse state. Milestones 8.2–8.4a
+changed no current BPF ABI, host routing, live address ownership, watcher/RBAC
+behavior, packet behavior, or platform claim.

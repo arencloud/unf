@@ -193,3 +193,12 @@ the previous bank. Startup commits a prepared winner or retains/reconstructs
 the current winner solely from pointer plus current/pending evidence; ambiguity
 fails closed. This state is intentionally separate from persistent BPF ABI v11
 until Phase 8.5 supplies a packet-consumed fixed-width layout; ADR 0117.
+
+Phase 8.4a adds an identity-indexed egress admission state machine outside the
+packet ABI. Explicit intent is installed as `Fenced` before it can become
+`Active`; withdrawal returns through the fence before an owner-matched release
+to native routing. An active state binds controller/projection/contract
+revisions, contract digest, and lease epoch. The accompanying flow proof is a
+deterministic commitment independently reproduced at the selected gateway, not
+stored authority or a bearer credential. Phase 8.5 must lower these semantics
+into bounded fixed-width state without weakening this ordering; ADR 0118.

@@ -404,7 +404,7 @@ worker-agent replacement, exact cleanup, five-agent convergence, and unchanged
 `insights`/`network` unhealthy baseline passed
 `hack/verify-openshift-service-selection.sh`; ADR 0112.
 Phase 8 begins an identity-aware enterprise egress fabric. Milestones 8.1
-through 8.2a are verified. Source-side security policy precedes steering and NAT, while
+through 8.4a are verified. Source-side security policy precedes steering and NAT, while
 `unf-egress` now canonically validates bounded Namespace, workload, and
 ServiceAccount selectors, destinations, non-overlapping dual-stack pools, and
 pool or explicit multiple-address intent. The controller strictly translates
@@ -425,9 +425,15 @@ authenticated Pod/Node principal, independently replays each exact-Node
 contract, and admits only that result into separate digest-bound userspace
 gateway banks. Staged readback, pointer rollback, strict checkpoints, crash
 repair, cold reconstruction, and version-scoped cleanup pass `make
-egress-host-state-test`; ADRs 0116–0117. Milestone 8.5 live distribution and
-dual-stack steering/NAT is next. No live egress address, packet-path, or platform
-claim is made yet.
+egress-host-state-test`; ADRs 0116–0117. Before freezing the packet ABI,
+milestone 8.4a adds the default Egress Proof Chain: explicitly managed
+identities transition through a fail-closed fence, the original flow
+deterministically chooses a same-family address and ready gateway, and that
+gateway independently reproduces a strict contract-, lease-, identity-, and
+tuple-bound proof. Ten adversarial tests pass `make egress-proof-test`; ADR
+0118. The proof is provenance, never an identity credential. Milestone 8.5 live
+distribution and dual-stack steering/NAT is next. No live egress address,
+packet-path, or platform claim is made yet.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

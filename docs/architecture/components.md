@@ -98,6 +98,13 @@ stage/readback/prepare/activate, last-known-good rollback, strict current/pendin
 checkpoints, crash repair, cold reconstruction, and version-scoped cleanup are
 owned behind a storage trait. Live controller/agent adapters and the consumable
 BPF layout remain milestone 8.5 work; ADR 0117.
+Before that layout is frozen, the default Egress Proof Chain gives every
+explicitly managed identity a `Native -> Fenced -> Active` admission lifecycle.
+The source deterministically selects a same-family address and ready gateway
+from the admitted contract and commits the authoritative identity, original
+tuple, contract/revisions, lease, selection, and witness. The selected gateway
+must independently reproduce the exact proof; proof bytes never establish
+identity. This reference/control contract changes no packet path; ADR 0118.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

@@ -17,12 +17,14 @@ mod contract;
 mod distribution;
 mod gateway;
 mod host_state;
+mod proof;
 
 pub use allocation::*;
 pub use contract::*;
 pub use distribution::*;
 pub use gateway::*;
 pub use host_state::*;
+pub use proof::*;
 
 pub const DEFAULT_EGRESS_INTENT_PRIORITY: u32 = 1_000;
 pub const MAX_EGRESS_POOLS: usize = 64;
