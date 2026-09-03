@@ -14,7 +14,7 @@ use crate::{
     MAX_EGRESS_INTENTS,
 };
 
-pub const EGRESS_GATEWAY_ADDRESS_SCHEMA_VERSION: u16 = 1;
+pub const EGRESS_GATEWAY_ADDRESS_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -29,6 +29,7 @@ pub struct EgressGatewayAddressProjection {
     pub revision: Revision,
     pub recipient: EgressProjectionRecipient,
     pub leases: Vec<EgressGatewayDesired>,
+    pub release_authorized_desired_revisions: Vec<Revision>,
     pub projection_digest: EgressGatewayAddressProjectionDigest,
 }
 
@@ -59,6 +60,7 @@ pub struct EgressGatewayAddressAcknowledgement {
     pub owned_addresses: Vec<IpAddr>,
     pub applied_desired_revisions: Vec<Revision>,
     pub quarantined_desired_revisions: Vec<Revision>,
+    pub released_desired_revisions: Vec<Revision>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -94,6 +96,21 @@ impl EgressGatewayAddressProjection {
         controller_epoch: u64,
         checkpoint: EgressGatewayCheckpoint,
     ) -> Result<Self, EgressGatewayAddressError> {
+        Self::issue_with_releases(principal, controller_epoch, checkpoint, Vec::new())
+    }
+
+    /// Filters desired state and binds explicit safe-release authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any release revision that is not an exact withdrawing lease in
+    /// this Node's projection.
+    pub fn issue_with_releases(
+        principal: &AuthenticatedEgressAgent,
+        controller_epoch: u64,
+        checkpoint: EgressGatewayCheckpoint,
+        mut release_authorized_desired_revisions: Vec<Revision>,
+    ) -> Result<Self, EgressGatewayAddressError> {
         validate_principal(principal)?;
         EgressGatewayRegistry::restore(checkpoint.clone())?;
         if controller_epoch == 0 || checkpoint.revision == Revision::INITIAL {
@@ -115,12 +132,14 @@ impl EgressGatewayAddressProjection {
             })
             .collect::<Vec<_>>();
         leases.sort_by(|left, right| left.owner.cmp(&right.owner));
+        release_authorized_desired_revisions.sort_unstable();
         let mut projection = Self {
             schema_version: EGRESS_GATEWAY_ADDRESS_SCHEMA_VERSION,
             controller_epoch,
             revision: checkpoint.revision,
             recipient,
             leases,
+            release_authorized_desired_revisions,
             projection_digest: EgressGatewayAddressProjectionDigest([0; 32]),
         };
         projection.validate_structure()?;
@@ -164,6 +183,18 @@ impl EgressGatewayAddressProjection {
             .leases
             .windows(2)
             .any(|pair| pair[0].owner >= pair[1].owner)
+            || self
+                .release_authorized_desired_revisions
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .release_authorized_desired_revisions
+                .iter()
+                .any(|revision| {
+                    !self.leases.iter().any(|lease| {
+                        lease.action == EgressGatewayAction::Withdraw && lease.revision == *revision
+                    })
+                })
         {
             return Err(EgressGatewayAddressError::InvalidLeaseOrder);
         }
@@ -184,6 +215,7 @@ impl EgressGatewayAddressProjection {
             self.revision,
             &self.recipient,
             &self.leases,
+            &self.release_authorized_desired_revisions,
         ))
         .map_err(|_| EgressGatewayAddressError::DigestMismatch)?;
         let mut hasher = Sha256::new();
@@ -229,14 +261,22 @@ impl EgressGatewayAddressAcknowledgement {
             quarantined_desired_revisions: projection
                 .leases
                 .iter()
-                .filter(|lease| lease.action == EgressGatewayAction::Withdraw)
+                .filter(|lease| {
+                    lease.action == EgressGatewayAction::Withdraw
+                        && projection
+                            .release_authorized_desired_revisions
+                            .binary_search(&lease.revision)
+                            .is_err()
+                })
                 .map(|lease| lease.revision)
                 .collect(),
+            released_desired_revisions: projection.release_authorized_desired_revisions.clone(),
         };
         acknowledgement.applied_desired_revisions.sort_unstable();
         acknowledgement
             .quarantined_desired_revisions
             .sort_unstable();
+        acknowledgement.released_desired_revisions.sort_unstable();
         acknowledgement.verify(admitted)?;
         Ok(acknowledgement)
     }
@@ -260,8 +300,19 @@ impl EgressGatewayAddressAcknowledgement {
         let expected_quarantined = projection
             .leases
             .iter()
-            .filter(|lease| lease.action == EgressGatewayAction::Withdraw)
+            .filter(|lease| {
+                lease.action == EgressGatewayAction::Withdraw
+                    && projection
+                        .release_authorized_desired_revisions
+                        .binary_search(&lease.revision)
+                        .is_err()
+            })
             .map(|lease| lease.revision)
+            .collect::<BTreeSet<_>>();
+        let expected_released = projection
+            .release_authorized_desired_revisions
+            .iter()
+            .copied()
             .collect::<BTreeSet<_>>();
         let owned = self
             .owned_addresses
@@ -271,7 +322,12 @@ impl EgressGatewayAddressAcknowledgement {
         let required = projection
             .leases
             .iter()
-            .filter(|lease| lease.action == EgressGatewayAction::Ensure)
+            .filter(|lease| {
+                projection
+                    .release_authorized_desired_revisions
+                    .binary_search(&lease.revision)
+                    .is_err()
+            })
             .flat_map(|lease| lease.addresses.iter().copied())
             .collect::<BTreeSet<_>>();
         if self.schema_version != EGRESS_GATEWAY_ADDRESS_SCHEMA_VERSION
@@ -296,6 +352,10 @@ impl EgressGatewayAddressAcknowledgement {
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
             || self
+                .released_desired_revisions
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
                 .applied_desired_revisions
                 .iter()
                 .copied()
@@ -307,7 +367,13 @@ impl EgressGatewayAddressAcknowledgement {
                 .copied()
                 .collect::<BTreeSet<_>>()
                 != expected_quarantined
-            || !required.is_subset(&owned)
+            || self
+                .released_desired_revisions
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                != expected_released
+            || required != owned
             || self.owned_addresses.len() > MAX_EGRESS_INTENTS * MAX_EGRESS_ADDRESSES_PER_INTENT
         {
             return Err(EgressGatewayAddressError::AcknowledgementMismatch);
@@ -445,6 +511,33 @@ mod tests {
         .unwrap();
         assert_eq!(ack.applied_desired_revisions.len(), 1);
         assert_eq!(ack.quarantined_desired_revisions.len(), 1);
+
+        let withdrawing_revision = admitted.projection().leases[1].revision;
+        let released = EgressGatewayAddressProjection::issue_with_releases(
+            &principal("a"),
+            7,
+            registry.checkpoint(),
+            vec![withdrawing_revision],
+        )
+        .unwrap()
+        .admit(&principal("a"))
+        .unwrap();
+        let released_ack = EgressGatewayAddressAcknowledgement::issue(
+            &released,
+            "unf-egress0".to_string(),
+            12,
+            1_500,
+            vec![
+                "192.0.2.20".parse().unwrap(),
+                "2001:db8::20".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            released_ack.released_desired_revisions,
+            vec![withdrawing_revision]
+        );
+        assert!(released_ack.quarantined_desired_revisions.is_empty());
 
         let mut incomplete = ack;
         incomplete.owned_addresses.remove(0);

@@ -628,7 +628,7 @@ impl GatewayAddressPlan {
     ///
     /// # Errors
     ///
-    /// Rejects an invalid Node UID, MTU, empty/oversized set, duplicates, and
+    /// Rejects an invalid Node UID, MTU, oversized set, duplicates, and
     /// addresses unsafe for external source ownership.
     pub fn new(node_uid: String, mtu: u32, addresses: Vec<IpAddr>) -> Result<Self, LinkError> {
         if node_uid.is_empty()
@@ -645,9 +645,9 @@ impl GatewayAddressPlan {
                 "MTU must be between {MIN_DUAL_STACK_MTU} and {MAX_MTU}"
             )));
         }
-        if addresses.is_empty() || addresses.len() > MAX_GATEWAY_ADDRESSES {
+        if addresses.len() > MAX_GATEWAY_ADDRESSES {
             return Err(LinkError::InvalidPlan(format!(
-                "gateway address set must contain 1..={MAX_GATEWAY_ADDRESSES} entries"
+                "gateway address set must contain 0..={MAX_GATEWAY_ADDRESSES} entries"
             )));
         }
         let address_count = addresses.len();
@@ -825,6 +825,88 @@ impl GatewayAddressPlan {
             })?;
         tokio::spawn(connection);
         self.readback_with_handle(&handle).await
+    }
+
+    /// Applies an explicitly authorized monotonic subset transition.
+    ///
+    /// The previous plan is independently read back before any removal. The
+    /// desired plan must retain the same Node ownership and may only remove
+    /// addresses. Exact replay is idempotent; a partial failure restores every
+    /// address already removed.
+    ///
+    /// # Errors
+    ///
+    /// Rejects ownership changes, additions, ambiguous current state, netlink
+    /// failures, or an inexact final readback.
+    pub async fn transition_from(
+        &self,
+        previous: &Self,
+    ) -> Result<GatewayAddressReadback, LinkError> {
+        if self.node_uid != previous.node_uid
+            || self.interface_name != previous.interface_name
+            || self.owner_alias != previous.owner_alias
+            || self.mtu != previous.mtu
+            || !self.addresses.is_subset(&previous.addresses)
+        {
+            return Err(LinkError::InvalidPlan(
+                "gateway address transition must be a same-owner monotonic subset".to_string(),
+            ));
+        }
+        let (connection, handle, _) =
+            new_connection().map_err(|source| LinkError::OpenNetlink {
+                operation: "open gateway-address transition connection",
+                source,
+            })?;
+        tokio::spawn(connection);
+        if let Ok(readback) = self.readback_with_handle(&handle).await {
+            return Ok(readback);
+        }
+        let prior = previous.readback_with_handle(&handle).await?;
+        let removing = previous
+            .addresses
+            .difference(&self.addresses)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut removed = Vec::new();
+        let mut stream = handle
+            .address()
+            .get()
+            .set_link_index_filter(prior.interface_index)
+            .execute();
+        while let Some(message) = stream
+            .try_next()
+            .await
+            .map_err(|source| LinkError::Netlink {
+                operation: "read gateway addresses for authorized transition",
+                source,
+            })?
+        {
+            let Some(address) = address_from_message(&message) else {
+                continue;
+            };
+            let assigned = AssignedAddress {
+                address,
+                prefix_len: message.header.prefix_len,
+            };
+            if !removing.contains(&assigned) {
+                continue;
+            }
+            if let Err(source) = handle.address().del(message).execute().await {
+                restore_gateway_addresses(&handle, prior.interface_index, &removed).await;
+                return Err(LinkError::Netlink {
+                    operation: "remove authorized gateway address",
+                    source,
+                });
+            }
+            removed.push(assigned);
+        }
+        match self.readback_with_handle(&handle).await {
+            Ok(readback) => Ok(readback),
+            Err(error) => {
+                restore_gateway_addresses(&handle, prior.interface_index, &removed).await;
+                Err(error)
+            }
+        }
     }
 
     /// Deletes the exact owned interface only after strict readback. Callers
@@ -1030,6 +1112,20 @@ async fn rollback_gateway_addresses(
         }) {
             let _ = handle.address().del(message).execute().await;
         }
+    }
+}
+
+async fn restore_gateway_addresses(
+    handle: &Handle,
+    interface_index: u32,
+    removed: &[AssignedAddress],
+) {
+    for assigned in removed {
+        let _ = handle
+            .address()
+            .add(interface_index, assigned.address, assigned.prefix_len)
+            .execute()
+            .await;
     }
 }
 
@@ -1536,7 +1632,6 @@ mod tests {
     #[test]
     fn gateway_address_plan_rejects_ambiguous_or_unsafe_ownership() {
         for addresses in [
-            Vec::new(),
             vec!["192.0.2.20".parse().unwrap(), "192.0.2.20".parse().unwrap()],
             vec!["127.0.0.2".parse().unwrap()],
             vec!["fe80::20".parse().unwrap()],
@@ -1544,6 +1639,7 @@ mod tests {
         ] {
             assert!(GatewayAddressPlan::new("node-uid-a".to_string(), 1_500, addresses).is_err());
         }
+        assert!(GatewayAddressPlan::new("node-uid-a".to_string(), 1_500, Vec::new()).is_ok());
         assert!(
             GatewayAddressPlan::new(String::new(), 1_500, vec!["192.0.2.20".parse().unwrap()])
                 .is_err()
@@ -1576,6 +1672,21 @@ mod tests {
             applied,
             "restart must reproduce exact ownership"
         );
+        let retained = GatewayAddressPlan::new(
+            "node-uid-a".to_string(),
+            1_500,
+            vec!["192.0.2.20".parse().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            retained
+                .transition_from(&plan)
+                .await
+                .expect("authorized subset transition")
+                .addresses,
+            retained.addresses
+        );
+        plan.apply().await.expect("restore full desired ownership");
 
         let (connection, handle, _) = new_connection().unwrap();
         tokio::spawn(connection);
@@ -1602,12 +1713,21 @@ mod tests {
         .await
         .expect_err("foreign address collision must fail before mutation");
         assert!(matches!(conflict, LinkError::LinkConflict { .. }));
+        let empty = GatewayAddressPlan::new("node-uid-a".to_string(), 1_500, Vec::new()).unwrap();
+        assert!(
+            empty
+                .transition_from(&plan)
+                .await
+                .expect("release every authorized address")
+                .addresses
+                .is_empty()
+        );
         assert_eq!(
-            plan.release().await.expect("release exact owned plan"),
+            empty.release().await.expect("release exact empty plan"),
             DeleteOutcome::Deleted
         );
         assert_eq!(
-            plan.release().await.expect("idempotent release"),
+            empty.release().await.expect("idempotent release"),
             DeleteOutcome::AlreadyAbsent
         );
     }

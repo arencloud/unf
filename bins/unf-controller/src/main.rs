@@ -48,7 +48,8 @@ use unf_egress::{
     EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
     EgressGatewayDrainEvidence, EgressGatewayProjection, EgressGatewayRetirementChallenges,
     EgressIntent, EgressIntentOwner, EgressModel, EgressNode, EgressNodeProjectionEnvelope,
-    EgressProviderOutcome, EgressProviderRef, EgressSourceActivationGrant,
+    EgressProviderOutcome, EgressProviderRef, EgressReachabilityAcknowledgement,
+    EgressSafeReleaseAuthority, EgressSourceActivationGrant,
     EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
     EgressSourceRetirementChallenges,
 };
@@ -324,6 +325,7 @@ struct ControllerState {
     egress_pending_gateway_applications: RwLock<BTreeMap<String, PendingEgressGatewayApplication>>,
     egress_gateway_applications: RwLock<BTreeMap<String, AppliedEgressGatewayApplication>>,
     egress_gateway_drains: RwLock<BTreeMap<(EgressIntentOwner, String), AppliedEgressGatewayDrain>>,
+    egress_release_authorities: RwLock<BTreeMap<EgressIntentOwner, EgressSafeReleaseAuthority>>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1538,6 +1540,7 @@ fn new_state_with_client_and_selector(
         egress_pending_gateway_applications: RwLock::new(BTreeMap::new()),
         egress_gateway_applications: RwLock::new(BTreeMap::new()),
         egress_gateway_drains: RwLock::new(BTreeMap::new()),
+        egress_release_authorities: RwLock::new(BTreeMap::new()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -3696,6 +3699,8 @@ fn reconcile_egress_control_plane(state: &ControllerState) -> Result<()> {
         next.register_retirement(&owner, &admitted_sources)
             .context("freeze exact admitted sources before egress withdrawal")?;
     }
+    acknowledge_static_egress_reachability(&mut next)
+        .context("acknowledge explicit static egress reachability")?;
     let changed = next.checkpoint() != before;
     *control_plane = next;
     drop(control_plane);
@@ -3713,6 +3718,36 @@ fn reconcile_egress_control_plane(state: &ControllerState) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn acknowledge_static_egress_reachability(control_plane: &mut EgressControlPlane) -> Result<bool> {
+    let acknowledgements = control_plane
+        .checkpoint()
+        .gateways
+        .records
+        .into_iter()
+        .filter(|record| record.desired.provider.name == "static")
+        .map(|record| EgressReachabilityAcknowledgement {
+            schema_version: EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
+            revision: record.desired.revision,
+            desired_revision: record.desired.revision,
+            allocation_revision: record.desired.allocation_revision,
+            owner: record.desired.owner,
+            provider: record.desired.provider,
+            lease_epoch: record.desired.lease_epoch,
+            outcome: match record.desired.action {
+                unf_egress::EgressGatewayAction::Ensure => EgressProviderOutcome::Ready,
+                unf_egress::EgressGatewayAction::Withdraw => EgressProviderOutcome::Withdrawn,
+            },
+            addresses: record.desired.addresses,
+            error: None,
+        })
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for acknowledgement in acknowledgements {
+        changed |= control_plane.acknowledge_reachability(acknowledgement)?;
+    }
+    Ok(changed)
 }
 
 fn invalidate_egress_distributions(state: &ControllerState) {
@@ -3743,6 +3778,18 @@ fn remove_node_egress_distributions(state: &ControllerState, source_node: &str) 
     write_lock(&state.egress_gateway_applications).remove(source_node);
     write_lock(&state.egress_gateway_drains)
         .retain(|(_, node), applied| node != source_node && applied.agent.node_name != source_node);
+    write_lock(&state.egress_release_authorities).retain(|_, authority| {
+        authority
+            .manifest
+            .gateways
+            .iter()
+            .all(|gateway| gateway.node_name != source_node)
+            && authority
+                .manifest
+                .sources
+                .iter()
+                .all(|source| source.recipient.node_name != source_node)
+    });
     write_lock(&state.egress_pending_gateway_addresses).remove(source_node);
     write_lock(&state.egress_gateway_address_applications).remove(source_node);
     write_lock(&state.egress_source_fences)
@@ -3763,6 +3810,18 @@ fn retain_node_egress_distributions(state: &ControllerState, live_nodes: &BTreeS
     write_lock(&state.egress_gateway_applications).retain(|node, _| live_nodes.contains(node));
     write_lock(&state.egress_gateway_drains).retain(|(_, node), applied| {
         live_nodes.contains(node) && live_nodes.contains(&applied.agent.node_name)
+    });
+    write_lock(&state.egress_release_authorities).retain(|_, authority| {
+        authority
+            .manifest
+            .gateways
+            .iter()
+            .all(|gateway| live_nodes.contains(&gateway.node_name))
+            && authority
+                .manifest
+                .sources
+                .iter()
+                .all(|source| live_nodes.contains(&source.recipient.node_name))
     });
     write_lock(&state.egress_pending_gateway_addresses).retain(|node, _| live_nodes.contains(node));
     write_lock(&state.egress_gateway_address_applications)
@@ -6759,6 +6818,7 @@ fn acknowledge_egress_source_fence_for(
             evidence: evidence.clone(),
         },
     );
+    refresh_egress_release_authorities(state);
     Ok(())
 }
 
@@ -6808,9 +6868,31 @@ fn egress_gateway_address_projection_for(
     if checkpoint.revision == Revision::INITIAL {
         return Ok(None);
     }
-    let projection =
-        EgressGatewayAddressProjection::issue(&principal, state.identity_epoch, checkpoint)
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+    let authorities = read_lock(&state.egress_release_authorities);
+    let release_revisions = checkpoint
+        .records
+        .iter()
+        .filter(|record| {
+            authorities
+                .get(&record.desired.owner)
+                .is_some_and(|authority| {
+                    authority.verify(&record.desired).is_ok()
+                        && authority.manifest.gateways.iter().any(|gateway| {
+                            gateway.node_name == principal.node_name
+                                && gateway.node_uid == principal.node_uid
+                        })
+                })
+        })
+        .map(|record| record.desired.revision)
+        .collect();
+    drop(authorities);
+    let projection = EgressGatewayAddressProjection::issue_with_releases(
+        &principal,
+        state.identity_epoch,
+        checkpoint,
+        release_revisions,
+    )
+    .map_err(|error| ApiError::internal(error.to_string()))?;
     if projection.leases.is_empty() {
         return Ok(None);
     }
@@ -6875,13 +6957,13 @@ fn acknowledge_ready_gateway_address_quorums(state: &ControllerState) -> Result<
     let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
     let pending = read_lock(&state.egress_pending_gateway_addresses);
     let applied = read_lock(&state.egress_gateway_address_applications);
-    let ready = checkpoint
+    let authorities = read_lock(&state.egress_release_authorities);
+    let acknowledgements = checkpoint
         .gateways
         .records
         .iter()
-        .filter(|record| record.desired.action == unf_egress::EgressGatewayAction::Ensure)
-        .filter(|record| {
-            record.desired.nodes.iter().all(|node| {
+        .filter_map(|record| {
+            let quorum = record.desired.nodes.iter().all(|node| {
                 let Some(pending) = pending.get(&node.name) else {
                     return false;
                 };
@@ -6892,30 +6974,46 @@ fn acknowledge_ready_gateway_address_quorums(state: &ControllerState) -> Result<
                     && agent_application_is_current(state, &applied.agent)
                     && pending.projection.projection().revision == checkpoint.gateways.revision
                     && applied.acknowledgement.verify(&pending.projection).is_ok()
-                    && applied
-                        .acknowledgement
-                        .applied_desired_revisions
-                        .contains(&record.desired.revision)
+                    && match record.desired.action {
+                        unf_egress::EgressGatewayAction::Ensure => applied
+                            .acknowledgement
+                            .applied_desired_revisions
+                            .contains(&record.desired.revision),
+                        unf_egress::EgressGatewayAction::Withdraw => {
+                            authorities.contains_key(&record.desired.owner)
+                                && applied
+                                    .acknowledgement
+                                    .released_desired_revisions
+                                    .contains(&record.desired.revision)
+                                && record.desired.addresses.iter().all(|address| {
+                                    !applied.acknowledgement.owned_addresses.contains(address)
+                                })
+                        }
+                    }
+            });
+            quorum.then(|| EgressGatewayAcknowledgement {
+                schema_version: EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
+                revision: record.desired.revision,
+                desired_revision: record.desired.revision,
+                allocation_revision: record.desired.allocation_revision,
+                owner: record.desired.owner.clone(),
+                provider: record.desired.provider.clone(),
+                lease_epoch: record.desired.lease_epoch,
+                outcome: match record.desired.action {
+                    unf_egress::EgressGatewayAction::Ensure => EgressProviderOutcome::Ready,
+                    unf_egress::EgressGatewayAction::Withdraw => EgressProviderOutcome::Withdrawn,
+                },
+                nodes: record.desired.nodes.clone(),
+                error: None,
             })
         })
-        .map(|record| EgressGatewayAcknowledgement {
-            schema_version: EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
-            revision: record.desired.revision,
-            desired_revision: record.desired.revision,
-            allocation_revision: record.desired.allocation_revision,
-            owner: record.desired.owner.clone(),
-            provider: record.desired.provider.clone(),
-            lease_epoch: record.desired.lease_epoch,
-            outcome: EgressProviderOutcome::Ready,
-            nodes: record.desired.nodes.clone(),
-            error: None,
-        })
         .collect::<Vec<_>>();
+    drop(authorities);
     drop(applied);
     drop(pending);
     let mut control_plane = mutex_lock(&state.egress_control_plane);
     let mut changed = false;
-    for acknowledgement in ready {
+    for acknowledgement in acknowledgements {
         changed |= control_plane
             .acknowledge_gateway(acknowledgement)
             .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -6925,6 +7023,56 @@ fn acknowledge_ready_gateway_address_quorums(state: &ControllerState) -> Result<
             .egress_control_plane_dirty
             .store(true, Ordering::Release);
     }
+    drop(control_plane);
+    consume_egress_release_authorities(state)?;
+    Ok(())
+}
+
+fn consume_egress_release_authorities(state: &ControllerState) -> Result<(), ApiError> {
+    let authorities = read_lock(&state.egress_release_authorities).clone();
+    if authorities.is_empty() {
+        return Ok(());
+    }
+    let mut control_plane = mutex_lock(&state.egress_control_plane);
+    let mut next = control_plane.clone();
+    let checkpoint = next.checkpoint();
+    let ready = authorities
+        .iter()
+        .filter(|(owner, _)| {
+            checkpoint
+                .gateways
+                .records
+                .iter()
+                .find(|record| &record.desired.owner == *owner)
+                .is_some_and(|record| {
+                    record.gateway.as_ref().is_some_and(|acknowledgement| {
+                        acknowledgement.outcome == EgressProviderOutcome::Withdrawn
+                    }) && record.reachability.as_ref().is_some_and(|acknowledgement| {
+                        acknowledgement.outcome == EgressProviderOutcome::Withdrawn
+                    })
+                })
+        })
+        .map(|(owner, authority)| (owner.clone(), authority.clone()))
+        .collect::<Vec<_>>();
+    for (_, authority) in &ready {
+        next.authorize_release(authority)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+    if ready.is_empty() {
+        return Ok(());
+    }
+    *control_plane = next;
+    drop(control_plane);
+    let released = ready
+        .into_iter()
+        .map(|(owner, _)| owner)
+        .collect::<BTreeSet<_>>();
+    write_lock(&state.egress_release_authorities).retain(|owner, _| !released.contains(owner));
+    write_lock(&state.egress_source_fences).retain(|(owner, _), _| !released.contains(owner));
+    write_lock(&state.egress_gateway_drains).retain(|(owner, _), _| !released.contains(owner));
+    state
+        .egress_control_plane_dirty
+        .store(true, Ordering::Release);
     Ok(())
 }
 
@@ -7116,7 +7264,54 @@ fn acknowledge_egress_gateway_drain_for(
             evidence: evidence.clone(),
         },
     );
+    refresh_egress_release_authorities(state);
     Ok(())
+}
+
+fn refresh_egress_release_authorities(state: &ControllerState) {
+    let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
+    let source_fences = read_lock(&state.egress_source_fences);
+    let gateway_drains = read_lock(&state.egress_gateway_drains);
+    let mut authorities = BTreeMap::new();
+    for manifest in checkpoint.retirements {
+        let Some(record) = checkpoint
+            .gateways
+            .records
+            .iter()
+            .find(|record| record.desired.owner == manifest.owner)
+        else {
+            continue;
+        };
+        let Some(reachability) = record
+            .reachability
+            .clone()
+            .filter(|acknowledgement| acknowledgement.outcome == EgressProviderOutcome::Withdrawn)
+        else {
+            continue;
+        };
+        let fences = source_fences
+            .iter()
+            .filter(|((owner, _), _)| owner == &manifest.owner)
+            .map(|(_, applied)| applied.evidence.clone())
+            .collect();
+        let drains = gateway_drains
+            .iter()
+            .filter(|((owner, _), _)| owner == &manifest.owner)
+            .map(|(_, applied)| applied.evidence.clone())
+            .collect();
+        if let Ok(authority) = EgressSafeReleaseAuthority::issue(
+            state.identity_epoch,
+            record.desired.revision,
+            &record.desired,
+            manifest,
+            fences,
+            drains,
+            reachability,
+        ) {
+            authorities.insert(record.desired.owner.clone(), authority);
+        }
+    }
+    *write_lock(&state.egress_release_authorities) = authorities;
 }
 
 fn egress_source_activation_grant_for(
@@ -10326,6 +10521,7 @@ mod tests {
             .facts
             .gateways
             .iter()
+            .take(1)
             .map(|gateway| gateway.node.clone())
             .collect();
         let mut control = EgressControlPlane::default();
@@ -10336,7 +10532,7 @@ mod tests {
                 &BTreeMap::from([(
                     owner.clone(),
                     EgressProviderRef {
-                        name: "native".to_owned(),
+                        name: "static".to_owned(),
                         instance: "test".to_owned(),
                     },
                 )]),
@@ -10354,6 +10550,11 @@ mod tests {
         control
             .register_retirement(&owner, std::slice::from_ref(&admitted))
             .expect("freeze admitted source set");
+        let withdrawing = control.checkpoint().gateways.records[0].desired.clone();
+        assert!(
+            acknowledge_static_egress_reachability(&mut control)
+                .expect("record independent static reachability withdrawal")
+        );
         *mutex_lock(&state.egress_control_plane) = control;
 
         let challenges = egress_source_retirements_for(&state, &source)
@@ -10421,6 +10622,37 @@ mod tests {
         acknowledge_egress_gateway_drain_for(&state, &gateway, &gateway_evidence)
             .expect("accept authenticated gateway drain");
         assert_eq!(read_lock(&state.egress_gateway_drains).len(), 1);
+        assert_eq!(read_lock(&state.egress_release_authorities).len(), 1);
+
+        let release_projection = egress_gateway_address_projection_for(&state, &gateway)
+            .expect("issue release-authorized address projection")
+            .expect("withdrawing address projection exists");
+        assert_eq!(
+            release_projection.release_authorized_desired_revisions,
+            vec![withdrawing.revision]
+        );
+        let pending_release = read_lock(&state.egress_pending_gateway_addresses)["gateway-a"]
+            .projection
+            .clone();
+        let release_acknowledgement = EgressGatewayAddressAcknowledgement::issue(
+            &pending_release,
+            "unf-egress0".to_owned(),
+            20,
+            1_500,
+            Vec::new(),
+        )
+        .expect("acknowledge exact released kernel address set");
+        acknowledge_egress_gateway_address_application_for(
+            &state,
+            &gateway,
+            &release_acknowledgement,
+        )
+        .expect("consume complete release authority");
+        let released = mutex_lock(&state.egress_control_plane).checkpoint();
+        assert!(released.retirements.is_empty());
+        assert!(released.gateways.records.is_empty());
+        assert!(released.allocation.leases.is_empty());
+        assert!(read_lock(&state.egress_release_authorities).is_empty());
         let mut gateway_replacement = gateway;
         gateway_replacement.pod_uid = "replacement-gateway-uid".to_owned();
         assert_eq!(

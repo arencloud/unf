@@ -509,16 +509,26 @@ manifests freeze the exact source/gateway/lease set, and address reuse requires
 complete source-fence, zero-flow gateway-drain, and exact
 withdrawn-reachability evidence. Provider acknowledgements, elapsed time,
 leadership, or inferred absence cannot release a lease. The domain/controller
-gate passes `make egress-safe-forgetting-test`; ADR 0130. Live agent/provider
-evidence transport, NAT events, HA failover, and platform dual-stack traffic
-are next, so production addresses remain quarantined rather than being
-released optimistically. Source-side transport is now the first live component:
+gate passes `make egress-safe-forgetting-test`; ADR 0130. Source-side transport
+is the first live component:
 the controller freezes admitted membership before invalidation and serves
 Pod/Node-bound retirement challenges; an agent responds only after atomically
 fencing its active bank and clearing source connection state. Replacement Pods,
 foreign Nodes, and stale controller epochs fail closed under `make
-egress-source-retirement-test`; ADR 0131. Gateway-drain and reachability
-producers still prevent final release.
+egress-source-retirement-test`; ADR 0131. Gateways now receive their own
+Node/Pod/epoch-bound challenges and retire only one absent lease at a time.
+They preserve every forward/reverse record if any is active, use the eBPF
+`CLOCK_BOOTTIME` lifetimes, and publish zero-flow evidence only after removing
+the entirely expired lease set and rescanning. This passes `make
+egress-gateway-retirement-test`; ADR 0132. Finally, explicit `static`
+reachability produces strict durable withdrawal evidence and the controller
+assembles the exact proof union. Schema-v2 address projections authorize only
+a monotonic host-address subset; all selected gateways must remove and read
+back the lease as absent before one atomic transaction releases gateway,
+allocation, and retirement state. The privileged gate passes `make
+egress-release-authority-test`; ADR 0133. Other reachability providers, NAT
+events, HA failover, and platform dual-stack traffic remain explicit later
+gates, so missing proof still quarantines rather than releasing optimistically.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

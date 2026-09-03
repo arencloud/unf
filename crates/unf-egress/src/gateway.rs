@@ -436,6 +436,7 @@ impl EgressGatewayRegistry {
         if !complete {
             return Err(EgressGatewayError::WithdrawalIncomplete(owner.clone()));
         }
+        self.revision = self.revision.next();
         self.records
             .remove(owner)
             .ok_or_else(|| EgressGatewayError::UnknownOwner(owner.clone()))

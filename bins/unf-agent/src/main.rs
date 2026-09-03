@@ -58,15 +58,15 @@ use unf_ebpf_common::{
     service_selection_tier_is_valid,
 };
 use unf_egress::{
-    AddressFamily as EgressAddressFamily, AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT,
-    EGRESS_AGENT_TOKEN_AUDIENCE, EGRESS_DISTRIBUTION_SCHEMA_VERSION,
-    EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard, EgressAgentAdvertisement,
-    EgressCapability, EgressDataplaneState, EgressGatewayAddressAcknowledgement,
-    EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
-    EgressGatewayDrainEvidence, EgressGatewayHostBank, EgressGatewayProjection,
-    EgressGatewayProjectionLedger, EgressGatewayRetirementChallenges, EgressNodeProjectionEnvelope,
-    EgressPathCertificate, EgressPathMode, EgressProjectionLedger, EgressSourceActivationGrant,
-    EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
+    AddressFamily as EgressAddressFamily, AdmittedEgressGatewayAddressProjection,
+    AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
+    EGRESS_DISTRIBUTION_SCHEMA_VERSION, EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard,
+    EgressAgentAdvertisement, EgressCapability, EgressDataplaneState,
+    EgressGatewayAddressAcknowledgement, EgressGatewayAddressProjection,
+    EgressGatewayApplicationAcknowledgement, EgressGatewayDrainEvidence, EgressGatewayHostBank,
+    EgressGatewayProjection, EgressGatewayProjectionLedger, EgressGatewayRetirementChallenges,
+    EgressNodeProjectionEnvelope, EgressPathCertificate, EgressPathMode, EgressProjectionLedger,
+    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
     EgressSourceRetirementChallenges, compile_egress_dataplane, compile_egress_gateway_dataplane,
 };
 use unf_ipam::{
@@ -8429,33 +8429,7 @@ async fn synchronize_egress_gateway_addresses(
     let admitted = projection
         .admit(&principal)
         .context("admit exact gateway-address projection")?;
-    let addresses = admitted
-        .projection()
-        .leases
-        .iter()
-        .flat_map(|lease| lease.addresses.iter().copied())
-        .collect::<BTreeSet<_>>();
-    if addresses.is_empty() {
-        bail!("gateway-address projection contains no owned or quarantined address");
-    }
-    let plan = GatewayAddressPlan::new(node.node_uid, 1_500, addresses.into_iter().collect())
-        .context("compile Node-UID-bound gateway-address plan")?;
-    let readback = plan
-        .apply()
-        .await
-        .context("apply and read back gateway-address ownership")?;
-    let acknowledgement = EgressGatewayAddressAcknowledgement::issue(
-        &admitted,
-        readback.interface_name,
-        readback.interface_index,
-        readback.mtu,
-        readback
-            .addresses
-            .into_iter()
-            .map(|address| address.address)
-            .collect(),
-    )
-    .context("build exact gateway-address application evidence")?;
+    let acknowledgement = apply_egress_gateway_address_projection(&admitted, node.node_uid).await?;
     synchronizer
         .client
         .current()
@@ -8474,10 +8448,72 @@ async fn synchronize_egress_gateway_addresses(
         addresses = acknowledgement.owned_addresses.len(),
         applied_leases = acknowledgement.applied_desired_revisions.len(),
         quarantined_leases = acknowledgement.quarantined_desired_revisions.len(),
+        released_leases = acknowledgement.released_desired_revisions.len(),
         interface_index = acknowledgement.interface_index,
         "applied lease-fenced gateway address ownership"
     );
     Ok(true)
+}
+
+async fn apply_egress_gateway_address_projection(
+    admitted: &AdmittedEgressGatewayAddressProjection,
+    node_uid: String,
+) -> Result<EgressGatewayAddressAcknowledgement> {
+    let all_addresses = admitted
+        .projection()
+        .leases
+        .iter()
+        .flat_map(|lease| lease.addresses.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if all_addresses.is_empty() {
+        bail!("gateway-address projection contains no owned or quarantined address");
+    }
+    let retained_addresses = admitted
+        .projection()
+        .leases
+        .iter()
+        .filter(|lease| {
+            admitted
+                .projection()
+                .release_authorized_desired_revisions
+                .binary_search(&lease.revision)
+                .is_err()
+        })
+        .flat_map(|lease| lease.addresses.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let previous_plan = GatewayAddressPlan::new(
+        node_uid.clone(),
+        1_500,
+        all_addresses.iter().copied().collect(),
+    )
+    .context("compile complete Node-UID-bound gateway-address plan")?;
+    let plan = GatewayAddressPlan::new(
+        node_uid,
+        1_500,
+        retained_addresses.iter().copied().collect(),
+    )
+    .context("compile release-authorized gateway-address plan")?;
+    let readback = if retained_addresses == all_addresses {
+        plan.apply()
+            .await
+            .context("apply and read back gateway-address ownership")?
+    } else {
+        plan.transition_from(&previous_plan)
+            .await
+            .context("apply and read back authorized gateway-address release")?
+    };
+    EgressGatewayAddressAcknowledgement::issue(
+        admitted,
+        readback.interface_name,
+        readback.interface_index,
+        readback.mtu,
+        readback
+            .addresses
+            .into_iter()
+            .map(|address| address.address)
+            .collect(),
+    )
+    .context("build exact gateway-address application evidence")
 }
 
 async fn synchronize_egress_source(
