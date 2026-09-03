@@ -2945,6 +2945,7 @@ dependencies = [
  "clap",
  "prometheus-client",
  "reqwest",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

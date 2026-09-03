@@ -46,9 +46,10 @@ use unf_egress::{
     EgressControlPlane, EgressControlPlaneCheckpoint, EgressDesiredCheckpoint, EgressDesiredStore,
     EgressDistributionError, EgressGatewayAcknowledgement, EgressGatewayAddressAcknowledgement,
     EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
-    EgressGatewayProjection, EgressIntent, EgressIntentOwner, EgressModel, EgressNode,
-    EgressNodeProjectionEnvelope, EgressProviderOutcome, EgressProviderRef,
-    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
+    EgressGatewayDrainEvidence, EgressGatewayProjection, EgressGatewayRetirementChallenges,
+    EgressIntent, EgressIntentOwner, EgressModel, EgressNode, EgressNodeProjectionEnvelope,
+    EgressProviderOutcome, EgressProviderRef, EgressSourceActivationGrant,
+    EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
     EgressSourceRetirementChallenges,
 };
 use unf_ipam::{
@@ -322,6 +323,7 @@ struct ControllerState {
         RwLock<BTreeMap<String, AppliedEgressGatewayAddressApplication>>,
     egress_pending_gateway_applications: RwLock<BTreeMap<String, PendingEgressGatewayApplication>>,
     egress_gateway_applications: RwLock<BTreeMap<String, AppliedEgressGatewayApplication>>,
+    egress_gateway_drains: RwLock<BTreeMap<(EgressIntentOwner, String), AppliedEgressGatewayDrain>>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -463,6 +465,12 @@ struct AppliedEgressSourceFence {
 struct AppliedEgressGatewayApplication {
     agent: AuthenticatedAgent,
     acknowledgement: EgressGatewayApplicationAcknowledgement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedEgressGatewayDrain {
+    agent: AuthenticatedAgent,
+    evidence: EgressGatewayDrainEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1216,6 +1224,14 @@ async fn spawn_internal_api(
             "/v1/state/egress-gateway-ack",
             post(acknowledge_egress_gateway_application),
         )
+        .route(
+            "/v1/state/egress-gateway-retirements",
+            get(egress_gateway_retirements),
+        )
+        .route(
+            "/v1/state/egress-gateway-drain",
+            post(acknowledge_egress_gateway_drain),
+        )
         .route("/v1/state/agents", post(ingest_agent_status))
         .route("/v1/telemetry/flows", post(ingest_flows))
         .with_state(state);
@@ -1521,6 +1537,7 @@ fn new_state_with_client_and_selector(
         egress_gateway_address_applications: RwLock::new(BTreeMap::new()),
         egress_pending_gateway_applications: RwLock::new(BTreeMap::new()),
         egress_gateway_applications: RwLock::new(BTreeMap::new()),
+        egress_gateway_drains: RwLock::new(BTreeMap::new()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -3724,6 +3741,8 @@ fn remove_node_egress_distributions(state: &ControllerState, source_node: &str) 
     write_lock(&state.egress_pending_source_applications).remove(source_node);
     write_lock(&state.egress_pending_gateway_applications).remove(source_node);
     write_lock(&state.egress_gateway_applications).remove(source_node);
+    write_lock(&state.egress_gateway_drains)
+        .retain(|(_, node), applied| node != source_node && applied.agent.node_name != source_node);
     write_lock(&state.egress_pending_gateway_addresses).remove(source_node);
     write_lock(&state.egress_gateway_address_applications).remove(source_node);
     write_lock(&state.egress_source_fences)
@@ -3742,6 +3761,9 @@ fn retain_node_egress_distributions(state: &ControllerState, live_nodes: &BTreeS
     write_lock(&state.egress_pending_gateway_applications)
         .retain(|node, _| live_nodes.contains(node));
     write_lock(&state.egress_gateway_applications).retain(|node, _| live_nodes.contains(node));
+    write_lock(&state.egress_gateway_drains).retain(|(_, node), applied| {
+        live_nodes.contains(node) && live_nodes.contains(&applied.agent.node_name)
+    });
     write_lock(&state.egress_pending_gateway_addresses).retain(|node, _| live_nodes.contains(node));
     write_lock(&state.egress_gateway_address_applications)
         .retain(|node, _| live_nodes.contains(node));
@@ -6992,6 +7014,111 @@ fn acknowledge_egress_gateway_application_for(
     Ok(())
 }
 
+async fn egress_gateway_retirements(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<EgressGatewayRetirementChallenges>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    egress_gateway_retirements_for(&state, &agent).map(Json)
+}
+
+fn egress_gateway_retirements_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+) -> Result<EgressGatewayRetirementChallenges, ApiError> {
+    let principal = egress_principal_for(state, agent)?;
+    let manifests = mutex_lock(&state.egress_control_plane)
+        .checkpoint()
+        .retirements
+        .into_iter()
+        .filter(|manifest| {
+            manifest.gateways.iter().any(|gateway| {
+                gateway.node_name == principal.node_name && gateway.node_uid == principal.node_uid
+            })
+        })
+        .collect();
+    EgressGatewayRetirementChallenges::issue(state.identity_epoch, manifests)
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+async fn acknowledge_egress_gateway_drain(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(evidence): Json<EgressGatewayDrainEvidence>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    acknowledge_egress_gateway_drain_for(&state, &agent, &evidence)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn acknowledge_egress_gateway_drain_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    evidence: &EgressGatewayDrainEvidence,
+) -> Result<(), ApiError> {
+    let principal = egress_principal_for(state, agent)?;
+    if evidence.recipient.node_name != principal.node_name
+        || evidence.recipient.node_uid != principal.node_uid
+        || evidence.controller_epoch != state.identity_epoch
+        || !agent_application_is_current(state, agent)
+    {
+        return Err(ApiError::forbidden(
+            "gateway-drain evidence does not match the current authenticated agent",
+        ));
+    }
+    let manifest = mutex_lock(&state.egress_control_plane)
+        .checkpoint()
+        .retirements
+        .into_iter()
+        .find(|manifest| manifest.owner == evidence.owner)
+        .ok_or_else(|| {
+            ApiError::bad_request("gateway-drain evidence has no retained retirement manifest")
+        })?;
+    evidence
+        .verify_manifest(&manifest)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+
+    let _guard = mutex_lock(&state.egress_distribution_guard);
+    let pending = read_lock(&state.egress_pending_gateway_applications)
+        .get(&agent.node_name)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::service_unavailable("no issued gateway projection awaits drain evidence")
+        })?;
+    let applied = read_lock(&state.egress_gateway_applications)
+        .get(&agent.node_name)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::service_unavailable("gateway projection has no application acknowledgement")
+        })?;
+    let lease_is_absent = pending
+        .projection
+        .projection()
+        .source_contracts
+        .iter()
+        .flat_map(|contract| &contract.plans)
+        .all(|plan| {
+            plan.intent != evidence.owner || plan.allocation.lease_epoch != evidence.lease_epoch
+        });
+    if pending.agent != *agent || applied.agent != *agent || !lease_is_absent {
+        return Err(ApiError::forbidden(
+            "gateway drain requires this Pod's current projection to exclude the retired lease",
+        ));
+    }
+    applied
+        .acknowledgement
+        .verify(&pending.projection)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    write_lock(&state.egress_gateway_drains).insert(
+        (manifest.owner, agent.node_name.clone()),
+        AppliedEgressGatewayDrain {
+            agent: agent.clone(),
+            evidence: evidence.clone(),
+        },
+    );
+    Ok(())
+}
+
 fn egress_source_activation_grant_for(
     state: &ControllerState,
     agent: &AuthenticatedAgent,
@@ -10170,7 +10297,8 @@ mod tests {
     }
 
     #[test]
-    fn egress_source_retirement_is_node_bound_exact_and_replayable() {
+    #[allow(clippy::too_many_lines)]
+    fn egress_retirement_evidence_is_node_bound_exact_and_requires_applied_withdrawal() {
         let state = new_state(true);
         let advertisement = egress_advertisement();
         let distribution = gateway_source_distribution(&advertisement);
@@ -10241,11 +10369,63 @@ mod tests {
         acknowledge_egress_source_fence_for(&state, &source, &evidence)
             .expect("accept authenticated source fence");
         assert_eq!(read_lock(&state.egress_source_fences).len(), 1);
-        let mut replacement = source;
+        let mut replacement = source.clone();
         replacement.pod_uid = "replacement-uid".to_owned();
         assert_eq!(
             acknowledge_egress_source_fence_for(&state, &replacement, &evidence)
                 .expect_err("replacement Pod cannot inherit fence evidence")
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let gateway = authenticated_egress_agent("gateway-a");
+        write_lock(&state.node_port_nodes).insert(
+            gateway.node_name.clone(),
+            NodePortNodeRecord {
+                node_uid: "gateway-a-uid".to_owned(),
+                revision: Revision::new(1),
+                addresses: Vec::new(),
+            },
+        );
+        record_current_egress_agents(&state, &[&gateway]);
+        let gateway_challenges = egress_gateway_retirements_for(&state, &gateway)
+            .expect("fetch Node-scoped gateway retirement challenge");
+        assert_eq!(gateway_challenges.manifests.len(), 1);
+        let gateway_evidence = EgressGatewayDrainEvidence::issue_for_challenge(
+            &gateway_challenges,
+            &gateway_challenges.manifests[0],
+            gateway_challenges.manifests[0].gateways[0].clone(),
+            0,
+            true,
+        )
+        .expect("build exact zero-flow gateway evidence");
+        assert_eq!(
+            acknowledge_egress_gateway_drain_for(&state, &gateway, &gateway_evidence)
+                .expect_err("a zero-flow claim alone is not application evidence")
+                .status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        mutex_lock(&state.egress_gateway_distributions).revision = Revision::new(1);
+        let projection = egress_gateway_projection_for(&state, &gateway, &advertisement)
+            .expect("issue empty gateway projection")
+            .expect("withdrawal projection exists");
+        assert!(projection.source_contracts.is_empty());
+        let pending = read_lock(&state.egress_pending_gateway_applications)["gateway-a"]
+            .projection
+            .clone();
+        let acknowledgement = EgressGatewayApplicationAcknowledgement::issue(&pending)
+            .expect("acknowledge explicit empty projection");
+        acknowledge_egress_gateway_application_for(&state, &gateway, &acknowledgement)
+            .expect("record applied empty projection");
+        acknowledge_egress_gateway_drain_for(&state, &gateway, &gateway_evidence)
+            .expect("accept authenticated gateway drain");
+        assert_eq!(read_lock(&state.egress_gateway_drains).len(), 1);
+        let mut gateway_replacement = gateway;
+        gateway_replacement.pod_uid = "replacement-gateway-uid".to_owned();
+        assert_eq!(
+            acknowledge_egress_gateway_drain_for(&state, &gateway_replacement, &gateway_evidence,)
+                .expect_err("replacement Pod cannot inherit gateway drain evidence")
                 .status,
             StatusCode::FORBIDDEN
         );

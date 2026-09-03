@@ -680,13 +680,13 @@ mod tests {
         assert_eq!(control.checkpoint().allocation.leases.len(), 1);
 
         assert!(matches!(
-            EgressGatewayDrainEvidence::issue(&desired, recipient(&desired.nodes[0]), 1, true,),
+            EgressGatewayDrainEvidence::issue(7, &desired, recipient(&desired.nodes[0]), 1, true,),
             Err(EgressSafeForgettingError::EvidenceMismatch)
         ));
         let manifest = EgressRetirementManifest::issue(&desired, &[])
             .expect("an unregistered empty source set can be sealed but is not authority");
         let gateway_drain =
-            EgressGatewayDrainEvidence::issue(&desired, recipient(&desired.nodes[0]), 0, true)
+            EgressGatewayDrainEvidence::issue(7, &desired, recipient(&desired.nodes[0]), 0, true)
                 .expect("withdrawn gateway has no retained connections");
         let authority = EgressSafeReleaseAuthority::issue(
             7,

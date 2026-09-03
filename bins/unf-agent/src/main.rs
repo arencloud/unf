@@ -30,6 +30,7 @@ use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
+use rustix::time::{ClockId, clock_gettime};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
@@ -61,8 +62,9 @@ use unf_egress::{
     EGRESS_AGENT_TOKEN_AUDIENCE, EGRESS_DISTRIBUTION_SCHEMA_VERSION,
     EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard, EgressAgentAdvertisement,
     EgressCapability, EgressDataplaneState, EgressGatewayAddressAcknowledgement,
-    EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement, EgressGatewayHostBank,
-    EgressGatewayProjection, EgressGatewayProjectionLedger, EgressNodeProjectionEnvelope,
+    EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
+    EgressGatewayDrainEvidence, EgressGatewayHostBank, EgressGatewayProjection,
+    EgressGatewayProjectionLedger, EgressGatewayRetirementChallenges, EgressNodeProjectionEnvelope,
     EgressPathCertificate, EgressPathMode, EgressProjectionLedger, EgressSourceActivationGrant,
     EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
     EgressSourceRetirementChallenges, compile_egress_dataplane, compile_egress_gateway_dataplane,
@@ -8742,6 +8744,7 @@ async fn synchronize_egress_gateway(
         .context("fence selected-gateway projection revision")?;
     if next.current() == synchronizer.gateway_ledger.current() {
         publish_egress_gateway_acknowledgement(synchronizer, &acknowledgement).await?;
+        publish_egress_gateway_retirement_evidence(synchronizer).await?;
         return Ok(false);
     }
     let current = next
@@ -8757,6 +8760,7 @@ async fn synchronize_egress_gateway(
     let withdrawal = current.is_withdrawal();
     synchronizer.gateway_ledger = next;
     publish_egress_gateway_acknowledgement(synchronizer, &acknowledgement).await?;
+    publish_egress_gateway_retirement_evidence(synchronizer).await?;
     info!(
         revision,
         contracts, sources, withdrawal, "authenticated selected-gateway projection admitted"
@@ -8872,6 +8876,149 @@ async fn publish_egress_gateway_acknowledgement(
         .error_for_status()
         .context("controller rejected egress gateway application acknowledgement")?;
     Ok(())
+}
+
+async fn publish_egress_gateway_retirement_evidence(
+    synchronizer: &mut EgressSynchronizer,
+) -> Result<()> {
+    let Some(current) = synchronizer.gateway_ledger.current().cloned() else {
+        return Ok(());
+    };
+    let recipient = current.recipient.clone();
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("egress gateway retirement requires a controller URL")?
+        .to_owned();
+    let response = authenticated_get(
+        &synchronizer.client,
+        format!("{controller_url}/v1/state/egress-gateway-retirements"),
+        &synchronizer.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request authenticated egress gateway retirement challenges")?;
+    let challenges: EgressGatewayRetirementChallenges = response
+        .error_for_status()
+        .context("controller rejected egress gateway retirement request")?
+        .json()
+        .await
+        .context("decode egress gateway retirement challenges")?;
+    challenges
+        .verify()
+        .context("verify egress gateway retirement challenges")?;
+    for manifest in &challenges.manifests {
+        let lease_is_absent = current
+            .source_contracts
+            .iter()
+            .flat_map(|contract| &contract.plans)
+            .all(|plan| {
+                plan.intent != manifest.owner || plan.allocation.lease_epoch != manifest.lease_epoch
+            });
+        if !lease_is_absent {
+            continue;
+        }
+        if !drain_expired_egress_gateway_lease(&mut synchronizer.connections, manifest.lease_epoch)?
+        {
+            continue;
+        }
+        let evidence = EgressGatewayDrainEvidence::issue_for_challenge(
+            &challenges,
+            manifest,
+            recipient.clone(),
+            0,
+            true,
+        )
+        .context("build lease-specific zero-flow gateway-drain evidence")?;
+        synchronizer
+            .client
+            .current()
+            .post(format!("{controller_url}/v1/state/egress-gateway-drain"))
+            .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+            .json(&evidence)
+            .send()
+            .await
+            .context("publish authenticated egress gateway-drain evidence")?
+            .error_for_status()
+            .context("controller rejected egress gateway-drain evidence")?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EgressGatewayDrainPlan {
+    Active(usize),
+    Remove(Vec<[u8; 44]>),
+}
+
+fn plan_egress_gateway_lease_drain(
+    connections: &BTreeMap<[u8; 44], [u8; 208]>,
+    lease_epoch: u64,
+    now_ns: u64,
+) -> Result<EgressGatewayDrainPlan> {
+    let mut lease_keys = Vec::new();
+    let mut active = 0_usize;
+    for (key, value) in connections {
+        validate_recovered_egress_connection(key, value)?;
+        if u64::from_ne_bytes(value[16..24].try_into().expect("fixed lease epoch")) != lease_epoch {
+            continue;
+        }
+        lease_keys.push(*key);
+        let last_seen_ns =
+            u64::from_ne_bytes(value[0..8].try_into().expect("fixed last-seen time"));
+        let timeout_ns = unf_ebpf_common::connection_timeout_ns(value[202])
+            .context("validated egress protocol has no connection timeout")?;
+        if now_ns.saturating_sub(last_seen_ns) <= timeout_ns {
+            active += 1;
+        }
+    }
+    if active == 0 {
+        Ok(EgressGatewayDrainPlan::Remove(lease_keys))
+    } else {
+        Ok(EgressGatewayDrainPlan::Active(active))
+    }
+}
+
+fn snapshot_egress_connections(
+    connections: &AyaHashMap<MapData, [u8; 44], [u8; 208]>,
+) -> Result<BTreeMap<[u8; 44], [u8; 208]>> {
+    connections
+        .into_iter()
+        .map(|entry| entry.context("iterate persistent egress connections"))
+        .collect()
+}
+
+fn boot_time_ns() -> Result<u64> {
+    let now = clock_gettime(ClockId::Boottime);
+    let seconds = u64::try_from(now.tv_sec).context("CLOCK_BOOTTIME returned negative seconds")?;
+    let nanoseconds =
+        u64::try_from(now.tv_nsec).context("CLOCK_BOOTTIME returned negative nanoseconds")?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .context("CLOCK_BOOTTIME nanoseconds overflowed")
+}
+
+fn drain_expired_egress_gateway_lease(
+    connections: &mut AyaHashMap<MapData, [u8; 44], [u8; 208]>,
+    lease_epoch: u64,
+) -> Result<bool> {
+    let snapshot = snapshot_egress_connections(connections)?;
+    let EgressGatewayDrainPlan::Remove(keys) =
+        plan_egress_gateway_lease_drain(&snapshot, lease_epoch, boot_time_ns()?)?
+    else {
+        return Ok(false);
+    };
+    for key in keys {
+        connections
+            .remove(&key)
+            .context("remove expired lease-bound egress connection")?;
+    }
+    let verified = snapshot_egress_connections(connections)?;
+    Ok(matches!(
+        plan_egress_gateway_lease_drain(&verified, lease_epoch, boot_time_ns()?)?,
+        EgressGatewayDrainPlan::Remove(keys) if keys.is_empty()
+    ))
 }
 
 fn egress_authority_is_current(
@@ -19325,6 +19472,77 @@ mod tests {
         value[120] = 0;
         value[121..152].fill(0);
         assert!(validate_recovered_egress_connection(&forward, &value).is_err());
+    }
+
+    #[test]
+    fn gateway_retirement_preserves_active_pairs_and_collects_only_one_expired_lease() {
+        fn pair(lease_epoch: u64, last_seen_ns: u64, identity: u32) -> Vec<([u8; 44], [u8; 208])> {
+            let source = [10, 0, 0, u8::try_from(identity).unwrap_or(8)];
+            let destination = [203, 0, 113, 9];
+            let translated = [198, 51, 100, u8::try_from(identity).unwrap_or(10)];
+            let mut value = [0_u8; 208];
+            value[0..8].copy_from_slice(&last_seen_ns.to_ne_bytes());
+            value[8..16].copy_from_slice(&13_u64.to_ne_bytes());
+            value[16..24].copy_from_slice(&lease_epoch.to_ne_bytes());
+            value[24..28].copy_from_slice(&source);
+            value[40..44].copy_from_slice(&destination);
+            value[56..60].copy_from_slice(&translated);
+            value[104..120].fill(0x11);
+            value[120..152].fill(0x22);
+            value[152..168].fill(0x33);
+            value[168..184].fill(0x44);
+            value[184..188].copy_from_slice(&identity.to_ne_bytes());
+            value[188..190].copy_from_slice(&40_000_u16.to_be_bytes());
+            value[190..192].copy_from_slice(&443_u16.to_be_bytes());
+            value[192..194].copy_from_slice(&50_000_u16.to_be_bytes());
+            value[200..202].copy_from_slice(&EGRESS_MAP_ABI_VERSION.to_ne_bytes());
+            value[202] = 6;
+            value[203] = 4;
+
+            let mut forward = [0_u8; 44];
+            forward[0..4].copy_from_slice(&source);
+            forward[16..20].copy_from_slice(&destination);
+            forward[32..34].copy_from_slice(&40_000_u16.to_be_bytes());
+            forward[34..36].copy_from_slice(&443_u16.to_be_bytes());
+            forward[36..40].copy_from_slice(&identity.to_ne_bytes());
+            forward[40] = 6;
+            forward[41] = 4;
+            forward[42] = unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD;
+
+            let mut reverse = [0_u8; 44];
+            reverse[0..4].copy_from_slice(&destination);
+            reverse[16..20].copy_from_slice(&translated);
+            reverse[32..34].copy_from_slice(&443_u16.to_be_bytes());
+            reverse[34..36].copy_from_slice(&50_000_u16.to_be_bytes());
+            reverse[40] = 6;
+            reverse[41] = 4;
+            reverse[42] = unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE;
+            vec![(forward, value), (reverse, value)]
+        }
+
+        let now_ns = unf_ebpf_common::CONNECTION_TCP_TIMEOUT_NS + 100;
+        let mut connections = BTreeMap::new();
+        connections.extend(pair(7, now_ns, 42));
+        connections.extend(pair(8, 0, 43));
+        assert_eq!(
+            plan_egress_gateway_lease_drain(&connections, 7, now_ns).unwrap(),
+            EgressGatewayDrainPlan::Active(2)
+        );
+        let EgressGatewayDrainPlan::Remove(expired) =
+            plan_egress_gateway_lease_drain(&connections, 8, now_ns).unwrap()
+        else {
+            panic!("expired lease must be removable");
+        };
+        assert_eq!(expired.len(), 2);
+        assert!(
+            expired
+                .iter()
+                .all(|key| connections[key][16..24] == 8_u64.to_ne_bytes())
+        );
+
+        let mut corrupt = connections;
+        corrupt.values_mut().next().expect("connection exists")[206] = 1;
+        assert!(plan_egress_gateway_lease_drain(&corrupt, 8, now_ns).is_err());
     }
 
     #[test]
