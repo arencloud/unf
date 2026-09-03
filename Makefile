@@ -3,6 +3,7 @@
 .PHONY: egress-ha-planner-test
 .PHONY: egress-ha-promotion-test
 .PHONY: egress-ha-continuity-test
+.PHONY: egress-ha-live-ownership-test
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -202,6 +203,13 @@ egress-ha-continuity-test: egress-ha-promotion-test
 	hack/verify-egress-ha-continuity.sh
 	cargo test -p unf-egress ha_continuity::tests
 	cargo clippy -p unf-egress --all-targets --all-features -- -D warnings
+
+egress-ha-live-ownership-test: egress-ha-continuity-test
+	hack/verify-egress-ha-live-ownership.sh
+	cargo test -p unf-egress --no-fail-fast
+	cargo test -p unf-controller --no-fail-fast
+	cargo test -p unf-agent --no-fail-fast
+	cargo clippy -p unf-agent -p unf-controller -p unf-ebpf-common -p unf-egress -p unf-link --all-targets --all-features -- -D warnings
 
 test:
 	cargo test --workspace

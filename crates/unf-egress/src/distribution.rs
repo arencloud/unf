@@ -14,13 +14,13 @@ use unf_common::Revision;
 
 use crate::{
     EGRESS_BEHAVIOR_CONTRACT_SCHEMA_VERSION, EgressBehaviorContract, EgressCapability,
-    EgressContractDigest, EgressContractError, EgressContractFacts, EgressFlowProof, EgressModel,
-    EgressNode, EgressOriginalFlow, EgressProofError, MAX_EGRESS_CONTRACT_PLANS,
+    EgressContractDigest, EgressContractError, EgressContractFacts, EgressFlowProof, EgressHaPlan,
+    EgressModel, EgressNode, EgressOriginalFlow, EgressProofError, MAX_EGRESS_CONTRACT_PLANS,
     MAX_EGRESS_GATEWAY_NODES,
 };
 
-pub const EGRESS_DISTRIBUTION_SCHEMA_VERSION: u16 = 1;
-pub const EGRESS_HOST_STATE_SCHEMA_VERSION: u16 = 1;
+pub const EGRESS_DISTRIBUTION_SCHEMA_VERSION: u16 = 2;
+pub const EGRESS_HOST_STATE_SCHEMA_VERSION: u16 = 2;
 pub const EGRESS_APPLICATION_ACK_SCHEMA_VERSION: u16 = 1;
 pub const EGRESS_SOURCE_ACTIVATION_SCHEMA_VERSION: u16 = 1;
 pub const MAX_EGRESS_ADVERTISED_SCHEMAS: usize = 8;
@@ -74,6 +74,7 @@ pub struct EgressNodeProjection {
     pub recipient: EgressProjectionRecipient,
     pub negotiated: EgressNegotiatedCapabilities,
     pub contract: EgressBehaviorContract,
+    pub ha_plans: Vec<EgressHaPlan>,
 }
 
 /// Self-contained source projection wire envelope. The model and independently
@@ -119,6 +120,7 @@ pub struct EgressGatewayProjection {
     pub negotiated: EgressNegotiatedCapabilities,
     pub gateway: EgressNode,
     pub source_contracts: Vec<EgressBehaviorContract>,
+    pub ha_plans: Vec<EgressHaPlan>,
     pub projection_digest: EgressGatewayProjectionDigest,
 }
 
@@ -168,7 +170,17 @@ impl AdmittedEgressGatewayProjection {
         if contracts.next().is_some() {
             return Err(EgressProofError::ProofMismatch);
         }
-        proof.verify_at_gateway(contract, &self.0.gateway, flow)
+        let plan = contract
+            .plans
+            .iter()
+            .find(|plan| plan.source.identity == flow.identity)
+            .ok_or(EgressProofError::ProofMismatch)?;
+        let ha_plan = self
+            .0
+            .ha_plans
+            .iter()
+            .find(|ha_plan| ha_plan.owner == plan.intent);
+        proof.verify_at_gateway_with_ha(contract, &self.0.gateway, flow, ha_plan)
     }
 }
 
@@ -500,6 +512,8 @@ pub enum EgressDistributionError {
     GatewayNotSelected,
     #[error("egress gateway projection digest does not match its content")]
     GatewayProjectionDigestMismatch,
+    #[error("egress HA plan set is missing, duplicated, foreign, or inconsistent")]
+    InvalidHaPlans,
     #[error(transparent)]
     Contract(#[from] EgressContractError),
 }
@@ -519,6 +533,30 @@ impl EgressNodeProjection {
         revision: Revision,
         contract: EgressBehaviorContract,
     ) -> Result<Self, EgressDistributionError> {
+        Self::issue_with_ha(
+            principal,
+            advertisement,
+            controller_epoch,
+            revision,
+            contract,
+            Vec::new(),
+        )
+    }
+
+    /// Creates a response with exact CCR plans for multi-gateway contracts.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the same invalid state as [`Self::issue`] plus foreign,
+    /// duplicate, or structurally mismatched HA plans.
+    pub fn issue_with_ha(
+        principal: &AuthenticatedEgressAgent,
+        advertisement: &EgressAgentAdvertisement,
+        controller_epoch: u64,
+        revision: Revision,
+        contract: EgressBehaviorContract,
+        mut ha_plans: Vec<EgressHaPlan>,
+    ) -> Result<Self, EgressDistributionError> {
         validate_principal(principal)?;
         let negotiated = negotiate(advertisement)?;
         if controller_epoch == 0 || revision == Revision::INITIAL {
@@ -529,6 +567,8 @@ impl EgressNodeProjection {
         }
         contract.verify_integrity()?;
         validate_capabilities(&contract, &negotiated)?;
+        ha_plans.sort_by(|left, right| left.owner.cmp(&right.owner));
+        validate_ha_plans(&contract.plans, &ha_plans)?;
         Ok(Self {
             schema_version: EGRESS_DISTRIBUTION_SCHEMA_VERSION,
             controller_epoch,
@@ -539,6 +579,7 @@ impl EgressNodeProjection {
             },
             negotiated,
             contract,
+            ha_plans,
         })
     }
 
@@ -575,6 +616,7 @@ impl EgressNodeProjection {
             return Err(EgressDistributionError::CapabilityMismatch);
         }
         validate_capabilities(&self.contract, &self.negotiated)?;
+        validate_ha_plans(&self.contract.plans, &self.ha_plans)?;
         self.contract.verify(model, facts, &self.contract.node)?;
         Ok(AdmittedEgressProjection(self))
     }
@@ -596,12 +638,41 @@ impl EgressNodeProjectionEnvelope {
         facts: EgressContractFacts,
         contract: EgressBehaviorContract,
     ) -> Result<Self, EgressDistributionError> {
-        let projection = EgressNodeProjection::issue(
+        Self::issue_with_ha(
+            principal,
+            advertisement,
+            controller_epoch,
+            revision,
+            model,
+            facts,
+            contract,
+            Vec::new(),
+        )
+    }
+
+    /// Issues a self-contained source response with exact CCR plan authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid contract replay or HA plan provenance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_with_ha(
+        principal: &AuthenticatedEgressAgent,
+        advertisement: &EgressAgentAdvertisement,
+        controller_epoch: u64,
+        revision: Revision,
+        model: EgressModel,
+        facts: EgressContractFacts,
+        contract: EgressBehaviorContract,
+        ha_plans: Vec<EgressHaPlan>,
+    ) -> Result<Self, EgressDistributionError> {
+        let projection = EgressNodeProjection::issue_with_ha(
             principal,
             advertisement,
             controller_epoch,
             revision,
             contract,
+            ha_plans,
         )?;
         projection
             .contract
@@ -653,6 +724,12 @@ impl EgressGatewayProjection {
             .iter()
             .map(|source| source.projection().contract.clone())
             .collect::<Vec<_>>();
+        let mut ha_plans = sources
+            .iter()
+            .flat_map(|source| source.projection().ha_plans.iter().cloned())
+            .collect::<Vec<_>>();
+        ha_plans.sort_by(|left, right| left.owner.cmp(&right.owner));
+        ha_plans.dedup();
         source_contracts.sort_by(|left, right| {
             (&left.node.uid, &left.node.name).cmp(&(&right.node.uid, &right.node.name))
         });
@@ -671,6 +748,7 @@ impl EgressGatewayProjection {
                 capabilities: advertisement.capabilities.clone(),
             },
             source_contracts,
+            ha_plans,
             projection_digest: EgressGatewayProjectionDigest([0; 32]),
         };
         projection.validate_structure(false)?;
@@ -710,6 +788,7 @@ impl EgressGatewayProjection {
                 capabilities: advertisement.capabilities.clone(),
             },
             source_contracts: Vec::new(),
+            ha_plans: Vec::new(),
             projection_digest: EgressGatewayProjectionDigest([0; 32]),
         };
         projection.projection_digest = projection.digest()?;
@@ -804,6 +883,12 @@ impl EgressGatewayProjection {
                 return Err(EgressDistributionError::GatewayNotSelected);
             }
         }
+        let plans = self
+            .source_contracts
+            .iter()
+            .flat_map(|contract| contract.plans.iter().cloned())
+            .collect::<Vec<_>>();
+        validate_ha_plans(&plans, &self.ha_plans)?;
         Ok(())
     }
 
@@ -816,6 +901,7 @@ impl EgressGatewayProjection {
             &self.negotiated,
             &self.gateway,
             &self.source_contracts,
+            &self.ha_plans,
         ))
         .map_err(|error| EgressContractError::CanonicalEncoding(error.to_string()))?;
         let mut hasher = Sha256::new();
@@ -1001,6 +1087,73 @@ fn validate_capabilities(
         .collect::<BTreeSet<_>>();
     if let Some(missing) = required.difference(&negotiated.capabilities).next() {
         return Err(EgressDistributionError::MissingCapability(*missing));
+    }
+    Ok(())
+}
+
+fn validate_ha_plans(
+    behavior_plans: &[crate::EgressBehaviorPlan],
+    ha_plans: &[EgressHaPlan],
+) -> Result<(), EgressDistributionError> {
+    if ha_plans
+        .windows(2)
+        .any(|pair| pair[0].owner >= pair[1].owner)
+    {
+        return Err(EgressDistributionError::InvalidHaPlans);
+    }
+    for plan in ha_plans {
+        plan.verify_integrity()
+            .map_err(|_| EgressDistributionError::InvalidHaPlans)?;
+    }
+    let expected = behavior_plans
+        .iter()
+        .filter(|plan| plan.gateways.len() > 1)
+        .map(|plan| plan.intent.clone())
+        .collect::<BTreeSet<_>>();
+    let actual = ha_plans
+        .iter()
+        .map(|plan| plan.owner.clone())
+        .collect::<BTreeSet<_>>();
+    // Legacy issue helpers remain valid for isolated unit foundations. Live
+    // multi-gateway distribution uses issue_with_ha and must be exact.
+    if !ha_plans.is_empty() && actual != expected {
+        return Err(EgressDistributionError::InvalidHaPlans);
+    }
+    for behavior in behavior_plans.iter().filter(|plan| plan.gateways.len() > 1) {
+        let Some(ha) = ha_plans.iter().find(|plan| plan.owner == behavior.intent) else {
+            if ha_plans.is_empty() {
+                continue;
+            }
+            return Err(EgressDistributionError::InvalidHaPlans);
+        };
+        let addresses = ha
+            .shards
+            .iter()
+            .flat_map(|shard| shard.addresses.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let gateways = ha
+            .candidates
+            .iter()
+            .map(|candidate| candidate.node.clone())
+            .collect::<BTreeSet<_>>();
+        let expected_gateways = behavior
+            .gateways
+            .iter()
+            .map(|gateway| gateway.node.clone())
+            .collect::<BTreeSet<_>>();
+        if ha.allocation_revision != behavior.revisions.allocation
+            || ha.lease_epoch != behavior.allocation.lease_epoch
+            || addresses
+                != behavior
+                    .allocation
+                    .addresses
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+            || gateways != expected_gateways
+        {
+            return Err(EgressDistributionError::InvalidHaPlans);
+        }
     }
     Ok(())
 }

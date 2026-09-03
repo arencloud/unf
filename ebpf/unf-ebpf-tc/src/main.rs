@@ -4641,11 +4641,10 @@ fn create_gateway_connection<const IPV6: bool>(
     value.schema_version = EGRESS_MAP_ABI_VERSION;
     value.protocol = observation.protocol;
     value.address_family = observation.address_family as u8;
-    value.flags = if scratch.selection.flags & unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0 {
-        unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_CERTIFIED
-    } else {
-        0
-    };
+    // A selected standby is only a replication target. Userspace sets
+    // STANDBY_CERTIFIED after the exact flow twin is independently read back;
+    // initial packet creation must never claim that acknowledgement early.
+    value.flags = 0;
     let proof_salt = u32::from_ne_bytes([
         scratch.selection.selection_witness[0],
         scratch.selection.selection_witness[1],

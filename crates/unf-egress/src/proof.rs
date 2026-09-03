@@ -19,11 +19,13 @@ use unf_ebpf_common::{
 use crate::{
     AddressFamily, AdmittedEgressProjection, EgressBehaviorContract, EgressBehaviorPlan,
     EgressContractDigest, EgressContractError, EgressContractRevisions, EgressDecisionWitness,
-    EgressDestinations, EgressIntentOwner, EgressNode, MAX_EGRESS_CONTRACT_PLANS,
+    EgressDestinations, EgressHaDigest, EgressHaPlan, EgressIntentOwner, EgressNode,
+    MAX_EGRESS_CONTRACT_PLANS,
 };
 
-pub const EGRESS_FLOW_PROOF_SCHEMA_VERSION: u16 = 1;
+pub const EGRESS_FLOW_PROOF_SCHEMA_VERSION: u16 = 2;
 pub const EGRESS_SELECTION_ALGORITHM_COMPILED_RENDEZVOUS_SHA256_V2: u16 = 2;
+pub const EGRESS_SELECTION_ALGORITHM_CCR_SHARD_V3: u16 = 3;
 pub const EGRESS_PROTOCOL_TCP: u8 = 6;
 pub const EGRESS_PROTOCOL_UDP: u8 = 17;
 
@@ -53,6 +55,7 @@ pub struct EgressActiveAdmission {
     pub projection_revision: Revision,
     pub contract_revision: Revision,
     pub contract_digest: EgressContractDigest,
+    pub ha_plan_digest: Option<EgressHaDigest>,
     pub lease_epoch: u64,
 }
 
@@ -184,6 +187,11 @@ impl EgressAdmissionGuard {
             projection_revision: projection.revision,
             contract_revision: projection.contract.contract_revision,
             contract_digest: projection.contract.contract_digest,
+            ha_plan_digest: projection
+                .ha_plans
+                .iter()
+                .find(|ha_plan| ha_plan.owner == plan.intent)
+                .map(|ha_plan| ha_plan.plan_digest),
             lease_epoch: plan.allocation.lease_epoch,
         };
         self.identities
@@ -286,6 +294,7 @@ pub struct EgressFlowProof {
     pub intent_uid: String,
     pub contract_revision: Revision,
     pub contract_digest: EgressContractDigest,
+    pub ha_plan_digest: Option<EgressHaDigest>,
     pub revisions: EgressContractRevisions,
     pub lease_epoch: u64,
     pub egress_address: IpAddr,
@@ -324,7 +333,14 @@ impl EgressFlowProof {
         {
             return Err(EgressProofError::AdmissionMismatch);
         }
-        derive(&projection.contract, plan, flow)
+        let ha_plan = projection
+            .ha_plans
+            .iter()
+            .find(|ha_plan| ha_plan.owner == plan.intent);
+        if active.ha_plan_digest != ha_plan.map(|plan| plan.plan_digest) {
+            return Err(EgressProofError::AdmissionMismatch);
+        }
+        derive(&projection.contract, plan, flow, ha_plan)
     }
 
     /// Independently reproduces the source decision on the selected gateway.
@@ -342,14 +358,35 @@ impl EgressFlowProof {
         flow: EgressOriginalFlow,
     ) -> Result<(), EgressProofError> {
         contract.verify_integrity()?;
+        self.verify_at_gateway_with_ha(contract, gateway, flow, None)
+    }
+
+    /// Reproduces a decision with the exact distributed CCR plan.
+    ///
+    /// # Errors
+    ///
+    /// Rejects plan, gateway, tuple, contract, or proof mismatch.
+    pub fn verify_at_gateway_with_ha(
+        &self,
+        contract: &EgressBehaviorContract,
+        gateway: &EgressNode,
+        flow: EgressOriginalFlow,
+        ha_plan: Option<&EgressHaPlan>,
+    ) -> Result<(), EgressProofError> {
+        contract.verify_integrity()?;
+        let expected_algorithm = if ha_plan.is_some() {
+            EGRESS_SELECTION_ALGORITHM_CCR_SHARD_V3
+        } else {
+            EGRESS_SELECTION_ALGORITHM_COMPILED_RENDEZVOUS_SHA256_V2
+        };
         if self.schema_version != EGRESS_FLOW_PROOF_SCHEMA_VERSION
-            || self.selection_algorithm != EGRESS_SELECTION_ALGORITHM_COMPILED_RENDEZVOUS_SHA256_V2
+            || self.selection_algorithm != expected_algorithm
             || self.gateway != *gateway
         {
             return Err(EgressProofError::GatewayMismatch);
         }
         let plan = unique_plan(contract, flow.identity)?;
-        let expected = derive(contract, plan, flow)?;
+        let expected = derive(contract, plan, flow, ha_plan)?;
         if *self != expected {
             return Err(EgressProofError::ProofMismatch);
         }
@@ -407,10 +444,11 @@ fn derive(
     contract: &EgressBehaviorContract,
     plan: &EgressBehaviorPlan,
     flow: EgressOriginalFlow,
+    ha_plan: Option<&EgressHaPlan>,
 ) -> Result<EgressFlowProof, EgressProofError> {
     validate_flow(plan, flow)?;
     let address_family = family(flow.source_address);
-    let selection = select_bucket(plan, address_family, flow_bucket(flow))?;
+    let selection = select_bucket_with_ha(plan, address_family, flow_bucket(flow), ha_plan)?;
     let address_index = selection.address_index;
     let egress_address = selection.address;
     let gateway_index = selection.primary_gateway_index;
@@ -423,11 +461,16 @@ fn derive(
     let original_tuple_digest = tuple_digest(flow);
     let mut proof = EgressFlowProof {
         schema_version: EGRESS_FLOW_PROOF_SCHEMA_VERSION,
-        selection_algorithm: EGRESS_SELECTION_ALGORITHM_COMPILED_RENDEZVOUS_SHA256_V2,
+        selection_algorithm: if ha_plan.is_some() {
+            EGRESS_SELECTION_ALGORITHM_CCR_SHARD_V3
+        } else {
+            EGRESS_SELECTION_ALGORITHM_COMPILED_RENDEZVOUS_SHA256_V2
+        },
         identity: flow.identity,
         intent_uid: plan.intent.uid.clone(),
         contract_revision: contract.contract_revision,
         contract_digest: contract.contract_digest,
+        ha_plan_digest: ha_plan.map(|plan| plan.plan_digest),
         revisions: plan.revisions,
         lease_epoch: plan.allocation.lease_epoch,
         egress_address,
@@ -544,6 +587,58 @@ pub(crate) fn select_bucket(
     })
 }
 
+pub(crate) fn select_bucket_with_ha<'a>(
+    plan: &'a EgressBehaviorPlan,
+    address_family: AddressFamily,
+    bucket: u16,
+    ha_plan: Option<&EgressHaPlan>,
+) -> Result<EgressBucketSelection<'a>, EgressProofError> {
+    let mut selected = select_bucket(plan, address_family, bucket)?;
+    let Some(ha_plan) = ha_plan else {
+        return Ok(selected);
+    };
+    ha_plan
+        .verify_integrity()
+        .map_err(|_| EgressProofError::ProofMismatch)?;
+    let shard = ha_plan
+        .shards
+        .iter()
+        .find(|shard| shard.addresses.contains(&selected.address))
+        .ok_or(EgressProofError::ProofMismatch)?;
+    let assignment = ha_plan
+        .assignments
+        .iter()
+        .find(|assignment| assignment.shard_index == shard.index)
+        .ok_or(EgressProofError::ProofMismatch)?;
+    let primary_gateway_index = plan
+        .gateways
+        .iter()
+        .position(|gateway| gateway.node == assignment.gateway)
+        .ok_or(EgressProofError::ProofMismatch)?;
+    let contingency = ha_plan
+        .contingencies
+        .iter()
+        .find(|contingency| contingency.failed_gateway == assignment.gateway)
+        .ok_or(EgressProofError::ProofMismatch)?;
+    let standby = contingency
+        .assignments
+        .iter()
+        .find(|candidate| candidate.shard_index == shard.index)
+        .ok_or(EgressProofError::ProofMismatch)?;
+    let standby_gateway_index = plan
+        .gateways
+        .iter()
+        .position(|gateway| gateway.node == standby.gateway)
+        .ok_or(EgressProofError::ProofMismatch)?;
+    if primary_gateway_index == standby_gateway_index {
+        return Err(EgressProofError::ProofMismatch);
+    }
+    selected.primary_gateway_index = primary_gateway_index;
+    selected.primary_gateway = &plan.gateways[primary_gateway_index];
+    selected.standby_gateway_index = Some(standby_gateway_index);
+    Ok(selected)
+}
+
 fn rendezvous_score(
     domain: &[u8],
     plan: &EgressBehaviorPlan,
@@ -595,6 +690,7 @@ fn proof_digest(proof: &EgressFlowProof) -> Result<EgressFlowProofDigest, Egress
         proof.intent_uid.as_str(),
         proof.contract_revision,
         proof.contract_digest,
+        proof.ha_plan_digest,
         proof.revisions,
         proof.lease_epoch,
         proof.egress_address,
@@ -605,7 +701,7 @@ fn proof_digest(proof: &EgressFlowProof) -> Result<EgressFlowProofDigest, Egress
     ))
     .map_err(|error| EgressProofError::Encoding(error.to_string()))?;
     let mut hasher = Sha256::new();
-    hasher.update(b"unf.egress-flow-proof.v1\0");
+    hasher.update(b"unf.egress-flow-proof.v2\0");
     hasher.update(material);
     Ok(EgressFlowProofDigest(hasher.finalize().into()))
 }

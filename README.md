@@ -438,7 +438,7 @@ adds authenticated gateway projections that aggregate only admitted
 source contracts selecting that gateway, and exact route/interface/next-hop/
 transport/MTU certificates lower into asserted fixed-width ABI-v1 source,
 candidate, selection, connection, and event state. Userspace compiles 251
-rendezvous buckets shared per intent, including a pre-certified standby by
+rendezvous buckets shared per intent, including a precomputed standby path by
 default when two gateways exist; packets will need only one stable hash and map
 lookup. The contract gate passes `make egress-dataplane-contract-test`; ADR
 0119. Persistent ABI v14 now owns and transactionally recovers the source,
@@ -462,7 +462,7 @@ Pod-bound authentication, publishes only controller-admitted contracts that
 name that ready/reachable lease-fenced candidate, and sends a monotonic empty
 projection for explicit withdrawal. The gateway agent independently validates
 and fences that state under `make egress-gateway-distribution-test`; ADR 0123.
-The watched revision now drives a separate schema-v2 durable control-plane
+The watched revision now drives a separate schema-v3 durable control-plane
 checkpoint that atomically allocates bounded addresses and emits deterministic
 lease-fenced gateway Ensure/Withdraw intent over Ready primary-CNI Nodes with
 authoritative UIDs. Pool tombstones and dual-provider withdrawal retain an
@@ -504,7 +504,7 @@ state survives projection churn until protocol timeout, and family-specific
 tail programs perform checksum-safe IPv4/IPv6 SNAT and exact reverse restore.
 Privileged restart, packet, collision, and first-flow-preservation evidence
 passes `make egress-gateway-nat-test`; ADR 0129. The release barrier now has a
-verified **Proof of Safe Forgetting** contract: checkpoint-v2 retirement
+verified **Proof of Safe Forgetting** contract: checkpoint-v3 retirement
 manifests freeze the exact source/gateway/lease set, and address reuse requires
 complete source-fence, zero-flow gateway-drain, and exact
 withdrawn-reachability evidence. Provider acknowledgements, elapsed time,
@@ -565,8 +565,15 @@ conntrack copying: complete NAT pairs travel through sequence-checked hash
 chains, the standby acknowledges an exact snapshot watermark, and promotion
 imports only live lease/address/shard-valid state into its atomic source-bank
 cutover. The unacknowledged asynchronous tail stays explicit and measurable.
-Five adversarial suites pass `make egress-ha-continuity-test`; ADR 0138. Watched
-integration and measured failover remain before 8.6 can claim availability.
+Five adversarial suites pass `make egress-ha-continuity-test`; ADR 0138.
+Checkpoint-v3 then persists CCR plans, freezes ordinary health-driven
+membership, distributes one exact owner per shard, and makes proof and compiled
+selection consume the same plan. Prior acknowledged ownership makes empty,
+subset, and superset address transitions readback-safe, while new connections
+cannot claim a flow twin was certified before standby acknowledgement. The
+complete domain/controller/agent gate passes `make
+egress-ha-live-ownership-test`; ADR 0139. Transactional promotion transport and
+measured failover remain before 8.6 can claim availability.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

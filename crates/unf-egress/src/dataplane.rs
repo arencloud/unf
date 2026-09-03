@@ -24,8 +24,9 @@ use unf_ebpf_common::{
 
 use crate::{
     AddressFamily, AdmittedEgressGatewayProjection, EgressAdmissionDecision, EgressAdmissionGuard,
-    EgressBehaviorPlan, EgressDestinations, EgressGatewayHostBank, EgressNode,
-    MAX_EGRESS_CONTRACT_PLANS, MAX_EGRESS_GATEWAYS_PER_PLAN, MAX_EGRESS_INTENTS, select_bucket,
+    EgressBehaviorPlan, EgressDestinations, EgressGatewayHostBank, EgressHaPlan, EgressNode,
+    MAX_EGRESS_CONTRACT_PLANS, MAX_EGRESS_GATEWAYS_PER_PLAN, MAX_EGRESS_INTENTS,
+    select_bucket_with_ha,
 };
 
 pub const EGRESS_PATH_CERTIFICATE_SCHEMA_VERSION: u16 = 1;
@@ -382,6 +383,9 @@ pub fn compile_egress_dataplane(
             &mut used_paths,
             &mut coherent_path_revision,
             active[0],
+            host.ha_plans
+                .iter()
+                .find(|ha_plan| ha_plan.owner == template.intent),
         )?;
     }
 
@@ -532,6 +536,10 @@ pub fn compile_egress_gateway_dataplane(
                 ));
             }
             for address_family in present_families(plan) {
+                let ha_plan = projection
+                    .ha_plans
+                    .iter()
+                    .find(|ha_plan| ha_plan.owner == plan.intent);
                 for (gateway_index, gateway) in plan.gateways.iter().enumerate() {
                     let gateway_index = u16::try_from(gateway_index)
                         .map_err(|_| EgressDataplaneError::CandidateIndex)?;
@@ -557,7 +565,7 @@ pub fn compile_egress_gateway_dataplane(
                     ));
                 }
                 for bucket in 0..EGRESS_SELECTION_TABLE_SIZE {
-                    let selected = select_bucket(plan, address_family, bucket)
+                    let selected = select_bucket_with_ha(plan, address_family, bucket, ha_plan)
                         .map_err(|_| EgressDataplaneError::Selection)?;
                     let address_index = u16::try_from(selected.address_index)
                         .map_err(|_| EgressDataplaneError::CandidateIndex)?;
@@ -770,6 +778,7 @@ fn compile_intent_candidates(
     used_paths: &mut BTreeSet<PathKey>,
     coherent_path_revision: &mut Option<Revision>,
     identity: IdentityId,
+    ha_plan: Option<&EgressHaPlan>,
 ) -> Result<(), EgressDataplaneError> {
     for (index, address) in plan.allocation.addresses.iter().enumerate() {
         let index = u16::try_from(index).map_err(|_| EgressDataplaneError::CandidateIndex)?;
@@ -846,7 +855,7 @@ fn compile_intent_candidates(
 
     for address_family in present_families(plan) {
         for bucket in 0..EGRESS_SELECTION_TABLE_SIZE {
-            let selected = select_bucket(plan, address_family, bucket)
+            let selected = select_bucket_with_ha(plan, address_family, bucket, ha_plan)
                 .map_err(|_| EgressDataplaneError::Selection)?;
             let address_index = u16::try_from(selected.address_index)
                 .map_err(|_| EgressDataplaneError::CandidateIndex)?;
@@ -1057,12 +1066,41 @@ mod tests {
     use super::*;
     use crate::distribution::test_support::{advertisement, fixture, node, principal};
     use crate::{
-        AdmittedEgressProjection, EGRESS_PROTOCOL_TCP, EgressBehaviorContract, EgressFlowProof,
-        EgressGatewayFact, EgressGatewayProjection, EgressNodeProjection, EgressOriginalFlow,
+        AdmittedEgressProjection, EGRESS_PROTOCOL_TCP, EgressAddressLease, EgressBehaviorContract,
+        EgressFlowProof, EgressGatewayFact, EgressGatewayProjection, EgressHaCandidate,
+        EgressNodeProjection, EgressOriginalFlow, EgressProviderRef, compile_egress_ha_plan,
     };
 
     fn ip(value: &str) -> IpAddr {
         value.parse().expect("valid address")
+    }
+
+    fn ha_plan(model: &crate::EgressModel, facts: &crate::EgressContractFacts) -> EgressHaPlan {
+        let intent = model.intents[0].clone();
+        let allocation = &facts.allocations[0];
+        let lease = EgressAddressLease {
+            intent,
+            pool: None,
+            provider: EgressProviderRef {
+                name: "static".to_owned(),
+                instance: "lab".to_owned(),
+            },
+            addresses: allocation.addresses.clone(),
+            lease_epoch: allocation.lease_epoch,
+            intent_epoch: 1,
+            intent_revision: facts.revisions.intent,
+            allocation_revision: facts.revisions.allocation,
+        };
+        let candidates = facts
+            .gateways
+            .iter()
+            .map(|gateway| EgressHaCandidate {
+                node: gateway.node.clone(),
+                capacity_units: 1,
+                failure_domains: BTreeMap::new(),
+            })
+            .collect();
+        compile_egress_ha_plan(&lease, candidates, None, facts.revisions.gateway).expect("HA plan")
     }
 
     fn source_projection() -> AdmittedEgressProjection {
@@ -1078,12 +1116,14 @@ mod tests {
         let contract =
             EgressBehaviorContract::issue(&model, &facts, node("worker-a"), Revision::new(20))
                 .expect("two-gateway contract");
-        EgressNodeProjection::issue(
+        let ha_plan = ha_plan(&model, &facts);
+        EgressNodeProjection::issue_with_ha(
             &principal("worker-a"),
             &advertisement(),
             10,
             Revision::new(4),
             contract,
+            vec![ha_plan],
         )
         .expect("source projection")
         .admit(&principal("worker-a"), &advertisement(), &model, &facts)
@@ -1111,12 +1151,14 @@ mod tests {
         let contract =
             EgressBehaviorContract::issue(&model, &facts, node("worker-a"), Revision::new(20))
                 .expect("two-source contract");
-        EgressNodeProjection::issue(
+        let ha_plan = ha_plan(&model, &facts);
+        EgressNodeProjection::issue_with_ha(
             &principal("worker-a"),
             &advertisement(),
             10,
             Revision::new(4),
             contract,
+            vec![ha_plan],
         )
         .expect("source projection")
         .admit(&principal("worker-a"), &advertisement(), &model, &facts)
@@ -1347,6 +1389,23 @@ mod tests {
                 && value.primary_gateway_index != value.standby_gateway_index
                 && value.selection_witness != [0; 16]
         }));
+        let ha = &projection.projection().ha_plans[0];
+        let owner = &ha.assignments[0].gateway;
+        let owner_index = u16::try_from(
+            projection.projection().contract.plans[0]
+                .gateways
+                .iter()
+                .position(|gateway| gateway.node == *owner)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            state
+                .selections
+                .iter()
+                .all(|(_, value)| value.primary_gateway_index == owner_index),
+            "every family of the dual-stack shard selects its exclusive CCR owner"
+        );
     }
 
     #[test]

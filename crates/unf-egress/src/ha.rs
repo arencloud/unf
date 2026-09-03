@@ -13,8 +13,9 @@ use thiserror::Error;
 use unf_common::Revision;
 
 use crate::{
-    EgressAddressLease, EgressIntentOwner, EgressNode, MAX_EGRESS_ADDRESSES_PER_INTENT,
-    MAX_EGRESS_GATEWAY_NODES,
+    DEFAULT_EGRESS_INTENT_PRIORITY, EgressAddressLease, EgressAddressRequest, EgressDestinations,
+    EgressIntent, EgressIntentOwner, EgressNode, EgressProviderRef, EgressSourceSelector,
+    MAX_EGRESS_ADDRESSES_PER_INTENT, MAX_EGRESS_GATEWAY_NODES,
 };
 
 pub const EGRESS_HA_PLAN_SCHEMA_VERSION: u16 = 1;
@@ -62,7 +63,7 @@ pub struct EgressHaDisruptionCertificate {
     pub domain_diverse_moves: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EgressHaDigest(pub [u8; 32]);
 
@@ -195,6 +196,57 @@ pub fn compile_egress_ha_plan(
 }
 
 impl EgressHaPlan {
+    /// Replays every internal assignment, capacity target, contingency, and
+    /// digest when the enclosing transport already binds allocation identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any malformed or mutated plan field.
+    pub fn verify_integrity(&self) -> Result<(), EgressHaError> {
+        if self.schema_version != EGRESS_HA_PLAN_SCHEMA_VERSION
+            || self.algorithm != EGRESS_HA_ALGORITHM_CONTINUITY_CERTIFIED_RENDEZVOUS_V1
+            || self.revision == Revision::INITIAL
+        {
+            return Err(EgressHaError::InvalidAuthority);
+        }
+        let addresses = self
+            .shards
+            .iter()
+            .flat_map(|shard| shard.addresses.iter().copied())
+            .collect::<Vec<_>>();
+        let lease = EgressAddressLease {
+            intent: EgressIntent {
+                owner: self.owner.clone(),
+                priority: DEFAULT_EGRESS_INTENT_PRIORITY,
+                source: EgressSourceSelector::default(),
+                destinations: EgressDestinations::Any,
+                addresses: EgressAddressRequest::Explicit {
+                    addresses: addresses.clone(),
+                },
+            },
+            pool: None,
+            provider: EgressProviderRef {
+                name: "integrity".to_owned(),
+                instance: "replay".to_owned(),
+            },
+            addresses,
+            lease_epoch: self.lease_epoch,
+            intent_epoch: 1,
+            intent_revision: self.revision,
+            allocation_revision: self.allocation_revision,
+        };
+        let expected_shards = address_shards(&lease.addresses)?;
+        validate_previous(Some(self), &lease, &expected_shards)?;
+        if !self.certificate.exact_capacity
+            || !self.certificate.minimum_disruption
+            || self.certificate.moved_shards != self.certificate.unavoidable_moves
+            || usize::from(self.certificate.moved_shards) > self.shards.len()
+        {
+            return Err(EgressHaError::InvalidAuthority);
+        }
+        Ok(())
+    }
+
     /// Recompiles and compares every assignment, contingency, certificate, and
     /// digest. Consumers do not trust serialized placement claims.
     ///

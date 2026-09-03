@@ -9,13 +9,14 @@ use unf_common::Revision;
 use crate::{
     AdmittedEgressProjection, EgressAllocationCheckpoint, EgressAllocationError,
     EgressAllocationRequest, EgressAllocator, EgressGatewayAcknowledgement,
-    EgressGatewayCheckpoint, EgressGatewayError, EgressGatewayRegistry, EgressIntentOwner,
-    EgressModel, EgressModelError, EgressNode, EgressProviderRef,
-    EgressReachabilityAcknowledgement, EgressRetirementManifest, EgressSafeForgettingError,
-    EgressSafeReleaseAuthority, MAX_EGRESS_GATEWAY_NODES, MAX_EGRESS_INTENTS, normalize_model,
+    EgressGatewayCheckpoint, EgressGatewayError, EgressGatewayRegistry, EgressHaCandidate,
+    EgressHaError, EgressHaPlan, EgressIntentOwner, EgressModel, EgressModelError, EgressNode,
+    EgressProviderRef, EgressReachabilityAcknowledgement, EgressRetirementManifest,
+    EgressSafeForgettingError, EgressSafeReleaseAuthority, MAX_EGRESS_GATEWAY_NODES,
+    MAX_EGRESS_INTENTS, compile_egress_ha_plan, normalize_model,
 };
 
-pub const EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
+pub const EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -25,6 +26,7 @@ pub struct EgressControlPlaneCheckpoint {
     pub desired_model: EgressModel,
     pub allocation: EgressAllocationCheckpoint,
     pub gateways: EgressGatewayCheckpoint,
+    pub ha_plans: Vec<EgressHaPlan>,
     pub retirements: Vec<EgressRetirementManifest>,
 }
 
@@ -57,6 +59,10 @@ pub enum EgressControlPlaneError {
     #[error(transparent)]
     Gateway(#[from] EgressGatewayError),
     #[error(transparent)]
+    Ha(#[from] EgressHaError),
+    #[error("durable HA plan set is missing, duplicated, or cross-domain incoherent")]
+    InvalidHaCheckpoint,
+    #[error(transparent)]
     SafeForgetting(#[from] EgressSafeForgettingError),
     #[error("safe release authority does not match retained provider evidence for {0:?}")]
     ReleaseAuthorityMismatch(EgressIntentOwner),
@@ -72,6 +78,7 @@ pub struct EgressControlPlane {
     desired_model: EgressModel,
     allocator: EgressAllocator,
     gateways: EgressGatewayRegistry,
+    ha_plans: BTreeMap<EgressIntentOwner, EgressHaPlan>,
     retirements: BTreeMap<EgressIntentOwner, EgressRetirementManifest>,
 }
 
@@ -85,6 +92,7 @@ impl Default for EgressControlPlane {
             },
             allocator: EgressAllocator::new(Vec::new()).expect("empty pool model is valid"),
             gateways: EgressGatewayRegistry::default(),
+            ha_plans: BTreeMap::new(),
             retirements: BTreeMap::new(),
         }
     }
@@ -117,6 +125,31 @@ impl EgressControlPlane {
         }
         let allocator = EgressAllocator::restore(checkpoint.allocation)?;
         let gateways = EgressGatewayRegistry::restore(checkpoint.gateways)?;
+        if checkpoint.ha_plans.len() > MAX_EGRESS_INTENTS
+            || checkpoint
+                .ha_plans
+                .windows(2)
+                .any(|pair| pair[0].owner >= pair[1].owner)
+        {
+            return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+        }
+        let mut ha_plans = BTreeMap::new();
+        for plan in checkpoint.ha_plans {
+            validate_ha_plan_checkpoint(&plan, &allocator, &gateways)?;
+            if ha_plans.insert(plan.owner.clone(), plan).is_some() {
+                return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+            }
+        }
+        let expected_ha = gateways
+            .checkpoint()
+            .records
+            .iter()
+            .filter(|record| record.desired.nodes.len() > 1)
+            .map(|record| record.desired.owner.clone())
+            .collect::<BTreeSet<_>>();
+        if ha_plans.keys().cloned().collect::<BTreeSet<_>>() != expected_ha {
+            return Err(EgressControlPlaneError::InvalidHaCheckpoint);
+        }
         if checkpoint.retirements.len() > MAX_EGRESS_INTENTS
             || checkpoint
                 .retirements
@@ -142,6 +175,7 @@ impl EgressControlPlane {
             desired_model,
             allocator,
             gateways,
+            ha_plans,
             retirements,
         })
     }
@@ -158,11 +192,53 @@ impl EgressControlPlane {
         desired_revision: Revision,
         model: EgressModel,
         explicit_providers: &BTreeMap<EgressIntentOwner, EgressProviderRef>,
-        mut gateway_candidates: Vec<EgressNode>,
+        gateway_candidates: Vec<EgressNode>,
+    ) -> Result<EgressControlPlaneReconcile, EgressControlPlaneError> {
+        self.reconcile_with_ha_candidates(
+            desired_revision,
+            model,
+            explicit_providers,
+            gateway_candidates
+                .into_iter()
+                .map(|node| EgressHaCandidate {
+                    node,
+                    capacity_units: 1,
+                    failure_domains: BTreeMap::new(),
+                })
+                .collect(),
+        )
+    }
+
+    /// Reconciles desired state while durably compiling exact CCR ownership.
+    /// Existing plans remain frozen until candidate membership explicitly
+    /// changes through the promotion/drain transaction.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid desired state, candidates, allocation, gateway state,
+    /// or any CCR plan that cannot preserve the prior authority atomically.
+    #[allow(clippy::too_many_lines)]
+    pub fn reconcile_with_ha_candidates(
+        &mut self,
+        desired_revision: Revision,
+        model: EgressModel,
+        explicit_providers: &BTreeMap<EgressIntentOwner, EgressProviderRef>,
+        mut ha_candidates: Vec<EgressHaCandidate>,
     ) -> Result<EgressControlPlaneReconcile, EgressControlPlaneError> {
         let model = normalize_model(model.pools, model.intents)?;
         validate_desired_fence(self, desired_revision, &model)?;
         validate_explicit_providers(&model, explicit_providers)?;
+        ha_candidates.sort_unstable();
+        if ha_candidates
+            .windows(2)
+            .any(|pair| pair[0].node >= pair[1].node)
+        {
+            return Err(EgressControlPlaneError::InvalidGatewayCandidates);
+        }
+        let mut gateway_candidates = ha_candidates
+            .iter()
+            .map(|candidate| candidate.node.clone())
+            .collect::<Vec<_>>();
         gateway_candidates.sort_unstable();
         validate_candidates(&gateway_candidates)?;
 
@@ -232,7 +308,32 @@ impl EgressControlPlane {
                     next.gateways.withdraw(&intent.owner)?;
                 }
             } else {
-                next.gateways.ensure(&lease, gateway_candidates.clone())?;
+                let desired = next.gateways.ensure(&lease, gateway_candidates.clone())?;
+                if gateway_candidates.len() > 1 {
+                    let unchanged = next.ha_plans.get(&intent.owner).is_some_and(|plan| {
+                        plan.owner == intent.owner
+                            && plan.allocation_revision == lease.allocation_revision
+                            && plan.lease_epoch == lease.lease_epoch
+                            && plan.revision == desired.revision
+                            && plan.candidates == ha_candidates
+                    });
+                    if !unchanged {
+                        let previous = next.ha_plans.get(&intent.owner).filter(|plan| {
+                            plan.owner == intent.owner
+                                && plan.allocation_revision == lease.allocation_revision
+                                && plan.lease_epoch == lease.lease_epoch
+                        });
+                        let plan = compile_egress_ha_plan(
+                            &lease,
+                            ha_candidates.clone(),
+                            previous,
+                            desired.revision,
+                        )?;
+                        next.ha_plans.insert(intent.owner.clone(), plan);
+                    }
+                } else {
+                    next.ha_plans.remove(&intent.owner);
+                }
             }
         }
         next.allocator.reconcile_pools(model.pools.clone())?;
@@ -341,6 +442,7 @@ impl EgressControlPlane {
         let mut next = self.clone();
         next.gateways.complete_withdrawal(&owner)?;
         next.allocator.release(&owner)?;
+        next.ha_plans.remove(&owner);
         next.retirements.remove(&owner);
         validate_cross_state(&next.allocator, &next.gateways)?;
         *self = next;
@@ -355,6 +457,7 @@ impl EgressControlPlane {
             desired_model: self.desired_model.clone(),
             allocation: self.allocator.checkpoint(),
             gateways: self.gateways.checkpoint(),
+            ha_plans: self.ha_plans.values().cloned().collect(),
             retirements: self.retirements.values().cloned().collect(),
         }
     }
@@ -434,6 +537,40 @@ fn validate_cross_state(
                 EgressGatewayError::LeaseEpochConflict(record.desired.owner.clone()),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_ha_plan_checkpoint(
+    plan: &EgressHaPlan,
+    allocator: &EgressAllocator,
+    gateways: &EgressGatewayRegistry,
+) -> Result<(), EgressControlPlaneError> {
+    plan.verify_integrity()?;
+    let lease = allocator
+        .lease(&plan.owner)
+        .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+    let record = gateways
+        .record(&plan.owner)
+        .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+    let plan_nodes = plan
+        .candidates
+        .iter()
+        .map(|candidate| candidate.node.clone())
+        .collect::<Vec<_>>();
+    let plan_addresses = plan
+        .shards
+        .iter()
+        .flat_map(|shard| shard.addresses.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if plan.owner != lease.intent.owner
+        || plan.allocation_revision != lease.allocation_revision
+        || plan.lease_epoch != lease.lease_epoch
+        || plan.revision != record.desired.revision
+        || plan_nodes != record.desired.nodes
+        || plan_addresses != lease.addresses.iter().copied().collect()
+    {
+        return Err(EgressControlPlaneError::InvalidHaCheckpoint);
     }
     Ok(())
 }
@@ -577,6 +714,9 @@ mod tests {
             checkpoint.gateways.records[0].desired.nodes[0].name,
             "gateway-a"
         );
+        assert_eq!(checkpoint.ha_plans.len(), 1);
+        assert_eq!(checkpoint.ha_plans[0].candidates.len(), 2);
+        assert_eq!(checkpoint.ha_plans[0].assignments.len(), 1);
         assert_eq!(
             EgressControlPlane::restore(checkpoint.clone())
                 .expect("exact restore")
@@ -594,6 +734,13 @@ mod tests {
                 .expect("idempotent replay")
                 .changed
         );
+
+        let mut mutated = checkpoint;
+        mutated.ha_plans[0].assignments[0].gateway = node("foreign");
+        assert!(matches!(
+            EgressControlPlane::restore(mutated),
+            Err(EgressControlPlaneError::Ha(_) | EgressControlPlaneError::InvalidHaCheckpoint)
+        ));
     }
 
     #[test]

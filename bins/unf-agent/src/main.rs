@@ -8537,15 +8537,12 @@ async fn apply_egress_gateway_address_projection(
     node_uid: String,
     ipv6_proxy_uplink: Option<(String, u32)>,
 ) -> Result<EgressGatewayAddressAcknowledgement> {
-    let all_addresses = admitted
+    let desired_addresses = admitted
         .projection()
         .leases
         .iter()
         .flat_map(|lease| lease.addresses.iter().copied())
         .collect::<BTreeSet<_>>();
-    if all_addresses.is_empty() {
-        bail!("gateway-address projection contains no owned or quarantined address");
-    }
     let retained_addresses = admitted
         .projection()
         .leases
@@ -8559,10 +8556,24 @@ async fn apply_egress_gateway_address_projection(
         })
         .flat_map(|lease| lease.addresses.iter().copied())
         .collect::<BTreeSet<_>>();
+    let previous_addresses = admitted
+        .projection()
+        .previous_owned_addresses
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if desired_addresses != retained_addresses && previous_addresses != desired_addresses {
+        bail!("release transition does not start from the exact acknowledged desired set");
+    }
+    if !retained_addresses.is_subset(&previous_addresses)
+        && !previous_addresses.is_subset(&retained_addresses)
+    {
+        bail!("gateway-address ownership cannot add and remove in one transaction");
+    }
     let mut previous_plan = GatewayAddressPlan::new(
         node_uid.clone(),
         1_500,
-        all_addresses.iter().copied().collect(),
+        previous_addresses.iter().copied().collect(),
     )
     .context("compile complete Node-UID-bound gateway-address plan")?;
     let mut plan = GatewayAddressPlan::new(
@@ -8579,10 +8590,18 @@ async fn apply_egress_gateway_address_projection(
             .with_ipv6_proxy_uplink(interface_name, interface_index)
             .context("bind retained gateway-address plan to IPv6 proxy uplink")?;
     }
-    let readback = if retained_addresses == all_addresses {
+    let readback = if previous_addresses.is_empty() || previous_addresses == retained_addresses {
         plan.apply()
             .await
             .context("apply and read back gateway-address ownership")?
+    } else if previous_addresses.is_subset(&retained_addresses) {
+        previous_plan
+            .readback()
+            .await
+            .context("verify exact prior gateway-address ownership before expansion")?;
+        plan.apply()
+            .await
+            .context("expand and read back gateway-address ownership")?
     } else {
         plan.transition_from(&previous_plan)
             .await

@@ -13,7 +13,7 @@ use unf_common::Revision;
 
 use crate::{
     AdmittedEgressProjection, EGRESS_HOST_STATE_SCHEMA_VERSION, EgressBehaviorContract,
-    MAX_EGRESS_CONTRACT_PLANS,
+    EgressHaPlan, MAX_EGRESS_CONTRACT_PLANS,
 };
 
 pub const EGRESS_HOST_STATE_ABI_VERSION: u16 = 1;
@@ -31,6 +31,7 @@ pub struct EgressGatewayHostBank {
     pub controller_epoch: u64,
     pub projection_revision: Revision,
     pub contract: EgressBehaviorContract,
+    pub ha_plans: Vec<EgressHaPlan>,
     pub state_digest: EgressHostStateDigest,
 }
 
@@ -48,6 +49,7 @@ impl EgressGatewayHostBank {
             controller_epoch: projection.controller_epoch,
             projection_revision: projection.revision,
             contract: projection.contract.clone(),
+            ha_plans: projection.ha_plans.clone(),
             state_digest: EgressHostStateDigest([0; 32]),
         };
         bank.state_digest = bank.digest()?;
@@ -81,6 +83,10 @@ impl EgressGatewayHostBank {
         self.contract
             .verify_integrity()
             .map_err(|_| EgressHostStateError::DigestMismatch)?;
+        for plan in &self.ha_plans {
+            plan.verify_integrity()
+                .map_err(|_| EgressHostStateError::DigestMismatch)?;
+        }
         let mut previous = None;
         for plan in &self.contract.plans {
             if plan.source.node != self.contract.node
@@ -114,6 +120,7 @@ impl EgressGatewayHostBank {
             self.controller_epoch,
             self.projection_revision,
             &self.contract,
+            &self.ha_plans,
         ))
         .map_err(|error| EgressHostStateError::Encoding(error.to_string()))?;
         let mut hasher = Sha256::new();

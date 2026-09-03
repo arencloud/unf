@@ -10,11 +10,11 @@ use unf_common::Revision;
 
 use crate::{
     AuthenticatedEgressAgent, EgressGatewayAction, EgressGatewayCheckpoint, EgressGatewayDesired,
-    EgressGatewayRegistry, EgressProjectionRecipient, MAX_EGRESS_ADDRESSES_PER_INTENT,
-    MAX_EGRESS_INTENTS,
+    EgressGatewayRegistry, EgressHaDigest, EgressHaPlan, EgressIntentOwner,
+    EgressProjectionRecipient, MAX_EGRESS_ADDRESSES_PER_INTENT, MAX_EGRESS_INTENTS,
 };
 
-pub const EGRESS_GATEWAY_ADDRESS_SCHEMA_VERSION: u16 = 2;
+pub const EGRESS_GATEWAY_ADDRESS_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -29,8 +29,23 @@ pub struct EgressGatewayAddressProjection {
     pub revision: Revision,
     pub recipient: EgressProjectionRecipient,
     pub leases: Vec<EgressGatewayDesired>,
+    pub ha_ownership: Vec<EgressGatewayHaOwnership>,
+    /// Exact last controller-acknowledged kernel set for this Node. This is
+    /// transition authority, not desired ownership.
+    pub previous_owned_addresses: Vec<IpAddr>,
     pub release_authorized_desired_revisions: Vec<Revision>,
     pub projection_digest: EgressGatewayAddressProjectionDigest,
+}
+
+/// Exact CCR ownership carried beside the Node-filtered lease. The address
+/// subset alone is not accepted as sufficient HA provenance.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressGatewayHaOwnership {
+    pub owner: EgressIntentOwner,
+    pub active_plan_revision: Revision,
+    pub active_plan_digest: EgressHaDigest,
+    pub shard_indexes: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +92,8 @@ pub enum EgressGatewayAddressError {
     InvalidLeaseOrder,
     #[error("gateway-address projection contains a lease not assigned to its recipient")]
     LeaseNotAssigned,
+    #[error("gateway-address projection HA ownership is missing, foreign, or non-exclusive")]
+    InvalidHaOwnership,
     #[error("gateway-address projection digest does not match its content")]
     DigestMismatch,
     #[error("gateway-address acknowledgement does not prove the exact issued state")]
@@ -109,6 +126,85 @@ impl EgressGatewayAddressProjection {
         principal: &AuthenticatedEgressAgent,
         controller_epoch: u64,
         checkpoint: EgressGatewayCheckpoint,
+        release_authorized_desired_revisions: Vec<Revision>,
+    ) -> Result<Self, EgressGatewayAddressError> {
+        validate_principal(principal)?;
+        EgressGatewayRegistry::restore(checkpoint.clone())?;
+        if controller_epoch == 0 || checkpoint.revision == Revision::INITIAL {
+            return Err(EgressGatewayAddressError::InvalidRevision);
+        }
+        Self::issue_filtered(
+            principal,
+            controller_epoch,
+            checkpoint,
+            &[],
+            Vec::new(),
+            release_authorized_desired_revisions,
+        )
+    }
+
+    /// Filters every multi-gateway lease through one replay-verified CCR plan.
+    /// Single-gateway records retain their complete lease without HA metadata.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing, duplicate, foreign, mutated, or non-exclusive plans.
+    pub fn issue_exclusive_with_releases(
+        principal: &AuthenticatedEgressAgent,
+        controller_epoch: u64,
+        checkpoint: EgressGatewayCheckpoint,
+        mut plans: Vec<EgressHaPlan>,
+        release_authorized_desired_revisions: Vec<Revision>,
+    ) -> Result<Self, EgressGatewayAddressError> {
+        plans.sort_by(|left, right| left.owner.cmp(&right.owner));
+        if plans.windows(2).any(|pair| pair[0].owner >= pair[1].owner) {
+            return Err(EgressGatewayAddressError::InvalidHaOwnership);
+        }
+        Self::issue_filtered(
+            principal,
+            controller_epoch,
+            checkpoint,
+            &plans,
+            Vec::new(),
+            release_authorized_desired_revisions,
+        )
+    }
+
+    /// Issues exclusive desired ownership together with the exact last
+    /// acknowledged Node set. This permits a rollback-safe subset/superset
+    /// transition, including complete old-owner revocation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed plans, identity, prior ownership, or release state.
+    pub fn issue_exclusive_transition_with_releases(
+        principal: &AuthenticatedEgressAgent,
+        controller_epoch: u64,
+        checkpoint: EgressGatewayCheckpoint,
+        mut plans: Vec<EgressHaPlan>,
+        previous_owned_addresses: Vec<IpAddr>,
+        release_authorized_desired_revisions: Vec<Revision>,
+    ) -> Result<Self, EgressGatewayAddressError> {
+        plans.sort_by(|left, right| left.owner.cmp(&right.owner));
+        if plans.windows(2).any(|pair| pair[0].owner >= pair[1].owner) {
+            return Err(EgressGatewayAddressError::InvalidHaOwnership);
+        }
+        Self::issue_filtered(
+            principal,
+            controller_epoch,
+            checkpoint,
+            &plans,
+            previous_owned_addresses,
+            release_authorized_desired_revisions,
+        )
+    }
+
+    fn issue_filtered(
+        principal: &AuthenticatedEgressAgent,
+        controller_epoch: u64,
+        checkpoint: EgressGatewayCheckpoint,
+        plans: &[EgressHaPlan],
+        mut previous_owned_addresses: Vec<IpAddr>,
         mut release_authorized_desired_revisions: Vec<Revision>,
     ) -> Result<Self, EgressGatewayAddressError> {
         validate_principal(principal)?;
@@ -120,18 +216,66 @@ impl EgressGatewayAddressProjection {
             node_name: principal.node_name.clone(),
             node_uid: principal.node_uid.clone(),
         };
-        let mut leases = checkpoint
-            .records
-            .into_iter()
-            .map(|record| record.desired)
-            .filter(|desired| {
-                desired
-                    .nodes
-                    .iter()
-                    .any(|node| node.name == recipient.node_name && node.uid == recipient.node_uid)
-            })
-            .collect::<Vec<_>>();
+        for plan in plans {
+            let desired = checkpoint
+                .records
+                .iter()
+                .map(|record| &record.desired)
+                .find(|desired| desired.owner == plan.owner && desired.nodes.len() > 1)
+                .ok_or(EgressGatewayAddressError::InvalidHaOwnership)?;
+            validate_ha_plan_for_desired(plan, desired)?;
+        }
+        let mut leases = Vec::new();
+        let mut ha_ownership = Vec::new();
+        for record in checkpoint.records {
+            let mut desired = record.desired;
+            if !desired
+                .nodes
+                .iter()
+                .any(|node| node.name == recipient.node_name && node.uid == recipient.node_uid)
+            {
+                continue;
+            }
+            if desired.nodes.len() == 1 {
+                leases.push(desired);
+                continue;
+            }
+            let plan = plans
+                .iter()
+                .find(|plan| plan.owner == desired.owner)
+                .ok_or(EgressGatewayAddressError::InvalidHaOwnership)?;
+            validate_ha_plan_for_desired(plan, &desired)?;
+            let shard_indexes = plan
+                .assignments
+                .iter()
+                .filter(|assignment| {
+                    assignment.gateway.name == recipient.node_name
+                        && assignment.gateway.uid == recipient.node_uid
+                })
+                .map(|assignment| assignment.shard_index)
+                .collect::<BTreeSet<_>>();
+            if shard_indexes.is_empty() {
+                continue;
+            }
+            desired.addresses = plan
+                .shards
+                .iter()
+                .filter(|shard| shard_indexes.contains(&shard.index))
+                .flat_map(|shard| shard.addresses.iter().copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            ha_ownership.push(EgressGatewayHaOwnership {
+                owner: desired.owner.clone(),
+                active_plan_revision: plan.revision,
+                active_plan_digest: plan.plan_digest,
+                shard_indexes: shard_indexes.into_iter().collect(),
+            });
+            leases.push(desired);
+        }
         leases.sort_by(|left, right| left.owner.cmp(&right.owner));
+        ha_ownership.sort_unstable();
+        previous_owned_addresses.sort_unstable();
         release_authorized_desired_revisions.sort_unstable();
         let mut projection = Self {
             schema_version: EGRESS_GATEWAY_ADDRESS_SCHEMA_VERSION,
@@ -139,6 +283,8 @@ impl EgressGatewayAddressProjection {
             revision: checkpoint.revision,
             recipient,
             leases,
+            ha_ownership,
+            previous_owned_addresses,
             release_authorized_desired_revisions,
             projection_digest: EgressGatewayAddressProjectionDigest([0; 32]),
         };
@@ -188,6 +334,10 @@ impl EgressGatewayAddressProjection {
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
             || self
+                .ha_ownership
+                .windows(2)
+                .any(|pair| pair[0].owner >= pair[1].owner)
+            || self
                 .release_authorized_desired_revisions
                 .iter()
                 .any(|revision| {
@@ -195,8 +345,38 @@ impl EgressGatewayAddressProjection {
                         lease.action == EgressGatewayAction::Withdraw && lease.revision == *revision
                     })
                 })
+            || self
+                .previous_owned_addresses
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self.previous_owned_addresses.len()
+                > MAX_EGRESS_INTENTS * MAX_EGRESS_ADDRESSES_PER_INTENT
         {
             return Err(EgressGatewayAddressError::InvalidLeaseOrder);
+        }
+        let ha_owners = self
+            .ha_ownership
+            .iter()
+            .map(|ownership| ownership.owner.clone())
+            .collect::<BTreeSet<_>>();
+        let expected_ha_owners = self
+            .leases
+            .iter()
+            .filter(|lease| lease.nodes.len() > 1)
+            .map(|lease| lease.owner.clone())
+            .collect::<BTreeSet<_>>();
+        if ha_owners != expected_ha_owners
+            || self.ha_ownership.iter().any(|ownership| {
+                ownership.active_plan_revision == Revision::INITIAL
+                    || ownership.active_plan_digest.0 == [0; 32]
+                    || ownership.shard_indexes.is_empty()
+                    || ownership
+                        .shard_indexes
+                        .windows(2)
+                        .any(|pair| pair[0] >= pair[1])
+            })
+        {
+            return Err(EgressGatewayAddressError::InvalidHaOwnership);
         }
         if self.leases.iter().any(|desired| {
             !desired.nodes.iter().any(|node| {
@@ -215,16 +395,62 @@ impl EgressGatewayAddressProjection {
             self.revision,
             &self.recipient,
             &self.leases,
+            &self.ha_ownership,
+            &self.previous_owned_addresses,
             &self.release_authorized_desired_revisions,
         ))
         .map_err(|_| EgressGatewayAddressError::DigestMismatch)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"unf.egress-gateway-address.v1\0");
+        hasher.update(b"unf.egress-gateway-address.v3\0");
         hasher.update(material);
         Ok(EgressGatewayAddressProjectionDigest(
             hasher.finalize().into(),
         ))
     }
+}
+
+fn validate_ha_plan_for_desired(
+    plan: &EgressHaPlan,
+    desired: &EgressGatewayDesired,
+) -> Result<(), EgressGatewayAddressError> {
+    let candidate_nodes = plan
+        .candidates
+        .iter()
+        .map(|candidate| candidate.node.clone())
+        .collect::<BTreeSet<_>>();
+    let desired_nodes = desired.nodes.iter().cloned().collect::<BTreeSet<_>>();
+    let addresses = plan
+        .shards
+        .iter()
+        .flat_map(|shard| shard.addresses.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let desired_addresses = desired.addresses.iter().copied().collect::<BTreeSet<_>>();
+    let assigned_shards = plan
+        .assignments
+        .iter()
+        .map(|assignment| assignment.shard_index)
+        .collect::<BTreeSet<_>>();
+    let shards = plan
+        .shards
+        .iter()
+        .map(|shard| shard.index)
+        .collect::<BTreeSet<_>>();
+    if plan.owner != desired.owner
+        || plan.allocation_revision != desired.allocation_revision
+        || plan.lease_epoch != desired.lease_epoch
+        || plan.revision == Revision::INITIAL
+        || candidate_nodes != desired_nodes
+        || addresses != desired_addresses
+        || assigned_shards != shards
+        || plan.assignments.len() != plan.shards.len()
+        || plan
+            .assignments
+            .iter()
+            .any(|assignment| !desired_nodes.contains(&assignment.gateway))
+    {
+        return Err(EgressGatewayAddressError::InvalidHaOwnership);
+    }
+    Ok(())
 }
 
 impl EgressGatewayAddressAcknowledgement {
@@ -401,8 +627,8 @@ mod tests {
     use crate::{
         DEFAULT_EGRESS_INTENT_PRIORITY, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
         EgressAddressLease, EgressAddressRequest, EgressCapability, EgressDestinations,
-        EgressIntent, EgressIntentOwner, EgressIntentScope, EgressNode, EgressProviderRef,
-        EgressSourceSelector,
+        EgressHaCandidate, EgressIntent, EgressIntentOwner, EgressIntentScope, EgressNode,
+        EgressProviderRef, EgressSourceSelector, compile_egress_ha_plan,
     };
 
     fn principal(name: &str) -> AuthenticatedEgressAgent {
@@ -460,21 +686,61 @@ mod tests {
     #[test]
     fn exact_node_projection_filters_and_seals_dual_stack_leases() {
         let mut registry = EgressGatewayRegistry::default();
+        let payments = lease(
+            "payments",
+            &["192.0.2.20", "192.0.2.21", "2001:db8::20", "2001:db8::21"],
+            1,
+        );
         registry
-            .ensure(
-                &lease("payments", &["192.0.2.20", "2001:db8::20"], 1),
-                vec![node("a"), node("b")],
-            )
+            .ensure(&payments, vec![node("a"), node("b")])
             .unwrap();
         registry
-            .ensure(&lease("reports", &["192.0.2.21"], 2), vec![node("b")])
+            .ensure(&lease("reports", &["192.0.2.30"], 2), vec![node("b")])
             .unwrap();
-        let projection =
+        let candidates = ["a", "b"]
+            .into_iter()
+            .map(|name| EgressHaCandidate {
+                node: node(name),
+                capacity_units: 1,
+                failure_domains: std::collections::BTreeMap::new(),
+            })
+            .collect();
+        let plan = compile_egress_ha_plan(&payments, candidates, None, Revision::new(10)).unwrap();
+        assert_eq!(
             EgressGatewayAddressProjection::issue(&principal("a"), 7, registry.checkpoint())
-                .unwrap();
+                .unwrap_err(),
+            EgressGatewayAddressError::InvalidHaOwnership
+        );
+        let projection = EgressGatewayAddressProjection::issue_exclusive_with_releases(
+            &principal("a"),
+            7,
+            registry.checkpoint(),
+            vec![plan.clone()],
+            Vec::new(),
+        )
+        .unwrap();
         assert_eq!(projection.leases.len(), 1);
         assert_eq!(projection.leases[0].owner.name, "payments");
+        assert_eq!(projection.leases[0].addresses.len(), 2);
+        assert_eq!(projection.ha_ownership.len(), 1);
+        assert_eq!(projection.ha_ownership[0].shard_indexes.len(), 1);
         projection.clone().admit(&principal("a")).unwrap();
+
+        let transitioned =
+            EgressGatewayAddressProjection::issue_exclusive_transition_with_releases(
+                &principal("a"),
+                7,
+                registry.checkpoint(),
+                vec![plan],
+                projection.leases[0].addresses.clone(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            transitioned.previous_owned_addresses,
+            projection.leases[0].addresses
+        );
+        transitioned.clone().admit(&principal("a")).unwrap();
 
         let mut mutated = projection;
         mutated.leases[0].addresses[0] = "192.0.2.99".parse().unwrap();

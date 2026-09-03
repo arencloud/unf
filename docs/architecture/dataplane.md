@@ -44,7 +44,7 @@ key layout without an ABI change.
 | `POLICY_CONFIG` | constant `u32` slot 0 | controller epoch, policy revision, combined entry count, schema, active bank | agent writer; TC reader | one atomic write activates matching banks; pinned | one entry; failed activation preserves the previous pointer |
 | `EGRESS_SOURCES` | source identity and bank | lease plus six revision domains, contract/intent commitments, shared intent index, candidate counts, admission and family/standby flags | egress compiler; agent transactional writer; source TC reader | inactive entries are replaced/read back before the shared egress pointer changes; persistent ABI v14 | 131,072 entries across two banks; an explicit source is only fenced or active |
 | `EGRESS_DESTINATIONS_V4`, `EGRESS_DESTINATIONS_V6` | exact intent index and bank followed by destination prefix | contract revision, intent digest, schema | egress compiler; agent transactional writer/reconstructor; source TC LPM reader | both families stage, read back, recover, roll back, and retire with source/candidate state under one pointer in persistent ABI v14 | 262,144 entries each; prefix length is 64 plus the network prefix, so `Any` remains isolated to its intent and bank |
-| `EGRESS_ADDRESSES`, `EGRESS_GATEWAYS`, `EGRESS_SELECTIONS` | shared intent index, candidate or bucket, family, bank | exact egress address witness; certified route/neighbor/tunnel path; or 251-bucket primary/pre-certified-standby choice | egress compiler; agent transactional writer; source TC reader | all three tables stage and recover with `EGRESS_SOURCES` under one bank | 131,072 addresses, 262,144 gateway paths, and 4,112,384 no-preallocate selections; any partial stage preserves the active pointer |
+| `EGRESS_ADDRESSES`, `EGRESS_GATEWAYS`, `EGRESS_SELECTIONS` | shared intent index, candidate or bucket, family, bank | exact egress address witness; certified route/neighbor/tunnel path; or 251-bucket primary/precomputed-standby choice | egress compiler; agent transactional writer; source TC reader | all three tables stage and recover with `EGRESS_SOURCES` under one bank | 131,072 addresses, 262,144 gateway paths, and 4,112,384 no-preallocate selections; any partial stage preserves the active pointer |
 | `EGRESS_CONFIG` | constant `u32` slot 0 | controller/projection/contract/path revisions, source/address/gateway/selection/destination counts, ABI schema, active bank | agent writer; source TC reader | sole atomic pointer; restart validates exact counts and removes uncommitted inactive state | one entry; zero config removes orphan staging state |
 | `EGRESS_GATEWAY_NAT_SOURCES`, `EGRESS_GATEWAY_NAT_DESTINATIONS_V4/V6`, `EGRESS_GATEWAY_NAT_ADDRESSES`, `EGRESS_GATEWAY_NAT_GATEWAYS`, `EGRESS_GATEWAY_NAT_SELECTIONS` | source identity plus bank, followed by destination prefix, candidate, or bucket dimensions | exact heterogeneous contract/lease/intent/digest, local-primary gateway, address, and proof-witness projection | gateway compiler; agent transactional writer/reconstructor; gateway TC reader | seven dedicated maps stage/read back/recover/retire under one aggregate pointer in persistent ABI v14; identity namespacing prevents cross-contract revision/index aliasing | same bounded capacities as the source tables; malformed aggregate or owned state fails closed |
 | `EGRESS_GATEWAY_NAT_CONFIG` | constant `u32` slot 0 | controller/projection revisions, aggregate counts, ABI schema, active bank, gateway-NAT flag | agent writer; gateway TC reader | sole aggregate gateway activation pointer; contract/path revisions are zero because one bank contains heterogeneous contracts | one entry; invalid state with any staged ownership is routed to a fail-closed NAT tail |
@@ -218,7 +218,7 @@ Explicit source entries are only fenced or active; absence remains native.
 Source-local path certificates bind gateway
 transport, next hop, interface, MTU, mode, revision, and lease before active
 lowering. Candidate and 251-bucket rendezvous tables are shared per intent and
-store a primary plus pre-certified standby when available. Fixed connection and
+store a primary plus precomputed standby path when available. Fixed connection and
 event layouts retain the original/translated tuple and bilateral proof
 provenance. Inactive-bank replacement/readback, atomic activation, capacity
 rollback, pointer-authoritative recovery, and exact cleanup now pass agent,
@@ -234,7 +234,7 @@ fence. A separate authenticated projection now drives Node-UID-bound `/32` and
 `/128` ownership on `unf-egress0`; exact proxy-NDP ownership on the configured
 IPv6 uplink, whole-host collision preflight, exact kernel readback, and
 all-selected-gateway quorum precede readiness. Withdrawal
-quarantines those addresses until a checkpoint-v2 retirement manifest has
+quarantines those addresses until a checkpoint-v3 retirement manifest has
 frozen the exact source/gateway/lease set and a schema-v1 Proof of Safe
 Forgetting joins complete source fences, zero-flow gateway drains, and the exact
 reachability withdrawal. Reconciliation, time, and leadership cannot infer
