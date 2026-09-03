@@ -413,7 +413,7 @@ pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
 is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
-and ADRs 0113–0126 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+and ADRs 0113–0127 track the work. Milestone 8.2a now adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -479,8 +479,14 @@ NetworkPolicy first, leaves service and nonmatching traffic on their native
 paths, drops fenced or incoherent exact targets, then uses the original-tuple
 bucket to hand an unchanged packet to a certified direct neighbor. The
 real-kernel dual-stack gate passes `make egress-source-steering-test`; ADR 0126.
-Live path activation, gateway address/NAT maps, reverse traffic, and platform
-dual-stack NAT are next.
+The source now crosses `Fenced -> Active` only when a digest-bound controller
+grant proves every selected gateway has applied the exact contract and the
+source independently reads back a stable native dual-stack route snapshot,
+Node UID, next-hop transport, interface index, and MTU. Withdrawal, loss of
+either proof, synchronization failure, and restart atomically restore
+destination-preserving fences and purge egress connection state. This passes
+`make egress-path-activation-test`; ADR 0127. Same-Node gateway activation,
+gateway address/NAT maps, reverse traffic, and platform dual-stack NAT are next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

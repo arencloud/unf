@@ -221,9 +221,13 @@ rollback, pointer-authoritative recovery, and exact cleanup now pass agent,
 eBPF, and privileged real-kernel tests. An authenticated exact-Node source
 endpoint feeds independently replayed contracts into fenced map banks, while
 destination-exact source TC steering executes only after egress policy allows
-the original flow. Live route/path acquisition must now drive the guarded
-transition to `Active`; gateway address ownership and collision-safe dual-stack
-SNAT/reverse processing follow. ADRs 0119–0126 record the verified boundary.
+the original flow. The controller issues a digest-bound activation grant only
+after every selected gateway application is current; the source separately
+reads back the exact native route set, Node identity, transport, interface
+index, MTU, and stable dual-stack route revision before atomically entering
+`Active`. Loss of either proof and restart return through a destination-preserving
+fence. Gateway address ownership and collision-safe dual-stack SNAT/reverse
+processing follow. ADRs 0119–0127 record the verified boundary.
 
 The legacy netlink path, encrypted internal transport, and IPv4/IPv6 policy
 provenance now have repeatable evidence on separate OpenShift 4.22 IPv4-only and

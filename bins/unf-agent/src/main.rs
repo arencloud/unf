@@ -57,12 +57,13 @@ use unf_ebpf_common::{
     service_selection_tier_is_valid,
 };
 use unf_egress::{
-    AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
-    EGRESS_DISTRIBUTION_SCHEMA_VERSION, EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard,
-    EgressAgentAdvertisement, EgressCapability, EgressDataplaneState,
-    EgressGatewayApplicationAcknowledgement, EgressGatewayHostBank, EgressGatewayProjection,
-    EgressGatewayProjectionLedger, EgressNodeProjectionEnvelope, EgressProjectionLedger,
-    EgressSourceApplicationAcknowledgement, compile_egress_dataplane,
+    AddressFamily as EgressAddressFamily, AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT,
+    EGRESS_AGENT_TOKEN_AUDIENCE, EGRESS_DISTRIBUTION_SCHEMA_VERSION,
+    EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard, EgressAgentAdvertisement,
+    EgressCapability, EgressDataplaneState, EgressGatewayApplicationAcknowledgement,
+    EgressGatewayHostBank, EgressGatewayProjection, EgressGatewayProjectionLedger,
+    EgressNodeProjectionEnvelope, EgressPathCertificate, EgressPathMode, EgressProjectionLedger,
+    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, compile_egress_dataplane,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -789,6 +790,7 @@ struct AgentState {
     applied_remote_route_revision: AtomicU64,
     remote_route_entries: AtomicU64,
     remote_route_reconcile_errors: AtomicU64,
+    applied_remote_routes: Mutex<Option<RemoteRouteSnapshot>>,
     queued_flow_exports: AtomicU64,
     dropped_flow_exports: AtomicU64,
     exported_flow_events: AtomicU64,
@@ -848,11 +850,160 @@ struct EgressSynchronizer {
     ledger: EgressProjectionLedger,
     gateway_ledger: EgressGatewayProjectionLedger,
     applied_authority: Option<EgressAppliedAuthority>,
+    path_provider: Option<NativeEgressPathProvider>,
     node_name: String,
     controller_url: Option<String>,
     client: ReloadingControllerClient,
     agent_token_path: PathBuf,
     interval: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeEgressPathProvider {
+    ipv4_interface: String,
+    ipv6_interface: String,
+    ipv4_output_interface: u32,
+    ipv6_output_interface: u32,
+    ipv4_onlink: bool,
+    ipv6_onlink: bool,
+    sys_class_net: PathBuf,
+}
+
+impl NativeEgressPathProvider {
+    async fn acquire(
+        &self,
+        source: &unf_egress::AdmittedEgressProjection,
+        state: &AgentState,
+    ) -> Result<Vec<EgressPathCertificate>> {
+        let snapshot = mutex_lock(&state.applied_remote_routes)
+            .clone()
+            .context("no read-back native remote-route snapshot is applied")?;
+        let contract = &source.projection().contract;
+        if contract.plans.is_empty() {
+            bail!("an empty egress contract cannot be activated");
+        }
+        if contract.plans.iter().any(|plan| {
+            plan.source.node.name != snapshot.node_name || plan.source.node.uid != snapshot.node_uid
+        }) {
+            bail!("egress source contract does not match remote-route Node provenance");
+        }
+        let local = NodeBlockSnapshot {
+            schema_version: NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION,
+            revision: snapshot.local_assignment_revision,
+            node_name: snapshot.node_name.clone(),
+            node_uid: snapshot.node_uid.clone(),
+            provider: snapshot.local_blocks,
+        };
+        let plan = lower_remote_route_snapshot(
+            &snapshot,
+            &local,
+            self.ipv4_output_interface,
+            self.ipv6_output_interface,
+            self.ipv4_onlink,
+            self.ipv6_onlink,
+        )?;
+        plan.readback()
+            .await
+            .context("read back exact native gateway routes")?;
+        let ipv4_mtu = interface_mtu_at(
+            &self.sys_class_net,
+            &self.ipv4_interface,
+            self.ipv4_output_interface,
+        )?;
+        let ipv6_mtu = interface_mtu_at(
+            &self.sys_class_net,
+            &self.ipv6_interface,
+            self.ipv6_output_interface,
+        )?;
+        let certificates =
+            build_egress_path_certificates(self, source, &snapshot, ipv4_mtu, ipv6_mtu)?;
+        if mutex_lock(&state.applied_remote_routes).as_ref() != Some(&snapshot) {
+            bail!("remote-route snapshot changed during egress path acquisition");
+        }
+        Ok(certificates)
+    }
+}
+
+fn build_egress_path_certificates(
+    provider: &NativeEgressPathProvider,
+    source: &unf_egress::AdmittedEgressProjection,
+    snapshot: &RemoteRouteSnapshot,
+    ipv4_mtu: u32,
+    ipv6_mtu: u32,
+) -> Result<Vec<EgressPathCertificate>> {
+    let contract = &source.projection().contract;
+    let remotes = snapshot
+        .remote_nodes
+        .iter()
+        .map(|remote| {
+            (
+                (
+                    remote.intent.node_name.as_str(),
+                    remote.intent.node_uid.as_str(),
+                ),
+                remote,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut certificates = BTreeMap::new();
+    for behavior in &contract.plans {
+        let families = behavior
+            .allocation
+            .addresses
+            .iter()
+            .map(|address| match address {
+                IpAddr::V4(_) => EgressAddressFamily::Ipv4,
+                IpAddr::V6(_) => EgressAddressFamily::Ipv6,
+            })
+            .collect::<BTreeSet<_>>();
+        for gateway in &behavior.gateways {
+            let remote = remotes
+                .get(&(gateway.node.name.as_str(), gateway.node.uid.as_str()))
+                .with_context(|| {
+                    format!(
+                        "selected gateway {}/{} has no exact remote-route ownership",
+                        gateway.node.name, gateway.node.uid
+                    )
+                })?;
+            for family in &families {
+                let (transport, output_interface, mtu) = match family {
+                    EgressAddressFamily::Ipv4 => (
+                        IpAddr::V4(remote.ipv4_transport),
+                        provider.ipv4_output_interface,
+                        ipv4_mtu,
+                    ),
+                    EgressAddressFamily::Ipv6 => (
+                        IpAddr::V6(remote.ipv6_transport),
+                        provider.ipv6_output_interface,
+                        ipv6_mtu,
+                    ),
+                };
+                let certificate = EgressPathCertificate::issue(
+                    behavior.source.node.clone(),
+                    gateway.node.clone(),
+                    *family,
+                    transport,
+                    transport,
+                    output_interface,
+                    mtu,
+                    EgressPathMode::DirectNeighbor,
+                    Revision::new(snapshot.revision),
+                    gateway.lease_epoch,
+                )
+                .context("seal exact source-local egress path")?;
+                certificates.insert(
+                    (
+                        behavior.source.node.uid.clone(),
+                        gateway.node.uid.clone(),
+                        *family,
+                        gateway.lease_epoch,
+                    ),
+                    certificate,
+                );
+            }
+        }
+    }
+    Ok(certificates.into_values().collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1051,6 +1202,7 @@ struct DataplaneConfig {
     bpf_pin_path: PathBuf,
     tc_attachment_preference: TcAttachmentPreference,
     service_dsr_transport_interfaces: [u32; 4],
+    egress_path_provider: Option<NativeEgressPathProvider>,
 }
 
 struct FlowExporterConfig {
@@ -1266,6 +1418,7 @@ async fn main() -> Result<()> {
         args.cni_native_ipv4_uplink.as_deref(),
         args.cni_native_ipv6_uplink.as_deref(),
     )?;
+    let egress_path_provider = native_egress_path_provider(&args)?;
     supervised_service_configured |= spawn_cni_transaction_server(
         &args,
         cni_provider,
@@ -1299,6 +1452,7 @@ async fn main() -> Result<()> {
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
             let bpf_pin_path = args.bpf_pin_path.clone();
             let tc_attachment_preference = args.tc_attachment_mode;
+            let egress_path_provider = egress_path_provider.clone();
             tasks.spawn(async move {
                 let config = DataplaneConfig {
                     object,
@@ -1318,6 +1472,7 @@ async fn main() -> Result<()> {
                     bpf_pin_path,
                     tc_attachment_preference,
                     service_dsr_transport_interfaces,
+                    egress_path_provider,
                 };
                 if let Err(error) = run_dataplane(config, Arc::clone(&state), cancellation).await {
                     error!(?error, "eBPF dataplane stopped");
@@ -1889,6 +2044,7 @@ async fn repair_last_known_good_routes(applied: &AppliedRemoteRoutes, state: &Ag
             state.remote_route_entries.store(0, Ordering::Release);
             state.metrics.applied_remote_route_revision.set(0);
             state.metrics.remote_route_entries.set(0);
+            *mutex_lock(&state.applied_remote_routes) = None;
             error!(%error, "last-known-good remote routes could not be repaired");
         }
     }
@@ -2114,6 +2270,7 @@ fn publish_applied_remote_routes(
     snapshot: &RemoteRouteSnapshot,
     plan: &NativeRemoteRoutePlan,
 ) {
+    *mutex_lock(&state.applied_remote_routes) = Some(snapshot.clone());
     let entries = u64::try_from(plan.routes().len()).unwrap_or(u64::MAX);
     state
         .applied_remote_route_epoch
@@ -5729,6 +5886,7 @@ fn new_state(
         applied_remote_route_revision: AtomicU64::new(0),
         remote_route_entries: AtomicU64::new(0),
         remote_route_reconcile_errors: AtomicU64::new(0),
+        applied_remote_routes: Mutex::new(None),
         queued_flow_exports: AtomicU64::new(0),
         dropped_flow_exports: AtomicU64::new(0),
         exported_flow_events: AtomicU64::new(0),
@@ -6194,6 +6352,7 @@ async fn run_dataplane(
         config.service_state_path.clone(),
         config.load_balancer_reachability_state_path.clone(),
         config.node_name.clone(),
+        config.egress_path_provider.clone(),
     );
     let recovered = recover_persistent_dataplane(
         &mut identities,
@@ -6458,6 +6617,7 @@ fn new_synchronizers(
     service_state_path: PathBuf,
     load_balancer_state_path: PathBuf,
     node_name: String,
+    egress_path_provider: Option<NativeEgressPathProvider>,
 ) -> (
     IdentitySynchronizer,
     PolicySynchronizer,
@@ -6583,6 +6743,7 @@ fn new_synchronizers(
             ledger: EgressProjectionLedger::default(),
             gateway_ledger: EgressGatewayProjectionLedger::default(),
             applied_authority: None,
+            path_provider: egress_path_provider,
             node_name,
             controller_url,
             client,
@@ -7448,6 +7609,12 @@ fn recover_egress_state(egress: &mut EgressSynchronizer) -> Result<()> {
     egress.applied_authority = Some(applied_authority);
     let inactive_bank = active_bank ^ 1;
     clear_egress_bank(egress, inactive_bank)?;
+    if fence_active_egress_dataplane(egress)? {
+        info!(
+            active_bank = egress.active_bank,
+            "recovered egress activation was fenced pending fresh controller and path proof"
+        );
+    }
     Ok(())
 }
 
@@ -7820,6 +7987,12 @@ async fn synchronize_egress(
 ) -> Result<bool> {
     let source_result = synchronize_egress_source(synchronizer, state).await;
     let gateway_result = synchronize_egress_gateway(synchronizer, state).await;
+    if (source_result.is_err() || gateway_result.is_err())
+        && let Err(error) = fence_active_egress_dataplane(synchronizer)
+    {
+        return Err(error)
+            .context("egress synchronization failed and active state could not be fenced");
+    }
     match (source_result, gateway_result) {
         (Ok(source), Ok(gateway)) => Ok(source || gateway),
         (Err(source), Ok(_)) => Err(source.context("egress source distribution failed")),
@@ -7849,7 +8022,8 @@ async fn synchronize_egress_source(
         .await
         .context("request authenticated egress source projection")?;
     if response.status() == reqwest::StatusCode::NO_CONTENT {
-        return Ok(false);
+        return fence_active_egress_dataplane(synchronizer)
+            .context("fence egress state after source authority withdrawal");
     }
     let envelope: EgressNodeProjectionEnvelope = response
         .error_for_status()
@@ -7888,7 +8062,7 @@ async fn synchronize_egress_source(
             .sources
             .len();
         acknowledge_current_egress_source(synchronizer, &admitted, source_count).await?;
-        return Ok(false);
+        return activate_current_egress_source(synchronizer, state, &admitted).await;
     }
     let mut next_ledger = synchronizer.ledger.clone();
     next_ledger
@@ -7926,6 +8100,90 @@ async fn synchronize_egress_source(
         "authenticated egress intent staged as fail-closed source fences"
     );
     Ok(true)
+}
+
+async fn activate_current_egress_source(
+    synchronizer: &mut EgressSynchronizer,
+    state: &AgentState,
+    admitted: &unf_egress::AdmittedEgressProjection,
+) -> Result<bool> {
+    let Some(grant) = fetch_egress_source_activation_grant(synchronizer).await? else {
+        return fence_active_egress_dataplane(synchronizer)
+            .context("fence egress state while gateway readiness is incomplete");
+    };
+    grant
+        .verify(admitted)
+        .context("verify controller egress source activation grant")?;
+    let provider = synchronizer
+        .path_provider
+        .as_ref()
+        .context("egress activation requires native dual-stack route ownership")?;
+    let paths = provider.acquire(admitted, state).await?;
+    let host = EgressGatewayHostBank::compile(admitted)
+        .context("compile admitted egress host bank for activation")?;
+    let mut guard = EgressAdmissionGuard::default();
+    for plan in &host.contract.plans {
+        guard
+            .fence(
+                plan.source.identity,
+                plan.intent.clone(),
+                plan.revisions.intent,
+            )
+            .context("install egress activation fence")?;
+        guard
+            .activate(plan.source.identity, admitted)
+            .context("activate exact admitted egress source")?;
+    }
+
+    let current = compile_egress_dataplane(&host, &guard, &paths, synchronizer.active_bank)
+        .context("compile current-bank egress activation candidate")?;
+    if encode_egress_dataplane(&current)?
+        == synchronizer.banks[usize::from(synchronizer.active_bank)]
+    {
+        return Ok(false);
+    }
+    let bank = synchronizer.active_bank ^ 1;
+    let candidate = compile_egress_dataplane(&host, &guard, &paths, bank)
+        .context("compile certified active egress dataplane candidate")?;
+    apply_egress_dataplane(synchronizer, &candidate)?;
+    info!(
+        controller_epoch = host.controller_epoch,
+        projection_revision = host.projection_revision.get(),
+        contract_revision = host.contract.contract_revision.get(),
+        path_revision = candidate.config.path_revision,
+        paths = paths.len(),
+        sources = candidate.sources.len(),
+        active_bank = synchronizer.active_bank,
+        "activated egress sources after gateway and local-path proof"
+    );
+    Ok(true)
+}
+
+async fn fetch_egress_source_activation_grant(
+    synchronizer: &EgressSynchronizer,
+) -> Result<Option<EgressSourceActivationGrant>> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("egress activation requires a controller URL")?;
+    let response = authenticated_get(
+        &synchronizer.client,
+        format!("{controller_url}/v1/state/egress-source-activation"),
+        &synchronizer.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request egress source activation grant")?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+    response
+        .error_for_status()
+        .context("controller rejected egress source activation request")?
+        .json()
+        .await
+        .map(Some)
+        .context("decode egress source activation grant")
 }
 
 async fn acknowledge_current_egress_source(
@@ -8111,7 +8369,16 @@ fn apply_egress_dataplane(
     state: &EgressDataplaneState,
 ) -> Result<()> {
     let desired = encode_egress_dataplane(state)?;
-    let bank = state.config.active_bank;
+    apply_encoded_egress_bank(egress, desired)
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_encoded_egress_bank(
+    egress: &mut EgressSynchronizer,
+    desired: EncodedEgressBank,
+) -> Result<()> {
+    let bank = desired.config[50];
+    egress_bank(bank)?;
     let current_config = egress
         .config
         .get(&0, 0)
@@ -8209,6 +8476,80 @@ fn apply_egress_dataplane(
         );
     }
     Ok(())
+}
+
+fn fence_active_egress_dataplane(egress: &mut EgressSynchronizer) -> Result<bool> {
+    let active = &egress.banks[usize::from(egress.active_bank)];
+    let bank = egress.active_bank ^ 1;
+    let Some(desired) = compile_fenced_egress_bank(active, bank)? else {
+        return Ok(false);
+    };
+    apply_encoded_egress_bank(egress, desired)?;
+    let connection_keys = egress
+        .connections
+        .iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    for key in connection_keys {
+        egress.connections.remove(&key)?;
+    }
+    Ok(true)
+}
+
+fn compile_fenced_egress_bank(
+    active: &EncodedEgressBank,
+    bank: u8,
+) -> Result<Option<EncodedEgressBank>> {
+    egress_bank(bank)?;
+    let needs_fence = active
+        .sources
+        .values()
+        .any(|source| source[122] == unf_ebpf_common::EGRESS_ADMISSION_ACTIVE)
+        || !active.addresses.is_empty()
+        || !active.gateways.is_empty()
+        || !active.selections.is_empty();
+    if !needs_fence {
+        return Ok(None);
+    }
+    let mut desired = active.clone();
+    desired.sources = desired
+        .sources
+        .into_iter()
+        .map(|(mut key, mut value)| {
+            key[4] = bank;
+            value[122] = unf_ebpf_common::EGRESS_ADMISSION_FENCED;
+            value[123] &= !unf_ebpf_common::EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY;
+            (key, value)
+        })
+        .collect();
+    desired.ipv4_destinations = desired
+        .ipv4_destinations
+        .into_iter()
+        .map(|((prefix, mut key), value)| {
+            key[4] = bank;
+            ((prefix, key), value)
+        })
+        .collect();
+    desired.ipv6_destinations = desired
+        .ipv6_destinations
+        .into_iter()
+        .map(|((prefix, mut key), value)| {
+            key[4] = bank;
+            ((prefix, key), value)
+        })
+        .collect();
+    desired.addresses.clear();
+    desired.gateways.clear();
+    desired.selections.clear();
+    desired.config[24..32].copy_from_slice(&0_u64.to_ne_bytes());
+    for offset in [36_usize, 40, 44] {
+        desired.config[offset..offset + 4].copy_from_slice(&0_u32.to_ne_bytes());
+    }
+    desired.config[50] = bank;
+    validate_egress_destination_bindings(&desired, desired.config)?;
+    Ok(Some(desired))
 }
 
 fn rollback_egress_stage(
@@ -9818,7 +10159,7 @@ async fn consume_events(
             }
             _ = egress_interval.tick(), if egress.controller_url.is_some() => {
                 if let Err(error) = synchronize_egress(egress, state).await {
-                    warn!(%error, "egress source synchronization failed; retaining last-known-good bank");
+                    warn!(%error, "egress synchronization failed; active source state was fenced when possible");
                 }
             }
             _ = event_interval.tick() => {
@@ -12067,6 +12408,36 @@ fn interface_index_at(sys_class_net: &Path, interface: &str) -> Result<u32> {
         .with_context(|| format!("parse interface index for {interface}"))
 }
 
+fn native_egress_path_provider(args: &Args) -> Result<Option<NativeEgressPathProvider>> {
+    let (Some(ipv4_interface), Some(ipv6_interface)) = (
+        args.cni_native_ipv4_uplink.as_deref(),
+        args.cni_native_ipv6_uplink.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(NativeEgressPathProvider {
+        ipv4_interface: ipv4_interface.to_owned(),
+        ipv6_interface: ipv6_interface.to_owned(),
+        ipv4_output_interface: interface_index(ipv4_interface)?,
+        ipv6_output_interface: interface_index(ipv6_interface)?,
+        ipv4_onlink: args.cni_native_ipv4_onlink,
+        ipv6_onlink: args.cni_native_ipv6_onlink,
+        sys_class_net: PathBuf::from("/sys/class/net"),
+    }))
+}
+
+fn interface_mtu_at(sys_class_net: &Path, interface: &str, expected_index: u32) -> Result<u32> {
+    let observed_index = interface_index_at(sys_class_net, interface)?;
+    if observed_index != expected_index {
+        bail!("interface {interface} index changed from {expected_index} to {observed_index}");
+    }
+    fs::read_to_string(sys_class_net.join(interface).join("mtu"))
+        .with_context(|| format!("read MTU for interface {interface}"))?
+        .trim()
+        .parse()
+        .with_context(|| format!("parse MTU for interface {interface}"))
+}
+
 fn service_dsr_transport_interfaces(
     ipv4_uplink: Option<&str>,
     ipv6_uplink: Option<&str>,
@@ -12890,6 +13261,262 @@ mod tests {
             }],
         };
         (local, snapshot)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn egress_path_test_source() -> unf_egress::AdmittedEgressProjection {
+        let capabilities = BTreeSet::from([
+            EgressCapability::IdentitySourceSteering,
+            EgressCapability::LeaseEpochFencing,
+            EgressCapability::OriginalTupleWitness,
+            EgressCapability::Ipv4TcpUdpNat,
+            EgressCapability::Ipv6TcpUdpNat,
+        ]);
+        let node = |name: &str| unf_egress::EgressNode {
+            name: name.to_owned(),
+            uid: format!("{name}-uid"),
+            capabilities: capabilities.clone(),
+        };
+        let source_node = node("worker-a");
+        let model = unf_egress::normalize_model(
+            vec![unf_egress::EgressAddressPool {
+                name: "public".to_owned(),
+                uid: "public-uid".to_owned(),
+                provider: unf_egress::EgressProviderRef {
+                    name: "native".to_owned(),
+                    instance: "test".to_owned(),
+                },
+                prefixes: vec![
+                    unf_egress::IpPrefix {
+                        address: "192.0.2.0".parse().unwrap(),
+                        prefix_len: 24,
+                    },
+                    unf_egress::IpPrefix {
+                        address: "2001:db8::".parse().unwrap(),
+                        prefix_len: 64,
+                    },
+                ],
+            }],
+            vec![unf_egress::EgressIntent {
+                owner: unf_egress::EgressIntentOwner {
+                    scope: unf_egress::EgressIntentScope::Namespace("finance".to_owned()),
+                    name: "payments".to_owned(),
+                    uid: "payments-uid".to_owned(),
+                },
+                priority: unf_egress::DEFAULT_EGRESS_INTENT_PRIORITY,
+                source: unf_egress::EgressSourceSelector::default(),
+                destinations: unf_egress::EgressDestinations::Any,
+                addresses: unf_egress::EgressAddressRequest::Pool {
+                    name: "public".to_owned(),
+                    families: vec![EgressAddressFamily::Ipv4, EgressAddressFamily::Ipv6],
+                    addresses_per_family: 1,
+                },
+            }],
+        )
+        .unwrap();
+        let facts = unf_egress::EgressContractFacts {
+            revisions: unf_egress::EgressContractRevisions {
+                intent: Revision::new(2),
+                identity: Revision::new(3),
+                policy: Revision::new(4),
+                allocation: Revision::new(5),
+                gateway: Revision::new(6),
+                reachability: Revision::new(7),
+            },
+            sources: vec![unf_egress::EgressSourceFact {
+                identity: IdentityId::new(42),
+                namespace: "finance".to_owned(),
+                workload: "ledger-0".to_owned(),
+                workload_uid: "ledger-uid".to_owned(),
+                service_account: "settlement".to_owned(),
+                namespace_labels: BTreeMap::new(),
+                workload_labels: BTreeMap::new(),
+                node: source_node.clone(),
+                intent_uid: "payments-uid".to_owned(),
+            }],
+            policies: vec![unf_egress::EgressPolicyFact {
+                identity: IdentityId::new(42),
+                intent_uid: "payments-uid".to_owned(),
+                allowed: true,
+                policy_ids: vec![PolicyId::new(9)],
+            }],
+            allocations: vec![unf_egress::EgressAllocationFact {
+                intent_uid: "payments-uid".to_owned(),
+                pool_name: Some("public".to_owned()),
+                pool_uid: Some("public-uid".to_owned()),
+                addresses: vec![
+                    "192.0.2.20".parse().unwrap(),
+                    "2001:db8::20".parse().unwrap(),
+                ],
+                lease_epoch: 11,
+            }],
+            gateways: vec![unf_egress::EgressGatewayFact {
+                intent_uid: "payments-uid".to_owned(),
+                rank: 0,
+                node: node("worker-b"),
+                lease_epoch: 11,
+                ready: true,
+                reachable: true,
+            }],
+        };
+        let contract = unf_egress::EgressBehaviorContract::issue(
+            &model,
+            &facts,
+            source_node,
+            Revision::new(8),
+        )
+        .unwrap();
+        let advertisement = egress_agent_advertisement();
+        let principal = AuthenticatedEgressAgent {
+            namespace: "unf-system".to_owned(),
+            service_account: EGRESS_AGENT_SERVICE_ACCOUNT.to_owned(),
+            pod_name: "unf-agent-a".to_owned(),
+            pod_uid: "unf-agent-a-uid".to_owned(),
+            node_name: "worker-a".to_owned(),
+            node_uid: "worker-a-uid".to_owned(),
+            audience: EGRESS_AGENT_TOKEN_AUDIENCE.to_owned(),
+        };
+        unf_egress::EgressNodeProjectionEnvelope::issue(
+            &principal,
+            &advertisement,
+            9,
+            Revision::new(10),
+            model,
+            facts,
+            contract,
+        )
+        .unwrap()
+        .admit(&principal, &advertisement)
+        .unwrap()
+    }
+
+    #[test]
+    fn dual_stack_egress_paths_bind_route_provenance_interface_and_mtu() {
+        let source = egress_path_test_source();
+        let (_, snapshot) = route_test_snapshots();
+        let provider = NativeEgressPathProvider {
+            ipv4_interface: "eth4".to_owned(),
+            ipv6_interface: "eth6".to_owned(),
+            ipv4_output_interface: 3,
+            ipv6_output_interface: 4,
+            ipv4_onlink: true,
+            ipv6_onlink: false,
+            sys_class_net: PathBuf::from("/unused"),
+        };
+        let paths = build_egress_path_certificates(&provider, &source, &snapshot, 1500, 9000)
+            .expect("dual-stack paths derive from exact route ownership");
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|path| {
+            path.source.name == "worker-a"
+                && path.gateway.name == "worker-b"
+                && path.path_revision == Revision::new(7)
+                && path.lease_epoch == 11
+                && path.transport_address == path.next_hop_address
+                && path.verify_integrity().is_ok()
+        }));
+        let ipv4 = paths
+            .iter()
+            .find(|path| path.address_family == EgressAddressFamily::Ipv4)
+            .unwrap();
+        assert_eq!(ipv4.output_interface, 3);
+        assert_eq!(ipv4.mtu, 1500);
+        let ipv6 = paths
+            .iter()
+            .find(|path| path.address_family == EgressAddressFamily::Ipv6)
+            .unwrap();
+        assert_eq!(ipv6.output_interface, 4);
+        assert_eq!(ipv6.mtu, 9000);
+
+        let mut missing = snapshot;
+        missing.remote_nodes.clear();
+        assert!(build_egress_path_certificates(&provider, &source, &missing, 1500, 9000).is_err());
+    }
+
+    #[test]
+    fn egress_path_interface_readback_rejects_index_reuse() {
+        let directory = tempdir().unwrap();
+        let interface = directory.path().join("eth-test");
+        fs::create_dir(&interface).unwrap();
+        fs::write(interface.join("ifindex"), "17\n").unwrap();
+        fs::write(interface.join("mtu"), "1500\n").unwrap();
+        assert_eq!(
+            interface_mtu_at(directory.path(), "eth-test", 17).unwrap(),
+            1500
+        );
+        assert!(interface_mtu_at(directory.path(), "eth-test", 18).is_err());
+        fs::write(interface.join("mtu"), "1279\n").unwrap();
+        let mtu = interface_mtu_at(directory.path(), "eth-test", 17).unwrap();
+        assert!(
+            EgressPathCertificate::issue(
+                unf_egress::EgressNode {
+                    name: "worker-a".to_owned(),
+                    uid: "worker-a-uid".to_owned(),
+                    capabilities: BTreeSet::new(),
+                },
+                unf_egress::EgressNode {
+                    name: "worker-b".to_owned(),
+                    uid: "worker-b-uid".to_owned(),
+                    capabilities: BTreeSet::new(),
+                },
+                EgressAddressFamily::Ipv4,
+                "192.0.2.2".parse().unwrap(),
+                "192.0.2.2".parse().unwrap(),
+                17,
+                mtu,
+                EgressPathMode::DirectNeighbor,
+                Revision::new(1),
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn active_egress_bank_compiles_to_destination_preserving_fences() {
+        let source = egress_path_test_source();
+        let (_, snapshot) = route_test_snapshots();
+        let provider = NativeEgressPathProvider {
+            ipv4_interface: "eth4".to_owned(),
+            ipv6_interface: "eth6".to_owned(),
+            ipv4_output_interface: 3,
+            ipv6_output_interface: 4,
+            ipv4_onlink: true,
+            ipv6_onlink: false,
+            sys_class_net: PathBuf::from("/unused"),
+        };
+        let paths =
+            build_egress_path_certificates(&provider, &source, &snapshot, 1500, 1500).unwrap();
+        let host = EgressGatewayHostBank::compile(&source).unwrap();
+        let identity = host.contract.plans[0].source.identity;
+        let mut guard = EgressAdmissionGuard::default();
+        let behavior = &host.contract.plans[0];
+        guard
+            .fence(identity, behavior.intent.clone(), behavior.revisions.intent)
+            .unwrap();
+        guard.activate(identity, &source).unwrap();
+        let active = compile_egress_dataplane(&host, &guard, &paths, 1).unwrap();
+        let encoded = encode_egress_dataplane(&active).unwrap();
+        let destination_count = encoded.ipv4_destinations.len() + encoded.ipv6_destinations.len();
+        let fenced = compile_fenced_egress_bank(&encoded, 0)
+            .unwrap()
+            .expect("active bank requires fencing");
+        assert!(fenced.sources.values().all(|value| {
+            value[122] == unf_ebpf_common::EGRESS_ADMISSION_FENCED
+                && value[123] & unf_ebpf_common::EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY == 0
+        }));
+        assert_eq!(
+            fenced.ipv4_destinations.len() + fenced.ipv6_destinations.len(),
+            destination_count
+        );
+        assert!(fenced.addresses.is_empty());
+        assert!(fenced.gateways.is_empty());
+        assert!(fenced.selections.is_empty());
+        assert_eq!(
+            u64::from_ne_bytes(fenced.config[24..32].try_into().unwrap()),
+            0
+        );
+        assert_eq!(fenced.config[50], 0);
+        assert!(compile_fenced_egress_bank(&fenced, 1).unwrap().is_none());
     }
 
     #[allow(clippy::default_trait_access)]
@@ -14230,6 +14857,7 @@ mod tests {
             ledger: EgressProjectionLedger::default(),
             gateway_ledger: EgressGatewayProjectionLedger::default(),
             applied_authority: None,
+            path_provider: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -14423,6 +15051,7 @@ mod tests {
             ledger: EgressProjectionLedger::default(),
             gateway_ledger: EgressGatewayProjectionLedger::default(),
             applied_authority: None,
+            path_provider: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(

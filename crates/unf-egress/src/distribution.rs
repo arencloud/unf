@@ -14,13 +14,15 @@ use unf_common::Revision;
 
 use crate::{
     EGRESS_BEHAVIOR_CONTRACT_SCHEMA_VERSION, EgressBehaviorContract, EgressCapability,
-    EgressContractError, EgressContractFacts, EgressFlowProof, EgressModel, EgressNode,
-    EgressOriginalFlow, EgressProofError, MAX_EGRESS_CONTRACT_PLANS,
+    EgressContractDigest, EgressContractError, EgressContractFacts, EgressFlowProof, EgressModel,
+    EgressNode, EgressOriginalFlow, EgressProofError, MAX_EGRESS_CONTRACT_PLANS,
+    MAX_EGRESS_GATEWAY_NODES,
 };
 
 pub const EGRESS_DISTRIBUTION_SCHEMA_VERSION: u16 = 1;
 pub const EGRESS_HOST_STATE_SCHEMA_VERSION: u16 = 1;
 pub const EGRESS_APPLICATION_ACK_SCHEMA_VERSION: u16 = 1;
+pub const EGRESS_SOURCE_ACTIVATION_SCHEMA_VERSION: u16 = 1;
 pub const MAX_EGRESS_ADVERTISED_SCHEMAS: usize = 8;
 pub const MAX_EGRESS_GATEWAY_SOURCE_CONTRACTS: usize = MAX_EGRESS_CONTRACT_PLANS;
 pub const EGRESS_AGENT_SERVICE_ACCOUNT: &str = "unf-agent";
@@ -56,7 +58,7 @@ pub struct EgressNegotiatedCapabilities {
     pub capabilities: BTreeSet<EgressCapability>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EgressProjectionRecipient {
     pub node_name: String,
@@ -258,6 +260,137 @@ pub struct EgressGatewayApplicationAcknowledgement {
     pub withdrawn: bool,
 }
 
+/// Controller-issued activation authority. It binds the exact admitted source
+/// contract to positive application evidence from every selected gateway.
+/// Source-local path evidence remains independently required by the agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressSourceActivationGrant {
+    pub schema_version: u16,
+    pub controller_epoch: u64,
+    pub projection_revision: Revision,
+    pub recipient: EgressProjectionRecipient,
+    pub contract_revision: Revision,
+    pub contract_digest: EgressContractDigest,
+    pub gateway_applications: Vec<EgressGatewayApplicationAcknowledgement>,
+    pub grant_digest: EgressSourceActivationDigest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EgressSourceActivationDigest(pub [u8; 32]);
+
+impl EgressSourceActivationGrant {
+    /// Seals exact gateway application evidence for one admitted source.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing, duplicate, withdrawn, stale, foreign, or oversized
+    /// gateway evidence.
+    pub fn issue(
+        source: &AdmittedEgressProjection,
+        mut gateway_applications: Vec<EgressGatewayApplicationAcknowledgement>,
+    ) -> Result<Self, EgressDistributionError> {
+        gateway_applications.sort_by(|left, right| left.recipient.cmp(&right.recipient));
+        let projection = source.projection();
+        let mut grant = Self {
+            schema_version: EGRESS_SOURCE_ACTIVATION_SCHEMA_VERSION,
+            controller_epoch: projection.controller_epoch,
+            projection_revision: projection.revision,
+            recipient: projection.recipient.clone(),
+            contract_revision: projection.contract.contract_revision,
+            contract_digest: projection.contract.contract_digest,
+            gateway_applications,
+            grant_digest: EgressSourceActivationDigest([0; 32]),
+        };
+        grant.validate_fields(projection)?;
+        grant.grant_digest = grant.digest()?;
+        Ok(grant)
+    }
+
+    /// Verifies the activation authority against an independently admitted
+    /// source projection.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any source, gateway-set, application, ordering, or digest drift.
+    pub fn verify(&self, source: &AdmittedEgressProjection) -> Result<(), EgressDistributionError> {
+        self.validate_fields(source.projection())?;
+        if self.grant_digest != self.digest()? {
+            return Err(EgressDistributionError::ActivationGrantDigestMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_fields(
+        &self,
+        projection: &EgressNodeProjection,
+    ) -> Result<(), EgressDistributionError> {
+        if self.schema_version != EGRESS_SOURCE_ACTIVATION_SCHEMA_VERSION
+            || self.controller_epoch != projection.controller_epoch
+            || self.projection_revision != projection.revision
+            || self.recipient != projection.recipient
+            || self.contract_revision != projection.contract.contract_revision
+            || self.contract_digest != projection.contract.contract_digest
+            || self.gateway_applications.is_empty()
+            || self.gateway_applications.len() > MAX_EGRESS_GATEWAY_NODES
+        {
+            return Err(EgressDistributionError::ActivationGrantMismatch);
+        }
+        let expected = projection
+            .contract
+            .plans
+            .iter()
+            .flat_map(|plan| &plan.gateways)
+            .map(|gateway| EgressProjectionRecipient {
+                node_name: gateway.node.name.clone(),
+                node_uid: gateway.node.uid.clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        let actual = self
+            .gateway_applications
+            .iter()
+            .map(|application| application.recipient.clone())
+            .collect::<BTreeSet<_>>();
+        if actual != expected || actual.len() != self.gateway_applications.len() {
+            return Err(EgressDistributionError::ActivationGrantMismatch);
+        }
+        if self
+            .gateway_applications
+            .windows(2)
+            .any(|pair| pair[0].recipient >= pair[1].recipient)
+            || self.gateway_applications.iter().any(|application| {
+                application.schema_version != EGRESS_APPLICATION_ACK_SCHEMA_VERSION
+                    || application.controller_epoch != self.controller_epoch
+                    || application.projection_revision == Revision::INITIAL
+                    || application.contract_count == 0
+                    || application.source_count == 0
+                    || application.withdrawn
+            })
+        {
+            return Err(EgressDistributionError::ActivationGrantMismatch);
+        }
+        Ok(())
+    }
+
+    fn digest(&self) -> Result<EgressSourceActivationDigest, EgressDistributionError> {
+        let material = serde_json::to_vec(&(
+            self.schema_version,
+            self.controller_epoch,
+            self.projection_revision,
+            &self.recipient,
+            self.contract_revision,
+            self.contract_digest,
+            &self.gateway_applications,
+        ))
+        .map_err(|_| EgressDistributionError::ActivationGrantMismatch)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"unf.egress-source-activation.v1\0");
+        hasher.update(material);
+        Ok(EgressSourceActivationDigest(hasher.finalize().into()))
+    }
+}
+
 impl EgressGatewayApplicationAcknowledgement {
     /// Builds exact gateway-host application evidence after ledger adoption.
     ///
@@ -335,6 +468,10 @@ pub enum EgressDistributionError {
     InvalidPrincipal(&'static str),
     #[error("egress application acknowledgement does not match issued projection")]
     ApplicationAcknowledgementMismatch,
+    #[error("egress source activation grant does not match its admitted contract and gateway set")]
+    ActivationGrantMismatch,
+    #[error("egress source activation grant digest does not match its content")]
+    ActivationGrantDigestMismatch,
     #[error("egress advertisement exceeds the schema bound")]
     AdvertisementTooLarge,
     #[error("no compatible egress {domain} schema; required {required}")]
@@ -1340,6 +1477,53 @@ mod tests {
             active_mutation.verify(&withdrawal),
             Err(EgressDistributionError::ApplicationAcknowledgementMismatch)
         );
+    }
+
+    #[test]
+    fn source_activation_grant_binds_every_selected_gateway_application() {
+        let source = admitted(4);
+        let gateway = EgressGatewayProjection::issue(
+            &principal("gateway-a"),
+            &advertisement(),
+            10,
+            Revision::new(5),
+            std::slice::from_ref(&source),
+        )
+        .expect("gateway projection")
+        .admit(&principal("gateway-a"), &advertisement())
+        .expect("admitted gateway");
+        let gateway_ack = EgressGatewayApplicationAcknowledgement::issue(&gateway)
+            .expect("gateway application evidence");
+        let grant = EgressSourceActivationGrant::issue(&source, vec![gateway_ack])
+            .expect("source activation grant");
+        grant
+            .verify(&source)
+            .expect("exact source activation grant");
+
+        let mut missing = grant.clone();
+        missing.gateway_applications.clear();
+        assert_eq!(
+            missing.verify(&source),
+            Err(EgressDistributionError::ActivationGrantMismatch)
+        );
+
+        let mut withdrawn = grant.clone();
+        withdrawn.gateway_applications[0].withdrawn = true;
+        assert_eq!(
+            withdrawn.verify(&source),
+            Err(EgressDistributionError::ActivationGrantMismatch)
+        );
+
+        let mut digest_mutation = grant.clone();
+        digest_mutation.grant_digest.0[0] ^= 1;
+        assert_eq!(
+            digest_mutation.verify(&source),
+            Err(EgressDistributionError::ActivationGrantDigestMismatch)
+        );
+
+        let mut wire = serde_json::to_value(grant).expect("grant JSON");
+        wire["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<EgressSourceActivationGrant>(wire).is_err());
     }
 
     #[test]

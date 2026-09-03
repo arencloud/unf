@@ -231,6 +231,10 @@ gateway ledger now owns digest-bound exact-Node source-contract projections and
 explicit empty withdrawals. It fences controller epoch/revision regression and
 same-revision mutation; restart reacquires it before any future activation
 because no gateway host or packet state exists yet. The source TC reader now
-consumes only a coherent destination match after NetworkPolicy allows it, and
-uses certified direct-neighbor state without modifying the tuple. Live path
-acquisition and gateway NAT remain separate. See ADRs 0119–0126.
+consumes only a coherent destination match after NetworkPolicy allows it. A
+controller grant binds the exact source projection to current positive evidence
+from every selected gateway, while the source independently certifies the
+stable applied remote-route snapshot, Node UID, next-hop transport, interface
+index, and MTU before activating direct-neighbor state. Grant/path loss,
+withdrawal, synchronization failure, and restart atomically restore fences and
+purge egress connections. Gateway NAT remains separate. See ADRs 0119–0127.
