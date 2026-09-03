@@ -1,0 +1,37 @@
+apiVersion: network.unf.io/v1alpha1
+kind: EgressPool
+metadata:
+  name: production-egress
+spec:
+  provider:
+    name: static
+    instance: datacenter-a
+  prefixes:
+    - 192.0.2.64/28
+    - 2001:db8:100::/124
+---
+apiVersion: network.unf.io/v1alpha1
+kind: EgressPolicy
+metadata:
+  name: payments-egress
+spec:
+  priority: 100
+  target:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: payments
+    workloadSelector:
+      matchLabels:
+        app.kubernetes.io/name: payment-api
+    serviceAccounts:
+      - payment-api
+  destinations:
+    networks:
+      - 0.0.0.0/0
+      - ::/0
+  egress:
+    pool: production-egress
+    families:
+      - IPv4
+      - IPv6
+    addressesPerFamily: 2

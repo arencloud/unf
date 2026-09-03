@@ -54,7 +54,7 @@ grep -q 'UNF coordinated uninstall plan (dry-run)' "${temporary_dir}/plan.txt"
 grep -q 'stop DaemonSet unf-system/unf-agent before host mutation' \
     "${temporary_dir}/plan.txt"
 grep -q 'delete dedicated Namespace unf-system' "${temporary_dir}/plan.txt"
-grep -q 'preserve SecurityPolicy CRD' "${temporary_dir}/plan.txt"
+grep -q 'preserve all UNF CRDs' "${temporary_dir}/plan.txt"
 grep -q 'dry run only' "${temporary_dir}/plan.txt"
 [[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v12/' \
     "${temporary_dir}/plan.txt") -eq $((agent_count * 31)) ]]

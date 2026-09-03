@@ -1,0 +1,79 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: egresspools.network.unf.io
+spec:
+  group: network.unf.io
+  names:
+    kind: EgressPool
+    plural: egresspools
+    shortNames:
+    - unfep
+    singular: egresspool
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for EgressPoolSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              prefixes:
+                items:
+                  type: string
+                type: array
+              provider:
+                properties:
+                  instance:
+                    type: string
+                  name:
+                    type: string
+                required:
+                - instance
+                - name
+                type: object
+            required:
+            - prefixes
+            - provider
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                items:
+                  properties:
+                    conditionType:
+                      type: string
+                    message:
+                      type: string
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                  required:
+                  - conditionType
+                  - message
+                  - reason
+                  - status
+                  type: object
+                type: array
+              desiredRevision:
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: EgressPool
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,102 @@ const fn default_priority() -> u32 {
     1_000
 }
 
+#[derive(CustomResource, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "network.unf.io",
+    version = "v1alpha1",
+    kind = "EgressPool",
+    plural = "egresspools",
+    status = "EgressResourceStatus",
+    shortname = "unfep"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressPoolSpec {
+    pub provider: EgressProvider,
+    pub prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressProvider {
+    pub name: String,
+    pub instance: String,
+}
+
+#[derive(CustomResource, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "network.unf.io",
+    version = "v1alpha1",
+    kind = "EgressPolicy",
+    plural = "egresspolicies",
+    status = "EgressResourceStatus",
+    shortname = "unfeg"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressPolicySpec {
+    pub target: EgressTarget,
+    #[serde(default)]
+    pub destinations: EgressDestinations,
+    pub egress: EgressAddressSelection,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressTarget {
+    #[serde(default)]
+    pub namespace_selector: LabelSelector,
+    #[serde(default)]
+    pub workload_selector: LabelSelector,
+    #[serde(default)]
+    pub service_accounts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressDestinations {
+    #[serde(default)]
+    pub networks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressAddressSelection {
+    #[serde(default)]
+    pub pool: Option<String>,
+    #[serde(default)]
+    pub explicit_addresses: Vec<String>,
+    #[serde(default)]
+    pub families: Vec<EgressAddressFamily>,
+    #[serde(default = "default_addresses_per_family")]
+    #[schemars(range(min = 1))]
+    pub addresses_per_family: u16,
+    #[serde(default)]
+    pub provider: Option<EgressProvider>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum EgressAddressFamily {
+    IPv4,
+    IPv6,
+}
+
+const fn default_addresses_per_family() -> u16 {
+    1
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressResourceStatus {
+    #[serde(default)]
+    pub observed_generation: Option<i64>,
+    #[serde(default)]
+    pub desired_revision: Option<u64>,
+    #[serde(default)]
+    pub conditions: Vec<PolicyCondition>,
+}
+
 #[cfg(test)]
 mod tests {
     use kube::CustomResourceExt;
@@ -122,6 +219,16 @@ mod tests {
     }
 
     #[test]
+    fn generated_egress_crds_are_cluster_scoped_and_structural() {
+        for crd in [EgressPool::crd(), EgressPolicy::crd()] {
+            let value = serde_json::to_value(crd).expect("CRD serializes");
+            assert_eq!(value["spec"]["group"], "network.unf.io");
+            assert_eq!(value["spec"]["scope"], "Cluster");
+            assert!(value["spec"]["versions"][0]["schema"]["openAPIV3Schema"].is_object());
+        }
+    }
+
+    #[test]
     fn checked_in_crd_matches_rust_schema() {
         let checked_in: serde_json::Value = serde_yaml::from_str(include_str!(
             "../../../deploy/crds/network.unf.io_securitypolicies.yaml"
@@ -129,6 +236,46 @@ mod tests {
         .expect("checked-in CRD is valid YAML");
         let generated = serde_json::to_value(SecurityPolicy::crd()).expect("CRD serializes");
         assert_eq!(checked_in, generated, "run `make generate-crds`");
+    }
+
+    #[test]
+    fn checked_in_egress_crds_match_rust_schema() {
+        for (checked_in, generated) in [
+            (
+                include_str!("../../../deploy/crds/network.unf.io_egresspools.yaml"),
+                EgressPool::crd(),
+            ),
+            (
+                include_str!("../../../deploy/crds/network.unf.io_egresspolicies.yaml"),
+                EgressPolicy::crd(),
+            ),
+        ] {
+            let checked_in: serde_json::Value =
+                serde_yaml::from_str(checked_in).expect("checked-in CRD is valid YAML");
+            let generated = serde_json::to_value(generated).expect("CRD serializes");
+            assert_eq!(checked_in, generated, "run `make generate-crds`");
+        }
+    }
+
+    #[test]
+    fn egress_policy_defaults_are_safe_and_explicit() {
+        let yaml = r"
+apiVersion: network.unf.io/v1alpha1
+kind: EgressPolicy
+metadata:
+  name: finance
+spec:
+  target:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: finance}
+  egress:
+    pool: finance-egress
+    families: [IPv4, IPv6]
+    addressesPerFamily: 2
+";
+        let policy: EgressPolicy = serde_yaml::from_str(yaml).expect("valid policy");
+        assert_eq!(policy.spec.priority, 1_000);
+        assert!(policy.spec.destinations.networks.is_empty());
     }
 
     #[test]

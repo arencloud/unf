@@ -21,6 +21,7 @@ pub const MAX_OPENSHIFT_EGRESS_STATUS_ITEMS: usize = 64;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct OpenShiftEgressIpSpec {
+    #[serde(rename = "egressIPs")]
     pub egress_ips: Vec<String>,
     pub namespace_selector: KubernetesLabelSelector,
     #[serde(default)]
@@ -30,6 +31,7 @@ pub struct OpenShiftEgressIpSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct OpenShiftEgressIpStatusItem {
+    #[serde(rename = "egressIP")]
     pub egress_ip: String,
     pub node: String,
 }

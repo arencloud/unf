@@ -21,8 +21,8 @@ Options:
   --execute                    Apply the reviewed plan.
   --confirm-context CONTEXT    Exact current context required with --execute.
   --delete-namespace           Delete the dedicated unf-system Namespace.
-  --delete-crd                 Delete the SecurityPolicy CRD after cleanup.
-  --confirm-crd-data-loss      Permit --delete-crd when SecurityPolicy objects exist.
+  --delete-crd                 Delete all UNF CRDs after cleanup.
+  --confirm-crd-data-loss      Permit --delete-crd when UNF custom resources exist.
   -h, --help                   Show this help.
 EOF
 }
@@ -104,15 +104,22 @@ mapfile -t agent_records < <(jq -r '
     exit 1
 }
 
-security_policy_count=0
-if "${kc[@]}" get customresourcedefinition \
-    securitypolicies.network.unf.io >/dev/null 2>&1; then
-    security_policy_count=$("${kc[@]}" get securitypolicies.network.unf.io \
-        --all-namespaces -o json | jq '.items | length')
-fi
-if ${execute} && ${delete_crd} && [[ ${security_policy_count} -gt 0 ]] \
+unf_crds=(
+    securitypolicies.network.unf.io
+    egresspools.network.unf.io
+    egresspolicies.network.unf.io
+)
+unf_custom_resource_count=0
+for unf_crd in "${unf_crds[@]}"; do
+    if "${kc[@]}" get customresourcedefinition "${unf_crd}" >/dev/null 2>&1; then
+        resource_count=$("${kc[@]}" get "${unf_crd}" --all-namespaces -o json \
+            | jq '.items | length')
+        unf_custom_resource_count=$((unf_custom_resource_count + resource_count))
+    fi
+done
+if ${execute} && ${delete_crd} && [[ ${unf_custom_resource_count} -gt 0 ]] \
     && ! ${confirm_crd_data_loss}; then
-    echo "refusing CRD deletion: ${security_policy_count} SecurityPolicy objects exist; add --confirm-crd-data-loss" >&2
+    echo "refusing CRD deletion: ${unf_custom_resource_count} UNF custom resources exist; add --confirm-crd-data-loss" >&2
     exit 1
 fi
 
@@ -181,9 +188,9 @@ else
 fi
 echo "  delete exact UNF admission, SCC, and RBAC objects"
 if ${delete_crd}; then
-    echo "  delete SecurityPolicy CRD and ${security_policy_count} existing custom resources"
+    echo "  delete all UNF CRDs and ${unf_custom_resource_count} existing custom resources"
 else
-    echo "  preserve SecurityPolicy CRD and ${security_policy_count} existing custom resources"
+    echo "  preserve all UNF CRDs and ${unf_custom_resource_count} existing custom resources"
 fi
 
 if ! ${execute}; then
@@ -344,8 +351,8 @@ fi
 "${kc[@]}" delete securitycontextconstraints unf-agent \
     --ignore-not-found >/dev/null
 if ${delete_crd}; then
-    "${kc[@]}" delete customresourcedefinition \
-        securitypolicies.network.unf.io --ignore-not-found --wait=true >/dev/null
+    "${kc[@]}" delete customresourcedefinition "${unf_crds[@]}" \
+        --ignore-not-found --wait=true >/dev/null
 fi
 
 echo "UNF coordinated uninstall completed on ${context}; host state and exact product resources removed"

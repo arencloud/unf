@@ -218,6 +218,10 @@ encodes, stages, reads back, activates, reconstructs, and garbage-collects them
 as one pointer-selected transaction. A live authenticated source endpoint now
 carries the exact normalized model/facts/contract envelope; the agent resolves
 its Node UID independently, replays it, applies monotonic projection fencing,
-and lowers every selected source as `Fenced` without path candidates. Watched
-desired-state population, gateway distribution, and packet consumption remain
-separate Phase 8.5 gates. See ADRs 0119–0121.
+and lowers every selected source as `Fenced` without path candidates. Native
+EgressPool/EgressPolicy and OpenShift EgressIP watch sources now transact their
+owned prefixes through a single canonical model revision. A schema-v1
+ConfigMap checkpoint restores exact source ownership before watches start;
+failed/incomplete relists preserve last-known-good state, while accepted model
+changes clear stale source distribution authority. Gateway distribution and
+packet consumption remain separate Phase 8.5 gates. See ADRs 0119–0122.

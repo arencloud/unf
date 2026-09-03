@@ -654,8 +654,12 @@ matrix is maintained in the
   plus authoritative Node UID, carries complete replay material, and stages
   only fail-closed source fences through the owned maps. Absence and every
   validation/transaction failure retain last-known-good state under `make
-  egress-live-distribution-test`; ADR 0121. Watched desired-state population,
-  gateway distribution, and TC steering/NAT remain.
+  egress-live-distribution-test`; ADR 0121. Structural native EgressPool and
+  EgressPolicy watches plus optional read-only OpenShift EgressIP compatibility
+  now feed one canonical revisioned ConfigMap checkpoint. Whole-model
+  transactions, exact relists, restart replay, foreign-status non-adoption, and
+  stale source-authority withdrawal pass `make egress-desired-state-test`; ADR
+  0122. Authenticated selected-gateway distribution and TC steering/NAT remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

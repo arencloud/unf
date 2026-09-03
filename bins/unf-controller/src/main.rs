@@ -22,7 +22,8 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{Patch, PatchParams, PostParams};
+use kube::api::{ListParams, Patch, PatchParams, PostParams};
+use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, ResourceExt};
 use prometheus_client::encoding::text::encode;
@@ -32,15 +33,16 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use unf_api::SecurityPolicy;
+use unf_api::{EgressPolicy, EgressPool, SecurityPolicy};
 use unf_common::{
     BackendId, IdentityId, PolicyAction, PolicyDirection, PolicyId, PolicyReason, Protocol,
     Revision, ServiceId, Verdict,
 };
 use unf_egress::{
     AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
-    EgressAgentAdvertisement, EgressBehaviorContract, EgressContractFacts, EgressDistributionError,
-    EgressModel, EgressNodeProjectionEnvelope,
+    EgressAddressPool, EgressAgentAdvertisement, EgressBehaviorContract, EgressContractFacts,
+    EgressDesiredCheckpoint, EgressDesiredStore, EgressDistributionError, EgressIntent,
+    EgressModel, EgressNodeProjectionEnvelope, EgressProviderRef,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -96,6 +98,7 @@ use unf_state::{
     TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
 };
 
+mod egress_api;
 mod external_flow_export;
 pub mod openshift_egress_ip;
 
@@ -122,6 +125,13 @@ const AGENT_REPORT_STORE_SCHEMA_VERSION: u16 = 1;
 const AGENT_REPORT_STORE_CAPACITY: usize = 1_024;
 const AGENT_REPORT_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_REPORT_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
+const EGRESS_DESIRED_STORE_NAME: &str = "unf-egress-desired-state";
+const EGRESS_DESIRED_STORE_KEY: &str = "desired.json";
+const EGRESS_DESIRED_STORE_DATA_LIMIT: usize = 900_000;
+const EGRESS_DESIRED_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
+const NATIVE_EGRESS_POOL_SOURCE_PREFIX: &str = "native:egresspool/";
+const NATIVE_EGRESS_POLICY_SOURCE_PREFIX: &str = "native:egresspolicy/";
+const OPENSHIFT_EGRESS_IP_SOURCE_PREFIX: &str = "openshift:egressip/";
 const FLOW_HISTORY_STORE_NAME: &str = "unf-flow-history";
 const FLOW_HISTORY_STORE_KEY: &str = "flows.json";
 const FLOW_HISTORY_DURABLE_ENTRY_LIMIT: usize = 1_024;
@@ -275,6 +285,19 @@ struct ControllerState {
     agent_node_selector: Option<String>,
     pods: RwLock<BTreeMap<String, PodRecord>>,
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
+    egress_desired: Mutex<EgressDesiredStore>,
+    egress_desired_dirty: AtomicBool,
+    egress_desired_store: Option<Api<ConfigMap>>,
+    egress_pool_initialization: Mutex<Option<BTreeMap<String, EgressAddressPool>>>,
+    egress_pool_initialization_failed: AtomicBool,
+    pending_egress_pool_deletions: Mutex<BTreeSet<String>>,
+    egress_policy_initialization: Mutex<Option<EgressIntentSources>>,
+    egress_policy_initialization_failed: AtomicBool,
+    rejected_egress_pools: RwLock<BTreeMap<String, String>>,
+    rejected_egress_policies: RwLock<BTreeMap<String, String>>,
+    openshift_egress_ip_initialization: Mutex<Option<EgressIntentSources>>,
+    openshift_egress_ip_initialization_failed: AtomicBool,
+    rejected_openshift_egress_ips: RwLock<BTreeMap<String, String>>,
     egress_source_distributions: RwLock<BTreeMap<String, EgressSourceDistribution>>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
@@ -415,6 +438,8 @@ type DataplanePolicyState = (
     Vec<unf_state::EgressIpv4PolicyMapEntry>,
     Vec<unf_state::EgressIpv6PolicyMapEntry>,
 );
+
+type EgressIntentSources = BTreeMap<String, (EgressIntent, Option<EgressProviderRef>)>;
 
 #[derive(Debug, Clone, PartialEq)]
 struct ServiceRecord {
@@ -973,9 +998,13 @@ async fn main() -> Result<()> {
         restore_topology_history(&state)
             .await
             .context("restore durable topology history")?;
+        restore_egress_desired_state(&state)
+            .await
+            .context("restore durable egress desired state")?;
         spawn_agent_report_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_flow_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_topology_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
+        spawn_egress_desired_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         let client = client.context("Kubernetes client is required in connected mode")?;
         spawn_load_balancer_reconciler(
             &mut tasks,
@@ -1364,6 +1393,19 @@ fn new_state_with_client_and_selector(
         agent_node_selector,
         pods: RwLock::new(BTreeMap::new()),
         nodes: RwLock::new(BTreeMap::new()),
+        egress_desired: Mutex::new(EgressDesiredStore::default()),
+        egress_desired_dirty: AtomicBool::new(false),
+        egress_desired_store: config_map_store.clone(),
+        egress_pool_initialization: Mutex::new(None),
+        egress_pool_initialization_failed: AtomicBool::new(false),
+        pending_egress_pool_deletions: Mutex::new(BTreeSet::new()),
+        egress_policy_initialization: Mutex::new(None),
+        egress_policy_initialization_failed: AtomicBool::new(false),
+        rejected_egress_pools: RwLock::new(BTreeMap::new()),
+        rejected_egress_policies: RwLock::new(BTreeMap::new()),
+        openshift_egress_ip_initialization: Mutex::new(None),
+        openshift_egress_ip_initialization_failed: AtomicBool::new(false),
+        rejected_openshift_egress_ips: RwLock::new(BTreeMap::new()),
         egress_source_distributions: RwLock::new(BTreeMap::new()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
@@ -1959,6 +2001,105 @@ async fn persist_load_balancer_runtime(
     )
     .await
     .with_context(|| format!("patch ConfigMap unf-system/{LOAD_BALANCER_STORE_NAME}"))?;
+    Ok(())
+}
+
+async fn restore_egress_desired_state(state: &ControllerState) -> Result<()> {
+    let api = state
+        .egress_desired_store
+        .as_ref()
+        .context("durable egress desired-state API is unavailable")?;
+    let config_map = api
+        .get(EGRESS_DESIRED_STORE_NAME)
+        .await
+        .with_context(|| format!("read ConfigMap unf-system/{EGRESS_DESIRED_STORE_NAME}"))?;
+    let Some(encoded) = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(EGRESS_DESIRED_STORE_KEY))
+    else {
+        info!("durable egress desired-state store is empty");
+        return Ok(());
+    };
+    let checkpoint: EgressDesiredCheckpoint =
+        serde_json::from_str(encoded).context("decode durable egress desired-state checkpoint")?;
+    let restored = EgressDesiredStore::restore(checkpoint)
+        .context("validate durable egress desired-state checkpoint")?;
+    let revision = restored.revision().get();
+    let pools = restored.model().pools.len();
+    let intents = restored.model().intents.len();
+    *mutex_lock(&state.egress_desired) = restored;
+    info!(
+        revision,
+        pools, intents, "restored durable egress desired state"
+    );
+    Ok(())
+}
+
+fn spawn_egress_desired_persistence(
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+    tasks: &mut JoinSet<()>,
+) {
+    tasks.spawn(async move {
+        let mut interval = tokio::time::interval(EGRESS_DESIRED_PERSISTENCE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    persist_egress_desired_if_dirty(&state).await;
+                    break;
+                }
+                _ = interval.tick() => persist_egress_desired_if_dirty(&state).await,
+            }
+        }
+    });
+}
+
+async fn persist_egress_desired_if_dirty(state: &ControllerState) {
+    if !state.egress_desired_dirty.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if let Err(error) = persist_egress_desired_state(state).await {
+        state.egress_desired_dirty.store(true, Ordering::Release);
+        state.metrics.errors.inc();
+        warn!(%error, "could not persist egress desired state; retrying");
+    }
+}
+
+async fn persist_egress_desired_state(state: &ControllerState) -> Result<()> {
+    let api = state
+        .egress_desired_store
+        .as_ref()
+        .context("durable egress desired-state API is unavailable")?;
+    let checkpoint = mutex_lock(&state.egress_desired).checkpoint();
+    let encoded = serde_json::to_string(&checkpoint)
+        .context("encode durable egress desired-state checkpoint")?;
+    if encoded.len() > EGRESS_DESIRED_STORE_DATA_LIMIT {
+        return Err(anyhow!(
+            "durable egress desired state requires {} bytes; ConfigMap limit is {}",
+            encoded.len(),
+            EGRESS_DESIRED_STORE_DATA_LIMIT
+        ));
+    }
+    let patch = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": EGRESS_DESIRED_STORE_NAME,
+            "namespace": "unf-system",
+        },
+        "data": {
+            (EGRESS_DESIRED_STORE_KEY): encoded,
+        },
+    });
+    api.patch(
+        EGRESS_DESIRED_STORE_NAME,
+        &PatchParams::apply("unf-controller-egress-desired").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch ConfigMap unf-system/{EGRESS_DESIRED_STORE_NAME}"))?;
     Ok(())
 }
 
@@ -2613,6 +2754,36 @@ fn spawn_watchers(
     });
 
     let policy_api = Api::<SecurityPolicy>::all(client.clone());
+    let egress_pool_state = Arc::clone(&state);
+    let egress_pool_cancel = cancellation.clone();
+    let egress_pool_api = Api::<EgressPool>::all(client.clone());
+    tasks.spawn(async move {
+        watch_egress_pools(egress_pool_api, egress_pool_state, egress_pool_cancel).await;
+    });
+
+    let egress_policy_state = Arc::clone(&state);
+    let egress_policy_cancel = cancellation.clone();
+    let egress_policy_api = Api::<EgressPolicy>::all(client.clone());
+    tasks.spawn(async move {
+        watch_egress_policies(egress_policy_api, egress_policy_state, egress_policy_cancel).await;
+    });
+
+    let openshift_egress_state = Arc::clone(&state);
+    let openshift_egress_cancel = cancellation.clone();
+    let egress_ip_resource = ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("k8s.ovn.org", "v1", "EgressIP"),
+        "egressips",
+    );
+    let openshift_egress_api = Api::<DynamicObject>::all_with(client.clone(), &egress_ip_resource);
+    tasks.spawn(async move {
+        watch_openshift_egress_ips(
+            openshift_egress_api,
+            openshift_egress_state,
+            openshift_egress_cancel,
+        )
+        .await;
+    });
+
     let network_policy_state = Arc::clone(&state);
     let network_policy_cancel = cancellation.clone();
     tasks.spawn(async move {
@@ -2938,6 +3109,478 @@ fn normalized_namespace_labels(name: &str, namespace: &Namespace) -> BTreeMap<St
         .collect();
     labels.insert("kubernetes.io/metadata.name".to_owned(), name.to_owned());
     labels
+}
+
+async fn watch_egress_pools(
+    api: Api<EgressPool>,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    let stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    tokio::pin!(stream);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            item = stream.try_next() => match item {
+                Ok(Some(event)) => apply_egress_pool_event(&state, event),
+                Ok(None) => break,
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, "EgressPool watch error");
+                }
+            }
+        }
+    }
+}
+
+fn apply_egress_pool_event(state: &ControllerState, event: Event<EgressPool>) {
+    match event {
+        Event::Apply(pool) => apply_egress_pool(state, &pool),
+        Event::Init => {
+            *mutex_lock(&state.egress_pool_initialization) = Some(BTreeMap::new());
+            state
+                .egress_pool_initialization_failed
+                .store(false, Ordering::Release);
+        }
+        Event::InitApply(pool) => {
+            let name = pool.name_any();
+            let key = native_egress_pool_key(&name);
+            mutex_lock(&state.pending_egress_pool_deletions).remove(&key);
+            match egress_api::translate_egress_pool(&pool) {
+                Ok(translated) => {
+                    if let Some(initializing) =
+                        mutex_lock(&state.egress_pool_initialization).as_mut()
+                    {
+                        initializing.insert(key, translated);
+                    } else {
+                        apply_egress_pool(state, &pool);
+                    }
+                }
+                Err(error) => reject_egress_pool_initialization(state, &key, &error),
+            }
+        }
+        Event::InitDone => finish_egress_pool_initialization(state),
+        Event::Delete(pool) => {
+            let key = native_egress_pool_key(&pool.name_any());
+            mutex_lock(&state.pending_egress_pool_deletions).insert(key.clone());
+            let result = mutex_lock(&state.egress_desired)
+                .remove_pool(&key)
+                .map_err(|error| error.to_string());
+            record_egress_pool_result(state, &key, result);
+        }
+    }
+}
+
+fn apply_egress_pool(state: &ControllerState, pool: &EgressPool) {
+    let key = native_egress_pool_key(&pool.name_any());
+    mutex_lock(&state.pending_egress_pool_deletions).remove(&key);
+    let result = egress_api::translate_egress_pool(pool)
+        .map_err(|error| error.to_string())
+        .and_then(|pool| {
+            mutex_lock(&state.egress_desired)
+                .apply_pool(key.clone(), pool)
+                .map_err(|error| error.to_string())
+        });
+    record_egress_pool_result(state, &key, result);
+}
+
+fn reject_egress_pool_initialization(
+    state: &ControllerState,
+    key: &str,
+    error: &impl std::fmt::Display,
+) {
+    state
+        .egress_pool_initialization_failed
+        .store(true, Ordering::Release);
+    state.metrics.errors.inc();
+    write_lock(&state.rejected_egress_pools).insert(key.to_owned(), error.to_string());
+    warn!(%error, %key, "EgressPool initialization rejected; retaining last-known-good set");
+}
+
+fn finish_egress_pool_initialization(state: &ControllerState) {
+    let replacement = mutex_lock(&state.egress_pool_initialization).take();
+    let Some(replacement) = replacement else {
+        return;
+    };
+    if state
+        .egress_pool_initialization_failed
+        .swap(false, Ordering::AcqRel)
+    {
+        return;
+    }
+    let replacement_keys: BTreeSet<_> = replacement.keys().cloned().collect();
+    let removed_keys: Vec<_> = mutex_lock(&state.egress_desired)
+        .checkpoint()
+        .pools
+        .into_iter()
+        .map(|record| record.source_key)
+        .filter(|key| {
+            key.starts_with(NATIVE_EGRESS_POOL_SOURCE_PREFIX) && !replacement_keys.contains(key)
+        })
+        .collect();
+    {
+        let mut pending = mutex_lock(&state.pending_egress_pool_deletions);
+        pending.retain(|key| !key.starts_with(NATIVE_EGRESS_POOL_SOURCE_PREFIX));
+        pending.extend(removed_keys);
+    }
+    let result = mutex_lock(&state.egress_desired)
+        .replace_pools(NATIVE_EGRESS_POOL_SOURCE_PREFIX, replacement)
+        .map_err(|error| error.to_string());
+    match result {
+        Ok(changed) => {
+            write_lock(&state.rejected_egress_pools)
+                .retain(|key, _| !key.starts_with(NATIVE_EGRESS_POOL_SOURCE_PREFIX));
+            record_egress_desired_change(state, changed);
+            mutex_lock(&state.pending_egress_pool_deletions)
+                .retain(|key| !key.starts_with(NATIVE_EGRESS_POOL_SOURCE_PREFIX));
+        }
+        Err(error) => {
+            state.metrics.errors.inc();
+            warn!(%error, "EgressPool relist rejected; retaining last-known-good set");
+        }
+    }
+}
+
+fn record_egress_pool_result(state: &ControllerState, key: &str, result: Result<bool, String>) {
+    match result {
+        Ok(changed) => {
+            write_lock(&state.rejected_egress_pools).remove(key);
+            state.metrics.reconciles.inc();
+            record_egress_desired_change(state, changed);
+            retry_pending_egress_pool_deletions(state);
+        }
+        Err(error) => {
+            state.metrics.errors.inc();
+            write_lock(&state.rejected_egress_pools).insert(key.to_owned(), error.clone());
+            warn!(%error, %key, "EgressPool reconciliation rejected; retaining last-known-good state");
+        }
+    }
+}
+
+async fn watch_egress_policies(
+    api: Api<EgressPolicy>,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    let stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    tokio::pin!(stream);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            item = stream.try_next() => match item {
+                Ok(Some(event)) => apply_egress_policy_event(&state, event),
+                Ok(None) => break,
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, "EgressPolicy watch error");
+                }
+            }
+        }
+    }
+}
+
+fn apply_egress_policy_event(state: &ControllerState, event: Event<EgressPolicy>) {
+    match event {
+        Event::Apply(policy) => apply_egress_policy(state, &policy),
+        Event::Init => {
+            *mutex_lock(&state.egress_policy_initialization) = Some(BTreeMap::new());
+            state
+                .egress_policy_initialization_failed
+                .store(false, Ordering::Release);
+        }
+        Event::InitApply(policy) => {
+            let key = native_egress_policy_key(&policy.name_any());
+            match egress_api::translate_egress_policy(&policy) {
+                Ok(translated) => {
+                    if let Some(initializing) =
+                        mutex_lock(&state.egress_policy_initialization).as_mut()
+                    {
+                        initializing.insert(key, translated);
+                    } else {
+                        apply_egress_policy(state, &policy);
+                    }
+                }
+                Err(error) => reject_egress_policy_initialization(state, &key, &error),
+            }
+        }
+        Event::InitDone => finish_egress_policy_initialization(state),
+        Event::Delete(policy) => {
+            let key = native_egress_policy_key(&policy.name_any());
+            let result = mutex_lock(&state.egress_desired).remove_intent(&key);
+            record_egress_policy_result(state, &key, result.map_err(|error| error.to_string()));
+        }
+    }
+}
+
+fn apply_egress_policy(state: &ControllerState, policy: &EgressPolicy) {
+    let key = native_egress_policy_key(&policy.name_any());
+    let result = egress_api::translate_egress_policy(policy)
+        .map_err(|error| error.to_string())
+        .and_then(|(intent, provider)| {
+            mutex_lock(&state.egress_desired)
+                .apply_intent(key.clone(), intent, provider)
+                .map_err(|error| error.to_string())
+        });
+    record_egress_policy_result(state, &key, result);
+}
+
+fn reject_egress_policy_initialization(
+    state: &ControllerState,
+    key: &str,
+    error: &impl std::fmt::Display,
+) {
+    state
+        .egress_policy_initialization_failed
+        .store(true, Ordering::Release);
+    state.metrics.errors.inc();
+    write_lock(&state.rejected_egress_policies).insert(key.to_owned(), error.to_string());
+    warn!(%error, %key, "EgressPolicy initialization rejected; retaining last-known-good set");
+}
+
+fn finish_egress_policy_initialization(state: &ControllerState) {
+    let replacement = mutex_lock(&state.egress_policy_initialization).take();
+    let Some(replacement) = replacement else {
+        return;
+    };
+    if state
+        .egress_policy_initialization_failed
+        .swap(false, Ordering::AcqRel)
+    {
+        return;
+    }
+    let result = mutex_lock(&state.egress_desired)
+        .replace_intents(NATIVE_EGRESS_POLICY_SOURCE_PREFIX, replacement)
+        .map_err(|error| error.to_string());
+    match result {
+        Ok(changed) => {
+            write_lock(&state.rejected_egress_policies)
+                .retain(|key, _| !key.starts_with(NATIVE_EGRESS_POLICY_SOURCE_PREFIX));
+            record_egress_desired_change(state, changed);
+            retry_pending_egress_pool_deletions(state);
+        }
+        Err(error) => {
+            state.metrics.errors.inc();
+            warn!(%error, "EgressPolicy relist rejected; retaining last-known-good set");
+        }
+    }
+}
+
+fn record_egress_policy_result(state: &ControllerState, key: &str, result: Result<bool, String>) {
+    match result {
+        Ok(changed) => {
+            write_lock(&state.rejected_egress_policies).remove(key);
+            state.metrics.reconciles.inc();
+            record_egress_desired_change(state, changed);
+            retry_pending_egress_pool_deletions(state);
+        }
+        Err(error) => {
+            state.metrics.errors.inc();
+            write_lock(&state.rejected_egress_policies).insert(key.to_owned(), error.clone());
+            warn!(%error, %key, "EgressPolicy reconciliation rejected; retaining last-known-good state");
+        }
+    }
+}
+
+fn record_egress_desired_change(state: &ControllerState, changed: bool) {
+    if changed {
+        state.egress_desired_dirty.store(true, Ordering::Release);
+        write_lock(&state.egress_source_distributions).clear();
+    }
+}
+
+fn retry_pending_egress_pool_deletions(state: &ControllerState) {
+    let pending: Vec<_> = mutex_lock(&state.pending_egress_pool_deletions)
+        .iter()
+        .cloned()
+        .collect();
+    for key in pending {
+        let result = mutex_lock(&state.egress_desired)
+            .remove_pool(&key)
+            .map_err(|error| error.to_string());
+        match result {
+            Ok(changed) => {
+                mutex_lock(&state.pending_egress_pool_deletions).remove(&key);
+                write_lock(&state.rejected_egress_pools).remove(&key);
+                record_egress_desired_change(state, changed);
+            }
+            Err(error) => {
+                write_lock(&state.rejected_egress_pools).insert(key.clone(), error);
+            }
+        }
+    }
+}
+
+fn native_egress_pool_key(name: &str) -> String {
+    format!("{NATIVE_EGRESS_POOL_SOURCE_PREFIX}{name}")
+}
+
+fn native_egress_policy_key(name: &str) -> String {
+    format!("{NATIVE_EGRESS_POLICY_SOURCE_PREFIX}{name}")
+}
+
+async fn watch_openshift_egress_ips(
+    api: Api<DynamicObject>,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    match api.list(&ListParams::default().limit(1)).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(response)) if response.code == 404 => {
+            info!("OpenShift EgressIP API is absent; compatibility watcher is disabled");
+            return;
+        }
+        Err(error) => {
+            state.metrics.errors.inc();
+            warn!(%error, "cannot discover OpenShift EgressIP API; compatibility watcher is disabled");
+            return;
+        }
+    }
+    let stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    tokio::pin!(stream);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            item = stream.try_next() => match item {
+                Ok(Some(event)) => apply_openshift_egress_ip_event(&state, event),
+                Ok(None) => break,
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, "OpenShift EgressIP watch error");
+                }
+            }
+        }
+    }
+}
+
+fn apply_openshift_egress_ip_event(state: &ControllerState, event: Event<DynamicObject>) {
+    match event {
+        Event::Apply(object) => apply_openshift_egress_ip(state, &object),
+        Event::Init => {
+            *mutex_lock(&state.openshift_egress_ip_initialization) = Some(BTreeMap::new());
+            state
+                .openshift_egress_ip_initialization_failed
+                .store(false, Ordering::Release);
+        }
+        Event::InitApply(object) => {
+            let key = openshift_egress_ip_key(&object.name_any());
+            match translate_openshift_egress_ip_object(&object) {
+                Ok(translated) => {
+                    if let Some(initializing) =
+                        mutex_lock(&state.openshift_egress_ip_initialization).as_mut()
+                    {
+                        initializing.insert(key, translated);
+                    } else {
+                        apply_openshift_egress_ip(state, &object);
+                    }
+                }
+                Err(error) => {
+                    state
+                        .openshift_egress_ip_initialization_failed
+                        .store(true, Ordering::Release);
+                    state.metrics.errors.inc();
+                    write_lock(&state.rejected_openshift_egress_ips)
+                        .insert(key.clone(), error.clone());
+                    warn!(%error, %key, "OpenShift EgressIP initialization rejected; retaining last-known-good set");
+                }
+            }
+        }
+        Event::InitDone => finish_openshift_egress_ip_initialization(state),
+        Event::Delete(object) => {
+            let key = openshift_egress_ip_key(&object.name_any());
+            let result = mutex_lock(&state.egress_desired)
+                .remove_intent(&key)
+                .map_err(|error| error.to_string());
+            record_openshift_egress_ip_result(state, &key, result);
+        }
+    }
+}
+
+fn apply_openshift_egress_ip(state: &ControllerState, object: &DynamicObject) {
+    let key = openshift_egress_ip_key(&object.name_any());
+    let result = translate_openshift_egress_ip_object(object).and_then(|(intent, provider)| {
+        mutex_lock(&state.egress_desired)
+            .apply_intent(key.clone(), intent, provider)
+            .map_err(|error| error.to_string())
+    });
+    record_openshift_egress_ip_result(state, &key, result);
+}
+
+fn finish_openshift_egress_ip_initialization(state: &ControllerState) {
+    let replacement = mutex_lock(&state.openshift_egress_ip_initialization).take();
+    let Some(replacement) = replacement else {
+        return;
+    };
+    if state
+        .openshift_egress_ip_initialization_failed
+        .swap(false, Ordering::AcqRel)
+    {
+        return;
+    }
+    let result = mutex_lock(&state.egress_desired)
+        .replace_intents(OPENSHIFT_EGRESS_IP_SOURCE_PREFIX, replacement)
+        .map_err(|error| error.to_string());
+    match result {
+        Ok(changed) => {
+            write_lock(&state.rejected_openshift_egress_ips)
+                .retain(|key, _| !key.starts_with(OPENSHIFT_EGRESS_IP_SOURCE_PREFIX));
+            record_egress_desired_change(state, changed);
+        }
+        Err(error) => {
+            state.metrics.errors.inc();
+            warn!(%error, "OpenShift EgressIP relist rejected; retaining last-known-good set");
+        }
+    }
+}
+
+fn record_openshift_egress_ip_result(
+    state: &ControllerState,
+    key: &str,
+    result: Result<bool, String>,
+) {
+    match result {
+        Ok(changed) => {
+            write_lock(&state.rejected_openshift_egress_ips).remove(key);
+            state.metrics.reconciles.inc();
+            record_egress_desired_change(state, changed);
+        }
+        Err(error) => {
+            state.metrics.errors.inc();
+            write_lock(&state.rejected_openshift_egress_ips).insert(key.to_owned(), error.clone());
+            warn!(%error, %key, "OpenShift EgressIP reconciliation rejected; retaining last-known-good state");
+        }
+    }
+}
+
+fn translate_openshift_egress_ip_object(
+    object: &DynamicObject,
+) -> Result<(EgressIntent, Option<EgressProviderRef>), String> {
+    let name = object.name_any();
+    let uid = object
+        .metadata
+        .uid
+        .as_deref()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| format!("OpenShift EgressIP {name:?} has no stable UID"))?;
+    let spec = object
+        .data
+        .get("spec")
+        .cloned()
+        .ok_or_else(|| format!("OpenShift EgressIP {name:?} has no spec"))?;
+    let spec: openshift_egress_ip::OpenShiftEgressIpSpec = serde_json::from_value(spec)
+        .map_err(|error| format!("decode OpenShift EgressIP {name:?}: {error}"))?;
+    let intent = openshift_egress_ip::translate_openshift_egress_ip(&name, uid, spec)
+        .map_err(|error| error.to_string())?;
+    Ok((
+        intent,
+        Some(EgressProviderRef {
+            name: "openshift-egressip".to_owned(),
+            instance: "k8s.ovn.org/v1".to_owned(),
+        }),
+    ))
+}
+
+fn openshift_egress_ip_key(name: &str) -> String {
+    format!("{OPENSHIFT_EGRESS_IP_SOURCE_PREFIX}{name}")
 }
 
 async fn watch_nodes(api: Api<Node>, state: Arc<ControllerState>, cancellation: CancellationToken) {
@@ -8410,6 +9053,143 @@ mod tests {
                 .status,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    fn native_egress_pool(prefix: &str) -> EgressPool {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "EgressPool",
+            "metadata": {"name": "finance", "uid": "finance-pool-uid"},
+            "spec": {
+                "provider": {"name": "static", "instance": "rack-a"},
+                "prefixes": [prefix]
+            }
+        }))
+        .expect("valid test EgressPool")
+    }
+
+    fn native_egress_policy() -> EgressPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "EgressPolicy",
+            "metadata": {"name": "finance", "uid": "finance-policy-uid"},
+            "spec": {
+                "target": {
+                    "namespaceSelector": {"matchLabels": {"team": "finance"}},
+                    "workloadSelector": {"matchLabels": {"app": "ledger"}},
+                    "serviceAccounts": ["settlement"]
+                },
+                "destinations": {"networks": ["198.51.100.0/24"]},
+                "egress": {
+                    "pool": "finance",
+                    "families": ["IPv4"],
+                    "addressesPerFamily": 2
+                }
+            }
+        }))
+        .expect("valid test EgressPolicy")
+    }
+
+    #[test]
+    fn native_egress_watch_is_atomic_revisioned_relist_safe_and_durable() {
+        let state = new_state(true);
+        let pool = native_egress_pool("192.0.2.0/24");
+        let policy = native_egress_policy();
+        apply_egress_pool_event(&state, Event::Apply(pool.clone()));
+        apply_egress_policy_event(&state, Event::Apply(policy.clone()));
+        {
+            let desired = mutex_lock(&state.egress_desired);
+            assert_eq!(desired.revision(), Revision::new(2));
+            assert_eq!(desired.model().pools.len(), 1);
+            assert_eq!(desired.model().intents.len(), 1);
+            assert_eq!(
+                EgressDesiredStore::restore(desired.checkpoint()).unwrap(),
+                *desired
+            );
+        }
+        assert!(state.egress_desired_dirty.load(Ordering::Acquire));
+
+        apply_egress_pool_event(&state, Event::Apply(native_egress_pool("192.0.2.4/24")));
+        assert_eq!(
+            mutex_lock(&state.egress_desired).revision(),
+            Revision::new(2)
+        );
+        assert!(
+            read_lock(&state.rejected_egress_pools)
+                .contains_key(&native_egress_pool_key("finance"))
+        );
+
+        apply_egress_policy_event(&state, Event::Init);
+        apply_egress_policy_event(&state, Event::InitApply(policy));
+        apply_egress_policy_event(&state, Event::InitDone);
+        assert_eq!(
+            mutex_lock(&state.egress_desired).revision(),
+            Revision::new(2),
+            "exact relist is idempotent"
+        );
+
+        apply_egress_pool_event(&state, Event::Delete(pool));
+        assert_eq!(
+            mutex_lock(&state.egress_desired).revision(),
+            Revision::new(2),
+            "a referenced pool deletion retains the coherent model"
+        );
+        apply_egress_policy_event(&state, Event::Delete(native_egress_policy()));
+        let desired = mutex_lock(&state.egress_desired);
+        assert_eq!(desired.revision(), Revision::new(4));
+        assert!(desired.model().pools.is_empty());
+        assert!(desired.model().intents.is_empty());
+    }
+
+    fn openshift_egress_ip(name: &str, address: &str) -> DynamicObject {
+        let resource = ApiResource::from_gvk_with_plural(
+            &GroupVersionKind::gvk("k8s.ovn.org", "v1", "EgressIP"),
+            "egressips",
+        );
+        let mut object = DynamicObject::new(name, &resource).data(serde_json::json!({
+            "spec": {
+                "egressIPs": [address],
+                "namespaceSelector": {"matchLabels": {"team": "finance"}},
+                "podSelector": {"matchLabels": {"app": "ledger"}}
+            },
+            "status": {"items": []}
+        }));
+        object.metadata.uid = Some(format!("{name}-uid"));
+        object
+    }
+
+    #[test]
+    fn openshift_egress_ip_watch_feeds_the_same_durable_model_without_status_adoption() {
+        let state = new_state(true);
+        let object = openshift_egress_ip("finance", "192.0.2.40");
+        apply_openshift_egress_ip_event(&state, Event::Apply(object.clone()));
+        {
+            let desired = mutex_lock(&state.egress_desired);
+            assert_eq!(desired.revision(), Revision::new(1));
+            assert_eq!(desired.model().intents.len(), 1);
+            let owner = &desired.model().intents[0].owner;
+            assert_eq!(
+                desired.explicit_provider(owner),
+                Some(&EgressProviderRef {
+                    name: "openshift-egressip".to_owned(),
+                    instance: "k8s.ovn.org/v1".to_owned(),
+                })
+            );
+        }
+
+        let mut status_only = object.clone();
+        status_only.data["status"] = serde_json::json!({
+            "items": [{"egressIP": "192.0.2.40", "node": "worker-a"}]
+        });
+        apply_openshift_egress_ip_event(&state, Event::Apply(status_only));
+        assert_eq!(
+            mutex_lock(&state.egress_desired).revision(),
+            Revision::new(1),
+            "platform status is not gateway readiness or desired-state churn"
+        );
+
+        apply_openshift_egress_ip_event(&state, Event::Delete(object));
+        assert!(mutex_lock(&state.egress_desired).model().intents.is_empty());
     }
 
     #[test]

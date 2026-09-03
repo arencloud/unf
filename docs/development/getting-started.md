@@ -123,7 +123,8 @@ OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" make openshift-uninstal
 
 After reviewing the reported context, nodes, pins, interfaces, and resource
 scope, execution requires that exact context. Namespace deletion is separately
-explicit; the CRD and `SecurityPolicy` objects remain by default:
+explicit; all UNF CRDs and their `SecurityPolicy`, `EgressPool`, and
+`EgressPolicy` objects remain by default:
 
 ```bash
 OPENSHIFT_KUBECONFIG="$PWD/.tools/cl02-audit.kubeconfig" \
@@ -133,8 +134,26 @@ make openshift-uninstall
 
 The orchestrator stops every agent, uses constrained per-node Jobs for cleanup,
 verifies host state is absent, and only then removes SCC, admission, and RBAC
-authority. CRD deletion additionally needs `--delete-crd`; if custom resources
-exist it also needs `--confirm-crd-data-loss`.
+authority. Deleting all UNF CRDs additionally needs `--delete-crd`; if any UNF
+custom resources exist it also needs `--confirm-crd-data-loss`.
+
+### Egress desired-state API
+
+Phase 8.5 installs cluster-scoped `EgressPool` and `EgressPolicy` resources.
+The example declares a dual-stack provider-owned pool and selects one
+Namespace/workload/ServiceAccount for two addresses per family:
+
+```bash
+kubectl apply -f deploy/examples/egress-intent.yaml
+```
+
+The controller transactionally validates the complete pool/policy model and
+checkpoints its source ownership. On OpenShift it also reads the existing
+`k8s.ovn.org/v1` `EgressIP` spec into the same model when that API is present;
+UNF does not adopt its status. This milestone deliberately does not allocate or
+configure the example addresses, select a ready gateway, or change packets yet.
+Source distribution is withdrawn until later allocation, gateway, and contract
+stages acknowledge the new model.
 
 ## kind
 

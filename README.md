@@ -447,9 +447,15 @@ self-contained source envelope only after Pod-bound TokenReview authentication
 and authoritative Node-UID binding. The agent independently replays it and
 atomically stages explicit intent only as `Fenced`; absence or any validation /
 transaction failure retains last-known-good state. This passes `make
-egress-live-distribution-test`; ADR 0121. Watched desired-state population,
-gateway distribution, and source/gateway steering/NAT are next. No live
-egress address, packet-path, or platform claim is made yet.
+egress-live-distribution-test`; ADR 0121. Structural cluster-scoped
+`EgressPool`/`EgressPolicy` APIs and the optional read-only OpenShift EgressIP
+watcher now feed one transactional, revisioned, schema-v1 ConfigMap-backed
+canonical model. Invalid updates/relist or restart drift retain last-known-good
+state, foreign status is ignored, and accepted model changes withdraw stale
+source authority. This passes `make egress-desired-state-test`; ADR 0122.
+Authenticated selected-gateway distribution and source/gateway steering/NAT
+are next. No live egress address, gateway-readiness, packet-path, or platform
+claim is made yet.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
@@ -521,7 +527,7 @@ legacy filters; current ABI removal requires an additional explicit confirmation
 and unknown directory content is refused. The
 OpenShift uninstall orchestrator reviews that plan on every selected worker,
 requires exact cluster-context confirmation, stops agents before mutation,
-verifies host cleanup, preserves the CRD by default, and removes its temporary
+verifies host cleanup, preserves all UNF CRDs by default, and removes its temporary
 cleanup authority only after the hosts are clean.
 See the authoritative
 [project status and requirements traceability](docs/project-status.md) for phase
@@ -538,7 +544,8 @@ and cleanup boundary.
 Implemented in the repository:
 
 - versioned userspace/eBPF flow ABI and strongly typed numeric IDs;
-- `SecurityPolicy` `network.unf.io/v1alpha1` API and generated CRD;
+- `SecurityPolicy`, `EgressPool`, and `EgressPolicy`
+  `network.unf.io/v1alpha1` APIs and generated structural CRDs;
 - deterministic L3/L4 policy compiler, shadow decisions, and property tests;
 - direction-aware policy IR and userspace decisions with destination-selected
   ingress, source-selected egress, cross-direction isolation, and explicit

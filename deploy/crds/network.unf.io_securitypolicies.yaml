@@ -8,128 +8,147 @@ spec:
     kind: SecurityPolicy
     plural: securitypolicies
     shortNames:
-      - unfsp
+    - unfsp
     singular: securitypolicy
   scope: Namespaced
   versions:
-    - name: v1alpha1
-      schema:
-        openAPIV3Schema:
-          description: Auto-generated derived type for SecurityPolicySpec via `CustomResource`
-          properties:
-            spec:
-              properties:
-                defaultAction:
-                  default: Deny
-                  enum: [Allow, Deny, Audit]
-                  type: string
-                enforcementMode:
-                  default: Enforce
-                  enum: [Enforce, Shadow]
-                  type: string
-                ingress:
-                  default: []
-                  items:
-                    properties:
-                      action:
-                        enum: [Allow, Deny, Audit]
-                        type: string
-                      from:
-                        default:
-                          application: null
-                          matchLabels: {}
-                          namespace: null
-                          serviceAccount: null
-                        properties:
-                          application:
-                            nullable: true
-                            type: string
-                          matchLabels:
-                            additionalProperties:
-                              type: string
-                            default: {}
-                            type: object
-                          namespace:
-                            nullable: true
-                            type: string
-                          serviceAccount:
-                            nullable: true
-                            type: string
-                        type: object
-                      protocols:
-                        default: []
-                        items:
-                          properties:
-                            port:
-                              format: uint16
-                              maximum: 65535.0
-                              minimum: 1.0
-                              type: integer
-                            protocol:
-                              enum: [Tcp, Udp]
-                              type: string
-                          required: [port, protocol]
-                          type: object
-                        type: array
-                    required: [action]
-                    type: object
-                  type: array
-                priority:
-                  default: 1000
-                  format: uint32
-                  minimum: 0.0
-                  type: integer
-                target:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SecurityPolicySpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              defaultAction:
+                default: Deny
+                enum:
+                - Allow
+                - Deny
+                - Audit
+                type: string
+              enforcementMode:
+                default: Enforce
+                enum:
+                - Enforce
+                - Shadow
+                type: string
+              ingress:
+                default: []
+                items:
                   properties:
-                    application:
-                      nullable: true
+                    action:
+                      enum:
+                      - Allow
+                      - Deny
+                      - Audit
                       type: string
-                    matchLabels:
-                      additionalProperties:
-                        type: string
-                      default: {}
+                    from:
+                      default:
+                        application: null
+                        matchLabels: {}
+                        namespace: null
+                        serviceAccount: null
+                      properties:
+                        application:
+                          nullable: true
+                          type: string
+                        matchLabels:
+                          additionalProperties:
+                            type: string
+                          default: {}
+                          type: object
+                        namespace:
+                          nullable: true
+                          type: string
+                        serviceAccount:
+                          nullable: true
+                          type: string
                       type: object
-                    namespace:
-                      nullable: true
-                      type: string
-                    serviceAccount:
-                      nullable: true
-                      type: string
+                    protocols:
+                      default: []
+                      items:
+                        properties:
+                          port:
+                            format: uint16
+                            maximum: 65535.0
+                            minimum: 1.0
+                            type: integer
+                          protocol:
+                            enum:
+                            - Tcp
+                            - Udp
+                            type: string
+                        required:
+                        - port
+                        - protocol
+                        type: object
+                      type: array
+                  required:
+                  - action
                   type: object
-              required: [target]
-              type: object
-            status:
-              nullable: true
-              properties:
-                compiledRevision:
-                  format: uint64
-                  minimum: 0.0
-                  nullable: true
-                  type: integer
-                conditions:
-                  default: []
-                  items:
-                    properties:
-                      conditionType:
-                        type: string
-                      message:
-                        type: string
-                      reason:
-                        type: string
-                      status:
-                        type: string
-                    required: [conditionType, message, reason, status]
+                type: array
+              priority:
+                default: 1000
+                format: uint32
+                minimum: 0.0
+                type: integer
+              target:
+                properties:
+                  application:
+                    nullable: true
+                    type: string
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    default: {}
                     type: object
-                  type: array
-                observedGeneration:
-                  format: int64
-                  nullable: true
-                  type: integer
-              type: object
-          required: [spec]
-          title: SecurityPolicy
-          type: object
-      served: true
-      storage: true
-      subresources:
-        status: {}
+                  namespace:
+                    nullable: true
+                    type: string
+                  serviceAccount:
+                    nullable: true
+                    type: string
+                type: object
+            required:
+            - target
+            type: object
+          status:
+            nullable: true
+            properties:
+              compiledRevision:
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              conditions:
+                default: []
+                items:
+                  properties:
+                    conditionType:
+                      type: string
+                    message:
+                      type: string
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                  required:
+                  - conditionType
+                  - message
+                  - reason
+                  - status
+                  type: object
+                type: array
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: SecurityPolicy
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

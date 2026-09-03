@@ -114,8 +114,11 @@ and 251-bucket primary/pre-certified-standby selection tables are shared per
 intent rather than duplicated per identity. Persistent ABI v12 owns those maps,
 and the authenticated live source endpoint now transports complete replay
 material to exact-Node agents. Agents stage only fail-closed source fences until
-path and packet readiness exist. ADRs 0119–0121 record these boundaries;
-watched desired-state, gateway distribution, and TC packet ownership remain.
+path and packet readiness exist. Structural native EgressPool/EgressPolicy
+watches and optional read-only OpenShift EgressIP compatibility now converge
+through one whole-model transactional store and durable revision checkpoint;
+accepted changes withdraw stale source distributions. ADRs 0119–0122 record
+these boundaries; gateway distribution and TC packet ownership remain.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

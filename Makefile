@@ -1,4 +1,4 @@
-.PHONY: egress-fabric-boundary-test egress-intent-test egress-contract-test egress-allocation-test egress-host-state-test egress-proof-test egress-dataplane-contract-test egress-dataplane-map-test egress-live-distribution-test service-selection-boundary-test service-selection-ir-test service-selection-contract-test service-selection-state-test service-selection-dataplane-test service-affinity-dataplane-test service-maglev-dataplane-test service-dsr-dataplane-test service-selection-operations-test service-selection-kind-up service-selection-kind-load service-selection-kind-deploy service-selection-kind-test service-selection-kind-down service-selection-openshift-deploy service-selection-openshift-test
+.PHONY: egress-fabric-boundary-test egress-intent-test egress-contract-test egress-allocation-test egress-host-state-test egress-proof-test egress-dataplane-contract-test egress-dataplane-map-test egress-live-distribution-test egress-desired-state-test service-selection-boundary-test service-selection-ir-test service-selection-contract-test service-selection-state-test service-selection-dataplane-test service-affinity-dataplane-test service-maglev-dataplane-test service-dsr-dataplane-test service-selection-operations-test service-selection-kind-up service-selection-kind-load service-selection-kind-deploy service-selection-kind-test service-selection-kind-down service-selection-openshift-deploy service-selection-openshift-test
 .PHONY: build test lint fmt fmt-check support-matrix-check loadbalancer-boundary-test loadbalancer-ir-test loadbalancer-control-plane-test loadbalancer-host-state-test loadbalancer-cluster-dataplane-test loadbalancer-local-dataplane-test loadbalancer-operations-test loadbalancer-kind-up loadbalancer-kind-load loadbalancer-kind-deploy loadbalancer-kind-test loadbalancer-kind-down loadbalancer-openshift-deploy loadbalancer-openshift-test service-ir-test service-compiler-test service-distribution-test nodeport-host-state-test nodeport-transaction-test nodeport-cluster-dataplane-test nodeport-local-dataplane-test nodeport-operations-test nodeport-kind-test nodeport-openshift-deploy nodeport-openshift-test service-dataplane-test service-operations-test primary-cni-installer-test service-kind-up service-kind-load service-kind-deploy service-kind-test service-kind-down ebpf generate-crds controller agent cni cni-protocol-test cni-transaction-test cni-ipam-test cni-veth-test cni-routing-test cni-lifecycle-test cni-node-block-test cni-remote-routing-test cni-route-reconciliation-test cli artifacts images upgrade-baseline-images skipped-upgrade-baseline-images incompatible-version-images clean-rebuild-version-images openshift-images openshift-upgrade-images openshift-deploy openshift-test openshift-upgrade-test openshift-tls-rotation-test openshift-agent-report-retention-test openshift-host-mount-policy-test openshift-uninstall openshift-uninstall-test openshift-primary-cni-audit openshift-primary-cni-preflight openshift-primary-cni-package-check openshift-primary-cni-runtime-fault-test openshift-primary-cni-node-reprovision-test openshift-primary-cni-deploy openshift-service-deploy openshift-service-test kind-tool kind-up kind-load kind-upgrade-load kind-skipped-upgrade-load kind-incompatible-version-load kind-clean-rebuild-load kind-deploy kind-demo kind-topology-history-test kind-flow-history-retention-test kind-external-flow-export-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test kind-scale-failure-test kind-test kind-platform-matrix-test kind-down primary-cni-kind-up primary-cni-kind-load primary-cni-kind-deploy primary-cni-kind-test primary-cni-kind-rollback primary-cni-kind-down
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
@@ -94,6 +94,15 @@ egress-live-distribution-test: egress-dataplane-map-test
 	cargo test -p unf-agent egress_agent_advertisement_is_exact_and_current
 	cargo test -p unf-agent egress_persistent_authority_rejects_regression_and_same_revision_mutation
 	cargo clippy -p unf-agent -p unf-controller -p unf-egress --all-targets --all-features -- -D warnings
+
+egress-desired-state-test: egress-live-distribution-test
+	hack/verify-egress-desired-state.sh
+	cargo test -p unf-api
+	cargo test -p unf-egress desired
+	cargo test -p unf-controller egress_api
+	cargo test -p unf-controller native_egress_watch_is_atomic_revisioned_relist_safe_and_durable
+	cargo test -p unf-controller openshift_egress_ip_watch_feeds_the_same_durable_model_without_status_adoption
+	cargo clippy -p unf-api -p unf-controller -p unf-egress --all-targets --all-features -- -D warnings
 
 test:
 	cargo test --workspace
@@ -379,7 +388,9 @@ ebpf:
 	cargo +$(BPF_TOOLCHAIN) build --manifest-path ebpf/unf-ebpf-tc/Cargo.toml -Z build-std=core --target bpfel-unknown-none --release
 
 generate-crds:
-	cargo run -p unf-api --example crdgen > deploy/crds/network.unf.io_securitypolicies.yaml
+	cargo run -p unf-api --example crdgen -- security-policy > deploy/crds/network.unf.io_securitypolicies.yaml
+	cargo run -p unf-api --example crdgen -- egress-pool > deploy/crds/network.unf.io_egresspools.yaml
+	cargo run -p unf-api --example crdgen -- egress-policy > deploy/crds/network.unf.io_egresspolicies.yaml
 
 controller:
 	cargo build -p unf-controller
