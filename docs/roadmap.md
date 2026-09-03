@@ -692,7 +692,10 @@ matrix is maintained in the
   domain-separated Proof of Safe Forgetting now require the exact source set,
   zero-flow gateway drains, and withdrawn reachability before atomic address
   release under `make egress-safe-forgetting-test`; ADR 0130. Live evidence
-  transport, NAT events, HA failover, and end-to-end platform packets remain.
+  transport now captures admitted membership before invalidation and accepts
+  source fences only from exact current Pod/Node/epoch challenges under `make
+  egress-source-retirement-test`; ADR 0131. Gateway-drain/reachability evidence,
+  NAT events, HA failover, and end-to-end platform packets remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

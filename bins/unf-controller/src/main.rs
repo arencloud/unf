@@ -46,9 +46,10 @@ use unf_egress::{
     EgressControlPlane, EgressControlPlaneCheckpoint, EgressDesiredCheckpoint, EgressDesiredStore,
     EgressDistributionError, EgressGatewayAcknowledgement, EgressGatewayAddressAcknowledgement,
     EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
-    EgressGatewayProjection, EgressIntent, EgressModel, EgressNode, EgressNodeProjectionEnvelope,
-    EgressProviderOutcome, EgressProviderRef, EgressSourceActivationGrant,
-    EgressSourceApplicationAcknowledgement,
+    EgressGatewayProjection, EgressIntent, EgressIntentOwner, EgressModel, EgressNode,
+    EgressNodeProjectionEnvelope, EgressProviderOutcome, EgressProviderRef,
+    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
+    EgressSourceRetirementChallenges,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -313,6 +314,7 @@ struct ControllerState {
     egress_distribution_guard: Mutex<()>,
     egress_source_distributions: RwLock<BTreeMap<String, EgressSourceDistribution>>,
     egress_pending_source_applications: RwLock<BTreeMap<String, PendingEgressSourceApplication>>,
+    egress_source_fences: RwLock<BTreeMap<(EgressIntentOwner, String), AppliedEgressSourceFence>>,
     egress_gateway_distributions: Mutex<EgressGatewayDistributionState>,
     egress_pending_gateway_addresses:
         RwLock<BTreeMap<String, PendingEgressGatewayAddressApplication>>,
@@ -449,6 +451,12 @@ struct PendingEgressSourceApplication {
 struct PendingEgressGatewayApplication {
     agent: AuthenticatedAgent,
     projection: AdmittedEgressGatewayProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedEgressSourceFence {
+    agent: AuthenticatedAgent,
+    evidence: EgressSourceFenceEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1132,6 +1140,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn spawn_internal_api(
     args: &Args,
     state: Arc<ControllerState>,
@@ -1185,6 +1194,14 @@ async fn spawn_internal_api(
         .route(
             "/v1/state/egress-source-ack",
             post(acknowledge_egress_source_application),
+        )
+        .route(
+            "/v1/state/egress-source-retirements",
+            get(egress_source_retirements),
+        )
+        .route(
+            "/v1/state/egress-source-fence",
+            post(acknowledge_egress_source_fence),
         )
         .route(
             "/v1/state/egress-gateway-address",
@@ -1498,6 +1515,7 @@ fn new_state_with_client_and_selector(
         egress_distribution_guard: Mutex::new(()),
         egress_source_distributions: RwLock::new(BTreeMap::new()),
         egress_pending_source_applications: RwLock::new(BTreeMap::new()),
+        egress_source_fences: RwLock::new(BTreeMap::new()),
         egress_gateway_distributions: Mutex::new(EgressGatewayDistributionState::default()),
         egress_pending_gateway_addresses: RwLock::new(BTreeMap::new()),
         egress_gateway_address_applications: RwLock::new(BTreeMap::new()),
@@ -3581,8 +3599,8 @@ fn record_egress_policy_result(state: &ControllerState, key: &str, result: Resul
 fn record_egress_desired_change(state: &ControllerState, changed: bool) {
     if changed {
         state.egress_desired_dirty.store(true, Ordering::Release);
-        invalidate_egress_distributions(state);
         if let Err(error) = reconcile_egress_control_plane(state) {
+            invalidate_egress_distributions(state);
             state.metrics.errors.inc();
             warn!(%error, "egress control-plane reconciliation rejected; retaining last-known-good state");
         }
@@ -3590,6 +3608,11 @@ fn record_egress_desired_change(state: &ControllerState, changed: bool) {
 }
 
 fn reconcile_egress_control_plane(state: &ControllerState) -> Result<()> {
+    let admitted_sources = mutex_lock(&state.egress_gateway_distributions)
+        .admitted_sources
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
     let (revision, model, explicit_providers) = {
         let desired = mutex_lock(&state.egress_desired);
         let model = desired.model().clone();
@@ -3632,10 +3655,34 @@ fn reconcile_egress_control_plane(state: &ControllerState) -> Result<()> {
         .collect::<Vec<_>>();
     drop(node_uids);
     drop(nodes);
-    let result = mutex_lock(&state.egress_control_plane)
+    let mut control_plane = mutex_lock(&state.egress_control_plane);
+    let before = control_plane.checkpoint();
+    let mut next = control_plane.clone();
+    let result = next
         .reconcile(revision, model, &explicit_providers, candidates)
         .context("derive allocation and gateway desired state")?;
-    if result.changed {
+    let checkpoint = next.checkpoint();
+    let registered = checkpoint
+        .retirements
+        .iter()
+        .map(|manifest| manifest.owner.clone())
+        .collect::<BTreeSet<_>>();
+    let withdrawing = checkpoint
+        .gateways
+        .records
+        .iter()
+        .filter(|record| record.desired.action == unf_egress::EgressGatewayAction::Withdraw)
+        .map(|record| record.desired.owner.clone())
+        .filter(|owner| !registered.contains(owner))
+        .collect::<Vec<_>>();
+    for owner in withdrawing {
+        next.register_retirement(&owner, &admitted_sources)
+            .context("freeze exact admitted sources before egress withdrawal")?;
+    }
+    let changed = next.checkpoint() != before;
+    *control_plane = next;
+    drop(control_plane);
+    if changed {
         state
             .egress_control_plane_dirty
             .store(true, Ordering::Release);
@@ -3679,6 +3726,8 @@ fn remove_node_egress_distributions(state: &ControllerState, source_node: &str) 
     write_lock(&state.egress_gateway_applications).remove(source_node);
     write_lock(&state.egress_pending_gateway_addresses).remove(source_node);
     write_lock(&state.egress_gateway_address_applications).remove(source_node);
+    write_lock(&state.egress_source_fences)
+        .retain(|(_, node), applied| node != source_node && applied.agent.node_name != source_node);
     let mut gateway = mutex_lock(&state.egress_gateway_distributions);
     if gateway.admitted_sources.remove(source_node).is_some() {
         gateway.revision = gateway.revision.next();
@@ -6605,6 +6654,89 @@ fn acknowledge_egress_source_application_for(
         .verify(&pending.projection)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     admit_egress_source_for_gateways(state, agent.node_name.clone(), pending.projection);
+    Ok(())
+}
+
+async fn egress_source_retirements(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<EgressSourceRetirementChallenges>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    egress_source_retirements_for(&state, &agent).map(Json)
+}
+
+fn egress_source_retirements_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+) -> Result<EgressSourceRetirementChallenges, ApiError> {
+    let principal = egress_principal_for(state, agent)?;
+    let manifests = mutex_lock(&state.egress_control_plane)
+        .checkpoint()
+        .retirements
+        .into_iter()
+        .filter(|manifest| {
+            manifest.sources.iter().any(|source| {
+                source.recipient.node_name == principal.node_name
+                    && source.recipient.node_uid == principal.node_uid
+            })
+        })
+        .collect();
+    EgressSourceRetirementChallenges::issue(state.identity_epoch, manifests)
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+async fn acknowledge_egress_source_fence(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(evidence): Json<EgressSourceFenceEvidence>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    acknowledge_egress_source_fence_for(&state, &agent, &evidence)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn acknowledge_egress_source_fence_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    evidence: &EgressSourceFenceEvidence,
+) -> Result<(), ApiError> {
+    let principal = egress_principal_for(state, agent)?;
+    if evidence.recipient.node_name != principal.node_name
+        || evidence.recipient.node_uid != principal.node_uid
+        || evidence.controller_epoch != state.identity_epoch
+        || !agent_application_is_current(state, agent)
+    {
+        return Err(ApiError::forbidden(
+            "source-fence evidence does not match the current authenticated agent",
+        ));
+    }
+    evidence
+        .verify()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let matches = mutex_lock(&state.egress_control_plane)
+        .checkpoint()
+        .retirements
+        .into_iter()
+        .filter(|manifest| {
+            manifest
+                .sources
+                .iter()
+                .filter(|source| source.recipient == evidence.recipient)
+                .eq(evidence.sources.iter())
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(ApiError::bad_request(
+            "source-fence evidence does not cover exactly one retirement manifest",
+        ));
+    }
+    write_lock(&state.egress_source_fences).insert(
+        (matches[0].owner.clone(), agent.node_name.clone()),
+        AppliedEgressSourceFence {
+            agent: agent.clone(),
+            evidence: evidence.clone(),
+        },
+    );
     Ok(())
 }
 
@@ -9816,14 +9948,14 @@ mod tests {
                 pool_name: None,
                 pool_uid: None,
                 addresses: vec!["192.0.2.40".parse().expect("address")],
-                lease_epoch: 8,
+                lease_epoch: 1,
             }],
             gateways: vec![
                 unf_egress::EgressGatewayFact {
                     intent_uid: "payments-intent-uid".to_owned(),
                     rank: 0,
                     node: gateway_node,
-                    lease_epoch: 8,
+                    lease_epoch: 1,
                     ready: true,
                     reachable: true,
                 },
@@ -9835,7 +9967,7 @@ mod tests {
                         uid: "gateway-b-uid".to_owned(),
                         capabilities: advertisement.capabilities.clone(),
                     },
-                    lease_epoch: 8,
+                    lease_epoch: 1,
                     ready: true,
                     reachable: true,
                 },
@@ -10034,6 +10166,88 @@ mod tests {
             &source_ack,
             &gateway_ack,
             active.revision,
+        );
+    }
+
+    #[test]
+    fn egress_source_retirement_is_node_bound_exact_and_replayable() {
+        let state = new_state(true);
+        let advertisement = egress_advertisement();
+        let distribution = gateway_source_distribution(&advertisement);
+        let owner = distribution.model.intents[0].owner.clone();
+        write_lock(&state.node_port_nodes).insert(
+            "worker-a".to_owned(),
+            NodePortNodeRecord {
+                node_uid: "worker-a-uid".to_owned(),
+                revision: Revision::new(1),
+                addresses: Vec::new(),
+            },
+        );
+        write_lock(&state.egress_source_distributions)
+            .insert("worker-a".to_owned(), distribution.clone());
+        let source = authenticated_egress_agent("worker-a");
+        record_current_egress_agents(&state, &[&source]);
+        egress_source_projection_for(&state, &source, &advertisement)
+            .expect("issue source projection")
+            .expect("source projection exists");
+        let admitted = read_lock(&state.egress_pending_source_applications)["worker-a"]
+            .projection
+            .clone();
+
+        let candidates = distribution
+            .facts
+            .gateways
+            .iter()
+            .map(|gateway| gateway.node.clone())
+            .collect();
+        let mut control = EgressControlPlane::default();
+        control
+            .reconcile(
+                Revision::new(1),
+                distribution.model,
+                &BTreeMap::from([(
+                    owner.clone(),
+                    EgressProviderRef {
+                        name: "native".to_owned(),
+                        instance: "test".to_owned(),
+                    },
+                )]),
+                candidates,
+            )
+            .expect("ensure egress lease");
+        control
+            .reconcile(
+                Revision::new(2),
+                unf_egress::normalize_model(Vec::new(), Vec::new()).expect("empty model"),
+                &BTreeMap::new(),
+                Vec::new(),
+            )
+            .expect("withdraw egress lease");
+        control
+            .register_retirement(&owner, std::slice::from_ref(&admitted))
+            .expect("freeze admitted source set");
+        *mutex_lock(&state.egress_control_plane) = control;
+
+        let challenges = egress_source_retirements_for(&state, &source)
+            .expect("fetch Node-scoped retirement challenge");
+        assert_eq!(challenges.manifests.len(), 1);
+        let evidence = EgressSourceFenceEvidence::issue_for_challenge(
+            &challenges,
+            &challenges.manifests[0],
+            admitted.projection(),
+            1,
+        )
+        .expect("build exact fenced-bank evidence");
+        acknowledge_egress_source_fence_for(&state, &source, &evidence)
+            .expect("accept authenticated source fence");
+        assert_eq!(read_lock(&state.egress_source_fences).len(), 1);
+        let mut replacement = source;
+        replacement.pod_uid = "replacement-uid".to_owned();
+        assert_eq!(
+            acknowledge_egress_source_fence_for(&state, &replacement, &evidence)
+                .expect_err("replacement Pod cannot inherit fence evidence")
+                .status,
+            StatusCode::FORBIDDEN
         );
     }
 
@@ -10395,6 +10609,11 @@ mod tests {
         assert_eq!(
             withdrawing.gateways.records[0].desired.action,
             unf_egress::EgressGatewayAction::Withdraw
+        );
+        assert_eq!(withdrawing.retirements.len(), 1);
+        assert!(
+            withdrawing.retirements[0].sources.is_empty(),
+            "an explicitly empty admitted set is still durably sealed"
         );
         assert!(state.egress_control_plane_dirty.load(Ordering::Acquire));
         assert_eq!(

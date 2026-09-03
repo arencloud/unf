@@ -512,7 +512,13 @@ leadership, or inferred absence cannot release a lease. The domain/controller
 gate passes `make egress-safe-forgetting-test`; ADR 0130. Live agent/provider
 evidence transport, NAT events, HA failover, and platform dual-stack traffic
 are next, so production addresses remain quarantined rather than being
-released optimistically.
+released optimistically. Source-side transport is now the first live component:
+the controller freezes admitted membership before invalidation and serves
+Pod/Node-bound retirement challenges; an agent responds only after atomically
+fencing its active bank and clearing source connection state. Replacement Pods,
+foreign Nodes, and stale controller epochs fail closed under `make
+egress-source-retirement-test`; ADR 0131. Gateway-drain and reachability
+producers still prevent final release.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

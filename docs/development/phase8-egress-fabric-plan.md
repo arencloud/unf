@@ -26,6 +26,11 @@ authoritative state remains in [project-status.md](../project-status.md).
 | 8.10 | Kube-proxy-free Kind qualification | **Planned** | Exact committed dual-stack multi-Node lifecycle covering policy, allocation, steering/NAT, HA, recovery, provenance, cleanup, and rollback with immutable evidence |
 | 8.11 | OpenShift qualification | **Planned** | Independent digest-pinned cl02 RHCOS/SELinux/CRI-O gate covering cross-worker dual-stack egress, source addresses, failover, recovery, exact cleanup, convergence, and ClusterOperator comparison |
 
+Within 8.5, ADR 0131 verifies the first live safe-forgetting producer. Admitted
+membership is captured before invalidation, and current Pod/Node-bound source
+agents publish exact fenced-bank evidence under `make
+egress-source-retirement-test`. Gateway-drain and reachability evidence remain.
+
 ## Accepted Phase 8 gate
 
 The phase closes only when one exact committed tuple passes independent Kind and
@@ -105,10 +110,10 @@ HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.5 next transports the verified safe-forgetting evidence through the
-live authenticated agent/controller path: source agents attest exact fenced-bank
-readback, gateway agents scan lease-bound NAT state and attest an explicit empty
-projection plus zero connections, and the reachability provider supplies its
-independent withdrawal result. Until the controller can durably join those
-producers against the registered manifest, the lease remains quarantined. NAT
-events and an end-to-end dual-stack packet lifecycle follow.
+Milestone 8.5 next completes safe-forgetting transport on gateways: each gateway
+must apply and acknowledge its explicit empty projection, scan lease-bound NAT
+state, and publish a zero-connection drain through its current Pod/Node identity.
+The independent reachability withdrawal then lets the controller assemble and
+atomically consume the registered authority. Until every producer agrees, the
+lease remains quarantined. NAT events and an end-to-end dual-stack packet
+lifecycle follow.

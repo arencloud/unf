@@ -11,7 +11,7 @@ use unf_common::{IdentityId, Revision};
 
 use crate::{
     AdmittedEgressProjection, EgressContractDigest, EgressGatewayAction, EgressGatewayDesired,
-    EgressIntentOwner, EgressProjectionRecipient, EgressProviderOutcome,
+    EgressIntentOwner, EgressNodeProjection, EgressProjectionRecipient, EgressProviderOutcome,
     EgressReachabilityAcknowledgement, MAX_EGRESS_CONTRACT_PLANS, MAX_EGRESS_GATEWAY_NODES,
 };
 
@@ -80,6 +80,56 @@ pub struct EgressSourceFenceEvidence {
     pub active_bank: u8,
     pub sources: Vec<EgressRetiringSource>,
     pub evidence_digest: EgressRetirementDigest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressSourceRetirementChallenges {
+    pub schema_version: u16,
+    pub controller_epoch: u64,
+    pub manifests: Vec<EgressRetirementManifest>,
+}
+
+impl EgressSourceRetirementChallenges {
+    /// Builds a bounded canonical challenge set for one authenticated source.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero epoch, malformed manifests, duplicates, or excess state.
+    pub fn issue(
+        controller_epoch: u64,
+        manifests: Vec<EgressRetirementManifest>,
+    ) -> Result<Self, EgressSafeForgettingError> {
+        let challenges = Self {
+            schema_version: EGRESS_SAFE_FORGETTING_SCHEMA_VERSION,
+            controller_epoch,
+            manifests,
+        };
+        challenges.verify()?;
+        Ok(challenges)
+    }
+
+    /// Validates the self-contained challenge set.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero epoch, malformed manifests, duplicates, or excess state.
+    pub fn verify(&self) -> Result<(), EgressSafeForgettingError> {
+        if self.schema_version != EGRESS_SAFE_FORGETTING_SCHEMA_VERSION
+            || self.controller_epoch == 0
+            || self.manifests.len() > crate::MAX_EGRESS_INTENTS
+            || self
+                .manifests
+                .windows(2)
+                .any(|pair| pair[0].owner >= pair[1].owner)
+        {
+            return Err(EgressSafeForgettingError::EvidenceMismatch);
+        }
+        for manifest in &self.manifests {
+            manifest.verify_seal()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +250,37 @@ impl EgressRetirementManifest {
         Ok(())
     }
 
+    /// Verifies the self-contained canonical shape and digest received by an
+    /// agent before it uses the manifest as a retirement challenge.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, noncanonical, oversized, or digest-mutated state.
+    pub fn verify_seal(&self) -> Result<(), EgressSafeForgettingError> {
+        if self.schema_version != EGRESS_SAFE_FORGETTING_SCHEMA_VERSION
+            || self.desired_revision == Revision::INITIAL
+            || self.allocation_revision == Revision::INITIAL
+            || self.owner.name.is_empty()
+            || self.owner.uid.is_empty()
+            || self.lease_epoch == 0
+            || self.addresses.is_empty()
+            || self.addresses.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.sources.len() > MAX_EGRESS_CONTRACT_PLANS
+            || self.sources.windows(2).any(|pair| pair[0] >= pair[1])
+            || self
+                .sources
+                .iter()
+                .any(|source| source.source_identity.get() == 0)
+            || self.gateways.is_empty()
+            || self.gateways.len() > MAX_EGRESS_GATEWAY_NODES
+            || self.gateways.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.manifest_digest != self.digest()?
+        {
+            return Err(EgressSafeForgettingError::DigestMismatch);
+        }
+        Ok(())
+    }
+
     fn validate(&self, desired: &EgressGatewayDesired) -> Result<(), EgressSafeForgettingError> {
         validate_withdrawal(desired)?;
         let expected_gateways = desired
@@ -262,17 +343,74 @@ impl EgressSourceFenceEvidence {
         active_bank: u8,
     ) -> Result<Self, EgressSafeForgettingError> {
         validate_withdrawal(desired)?;
+        Self::issue_for_owner(
+            &desired.owner,
+            desired.lease_epoch,
+            admitted.projection(),
+            active_bank,
+            admitted.projection().controller_epoch,
+        )
+    }
+
+    /// Derives evidence from a controller-retained retirement manifest.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a mutated manifest, invalid bank, or no matching source.
+    pub fn issue_for_manifest(
+        manifest: &EgressRetirementManifest,
+        projection: &EgressNodeProjection,
+        active_bank: u8,
+    ) -> Result<Self, EgressSafeForgettingError> {
+        manifest.verify_seal()?;
+        Self::issue_for_owner(
+            &manifest.owner,
+            manifest.lease_epoch,
+            projection,
+            active_bank,
+            projection.controller_epoch,
+        )
+    }
+
+    /// Derives evidence under the current authenticated controller epoch.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a malformed challenge, invalid bank, or no matching source.
+    pub fn issue_for_challenge(
+        challenges: &EgressSourceRetirementChallenges,
+        manifest: &EgressRetirementManifest,
+        projection: &EgressNodeProjection,
+        active_bank: u8,
+    ) -> Result<Self, EgressSafeForgettingError> {
+        challenges.verify()?;
+        if !challenges.manifests.contains(manifest) {
+            return Err(EgressSafeForgettingError::EvidenceMismatch);
+        }
+        Self::issue_for_owner(
+            &manifest.owner,
+            manifest.lease_epoch,
+            projection,
+            active_bank,
+            challenges.controller_epoch,
+        )
+    }
+
+    fn issue_for_owner(
+        owner: &EgressIntentOwner,
+        lease_epoch: u64,
+        projection: &EgressNodeProjection,
+        active_bank: u8,
+        controller_epoch: u64,
+    ) -> Result<Self, EgressSafeForgettingError> {
         if active_bank >= 2 {
             return Err(EgressSafeForgettingError::EvidenceMismatch);
         }
-        let projection = admitted.projection();
         let mut sources = projection
             .contract
             .plans
             .iter()
-            .filter(|plan| {
-                plan.intent == desired.owner && plan.allocation.lease_epoch == desired.lease_epoch
-            })
+            .filter(|plan| &plan.intent == owner && plan.allocation.lease_epoch == lease_epoch)
             .map(|plan| EgressRetiringSource {
                 recipient: projection.recipient.clone(),
                 source_identity: plan.source.identity,
@@ -283,7 +421,7 @@ impl EgressSourceFenceEvidence {
         sources.sort();
         let mut evidence = Self {
             schema_version: EGRESS_SAFE_FORGETTING_SCHEMA_VERSION,
-            controller_epoch: projection.controller_epoch,
+            controller_epoch,
             projection_revision: projection.revision,
             recipient: projection.recipient.clone(),
             active_bank,

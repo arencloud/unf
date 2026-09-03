@@ -64,8 +64,8 @@ use unf_egress::{
     EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement, EgressGatewayHostBank,
     EgressGatewayProjection, EgressGatewayProjectionLedger, EgressNodeProjectionEnvelope,
     EgressPathCertificate, EgressPathMode, EgressProjectionLedger, EgressSourceActivationGrant,
-    EgressSourceApplicationAcknowledgement, compile_egress_dataplane,
-    compile_egress_gateway_dataplane,
+    EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
+    EgressSourceRetirementChallenges, compile_egress_dataplane, compile_egress_gateway_dataplane,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -8497,8 +8497,10 @@ async fn synchronize_egress_source(
         .await
         .context("request authenticated egress source projection")?;
     if response.status() == reqwest::StatusCode::NO_CONTENT {
-        return fence_active_egress_dataplane(synchronizer)
-            .context("fence egress state after source authority withdrawal");
+        let changed = fence_active_egress_dataplane(synchronizer)
+            .context("fence egress state after source authority withdrawal")?;
+        publish_egress_source_retirement_evidence(synchronizer).await?;
+        return Ok(changed);
     }
     let envelope: EgressNodeProjectionEnvelope = response
         .error_for_status()
@@ -8797,6 +8799,56 @@ async fn publish_egress_source_acknowledgement(
         .context("publish exact egress source application acknowledgement")?
         .error_for_status()
         .context("controller rejected egress source application acknowledgement")?;
+    Ok(())
+}
+
+async fn publish_egress_source_retirement_evidence(
+    synchronizer: &EgressSynchronizer,
+) -> Result<()> {
+    let Some(admitted) = synchronizer.ledger.current() else {
+        return Ok(());
+    };
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("egress source retirement requires a controller URL")?;
+    let response = authenticated_get(
+        &synchronizer.client,
+        format!("{controller_url}/v1/state/egress-source-retirements"),
+        &synchronizer.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request authenticated egress source retirement challenges")?;
+    let challenges: EgressSourceRetirementChallenges = response
+        .error_for_status()
+        .context("controller rejected egress source retirement request")?
+        .json()
+        .await
+        .context("decode egress source retirement challenges")?;
+    challenges
+        .verify()
+        .context("verify egress source retirement challenges")?;
+    for manifest in &challenges.manifests {
+        let evidence = EgressSourceFenceEvidence::issue_for_challenge(
+            &challenges,
+            manifest,
+            admitted,
+            synchronizer.active_bank,
+        )
+        .context("build destination-preserving source-fence evidence")?;
+        synchronizer
+            .client
+            .current()
+            .post(format!("{controller_url}/v1/state/egress-source-fence"))
+            .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+            .json(&evidence)
+            .send()
+            .await
+            .context("publish authenticated egress source-fence evidence")?
+            .error_for_status()
+            .context("controller rejected egress source-fence evidence")?;
+    }
     Ok(())
 }
 
