@@ -17,8 +17,12 @@ pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
 pub const POLICY_BANK_COUNT: u8 = 2;
-pub const EGRESS_MAP_ABI_VERSION: u16 = 1;
+pub const EGRESS_MAP_ABI_VERSION: u16 = 2;
 pub const EGRESS_BANK_COUNT: u8 = 2;
+/// LPM keys begin with an exact intent-and-bank discriminator before the
+/// destination network bits. A `/0` intent destination is therefore a
+/// 64-bit prefix, never a global trie wildcard.
+pub const EGRESS_DESTINATION_PREFIX_BASE_BITS: u32 = 64;
 pub const EGRESS_SELECTION_TABLE_SIZE: u16 = 251;
 pub const EGRESS_ADMISSION_FENCED: u8 = 1;
 pub const EGRESS_ADMISSION_ACTIVE: u8 = 2;
@@ -726,6 +730,39 @@ pub struct EgressSourceValue {
     pub reserved: [u8; 4],
 }
 
+/// Banked IPv4 destination selector. Userspace supplies `64 + prefix_len` to
+/// the LPM key so destination overlap is isolated per immutable intent bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressIpv4DestinationData {
+    pub intent_index: u32,
+    pub bank: u8,
+    pub reserved: [u8; 3],
+    pub destination_address: [u8; 4],
+}
+
+/// Banked IPv6 counterpart of [`EgressIpv4DestinationData`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressIpv6DestinationData {
+    pub intent_index: u32,
+    pub bank: u8,
+    pub reserved: [u8; 3],
+    pub destination_address: [u8; 16],
+}
+
+/// A destination entry is bound to the same contract and intent digest as
+/// its source admission record. Packet code rejects mixed-revision state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressDestinationValue {
+    pub contract_revision: u64,
+    pub intent_digest: [u8; 16],
+    pub schema_version: u16,
+    pub flags: u16,
+    pub reserved: [u8; 4],
+}
+
 /// Per-family candidate indexes are local to one source identity and bank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -804,7 +841,7 @@ pub struct EgressMapConfig {
     pub schema_version: u16,
     pub active_bank: u8,
     pub flags: u8,
-    pub reserved: [u8; 4],
+    pub destination_count: u32,
 }
 
 /// Forward and reverse keys both point at the same immutable translation and
@@ -1296,6 +1333,9 @@ const _: () = assert!(core::mem::size_of::<PolicyMapValue>() == 32);
 const _: () = assert!(core::mem::size_of::<PolicyMapConfig>() == 24);
 const _: () = assert!(core::mem::size_of::<EgressSourceKey>() == 8);
 const _: () = assert!(core::mem::size_of::<EgressSourceValue>() == 128);
+const _: () = assert!(core::mem::size_of::<EgressIpv4DestinationData>() == 12);
+const _: () = assert!(core::mem::size_of::<EgressIpv6DestinationData>() == 24);
+const _: () = assert!(core::mem::size_of::<EgressDestinationValue>() == 32);
 const _: () = assert!(core::mem::size_of::<EgressCandidateKey>() == 8);
 const _: () = assert!(core::mem::size_of::<EgressAddressValue>() == 56);
 const _: () = assert!(core::mem::size_of::<EgressGatewayValue>() == 88);
@@ -1372,6 +1412,12 @@ mod tests {
         assert_eq!(core::mem::size_of::<EgressSourceKey>(), 8);
         assert_eq!(core::mem::align_of::<EgressSourceValue>(), 8);
         assert_eq!(core::mem::size_of::<EgressSourceValue>(), 128);
+        assert_eq!(core::mem::align_of::<EgressIpv4DestinationData>(), 4);
+        assert_eq!(core::mem::size_of::<EgressIpv4DestinationData>(), 12);
+        assert_eq!(core::mem::align_of::<EgressIpv6DestinationData>(), 4);
+        assert_eq!(core::mem::size_of::<EgressIpv6DestinationData>(), 24);
+        assert_eq!(core::mem::align_of::<EgressDestinationValue>(), 8);
+        assert_eq!(core::mem::size_of::<EgressDestinationValue>(), 32);
         assert_eq!(core::mem::align_of::<EgressCandidateKey>(), 4);
         assert_eq!(core::mem::size_of::<EgressCandidateKey>(), 8);
         assert_eq!(core::mem::align_of::<EgressAddressValue>(), 8);

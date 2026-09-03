@@ -10,21 +10,19 @@ command -v rg >/dev/null
 sudo -n true
 
 rg --fixed-strings --quiet \
+    'pub const EGRESS_MAP_ABI_VERSION: u16 = 2;' \
+    "${project_root}/ebpf/unf-ebpf-common/src/lib.rs"
+rg --fixed-strings --quiet \
     'pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 13;' \
     "${project_root}/crates/unf-state/src/lib.rs"
 rg --fixed-strings --quiet \
-    'const PERSISTENT_MAP_NAMES: [&str; 33]' \
-    "${project_root}/bins/unf-agent/src/main.rs"
-rg --fixed-strings --quiet \
-    '| Transactional persistent egress maps | **Verified** |' \
+    '| Destination-exact policy-first source steering | **Verified** |' \
     "${project_root}/docs/project-status.md"
 
 cargo +"${bpf_toolchain}" build \
     --manifest-path "${project_root}/ebpf/unf-ebpf-tc/Cargo.toml" \
     -Z build-std=core --target bpfel-unknown-none --release
-
-cargo test -p unf-agent \
-    egress_dataplane_encoding_is_exact_and_rejects_foreign_bank_entries
+cargo test -p unf-egress dataplane
 
 test_binary=$(cargo test -p unf-agent --no-run --message-format=json \
     | jq -r 'select(.profile.test == true and .target.name == "unf-agent") | .executable' \
@@ -33,6 +31,6 @@ test_binary=$(cargo test -p unf-agent --no-run --message-format=json \
 
 sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
     --ignored --exact \
-    tests::privileged_egress_bank_activation_rollback_and_recovery_are_exact
+    tests::privileged_egress_source_steering_is_policy_first_destination_exact_and_dual_stack
 
-echo "Phase 8.5 egress map transaction passed: ABI-v13 ownership, destination-aware readback, capacity rollback, and pointer recovery are exact"
+echo "Phase 8.5 source steering passed: destination-exact dual-stack handoff, policy precedence, fencing, and native nonmatch are verifier-proven"

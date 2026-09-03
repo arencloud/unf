@@ -108,18 +108,18 @@ compile N+1 -> populate all staging maps -> read back and validate
 Existing applied state must remain usable if the controller or Kubernetes API is
 temporarily unavailable. New identity, policy, and service state never partially
 overwrites active maps; each prior bank remains selected through any pre-switch
-failure. Thirty-one maps are pinned under the `/sys/fs/bpf/unf/v12` ABI directory,
+failure. Thirty-three maps are pinned under the `/sys/fs/bpf/unf/v13` ABI directory,
 reopened with strict all-or-none validation, and reconstructed into userspace
-caches after restart. ABI v4, v5, v6–v8, and v9–v11 remain explicitly recognized
-as 18-map, 21-map, 24-map, and 25-map cleanup boundaries; none is interpreted as
-partial v12 state. These historical boundaries are never adopted as current
+caches after restart. ABI v4, v5, v6–v8, v9–v11, and v12 remain explicitly recognized
+as 18-map, 21-map, 24-map, 25-map, and 31-map cleanup boundaries; none is interpreted as
+partial v13 state. These historical boundaries are never adopted as current
 state. The active service, NodePort,
 and LoadBalancer banks must exactly recompile from
 their owner-only durable checkpoints. A Service checkpoint retains the current
 schema whenever LoadBalancer intent is present; rollback-compatible legacy
 projection is limited to state with no NodePort or LoadBalancer intent.
 LoadBalancer source-range LPM tries are
-runtime-only maps outside that exact 31-map persistent set; the agent rebuilds
+runtime-only maps outside that exact 33-map persistent set; the agent rebuilds
 and reads them back from the same authenticated active Service/reachability
 tuple before attaching TC. A crash between the service and NodePort
 activation pointers restores the prior
@@ -192,9 +192,9 @@ back a pending checkpoint, switches one pointer, commits, and only then retires
 the previous bank. Startup commits a prepared winner or retains/reconstructs
 the current winner solely from pointer plus current/pending evidence; ambiguity
 fails closed. This userspace host checkpoint remains distinct from persistent
-BPF ABI v12; Phase 8.5 lowers it into independently versioned fixed-width ABI-v1
+BPF ABI v13; Phase 8.5 lowers it into independently versioned fixed-width ABI-v2
 kernel banks without treating either representation as interchangeable; ADRs
-0117 and 0120.
+0117, 0120, and 0126.
 
 Phase 8.4a adds an identity-indexed egress admission state machine outside the
 packet ABI. Explicit intent is installed as `Fenced` before it can become
@@ -202,18 +202,20 @@ packet ABI. Explicit intent is installed as `Fenced` before it can become
 to native routing. An active state binds controller/projection/contract
 revisions, contract digest, and lease epoch. The accompanying flow proof is a
 deterministic commitment independently reproduced at the selected gateway, not
-stored authority or a bearer credential. Phase 8.5 must lower these semantics
-into bounded fixed-width state without weakening this ordering; ADR 0118.
+stored authority or a bearer credential. Phase 8.5 lowers these semantics into
+bounded fixed-width state without weakening this ordering; ADR 0118.
 
-The Phase 8.5 contract slice defines that fixed state as an independent egress
-ABI v1. Identity-keyed source entries retain all contract revision domains,
+The Phase 8.5 contract slice defines fixed-width source/candidate state, while
+the first packet slice advances it to egress ABI v2. Identity-keyed source
+entries retain all contract revision domains,
 lease, digest, admission, intent index, candidate counts, and family/standby
-flags. Address, gateway-path, and 251-bucket selection entries are keyed by the
+flags. Intent-and-bank-prefixed IPv4/IPv6 LPM tables retain canonical destination
+constraints plus contract/intent bindings. Address, gateway-path, and 251-bucket selection entries are keyed by the
 shared intent index; this avoids multiplying candidates for every selected
 workload. Path certificates must form one coherent path revision and unused,
 foreign, missing, or duplicate evidence is rejected. Connection and event
 layouts reserve exact original/translated tuples plus primary/standby proof
-provenance. Persistent ABI v12 now owns these tables. The agent explicitly
+provenance. Persistent ABI v13 now owns these tables. The agent explicitly
 encodes, stages, reads back, activates, reconstructs, and garbage-collects them
 as one pointer-selected transaction. A live authenticated source endpoint now
 carries the exact normalized model/facts/contract envelope; the agent resolves
@@ -223,9 +225,12 @@ EgressPool/EgressPolicy and OpenShift EgressIP watch sources now transact their
 owned prefixes through a single canonical model revision. A schema-v1
 ConfigMap checkpoint restores exact source ownership before watches start;
 failed/incomplete relists preserve last-known-good state, while accepted model
-changes clear stale source distribution authority. Gateway application
-acknowledgement and packet consumption remain separate Phase 8.5 gates. A distinct in-process
+changes clear stale source distribution authority. Exact Pod-bound source and
+gateway application acknowledgements remain separate from delivery. A distinct in-process
 gateway ledger now owns digest-bound exact-Node source-contract projections and
 explicit empty withdrawals. It fences controller epoch/revision regression and
 same-revision mutation; restart reacquires it before any future activation
-because no gateway host or packet state exists yet. See ADRs 0119–0123.
+because no gateway host or packet state exists yet. The source TC reader now
+consumes only a coherent destination match after NetworkPolicy allows it, and
+uses certified direct-neighbor state without modifying the tuple. Live path
+acquisition and gateway NAT remain separate. See ADRs 0119–0126.

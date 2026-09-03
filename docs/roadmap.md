@@ -644,11 +644,12 @@ matrix is maintained in the
   source-local route/interface/next-hop/transport/MTU paths before activation,
   and lowers identity admission plus shared per-intent address, primary/
   standby, 251-bucket rendezvous, connection, and event state into asserted
-  fixed-width ABI-v1 layouts. Proof and table selection are identical under
+  fixed-width layouts. Proof and table selection are identical under
   `make egress-dataplane-contract-test`; ADR 0119. The next verified slice moves
-  persistent state to exact 31-pin ABI v12: the agent owns four banked tables,
-  one activation pointer, and the connection LRU, with inactive readback,
-  capacity rollback, pointer-authoritative recovery, and historical-v11 cleanup
+  persistent state to exact 33-pin ABI v13: the agent owns source, destination,
+  candidate and selection banks, one activation pointer, and the connection LRU,
+  with inactive readback,
+  capacity rollback, pointer-authoritative recovery, and historical-v12 cleanup
   separation proven by `make egress-dataplane-map-test`; ADR 0120. Authenticated
   live source distribution now derives the recipient from Pod-bound TokenReview
   plus authoritative Node UID, carries complete replay material, and stages
@@ -672,8 +673,14 @@ matrix is maintained in the
   acknowledge the exact active projection, explicit withdrawal is positively
   acknowledged, and Pod replacement, mutation, invalidation, or stale replay
   fails closed. Runtime status exposes bilateral readiness under `make
-  egress-application-ack-test`; ADR 0125. This does not activate TC steering,
-  apply gateway NAT maps, or assert addresses, reachability, or packets.
+  egress-application-ack-test`; ADR 0125. Egress ABI v2 now binds every source
+  to banked IPv4/IPv6 destination prefixes and exact contract/intent state.
+  The workload-veth ingress path evaluates NetworkPolicy first, preserves
+  service and nonmatching native traffic, drops fenced/incoherent matches, and
+  hands allowed exact TCP/UDP flows unchanged to a certified direct neighbor.
+  Compiler, recovery, verifier, and dual-stack real-kernel packets pass `make
+  egress-source-steering-test`; ADR 0126. Live path activation, gateway address
+  ownership, SNAT/reverse state, events, and end-to-end packets remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

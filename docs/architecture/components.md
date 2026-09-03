@@ -109,9 +109,9 @@ The first Phase 8.5 slice closes the other half of that path: an authenticated
 gateway projection aggregates complete admitted source contracts only when the
 gateway is their exact ready/reachable lease-fenced candidate. Source-local path
 certificates bind route, interface, next hop, transport, MTU, mode, revision,
-and lease before a pure compiler can emit fixed-width ABI-v1 state. Candidate
+and lease before a pure compiler can emit fixed-width state. Candidate
 and 251-bucket primary/pre-certified-standby selection tables are shared per
-intent rather than duplicated per identity. Persistent ABI v12 owns those maps,
+intent rather than duplicated per identity. Persistent ABI v13 owns those maps,
 and the authenticated live source endpoint now transports complete replay
 material to exact-Node agents. Agents stage only fail-closed source fences until
 path and packet readiness exist. Structural native EgressPool/EgressPolicy
@@ -121,9 +121,11 @@ accepted changes withdraw stale source distributions. ADRs 0119–0122 record
 these boundaries. The live selected-gateway endpoint now derives its recipient
 from Pod-bound authentication, aggregates only admitted ready/reachable
 lease-matched source contracts, and sends explicit monotonic withdrawal. The
-agent independently validates and fences that projection, but this request is
-not a source-application acknowledgement. ADR 0123 records the boundary;
-activation acknowledgements and TC packet ownership remain.
+agent independently validates and fences that projection. Exact Pod-bound
+bilateral acknowledgements then separate application from delivery. Egress ABI
+v2 adds intent-and-bank-prefixed destination LPM state, and the source TC reader
+now enforces NetworkPolicy before an unchanged-tuple certified-neighbor handoff.
+Live path activation and gateway NAT remain. ADRs 0123–0126 record the boundary.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

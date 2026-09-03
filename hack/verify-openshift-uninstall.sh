@@ -56,6 +56,8 @@ grep -q 'stop DaemonSet unf-system/unf-agent before host mutation' \
 grep -q 'delete dedicated Namespace unf-system' "${temporary_dir}/plan.txt"
 grep -q 'preserve all UNF CRDs' "${temporary_dir}/plan.txt"
 grep -q 'dry run only' "${temporary_dir}/plan.txt"
+[[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v13/' \
+    "${temporary_dir}/plan.txt") -eq $((agent_count * 33)) ]]
 [[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v12/' \
     "${temporary_dir}/plan.txt") -eq $((agent_count * 31)) ]]
 [[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v11/' \
@@ -129,7 +131,9 @@ for node in "${nodes[@]}"; do
             test ! -e /sys/fs/bpf/unf/v8
             test ! -e /sys/fs/bpf/unf/v9
             test ! -e /sys/fs/bpf/unf/v10
+            test ! -e /sys/fs/bpf/unf/v11
             test ! -e /sys/fs/bpf/unf/v12
+            test ! -e /sys/fs/bpf/unf/v13
             for path in /sys/class/net/*; do
                 interface=${path##*/}
                 [ "${interface}" = lo ] && continue

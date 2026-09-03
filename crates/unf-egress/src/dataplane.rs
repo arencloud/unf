@@ -16,20 +16,26 @@ use unf_ebpf_common::{
     EGRESS_BANK_COUNT, EGRESS_MAP_ABI_VERSION, EGRESS_PATH_DIRECT_NEIGHBOR, EGRESS_PATH_TUNNEL,
     EGRESS_SELECTION_FLAG_STANDBY, EGRESS_SELECTION_TABLE_SIZE, EGRESS_SOURCE_FLAG_IPV4,
     EGRESS_SOURCE_FLAG_IPV6, EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY, EgressAddressValue,
-    EgressCandidateKey, EgressGatewayValue, EgressMapConfig, EgressSelectionKey,
-    EgressSelectionValue, EgressSourceKey, EgressSourceValue,
+    EgressCandidateKey, EgressDestinationValue, EgressGatewayValue, EgressIpv4DestinationData,
+    EgressIpv6DestinationData, EgressMapConfig, EgressSelectionKey, EgressSelectionValue,
+    EgressSourceKey, EgressSourceValue,
 };
 
 use crate::{
     AddressFamily, EgressAdmissionDecision, EgressAdmissionGuard, EgressBehaviorPlan,
-    EgressGatewayHostBank, EgressNode, MAX_EGRESS_CONTRACT_PLANS, MAX_EGRESS_GATEWAYS_PER_PLAN,
-    MAX_EGRESS_INTENTS, select_bucket,
+    EgressDestinations, EgressGatewayHostBank, EgressNode, MAX_EGRESS_CONTRACT_PLANS,
+    MAX_EGRESS_GATEWAYS_PER_PLAN, MAX_EGRESS_INTENTS, select_bucket,
 };
 
 pub const EGRESS_PATH_CERTIFICATE_SCHEMA_VERSION: u16 = 1;
 pub const MAX_EGRESS_DATAPLANE_PATHS: usize = MAX_EGRESS_INTENTS * MAX_EGRESS_GATEWAYS_PER_PLAN * 2;
 pub const MAX_EGRESS_DATAPLANE_SELECTIONS: usize =
     MAX_EGRESS_INTENTS * EGRESS_SELECTION_TABLE_SIZE as usize * 2;
+/// One logical bank receives at most half of each physical 262,144-entry LPM
+/// map so the active and staging banks can coexist during replacement.
+pub const MAX_EGRESS_DATAPLANE_DESTINATIONS_PER_FAMILY: usize = 131_072;
+pub const MAX_EGRESS_DATAPLANE_DESTINATIONS: usize =
+    MAX_EGRESS_DATAPLANE_DESTINATIONS_PER_FAMILY * 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,6 +177,8 @@ impl EgressPathCertificate {
 pub struct EgressDataplaneState {
     pub config: EgressMapConfig,
     pub sources: Vec<(EgressSourceKey, EgressSourceValue)>,
+    pub ipv4_destinations: Vec<(u32, EgressIpv4DestinationData, EgressDestinationValue)>,
+    pub ipv6_destinations: Vec<(u32, EgressIpv6DestinationData, EgressDestinationValue)>,
     pub addresses: Vec<(EgressCandidateKey, EgressAddressValue)>,
     pub gateways: Vec<(EgressCandidateKey, EgressGatewayValue)>,
     pub selections: Vec<(EgressSelectionKey, EgressSelectionValue)>,
@@ -270,9 +278,11 @@ pub fn compile_egress_dataplane(
             schema_version: EGRESS_MAP_ABI_VERSION,
             active_bank: bank,
             flags: 0,
-            reserved: [0; 4],
+            destination_count: 0,
         },
         sources: Vec::with_capacity(host.contract.plans.len()),
+        ipv4_destinations: Vec::new(),
+        ipv6_destinations: Vec::new(),
         addresses: Vec::new(),
         gateways: Vec::new(),
         selections: Vec::new(),
@@ -286,6 +296,7 @@ pub fn compile_egress_dataplane(
         if plans.iter().skip(1).any(|plan| {
             plan.allocation != template.allocation
                 || plan.gateways != template.gateways
+                || plan.destinations != template.destinations
                 || plan.revisions.allocation != template.revisions.allocation
                 || plan.revisions.gateway != template.revisions.gateway
                 || plan.revisions.reachability != template.revisions.reachability
@@ -356,6 +367,7 @@ pub fn compile_egress_dataplane(
             ));
         }
 
+        compile_intent_destinations(&mut state, host, template, intent_index, bank, intent_uid)?;
         if active.is_empty() {
             continue;
         }
@@ -380,10 +392,94 @@ pub fn compile_egress_dataplane(
     state.config.address_count = count("addresses", state.addresses.len())?;
     state.config.gateway_count = count("gateways", state.gateways.len())?;
     state.config.selection_count = count("selections", state.selections.len())?;
+    state.config.destination_count = count(
+        "destinations",
+        state.ipv4_destinations.len() + state.ipv6_destinations.len(),
+    )?;
     if state.selections.len() > MAX_EGRESS_DATAPLANE_SELECTIONS {
         return Err(EgressDataplaneError::Capacity { kind: "selections" });
     }
+    if state.ipv4_destinations.len() > MAX_EGRESS_DATAPLANE_DESTINATIONS_PER_FAMILY
+        || state.ipv6_destinations.len() > MAX_EGRESS_DATAPLANE_DESTINATIONS_PER_FAMILY
+        || usize::try_from(state.config.destination_count).unwrap_or(usize::MAX)
+            > MAX_EGRESS_DATAPLANE_DESTINATIONS
+    {
+        return Err(EgressDataplaneError::Capacity {
+            kind: "destinations",
+        });
+    }
     Ok(state)
+}
+
+fn compile_intent_destinations(
+    state: &mut EgressDataplaneState,
+    host: &EgressGatewayHostBank,
+    plan: &EgressBehaviorPlan,
+    intent_index: u32,
+    bank: u8,
+    intent_uid: &str,
+) -> Result<(), EgressDataplaneError> {
+    let value = EgressDestinationValue {
+        contract_revision: host.contract.contract_revision.get(),
+        intent_digest: digest16(b"unf.egress-intent.v1\0", intent_uid.as_bytes()),
+        schema_version: EGRESS_MAP_ABI_VERSION,
+        flags: 0,
+        reserved: [0; 4],
+    };
+    match &plan.destinations {
+        EgressDestinations::Any => {
+            state.ipv4_destinations.push((
+                0,
+                EgressIpv4DestinationData {
+                    intent_index,
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: [0; 4],
+                },
+                value,
+            ));
+            state.ipv6_destinations.push((
+                0,
+                EgressIpv6DestinationData {
+                    intent_index,
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: [0; 16],
+                },
+                value,
+            ));
+        }
+        EgressDestinations::Networks(networks) => {
+            for prefix in networks {
+                if !prefix.is_canonical() {
+                    return Err(EgressDataplaneError::InvalidHostBank);
+                }
+                match prefix.address {
+                    std::net::IpAddr::V4(address) => state.ipv4_destinations.push((
+                        u32::from(prefix.prefix_len),
+                        EgressIpv4DestinationData {
+                            intent_index,
+                            bank,
+                            reserved: [0; 3],
+                            destination_address: address.octets(),
+                        },
+                        value,
+                    )),
+                    std::net::IpAddr::V6(address) => state.ipv6_destinations.push((
+                        u32::from(prefix.prefix_len),
+                        EgressIpv6DestinationData {
+                            intent_index,
+                            bank,
+                            reserved: [0; 3],
+                            destination_address: address.octets(),
+                        },
+                        value,
+                    )),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -848,7 +944,64 @@ mod tests {
         assert!(state.addresses.is_empty());
         assert!(state.gateways.is_empty());
         assert!(state.selections.is_empty());
+        assert_eq!(state.ipv4_destinations.len(), 1);
+        assert_eq!(state.ipv6_destinations.len(), 1);
+        assert_eq!(state.config.destination_count, 2);
         assert_eq!(state.config.path_revision, 0);
+    }
+
+    #[test]
+    fn destination_prefixes_are_exact_banked_and_contract_bound() {
+        let (mut model, facts, _) = fixture();
+        model.intents[0].destinations = EgressDestinations::Networks(vec![
+            crate::IpPrefix {
+                address: ip("198.51.100.0"),
+                prefix_len: 24,
+            },
+            crate::IpPrefix {
+                address: ip("2001:db8:42::"),
+                prefix_len: 64,
+            },
+        ]);
+        let contract =
+            EgressBehaviorContract::issue(&model, &facts, node("worker-a"), Revision::new(20))
+                .expect("destination-scoped contract");
+        let projection = EgressNodeProjection::issue(
+            &principal("worker-a"),
+            &advertisement(),
+            10,
+            Revision::new(4),
+            contract,
+        )
+        .expect("source projection")
+        .admit(&principal("worker-a"), &advertisement(), &model, &facts)
+        .expect("admitted source");
+        let host = EgressGatewayHostBank::compile(&projection).expect("host bank");
+        let state = compile_egress_dataplane(&host, &guard(&projection, false), &[], 1)
+            .expect("fenced destination state");
+        assert_eq!(state.config.destination_count, 2);
+        let (prefix, data, value) = state.ipv4_destinations[0];
+        assert_eq!(prefix, 24);
+        assert_eq!(data.intent_index, 0);
+        assert_eq!(data.bank, 1);
+        assert_eq!(data.destination_address, [198, 51, 100, 0]);
+        assert_eq!(
+            value.contract_revision,
+            host.contract.contract_revision.get()
+        );
+        assert_eq!(value.intent_digest, state.sources[0].1.intent_digest);
+        let (prefix, data, value) = state.ipv6_destinations[0];
+        assert_eq!(prefix, 64);
+        assert_eq!(data.intent_index, 0);
+        assert_eq!(data.bank, 1);
+        assert_eq!(
+            data.destination_address,
+            "2001:db8:42::"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+        );
+        assert_eq!(value.intent_digest, state.sources[0].1.intent_digest);
     }
 
     #[test]
@@ -866,6 +1019,7 @@ mod tests {
         );
         assert_eq!(state.addresses.len(), 2);
         assert_eq!(state.gateways.len(), 4);
+        assert_eq!(state.config.destination_count, 2);
         assert_eq!(
             state.selections.len(),
             usize::from(EGRESS_SELECTION_TABLE_SIZE) * 2

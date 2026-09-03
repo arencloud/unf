@@ -19,8 +19,11 @@ use unf_common::{BackendId, IdentityId, PolicyId, PolicyReason, RuleId, ServiceI
 use unf_ebpf_common::{
     AddressFamily, ConnectionKey, ConnectionState, Direction, EgressIpv4PolicyMapKey,
     EgressIpv6PolicyMapData, EgressAddressValue, EgressCandidateKey, EgressConnectionKey,
-    EgressConnectionValue, EgressGatewayValue, EgressMapConfig, EgressSelectionKey,
-    EgressSelectionValue, EgressSourceKey, EgressSourceValue, FLOW_ABI_VERSION, FlowEvent,
+    EgressConnectionValue, EgressDestinationValue, EgressGatewayValue,
+    EgressIpv4DestinationData, EgressIpv6DestinationData, EgressMapConfig, EgressSelectionKey,
+    EgressSelectionValue, EgressSourceKey, EgressSourceValue, EGRESS_ADMISSION_ACTIVE,
+    EGRESS_ADMISSION_FENCED, EGRESS_BANK_COUNT, EGRESS_MAP_ABI_VERSION,
+    EGRESS_PATH_DIRECT_NEIGHBOR, FLOW_ABI_VERSION, FlowEvent,
     IDENTITY_BANK_COUNT,
     IDENTITY_MAP_ABI_VERSION, IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT,
     IPV6_NEXT_HEADER_HOP_BY_HOP, IdentityMapConfig, IdentityMapValue, Ipv4IdentityKey,
@@ -64,8 +67,8 @@ use unf_ebpf_common::{
     ServiceBackendSlotKey, ServiceBackendSlotValue, ServiceConnectionKey, ServiceConnectionValue,
     ServiceEvent, ServiceFrontendValue, ServiceMapConfig, connection_is_active,
     ipv6_extension_step, node_port_snat_candidate,
-    packet_starts_connection, service_backend_is_eligible, service_connection_is_active,
-    service_flow_hash, service_selection_tier_is_valid,
+    egress_selection_bucket, packet_starts_connection, service_backend_is_eligible,
+    service_connection_is_active, service_flow_hash, service_selection_tier_is_valid,
 };
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -81,6 +84,7 @@ const SERVICE_BACKEND_CAPACITY: u32 = 524_288;
 const SERVICE_BACKEND_SLOT_CAPACITY: u32 = 1_048_576;
 const SERVICE_CONNECTION_CAPACITY: u32 = 262_144;
 const EGRESS_SOURCE_CAPACITY: u32 = 131_072;
+const EGRESS_DESTINATION_CAPACITY: u32 = 262_144;
 const EGRESS_ADDRESS_CAPACITY: u32 = 131_072;
 const EGRESS_GATEWAY_CAPACITY: u32 = 262_144;
 const EGRESS_SELECTION_CAPACITY: u32 = 4_112_384;
@@ -142,18 +146,44 @@ static POLICY_DECISION_SCRATCH: PerCpuArray<DataplaneDecision> =
 static POLICY_DIRECTION_DECISION_SCRATCH: PerCpuArray<DataplaneDecision> =
     PerCpuArray::with_max_entries(2, 0);
 
+#[map]
+static EGRESS_CONNECTION_KEY_SCRATCH: PerCpuArray<EgressConnectionKey> =
+    PerCpuArray::with_max_entries(1, 0);
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct EgressSteeringScratch {
+    config: EgressMapConfig,
+    source: EgressSourceValue,
+    destination: EgressDestinationValue,
+    selection: EgressSelectionValue,
+    address: EgressAddressValue,
+    gateway: EgressGatewayValue,
+}
+
+#[map]
+static EGRESS_STEERING_SCRATCH: PerCpuArray<EgressSteeringScratch> =
+    PerCpuArray::with_max_entries(1, 0);
+
 /// Runtime-only, bounded flow state. Policy maps remain the complete persistent
 /// recovery boundary; replacing the eBPF program intentionally resets flows.
 #[map]
 static CONNECTIONS: LruHashMap<ConnectionKey, ConnectionState> =
     LruHashMap::with_max_entries(CONNECTION_CAPACITY, 0);
 
-/// Phase 8.5 egress state is independently banked. The packet path does not
-/// consume it until the source-steering gate is implemented; declaring and
-/// pinning it now gives userspace one exact, recoverable transaction boundary.
+/// Phase 8.5 egress state is independently banked. Source admission and its
+/// exact destination constraints become visible through one config flip.
 #[map]
 static EGRESS_SOURCES: HashMap<EgressSourceKey, EgressSourceValue> =
     HashMap::with_max_entries(EGRESS_SOURCE_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static EGRESS_DESTINATIONS_V4: LpmTrie<EgressIpv4DestinationData, EgressDestinationValue> =
+    LpmTrie::with_max_entries(EGRESS_DESTINATION_CAPACITY, 0);
+
+#[map]
+static EGRESS_DESTINATIONS_V6: LpmTrie<EgressIpv6DestinationData, EgressDestinationValue> =
+    LpmTrie::with_max_entries(EGRESS_DESTINATION_CAPACITY, 0);
 
 #[map]
 static EGRESS_ADDRESSES: HashMap<EgressCandidateKey, EgressAddressValue> =
@@ -545,6 +575,8 @@ pub fn unf_policy_v4(ctx: TcContext) -> i32 {
         if !observation.enforce && post_lookup & SERVICE_POST_LOOKUP_REROUTE_HOST != 0 {
             return reroute_host_service_v4(&ctx, observation, false);
         }
+    } else if observation.enforce {
+        return source_egress_action(&ctx, observation).unwrap_or(action);
     }
     action
 }
@@ -577,6 +609,8 @@ pub fn unf_policy_v6(ctx: TcContext) -> i32 {
         if !observation.enforce && post_lookup & SERVICE_POST_LOOKUP_REROUTE_HOST != 0 {
             return reroute_host_service_v6(&ctx, observation, false);
         }
+    } else if observation.enforce {
+        return source_egress_action(&ctx, observation).unwrap_or(action);
     }
     action
 }
@@ -3786,6 +3820,339 @@ fn active_policy_config() -> Option<PolicyMapConfig> {
 #[inline(always)]
 fn active_policy_revision() -> u64 {
     active_policy_config().map_or(0, |config| config.revision)
+}
+
+/// Returns `None` only when the source identity or destination is not owned by
+/// an active UNF egress intent. Once both match, every malformed, stale,
+/// incomplete, fenced, or unsupported state is fail-closed.
+#[inline(always)]
+fn source_egress_action(ctx: &TcContext, observation: &FlowObservation) -> Option<i32> {
+    if observation.source_identity.get() == 0
+        || !matches!(observation.protocol, PROTOCOL_TCP | PROTOCOL_UDP)
+    {
+        return None;
+    }
+    let Some(scratch_ptr) = EGRESS_STEERING_SCRATCH.get_ptr_mut(0) else {
+        return Some(TC_ACT_SHOT);
+    };
+    // SAFETY: the current CPU exclusively owns this scratch slot.
+    #[allow(unsafe_code)]
+    let scratch = unsafe { &mut *scratch_ptr };
+    let Some(config) = active_egress_config() else {
+        return if egress_source_exists(observation.source_identity) {
+            Some(TC_ACT_SHOT)
+        } else {
+            None
+        };
+    };
+    scratch.config = config;
+    let source_key = EgressSourceKey {
+        source_identity: observation.source_identity,
+        bank: scratch.config.active_bank,
+        reserved: [0; 3],
+    };
+    // SAFETY: fixed-layout source is copied into CPU-local scratch immediately.
+    #[allow(unsafe_code)]
+    let source = unsafe { EGRESS_SOURCES.get(&source_key) }?;
+    scratch.source = *source;
+    if !valid_egress_source(&scratch.source, &scratch.config, observation.address_family) {
+        return Some(TC_ACT_SHOT);
+    }
+    if !load_egress_destination(
+        observation,
+        &scratch.source,
+        scratch.config.active_bank,
+        &mut scratch.destination,
+    ) {
+        return None;
+    }
+    if scratch.destination.schema_version != EGRESS_MAP_ABI_VERSION
+        || scratch.destination.contract_revision != scratch.source.contract_revision
+        || scratch.destination.intent_digest != scratch.source.intent_digest
+        || scratch.destination.flags != 0
+        || scratch.destination.reserved != [0; 4]
+    {
+        return Some(TC_ACT_SHOT);
+    }
+    if scratch.source.admission == EGRESS_ADMISSION_FENCED {
+        return Some(TC_ACT_SHOT);
+    }
+    if scratch.source.admission != EGRESS_ADMISSION_ACTIVE
+        || scratch.source.address_count == 0
+        || scratch.source.gateway_count == 0
+        || scratch.source.policy_revision != active_policy_revision()
+        || scratch.config.path_revision == 0
+    {
+        return Some(TC_ACT_SHOT);
+    }
+
+    let Some(flow_ptr) = EGRESS_CONNECTION_KEY_SCRATCH.get_ptr_mut(0) else {
+        return Some(TC_ACT_SHOT);
+    };
+    // SAFETY: this CPU owns the fixed scratch slot for the invocation.
+    #[allow(unsafe_code)]
+    let flow = unsafe { &mut *flow_ptr };
+    flow.source_address = observation.source_address;
+    flow.destination_address = observation.destination_address;
+    flow.source_port = observation.source_port;
+    flow.destination_port = observation.destination_port;
+    flow.source_identity = observation.source_identity;
+    flow.protocol = observation.protocol;
+    flow.address_family = observation.address_family as u8;
+    flow.role = unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD;
+    flow.reserved = 0;
+    let selection_key = EgressSelectionKey {
+        intent_index: scratch.source.intent_index,
+        bucket: egress_selection_bucket(flow),
+        address_family: observation.address_family as u8,
+        bank: scratch.config.active_bank,
+    };
+    // SAFETY: selected entry is copied into CPU-local scratch immediately.
+    #[allow(unsafe_code)]
+    let Some(selection) = (unsafe { EGRESS_SELECTIONS.get(&selection_key) }) else {
+        return Some(TC_ACT_SHOT);
+    };
+    scratch.selection = *selection;
+    if scratch.selection.schema_version != EGRESS_MAP_ABI_VERSION
+        || scratch.selection.address_index >= scratch.source.address_count
+        || scratch.selection.primary_gateway_index >= scratch.source.gateway_count
+        || scratch.selection.flags & !unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0
+        || (scratch.selection.flags == 0
+            && scratch.selection.standby_gateway_index
+                != scratch.selection.primary_gateway_index)
+        || (scratch.selection.flags & unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0
+            && (scratch.selection.standby_gateway_index >= scratch.source.gateway_count
+                || scratch.selection.standby_gateway_index
+                    == scratch.selection.primary_gateway_index))
+        || scratch.selection.selection_witness == [0; 16]
+        || scratch.selection.reserved != [0; 6]
+    {
+        return Some(TC_ACT_SHOT);
+    }
+    let address_key = EgressCandidateKey {
+        intent_index: scratch.source.intent_index,
+        candidate_index: scratch.selection.address_index,
+        address_family: observation.address_family as u8,
+        bank: scratch.config.active_bank,
+    };
+    let gateway_key = EgressCandidateKey {
+        intent_index: scratch.source.intent_index,
+        candidate_index: scratch.selection.primary_gateway_index,
+        address_family: observation.address_family as u8,
+        bank: scratch.config.active_bank,
+    };
+    // SAFETY: fixed-layout entries are copied into CPU-local scratch.
+    #[allow(unsafe_code)]
+    let (Some(address), Some(gateway)) = (unsafe {
+        (
+            EGRESS_ADDRESSES.get(&address_key),
+            EGRESS_GATEWAYS.get(&gateway_key),
+        )
+    }) else {
+        return Some(TC_ACT_SHOT);
+    };
+    scratch.address = *address;
+    scratch.gateway = *gateway;
+    if !valid_egress_address(&scratch.address, &scratch.source, observation.address_family)
+        || !valid_egress_gateway(
+            &scratch.gateway,
+            &scratch.source,
+            &scratch.config,
+            observation.address_family,
+        )
+        || ctx.len() as u32 > scratch.gateway.mtu
+    {
+        return Some(TC_ACT_SHOT);
+    }
+    Some(redirect_egress_neighbor(
+        &scratch.gateway,
+        observation.address_family,
+    ))
+}
+
+#[inline(always)]
+fn active_egress_config() -> Option<EgressMapConfig> {
+    let config = EGRESS_CONFIG.get(0).copied()?;
+    if config.schema_version != EGRESS_MAP_ABI_VERSION
+        || config.active_bank >= EGRESS_BANK_COUNT
+        || config.controller_epoch == 0
+        || config.projection_revision == 0
+        || config.contract_revision == 0
+        || config.source_count == 0
+        || config.destination_count == 0
+        || config.flags != 0
+    {
+        return None;
+    }
+    Some(config)
+}
+
+#[inline(always)]
+fn egress_source_exists(identity: IdentityId) -> bool {
+    let first = EgressSourceKey {
+        source_identity: identity,
+        bank: 0,
+        reserved: [0; 3],
+    };
+    let second = EgressSourceKey {
+        source_identity: identity,
+        bank: 1,
+        reserved: [0; 3],
+    };
+    // SAFETY: read-only fixed-layout probes; no references escape.
+    #[allow(unsafe_code)]
+    unsafe {
+        EGRESS_SOURCES.get(&first).is_some() || EGRESS_SOURCES.get(&second).is_some()
+    }
+}
+
+#[inline(always)]
+fn valid_egress_source(
+    source: &EgressSourceValue,
+    config: &EgressMapConfig,
+    family: AddressFamily,
+) -> bool {
+    let family_flag = if matches!(family, AddressFamily::Ipv4) {
+        unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV4
+    } else {
+        unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV6
+    };
+    source.schema_version == EGRESS_MAP_ABI_VERSION
+        && source.contract_revision == config.contract_revision
+        && source.lease_epoch != 0
+        && source.intent_revision != 0
+        && source.identity_revision != 0
+        && source.policy_revision != 0
+        && source.allocation_revision != 0
+        && source.gateway_revision != 0
+        && source.reachability_revision != 0
+        && source.contract_digest != [0; 32]
+        && source.intent_digest != [0; 16]
+        && matches!(source.admission, EGRESS_ADMISSION_FENCED | EGRESS_ADMISSION_ACTIVE)
+        && source.flags & family_flag != 0
+        && source.flags
+            & !(unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV4
+                | unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV6
+                | unf_ebpf_common::EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY)
+            == 0
+        && source.reserved == [0; 4]
+}
+
+#[inline(always)]
+fn load_egress_destination(
+    observation: &FlowObservation,
+    source: &EgressSourceValue,
+    bank: u8,
+    destination: &mut EgressDestinationValue,
+) -> bool {
+    if matches!(observation.address_family, AddressFamily::Ipv4) {
+        let key = LpmKey::new(
+            96,
+            EgressIpv4DestinationData {
+                intent_index: source.intent_index,
+                bank,
+                reserved: [0; 3],
+                destination_address: [
+                    observation.destination_address[0],
+                    observation.destination_address[1],
+                    observation.destination_address[2],
+                    observation.destination_address[3],
+                ],
+            },
+        );
+        let Some(value) = EGRESS_DESTINATIONS_V4.get(&key) else {
+            return false;
+        };
+        *destination = *value;
+        true
+    } else {
+        let key = LpmKey::new(
+            192,
+            EgressIpv6DestinationData {
+                intent_index: source.intent_index,
+                bank,
+                reserved: [0; 3],
+                destination_address: observation.destination_address,
+            },
+        );
+        let Some(value) = EGRESS_DESTINATIONS_V6.get(&key) else {
+            return false;
+        };
+        *destination = *value;
+        true
+    }
+}
+
+#[inline(always)]
+fn valid_egress_address(
+    address: &EgressAddressValue,
+    source: &EgressSourceValue,
+    family: AddressFamily,
+) -> bool {
+    address.schema_version == EGRESS_MAP_ABI_VERSION
+        && address.contract_revision == source.contract_revision
+        && address.lease_epoch == source.lease_epoch
+        && address.candidate_witness != [0; 16]
+        && address.flags == 0
+        && address.reserved == [0; 4]
+        && valid_egress_family_address(address.address, family)
+}
+
+#[inline(always)]
+fn valid_egress_gateway(
+    gateway: &EgressGatewayValue,
+    source: &EgressSourceValue,
+    config: &EgressMapConfig,
+    family: AddressFamily,
+) -> bool {
+    gateway.schema_version == EGRESS_MAP_ABI_VERSION
+        && gateway.contract_revision == source.contract_revision
+        && gateway.lease_epoch == source.lease_epoch
+        && gateway.path_revision == config.path_revision
+        && gateway.path_mode == EGRESS_PATH_DIRECT_NEIGHBOR
+        && gateway.output_interface != 0
+        && (1280..=65_535).contains(&gateway.mtu)
+        && gateway.gateway_digest != [0; 16]
+        && gateway.flags == 0
+        && gateway.reserved == [0; 4]
+        && valid_egress_family_address(gateway.transport_address, family)
+        && valid_egress_family_address(gateway.next_hop_address, family)
+}
+
+#[inline(always)]
+fn valid_egress_family_address(address: [u8; 16], family: AddressFamily) -> bool {
+    if matches!(family, AddressFamily::Ipv4) {
+        address[..4] != [0; 4] && address[4..] == [0; 12]
+    } else {
+        address != [0; 16]
+    }
+}
+
+#[inline(always)]
+fn redirect_egress_neighbor(gateway: &EgressGatewayValue, family: AddressFamily) -> i32 {
+    let Some(lookup_ptr) = FIB_LOOKUP_SCRATCH.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: this CPU owns the scratch slot and zero is valid initialization.
+    #[allow(unsafe_code)]
+    unsafe { core::ptr::write_bytes(lookup_ptr, 0, 1) };
+    // SAFETY: the pointer remains valid for this non-preemptible invocation.
+    #[allow(unsafe_code)]
+    let lookup = unsafe { &mut *lookup_ptr };
+    lookup.ifindex = gateway.output_interface;
+    if matches!(family, AddressFamily::Ipv4) {
+        lookup.family = ADDRESS_FAMILY_INET;
+        lookup.__bindgen_anon_4.ipv4_dst = u32::from_ne_bytes([
+            gateway.next_hop_address[0],
+            gateway.next_hop_address[1],
+            gateway.next_hop_address[2],
+            gateway.next_hop_address[3],
+        ]);
+    } else {
+        lookup.family = ADDRESS_FAMILY_INET6;
+        lookup.__bindgen_anon_4.ipv6_dst = ipv6_fib_words(gateway.next_hop_address);
+    }
+    redirect_service_dsr_neighbor(lookup) as i32
 }
 
 #[inline(always)]

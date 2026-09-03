@@ -385,7 +385,8 @@ intent and drain state with observation-weighted revision history, while
 load-balancer-simulate` return
 the digest-bound per-Node eligibility plan without mutating state or guessing
 private connection/affinity entries. That gate used ABI v11; current egress map
-ownership advances the all-or-none persistent boundary to ABI v12.
+ownership now uses the all-or-none persistent ABI v13 boundary; v12 remains a
+recognized historical cleanup scope.
 Milestone 7.9 is verified. Runtime/qualifier `06fc937` passed the 463-second
 three-Node Kubernetes v1.35.0 dual-stack gate with kube-proxy absent.
 Real traffic proved strict SameNode/SameZone/Cluster fallback, ClientIP
@@ -412,7 +413,7 @@ pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
 is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
-and ADRs 0113–0125 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+and ADRs 0113–0126 track the work. Milestone 8.2a now adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -440,9 +441,11 @@ candidate, selection, connection, and event state. Userspace compiles 251
 rendezvous buckets shared per intent, including a pre-certified standby by
 default when two gateways exist; packets will need only one stable hash and map
 lookup. The contract gate passes `make egress-dataplane-contract-test`; ADR
-0119. Persistent ABI v12 now owns and transactionally recovers the four banked
-tables, atomic config pointer, and future connection LRU; capacity rollback is
-proven on real kernel maps (ADR 0120). The internal TLS API now distributes a
+0119. Persistent ABI v13 now owns and transactionally recovers the source,
+destination, candidate and selection banks, atomic config pointer, and future
+connection LRU; capacity rollback is proven on real kernel maps while v12
+remains a historical exact cleanup boundary (ADRs 0120 and 0126). The internal
+TLS API now distributes a
 self-contained source envelope only after Pod-bound TokenReview authentication
 and authoritative Node-UID binding. The agent independently replays it and
 atomically stages explicit intent only as `Fenced`; absence or any validation /
@@ -470,9 +473,13 @@ transactional map activation, which alone admits it for gateway distribution;
 every selected gateway then acknowledges exact monotonic ledger adoption or
 withdrawal. Pod replacement, mutation, invalidation, and stale replay fail
 closed, while status exposes issued applications and bilateral readiness under
-`make egress-application-ack-test`; ADR 0125. These acknowledgements are runtime
-prerequisites only. They do not activate source steering, apply gateway NAT
-maps, configure addresses, or make a packet/platform claim; TC steering and
+`make egress-application-ack-test`; ADR 0125. Egress ABI v2 now adds banked
+intent-prefixed IPv4/IPv6 destination LPM state, and the source TC path runs
+NetworkPolicy first, leaves service and nonmatching traffic on their native
+paths, drops fenced or incoherent exact targets, then uses the original-tuple
+bucket to hand an unchanged packet to a certified direct neighbor. The
+real-kernel dual-stack gate passes `make egress-source-steering-test`; ADR 0126.
+Live path activation, gateway address/NAT maps, reverse traffic, and platform
 dual-stack NAT are next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

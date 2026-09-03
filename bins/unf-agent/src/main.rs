@@ -110,7 +110,7 @@ use cni_server::CniTransactionServer;
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v12";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v13";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
@@ -262,7 +262,7 @@ const ABI_V11_MAP_NAMES: [&str; 25] = [
     "LOAD_BALANCER_FRONTENDS_V6",
     "LOAD_BALANCER_CONFIG",
 ];
-const PERSISTENT_MAP_NAMES: [&str; 31] = [
+const ABI_V12_MAP_NAMES: [&str; 31] = [
     "IDENTITY_V4",
     "IDENTITY_V4_B",
     "IDENTITY_V6",
@@ -295,6 +295,41 @@ const PERSISTENT_MAP_NAMES: [&str; 31] = [
     "EGRESS_CONFIG",
     "EGRESS_CONNECTIONS",
 ];
+const PERSISTENT_MAP_NAMES: [&str; 33] = [
+    "IDENTITY_V4",
+    "IDENTITY_V4_B",
+    "IDENTITY_V6",
+    "IDENTITY_V6_B",
+    "IDENTITY_CONFIG",
+    "POLICY_RULES",
+    "POLICY_IPV4",
+    "POLICY_IPV6",
+    "EGRESS_IPV4",
+    "EGRESS_IPV6",
+    "POLICY_CONFIG",
+    "SERVICE_FRONTENDS_V4",
+    "SERVICE_FRONTENDS_V6",
+    "SERVICE_BACKENDS_V4",
+    "SERVICE_BACKENDS_V6",
+    "SERVICE_BACKEND_SLOTS",
+    "SERVICE_CONFIG",
+    "SERVICE_CONNECTIONS",
+    "SERVICE_AFFINITY",
+    "NODE_PORT_FRONTENDS_V4",
+    "NODE_PORT_FRONTENDS_V6",
+    "NODE_PORT_CONFIG",
+    "LOAD_BALANCER_FRONTENDS_V4",
+    "LOAD_BALANCER_FRONTENDS_V6",
+    "LOAD_BALANCER_CONFIG",
+    "EGRESS_SOURCES",
+    "EGRESS_DESTINATIONS_V4",
+    "EGRESS_DESTINATIONS_V6",
+    "EGRESS_ADDRESSES",
+    "EGRESS_GATEWAYS",
+    "EGRESS_SELECTIONS",
+    "EGRESS_CONFIG",
+    "EGRESS_CONNECTIONS",
+];
 const IDENTITY_MAP_CAPACITY: u32 = 65_536;
 const POLICY_MAP_CAPACITY: u32 = 262_144;
 const SERVICE_FRONTEND_MAP_CAPACITY: u32 = 262_144;
@@ -302,6 +337,7 @@ const SERVICE_BACKEND_MAP_CAPACITY: u32 = 524_288;
 const SERVICE_BACKEND_SLOT_MAP_CAPACITY: u32 = 1_048_576;
 const SERVICE_CONNECTION_MAP_CAPACITY: u32 = 262_144;
 const EGRESS_SOURCE_MAP_CAPACITY: u32 = 131_072;
+const EGRESS_DESTINATION_MAP_CAPACITY: u32 = 262_144;
 const EGRESS_ADDRESS_MAP_CAPACITY: u32 = 131_072;
 const EGRESS_GATEWAY_MAP_CAPACITY: u32 = 262_144;
 const EGRESS_SELECTION_MAP_CAPACITY: u32 = 4_112_384;
@@ -800,6 +836,8 @@ struct PolicySynchronizer {
 
 struct EgressSynchronizer {
     sources: AyaHashMap<MapData, [u8; 8], [u8; 128]>,
+    ipv4_destinations: AyaLpmTrie<MapData, [u8; 12], [u8; 32]>,
+    ipv6_destinations: AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
     addresses: AyaHashMap<MapData, [u8; 8], [u8; 56]>,
     gateways: AyaHashMap<MapData, [u8; 8], [u8; 88]>,
     selections: AyaHashMap<MapData, [u8; 8], [u8; 32]>,
@@ -928,6 +966,8 @@ type EncodedIpv6PolicyBank = BTreeMap<EncodedIpv6PolicyKey, [u8; 32]>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EncodedEgressBank {
     sources: BTreeMap<[u8; 8], [u8; 128]>,
+    ipv4_destinations: BTreeMap<(u32, [u8; 12]), [u8; 32]>,
+    ipv6_destinations: BTreeMap<(u32, [u8; 24]), [u8; 32]>,
     addresses: BTreeMap<[u8; 8], [u8; 56]>,
     gateways: BTreeMap<[u8; 8], [u8; 88]>,
     selections: BTreeMap<[u8; 8], [u8; 32]>,
@@ -938,6 +978,8 @@ impl Default for EncodedEgressBank {
     fn default() -> Self {
         Self {
             sources: BTreeMap::new(),
+            ipv4_destinations: BTreeMap::new(),
+            ipv6_destinations: BTreeMap::new(),
             addresses: BTreeMap::new(),
             gateways: BTreeMap::new(),
             selections: BTreeMap::new(),
@@ -980,6 +1022,8 @@ type ServiceMaps = (
 type ServiceAffinityMap = AyaHashMap<MapData, [u8; 40], [u8; 32]>;
 type EgressMaps = (
     AyaHashMap<MapData, [u8; 8], [u8; 128]>,
+    AyaLpmTrie<MapData, [u8; 12], [u8; 32]>,
+    AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
     AyaHashMap<MapData, [u8; 8], [u8; 56]>,
     AyaHashMap<MapData, [u8; 8], [u8; 88]>,
     AyaHashMap<MapData, [u8; 8], [u8; 32]>,
@@ -5282,6 +5326,7 @@ fn plan_abi_cleanup(
         5 => &ABI_V5_MAP_NAMES,
         6..=8 => &ABI_V8_MAP_NAMES,
         9..=11 => &ABI_V11_MAP_NAMES,
+        12 => &ABI_V12_MAP_NAMES,
         _ => &PERSISTENT_MAP_NAMES,
     };
     let mut unknown = Vec::new();
@@ -6443,6 +6488,8 @@ fn new_synchronizers(
     ) = service_maps;
     let (
         egress_sources,
+        egress_ipv4_destinations,
+        egress_ipv6_destinations,
         egress_addresses,
         egress_gateways,
         egress_selections,
@@ -6524,6 +6571,8 @@ fn new_synchronizers(
         },
         EgressSynchronizer {
             sources: egress_sources,
+            ipv4_destinations: egress_ipv4_destinations,
+            ipv6_destinations: egress_ipv6_destinations,
             addresses: egress_addresses,
             gateways: egress_gateways,
             selections: egress_selections,
@@ -6898,7 +6947,7 @@ fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool)> {
 
     // A root program reference keeps the program-array map object alive, but Linux clears its
     // entries after the final userspace map descriptor closes unless the map itself is pinned.
-    // Keep this runtime dispatch state outside the durable 31-map ABI set: it is repopulated on
+    // Keep this runtime dispatch state outside the durable 33-map ABI set: it is repopulated on
     // every start, while the pin preserves last-known-good tail targets between agent processes.
     let tail_program_pin_root = config.bpf_pin_path.join("programs");
     fs::create_dir_all(&tail_program_pin_root).with_context(|| {
@@ -7071,6 +7120,16 @@ fn recover_persistent_dataplane(
         "EGRESS_SOURCES",
         egress.sources.map(),
         EGRESS_SOURCE_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "EGRESS_DESTINATIONS_V4",
+        egress.ipv4_destinations.map(),
+        EGRESS_DESTINATION_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "EGRESS_DESTINATIONS_V6",
+        egress.ipv6_destinations.map(),
+        EGRESS_DESTINATION_MAP_CAPACITY,
     )?;
     validate_map_capacity(
         "EGRESS_ADDRESSES",
@@ -7282,12 +7341,31 @@ fn recover_policy_entries(policies: &mut PolicySynchronizer) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn recover_egress_state(egress: &mut EgressSynchronizer) -> Result<()> {
     for entry in &egress.sources {
         let (key, value) = entry.context("iterate persistent egress sources")?;
         let bank = egress_bank(key[4])?;
         validate_recovered_egress_source(key, &value)?;
         egress.banks[bank].sources.insert(key, value);
+    }
+    for entry in &egress.ipv4_destinations {
+        let (key, value) = entry.context("iterate persistent IPv4 egress destinations")?;
+        let data = key.data();
+        let bank = egress_bank(data[4])?;
+        validate_recovered_egress_destination(key.prefix_len(), &data, &value, 32)?;
+        egress.banks[bank]
+            .ipv4_destinations
+            .insert((key.prefix_len(), data), value);
+    }
+    for entry in &egress.ipv6_destinations {
+        let (key, value) = entry.context("iterate persistent IPv6 egress destinations")?;
+        let data = key.data();
+        let bank = egress_bank(data[4])?;
+        validate_recovered_egress_destination(key.prefix_len(), &data, &value, 128)?;
+        egress.banks[bank]
+            .ipv6_destinations
+            .insert((key.prefix_len(), data), value);
     }
     for entry in &egress.addresses {
         let (key, value) = entry.context("iterate persistent egress addresses")?;
@@ -7325,11 +7403,7 @@ fn recover_egress_state(egress: &mut EgressSynchronizer) -> Result<()> {
     }
     let schema = u16::from_ne_bytes(config[48..50].try_into().expect("fixed egress schema"));
     let active_bank = config[50];
-    if schema != EGRESS_MAP_ABI_VERSION
-        || active_bank >= EGRESS_BANK_COUNT
-        || config[51] != 0
-        || config[52..56] != [0; 4]
-    {
+    if schema != EGRESS_MAP_ABI_VERSION || active_bank >= EGRESS_BANK_COUNT || config[51] != 0 {
         bail!("persistent egress config is incompatible");
     }
     let active = &egress.banks[usize::from(active_bank)];
@@ -7349,6 +7423,16 @@ fn recover_egress_state(egress: &mut EgressSynchronizer) -> Result<()> {
             bail!("persistent egress config count does not match its active bank");
         }
     }
+    let destination_count = active.ipv4_destinations.len() + active.ipv6_destinations.len();
+    if u64::from(u32::from_ne_bytes(
+        config[52..56]
+            .try_into()
+            .expect("fixed egress destination count"),
+    )) != destination_count as u64
+    {
+        bail!("persistent egress destination count does not match its active bank");
+    }
+    validate_egress_destination_bindings(active, config)?;
     if u64::from_ne_bytes(config[0..8].try_into().expect("fixed controller epoch")) == 0
         || u64::from_ne_bytes(config[8..16].try_into().expect("fixed projection revision")) == 0
         || u64::from_ne_bytes(config[16..24].try_into().expect("fixed contract revision")) == 0
@@ -7364,6 +7448,72 @@ fn recover_egress_state(egress: &mut EgressSynchronizer) -> Result<()> {
     egress.applied_authority = Some(applied_authority);
     let inactive_bank = active_bank ^ 1;
     clear_egress_bank(egress, inactive_bank)?;
+    Ok(())
+}
+
+fn validate_egress_destination_bindings(
+    active: &EncodedEgressBank,
+    config: [u8; 56],
+) -> Result<()> {
+    let contract_revision = &config[16..24];
+    if !active.sources.is_empty()
+        && active.ipv4_destinations.is_empty()
+        && active.ipv6_destinations.is_empty()
+    {
+        bail!("persistent egress sources have no destination ownership state");
+    }
+    if active
+        .sources
+        .values()
+        .any(|source| source[8..16] != *contract_revision)
+    {
+        bail!("persistent egress source revision does not match config");
+    }
+    for ((_, data), value) in &active.ipv4_destinations {
+        validate_egress_destination_binding(active, &data[0..4], value, contract_revision)?;
+    }
+    for ((_, data), value) in &active.ipv6_destinations {
+        validate_egress_destination_binding(active, &data[0..4], value, contract_revision)?;
+    }
+    Ok(())
+}
+
+fn validate_egress_destination_binding(
+    active: &EncodedEgressBank,
+    intent_index: &[u8],
+    value: &[u8; 32],
+    contract_revision: &[u8],
+) -> Result<()> {
+    if value[0..8] != *contract_revision
+        || !active
+            .sources
+            .values()
+            .any(|source| source[112..116] == *intent_index && source[96..112] == value[8..24])
+    {
+        bail!("persistent egress destination is not bound to an active-bank source intent");
+    }
+    Ok(())
+}
+
+fn validate_recovered_egress_destination<const K: usize>(
+    prefix_len: u32,
+    data: &[u8; K],
+    value: &[u8; 32],
+    family_bits: u32,
+) -> Result<()> {
+    let base = unf_ebpf_common::EGRESS_DESTINATION_PREFIX_BASE_BITS;
+    if prefix_len < base
+        || prefix_len > base + family_bits
+        || data[5..8] != [0; 3]
+        || u64::from_ne_bytes(value[0..8].try_into().expect("fixed destination revision")) == 0
+        || value[8..24] == [0; 16]
+        || u16::from_ne_bytes(value[24..26].try_into().expect("fixed destination schema"))
+            != EGRESS_MAP_ABI_VERSION
+        || value[26..28] != [0; 2]
+        || value[28..32] != [0; 4]
+    {
+        bail!("persistent egress destination entry is incompatible");
+    }
     Ok(())
 }
 
@@ -7538,6 +7688,10 @@ fn clear_egress_bank(egress: &mut EgressSynchronizer, bank: u8) -> Result<()> {
     let index = egress_bank(bank)?;
     restore_encoded_bank(&mut egress.sources, &BTreeMap::new(), bank, 4)
         .context("clear egress source bank")?;
+    restore_lpm_bank(&mut egress.ipv4_destinations, &BTreeMap::new(), bank)
+        .context("clear IPv4 egress destination bank")?;
+    restore_lpm_bank(&mut egress.ipv6_destinations, &BTreeMap::new(), bank)
+        .context("clear IPv6 egress destination bank")?;
     restore_encoded_bank(&mut egress.addresses, &BTreeMap::new(), bank, 7)
         .context("clear egress address bank")?;
     restore_encoded_bank(&mut egress.gateways, &BTreeMap::new(), bank, 7)
@@ -7553,9 +7707,14 @@ fn encode_egress_dataplane(state: &EgressDataplaneState) -> Result<EncodedEgress
     egress_bank(bank)?;
     if state.config.schema_version != EGRESS_MAP_ABI_VERSION
         || usize::try_from(state.config.source_count).ok() != Some(state.sources.len())
+        || usize::try_from(state.config.destination_count).ok()
+            != Some(state.ipv4_destinations.len() + state.ipv6_destinations.len())
         || usize::try_from(state.config.address_count).ok() != Some(state.addresses.len())
         || usize::try_from(state.config.gateway_count).ok() != Some(state.gateways.len())
         || usize::try_from(state.config.selection_count).ok() != Some(state.selections.len())
+        || (!state.sources.is_empty()
+            && state.ipv4_destinations.is_empty()
+            && state.ipv6_destinations.is_empty())
     {
         bail!("compiled egress state does not match its ABI config");
     }
@@ -7572,6 +7731,30 @@ fn encode_egress_dataplane(state: &EgressDataplaneState) -> Result<EncodedEgress
                 .is_some()
         {
             bail!("compiled egress state contains a duplicate or foreign source entry");
+        }
+    }
+    for (prefix, data, value) in &state.ipv4_destinations {
+        let key = encode_egress_ipv4_destination(*data);
+        let prefix = unf_ebpf_common::EGRESS_DESTINATION_PREFIX_BASE_BITS + prefix;
+        if key[4] != bank
+            || encoded
+                .ipv4_destinations
+                .insert((prefix, key), encode_egress_destination_value(value))
+                .is_some()
+        {
+            bail!("compiled egress state contains a duplicate or foreign IPv4 destination");
+        }
+    }
+    for (prefix, data, value) in &state.ipv6_destinations {
+        let key = encode_egress_ipv6_destination(*data);
+        let prefix = unf_ebpf_common::EGRESS_DESTINATION_PREFIX_BASE_BITS + prefix;
+        if key[4] != bank
+            || encoded
+                .ipv6_destinations
+                .insert((prefix, key), encode_egress_destination_value(value))
+                .is_some()
+        {
+            bail!("compiled egress state contains a duplicate or foreign IPv6 destination");
         }
     }
     for (key, value) in &state.addresses {
@@ -7607,6 +7790,13 @@ fn encode_egress_dataplane(state: &EgressDataplaneState) -> Result<EncodedEgress
             bail!("compiled egress state contains a duplicate or foreign selection entry");
         }
     }
+    for ((prefix, data), value) in &encoded.ipv4_destinations {
+        validate_recovered_egress_destination(*prefix, data, value, 32)?;
+    }
+    for ((prefix, data), value) in &encoded.ipv6_destinations {
+        validate_recovered_egress_destination(*prefix, data, value, 128)?;
+    }
+    validate_egress_destination_bindings(&encoded, encoded.config)?;
     Ok(encoded)
 }
 
@@ -7915,6 +8105,7 @@ fn egress_authority_is_current(
     Ok(false)
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_egress_dataplane(
     egress: &mut EgressSynchronizer,
     state: &EgressDataplaneState,
@@ -7933,6 +8124,22 @@ fn apply_egress_dataplane(
     let staging_result =
         replace_encoded_entries(&mut egress.sources, &previous.sources, &desired.sources)
             .context("stage egress sources")
+            .and_then(|()| {
+                replace_lpm_entries(
+                    &mut egress.ipv4_destinations,
+                    &previous.ipv4_destinations,
+                    &desired.ipv4_destinations,
+                )
+                .context("stage IPv4 egress destinations")
+            })
+            .and_then(|()| {
+                replace_lpm_entries(
+                    &mut egress.ipv6_destinations,
+                    &previous.ipv6_destinations,
+                    &desired.ipv6_destinations,
+                )
+                .context("stage IPv6 egress destinations")
+            })
             .and_then(|()| {
                 replace_encoded_entries(
                     &mut egress.addresses,
@@ -7955,6 +8162,14 @@ fn apply_egress_dataplane(
             })
             .and_then(|()| {
                 validate_encoded_entries(&egress.sources, &desired.sources, "egress source")
+            })
+            .and_then(|()| {
+                validate_lpm_bank(&egress.ipv4_destinations, &desired.ipv4_destinations, bank)
+                    .context("validate IPv4 egress destinations")
+            })
+            .and_then(|()| {
+                validate_lpm_bank(&egress.ipv6_destinations, &desired.ipv6_destinations, bank)
+                    .context("validate IPv6 egress destinations")
             })
             .and_then(|()| {
                 validate_encoded_entries(&egress.addresses, &desired.addresses, "egress address")
@@ -8003,6 +8218,20 @@ fn rollback_egress_stage(
     cause: &anyhow::Error,
 ) -> anyhow::Error {
     let rollback = restore_encoded_bank(&mut egress.sources, &previous.sources, bank, 4)
+        .and_then(|()| {
+            restore_lpm_bank(
+                &mut egress.ipv4_destinations,
+                &previous.ipv4_destinations,
+                bank,
+            )
+        })
+        .and_then(|()| {
+            restore_lpm_bank(
+                &mut egress.ipv6_destinations,
+                &previous.ipv6_destinations,
+                bank,
+            )
+        })
         .and_then(|()| restore_encoded_bank(&mut egress.addresses, &previous.addresses, bank, 7))
         .and_then(|()| restore_encoded_bank(&mut egress.gateways, &previous.gateways, bank, 7))
         .and_then(|()| restore_encoded_bank(&mut egress.selections, &previous.selections, bank, 7));
@@ -8046,6 +8275,34 @@ fn encode_egress_source_value(value: &unf_ebpf_common::EgressSourceValue) -> [u8
     encoded[122] = value.admission;
     encoded[123] = value.flags;
     encoded[124..128].copy_from_slice(&value.reserved);
+    encoded
+}
+
+fn encode_egress_ipv4_destination(value: unf_ebpf_common::EgressIpv4DestinationData) -> [u8; 12] {
+    let mut encoded = [0; 12];
+    encoded[0..4].copy_from_slice(&value.intent_index.to_ne_bytes());
+    encoded[4] = value.bank;
+    encoded[5..8].copy_from_slice(&value.reserved);
+    encoded[8..12].copy_from_slice(&value.destination_address);
+    encoded
+}
+
+fn encode_egress_ipv6_destination(value: unf_ebpf_common::EgressIpv6DestinationData) -> [u8; 24] {
+    let mut encoded = [0; 24];
+    encoded[0..4].copy_from_slice(&value.intent_index.to_ne_bytes());
+    encoded[4] = value.bank;
+    encoded[5..8].copy_from_slice(&value.reserved);
+    encoded[8..24].copy_from_slice(&value.destination_address);
+    encoded
+}
+
+fn encode_egress_destination_value(value: &unf_ebpf_common::EgressDestinationValue) -> [u8; 32] {
+    let mut encoded = [0; 32];
+    encoded[0..8].copy_from_slice(&value.contract_revision.to_ne_bytes());
+    encoded[8..24].copy_from_slice(&value.intent_digest);
+    encoded[24..26].copy_from_slice(&value.schema_version.to_ne_bytes());
+    encoded[26..28].copy_from_slice(&value.flags.to_ne_bytes());
+    encoded[28..32].copy_from_slice(&value.reserved);
     encoded
 }
 
@@ -8136,7 +8393,7 @@ fn encode_egress_config(value: &unf_ebpf_common::EgressMapConfig) -> [u8; 56] {
     encoded[48..50].copy_from_slice(&value.schema_version.to_ne_bytes());
     encoded[50] = value.active_bank;
     encoded[51] = value.flags;
-    encoded[52..56].copy_from_slice(&value.reserved);
+    encoded[52..56].copy_from_slice(&value.destination_count.to_ne_bytes());
     encoded
 }
 
@@ -9341,6 +9598,16 @@ fn take_egress_maps(ebpf: &mut Ebpf) -> Result<EgressMaps> {
             .context("eBPF object does not contain EGRESS_SOURCES map")?,
     )
     .context("open EGRESS_SOURCES map")?;
+    let ipv4_destinations = AyaLpmTrie::<_, [u8; 12], [u8; 32]>::try_from(
+        ebpf.take_map("EGRESS_DESTINATIONS_V4")
+            .context("eBPF object does not contain EGRESS_DESTINATIONS_V4 map")?,
+    )
+    .context("open EGRESS_DESTINATIONS_V4 map")?;
+    let ipv6_destinations = AyaLpmTrie::<_, [u8; 24], [u8; 32]>::try_from(
+        ebpf.take_map("EGRESS_DESTINATIONS_V6")
+            .context("eBPF object does not contain EGRESS_DESTINATIONS_V6 map")?,
+    )
+    .context("open EGRESS_DESTINATIONS_V6 map")?;
     let addresses = AyaHashMap::<_, [u8; 8], [u8; 56]>::try_from(
         ebpf.take_map("EGRESS_ADDRESSES")
             .context("eBPF object does not contain EGRESS_ADDRESSES map")?,
@@ -9368,6 +9635,8 @@ fn take_egress_maps(ebpf: &mut Ebpf) -> Result<EgressMaps> {
     .context("open EGRESS_CONNECTIONS map")?;
     Ok((
         sources,
+        ipv4_destinations,
+        ipv6_destinations,
         addresses,
         gateways,
         selections,
@@ -13929,6 +14198,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires root BPF map creation and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
     fn privileged_egress_bank_activation_rollback_and_recovery_are_exact() {
         let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
         let mut loader = EbpfLoader::new();
@@ -13936,10 +14206,20 @@ mod tests {
         let mut ebpf = loader
             .load_file(object)
             .expect("load verifier-approved eBPF object");
-        let (sources, addresses, gateways, selections, config, connections) =
-            take_egress_maps(&mut ebpf).expect("take egress maps");
+        let (
+            sources,
+            ipv4_destinations,
+            ipv6_destinations,
+            addresses,
+            gateways,
+            selections,
+            config,
+            connections,
+        ) = take_egress_maps(&mut ebpf).expect("take egress maps");
         let mut synchronizer = EgressSynchronizer {
             sources,
+            ipv4_destinations,
+            ipv6_destinations,
             addresses,
             gateways,
             selections,
@@ -13972,7 +14252,7 @@ mod tests {
                 schema_version: EGRESS_MAP_ABI_VERSION,
                 active_bank: bank,
                 flags: 0,
-                reserved: [0; 4],
+                destination_count: 1,
             },
             sources: identities
                 .iter()
@@ -14005,6 +14285,23 @@ mod tests {
                     )
                 })
                 .collect(),
+            ipv4_destinations: vec![(
+                0,
+                unf_ebpf_common::EgressIpv4DestinationData {
+                    intent_index: 0,
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: [0; 4],
+                },
+                unf_ebpf_common::EgressDestinationValue {
+                    contract_revision: 13 + u64::from(bank),
+                    intent_digest: [0x5A; 16],
+                    schema_version: EGRESS_MAP_ABI_VERSION,
+                    flags: 0,
+                    reserved: [0; 4],
+                },
+            )],
+            ipv6_destinations: Vec::new(),
             addresses: Vec::new(),
             gateways: Vec::new(),
             selections: Vec::new(),
@@ -14028,6 +14325,413 @@ mod tests {
         assert_eq!(synchronizer.active_bank, 1);
         assert_eq!(synchronizer.banks[1].sources.len(), 1);
         assert!(synchronizer.banks[0].sources.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
+    fn privileged_egress_source_steering_is_policy_first_destination_exact_and_dual_stack() {
+        const TC_ACT_SHOT: u32 = 2;
+        const TC_ACT_PIPE: u32 = 3;
+        const TC_ACT_REDIRECT: u32 = 7;
+        const POLICY_REVISION: u64 = 5;
+        const CONTRACT_REVISION: u64 = 13;
+        const PATH_REVISION: u64 = 19;
+        const BANK: u8 = 1;
+
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new()
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        load_dataplane_tail_programs(&mut ebpf)
+            .expect("kernel verifier accepts source-steering tail programs");
+        for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(program_name)
+                .expect("UNF TC program exists")
+                .try_into()
+                .expect("UNF program is a TC classifier");
+            program
+                .load()
+                .expect("kernel verifier accepts UNF TC program");
+        }
+
+        let source_v4 = Ipv4Addr::new(10, 244, 0, 20);
+        let destination_v4 = Ipv4Addr::new(203, 0, 113, 9);
+        let source_v6: Ipv6Addr = "fd00::20".parse().unwrap();
+        let destination_v6: Ipv6Addr = "2001:db8:1::9".parse().unwrap();
+        let identity_v4 = IdentityId::new(42);
+        let identity_v6 = IdentityId::new(43);
+
+        let (mut identity_v4_maps, mut identity_v6_maps, mut identity_config) =
+            take_identity_maps(&mut ebpf).expect("take identity maps");
+        identity_v4_maps[0]
+            .insert(
+                source_v4.octets(),
+                encode_identity_value(IdentityMapValue::new(identity_v4, 3)),
+                0,
+            )
+            .unwrap();
+        identity_v6_maps[0]
+            .insert(
+                source_v6.octets(),
+                encode_identity_value(IdentityMapValue::new(identity_v6, 3)),
+                0,
+            )
+            .unwrap();
+        identity_config
+            .set(0, encode_identity_config(7, 3, 2, 0).unwrap(), 0)
+            .unwrap();
+
+        let (
+            _identity_policy,
+            _ipv4_policy,
+            _ipv6_policy,
+            mut egress_ipv4_policy,
+            _egress_ipv6_policy,
+            mut policy_config,
+        ) = take_policy_maps(&mut ebpf).expect("take policy maps");
+        policy_config
+            .set(
+                0,
+                encode_policy_config(7, POLICY_REVISION, 0, 0).unwrap(),
+                0,
+            )
+            .unwrap();
+
+        let (
+            sources,
+            ipv4_destinations,
+            ipv6_destinations,
+            addresses,
+            gateways,
+            selections,
+            config,
+            connections,
+        ) = take_egress_maps(&mut ebpf).expect("take egress maps");
+        let mut synchronizer = EgressSynchronizer {
+            sources,
+            ipv4_destinations,
+            ipv6_destinations,
+            addresses,
+            gateways,
+            selections,
+            config,
+            connections,
+            banks: [EncodedEgressBank::default(), EncodedEgressBank::default()],
+            active_bank: 0,
+            ledger: EgressProjectionLedger::default(),
+            gateway_ledger: EgressGatewayProjectionLedger::default(),
+            applied_authority: None,
+            node_name: "worker-a".to_owned(),
+            controller_url: None,
+            client: ReloadingControllerClient::without_custom_trust(
+                Counter::default(),
+                Counter::default(),
+            ),
+            agent_token_path: PathBuf::new(),
+            interval: Duration::from_secs(1),
+        };
+
+        let source_value = |flags: u8| unf_ebpf_common::EgressSourceValue {
+            lease_epoch: 17,
+            contract_revision: CONTRACT_REVISION,
+            intent_revision: 2,
+            identity_revision: 3,
+            policy_revision: POLICY_REVISION,
+            allocation_revision: 7,
+            gateway_revision: 11,
+            reachability_revision: 12,
+            contract_digest: [0xA5; 32],
+            intent_digest: [0x5A; 16],
+            intent_index: flags.into(),
+            address_count: 1,
+            gateway_count: 1,
+            schema_version: EGRESS_MAP_ABI_VERSION,
+            admission: unf_ebpf_common::EGRESS_ADMISSION_ACTIVE,
+            flags,
+            reserved: [0; 4],
+        };
+        let source_v4_value = source_value(unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV4);
+        let source_v6_value = source_value(unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV6);
+        let intent_v4 = source_v4_value.intent_index;
+        let intent_v6 = source_v6_value.intent_index;
+        let destination_value = unf_ebpf_common::EgressDestinationValue {
+            contract_revision: CONTRACT_REVISION,
+            intent_digest: [0x5A; 16],
+            schema_version: EGRESS_MAP_ABI_VERSION,
+            flags: 0,
+            reserved: [0; 4],
+        };
+        let address_bytes = |address: IpAddr| match address {
+            IpAddr::V4(address) => {
+                let mut value = [0; 16];
+                value[..4].copy_from_slice(&address.octets());
+                value
+            }
+            IpAddr::V6(address) => address.octets(),
+        };
+        let address_value = |address: IpAddr| unf_ebpf_common::EgressAddressValue {
+            lease_epoch: 17,
+            contract_revision: CONTRACT_REVISION,
+            address: address_bytes(address),
+            candidate_witness: [0x11; 16],
+            schema_version: EGRESS_MAP_ABI_VERSION,
+            flags: 0,
+            reserved: [0; 4],
+        };
+        let gateway_value = |transport: IpAddr| unf_ebpf_common::EgressGatewayValue {
+            lease_epoch: 17,
+            contract_revision: CONTRACT_REVISION,
+            path_revision: PATH_REVISION,
+            transport_address: address_bytes(transport),
+            next_hop_address: address_bytes(transport),
+            gateway_digest: [0x22; 16],
+            output_interface: 1,
+            mtu: 1_500,
+            schema_version: EGRESS_MAP_ABI_VERSION,
+            path_mode: unf_ebpf_common::EGRESS_PATH_DIRECT_NEIGHBOR,
+            flags: 0,
+            reserved: [0; 4],
+        };
+        let packet_v4 = ipv4_packet(6, source_v4, destination_v4, 40_000, 443);
+        let packet_v6 = ipv6_packet(6, source_v6, destination_v6, 40_001, 443);
+        let selection = |identity: IdentityId,
+                         source: [u8; 16],
+                         destination: [u8; 16],
+                         source_port: u16,
+                         family: u8,
+                         intent_index: u32| {
+            let flow = unf_ebpf_common::EgressConnectionKey {
+                source_address: source,
+                destination_address: destination,
+                source_port: source_port.to_be_bytes(),
+                destination_port: 443_u16.to_be_bytes(),
+                source_identity: identity,
+                protocol: 6,
+                address_family: family,
+                role: unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD,
+                reserved: 0,
+            };
+            (
+                unf_ebpf_common::EgressSelectionKey {
+                    intent_index,
+                    bucket: unf_ebpf_common::egress_selection_bucket(&flow),
+                    address_family: family,
+                    bank: BANK,
+                },
+                unf_ebpf_common::EgressSelectionValue {
+                    selection_witness: [0x33; 16],
+                    address_index: 0,
+                    primary_gateway_index: 0,
+                    standby_gateway_index: 0,
+                    schema_version: EGRESS_MAP_ABI_VERSION,
+                    flags: 0,
+                    reserved: [0; 6],
+                },
+            )
+        };
+        let expanded_v4 = {
+            let mut value = [0; 16];
+            value[..4].copy_from_slice(&source_v4.octets());
+            value
+        };
+        let expanded_destination_v4 = {
+            let mut value = [0; 16];
+            value[..4].copy_from_slice(&destination_v4.octets());
+            value
+        };
+        let state = EgressDataplaneState {
+            config: unf_ebpf_common::EgressMapConfig {
+                controller_epoch: 7,
+                projection_revision: 11,
+                contract_revision: CONTRACT_REVISION,
+                path_revision: PATH_REVISION,
+                source_count: 2,
+                address_count: 2,
+                gateway_count: 2,
+                selection_count: 2,
+                schema_version: EGRESS_MAP_ABI_VERSION,
+                active_bank: BANK,
+                flags: 0,
+                destination_count: 2,
+            },
+            sources: vec![
+                (
+                    unf_ebpf_common::EgressSourceKey {
+                        source_identity: identity_v4,
+                        bank: BANK,
+                        reserved: [0; 3],
+                    },
+                    source_v4_value,
+                ),
+                (
+                    unf_ebpf_common::EgressSourceKey {
+                        source_identity: identity_v6,
+                        bank: BANK,
+                        reserved: [0; 3],
+                    },
+                    source_v6_value,
+                ),
+            ],
+            ipv4_destinations: vec![(
+                24,
+                unf_ebpf_common::EgressIpv4DestinationData {
+                    intent_index: intent_v4,
+                    bank: BANK,
+                    reserved: [0; 3],
+                    destination_address: [203, 0, 113, 0],
+                },
+                destination_value,
+            )],
+            ipv6_destinations: vec![(
+                64,
+                unf_ebpf_common::EgressIpv6DestinationData {
+                    intent_index: intent_v6,
+                    bank: BANK,
+                    reserved: [0; 3],
+                    destination_address: "2001:db8:1::".parse::<Ipv6Addr>().unwrap().octets(),
+                },
+                destination_value,
+            )],
+            addresses: vec![
+                (
+                    unf_ebpf_common::EgressCandidateKey {
+                        intent_index: intent_v4,
+                        candidate_index: 0,
+                        address_family: 4,
+                        bank: BANK,
+                    },
+                    address_value("198.51.100.10".parse().unwrap()),
+                ),
+                (
+                    unf_ebpf_common::EgressCandidateKey {
+                        intent_index: intent_v6,
+                        candidate_index: 0,
+                        address_family: 6,
+                        bank: BANK,
+                    },
+                    address_value("2001:db8:ffff::10".parse().unwrap()),
+                ),
+            ],
+            gateways: vec![
+                (
+                    unf_ebpf_common::EgressCandidateKey {
+                        intent_index: intent_v4,
+                        candidate_index: 0,
+                        address_family: 4,
+                        bank: BANK,
+                    },
+                    gateway_value("192.0.2.2".parse().unwrap()),
+                ),
+                (
+                    unf_ebpf_common::EgressCandidateKey {
+                        intent_index: intent_v6,
+                        candidate_index: 0,
+                        address_family: 6,
+                        bank: BANK,
+                    },
+                    gateway_value("2001:db8:ffff::2".parse().unwrap()),
+                ),
+            ],
+            selections: vec![
+                selection(
+                    identity_v4,
+                    expanded_v4,
+                    expanded_destination_v4,
+                    40_000,
+                    4,
+                    intent_v4,
+                ),
+                selection(
+                    identity_v6,
+                    source_v6.octets(),
+                    destination_v6.octets(),
+                    40_001,
+                    6,
+                    intent_v6,
+                ),
+            ],
+        };
+        apply_egress_dataplane(&mut synchronizer, &state)
+            .expect("activate exact destination-aware egress state");
+
+        for packet in [&packet_v4, &packet_v6] {
+            let (action, output) = run_tc(&mut ebpf, "unf_observe_ingress", packet);
+            assert_eq!(action, TC_ACT_REDIRECT);
+            assert_eq!(
+                &output, packet,
+                "source steering must preserve the original tuple"
+            );
+        }
+        let outside_v4 = ipv4_packet(6, source_v4, Ipv4Addr::new(198, 51, 100, 9), 40_002, 443);
+        let outside_v6 = ipv6_packet(6, source_v6, "2001:db9::9".parse().unwrap(), 40_003, 443);
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &outside_v4).0,
+            TC_ACT_PIPE
+        );
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &outside_v6).0,
+            TC_ACT_PIPE
+        );
+
+        let mut fenced = state.sources[0].1;
+        fenced.admission = unf_ebpf_common::EGRESS_ADMISSION_FENCED;
+        fenced.address_count = 0;
+        fenced.gateway_count = 0;
+        synchronizer
+            .sources
+            .insert(
+                encode_egress_source_key(state.sources[0].0),
+                encode_egress_source_value(&fenced),
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &packet_v4).0,
+            TC_ACT_SHOT
+        );
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &outside_v4).0,
+            TC_ACT_PIPE,
+            "a fenced target must not capture an unrelated destination"
+        );
+        synchronizer
+            .sources
+            .insert(
+                encode_egress_source_key(state.sources[0].0),
+                encode_egress_source_value(&state.sources[0].1),
+                0,
+            )
+            .unwrap();
+
+        let mut deny_key = [0_u8; 12];
+        deny_key[0..4].copy_from_slice(&destination_v4.octets());
+        deny_key[4..8].copy_from_slice(&identity_v4.get().to_ne_bytes());
+        deny_key[8..10].copy_from_slice(&443_u16.to_be_bytes());
+        deny_key[10] = 6;
+        let mut deny_value = [0_u8; 32];
+        deny_value[0..4].copy_from_slice(&1_u32.to_ne_bytes());
+        deny_value[4..8].copy_from_slice(&1_u32.to_ne_bytes());
+        deny_value[16..24].copy_from_slice(&POLICY_REVISION.to_ne_bytes());
+        deny_value[24..26].copy_from_slice(&POLICY_MAP_ABI_VERSION.to_ne_bytes());
+        deny_value[26..28]
+            .copy_from_slice(&(POLICY_FLAG_HAS_POLICY | POLICY_FLAG_HAS_RULE).to_ne_bytes());
+        deny_value[28] = Verdict::Deny as u8;
+        deny_value[29] = PolicyReason::ExplicitRule as u8;
+        egress_ipv4_policy.insert(deny_key, deny_value, 0).unwrap();
+        policy_config
+            .set(
+                0,
+                encode_policy_config(7, POLICY_REVISION, 1, 0).unwrap(),
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &packet_v4).0,
+            TC_ACT_SHOT,
+            "policy denial must win before a valid source-steering contract"
+        );
     }
 
     #[test]
@@ -16950,6 +17654,7 @@ mod tests {
             (9_u16, ABI_V11_MAP_NAMES.as_slice()),
             (10_u16, ABI_V11_MAP_NAMES.as_slice()),
             (11_u16, ABI_V11_MAP_NAMES.as_slice()),
+            (12_u16, ABI_V12_MAP_NAMES.as_slice()),
             (CURRENT_BPF_ABI_VERSION, PERSISTENT_MAP_NAMES.as_slice()),
         ] {
             let abi = root.join(format!("v{version}"));
@@ -16965,7 +17670,8 @@ mod tests {
         assert_eq!(ABI_V5_MAP_NAMES.len(), 21);
         assert_eq!(ABI_V8_MAP_NAMES.len(), 24);
         assert_eq!(ABI_V11_MAP_NAMES.len(), 25);
-        assert_eq!(PERSISTENT_MAP_NAMES.len(), 31);
+        assert_eq!(ABI_V12_MAP_NAMES.len(), 31);
+        assert_eq!(PERSISTENT_MAP_NAMES.len(), 33);
     }
 
     #[test]
@@ -17058,9 +17764,26 @@ mod tests {
                 schema_version: EGRESS_MAP_ABI_VERSION,
                 active_bank: 1,
                 flags: 0,
-                reserved: [0; 4],
+                destination_count: 1,
             },
             sources: vec![(source, value)],
+            ipv4_destinations: vec![(
+                0,
+                unf_ebpf_common::EgressIpv4DestinationData {
+                    intent_index: 9,
+                    bank: 1,
+                    reserved: [0; 3],
+                    destination_address: [0; 4],
+                },
+                unf_ebpf_common::EgressDestinationValue {
+                    contract_revision: 13,
+                    intent_digest: [0x5A; 16],
+                    schema_version: EGRESS_MAP_ABI_VERSION,
+                    flags: 0,
+                    reserved: [0; 4],
+                },
+            )],
+            ipv6_destinations: Vec::new(),
             addresses: Vec::new(),
             gateways: Vec::new(),
             selections: Vec::new(),
@@ -17080,6 +17803,9 @@ mod tests {
         assert_eq!(encoded.config[50], 1);
 
         state.sources[0].0.bank = 0;
+        assert!(encode_egress_dataplane(&state).is_err());
+        state.sources[0].0.bank = 1;
+        state.ipv4_destinations[0].2.intent_digest = [0x11; 16];
         assert!(encode_egress_dataplane(&state).is_err());
     }
 
@@ -17317,11 +18043,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v12/links"),
+                Path::new("/sys/fs/bpf/unf/v13/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v12/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v13/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -17457,16 +18183,16 @@ mod tests {
 
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v12")).is_ok());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v13")).is_ok());
         assert_eq!(
-            configured_abi_version(Path::new("/sys/fs/bpf/unf/v12")),
-            Some(12)
+            configured_abi_version(Path::new("/sys/fs/bpf/unf/v13")),
+            Some(13)
         );
         let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
             error.to_string().contains(
-                "incompatible with persistent BPF-state ABI v12; expected a /v12 directory"
+                "incompatible with persistent BPF-state ABI v13; expected a /v13 directory"
             )
         );
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v4")).is_err());

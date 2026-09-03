@@ -714,7 +714,7 @@ for replacement_node in "${client_node}" "${remote_node}"; do
         checkpoint=/var/lib/unf/cni/v1/service-snapshot.json.selection
         test -f "$checkpoint" && test "$(stat -c %a "$checkpoint")" = 600
         jq -e ".schemaVersion == 1 and .contract.schemaVersion == 1 and .contract.contractRevision > 0 and (.contract.contractDigest | length) == 64" "$checkpoint" >/dev/null
-        for map in SERVICE_CONFIG SERVICE_AFFINITY SERVICE_BACKEND_SLOTS; do test -e "/sys/fs/bpf/unf/v12/$map"; done
+        for map in SERVICE_CONFIG SERVICE_AFFINITY SERVICE_BACKEND_SLOTS; do test -e "/sys/fs/bpf/unf/v13/$map"; done
     '
     tcp_probe "${selection_v4}"
     "${kc[@]}" -n "${namespace}" exec selection-external -- wget -T 10 -t 1 -qO- "http://${dsr_v4}:8080/health" | grep -qx ok
