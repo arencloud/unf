@@ -262,6 +262,67 @@ impl EgressAllocator {
         Ok(lease)
     }
 
+    /// Reconciles the currently desired pool set while retaining exact pool
+    /// definitions that still back fenced leases.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid desired pools. A changed, removed, or newly overlapping
+    /// pool is deferred while an old definition still owns an address lease.
+    pub fn reconcile_pools(
+        &mut self,
+        pools: Vec<EgressAddressPool>,
+    ) -> Result<bool, EgressAllocationError> {
+        let desired = normalize_pools(pools)
+            .map_err(|error| EgressAllocationError::InvalidModel(error.to_string()))?
+            .into_iter()
+            .map(|pool| (pool.name.clone(), pool))
+            .collect::<BTreeMap<_, _>>();
+        let mut retained = BTreeSet::new();
+        for lease in self.leases.values() {
+            let Some(pool) = &lease.pool else {
+                continue;
+            };
+            let current =
+                self.pools.get(&pool.name).cloned().ok_or_else(|| {
+                    EgressAllocationError::ForeignLease(lease.intent.owner.clone())
+                })?;
+            retained.insert(current);
+        }
+        let mut next = desired
+            .into_iter()
+            .filter(|(_, candidate)| {
+                retained.iter().all(|current| {
+                    if current.name == candidate.name {
+                        current == candidate
+                    } else {
+                        !current.prefixes.iter().any(|left| {
+                            candidate.prefixes.iter().any(|right| left.overlaps(*right))
+                        })
+                    }
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        for pool in retained {
+            next.insert(pool.name.clone(), pool);
+        }
+        if next == self.pools {
+            return Ok(false);
+        }
+        self.pools = next;
+        Ok(true)
+    }
+
+    #[must_use]
+    pub fn owners(&self) -> Vec<EgressIntentOwner> {
+        self.leases.keys().cloned().collect()
+    }
+
+    #[must_use]
+    pub fn has_exact_pool(&self, pool: &EgressAddressPool) -> bool {
+        self.pools.get(&pool.name) == Some(pool)
+    }
+
     #[must_use]
     pub fn lease(&self, owner: &EgressIntentOwner) -> Option<&EgressAddressLease> {
         self.leases.get(owner)

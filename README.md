@@ -458,9 +458,17 @@ Pod-bound authentication, publishes only controller-admitted contracts that
 name that ready/reachable lease-fenced candidate, and sends a monotonic empty
 projection for explicit withdrawal. The gateway agent independently validates
 and fences that state under `make egress-gateway-distribution-test`; ADR 0123.
+The watched revision now drives a separate schema-v1 durable control-plane
+checkpoint that atomically allocates bounded addresses and emits deterministic
+lease-fenced gateway Ensure/Withdraw intent over Ready primary-CNI Nodes with
+authoritative UIDs. Pool tombstones and dual-provider withdrawal retain an
+address until safe reuse with a newer lease epoch, while ordered
+desired-before-derived persistence makes restart replay fail closed. This passes
+`make egress-control-plane-test`; ADR 0124.
 This request boundary is not a source-application acknowledgement. Exact
 source/gateway activation acknowledgements and steering/NAT are next. No live
-egress address, gateway-readiness, packet-path, or platform claim is made yet.
+applied egress address, gateway-readiness, packet-path, or platform claim is
+made yet.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

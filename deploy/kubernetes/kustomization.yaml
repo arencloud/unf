@@ -10,6 +10,7 @@ resources:
   - load-balancer-store.yaml
   - load-balancer-status-store.yaml
   - egress-desired-store.yaml
+  - egress-control-plane-store.yaml
   - controller.yaml
   - service.yaml
   - agent.yaml

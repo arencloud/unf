@@ -11,7 +11,7 @@ rules:
     verbs: ["patch"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    resourceNames: ["unf-agent-acknowledgements", "unf-flow-history", "unf-topology-history", "unf-load-balancer-control-plane", "unf-load-balancer-status-ownership", "unf-egress-desired-state"]
+    resourceNames: ["unf-agent-acknowledgements", "unf-flow-history", "unf-topology-history", "unf-load-balancer-control-plane", "unf-load-balancer-status-ownership", "unf-egress-desired-state", "unf-egress-control-plane"]
     verbs: ["get", "patch"]
   - apiGroups: ["network.unf.io"]
     resources: ["securitypolicies", "egresspools", "egresspolicies"]

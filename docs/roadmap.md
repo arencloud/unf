@@ -663,7 +663,12 @@ matrix is maintained in the
   ready/reachable lease-fenced candidates, independently admits the digest-bound
   projection, and uses a monotonic empty projection for withdrawal under `make
   egress-gateway-distribution-test`; ADR 0123. Application acknowledgements and
-  TC steering/NAT remain.
+  TC steering/NAT remain. The watched canonical revision now also drives one
+  schema-v1 durable orchestration checkpoint: deterministic bounded allocation,
+  Ready primary-CNI Node/UID gateway intent, exact restart replay, pool
+  tombstones, and dual-provider withdrawal-before-release pass `make
+  egress-control-plane-test`; ADR 0124. This creates desired ownership only and
+  does not assert applied addresses, readiness, reachability, or packets.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

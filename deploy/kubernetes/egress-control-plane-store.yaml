@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unf-egress-control-plane
+  namespace: unf-system
+  labels:
+    app.kubernetes.io/name: unf
+    app.kubernetes.io/component: controller
+data: {}

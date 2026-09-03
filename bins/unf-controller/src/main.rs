@@ -41,8 +41,9 @@ use unf_common::{
 use unf_egress::{
     AdmittedEgressProjection, AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT,
     EGRESS_AGENT_TOKEN_AUDIENCE, EgressAddressPool, EgressAgentAdvertisement,
-    EgressBehaviorContract, EgressContractFacts, EgressDesiredCheckpoint, EgressDesiredStore,
-    EgressDistributionError, EgressGatewayProjection, EgressIntent, EgressModel,
+    EgressBehaviorContract, EgressCapability, EgressContractFacts, EgressControlPlane,
+    EgressControlPlaneCheckpoint, EgressDesiredCheckpoint, EgressDesiredStore,
+    EgressDistributionError, EgressGatewayProjection, EgressIntent, EgressModel, EgressNode,
     EgressNodeProjectionEnvelope, EgressProviderRef,
 };
 use unf_ipam::{
@@ -130,6 +131,9 @@ const EGRESS_DESIRED_STORE_NAME: &str = "unf-egress-desired-state";
 const EGRESS_DESIRED_STORE_KEY: &str = "desired.json";
 const EGRESS_DESIRED_STORE_DATA_LIMIT: usize = 900_000;
 const EGRESS_DESIRED_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
+const EGRESS_CONTROL_PLANE_STORE_NAME: &str = "unf-egress-control-plane";
+const EGRESS_CONTROL_PLANE_STORE_KEY: &str = "state.json";
+const EGRESS_CONTROL_PLANE_STORE_DATA_LIMIT: usize = 900_000;
 const NATIVE_EGRESS_POOL_SOURCE_PREFIX: &str = "native:egresspool/";
 const NATIVE_EGRESS_POLICY_SOURCE_PREFIX: &str = "native:egresspolicy/";
 const OPENSHIFT_EGRESS_IP_SOURCE_PREFIX: &str = "openshift:egressip/";
@@ -289,6 +293,9 @@ struct ControllerState {
     egress_desired: Mutex<EgressDesiredStore>,
     egress_desired_dirty: AtomicBool,
     egress_desired_store: Option<Api<ConfigMap>>,
+    egress_control_plane: Mutex<EgressControlPlane>,
+    egress_control_plane_dirty: AtomicBool,
+    egress_control_plane_store: Option<Api<ConfigMap>>,
     egress_pool_initialization: Mutex<Option<BTreeMap<String, EgressAddressPool>>>,
     egress_pool_initialization_failed: AtomicBool,
     pending_egress_pool_deletions: Mutex<BTreeSet<String>>,
@@ -1010,10 +1017,15 @@ async fn main() -> Result<()> {
         restore_egress_desired_state(&state)
             .await
             .context("restore durable egress desired state")?;
+        restore_egress_control_plane(&state)
+            .await
+            .context("restore durable egress control plane")?;
         spawn_agent_report_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_flow_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_topology_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
-        spawn_egress_desired_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
+        reconcile_egress_control_plane(&state)
+            .context("reconcile restored egress desired state")?;
+        spawn_egress_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         let client = client.context("Kubernetes client is required in connected mode")?;
         spawn_load_balancer_reconciler(
             &mut tasks,
@@ -1406,6 +1418,9 @@ fn new_state_with_client_and_selector(
         egress_desired: Mutex::new(EgressDesiredStore::default()),
         egress_desired_dirty: AtomicBool::new(false),
         egress_desired_store: config_map_store.clone(),
+        egress_control_plane: Mutex::new(EgressControlPlane::default()),
+        egress_control_plane_dirty: AtomicBool::new(false),
+        egress_control_plane_store: config_map_store.clone(),
         egress_pool_initialization: Mutex::new(None),
         egress_pool_initialization_failed: AtomicBool::new(false),
         pending_egress_pool_deletions: Mutex::new(BTreeSet::new()),
@@ -2048,7 +2063,7 @@ async fn restore_egress_desired_state(state: &ControllerState) -> Result<()> {
     Ok(())
 }
 
-fn spawn_egress_desired_persistence(
+fn spawn_egress_persistence(
     state: Arc<ControllerState>,
     cancellation: CancellationToken,
     tasks: &mut JoinSet<()>,
@@ -2060,9 +2075,13 @@ fn spawn_egress_desired_persistence(
             tokio::select! {
                 () = cancellation.cancelled() => {
                     persist_egress_desired_if_dirty(&state).await;
+                    persist_egress_control_plane_if_dirty(&state).await;
                     break;
                 }
-                _ = interval.tick() => persist_egress_desired_if_dirty(&state).await,
+                _ = interval.tick() => {
+                    persist_egress_desired_if_dirty(&state).await;
+                    persist_egress_control_plane_if_dirty(&state).await;
+                }
             }
         }
     });
@@ -2112,6 +2131,103 @@ async fn persist_egress_desired_state(state: &ControllerState) -> Result<()> {
     )
     .await
     .with_context(|| format!("patch ConfigMap unf-system/{EGRESS_DESIRED_STORE_NAME}"))?;
+    Ok(())
+}
+
+async fn restore_egress_control_plane(state: &ControllerState) -> Result<()> {
+    let api = state
+        .egress_control_plane_store
+        .as_ref()
+        .context("durable egress control-plane API is unavailable")?;
+    let Some(config_map) = api
+        .get_opt(EGRESS_CONTROL_PLANE_STORE_NAME)
+        .await
+        .with_context(|| format!("read ConfigMap unf-system/{EGRESS_CONTROL_PLANE_STORE_NAME}"))?
+    else {
+        info!("durable egress control-plane checkpoint does not exist yet");
+        return Ok(());
+    };
+    let Some(encoded) = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(EGRESS_CONTROL_PLANE_STORE_KEY))
+    else {
+        info!("durable egress control-plane checkpoint is empty");
+        return Ok(());
+    };
+    let checkpoint: EgressControlPlaneCheckpoint =
+        serde_json::from_str(encoded).context("decode durable egress control-plane checkpoint")?;
+    let restored = EgressControlPlane::restore(checkpoint)
+        .context("validate durable egress control-plane checkpoint")?;
+    let desired_revision = restored.checkpoint().desired_revision;
+    let watched_revision = mutex_lock(&state.egress_desired).revision();
+    if desired_revision > watched_revision {
+        return Err(anyhow!(
+            "egress control-plane desired revision {} is ahead of durable watched revision {}",
+            desired_revision.get(),
+            watched_revision.get()
+        ));
+    }
+    let checkpoint = restored.checkpoint();
+    info!(
+        desired_revision = desired_revision.get(),
+        allocations = checkpoint.allocation.leases.len(),
+        gateways = checkpoint.gateways.records.len(),
+        "restored durable egress control plane"
+    );
+    *mutex_lock(&state.egress_control_plane) = restored;
+    Ok(())
+}
+
+async fn persist_egress_control_plane_if_dirty(state: &ControllerState) {
+    if !state
+        .egress_control_plane_dirty
+        .swap(false, Ordering::AcqRel)
+    {
+        return;
+    }
+    if let Err(error) = persist_egress_control_plane(state).await {
+        state
+            .egress_control_plane_dirty
+            .store(true, Ordering::Release);
+        state.metrics.errors.inc();
+        warn!(%error, "could not persist egress control plane; retrying");
+    }
+}
+
+async fn persist_egress_control_plane(state: &ControllerState) -> Result<()> {
+    let api = state
+        .egress_control_plane_store
+        .as_ref()
+        .context("durable egress control-plane API is unavailable")?;
+    let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
+    let encoded = serde_json::to_string(&checkpoint)
+        .context("encode durable egress control-plane checkpoint")?;
+    if encoded.len() > EGRESS_CONTROL_PLANE_STORE_DATA_LIMIT {
+        return Err(anyhow!(
+            "durable egress control plane requires {} bytes; ConfigMap limit is {}",
+            encoded.len(),
+            EGRESS_CONTROL_PLANE_STORE_DATA_LIMIT
+        ));
+    }
+    let patch = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": EGRESS_CONTROL_PLANE_STORE_NAME,
+            "namespace": "unf-system",
+        },
+        "data": {
+            (EGRESS_CONTROL_PLANE_STORE_KEY): encoded,
+        },
+    });
+    api.patch(
+        EGRESS_CONTROL_PLANE_STORE_NAME,
+        &PatchParams::apply("unf-controller-egress-control-plane").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch ConfigMap unf-system/{EGRESS_CONTROL_PLANE_STORE_NAME}"))?;
     Ok(())
 }
 
@@ -3397,7 +3513,73 @@ fn record_egress_desired_change(state: &ControllerState, changed: bool) {
     if changed {
         state.egress_desired_dirty.store(true, Ordering::Release);
         invalidate_egress_distributions(state);
+        if let Err(error) = reconcile_egress_control_plane(state) {
+            state.metrics.errors.inc();
+            warn!(%error, "egress control-plane reconciliation rejected; retaining last-known-good state");
+        }
     }
+}
+
+fn reconcile_egress_control_plane(state: &ControllerState) -> Result<()> {
+    let (revision, model, explicit_providers) = {
+        let desired = mutex_lock(&state.egress_desired);
+        let model = desired.model().clone();
+        let explicit_providers = model
+            .intents
+            .iter()
+            .filter_map(|intent| {
+                desired
+                    .explicit_provider(&intent.owner)
+                    .cloned()
+                    .map(|provider| (intent.owner.clone(), provider))
+            })
+            .collect::<BTreeMap<_, _>>();
+        (desired.revision(), model, explicit_providers)
+    };
+    let nodes = read_lock(&state.nodes);
+    let node_uids = read_lock(&state.node_port_nodes);
+    let capabilities = BTreeSet::from([
+        EgressCapability::IdentitySourceSteering,
+        EgressCapability::LeaseEpochFencing,
+        EgressCapability::OriginalTupleWitness,
+        EgressCapability::Ipv4TcpUdpNat,
+        EgressCapability::Ipv6TcpUdpNat,
+    ]);
+    let candidates = nodes
+        .values()
+        .filter(|node| {
+            node.ready
+                && node.labels.get(PRIMARY_CNI_NODE_LABEL).map(String::as_str)
+                    == Some(PRIMARY_CNI_NODE_LABEL_VALUE)
+        })
+        .filter_map(|node| {
+            node_uids.get(&node.name).map(|record| EgressNode {
+                name: node.name.clone(),
+                uid: record.node_uid.clone(),
+                capabilities: capabilities.clone(),
+            })
+        })
+        .take(unf_egress::MAX_EGRESS_GATEWAY_NODES)
+        .collect::<Vec<_>>();
+    drop(node_uids);
+    drop(nodes);
+    let result = mutex_lock(&state.egress_control_plane)
+        .reconcile(revision, model, &explicit_providers, candidates)
+        .context("derive allocation and gateway desired state")?;
+    if result.changed {
+        state
+            .egress_control_plane_dirty
+            .store(true, Ordering::Release);
+        invalidate_egress_distributions(state);
+        info!(
+            desired_revision = revision.get(),
+            allocated = result.allocated,
+            ensuring = result.ensuring,
+            withdrawing = result.withdrawing,
+            "reconciled durable egress control plane"
+        );
+    }
+    Ok(())
 }
 
 fn invalidate_egress_distributions(state: &ControllerState) {
@@ -3681,6 +3863,10 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             {
                 state.agent_reports_dirty.store(true, Ordering::Release);
             }
+            if let Err(error) = reconcile_egress_control_plane(state) {
+                state.metrics.errors.inc();
+                warn!(%error, "Node deletion egress reconciliation rejected; retaining last-known-good state");
+            }
         }
         Event::Init => {
             begin_topology_initialization(state);
@@ -3723,6 +3909,10 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             drop(nodes);
             retain_node_egress_distributions(state, &live_nodes);
             finish_topology_initialization(state);
+            if let Err(error) = reconcile_egress_control_plane(state) {
+                state.metrics.errors.inc();
+                warn!(%error, "Node relist egress reconciliation rejected; retaining last-known-good state");
+            }
         }
     }
 }
@@ -3757,6 +3947,10 @@ fn reconcile_node(state: &ControllerState, node: &Node, initializing: bool) {
     );
     if gateways_changed {
         bump_policy_revision(state);
+    }
+    if !initializing && let Err(error) = reconcile_egress_control_plane(state) {
+        state.metrics.errors.inc();
+        warn!(%error, "Node egress reconciliation rejected; retaining last-known-good state");
     }
 }
 
@@ -9438,6 +9632,65 @@ mod tests {
         assert_eq!(desired.revision(), Revision::new(4));
         assert!(desired.model().pools.is_empty());
         assert!(desired.model().intents.is_empty());
+    }
+
+    #[test]
+    fn live_egress_desired_state_drives_durable_allocation_and_gateway_withdrawal() {
+        let state = new_state(true);
+        apply_egress_pool_event(&state, Event::Apply(native_egress_pool("192.0.2.0/24")));
+        apply_egress_policy_event(&state, Event::Apply(native_egress_policy()));
+        {
+            let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
+            assert_eq!(checkpoint.desired_revision, Revision::new(2));
+            assert_eq!(checkpoint.allocation.leases.len(), 1);
+            assert_eq!(
+                checkpoint.allocation.leases[0].addresses,
+                vec![
+                    "192.0.2.1".parse::<IpAddr>().unwrap(),
+                    "192.0.2.2".parse::<IpAddr>().unwrap()
+                ]
+            );
+            assert!(
+                checkpoint.gateways.records.is_empty(),
+                "allocation must not invent a gateway before an eligible Node exists"
+            );
+        }
+
+        let mut gateway = node(true);
+        gateway.metadata.labels.get_or_insert_default().insert(
+            PRIMARY_CNI_NODE_LABEL.to_owned(),
+            PRIMARY_CNI_NODE_LABEL_VALUE.to_owned(),
+        );
+        apply_node_event(&state, Event::Apply(gateway));
+        let ensured = mutex_lock(&state.egress_control_plane).checkpoint();
+        assert_eq!(ensured.gateways.records.len(), 1);
+        assert_eq!(
+            ensured.gateways.records[0].desired.action,
+            unf_egress::EgressGatewayAction::Ensure
+        );
+        assert_eq!(
+            ensured.gateways.records[0].desired.nodes[0].name,
+            "worker-a"
+        );
+        assert_eq!(
+            ensured.gateways.records[0].desired.nodes[0].uid,
+            "worker-a-uid"
+        );
+
+        apply_egress_policy_event(&state, Event::Delete(native_egress_policy()));
+        let withdrawing = mutex_lock(&state.egress_control_plane).checkpoint();
+        assert_eq!(withdrawing.allocation.leases.len(), 1);
+        assert_eq!(
+            withdrawing.gateways.records[0].desired.action,
+            unf_egress::EgressGatewayAction::Withdraw
+        );
+        assert!(state.egress_control_plane_dirty.load(Ordering::Acquire));
+        assert_eq!(
+            EgressControlPlane::restore(withdrawing.clone())
+                .expect("restart replay")
+                .checkpoint(),
+            withdrawing
+        );
     }
 
     fn openshift_egress_ip(name: &str, address: &str) -> DynamicObject {
