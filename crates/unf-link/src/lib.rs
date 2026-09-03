@@ -11,7 +11,7 @@ use rtnetlink::packet_route::address::AddressAttribute;
 use rtnetlink::packet_route::link::{
     InfoData, InfoKind, InfoVeth, LinkAttribute, LinkFlags, LinkInfo, LinkMessage,
 };
-use rtnetlink::{Handle, LinkMessageBuilder, LinkUnspec, LinkVeth, new_connection};
+use rtnetlink::{Handle, LinkDummy, LinkMessageBuilder, LinkUnspec, LinkVeth, new_connection};
 use rustix::fs::{Mode, OFlags, open};
 use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
 use thiserror::Error;
@@ -21,6 +21,9 @@ const LINUX_INTERFACE_NAME_MAX: usize = 15;
 const MIN_DUAL_STACK_MTU: u32 = 1_280;
 const MAX_MTU: u32 = 65_535;
 const OWNER_PREFIX: &str = "unf:cni:v1:";
+const EGRESS_OWNER_PREFIX: &str = "unf:egress-address:v1:";
+pub const EGRESS_GATEWAY_INTERFACE: &str = "unf-egress0";
+const MAX_GATEWAY_ADDRESSES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct AssignedAddress {
@@ -50,6 +53,27 @@ pub struct LinkReadback {
     pub peer_name: String,
     pub host_address: [u8; 6],
     pub peer_address: [u8; 6],
+    pub mtu: u32,
+    pub addresses: BTreeSet<AssignedAddress>,
+}
+
+/// Exact, Node-UID-bound ownership plan for egress addresses. The addresses
+/// live on a dedicated dummy interface as host prefixes; reachability is an
+/// independent provider concern.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayAddressPlan {
+    node_uid: String,
+    interface_name: String,
+    owner_alias: String,
+    mtu: u32,
+    addresses: BTreeSet<AssignedAddress>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayAddressReadback {
+    pub node_uid: String,
+    pub interface_name: String,
+    pub interface_index: u32,
     pub mtu: u32,
     pub addresses: BTreeSet<AssignedAddress>,
 }
@@ -598,6 +622,274 @@ impl VethPlan {
     }
 }
 
+impl GatewayAddressPlan {
+    /// Builds a canonical ownership plan. Addresses are always represented as
+    /// IPv4 /32 or IPv6 /128 so no connected pool route is invented.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid Node UID, MTU, empty/oversized set, duplicates, and
+    /// addresses unsafe for external source ownership.
+    pub fn new(node_uid: String, mtu: u32, addresses: Vec<IpAddr>) -> Result<Self, LinkError> {
+        if node_uid.is_empty()
+            || node_uid.len() > 128
+            || !node_uid.is_ascii()
+            || node_uid.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(LinkError::InvalidPlan(
+                "gateway Node UID must contain 1..=128 printable ASCII bytes".to_string(),
+            ));
+        }
+        if !(MIN_DUAL_STACK_MTU..=MAX_MTU).contains(&mtu) {
+            return Err(LinkError::InvalidPlan(format!(
+                "MTU must be between {MIN_DUAL_STACK_MTU} and {MAX_MTU}"
+            )));
+        }
+        if addresses.is_empty() || addresses.len() > MAX_GATEWAY_ADDRESSES {
+            return Err(LinkError::InvalidPlan(format!(
+                "gateway address set must contain 1..={MAX_GATEWAY_ADDRESSES} entries"
+            )));
+        }
+        let address_count = addresses.len();
+        let addresses = addresses
+            .into_iter()
+            .map(|address| AssignedAddress {
+                prefix_len: if address.is_ipv4() { 32 } else { 128 },
+                address,
+            })
+            .collect::<BTreeSet<_>>();
+        if addresses.len() != address_count {
+            return Err(LinkError::InvalidPlan(
+                "gateway addresses must be unique".to_string(),
+            ));
+        }
+        if addresses
+            .iter()
+            .any(|assigned| !valid_gateway_address(assigned.address))
+        {
+            return Err(LinkError::InvalidPlan(
+                "gateway addresses cannot be unspecified, loopback, multicast, or link-local"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            owner_alias: format!("{EGRESS_OWNER_PREFIX}{node_uid}"),
+            node_uid,
+            interface_name: EGRESS_GATEWAY_INTERFACE.to_string(),
+            mtu,
+            addresses,
+        })
+    }
+
+    #[must_use]
+    pub fn addresses(&self) -> &BTreeSet<AssignedAddress> {
+        &self.addresses
+    }
+
+    /// Preflights the whole host for collisions, creates or resumes the exact
+    /// owned dummy interface, applies missing host prefixes, and independently
+    /// reads back the complete managed set. A partial add is rolled back.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on foreign link/address ownership or any kernel mismatch.
+    pub async fn apply(&self) -> Result<GatewayAddressReadback, LinkError> {
+        let (connection, handle, _) =
+            new_connection().map_err(|source| LinkError::OpenNetlink {
+                operation: "open gateway-address connection",
+                source,
+            })?;
+        tokio::spawn(connection);
+        let existing = find_link(&handle, &self.interface_name).await?;
+        if let Some(link) = &existing {
+            validate_gateway_link(link, self)?;
+        }
+        preflight_gateway_address_collisions(
+            &handle,
+            existing.as_ref().map(|link| link.header.index),
+            &self.addresses,
+        )
+        .await?;
+
+        let created = existing.is_none();
+        if created {
+            handle
+                .link()
+                .add(
+                    LinkDummy::new(&self.interface_name)
+                        .mtu(self.mtu)
+                        .alias(&self.owner_alias)
+                        .up()
+                        .build(),
+                )
+                .execute()
+                .await
+                .map_err(|source| LinkError::Netlink {
+                    operation: "create gateway-address interface",
+                    source,
+                })?;
+        }
+        let link = require_link(&handle, &self.interface_name).await?;
+        if created {
+            validate_gateway_link_kind(&link, &self.interface_name)?;
+        } else {
+            validate_gateway_link(&link, self)?;
+        }
+        let link = self.configure_gateway_link(&handle, &link, created).await?;
+
+        let current = addresses_on_link(&handle, link.header.index).await?;
+        let missing = self
+            .addresses
+            .difference(&current)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut added = Vec::new();
+        for assigned in missing {
+            if let Err(source) = handle
+                .address()
+                .add(link.header.index, assigned.address, assigned.prefix_len)
+                .execute()
+                .await
+            {
+                rollback_gateway_addresses(&handle, link.header.index, &added).await;
+                if created {
+                    let _ = handle.link().del(link.header.index).execute().await;
+                }
+                return Err(LinkError::Netlink {
+                    operation: "assign gateway address",
+                    source,
+                });
+            }
+            added.push(assigned);
+        }
+        match self.readback_with_handle(&handle).await {
+            Ok(readback) => Ok(readback),
+            Err(error) => {
+                rollback_gateway_addresses(&handle, link.header.index, &added).await;
+                if created {
+                    let _ = handle.link().del(link.header.index).execute().await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn configure_gateway_link(
+        &self,
+        handle: &Handle,
+        link: &LinkMessage,
+        created: bool,
+    ) -> Result<LinkMessage, LinkError> {
+        if let Err(source) = handle
+            .link()
+            .set(
+                LinkUnspec::new_with_index(link.header.index)
+                    .mtu(self.mtu)
+                    .alias(&self.owner_alias)
+                    .up()
+                    .build(),
+            )
+            .execute()
+            .await
+        {
+            if created {
+                let _ = handle.link().del(link.header.index).execute().await;
+            }
+            return Err(LinkError::Netlink {
+                operation: "configure gateway-address interface",
+                source,
+            });
+        }
+        let link = require_link(handle, &self.interface_name).await?;
+        if let Err(error) = validate_gateway_link(&link, self) {
+            if created {
+                let _ = handle.link().del(link.header.index).execute().await;
+            }
+            return Err(error);
+        }
+        Ok(link)
+    }
+
+    /// Independently verifies exact ownership and that every planned address
+    /// remains present. Extra host-prefix addresses are rejected because they
+    /// cannot be attributed to this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing, foreign, down, or otherwise mismatched kernel state.
+    pub async fn readback(&self) -> Result<GatewayAddressReadback, LinkError> {
+        let (connection, handle, _) =
+            new_connection().map_err(|source| LinkError::OpenNetlink {
+                operation: "open gateway-address readback connection",
+                source,
+            })?;
+        tokio::spawn(connection);
+        self.readback_with_handle(&handle).await
+    }
+
+    /// Deletes the exact owned interface only after strict readback. Callers
+    /// must supply the distributed source-fence barrier; this primitive never
+    /// infers release authority from elapsed time or controller leadership.
+    ///
+    /// # Errors
+    ///
+    /// Refuses deletion when ownership or the complete address set differs.
+    pub async fn release(&self) -> Result<DeleteOutcome, LinkError> {
+        let (connection, handle, _) =
+            new_connection().map_err(|source| LinkError::OpenNetlink {
+                operation: "open gateway-address release connection",
+                source,
+            })?;
+        tokio::spawn(connection);
+        let Some(link) = find_link(&handle, &self.interface_name).await? else {
+            return Ok(DeleteOutcome::AlreadyAbsent);
+        };
+        self.readback_with_handle(&handle).await?;
+        handle
+            .link()
+            .del(link.header.index)
+            .execute()
+            .await
+            .map_err(|source| LinkError::Netlink {
+                operation: "release gateway-address interface",
+                source,
+            })?;
+        Ok(DeleteOutcome::Deleted)
+    }
+
+    async fn readback_with_handle(
+        &self,
+        handle: &Handle,
+    ) -> Result<GatewayAddressReadback, LinkError> {
+        let link = require_link(handle, &self.interface_name).await?;
+        validate_gateway_link(&link, self)?;
+        if !link.header.flags.contains(LinkFlags::Up) {
+            return Err(conflict(
+                &self.interface_name,
+                "gateway-address interface is not administratively up",
+            ));
+        }
+        let observed = addresses_on_link(handle, link.header.index).await?;
+        let managed = observed
+            .into_iter()
+            .filter(|assigned| valid_gateway_address(assigned.address))
+            .collect::<BTreeSet<_>>();
+        if managed != self.addresses {
+            return Err(LinkError::Readback(format!(
+                "gateway interface {:?} address mismatch; expected {:?}, observed {:?}",
+                self.interface_name, self.addresses, managed
+            )));
+        }
+        Ok(GatewayAddressReadback {
+            node_uid: self.node_uid.clone(),
+            interface_name: self.interface_name.clone(),
+            interface_index: link.header.index,
+            mtu: self.mtu,
+            addresses: managed,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct PeerReadback {
     index: u32,
@@ -654,6 +946,156 @@ async fn read_peer(handle: &Handle, plan: &VethPlan) -> Result<PeerReadback, Lin
         index: peer.header.index,
         addresses: expected,
     })
+}
+
+async fn addresses_on_link(
+    handle: &Handle,
+    interface_index: u32,
+) -> Result<BTreeSet<AssignedAddress>, LinkError> {
+    let mut stream = handle
+        .address()
+        .get()
+        .set_link_index_filter(interface_index)
+        .execute();
+    let mut addresses = BTreeSet::new();
+    while let Some(message) = stream
+        .try_next()
+        .await
+        .map_err(|source| LinkError::Netlink {
+            operation: "read gateway addresses",
+            source,
+        })?
+    {
+        if let Some(address) = address_from_message(&message) {
+            addresses.insert(AssignedAddress {
+                address,
+                prefix_len: message.header.prefix_len,
+            });
+        }
+    }
+    Ok(addresses)
+}
+
+async fn preflight_gateway_address_collisions(
+    handle: &Handle,
+    owned_interface_index: Option<u32>,
+    desired: &BTreeSet<AssignedAddress>,
+) -> Result<(), LinkError> {
+    let mut stream = handle.address().get().execute();
+    while let Some(message) = stream
+        .try_next()
+        .await
+        .map_err(|source| LinkError::Netlink {
+            operation: "preflight gateway address ownership",
+            source,
+        })?
+    {
+        let Some(address) = address_from_message(&message) else {
+            continue;
+        };
+        if desired.iter().any(|assigned| assigned.address == address)
+            && Some(message.header.index) != owned_interface_index
+        {
+            return Err(LinkError::LinkConflict {
+                name: EGRESS_GATEWAY_INTERFACE.to_string(),
+                reason: format!(
+                    "address {address} is already owned by foreign interface index {}",
+                    message.header.index
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn rollback_gateway_addresses(
+    handle: &Handle,
+    interface_index: u32,
+    added: &[AssignedAddress],
+) {
+    if added.is_empty() {
+        return;
+    }
+    let mut stream = handle
+        .address()
+        .get()
+        .set_link_index_filter(interface_index)
+        .execute();
+    while let Ok(Some(message)) = stream.try_next().await {
+        let Some(address) = address_from_message(&message) else {
+            continue;
+        };
+        if added.iter().any(|assigned| {
+            assigned.address == address && assigned.prefix_len == message.header.prefix_len
+        }) {
+            let _ = handle.address().del(message).execute().await;
+        }
+    }
+}
+
+fn address_from_message(
+    message: &rtnetlink::packet_route::address::AddressMessage,
+) -> Option<IpAddr> {
+    message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            AddressAttribute::Local(address) | AddressAttribute::Address(address) => Some(*address),
+            _ => None,
+        })
+}
+
+fn validate_gateway_link(link: &LinkMessage, plan: &GatewayAddressPlan) -> Result<(), LinkError> {
+    if link_name(link) != Some(plan.interface_name.as_str())
+        || link_alias(link) != Some(plan.owner_alias.as_str())
+        || link_mtu(link) != Some(plan.mtu)
+    {
+        return Err(conflict(
+            &plan.interface_name,
+            &format!(
+                "expected name {:?}, alias {:?}, MTU {}; observed name {:?}, alias {:?}, MTU {:?}",
+                plan.interface_name,
+                plan.owner_alias,
+                plan.mtu,
+                link_name(link),
+                link_alias(link),
+                link_mtu(link)
+            ),
+        ));
+    }
+    validate_gateway_link_kind(link, &plan.interface_name)
+}
+
+fn validate_gateway_link_kind(link: &LinkMessage, name: &str) -> Result<(), LinkError> {
+    let dummy = link.attributes.iter().any(|attribute| {
+        matches!(
+            attribute,
+            LinkAttribute::LinkInfo(infos)
+                if infos.iter().any(|info| matches!(info, LinkInfo::Kind(InfoKind::Dummy)))
+        )
+    });
+    if !dummy {
+        return Err(conflict(name, "interface is not a dummy link"));
+    }
+    Ok(())
+}
+
+fn valid_gateway_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !address.is_link_local()
+                && !address.is_broadcast()
+        }
+        IpAddr::V6(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !address.is_unicast_link_local()
+        }
+    }
 }
 
 async fn run_in_namespace<F, Fut, T>(namespace: File, operation: F) -> Result<T, LinkError>
@@ -1061,5 +1503,112 @@ mod tests {
         let plan = VethPlan::from_attachment(&record).expect("durable record is valid");
         assert_eq!(plan.addresses[0].prefix_len, 32);
         assert_eq!(plan.addresses[1].prefix_len, 128);
+    }
+
+    #[test]
+    fn gateway_address_plan_is_canonical_dual_stack_and_node_bound() {
+        let plan = GatewayAddressPlan::new(
+            "node-uid-a".to_string(),
+            1_500,
+            vec![
+                IpAddr::V6("2001:db8:100::20".parse().unwrap()),
+                IpAddr::V4("192.0.2.20".parse().unwrap()),
+            ],
+        )
+        .expect("valid gateway address plan");
+        assert_eq!(plan.interface_name, EGRESS_GATEWAY_INTERFACE);
+        assert_eq!(plan.owner_alias, "unf:egress-address:v1:node-uid-a");
+        assert_eq!(
+            plan.addresses,
+            BTreeSet::from([
+                AssignedAddress {
+                    address: IpAddr::V4("192.0.2.20".parse().unwrap()),
+                    prefix_len: 32,
+                },
+                AssignedAddress {
+                    address: IpAddr::V6("2001:db8:100::20".parse().unwrap()),
+                    prefix_len: 128,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn gateway_address_plan_rejects_ambiguous_or_unsafe_ownership() {
+        for addresses in [
+            Vec::new(),
+            vec!["192.0.2.20".parse().unwrap(), "192.0.2.20".parse().unwrap()],
+            vec!["127.0.0.2".parse().unwrap()],
+            vec!["fe80::20".parse().unwrap()],
+            vec!["ff02::1".parse().unwrap()],
+        ] {
+            assert!(GatewayAddressPlan::new("node-uid-a".to_string(), 1_500, addresses).is_err());
+        }
+        assert!(
+            GatewayAddressPlan::new(String::new(), 1_500, vec!["192.0.2.20".parse().unwrap()])
+                .is_err()
+        );
+        assert!(
+            GatewayAddressPlan::new(
+                "node-uid-a".to_string(),
+                1_200,
+                vec!["192.0.2.20".parse().unwrap()]
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated network namespace with CAP_NET_ADMIN"]
+    async fn privileged_gateway_address_transaction_is_exact_and_collision_safe() {
+        let addresses = vec![
+            "192.0.2.20".parse().unwrap(),
+            "2001:db8:100::20".parse().unwrap(),
+        ];
+        let plan = GatewayAddressPlan::new("node-uid-a".to_string(), 1_500, addresses).unwrap();
+        let applied = plan.apply().await.expect("apply gateway addresses");
+        assert_eq!(
+            applied,
+            plan.readback().await.expect("independent readback")
+        );
+        assert_eq!(
+            plan.apply().await.expect("idempotent apply"),
+            applied,
+            "restart must reproduce exact ownership"
+        );
+
+        let (connection, handle, _) = new_connection().unwrap();
+        tokio::spawn(connection);
+        handle
+            .link()
+            .add(LinkDummy::new("foreign0").up().build())
+            .execute()
+            .await
+            .unwrap();
+        let foreign = require_link(&handle, "foreign0").await.unwrap();
+        handle
+            .address()
+            .add(foreign.header.index, "192.0.2.30".parse().unwrap(), 32)
+            .execute()
+            .await
+            .unwrap();
+        let conflict = GatewayAddressPlan::new(
+            "node-uid-a".to_string(),
+            1_500,
+            vec!["192.0.2.30".parse().unwrap()],
+        )
+        .unwrap()
+        .apply()
+        .await
+        .expect_err("foreign address collision must fail before mutation");
+        assert!(matches!(conflict, LinkError::LinkConflict { .. }));
+        assert_eq!(
+            plan.release().await.expect("release exact owned plan"),
+            DeleteOutcome::Deleted
+        );
+        assert_eq!(
+            plan.release().await.expect("idempotent release"),
+            DeleteOutcome::AlreadyAbsent
+        );
     }
 }

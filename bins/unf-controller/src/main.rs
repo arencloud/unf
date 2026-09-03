@@ -39,13 +39,16 @@ use unf_common::{
     Revision, ServiceId, Verdict,
 };
 use unf_egress::{
-    AdmittedEgressGatewayProjection, AdmittedEgressProjection, AuthenticatedEgressAgent,
-    EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE, EgressAddressPool,
+    AdmittedEgressGatewayAddressProjection, AdmittedEgressGatewayProjection,
+    AdmittedEgressProjection, AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT,
+    EGRESS_AGENT_TOKEN_AUDIENCE, EGRESS_GATEWAY_ACK_SCHEMA_VERSION, EgressAddressPool,
     EgressAgentAdvertisement, EgressBehaviorContract, EgressCapability, EgressContractFacts,
     EgressControlPlane, EgressControlPlaneCheckpoint, EgressDesiredCheckpoint, EgressDesiredStore,
-    EgressDistributionError, EgressGatewayApplicationAcknowledgement, EgressGatewayProjection,
-    EgressIntent, EgressModel, EgressNode, EgressNodeProjectionEnvelope, EgressProviderRef,
-    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement,
+    EgressDistributionError, EgressGatewayAcknowledgement, EgressGatewayAddressAcknowledgement,
+    EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
+    EgressGatewayProjection, EgressIntent, EgressModel, EgressNode, EgressNodeProjectionEnvelope,
+    EgressProviderOutcome, EgressProviderRef, EgressSourceActivationGrant,
+    EgressSourceApplicationAcknowledgement,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -311,6 +314,10 @@ struct ControllerState {
     egress_source_distributions: RwLock<BTreeMap<String, EgressSourceDistribution>>,
     egress_pending_source_applications: RwLock<BTreeMap<String, PendingEgressSourceApplication>>,
     egress_gateway_distributions: Mutex<EgressGatewayDistributionState>,
+    egress_pending_gateway_addresses:
+        RwLock<BTreeMap<String, PendingEgressGatewayAddressApplication>>,
+    egress_gateway_address_applications:
+        RwLock<BTreeMap<String, AppliedEgressGatewayAddressApplication>>,
     egress_pending_gateway_applications: RwLock<BTreeMap<String, PendingEgressGatewayApplication>>,
     egress_gateway_applications: RwLock<BTreeMap<String, AppliedEgressGatewayApplication>>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
@@ -448,6 +455,18 @@ struct PendingEgressGatewayApplication {
 struct AppliedEgressGatewayApplication {
     agent: AuthenticatedAgent,
     acknowledgement: EgressGatewayApplicationAcknowledgement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingEgressGatewayAddressApplication {
+    agent: AuthenticatedAgent,
+    projection: AdmittedEgressGatewayAddressProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedEgressGatewayAddressApplication {
+    agent: AuthenticatedAgent,
+    acknowledgement: EgressGatewayAddressAcknowledgement,
 }
 
 #[derive(Debug, Clone)]
@@ -1167,6 +1186,14 @@ async fn spawn_internal_api(
             "/v1/state/egress-source-ack",
             post(acknowledge_egress_source_application),
         )
+        .route(
+            "/v1/state/egress-gateway-address",
+            get(egress_gateway_address_projection),
+        )
+        .route(
+            "/v1/state/egress-gateway-address-ack",
+            post(acknowledge_egress_gateway_address_application),
+        )
         .route("/v1/state/egress-gateway", post(egress_gateway_projection))
         .route(
             "/v1/state/egress-gateway-ack",
@@ -1472,6 +1499,8 @@ fn new_state_with_client_and_selector(
         egress_source_distributions: RwLock::new(BTreeMap::new()),
         egress_pending_source_applications: RwLock::new(BTreeMap::new()),
         egress_gateway_distributions: Mutex::new(EgressGatewayDistributionState::default()),
+        egress_pending_gateway_addresses: RwLock::new(BTreeMap::new()),
+        egress_gateway_address_applications: RwLock::new(BTreeMap::new()),
         egress_pending_gateway_applications: RwLock::new(BTreeMap::new()),
         egress_gateway_applications: RwLock::new(BTreeMap::new()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
@@ -3628,6 +3657,8 @@ fn invalidate_egress_distributions(state: &ControllerState) {
     write_lock(&state.egress_pending_source_applications).clear();
     write_lock(&state.egress_pending_gateway_applications).clear();
     write_lock(&state.egress_gateway_applications).clear();
+    write_lock(&state.egress_pending_gateway_addresses).clear();
+    write_lock(&state.egress_gateway_address_applications).clear();
     withdraw_all_admitted_egress_sources_locked(state);
 }
 
@@ -3646,6 +3677,8 @@ fn remove_node_egress_distributions(state: &ControllerState, source_node: &str) 
     write_lock(&state.egress_pending_source_applications).remove(source_node);
     write_lock(&state.egress_pending_gateway_applications).remove(source_node);
     write_lock(&state.egress_gateway_applications).remove(source_node);
+    write_lock(&state.egress_pending_gateway_addresses).remove(source_node);
+    write_lock(&state.egress_gateway_address_applications).remove(source_node);
     let mut gateway = mutex_lock(&state.egress_gateway_distributions);
     if gateway.admitted_sources.remove(source_node).is_some() {
         gateway.revision = gateway.revision.next();
@@ -3660,6 +3693,9 @@ fn retain_node_egress_distributions(state: &ControllerState, live_nodes: &BTreeS
     write_lock(&state.egress_pending_gateway_applications)
         .retain(|node, _| live_nodes.contains(node));
     write_lock(&state.egress_gateway_applications).retain(|node, _| live_nodes.contains(node));
+    write_lock(&state.egress_pending_gateway_addresses).retain(|node, _| live_nodes.contains(node));
+    write_lock(&state.egress_gateway_address_applications)
+        .retain(|node, _| live_nodes.contains(node));
     let mut gateway = mutex_lock(&state.egress_gateway_distributions);
     let previous = gateway.admitted_sources.len();
     gateway
@@ -6593,6 +6629,149 @@ async fn egress_gateway_projection(
         Some(projection) => Ok(Json(projection).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+async fn egress_gateway_address_projection(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    match egress_gateway_address_projection_for(&state, &agent)? {
+        Some(projection) => Ok(Json(projection).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+fn egress_gateway_address_projection_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+) -> Result<Option<EgressGatewayAddressProjection>, ApiError> {
+    let _guard = mutex_lock(&state.egress_distribution_guard);
+    let principal = egress_principal_for(state, agent)?;
+    let checkpoint = mutex_lock(&state.egress_control_plane)
+        .checkpoint()
+        .gateways;
+    if checkpoint.revision == Revision::INITIAL {
+        return Ok(None);
+    }
+    let projection =
+        EgressGatewayAddressProjection::issue(&principal, state.identity_epoch, checkpoint)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    if projection.leases.is_empty() {
+        return Ok(None);
+    }
+    let admitted = projection
+        .clone()
+        .admit(&principal)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    write_lock(&state.egress_pending_gateway_addresses).insert(
+        agent.node_name.clone(),
+        PendingEgressGatewayAddressApplication {
+            agent: agent.clone(),
+            projection: admitted,
+        },
+    );
+    Ok(Some(projection))
+}
+
+async fn acknowledge_egress_gateway_address_application(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(acknowledgement): Json<EgressGatewayAddressAcknowledgement>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    acknowledge_egress_gateway_address_application_for(&state, &agent, &acknowledgement)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn acknowledge_egress_gateway_address_application_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    acknowledgement: &EgressGatewayAddressAcknowledgement,
+) -> Result<(), ApiError> {
+    let _guard = mutex_lock(&state.egress_distribution_guard);
+    let pending = read_lock(&state.egress_pending_gateway_addresses)
+        .get(&agent.node_name)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "no issued gateway-address projection awaits acknowledgement",
+            )
+        })?;
+    if pending.agent != *agent {
+        return Err(ApiError::forbidden(
+            "gateway-address acknowledgement does not match the issuing agent Pod",
+        ));
+    }
+    acknowledgement
+        .verify(&pending.projection)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    write_lock(&state.egress_gateway_address_applications).insert(
+        agent.node_name.clone(),
+        AppliedEgressGatewayAddressApplication {
+            agent: agent.clone(),
+            acknowledgement: acknowledgement.clone(),
+        },
+    );
+    acknowledge_ready_gateway_address_quorums(state)?;
+    Ok(())
+}
+
+fn acknowledge_ready_gateway_address_quorums(state: &ControllerState) -> Result<(), ApiError> {
+    let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
+    let pending = read_lock(&state.egress_pending_gateway_addresses);
+    let applied = read_lock(&state.egress_gateway_address_applications);
+    let ready = checkpoint
+        .gateways
+        .records
+        .iter()
+        .filter(|record| record.desired.action == unf_egress::EgressGatewayAction::Ensure)
+        .filter(|record| {
+            record.desired.nodes.iter().all(|node| {
+                let Some(pending) = pending.get(&node.name) else {
+                    return false;
+                };
+                let Some(applied) = applied.get(&node.name) else {
+                    return false;
+                };
+                pending.agent == applied.agent
+                    && agent_application_is_current(state, &applied.agent)
+                    && pending.projection.projection().revision == checkpoint.gateways.revision
+                    && applied.acknowledgement.verify(&pending.projection).is_ok()
+                    && applied
+                        .acknowledgement
+                        .applied_desired_revisions
+                        .contains(&record.desired.revision)
+            })
+        })
+        .map(|record| EgressGatewayAcknowledgement {
+            schema_version: EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
+            revision: record.desired.revision,
+            desired_revision: record.desired.revision,
+            allocation_revision: record.desired.allocation_revision,
+            owner: record.desired.owner.clone(),
+            provider: record.desired.provider.clone(),
+            lease_epoch: record.desired.lease_epoch,
+            outcome: EgressProviderOutcome::Ready,
+            nodes: record.desired.nodes.clone(),
+            error: None,
+        })
+        .collect::<Vec<_>>();
+    drop(applied);
+    drop(pending);
+    let mut control_plane = mutex_lock(&state.egress_control_plane);
+    let mut changed = false;
+    for acknowledgement in ready {
+        changed |= control_plane
+            .acknowledge_gateway(acknowledgement)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+    if changed {
+        state
+            .egress_control_plane_dirty
+            .store(true, Ordering::Release);
+    }
+    Ok(())
 }
 
 fn egress_gateway_projection_for(
@@ -9855,6 +10034,109 @@ mod tests {
             &source_ack,
             &gateway_ack,
             active.revision,
+        );
+    }
+
+    #[test]
+    fn egress_gateway_address_readiness_requires_exact_all_node_quorum() {
+        let state = new_state(true);
+        let advertisement = egress_advertisement();
+        let distribution = gateway_source_distribution(&advertisement);
+        let owner = distribution.model.intents[0].owner.clone();
+        let provider = EgressProviderRef {
+            name: "native".to_owned(),
+            instance: "default".to_owned(),
+        };
+        let candidates = ["gateway-a", "gateway-b"]
+            .into_iter()
+            .map(|name| EgressNode {
+                name: name.to_owned(),
+                uid: format!("{name}-uid"),
+                capabilities: advertisement.capabilities.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut control_plane = EgressControlPlane::default();
+        control_plane
+            .reconcile(
+                Revision::new(1),
+                distribution.model,
+                &BTreeMap::from([(owner.clone(), provider)]),
+                candidates,
+            )
+            .expect("derive gateway address desired state");
+        *mutex_lock(&state.egress_control_plane) = control_plane;
+
+        for node in ["gateway-a", "gateway-b"] {
+            write_lock(&state.node_port_nodes).insert(
+                node.to_owned(),
+                NodePortNodeRecord {
+                    node_uid: format!("{node}-uid"),
+                    revision: Revision::new(1),
+                    addresses: Vec::new(),
+                },
+            );
+            let agent = authenticated_egress_agent(node);
+            write_lock(&state.pods).insert(
+                format!("{}/{}", agent.namespace, agent.pod_name),
+                PodRecord {
+                    namespace: agent.namespace.clone(),
+                    name: agent.pod_name.clone(),
+                    uid: agent.pod_uid.clone(),
+                    node_name: Some(agent.node_name.clone()),
+                    host_network: true,
+                    endpoint: Endpoint {
+                        identity: IdentityId::new(10),
+                        namespace: agent.namespace.clone(),
+                        namespace_labels: BTreeMap::new(),
+                        service_account: agent.service_account.clone(),
+                        application: Some("unf-agent".to_owned()),
+                        labels: BTreeMap::new(),
+                        named_ports: BTreeMap::new(),
+                    },
+                    ipv4_addresses: BTreeSet::new(),
+                    ipv6_addresses: BTreeSet::new(),
+                },
+            );
+            egress_gateway_address_projection_for(&state, &agent)
+                .expect("issue exact gateway address projection")
+                .expect("gateway owns the lease");
+        }
+
+        let acknowledge = |node: &str, index: u32| {
+            let agent = authenticated_egress_agent(node);
+            let pending = read_lock(&state.egress_pending_gateway_addresses)[node].clone();
+            let acknowledgement = EgressGatewayAddressAcknowledgement::issue(
+                &pending.projection,
+                "unf-egress0".to_owned(),
+                index,
+                1_500,
+                vec!["192.0.2.40".parse().unwrap()],
+            )
+            .expect("exact readback evidence");
+            acknowledge_egress_gateway_address_application_for(&state, &agent, &acknowledgement)
+                .expect("accept current gateway address evidence");
+        };
+
+        acknowledge("gateway-a", 20);
+        assert!(
+            mutex_lock(&state.egress_control_plane)
+                .checkpoint()
+                .gateways
+                .records[0]
+                .gateway
+                .is_none(),
+            "one gateway must never make a replicated address ready"
+        );
+        acknowledge("gateway-b", 21);
+        assert_eq!(
+            mutex_lock(&state.egress_control_plane)
+                .checkpoint()
+                .gateways
+                .records[0]
+                .gateway
+                .as_ref()
+                .map(|ack| ack.outcome),
+            Some(EgressProviderOutcome::Ready)
         );
     }
 

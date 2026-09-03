@@ -19,6 +19,7 @@ mod dataplane;
 mod desired;
 mod distribution;
 mod gateway;
+mod gateway_address;
 mod host_state;
 mod proof;
 
@@ -29,6 +30,7 @@ pub use dataplane::*;
 pub use desired::*;
 pub use distribution::*;
 pub use gateway::*;
+pub use gateway_address::*;
 pub use host_state::*;
 pub use proof::*;
 

@@ -2959,6 +2959,7 @@ dependencies = [
  "unf-ebpf-common",
  "unf-egress",
  "unf-ipam",
+ "unf-link",
  "unf-loadbalancer",
  "unf-route",
  "unf-service",

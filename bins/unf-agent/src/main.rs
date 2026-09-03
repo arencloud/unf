@@ -60,15 +60,17 @@ use unf_egress::{
     AddressFamily as EgressAddressFamily, AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT,
     EGRESS_AGENT_TOKEN_AUDIENCE, EGRESS_DISTRIBUTION_SCHEMA_VERSION,
     EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard, EgressAgentAdvertisement,
-    EgressCapability, EgressDataplaneState, EgressGatewayApplicationAcknowledgement,
-    EgressGatewayHostBank, EgressGatewayProjection, EgressGatewayProjectionLedger,
-    EgressNodeProjectionEnvelope, EgressPathCertificate, EgressPathMode, EgressProjectionLedger,
-    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, compile_egress_dataplane,
+    EgressCapability, EgressDataplaneState, EgressGatewayAddressAcknowledgement,
+    EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement, EgressGatewayHostBank,
+    EgressGatewayProjection, EgressGatewayProjectionLedger, EgressNodeProjectionEnvelope,
+    EgressPathCertificate, EgressPathMode, EgressProjectionLedger, EgressSourceActivationGrant,
+    EgressSourceApplicationAcknowledgement, compile_egress_dataplane,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
     NodeBlockSnapshot,
 };
+use unf_link::GatewayAddressPlan;
 use unf_loadbalancer::{
     LOAD_BALANCER_FRONTEND_BANK_CAPACITY, LoadBalancerDataplaneState,
     NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION, NodeReachabilityCheckpoint,
@@ -7985,22 +7987,129 @@ async fn synchronize_egress(
     synchronizer: &mut EgressSynchronizer,
     state: &AgentState,
 ) -> Result<bool> {
+    let gateway_address_result = synchronize_egress_gateway_addresses(synchronizer, state).await;
     let source_result = synchronize_egress_source(synchronizer, state).await;
     let gateway_result = synchronize_egress_gateway(synchronizer, state).await;
-    if (source_result.is_err() || gateway_result.is_err())
+    if (gateway_address_result.is_err() || source_result.is_err() || gateway_result.is_err())
         && let Err(error) = fence_active_egress_dataplane(synchronizer)
     {
         return Err(error)
             .context("egress synchronization failed and active state could not be fenced");
     }
-    match (source_result, gateway_result) {
-        (Ok(source), Ok(gateway)) => Ok(source || gateway),
-        (Err(source), Ok(_)) => Err(source.context("egress source distribution failed")),
-        (Ok(_), Err(gateway)) => Err(gateway.context("egress gateway distribution failed")),
-        (Err(source), Err(gateway)) => Err(anyhow!(
-            "egress source distribution failed: {source:#}; gateway distribution failed: {gateway:#}"
-        )),
+    match (gateway_address_result, source_result, gateway_result) {
+        (Ok(address), Ok(source), Ok(gateway)) => Ok(address || source || gateway),
+        (address, source, gateway) => {
+            let mut failures = Vec::new();
+            if let Err(error) = address {
+                failures.push(format!("gateway address ownership: {error:#}"));
+            }
+            if let Err(error) = source {
+                failures.push(format!("source distribution: {error:#}"));
+            }
+            if let Err(error) = gateway {
+                failures.push(format!("gateway distribution: {error:#}"));
+            }
+            Err(anyhow!(
+                "egress synchronization failed: {}",
+                failures.join("; ")
+            ))
+        }
     }
+}
+
+async fn synchronize_egress_gateway_addresses(
+    synchronizer: &EgressSynchronizer,
+    state: &AgentState,
+) -> Result<bool> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("gateway address synchronization requires a controller URL")?;
+    let response = authenticated_get(
+        &synchronizer.client,
+        format!("{controller_url}/v1/state/egress-gateway-address"),
+        &synchronizer.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request authenticated gateway-address projection")?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(false);
+    }
+    let projection: EgressGatewayAddressProjection = response
+        .error_for_status()
+        .context("controller rejected gateway-address projection request")?
+        .json()
+        .await
+        .context("decode gateway-address projection")?;
+    let node = fetch_node_port_node_snapshot(
+        controller_url,
+        &synchronizer.client,
+        &synchronizer.agent_token_path,
+    )
+    .await?
+    .validate_and_normalize()
+    .context("validate authoritative gateway Node identity")?;
+    if node.node_name != synchronizer.node_name {
+        bail!(
+            "controller returned Node identity for {}; gateway-address agent owns {}",
+            node.node_name,
+            synchronizer.node_name
+        );
+    }
+    let principal = authenticated_egress_principal(synchronizer, state, node.node_uid.clone());
+    let admitted = projection
+        .admit(&principal)
+        .context("admit exact gateway-address projection")?;
+    let addresses = admitted
+        .projection()
+        .leases
+        .iter()
+        .flat_map(|lease| lease.addresses.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if addresses.is_empty() {
+        bail!("gateway-address projection contains no owned or quarantined address");
+    }
+    let plan = GatewayAddressPlan::new(node.node_uid, 1_500, addresses.into_iter().collect())
+        .context("compile Node-UID-bound gateway-address plan")?;
+    let readback = plan
+        .apply()
+        .await
+        .context("apply and read back gateway-address ownership")?;
+    let acknowledgement = EgressGatewayAddressAcknowledgement::issue(
+        &admitted,
+        readback.interface_name,
+        readback.interface_index,
+        readback.mtu,
+        readback
+            .addresses
+            .into_iter()
+            .map(|address| address.address)
+            .collect(),
+    )
+    .context("build exact gateway-address application evidence")?;
+    synchronizer
+        .client
+        .current()
+        .post(format!(
+            "{controller_url}/v1/state/egress-gateway-address-ack"
+        ))
+        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+        .json(&acknowledgement)
+        .send()
+        .await
+        .context("publish gateway-address application evidence")?
+        .error_for_status()
+        .context("controller rejected gateway-address application evidence")?;
+    info!(
+        projection_revision = admitted.projection().revision.get(),
+        addresses = acknowledgement.owned_addresses.len(),
+        applied_leases = acknowledgement.applied_desired_revisions.len(),
+        quarantined_leases = acknowledgement.quarantined_desired_revisions.len(),
+        interface_index = acknowledgement.interface_index,
+        "applied lease-fenced gateway address ownership"
+    );
+    Ok(true)
 }
 
 async fn synchronize_egress_source(

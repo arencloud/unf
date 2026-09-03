@@ -26,6 +26,7 @@ unf-cni-state = { path = "../../crates/unf-cni-state" }
 unf-ebpf-common = { path = "../../ebpf/unf-ebpf-common" }
 unf-egress = { path = "../../crates/unf-egress" }
 unf-ipam = { path = "../../crates/unf-ipam" }
+unf-link = { path = "../../crates/unf-link" }
 unf-loadbalancer = { path = "../../crates/unf-loadbalancer" }
 unf-route = { path = "../../crates/unf-route" }
 unf-service = { path = "../../crates/unf-service" }

@@ -226,8 +226,12 @@ after every selected gateway application is current; the source separately
 reads back the exact native route set, Node identity, transport, interface
 index, MTU, and stable dual-stack route revision before atomically entering
 `Active`. Loss of either proof and restart return through a destination-preserving
-fence. Gateway address ownership and collision-safe dual-stack SNAT/reverse
-processing follow. ADRs 0119–0127 record the verified boundary.
+fence. A separate authenticated projection now drives Node-UID-bound `/32` and
+`/128` ownership on `unf-egress0`; whole-host collision preflight, exact kernel
+readback, and all-selected-gateway quorum precede readiness. Withdrawal
+quarantines those addresses until an explicit source-fence/reachability release
+barrier. Collision-safe dual-stack SNAT/reverse processing follows. ADRs
+0119–0128 record the verified boundary.
 
 The legacy netlink path, encrypted internal transport, and IPv4/IPv6 policy
 provenance now have repeatable evidence on separate OpenShift 4.22 IPv4-only and

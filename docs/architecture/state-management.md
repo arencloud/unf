@@ -229,12 +229,18 @@ changes clear stale source distribution authority. Exact Pod-bound source and
 gateway application acknowledgements remain separate from delivery. A distinct in-process
 gateway ledger now owns digest-bound exact-Node source-contract projections and
 explicit empty withdrawals. It fences controller epoch/revision regression and
-same-revision mutation; restart reacquires it before any future activation
-because no gateway host or packet state exists yet. The source TC reader now
+same-revision mutation; restart reacquires it before any selected-contract
+packet state activation. The source TC reader now
 consumes only a coherent destination match after NetworkPolicy allows it. A
 controller grant binds the exact source projection to current positive evidence
 from every selected gateway, while the source independently certifies the
 stable applied remote-route snapshot, Node UID, next-hop transport, interface
 index, and MTU before activating direct-neighbor state. Grant/path loss,
 withdrawal, synchronization failure, and restart atomically restore fences and
-purge egress connections. Gateway NAT remains separate. See ADRs 0119–0127.
+purge egress connections. Gateway address projections are separately sealed to
+the exact Node UID and gateway-registry revision. Agents apply them to a
+versioned owned dummy link, read back the complete host-prefix set, and the
+controller requires every selected gateway acknowledgement before recording
+readiness. Withdraw state is quarantined and allocator-fenced until explicit
+source-fence and reachability release evidence exists. Gateway NAT remains
+separate. See ADRs 0119–0128.
