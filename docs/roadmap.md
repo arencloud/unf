@@ -665,7 +665,7 @@ matrix is maintained in the
   ready/reachable lease-fenced candidates, independently admits the digest-bound
   projection, and uses a monotonic empty projection for withdrawal under `make
   egress-gateway-distribution-test`; ADR 0123. The watched canonical revision now also drives one
-  schema-v1 durable orchestration checkpoint: deterministic bounded allocation,
+  schema-v2 durable orchestration checkpoint: deterministic bounded allocation,
   Ready primary-CNI Node/UID gateway intent, exact restart replay, pool
   tombstones, and dual-provider withdrawal-before-release pass `make
   egress-control-plane-test`; ADR 0124. Exact schema-v1 application evidence now
@@ -688,8 +688,11 @@ matrix is maintained in the
   Proof-salted odd-stride port candidates plus reverse-first and forward-second
   no-overwrite insertion provide collision-safe dual-stack TCP/UDP state;
   privileged recovery, checksum, reverse, and collision packets pass `make
-  egress-gateway-nat-test`; ADR 0129. Explicit release authority, NAT events,
-  HA failover, and end-to-end platform packets remain.
+  egress-gateway-nat-test`; ADR 0129. Checkpoint-v2 retirement manifests and a
+  domain-separated Proof of Safe Forgetting now require the exact source set,
+  zero-flow gateway drains, and withdrawn reachability before atomic address
+  release under `make egress-safe-forgetting-test`; ADR 0130. Live evidence
+  transport, NAT events, HA failover, and end-to-end platform packets remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

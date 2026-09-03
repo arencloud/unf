@@ -413,7 +413,7 @@ pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
 is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
-and ADRs 0113–0128 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+and ADRs 0113–0130 track the work. Milestone 8.2a now adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -462,7 +462,7 @@ Pod-bound authentication, publishes only controller-admitted contracts that
 name that ready/reachable lease-fenced candidate, and sends a monotonic empty
 projection for explicit withdrawal. The gateway agent independently validates
 and fences that state under `make egress-gateway-distribution-test`; ADR 0123.
-The watched revision now drives a separate schema-v1 durable control-plane
+The watched revision now drives a separate schema-v2 durable control-plane
 checkpoint that atomically allocates bounded addresses and emits deterministic
 lease-fenced gateway Ensure/Withdraw intent over Ready primary-CNI Nodes with
 authoritative UIDs. Pool tombstones and dual-provider withdrawal retain an
@@ -503,8 +503,16 @@ forward `BPF_NOEXIST` insertion never overwrites a colliding flow. Established
 state survives projection churn until protocol timeout, and family-specific
 tail programs perform checksum-safe IPv4/IPv6 SNAT and exact reverse restore.
 Privileged restart, packet, collision, and first-flow-preservation evidence
-passes `make egress-gateway-nat-test`; ADR 0129. Release-barrier completion,
-NAT events, HA failover, and platform dual-stack traffic are next.
+passes `make egress-gateway-nat-test`; ADR 0129. The release barrier now has a
+verified **Proof of Safe Forgetting** contract: checkpoint-v2 retirement
+manifests freeze the exact source/gateway/lease set, and address reuse requires
+complete source-fence, zero-flow gateway-drain, and exact
+withdrawn-reachability evidence. Provider acknowledgements, elapsed time,
+leadership, or inferred absence cannot release a lease. The domain/controller
+gate passes `make egress-safe-forgetting-test`; ADR 0130. Live agent/provider
+evidence transport, NAT events, HA failover, and platform dual-stack traffic
+are next, so production addresses remain quarantined rather than being
+released optimistically.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

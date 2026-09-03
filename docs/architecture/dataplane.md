@@ -233,12 +233,15 @@ index, MTU, and stable dual-stack route revision before atomically entering
 fence. A separate authenticated projection now drives Node-UID-bound `/32` and
 `/128` ownership on `unf-egress0`; whole-host collision preflight, exact kernel
 readback, and all-selected-gateway quorum precede readiness. Withdrawal
-quarantines those addresses until an explicit source-fence/reachability release
-barrier. Collision-safe dual-stack SNAT/reverse processing now validates the
+quarantines those addresses until a checkpoint-v2 retirement manifest has
+frozen the exact source/gateway/lease set and a schema-v1 Proof of Safe
+Forgetting joins complete source fences, zero-flow gateway drains, and the exact
+reachability withdrawal. Reconciliation, time, and leadership cannot infer
+release. Collision-safe dual-stack SNAT/reverse processing now validates the
 full contract/lease/digest/witness chain, reserves reverse then forward state
 without overwrite, and performs checksum-safe family-specific translation.
-Release authority and NAT events follow. ADRs 0119–0129 record the verified
-boundary.
+Live release-evidence transport and NAT events follow. ADRs 0119–0130 record the
+verified boundary.
 
 The legacy netlink path, encrypted internal transport, and IPv4/IPv6 policy
 provenance now have repeatable evidence on separate OpenShift 4.22 IPv4-only and

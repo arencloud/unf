@@ -7,14 +7,15 @@ use thiserror::Error;
 use unf_common::Revision;
 
 use crate::{
-    EgressAllocationCheckpoint, EgressAllocationError, EgressAllocationRequest, EgressAllocator,
-    EgressGatewayAcknowledgement, EgressGatewayCheckpoint, EgressGatewayError,
-    EgressGatewayRegistry, EgressIntentOwner, EgressModel, EgressModelError, EgressNode,
-    EgressProviderRef, EgressReachabilityAcknowledgement, MAX_EGRESS_GATEWAY_NODES,
-    normalize_model,
+    AdmittedEgressProjection, EgressAllocationCheckpoint, EgressAllocationError,
+    EgressAllocationRequest, EgressAllocator, EgressGatewayAcknowledgement,
+    EgressGatewayCheckpoint, EgressGatewayError, EgressGatewayRegistry, EgressIntentOwner,
+    EgressModel, EgressModelError, EgressNode, EgressProviderRef,
+    EgressReachabilityAcknowledgement, EgressRetirementManifest, EgressSafeForgettingError,
+    EgressSafeReleaseAuthority, MAX_EGRESS_GATEWAY_NODES, MAX_EGRESS_INTENTS, normalize_model,
 };
 
-pub const EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
+pub const EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -24,6 +25,7 @@ pub struct EgressControlPlaneCheckpoint {
     pub desired_model: EgressModel,
     pub allocation: EgressAllocationCheckpoint,
     pub gateways: EgressGatewayCheckpoint,
+    pub retirements: Vec<EgressRetirementManifest>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -54,6 +56,14 @@ pub enum EgressControlPlaneError {
     Allocation(#[from] EgressAllocationError),
     #[error(transparent)]
     Gateway(#[from] EgressGatewayError),
+    #[error(transparent)]
+    SafeForgetting(#[from] EgressSafeForgettingError),
+    #[error("safe release authority does not match retained provider evidence for {0:?}")]
+    ReleaseAuthorityMismatch(EgressIntentOwner),
+    #[error("retirement manifest is missing, mutated, or foreign for {0:?}")]
+    RetirementManifestConflict(EgressIntentOwner),
+    #[error("retirement checkpoint is oversized, duplicated, or noncanonical")]
+    InvalidRetirementCheckpoint,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +72,7 @@ pub struct EgressControlPlane {
     desired_model: EgressModel,
     allocator: EgressAllocator,
     gateways: EgressGatewayRegistry,
+    retirements: BTreeMap<EgressIntentOwner, EgressRetirementManifest>,
 }
 
 impl Default for EgressControlPlane {
@@ -74,6 +85,7 @@ impl Default for EgressControlPlane {
             },
             allocator: EgressAllocator::new(Vec::new()).expect("empty pool model is valid"),
             gateways: EgressGatewayRegistry::default(),
+            retirements: BTreeMap::new(),
         }
     }
 }
@@ -105,12 +117,32 @@ impl EgressControlPlane {
         }
         let allocator = EgressAllocator::restore(checkpoint.allocation)?;
         let gateways = EgressGatewayRegistry::restore(checkpoint.gateways)?;
+        if checkpoint.retirements.len() > MAX_EGRESS_INTENTS
+            || checkpoint
+                .retirements
+                .windows(2)
+                .any(|pair| pair[0].owner >= pair[1].owner)
+        {
+            return Err(EgressControlPlaneError::InvalidRetirementCheckpoint);
+        }
+        let mut retirements = BTreeMap::new();
+        for manifest in checkpoint.retirements {
+            let owner = manifest.owner.clone();
+            let record = gateways.record(&owner).ok_or_else(|| {
+                EgressControlPlaneError::RetirementManifestConflict(owner.clone())
+            })?;
+            manifest.verify(&record.desired)?;
+            if retirements.insert(owner.clone(), manifest).is_some() {
+                return Err(EgressControlPlaneError::RetirementManifestConflict(owner));
+            }
+        }
         validate_cross_state(&allocator, &gateways)?;
         Ok(Self {
             desired_revision: checkpoint.desired_revision,
             desired_model,
             allocator,
             gateways,
+            retirements,
         })
     }
 
@@ -136,7 +168,6 @@ impl EgressControlPlane {
 
         let before = self.checkpoint();
         let mut next = self.clone();
-        next.finalize_withdrawals()?;
 
         let desired_owners = model
             .intents
@@ -253,6 +284,69 @@ impl EgressControlPlane {
         Ok(self.gateways.acknowledge_reachability(acknowledgement)?)
     }
 
+    /// Freezes the authoritative admitted-source snapshot for one withdrawal.
+    /// An exact replay is idempotent; a different later snapshot is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown/non-withdrawing ownership, malformed projections, or
+    /// any attempt to mutate a previously registered retirement set.
+    pub fn register_retirement(
+        &mut self,
+        owner: &EgressIntentOwner,
+        admitted_sources: &[AdmittedEgressProjection],
+    ) -> Result<EgressRetirementManifest, EgressControlPlaneError> {
+        let record = self
+            .gateways
+            .record(owner)
+            .ok_or_else(|| EgressGatewayError::UnknownOwner(owner.clone()))?;
+        let manifest = EgressRetirementManifest::issue(&record.desired, admitted_sources)?;
+        if let Some(previous) = self.retirements.get(owner) {
+            if previous != &manifest {
+                return Err(EgressControlPlaneError::RetirementManifestConflict(
+                    owner.clone(),
+                ));
+            }
+            return Ok(previous.clone());
+        }
+        self.retirements.insert(owner.clone(), manifest.clone());
+        Ok(manifest)
+    }
+
+    /// Atomically consumes a complete, sealed proof that every source,
+    /// gateway, and reachability owner has forgotten one withdrawn lease.
+    /// Ordinary reconciliation never infers this condition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale, incomplete, mutated, or foreign evidence and preserves
+    /// both the gateway record and allocation on every failure.
+    pub fn authorize_release(
+        &mut self,
+        authority: &EgressSafeReleaseAuthority,
+    ) -> Result<bool, EgressControlPlaneError> {
+        let owner = authority.manifest.owner.clone();
+        let record = self
+            .gateways
+            .record(&owner)
+            .ok_or_else(|| EgressGatewayError::UnknownOwner(owner.clone()))?
+            .clone();
+        authority.verify(&record.desired)?;
+        if self.retirements.get(&owner) != Some(&authority.manifest)
+            || record.reachability.as_ref() != Some(&authority.reachability)
+        {
+            return Err(EgressControlPlaneError::ReleaseAuthorityMismatch(owner));
+        }
+
+        let mut next = self.clone();
+        next.gateways.complete_withdrawal(&owner)?;
+        next.allocator.release(&owner)?;
+        next.retirements.remove(&owner);
+        validate_cross_state(&next.allocator, &next.gateways)?;
+        *self = next;
+        Ok(true)
+    }
+
     #[must_use]
     pub fn checkpoint(&self) -> EgressControlPlaneCheckpoint {
         EgressControlPlaneCheckpoint {
@@ -261,28 +355,8 @@ impl EgressControlPlane {
             desired_model: self.desired_model.clone(),
             allocation: self.allocator.checkpoint(),
             gateways: self.gateways.checkpoint(),
+            retirements: self.retirements.values().cloned().collect(),
         }
-    }
-
-    fn finalize_withdrawals(&mut self) -> Result<(), EgressControlPlaneError> {
-        for owner in self.allocator.owners() {
-            let complete =
-                self.gateways.record(&owner).is_some_and(|record| {
-                    record.desired.action == crate::EgressGatewayAction::Withdraw
-                        && record.gateway.as_ref().is_some_and(|ack| {
-                            ack.outcome == crate::EgressProviderOutcome::Withdrawn
-                        })
-                        && record.reachability.as_ref().is_some_and(|ack| {
-                            ack.outcome == crate::EgressProviderOutcome::Withdrawn
-                        })
-                });
-            if !complete {
-                continue;
-            }
-            self.gateways.complete_withdrawal(&owner)?;
-            self.allocator.release(&owner)?;
-        }
-        Ok(())
     }
 }
 
@@ -372,7 +446,8 @@ mod tests {
     use crate::{
         AddressFamily, DEFAULT_EGRESS_INTENT_PRIORITY, EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
         EgressAddressPool, EgressAddressRequest, EgressCapability, EgressDestinations,
-        EgressGatewayAction, EgressIntent, EgressIntentScope, EgressProviderOutcome,
+        EgressGatewayAction, EgressGatewayDrainEvidence, EgressIntent, EgressIntentScope,
+        EgressProjectionRecipient, EgressProviderOutcome, EgressRetirementManifest,
         EgressSourceSelector, IpPrefix,
     };
 
@@ -432,6 +507,47 @@ mod tests {
                 EgressCapability::IdentitySourceSteering,
                 EgressCapability::LeaseEpochFencing,
             ]),
+        }
+    }
+
+    fn withdrawn_acknowledgements(
+        desired: &crate::EgressGatewayDesired,
+    ) -> (
+        EgressGatewayAcknowledgement,
+        EgressReachabilityAcknowledgement,
+    ) {
+        (
+            EgressGatewayAcknowledgement {
+                schema_version: EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
+                revision: Revision::new(1),
+                desired_revision: desired.revision,
+                allocation_revision: desired.allocation_revision,
+                owner: desired.owner.clone(),
+                provider: desired.provider.clone(),
+                lease_epoch: desired.lease_epoch,
+                outcome: EgressProviderOutcome::Withdrawn,
+                nodes: desired.nodes.clone(),
+                error: None,
+            },
+            EgressReachabilityAcknowledgement {
+                schema_version: EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
+                revision: Revision::new(1),
+                desired_revision: desired.revision,
+                allocation_revision: desired.allocation_revision,
+                owner: desired.owner.clone(),
+                provider: desired.provider.clone(),
+                lease_epoch: desired.lease_epoch,
+                outcome: EgressProviderOutcome::Withdrawn,
+                addresses: desired.addresses.clone(),
+                error: None,
+            },
+        )
+    }
+
+    fn recipient(node: &EgressNode) -> EgressProjectionRecipient {
+        EgressProjectionRecipient {
+            node_name: node.name.clone(),
+            node_uid: node.uid.clone(),
         }
     }
 
@@ -523,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn removal_retains_address_until_both_withdrawals_then_reuses_new_epoch() {
+    fn removal_requires_safe_forgetting_authority_before_reuse() {
         let mut control = EgressControlPlane::default();
         control
             .reconcile(
@@ -546,33 +662,12 @@ mod tests {
         assert_eq!(desired.action, EgressGatewayAction::Withdraw);
         assert_eq!(checkpoint.allocation.leases.len(), 1);
 
+        let (gateway, reachability) = withdrawn_acknowledgements(&desired);
         control
-            .acknowledge_gateway(EgressGatewayAcknowledgement {
-                schema_version: EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
-                revision: Revision::new(1),
-                desired_revision: desired.revision,
-                allocation_revision: desired.allocation_revision,
-                owner: desired.owner.clone(),
-                provider: desired.provider.clone(),
-                lease_epoch: desired.lease_epoch,
-                outcome: EgressProviderOutcome::Withdrawn,
-                nodes: desired.nodes.clone(),
-                error: None,
-            })
+            .acknowledge_gateway(gateway)
             .expect("gateway withdrawn");
         control
-            .acknowledge_reachability(EgressReachabilityAcknowledgement {
-                schema_version: EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
-                revision: Revision::new(1),
-                desired_revision: desired.revision,
-                allocation_revision: desired.allocation_revision,
-                owner: desired.owner.clone(),
-                provider: desired.provider.clone(),
-                lease_epoch: desired.lease_epoch,
-                outcome: EgressProviderOutcome::Withdrawn,
-                addresses: desired.addresses.clone(),
-                error: None,
-            })
+            .acknowledge_reachability(reachability.clone())
             .expect("reachability withdrawn");
         control
             .reconcile(
@@ -581,7 +676,46 @@ mod tests {
                 &providers(),
                 vec![node("gateway-a")],
             )
-            .expect("complete withdrawal");
+            .expect("provider acknowledgements do not imply safe release");
+        assert_eq!(control.checkpoint().allocation.leases.len(), 1);
+
+        assert!(matches!(
+            EgressGatewayDrainEvidence::issue(&desired, recipient(&desired.nodes[0]), 1, true,),
+            Err(EgressSafeForgettingError::EvidenceMismatch)
+        ));
+        let manifest = EgressRetirementManifest::issue(&desired, &[])
+            .expect("an unregistered empty source set can be sealed but is not authority");
+        let gateway_drain =
+            EgressGatewayDrainEvidence::issue(&desired, recipient(&desired.nodes[0]), 0, true)
+                .expect("withdrawn gateway has no retained connections");
+        let authority = EgressSafeReleaseAuthority::issue(
+            7,
+            Revision::new(1),
+            &desired,
+            manifest,
+            Vec::new(),
+            vec![gateway_drain],
+            reachability,
+        )
+        .expect("complete proof of safe forgetting");
+        assert!(matches!(
+            control.authorize_release(&authority),
+            Err(EgressControlPlaneError::ReleaseAuthorityMismatch(_))
+        ));
+        let registered = control
+            .register_retirement(&desired.owner, &[])
+            .expect("freeze authoritative source snapshot");
+        assert_eq!(registered, authority.manifest);
+        let checkpoint = control.checkpoint();
+        assert_eq!(checkpoint.retirements, vec![registered]);
+        let mut drift = checkpoint.clone();
+        drift.retirements[0].lease_epoch += 1;
+        assert!(matches!(
+            EgressControlPlane::restore(drift),
+            Err(EgressControlPlaneError::SafeForgetting(_))
+        ));
+        control = EgressControlPlane::restore(checkpoint).expect("retirement survives restart");
+        assert!(control.authorize_release(&authority).expect("safe release"));
         assert!(control.checkpoint().allocation.leases.is_empty());
 
         let mut replacement = intent("replacement");

@@ -22,6 +22,7 @@ mod gateway;
 mod gateway_address;
 mod host_state;
 mod proof;
+mod safe_forgetting;
 
 pub use allocation::*;
 pub use contract::*;
@@ -33,6 +34,7 @@ pub use gateway::*;
 pub use gateway_address::*;
 pub use host_state::*;
 pub use proof::*;
+pub use safe_forgetting::*;
 
 pub const DEFAULT_EGRESS_INTENT_PRIORITY: u32 = 1_000;
 pub const MAX_EGRESS_POOLS: usize = 64;

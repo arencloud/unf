@@ -245,6 +245,8 @@ purge egress connections. Gateway address projections are separately sealed to
 the exact Node UID and gateway-registry revision. Agents apply them to a
 versioned owned dummy link, read back the complete host-prefix set, and the
 controller requires every selected gateway acknowledgement before recording
-readiness. Withdraw state is quarantined and allocator-fenced until explicit
-source-fence and reachability release evidence exists. Gateway NAT remains
-separate. See ADRs 0119–0128.
+readiness. Withdraw state is quarantined and allocator-fenced. A durable
+retirement manifest plus Proof of Safe Forgetting now defines the only release
+authority: the exact source set must be fenced, every gateway explicitly
+withdrawn and zero-flow drained, and reachability withdrawn. Live evidence
+transport remains separate. See ADRs 0119–0130.
