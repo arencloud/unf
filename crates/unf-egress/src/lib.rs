@@ -1,8 +1,8 @@
-//! Kubernetes-independent identity-aware egress intent and address-pool model.
+//! Kubernetes-independent identity-aware egress domain.
 //!
-//! This crate ends before allocation, gateway placement, reachability, host
-//! state, or packet processing. Platform adapters must translate their APIs
-//! into these validated and deterministically ordered types.
+//! Intent, allocation, provider ownership, verified exact-Node contracts, and
+//! transactional userspace host state live here. Platform adapters translate
+//! their APIs into these types; packet processing remains a later boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -14,11 +14,15 @@ use thiserror::Error;
 
 mod allocation;
 mod contract;
+mod distribution;
 mod gateway;
+mod host_state;
 
 pub use allocation::*;
 pub use contract::*;
+pub use distribution::*;
 pub use gateway::*;
+pub use host_state::*;
 
 pub const DEFAULT_EGRESS_INTENT_PRIORITY: u32 = 1_000;
 pub const MAX_EGRESS_POOLS: usize = 64;

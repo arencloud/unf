@@ -90,7 +90,14 @@ epochs. A separate gateway registry versions desired state, gateway readiness,
 and external reachability independently, retains address fences through
 dual-acknowledged withdrawal, and projects only completely acknowledged facts
 into behavior contracts. These are durable domain records; controller storage
-and host-state integration begin in milestone 8.4; ADR 0116.
+and host-state integration begin in milestone 8.4; ADR 0116. Schema-v1
+distribution now binds that complete contract to the existing authenticated
+Pod/Node principal and exact negotiated capabilities. Only an independently
+replayed projection can compile isolated userspace ABI-v1 gateway host banks;
+stage/readback/prepare/activate, last-known-good rollback, strict current/pending
+checkpoints, crash repair, cold reconstruction, and version-scoped cleanup are
+owned behind a storage trait. Live controller/agent adapters and the consumable
+BPF layout remain milestone 8.5 work; ADR 0117.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

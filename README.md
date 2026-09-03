@@ -420,9 +420,14 @@ passes. Milestone 8.3 now adds schema-v1 durable atomic multi-address
 allocation, exact pool/provider provenance, monotonic lease epochs, checkpoint
 replay, separate gateway/readiness and reachability acknowledgements, safe
 withdrawal, and publication only after both providers acknowledge the exact
-revision. `make egress-allocation-test` passes; milestone 8.4 transactional
-distribution and gateway host state is next. No live egress address, packet-path,
-or platform claim is made yet.
+revision. Milestone 8.4 then binds schema/capability negotiation to an existing
+authenticated Pod/Node principal, independently replays each exact-Node
+contract, and admits only that result into separate digest-bound userspace
+gateway banks. Staged readback, pointer rollback, strict checkpoints, crash
+repair, cold reconstruction, and version-scoped cleanup pass `make
+egress-host-state-test`; ADRs 0116–0117. Milestone 8.5 live distribution and
+dual-stack steering/NAT is next. No live egress address, packet-path, or platform
+claim is made yet.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

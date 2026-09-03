@@ -16,8 +16,8 @@ authoritative state remains in [project-status.md](../project-status.md).
 | 8.2 | Egress intent, pool, and compatibility model | **Verified** | `unf-egress` provides bounded canonical Namespace/workload/ServiceAccount selectors, destinations, dual-stack non-overlapping pools, pool or explicit-address requests, deterministic complete-model validation, and strict ownership. The controller translates OpenShift `k8s.ovn.org/v1` EgressIP into the same intent, defaults/intersects selectors exactly, and preserves foreign status; `make egress-intent-test`; ADR 0114 |
 | 8.2a | Egress Behavior Contract and reference validator | **Verified** | Schema-v1 exact-Node plans bind selected source identity, original destinations, policy allow, exact pool/explicit allocation, lease-fenced ready/reachable ranked gateways, derived capabilities, and six independent revision domains. Independent replay, domain-separated SHA-256 digests, 16-byte witnesses, and bounded explicit single-gateway failure envelopes pass `make egress-contract-test`; ADR 0115 |
 | 8.3 | Durable allocation and gateway-provider contract | **Verified** | Schema-v1 allocation atomically assigns conflict-safe multiple IPv4/IPv6 addresses with exact owner/pool/provider provenance, bounded exhaustion, monotonic revisions/lease epochs, release/reuse, and strict checkpoint replay. Separate gateway/reachability provider interfaces, desired/ack revisions, epoch/address fencing, dual acknowledgement, safe withdrawal, and direct contract-fact projection pass `make egress-allocation-test`; ADR 0116 |
-| 8.4 | Transactional distribution and gateway host state | **Planned** | Authenticated exact-Node projection, capability negotiation, inactive staging/readback/activation, last-known-good checkpoints, epoch fencing, rollback/crash repair, and exact versioned cleanup |
-| 8.5 | Source steering and gateway NAT dataplane | **Planned** | Policy-first IPv4/IPv6 TCP/UDP steering, original identity/source witness, collision-safe SNAT/reverse state, fragments and unsupported protocols fail closed, and bounded event provenance without Linux-conntrack duplication by assumption |
+| 8.4 | Transactional distribution and gateway host state | **Verified** | Schema-v1 projection binds the existing authenticated Pod/Node principal, negotiates exact contract/host capabilities, independently replays all facts, and fences last-known-good epochs/revisions. Separate userspace ABI-v1 host banks commit through stage/readback/prepare/activate, pointer rollback, exact current/pending recovery, cold reconstruction, and version-scoped cleanup; `make egress-host-state-test`; ADR 0117 |
+| 8.5 | Live distribution, source steering, and gateway NAT dataplane | **Planned** | Controller/agent adapters and convergence first; then policy-first IPv4/IPv6 TCP/UDP steering, original identity/source witness, collision-safe SNAT/reverse state, fragments and unsupported protocols fail closed, and bounded event provenance without Linux-conntrack duplication by assumption |
 | 8.6 | Deterministic HA, failover, and multiple addresses | **Planned** | Lease-fenced gateway ownership, deterministic placement and failover, established-flow contract, bounded convergence, split-brain rejection, node drain/recovery, and measured disruption |
 | 8.7 | FQDN and internet-access controls | **Planned** | DNS-derived destination sets with bounded TTL/staleness/provenance, explicit wildcard semantics, fail-closed capacity behavior, IP fallback visibility, and no use of DNS names as workload identity |
 | 8.8 | Reachability and advertisement providers | **Planned** | Static/native development provider first; BGP advertisement remains a replaceable provider with independent route-policy, ECMP, graceful-restart, BFD, and production qualification gates |
@@ -102,7 +102,8 @@ HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.4 implements authenticated exact-Node distribution, capability
-negotiation, transactional gateway host state, and crash recovery. Milestones
-8.2–8.3 changed no BPF ABI, host routing, live address ownership, watcher/RBAC
-behavior, packet behavior, or platform claim.
+Milestone 8.5 wires the admitted projection and host-state store into the live
+controller/agent path, defines a fixed-width BPF ABI, and implements policy-first
+dual-stack TCP/UDP source steering plus collision-safe gateway NAT/reverse state.
+Milestones 8.2–8.4 changed no current BPF ABI, host routing, live address
+ownership, watcher/RBAC behavior, packet behavior, or platform claim.

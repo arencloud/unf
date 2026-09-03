@@ -287,6 +287,36 @@ impl EgressBehaviorContract {
         Ok(())
     }
 
+    /// Verifies the self-contained contract commitment without requiring live
+    /// controller facts. This is used only to reject corrupted durable state;
+    /// fresh activation still requires [`Self::verify`] against every source
+    /// domain.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unsupported schema or any mutation covered by the canonical
+    /// contract digest.
+    pub fn verify_integrity(&self) -> Result<(), EgressContractError> {
+        if self.schema_version != EGRESS_BEHAVIOR_CONTRACT_SCHEMA_VERSION {
+            return Err(EgressContractError::UnsupportedSchema {
+                actual: self.schema_version,
+                expected: EGRESS_BEHAVIOR_CONTRACT_SCHEMA_VERSION,
+            });
+        }
+        if self.contract_digest
+            != contract_digest(
+                self.contract_revision,
+                &self.node,
+                &self.plans,
+                &self.verified_invariants,
+                &self.failure_envelope,
+            )?
+        {
+            return Err(EgressContractError::ReplayMismatch);
+        }
+        Ok(())
+    }
+
     /// Derives a fixed-width provenance witness for one selected path.
     ///
     /// The witness is not authority; it resolves only against the retained
@@ -373,19 +403,13 @@ fn compile_contract(
         EgressInvariant::FailureEnvelopeBounded,
     ];
     let failure_envelope = failure_envelope(&plans);
-    let digest_material = serde_json::to_vec(&(
-        EGRESS_BEHAVIOR_CONTRACT_SCHEMA_VERSION,
+    let contract_digest = contract_digest(
         contract_revision,
         &node,
         &plans,
         &verified_invariants,
         &failure_envelope,
-    ))
-    .map_err(|error| EgressContractError::CanonicalEncoding(error.to_string()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"unf.egress-behavior-contract.v1\0");
-    hasher.update(digest_material);
-    let contract_digest = EgressContractDigest(hasher.finalize().into());
+    )?;
     Ok(EgressBehaviorContract {
         schema_version: EGRESS_BEHAVIOR_CONTRACT_SCHEMA_VERSION,
         contract_revision,
@@ -395,6 +419,28 @@ fn compile_contract(
         failure_envelope,
         contract_digest,
     })
+}
+
+fn contract_digest(
+    contract_revision: Revision,
+    node: &EgressNode,
+    plans: &[EgressBehaviorPlan],
+    verified_invariants: &[EgressInvariant],
+    failure_envelope: &EgressFailureEnvelope,
+) -> Result<EgressContractDigest, EgressContractError> {
+    let digest_material = serde_json::to_vec(&(
+        EGRESS_BEHAVIOR_CONTRACT_SCHEMA_VERSION,
+        contract_revision,
+        node,
+        plans,
+        verified_invariants,
+        failure_envelope,
+    ))
+    .map_err(|error| EgressContractError::CanonicalEncoding(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"unf.egress-behavior-contract.v1\0");
+    hasher.update(digest_material);
+    Ok(EgressContractDigest(hasher.finalize().into()))
 }
 
 fn compile_plan(

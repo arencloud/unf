@@ -624,8 +624,14 @@ matrix is maintained in the
   gateway/readiness and reachability provider acknowledgements fence epochs and
   revisions, retain addresses through safe withdrawal, and gate contract/status
   publication; `make egress-allocation-test`; ADR 0116.
-- Milestone 8.4 implements authenticated transactional distribution and gateway
-  host state.
+- Milestone 8.4 is verified. Schema-v1 projections bind the existing
+  authenticated Pod/Node principal, negotiate exact schemas/capabilities, and
+  require independent contract replay before an admitted-only compiler can
+  create isolated userspace ABI-v1 gateway host state. Two-bank
+  stage/readback/prepare/activate, last-known-good rollback, current/pending
+  crash repair, cold reconstruction, strict checkpoints, and version-scoped
+  cleanup pass `make egress-host-state-test`; ADR 0117. Live endpoint/storage
+  integration and packet behavior begin in milestone 8.5.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

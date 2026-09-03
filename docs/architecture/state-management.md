@@ -182,3 +182,14 @@ orchestrator retry. See ADRs 0016 through 0030.
 Kubernetes watches remain the controller input. Internal HTTPS snapshots are the
 smallest Phase 2 distribution mechanism; gRPC will not be added until measured
 scale or streaming requirements justify it.
+
+Phase 8 egress host state has an independent schema-v1/ABI-v1 userspace
+transaction. An exact-Node response is bound to the existing Pod-bound
+authentication result and negotiated capabilities, then independently replayed
+before it can become an admitted projection. The agent-facing store contract
+stages and reads back an inactive complete-contract bank, persists and reads
+back a pending checkpoint, switches one pointer, commits, and only then retires
+the previous bank. Startup commits a prepared winner or retains/reconstructs
+the current winner solely from pointer plus current/pending evidence; ambiguity
+fails closed. This state is intentionally separate from persistent BPF ABI v11
+until Phase 8.5 supplies a packet-consumed fixed-width layout; ADR 0117.
