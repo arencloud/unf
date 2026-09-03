@@ -18,7 +18,10 @@ use aya_ebpf::programs::TcContext;
 use unf_common::{BackendId, IdentityId, PolicyId, PolicyReason, RuleId, ServiceId, Verdict};
 use unf_ebpf_common::{
     AddressFamily, ConnectionKey, ConnectionState, Direction, EgressIpv4PolicyMapKey,
-    EgressIpv6PolicyMapData, FLOW_ABI_VERSION, FlowEvent, IDENTITY_BANK_COUNT,
+    EgressIpv6PolicyMapData, EgressAddressValue, EgressCandidateKey, EgressConnectionKey,
+    EgressConnectionValue, EgressGatewayValue, EgressMapConfig, EgressSelectionKey,
+    EgressSelectionValue, EgressSourceKey, EgressSourceValue, FLOW_ABI_VERSION, FlowEvent,
+    IDENTITY_BANK_COUNT,
     IDENTITY_MAP_ABI_VERSION, IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT,
     IPV6_NEXT_HEADER_HOP_BY_HOP, IdentityMapConfig, IdentityMapValue, Ipv4IdentityKey,
     Ipv4LoadBalancerFrontendKey, Ipv4NodePortFrontendKey, Ipv4PolicyMapKey,
@@ -77,6 +80,11 @@ const SERVICE_FRONTEND_CAPACITY: u32 = 262_144;
 const SERVICE_BACKEND_CAPACITY: u32 = 524_288;
 const SERVICE_BACKEND_SLOT_CAPACITY: u32 = 1_048_576;
 const SERVICE_CONNECTION_CAPACITY: u32 = 262_144;
+const EGRESS_SOURCE_CAPACITY: u32 = 131_072;
+const EGRESS_ADDRESS_CAPACITY: u32 = 131_072;
+const EGRESS_GATEWAY_CAPACITY: u32 = 262_144;
+const EGRESS_SELECTION_CAPACITY: u32 = 4_112_384;
+const EGRESS_CONNECTION_CAPACITY: u32 = 262_144;
 const SERVICE_FRONTEND_SELECTION_MISS: u8 = 0;
 const SERVICE_FRONTEND_SELECTION_DROP: u8 = u8::MAX;
 const IPV4_HEADER_CHECKSUM_OFFSET: usize = ETHERNET_HEADER_LEN + 10;
@@ -139,6 +147,34 @@ static POLICY_DIRECTION_DECISION_SCRATCH: PerCpuArray<DataplaneDecision> =
 #[map]
 static CONNECTIONS: LruHashMap<ConnectionKey, ConnectionState> =
     LruHashMap::with_max_entries(CONNECTION_CAPACITY, 0);
+
+/// Phase 8.5 egress state is independently banked. The packet path does not
+/// consume it until the source-steering gate is implemented; declaring and
+/// pinning it now gives userspace one exact, recoverable transaction boundary.
+#[map]
+static EGRESS_SOURCES: HashMap<EgressSourceKey, EgressSourceValue> =
+    HashMap::with_max_entries(EGRESS_SOURCE_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static EGRESS_ADDRESSES: HashMap<EgressCandidateKey, EgressAddressValue> =
+    HashMap::with_max_entries(EGRESS_ADDRESS_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static EGRESS_GATEWAYS: HashMap<EgressCandidateKey, EgressGatewayValue> =
+    HashMap::with_max_entries(EGRESS_GATEWAY_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static EGRESS_SELECTIONS: HashMap<EgressSelectionKey, EgressSelectionValue> =
+    HashMap::with_max_entries(EGRESS_SELECTION_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static EGRESS_CONFIG: Array<EgressMapConfig> = Array::with_max_entries(1, 0);
+
+/// Runtime flow ownership is pinned so an agent-only restart cannot erase NAT
+/// state. Packet insertion and validation arrive with the steering/NAT gate.
+#[map]
+static EGRESS_CONNECTIONS: LruHashMap<EgressConnectionKey, EgressConnectionValue> =
+    LruHashMap::with_max_entries(EGRESS_CONNECTION_CAPACITY, 0);
 
 #[map]
 static IDENTITY_V4: HashMap<Ipv4IdentityKey, IdentityMapValue> =

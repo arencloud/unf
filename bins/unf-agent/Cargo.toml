@@ -24,6 +24,7 @@ tracing-subscriber.workspace = true
 unf-common = { path = "../../crates/unf-common" }
 unf-cni-state = { path = "../../crates/unf-cni-state" }
 unf-ebpf-common = { path = "../../ebpf/unf-ebpf-common" }
+unf-egress = { path = "../../crates/unf-egress" }
 unf-ipam = { path = "../../crates/unf-ipam" }
 unf-loadbalancer = { path = "../../crates/unf-loadbalancer" }
 unf-route = { path = "../../crates/unf-route" }

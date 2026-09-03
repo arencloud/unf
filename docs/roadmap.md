@@ -645,7 +645,12 @@ matrix is maintained in the
   and lowers identity admission plus shared per-intent address, primary/
   standby, 251-bucket rendezvous, connection, and event state into asserted
   fixed-width ABI-v1 layouts. Proof and table selection are identical under
-  `make egress-dataplane-contract-test`; ADR 0119. Live maps and TC NAT remain.
+  `make egress-dataplane-contract-test`; ADR 0119. The next verified slice moves
+  persistent state to exact 31-pin ABI v12: the agent owns four banked tables,
+  one activation pointer, and the connection LRU, with inactive readback,
+  capacity rollback, pointer-authoritative recovery, and historical-v11 cleanup
+  separation proven by `make egress-dataplane-map-test`; ADR 0120. Live
+  endpoints and TC steering/NAT remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

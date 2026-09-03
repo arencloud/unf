@@ -557,10 +557,10 @@ for node in "${nodes[@]}"; do
     [[ $("${kc[@]}" -n unf-system get pod "$(agent_pod_on_node "${node}")" -o jsonpath='{.spec.containers[0].image}') == "${agent_image}" ]]
     host_check=$(host_exec "${node}" '
         test "$(getenforce)" = Enforcing
-        test -d /sys/fs/bpf/unf/v11
-        test -e /sys/fs/bpf/unf/v11/NODE_PORT_CONFIG
-        test -e /sys/fs/bpf/unf/v11/NODE_PORT_FRONTENDS_V4
-        test -e /sys/fs/bpf/unf/v11/NODE_PORT_FRONTENDS_V6
+        test -d /sys/fs/bpf/unf/v12
+        test -e /sys/fs/bpf/unf/v12/NODE_PORT_CONFIG
+        test -e /sys/fs/bpf/unf/v12/NODE_PORT_FRONTENDS_V4
+        test -e /sys/fs/bpf/unf/v12/NODE_PORT_FRONTENDS_V6
         for key in all default; do
             test "$(cat /proc/sys/net/ipv4/conf/${key}/rp_filter)" -eq 0
             test "$(cat /proc/sys/net/ipv4/conf/${key}/accept_local)" -eq 1
@@ -979,8 +979,8 @@ spec:
       command: [sh, -ec]
       args:
         - |
-          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v11/NODE_PORT_FRONTENDS_V4 | jq length)" -eq 0
-          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v11/NODE_PORT_FRONTENDS_V6 | jq length)" -eq 0
+          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v12/NODE_PORT_FRONTENDS_V4 | jq length)" -eq 0
+          test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v12/NODE_PORT_FRONTENDS_V6 | jq length)" -eq 0
           snapshot=/var/lib/unf/cni/v1/service-snapshot.json
           jq -e '.schemaVersion == 1 and has("service") == false and (.services | all(.nodePorts | length == 0))' "\$snapshot" >/dev/null
           echo nodeport-state-empty
@@ -1039,9 +1039,9 @@ for node in "${nodes[@]}"; do
     fi
     host_check=$(host_exec "${node}" '
         test ! -e /sys/fs/bpf/unf/v4
-        test -d /sys/fs/bpf/unf/v11
-        test -e /sys/fs/bpf/unf/v11/SERVICE_CONFIG
-        test -e /sys/fs/bpf/unf/v11/NODE_PORT_CONFIG
+        test -d /sys/fs/bpf/unf/v12
+        test -e /sys/fs/bpf/unf/v12/SERVICE_CONFIG
+        test -e /sys/fs/bpf/unf/v12/NODE_PORT_CONFIG
         echo abi-retired
     ' 2>&1)
     grep -q '^abi-retired$' <<<"${host_check}"

@@ -108,18 +108,18 @@ compile N+1 -> populate all staging maps -> read back and validate
 Existing applied state must remain usable if the controller or Kubernetes API is
 temporarily unavailable. New identity, policy, and service state never partially
 overwrites active maps; each prior bank remains selected through any pre-switch
-failure. Twenty-five maps are pinned under the `/sys/fs/bpf/unf/v11` ABI directory,
+failure. Thirty-one maps are pinned under the `/sys/fs/bpf/unf/v12` ABI directory,
 reopened with strict all-or-none validation, and reconstructed into userspace
-caches after restart. ABI v4, v5, v6–v8, and v9 remain explicitly recognized as
-18-map, 21-map, 24-map, and 25-map cleanup boundaries; none is interpreted as
-partial v11 state. ABI v10 remains a separately recognized 25-map historical
-boundary and is never adopted as current state. The active service, NodePort,
+caches after restart. ABI v4, v5, v6–v8, and v9–v11 remain explicitly recognized
+as 18-map, 21-map, 24-map, and 25-map cleanup boundaries; none is interpreted as
+partial v12 state. These historical boundaries are never adopted as current
+state. The active service, NodePort,
 and LoadBalancer banks must exactly recompile from
 their owner-only durable checkpoints. A Service checkpoint retains the current
 schema whenever LoadBalancer intent is present; rollback-compatible legacy
 projection is limited to state with no NodePort or LoadBalancer intent.
 LoadBalancer source-range LPM tries are
-runtime-only maps outside that exact 25-map persistent set; the agent rebuilds
+runtime-only maps outside that exact 31-map persistent set; the agent rebuilds
 and reads them back from the same authenticated active Service/reachability
 tuple before attaching TC. A crash between the service and NodePort
 activation pointers restores the prior
@@ -191,8 +191,10 @@ stages and reads back an inactive complete-contract bank, persists and reads
 back a pending checkpoint, switches one pointer, commits, and only then retires
 the previous bank. Startup commits a prepared winner or retains/reconstructs
 the current winner solely from pointer plus current/pending evidence; ambiguity
-fails closed. This state is intentionally separate from persistent BPF ABI v11
-until Phase 8.5 supplies a packet-consumed fixed-width layout; ADR 0117.
+fails closed. This userspace host checkpoint remains distinct from persistent
+BPF ABI v12; Phase 8.5 lowers it into independently versioned fixed-width ABI-v1
+kernel banks without treating either representation as interchangeable; ADRs
+0117 and 0120.
 
 Phase 8.4a adds an identity-indexed egress admission state machine outside the
 packet ABI. Explicit intent is installed as `Fenced` before it can become
@@ -211,5 +213,7 @@ shared intent index; this avoids multiplying candidates for every selected
 workload. Path certificates must form one coherent path revision and unused,
 foreign, missing, or duplicate evidence is rejected. Connection and event
 layouts reserve exact original/translated tuples plus primary/standby proof
-provenance. These types and the pure compiler do not yet create persistent maps;
-transactional agent ownership is the next Phase 8.5 gate. See ADR 0119.
+provenance. Persistent ABI v12 now owns these tables. The agent explicitly
+encodes, stages, reads back, activates, reconstructs, and garbage-collects them
+as one pointer-selected transaction; live distribution and packet consumption
+remain separate Phase 8.5 gates. See ADRs 0119–0120.

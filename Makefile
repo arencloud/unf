@@ -83,6 +83,10 @@ egress-dataplane-contract-test: egress-proof-test
 	cargo test -p unf-egress dataplane
 	cargo clippy -p unf-ebpf-common -p unf-egress --all-targets --all-features -- -D warnings
 
+egress-dataplane-map-test: egress-dataplane-contract-test
+	hack/verify-egress-map-transaction.sh
+	cargo clippy -p unf-agent -p unf-ebpf-common -p unf-egress --all-targets --all-features -- -D warnings
+
 test:
 	cargo test --workspace
 

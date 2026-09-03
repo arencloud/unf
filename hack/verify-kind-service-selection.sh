@@ -589,9 +589,9 @@ for replacement_node in "${client_node}" "${remote_node}"; do
         checkpoint=/var/lib/unf/cni/v1/service-snapshot.json.selection
         test -f "$checkpoint" && test "$(stat -c %a "$checkpoint")" = 600
         jq -e ".schemaVersion == 1 and .contract.schemaVersion == 1 and .contract.contractRevision > 0 and (.contract.contractDigest | length) == 64" "$checkpoint" >/dev/null
-        test -e /sys/fs/bpf/unf/v11/SERVICE_CONFIG
-        test -e /sys/fs/bpf/unf/v11/SERVICE_AFFINITY
-        test -e /sys/fs/bpf/unf/v11/SERVICE_BACKEND_SLOTS
+        test -e /sys/fs/bpf/unf/v12/SERVICE_CONFIG
+        test -e /sys/fs/bpf/unf/v12/SERVICE_AFFINITY
+        test -e /sys/fs/bpf/unf/v12/SERVICE_BACKEND_SLOTS
     '
     tcp_probe "${selection_v4}"
 done

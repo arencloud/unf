@@ -2957,6 +2957,7 @@ dependencies = [
  "unf-cni-state",
  "unf-common",
  "unf-ebpf-common",
+ "unf-egress",
  "unf-ipam",
  "unf-loadbalancer",
  "unf-route",
