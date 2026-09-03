@@ -13,8 +13,9 @@ use thiserror::Error;
 use unf_common::{IdentityId, Revision};
 use unf_ebpf_common::{
     AddressFamily as BpfAddressFamily, EGRESS_ADMISSION_ACTIVE, EGRESS_ADMISSION_FENCED,
-    EGRESS_BANK_COUNT, EGRESS_MAP_ABI_VERSION, EGRESS_PATH_DIRECT_NEIGHBOR, EGRESS_PATH_TUNNEL,
-    EGRESS_SELECTION_FLAG_STANDBY, EGRESS_SELECTION_TABLE_SIZE, EGRESS_SOURCE_FLAG_IPV4,
+    EGRESS_BANK_COUNT, EGRESS_CONFIG_FLAG_GATEWAY_NAT, EGRESS_MAP_ABI_VERSION,
+    EGRESS_PATH_DIRECT_NEIGHBOR, EGRESS_PATH_TUNNEL, EGRESS_SELECTION_FLAG_STANDBY,
+    EGRESS_SELECTION_TABLE_SIZE, EGRESS_SOURCE_FLAG_GATEWAY_NAT, EGRESS_SOURCE_FLAG_IPV4,
     EGRESS_SOURCE_FLAG_IPV6, EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY, EgressAddressValue,
     EgressCandidateKey, EgressDestinationValue, EgressGatewayValue, EgressIpv4DestinationData,
     EgressIpv6DestinationData, EgressMapConfig, EgressSelectionKey, EgressSelectionValue,
@@ -22,9 +23,9 @@ use unf_ebpf_common::{
 };
 
 use crate::{
-    AddressFamily, EgressAdmissionDecision, EgressAdmissionGuard, EgressBehaviorPlan,
-    EgressDestinations, EgressGatewayHostBank, EgressNode, MAX_EGRESS_CONTRACT_PLANS,
-    MAX_EGRESS_GATEWAYS_PER_PLAN, MAX_EGRESS_INTENTS, select_bucket,
+    AddressFamily, AdmittedEgressGatewayProjection, EgressAdmissionDecision, EgressAdmissionGuard,
+    EgressBehaviorPlan, EgressDestinations, EgressGatewayHostBank, EgressNode,
+    MAX_EGRESS_CONTRACT_PLANS, MAX_EGRESS_GATEWAYS_PER_PLAN, MAX_EGRESS_INTENTS, select_bucket,
 };
 
 pub const EGRESS_PATH_CERTIFICATE_SCHEMA_VERSION: u16 = 1;
@@ -411,6 +412,282 @@ pub fn compile_egress_dataplane(
     Ok(state)
 }
 
+/// Lowers one admitted selected-gateway projection into a heterogeneous,
+/// identity-keyed NAT bank. Unlike a source bank, every source may carry a
+/// different contract revision; the source identity is therefore also the
+/// candidate/selection namespace and no contract can alias another.
+///
+/// # Errors
+///
+/// Rejects an invalid bank, duplicate or zero identity, missing local gateway,
+/// malformed allocation, or a capacity/index overflow.
+#[allow(clippy::too_many_lines)]
+pub fn compile_egress_gateway_dataplane(
+    admitted: &AdmittedEgressGatewayProjection,
+    bank: u8,
+) -> Result<EgressDataplaneState, EgressDataplaneError> {
+    if bank >= EGRESS_BANK_COUNT {
+        return Err(EgressDataplaneError::InvalidBank(bank));
+    }
+    let projection = admitted.projection();
+    let mut state = EgressDataplaneState {
+        config: EgressMapConfig {
+            controller_epoch: projection.controller_epoch,
+            projection_revision: projection.revision.get(),
+            contract_revision: 0,
+            path_revision: 0,
+            source_count: 0,
+            address_count: 0,
+            gateway_count: 0,
+            selection_count: 0,
+            schema_version: EGRESS_MAP_ABI_VERSION,
+            active_bank: bank,
+            flags: EGRESS_CONFIG_FLAG_GATEWAY_NAT,
+            destination_count: 0,
+        },
+        sources: Vec::new(),
+        ipv4_destinations: Vec::new(),
+        ipv6_destinations: Vec::new(),
+        addresses: Vec::new(),
+        gateways: Vec::new(),
+        selections: Vec::new(),
+    };
+    let mut identities = BTreeSet::new();
+    for contract in &projection.source_contracts {
+        for plan in &contract.plans {
+            let Some((local_index, _)) = plan.gateways.iter().enumerate().find(|(_, candidate)| {
+                candidate.node == projection.gateway
+                    && candidate.ready
+                    && candidate.reachable
+                    && candidate.lease_epoch == plan.allocation.lease_epoch
+            }) else {
+                continue;
+            };
+            let identity = plan.source.identity;
+            if identity.get() == 0 || !identities.insert(identity) {
+                return Err(EgressDataplaneError::InvalidHostBank);
+            }
+            let local_index =
+                u16::try_from(local_index).map_err(|_| EgressDataplaneError::CandidateIndex)?;
+            let namespace = identity.get();
+            let intent_digest = digest16(b"unf.egress-intent.v1\0", plan.intent.uid.as_bytes());
+            let mut reserved = [0; 4];
+            reserved[..2].copy_from_slice(&local_index.to_ne_bytes());
+            state.sources.push((
+                EgressSourceKey {
+                    source_identity: identity,
+                    bank,
+                    reserved: [0; 3],
+                },
+                EgressSourceValue {
+                    lease_epoch: plan.allocation.lease_epoch,
+                    contract_revision: contract.contract_revision.get(),
+                    intent_revision: plan.revisions.intent.get(),
+                    identity_revision: plan.revisions.identity.get(),
+                    policy_revision: plan.revisions.policy.get(),
+                    allocation_revision: plan.revisions.allocation.get(),
+                    gateway_revision: plan.revisions.gateway.get(),
+                    reachability_revision: plan.revisions.reachability.get(),
+                    contract_digest: contract.contract_digest.0,
+                    intent_digest,
+                    intent_index: namespace,
+                    address_count: u16::try_from(plan.allocation.addresses.len())
+                        .map_err(|_| EgressDataplaneError::CandidateIndex)?,
+                    gateway_count: u16::try_from(plan.gateways.len())
+                        .map_err(|_| EgressDataplaneError::CandidateIndex)?,
+                    schema_version: EGRESS_MAP_ABI_VERSION,
+                    admission: EGRESS_ADMISSION_ACTIVE,
+                    flags: family_flags(plan, has_standby(plan)) | EGRESS_SOURCE_FLAG_GATEWAY_NAT,
+                    reserved,
+                },
+            ));
+            compile_gateway_destinations(
+                &mut state,
+                plan,
+                namespace,
+                bank,
+                contract.contract_revision.get(),
+                intent_digest,
+            )?;
+            for (index, address) in plan.allocation.addresses.iter().enumerate() {
+                let index =
+                    u16::try_from(index).map_err(|_| EgressDataplaneError::CandidateIndex)?;
+                state.addresses.push((
+                    candidate_key(namespace, index, family(*address), bank),
+                    EgressAddressValue {
+                        lease_epoch: plan.allocation.lease_epoch,
+                        contract_revision: contract.contract_revision.get(),
+                        address: address_bytes(*address),
+                        candidate_witness: candidate_witness(
+                            b"unf.egress-address-candidate.v1\0",
+                            &contract.contract_digest.0,
+                            plan.intent.uid.as_bytes(),
+                            index,
+                            &address_bytes(*address),
+                        ),
+                        schema_version: EGRESS_MAP_ABI_VERSION,
+                        flags: 0,
+                        reserved: [0; 4],
+                    },
+                ));
+            }
+            for address_family in present_families(plan) {
+                for (gateway_index, gateway) in plan.gateways.iter().enumerate() {
+                    let gateway_index = u16::try_from(gateway_index)
+                        .map_err(|_| EgressDataplaneError::CandidateIndex)?;
+                    state.gateways.push((
+                        candidate_key(namespace, gateway_index, address_family, bank),
+                        EgressGatewayValue {
+                            lease_epoch: plan.allocation.lease_epoch,
+                            contract_revision: contract.contract_revision.get(),
+                            path_revision: plan.revisions.reachability.get(),
+                            transport_address: [0; 16],
+                            next_hop_address: [0; 16],
+                            gateway_digest: digest16(
+                                b"unf.egress-gateway.v1\0",
+                                gateway.node.uid.as_bytes(),
+                            ),
+                            output_interface: 0,
+                            mtu: 0,
+                            schema_version: EGRESS_MAP_ABI_VERSION,
+                            path_mode: 0,
+                            flags: 0,
+                            reserved: [0; 4],
+                        },
+                    ));
+                }
+                for bucket in 0..EGRESS_SELECTION_TABLE_SIZE {
+                    let selected = select_bucket(plan, address_family, bucket)
+                        .map_err(|_| EgressDataplaneError::Selection)?;
+                    let address_index = u16::try_from(selected.address_index)
+                        .map_err(|_| EgressDataplaneError::CandidateIndex)?;
+                    let primary_gateway_index = u16::try_from(selected.primary_gateway_index)
+                        .map_err(|_| EgressDataplaneError::CandidateIndex)?;
+                    let standby_gateway_index = selected
+                        .standby_gateway_index
+                        .map(u16::try_from)
+                        .transpose()
+                        .map_err(|_| EgressDataplaneError::CandidateIndex)?;
+                    let flags = if standby_gateway_index.is_some() {
+                        EGRESS_SELECTION_FLAG_STANDBY
+                    } else {
+                        0
+                    };
+                    let standby = standby_gateway_index.unwrap_or(primary_gateway_index);
+                    state.selections.push((
+                        EgressSelectionKey {
+                            intent_index: namespace,
+                            bucket,
+                            address_family: family_abi(address_family),
+                            bank,
+                        },
+                        EgressSelectionValue {
+                            selection_witness: selection_witness(
+                                &contract.contract_digest.0,
+                                &plan.intent.uid,
+                                address_family,
+                                bucket,
+                                address_index,
+                                primary_gateway_index,
+                                standby,
+                            ),
+                            address_index,
+                            primary_gateway_index,
+                            standby_gateway_index: standby,
+                            schema_version: EGRESS_MAP_ABI_VERSION,
+                            flags,
+                            reserved: [0; 6],
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    state.config.source_count = count("gateway sources", state.sources.len())?;
+    state.config.address_count = count("gateway addresses", state.addresses.len())?;
+    state.config.gateway_count = count("local gateways", state.gateways.len())?;
+    state.config.selection_count = count("gateway selections", state.selections.len())?;
+    state.config.destination_count = count(
+        "gateway destinations",
+        state.ipv4_destinations.len() + state.ipv6_destinations.len(),
+    )?;
+    if state.selections.len() > MAX_EGRESS_DATAPLANE_SELECTIONS {
+        return Err(EgressDataplaneError::Capacity { kind: "selections" });
+    }
+    Ok(state)
+}
+
+fn compile_gateway_destinations(
+    state: &mut EgressDataplaneState,
+    plan: &EgressBehaviorPlan,
+    namespace: u32,
+    bank: u8,
+    contract_revision: u64,
+    intent_digest: [u8; 16],
+) -> Result<(), EgressDataplaneError> {
+    let value = EgressDestinationValue {
+        contract_revision,
+        intent_digest,
+        schema_version: EGRESS_MAP_ABI_VERSION,
+        flags: 0,
+        reserved: [0; 4],
+    };
+    let networks = match &plan.destinations {
+        EgressDestinations::Any => {
+            state.ipv4_destinations.push((
+                0,
+                EgressIpv4DestinationData {
+                    intent_index: namespace,
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: [0; 4],
+                },
+                value,
+            ));
+            state.ipv6_destinations.push((
+                0,
+                EgressIpv6DestinationData {
+                    intent_index: namespace,
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: [0; 16],
+                },
+                value,
+            ));
+            return Ok(());
+        }
+        EgressDestinations::Networks(networks) => networks,
+    };
+    for prefix in networks {
+        if !prefix.is_canonical() {
+            return Err(EgressDataplaneError::InvalidHostBank);
+        }
+        match prefix.address {
+            IpAddr::V4(address) => state.ipv4_destinations.push((
+                u32::from(prefix.prefix_len),
+                EgressIpv4DestinationData {
+                    intent_index: namespace,
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: address.octets(),
+                },
+                value,
+            )),
+            IpAddr::V6(address) => state.ipv6_destinations.push((
+                u32::from(prefix.prefix_len),
+                EgressIpv6DestinationData {
+                    intent_index: namespace,
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: address.octets(),
+                },
+                value,
+            )),
+        }
+    }
+    Ok(())
+}
+
 fn compile_intent_destinations(
     state: &mut EgressDataplaneState,
     host: &EgressGatewayHostBank,
@@ -781,7 +1058,7 @@ mod tests {
     use crate::distribution::test_support::{advertisement, fixture, node, principal};
     use crate::{
         AdmittedEgressProjection, EGRESS_PROTOCOL_TCP, EgressBehaviorContract, EgressFlowProof,
-        EgressGatewayFact, EgressNodeProjection, EgressOriginalFlow,
+        EgressGatewayFact, EgressGatewayProjection, EgressNodeProjection, EgressOriginalFlow,
     };
 
     fn ip(value: &str) -> IpAddr {
@@ -844,6 +1121,46 @@ mod tests {
         .expect("source projection")
         .admit(&principal("worker-a"), &advertisement(), &model, &facts)
         .expect("admitted source")
+    }
+
+    #[test]
+    fn gateway_nat_bank_is_identity_namespaced_and_heterogeneous() {
+        let source = two_source_projection();
+        let gateway_principal = principal("gateway-a");
+        let admitted = EgressGatewayProjection::issue(
+            &gateway_principal,
+            &advertisement(),
+            10,
+            Revision::new(9),
+            &[source],
+        )
+        .expect("gateway projection")
+        .admit(&gateway_principal, &advertisement())
+        .expect("admitted gateway projection");
+        let state = compile_egress_gateway_dataplane(&admitted, 1).expect("gateway NAT bank");
+        assert_eq!(
+            state.config.flags,
+            unf_ebpf_common::EGRESS_CONFIG_FLAG_GATEWAY_NAT
+        );
+        assert_eq!(state.config.contract_revision, 0);
+        assert_eq!(state.config.path_revision, 0);
+        assert_eq!(state.sources.len(), 2);
+        assert_eq!(state.ipv4_destinations.len(), 2);
+        assert_eq!(state.ipv6_destinations.len(), 2);
+        for (key, value) in &state.sources {
+            assert_eq!(value.intent_index, key.source_identity.get());
+            assert_ne!(
+                value.flags & unf_ebpf_common::EGRESS_SOURCE_FLAG_GATEWAY_NAT,
+                0
+            );
+            assert_eq!(key.bank, 1);
+        }
+        let namespaces = state
+            .selections
+            .iter()
+            .map(|(key, _)| key.intent_index)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(namespaces, BTreeSet::from([42, 43]));
     }
 
     fn guard(projection: &AdmittedEgressProjection, active: bool) -> EgressAdmissionGuard {

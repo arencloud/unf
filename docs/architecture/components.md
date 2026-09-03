@@ -111,7 +111,9 @@ gateway is their exact ready/reachable lease-fenced candidate. Source-local path
 certificates bind route, interface, next hop, transport, MTU, mode, revision,
 and lease before a pure compiler can emit fixed-width state. Candidate
 and 251-bucket primary/pre-certified-standby selection tables are shared per
-intent rather than duplicated per identity. Persistent ABI v13 owns those maps,
+intent rather than duplicated per identity. Persistent ABI v14 owns those maps,
+dedicated identity-namespaced gateway-NAT banks, and collision-safe connection
+state,
 and the authenticated live source endpoint now transports complete replay
 material to exact-Node agents. Agents stage only fail-closed source fences until
 path and packet readiness exist. Structural native EgressPool/EgressPolicy

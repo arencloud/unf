@@ -385,8 +385,8 @@ intent and drain state with observation-weighted revision history, while
 load-balancer-simulate` return
 the digest-bound per-Node eligibility plan without mutating state or guessing
 private connection/affinity entries. That gate used ABI v11; current egress map
-ownership now uses the all-or-none persistent ABI v13 boundary; v12 remains a
-recognized historical cleanup scope.
+ownership now uses the all-or-none persistent ABI v14 boundary; v13 remains a
+recognized historical 33-map cleanup scope.
 Milestone 7.9 is verified. Runtime/qualifier `06fc937` passed the 463-second
 three-Node Kubernetes v1.35.0 dual-stack gate with kube-proxy absent.
 Real traffic proved strict SameNode/SameZone/Cluster fallback, ClientIP
@@ -441,10 +441,11 @@ candidate, selection, connection, and event state. Userspace compiles 251
 rendezvous buckets shared per intent, including a pre-certified standby by
 default when two gateways exist; packets will need only one stable hash and map
 lookup. The contract gate passes `make egress-dataplane-contract-test`; ADR
-0119. Persistent ABI v13 now owns and transactionally recovers the source,
-destination, candidate and selection banks, atomic config pointer, and future
-connection LRU; capacity rollback is proven on real kernel maps while v12
-remains a historical exact cleanup boundary (ADRs 0120 and 0126). The internal
+0119. Persistent ABI v14 now owns and transactionally recovers the source,
+destination, candidate and selection banks, atomic source and aggregate gateway
+pointers, dedicated heterogeneous gateway-NAT banks, and connection LRU;
+capacity rollback is proven on real kernel maps while v13 remains a historical
+exact 33-map cleanup boundary (ADRs 0120, 0126, and 0129). The internal
 TLS API now distributes a
 self-contained source envelope only after Pod-bound TokenReview authentication
 and authoritative Node-UID binding. The agent independently replays it and
@@ -493,9 +494,17 @@ readback, and an exact all-selected-Node acknowledgement quorum prevent
 split-brain readiness. Withdrawal enters explicit quarantine: address and
 allocator ownership remain fenced until future source-fence and reachability
 proof authorizes release, never because a timer expired. The isolated
-real-kernel gate passes `make egress-gateway-address-test`; ADR 0128. Same-Node
-gateway activation, gateway NAT/reverse state, release-barrier completion, and
-platform dual-stack traffic are next.
+real-kernel gate passes `make egress-gateway-address-test`; ADR 0128. Gateway
+NAT now uses source-identity-namespaced heterogeneous banks and validates the
+exact contract, lease, destination, local-primary gateway, digest, and proof
+witness before creating TCP/UDP state. A proof-salted odd-stride full-cycle
+ephemeral-port permutation supplies 32 bounded candidates; reverse-first then
+forward `BPF_NOEXIST` insertion never overwrites a colliding flow. Established
+state survives projection churn until protocol timeout, and family-specific
+tail programs perform checksum-safe IPv4/IPv6 SNAT and exact reverse restore.
+Privileged restart, packet, collision, and first-flow-preservation evidence
+passes `make egress-gateway-nat-test`; ADR 0129. Release-barrier completion,
+NAT events, HA failover, and platform dual-stack traffic are next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

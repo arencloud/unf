@@ -22,7 +22,8 @@ use unf_ebpf_common::{
     EgressConnectionValue, EgressDestinationValue, EgressGatewayValue,
     EgressIpv4DestinationData, EgressIpv6DestinationData, EgressMapConfig, EgressSelectionKey,
     EgressSelectionValue, EgressSourceKey, EgressSourceValue, EGRESS_ADMISSION_ACTIVE,
-    EGRESS_ADMISSION_FENCED, EGRESS_BANK_COUNT, EGRESS_MAP_ABI_VERSION,
+    EGRESS_ADMISSION_FENCED, EGRESS_BANK_COUNT, EGRESS_CONFIG_FLAG_GATEWAY_NAT,
+    EGRESS_MAP_ABI_VERSION,
     EGRESS_PATH_DIRECT_NEIGHBOR, FLOW_ABI_VERSION, FlowEvent,
     IDENTITY_BANK_COUNT,
     IDENTITY_MAP_ABI_VERSION, IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT,
@@ -67,7 +68,8 @@ use unf_ebpf_common::{
     ServiceBackendSlotKey, ServiceBackendSlotValue, ServiceConnectionKey, ServiceConnectionValue,
     ServiceEvent, ServiceFrontendValue, ServiceMapConfig, connection_is_active,
     ipv6_extension_step, node_port_snat_candidate,
-    egress_selection_bucket, packet_starts_connection, service_backend_is_eligible,
+    egress_connection_is_active, egress_flow_hash, egress_selection_bucket,
+    egress_snat_candidate, packet_starts_connection, service_backend_is_eligible,
     service_connection_is_active, service_flow_hash, service_selection_tier_is_valid,
 };
 
@@ -100,8 +102,11 @@ const SERVICE_POLICY_TAIL_V4: u32 = 0;
 const SERVICE_POLICY_TAIL_V6: u32 = 1;
 const SERVICE_DSR_TAIL_V4: u32 = 2;
 const SERVICE_DSR_TAIL_V6: u32 = 3;
+const EGRESS_GATEWAY_TAIL_V4: u32 = 4;
+const EGRESS_GATEWAY_TAIL_V6: u32 = 5;
 const SERVICE_POLICY_DISPATCH_V4: i32 = -1_001;
 const SERVICE_POLICY_DISPATCH_V6: i32 = -1_002;
+const EGRESS_GATEWAY_NOT_OWNED: i32 = -1_003;
 const SERVICE_POST_LOOKUP_TRANSLATED: u8 = 1 << 0;
 const SERVICE_POST_LOOKUP_REROUTE_HOST: u8 = 1 << 1;
 // A DSR redirect preserves the frontend tuple. Reserve one skb mark bit so a
@@ -148,6 +153,10 @@ static POLICY_DIRECTION_DECISION_SCRATCH: PerCpuArray<DataplaneDecision> =
 
 #[map]
 static EGRESS_CONNECTION_KEY_SCRATCH: PerCpuArray<EgressConnectionKey> =
+    PerCpuArray::with_max_entries(2, 0);
+
+#[map]
+static EGRESS_CONNECTION_VALUE_SCRATCH: PerCpuArray<EgressConnectionValue> =
     PerCpuArray::with_max_entries(1, 0);
 
 #[derive(Clone, Copy)]
@@ -199,6 +208,36 @@ static EGRESS_SELECTIONS: HashMap<EgressSelectionKey, EgressSelectionValue> =
 
 #[map]
 static EGRESS_CONFIG: Array<EgressMapConfig> = Array::with_max_entries(1, 0);
+
+/// A gateway serves independently revisioned source contracts, so these maps
+/// cannot share the source-local bank/config namespace above. Candidate and
+/// selection indexes are scoped by source identity to prevent aliasing.
+#[map]
+static EGRESS_GATEWAY_NAT_SOURCES: HashMap<EgressSourceKey, EgressSourceValue> =
+    HashMap::with_max_entries(EGRESS_SOURCE_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static EGRESS_GATEWAY_NAT_DESTINATIONS_V4: LpmTrie<EgressIpv4DestinationData, EgressDestinationValue> =
+    LpmTrie::with_max_entries(EGRESS_DESTINATION_CAPACITY, 0);
+
+#[map]
+static EGRESS_GATEWAY_NAT_DESTINATIONS_V6: LpmTrie<EgressIpv6DestinationData, EgressDestinationValue> =
+    LpmTrie::with_max_entries(EGRESS_DESTINATION_CAPACITY, 0);
+
+#[map]
+static EGRESS_GATEWAY_NAT_ADDRESSES: HashMap<EgressCandidateKey, EgressAddressValue> =
+    HashMap::with_max_entries(EGRESS_ADDRESS_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static EGRESS_GATEWAY_NAT_GATEWAYS: HashMap<EgressCandidateKey, EgressGatewayValue> =
+    HashMap::with_max_entries(EGRESS_GATEWAY_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static EGRESS_GATEWAY_NAT_SELECTIONS: HashMap<EgressSelectionKey, EgressSelectionValue> =
+    HashMap::with_max_entries(EGRESS_SELECTION_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static EGRESS_GATEWAY_NAT_CONFIG: Array<EgressMapConfig> = Array::with_max_entries(1, 0);
 
 /// Runtime flow ownership is pinned so an agent-only restart cannot erase NAT
 /// state. Packet insertion and validation arrive with the steering/NAT gate.
@@ -370,7 +409,7 @@ static SERVICE_POST_LOOKUP_SCRATCH: PerCpuArray<u8> = PerCpuArray::with_max_entr
 /// from the bounded main classifiers. The agent loads all four targets before
 /// attaching either hook.
 #[map]
-static SERVICE_DATAPLANE_TAIL_CALLS: ProgramArray = ProgramArray::with_max_entries(4, 0);
+static SERVICE_DATAPLANE_TAIL_CALLS: ProgramArray = ProgramArray::with_max_entries(6, 0);
 
 #[classifier]
 pub fn unf_observe_ingress(ctx: TcContext) -> i32 {
@@ -560,6 +599,12 @@ pub fn unf_policy_v4(ctx: TcContext) -> i32 {
     if action == TC_ACT_SHOT {
         return action;
     }
+    if gateway_egress_maybe_owned(observation) {
+        // SAFETY: index 4 is the verifier-isolated IPv4 gateway NAT stage.
+        #[allow(unsafe_code)]
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, EGRESS_GATEWAY_TAIL_V4) };
+        return TC_ACT_SHOT;
+    }
     let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
         return TC_ACT_SHOT;
     };
@@ -593,6 +638,12 @@ pub fn unf_policy_v6(ctx: TcContext) -> i32 {
     let action = emit_flow(observation);
     if action == TC_ACT_SHOT {
         return action;
+    }
+    if gateway_egress_maybe_owned(observation) {
+        // SAFETY: index 5 is the verifier-isolated IPv6 gateway NAT stage.
+        #[allow(unsafe_code)]
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, EGRESS_GATEWAY_TAIL_V6) };
+        return TC_ACT_SHOT;
     }
     let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
         return TC_ACT_SHOT;
@@ -637,6 +688,30 @@ pub fn unf_dsr_v6(ctx: TcContext) -> i32 {
     #[allow(unsafe_code)]
     let observation = unsafe { &*observation_ptr };
     reroute_host_service_v6(&ctx, observation, true)
+}
+
+#[classifier]
+pub fn unf_egress_gateway_v4(ctx: TcContext) -> i32 {
+    let Some(observation_ptr) = FLOW_OBSERVATION_SCRATCH.get_ptr(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: the originating classifier initialized this CPU's scratch slot
+    // immediately before its non-returning tail call.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &*observation_ptr };
+    gateway_egress_action::<false>(&ctx, observation).unwrap_or(TC_ACT_PIPE)
+}
+
+#[classifier]
+pub fn unf_egress_gateway_v6(ctx: TcContext) -> i32 {
+    let Some(observation_ptr) = FLOW_OBSERVATION_SCRATCH.get_ptr(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: as above; the dedicated symbol keeps IPv6 NAT below verifier
+    // instruction and combined-stack limits independently of policy lookup.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &*observation_ptr };
+    gateway_egress_action::<true>(&ctx, observation).unwrap_or(TC_ACT_PIPE)
 }
 
 #[inline(always)]
@@ -3416,6 +3491,101 @@ fn rewrite_ipv6(
     true
 }
 
+/// Gateway-specialized IPv6 rewrite avoids materializing address arrays on
+/// the BPF stack. The service path retains its independently verified routine.
+#[inline(never)]
+fn rewrite_egress_ipv6(
+    ctx: &TcContext,
+    transport_offset: usize,
+    protocol: u8,
+    translation: &ServiceTranslation,
+    source: bool,
+) -> bool {
+    let address_offset = if source {
+        ETHERNET_HEADER_LEN + 8
+    } else {
+        ETHERNET_HEADER_LEN + 24
+    };
+    let port_offset = if source {
+        transport_offset
+    } else {
+        transport_offset + 2
+    };
+    let (Ok(old_0), Ok(old_1), Ok(old_2), Ok(old_3)) = (
+        ctx.load::<u32>(address_offset),
+        ctx.load::<u32>(address_offset + 4),
+        ctx.load::<u32>(address_offset + 8),
+        ctx.load::<u32>(address_offset + 12),
+    ) else {
+        return false;
+    };
+    let Ok(old_port) = ctx.load::<u16>(port_offset) else {
+        return false;
+    };
+    let new_0 = u32::from_ne_bytes([
+        translation.address[0],
+        translation.address[1],
+        translation.address[2],
+        translation.address[3],
+    ]);
+    let new_1 = u32::from_ne_bytes([
+        translation.address[4],
+        translation.address[5],
+        translation.address[6],
+        translation.address[7],
+    ]);
+    let new_2 = u32::from_ne_bytes([
+        translation.address[8],
+        translation.address[9],
+        translation.address[10],
+        translation.address[11],
+    ]);
+    let new_3 = u32::from_ne_bytes([
+        translation.address[12],
+        translation.address[13],
+        translation.address[14],
+        translation.address[15],
+    ]);
+    let new_port = u16::from_ne_bytes(translation.port);
+    let checksum_offset = l4_checksum_offset(transport_offset, protocol);
+    if old_0 != new_0 || old_1 != new_1 || old_2 != new_2 || old_3 != new_3 {
+        let flags = l4_checksum_flags(protocol, 4, true);
+        if ctx
+            .l4_csum_replace(checksum_offset, old_0 as u64, new_0 as u64, flags)
+            .is_err()
+            || ctx
+                .l4_csum_replace(checksum_offset, old_1 as u64, new_1 as u64, flags)
+                .is_err()
+            || ctx
+                .l4_csum_replace(checksum_offset, old_2 as u64, new_2 as u64, flags)
+                .is_err()
+            || ctx
+                .l4_csum_replace(checksum_offset, old_3 as u64, new_3 as u64, flags)
+                .is_err()
+            || ctx
+                .store(address_offset, &translation.address, 0)
+                .is_err()
+        {
+            return false;
+        }
+    }
+    if old_port != new_port {
+        if ctx
+            .l4_csum_replace(
+                checksum_offset,
+                old_port as u64,
+                new_port as u64,
+                l4_checksum_flags(protocol, 2, false),
+            )
+            .is_err()
+            || ctx.store(port_offset, &translation.port, 0).is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 #[inline(never)]
 fn emit_flow(observation: &FlowObservation) -> i32 {
     if !observation.enforce {
@@ -3820,6 +3990,632 @@ fn active_policy_config() -> Option<PolicyMapConfig> {
 #[inline(always)]
 fn active_policy_revision() -> u64 {
     active_policy_config().map_or(0, |config| config.revision)
+}
+
+/// Keeps the policy classifier's gateway decision bounded: existing forward or
+/// reverse state always reaches the NAT tail program, while new flows do so
+/// only for an identity currently projected onto this gateway. A malformed or
+/// missing aggregate pointer with staged identity state is treated as owned so
+/// the isolated stage can fail closed instead of leaking native traffic.
+#[inline(always)]
+fn gateway_egress_maybe_owned(observation: &FlowObservation) -> bool {
+    if !matches!(observation.protocol, PROTOCOL_TCP | PROTOCOL_UDP) {
+        return false;
+    }
+    let Some(key_ptr) = EGRESS_CONNECTION_KEY_SCRATCH.get_ptr_mut(0) else {
+        return true;
+    };
+    // SAFETY: the current CPU exclusively owns this fixed scratch slot.
+    #[allow(unsafe_code)]
+    let key = unsafe { &mut *key_ptr };
+    fill_egress_observation_key(
+        observation,
+        IdentityId::new(0),
+        unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE,
+        key,
+    );
+    // SAFETY: lookup references do not escape and no mutation occurs here.
+    #[allow(unsafe_code)]
+    if unsafe { EGRESS_CONNECTIONS.get(&*key) }.is_some() {
+        return true;
+    }
+    if observation.source_identity.get() == 0 {
+        return false;
+    }
+    fill_egress_observation_key(
+        observation,
+        observation.source_identity,
+        unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD,
+        key,
+    );
+    // SAFETY: as above; an established forward flow remains owned after a
+    // desired-state bank switch or withdrawal.
+    #[allow(unsafe_code)]
+    if unsafe { EGRESS_CONNECTIONS.get(&*key) }.is_some() {
+        return true;
+    }
+
+    let source_key = |bank| EgressSourceKey {
+        source_identity: observation.source_identity,
+        bank,
+        reserved: [0; 3],
+    };
+    if let Some(config) = EGRESS_GATEWAY_NAT_CONFIG.get(0).copied() {
+        if config.schema_version == EGRESS_MAP_ABI_VERSION
+            && config.active_bank < EGRESS_BANK_COUNT
+            && config.controller_epoch != 0
+            && config.projection_revision != 0
+            && config.contract_revision == 0
+            && config.path_revision == 0
+            && config.flags == EGRESS_CONFIG_FLAG_GATEWAY_NAT
+        {
+            // SAFETY: fixed-layout key and read-only existence probe.
+            #[allow(unsafe_code)]
+            return unsafe {
+                EGRESS_GATEWAY_NAT_SOURCES
+                    .get(&source_key(config.active_bank))
+                    .is_some()
+            };
+        }
+    }
+    // SAFETY: invalid aggregate state plus any staged ownership must enter the
+    // NAT stage, which rejects the malformed pointer and drops the packet.
+    #[allow(unsafe_code)]
+    unsafe {
+        EGRESS_GATEWAY_NAT_SOURCES.get(&source_key(0)).is_some()
+            || EGRESS_GATEWAY_NAT_SOURCES.get(&source_key(1)).is_some()
+    }
+}
+
+/// Handles gateway-side established reverse traffic first, then exact
+/// contract-bound forward traffic. `None` means the tuple is not owned by the
+/// gateway NAT fabric; an owned but malformed/incomplete tuple always drops.
+#[inline(never)]
+fn gateway_egress_action<const IPV6: bool>(
+    ctx: &TcContext,
+    observation: &FlowObservation,
+) -> Option<i32> {
+    if !matches!(observation.protocol, PROTOCOL_TCP | PROTOCOL_UDP) {
+        return None;
+    }
+    let transport_offset = if !IPV6 {
+        let ihl = ctx.load::<u8>(ETHERNET_HEADER_LEN).ok()? & 0x0f;
+        ETHERNET_HEADER_LEN + usize::from(ihl) * 4
+    } else {
+        let (protocol, offset, translatable) = ipv6_transport(ctx)?;
+        if protocol != observation.protocol || !translatable {
+            return None;
+        }
+        offset
+    };
+    // SAFETY: this helper has no preconditions and returns monotonic kernel time.
+    #[allow(unsafe_code)]
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    let Some(key_ptr) = EGRESS_CONNECTION_KEY_SCRATCH.get_ptr_mut(0) else {
+        return Some(TC_ACT_SHOT);
+    };
+    // SAFETY: the current CPU exclusively owns this scratch slot.
+    #[allow(unsafe_code)]
+    let key = unsafe { &mut *key_ptr };
+    fill_egress_observation_key(
+        observation,
+        IdentityId::new(0),
+        unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE,
+        key,
+    );
+    // SAFETY: the fixed-layout value is copied before any map mutation.
+    #[allow(unsafe_code)]
+    if let Some(stored) = unsafe { EGRESS_CONNECTIONS.get(&*key) } {
+        return Some(apply_gateway_connection::<IPV6>(
+            ctx,
+            transport_offset,
+            key,
+            stored,
+            now_ns,
+        ));
+    }
+    if observation.source_identity.get() == 0 {
+        return None;
+    }
+    fill_egress_observation_key(
+        observation,
+        observation.source_identity,
+        unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD,
+        key,
+    );
+    // SAFETY: the fixed-layout value is copied before any map mutation.
+    #[allow(unsafe_code)]
+    if let Some(stored) = unsafe { EGRESS_CONNECTIONS.get(&*key) } {
+        return Some(apply_gateway_connection::<IPV6>(
+            ctx,
+            transport_offset,
+            key,
+            stored,
+            now_ns,
+        ));
+    }
+    let action = create_gateway_connection::<IPV6>(
+        ctx,
+        transport_offset,
+        observation,
+        key,
+        now_ns,
+    );
+    if action == EGRESS_GATEWAY_NOT_OWNED {
+        None
+    } else {
+        Some(action)
+    }
+}
+
+#[inline(always)]
+fn fill_egress_observation_key(
+    observation: &FlowObservation,
+    identity: IdentityId,
+    role: u8,
+    key: &mut EgressConnectionKey,
+) {
+    key.source_address = observation.source_address;
+    key.destination_address = observation.destination_address;
+    key.source_port = observation.source_port;
+    key.destination_port = observation.destination_port;
+    key.source_identity = identity;
+    key.protocol = observation.protocol;
+    key.address_family = observation.address_family as u8;
+    key.role = role;
+    key.reserved = 0;
+}
+
+#[inline(always)]
+fn fill_egress_forward_key(value: &EgressConnectionValue, key: &mut EgressConnectionKey) {
+    key.source_address = value.original_source_address;
+    key.destination_address = value.original_destination_address;
+    key.source_port = value.original_source_port;
+    key.destination_port = value.original_destination_port;
+    key.source_identity = value.source_identity;
+    key.protocol = value.protocol;
+    key.address_family = value.address_family;
+    key.role = unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD;
+    key.reserved = 0;
+}
+
+#[inline(always)]
+fn fill_egress_reverse_key(value: &EgressConnectionValue, key: &mut EgressConnectionKey) {
+    key.source_address = value.original_destination_address;
+    key.destination_address = value.egress_address;
+    key.source_port = value.original_destination_port;
+    key.destination_port = value.translated_source_port;
+    key.source_identity = IdentityId::new(0);
+    key.protocol = value.protocol;
+    key.address_family = value.address_family;
+    key.role = unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE;
+    key.reserved = 0;
+}
+
+#[inline(always)]
+fn remove_egress_pair(value: &EgressConnectionValue) {
+    let (Some(forward_ptr), Some(reverse_ptr)) = (
+        EGRESS_CONNECTION_KEY_SCRATCH.get_ptr_mut(0),
+        EGRESS_CONNECTION_KEY_SCRATCH.get_ptr_mut(1),
+    ) else {
+        return;
+    };
+    // SAFETY: each pointer is a distinct per-CPU scratch slot.
+    #[allow(unsafe_code)]
+    let (forward, reverse) = unsafe { (&mut *forward_ptr, &mut *reverse_ptr) };
+    fill_egress_forward_key(value, forward);
+    fill_egress_reverse_key(value, reverse);
+    let _ = EGRESS_CONNECTIONS.remove(forward);
+    let _ = EGRESS_CONNECTIONS.remove(reverse);
+}
+
+#[inline(always)]
+fn store_egress_pair(value: &EgressConnectionValue) -> bool {
+    let (Some(forward_ptr), Some(reverse_ptr)) = (
+        EGRESS_CONNECTION_KEY_SCRATCH.get_ptr_mut(0),
+        EGRESS_CONNECTION_KEY_SCRATCH.get_ptr_mut(1),
+    ) else {
+        return false;
+    };
+    // SAFETY: each pointer is a distinct per-CPU scratch slot.
+    #[allow(unsafe_code)]
+    let (forward, reverse) = unsafe { (&mut *forward_ptr, &mut *reverse_ptr) };
+    fill_egress_forward_key(value, forward);
+    fill_egress_reverse_key(value, reverse);
+    if EGRESS_CONNECTIONS.insert(&*reverse, value, 0).is_err() {
+        return false;
+    }
+    if EGRESS_CONNECTIONS.insert(&*forward, value, 0).is_err() {
+        let _ = EGRESS_CONNECTIONS.remove(reverse);
+        return false;
+    }
+    true
+}
+
+#[inline(never)]
+fn reserve_egress_pair(value: &EgressConnectionValue) -> bool {
+    let (Some(forward_ptr), Some(reverse_ptr)) = (
+        EGRESS_CONNECTION_KEY_SCRATCH.get_ptr_mut(0),
+        EGRESS_CONNECTION_KEY_SCRATCH.get_ptr_mut(1),
+    ) else {
+        return false;
+    };
+    // SAFETY: each pointer is a distinct per-CPU scratch slot.
+    #[allow(unsafe_code)]
+    let (forward, reverse) = unsafe { (&mut *forward_ptr, &mut *reverse_ptr) };
+    fill_egress_forward_key(value, forward);
+    fill_egress_reverse_key(value, reverse);
+    if EGRESS_CONNECTIONS
+        .insert(&*reverse, value, BPF_NOEXIST as u64)
+        .is_err()
+    {
+        return false;
+    }
+    if EGRESS_CONNECTIONS
+        .insert(&*forward, value, BPF_NOEXIST as u64)
+        .is_err()
+    {
+        let _ = EGRESS_CONNECTIONS.remove(reverse);
+        return false;
+    }
+    true
+}
+
+#[inline(always)]
+fn valid_egress_connection_key(key: &EgressConnectionKey, value: &EgressConnectionValue) -> bool {
+    let tuple_valid = if key.role == unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD {
+        key.source_address == value.original_source_address
+            && key.destination_address == value.original_destination_address
+            && key.source_port == value.original_source_port
+            && key.destination_port == value.original_destination_port
+            && key.source_identity == value.source_identity
+    } else if key.role == unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE {
+        key.source_address == value.original_destination_address
+            && key.destination_address == value.egress_address
+            && key.source_port == value.original_destination_port
+            && key.destination_port == value.translated_source_port
+            && key.source_identity.get() == 0
+    } else {
+        false
+    };
+    tuple_valid
+        && key.protocol == value.protocol
+        && key.address_family == value.address_family
+        && key.reserved == 0
+        && value.contract_digest != [0; 32]
+        && value.proof_witness != [0; 16]
+        && value.primary_gateway_digest != [0; 16]
+        && value.egress_address != [0; 16]
+        && value.flags
+            & !(unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_CERTIFIED
+                | unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_ACTIVE)
+            == 0
+        && value.reserved == [0; 2]
+}
+
+#[inline(never)]
+fn apply_gateway_connection<const IPV6: bool>(
+    ctx: &TcContext,
+    transport_offset: usize,
+    key: &EgressConnectionKey,
+    stored: &EgressConnectionValue,
+    now_ns: u64,
+) -> i32 {
+    let Some(value_ptr) = EGRESS_CONNECTION_VALUE_SCRATCH.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: this CPU owns the scratch slot; copy before any map mutation.
+    #[allow(unsafe_code)]
+    unsafe { value_ptr.write(*stored) };
+    // SAFETY: the pointer remains valid for this non-preemptible invocation.
+    #[allow(unsafe_code)]
+    let value = unsafe { &mut *value_ptr };
+    if !valid_egress_connection_key(key, value)
+        || !egress_connection_is_active(value, now_ns)
+    {
+        remove_egress_pair(value);
+        return TC_ACT_SHOT;
+    }
+    let translation = if key.role == unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD {
+        ServiceTranslation {
+            address: value.egress_address,
+            port: value.translated_source_port,
+        }
+    } else {
+        ServiceTranslation {
+            address: value.original_source_address,
+            port: value.original_source_port,
+        }
+    };
+    let source = key.role == unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD;
+    let rewritten = if IPV6 {
+        rewrite_egress_ipv6(ctx, transport_offset, key.protocol, &translation, source)
+    } else {
+        rewrite_ipv4(ctx, transport_offset, key.protocol, &translation, source)
+    };
+    if !rewritten {
+        return TC_ACT_SHOT;
+    }
+    value.last_seen_ns = now_ns;
+    if !store_egress_pair(value) {
+        remove_egress_pair(value);
+        return TC_ACT_SHOT;
+    }
+    TC_ACT_PIPE
+}
+
+#[inline(never)]
+fn create_gateway_connection<const IPV6: bool>(
+    ctx: &TcContext,
+    transport_offset: usize,
+    observation: &FlowObservation,
+    forward: &EgressConnectionKey,
+    now_ns: u64,
+) -> i32 {
+    let Some(config) = EGRESS_GATEWAY_NAT_CONFIG.get(0).copied() else {
+        return EGRESS_GATEWAY_NOT_OWNED;
+    };
+    let Some(scratch_ptr) = EGRESS_STEERING_SCRATCH.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: the current CPU exclusively owns this scratch slot.
+    #[allow(unsafe_code)]
+    let scratch = unsafe { &mut *scratch_ptr };
+    scratch.config = config;
+    if scratch.config.schema_version != EGRESS_MAP_ABI_VERSION
+        || scratch.config.active_bank >= EGRESS_BANK_COUNT
+        || scratch.config.controller_epoch == 0
+        || scratch.config.projection_revision == 0
+        || scratch.config.contract_revision != 0
+        || scratch.config.path_revision != 0
+        || scratch.config.flags != EGRESS_CONFIG_FLAG_GATEWAY_NAT
+    {
+        return TC_ACT_SHOT;
+    }
+    let source_key = EgressSourceKey {
+        source_identity: observation.source_identity,
+        bank: scratch.config.active_bank,
+        reserved: [0; 3],
+    };
+    // SAFETY: fixed-layout records are copied before map mutation.
+    #[allow(unsafe_code)]
+    let Some(source) = (unsafe { EGRESS_GATEWAY_NAT_SOURCES.get(&source_key) }) else {
+        return EGRESS_GATEWAY_NOT_OWNED;
+    };
+    scratch.source = *source;
+    let family_flag = if matches!(observation.address_family, AddressFamily::Ipv4) {
+        unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV4
+    } else {
+        unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV6
+    };
+    if scratch.source.schema_version != EGRESS_MAP_ABI_VERSION
+        || scratch.source.admission != EGRESS_ADMISSION_ACTIVE
+        || scratch.source.flags & unf_ebpf_common::EGRESS_SOURCE_FLAG_GATEWAY_NAT == 0
+        || scratch.source.flags & family_flag == 0
+        || scratch.source.intent_index != observation.source_identity.get()
+        || scratch.source.contract_revision == 0
+        || scratch.source.lease_epoch == 0
+        || scratch.source.contract_digest == [0; 32]
+        || scratch.source.intent_digest == [0; 16]
+        || scratch.source.address_count == 0
+        || scratch.source.gateway_count == 0
+        || scratch.source.reserved[2..] != [0; 2]
+    {
+        return TC_ACT_SHOT;
+    }
+    if !load_gateway_egress_destination(
+        observation,
+        &scratch.source,
+        scratch.config.active_bank,
+        &mut scratch.destination,
+    ) {
+        return EGRESS_GATEWAY_NOT_OWNED;
+    }
+    if scratch.destination.contract_revision != scratch.source.contract_revision
+        || scratch.destination.intent_digest != scratch.source.intent_digest
+        || scratch.destination.schema_version != EGRESS_MAP_ABI_VERSION
+        || scratch.destination.flags != 0
+        || scratch.destination.reserved != [0; 4]
+    {
+        return TC_ACT_SHOT;
+    }
+    let selection_key = EgressSelectionKey {
+        intent_index: scratch.source.intent_index,
+        bucket: egress_selection_bucket(forward),
+        address_family: observation.address_family as u8,
+        bank: scratch.config.active_bank,
+    };
+    // SAFETY: copied before any map mutation.
+    #[allow(unsafe_code)]
+    let Some(selection) = (unsafe { EGRESS_GATEWAY_NAT_SELECTIONS.get(&selection_key) }) else {
+        return TC_ACT_SHOT;
+    };
+    scratch.selection = *selection;
+    let local_gateway_index =
+        u16::from_ne_bytes([scratch.source.reserved[0], scratch.source.reserved[1]]);
+    if scratch.selection.schema_version != EGRESS_MAP_ABI_VERSION
+        || scratch.selection.selection_witness == [0; 16]
+        || scratch.selection.address_index >= scratch.source.address_count
+        || scratch.selection.primary_gateway_index >= scratch.source.gateway_count
+        || scratch.selection.primary_gateway_index != local_gateway_index
+        || scratch.selection.standby_gateway_index >= scratch.source.gateway_count
+        || scratch.selection.flags & !unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0
+        || (scratch.selection.flags == 0
+            && scratch.selection.standby_gateway_index
+                != scratch.selection.primary_gateway_index)
+        || (scratch.selection.flags & unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0
+            && scratch.selection.standby_gateway_index
+                == scratch.selection.primary_gateway_index)
+        || scratch.selection.reserved != [0; 6]
+    {
+        return TC_ACT_SHOT;
+    }
+    let address_key = EgressCandidateKey {
+        intent_index: scratch.source.intent_index,
+        candidate_index: scratch.selection.address_index,
+        address_family: observation.address_family as u8,
+        bank: scratch.config.active_bank,
+    };
+    let gateway_key = EgressCandidateKey {
+        intent_index: scratch.source.intent_index,
+        candidate_index: scratch.selection.primary_gateway_index,
+        address_family: observation.address_family as u8,
+        bank: scratch.config.active_bank,
+    };
+    // SAFETY: copied before any map mutation.
+    #[allow(unsafe_code)]
+    let (Some(address), Some(gateway)) = (unsafe {
+        (
+            EGRESS_GATEWAY_NAT_ADDRESSES.get(&address_key),
+            EGRESS_GATEWAY_NAT_GATEWAYS.get(&gateway_key),
+        )
+    }) else {
+        return TC_ACT_SHOT;
+    };
+    scratch.address = *address;
+    scratch.gateway = *gateway;
+    if !valid_egress_address(&scratch.address, &scratch.source, observation.address_family)
+        || scratch.gateway.schema_version != EGRESS_MAP_ABI_VERSION
+        || scratch.gateway.contract_revision != scratch.source.contract_revision
+        || scratch.gateway.lease_epoch != scratch.source.lease_epoch
+        || scratch.gateway.gateway_digest == [0; 16]
+        || scratch.gateway.flags != 0
+        || scratch.gateway.reserved != [0; 4]
+    {
+        return TC_ACT_SHOT;
+    }
+    let standby_gateway_digest = if scratch.selection.flags
+        & unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY
+        != 0
+    {
+        let standby_key = EgressCandidateKey {
+            intent_index: scratch.source.intent_index,
+            candidate_index: scratch.selection.standby_gateway_index,
+            address_family: observation.address_family as u8,
+            bank: scratch.config.active_bank,
+        };
+        // SAFETY: copied immediately and never retained across a map mutation.
+        #[allow(unsafe_code)]
+        let Some(standby) = (unsafe { EGRESS_GATEWAY_NAT_GATEWAYS.get(&standby_key) }) else {
+            return TC_ACT_SHOT;
+        };
+        let standby = *standby;
+        if standby.schema_version != EGRESS_MAP_ABI_VERSION
+            || standby.contract_revision != scratch.source.contract_revision
+            || standby.lease_epoch != scratch.source.lease_epoch
+            || standby.gateway_digest == [0; 16]
+            || standby.flags != 0
+            || standby.reserved != [0; 4]
+        {
+            return TC_ACT_SHOT;
+        }
+        standby.gateway_digest
+    } else {
+        scratch.gateway.gateway_digest
+    };
+    if !packet_starts_connection(observation.protocol, observation.tcp_flags) {
+        return TC_ACT_SHOT;
+    }
+    let Some(value_ptr) = EGRESS_CONNECTION_VALUE_SCRATCH.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: this CPU exclusively owns the scratch slot; zero initializes
+    // every scalar and byte-array field without constructing a 208-byte stack
+    // temporary that would violate the verifier's combined call-depth limit.
+    #[allow(unsafe_code)]
+    unsafe { core::ptr::write_bytes(value_ptr, 0, 1) };
+    // SAFETY: the pointer remains valid for this non-preemptible invocation.
+    #[allow(unsafe_code)]
+    let value = unsafe { &mut *value_ptr };
+    value.last_seen_ns = now_ns;
+    value.contract_revision = scratch.source.contract_revision;
+    value.lease_epoch = scratch.source.lease_epoch;
+    value.original_source_address = observation.source_address;
+    value.original_destination_address = observation.destination_address;
+    value.egress_address = scratch.address.address;
+    value.primary_transport_address = scratch.gateway.transport_address;
+    value.proof_witness = scratch.selection.selection_witness;
+    value.contract_digest = scratch.source.contract_digest;
+    value.primary_gateway_digest = scratch.gateway.gateway_digest;
+    value.standby_gateway_digest = standby_gateway_digest;
+    value.source_identity = observation.source_identity;
+    value.original_source_port = observation.source_port;
+    value.original_destination_port = observation.destination_port;
+    value.address_index = scratch.selection.address_index;
+    value.primary_gateway_index = scratch.selection.primary_gateway_index;
+    value.standby_gateway_index = scratch.selection.standby_gateway_index;
+    value.schema_version = EGRESS_MAP_ABI_VERSION;
+    value.protocol = observation.protocol;
+    value.address_family = observation.address_family as u8;
+    value.flags = if scratch.selection.flags & unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0 {
+        unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_CERTIFIED
+    } else {
+        0
+    };
+    let proof_salt = u32::from_ne_bytes([
+        scratch.selection.selection_witness[0],
+        scratch.selection.selection_witness[1],
+        scratch.selection.selection_witness[2],
+        scratch.selection.selection_witness[3],
+    ]);
+    let hash = egress_flow_hash(forward);
+    let mut probe = 0;
+    while probe < unf_ebpf_common::EGRESS_SNAT_PORT_PROBES {
+        value.translated_source_port = egress_snat_candidate(hash, proof_salt, probe).to_be_bytes();
+        if reserve_egress_pair(value) {
+            let translation = ServiceTranslation {
+                address: value.egress_address,
+                port: value.translated_source_port,
+            };
+            let rewritten = if IPV6 {
+                rewrite_egress_ipv6(
+                    ctx,
+                    transport_offset,
+                    observation.protocol,
+                    &translation,
+                    true,
+                )
+            } else {
+                rewrite_ipv4(ctx, transport_offset, observation.protocol, &translation, true)
+            };
+            if rewritten {
+                return TC_ACT_PIPE;
+            }
+            remove_egress_pair(value);
+            return TC_ACT_SHOT;
+        }
+        probe += 1;
+    }
+    TC_ACT_SHOT
+}
+
+#[inline(always)]
+fn load_gateway_egress_destination(
+    observation: &FlowObservation,
+    source: &EgressSourceValue,
+    bank: u8,
+    destination: &mut EgressDestinationValue,
+) -> bool {
+    if matches!(observation.address_family, AddressFamily::Ipv4) {
+        let key = LpmKey::new(96, EgressIpv4DestinationData {
+            intent_index: source.intent_index,
+            bank,
+            reserved: [0; 3],
+            destination_address: [observation.destination_address[0], observation.destination_address[1], observation.destination_address[2], observation.destination_address[3]],
+        });
+        let Some(value) = EGRESS_GATEWAY_NAT_DESTINATIONS_V4.get(&key) else { return false; };
+        *destination = *value;
+    } else {
+        let key = LpmKey::new(192, EgressIpv6DestinationData {
+            intent_index: source.intent_index,
+            bank,
+            reserved: [0; 3],
+            destination_address: observation.destination_address,
+        });
+        let Some(value) = EGRESS_GATEWAY_NAT_DESTINATIONS_V6.get(&key) else { return false; };
+        *destination = *value;
+    }
+    true
 }
 
 /// Returns `None` only when the source identity or destination is not owned by

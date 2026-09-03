@@ -65,6 +65,7 @@ use unf_egress::{
     EgressGatewayProjection, EgressGatewayProjectionLedger, EgressNodeProjectionEnvelope,
     EgressPathCertificate, EgressPathMode, EgressProjectionLedger, EgressSourceActivationGrant,
     EgressSourceApplicationAcknowledgement, compile_egress_dataplane,
+    compile_egress_gateway_dataplane,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -113,7 +114,7 @@ use cni_server::CniTransactionServer;
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v13";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v14";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
@@ -130,8 +131,14 @@ const SELECTION_CONTRACT_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 const SELECTION_BANK_COUNT: u8 = 2;
 const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
 const BLOCKED_TRANSITION_REPORTING_WINDOW: Duration = Duration::from_secs(30);
-const DATAPLANE_TAIL_PROGRAM_NAMES: [&str; 4] =
-    ["unf_policy_v4", "unf_policy_v6", "unf_dsr_v4", "unf_dsr_v6"];
+const DATAPLANE_TAIL_PROGRAM_NAMES: [&str; 6] = [
+    "unf_policy_v4",
+    "unf_policy_v6",
+    "unf_dsr_v4",
+    "unf_dsr_v6",
+    "unf_egress_gateway_v4",
+    "unf_egress_gateway_v6",
+];
 const DATAPLANE_TAIL_CALL_MAP_NAME: &str = "SERVICE_DATAPLANE_TAIL_CALLS";
 const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
     Some(revision) => revision,
@@ -298,7 +305,7 @@ const ABI_V12_MAP_NAMES: [&str; 31] = [
     "EGRESS_CONFIG",
     "EGRESS_CONNECTIONS",
 ];
-const PERSISTENT_MAP_NAMES: [&str; 33] = [
+const ABI_V13_MAP_NAMES: [&str; 33] = [
     "IDENTITY_V4",
     "IDENTITY_V4_B",
     "IDENTITY_V6",
@@ -332,6 +339,48 @@ const PERSISTENT_MAP_NAMES: [&str; 33] = [
     "EGRESS_SELECTIONS",
     "EGRESS_CONFIG",
     "EGRESS_CONNECTIONS",
+];
+const PERSISTENT_MAP_NAMES: [&str; 40] = [
+    "IDENTITY_V4",
+    "IDENTITY_V4_B",
+    "IDENTITY_V6",
+    "IDENTITY_V6_B",
+    "IDENTITY_CONFIG",
+    "POLICY_RULES",
+    "POLICY_IPV4",
+    "POLICY_IPV6",
+    "EGRESS_IPV4",
+    "EGRESS_IPV6",
+    "POLICY_CONFIG",
+    "SERVICE_FRONTENDS_V4",
+    "SERVICE_FRONTENDS_V6",
+    "SERVICE_BACKENDS_V4",
+    "SERVICE_BACKENDS_V6",
+    "SERVICE_BACKEND_SLOTS",
+    "SERVICE_CONFIG",
+    "SERVICE_CONNECTIONS",
+    "SERVICE_AFFINITY",
+    "NODE_PORT_FRONTENDS_V4",
+    "NODE_PORT_FRONTENDS_V6",
+    "NODE_PORT_CONFIG",
+    "LOAD_BALANCER_FRONTENDS_V4",
+    "LOAD_BALANCER_FRONTENDS_V6",
+    "LOAD_BALANCER_CONFIG",
+    "EGRESS_SOURCES",
+    "EGRESS_DESTINATIONS_V4",
+    "EGRESS_DESTINATIONS_V6",
+    "EGRESS_ADDRESSES",
+    "EGRESS_GATEWAYS",
+    "EGRESS_SELECTIONS",
+    "EGRESS_CONFIG",
+    "EGRESS_CONNECTIONS",
+    "EGRESS_GATEWAY_NAT_SOURCES",
+    "EGRESS_GATEWAY_NAT_DESTINATIONS_V4",
+    "EGRESS_GATEWAY_NAT_DESTINATIONS_V6",
+    "EGRESS_GATEWAY_NAT_ADDRESSES",
+    "EGRESS_GATEWAY_NAT_GATEWAYS",
+    "EGRESS_GATEWAY_NAT_SELECTIONS",
+    "EGRESS_GATEWAY_NAT_CONFIG",
 ];
 const IDENTITY_MAP_CAPACITY: u32 = 65_536;
 const POLICY_MAP_CAPACITY: u32 = 262_144;
@@ -846,9 +895,18 @@ struct EgressSynchronizer {
     gateways: AyaHashMap<MapData, [u8; 8], [u8; 88]>,
     selections: AyaHashMap<MapData, [u8; 8], [u8; 32]>,
     config: AyaArray<MapData, [u8; 56]>,
-    connections: AyaHashMap<MapData, [u8; 44], [u8; 144]>,
+    gateway_nat_sources: AyaHashMap<MapData, [u8; 8], [u8; 128]>,
+    gateway_nat_ipv4_destinations: AyaLpmTrie<MapData, [u8; 12], [u8; 32]>,
+    gateway_nat_ipv6_destinations: AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
+    gateway_nat_addresses: AyaHashMap<MapData, [u8; 8], [u8; 56]>,
+    gateway_nat_gateways: AyaHashMap<MapData, [u8; 8], [u8; 88]>,
+    gateway_nat_selections: AyaHashMap<MapData, [u8; 8], [u8; 32]>,
+    gateway_nat_config: AyaArray<MapData, [u8; 56]>,
+    connections: AyaHashMap<MapData, [u8; 44], [u8; 208]>,
     banks: [EncodedEgressBank; EGRESS_BANK_COUNT as usize],
+    gateway_nat_banks: [EncodedEgressBank; EGRESS_BANK_COUNT as usize],
     active_bank: u8,
+    gateway_nat_active_bank: u8,
     ledger: EgressProjectionLedger,
     gateway_ledger: EgressGatewayProjectionLedger,
     applied_authority: Option<EgressAppliedAuthority>,
@@ -1181,7 +1239,14 @@ type EgressMaps = (
     AyaHashMap<MapData, [u8; 8], [u8; 88]>,
     AyaHashMap<MapData, [u8; 8], [u8; 32]>,
     AyaArray<MapData, [u8; 56]>,
-    AyaHashMap<MapData, [u8; 44], [u8; 144]>,
+    AyaHashMap<MapData, [u8; 8], [u8; 128]>,
+    AyaLpmTrie<MapData, [u8; 12], [u8; 32]>,
+    AyaLpmTrie<MapData, [u8; 24], [u8; 32]>,
+    AyaHashMap<MapData, [u8; 8], [u8; 56]>,
+    AyaHashMap<MapData, [u8; 8], [u8; 88]>,
+    AyaHashMap<MapData, [u8; 8], [u8; 32]>,
+    AyaArray<MapData, [u8; 56]>,
+    AyaHashMap<MapData, [u8; 44], [u8; 208]>,
 );
 type RecoveredServiceConfig = (u64, u64, u32, u32, u32, u8);
 type RecoveredNodePortConfig = (u64, u64, u64, u32, u32, u8);
@@ -5486,6 +5551,7 @@ fn plan_abi_cleanup(
         6..=8 => &ABI_V8_MAP_NAMES,
         9..=11 => &ABI_V11_MAP_NAMES,
         12 => &ABI_V12_MAP_NAMES,
+        13 => &ABI_V13_MAP_NAMES,
         _ => &PERSISTENT_MAP_NAMES,
     };
     let mut unknown = Vec::new();
@@ -6468,7 +6534,7 @@ fn attach_dataplane_programs<'ebpf>(
 }
 
 fn load_dataplane_tail_programs(ebpf: &mut Ebpf) -> Result<()> {
-    let mut program_fds = Vec::with_capacity(4);
+    let mut program_fds = Vec::with_capacity(DATAPLANE_TAIL_PROGRAM_NAMES.len());
     for program_name in DATAPLANE_TAIL_PROGRAM_NAMES {
         let program: &mut SchedClassifier = ebpf
             .program_mut(program_name)
@@ -6656,6 +6722,13 @@ fn new_synchronizers(
         egress_gateways,
         egress_selections,
         egress_config,
+        gateway_nat_sources,
+        gateway_nat_ipv4_destinations,
+        gateway_nat_ipv6_destinations,
+        gateway_nat_addresses,
+        gateway_nat_gateways,
+        gateway_nat_selections,
+        gateway_nat_config,
         egress_connections,
     ) = egress_maps;
     (
@@ -6739,9 +6812,18 @@ fn new_synchronizers(
             gateways: egress_gateways,
             selections: egress_selections,
             config: egress_config,
+            gateway_nat_sources,
+            gateway_nat_ipv4_destinations,
+            gateway_nat_ipv6_destinations,
+            gateway_nat_addresses,
+            gateway_nat_gateways,
+            gateway_nat_selections,
+            gateway_nat_config,
             connections: egress_connections,
             banks: [EncodedEgressBank::default(), EncodedEgressBank::default()],
+            gateway_nat_banks: [EncodedEgressBank::default(), EncodedEgressBank::default()],
             active_bank: 0,
+            gateway_nat_active_bank: 0,
             ledger: EgressProjectionLedger::default(),
             gateway_ledger: EgressGatewayProjectionLedger::default(),
             applied_authority: None,
@@ -7110,7 +7192,7 @@ fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool)> {
 
     // A root program reference keeps the program-array map object alive, but Linux clears its
     // entries after the final userspace map descriptor closes unless the map itself is pinned.
-    // Keep this runtime dispatch state outside the durable 33-map ABI set: it is repopulated on
+    // Keep this runtime dispatch state outside the durable 40-map ABI set: it is repopulated on
     // every start, while the pin preserves last-known-good tail targets between agent processes.
     let tail_program_pin_root = config.bpf_pin_path.join("programs");
     fs::create_dir_all(&tail_program_pin_root).with_context(|| {
@@ -7311,6 +7393,41 @@ fn recover_persistent_dataplane(
     )?;
     validate_map_capacity("EGRESS_CONFIG", egress.config.map(), 1)?;
     validate_map_capacity(
+        "EGRESS_GATEWAY_NAT_SOURCES",
+        egress.gateway_nat_sources.map(),
+        EGRESS_SOURCE_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "EGRESS_GATEWAY_NAT_DESTINATIONS_V4",
+        egress.gateway_nat_ipv4_destinations.map(),
+        EGRESS_DESTINATION_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "EGRESS_GATEWAY_NAT_DESTINATIONS_V6",
+        egress.gateway_nat_ipv6_destinations.map(),
+        EGRESS_DESTINATION_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "EGRESS_GATEWAY_NAT_ADDRESSES",
+        egress.gateway_nat_addresses.map(),
+        EGRESS_ADDRESS_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "EGRESS_GATEWAY_NAT_GATEWAYS",
+        egress.gateway_nat_gateways.map(),
+        EGRESS_GATEWAY_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "EGRESS_GATEWAY_NAT_SELECTIONS",
+        egress.gateway_nat_selections.map(),
+        EGRESS_SELECTION_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "EGRESS_GATEWAY_NAT_CONFIG",
+        egress.gateway_nat_config.map(),
+        1,
+    )?;
+    validate_map_capacity(
         "EGRESS_CONNECTIONS",
         egress.connections.map(),
         EGRESS_CONNECTION_MAP_CAPACITY,
@@ -7506,6 +7623,7 @@ fn recover_policy_entries(policies: &mut PolicySynchronizer) -> Result<()> {
 
 #[allow(clippy::too_many_lines)]
 fn recover_egress_state(egress: &mut EgressSynchronizer) -> Result<()> {
+    recover_egress_gateway_nat_state(egress)?;
     for entry in &egress.sources {
         let (key, value) = entry.context("iterate persistent egress sources")?;
         let bank = egress_bank(key[4])?;
@@ -7617,6 +7735,106 @@ fn recover_egress_state(egress: &mut EgressSynchronizer) -> Result<()> {
             "recovered egress activation was fenced pending fresh controller and path proof"
         );
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn recover_egress_gateway_nat_state(egress: &mut EgressSynchronizer) -> Result<()> {
+    for entry in &egress.gateway_nat_sources {
+        let (key, value) = entry.context("iterate persistent gateway NAT sources")?;
+        let bank = egress_bank(key[4])?;
+        validate_recovered_egress_gateway_nat_source(key, &value)?;
+        egress.gateway_nat_banks[bank].sources.insert(key, value);
+    }
+    for entry in &egress.gateway_nat_ipv4_destinations {
+        let (key, value) = entry.context("iterate persistent gateway NAT IPv4 destinations")?;
+        let data = key.data();
+        let bank = egress_bank(data[4])?;
+        validate_recovered_egress_destination(key.prefix_len(), &data, &value, 32)?;
+        egress.gateway_nat_banks[bank]
+            .ipv4_destinations
+            .insert((key.prefix_len(), data), value);
+    }
+    for entry in &egress.gateway_nat_ipv6_destinations {
+        let (key, value) = entry.context("iterate persistent gateway NAT IPv6 destinations")?;
+        let data = key.data();
+        let bank = egress_bank(data[4])?;
+        validate_recovered_egress_destination(key.prefix_len(), &data, &value, 128)?;
+        egress.gateway_nat_banks[bank]
+            .ipv6_destinations
+            .insert((key.prefix_len(), data), value);
+    }
+    for entry in &egress.gateway_nat_addresses {
+        let (key, value) = entry.context("iterate persistent gateway NAT addresses")?;
+        let bank = egress_bank(key[7])?;
+        validate_recovered_egress_candidate_key(key)?;
+        validate_recovered_egress_address(&value)?;
+        egress.gateway_nat_banks[bank].addresses.insert(key, value);
+    }
+    for entry in &egress.gateway_nat_gateways {
+        let (key, value) = entry.context("iterate persistent gateway NAT gateways")?;
+        let bank = egress_bank(key[7])?;
+        validate_recovered_egress_candidate_key(key)?;
+        validate_recovered_egress_gateway_nat_gateway(&value)?;
+        egress.gateway_nat_banks[bank].gateways.insert(key, value);
+    }
+    for entry in &egress.gateway_nat_selections {
+        let (key, value) = entry.context("iterate persistent gateway NAT selections")?;
+        let bank = egress_bank(key[7])?;
+        validate_recovered_egress_selection(key, &value)?;
+        egress.gateway_nat_banks[bank].selections.insert(key, value);
+    }
+    let config = egress
+        .gateway_nat_config
+        .get(&0, 0)
+        .context("read persistent gateway NAT config")?;
+    if config == [0; 56] {
+        clear_egress_gateway_nat_bank(egress, 0)?;
+        clear_egress_gateway_nat_bank(egress, 1)?;
+        egress.gateway_nat_active_bank = 0;
+        return Ok(());
+    }
+    let schema = u16::from_ne_bytes(config[48..50].try_into().expect("fixed gateway schema"));
+    let active_bank = config[50];
+    if schema != EGRESS_MAP_ABI_VERSION
+        || active_bank >= EGRESS_BANK_COUNT
+        || config[51] != unf_ebpf_common::EGRESS_CONFIG_FLAG_GATEWAY_NAT
+        || config[16..32] != [0; 16]
+        || u64::from_ne_bytes(config[0..8].try_into().expect("fixed gateway epoch")) == 0
+        || u64::from_ne_bytes(config[8..16].try_into().expect("fixed gateway revision")) == 0
+    {
+        bail!("persistent gateway NAT config is incompatible");
+    }
+    let active = &egress.gateway_nat_banks[usize::from(active_bank)];
+    let expected = [
+        active.sources.len(),
+        active.addresses.len(),
+        active.gateways.len(),
+        active.selections.len(),
+    ];
+    for (offset, actual) in [32_usize, 36, 40, 44].into_iter().zip(expected) {
+        if u64::from(u32::from_ne_bytes(
+            config[offset..offset + 4]
+                .try_into()
+                .expect("fixed gateway count"),
+        )) != actual as u64
+        {
+            bail!("persistent gateway NAT config count does not match its bank");
+        }
+    }
+    let destinations = active.ipv4_destinations.len() + active.ipv6_destinations.len();
+    if u64::from(u32::from_ne_bytes(
+        config[52..56]
+            .try_into()
+            .expect("fixed gateway destination count"),
+    )) != destinations as u64
+    {
+        bail!("persistent gateway NAT destination count does not match its bank");
+    }
+    validate_egress_gateway_nat_bindings(active, config)?;
+    egress.gateway_nat_banks[usize::from(active_bank)].config = config;
+    egress.gateway_nat_active_bank = active_bank;
+    clear_egress_gateway_nat_bank(egress, active_bank ^ 1)?;
     Ok(())
 }
 
@@ -7758,6 +7976,48 @@ fn validate_recovered_egress_source(key: [u8; 8], value: &[u8; 128]) -> Result<(
     Ok(())
 }
 
+fn validate_recovered_egress_gateway_nat_source(key: [u8; 8], value: &[u8; 128]) -> Result<()> {
+    let identity = u32::from_ne_bytes(key[0..4].try_into().expect("fixed gateway identity"));
+    let namespace =
+        u32::from_ne_bytes(value[112..116].try_into().expect("fixed gateway namespace"));
+    let local_gateway =
+        u16::from_ne_bytes(value[124..126].try_into().expect("fixed local gateway"));
+    let gateway_count =
+        u16::from_ne_bytes(value[118..120].try_into().expect("fixed gateway count"));
+    let known_flags = unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV4
+        | unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV6
+        | unf_ebpf_common::EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY
+        | unf_ebpf_common::EGRESS_SOURCE_FLAG_GATEWAY_NAT;
+    if identity == 0
+        || namespace != identity
+        || key[5..8] != [0; 3]
+        || (0..8).any(|index| {
+            let start = index * 8;
+            u64::from_ne_bytes(
+                value[start..start + 8]
+                    .try_into()
+                    .expect("fixed gateway revision"),
+            ) == 0
+        })
+        || value[64..96] == [0; 32]
+        || value[96..112] == [0; 16]
+        || u16::from_ne_bytes(value[120..122].try_into().expect("fixed gateway schema"))
+            != EGRESS_MAP_ABI_VERSION
+        || value[122] != unf_ebpf_common::EGRESS_ADMISSION_ACTIVE
+        || value[123] & unf_ebpf_common::EGRESS_SOURCE_FLAG_GATEWAY_NAT == 0
+        || value[123] & !known_flags != 0
+        || value[123]
+            & (unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV4 | unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV6)
+            == 0
+        || gateway_count == 0
+        || local_gateway >= gateway_count
+        || value[126..128] != [0; 2]
+    {
+        bail!("persistent gateway NAT source entry is incompatible");
+    }
+    Ok(())
+}
+
 fn validate_recovered_egress_candidate_key(key: [u8; 8]) -> Result<()> {
     if !matches!(key[6], 4 | 6) || key[7] >= EGRESS_BANK_COUNT {
         bail!("persistent egress candidate key is incompatible");
@@ -7802,6 +8062,26 @@ fn validate_recovered_egress_gateway(value: &[u8; 88]) -> Result<()> {
     Ok(())
 }
 
+fn validate_recovered_egress_gateway_nat_gateway(value: &[u8; 88]) -> Result<()> {
+    if u64::from_ne_bytes(value[0..8].try_into().expect("fixed gateway lease")) == 0
+        || u64::from_ne_bytes(value[8..16].try_into().expect("fixed gateway contract")) == 0
+        || u64::from_ne_bytes(
+            value[16..24]
+                .try_into()
+                .expect("fixed reachability revision"),
+        ) == 0
+        || value[24..56] != [0; 32]
+        || value[56..72] == [0; 16]
+        || value[72..80] != [0; 8]
+        || u16::from_ne_bytes(value[80..82].try_into().expect("fixed gateway schema"))
+            != EGRESS_MAP_ABI_VERSION
+        || value[82..88] != [0; 6]
+    {
+        bail!("persistent gateway NAT gateway entry is incompatible");
+    }
+    Ok(())
+}
+
 fn validate_recovered_egress_selection(key: [u8; 8], value: &[u8; 32]) -> Result<()> {
     let bucket = u16::from_ne_bytes(key[4..6].try_into().expect("fixed selection bucket"));
     let primary = u16::from_ne_bytes(value[18..20].try_into().expect("fixed primary index"));
@@ -7821,27 +8101,58 @@ fn validate_recovered_egress_selection(key: [u8; 8], value: &[u8; 32]) -> Result
     Ok(())
 }
 
-fn validate_recovered_egress_connection(key: &[u8; 44], value: &[u8; 144]) -> Result<()> {
+fn validate_recovered_egress_connection(key: &[u8; 44], value: &[u8; 208]) -> Result<()> {
     let identity = u32::from_ne_bytes(key[36..40].try_into().expect("fixed connection identity"));
-    let flags = u16::from_ne_bytes(value[140..142].try_into().expect("fixed connection flags"));
+    let value_identity =
+        u32::from_ne_bytes(value[184..188].try_into().expect("fixed value identity"));
+    let flags = u16::from_ne_bytes(value[204..206].try_into().expect("fixed connection flags"));
     let known_flags = unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_CERTIFIED
         | unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_ACTIVE;
-    if identity == 0
-        || !matches!(key[40], 6 | 17)
+    let forward_tuple = key[0..16] == value[24..40]
+        && key[16..32] == value[40..56]
+        && key[32..34] == value[188..190]
+        && key[34..36] == value[190..192];
+    let reverse_tuple = key[0..16] == value[40..56]
+        && key[16..32] == value[56..72]
+        && key[32..34] == value[190..192]
+        && key[34..36] == value[192..194];
+    let address_valid = |address: &[u8]| {
+        if key[41] == 4 {
+            address[0..4] != [0; 4] && address[4..16] == [0; 12]
+        } else {
+            address != [0; 16]
+        }
+    };
+    if !matches!(key[40], 6 | 17)
         || !matches!(key[41], 4 | 6)
         || !matches!(
             key[42],
             unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD
                 | unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE
         )
+        || (key[42] == unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD
+            && (identity == 0 || identity != value_identity || !forward_tuple))
+        || (key[42] == unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE
+            && (identity != 0 || !reverse_tuple))
+        || value_identity == 0
         || key[43] != 0
-        || value[120..124] != key[36..40]
-        || u16::from_ne_bytes(value[136..138].try_into().expect("fixed connection schema"))
+        || u64::from_ne_bytes(value[8..16].try_into().expect("fixed contract revision")) == 0
+        || u64::from_ne_bytes(value[16..24].try_into().expect("fixed lease epoch")) == 0
+        || !address_valid(&value[24..40])
+        || !address_valid(&value[40..56])
+        || !address_valid(&value[56..72])
+        || value[104..120] == [0; 16]
+        || value[120..152] == [0; 32]
+        || value[152..168] == [0; 16]
+        || value[168..184] == [0; 16]
+        || u16::from_be_bytes(value[192..194].try_into().expect("fixed translated port"))
+            < unf_ebpf_common::EGRESS_SNAT_PORT_BASE
+        || u16::from_ne_bytes(value[200..202].try_into().expect("fixed connection schema"))
             != EGRESS_MAP_ABI_VERSION
-        || value[138] != key[40]
-        || value[139] != key[41]
+        || value[202] != key[40]
+        || value[203] != key[41]
         || flags & !known_flags != 0
-        || value[142..144] != [0; 2]
+        || value[206..208] != [0; 2]
     {
         bail!("persistent egress connection entry is incompatible");
     }
@@ -7871,6 +8182,7 @@ fn clear_egress_bank(egress: &mut EgressSynchronizer, bank: u8) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn encode_egress_dataplane(state: &EgressDataplaneState) -> Result<EncodedEgressBank> {
     let bank = state.config.active_bank;
     egress_bank(bank)?;
@@ -7965,8 +8277,62 @@ fn encode_egress_dataplane(state: &EgressDataplaneState) -> Result<EncodedEgress
     for ((prefix, data), value) in &encoded.ipv6_destinations {
         validate_recovered_egress_destination(*prefix, data, value, 128)?;
     }
-    validate_egress_destination_bindings(&encoded, encoded.config)?;
+    if state.config.flags == unf_ebpf_common::EGRESS_CONFIG_FLAG_GATEWAY_NAT {
+        validate_egress_gateway_nat_bindings(&encoded, encoded.config)?;
+    } else if state.config.flags == 0 {
+        validate_egress_destination_bindings(&encoded, encoded.config)?;
+    } else {
+        bail!("compiled egress state contains unknown config flags");
+    }
     Ok(encoded)
+}
+
+fn validate_egress_gateway_nat_bindings(
+    active: &EncodedEgressBank,
+    config: [u8; 56],
+) -> Result<()> {
+    if config[51] != unf_ebpf_common::EGRESS_CONFIG_FLAG_GATEWAY_NAT || config[16..32] != [0; 16] {
+        bail!("gateway NAT config is not heterogeneous-contract state");
+    }
+    for (key, source) in &active.sources {
+        let identity = &key[0..4];
+        let namespace = &source[112..116];
+        let local_gateway = u16::from_ne_bytes(
+            source[124..126]
+                .try_into()
+                .expect("fixed local gateway index"),
+        );
+        let gateway_count =
+            u16::from_ne_bytes(source[118..120].try_into().expect("fixed gateway count"));
+        if identity != namespace
+            || source[123] & unf_ebpf_common::EGRESS_SOURCE_FLAG_GATEWAY_NAT == 0
+            || source[122] != unf_ebpf_common::EGRESS_ADMISSION_ACTIVE
+            || local_gateway >= gateway_count
+            || source[126..128] != [0; 2]
+        {
+            bail!("gateway NAT source binding is incompatible");
+        }
+    }
+    for ((_, data), value) in &active.ipv4_destinations {
+        validate_egress_gateway_nat_destination(active, &data[0..4], value)?;
+    }
+    for ((_, data), value) in &active.ipv6_destinations {
+        validate_egress_gateway_nat_destination(active, &data[0..4], value)?;
+    }
+    Ok(())
+}
+
+fn validate_egress_gateway_nat_destination(
+    active: &EncodedEgressBank,
+    identity: &[u8],
+    value: &[u8; 32],
+) -> Result<()> {
+    if !active.sources.iter().any(|(key, source)| {
+        key[0..4] == *identity && source[8..16] == value[0..8] && source[96..112] == value[8..24]
+    }) {
+        bail!("gateway NAT destination is not bound to its source contract");
+    }
+    Ok(())
 }
 
 fn egress_agent_advertisement() -> EgressAgentAdvertisement {
@@ -8355,6 +8721,18 @@ async fn synchronize_egress_gateway(
     let admitted = projection
         .admit(&principal, &advertisement)
         .context("independently admit selected-gateway projection")?;
+    let current_candidate =
+        compile_egress_gateway_dataplane(&admitted, synchronizer.gateway_nat_active_bank)
+            .context("compile current-bank gateway NAT projection")?;
+    if encode_egress_dataplane(&current_candidate)?
+        != synchronizer.gateway_nat_banks[usize::from(synchronizer.gateway_nat_active_bank)]
+    {
+        let candidate =
+            compile_egress_gateway_dataplane(&admitted, synchronizer.gateway_nat_active_bank ^ 1)
+                .context("compile inactive-bank gateway NAT projection")?;
+        apply_egress_gateway_dataplane(synchronizer, &candidate)
+            .context("transactionally apply selected-gateway NAT projection")?;
+    }
     let acknowledgement = EgressGatewayApplicationAcknowledgement::issue(&admitted)
         .context("build gateway application acknowledgement")?;
     let mut next = synchronizer.gateway_ledger.clone();
@@ -8479,6 +8857,217 @@ fn apply_egress_dataplane(
 ) -> Result<()> {
     let desired = encode_egress_dataplane(state)?;
     apply_encoded_egress_bank(egress, desired)
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_egress_gateway_dataplane(
+    egress: &mut EgressSynchronizer,
+    state: &EgressDataplaneState,
+) -> Result<()> {
+    let desired = encode_egress_dataplane(state)?;
+    let bank = desired.config[50];
+    egress_bank(bank)?;
+    if desired.config[51] != unf_ebpf_common::EGRESS_CONFIG_FLAG_GATEWAY_NAT {
+        bail!("gateway NAT update requires an aggregate config");
+    }
+    let current_config = egress
+        .gateway_nat_config
+        .get(&0, 0)
+        .context("read active gateway NAT config before staging")?;
+    if bank == egress.gateway_nat_active_bank && current_config != [0; 56] {
+        bail!("gateway NAT updates must stage the inactive bank");
+    }
+    let index = usize::from(bank);
+    let previous = egress.gateway_nat_banks[index].clone();
+    let staging = replace_encoded_entries(
+        &mut egress.gateway_nat_sources,
+        &previous.sources,
+        &desired.sources,
+    )
+    .context("stage gateway NAT sources")
+    .and_then(|()| {
+        replace_lpm_entries(
+            &mut egress.gateway_nat_ipv4_destinations,
+            &previous.ipv4_destinations,
+            &desired.ipv4_destinations,
+        )
+        .context("stage gateway NAT IPv4 destinations")
+    })
+    .and_then(|()| {
+        replace_lpm_entries(
+            &mut egress.gateway_nat_ipv6_destinations,
+            &previous.ipv6_destinations,
+            &desired.ipv6_destinations,
+        )
+        .context("stage gateway NAT IPv6 destinations")
+    })
+    .and_then(|()| {
+        replace_encoded_entries(
+            &mut egress.gateway_nat_addresses,
+            &previous.addresses,
+            &desired.addresses,
+        )
+        .context("stage gateway NAT addresses")
+    })
+    .and_then(|()| {
+        replace_encoded_entries(
+            &mut egress.gateway_nat_gateways,
+            &previous.gateways,
+            &desired.gateways,
+        )
+        .context("stage gateway NAT gateways")
+    })
+    .and_then(|()| {
+        replace_encoded_entries(
+            &mut egress.gateway_nat_selections,
+            &previous.selections,
+            &desired.selections,
+        )
+        .context("stage gateway NAT selections")
+    })
+    .and_then(|()| {
+        validate_encoded_entries(
+            &egress.gateway_nat_sources,
+            &desired.sources,
+            "gateway NAT source",
+        )
+    })
+    .and_then(|()| {
+        validate_lpm_bank(
+            &egress.gateway_nat_ipv4_destinations,
+            &desired.ipv4_destinations,
+            bank,
+        )
+        .context("validate gateway NAT IPv4 destinations")
+    })
+    .and_then(|()| {
+        validate_lpm_bank(
+            &egress.gateway_nat_ipv6_destinations,
+            &desired.ipv6_destinations,
+            bank,
+        )
+        .context("validate gateway NAT IPv6 destinations")
+    })
+    .and_then(|()| {
+        validate_encoded_entries(
+            &egress.gateway_nat_addresses,
+            &desired.addresses,
+            "gateway NAT address",
+        )
+    })
+    .and_then(|()| {
+        validate_encoded_entries(
+            &egress.gateway_nat_gateways,
+            &desired.gateways,
+            "gateway NAT gateway",
+        )
+    })
+    .and_then(|()| {
+        validate_encoded_entries(
+            &egress.gateway_nat_selections,
+            &desired.selections,
+            "gateway NAT selection",
+        )
+    });
+    if let Err(error) = staging {
+        return Err(rollback_egress_gateway_nat_stage(
+            egress, &previous, bank, &error,
+        ));
+    }
+    if let Err(error) = egress.gateway_nat_config.set(0, desired.config, 0) {
+        return Err(rollback_egress_gateway_nat_stage(
+            egress,
+            &previous,
+            bank,
+            &anyhow!(error).context("activate gateway NAT bank"),
+        ));
+    }
+    let retired = egress.gateway_nat_active_bank;
+    egress.gateway_nat_banks[index] = desired;
+    egress.gateway_nat_active_bank = bank;
+    if retired != bank
+        && let Err(error) = clear_egress_gateway_nat_bank(egress, retired)
+    {
+        warn!(?error, bank = retired, "could not retire gateway NAT bank");
+    }
+    Ok(())
+}
+
+fn clear_egress_gateway_nat_bank(egress: &mut EgressSynchronizer, bank: u8) -> Result<()> {
+    let index = egress_bank(bank)?;
+    restore_encoded_bank(&mut egress.gateway_nat_sources, &BTreeMap::new(), bank, 4)?;
+    restore_lpm_bank(
+        &mut egress.gateway_nat_ipv4_destinations,
+        &BTreeMap::new(),
+        bank,
+    )?;
+    restore_lpm_bank(
+        &mut egress.gateway_nat_ipv6_destinations,
+        &BTreeMap::new(),
+        bank,
+    )?;
+    restore_encoded_bank(&mut egress.gateway_nat_addresses, &BTreeMap::new(), bank, 7)?;
+    restore_encoded_bank(&mut egress.gateway_nat_gateways, &BTreeMap::new(), bank, 7)?;
+    restore_encoded_bank(
+        &mut egress.gateway_nat_selections,
+        &BTreeMap::new(),
+        bank,
+        7,
+    )?;
+    egress.gateway_nat_banks[index] = EncodedEgressBank::default();
+    Ok(())
+}
+
+fn rollback_egress_gateway_nat_stage(
+    egress: &mut EgressSynchronizer,
+    previous: &EncodedEgressBank,
+    bank: u8,
+    cause: &anyhow::Error,
+) -> anyhow::Error {
+    let rollback =
+        restore_encoded_bank(&mut egress.gateway_nat_sources, &previous.sources, bank, 4)
+            .and_then(|()| {
+                restore_lpm_bank(
+                    &mut egress.gateway_nat_ipv4_destinations,
+                    &previous.ipv4_destinations,
+                    bank,
+                )
+            })
+            .and_then(|()| {
+                restore_lpm_bank(
+                    &mut egress.gateway_nat_ipv6_destinations,
+                    &previous.ipv6_destinations,
+                    bank,
+                )
+            })
+            .and_then(|()| {
+                restore_encoded_bank(
+                    &mut egress.gateway_nat_addresses,
+                    &previous.addresses,
+                    bank,
+                    7,
+                )
+            })
+            .and_then(|()| {
+                restore_encoded_bank(
+                    &mut egress.gateway_nat_gateways,
+                    &previous.gateways,
+                    bank,
+                    7,
+                )
+            })
+            .and_then(|()| {
+                restore_encoded_bank(
+                    &mut egress.gateway_nat_selections,
+                    &previous.selections,
+                    bank,
+                    7,
+                )
+            });
+    match rollback {
+        Ok(()) => anyhow!("gateway NAT update failed and staging bank was rolled back: {cause:#}"),
+        Err(error) => anyhow!("gateway NAT update failed: {cause:#}; rollback failed: {error:#}"),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -10078,7 +10667,42 @@ fn take_egress_maps(ebpf: &mut Ebpf) -> Result<EgressMaps> {
             .context("eBPF object does not contain EGRESS_CONFIG map")?,
     )
     .context("open EGRESS_CONFIG map")?;
-    let connections = AyaHashMap::<_, [u8; 44], [u8; 144]>::try_from(
+    let gateway_nat_sources = AyaHashMap::<_, [u8; 8], [u8; 128]>::try_from(
+        ebpf.take_map("EGRESS_GATEWAY_NAT_SOURCES")
+            .context("eBPF object does not contain EGRESS_GATEWAY_NAT_SOURCES map")?,
+    )
+    .context("open EGRESS_GATEWAY_NAT_SOURCES map")?;
+    let gateway_nat_ipv4_destinations = AyaLpmTrie::<_, [u8; 12], [u8; 32]>::try_from(
+        ebpf.take_map("EGRESS_GATEWAY_NAT_DESTINATIONS_V4")
+            .context("eBPF object does not contain EGRESS_GATEWAY_NAT_DESTINATIONS_V4 map")?,
+    )
+    .context("open EGRESS_GATEWAY_NAT_DESTINATIONS_V4 map")?;
+    let gateway_nat_ipv6_destinations = AyaLpmTrie::<_, [u8; 24], [u8; 32]>::try_from(
+        ebpf.take_map("EGRESS_GATEWAY_NAT_DESTINATIONS_V6")
+            .context("eBPF object does not contain EGRESS_GATEWAY_NAT_DESTINATIONS_V6 map")?,
+    )
+    .context("open EGRESS_GATEWAY_NAT_DESTINATIONS_V6 map")?;
+    let gateway_nat_addresses = AyaHashMap::<_, [u8; 8], [u8; 56]>::try_from(
+        ebpf.take_map("EGRESS_GATEWAY_NAT_ADDRESSES")
+            .context("eBPF object does not contain EGRESS_GATEWAY_NAT_ADDRESSES map")?,
+    )
+    .context("open EGRESS_GATEWAY_NAT_ADDRESSES map")?;
+    let gateway_nat_gateways = AyaHashMap::<_, [u8; 8], [u8; 88]>::try_from(
+        ebpf.take_map("EGRESS_GATEWAY_NAT_GATEWAYS")
+            .context("eBPF object does not contain EGRESS_GATEWAY_NAT_GATEWAYS map")?,
+    )
+    .context("open EGRESS_GATEWAY_NAT_GATEWAYS map")?;
+    let gateway_nat_selections = AyaHashMap::<_, [u8; 8], [u8; 32]>::try_from(
+        ebpf.take_map("EGRESS_GATEWAY_NAT_SELECTIONS")
+            .context("eBPF object does not contain EGRESS_GATEWAY_NAT_SELECTIONS map")?,
+    )
+    .context("open EGRESS_GATEWAY_NAT_SELECTIONS map")?;
+    let gateway_nat_config = AyaArray::<_, [u8; 56]>::try_from(
+        ebpf.take_map("EGRESS_GATEWAY_NAT_CONFIG")
+            .context("eBPF object does not contain EGRESS_GATEWAY_NAT_CONFIG map")?,
+    )
+    .context("open EGRESS_GATEWAY_NAT_CONFIG map")?;
+    let connections = AyaHashMap::<_, [u8; 44], [u8; 208]>::try_from(
         ebpf.take_map("EGRESS_CONNECTIONS")
             .context("eBPF object does not contain EGRESS_CONNECTIONS map")?,
     )
@@ -10091,6 +10715,13 @@ fn take_egress_maps(ebpf: &mut Ebpf) -> Result<EgressMaps> {
         gateways,
         selections,
         config,
+        gateway_nat_sources,
+        gateway_nat_ipv4_destinations,
+        gateway_nat_ipv6_destinations,
+        gateway_nat_addresses,
+        gateway_nat_gateways,
+        gateway_nat_selections,
+        gateway_nat_config,
         connections,
     ))
 }
@@ -14925,7 +15556,7 @@ mod tests {
             .indices()
             .collect::<std::result::Result<Vec<_>, _>>()
             .expect("read retained tail-call indices");
-        assert_eq!(indices, vec![0, 1, 2, 3]);
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
         drop(tail_calls);
 
         fs::remove_file(&pin).expect("remove isolated tail-call map pin");
@@ -14950,6 +15581,13 @@ mod tests {
             gateways,
             selections,
             config,
+            gateway_nat_sources,
+            gateway_nat_ipv4_destinations,
+            gateway_nat_ipv6_destinations,
+            gateway_nat_addresses,
+            gateway_nat_gateways,
+            gateway_nat_selections,
+            gateway_nat_config,
             connections,
         ) = take_egress_maps(&mut ebpf).expect("take egress maps");
         let mut synchronizer = EgressSynchronizer {
@@ -14960,9 +15598,18 @@ mod tests {
             gateways,
             selections,
             config,
+            gateway_nat_sources,
+            gateway_nat_ipv4_destinations,
+            gateway_nat_ipv6_destinations,
+            gateway_nat_addresses,
+            gateway_nat_gateways,
+            gateway_nat_selections,
+            gateway_nat_config,
             connections,
             banks: [EncodedEgressBank::default(), EncodedEgressBank::default()],
+            gateway_nat_banks: [EncodedEgressBank::default(), EncodedEgressBank::default()],
             active_bank: 0,
+            gateway_nat_active_bank: 0,
             ledger: EgressProjectionLedger::default(),
             gateway_ledger: EgressGatewayProjectionLedger::default(),
             applied_authority: None,
@@ -15144,6 +15791,13 @@ mod tests {
             gateways,
             selections,
             config,
+            gateway_nat_sources,
+            gateway_nat_ipv4_destinations,
+            gateway_nat_ipv6_destinations,
+            gateway_nat_addresses,
+            gateway_nat_gateways,
+            gateway_nat_selections,
+            gateway_nat_config,
             connections,
         ) = take_egress_maps(&mut ebpf).expect("take egress maps");
         let mut synchronizer = EgressSynchronizer {
@@ -15154,9 +15808,18 @@ mod tests {
             gateways,
             selections,
             config,
+            gateway_nat_sources,
+            gateway_nat_ipv4_destinations,
+            gateway_nat_ipv6_destinations,
+            gateway_nat_addresses,
+            gateway_nat_gateways,
+            gateway_nat_selections,
+            gateway_nat_config,
             connections,
             banks: [EncodedEgressBank::default(), EncodedEgressBank::default()],
+            gateway_nat_banks: [EncodedEgressBank::default(), EncodedEgressBank::default()],
             active_bank: 0,
+            gateway_nat_active_bank: 0,
             ledger: EgressProjectionLedger::default(),
             gateway_ledger: EgressGatewayProjectionLedger::default(),
             applied_authority: None,
@@ -15442,6 +16105,153 @@ mod tests {
                 0,
             )
             .unwrap();
+
+        let mut gateway_state = state.clone();
+        gateway_state.config.contract_revision = 0;
+        gateway_state.config.path_revision = 0;
+        gateway_state.config.flags = unf_ebpf_common::EGRESS_CONFIG_FLAG_GATEWAY_NAT;
+        for (key, value) in &mut gateway_state.sources {
+            value.intent_index = key.source_identity.get();
+            value.flags |= unf_ebpf_common::EGRESS_SOURCE_FLAG_GATEWAY_NAT;
+            value.reserved = [0; 4];
+        }
+        gateway_state.ipv4_destinations[0].1.intent_index = identity_v4.get();
+        gateway_state.ipv6_destinations[0].1.intent_index = identity_v6.get();
+        gateway_state.addresses[0].0.intent_index = identity_v4.get();
+        gateway_state.addresses[1].0.intent_index = identity_v6.get();
+        gateway_state.gateways[0].0.intent_index = identity_v4.get();
+        gateway_state.gateways[1].0.intent_index = identity_v6.get();
+        for (_, gateway) in &mut gateway_state.gateways {
+            gateway.transport_address = [0; 16];
+            gateway.next_hop_address = [0; 16];
+            gateway.output_interface = 0;
+            gateway.mtu = 0;
+            gateway.path_mode = 0;
+        }
+        gateway_state.selections.clear();
+        for (identity, family) in [(identity_v4, 4_u8), (identity_v6, 6_u8)] {
+            for bucket in 0..unf_ebpf_common::EGRESS_SELECTION_TABLE_SIZE {
+                gateway_state.selections.push((
+                    unf_ebpf_common::EgressSelectionKey {
+                        intent_index: identity.get(),
+                        bucket,
+                        address_family: family,
+                        bank: BANK,
+                    },
+                    unf_ebpf_common::EgressSelectionValue {
+                        selection_witness: [0x33; 16],
+                        address_index: 0,
+                        primary_gateway_index: 0,
+                        standby_gateway_index: 0,
+                        schema_version: EGRESS_MAP_ABI_VERSION,
+                        flags: 0,
+                        reserved: [0; 6],
+                    },
+                ));
+            }
+        }
+        gateway_state.config.selection_count =
+            u32::try_from(gateway_state.selections.len()).unwrap();
+        apply_egress_gateway_dataplane(&mut synchronizer, &gateway_state)
+            .expect("activate heterogeneous gateway NAT bank");
+        synchronizer.gateway_nat_banks =
+            [EncodedEgressBank::default(), EncodedEgressBank::default()];
+        synchronizer.gateway_nat_active_bank = 0;
+        recover_egress_gateway_nat_state(&mut synchronizer)
+            .expect("recover exact gateway NAT bank after agent restart");
+        assert_eq!(synchronizer.gateway_nat_active_bank, BANK);
+        let recovered_gateway =
+            &synchronizer.gateway_nat_banks[usize::from(synchronizer.gateway_nat_active_bank)];
+        assert_eq!(recovered_gateway.sources.len(), 2);
+        assert_eq!(recovered_gateway.ipv4_destinations.len(), 1);
+        assert_eq!(recovered_gateway.ipv6_destinations.len(), 1);
+        assert_eq!(
+            recovered_gateway.selections.len(),
+            usize::from(unf_ebpf_common::EGRESS_SELECTION_TABLE_SIZE) * 2
+        );
+
+        let egress_v4 = Ipv4Addr::new(198, 51, 100, 10);
+        let egress_v6: Ipv6Addr = "2001:db8:ffff::10".parse().unwrap();
+        let (action, translated_v4) = run_tc(&mut ebpf, "unf_observe_ingress", &packet_v4);
+        assert_eq!(action, TC_ACT_PIPE);
+        let translated_port_v4 = u16::from_be_bytes([translated_v4[34], translated_v4[35]]);
+        assert!((unf_ebpf_common::EGRESS_SNAT_PORT_BASE..=u16::MAX).contains(&translated_port_v4));
+        assert_ipv4_packet(
+            &translated_v4,
+            6,
+            egress_v4,
+            destination_v4,
+            translated_port_v4,
+            443,
+        );
+        let reverse_v4 = ipv4_packet(6, destination_v4, egress_v4, 443, translated_port_v4);
+        let (action, restored_v4) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse_v4);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(&restored_v4, 6, destination_v4, source_v4, 443, 40_000);
+
+        let (action, translated_v6) = run_tc(&mut ebpf, "unf_observe_ingress", &packet_v6);
+        assert_eq!(action, TC_ACT_PIPE);
+        let translated_port_v6 = u16::from_be_bytes([translated_v6[54], translated_v6[55]]);
+        assert_ipv6_packet(
+            &translated_v6,
+            6,
+            egress_v6,
+            destination_v6,
+            translated_port_v6,
+            443,
+        );
+        let reverse_v6 = ipv6_packet(6, destination_v6, egress_v6, 443, translated_port_v6);
+        let (action, restored_v6) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse_v6);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv6_packet(&restored_v6, 6, destination_v6, source_v6, 443, 40_001);
+
+        let first_flow = unf_ebpf_common::EgressConnectionKey {
+            source_address: expanded_v4,
+            destination_address: expanded_destination_v4,
+            source_port: 40_000_u16.to_be_bytes(),
+            destination_port: 443_u16.to_be_bytes(),
+            source_identity: identity_v4,
+            protocol: 6,
+            address_family: 4,
+            role: unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD,
+            reserved: 0,
+        };
+        let proof_salt = u32::from_ne_bytes([0x33; 4]);
+        let first_candidate = unf_ebpf_common::egress_snat_candidate(
+            unf_ebpf_common::egress_flow_hash(&first_flow),
+            proof_salt,
+            0,
+        );
+        assert_eq!(first_candidate, translated_port_v4);
+        let colliding_source_port = (1_u16..=u16::MAX)
+            .filter(|port| *port != 40_000)
+            .find(|port| {
+                let mut candidate = first_flow;
+                candidate.source_port = port.to_be_bytes();
+                unf_ebpf_common::egress_snat_candidate(
+                    unf_ebpf_common::egress_flow_hash(&candidate),
+                    proof_salt,
+                    0,
+                ) == first_candidate
+            })
+            .expect("another original tuple shares the first candidate");
+        let collision_packet =
+            ipv4_packet(6, source_v4, destination_v4, colliding_source_port, 443);
+        let (action, collision_output) =
+            run_tc(&mut ebpf, "unf_observe_ingress", &collision_packet);
+        assert_eq!(action, TC_ACT_PIPE);
+        let collision_port = u16::from_be_bytes([collision_output[34], collision_output[35]]);
+        assert_ne!(collision_port, translated_port_v4);
+        let (action, restored_v4_again) = run_tc(&mut ebpf, "unf_observe_ingress", &reverse_v4);
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_ipv4_packet(
+            &restored_v4_again,
+            6,
+            destination_v4,
+            source_v4,
+            443,
+            40_000,
+        );
 
         let mut deny_key = [0_u8; 12];
         deny_key[0..4].copy_from_slice(&destination_v4.octets());
@@ -18393,6 +19203,7 @@ mod tests {
             (10_u16, ABI_V11_MAP_NAMES.as_slice()),
             (11_u16, ABI_V11_MAP_NAMES.as_slice()),
             (12_u16, ABI_V12_MAP_NAMES.as_slice()),
+            (13_u16, ABI_V13_MAP_NAMES.as_slice()),
             (CURRENT_BPF_ABI_VERSION, PERSISTENT_MAP_NAMES.as_slice()),
         ] {
             let abi = root.join(format!("v{version}"));
@@ -18409,7 +19220,59 @@ mod tests {
         assert_eq!(ABI_V8_MAP_NAMES.len(), 24);
         assert_eq!(ABI_V11_MAP_NAMES.len(), 25);
         assert_eq!(ABI_V12_MAP_NAMES.len(), 31);
-        assert_eq!(PERSISTENT_MAP_NAMES.len(), 33);
+        assert_eq!(ABI_V13_MAP_NAMES.len(), 33);
+        assert_eq!(PERSISTENT_MAP_NAMES.len(), 40);
+    }
+
+    #[test]
+    fn recovered_egress_connections_require_exact_bidirectional_tuples_and_proofs() {
+        let source = [10, 0, 0, 8];
+        let destination = [203, 0, 113, 9];
+        let translated = [198, 51, 100, 10];
+        let mut value = [0_u8; 208];
+        value[8..16].copy_from_slice(&13_u64.to_ne_bytes());
+        value[16..24].copy_from_slice(&7_u64.to_ne_bytes());
+        value[24..28].copy_from_slice(&source);
+        value[40..44].copy_from_slice(&destination);
+        value[56..60].copy_from_slice(&translated);
+        value[104..120].fill(0x11);
+        value[120..152].fill(0x22);
+        value[152..168].fill(0x33);
+        value[168..184].fill(0x44);
+        value[184..188].copy_from_slice(&42_u32.to_ne_bytes());
+        value[188..190].copy_from_slice(&40_000_u16.to_be_bytes());
+        value[190..192].copy_from_slice(&443_u16.to_be_bytes());
+        value[192..194].copy_from_slice(&50_000_u16.to_be_bytes());
+        value[200..202].copy_from_slice(&EGRESS_MAP_ABI_VERSION.to_ne_bytes());
+        value[202] = 6;
+        value[203] = 4;
+
+        let mut forward = [0_u8; 44];
+        forward[0..4].copy_from_slice(&source);
+        forward[16..20].copy_from_slice(&destination);
+        forward[32..34].copy_from_slice(&40_000_u16.to_be_bytes());
+        forward[34..36].copy_from_slice(&443_u16.to_be_bytes());
+        forward[36..40].copy_from_slice(&42_u32.to_ne_bytes());
+        forward[40] = 6;
+        forward[41] = 4;
+        forward[42] = unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD;
+        validate_recovered_egress_connection(&forward, &value).unwrap();
+
+        let mut reverse = [0_u8; 44];
+        reverse[0..4].copy_from_slice(&destination);
+        reverse[16..20].copy_from_slice(&translated);
+        reverse[32..34].copy_from_slice(&443_u16.to_be_bytes());
+        reverse[34..36].copy_from_slice(&50_000_u16.to_be_bytes());
+        reverse[40] = 6;
+        reverse[41] = 4;
+        reverse[42] = unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE;
+        validate_recovered_egress_connection(&reverse, &value).unwrap();
+
+        reverse[16] ^= 1;
+        assert!(validate_recovered_egress_connection(&reverse, &value).is_err());
+        value[120] = 0;
+        value[121..152].fill(0);
+        assert!(validate_recovered_egress_connection(&forward, &value).is_err());
     }
 
     #[test]
@@ -18781,11 +19644,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v13/links"),
+                Path::new("/sys/fs/bpf/unf/v14/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v13/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v14/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -18921,16 +19784,16 @@ mod tests {
 
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v13")).is_ok());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v14")).is_ok());
         assert_eq!(
-            configured_abi_version(Path::new("/sys/fs/bpf/unf/v13")),
-            Some(13)
+            configured_abi_version(Path::new("/sys/fs/bpf/unf/v14")),
+            Some(14)
         );
         let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
             error.to_string().contains(
-                "incompatible with persistent BPF-state ABI v13; expected a /v13 directory"
+                "incompatible with persistent BPF-state ABI v14; expected a /v14 directory"
             )
         );
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v4")).is_err());

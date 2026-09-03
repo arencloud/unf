@@ -17,7 +17,7 @@ pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
 pub const POLICY_BANK_COUNT: u8 = 2;
-pub const EGRESS_MAP_ABI_VERSION: u16 = 2;
+pub const EGRESS_MAP_ABI_VERSION: u16 = 3;
 pub const EGRESS_BANK_COUNT: u8 = 2;
 /// LPM keys begin with an exact intent-and-bank discriminator before the
 /// destination network bits. A `/0` intent destination is therefore a
@@ -31,11 +31,18 @@ pub const EGRESS_PATH_TUNNEL: u8 = 2;
 pub const EGRESS_SOURCE_FLAG_IPV4: u8 = 1;
 pub const EGRESS_SOURCE_FLAG_IPV6: u8 = 1 << 1;
 pub const EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY: u8 = 1 << 2;
+/// The source record belongs to a gateway-side heterogeneous contract bank.
+pub const EGRESS_SOURCE_FLAG_GATEWAY_NAT: u8 = 1 << 3;
+/// Gateway banks intentionally contain independently revisioned contracts.
+pub const EGRESS_CONFIG_FLAG_GATEWAY_NAT: u8 = 1;
 pub const EGRESS_SELECTION_FLAG_STANDBY: u16 = 1;
 pub const EGRESS_CONNECTION_ROLE_FORWARD: u8 = 1;
 pub const EGRESS_CONNECTION_ROLE_REVERSE: u8 = 2;
 pub const EGRESS_CONNECTION_FLAG_STANDBY_CERTIFIED: u16 = 1;
 pub const EGRESS_CONNECTION_FLAG_STANDBY_ACTIVE: u16 = 1 << 1;
+pub const EGRESS_SNAT_PORT_BASE: u16 = 32_768;
+pub const EGRESS_SNAT_PORT_MASK: u32 = 32_767;
+pub const EGRESS_SNAT_PORT_PROBES: u32 = 32;
 pub const SERVICE_MAP_ABI_VERSION: u16 = 5;
 pub const SERVICE_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_MAP_ABI_VERSION: u16 = 4;
@@ -488,6 +495,30 @@ pub const fn node_port_snat_candidate(hash: u32, probe: u32) -> u16 {
     )
 }
 
+/// Selects one collision candidate from a full-cycle permutation of the
+/// dynamic/private port half. The proof salt makes otherwise identical
+/// tenants use unrelated permutations without a mutable global allocator.
+#[must_use]
+pub const fn egress_snat_candidate(hash: u32, proof_salt: u32, probe: u32) -> u16 {
+    let seeded = hash ^ proof_salt.rotate_left(13) ^ 0x9e37_79b9;
+    let stride = ((seeded >> 16) & EGRESS_SNAT_PORT_MASK) | 1;
+    EGRESS_SNAT_PORT_BASE.wrapping_add(
+        (seeded.wrapping_add(probe.wrapping_mul(stride)) & EGRESS_SNAT_PORT_MASK) as u16,
+    )
+}
+
+#[must_use]
+pub const fn egress_connection_is_active(value: &EgressConnectionValue, now_ns: u64) -> bool {
+    let Some(timeout_ns) = connection_timeout_ns(value.protocol) else {
+        return false;
+    };
+    value.schema_version == EGRESS_MAP_ABI_VERSION
+        && value.contract_revision != 0
+        && value.lease_epoch != 0
+        && value.source_identity.get() != 0
+        && now_ns.saturating_sub(value.last_seen_ns) <= timeout_ns
+}
+
 #[must_use]
 pub const fn packet_starts_connection(protocol: u8, tcp_flags: u8) -> bool {
     match protocol {
@@ -872,6 +903,9 @@ pub struct EgressConnectionValue {
     pub primary_transport_address: [u8; 16],
     pub standby_transport_address: [u8; 16],
     pub proof_witness: [u8; 16],
+    pub contract_digest: [u8; 32],
+    pub primary_gateway_digest: [u8; 16],
+    pub standby_gateway_digest: [u8; 16],
     pub source_identity: IdentityId,
     pub original_source_port: [u8; 2],
     pub original_destination_port: [u8; 2],
@@ -1343,7 +1377,7 @@ const _: () = assert!(core::mem::size_of::<EgressSelectionKey>() == 8);
 const _: () = assert!(core::mem::size_of::<EgressSelectionValue>() == 32);
 const _: () = assert!(core::mem::size_of::<EgressMapConfig>() == 56);
 const _: () = assert!(core::mem::size_of::<EgressConnectionKey>() == 44);
-const _: () = assert!(core::mem::size_of::<EgressConnectionValue>() == 144);
+const _: () = assert!(core::mem::size_of::<EgressConnectionValue>() == 208);
 const _: () = assert!(core::mem::size_of::<EgressEvent>() == 152);
 const _: () = assert!(core::mem::size_of::<Ipv4ServiceFrontendKey>() == 8);
 const _: () = assert!(core::mem::size_of::<Ipv6ServiceFrontendKey>() == 20);
@@ -1433,7 +1467,7 @@ mod tests {
         assert_eq!(core::mem::align_of::<EgressConnectionKey>(), 4);
         assert_eq!(core::mem::size_of::<EgressConnectionKey>(), 44);
         assert_eq!(core::mem::align_of::<EgressConnectionValue>(), 8);
-        assert_eq!(core::mem::size_of::<EgressConnectionValue>(), 144);
+        assert_eq!(core::mem::size_of::<EgressConnectionValue>(), 208);
         assert_eq!(core::mem::align_of::<EgressEvent>(), 8);
         assert_eq!(core::mem::size_of::<EgressEvent>(), 152);
         assert_eq!(core::mem::align_of::<Ipv4ServiceFrontendKey>(), 1);
@@ -1742,6 +1776,28 @@ mod tests {
                 "bounded allocation failed at source port {source_port}"
             );
         }
+    }
+
+    #[test]
+    fn egress_snat_candidates_form_proof_salted_nonrepeating_cycles() {
+        let mut cycle = std::collections::HashSet::new();
+        for probe in 0..=EGRESS_SNAT_PORT_MASK {
+            let candidate = egress_snat_candidate(0x1234_5678, 0xa5a5_5a5a, probe);
+            assert!(candidate >= EGRESS_SNAT_PORT_BASE);
+            assert!(cycle.insert(candidate));
+        }
+        assert_eq!(cycle.len(), (EGRESS_SNAT_PORT_MASK + 1) as usize);
+
+        let mut first_window = std::collections::HashSet::new();
+        let mut second_window = std::collections::HashSet::new();
+        for probe in 0..EGRESS_SNAT_PORT_PROBES {
+            let candidate = egress_snat_candidate(0x1234_5678, 0xa5a5_5a5a, probe);
+            assert!(first_window.insert(candidate));
+            second_window.insert(egress_snat_candidate(0x1234_5678, 0x5a5a_a5a5, probe));
+        }
+        assert_eq!(first_window.len(), EGRESS_SNAT_PORT_PROBES as usize);
+        assert_eq!(second_window.len(), EGRESS_SNAT_PORT_PROBES as usize);
+        assert_ne!(first_window, second_window);
     }
 
     #[test]
