@@ -711,6 +711,17 @@ matrix is maintained in the
   reuse, final release, and retained diagnostics under `make
   egress-kind-lifecycle-test`; ADR 0135. Measured HA/failover and the later
   Phase 8 platform milestones remain.
+- Milestone 8.6 is in progress. Its first verified slice introduces
+  Continuity-Certified Rendezvous (CCR): same-ordinal IPv4/IPv6 addresses form
+  exclusive ownership shards; exact integer capacity targets bound imbalance;
+  the compiler retains the mathematical maximum prior ownership; and
+  failure-domain diversity precedes rendezvous score when a failed owner's
+  shards move. A complete digest-bound capacity-exact contingency is compiled
+  for each single-gateway failure, and replay verifies that actual movement
+  equals its lower bound. Candidate ordering, malformed membership, duplicate
+  identity, stale lease, foreign prior state, and certificate mutation fail
+  closed under `make egress-ha-planner-test`; ADR 0136. Lease-fenced live
+  promotion, connection continuity, and measured failure/drain behavior remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

@@ -135,6 +135,12 @@ reconciler joins watched cluster facts into per-source-Node contracts and the
 repeatable Kind lifecycle proves restart, withdrawal, drain, monotonic safe
 reuse, and final release. ADRs 0123–0135 record the verified Phase 8.5 boundary;
 measured multi-gateway HA begins in milestone 8.6.
+Its first control-plane slice compiles Continuity-Certified Rendezvous plans.
+Same-ordinal IPv4/IPv6 addresses become exclusive ownership shards, exact
+integer capacity targets bound placement, and the maximum legal prior ownership
+is retained. Every single-gateway failure has a digest-bound, independently
+replayable contingency and minimum-disruption certificate. Live activation is
+deliberately separate from planning; ADR 0136.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

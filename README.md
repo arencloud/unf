@@ -547,6 +547,16 @@ reuse, and final cleanup on three-Node kube-proxy-free Kind. ADR 0135 closes
 milestone 8.5; durable enriched history, measured HA/failover, FQDN controls,
 production reachability providers, the full Phase 8 platform matrix, and
 OpenShift qualification remain later milestones.
+Phase 8.6 starts with Continuity-Certified Rendezvous (CCR), a provider-neutral
+HA planner for multiple egress addresses. It pairs same-ordinal IPv4/IPv6
+addresses into exclusive ownership shards, computes exact integer
+capacity-weighted targets without floating point, retains the mathematical
+maximum legal prior ownership, and prefers failure-domain-diverse replacements.
+Every single-gateway failure is compiled ahead of time into a digest-bound,
+capacity-exact contingency with an independently replayable minimum-disruption
+certificate. Five adversarial suites pass `make egress-ha-planner-test`; ADR
+0136. Live promotion and established-flow continuity remain the next 8.6 gates,
+so the planning result is not presented as availability evidence.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -254,3 +254,13 @@ transport consumes that authority to remove the exact address/proxy subset and
 reconciles unchanged watched desired state only after atomic release. The
 three-Node dual-stack lifecycle proves recovery, monotonic safe reuse, and final
 cleanup. See ADRs 0119–0135.
+
+Phase 8.6 adds an HA plan outside the packet ABI. Schema-v1
+Continuity-Certified Rendezvous state binds the exact allocation lease,
+canonical gateway membership, integer capacities, explicit failure domains,
+exclusive dual-stack address shards, active assignments, and one complete
+contingency per candidate. Membership, each contingency, and the whole plan
+have separate digests. Replayers recompute assignments and verify that observed
+ownership movement equals its mathematical lower bound; digests alone are not
+authority. Promotion state remains a later, separately fenced transaction; ADR
+0136.
