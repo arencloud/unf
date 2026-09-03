@@ -725,9 +725,12 @@ matrix is maintained in the
   graceful old-owner address absence or positive independent infrastructure
   isolation. Kubernetes readiness/Lease is never a fence. Exact replacement
   ownership and reachability compare-and-swap evidence seal the activation
-  capability under `make egress-ha-promotion-test`; ADR 0137. Established-flow
-  continuity, watched live integration, and measured failure/drain behavior
-  remain.
+  capability under `make egress-ha-promotion-test`; ADR 0137. Acknowledged Flow
+  Twins then replicate complete NAT pairs through sequence-checked hash chains;
+  exact standby watermark/readback permits only live lease- and shard-valid
+  pairs into a promotion-bound atomic cutover. The asynchronous unacknowledged
+  tail remains explicit and measurable under `make egress-ha-continuity-test`;
+  ADR 0138. Watched live integration and measured failure/drain behavior remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

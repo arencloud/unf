@@ -560,8 +560,13 @@ first, then exact old-owner address absence or an independent infrastructure
 fence is mandatory; Kubernetes health is never isolation evidence. Exact new
 ownership and an atomic reachability compare-and-swap seal one activation
 capability. Five adversarial suites pass `make egress-ha-promotion-test`; ADR
-0137. Established-flow continuity, watched integration, and measured failover
-remain before 8.6 can claim availability.
+0137. Acknowledged Flow Twins add established-flow continuity without opaque
+conntrack copying: complete NAT pairs travel through sequence-checked hash
+chains, the standby acknowledges an exact snapshot watermark, and promotion
+imports only live lease/address/shard-valid state into its atomic source-bank
+cutover. The unacknowledged asynchronous tail stays explicit and measurable.
+Five adversarial suites pass `make egress-ha-continuity-test`; ADR 0138. Watched
+integration and measured failover remain before 8.6 can claim availability.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
