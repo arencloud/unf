@@ -4621,6 +4621,10 @@ fn service_record_semantics_equal(left: &ServiceRecord, right: &ServiceRecord) -
         && left.compiler_source == right.compiler_source
 }
 
+fn normalized_port_name(name: Option<&str>) -> Option<String> {
+    name.filter(|name| !name.is_empty()).map(str::to_owned)
+}
+
 #[allow(clippy::too_many_lines)]
 fn service_record(service: &Service) -> Result<ServiceRecord> {
     let namespace = service.namespace().unwrap_or_default();
@@ -4693,13 +4697,13 @@ fn service_record(service: &Service) -> Result<ServiceRecord> {
             },
         ));
         ports.push(TopologyServicePort {
-            name: port.name.clone(),
+            name: normalized_port_name(port.name.as_deref()),
             protocol: protocol.clone(),
             port: number,
             target_port,
         });
         compiler_ports.push(ServiceSourcePort {
-            name: port.name.clone(),
+            name: normalized_port_name(port.name.as_deref()),
             protocol: service_protocol(&protocol)?,
             port: number,
             app_protocol: port.app_protocol.clone(),
@@ -5104,7 +5108,7 @@ fn endpoint_slice_record(endpoint_slice: &EndpointSlice) -> Result<EndpointSlice
                 ));
             }
             Ok(TopologyServiceBackendPort {
-                name: port.name.clone(),
+                name: normalized_port_name(port.name.as_deref()),
                 protocol: port.protocol.clone().unwrap_or_else(|| "TCP".to_owned()),
                 port: number,
             })
@@ -5119,7 +5123,7 @@ fn endpoint_slice_record(endpoint_slice: &EndpointSlice) -> Result<EndpointSlice
         .map(|port| {
             let protocol = port.protocol.as_deref().unwrap_or("TCP");
             Ok(EndpointPortSource {
-                name: port.name.clone(),
+                name: normalized_port_name(port.name.as_deref()),
                 protocol: service_protocol(protocol)?,
                 port: port.port.map(u16::try_from).transpose().with_context(|| {
                     format!("EndpointSlice {slice_reference} contains a port outside the u16 range")
@@ -13853,6 +13857,35 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn kubernetes_empty_port_names_match_unnamed_service_ports() {
+        let mut service = service();
+        service.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].name = Some(String::new());
+        let service = service_record(&service).expect("valid unnamed Service port");
+        assert_eq!(service.ports[0].name, None);
+        assert_eq!(service.compiler_source.ports[0].name, None);
+
+        let mut endpoint_slice = endpoint_slice(true);
+        endpoint_slice.ports.as_mut().unwrap()[0].name = Some(String::new());
+        let endpoint_slice =
+            endpoint_slice_record(&endpoint_slice).expect("valid unnamed EndpointSlice port");
+        assert_eq!(endpoint_slice.backends[0].ports[0].name, None);
+        assert_eq!(
+            endpoint_slice.compiler_source.endpoints[0].ports[0].name,
+            None
+        );
+
+        let snapshot = compile_service_snapshot(
+            7,
+            Revision::new(1),
+            vec![service.compiler_source],
+            vec![endpoint_slice.compiler_source],
+        )
+        .expect("empty Kubernetes names normalize to one unnamed port identity");
+        assert_eq!(snapshot.services[0].frontends[0].backend_ids.len(), 1);
+        assert_eq!(snapshot.services[0].backends.len(), 1);
     }
 
     #[test]
