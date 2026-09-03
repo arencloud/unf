@@ -720,8 +720,14 @@ matrix is maintained in the
   for each single-gateway failure, and replay verifies that actual movement
   equals its lower bound. Candidate ordering, malformed membership, duplicate
   identity, stale lease, foreign prior state, and certificate mutation fail
-  closed under `make egress-ha-planner-test`; ADR 0136. Lease-fenced live
-  promotion, connection continuity, and measured failure/drain behavior remain.
+  closed under `make egress-ha-planner-test`; ADR 0136. The verified 8.6b
+  proof-carrying protocol fences every exact source before it accepts either
+  graceful old-owner address absence or positive independent infrastructure
+  isolation. Kubernetes readiness/Lease is never a fence. Exact replacement
+  ownership and reachability compare-and-swap evidence seal the activation
+  capability under `make egress-ha-promotion-test`; ADR 0137. Established-flow
+  continuity, watched live integration, and measured failure/drain behavior
+  remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

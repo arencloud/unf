@@ -555,8 +555,13 @@ maximum legal prior ownership, and prefers failure-domain-diverse replacements.
 Every single-gateway failure is compiled ahead of time into a digest-bound,
 capacity-exact contingency with an independently replayable minimum-disruption
 certificate. Five adversarial suites pass `make egress-ha-planner-test`; ADR
-0136. Live promotion and established-flow continuity remain the next 8.6 gates,
-so the planning result is not presented as availability evidence.
+0136. The next verified slice adds proof-carrying promotion: every source fences
+first, then exact old-owner address absence or an independent infrastructure
+fence is mandatory; Kubernetes health is never isolation evidence. Exact new
+ownership and an atomic reachability compare-and-swap seal one activation
+capability. Five adversarial suites pass `make egress-ha-promotion-test`; ADR
+0137. Established-flow continuity, watched integration, and measured failover
+remain before 8.6 can claim availability.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
