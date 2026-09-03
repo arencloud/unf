@@ -374,9 +374,52 @@ impl EgressGatewayProjection {
             source_contracts,
             projection_digest: EgressGatewayProjectionDigest([0; 32]),
         };
-        projection.validate_structure()?;
+        projection.validate_structure(false)?;
         projection.projection_digest = projection.digest()?;
         Ok(projection)
+    }
+
+    /// Issues an explicit empty projection that withdraws all previously
+    /// admitted source contracts from one exact gateway Node.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid authentication, schema negotiation, epoch, or revision.
+    pub fn withdraw(
+        principal: &AuthenticatedEgressAgent,
+        advertisement: &EgressAgentAdvertisement,
+        controller_epoch: u64,
+        revision: Revision,
+    ) -> Result<Self, EgressDistributionError> {
+        validate_principal(principal)?;
+        let negotiated = negotiate(advertisement)?;
+        if controller_epoch == 0 || revision == Revision::INITIAL {
+            return Err(EgressDistributionError::InvalidRevision);
+        }
+        let mut projection = Self {
+            schema_version: EGRESS_DISTRIBUTION_SCHEMA_VERSION,
+            controller_epoch,
+            revision,
+            recipient: EgressProjectionRecipient {
+                node_name: principal.node_name.clone(),
+                node_uid: principal.node_uid.clone(),
+            },
+            negotiated,
+            gateway: EgressNode {
+                name: principal.node_name.clone(),
+                uid: principal.node_uid.clone(),
+                capabilities: advertisement.capabilities.clone(),
+            },
+            source_contracts: Vec::new(),
+            projection_digest: EgressGatewayProjectionDigest([0; 32]),
+        };
+        projection.projection_digest = projection.digest()?;
+        Ok(projection)
+    }
+
+    #[must_use]
+    pub fn is_withdrawal(&self) -> bool {
+        self.source_contracts.is_empty()
     }
 
     /// Admits a wire projection on the exact gateway Node. The authenticated
@@ -411,15 +454,15 @@ impl EgressGatewayProjection {
         if self.negotiated != expected || self.gateway.capabilities != expected.capabilities {
             return Err(EgressDistributionError::CapabilityMismatch);
         }
-        self.validate_structure()?;
+        self.validate_structure(true)?;
         if self.projection_digest != self.digest()? {
             return Err(EgressDistributionError::GatewayProjectionDigestMismatch);
         }
         Ok(AdmittedEgressGatewayProjection(self))
     }
 
-    fn validate_structure(&self) -> Result<(), EgressDistributionError> {
-        if self.source_contracts.is_empty() {
+    fn validate_structure(&self, allow_withdrawal: bool) -> Result<(), EgressDistributionError> {
+        if self.source_contracts.is_empty() && !allow_withdrawal {
             return Err(EgressDistributionError::EmptyGatewayProjection);
         }
         if self.source_contracts.len() > MAX_EGRESS_GATEWAY_SOURCE_CONTRACTS {
@@ -480,6 +523,56 @@ impl EgressGatewayProjection {
         hasher.update(b"unf.egress-gateway-projection.v1\0");
         hasher.update(material);
         Ok(EgressGatewayProjectionDigest(hasher.finalize().into()))
+    }
+}
+
+/// Monotonic last-known-good selected-gateway projection ownership. Explicit
+/// empty projections are retained as withdrawal authority.
+#[derive(Debug, Clone, Default)]
+pub struct EgressGatewayProjectionLedger {
+    current: Option<EgressGatewayProjection>,
+}
+
+impl EgressGatewayProjectionLedger {
+    #[must_use]
+    pub const fn current(&self) -> Option<&EgressGatewayProjection> {
+        self.current.as_ref()
+    }
+
+    /// Adopts an independently admitted gateway projection after monotonic
+    /// epoch/revision fencing.
+    ///
+    /// # Errors
+    ///
+    /// Rejects regression or mutation at an already accepted revision tuple.
+    pub fn adopt(
+        &mut self,
+        projection: AdmittedEgressGatewayProjection,
+    ) -> Result<&EgressGatewayProjection, EgressDistributionError> {
+        let candidate = projection.into_projection();
+        if let Some(current) = &self.current {
+            if candidate.controller_epoch < current.controller_epoch
+                || (candidate.controller_epoch == current.controller_epoch
+                    && candidate.revision < current.revision)
+            {
+                return Err(EgressDistributionError::RevisionRegression);
+            }
+            if candidate.controller_epoch == current.controller_epoch
+                && candidate.revision == current.revision
+            {
+                if candidate != *current {
+                    return Err(EgressDistributionError::SameRevisionMutation);
+                }
+                return self
+                    .current
+                    .as_ref()
+                    .ok_or(EgressDistributionError::InvalidRevision);
+            }
+        }
+        self.current = Some(candidate);
+        self.current
+            .as_ref()
+            .ok_or(EgressDistributionError::InvalidRevision)
     }
 }
 
@@ -1086,5 +1179,50 @@ mod tests {
             .expect("object")
             .insert("trusted".to_owned(), serde_json::json!(true));
         assert!(serde_json::from_value::<EgressGatewayProjection>(value).is_err());
+    }
+
+    #[test]
+    fn gateway_withdrawal_and_ledger_are_explicit_monotonic_and_idempotent() {
+        let source = admitted(4);
+        let active = EgressGatewayProjection::issue(
+            &principal("gateway-a"),
+            &advertisement(),
+            10,
+            Revision::new(5),
+            &[source],
+        )
+        .expect("issue active gateway projection")
+        .admit(&principal("gateway-a"), &advertisement())
+        .expect("admit active gateway projection");
+        let withdrawal = EgressGatewayProjection::withdraw(
+            &principal("gateway-a"),
+            &advertisement(),
+            10,
+            Revision::new(6),
+        )
+        .expect("issue explicit withdrawal");
+        assert!(withdrawal.is_withdrawal());
+        let withdrawal = withdrawal
+            .admit(&principal("gateway-a"), &advertisement())
+            .expect("admit explicit withdrawal");
+
+        let mut ledger = EgressGatewayProjectionLedger::default();
+        ledger.adopt(active.clone()).expect("adopt active state");
+        ledger
+            .adopt(withdrawal.clone())
+            .expect("adopt newer withdrawal");
+        ledger
+            .adopt(withdrawal)
+            .expect("exact withdrawal replay is idempotent");
+        assert!(
+            ledger
+                .current()
+                .expect("current projection")
+                .is_withdrawal()
+        );
+        assert_eq!(
+            ledger.adopt(active),
+            Err(EgressDistributionError::RevisionRegression)
+        );
     }
 }

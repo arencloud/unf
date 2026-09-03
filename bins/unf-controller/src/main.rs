@@ -39,10 +39,11 @@ use unf_common::{
     Revision, ServiceId, Verdict,
 };
 use unf_egress::{
-    AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
-    EgressAddressPool, EgressAgentAdvertisement, EgressBehaviorContract, EgressContractFacts,
-    EgressDesiredCheckpoint, EgressDesiredStore, EgressDistributionError, EgressIntent,
-    EgressModel, EgressNodeProjectionEnvelope, EgressProviderRef,
+    AdmittedEgressProjection, AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT,
+    EGRESS_AGENT_TOKEN_AUDIENCE, EgressAddressPool, EgressAgentAdvertisement,
+    EgressBehaviorContract, EgressContractFacts, EgressDesiredCheckpoint, EgressDesiredStore,
+    EgressDistributionError, EgressGatewayProjection, EgressIntent, EgressModel,
+    EgressNodeProjectionEnvelope, EgressProviderRef,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -298,7 +299,9 @@ struct ControllerState {
     openshift_egress_ip_initialization: Mutex<Option<EgressIntentSources>>,
     openshift_egress_ip_initialization_failed: AtomicBool,
     rejected_openshift_egress_ips: RwLock<BTreeMap<String, String>>,
+    egress_distribution_guard: Mutex<()>,
     egress_source_distributions: RwLock<BTreeMap<String, EgressSourceDistribution>>,
+    egress_gateway_distributions: Mutex<EgressGatewayDistributionState>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -410,6 +413,12 @@ struct EgressSourceDistribution {
     model: EgressModel,
     facts: EgressContractFacts,
     contract: EgressBehaviorContract,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EgressGatewayDistributionState {
+    revision: Revision,
+    admitted_sources: BTreeMap<String, AdmittedEgressProjection>,
 }
 
 #[derive(Debug, Clone)]
@@ -1113,6 +1122,7 @@ async fn spawn_internal_api(
         .route("/v1/state/node-block", get(node_block_snapshot))
         .route("/v1/state/remote-routes", get(remote_route_snapshot))
         .route("/v1/state/egress-source", post(egress_source_projection))
+        .route("/v1/state/egress-gateway", post(egress_gateway_projection))
         .route("/v1/state/agents", post(ingest_agent_status))
         .route("/v1/telemetry/flows", post(ingest_flows))
         .with_state(state);
@@ -1406,7 +1416,9 @@ fn new_state_with_client_and_selector(
         openshift_egress_ip_initialization: Mutex::new(None),
         openshift_egress_ip_initialization_failed: AtomicBool::new(false),
         rejected_openshift_egress_ips: RwLock::new(BTreeMap::new()),
+        egress_distribution_guard: Mutex::new(()),
         egress_source_distributions: RwLock::new(BTreeMap::new()),
+        egress_gateway_distributions: Mutex::new(EgressGatewayDistributionState::default()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -3384,7 +3396,44 @@ fn record_egress_policy_result(state: &ControllerState, key: &str, result: Resul
 fn record_egress_desired_change(state: &ControllerState, changed: bool) {
     if changed {
         state.egress_desired_dirty.store(true, Ordering::Release);
-        write_lock(&state.egress_source_distributions).clear();
+        invalidate_egress_distributions(state);
+    }
+}
+
+fn invalidate_egress_distributions(state: &ControllerState) {
+    let _guard = mutex_lock(&state.egress_distribution_guard);
+    write_lock(&state.egress_source_distributions).clear();
+    withdraw_all_admitted_egress_sources_locked(state);
+}
+
+fn withdraw_all_admitted_egress_sources_locked(state: &ControllerState) {
+    let mut gateway = mutex_lock(&state.egress_gateway_distributions);
+    if gateway.admitted_sources.is_empty() {
+        return;
+    }
+    gateway.revision = gateway.revision.next();
+    gateway.admitted_sources.clear();
+}
+
+fn remove_node_egress_distributions(state: &ControllerState, source_node: &str) {
+    let _guard = mutex_lock(&state.egress_distribution_guard);
+    write_lock(&state.egress_source_distributions).remove(source_node);
+    let mut gateway = mutex_lock(&state.egress_gateway_distributions);
+    if gateway.admitted_sources.remove(source_node).is_some() {
+        gateway.revision = gateway.revision.next();
+    }
+}
+
+fn retain_node_egress_distributions(state: &ControllerState, live_nodes: &BTreeSet<String>) {
+    let _guard = mutex_lock(&state.egress_distribution_guard);
+    write_lock(&state.egress_source_distributions).retain(|node, _| live_nodes.contains(node));
+    let mut gateway = mutex_lock(&state.egress_gateway_distributions);
+    let previous = gateway.admitted_sources.len();
+    gateway
+        .admitted_sources
+        .retain(|node, _| live_nodes.contains(node));
+    if gateway.admitted_sources.len() != previous {
+        gateway.revision = gateway.revision.next();
     }
 }
 
@@ -3608,6 +3657,7 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
         Event::InitApply(node) => reconcile_node(state, &node, true),
         Event::Delete(node) => {
             let node_name = node.name_any();
+            remove_node_egress_distributions(state, &node_name);
             write_lock(&state.node_port_nodes).remove(&node_name);
             write_lock(&state.rejected_node_port_nodes).remove(&node_name);
             if write_lock(&state.node_block_inputs)
@@ -3662,6 +3712,7 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
                 }
             }
             let nodes = read_lock(&state.nodes);
+            let live_nodes = nodes.keys().cloned().collect::<BTreeSet<_>>();
             let mut reports = write_lock(&state.agent_reports);
             let previous_len = reports.len();
             reports.retain(|node_name, _| nodes.contains_key(node_name));
@@ -3670,6 +3721,7 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             }
             drop(reports);
             drop(nodes);
+            retain_node_egress_distributions(state, &live_nodes);
             finish_topology_initialization(state);
         }
     }
@@ -3721,6 +3773,12 @@ fn reconcile_node_port_node(state: &ControllerState, node: &Node) {
                 record.node_uid == candidate.node_uid && record.addresses == candidate.addresses
             }) {
                 return;
+            }
+            if previous
+                .as_ref()
+                .is_some_and(|record| record.node_uid != candidate.node_uid)
+            {
+                remove_node_egress_distributions(state, &node_name);
             }
             write_lock(&state.node_port_nodes).insert(node_name, candidate);
         }
@@ -6180,12 +6238,83 @@ fn egress_source_projection_for(
     agent: &AuthenticatedAgent,
     advertisement: &EgressAgentAdvertisement,
 ) -> Result<Option<EgressNodeProjectionEnvelope>, ApiError> {
+    let _guard = mutex_lock(&state.egress_distribution_guard);
     let desired = read_lock(&state.egress_source_distributions)
         .get(&agent.node_name)
         .cloned();
     let Some(desired) = desired else {
         return Ok(None);
     };
+    let principal = egress_principal_for(state, agent)?;
+    let envelope = EgressNodeProjectionEnvelope::issue(
+        &principal,
+        advertisement,
+        state.identity_epoch,
+        desired.revision,
+        desired.model,
+        desired.facts,
+        desired.contract,
+    )
+    .map_err(|error| egress_distribution_api_error(&error))?;
+    let admitted = envelope
+        .clone()
+        .admit(&principal, advertisement)
+        .map_err(|error| egress_distribution_api_error(&error))?;
+    admit_egress_source_for_gateways(state, agent.node_name.clone(), admitted);
+    Ok(Some(envelope))
+}
+
+async fn egress_gateway_projection(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(advertisement): Json<EgressAgentAdvertisement>,
+) -> Result<Response, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    match egress_gateway_projection_for(&state, &agent, &advertisement)? {
+        Some(projection) => Ok(Json(projection).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+fn egress_gateway_projection_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    advertisement: &EgressAgentAdvertisement,
+) -> Result<Option<EgressGatewayProjection>, ApiError> {
+    let _guard = mutex_lock(&state.egress_distribution_guard);
+    let principal = egress_principal_for(state, agent)?;
+    let (revision, sources) = {
+        let gateway = mutex_lock(&state.egress_gateway_distributions);
+        let sources = gateway
+            .admitted_sources
+            .values()
+            .filter(|source| source_selects_gateway(source, &principal, advertisement))
+            .cloned()
+            .collect::<Vec<_>>();
+        (gateway.revision, sources)
+    };
+    if revision == Revision::INITIAL {
+        return Ok(None);
+    }
+    let projection = if sources.is_empty() {
+        EgressGatewayProjection::withdraw(&principal, advertisement, state.identity_epoch, revision)
+    } else {
+        EgressGatewayProjection::issue(
+            &principal,
+            advertisement,
+            state.identity_epoch,
+            revision,
+            &sources,
+        )
+    }
+    .map_err(|error| egress_distribution_api_error(&error))?;
+    Ok(Some(projection))
+}
+
+fn egress_principal_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+) -> Result<AuthenticatedEgressAgent, ApiError> {
     let node_uid = read_lock(&state.node_port_nodes)
         .get(&agent.node_name)
         .map(|record| record.node_uid.clone())
@@ -6195,7 +6324,7 @@ fn egress_source_projection_for(
                 agent.node_name
             ))
         })?;
-    let principal = AuthenticatedEgressAgent {
+    Ok(AuthenticatedEgressAgent {
         namespace: agent.namespace.clone(),
         service_account: agent.service_account.clone(),
         pod_name: agent.pod_name.clone(),
@@ -6203,18 +6332,37 @@ fn egress_source_projection_for(
         node_name: agent.node_name.clone(),
         node_uid,
         audience: agent.audience.clone(),
-    };
-    EgressNodeProjectionEnvelope::issue(
-        &principal,
-        advertisement,
-        state.identity_epoch,
-        desired.revision,
-        desired.model,
-        desired.facts,
-        desired.contract,
-    )
-    .map(Some)
-    .map_err(|error| egress_distribution_api_error(&error))
+    })
+}
+
+fn admit_egress_source_for_gateways(
+    state: &ControllerState,
+    source_node: String,
+    admitted: AdmittedEgressProjection,
+) {
+    let mut gateway = mutex_lock(&state.egress_gateway_distributions);
+    if gateway.admitted_sources.get(&source_node) == Some(&admitted) {
+        return;
+    }
+    gateway.revision = gateway.revision.next();
+    gateway.admitted_sources.insert(source_node, admitted);
+}
+
+fn source_selects_gateway(
+    source: &AdmittedEgressProjection,
+    principal: &AuthenticatedEgressAgent,
+    advertisement: &EgressAgentAdvertisement,
+) -> bool {
+    source.projection().contract.plans.iter().any(|plan| {
+        plan.gateways.iter().any(|gateway| {
+            gateway.node.name == principal.node_name
+                && gateway.node.uid == principal.node_uid
+                && gateway.node.capabilities == advertisement.capabilities
+                && gateway.ready
+                && gateway.reachable
+                && gateway.lease_epoch == plan.allocation.lease_epoch
+        })
+    })
 }
 
 fn egress_distribution_api_error(error: &EgressDistributionError) -> ApiError {
@@ -8966,6 +9114,98 @@ mod tests {
         }
     }
 
+    fn authenticated_egress_agent(node: &str) -> AuthenticatedAgent {
+        AuthenticatedAgent {
+            namespace: "unf-system".to_owned(),
+            service_account: EGRESS_AGENT_SERVICE_ACCOUNT.to_owned(),
+            node_name: node.to_owned(),
+            pod_name: format!("unf-agent-{node}"),
+            pod_uid: format!("unf-agent-{node}-uid"),
+            audience: EGRESS_AGENT_TOKEN_AUDIENCE.to_owned(),
+        }
+    }
+
+    fn gateway_source_distribution(
+        advertisement: &EgressAgentAdvertisement,
+    ) -> EgressSourceDistribution {
+        let intent = unf_egress::EgressIntent {
+            owner: unf_egress::EgressIntentOwner {
+                scope: unf_egress::EgressIntentScope::Cluster,
+                name: "payments".to_owned(),
+                uid: "payments-intent-uid".to_owned(),
+            },
+            priority: 100,
+            source: unf_egress::EgressSourceSelector::default(),
+            destinations: unf_egress::EgressDestinations::Any,
+            addresses: unf_egress::EgressAddressRequest::Explicit {
+                addresses: vec!["192.0.2.40".parse().expect("address")],
+            },
+        };
+        let model = unf_egress::normalize_model(Vec::new(), vec![intent])
+            .expect("valid explicit-address model");
+        let source_node = unf_egress::EgressNode {
+            name: "worker-a".to_owned(),
+            uid: "worker-a-uid".to_owned(),
+            capabilities: advertisement.capabilities.clone(),
+        };
+        let gateway_node = unf_egress::EgressNode {
+            name: "gateway-a".to_owned(),
+            uid: "gateway-a-uid".to_owned(),
+            capabilities: advertisement.capabilities.clone(),
+        };
+        let revisions = unf_egress::EgressContractRevisions {
+            intent: Revision::new(1),
+            identity: Revision::new(2),
+            policy: Revision::new(3),
+            allocation: Revision::new(4),
+            gateway: Revision::new(5),
+            reachability: Revision::new(6),
+        };
+        let facts = unf_egress::EgressContractFacts {
+            revisions,
+            sources: vec![unf_egress::EgressSourceFact {
+                identity: IdentityId::new(42),
+                namespace: "payments".to_owned(),
+                workload: "api".to_owned(),
+                workload_uid: "api-uid".to_owned(),
+                service_account: "api".to_owned(),
+                namespace_labels: BTreeMap::new(),
+                workload_labels: BTreeMap::new(),
+                node: source_node.clone(),
+                intent_uid: "payments-intent-uid".to_owned(),
+            }],
+            policies: vec![unf_egress::EgressPolicyFact {
+                identity: IdentityId::new(42),
+                intent_uid: "payments-intent-uid".to_owned(),
+                allowed: true,
+                policy_ids: vec![PolicyId::new(7)],
+            }],
+            allocations: vec![unf_egress::EgressAllocationFact {
+                intent_uid: "payments-intent-uid".to_owned(),
+                pool_name: None,
+                pool_uid: None,
+                addresses: vec!["192.0.2.40".parse().expect("address")],
+                lease_epoch: 8,
+            }],
+            gateways: vec![unf_egress::EgressGatewayFact {
+                intent_uid: "payments-intent-uid".to_owned(),
+                rank: 0,
+                node: gateway_node,
+                lease_epoch: 8,
+                ready: true,
+                reachable: true,
+            }],
+        };
+        let contract = EgressBehaviorContract::issue(&model, &facts, source_node, Revision::new(9))
+            .expect("valid source contract");
+        EgressSourceDistribution {
+            revision: Revision::new(10),
+            model,
+            facts,
+            contract,
+        }
+    }
+
     #[test]
     fn egress_distribution_is_exact_node_scoped_replayable_and_fail_closed() {
         let state = new_state(true);
@@ -9053,6 +9293,65 @@ mod tests {
                 .status,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn egress_gateway_distribution_requires_authenticated_source_admission_and_withdraws() {
+        let state = new_state(true);
+        for node in ["worker-a", "gateway-a", "gateway-b"] {
+            write_lock(&state.node_port_nodes).insert(
+                node.to_owned(),
+                NodePortNodeRecord {
+                    node_uid: format!("{node}-uid"),
+                    revision: Revision::new(1),
+                    addresses: Vec::new(),
+                },
+            );
+        }
+        let advertisement = egress_advertisement();
+        write_lock(&state.egress_source_distributions).insert(
+            "worker-a".to_owned(),
+            gateway_source_distribution(&advertisement),
+        );
+        let gateway = authenticated_egress_agent("gateway-a");
+        assert!(
+            egress_gateway_projection_for(&state, &gateway, &advertisement)
+                .expect("unadmitted source is not an error")
+                .is_none(),
+            "gateway authority must wait for an authenticated source fetch"
+        );
+
+        let source = authenticated_egress_agent("worker-a");
+        egress_source_projection_for(&state, &source, &advertisement)
+            .expect("issue source projection")
+            .expect("source projection exists");
+        let active = egress_gateway_projection_for(&state, &gateway, &advertisement)
+            .expect("issue gateway projection")
+            .expect("gateway projection exists");
+        assert_eq!(active.source_contracts.len(), 1);
+        active
+            .clone()
+            .admit(
+                &egress_principal_for(&state, &gateway).expect("gateway principal"),
+                &advertisement,
+            )
+            .expect("gateway independently admits exact projection");
+
+        let unrelated = egress_gateway_projection_for(
+            &state,
+            &authenticated_egress_agent("gateway-b"),
+            &advertisement,
+        )
+        .expect("issue unrelated withdrawal")
+        .expect("global revision produces explicit projection");
+        assert!(unrelated.is_withdrawal());
+
+        invalidate_egress_distributions(&state);
+        let withdrawn = egress_gateway_projection_for(&state, &gateway, &advertisement)
+            .expect("issue withdrawal")
+            .expect("withdrawal is explicit");
+        assert!(withdrawn.is_withdrawal());
+        assert!(withdrawn.revision > active.revision);
     }
 
     fn native_egress_pool(prefix: &str) -> EgressPool {

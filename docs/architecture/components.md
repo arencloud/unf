@@ -118,7 +118,12 @@ path and packet readiness exist. Structural native EgressPool/EgressPolicy
 watches and optional read-only OpenShift EgressIP compatibility now converge
 through one whole-model transactional store and durable revision checkpoint;
 accepted changes withdraw stale source distributions. ADRs 0119–0122 record
-these boundaries; gateway distribution and TC packet ownership remain.
+these boundaries. The live selected-gateway endpoint now derives its recipient
+from Pod-bound authentication, aggregates only admitted ready/reachable
+lease-matched source contracts, and sends explicit monotonic withdrawal. The
+agent independently validates and fences that projection, but this request is
+not a source-application acknowledgement. ADR 0123 records the boundary;
+activation acknowledgements and TC packet ownership remain.
 
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,

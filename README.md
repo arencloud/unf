@@ -453,9 +453,14 @@ watcher now feed one transactional, revisioned, schema-v1 ConfigMap-backed
 canonical model. Invalid updates/relist or restart drift retain last-known-good
 state, foreign status is ignored, and accepted model changes withdraw stale
 source authority. This passes `make egress-desired-state-test`; ADR 0122.
-Authenticated selected-gateway distribution and source/gateway steering/NAT
-are next. No live egress address, gateway-readiness, packet-path, or platform
-claim is made yet.
+The POST-only gateway endpoint now derives its exact Node from the same
+Pod-bound authentication, publishes only controller-admitted contracts that
+name that ready/reachable lease-fenced candidate, and sends a monotonic empty
+projection for explicit withdrawal. The gateway agent independently validates
+and fences that state under `make egress-gateway-distribution-test`; ADR 0123.
+This request boundary is not a source-application acknowledgement. Exact
+source/gateway activation acknowledgements and steering/NAT are next. No live
+egress address, gateway-readiness, packet-path, or platform claim is made yet.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

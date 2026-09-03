@@ -60,7 +60,8 @@ use unf_egress::{
     AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
     EGRESS_DISTRIBUTION_SCHEMA_VERSION, EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard,
     EgressAgentAdvertisement, EgressCapability, EgressDataplaneState, EgressGatewayHostBank,
-    EgressNodeProjectionEnvelope, EgressProjectionLedger, compile_egress_dataplane,
+    EgressGatewayProjection, EgressGatewayProjectionLedger, EgressNodeProjectionEnvelope,
+    EgressProjectionLedger, compile_egress_dataplane,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -806,6 +807,7 @@ struct EgressSynchronizer {
     banks: [EncodedEgressBank; EGRESS_BANK_COUNT as usize],
     active_bank: u8,
     ledger: EgressProjectionLedger,
+    gateway_ledger: EgressGatewayProjectionLedger,
     applied_authority: Option<EgressAppliedAuthority>,
     node_name: String,
     controller_url: Option<String>,
@@ -6529,6 +6531,7 @@ fn new_synchronizers(
             banks: [EncodedEgressBank::default(), EncodedEgressBank::default()],
             active_bank: 0,
             ledger: EgressProjectionLedger::default(),
+            gateway_ledger: EgressGatewayProjectionLedger::default(),
             applied_authority: None,
             node_name,
             controller_url,
@@ -7624,6 +7627,22 @@ async fn synchronize_egress(
     synchronizer: &mut EgressSynchronizer,
     state: &AgentState,
 ) -> Result<bool> {
+    let source_result = synchronize_egress_source(synchronizer, state).await;
+    let gateway_result = synchronize_egress_gateway(synchronizer, state).await;
+    match (source_result, gateway_result) {
+        (Ok(source), Ok(gateway)) => Ok(source || gateway),
+        (Err(source), Ok(_)) => Err(source.context("egress source distribution failed")),
+        (Ok(_), Err(gateway)) => Err(gateway.context("egress gateway distribution failed")),
+        (Err(source), Err(gateway)) => Err(anyhow!(
+            "egress source distribution failed: {source:#}; gateway distribution failed: {gateway:#}"
+        )),
+    }
+}
+
+async fn synchronize_egress_source(
+    synchronizer: &mut EgressSynchronizer,
+    state: &AgentState,
+) -> Result<bool> {
     let controller_url = synchronizer
         .controller_url
         .as_deref()
@@ -7717,6 +7736,85 @@ async fn synchronize_egress(
         sources = candidate.sources.len(),
         active_bank = synchronizer.active_bank,
         "authenticated egress intent staged as fail-closed source fences"
+    );
+    Ok(true)
+}
+
+async fn synchronize_egress_gateway(
+    synchronizer: &mut EgressSynchronizer,
+    state: &AgentState,
+) -> Result<bool> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("egress synchronization requires a controller URL")?;
+    let advertisement = egress_agent_advertisement();
+    let response = synchronizer
+        .client
+        .current()
+        .post(format!("{controller_url}/v1/state/egress-gateway"))
+        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+        .json(&advertisement)
+        .send()
+        .await
+        .context("request authenticated egress gateway projection")?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(false);
+    }
+    let projection: EgressGatewayProjection = response
+        .error_for_status()
+        .context("controller rejected egress gateway projection request")?
+        .json()
+        .await
+        .context("decode egress gateway projection")?;
+    let node = fetch_node_port_node_snapshot(
+        controller_url,
+        &synchronizer.client,
+        &synchronizer.agent_token_path,
+    )
+    .await?
+    .validate_and_normalize()
+    .context("validate authoritative local Node identity for egress gateway")?;
+    if node.node_name != synchronizer.node_name {
+        bail!(
+            "controller returned Node identity for {}; authenticated egress gateway owns {}",
+            node.node_name,
+            synchronizer.node_name
+        );
+    }
+    let principal = AuthenticatedEgressAgent {
+        namespace: "unf-system".to_owned(),
+        service_account: EGRESS_AGENT_SERVICE_ACCOUNT.to_owned(),
+        pod_name: state.pod_name.clone(),
+        pod_uid: state.pod_uid.clone(),
+        node_name: synchronizer.node_name.clone(),
+        node_uid: node.node_uid,
+        audience: EGRESS_AGENT_TOKEN_AUDIENCE.to_owned(),
+    };
+    let admitted = projection
+        .admit(&principal, &advertisement)
+        .context("independently admit selected-gateway projection")?;
+    let mut next = synchronizer.gateway_ledger.clone();
+    next.adopt(admitted)
+        .context("fence selected-gateway projection revision")?;
+    if next.current() == synchronizer.gateway_ledger.current() {
+        return Ok(false);
+    }
+    let current = next
+        .current()
+        .context("admitted selected-gateway projection disappeared")?;
+    let revision = current.revision.get();
+    let contracts = current.source_contracts.len();
+    let sources = current
+        .source_contracts
+        .iter()
+        .map(|contract| contract.plans.len())
+        .sum::<usize>();
+    let withdrawal = current.is_withdrawal();
+    synchronizer.gateway_ledger = next;
+    info!(
+        revision,
+        contracts, sources, withdrawal, "authenticated selected-gateway projection admitted"
     );
     Ok(true)
 }
@@ -13782,6 +13880,7 @@ mod tests {
             banks: [EncodedEgressBank::default(), EncodedEgressBank::default()],
             active_bank: 0,
             ledger: EgressProjectionLedger::default(),
+            gateway_ledger: EgressGatewayProjectionLedger::default(),
             applied_authority: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,

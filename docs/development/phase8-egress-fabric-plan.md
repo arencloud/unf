@@ -18,7 +18,7 @@ authoritative state remains in [project-status.md](../project-status.md).
 | 8.3 | Durable allocation and gateway-provider contract | **Verified** | Schema-v1 allocation atomically assigns conflict-safe multiple IPv4/IPv6 addresses with exact owner/pool/provider provenance, bounded exhaustion, monotonic revisions/lease epochs, release/reuse, and strict checkpoint replay. Separate gateway/reachability provider interfaces, desired/ack revisions, epoch/address fencing, dual acknowledgement, safe withdrawal, and direct contract-fact projection pass `make egress-allocation-test`; ADR 0116 |
 | 8.4 | Transactional distribution and gateway host state | **Verified** | Schema-v1 projection binds the existing authenticated Pod/Node principal, negotiates exact contract/host capabilities, independently replays all facts, and fences last-known-good epochs/revisions. Separate userspace ABI-v1 host banks commit through stage/readback/prepare/activate, pointer rollback, exact current/pending recovery, cold reconstruction, and version-scoped cleanup; `make egress-host-state-test`; ADR 0117 |
 | 8.4a | Egress Proof Chain and zero-leak admission | **Verified** | Default `Native -> Fenced -> Active` admission prevents explicit-intent convergence/withdrawal leaks. Domain-separated rendezvous hashing deterministically selects same-family multiple addresses and ready gateways; a versioned proof binds the authoritative identity, original tuple, exact contract/revisions, lease, choice, and witness for independent selected-gateway replay. Ten adversarial tests and strict Clippy pass `make egress-proof-test`; ADR 0118 |
-| 8.5 | Live distribution, source steering, and gateway NAT dataplane | **In progress** | The verified contract/map slices lower exact path evidence into ABI-v1 state and transactionally own its 31-pin ABI-v12 kernel boundary. Authenticated live source distribution binds TokenReview Pod identity to an authoritative Node UID and stages explicit intent only as source fences. Structural native EgressPool/EgressPolicy watches and optional OpenShift EgressIP compatibility now transact through one durable canonical model under `make egress-desired-state-test`; ADRs 0119–0122. Gateway distribution, TC steering/NAT, and packet gates remain |
+| 8.5 | Live distribution, source steering, and gateway NAT dataplane | **In progress** | The verified contract/map slices lower exact path evidence into ABI-v1 state and transactionally own its 31-pin ABI-v12 kernel boundary. Authenticated source distribution stages only fences; structural native/OpenShift watches transact through one durable model. Exact selected gateways now receive only admitted ready/reachable lease-matched contracts and explicit monotonic withdrawal under `make egress-gateway-distribution-test`; ADRs 0119–0123. Activation acknowledgements, TC steering/NAT, and packet gates remain |
 | 8.6 | Deterministic HA, failover, and multiple addresses | **Planned** | Lease-fenced gateway ownership, deterministic placement and failover, established-flow contract, bounded convergence, split-brain rejection, node drain/recovery, and measured disruption |
 | 8.7 | FQDN and internet-access controls | **Planned** | DNS-derived destination sets with bounded TTL/staleness/provenance, explicit wildcard semantics, fail-closed capacity behavior, IP fallback visibility, and no use of DNS names as workload identity |
 | 8.8 | Reachability and advertisement providers | **Planned** | Static/native development provider first; BGP advertisement remains a replaceable provider with independent route-policy, ECMP, graceful-restart, BFD, and production qualification gates |
@@ -105,9 +105,9 @@ HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.5 next adds authenticated selected-gateway distribution from the
-now-watched, durable native/OpenShift desired model. Source/gateway TC stages
-then attach after the existing egress policy decision, followed by
-collision-safe dual-stack TCP/UDP SNAT/reverse state and kernel packet gates.
-The desired-state slice changes no host routing, address ownership, gateway
-readiness, packet behavior, or platform claim.
+Milestone 8.5 next adds exact source-map and gateway-host application
+acknowledgements before activation. Source/gateway TC stages then attach after
+the existing egress policy decision, followed by collision-safe dual-stack
+TCP/UDP SNAT/reverse state and kernel packet gates. The selected-gateway slice
+changes no host routing, address ownership, gateway readiness, packet behavior,
+or platform claim.

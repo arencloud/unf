@@ -659,7 +659,11 @@ matrix is maintained in the
   now feed one canonical revisioned ConfigMap checkpoint. Whole-model
   transactions, exact relists, restart replay, foreign-status non-adoption, and
   stale source-authority withdrawal pass `make egress-desired-state-test`; ADR
-  0122. Authenticated selected-gateway distribution and TC steering/NAT remain.
+  0122. Authenticated selected-gateway distribution now filters only exact
+  ready/reachable lease-fenced candidates, independently admits the digest-bound
+  projection, and uses a monotonic empty projection for withdrawal under `make
+  egress-gateway-distribution-test`; ADR 0123. Application acknowledgements and
+  TC steering/NAT remain.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

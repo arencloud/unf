@@ -223,5 +223,9 @@ EgressPool/EgressPolicy and OpenShift EgressIP watch sources now transact their
 owned prefixes through a single canonical model revision. A schema-v1
 ConfigMap checkpoint restores exact source ownership before watches start;
 failed/incomplete relists preserve last-known-good state, while accepted model
-changes clear stale source distribution authority. Gateway distribution and
-packet consumption remain separate Phase 8.5 gates. See ADRs 0119–0122.
+changes clear stale source distribution authority. Gateway application
+acknowledgement and packet consumption remain separate Phase 8.5 gates. A distinct in-process
+gateway ledger now owns digest-bound exact-Node source-contract projections and
+explicit empty withdrawals. It fences controller epoch/revision regression and
+same-revision mutation; restart reacquires it before any future activation
+because no gateway host or packet state exists yet. See ADRs 0119–0123.
