@@ -23,10 +23,11 @@ bounded supported schemas and capabilities; it contains no Node or gateway
 selector.
 
 After an authenticated source request, the controller independently issues and
-replays the exact source envelope before retaining it as eligible distribution
-material. This is controller admission, not an agent-application
-acknowledgement. Any desired-model change or source-Node deletion withdraws
-that retained material.
+replays the exact source envelope. ADR 0125 tightens the initial admission
+boundary: delivery records only pending material, and the source becomes
+eligible for gateway distribution only after the issuing Pod acknowledges the
+exact transactionally applied source revision and digest. Any desired-model
+change or source-Node deletion withdraws that admitted material.
 
 For each gateway request, the controller derives the exact recipient and
 filters admitted source contracts to ready and reachable gateway candidates
@@ -46,10 +47,11 @@ The agent polls source and gateway routes independently. It reconstructs its
 principal from the separately authenticated Node snapshot, validates recipient,
 schema, capabilities, contract integrity, candidate membership, ordering,
 bounds, and projection digest, then adopts the result through its gateway
-ledger. Transport, authentication, decoding, validation, or replay failure
-retains the current in-process gateway projection. After process restart the
-ledger is reacquired from the controller before any future packet activation;
-this slice creates no gateway packet or host authority that would need recovery.
+ledger. ADR 0125 additionally requires an exact Pod-bound acknowledgement of
+that adoption or withdrawal. Transport, authentication, decoding, validation,
+or replay failure retains the current in-process gateway projection. After
+process restart the ledger and acknowledgement are reacquired before any future
+packet activation; this slice creates no gateway packet authority.
 
 ## Consequences
 
@@ -58,10 +60,10 @@ needed to reproduce a future source flow proof, with an unambiguous withdrawal
 state. Source and gateway polling can make progress independently, and Node
 deletion/relist cannot leave a stale source contract eligible.
 
-The endpoint does not acknowledge source-map installation, configure an egress
-address/interface/route, stage gateway NAT maps, or process packets. A later
-source/gateway activation handshake must require exact application and path
-acknowledgements before crossing `Fenced -> Active`.
+The endpoint does not configure an egress address/interface/route, stage gateway
+NAT maps, or process packets. ADR 0125 supplies the application handshake, but
+crossing `Fenced -> Active` remains reserved for the later TC steering/NAT
+slice.
 
 `make egress-gateway-distribution-test` inherits all earlier Phase 8.5 gates and
 adds exact controller aggregation/withdrawal, domain mutation/replay tests,

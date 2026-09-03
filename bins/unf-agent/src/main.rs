@@ -59,9 +59,10 @@ use unf_ebpf_common::{
 use unf_egress::{
     AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
     EGRESS_DISTRIBUTION_SCHEMA_VERSION, EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard,
-    EgressAgentAdvertisement, EgressCapability, EgressDataplaneState, EgressGatewayHostBank,
-    EgressGatewayProjection, EgressGatewayProjectionLedger, EgressNodeProjectionEnvelope,
-    EgressProjectionLedger, compile_egress_dataplane,
+    EgressAgentAdvertisement, EgressCapability, EgressDataplaneState,
+    EgressGatewayApplicationAcknowledgement, EgressGatewayHostBank, EgressGatewayProjection,
+    EgressGatewayProjectionLedger, EgressNodeProjectionEnvelope, EgressProjectionLedger,
+    EgressSourceApplicationAcknowledgement, compile_egress_dataplane,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -7681,15 +7682,7 @@ async fn synchronize_egress_source(
             synchronizer.node_name
         );
     }
-    let principal = AuthenticatedEgressAgent {
-        namespace: "unf-system".to_owned(),
-        service_account: EGRESS_AGENT_SERVICE_ACCOUNT.to_owned(),
-        pod_name: state.pod_name.clone(),
-        pod_uid: state.pod_uid.clone(),
-        node_name: synchronizer.node_name.clone(),
-        node_uid: node.node_uid,
-        audience: EGRESS_AGENT_TOKEN_AUDIENCE.to_owned(),
-    };
+    let principal = authenticated_egress_principal(synchronizer, state, node.node_uid);
     let admitted = envelope
         .admit(&principal, &advertisement)
         .context("independently replay egress source projection")?;
@@ -7701,6 +7694,10 @@ async fn synchronize_egress_source(
         contract_digest: Some(projection.contract.contract_digest.0),
     };
     if egress_authority_is_current(synchronizer.applied_authority, candidate_authority)? {
+        let source_count = synchronizer.banks[usize::from(synchronizer.active_bank)]
+            .sources
+            .len();
+        acknowledge_current_egress_source(synchronizer, &admitted, source_count).await?;
         return Ok(false);
     }
     let mut next_ledger = synchronizer.ledger.clone();
@@ -7729,6 +7726,7 @@ async fn synchronize_egress_source(
     apply_egress_dataplane(synchronizer, &candidate)?;
     synchronizer.ledger = next_ledger;
     synchronizer.applied_authority = Some(candidate_authority);
+    acknowledge_current_egress_source(synchronizer, &admitted, candidate.sources.len()).await?;
     info!(
         controller_epoch = host.controller_epoch,
         projection_revision = host.projection_revision.get(),
@@ -7738,6 +7736,20 @@ async fn synchronize_egress_source(
         "authenticated egress intent staged as fail-closed source fences"
     );
     Ok(true)
+}
+
+async fn acknowledge_current_egress_source(
+    synchronizer: &EgressSynchronizer,
+    admitted: &unf_egress::AdmittedEgressProjection,
+    source_count: usize,
+) -> Result<()> {
+    let acknowledgement = EgressSourceApplicationAcknowledgement::issue(
+        admitted,
+        synchronizer.active_bank,
+        source_count,
+    )
+    .context("build current source application acknowledgement")?;
+    publish_egress_source_acknowledgement(synchronizer, &acknowledgement).await
 }
 
 async fn synchronize_egress_gateway(
@@ -7782,22 +7794,17 @@ async fn synchronize_egress_gateway(
             synchronizer.node_name
         );
     }
-    let principal = AuthenticatedEgressAgent {
-        namespace: "unf-system".to_owned(),
-        service_account: EGRESS_AGENT_SERVICE_ACCOUNT.to_owned(),
-        pod_name: state.pod_name.clone(),
-        pod_uid: state.pod_uid.clone(),
-        node_name: synchronizer.node_name.clone(),
-        node_uid: node.node_uid,
-        audience: EGRESS_AGENT_TOKEN_AUDIENCE.to_owned(),
-    };
+    let principal = authenticated_egress_principal(synchronizer, state, node.node_uid);
     let admitted = projection
         .admit(&principal, &advertisement)
         .context("independently admit selected-gateway projection")?;
+    let acknowledgement = EgressGatewayApplicationAcknowledgement::issue(&admitted)
+        .context("build gateway application acknowledgement")?;
     let mut next = synchronizer.gateway_ledger.clone();
     next.adopt(admitted)
         .context("fence selected-gateway projection revision")?;
     if next.current() == synchronizer.gateway_ledger.current() {
+        publish_egress_gateway_acknowledgement(synchronizer, &acknowledgement).await?;
         return Ok(false);
     }
     let current = next
@@ -7812,11 +7819,72 @@ async fn synchronize_egress_gateway(
         .sum::<usize>();
     let withdrawal = current.is_withdrawal();
     synchronizer.gateway_ledger = next;
+    publish_egress_gateway_acknowledgement(synchronizer, &acknowledgement).await?;
     info!(
         revision,
         contracts, sources, withdrawal, "authenticated selected-gateway projection admitted"
     );
     Ok(true)
+}
+
+fn authenticated_egress_principal(
+    synchronizer: &EgressSynchronizer,
+    state: &AgentState,
+    node_uid: String,
+) -> AuthenticatedEgressAgent {
+    AuthenticatedEgressAgent {
+        namespace: "unf-system".to_owned(),
+        service_account: EGRESS_AGENT_SERVICE_ACCOUNT.to_owned(),
+        pod_name: state.pod_name.clone(),
+        pod_uid: state.pod_uid.clone(),
+        node_name: synchronizer.node_name.clone(),
+        node_uid,
+        audience: EGRESS_AGENT_TOKEN_AUDIENCE.to_owned(),
+    }
+}
+
+async fn publish_egress_source_acknowledgement(
+    synchronizer: &EgressSynchronizer,
+    acknowledgement: &EgressSourceApplicationAcknowledgement,
+) -> Result<()> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("egress source acknowledgement requires a controller URL")?;
+    synchronizer
+        .client
+        .current()
+        .post(format!("{controller_url}/v1/state/egress-source-ack"))
+        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+        .json(acknowledgement)
+        .send()
+        .await
+        .context("publish exact egress source application acknowledgement")?
+        .error_for_status()
+        .context("controller rejected egress source application acknowledgement")?;
+    Ok(())
+}
+
+async fn publish_egress_gateway_acknowledgement(
+    synchronizer: &EgressSynchronizer,
+    acknowledgement: &EgressGatewayApplicationAcknowledgement,
+) -> Result<()> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("egress gateway acknowledgement requires a controller URL")?;
+    synchronizer
+        .client
+        .current()
+        .post(format!("{controller_url}/v1/state/egress-gateway-ack"))
+        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+        .json(acknowledgement)
+        .send()
+        .await
+        .context("publish exact egress gateway application acknowledgement")?
+        .error_for_status()
+        .context("controller rejected egress gateway application acknowledgement")?;
+    Ok(())
 }
 
 fn egress_authority_is_current(

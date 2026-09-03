@@ -20,6 +20,7 @@ use crate::{
 
 pub const EGRESS_DISTRIBUTION_SCHEMA_VERSION: u16 = 1;
 pub const EGRESS_HOST_STATE_SCHEMA_VERSION: u16 = 1;
+pub const EGRESS_APPLICATION_ACK_SCHEMA_VERSION: u16 = 1;
 pub const MAX_EGRESS_ADVERTISED_SCHEMAS: usize = 8;
 pub const MAX_EGRESS_GATEWAY_SOURCE_CONTRACTS: usize = MAX_EGRESS_CONTRACT_PLANS;
 pub const EGRESS_AGENT_SERVICE_ACCOUNT: &str = "unf-agent";
@@ -169,10 +170,171 @@ impl AdmittedEgressGatewayProjection {
     }
 }
 
+/// Exact evidence emitted only after a source projection has been committed to
+/// one active egress map bank and read back successfully.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressSourceApplicationAcknowledgement {
+    pub schema_version: u16,
+    pub controller_epoch: u64,
+    pub projection_revision: Revision,
+    pub recipient: EgressProjectionRecipient,
+    pub contract_revision: Revision,
+    pub contract_digest: crate::EgressContractDigest,
+    pub active_bank: u8,
+    pub source_count: u32,
+}
+
+impl EgressSourceApplicationAcknowledgement {
+    /// Builds exact source application evidence from an admitted projection.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid bank or count that disagrees with the contract.
+    pub fn issue(
+        projection: &AdmittedEgressProjection,
+        active_bank: u8,
+        source_count: usize,
+    ) -> Result<Self, EgressDistributionError> {
+        let projection = projection.projection();
+        let acknowledgement = Self {
+            schema_version: EGRESS_APPLICATION_ACK_SCHEMA_VERSION,
+            controller_epoch: projection.controller_epoch,
+            projection_revision: projection.revision,
+            recipient: projection.recipient.clone(),
+            contract_revision: projection.contract.contract_revision,
+            contract_digest: projection.contract.contract_digest,
+            active_bank,
+            source_count: u32::try_from(source_count)
+                .map_err(|_| EgressDistributionError::ApplicationAcknowledgementMismatch)?,
+        };
+        acknowledgement.verify_projection(projection)?;
+        Ok(acknowledgement)
+    }
+
+    /// Verifies that application evidence names every immutable source tuple.
+    ///
+    /// # Errors
+    ///
+    /// Rejects schema, epoch, revision, recipient, digest, bank, or count drift.
+    pub fn verify(
+        &self,
+        projection: &AdmittedEgressProjection,
+    ) -> Result<(), EgressDistributionError> {
+        self.verify_projection(projection.projection())
+    }
+
+    fn verify_projection(
+        &self,
+        projection: &EgressNodeProjection,
+    ) -> Result<(), EgressDistributionError> {
+        if self.schema_version != EGRESS_APPLICATION_ACK_SCHEMA_VERSION
+            || self.controller_epoch != projection.controller_epoch
+            || self.projection_revision != projection.revision
+            || self.recipient != projection.recipient
+            || self.contract_revision != projection.contract.contract_revision
+            || self.contract_digest != projection.contract.contract_digest
+            || self.active_bank >= 2
+            || usize::try_from(self.source_count).ok() != Some(projection.contract.plans.len())
+        {
+            return Err(EgressDistributionError::ApplicationAcknowledgementMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Exact evidence emitted after a gateway has adopted the complete selected
+/// contract set (including an explicit empty withdrawal).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressGatewayApplicationAcknowledgement {
+    pub schema_version: u16,
+    pub controller_epoch: u64,
+    pub projection_revision: Revision,
+    pub recipient: EgressProjectionRecipient,
+    pub projection_digest: EgressGatewayProjectionDigest,
+    pub contract_count: u32,
+    pub source_count: u32,
+    pub withdrawn: bool,
+}
+
+impl EgressGatewayApplicationAcknowledgement {
+    /// Builds exact gateway-host application evidence after ledger adoption.
+    ///
+    /// # Errors
+    ///
+    /// Rejects counts that exceed the fixed projection bounds.
+    pub fn issue(
+        projection: &AdmittedEgressGatewayProjection,
+    ) -> Result<Self, EgressDistributionError> {
+        let projection = projection.projection();
+        let source_count = projection
+            .source_contracts
+            .iter()
+            .try_fold(0_usize, |total, contract| {
+                total.checked_add(contract.plans.len())
+            })
+            .ok_or(EgressDistributionError::GatewayProjectionTooLarge)?;
+        let acknowledgement = Self {
+            schema_version: EGRESS_APPLICATION_ACK_SCHEMA_VERSION,
+            controller_epoch: projection.controller_epoch,
+            projection_revision: projection.revision,
+            recipient: projection.recipient.clone(),
+            projection_digest: projection.projection_digest,
+            contract_count: u32::try_from(projection.source_contracts.len())
+                .map_err(|_| EgressDistributionError::GatewayProjectionTooLarge)?,
+            source_count: u32::try_from(source_count)
+                .map_err(|_| EgressDistributionError::GatewayProjectionTooLarge)?,
+            withdrawn: projection.is_withdrawal(),
+        };
+        acknowledgement.verify_projection(projection)?;
+        Ok(acknowledgement)
+    }
+
+    /// Verifies exact gateway application or withdrawal evidence.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any schema, recipient, revision, digest, count, or action drift.
+    pub fn verify(
+        &self,
+        projection: &AdmittedEgressGatewayProjection,
+    ) -> Result<(), EgressDistributionError> {
+        self.verify_projection(projection.projection())
+    }
+
+    fn verify_projection(
+        &self,
+        projection: &EgressGatewayProjection,
+    ) -> Result<(), EgressDistributionError> {
+        let source_count = projection
+            .source_contracts
+            .iter()
+            .try_fold(0_usize, |total, contract| {
+                total.checked_add(contract.plans.len())
+            })
+            .ok_or(EgressDistributionError::GatewayProjectionTooLarge)?;
+        if self.schema_version != EGRESS_APPLICATION_ACK_SCHEMA_VERSION
+            || self.controller_epoch != projection.controller_epoch
+            || self.projection_revision != projection.revision
+            || self.recipient != projection.recipient
+            || self.projection_digest != projection.projection_digest
+            || usize::try_from(self.contract_count).ok() != Some(projection.source_contracts.len())
+            || usize::try_from(self.source_count).ok() != Some(source_count)
+            || self.withdrawn != projection.is_withdrawal()
+        {
+            return Err(EgressDistributionError::ApplicationAcknowledgementMismatch);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EgressDistributionError {
     #[error("invalid authenticated egress agent: {0}")]
     InvalidPrincipal(&'static str),
+    #[error("egress application acknowledgement does not match issued projection")]
+    ApplicationAcknowledgementMismatch,
     #[error("egress advertisement exceeds the schema bound")]
     AdvertisementTooLarge,
     #[error("no compatible egress {domain} schema; required {required}")]
@@ -1106,6 +1268,77 @@ mod tests {
                 &[source.clone(), source],
             ),
             Err(EgressDistributionError::InvalidGatewayContractOrder)
+        );
+    }
+
+    #[test]
+    fn application_acknowledgements_bind_exact_source_and_gateway_state() {
+        let source = admitted(4);
+        let source_ack = EgressSourceApplicationAcknowledgement::issue(&source, 1, 1)
+            .expect("source application evidence");
+        source_ack.verify(&source).expect("exact source evidence");
+        let mut source_mutation = source_ack;
+        source_mutation.source_count = 2;
+        assert_eq!(
+            source_mutation.verify(&source),
+            Err(EgressDistributionError::ApplicationAcknowledgementMismatch)
+        );
+        let mut source_wire = serde_json::to_value(&source_mutation).expect("source JSON");
+        source_wire["unknown"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<EgressSourceApplicationAcknowledgement>(source_wire).is_err()
+        );
+
+        let gateway = EgressGatewayProjection::issue(
+            &principal("gateway-a"),
+            &advertisement(),
+            10,
+            Revision::new(5),
+            &[source],
+        )
+        .expect("gateway projection")
+        .admit(&principal("gateway-a"), &advertisement())
+        .expect("admitted gateway");
+        let gateway_ack = EgressGatewayApplicationAcknowledgement::issue(&gateway)
+            .expect("gateway application evidence");
+        gateway_ack
+            .verify(&gateway)
+            .expect("exact gateway evidence");
+        let mut gateway_mutation = gateway_ack;
+        gateway_mutation.projection_digest.0[0] ^= 1;
+        assert_eq!(
+            gateway_mutation.verify(&gateway),
+            Err(EgressDistributionError::ApplicationAcknowledgementMismatch)
+        );
+        let mut gateway_wire = serde_json::to_value(&gateway_mutation).expect("gateway JSON");
+        gateway_wire["unknown"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<EgressGatewayApplicationAcknowledgement>(gateway_wire)
+                .is_err()
+        );
+
+        let withdrawal = EgressGatewayProjection::withdraw(
+            &principal("gateway-a"),
+            &advertisement(),
+            10,
+            Revision::new(6),
+        )
+        .expect("gateway withdrawal")
+        .admit(&principal("gateway-a"), &advertisement())
+        .expect("admitted gateway withdrawal");
+        let withdrawal_ack = EgressGatewayApplicationAcknowledgement::issue(&withdrawal)
+            .expect("withdrawal application evidence");
+        assert!(withdrawal_ack.withdrawn);
+        assert_eq!(withdrawal_ack.contract_count, 0);
+        assert_eq!(withdrawal_ack.source_count, 0);
+        withdrawal_ack
+            .verify(&withdrawal)
+            .expect("exact withdrawal evidence");
+        let mut active_mutation = withdrawal_ack;
+        active_mutation.withdrawn = false;
+        assert_eq!(
+            active_mutation.verify(&withdrawal),
+            Err(EgressDistributionError::ApplicationAcknowledgementMismatch)
         );
     }
 

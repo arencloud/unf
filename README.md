@@ -411,8 +411,8 @@ ServiceAccount selectors, destinations, non-overlapping dual-stack pools, and
 pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
-is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md),
-ADRs 0113–0115 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
+and ADRs 0113–0125 track the work. Milestone 8.2a now adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -464,11 +464,16 @@ lease-fenced gateway Ensure/Withdraw intent over Ready primary-CNI Nodes with
 authoritative UIDs. Pool tombstones and dual-provider withdrawal retain an
 address until safe reuse with a newer lease epoch, while ordered
 desired-before-derived persistence makes restart replay fail closed. This passes
-`make egress-control-plane-test`; ADR 0124.
-This request boundary is not a source-application acknowledgement. Exact
-source/gateway activation acknowledgements and steering/NAT are next. No live
-applied egress address, gateway-readiness, packet-path, or platform claim is
-made yet.
+`make egress-control-plane-test`; ADR 0124. Delivery is now explicitly separate
+from application: the source acknowledges the exact revision/digest only after
+transactional map activation, which alone admits it for gateway distribution;
+every selected gateway then acknowledges exact monotonic ledger adoption or
+withdrawal. Pod replacement, mutation, invalidation, and stale replay fail
+closed, while status exposes issued applications and bilateral readiness under
+`make egress-application-ack-test`; ADR 0125. These acknowledgements are runtime
+prerequisites only. They do not activate source steering, apply gateway NAT
+maps, configure addresses, or make a packet/platform claim; TC steering and
+dual-stack NAT are next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

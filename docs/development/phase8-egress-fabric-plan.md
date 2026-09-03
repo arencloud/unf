@@ -18,7 +18,7 @@ authoritative state remains in [project-status.md](../project-status.md).
 | 8.3 | Durable allocation and gateway-provider contract | **Verified** | Schema-v1 allocation atomically assigns conflict-safe multiple IPv4/IPv6 addresses with exact owner/pool/provider provenance, bounded exhaustion, monotonic revisions/lease epochs, release/reuse, and strict checkpoint replay. Separate gateway/reachability provider interfaces, desired/ack revisions, epoch/address fencing, dual acknowledgement, safe withdrawal, and direct contract-fact projection pass `make egress-allocation-test`; ADR 0116 |
 | 8.4 | Transactional distribution and gateway host state | **Verified** | Schema-v1 projection binds the existing authenticated Pod/Node principal, negotiates exact contract/host capabilities, independently replays all facts, and fences last-known-good epochs/revisions. Separate userspace ABI-v1 host banks commit through stage/readback/prepare/activate, pointer rollback, exact current/pending recovery, cold reconstruction, and version-scoped cleanup; `make egress-host-state-test`; ADR 0117 |
 | 8.4a | Egress Proof Chain and zero-leak admission | **Verified** | Default `Native -> Fenced -> Active` admission prevents explicit-intent convergence/withdrawal leaks. Domain-separated rendezvous hashing deterministically selects same-family multiple addresses and ready gateways; a versioned proof binds the authoritative identity, original tuple, exact contract/revisions, lease, choice, and witness for independent selected-gateway replay. Ten adversarial tests and strict Clippy pass `make egress-proof-test`; ADR 0118 |
-| 8.5 | Live distribution, source steering, and gateway NAT dataplane | **In progress** | The verified contract/map slices lower exact path evidence into ABI-v1 state and transactionally own its 31-pin ABI-v12 kernel boundary. Authenticated source distribution stages only fences; structural native/OpenShift watches now drive durable allocation and lease-fenced gateway Ensure/Withdraw state. Exact selected gateways receive only admitted ready/reachable lease-matched contracts and explicit monotonic withdrawal. `make egress-control-plane-test`; ADRs 0119–0124. Activation acknowledgements, TC steering/NAT, and packet gates remain |
+| 8.5 | Live distribution, source steering, and gateway NAT dataplane | **In progress** | The verified contract/map slices lower exact path evidence into ABI-v1 state and transactionally own its 31-pin ABI-v12 kernel boundary. Authenticated source distribution stages only fences; structural native/OpenShift watches drive durable allocation and lease-fenced gateway Ensure/Withdraw state. Exact source-map commit and selected-gateway ledger/withdrawal adoption now require strict Pod-bound bilateral acknowledgements before readiness. `make egress-application-ack-test`; ADRs 0119–0125. Policy-first TC steering/NAT and packet gates remain |
 | 8.6 | Deterministic HA, failover, and multiple addresses | **Planned** | Lease-fenced gateway ownership, deterministic placement and failover, established-flow contract, bounded convergence, split-brain rejection, node drain/recovery, and measured disruption |
 | 8.7 | FQDN and internet-access controls | **Planned** | DNS-derived destination sets with bounded TTL/staleness/provenance, explicit wildcard semantics, fail-closed capacity behavior, IP fallback visibility, and no use of DNS names as workload identity |
 | 8.8 | Reachability and advertisement providers | **Planned** | Static/native development provider first; BGP advertisement remains a replaceable provider with independent route-policy, ECMP, graceful-restart, BFD, and production qualification gates |
@@ -105,9 +105,8 @@ HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.5 next adds exact source-map and gateway-host application
-acknowledgements before activation. Source/gateway TC stages then attach after
-the existing egress policy decision, followed by collision-safe dual-stack
-TCP/UDP SNAT/reverse state and kernel packet gates. The selected-gateway slice
-and live control-plane slice change no host routing, applied address ownership,
-gateway readiness, packet behavior, or platform claim.
+Milestone 8.5 next consumes the verified bilateral-readiness prerequisite in
+source/gateway TC stages attached after the existing egress policy decision,
+then adds collision-safe dual-stack TCP/UDP SNAT/reverse state and kernel packet
+gates. Current application acknowledgement changes no host routing, applied
+address ownership, gateway NAT maps, packet behavior, or platform claim.

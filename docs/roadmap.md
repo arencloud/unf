@@ -662,13 +662,18 @@ matrix is maintained in the
   0122. Authenticated selected-gateway distribution now filters only exact
   ready/reachable lease-fenced candidates, independently admits the digest-bound
   projection, and uses a monotonic empty projection for withdrawal under `make
-  egress-gateway-distribution-test`; ADR 0123. Application acknowledgements and
-  TC steering/NAT remain. The watched canonical revision now also drives one
+  egress-gateway-distribution-test`; ADR 0123. The watched canonical revision now also drives one
   schema-v1 durable orchestration checkpoint: deterministic bounded allocation,
   Ready primary-CNI Node/UID gateway intent, exact restart replay, pool
   tombstones, and dual-provider withdrawal-before-release pass `make
-  egress-control-plane-test`; ADR 0124. This creates desired ownership only and
-  does not assert applied addresses, readiness, reachability, or packets.
+  egress-control-plane-test`; ADR 0124. Exact schema-v1 application evidence now
+  separates delivery from source-map commit and gateway-ledger adoption. Only
+  an acknowledged source becomes distributable, every selected gateway must
+  acknowledge the exact active projection, explicit withdrawal is positively
+  acknowledged, and Pod replacement, mutation, invalidation, or stale replay
+  fails closed. Runtime status exposes bilateral readiness under `make
+  egress-application-ack-test`; ADR 0125. This does not activate TC steering,
+  apply gateway NAT maps, or assert addresses, reachability, or packets.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale
