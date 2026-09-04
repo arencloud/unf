@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use unf_api::{EgressPolicy, EgressPool, SecurityPolicy};
+use unf_api::{EgressInternetClassification, EgressPolicy, EgressPool, SecurityPolicy};
 use unf_common::{
     BackendId, IdentityId, PolicyAction, PolicyDirection, PolicyId, PolicyReason, Protocol,
     Revision, ServiceId, Verdict,
@@ -50,9 +50,10 @@ use unf_egress::{
     EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
     EgressGatewayDrainEvidence, EgressGatewayProjection, EgressGatewayRetirementChallenges,
     EgressHaAgentChallenges, EgressHaAgentEvidence, EgressHaCandidate, EgressHaPlan, EgressIntent,
-    EgressIntentOwner, EgressModel, EgressNode, EgressNodeProjectionEnvelope,
-    EgressProjectionRecipient, EgressProviderOutcome, EgressProviderRef,
-    EgressReachabilityAcknowledgement, EgressSafeReleaseAuthority, EgressSourceActivationGrant,
+    EgressIntentOwner, EgressInternetClassificationStore, EgressInternetStoreCheckpoint,
+    EgressModel, EgressNode, EgressNodeProjectionEnvelope, EgressProjectionRecipient,
+    EgressProviderOutcome, EgressProviderRef, EgressReachabilityAcknowledgement,
+    EgressSafeReleaseAuthority, EgressSourceActivationGrant,
     EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
     EgressSourceRetirementChallenges,
 };
@@ -140,6 +141,7 @@ const AGENT_REPORT_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
 const EGRESS_DESIRED_STORE_NAME: &str = "unf-egress-desired-state";
 const EGRESS_DESIRED_STORE_KEY: &str = "desired.json";
 const EGRESS_FQDN_OBSERVATION_STORE_KEY: &str = "fqdn-observations.json";
+const EGRESS_INTERNET_CLASSIFICATION_STORE_KEY: &str = "internet-classifications.json";
 const EGRESS_DESIRED_STORE_DATA_LIMIT: usize = 900_000;
 const EGRESS_DESIRED_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const EGRESS_CONTROL_PLANE_STORE_NAME: &str = "unf-egress-control-plane";
@@ -147,6 +149,8 @@ const EGRESS_CONTROL_PLANE_STORE_KEY: &str = "state.json";
 const EGRESS_CONTROL_PLANE_STORE_DATA_LIMIT: usize = 900_000;
 const NATIVE_EGRESS_POOL_SOURCE_PREFIX: &str = "native:egresspool/";
 const NATIVE_EGRESS_POLICY_SOURCE_PREFIX: &str = "native:egresspolicy/";
+const NATIVE_EGRESS_INTERNET_CLASSIFICATION_SOURCE_PREFIX: &str =
+    "native:egressinternetclassification/";
 const OPENSHIFT_EGRESS_IP_SOURCE_PREFIX: &str = "openshift:egressip/";
 const FLOW_HISTORY_STORE_NAME: &str = "unf-flow-history";
 const FLOW_HISTORY_STORE_KEY: &str = "flows.json";
@@ -300,6 +304,7 @@ struct TlsMaterial {
 struct EgressFqdnMaterialization {
     desired_revision: Revision,
     observation_revision: Revision,
+    classification_revision: Revision,
     refresh_at_unix_seconds: Option<u64>,
     model: unf_egress::EgressModel,
 }
@@ -313,6 +318,7 @@ struct ControllerState {
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
     egress_desired: Mutex<EgressDesiredStore>,
     egress_fqdn_observations: Mutex<EgressFqdnObservationLedger>,
+    egress_internet_classifications: Mutex<EgressInternetClassificationStore>,
     egress_fqdn_materialization: Mutex<Option<EgressFqdnMaterialization>>,
     egress_desired_dirty: AtomicBool,
     egress_desired_store: Option<Api<ConfigMap>>,
@@ -1540,6 +1546,7 @@ fn new_state_with_client_and_selector(
         nodes: RwLock::new(BTreeMap::new()),
         egress_desired: Mutex::new(EgressDesiredStore::default()),
         egress_fqdn_observations: Mutex::new(EgressFqdnObservationLedger::default()),
+        egress_internet_classifications: Mutex::new(EgressInternetClassificationStore::default()),
         egress_fqdn_materialization: Mutex::new(None),
         egress_desired_dirty: AtomicBool::new(false),
         egress_desired_store: config_map_store.clone(),
@@ -2202,6 +2209,18 @@ async fn restore_egress_desired_state(state: &ControllerState) -> Result<()> {
     } else {
         info!("durable FQDN observation store is empty");
     }
+    if let Some(encoded) = data.and_then(|data| data.get(EGRESS_INTERNET_CLASSIFICATION_STORE_KEY))
+    {
+        let checkpoint: EgressInternetStoreCheckpoint = serde_json::from_str(encoded)
+            .context("decode durable internet-classifier checkpoint")?;
+        let restored = EgressInternetClassificationStore::restore(&checkpoint, unix_time_seconds())
+            .context("validate durable internet-classifier checkpoint")?;
+        let revision = restored.revision().get();
+        *mutex_lock(&state.egress_internet_classifications) = restored;
+        info!(revision, "restored durable internet-classifier state");
+    } else {
+        info!("durable internet-classifier store is empty");
+    }
     Ok(())
 }
 
@@ -2253,10 +2272,18 @@ async fn persist_egress_desired_state(state: &ControllerState) -> Result<()> {
         .context("compile durable FQDN observation checkpoint")?;
     let fqdn_encoded = serde_json::to_string(&fqdn_checkpoint)
         .context("encode durable FQDN observation checkpoint")?;
-    let total_len = encoded.len().saturating_add(fqdn_encoded.len());
+    let internet_checkpoint = mutex_lock(&state.egress_internet_classifications)
+        .checkpoint(unix_time_seconds())
+        .context("compile durable internet-classifier checkpoint")?;
+    let internet_encoded = serde_json::to_string(&internet_checkpoint)
+        .context("encode durable internet-classifier checkpoint")?;
+    let total_len = encoded
+        .len()
+        .saturating_add(fqdn_encoded.len())
+        .saturating_add(internet_encoded.len());
     if total_len > EGRESS_DESIRED_STORE_DATA_LIMIT {
         return Err(anyhow!(
-            "durable egress desired and FQDN state requires {total_len} bytes; ConfigMap limit is {EGRESS_DESIRED_STORE_DATA_LIMIT}"
+            "durable egress desired, FQDN, and internet-classifier state requires {total_len} bytes; ConfigMap limit is {EGRESS_DESIRED_STORE_DATA_LIMIT}"
         ));
     }
     let patch = serde_json::json!({
@@ -2269,6 +2296,7 @@ async fn persist_egress_desired_state(state: &ControllerState) -> Result<()> {
         "data": {
             (EGRESS_DESIRED_STORE_KEY): encoded,
             (EGRESS_FQDN_OBSERVATION_STORE_KEY): fqdn_encoded,
+            (EGRESS_INTERNET_CLASSIFICATION_STORE_KEY): internet_encoded,
         },
     });
     api.patch(
@@ -3046,6 +3074,18 @@ fn spawn_watchers(
         watch_egress_policies(egress_policy_api, egress_policy_state, egress_policy_cancel).await;
     });
 
+    let internet_classification_state = Arc::clone(&state);
+    let internet_classification_cancel = cancellation.clone();
+    let internet_classification_api = Api::<EgressInternetClassification>::all(client.clone());
+    tasks.spawn(async move {
+        watch_egress_internet_classifications(
+            internet_classification_api,
+            internet_classification_state,
+            internet_classification_cancel,
+        )
+        .await;
+    });
+
     let openshift_egress_state = Arc::clone(&state);
     let openshift_egress_cancel = cancellation.clone();
     let egress_ip_resource = ApiResource::from_gvk_with_plural(
@@ -3557,6 +3597,124 @@ async fn watch_egress_policies(
     }
 }
 
+async fn watch_egress_internet_classifications(
+    api: Api<EgressInternetClassification>,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    let stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    tokio::pin!(stream);
+    let mut initializing = None::<BTreeMap<String, unf_egress::EgressInternetClassification>>;
+    let mut initialization_failed = false;
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            item = stream.try_next() => match item {
+                Ok(Some(Event::Init)) => {
+                    initializing = Some(BTreeMap::new());
+                    initialization_failed = false;
+                }
+                Ok(Some(Event::InitApply(publication))) => {
+                    let key = native_egress_internet_classification_key(&publication.name_any());
+                    match egress_api::translate_egress_internet_classification(&publication) {
+                        Ok(classification) => {
+                            if let Some(replacement) = initializing.as_mut() {
+                                replacement.insert(key, classification);
+                            } else {
+                                apply_egress_internet_classification(&state, key, classification)
+                                    .await;
+                            }
+                        }
+                        Err(error) => {
+                            initialization_failed = true;
+                            state.metrics.errors.inc();
+                            warn!(%error, %key, "internet-classifier initialization rejected; retaining last-known-good set");
+                        }
+                    }
+                }
+                Ok(Some(Event::InitDone)) => {
+                    if let Some(replacement) = initializing.take()
+                        && !std::mem::take(&mut initialization_failed)
+                    {
+                        let result = mutex_lock(&state.egress_internet_classifications)
+                            .replace_current(replacement)
+                            .map_err(|error| error.to_string());
+                        record_egress_internet_classification_result(&state, result).await;
+                    }
+                }
+                Ok(Some(Event::Apply(publication))) => {
+                    let key = native_egress_internet_classification_key(&publication.name_any());
+                    match egress_api::translate_egress_internet_classification(&publication) {
+                        Ok(classification) => {
+                            apply_egress_internet_classification(&state, key, classification).await;
+                        }
+                        Err(error) => {
+                            state.metrics.errors.inc();
+                            warn!(%error, %key, "internet-classifier publication rejected; retaining last-known-good state");
+                        }
+                    }
+                }
+                Ok(Some(Event::Delete(publication))) => {
+                    let key = native_egress_internet_classification_key(&publication.name_any());
+                    let result = mutex_lock(&state.egress_internet_classifications)
+                        .remove(&key)
+                        .map_err(|error| error.to_string());
+                    record_egress_internet_classification_result(&state, result).await;
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, "EgressInternetClassification watch error");
+                }
+            }
+        }
+    }
+}
+
+async fn apply_egress_internet_classification(
+    state: &ControllerState,
+    key: String,
+    classification: unf_egress::EgressInternetClassification,
+) {
+    let result = mutex_lock(&state.egress_internet_classifications)
+        .apply(key, classification)
+        .map_err(|error| error.to_string());
+    record_egress_internet_classification_result(state, result).await;
+}
+
+async fn record_egress_internet_classification_result(
+    state: &ControllerState,
+    result: Result<bool, String>,
+) {
+    match result {
+        Ok(false) => {}
+        Ok(true) => {
+            state.metrics.reconciles.inc();
+            mutex_lock(&state.egress_fqdn_materialization).take();
+            state.egress_desired_dirty.store(true, Ordering::Release);
+            let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
+            if let Err(error) = materialized_egress_model(state, &checkpoint) {
+                state.metrics.errors.inc();
+                warn!(error = ?error, "internet-classifier materialization rejected; retaining last-known-good distribution");
+                return;
+            }
+            if let Err(error) = persist_egress_desired_state(state).await {
+                state.metrics.errors.inc();
+                warn!(error = ?error, "internet-classifier checkpoint failed; retaining last-known-good distribution");
+                return;
+            }
+            if let Err(error) = reconcile_egress_source_distributions(state) {
+                state.metrics.errors.inc();
+                warn!(error = ?error, "internet-classifier reconciliation rejected; retaining last-known-good distribution");
+            }
+        }
+        Err(error) => {
+            state.metrics.errors.inc();
+            warn!(%error, "internet-classifier publication rejected; retaining last-known-good state");
+        }
+    }
+}
+
 fn apply_egress_policy_event(state: &ControllerState, event: Event<EgressPolicy>) {
     match event {
         Event::Apply(policy) => apply_egress_policy(state, &policy),
@@ -4041,9 +4199,11 @@ fn materialized_egress_model(
 ) -> Result<unf_egress::EgressModel> {
     let now_unix_seconds = unix_time_seconds();
     let observation_revision = mutex_lock(&state.egress_fqdn_observations).revision();
+    let classification_revision = mutex_lock(&state.egress_internet_classifications).revision();
     if let Some(cached) = mutex_lock(&state.egress_fqdn_materialization).as_ref()
         && cached.desired_revision == checkpoint.desired_revision
         && cached.observation_revision == observation_revision
+        && cached.classification_revision == classification_revision
         && cached
             .refresh_at_unix_seconds
             .is_none_or(|deadline| now_unix_seconds < deadline)
@@ -4058,6 +4218,13 @@ fn materialized_egress_model(
         now_unix_seconds,
     )
     .context("compile durable DNS observations into PLR destinations")?;
+    let (model, _, internet_state_changed) = mutex_lock(&state.egress_internet_classifications)
+        .materialize(model, checkpoint.desired_revision, now_unix_seconds)
+        .context("compile durable internet classifications into destinations")?;
+    if internet_state_changed {
+        state.egress_desired_dirty.store(true, Ordering::Release);
+    }
+    let classification_revision = mutex_lock(&state.egress_internet_classifications).revision();
     let refresh_at_unix_seconds = model
         .intents
         .iter()
@@ -4072,11 +4239,23 @@ fn materialized_egress_model(
                 lease.established_flows_until_unix_seconds,
             ]
         })
+        .chain(
+            model
+                .intents
+                .iter()
+                .filter_map(|intent| match &intent.destinations {
+                    unf_egress::EgressDestinations::Internet(snapshot) => {
+                        Some(snapshot.authority_until_unix_seconds)
+                    }
+                    _ => None,
+                }),
+        )
         .filter(|deadline| *deadline > now_unix_seconds)
         .min();
     *mutex_lock(&state.egress_fqdn_materialization) = Some(EgressFqdnMaterialization {
         desired_revision: checkpoint.desired_revision,
         observation_revision,
+        classification_revision,
         refresh_at_unix_seconds,
         model: model.clone(),
     });
@@ -4208,6 +4387,10 @@ fn native_egress_pool_key(name: &str) -> String {
 
 fn native_egress_policy_key(name: &str) -> String {
     format!("{NATIVE_EGRESS_POLICY_SOURCE_PREFIX}{name}")
+}
+
+fn native_egress_internet_classification_key(name: &str) -> String {
+    format!("{NATIVE_EGRESS_INTERNET_CLASSIFICATION_SOURCE_PREFIX}{name}")
 }
 
 async fn watch_openshift_egress_ips(

@@ -8,14 +8,19 @@ use kube::ResourceExt;
 use thiserror::Error;
 use unf_api::{
     EgressAddressFamily as ApiAddressFamily, EgressDestinations as ApiEgressDestinations,
+    EgressInternetClass as ApiInternetClass, EgressInternetClassification,
     EgressInternetFallback as ApiInternetFallback, EgressPolicy, EgressPool,
 };
+use unf_common::Revision;
 use unf_egress::{
     AddressFamily, EgressAddressPool, EgressAddressRequest,
     EgressDestinations as DomainDestinations, EgressFqdnDestinationSpec, EgressFqdnPattern,
-    EgressIntent, EgressIntentOwner, EgressIntentScope, EgressInternetDestinationSpec,
-    EgressInternetFallback, EgressModelError, EgressProviderRef, EgressSourceSelector, IpPrefix,
-    LabelExpression, LabelExpressionOperator, LabelSelector, normalize_intent, normalize_pools,
+    EgressIntent, EgressIntentOwner, EgressIntentScope, EgressInternetClass,
+    EgressInternetClassification as DomainInternetClassification,
+    EgressInternetClassificationDigest, EgressInternetClassificationRule,
+    EgressInternetDestinationSpec, EgressInternetFallback, EgressModelError, EgressProviderRef,
+    EgressSourceSelector, IpPrefix, LabelExpression, LabelExpressionOperator, LabelSelector,
+    normalize_intent, normalize_pools, seal_egress_internet_classification,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -74,6 +79,42 @@ pub fn translate_egress_pool(pool: &EgressPool) -> Result<EgressAddressPool, Nat
         .map_err(|error| model_error(&error))?
         .pop()
         .ok_or_else(|| NativeEgressApiError::InvalidModel("pool disappeared".to_owned()))
+}
+
+pub fn translate_egress_internet_classification(
+    publication: &EgressInternetClassification,
+) -> Result<DomainInternetClassification, NativeEgressApiError> {
+    let name = publication.name_any();
+    let rules = publication
+        .spec
+        .rules
+        .iter()
+        .map(|rule| {
+            Ok(EgressInternetClassificationRule {
+                prefix: parse_prefix("EgressInternetClassification", &name, &rule.prefix)?,
+                class: match rule.class {
+                    ApiInternetClass::Internet => EgressInternetClass::Internet,
+                    ApiInternetClass::NonInternet => EgressInternetClass::NonInternet,
+                },
+                provenance: rule.provenance.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, NativeEgressApiError>>()?;
+    seal_egress_internet_classification(DomainInternetClassification {
+        schema_version: unf_egress::EGRESS_INTERNET_CLASSIFICATION_SCHEMA_VERSION,
+        algorithm: unf_egress::EGRESS_INTERNET_CLASSIFICATION_ALGORITHM_AUTHORITY_CARVING_V1,
+        revision: Revision::new(publication.spec.revision),
+        source: EgressProviderRef {
+            name: publication.spec.classifier.name.clone(),
+            instance: publication.spec.classifier.instance.clone(),
+        },
+        source_epoch: publication.spec.source_epoch,
+        observed_at_unix_seconds: publication.spec.observed_at_unix_seconds,
+        valid_until_unix_seconds: publication.spec.valid_until_unix_seconds,
+        rules,
+        digest: EgressInternetClassificationDigest([0; 32]),
+    })
+    .map_err(|error| NativeEgressApiError::InvalidModel(error.to_string()))
 }
 
 pub fn translate_egress_policy(
@@ -532,6 +573,39 @@ mod tests {
         assert!(matches!(
             translate_egress_policy(&invalid),
             Err(NativeEgressApiError::InvalidInternetFallback(_))
+        ));
+    }
+
+    #[test]
+    fn authenticated_classifier_publication_is_sealed_and_canonical() {
+        let publication: EgressInternetClassification = serde_json::from_value(serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "EgressInternetClassification",
+            "metadata": {"name": "global-routes"},
+            "spec": {
+                "classifier": {"name": "route-authority", "instance": "global-v1"},
+                "sourceEpoch": 9,
+                "revision": 17,
+                "observedAtUnixSeconds": 1000,
+                "validUntilUnixSeconds": 1100,
+                "rules": [
+                    {"prefix": "2001:db8::/32", "class": "NonInternet", "provenance": "tenant:v4"},
+                    {"prefix": "0.0.0.0/0", "class": "Internet", "provenance": "rpki:42"}
+                ]
+            }
+        }))
+        .unwrap();
+        let translated = translate_egress_internet_classification(&publication).unwrap();
+        assert_eq!(translated.revision, Revision::new(17));
+        assert_eq!(translated.source_epoch, 9);
+        assert_eq!(translated.rules[0].prefix.address.to_string(), "0.0.0.0");
+        assert_ne!(translated.digest.0, [0; 32]);
+
+        let mut invalid = publication;
+        invalid.spec.rules[0].prefix = "2001:db8::1/32".to_owned();
+        assert!(matches!(
+            translate_egress_internet_classification(&invalid),
+            Err(NativeEgressApiError::InvalidCidr { .. })
         ));
     }
 }

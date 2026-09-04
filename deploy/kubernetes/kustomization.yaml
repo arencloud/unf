@@ -4,6 +4,7 @@ resources:
   - namespace.yaml
   - service-account.yaml
   - rbac.yaml
+  - internet-classifier-rbac.yaml
   - agent-report-store.yaml
   - flow-history-store.yaml
   - topology-history-store.yaml

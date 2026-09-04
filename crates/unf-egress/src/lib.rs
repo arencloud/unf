@@ -27,6 +27,7 @@ mod ha_continuity;
 mod ha_promotion;
 mod host_state;
 mod internet;
+mod internet_store;
 mod proof;
 mod safe_forgetting;
 
@@ -45,6 +46,7 @@ pub use ha_continuity::*;
 pub use ha_promotion::*;
 pub use host_state::*;
 pub use internet::*;
+pub use internet_store::*;
 pub use proof::*;
 pub use safe_forgetting::*;
 

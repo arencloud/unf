@@ -11,6 +11,7 @@
 .PHONY: egress-fqdn-dataplane-test
 .PHONY: egress-fqdn-lifecycle-test
 .PHONY: egress-internet-classification-test
+.PHONY: egress-internet-lifecycle-test
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -262,6 +263,11 @@ egress-fqdn-lifecycle-test: egress-fqdn-dataplane-test service-kind-load
 
 egress-internet-classification-test: egress-fqdn-lifecycle-test
 	hack/verify-egress-internet-classification.sh
+
+egress-internet-lifecycle-test: egress-internet-classification-test service-kind-load
+	hack/verify-egress-internet-lifecycle.sh
+	bash -n hack/verify-kind-egress-internet-lifecycle.sh
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) UNF_TEST_TOOLS_IMAGE=$(TEST_TOOLS_IMAGE) hack/verify-kind-egress-internet-lifecycle.sh
 
 test:
 	cargo test --workspace
@@ -550,6 +556,7 @@ generate-crds:
 	cargo run -p unf-api --example crdgen -- security-policy > deploy/crds/network.unf.io_securitypolicies.yaml
 	cargo run -p unf-api --example crdgen -- egress-pool > deploy/crds/network.unf.io_egresspools.yaml
 	cargo run -p unf-api --example crdgen -- egress-policy > deploy/crds/network.unf.io_egresspolicies.yaml
+	cargo run -p unf-api --example crdgen -- egress-internet-classification > deploy/crds/network.unf.io_egressinternetclassifications.yaml
 
 controller:
 	cargo build -p unf-controller

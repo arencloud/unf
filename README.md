@@ -406,14 +406,14 @@ worker-agent replacement, exact cleanup, five-agent convergence, and unchanged
 `insights`/`network` unhealthy baseline passed
 `hack/verify-openshift-service-selection.sh`; ADR 0112.
 Phase 8 begins an identity-aware enterprise egress fabric. Milestones 8.1
-through 8.6 and slices 8.7a–8.7e are verified. Source-side security policy precedes steering and NAT, while
+through 8.7 are verified. Source-side security policy precedes steering and NAT, while
 `unf-egress` now canonically validates bounded Namespace, workload, and
 ServiceAccount selectors, destinations, non-overlapping dual-stack pools, and
 pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
 is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
-and ADRs 0113–0146 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+and ADRs 0113–0147 track the work. Milestone 8.2a now adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -635,8 +635,18 @@ dual-stack prefix evidence commits provider epoch/revision, validity, and
 per-rule provenance. Unknown space denies, policy exceptions cannot be
 overridden by a more-specific provider allow, and source/gateway eBPF maps share
 one autonomously expiring replayed decision. `make
-egress-internet-classification-test` and ADR 0146 verify this contract;
-authenticated durable classifier ingestion and its live lifecycle are next.
+egress-internet-classification-test` and ADR 0146 verify this contract. Slice
+8.7f closes the lifecycle with a cluster-scoped authenticated publication API,
+an opt-in unbound publisher role, transactional relist, and a canonical
+digest-checked checkpoint that retains both replay positions and exact
+per-intent snapshots. Persistence precedes replacement distribution. Publication
+loss can enter bounded digest-linked LKG before source validity expires without
+extending the absolute deadline; controller restart preserves it and packet
+authority still expires autonomously. The three-Node dual-stack Kind gate also
+proves agent publish denial, absolute exceptions, provider-negative and unknown
+denial, replay/mutation rejection, higher-revision recovery, and exact cleanup
+under `make egress-internet-lifecycle-test`; ADR 0147. Milestone 8.8,
+provider-neutral reachability and advertisement providers, is next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -1,0 +1,83 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: egressinternetclassifications.network.unf.io
+spec:
+  group: network.unf.io
+  names:
+    kind: EgressInternetClassification
+    plural: egressinternetclassifications
+    shortNames:
+    - unfeic
+    singular: egressinternetclassification
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for EgressInternetClassificationSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              A complete, time-bounded publication from one authenticated internet
+              classifier. Kubernetes authentication and RBAC own publication identity;
+              the controller independently seals and replays this content before use.
+            properties:
+              classifier:
+                properties:
+                  instance:
+                    type: string
+                  name:
+                    type: string
+                required:
+                - instance
+                - name
+                type: object
+              observedAtUnixSeconds:
+                format: uint64
+                minimum: 0.0
+                type: integer
+              revision:
+                format: uint64
+                minimum: 1.0
+                type: integer
+              rules:
+                items:
+                  properties:
+                    class:
+                      enum:
+                      - Internet
+                      - NonInternet
+                      type: string
+                    prefix:
+                      type: string
+                    provenance:
+                      type: string
+                  required:
+                  - class
+                  - prefix
+                  - provenance
+                  type: object
+                type: array
+              sourceEpoch:
+                format: uint64
+                minimum: 1.0
+                type: integer
+              validUntilUnixSeconds:
+                format: uint64
+                minimum: 0.0
+                type: integer
+            required:
+            - classifier
+            - observedAtUnixSeconds
+            - revision
+            - rules
+            - sourceEpoch
+            - validUntilUnixSeconds
+            type: object
+        required:
+        - spec
+        title: EgressInternetClassification
+        type: object
+    served: true
+    storage: true

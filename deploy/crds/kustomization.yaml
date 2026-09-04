@@ -4,3 +4,4 @@ resources:
   - network.unf.io_securitypolicies.yaml
   - network.unf.io_egresspools.yaml
   - network.unf.io_egresspolicies.yaml
+  - network.unf.io_egressinternetclassifications.yaml

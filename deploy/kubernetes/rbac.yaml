@@ -14,7 +14,7 @@ rules:
     resourceNames: ["unf-agent-acknowledgements", "unf-flow-history", "unf-topology-history", "unf-load-balancer-control-plane", "unf-load-balancer-status-ownership", "unf-egress-desired-state", "unf-egress-control-plane"]
     verbs: ["get", "patch"]
   - apiGroups: ["network.unf.io"]
-    resources: ["securitypolicies", "egresspools", "egresspolicies"]
+    resources: ["securitypolicies", "egresspools", "egresspolicies", "egressinternetclassifications"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["network.unf.io"]
     resources: ["securitypolicies/status"]

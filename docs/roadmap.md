@@ -620,6 +620,14 @@ matrix is maintained in the
   is the default fallback; opt-in last-known-good snapshots link the exact prior
   digest and expire autonomously. Source and gateway map compilers replay the
   same decision under `make egress-internet-classification-test`; ADR 0146.
+- Phase 8.7f verifies authenticated durable classifier lifecycle. A
+  cluster-scoped API and opt-in publisher role separate publication from agent
+  authority; canonical checkpointing retains current input, replay positions,
+  and exact per-intent snapshots before replacement distribution. The
+  three-Node dual-stack Kind gate proves current, exception, private, unknown,
+  loss, early-LKG, restart, autonomous expiry, replay/mutation rejection, and
+  higher-revision recovery under `make egress-internet-lifecycle-test`; ADR
+  0147.
 - Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
   ServiceAccount selectors; canonical destinations and non-overlapping
   dual-stack pools; pool-family/multiple-address intent; strict OpenShift

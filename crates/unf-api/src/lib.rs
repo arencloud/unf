@@ -190,6 +190,44 @@ pub struct EgressInternetControls {
     pub max_staleness_seconds: u64,
 }
 
+/// A complete, time-bounded publication from one authenticated internet
+/// classifier. Kubernetes authentication and RBAC own publication identity;
+/// the controller independently seals and replays this content before use.
+#[derive(CustomResource, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "network.unf.io",
+    version = "v1alpha1",
+    kind = "EgressInternetClassification",
+    plural = "egressinternetclassifications",
+    shortname = "unfeic"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressInternetClassificationSpec {
+    pub classifier: EgressProvider,
+    #[schemars(range(min = 1))]
+    pub source_epoch: u64,
+    #[schemars(range(min = 1))]
+    pub revision: u64,
+    pub observed_at_unix_seconds: u64,
+    pub valid_until_unix_seconds: u64,
+    pub rules: Vec<EgressInternetClassificationRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressInternetClassificationRule {
+    pub prefix: String,
+    pub class: EgressInternetClass,
+    pub provenance: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "PascalCase")]
+pub enum EgressInternetClass {
+    Internet,
+    NonInternet,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "PascalCase")]
 pub enum EgressInternetFallback {
@@ -312,7 +350,11 @@ mod tests {
 
     #[test]
     fn generated_egress_crds_are_cluster_scoped_and_structural() {
-        for crd in [EgressPool::crd(), EgressPolicy::crd()] {
+        for crd in [
+            EgressPool::crd(),
+            EgressPolicy::crd(),
+            EgressInternetClassification::crd(),
+        ] {
             let value = serde_json::to_value(crd).expect("CRD serializes");
             assert_eq!(value["spec"]["group"], "network.unf.io");
             assert_eq!(value["spec"]["scope"], "Cluster");
@@ -340,6 +382,12 @@ mod tests {
             (
                 include_str!("../../../deploy/crds/network.unf.io_egresspolicies.yaml"),
                 EgressPolicy::crd(),
+            ),
+            (
+                include_str!(
+                    "../../../deploy/crds/network.unf.io_egressinternetclassifications.yaml"
+                ),
+                EgressInternetClassification::crd(),
             ),
         ] {
             let checked_in: serde_json::Value =

@@ -518,7 +518,6 @@ pub fn verify_egress_internet_snapshot(
                     != classification
                         .valid_until_unix_seconds
                         .saturating_add(max_staleness_seconds)
-                || snapshot.compiled_at_unix_seconds < classification.valid_until_unix_seconds
                 || snapshot.compiled_at_unix_seconds >= snapshot.authority_until_unix_seconds
             {
                 return Err(EgressInternetError::NoncanonicalSnapshot);
@@ -827,6 +826,29 @@ mod tests {
             1_010,
         )
         .unwrap();
+        let retained_before_expiry = materialize_egress_internet_snapshot(
+            Revision::new(4),
+            owner(),
+            spec(fallback),
+            None,
+            Some(&current),
+            1_050,
+        )
+        .unwrap();
+        assert!(matches!(
+            retained_before_expiry.snapshot().authority,
+            EgressInternetAuthority::LastKnownGood {
+                previous_snapshot_digest
+            } if previous_snapshot_digest == current.snapshot().digest
+        ));
+        assert_eq!(
+            retained_before_expiry
+                .snapshot()
+                .authority_until_unix_seconds,
+            1_160
+        );
+        verify_egress_internet_fallback_chain(retained_before_expiry.snapshot().clone(), &current)
+            .unwrap();
         let retained = materialize_egress_internet_snapshot(
             Revision::new(4),
             owner(),

@@ -1,0 +1,8 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unf-internet-classifier-publisher
+rules:
+  - apiGroups: ["network.unf.io"]
+    resources: ["egressinternetclassifications"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
