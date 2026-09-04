@@ -512,6 +512,10 @@ fn validate_flow(
         EgressDestinations::Networks(networks) => networks
             .iter()
             .any(|network| network.contains(flow.destination_address)),
+        EgressDestinations::Fqdn(snapshot) => snapshot
+            .leases
+            .iter()
+            .any(|lease| lease.address == flow.destination_address),
     };
     if !allowed {
         return Err(EgressProofError::DestinationMismatch);

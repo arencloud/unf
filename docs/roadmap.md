@@ -646,7 +646,8 @@ matrix is maintained in the
   standby, 251-bucket rendezvous, connection, and event state into asserted
   fixed-width layouts. Proof and table selection are identical under
   `make egress-dataplane-contract-test`; ADR 0119. The next verified slice moves
-  persistent state to exact 40-pin ABI v14: the agent owns source, destination,
+  persistent state to the then-current exact 40-pin ABI v14 (superseded by
+  ABI v15 temporal semantics in milestone 8.7c): the agent owns source, destination,
   candidate and selection banks, source and aggregate gateway pointers,
   dedicated gateway-NAT projection banks, and the connection LRU,
   with inactive readback,

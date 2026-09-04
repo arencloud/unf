@@ -108,11 +108,12 @@ compile N+1 -> populate all staging maps -> read back and validate
 Existing applied state must remain usable if the controller or Kubernetes API is
 temporarily unavailable. New identity, policy, and service state never partially
 overwrites active maps; each prior bank remains selected through any pre-switch
-failure. Forty maps are pinned under the `/sys/fs/bpf/unf/v14` ABI directory,
+failure. Forty maps are pinned under the `/sys/fs/bpf/unf/v15` ABI directory,
 reopened with strict all-or-none validation, and reconstructed into userspace
 caches after restart. ABI v4, v5, v6–v8, v9–v11, v12, and v13 remain explicitly
 recognized as 18-map, 21-map, 24-map, 25-map, 31-map, and 33-map cleanup
-boundaries; none is interpreted as partial v14 state. These historical boundaries are never adopted as current
+boundaries. ABI v14 is a separate exact historical 40-map boundary; none is
+interpreted as partial v15 state. These historical boundaries are never adopted as current
 state. The active service, NodePort,
 and LoadBalancer banks must exactly recompile from
 their owner-only durable checkpoints. A Service checkpoint retains the current
@@ -192,9 +193,10 @@ back a pending checkpoint, switches one pointer, commits, and only then retires
 the previous bank. Startup commits a prepared winner or retains/reconstructs
 the current winner solely from pointer plus current/pending evidence; ambiguity
 fails closed. This userspace host checkpoint remains distinct from persistent
-BPF ABI v14; Phase 8.5 lowers it into independently versioned fixed-width ABI-v3
-kernel banks without treating either representation as interchangeable; ADRs
-0117, 0120, and 0126.
+BPF ABI v15; Phase 8.5 originally lowered it into fixed-width egress ABI v3,
+while Phase 8.7c advances the same-size layouts to egress ABI v4 temporal
+semantics. Neither representation is interchangeable; ADRs 0117, 0120, 0126,
+and 0144.
 
 Phase 8.4a adds an identity-indexed egress admission state machine outside the
 packet ABI. Explicit intent is installed as `Fenced` before it can become
@@ -206,22 +208,27 @@ stored authority or a bearer credential. Phase 8.5 lowers these semantics into
 bounded fixed-width state without weakening this ordering; ADR 0118.
 
 The Phase 8.5 contract slice defines fixed-width source/candidate state, while
-the gateway packet slice advances it to egress ABI v3. Identity-keyed source
+the gateway packet slice introduced egress ABI v3 and Phase 8.7c advances it to
+v4. Identity-keyed source
 entries retain all contract revision domains,
 lease, digest, admission, intent index, candidate counts, and family/standby
 flags. Intent-and-bank-prefixed IPv4/IPv6 LPM tables retain canonical destination
-constraints plus contract/intent bindings. Address, gateway-path, and 251-bucket selection entries are keyed by the
+constraints plus contract/intent bindings and monotonic new/established-flow
+deadlines. Address, gateway-path, and 251-bucket selection entries are keyed by the
 shared intent index; this avoids multiplying candidates for every selected
 workload. Path certificates must form one coherent path revision and unused,
 foreign, missing, or duplicate evidence is rejected. Connection and event
 layouts reserve exact original/translated tuples plus primary/standby proof
-provenance. Persistent ABI v14 now owns these tables plus seven dedicated
+provenance. Persistent ABI v15 now owns these tables plus seven dedicated
 identity-namespaced gateway-NAT projection maps. The agent explicitly encodes,
 stages, reads back, activates, reconstructs, and garbage-collects each source or
 aggregate gateway bank as one pointer-selected transaction. The connection LRU
 validates complete forward/reverse tuples and contract, lease, proof, and
 gateway commitments; reverse-first `BPF_NOEXIST` insertion prevents collision
-overwrite while protocol-bounded entries survive projection churn. A live authenticated source endpoint now
+overwrite while protocol-bounded entries survive projection churn. PLR-derived
+pairs additionally carry an autonomous established-flow deadline; portable AFT
+schema-v2 deadlines are conservatively re-anchored to each Node's monotonic
+clock. A live authenticated source endpoint now
 carries the exact normalized model/facts/contract envelope; the agent resolves
 its Node UID independently, replays it, applies monotonic projection fencing,
 and lowers every selected source as `Fenced` without path candidates. Native

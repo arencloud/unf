@@ -17,7 +17,11 @@ pub const IDENTITY_MAP_ABI_VERSION: u16 = 2;
 pub const IDENTITY_BANK_COUNT: u8 = 2;
 pub const POLICY_MAP_ABI_VERSION: u16 = 3;
 pub const POLICY_BANK_COUNT: u8 = 2;
-pub const EGRESS_MAP_ABI_VERSION: u16 = 3;
+pub const EGRESS_MAP_ABI_VERSION: u16 = 4;
+/// Static network destinations have no DNS-derived temporal limit.
+pub const EGRESS_DESTINATION_STATIC_DEADLINE: u32 = u32::MAX;
+/// A zero deadline is an explicit owned deny entry, never native fall-through.
+pub const EGRESS_DESTINATION_DENY_DEADLINE: u32 = 0;
 pub const EGRESS_EVENT_ABI_VERSION: u16 = 1;
 pub const EGRESS_BANK_COUNT: u8 = 2;
 /// LPM keys begin with an exact intent-and-bank discriminator before the
@@ -526,8 +530,7 @@ pub const fn egress_connection_is_active(value: &EgressConnectionValue, now_ns: 
     let Some(timeout_ns) = connection_timeout_ns(value.protocol) else {
         return false;
     };
-    value.schema_version == EGRESS_MAP_ABI_VERSION
-        && value.contract_revision != 0
+    value.contract_revision != 0
         && value.lease_epoch != 0
         && value.source_identity.get() != 0
         && now_ns.saturating_sub(value.last_seen_ns) <= timeout_ns
@@ -803,9 +806,10 @@ pub struct EgressIpv6DestinationData {
 pub struct EgressDestinationValue {
     pub contract_revision: u64,
     pub intent_digest: [u8; 16],
-    pub schema_version: u16,
-    pub flags: u16,
-    pub reserved: [u8; 4],
+    /// Absolute `CLOCK_MONOTONIC` second before which a new flow may start.
+    pub new_flows_until_monotonic_seconds: u32,
+    /// Absolute `CLOCK_MONOTONIC` second before which established state may drain.
+    pub established_flows_until_monotonic_seconds: u32,
 }
 
 /// Per-family candidate indexes are local to one source identity and bank.
@@ -905,6 +909,18 @@ pub struct EgressConnectionKey {
     pub reserved: u8,
 }
 
+/// Runtime-only source-side state for a DNS-authorized original tuple. The
+/// intent digest prevents an old tuple from crossing intent ownership, while
+/// the absolute deadline bounds drain even when control-plane refresh stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EgressFqdnConnectionValue {
+    pub last_seen_ns: u64,
+    pub established_flows_until_monotonic_seconds: u32,
+    pub intent_digest: [u8; 16],
+    pub reserved: [u8; 4],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct EgressConnectionValue {
@@ -927,11 +943,11 @@ pub struct EgressConnectionValue {
     pub address_index: u16,
     pub primary_gateway_index: u16,
     pub standby_gateway_index: u16,
-    pub schema_version: u16,
+    /// FQDN drain deadline, or [`EGRESS_DESTINATION_STATIC_DEADLINE`].
+    pub established_flows_until_monotonic_seconds: u32,
+    pub flags: u16,
     pub protocol: u8,
     pub address_family: u8,
-    pub flags: u16,
-    pub reserved: [u8; 2],
 }
 
 /// Fixed event data; Kubernetes strings and full proofs are joined in
@@ -1415,6 +1431,7 @@ const _: () = assert!(core::mem::size_of::<EgressSelectionKey>() == 8);
 const _: () = assert!(core::mem::size_of::<EgressSelectionValue>() == 32);
 const _: () = assert!(core::mem::size_of::<EgressMapConfig>() == 56);
 const _: () = assert!(core::mem::size_of::<EgressConnectionKey>() == 44);
+const _: () = assert!(core::mem::size_of::<EgressFqdnConnectionValue>() == 32);
 const _: () = assert!(core::mem::size_of::<EgressConnectionValue>() == 208);
 const _: () = assert!(core::mem::size_of::<EgressEvent>() == 152);
 const _: () = assert!(core::mem::size_of::<Ipv4ServiceFrontendKey>() == 8);

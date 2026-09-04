@@ -10,10 +10,10 @@ command -v rg >/dev/null
 sudo -n true
 
 rg --fixed-strings --quiet \
-    'pub const EGRESS_MAP_ABI_VERSION: u16 = 3;' \
+    'pub const EGRESS_MAP_ABI_VERSION: u16 = 4;' \
     "${project_root}/ebpf/unf-ebpf-common/src/lib.rs"
 rg --fixed-strings --quiet \
-    'pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 14;' \
+    'pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 15;' \
     "${project_root}/crates/unf-state/src/lib.rs"
 rg --fixed-strings --quiet \
     '| Destination-exact policy-first source steering | **Verified** |' \

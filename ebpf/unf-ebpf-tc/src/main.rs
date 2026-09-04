@@ -2,10 +2,9 @@
 #![no_main]
 
 use aya_ebpf::bindings::{
-    BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR,
-    BPF_FIB_LOOKUP_OUTPUT, BPF_FIB_LOOKUP_SRC, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_NOEXIST,
-    TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT, bpf_fib_lookup as BpfFibLookup,
-    bpf_redir_neigh as BpfRedirNeigh,
+    BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_FIB_LOOKUP_OUTPUT,
+    BPF_FIB_LOOKUP_SRC, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT,
+    bpf_fib_lookup as BpfFibLookup, bpf_redir_neigh as BpfRedirNeigh,
     bpf_redir_neigh__bindgen_ty_1 as BpfRedirNeighAddress,
 };
 use aya_ebpf::helpers::{
@@ -17,64 +16,60 @@ use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramAr
 use aya_ebpf::programs::TcContext;
 use unf_common::{BackendId, IdentityId, PolicyId, PolicyReason, RuleId, ServiceId, Verdict};
 use unf_ebpf_common::{
-    AddressFamily, ConnectionKey, ConnectionState, Direction, EgressIpv4PolicyMapKey,
-    EgressIpv6PolicyMapData, EgressAddressValue, EgressCandidateKey, EgressConnectionKey,
-    EgressConnectionValue, EgressDestinationValue, EgressGatewayValue,
-    EgressEvent, EgressIpv4DestinationData, EgressIpv6DestinationData, EgressMapConfig, EgressSelectionKey,
-    EgressSelectionValue, EgressSourceKey, EgressSourceValue, EGRESS_ADMISSION_ACTIVE,
+    AddressFamily, ConnectionKey, ConnectionState, Direction, EGRESS_ADMISSION_ACTIVE,
     EGRESS_ADMISSION_FENCED, EGRESS_BANK_COUNT, EGRESS_CONFIG_FLAG_GATEWAY_NAT,
-    EGRESS_EVENT_ABI_VERSION, EGRESS_EVENT_ACTION_CREATE, EGRESS_EVENT_ACTION_DROP,
-    EGRESS_EVENT_ACTION_EXPIRE, EGRESS_EVENT_REASON_EXPIRED_OR_CORRUPT,
-    EGRESS_EVENT_REASON_PAIR_STORE_FAILED, EGRESS_EVENT_REASON_PORT_EXHAUSTED,
-    EGRESS_EVENT_REASON_REWRITE_FAILED, EGRESS_EVENT_REASON_TRANSLATION_CREATED,
-    EGRESS_MAP_ABI_VERSION,
-    EGRESS_PATH_DIRECT_NEIGHBOR, EGRESS_PATH_LOCAL_GATEWAY, FLOW_ABI_VERSION, FlowEvent,
-    IDENTITY_BANK_COUNT,
-    IDENTITY_MAP_ABI_VERSION, IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT,
-    IPV6_NEXT_HEADER_HOP_BY_HOP, IdentityMapConfig, IdentityMapValue, Ipv4IdentityKey,
-    Ipv4LoadBalancerFrontendKey, Ipv4NodePortFrontendKey, Ipv4PolicyMapKey,
+    EGRESS_DESTINATION_DENY_DEADLINE, EGRESS_DESTINATION_STATIC_DEADLINE, EGRESS_EVENT_ABI_VERSION,
+    EGRESS_EVENT_ACTION_CREATE, EGRESS_EVENT_ACTION_DROP, EGRESS_EVENT_ACTION_EXPIRE,
+    EGRESS_EVENT_REASON_EXPIRED_OR_CORRUPT, EGRESS_EVENT_REASON_PAIR_STORE_FAILED,
+    EGRESS_EVENT_REASON_PORT_EXHAUSTED, EGRESS_EVENT_REASON_REWRITE_FAILED,
+    EGRESS_EVENT_REASON_TRANSLATION_CREATED, EGRESS_MAP_ABI_VERSION, EGRESS_PATH_DIRECT_NEIGHBOR,
+    EGRESS_PATH_LOCAL_GATEWAY, EgressAddressValue, EgressCandidateKey, EgressConnectionKey,
+    EgressConnectionValue, EgressDestinationValue, EgressEvent, EgressFqdnConnectionValue,
+    EgressGatewayValue, EgressIpv4DestinationData, EgressIpv4PolicyMapKey,
+    EgressIpv6DestinationData, EgressIpv6PolicyMapData, EgressMapConfig, EgressSelectionKey,
+    EgressSelectionValue, EgressSourceKey, EgressSourceValue, FLOW_ABI_VERSION, FlowEvent,
+    IDENTITY_BANK_COUNT, IDENTITY_MAP_ABI_VERSION, IPV6_EXTENSION_BYTE_LIMIT,
+    IPV6_EXTENSION_HEADER_LIMIT, IPV6_NEXT_HEADER_HOP_BY_HOP, IdentityMapConfig, IdentityMapValue,
+    Ipv4IdentityKey, Ipv4LoadBalancerFrontendKey, Ipv4NodePortFrontendKey, Ipv4PolicyMapKey,
     Ipv4ServiceBackendValue, Ipv4ServiceFrontendKey, Ipv6ExtensionStep, Ipv6IdentityKey,
     Ipv6LoadBalancerFrontendKey, Ipv6NodePortFrontendKey, Ipv6PolicyMapData,
-    Ipv6ServiceBackendValue, Ipv6ServiceFrontendKey, LoadBalancerFrontendValue,
-    LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4, LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6,
-    LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION, LoadBalancerMapConfig,
-    LoadBalancerNodeSourceConfig, NodePortFrontendValue, NodePortMapConfig,
+    Ipv6ServiceBackendValue, Ipv6ServiceFrontendKey, LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4,
+    LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6, LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION,
+    LoadBalancerFrontendValue, LoadBalancerMapConfig, LoadBalancerNodeSourceConfig,
     NODE_PORT_BANK_COUNT, NODE_PORT_FRONTEND_FLAG_CLIENT_IP_AFFINITY,
     NODE_PORT_FRONTEND_FLAG_LOCAL, NODE_PORT_FRONTEND_FLAG_MAGLEV,
     NODE_PORT_LOCAL_FRONTEND_INDEX_FLAG, NODE_PORT_MAP_ABI_VERSION, NODE_PORT_SNAT_PORT_PROBES,
-    POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
-    POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
-    PolicyMapConfig, PolicyMapKey, PolicyMapValue, ReasonCode, SERVICE_BANK_COUNT,
-    SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS, SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS,
-    SERVICE_AFFINITY_OUTCOME_CREATED, SERVICE_AFFINITY_OUTCOME_NONE,
-    SERVICE_AFFINITY_OUTCOME_RESELECTED, SERVICE_AFFINITY_OUTCOME_REUSED,
-    SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT, SERVICE_CONNECTION_FLAG_DSR,
-    SERVICE_CONNECTION_FLAG_MAGLEV,
+    NodePortFrontendValue, NodePortMapConfig, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY,
+    POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW, POLICY_FLAG_SHADOW_HAS_POLICY,
+    POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION, PolicyMapConfig, PolicyMapKey,
+    PolicyMapValue, ReasonCode, SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS,
+    SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS, SERVICE_AFFINITY_OUTCOME_CREATED,
+    SERVICE_AFFINITY_OUTCOME_NONE, SERVICE_AFFINITY_OUTCOME_RESELECTED,
+    SERVICE_AFFINITY_OUTCOME_REUSED, SERVICE_BANK_COUNT, SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT,
+    SERVICE_CONNECTION_FLAG_DSR, SERVICE_CONNECTION_FLAG_MAGLEV,
     SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER, SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL,
-    SERVICE_CONNECTION_ROLE_AFFINITY,
-    SERVICE_CONNECTION_ROLE_FORWARD, SERVICE_CONNECTION_ROLE_REVERSE,
-    SERVICE_CONNECTION_SELECTION_TIER_MASK, SERVICE_EVENT_ABI_VERSION,
-    SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
+    SERVICE_CONNECTION_ROLE_AFFINITY, SERVICE_CONNECTION_ROLE_FORWARD,
+    SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_CONNECTION_SELECTION_TIER_MASK,
+    SERVICE_EVENT_ABI_VERSION, SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE,
+    SERVICE_EVENT_ACTION_TRANSLATE, SERVICE_EVENT_FORWARDING_DSR, SERVICE_EVENT_FORWARDING_NAT,
     SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
     SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
-    SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL,
-    SERVICE_EVENT_FORWARDING_DSR, SERVICE_EVENT_FORWARDING_NAT,
-    SERVICE_EVENT_REASON_DSR_ROUTE_FAILED, SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT,
-    SERVICE_EVENT_REASON_FORWARD_DSR, SERVICE_EVENT_REASON_FORWARD_TRANSLATED,
-    SERVICE_EVENT_REASON_INVALID_BACKEND, SERVICE_EVENT_REASON_INVALID_FRONTEND,
-    SERVICE_EVENT_REASON_INVALID_SLOT, SERVICE_EVENT_REASON_MISSING_BACKEND,
-    SERVICE_EVENT_REASON_MISSING_SLOT, SERVICE_EVENT_REASON_NO_BACKEND,
-    SERVICE_EVENT_REASON_PAIR_INSERT_FAILED, SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
-    SERVICE_EVENT_REASON_REWRITE_FAILED, SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED,
-    SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY, SERVICE_FRONTEND_FLAG_MAGLEV,
-    SERVICE_MAP_ABI_VERSION, SERVICE_SELECTION_ALGORITHM_MAGLEV,
-    SERVICE_SELECTION_ALGORITHM_STABLE_HASH, ServiceBackendKey, ServiceAffinityValue,
+    SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL, SERVICE_EVENT_REASON_DSR_ROUTE_FAILED,
+    SERVICE_EVENT_REASON_EXPIRED_OR_CORRUPT, SERVICE_EVENT_REASON_FORWARD_DSR,
+    SERVICE_EVENT_REASON_FORWARD_TRANSLATED, SERVICE_EVENT_REASON_INVALID_BACKEND,
+    SERVICE_EVENT_REASON_INVALID_FRONTEND, SERVICE_EVENT_REASON_INVALID_SLOT,
+    SERVICE_EVENT_REASON_MISSING_BACKEND, SERVICE_EVENT_REASON_MISSING_SLOT,
+    SERVICE_EVENT_REASON_NO_BACKEND, SERVICE_EVENT_REASON_PAIR_INSERT_FAILED,
+    SERVICE_EVENT_REASON_REVERSE_TRANSLATED, SERVICE_EVENT_REASON_REWRITE_FAILED,
+    SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED, SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY,
+    SERVICE_FRONTEND_FLAG_MAGLEV, SERVICE_MAP_ABI_VERSION, SERVICE_SELECTION_ALGORITHM_MAGLEV,
+    SERVICE_SELECTION_ALGORITHM_STABLE_HASH, ServiceAffinityValue, ServiceBackendKey,
     ServiceBackendSlotKey, ServiceBackendSlotValue, ServiceConnectionKey, ServiceConnectionValue,
     ServiceEvent, ServiceFrontendValue, ServiceMapConfig, connection_is_active,
-    ipv6_extension_step, node_port_snat_candidate,
-    egress_connection_is_active, egress_flow_hash, egress_selection_bucket,
-    egress_snat_candidate, packet_starts_connection, service_backend_is_eligible,
-    service_connection_is_active, service_flow_hash, service_selection_tier_is_valid,
+    connection_timeout_ns, egress_connection_is_active, egress_flow_hash, egress_selection_bucket,
+    egress_snat_candidate, ipv6_extension_step, node_port_snat_candidate, packet_starts_connection,
+    service_backend_is_eligible, service_connection_is_active, service_flow_hash,
+    service_selection_tier_is_valid,
 };
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -165,6 +160,10 @@ static EGRESS_CONNECTION_KEY_SCRATCH: PerCpuArray<EgressConnectionKey> =
 static EGRESS_CONNECTION_VALUE_SCRATCH: PerCpuArray<EgressConnectionValue> =
     PerCpuArray::with_max_entries(1, 0);
 
+#[map]
+static EGRESS_FQDN_CONNECTION_VALUE_SCRATCH: PerCpuArray<EgressFqdnConnectionValue> =
+    PerCpuArray::with_max_entries(1, 0);
+
 /// Sparse lifecycle witnesses only: one successful create and exceptional
 /// retirement/drop outcomes. Established packets never emit per-packet NAT
 /// telemetry, so a slow reader cannot amplify packet-path work.
@@ -238,12 +237,16 @@ static EGRESS_GATEWAY_NAT_SOURCES: HashMap<EgressSourceKey, EgressSourceValue> =
     HashMap::with_max_entries(EGRESS_SOURCE_CAPACITY, BPF_F_NO_PREALLOC);
 
 #[map]
-static EGRESS_GATEWAY_NAT_DESTINATIONS_V4: LpmTrie<EgressIpv4DestinationData, EgressDestinationValue> =
-    LpmTrie::with_max_entries(EGRESS_DESTINATION_CAPACITY, 0);
+static EGRESS_GATEWAY_NAT_DESTINATIONS_V4: LpmTrie<
+    EgressIpv4DestinationData,
+    EgressDestinationValue,
+> = LpmTrie::with_max_entries(EGRESS_DESTINATION_CAPACITY, 0);
 
 #[map]
-static EGRESS_GATEWAY_NAT_DESTINATIONS_V6: LpmTrie<EgressIpv6DestinationData, EgressDestinationValue> =
-    LpmTrie::with_max_entries(EGRESS_DESTINATION_CAPACITY, 0);
+static EGRESS_GATEWAY_NAT_DESTINATIONS_V6: LpmTrie<
+    EgressIpv6DestinationData,
+    EgressDestinationValue,
+> = LpmTrie::with_max_entries(EGRESS_DESTINATION_CAPACITY, 0);
 
 #[map]
 static EGRESS_GATEWAY_NAT_ADDRESSES: HashMap<EgressCandidateKey, EgressAddressValue> =
@@ -264,6 +267,13 @@ static EGRESS_GATEWAY_NAT_CONFIG: Array<EgressMapConfig> = Array::with_max_entri
 /// state. Packet insertion and validation arrive with the steering/NAT gate.
 #[map]
 static EGRESS_CONNECTIONS: LruHashMap<EgressConnectionKey, EgressConnectionValue> =
+    LruHashMap::with_max_entries(EGRESS_CONNECTION_CAPACITY, 0);
+
+/// Source-side PLR flow memory is intentionally runtime-only. Agent restart
+/// forgets grace state and therefore fails closed; it can never extend a DNS
+/// lease or corrupt the persistent NAT recovery boundary.
+#[map]
+static EGRESS_FQDN_CONNECTIONS: LruHashMap<EgressConnectionKey, EgressFqdnConnectionValue> =
     LruHashMap::with_max_entries(EGRESS_CONNECTION_CAPACITY, 0);
 
 #[map]
@@ -358,16 +368,12 @@ static NODE_PORT_CONFIG: Array<NodePortMapConfig> = Array::with_max_entries(1, 0
 /// Phase 6 host state is staged independently and remains unconsumed until the
 /// following packet-path milestone explicitly admits its revision tuple.
 #[map]
-static LOAD_BALANCER_FRONTENDS_V4: HashMap<
-    Ipv4LoadBalancerFrontendKey,
-    LoadBalancerFrontendValue,
-> = HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
+static LOAD_BALANCER_FRONTENDS_V4: HashMap<Ipv4LoadBalancerFrontendKey, LoadBalancerFrontendValue> =
+    HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
 
 #[map]
-static LOAD_BALANCER_FRONTENDS_V6: HashMap<
-    Ipv6LoadBalancerFrontendKey,
-    LoadBalancerFrontendValue,
-> = HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
+static LOAD_BALANCER_FRONTENDS_V6: HashMap<Ipv6LoadBalancerFrontendKey, LoadBalancerFrontendValue> =
+    HashMap::with_max_entries(SERVICE_FRONTEND_CAPACITY, BPF_F_NO_PREALLOC);
 
 #[map]
 static LOAD_BALANCER_SOURCE_RANGES_V4: LpmTrie<
@@ -442,14 +448,18 @@ pub fn unf_observe_ingress(ctx: TcContext) -> i32 {
         // SAFETY: index 0 is a TC classifier over this exact context and the
         // agent installs it before attaching the main hook.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V4) };
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V4)
+        };
         return TC_ACT_SHOT;
     }
     if action == SERVICE_POLICY_DISPATCH_V6 {
         // SAFETY: index 1 is a TC classifier over this exact context and the
         // agent installs it before attaching the main hook.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V6) };
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V6)
+        };
         return TC_ACT_SHOT;
     }
     action
@@ -464,14 +474,18 @@ pub fn unf_observe_egress(ctx: TcContext) -> i32 {
         // SAFETY: index 0 is a TC classifier over this exact context and the
         // agent installs it before attaching the main hook.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V4) };
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V4)
+        };
         return TC_ACT_SHOT;
     }
     if action == SERVICE_POLICY_DISPATCH_V6 {
         // SAFETY: index 1 is a TC classifier over this exact context and the
         // agent installs it before attaching the main hook.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V6) };
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V6)
+        };
         return TC_ACT_SHOT;
     }
     action
@@ -519,9 +533,7 @@ fn normalize_service_dsr_vlan(ctx: &TcContext, lookup: &BpfFibLookup) -> bool {
     // helper is called only when the verifier-visible VLAN-present bit is set.
     #[allow(unsafe_code)]
     unsafe {
-        if service_dsr_transport_interface(lookup)
-            || (*ctx.skb.skb).vlan_present == 0
-        {
+        if service_dsr_transport_interface(lookup) || (*ctx.skb.skb).vlan_present == 0 {
             return true;
         }
         bpf_skb_vlan_pop(ctx.skb.skb.cast()) == 0
@@ -561,9 +573,7 @@ fn service_dsr_transport_interfaces() -> [u32; 4] {
     // classifiers only read the fixed-size value afterward.
     #[allow(unsafe_code)]
     unsafe {
-        core::ptr::read_volatile(core::ptr::addr_of!(
-            SERVICE_DSR_TRANSPORT_INTERFACES
-        ))
+        core::ptr::read_volatile(core::ptr::addr_of!(SERVICE_DSR_TRANSPORT_INTERFACES))
     }
 }
 
@@ -623,7 +633,9 @@ pub fn unf_policy_v4(ctx: TcContext) -> i32 {
     if gateway_egress_maybe_owned(observation) {
         // SAFETY: index 4 is the verifier-isolated IPv4 gateway NAT stage.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_GATEWAY_TAIL_V4) };
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_GATEWAY_TAIL_V4)
+        };
         return TC_ACT_SHOT;
     }
     let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
@@ -635,7 +647,9 @@ pub fn unf_policy_v4(ctx: TcContext) -> i32 {
             // SAFETY: index 2 is a TC classifier over this exact context and
             // the agent installs it before attaching the main hook.
             #[allow(unsafe_code)]
-            unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V4) };
+            unsafe {
+                SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V4)
+            };
             return dsr_route_failed();
         }
         if !observation.enforce && post_lookup & SERVICE_POST_LOOKUP_REROUTE_HOST != 0 {
@@ -663,7 +677,9 @@ pub fn unf_policy_v6(ctx: TcContext) -> i32 {
     if gateway_egress_maybe_owned(observation) {
         // SAFETY: index 5 is the verifier-isolated IPv6 gateway NAT stage.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_GATEWAY_TAIL_V6) };
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_GATEWAY_TAIL_V6)
+        };
         return TC_ACT_SHOT;
     }
     let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
@@ -675,7 +691,9 @@ pub fn unf_policy_v6(ctx: TcContext) -> i32 {
             // SAFETY: index 3 is a TC classifier over this exact context and
             // the agent installs it before attaching the main hook.
             #[allow(unsafe_code)]
-            unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V6) };
+            unsafe {
+                SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V6)
+            };
             return dsr_route_failed();
         }
         if !observation.enforce && post_lookup & SERVICE_POST_LOOKUP_REROUTE_HOST != 0 {
@@ -729,7 +747,9 @@ pub fn unf_egress_gateway_v4(ctx: TcContext) -> i32 {
     if observation.enforce {
         // SAFETY: index 6 is the dedicated IPv4 source classifier.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_SOURCE_TAIL_V4) };
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_SOURCE_TAIL_V4)
+        };
         return TC_ACT_SHOT;
     }
     TC_ACT_PIPE
@@ -750,7 +770,9 @@ pub fn unf_egress_gateway_v6(ctx: TcContext) -> i32 {
     if observation.enforce {
         // SAFETY: index 7 is the dedicated IPv6 source classifier.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_SOURCE_TAIL_V6) };
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_SOURCE_TAIL_V6)
+        };
         return TC_ACT_SHOT;
     }
     TC_ACT_PIPE
@@ -916,17 +938,15 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                             now_ns,
                         );
                     } else {
-                        if service_connection_translation(true).is_some_and(
-                            |source_translation| {
-                                !rewrite_ipv4(
-                                    ctx,
-                                    transport_offset,
-                                    protocol,
-                                    &source_translation,
-                                    true,
-                                )
-                            },
-                        ) || !rewrite_ipv4(ctx, transport_offset, protocol, &translation, false)
+                        if service_connection_translation(true).is_some_and(|source_translation| {
+                            !rewrite_ipv4(
+                                ctx,
+                                transport_offset,
+                                protocol,
+                                &source_translation,
+                                true,
+                            )
+                        }) || !rewrite_ipv4(ctx, transport_offset, protocol, &translation, false)
                         {
                             emit_service_connection_event(
                                 SERVICE_EVENT_ACTION_DROP,
@@ -1023,8 +1043,13 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                                         true,
                                     )
                                 },
-                            ) || !rewrite_ipv4(ctx, transport_offset, protocol, &translation, false)
-                            {
+                            ) || !rewrite_ipv4(
+                                ctx,
+                                transport_offset,
+                                protocol,
+                                &translation,
+                                false,
+                            ) {
                                 emit_service_connection_event(
                                     SERVICE_EVENT_ACTION_DROP,
                                     SERVICE_EVENT_REASON_REWRITE_FAILED,
@@ -1080,7 +1105,9 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     });
     // SAFETY: this CPU owns the post-lookup scratch slot for the invocation.
     #[allow(unsafe_code)]
-    unsafe { *post_lookup_ptr = post_lookup };
+    unsafe {
+        *post_lookup_ptr = post_lookup
+    };
     SERVICE_POLICY_DISPATCH_V4
 }
 
@@ -1189,17 +1216,15 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                             now_ns,
                         );
                     } else {
-                        if service_connection_translation(true).is_some_and(
-                            |source_translation| {
-                                !rewrite_ipv6(
-                                    ctx,
-                                    transport_offset,
-                                    protocol,
-                                    &source_translation,
-                                    true,
-                                )
-                            },
-                        ) || !rewrite_ipv6(ctx, transport_offset, protocol, &translation, false)
+                        if service_connection_translation(true).is_some_and(|source_translation| {
+                            !rewrite_ipv6(
+                                ctx,
+                                transport_offset,
+                                protocol,
+                                &source_translation,
+                                true,
+                            )
+                        }) || !rewrite_ipv6(ctx, transport_offset, protocol, &translation, false)
                         {
                             emit_service_connection_event(
                                 SERVICE_EVENT_ACTION_DROP,
@@ -1286,8 +1311,13 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                                         true,
                                     )
                                 },
-                            ) || !rewrite_ipv6(ctx, transport_offset, protocol, &translation, false)
-                            {
+                            ) || !rewrite_ipv6(
+                                ctx,
+                                transport_offset,
+                                protocol,
+                                &translation,
+                                false,
+                            ) {
                                 emit_service_connection_event(
                                     SERVICE_EVENT_ACTION_DROP,
                                     SERVICE_EVENT_REASON_REWRITE_FAILED,
@@ -1331,7 +1361,9 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
     });
     // SAFETY: this CPU owns the post-lookup scratch slot for the invocation.
     #[allow(unsafe_code)]
-    unsafe { *post_lookup_ptr = post_lookup };
+    unsafe {
+        *post_lookup_ptr = post_lookup
+    };
     SERVICE_POLICY_DISPATCH_V6
 }
 
@@ -1515,7 +1547,8 @@ fn load_balancer_node_source(address_family: u8) -> Option<[u8; 16]> {
     let config = LOAD_BALANCER_NODE_SOURCE.get(0).copied()?;
     if config.schema_version != LOAD_BALANCER_NODE_SOURCE_SCHEMA_VERSION
         || config.node_revision == 0
-        || config.flags & !(LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4 | LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6)
+        || config.flags
+            & !(LOAD_BALANCER_NODE_SOURCE_FLAG_IPV4 | LOAD_BALANCER_NODE_SOURCE_FLAG_IPV6)
             != 0
         || config.reserved != [0; 9]
     {
@@ -1597,9 +1630,7 @@ fn validate_load_balancer_frontend(
             != 0
         || !valid_selection_reserved(
             frontend.reserved,
-            frontend.flags
-                & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY
-                != 0,
+            frontend.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY != 0,
         )
     {
         emit_service_lookup_failure(
@@ -1620,8 +1651,7 @@ fn validate_load_balancer_frontend(
         frontend_index: frontend.frontend_index,
         backend_count: frontend.backend_count,
         schema_version: SERVICE_MAP_ABI_VERSION,
-        flags: (if frontend.flags
-            & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY
+        flags: (if frontend.flags & unf_ebpf_common::LOAD_BALANCER_FRONTEND_FLAG_CLIENT_IP_AFFINITY
             != 0
         {
             SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY
@@ -1992,10 +2022,7 @@ fn remove_service_pair(value: &ServiceConnectionValue, current: &ServiceConnecti
 }
 
 #[inline(always)]
-fn store_service_pair(
-    value: &ServiceConnectionValue,
-    current: &ServiceConnectionKey,
-) -> bool {
+fn store_service_pair(value: &ServiceConnectionValue, current: &ServiceConnectionKey) -> bool {
     if value.flags & SERVICE_CONNECTION_FLAG_DSR != 0 {
         return current.role == SERVICE_CONNECTION_ROLE_FORWARD
             && SERVICE_CONNECTIONS.insert(current, value, 0).is_ok();
@@ -2083,8 +2110,7 @@ fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
 fn current_load_balancer_frontend_owner(value: &ServiceConnectionValue) -> Option<ServiceId> {
     if !matches!(
         value.reserved[2],
-        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
-            | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
     ) {
         return None;
     }
@@ -2105,7 +2131,9 @@ fn current_load_balancer_frontend_owner(value: &ServiceConnectionValue) -> Optio
         // SAFETY: the exact fixed-layout key/value pair matches the map ABI and
         // the value is copied before any subsequent map operation.
         #[allow(unsafe_code)]
-        unsafe { LOAD_BALANCER_FRONTENDS_V4.get(&key).copied() }
+        unsafe {
+            LOAD_BALANCER_FRONTENDS_V4.get(&key).copied()
+        }
     } else if value.address_family == AddressFamily::Ipv6 as u8 {
         let key = Ipv6LoadBalancerFrontendKey {
             address: value.frontend_address,
@@ -2116,7 +2144,9 @@ fn current_load_balancer_frontend_owner(value: &ServiceConnectionValue) -> Optio
         // SAFETY: the exact fixed-layout key/value pair matches the map ABI and
         // the value is copied before any subsequent map operation.
         #[allow(unsafe_code)]
-        unsafe { LOAD_BALANCER_FRONTENDS_V6.get(&key).copied() }
+        unsafe {
+            LOAD_BALANCER_FRONTENDS_V6.get(&key).copied()
+        }
     } else {
         None
     }?;
@@ -2217,8 +2247,7 @@ fn new_service_connection(
     value.last_seen_ns = now_ns;
     if matches!(
         frontend_kind,
-        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
-            | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
+        SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
     ) {
         value.reserved[2] = frontend_kind;
     }
@@ -2229,19 +2258,19 @@ fn new_service_connection(
             value.translated_source_address[2],
             value.translated_source_address[3],
         ]);
-        value.translated_source_address = if frontend_kind
-            == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER
-        {
-            load_balancer_node_source(value.address_family).or_else(|| {
-                LOAD_BALANCER_CLUSTER_SOURCE_SCRATCH
-                .get(0)
-                .copied()
-                .filter(|address| *address != [0; 16])
-            })
-                .unwrap_or(value.frontend_address)
-        } else {
-            value.frontend_address
-        };
+        value.translated_source_address =
+            if frontend_kind == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER {
+                load_balancer_node_source(value.address_family)
+                    .or_else(|| {
+                        LOAD_BALANCER_CLUSTER_SOURCE_SCRATCH
+                            .get(0)
+                            .copied()
+                            .filter(|address| *address != [0; 16])
+                    })
+                    .unwrap_or(value.frontend_address)
+            } else {
+                value.frontend_address
+            };
         let mut probe = 0_u32;
         while probe < NODE_PORT_SNAT_PORT_PROBES {
             let port = node_port_snat_candidate(hash, probe);
@@ -2291,8 +2320,7 @@ fn lookup_load_balancer_frontend_v4(
     let Some(value) = (unsafe { LOAD_BALANCER_FRONTENDS_V4.get(&key).copied() }) else {
         return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_MISS);
     };
-    let Ok(frontend) =
-        validate_load_balancer_frontend(forward_key, value, config, service, now_ns)
+    let Ok(frontend) = validate_load_balancer_frontend(forward_key, value, config, service, now_ns)
     else {
         return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_DROP);
     };
@@ -2348,8 +2376,7 @@ fn lookup_load_balancer_frontend_v6(
     let Some(value) = (unsafe { LOAD_BALANCER_FRONTENDS_V6.get(&key).copied() }) else {
         return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_MISS);
     };
-    let Ok(frontend) =
-        validate_load_balancer_frontend(forward_key, value, config, service, now_ns)
+    let Ok(frontend) = validate_load_balancer_frontend(forward_key, value, config, service, now_ns)
     else {
         return empty_service_frontend_selection(SERVICE_FRONTEND_SELECTION_DROP);
     };
@@ -2567,10 +2594,7 @@ fn store_service_affinity(
 
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn lookup_new_forward_service_v4(
-    forward_key: &ServiceConnectionKey,
-    now_ns: u64,
-) -> ServiceLookup {
+fn lookup_new_forward_service_v4(forward_key: &ServiceConnectionKey, now_ns: u64) -> ServiceLookup {
     let Some(config) = active_service_config() else {
         return ServiceLookup::Miss;
     };
@@ -2589,25 +2613,29 @@ fn lookup_new_forward_service_v4(
     // the value is copied before any other map operation.
     #[allow(unsafe_code)]
     let cluster_frontend = unsafe { SERVICE_FRONTENDS_V4.get(&frontend_key).copied() };
-    let (frontend, service_bank, mut connection_flags, frontend_kind) = if let Some(frontend) =
-        cluster_frontend
-    {
-        (frontend, config.active_bank, 0, SERVICE_EVENT_FRONTEND_CLUSTER_IP)
-    } else {
-        let selection = lookup_external_frontend_v4(forward_key, config, now_ns);
-        if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_MISS {
-            return ServiceLookup::Miss;
-        }
-        if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_DROP {
-            return ServiceLookup::Drop;
-        }
-        (
-            selection.frontend,
-            selection.service_bank,
-            selection.connection_flags,
-            selection.frontend_kind,
-        )
-    };
+    let (frontend, service_bank, mut connection_flags, frontend_kind) =
+        if let Some(frontend) = cluster_frontend {
+            (
+                frontend,
+                config.active_bank,
+                0,
+                SERVICE_EVENT_FRONTEND_CLUSTER_IP,
+            )
+        } else {
+            let selection = lookup_external_frontend_v4(forward_key, config, now_ns);
+            if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_MISS {
+                return ServiceLookup::Miss;
+            }
+            if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_DROP {
+                return ServiceLookup::Drop;
+            }
+            (
+                selection.frontend,
+                selection.service_bank,
+                selection.connection_flags,
+                selection.frontend_kind,
+            )
+        };
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
         || frontend.revision != config.revision
         || frontend.service_id.get() == 0
@@ -2788,10 +2816,7 @@ fn lookup_new_forward_service_v4(
 
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn lookup_new_forward_service_v6(
-    forward_key: &ServiceConnectionKey,
-    now_ns: u64,
-) -> ServiceLookup {
+fn lookup_new_forward_service_v6(forward_key: &ServiceConnectionKey, now_ns: u64) -> ServiceLookup {
     let Some(config) = active_service_config() else {
         return ServiceLookup::Miss;
     };
@@ -2805,25 +2830,29 @@ fn lookup_new_forward_service_v6(
     // the value is copied before any other map operation.
     #[allow(unsafe_code)]
     let cluster_frontend = unsafe { SERVICE_FRONTENDS_V6.get(&frontend_key).copied() };
-    let (frontend, service_bank, mut connection_flags, frontend_kind) = if let Some(frontend) =
-        cluster_frontend
-    {
-        (frontend, config.active_bank, 0, SERVICE_EVENT_FRONTEND_CLUSTER_IP)
-    } else {
-        let selection = lookup_external_frontend_v6(forward_key, config, now_ns);
-        if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_MISS {
-            return ServiceLookup::Miss;
-        }
-        if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_DROP {
-            return ServiceLookup::Drop;
-        }
-        (
-            selection.frontend,
-            selection.service_bank,
-            selection.connection_flags,
-            selection.frontend_kind,
-        )
-    };
+    let (frontend, service_bank, mut connection_flags, frontend_kind) =
+        if let Some(frontend) = cluster_frontend {
+            (
+                frontend,
+                config.active_bank,
+                0,
+                SERVICE_EVENT_FRONTEND_CLUSTER_IP,
+            )
+        } else {
+            let selection = lookup_external_frontend_v6(forward_key, config, now_ns);
+            if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_MISS {
+                return ServiceLookup::Miss;
+            }
+            if selection.frontend_kind == SERVICE_FRONTEND_SELECTION_DROP {
+                return ServiceLookup::Drop;
+            }
+            (
+                selection.frontend,
+                selection.service_bank,
+                selection.connection_flags,
+                selection.frontend_kind,
+            )
+        };
     if frontend.schema_version != SERVICE_MAP_ABI_VERSION
         || frontend.revision != config.revision
         || frontend.service_id.get() == 0
@@ -3056,7 +3085,9 @@ fn prepare_load_balancer_cluster_source_v4(ctx: &TcContext, client_address: [u8;
     };
     // SAFETY: this CPU owns the scratch slot and zero is a valid helper input.
     #[allow(unsafe_code)]
-    unsafe { core::ptr::write_bytes(lookup_ptr, 0, 1) };
+    unsafe {
+        core::ptr::write_bytes(lookup_ptr, 0, 1)
+    };
     // SAFETY: the pointer remains valid for this non-preemptible invocation.
     #[allow(unsafe_code)]
     let lookup = unsafe { &mut *lookup_ptr };
@@ -3101,7 +3132,9 @@ fn prepare_load_balancer_cluster_source_v6(ctx: &TcContext, client_address: [u8;
     };
     // SAFETY: this CPU owns the scratch slot and zero is a valid helper input.
     #[allow(unsafe_code)]
-    unsafe { core::ptr::write_bytes(lookup_ptr, 0, 1) };
+    unsafe {
+        core::ptr::write_bytes(lookup_ptr, 0, 1)
+    };
     // SAFETY: the pointer remains valid for this non-preemptible invocation.
     #[allow(unsafe_code)]
     let lookup = unsafe { &mut *lookup_ptr };
@@ -3142,7 +3175,9 @@ fn set_load_balancer_cluster_source(address: [u8; 16]) {
     };
     // SAFETY: this CPU owns the scratch slot for this invocation.
     #[allow(unsafe_code)]
-    unsafe { pointer.write(address) };
+    unsafe {
+        pointer.write(address)
+    };
 }
 
 #[inline(always)]
@@ -3163,11 +3198,7 @@ fn dsr_route_failed() -> i32 {
 /// and neighbor resolution so the packet uses the backend route rather than
 /// the frontend route's stale L2 next hop.
 #[inline(never)]
-fn reroute_host_service_v4(
-    ctx: &TcContext,
-    observation: &FlowObservation,
-    dsr: bool,
-) -> i32 {
+fn reroute_host_service_v4(ctx: &TcContext, observation: &FlowObservation, dsr: bool) -> i32 {
     // SAFETY: the TC context owns a valid `__sk_buff` for this invocation.
     #[allow(unsafe_code)]
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
@@ -3221,11 +3252,7 @@ fn reroute_host_service_v4(
 }
 
 #[inline(never)]
-fn reroute_host_service_v6(
-    ctx: &TcContext,
-    observation: &FlowObservation,
-    dsr: bool,
-) -> i32 {
+fn reroute_host_service_v6(ctx: &TcContext, observation: &FlowObservation, dsr: bool) -> i32 {
     // SAFETY: the TC context owns a valid `__sk_buff` for this invocation.
     #[allow(unsafe_code)]
     let ifindex = unsafe { (*ctx.skb.skb).ifindex };
@@ -3272,12 +3299,7 @@ fn ipv6_fib_words(address: [u8; 16]) -> [u32; 4] {
 }
 
 #[inline(always)]
-fn redirect_service_route(
-    ctx: &TcContext,
-    lookup: &BpfFibLookup,
-    result: i64,
-    dsr: bool,
-) -> i32 {
+fn redirect_service_route(ctx: &TcContext, lookup: &BpfFibLookup, result: i64, dsr: bool) -> i32 {
     if lookup.ifindex == 0 {
         return if dsr {
             dsr_route_failed()
@@ -3289,9 +3311,7 @@ fn redirect_service_route(
         if dsr && !normalize_service_dsr_vlan(ctx, lookup) {
             return dsr_route_failed();
         }
-        if ctx.store(0, &lookup.dmac, 0).is_err()
-            || ctx.store(6, &lookup.smac, 0).is_err()
-        {
+        if ctx.store(0, &lookup.dmac, 0).is_err() || ctx.store(6, &lookup.smac, 0).is_err() {
             return if dsr {
                 dsr_route_failed()
             } else {
@@ -3627,9 +3647,7 @@ fn rewrite_egress_ipv6(
             || ctx
                 .l4_csum_replace(checksum_offset, old_3 as u64, new_3 as u64, flags)
                 .is_err()
-            || ctx
-                .store(address_offset, &translation.address, 0)
-                .is_err()
+            || ctx.store(address_offset, &translation.address, 0).is_err()
         {
             return false;
         }
@@ -4199,13 +4217,7 @@ fn gateway_egress_action<const IPV6: bool>(
             now_ns,
         ));
     }
-    let action = create_gateway_connection::<IPV6>(
-        ctx,
-        transport_offset,
-        observation,
-        key,
-        now_ns,
-    );
+    let action = create_gateway_connection::<IPV6>(ctx, transport_offset, observation, key, now_ns);
     if action == EGRESS_GATEWAY_NOT_OWNED {
         None
     } else {
@@ -4351,11 +4363,11 @@ fn valid_egress_connection_key(key: &EgressConnectionKey, value: &EgressConnecti
         && value.proof_witness != [0; 16]
         && value.primary_gateway_digest != [0; 16]
         && value.egress_address != [0; 16]
+        && value.established_flows_until_monotonic_seconds != EGRESS_DESTINATION_DENY_DEADLINE
         && value.flags
             & !(unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_CERTIFIED
                 | unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_ACTIVE)
             == 0
-        && value.reserved == [0; 2]
 }
 
 /// Emits one compact, proof-bound lifecycle witness without making forwarding
@@ -4371,7 +4383,9 @@ fn emit_egress_event(value: &EgressConnectionValue, now_ns: u64, action: u8, rea
     // SAFETY: the current CPU owns this scratch slot. Zeroing first guarantees
     // deterministic padding and reserved bytes in the stable wire record.
     #[allow(unsafe_code)]
-    unsafe { core::ptr::write_bytes(event_ptr, 0, 1) };
+    unsafe {
+        core::ptr::write_bytes(event_ptr, 0, 1)
+    };
     // SAFETY: the pointer remains valid for this non-preemptible invocation.
     #[allow(unsafe_code)]
     let event = unsafe { &mut *event_ptr };
@@ -4428,12 +4442,16 @@ fn apply_gateway_connection<const IPV6: bool>(
     };
     // SAFETY: this CPU owns the scratch slot; copy before any map mutation.
     #[allow(unsafe_code)]
-    unsafe { value_ptr.write(*stored) };
+    unsafe {
+        value_ptr.write(*stored)
+    };
     // SAFETY: the pointer remains valid for this non-preemptible invocation.
     #[allow(unsafe_code)]
     let value = unsafe { &mut *value_ptr };
     if !valid_egress_connection_key(key, value)
         || !egress_connection_is_active(value, now_ns)
+        || (value.established_flows_until_monotonic_seconds != EGRESS_DESTINATION_STATIC_DEADLINE
+            && now_ns / 1_000_000_000 >= u64::from(value.established_flows_until_monotonic_seconds))
     {
         emit_egress_event(
             value,
@@ -4553,9 +4571,8 @@ fn create_gateway_connection<const IPV6: bool>(
     }
     if scratch.destination.contract_revision != scratch.source.contract_revision
         || scratch.destination.intent_digest != scratch.source.intent_digest
-        || scratch.destination.schema_version != EGRESS_MAP_ABI_VERSION
-        || scratch.destination.flags != 0
-        || scratch.destination.reserved != [0; 4]
+        || !valid_egress_destination_deadlines(&scratch.destination)
+        || !egress_destination_allows_new(&scratch.destination, now_ns)
     {
         return TC_ACT_SHOT;
     }
@@ -4580,11 +4597,9 @@ fn create_gateway_connection<const IPV6: bool>(
         || scratch.selection.standby_gateway_index >= scratch.source.gateway_count
         || scratch.selection.flags & !unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0
         || (scratch.selection.flags == 0
-            && scratch.selection.standby_gateway_index
-                != scratch.selection.primary_gateway_index)
+            && scratch.selection.standby_gateway_index != scratch.selection.primary_gateway_index)
         || (scratch.selection.flags & unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0
-            && scratch.selection.standby_gateway_index
-                == scratch.selection.primary_gateway_index)
+            && scratch.selection.standby_gateway_index == scratch.selection.primary_gateway_index)
         || scratch.selection.reserved != [0; 6]
     {
         return TC_ACT_SHOT;
@@ -4616,8 +4631,11 @@ fn create_gateway_connection<const IPV6: bool>(
     };
     scratch.address = *address;
     scratch.gateway = *gateway;
-    if !valid_egress_address(&scratch.address, &scratch.source, observation.address_family)
-        || scratch.gateway.schema_version != EGRESS_MAP_ABI_VERSION
+    if !valid_egress_address(
+        &scratch.address,
+        &scratch.source,
+        observation.address_family,
+    ) || scratch.gateway.schema_version != EGRESS_MAP_ABI_VERSION
         || scratch.gateway.contract_revision != scratch.source.contract_revision
         || scratch.gateway.lease_epoch != scratch.source.lease_epoch
         || scratch.gateway.gateway_digest == [0; 16]
@@ -4626,35 +4644,33 @@ fn create_gateway_connection<const IPV6: bool>(
     {
         return TC_ACT_SHOT;
     }
-    let standby_gateway_digest = if scratch.selection.flags
-        & unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY
-        != 0
-    {
-        let standby_key = EgressCandidateKey {
-            intent_index: scratch.source.intent_index,
-            candidate_index: scratch.selection.standby_gateway_index,
-            address_family: observation.address_family as u8,
-            bank: scratch.config.active_bank,
+    let standby_gateway_digest =
+        if scratch.selection.flags & unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0 {
+            let standby_key = EgressCandidateKey {
+                intent_index: scratch.source.intent_index,
+                candidate_index: scratch.selection.standby_gateway_index,
+                address_family: observation.address_family as u8,
+                bank: scratch.config.active_bank,
+            };
+            // SAFETY: copied immediately and never retained across a map mutation.
+            #[allow(unsafe_code)]
+            let Some(standby) = (unsafe { EGRESS_GATEWAY_NAT_GATEWAYS.get(&standby_key) }) else {
+                return TC_ACT_SHOT;
+            };
+            let standby = *standby;
+            if standby.schema_version != EGRESS_MAP_ABI_VERSION
+                || standby.contract_revision != scratch.source.contract_revision
+                || standby.lease_epoch != scratch.source.lease_epoch
+                || standby.gateway_digest == [0; 16]
+                || standby.flags != 0
+                || standby.reserved != [0; 4]
+            {
+                return TC_ACT_SHOT;
+            }
+            standby.gateway_digest
+        } else {
+            scratch.gateway.gateway_digest
         };
-        // SAFETY: copied immediately and never retained across a map mutation.
-        #[allow(unsafe_code)]
-        let Some(standby) = (unsafe { EGRESS_GATEWAY_NAT_GATEWAYS.get(&standby_key) }) else {
-            return TC_ACT_SHOT;
-        };
-        let standby = *standby;
-        if standby.schema_version != EGRESS_MAP_ABI_VERSION
-            || standby.contract_revision != scratch.source.contract_revision
-            || standby.lease_epoch != scratch.source.lease_epoch
-            || standby.gateway_digest == [0; 16]
-            || standby.flags != 0
-            || standby.reserved != [0; 4]
-        {
-            return TC_ACT_SHOT;
-        }
-        standby.gateway_digest
-    } else {
-        scratch.gateway.gateway_digest
-    };
     if !packet_starts_connection(observation.protocol, observation.tcp_flags) {
         return TC_ACT_SHOT;
     }
@@ -4665,7 +4681,9 @@ fn create_gateway_connection<const IPV6: bool>(
     // every scalar and byte-array field without constructing a 208-byte stack
     // temporary that would violate the verifier's combined call-depth limit.
     #[allow(unsafe_code)]
-    unsafe { core::ptr::write_bytes(value_ptr, 0, 1) };
+    unsafe {
+        core::ptr::write_bytes(value_ptr, 0, 1)
+    };
     // SAFETY: the pointer remains valid for this non-preemptible invocation.
     #[allow(unsafe_code)]
     let value = unsafe { &mut *value_ptr };
@@ -4686,7 +4704,9 @@ fn create_gateway_connection<const IPV6: bool>(
     value.address_index = scratch.selection.address_index;
     value.primary_gateway_index = scratch.selection.primary_gateway_index;
     value.standby_gateway_index = scratch.selection.standby_gateway_index;
-    value.schema_version = EGRESS_MAP_ABI_VERSION;
+    value.established_flows_until_monotonic_seconds = scratch
+        .destination
+        .established_flows_until_monotonic_seconds;
     value.protocol = observation.protocol;
     value.address_family = observation.address_family as u8;
     // A selected standby is only a replication target. Userspace sets
@@ -4717,7 +4737,13 @@ fn create_gateway_connection<const IPV6: bool>(
                     true,
                 )
             } else {
-                rewrite_ipv4(ctx, transport_offset, observation.protocol, &translation, true)
+                rewrite_ipv4(
+                    ctx,
+                    transport_offset,
+                    observation.protocol,
+                    &translation,
+                    true,
+                )
             };
             if rewritten {
                 emit_egress_event(
@@ -4756,25 +4782,130 @@ fn load_gateway_egress_destination(
     destination: &mut EgressDestinationValue,
 ) -> bool {
     if matches!(observation.address_family, AddressFamily::Ipv4) {
-        let key = LpmKey::new(96, EgressIpv4DestinationData {
-            intent_index: source.intent_index,
-            bank,
-            reserved: [0; 3],
-            destination_address: [observation.destination_address[0], observation.destination_address[1], observation.destination_address[2], observation.destination_address[3]],
-        });
-        let Some(value) = EGRESS_GATEWAY_NAT_DESTINATIONS_V4.get(&key) else { return false; };
+        let key = LpmKey::new(
+            96,
+            EgressIpv4DestinationData {
+                intent_index: source.intent_index,
+                bank,
+                reserved: [0; 3],
+                destination_address: [
+                    observation.destination_address[0],
+                    observation.destination_address[1],
+                    observation.destination_address[2],
+                    observation.destination_address[3],
+                ],
+            },
+        );
+        let Some(value) = EGRESS_GATEWAY_NAT_DESTINATIONS_V4.get(&key) else {
+            return false;
+        };
         *destination = *value;
     } else {
-        let key = LpmKey::new(192, EgressIpv6DestinationData {
-            intent_index: source.intent_index,
-            bank,
-            reserved: [0; 3],
-            destination_address: observation.destination_address,
-        });
-        let Some(value) = EGRESS_GATEWAY_NAT_DESTINATIONS_V6.get(&key) else { return false; };
+        let key = LpmKey::new(
+            192,
+            EgressIpv6DestinationData {
+                intent_index: source.intent_index,
+                bank,
+                reserved: [0; 3],
+                destination_address: observation.destination_address,
+            },
+        );
+        let Some(value) = EGRESS_GATEWAY_NAT_DESTINATIONS_V6.get(&key) else {
+            return false;
+        };
         *destination = *value;
     }
     true
+}
+
+#[inline(always)]
+fn valid_egress_destination_deadlines(destination: &EgressDestinationValue) -> bool {
+    let new_until = destination.new_flows_until_monotonic_seconds;
+    let established_until = destination.established_flows_until_monotonic_seconds;
+    (new_until == EGRESS_DESTINATION_STATIC_DEADLINE
+        && established_until == EGRESS_DESTINATION_STATIC_DEADLINE)
+        || (established_until != EGRESS_DESTINATION_STATIC_DEADLINE
+            && new_until <= established_until)
+}
+
+#[inline(always)]
+fn egress_destination_allows_new(destination: &EgressDestinationValue, now_ns: u64) -> bool {
+    destination.new_flows_until_monotonic_seconds == EGRESS_DESTINATION_STATIC_DEADLINE
+        || now_ns / 1_000_000_000 < u64::from(destination.new_flows_until_monotonic_seconds)
+}
+
+#[inline(always)]
+fn admit_source_fqdn_flow(
+    flow: &EgressConnectionKey,
+    destination: &EgressDestinationValue,
+    now_ns: u64,
+    tcp_flags: u8,
+) -> bool {
+    if !valid_egress_destination_deadlines(destination) {
+        return false;
+    }
+    if destination.new_flows_until_monotonic_seconds == EGRESS_DESTINATION_STATIC_DEADLINE {
+        return true;
+    }
+    let Some(state_ptr) = EGRESS_FQDN_CONNECTION_VALUE_SCRATCH.get_ptr_mut(0) else {
+        return false;
+    };
+    let now_seconds = now_ns / 1_000_000_000;
+    // SAFETY: fixed-layout runtime state is copied before any map mutation.
+    #[allow(unsafe_code)]
+    if let Some(stored) = unsafe { EGRESS_FQDN_CONNECTIONS.get(flow) } {
+        // SAFETY: the current CPU exclusively owns this scratch slot.
+        #[allow(unsafe_code)]
+        unsafe {
+            state_ptr.write(*stored)
+        };
+        // SAFETY: the pointer remains valid for this non-preemptible invocation.
+        #[allow(unsafe_code)]
+        let state = unsafe { &mut *state_ptr };
+        let timeout_valid = connection_timeout_ns(flow.protocol)
+            .is_some_and(|timeout| now_ns.saturating_sub(state.last_seen_ns) <= timeout);
+        if state.intent_digest == destination.intent_digest
+            && state.reserved == [0; 4]
+            && timeout_valid
+            && now_seconds < u64::from(state.established_flows_until_monotonic_seconds)
+        {
+            state.last_seen_ns = now_ns;
+            if egress_destination_allows_new(destination, now_ns) {
+                state.established_flows_until_monotonic_seconds =
+                    destination.established_flows_until_monotonic_seconds;
+            } else if destination.established_flows_until_monotonic_seconds
+                != EGRESS_DESTINATION_DENY_DEADLINE
+            {
+                state.established_flows_until_monotonic_seconds = state
+                    .established_flows_until_monotonic_seconds
+                    .min(destination.established_flows_until_monotonic_seconds);
+            }
+            if now_seconds >= u64::from(state.established_flows_until_monotonic_seconds) {
+                let _ = EGRESS_FQDN_CONNECTIONS.remove(flow);
+                return false;
+            }
+            return EGRESS_FQDN_CONNECTIONS.insert(flow, state, 0).is_ok();
+        }
+        let _ = EGRESS_FQDN_CONNECTIONS.remove(flow);
+    }
+    if !egress_destination_allows_new(destination, now_ns)
+        || !packet_starts_connection(flow.protocol, tcp_flags)
+    {
+        return false;
+    }
+    // SAFETY: the current CPU exclusively owns this scratch slot.
+    #[allow(unsafe_code)]
+    unsafe {
+        core::ptr::write_bytes(state_ptr, 0, 1)
+    };
+    // SAFETY: the pointer remains valid for this non-preemptible invocation.
+    #[allow(unsafe_code)]
+    let state = unsafe { &mut *state_ptr };
+    state.last_seen_ns = now_ns;
+    state.established_flows_until_monotonic_seconds =
+        destination.established_flows_until_monotonic_seconds;
+    state.intent_digest = destination.intent_digest;
+    EGRESS_FQDN_CONNECTIONS.insert(flow, state, 0).is_ok()
 }
 
 /// Returns `None` only when the source identity or destination is not owned by
@@ -4821,11 +4952,9 @@ fn source_egress_action(ctx: &TcContext, observation: &FlowObservation) -> Optio
     ) {
         return None;
     }
-    if scratch.destination.schema_version != EGRESS_MAP_ABI_VERSION
-        || scratch.destination.contract_revision != scratch.source.contract_revision
+    if scratch.destination.contract_revision != scratch.source.contract_revision
         || scratch.destination.intent_digest != scratch.source.intent_digest
-        || scratch.destination.flags != 0
-        || scratch.destination.reserved != [0; 4]
+        || !valid_egress_destination_deadlines(&scratch.destination)
     {
         return Some(TC_ACT_SHOT);
     }
@@ -4856,6 +4985,12 @@ fn source_egress_action(ctx: &TcContext, observation: &FlowObservation) -> Optio
     flow.address_family = observation.address_family as u8;
     flow.role = unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD;
     flow.reserved = 0;
+    // SAFETY: this helper has no preconditions and returns monotonic kernel time.
+    #[allow(unsafe_code)]
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    if !admit_source_fqdn_flow(flow, &scratch.destination, now_ns, observation.tcp_flags) {
+        return Some(TC_ACT_SHOT);
+    }
     let selection_key = EgressSelectionKey {
         intent_index: scratch.source.intent_index,
         bucket: egress_selection_bucket(flow),
@@ -4873,8 +5008,7 @@ fn source_egress_action(ctx: &TcContext, observation: &FlowObservation) -> Optio
         || scratch.selection.primary_gateway_index >= scratch.source.gateway_count
         || scratch.selection.flags & !unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0
         || (scratch.selection.flags == 0
-            && scratch.selection.standby_gateway_index
-                != scratch.selection.primary_gateway_index)
+            && scratch.selection.standby_gateway_index != scratch.selection.primary_gateway_index)
         || (scratch.selection.flags & unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0
             && (scratch.selection.standby_gateway_index >= scratch.source.gateway_count
                 || scratch.selection.standby_gateway_index
@@ -4908,14 +5042,16 @@ fn source_egress_action(ctx: &TcContext, observation: &FlowObservation) -> Optio
     };
     scratch.address = *address;
     scratch.gateway = *gateway;
-    if !valid_egress_address(&scratch.address, &scratch.source, observation.address_family)
-        || !valid_egress_gateway(
-            &scratch.gateway,
-            &scratch.source,
-            &scratch.config,
-            observation.address_family,
-        )
-        || ctx.len() as u32 > scratch.gateway.mtu
+    if !valid_egress_address(
+        &scratch.address,
+        &scratch.source,
+        observation.address_family,
+    ) || !valid_egress_gateway(
+        &scratch.gateway,
+        &scratch.source,
+        &scratch.config,
+        observation.address_family,
+    ) || ctx.len() as u32 > scratch.gateway.mtu
     {
         return Some(TC_ACT_SHOT);
     }
@@ -4983,7 +5119,10 @@ fn valid_egress_source(
         && source.reachability_revision != 0
         && source.contract_digest != [0; 32]
         && source.intent_digest != [0; 16]
-        && matches!(source.admission, EGRESS_ADMISSION_FENCED | EGRESS_ADMISSION_ACTIVE)
+        && matches!(
+            source.admission,
+            EGRESS_ADMISSION_FENCED | EGRESS_ADMISSION_ACTIVE
+        )
         && source.flags & family_flag != 0
         && source.flags
             & !(unf_ebpf_common::EGRESS_SOURCE_FLAG_IPV4
@@ -5098,7 +5237,9 @@ fn redirect_egress_neighbor(gateway: &EgressGatewayValue, family: AddressFamily)
     };
     // SAFETY: this CPU owns the scratch slot and zero is valid initialization.
     #[allow(unsafe_code)]
-    unsafe { core::ptr::write_bytes(lookup_ptr, 0, 1) };
+    unsafe {
+        core::ptr::write_bytes(lookup_ptr, 0, 1)
+    };
     // SAFETY: the pointer remains valid for this non-preemptible invocation.
     #[allow(unsafe_code)]
     let lookup = unsafe { &mut *lookup_ptr };

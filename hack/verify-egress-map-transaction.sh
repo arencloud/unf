@@ -10,7 +10,7 @@ command -v rg >/dev/null
 sudo -n true
 
 rg --fixed-strings --quiet \
-    'pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 14;' \
+    'pub const PERSISTENT_BPF_STATE_ABI_VERSION: u16 = 15;' \
     "${project_root}/crates/unf-state/src/lib.rs"
 rg --fixed-strings --quiet \
     'const PERSISTENT_MAP_NAMES: [&str; 40]' \
@@ -35,4 +35,4 @@ sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
     --ignored --exact \
     tests::privileged_egress_bank_activation_rollback_and_recovery_are_exact
 
-echo "Phase 8.5 egress map transaction passed: ABI-v14 ownership, destination-aware readback, capacity rollback, and pointer recovery are exact"
+echo "Egress map transaction passed: ABI-v15 ownership, temporal destination readback, capacity rollback, and pointer recovery are exact"

@@ -749,11 +749,11 @@ for replacement_node in "${client_node}" "${server_node}"; do
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
         test -f "$state" && test "$(stat -c %a "$state")" = 600
         jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and .applied.revision > 0 and .applied.allocationRevision > 0 and (.applied.targets | length) > 0" "$state" >/dev/null
-        test -e /sys/fs/bpf/unf/v14/LOAD_BALANCER_CONFIG
-        test -e /sys/fs/bpf/unf/v14/LOAD_BALANCER_FRONTENDS_V4
-        test -e /sys/fs/bpf/unf/v14/LOAD_BALANCER_FRONTENDS_V6
-        test ! -e /sys/fs/bpf/unf/v14/LOAD_BALANCER_SOURCE_RANGES_V4
-        test ! -e /sys/fs/bpf/unf/v14/LOAD_BALANCER_SOURCE_RANGES_V6
+        test -e /sys/fs/bpf/unf/v15/LOAD_BALANCER_CONFIG
+        test -e /sys/fs/bpf/unf/v15/LOAD_BALANCER_FRONTENDS_V4
+        test -e /sys/fs/bpf/unf/v15/LOAD_BALANCER_FRONTENDS_V6
+        test ! -e /sys/fs/bpf/unf/v15/LOAD_BALANCER_SOURCE_RANGES_V4
+        test ! -e /sys/fs/bpf/unf/v15/LOAD_BALANCER_SOURCE_RANGES_V6
     '
 done
 "${kc[@]}" -n unf-system scale deployment/unf-controller --replicas=1 >/dev/null
@@ -794,8 +794,8 @@ done
 jq -e '(.allocation.leases | length) == 0' <<<"${cleanup_state}" >/dev/null
 for node in "${nodes[@]}"; do
     sudo "${container_runtime}" exec "${node}" sh -ec '
-        test ! -e /sys/fs/bpf/unf/v14/LOAD_BALANCER_SOURCE_RANGES_V4
-        test ! -e /sys/fs/bpf/unf/v14/LOAD_BALANCER_SOURCE_RANGES_V6
+        test ! -e /sys/fs/bpf/unf/v15/LOAD_BALANCER_SOURCE_RANGES_V4
+        test ! -e /sys/fs/bpf/unf/v15/LOAD_BALANCER_SOURCE_RANGES_V6
         state=/var/lib/unf/cni/v1/load-balancer-reachability.json
         test -f "$state" && jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and (.applied.targets | length) == 0" "$state" >/dev/null
     '
@@ -822,7 +822,7 @@ spec:
       args:
         - |
           for map in LOAD_BALANCER_FRONTENDS_V4 LOAD_BALANCER_FRONTENDS_V6; do
-            test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v14/\$map | jq length)" -eq 0
+            test "\$(bpftool -j map dump pinned /sys/fs/bpf/unf/v15/\$map | jq length)" -eq 0
           done
           echo loadbalancer-maps-empty
       securityContext:

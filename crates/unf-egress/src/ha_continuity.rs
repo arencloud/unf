@@ -18,7 +18,7 @@ use crate::{
     EgressHaDigest, EgressHaPromotionDigest, EgressHaPromotionManifest, EgressNode,
 };
 
-pub const EGRESS_HA_CONTINUITY_SCHEMA_VERSION: u16 = 1;
+pub const EGRESS_HA_CONTINUITY_SCHEMA_VERSION: u16 = 2;
 pub const MAX_EGRESS_HA_TWIN_RECORDS: usize = 262_144 / 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -49,6 +49,9 @@ pub struct EgressHaFlowTwin {
     pub proof_witness: [u8; 16],
     pub lease_epoch: u64,
     pub last_seen_ns: u64,
+    /// Portable wall-clock deadline converted conservatively from the source
+    /// Node's monotonic ABI value and re-anchored by the standby Node.
+    pub established_flows_until_unix_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +162,7 @@ impl EgressHaFlowTwin {
         proof_witness: [u8; 16],
         lease_epoch: u64,
         last_seen_ns: u64,
+        established_flows_until_unix_seconds: u64,
     ) -> Result<Self, EgressHaContinuityError> {
         let mut record = Self {
             flow_id: EgressHaFlowId([0; 32]),
@@ -176,6 +180,7 @@ impl EgressHaFlowTwin {
             proof_witness,
             lease_epoch,
             last_seen_ns,
+            established_flows_until_unix_seconds,
         };
         record.validate_fields()?;
         record.flow_id = record.compute_flow_id()?;
@@ -225,6 +230,7 @@ impl EgressHaFlowTwin {
             || self.proof_witness == [0; 16]
             || self.lease_epoch == 0
             || self.last_seen_ns == 0
+            || self.established_flows_until_unix_seconds == 0
         {
             return Err(EgressHaContinuityError::InvalidRecord);
         }
@@ -248,6 +254,7 @@ impl EgressHaFlowTwin {
                 self.contract_digest,
                 self.proof_witness,
                 self.lease_epoch,
+                self.established_flows_until_unix_seconds,
             ),
         )?))
     }
@@ -935,6 +942,7 @@ mod tests {
             [8; 16],
             authority.manifest.lease_epoch,
             last_seen_ns,
+            u64::MAX,
         )
         .unwrap()
     }

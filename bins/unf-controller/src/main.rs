@@ -296,6 +296,14 @@ struct TlsMaterial {
     private_key: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct EgressFqdnMaterialization {
+    desired_revision: Revision,
+    observation_revision: Revision,
+    refresh_at_unix_seconds: Option<u64>,
+    model: unf_egress::EgressModel,
+}
+
 struct ControllerState {
     ready: AtomicBool,
     identity_epoch: u64,
@@ -305,6 +313,7 @@ struct ControllerState {
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
     egress_desired: Mutex<EgressDesiredStore>,
     egress_fqdn_observations: Mutex<EgressFqdnObservationLedger>,
+    egress_fqdn_materialization: Mutex<Option<EgressFqdnMaterialization>>,
     egress_desired_dirty: AtomicBool,
     egress_desired_store: Option<Api<ConfigMap>>,
     egress_control_plane: Mutex<EgressControlPlane>,
@@ -1531,6 +1540,7 @@ fn new_state_with_client_and_selector(
         nodes: RwLock::new(BTreeMap::new()),
         egress_desired: Mutex::new(EgressDesiredStore::default()),
         egress_fqdn_observations: Mutex::new(EgressFqdnObservationLedger::default()),
+        egress_fqdn_materialization: Mutex::new(None),
         egress_desired_dirty: AtomicBool::new(false),
         egress_desired_store: config_map_store.clone(),
         egress_control_plane: Mutex::new(EgressControlPlane::default()),
@@ -3651,6 +3661,7 @@ fn record_egress_policy_result(state: &ControllerState, key: &str, result: Resul
 
 fn record_egress_desired_change(state: &ControllerState, changed: bool) {
     if changed {
+        mutex_lock(&state.egress_fqdn_materialization).take();
         state.egress_desired_dirty.store(true, Ordering::Release);
         if let Err(error) = reconcile_egress_control_plane(state) {
             invalidate_egress_distributions(state);
@@ -3768,7 +3779,7 @@ fn reconcile_egress_source_distributions(state: &ControllerState) -> Result<bool
     let _policy_guard = read_lock(&state.policy_state_guard);
     let _distribution_guard = mutex_lock(&state.egress_distribution_guard);
     let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
-    let model = checkpoint.desired_model.clone();
+    let model = materialized_egress_model(state, &checkpoint)?;
     let identity_revision = mutex_lock(&state.identities).revision();
     let policy_revision = mutex_lock(&state.revisions).policy;
 
@@ -4022,6 +4033,54 @@ fn reconcile_egress_source_distributions(state: &ControllerState) -> Result<bool
     reset_egress_contract_distributions_locked(state);
     *write_lock(&state.egress_source_distributions) = distributions;
     Ok(true)
+}
+
+fn materialized_egress_model(
+    state: &ControllerState,
+    checkpoint: &unf_egress::EgressControlPlaneCheckpoint,
+) -> Result<unf_egress::EgressModel> {
+    let now_unix_seconds = unix_time_seconds();
+    let observation_revision = mutex_lock(&state.egress_fqdn_observations).revision();
+    if let Some(cached) = mutex_lock(&state.egress_fqdn_materialization).as_ref()
+        && cached.desired_revision == checkpoint.desired_revision
+        && cached.observation_revision == observation_revision
+        && cached
+            .refresh_at_unix_seconds
+            .is_none_or(|deadline| now_unix_seconds < deadline)
+    {
+        return Ok(cached.model.clone());
+    }
+    let ledger = mutex_lock(&state.egress_fqdn_observations).clone();
+    let (model, _) = unf_egress::materialize_egress_fqdn_model(
+        checkpoint.desired_model.clone(),
+        &ledger,
+        checkpoint.desired_revision,
+        now_unix_seconds,
+    )
+    .context("compile durable DNS observations into PLR destinations")?;
+    let refresh_at_unix_seconds = model
+        .intents
+        .iter()
+        .filter_map(|intent| match &intent.destinations {
+            unf_egress::EgressDestinations::Fqdn(snapshot) => Some(snapshot),
+            _ => None,
+        })
+        .flat_map(|snapshot| &snapshot.leases)
+        .flat_map(|lease| {
+            [
+                lease.new_flows_until_unix_seconds,
+                lease.established_flows_until_unix_seconds,
+            ]
+        })
+        .filter(|deadline| *deadline > now_unix_seconds)
+        .min();
+    *mutex_lock(&state.egress_fqdn_materialization) = Some(EgressFqdnMaterialization {
+        desired_revision: checkpoint.desired_revision,
+        observation_revision,
+        refresh_at_unix_seconds,
+        model: model.clone(),
+    });
+    Ok(model)
 }
 
 fn reset_egress_contract_distributions_locked(state: &ControllerState) {
@@ -6994,11 +7053,17 @@ fn ingest_egress_fqdn_observations_for(
         ));
     }
     let principal = egress_principal_for(state, agent)?;
-    let changed = mutex_lock(&state.egress_fqdn_observations)
-        .apply(&principal, batch, now_unix_seconds)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let changed = {
+        mutex_lock(&state.egress_fqdn_observations)
+            .apply(&principal, batch, now_unix_seconds)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?
+    };
     if changed {
+        mutex_lock(&state.egress_fqdn_materialization).take();
         state.egress_desired_dirty.store(true, Ordering::Release);
+        reconcile_egress_source_distributions(state).map_err(|error| {
+            ApiError::internal(format!("refresh PLR-backed egress distributions: {error}"))
+        })?;
     }
     Ok(changed)
 }

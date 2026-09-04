@@ -8,6 +8,7 @@
 .PHONY: egress-ha-kind-test
 .PHONY: egress-fqdn-evidence-test
 .PHONY: egress-fqdn-control-test
+.PHONY: egress-fqdn-dataplane-test
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -222,6 +223,11 @@ egress-ha-transaction-test: egress-ha-live-ownership-test
 	cargo clippy -p unf-egress --all-targets --all-features -- -D warnings
 
 egress-ha-kind-test: egress-ha-transaction-test service-kind-load
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) apply -k deploy/kind-service-fabric
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout restart deployment/unf-controller daemonset/unf-agent -n unf-system
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout status deployment/unf-controller -n unf-system --timeout=180s
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout status daemonset/unf-agent -n unf-system --timeout=180s
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) hack/migrate-kind-bpf-abi-v15.sh
 	bash -n hack/verify-kind-egress-ha.sh
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) UNF_TEST_TOOLS_IMAGE=$(TEST_TOOLS_IMAGE) hack/verify-kind-egress-ha.sh
 
@@ -237,6 +243,10 @@ egress-fqdn-control-test: egress-fqdn-evidence-test
 	cargo test -p unf-controller egress_api --no-fail-fast
 	cargo test -p unf-controller authenticated_fqdn_observation_batches_are_durable_monotonic_and_node_bound
 	cargo clippy -p unf-api -p unf-controller -p unf-egress --all-targets --all-features -- -D warnings
+
+egress-fqdn-dataplane-test: egress-fqdn-control-test
+	hack/verify-egress-fqdn-dataplane.sh
+	cargo clippy -p unf-agent -p unf-controller -p unf-ebpf-common -p unf-egress --all-targets --all-features -- -D warnings
 
 test:
 	cargo test --workspace

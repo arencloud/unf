@@ -7,7 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::State;
@@ -59,22 +59,25 @@ use unf_ebpf_common::{
     service_event_action_reason_is_valid, service_event_frontend_kind_is_valid,
     service_selection_algorithm_is_valid, service_selection_tier_is_valid,
 };
+#[cfg(test)]
+use unf_egress::compile_egress_dataplane;
 use unf_egress::{
     AddressFamily as EgressAddressFamily, AdmittedEgressGatewayAddressProjection,
     AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
     EGRESS_DISTRIBUTION_SCHEMA_VERSION, EGRESS_HA_PROMOTION_SCHEMA_VERSION,
     EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard, EgressAgentAdvertisement,
-    EgressCapability, EgressDataplaneState, EgressGatewayAddressAcknowledgement,
-    EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
-    EgressGatewayDrainEvidence, EgressGatewayHostBank, EgressGatewayProjection,
-    EgressGatewayProjectionLedger, EgressGatewayRetirementChallenges, EgressHaActivationAuthority,
-    EgressHaAgentChallenge, EgressHaAgentChallenges, EgressHaAgentEvidence,
-    EgressHaContinuityCutover, EgressHaDigest, EgressHaFlowTwin, EgressHaFlowTwinOperation,
-    EgressHaFlowTwinStream, EgressHaOldOwnerRevocationEvidence, EgressHaSourceActivationEvidence,
-    EgressIntentOwner, EgressNodeProjectionEnvelope, EgressPathCertificate, EgressPathMode,
-    EgressProjectionLedger, EgressProjectionRecipient, EgressSourceActivationGrant,
-    EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
-    EgressSourceRetirementChallenges, compile_egress_dataplane, compile_egress_gateway_dataplane,
+    EgressCapability, EgressDataplaneClock, EgressDataplaneState, EgressFqdnPattern,
+    EgressGatewayAddressAcknowledgement, EgressGatewayAddressProjection,
+    EgressGatewayApplicationAcknowledgement, EgressGatewayDrainEvidence, EgressGatewayHostBank,
+    EgressGatewayProjection, EgressGatewayProjectionLedger, EgressGatewayRetirementChallenges,
+    EgressHaActivationAuthority, EgressHaAgentChallenge, EgressHaAgentChallenges,
+    EgressHaAgentEvidence, EgressHaContinuityCutover, EgressHaDigest, EgressHaFlowTwin,
+    EgressHaFlowTwinOperation, EgressHaFlowTwinStream, EgressHaOldOwnerRevocationEvidence,
+    EgressHaSourceActivationEvidence, EgressIntentOwner, EgressNodeProjectionEnvelope,
+    EgressPathCertificate, EgressPathMode, EgressProjectionLedger, EgressProjectionRecipient,
+    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
+    EgressSourceRetirementChallenges, compile_egress_dataplane_at,
+    compile_egress_gateway_dataplane_at,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -118,12 +121,14 @@ use unf_state::{
 };
 
 mod cni_server;
+mod fqdn_observer;
 
 use cni_server::CniTransactionServer;
+use fqdn_observer::FqdnObserver;
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
-const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v14";
+const DEFAULT_BPF_PIN_PATH: &str = "/sys/fs/bpf/unf/v15";
 const DEFAULT_AGENT_TOKEN_PATH: &str = "/var/run/secrets/unf-agent/token";
 const DEFAULT_CONTROLLER_CA_PATH: &str = "/var/run/secrets/unf-internal-ca/ca.crt";
 const DEFAULT_CNI_STATE_PATH: &str = "/var/lib/unf/cni/v1/attachments.json";
@@ -394,6 +399,7 @@ const PERSISTENT_MAP_NAMES: [&str; 40] = [
     "EGRESS_GATEWAY_NAT_SELECTIONS",
     "EGRESS_GATEWAY_NAT_CONFIG",
 ];
+const ABI_V14_MAP_NAMES: [&str; 40] = PERSISTENT_MAP_NAMES;
 const IDENTITY_MAP_CAPACITY: u32 = 65_536;
 const POLICY_MAP_CAPACITY: u32 = 262_144;
 const SERVICE_FRONTEND_MAP_CAPACITY: u32 = 262_144;
@@ -933,6 +939,8 @@ struct EgressSynchronizer {
     ha_replicas: BTreeMap<(EgressHaDigest, String, String), EgressHaFlowTwinStream>,
     ha_activations:
         BTreeMap<EgressIntentOwner, (EgressHaActivationAuthority, EgressHaContinuityCutover)>,
+    clock_anchor: Option<EgressDataplaneClock>,
+    fqdn_observer: Option<FqdnObserver>,
     path_provider: Option<NativeEgressPathProvider>,
     node_name: String,
     controller_url: Option<String>,
@@ -5656,6 +5664,7 @@ fn plan_abi_cleanup(
         9..=11 => &ABI_V11_MAP_NAMES,
         12 => &ABI_V12_MAP_NAMES,
         13 => &ABI_V13_MAP_NAMES,
+        14 => &ABI_V14_MAP_NAMES,
         _ => &PERSISTENT_MAP_NAMES,
     };
     let mut unknown = Vec::new();
@@ -6993,6 +7002,8 @@ fn new_synchronizers(
             gateway_owned_addresses: BTreeSet::new(),
             ha_replicas: BTreeMap::new(),
             ha_activations: BTreeMap::new(),
+            clock_anchor: None,
+            fqdn_observer: None,
             path_provider: egress_path_provider,
             node_name,
             controller_url,
@@ -8060,14 +8071,22 @@ fn validate_recovered_egress_destination<const K: usize>(
         || data[5..8] != [0; 3]
         || u64::from_ne_bytes(value[0..8].try_into().expect("fixed destination revision")) == 0
         || value[8..24] == [0; 16]
-        || u16::from_ne_bytes(value[24..26].try_into().expect("fixed destination schema"))
-            != EGRESS_MAP_ABI_VERSION
-        || value[26..28] != [0; 2]
-        || value[28..32] != [0; 4]
+        || !valid_encoded_egress_destination_deadlines(value)
     {
         bail!("persistent egress destination entry is incompatible");
     }
     Ok(())
+}
+
+fn valid_encoded_egress_destination_deadlines(value: &[u8; 32]) -> bool {
+    let new_until = u32::from_ne_bytes(value[24..28].try_into().expect("fixed new deadline"));
+    let established_until = u32::from_ne_bytes(
+        value[28..32]
+            .try_into()
+            .expect("fixed established deadline"),
+    );
+    (new_until == u32::MAX && established_until == u32::MAX)
+        || (established_until != u32::MAX && new_until <= established_until)
 }
 
 fn recovered_egress_authority(
@@ -8313,12 +8332,10 @@ fn validate_recovered_egress_connection(key: &[u8; 44], value: &[u8; 208]) -> Re
         || value[168..184] == [0; 16]
         || u16::from_be_bytes(value[192..194].try_into().expect("fixed translated port"))
             < unf_ebpf_common::EGRESS_SNAT_PORT_BASE
-        || u16::from_ne_bytes(value[200..202].try_into().expect("fixed connection schema"))
-            != EGRESS_MAP_ABI_VERSION
-        || value[202] != key[40]
-        || value[203] != key[41]
+        || u32::from_ne_bytes(value[200..204].try_into().expect("fixed drain deadline")) == 0
         || flags & !known_flags != 0
-        || value[206..208] != [0; 2]
+        || value[206] != key[40]
+        || value[207] != key[41]
     {
         bail!("persistent egress connection entry is incompatible");
     }
@@ -8977,6 +8994,7 @@ fn snapshot_ha_flow_twin_stream(
     standby_gateway: unf_egress::EgressNode,
     shard_indexes: Vec<u16>,
 ) -> Result<EgressHaFlowTwinStream> {
+    let clock = current_egress_clock()?;
     let snapshot = snapshot_egress_connections(connections)?;
     let address_shards = manifest
         .handoffs
@@ -9004,7 +9022,7 @@ fn snapshot_ha_flow_twin_stream(
         if key[42] != unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD {
             continue;
         }
-        let egress_address = decode_egress_connection_ip(&value[56..72], value[203])?;
+        let egress_address = decode_egress_connection_ip(&value[56..72], value[207])?;
         let Some(shard_index) = address_shards.get(&egress_address).copied() else {
             continue;
         };
@@ -9013,8 +9031,8 @@ fn snapshot_ha_flow_twin_stream(
         reverse_key[16..32].copy_from_slice(&value[56..72]);
         reverse_key[32..34].copy_from_slice(&value[190..192]);
         reverse_key[34..36].copy_from_slice(&value[192..194]);
-        reverse_key[40] = value[202];
-        reverse_key[41] = value[203];
+        reverse_key[40] = value[206];
+        reverse_key[41] = value[207];
         reverse_key[42] = unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE;
         if snapshot.get(&reverse_key) != Some(value) {
             bail!("HA snapshot found an incomplete forward/reverse NAT pair");
@@ -9022,9 +9040,9 @@ fn snapshot_ha_flow_twin_stream(
         let record = EgressHaFlowTwin::issue(
             shard_index,
             IdentityId::new(u32::from_ne_bytes(value[184..188].try_into()?)),
-            value[202],
-            decode_egress_connection_ip(&value[24..40], value[203])?,
-            decode_egress_connection_ip(&value[40..56], value[203])?,
+            value[206],
+            decode_egress_connection_ip(&value[24..40], value[207])?,
+            decode_egress_connection_ip(&value[40..56], value[207])?,
             u16::from_be_bytes(value[188..190].try_into()?),
             u16::from_be_bytes(value[190..192].try_into()?),
             egress_address,
@@ -9034,6 +9052,7 @@ fn snapshot_ha_flow_twin_stream(
             value[104..120].try_into()?,
             u64::from_ne_bytes(value[16..24].try_into()?),
             u64::from_ne_bytes(value[0..8].try_into()?),
+            egress_deadline_to_unix(u32::from_ne_bytes(value[200..204].try_into()?), clock)?,
         )?;
         let delta = stream.next_delta(EgressHaFlowTwinOperation::Upsert(record))?;
         stream.apply(manifest, &delta)?;
@@ -9056,6 +9075,7 @@ fn import_ha_flow_twin_stream(
     synchronizer: &mut EgressSynchronizer,
     stream: &EgressHaFlowTwinStream,
 ) -> Result<()> {
+    let clock = egress_clock_anchor(synchronizer)?;
     let active =
         synchronizer.gateway_nat_banks[usize::from(synchronizer.gateway_nat_active_bank)].clone();
     for record in &stream.records {
@@ -9135,9 +9155,12 @@ fn import_ha_flow_twin_stream(
         value[194..196].copy_from_slice(&address_index.to_ne_bytes());
         value[196..198].copy_from_slice(&local_gateway_index.to_ne_bytes());
         value[198..200].copy_from_slice(&local_gateway_index.to_ne_bytes());
-        value[200..202].copy_from_slice(&EGRESS_MAP_ABI_VERSION.to_ne_bytes());
-        value[202] = record.protocol;
-        value[203] = family;
+        value[200..204].copy_from_slice(
+            &egress_deadline_from_unix(record.established_flows_until_unix_seconds, clock)?
+                .to_ne_bytes(),
+        );
+        value[206] = record.protocol;
+        value[207] = family;
         value[204..206].copy_from_slice(
             &unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_CERTIFIED.to_ne_bytes(),
         );
@@ -9198,10 +9221,12 @@ fn encode_connection_ip(address: IpAddr) -> [u8; 16] {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn synchronize_egress_source(
     synchronizer: &mut EgressSynchronizer,
     state: &AgentState,
 ) -> Result<bool> {
+    let clock = egress_clock_anchor(synchronizer)?;
     let controller_url = synchronizer
         .controller_url
         .as_deref()
@@ -9228,6 +9253,7 @@ async fn synchronize_egress_source(
         .json()
         .await
         .context("decode egress source projection envelope")?;
+    let observation_targets = exact_fqdn_observation_targets(&envelope);
     let node = fetch_node_port_node_snapshot(
         controller_url,
         &synchronizer.client,
@@ -9247,6 +9273,17 @@ async fn synchronize_egress_source(
     let admitted = envelope
         .admit(&principal, &advertisement)
         .context("independently replay egress source projection")?;
+    match publish_fqdn_observations(synchronizer, &principal.node_uid, observation_targets).await {
+        Ok(true) => {
+            // The accepted complete batch creates a new controller projection.
+            // Never apply the now-stale response fetched immediately before it.
+            return Ok(false);
+        }
+        Ok(false) => {}
+        Err(error) => {
+            warn!(%error, "Node-local FQDN observation was lost; existing TTL authority was not extended");
+        }
+    }
     let projection = admitted.projection();
     let candidate_authority = EgressAppliedAuthority {
         controller_epoch: projection.controller_epoch,
@@ -9282,7 +9319,7 @@ async fn synchronize_egress_source(
             .context("install fail-closed egress source admission")?;
     }
     let bank = synchronizer.active_bank ^ 1;
-    let candidate = compile_egress_dataplane(&host, &guard, &[], bank)
+    let candidate = compile_egress_dataplane_at(&host, &guard, &[], bank, clock)
         .context("compile fenced egress dataplane candidate")?;
     apply_egress_dataplane(synchronizer, &candidate)?;
     synchronizer.ledger = next_ledger;
@@ -9299,12 +9336,99 @@ async fn synchronize_egress_source(
     Ok(true)
 }
 
+fn exact_fqdn_observation_targets(envelope: &EgressNodeProjectionEnvelope) -> BTreeSet<String> {
+    let owners = envelope
+        .projection
+        .contract
+        .plans
+        .iter()
+        .map(|plan| &plan.intent)
+        .collect::<BTreeSet<_>>();
+    envelope
+        .model
+        .intents
+        .iter()
+        .filter(|intent| owners.contains(&intent.owner))
+        .filter_map(|intent| intent.fqdn.as_ref())
+        .filter(|spec| spec.view == unf_egress::DEFAULT_EGRESS_FQDN_VIEW)
+        .flat_map(|spec| &spec.patterns)
+        .filter_map(|pattern| match pattern {
+            EgressFqdnPattern::Exact(name) => Some(name.clone()),
+            EgressFqdnPattern::WildcardSuffix(_) => None,
+        })
+        .collect()
+}
+
+async fn publish_fqdn_observations(
+    synchronizer: &mut EgressSynchronizer,
+    observer_node_uid: &str,
+    targets: BTreeSet<String>,
+) -> Result<bool> {
+    if targets.is_empty() && synchronizer.fqdn_observer.is_none() {
+        return Ok(false);
+    }
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("FQDN observation requires a controller URL")?
+        .to_owned();
+    let client = synchronizer.client.current();
+    let token = read_agent_token(&synchronizer.agent_token_path)?;
+    let now_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes UNIX epoch")?
+        .as_secs();
+    if synchronizer.fqdn_observer.is_none() {
+        let source_epoch = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock precedes UNIX epoch")?
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
+        synchronizer.fqdn_observer = Some(FqdnObserver::new(source_epoch));
+    }
+    let observer = synchronizer
+        .fqdn_observer
+        .as_mut()
+        .expect("initialized FQDN observer");
+    let previous = observer.clone();
+    let Some(batch) = observer
+        .observe(
+            observer_node_uid,
+            targets,
+            now_unix_seconds,
+            Path::new("/etc/resolv.conf"),
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let result = client
+        .post(format!(
+            "{controller_url}/v1/state/egress-fqdn-observations"
+        ))
+        .bearer_auth(token)
+        .json(&batch)
+        .send()
+        .await
+        .context("publish complete FQDN observation batch")?
+        .error_for_status()
+        .context("controller rejected complete FQDN observation batch");
+    if let Err(error) = result {
+        *observer = previous;
+        return Err(error);
+    }
+    Ok(true)
+}
+
 async fn activate_current_egress_source(
     synchronizer: &mut EgressSynchronizer,
     state: &AgentState,
     admitted: &unf_egress::AdmittedEgressProjection,
     local_node: &NodePortNodeSnapshot,
 ) -> Result<bool> {
+    let clock = egress_clock_anchor(synchronizer)?;
     let Some(grant) = fetch_egress_source_activation_grant(synchronizer).await? else {
         return fence_active_egress_source(synchronizer)
             .context("fence source egress while gateway or HA readiness is incomplete");
@@ -9334,8 +9458,9 @@ async fn activate_current_egress_source(
             .context("activate exact admitted egress source")?;
     }
 
-    let current = compile_egress_dataplane(&host, &guard, &paths, synchronizer.active_bank)
-        .context("compile current-bank egress activation candidate")?;
+    let current =
+        compile_egress_dataplane_at(&host, &guard, &paths, synchronizer.active_bank, clock)
+            .context("compile current-bank egress activation candidate")?;
     if encode_egress_dataplane(&current)?
         == synchronizer.banks[usize::from(synchronizer.active_bank)]
     {
@@ -9357,7 +9482,7 @@ async fn activate_current_egress_source(
     if bank == synchronizer.active_bank {
         bail!("HA activation target bank did not become inactive");
     }
-    let candidate = compile_egress_dataplane(&host, &guard, &paths, bank)
+    let candidate = compile_egress_dataplane_at(&host, &guard, &paths, bank, clock)
         .context("compile certified active egress dataplane candidate")?;
     apply_egress_dataplane(synchronizer, &candidate)?;
     publish_ha_source_activation_evidence(synchronizer, admitted).await?;
@@ -9488,6 +9613,7 @@ async fn synchronize_egress_gateway(
     synchronizer: &mut EgressSynchronizer,
     state: &AgentState,
 ) -> Result<bool> {
+    let clock = egress_clock_anchor(synchronizer)?;
     let controller_url = synchronizer
         .controller_url
         .as_deref()
@@ -9531,14 +9657,17 @@ async fn synchronize_egress_gateway(
         .admit(&principal, &advertisement)
         .context("independently admit selected-gateway projection")?;
     let current_candidate =
-        compile_egress_gateway_dataplane(&admitted, synchronizer.gateway_nat_active_bank)
+        compile_egress_gateway_dataplane_at(&admitted, synchronizer.gateway_nat_active_bank, clock)
             .context("compile current-bank gateway NAT projection")?;
     if encode_egress_dataplane(&current_candidate)?
         != synchronizer.gateway_nat_banks[usize::from(synchronizer.gateway_nat_active_bank)]
     {
-        let candidate =
-            compile_egress_gateway_dataplane(&admitted, synchronizer.gateway_nat_active_bank ^ 1)
-                .context("compile inactive-bank gateway NAT projection")?;
+        let candidate = compile_egress_gateway_dataplane_at(
+            &admitted,
+            synchronizer.gateway_nat_active_bank ^ 1,
+            clock,
+        )
+        .context("compile inactive-bank gateway NAT projection")?;
         apply_egress_gateway_dataplane(synchronizer, &candidate)
             .context("transactionally apply selected-gateway NAT projection")?;
     }
@@ -9835,9 +9964,14 @@ fn plan_egress_gateway_lease_drain(
         lease_keys.push(*key);
         let last_seen_ns =
             u64::from_ne_bytes(value[0..8].try_into().expect("fixed last-seen time"));
-        let timeout_ns = unf_ebpf_common::connection_timeout_ns(value[202])
+        let timeout_ns = unf_ebpf_common::connection_timeout_ns(value[206])
             .context("validated egress protocol has no connection timeout")?;
-        if now_ns.saturating_sub(last_seen_ns) <= timeout_ns {
+        let established_until =
+            u32::from_ne_bytes(value[200..204].try_into().expect("fixed drain deadline"));
+        if now_ns.saturating_sub(last_seen_ns) <= timeout_ns
+            && (established_until == u32::MAX
+                || now_ns / 1_000_000_000 < u64::from(established_until))
+        {
             active += 1;
         }
     }
@@ -9866,6 +10000,53 @@ fn boot_time_ns() -> Result<u64> {
         .checked_mul(1_000_000_000)
         .and_then(|value| value.checked_add(nanoseconds))
         .context("CLOCK_BOOTTIME nanoseconds overflowed")
+}
+
+fn egress_clock_anchor(synchronizer: &mut EgressSynchronizer) -> Result<EgressDataplaneClock> {
+    let clock = current_egress_clock()?;
+    synchronizer.clock_anchor = Some(clock);
+    Ok(clock)
+}
+
+fn current_egress_clock() -> Result<EgressDataplaneClock> {
+    let unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes UNIX epoch")?
+        .as_secs();
+    let monotonic = clock_gettime(ClockId::Monotonic);
+    let monotonic_seconds = u32::try_from(monotonic.tv_sec)
+        .context("CLOCK_MONOTONIC cannot be represented by the egress ABI")?;
+    let clock = EgressDataplaneClock {
+        unix_seconds,
+        monotonic_seconds,
+    };
+    Ok(clock)
+}
+
+fn egress_deadline_to_unix(deadline: u32, clock: EgressDataplaneClock) -> Result<u64> {
+    if deadline == u32::MAX {
+        return Ok(u64::MAX);
+    }
+    let remaining = deadline.saturating_sub(clock.monotonic_seconds);
+    Ok(clock
+        .unix_seconds
+        .checked_add(u64::from(remaining))
+        .context("portable egress drain deadline overflowed")?
+        .saturating_sub(u64::from(remaining != 0)))
+}
+
+fn egress_deadline_from_unix(deadline: u64, clock: EgressDataplaneClock) -> Result<u32> {
+    if deadline == u64::MAX {
+        return Ok(u32::MAX);
+    }
+    let remaining = deadline.saturating_sub(clock.unix_seconds);
+    let remaining = u32::try_from(remaining).context("egress drain deadline exceeds ABI range")?;
+    clock
+        .monotonic_seconds
+        .checked_add(remaining)
+        .map(|value| value.saturating_sub(u32::from(remaining != 0)))
+        .filter(|value| *value != u32::MAX)
+        .context("egress drain deadline cannot be represented safely")
 }
 
 fn drain_expired_egress_gateway_lease(
@@ -10413,9 +10594,12 @@ fn encode_egress_destination_value(value: &unf_ebpf_common::EgressDestinationVal
     let mut encoded = [0; 32];
     encoded[0..8].copy_from_slice(&value.contract_revision.to_ne_bytes());
     encoded[8..24].copy_from_slice(&value.intent_digest);
-    encoded[24..26].copy_from_slice(&value.schema_version.to_ne_bytes());
-    encoded[26..28].copy_from_slice(&value.flags.to_ne_bytes());
-    encoded[28..32].copy_from_slice(&value.reserved);
+    encoded[24..28].copy_from_slice(&value.new_flows_until_monotonic_seconds.to_ne_bytes());
+    encoded[28..32].copy_from_slice(
+        &value
+            .established_flows_until_monotonic_seconds
+            .to_ne_bytes(),
+    );
     encoded
 }
 
@@ -16966,6 +17150,8 @@ mod tests {
             gateway_owned_addresses: BTreeSet::new(),
             ha_replicas: BTreeMap::new(),
             ha_activations: BTreeMap::new(),
+            clock_anchor: None,
+            fqdn_observer: None,
             path_provider: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
@@ -17033,9 +17219,8 @@ mod tests {
                 unf_ebpf_common::EgressDestinationValue {
                     contract_revision: 13 + u64::from(bank),
                     intent_digest: [0x5A; 16],
-                    schema_version: EGRESS_MAP_ABI_VERSION,
-                    flags: 0,
-                    reserved: [0; 4],
+                    new_flows_until_monotonic_seconds: u32::MAX,
+                    established_flows_until_monotonic_seconds: u32::MAX,
                 },
             )],
             ipv6_destinations: Vec::new(),
@@ -17191,6 +17376,8 @@ mod tests {
             gateway_owned_addresses: BTreeSet::new(),
             ha_replicas: BTreeMap::new(),
             ha_activations: BTreeMap::new(),
+            clock_anchor: None,
+            fqdn_observer: None,
             path_provider: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
@@ -17228,9 +17415,8 @@ mod tests {
         let destination_value = unf_ebpf_common::EgressDestinationValue {
             contract_revision: CONTRACT_REVISION,
             intent_digest: [0x5A; 16],
-            schema_version: EGRESS_MAP_ABI_VERSION,
-            flags: 0,
-            reserved: [0; 4],
+            new_flows_until_monotonic_seconds: u32::MAX,
+            established_flows_until_monotonic_seconds: u32::MAX,
         };
         let address_bytes = |address: IpAddr| match address {
             IpAddr::V4(address) => {
@@ -17433,6 +17619,67 @@ mod tests {
                 "source steering must preserve the original tuple"
             );
         }
+
+        let monotonic_seconds = u32::try_from(clock_gettime(ClockId::Monotonic).tv_sec).unwrap();
+        let temporal_key = LpmKey::new(
+            unf_ebpf_common::EGRESS_DESTINATION_PREFIX_BASE_BITS + 32,
+            encode_egress_ipv4_destination(unf_ebpf_common::EgressIpv4DestinationData {
+                intent_index: intent_v4,
+                bank: BANK,
+                reserved: [0; 3],
+                destination_address: destination_v4.octets(),
+            }),
+        );
+        let temporal_packet = packet_v4.clone();
+        let temporal_value = |new_until, established_until| {
+            encode_egress_destination_value(&unf_ebpf_common::EgressDestinationValue {
+                contract_revision: CONTRACT_REVISION,
+                intent_digest: [0x5A; 16],
+                new_flows_until_monotonic_seconds: new_until,
+                established_flows_until_monotonic_seconds: established_until,
+            })
+        };
+        synchronizer
+            .ipv4_destinations
+            .insert(
+                &temporal_key,
+                temporal_value(monotonic_seconds + 10, monotonic_seconds + 20),
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &temporal_packet).0,
+            TC_ACT_REDIRECT,
+            "fresh PLR evidence admits a new tuple"
+        );
+        synchronizer
+            .ipv4_destinations
+            .insert(&temporal_key, temporal_value(0, monotonic_seconds + 20), 0)
+            .unwrap();
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &temporal_packet).0,
+            TC_ACT_REDIRECT,
+            "an existing tuple drains after new-flow authority closes"
+        );
+        let new_during_drain = ipv4_packet(6, source_v4, destination_v4, 40_011, 443);
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &new_during_drain).0,
+            TC_ACT_SHOT,
+            "a new tuple cannot borrow established-flow grace"
+        );
+        synchronizer
+            .ipv4_destinations
+            .insert(&temporal_key, temporal_value(0, monotonic_seconds), 0)
+            .unwrap();
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &temporal_packet).0,
+            TC_ACT_SHOT,
+            "established state expires autonomously without a map refresh"
+        );
+        synchronizer
+            .ipv4_destinations
+            .remove(&temporal_key)
+            .unwrap();
         let outside_v4 = ipv4_packet(6, source_v4, Ipv4Addr::new(198, 51, 100, 9), 40_002, 443);
         let outside_v6 = ipv6_packet(6, source_v6, "2001:db9::9".parse().unwrap(), 40_003, 443);
         assert_eq!(
@@ -17540,6 +17787,67 @@ mod tests {
 
         let egress_v4 = Ipv4Addr::new(198, 51, 100, 10);
         let egress_v6: Ipv6Addr = "2001:db8:ffff::10".parse().unwrap();
+        let gateway_now = u32::try_from(clock_gettime(ClockId::Monotonic).tv_sec).unwrap();
+        let gateway_temporal_key = LpmKey::new(
+            unf_ebpf_common::EGRESS_DESTINATION_PREFIX_BASE_BITS + 32,
+            encode_egress_ipv4_destination(unf_ebpf_common::EgressIpv4DestinationData {
+                intent_index: identity_v4.get(),
+                bank: BANK,
+                reserved: [0; 3],
+                destination_address: destination_v4.octets(),
+            }),
+        );
+        synchronizer
+            .gateway_nat_ipv4_destinations
+            .insert(
+                &gateway_temporal_key,
+                temporal_value(gateway_now + 10, gateway_now + 20),
+                0,
+            )
+            .unwrap();
+        let expiring_gateway_packet = ipv4_packet(6, source_v4, destination_v4, 40_010, 443);
+        let (action, expiring_translation) =
+            run_tc(&mut ebpf, "unf_observe_ingress", &expiring_gateway_packet);
+        assert_eq!(action, TC_ACT_PIPE);
+        let expiring_port =
+            u16::from_be_bytes([expiring_translation[34], expiring_translation[35]]);
+        let mut expiring_entries = snapshot_egress_connections(&synchronizer.connections)
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| {
+                key[32..34] == 40_010_u16.to_be_bytes()
+                    || (key[42] == unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE
+                        && key[34..36] == expiring_port.to_be_bytes())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expiring_entries.len(), 2);
+        for (key, value) in &mut expiring_entries {
+            value[200..204].copy_from_slice(&gateway_now.to_ne_bytes());
+            synchronizer.connections.insert(*key, *value, 0).unwrap();
+        }
+        let expired_reverse = ipv4_packet(6, destination_v4, egress_v4, 443, expiring_port);
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &expired_reverse).0,
+            TC_ACT_SHOT,
+            "gateway NAT state enforces its copied PLR deadline without controller refresh"
+        );
+        let mut temporal_events = Vec::new();
+        while let Some(item) = egress_events.next() {
+            temporal_events.push(decode_egress_event(&item).unwrap());
+        }
+        assert_eq!(temporal_events.len(), 2);
+        assert!(temporal_events.iter().any(|event| {
+            event.action == EGRESS_EVENT_ACTION_CREATE
+                && event.reason == unf_ebpf_common::EGRESS_EVENT_REASON_TRANSLATION_CREATED
+        }));
+        assert!(temporal_events.iter().any(|event| {
+            event.action == EGRESS_EVENT_ACTION_EXPIRE
+                && event.reason == unf_ebpf_common::EGRESS_EVENT_REASON_EXPIRED_OR_CORRUPT
+        }));
+        synchronizer
+            .gateway_nat_ipv4_destinations
+            .remove(&gateway_temporal_key)
+            .unwrap();
         let (action, translated_v4) = run_tc(&mut ebpf, "unf_observe_ingress", &packet_v4);
         assert_eq!(action, TC_ACT_PIPE);
         let translated_port_v4 = u16::from_be_bytes([translated_v4[34], translated_v4[35]]);
@@ -17657,7 +17965,7 @@ mod tests {
                 .copied()
                 .sum::<u64>()
         };
-        assert_eq!(counter_total(EGRESS_EVENT_COUNTER_ATTEMPTED), 3);
+        assert_eq!(counter_total(EGRESS_EVENT_COUNTER_ATTEMPTED), 5);
         assert_eq!(counter_total(EGRESS_EVENT_COUNTER_DROPPED), 0);
 
         for source_port in 41_000_u16..41_064 {
@@ -17670,7 +17978,7 @@ mod tests {
         }
         let attempts_after_pressure = counter_total(EGRESS_EVENT_COUNTER_ATTEMPTED);
         let drops_after_pressure = counter_total(EGRESS_EVENT_COUNTER_DROPPED);
-        assert_eq!(attempts_after_pressure, 67);
+        assert_eq!(attempts_after_pressure, 69);
         assert!(
             drops_after_pressure > 0,
             "small ring must expose event loss"
@@ -20633,6 +20941,7 @@ mod tests {
             (11_u16, ABI_V11_MAP_NAMES.as_slice()),
             (12_u16, ABI_V12_MAP_NAMES.as_slice()),
             (13_u16, ABI_V13_MAP_NAMES.as_slice()),
+            (14_u16, ABI_V14_MAP_NAMES.as_slice()),
             (CURRENT_BPF_ABI_VERSION, PERSISTENT_MAP_NAMES.as_slice()),
         ] {
             let abi = root.join(format!("v{version}"));
@@ -20672,9 +20981,9 @@ mod tests {
         value[188..190].copy_from_slice(&40_000_u16.to_be_bytes());
         value[190..192].copy_from_slice(&443_u16.to_be_bytes());
         value[192..194].copy_from_slice(&50_000_u16.to_be_bytes());
-        value[200..202].copy_from_slice(&EGRESS_MAP_ABI_VERSION.to_ne_bytes());
-        value[202] = 6;
-        value[203] = 4;
+        value[200..204].copy_from_slice(&u32::MAX.to_ne_bytes());
+        value[206] = 6;
+        value[207] = 4;
 
         let mut forward = [0_u8; 44];
         forward[0..4].copy_from_slice(&source);
@@ -20725,9 +21034,9 @@ mod tests {
             value[188..190].copy_from_slice(&40_000_u16.to_be_bytes());
             value[190..192].copy_from_slice(&443_u16.to_be_bytes());
             value[192..194].copy_from_slice(&50_000_u16.to_be_bytes());
-            value[200..202].copy_from_slice(&EGRESS_MAP_ABI_VERSION.to_ne_bytes());
-            value[202] = 6;
-            value[203] = 4;
+            value[200..204].copy_from_slice(&u32::MAX.to_ne_bytes());
+            value[206] = 6;
+            value[207] = 4;
 
             let mut forward = [0_u8; 44];
             forward[0..4].copy_from_slice(&source);
@@ -20879,9 +21188,8 @@ mod tests {
                 unf_ebpf_common::EgressDestinationValue {
                     contract_revision: 13,
                     intent_digest: [0x5A; 16],
-                    schema_version: EGRESS_MAP_ABI_VERSION,
-                    flags: 0,
-                    reserved: [0; 4],
+                    new_flows_until_monotonic_seconds: u32::MAX,
+                    established_flows_until_monotonic_seconds: u32::MAX,
                 },
             )],
             ipv6_destinations: Vec::new(),
@@ -21195,11 +21503,11 @@ mod tests {
     fn attachment_names_and_legacy_handles_are_direction_stable() {
         assert_eq!(
             tcx_link_pin_path(
-                Path::new("/sys/fs/bpf/unf/v14/links"),
+                Path::new("/sys/fs/bpf/unf/v15/links"),
                 Direction::Ingress,
                 17
             ),
-            Path::new("/sys/fs/bpf/unf/v14/links/tcx-ingress-17")
+            Path::new("/sys/fs/bpf/unf/v15/links/tcx-ingress-17")
         );
         assert_eq!(u32::from(legacy_tc_handle(Direction::Ingress)), 0x554e_0001);
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
@@ -21335,16 +21643,16 @@ mod tests {
 
     #[test]
     fn persistent_abi_requires_its_exact_versioned_pin_directory() {
-        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v14")).is_ok());
+        assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v15")).is_ok());
         assert_eq!(
-            configured_abi_version(Path::new("/sys/fs/bpf/unf/v14")),
-            Some(14)
+            configured_abi_version(Path::new("/sys/fs/bpf/unf/v15")),
+            Some(15)
         );
         let error = ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf/v2"))
             .expect_err("a stale ABI directory is rejected before access");
         assert!(
             error.to_string().contains(
-                "incompatible with persistent BPF-state ABI v14; expected a /v14 directory"
+                "incompatible with persistent BPF-state ABI v15; expected a /v15 directory"
             )
         );
         assert!(ensure_bpf_pin_path_abi(Path::new("/sys/fs/bpf/unf-v4")).is_err());

@@ -385,8 +385,8 @@ intent and drain state with observation-weighted revision history, while
 load-balancer-simulate` return
 the digest-bound per-Node eligibility plan without mutating state or guessing
 private connection/affinity entries. That gate used ABI v11; current egress map
-ownership now uses the all-or-none persistent ABI v14 boundary; v13 remains a
-recognized historical 33-map cleanup scope.
+ownership now uses the all-or-none persistent ABI v15 boundary; v14 remains a
+recognized historical 40-map cleanup scope and v13 a historical 33-map scope.
 Milestone 7.9 is verified. Runtime/qualifier `06fc937` passed the 463-second
 three-Node Kubernetes v1.35.0 dual-stack gate with kube-proxy absent.
 Real traffic proved strict SameNode/SameZone/Cluster fallback, ClientIP
@@ -406,14 +406,14 @@ worker-agent replacement, exact cleanup, five-agent convergence, and unchanged
 `insights`/`network` unhealthy baseline passed
 `hack/verify-openshift-service-selection.sh`; ADR 0112.
 Phase 8 begins an identity-aware enterprise egress fabric. Milestones 8.1
-through 8.6 and slices 8.7a–8.7b are verified. Source-side security policy precedes steering and NAT, while
+through 8.6 and slices 8.7a–8.7c are verified. Source-side security policy precedes steering and NAT, while
 `unf-egress` now canonically validates bounded Namespace, workload, and
 ServiceAccount selectors, destinations, non-overlapping dual-stack pools, and
 pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
 is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
-and ADRs 0113–0143 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+and ADRs 0113–0144 track the work. Milestone 8.2a now adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -441,11 +441,12 @@ candidate, selection, connection, and event state. Userspace compiles 251
 rendezvous buckets shared per intent, including a precomputed standby path by
 default when two gateways exist; packets will need only one stable hash and map
 lookup. The contract gate passes `make egress-dataplane-contract-test`; ADR
-0119. Persistent ABI v14 now owns and transactionally recovers the source,
+0119. Persistent ABI v15 now owns and transactionally recovers the source,
 destination, candidate and selection banks, atomic source and aggregate gateway
 pointers, dedicated heterogeneous gateway-NAT banks, and connection LRU;
-capacity rollback is proven on real kernel maps while v13 remains a historical
-exact 33-map cleanup boundary (ADRs 0120, 0126, and 0129). The internal
+capacity rollback is proven on real kernel maps while v14 remains a historical
+exact 40-map cleanup boundary and v13 a historical 33-map boundary (ADRs 0120,
+0126, 0129, and 0144). The internal
 TLS API now distributes a
 self-contained source envelope only after Pod-bound TokenReview authentication
 and authoritative Node-UID binding. The agent independently replays it and
@@ -609,10 +610,17 @@ authoritative-empty versus observation-loss semantics, and canonical
 digest-checked ConfigMap recovery prevent refresh ambiguity across restart.
 Before evidence is compiled, source and gateway banks own IPv4/IPv6 catch-all
 destinations and remain fenced, closing the absent-LPM native-routing escape.
-`make egress-fqdn-control-test` and ADR 0143 verify that control boundary. Agent
-DNS observation production, ledger-to-PLR transactional refresh, DNS-derived
-live packets, internet fallback, operations, and platform qualification remain
-explicit later 8.7 slices.
+`make egress-fqdn-control-test` and ADR 0143 verify that control boundary. Slice
+8.7c adds bounded Node-local exact-name A/AAAA observation, CNAME-minimum TTL,
+complete loss-explicit batches, deadline-aware controller materialization, and
+transactional source/gateway bank refresh. Its autonomous dual-clock lease
+firewall stores conservative monotonic new-flow and established-flow deadlines
+in egress ABI v4: source tuple memory and persistent gateway NAT state expire
+even while the controller is unavailable. AFT schema v2 carries portable UNIX
+deadlines and safely re-anchors them on the standby Node. Real-kernel packet
+tests pass `make egress-fqdn-dataplane-test`; ADR 0144. Wildcard/custom-view
+observation, a live multi-Node DNS lifecycle, internet fallback, operations,
+and platform qualification remain explicit later 8.7 slices.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

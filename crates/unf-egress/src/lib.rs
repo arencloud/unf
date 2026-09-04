@@ -213,6 +213,9 @@ pub enum EgressDestinations {
     DenyAll,
     Any,
     Networks(Vec<IpPrefix>),
+    /// Independently replayable DNS evidence materialized by the controller.
+    /// Native API translation never accepts this internal form directly.
+    Fqdn(EgressFqdnSnapshot),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -404,11 +407,32 @@ pub fn normalize_intent(mut intent: EgressIntent) -> Result<EgressIntent, Egress
     if let Some(fqdn) = intent.fqdn.take() {
         let fqdn = normalize_egress_fqdn_destination_spec(fqdn)
             .map_err(|_| invalid_intent(&intent, "FQDN destination specification is invalid"))?;
-        if matches!(intent.destinations, EgressDestinations::Any) {
+        if matches!(
+            intent.destinations,
+            EgressDestinations::Any | EgressDestinations::Networks(_)
+        ) {
             return Err(invalid_intent(
                 &intent,
-                "FQDN destinations cannot silently broaden to any destination",
+                "FQDN destinations cannot be combined with network destinations",
             ));
+        }
+        if let EgressDestinations::Fqdn(snapshot) = &intent.destinations {
+            let verified = verify_egress_fqdn_snapshot(snapshot.clone())
+                .map_err(|_| invalid_intent(&intent, "materialized FQDN snapshot is invalid"))?;
+            if verified.snapshot().policy.owner != intent.owner
+                || verified.snapshot().policy.patterns != fqdn.patterns
+                || verified.snapshot().policy.view != fqdn.view
+                || verified.snapshot().policy.required_observers != fqdn.required_observers
+                || verified.snapshot().policy.max_addresses != fqdn.max_addresses
+                || verified.snapshot().policy.max_ttl_seconds != fqdn.max_ttl_seconds
+                || verified.snapshot().policy.established_flow_grace_seconds
+                    != fqdn.established_flow_grace_seconds
+            {
+                return Err(invalid_intent(
+                    &intent,
+                    "materialized FQDN snapshot does not match its intent",
+                ));
+            }
         }
         intent.fqdn = Some(fqdn);
     } else if matches!(intent.destinations, EgressDestinations::DenyAll) {

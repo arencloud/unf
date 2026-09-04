@@ -135,12 +135,15 @@ for index in "${!nodes[@]}"; do
     echo "node cleanup: ${node} via ${pod}"
     cleanup_plan=$("${kc[@]}" -n unf-system exec "${pod}" -- \
         /usr/local/bin/unf-component cleanup \
-        --abi-version 14 --allow-current-abi \
+        --abi-version 15 --allow-current-abi \
         --legacy-attachments --all-interfaces --legacy-direction both)
     grep -q 'UNF cleanup plan (dry-run)' <<<"${cleanup_plan}"
     grep -q 'dry run only' <<<"${cleanup_plan}"
-    grep -q 'ABI directory: /sys/fs/bpf/unf/v14' <<<"${cleanup_plan}"
-    [[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v14/' <<<"${cleanup_plan}") -eq 40 ]]
+    grep -q 'ABI directory: /sys/fs/bpf/unf/v15' <<<"${cleanup_plan}"
+    [[ $(grep -c 'remove map pin: /sys/fs/bpf/unf/v15/' <<<"${cleanup_plan}") -eq 40 ]]
+    legacy_v14_plan=$("${kc[@]}" -n unf-system exec "${pod}" -- \
+        /usr/local/bin/unf-component cleanup --abi-version 14)
+    grep -q 'ABI directory: /sys/fs/bpf/unf/v14' <<<"${legacy_v14_plan}"
     legacy_v13_plan=$("${kc[@]}" -n unf-system exec "${pod}" -- \
         /usr/local/bin/unf-component cleanup --abi-version 13)
     grep -q 'ABI directory: /sys/fs/bpf/unf/v13' <<<"${legacy_v13_plan}"
@@ -181,13 +184,14 @@ for index in "${!nodes[@]}"; do
     sed 's/^/  /' <<<"${legacy_v11_plan}"
     sed 's/^/  /' <<<"${legacy_v12_plan}"
     sed 's/^/  /' <<<"${legacy_v13_plan}"
+    sed 's/^/  /' <<<"${legacy_v14_plan}"
     sed 's/^/  /' <<<"${cleanup_plan}"
 done
 
 echo "cluster cleanup:"
 echo "  stop DaemonSet unf-system/unf-agent before host mutation"
 echo "  run one constrained cleanup Job on each selected node"
-echo "  verify /sys/fs/bpf/unf/v4 through /sys/fs/bpf/unf/v14 and UNF legacy filters are absent"
+echo "  verify /sys/fs/bpf/unf/v4 through /sys/fs/bpf/unf/v15 and UNF legacy filters are absent"
 if ${delete_namespace}; then
     echo "  delete dedicated Namespace unf-system"
 else
@@ -276,7 +280,7 @@ for index in "${!nodes[@]}"; do
                             imagePullPolicy: $image_pull_policy,
                             command: ["/bin/sh", "-eu", "-c"],
                             args: [
-                                "/usr/local/bin/unf-component cleanup --abi-version 14 --allow-current-abi --legacy-attachments --all-interfaces --legacy-direction both --execute; /usr/local/bin/unf-component cleanup --abi-version 13 --execute; /usr/local/bin/unf-component cleanup --abi-version 12 --execute; /usr/local/bin/unf-component cleanup --abi-version 11 --execute; /usr/local/bin/unf-component cleanup --abi-version 10 --execute; /usr/local/bin/unf-component cleanup --abi-version 9 --execute; /usr/local/bin/unf-component cleanup --abi-version 8 --execute; /usr/local/bin/unf-component cleanup --abi-version 7 --execute; /usr/local/bin/unf-component cleanup --abi-version 6 --execute; /usr/local/bin/unf-component cleanup --abi-version 5 --execute; /usr/local/bin/unf-component cleanup --abi-version 4 --execute"
+                                "/usr/local/bin/unf-component cleanup --abi-version 15 --allow-current-abi --legacy-attachments --all-interfaces --legacy-direction both --execute; /usr/local/bin/unf-component cleanup --abi-version 14 --execute; /usr/local/bin/unf-component cleanup --abi-version 13 --execute; /usr/local/bin/unf-component cleanup --abi-version 12 --execute; /usr/local/bin/unf-component cleanup --abi-version 11 --execute; /usr/local/bin/unf-component cleanup --abi-version 10 --execute; /usr/local/bin/unf-component cleanup --abi-version 9 --execute; /usr/local/bin/unf-component cleanup --abi-version 8 --execute; /usr/local/bin/unf-component cleanup --abi-version 7 --execute; /usr/local/bin/unf-component cleanup --abi-version 6 --execute; /usr/local/bin/unf-component cleanup --abi-version 5 --execute; /usr/local/bin/unf-component cleanup --abi-version 4 --execute"
                             ],
                             securityContext: $security_context,
                             volumeMounts: $volume_mounts
@@ -312,6 +316,7 @@ for node in "${nodes[@]}"; do
             test ! -e /sys/fs/bpf/unf/v12
             test ! -e /sys/fs/bpf/unf/v13
             test ! -e /sys/fs/bpf/unf/v14
+            test ! -e /sys/fs/bpf/unf/v15
             for path in /sys/class/net/*; do
                 interface=${path##*/}
                 [ "${interface}" = lo ] && continue

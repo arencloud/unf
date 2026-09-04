@@ -13,7 +13,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unf_common::Revision;
 
-use crate::{EgressIntentOwner, EgressIntentScope};
+use crate::{EgressDestinations, EgressIntentOwner, EgressIntentScope};
 
 pub const EGRESS_FQDN_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 pub const EGRESS_FQDN_ALGORITHM_PROVENANCE_LEASED_RESOLUTION_V1: u16 = 1;
@@ -185,7 +185,7 @@ pub struct EgressDnsAnswer {
     pub ttl_seconds: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EgressDnsObservation {
     pub source: EgressDnsObservationSource,
@@ -209,7 +209,7 @@ pub struct EgressFqdnLeaseProvenance {
     pub expires_at_unix_seconds: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EgressFqdnDestinationLease {
     pub query_name: String,
@@ -226,7 +226,7 @@ pub struct EgressFqdnDestinationLease {
 #[serde(transparent)]
 pub struct EgressFqdnSnapshotDigest(pub [u8; 32]);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EgressFqdnSnapshot {
     pub schema_version: u16,
@@ -235,6 +235,55 @@ pub struct EgressFqdnSnapshot {
     pub policy: EgressFqdnPolicy,
     pub leases: Vec<EgressFqdnDestinationLease>,
     pub digest: EgressFqdnSnapshotDigest,
+}
+
+/// Replaces unresolved FQDN destinations in a normalized model with one
+/// independently replayable PLR snapshot per intent. The ledger remains the
+/// only evidence source; silence cannot extend a lease.
+///
+/// # Errors
+///
+/// Rejects malformed evidence, an invalid policy, capacity overflow, or an
+/// already-materialized snapshot that does not replay exactly.
+pub fn materialize_egress_fqdn_model(
+    mut model: crate::EgressModel,
+    ledger: &crate::EgressFqdnObservationLedger,
+    policy_revision: Revision,
+    now_unix_seconds: u64,
+) -> Result<
+    (
+        crate::EgressModel,
+        BTreeMap<EgressIntentOwner, EgressFqdnCompilationReport>,
+    ),
+    EgressFqdnError,
+> {
+    let mut reports = BTreeMap::new();
+    for intent in &mut model.intents {
+        let Some(spec) = intent.fqdn.clone() else {
+            continue;
+        };
+        if policy_revision == Revision::INITIAL {
+            return Err(EgressFqdnError::InvalidPolicy("revision zero is reserved"));
+        }
+        let policy = EgressFqdnPolicy {
+            revision: policy_revision,
+            owner: intent.owner.clone(),
+            patterns: spec.patterns,
+            view: spec.view.clone(),
+            required_observers: spec.required_observers,
+            max_addresses: spec.max_addresses,
+            max_ttl_seconds: spec.max_ttl_seconds,
+            established_flow_grace_seconds: spec.established_flow_grace_seconds,
+        };
+        let compiled = compile_egress_fqdn_snapshot(
+            policy,
+            ledger.observations_for_view(&spec.view),
+            now_unix_seconds,
+        )?;
+        reports.insert(intent.owner.clone(), compiled.report);
+        intent.destinations = EgressDestinations::Fqdn(compiled.snapshot);
+    }
+    Ok((model, reports))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1166,5 +1215,121 @@ mod tests {
             decide_egress_fqdn_destination(&verified, address, EgressFqdnFlowClass::New, NOW),
             EgressFqdnDecision::Deny(EgressFqdnDenyReason::NoDestinationEvidence)
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn durable_ledger_materializes_one_quorum_snapshot_and_empty_withdraws_it() {
+        fn principal(node: &str) -> crate::AuthenticatedEgressAgent {
+            crate::AuthenticatedEgressAgent {
+                namespace: "unf-system".to_owned(),
+                service_account: crate::EGRESS_AGENT_SERVICE_ACCOUNT.to_owned(),
+                pod_name: format!("unf-agent-{node}"),
+                pod_uid: format!("pod-{node}"),
+                node_name: node.to_owned(),
+                node_uid: format!("uid-{node}"),
+                audience: crate::EGRESS_AGENT_TOKEN_AUDIENCE.to_owned(),
+            }
+        }
+        fn batch(
+            principal: &crate::AuthenticatedEgressAgent,
+            mut observations: Vec<EgressDnsObservation>,
+            revision: u64,
+        ) -> crate::EgressFqdnObservationBatch {
+            for observation in &mut observations {
+                observation.observation_revision = Revision::new(revision);
+            }
+            crate::EgressFqdnObservationBatch {
+                schema_version: crate::EGRESS_FQDN_OBSERVATION_BATCH_SCHEMA_VERSION,
+                observer_node_uid: principal.node_uid.clone(),
+                source_epoch: 3,
+                batch_revision: Revision::new(revision),
+                view: "finance/production".to_owned(),
+                collected_at_unix_seconds: NOW,
+                observations,
+            }
+        }
+
+        let owner = policy().owner;
+        let spec = EgressFqdnDestinationSpec {
+            patterns: policy().patterns,
+            view: "finance/production".to_owned(),
+            required_observers: 2,
+            max_addresses: 8,
+            max_ttl_seconds: 300,
+            established_flow_grace_seconds: 30,
+        };
+        let model = crate::EgressModel {
+            pools: Vec::new(),
+            intents: vec![crate::EgressIntent {
+                owner: owner.clone(),
+                priority: 1,
+                source: crate::EgressSourceSelector::default(),
+                destinations: EgressDestinations::DenyAll,
+                fqdn: Some(spec),
+                addresses: crate::EgressAddressRequest::Explicit {
+                    addresses: vec!["198.51.100.10".parse().unwrap()],
+                },
+            }],
+        };
+        let destination: IpAddr = "203.0.113.80".parse().unwrap();
+        let first = principal("a");
+        let second = principal("b");
+        let mut ledger = crate::EgressFqdnObservationLedger::default();
+        ledger
+            .apply(
+                &first,
+                batch(
+                    &first,
+                    vec![observation(
+                        &first.node_uid,
+                        "finance/production",
+                        "api.partner.test",
+                        destination,
+                        60,
+                        NOW,
+                    )],
+                    1,
+                ),
+                NOW,
+            )
+            .unwrap();
+        ledger
+            .apply(
+                &second,
+                batch(
+                    &second,
+                    vec![observation(
+                        &second.node_uid,
+                        "finance/production",
+                        "api.partner.test",
+                        destination,
+                        60,
+                        NOW,
+                    )],
+                    1,
+                ),
+                NOW,
+            )
+            .unwrap();
+        let (materialized, reports) =
+            materialize_egress_fqdn_model(model.clone(), &ledger, Revision::new(9), NOW).unwrap();
+        let EgressDestinations::Fqdn(snapshot) = &materialized.intents[0].destinations else {
+            panic!("PLR snapshot was not materialized");
+        };
+        assert_eq!(snapshot.leases.len(), 1);
+        assert_eq!(snapshot.leases[0].address, destination);
+        assert_eq!(reports[&owner].admitted_destinations, 1);
+
+        ledger
+            .apply(&first, batch(&first, Vec::new(), 2), NOW)
+            .unwrap();
+        let (withdrawn, reports) =
+            materialize_egress_fqdn_model(model, &ledger, Revision::new(9), NOW).unwrap();
+        let EgressDestinations::Fqdn(snapshot) = &withdrawn.intents[0].destinations else {
+            panic!("empty PLR snapshot was not materialized");
+        };
+        assert!(snapshot.leases.is_empty());
+        assert_eq!(reports[&owner].below_quorum_destinations, 1);
     }
 }

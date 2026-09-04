@@ -13,13 +13,14 @@ use thiserror::Error;
 use unf_common::{IdentityId, Revision};
 use unf_ebpf_common::{
     AddressFamily as BpfAddressFamily, EGRESS_ADMISSION_ACTIVE, EGRESS_ADMISSION_FENCED,
-    EGRESS_BANK_COUNT, EGRESS_CONFIG_FLAG_GATEWAY_NAT, EGRESS_MAP_ABI_VERSION,
-    EGRESS_PATH_DIRECT_NEIGHBOR, EGRESS_PATH_LOCAL_GATEWAY, EGRESS_PATH_TUNNEL,
-    EGRESS_SELECTION_FLAG_STANDBY, EGRESS_SELECTION_TABLE_SIZE, EGRESS_SOURCE_FLAG_GATEWAY_NAT,
-    EGRESS_SOURCE_FLAG_IPV4, EGRESS_SOURCE_FLAG_IPV6, EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY,
-    EgressAddressValue, EgressCandidateKey, EgressDestinationValue, EgressGatewayValue,
-    EgressIpv4DestinationData, EgressIpv6DestinationData, EgressMapConfig, EgressSelectionKey,
-    EgressSelectionValue, EgressSourceKey, EgressSourceValue,
+    EGRESS_BANK_COUNT, EGRESS_CONFIG_FLAG_GATEWAY_NAT, EGRESS_DESTINATION_DENY_DEADLINE,
+    EGRESS_DESTINATION_STATIC_DEADLINE, EGRESS_MAP_ABI_VERSION, EGRESS_PATH_DIRECT_NEIGHBOR,
+    EGRESS_PATH_LOCAL_GATEWAY, EGRESS_PATH_TUNNEL, EGRESS_SELECTION_FLAG_STANDBY,
+    EGRESS_SELECTION_TABLE_SIZE, EGRESS_SOURCE_FLAG_GATEWAY_NAT, EGRESS_SOURCE_FLAG_IPV4,
+    EGRESS_SOURCE_FLAG_IPV6, EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY, EgressAddressValue,
+    EgressCandidateKey, EgressDestinationValue, EgressGatewayValue, EgressIpv4DestinationData,
+    EgressIpv6DestinationData, EgressMapConfig, EgressSelectionKey, EgressSelectionValue,
+    EgressSourceKey, EgressSourceValue,
 };
 
 use crate::{
@@ -38,6 +39,15 @@ pub const MAX_EGRESS_DATAPLANE_SELECTIONS: usize =
 pub const MAX_EGRESS_DATAPLANE_DESTINATIONS_PER_FAMILY: usize = 131_072;
 pub const MAX_EGRESS_DATAPLANE_DESTINATIONS: usize =
     MAX_EGRESS_DATAPLANE_DESTINATIONS_PER_FAMILY * 2;
+
+/// Stable wall/monotonic anchor captured by the agent immediately before a
+/// bank is compiled. DNS leases are converted once; eBPF never trusts wall
+/// clock time or userspace refresh for expiry enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EgressDataplaneClock {
+    pub unix_seconds: u64,
+    pub monotonic_seconds: u32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -226,6 +236,10 @@ pub enum EgressDataplaneError {
     CandidateIndex,
     #[error("egress rendezvous selection failed")]
     Selection,
+    #[error("FQDN egress destinations require a valid wall/monotonic clock anchor")]
+    MissingClock,
+    #[error("FQDN egress deadline cannot be represented safely in the dataplane")]
+    Deadline,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -249,6 +263,33 @@ pub fn compile_egress_dataplane(
     guard: &EgressAdmissionGuard,
     paths: &[EgressPathCertificate],
     bank: u8,
+) -> Result<EgressDataplaneState, EgressDataplaneError> {
+    compile_egress_dataplane_inner(host, guard, paths, bank, None)
+}
+
+/// Clock-anchored variant required for temporal FQDN destinations.
+///
+/// # Errors
+///
+/// Returns an error when the admitted host state, bank, paths, destinations,
+/// or temporal deadline cannot be lowered exactly.
+pub fn compile_egress_dataplane_at(
+    host: &EgressGatewayHostBank,
+    guard: &EgressAdmissionGuard,
+    paths: &[EgressPathCertificate],
+    bank: u8,
+    clock: EgressDataplaneClock,
+) -> Result<EgressDataplaneState, EgressDataplaneError> {
+    compile_egress_dataplane_inner(host, guard, paths, bank, Some(clock))
+}
+
+#[allow(clippy::too_many_lines)]
+fn compile_egress_dataplane_inner(
+    host: &EgressGatewayHostBank,
+    guard: &EgressAdmissionGuard,
+    paths: &[EgressPathCertificate],
+    bank: u8,
+    clock: Option<EgressDataplaneClock>,
 ) -> Result<EgressDataplaneState, EgressDataplaneError> {
     if bank >= EGRESS_BANK_COUNT {
         return Err(EgressDataplaneError::InvalidBank(bank));
@@ -378,7 +419,15 @@ pub fn compile_egress_dataplane(
             ));
         }
 
-        compile_intent_destinations(&mut state, host, template, intent_index, bank, intent_uid)?;
+        compile_intent_destinations(
+            &mut state,
+            host,
+            template,
+            intent_index,
+            bank,
+            intent_uid,
+            clock,
+        )?;
         if active.is_empty() {
             continue;
         }
@@ -438,6 +487,29 @@ pub fn compile_egress_dataplane(
 pub fn compile_egress_gateway_dataplane(
     admitted: &AdmittedEgressGatewayProjection,
     bank: u8,
+) -> Result<EgressDataplaneState, EgressDataplaneError> {
+    compile_egress_gateway_dataplane_inner(admitted, bank, None)
+}
+
+/// Clock-anchored gateway compiler for temporal FQDN destinations.
+///
+/// # Errors
+///
+/// Returns an error when the admitted aggregate, bank, destination evidence,
+/// or temporal deadline cannot be lowered exactly.
+pub fn compile_egress_gateway_dataplane_at(
+    admitted: &AdmittedEgressGatewayProjection,
+    bank: u8,
+    clock: EgressDataplaneClock,
+) -> Result<EgressDataplaneState, EgressDataplaneError> {
+    compile_egress_gateway_dataplane_inner(admitted, bank, Some(clock))
+}
+
+#[allow(clippy::too_many_lines)]
+fn compile_egress_gateway_dataplane_inner(
+    admitted: &AdmittedEgressGatewayProjection,
+    bank: u8,
+    clock: Option<EgressDataplaneClock>,
 ) -> Result<EgressDataplaneState, EgressDataplaneError> {
     if bank >= EGRESS_BANK_COUNT {
         return Err(EgressDataplaneError::InvalidBank(bank));
@@ -525,6 +597,7 @@ pub fn compile_egress_gateway_dataplane(
                 bank,
                 contract.contract_revision.get(),
                 intent_digest,
+                clock,
             )?;
             for (index, address) in plan.allocation.addresses.iter().enumerate() {
                 let index =
@@ -645,17 +718,17 @@ fn compile_gateway_destinations(
     bank: u8,
     contract_revision: u64,
     intent_digest: [u8; 16],
+    clock: Option<EgressDataplaneClock>,
 ) -> Result<(), EgressDataplaneError> {
-    let value = EgressDestinationValue {
-        contract_revision,
-        intent_digest,
-        schema_version: EGRESS_MAP_ABI_VERSION,
-        flags: 0,
-        reserved: [0; 4],
-    };
+    let static_value = static_destination_value(contract_revision, intent_digest);
     let networks = match &plan.destinations {
         EgressDestinations::DenyAll => {
-            push_catch_all_destinations(state, namespace, bank, value);
+            push_catch_all_destinations(
+                state,
+                namespace,
+                bank,
+                deny_destination_value(contract_revision, intent_digest),
+            );
             return Ok(());
         }
         EgressDestinations::Any => {
@@ -667,7 +740,7 @@ fn compile_gateway_destinations(
                     reserved: [0; 3],
                     destination_address: [0; 4],
                 },
-                value,
+                static_value,
             ));
             state.ipv6_destinations.push((
                 0,
@@ -677,11 +750,23 @@ fn compile_gateway_destinations(
                     reserved: [0; 3],
                     destination_address: [0; 16],
                 },
-                value,
+                static_value,
             ));
             return Ok(());
         }
         EgressDestinations::Networks(networks) => networks,
+        EgressDestinations::Fqdn(snapshot) => {
+            compile_fqdn_destinations(
+                state,
+                namespace,
+                bank,
+                contract_revision,
+                intent_digest,
+                snapshot,
+                clock.ok_or(EgressDataplaneError::MissingClock)?,
+            )?;
+            return Ok(());
+        }
     };
     for prefix in networks {
         if !prefix.is_canonical() {
@@ -696,7 +781,7 @@ fn compile_gateway_destinations(
                     reserved: [0; 3],
                     destination_address: address.octets(),
                 },
-                value,
+                static_value,
             )),
             IpAddr::V6(address) => state.ipv6_destinations.push((
                 u32::from(prefix.prefix_len),
@@ -706,7 +791,7 @@ fn compile_gateway_destinations(
                     reserved: [0; 3],
                     destination_address: address.octets(),
                 },
-                value,
+                static_value,
             )),
         }
     }
@@ -720,17 +805,19 @@ fn compile_intent_destinations(
     intent_index: u32,
     bank: u8,
     intent_uid: &str,
+    clock: Option<EgressDataplaneClock>,
 ) -> Result<(), EgressDataplaneError> {
-    let value = EgressDestinationValue {
-        contract_revision: host.contract.contract_revision.get(),
-        intent_digest: digest16(b"unf.egress-intent.v1\0", intent_uid.as_bytes()),
-        schema_version: EGRESS_MAP_ABI_VERSION,
-        flags: 0,
-        reserved: [0; 4],
-    };
+    let contract_revision = host.contract.contract_revision.get();
+    let intent_digest = digest16(b"unf.egress-intent.v1\0", intent_uid.as_bytes());
+    let value = static_destination_value(contract_revision, intent_digest);
     match &plan.destinations {
         EgressDestinations::DenyAll => {
-            push_catch_all_destinations(state, intent_index, bank, value);
+            push_catch_all_destinations(
+                state,
+                intent_index,
+                bank,
+                deny_destination_value(contract_revision, intent_digest),
+            );
         }
         EgressDestinations::Any => {
             state.ipv4_destinations.push((
@@ -783,8 +870,134 @@ fn compile_intent_destinations(
                 }
             }
         }
+        EgressDestinations::Fqdn(snapshot) => compile_fqdn_destinations(
+            state,
+            intent_index,
+            bank,
+            contract_revision,
+            intent_digest,
+            snapshot,
+            clock.ok_or(EgressDataplaneError::MissingClock)?,
+        )?,
     }
     Ok(())
+}
+
+const fn static_destination_value(
+    contract_revision: u64,
+    intent_digest: [u8; 16],
+) -> EgressDestinationValue {
+    EgressDestinationValue {
+        contract_revision,
+        intent_digest,
+        new_flows_until_monotonic_seconds: EGRESS_DESTINATION_STATIC_DEADLINE,
+        established_flows_until_monotonic_seconds: EGRESS_DESTINATION_STATIC_DEADLINE,
+    }
+}
+
+const fn deny_destination_value(
+    contract_revision: u64,
+    intent_digest: [u8; 16],
+) -> EgressDestinationValue {
+    EgressDestinationValue {
+        contract_revision,
+        intent_digest,
+        new_flows_until_monotonic_seconds: EGRESS_DESTINATION_DENY_DEADLINE,
+        established_flows_until_monotonic_seconds: EGRESS_DESTINATION_DENY_DEADLINE,
+    }
+}
+
+fn compile_fqdn_destinations(
+    state: &mut EgressDataplaneState,
+    intent_index: u32,
+    bank: u8,
+    contract_revision: u64,
+    intent_digest: [u8; 16],
+    snapshot: &crate::EgressFqdnSnapshot,
+    clock: EgressDataplaneClock,
+) -> Result<(), EgressDataplaneError> {
+    crate::verify_egress_fqdn_snapshot(snapshot.clone())
+        .map_err(|_| EgressDataplaneError::InvalidHostBank)?;
+    push_catch_all_destinations(
+        state,
+        intent_index,
+        bank,
+        deny_destination_value(contract_revision, intent_digest),
+    );
+    let mut leases = BTreeMap::<IpAddr, (u64, u64)>::new();
+    for lease in &snapshot.leases {
+        leases
+            .entry(lease.address)
+            .and_modify(|current| {
+                *current = (*current).max((
+                    lease.new_flows_until_unix_seconds,
+                    lease.established_flows_until_unix_seconds,
+                ));
+            })
+            .or_insert((
+                lease.new_flows_until_unix_seconds,
+                lease.established_flows_until_unix_seconds,
+            ));
+    }
+    for (address, (new_until, established_until)) in leases {
+        let value = EgressDestinationValue {
+            contract_revision,
+            intent_digest,
+            new_flows_until_monotonic_seconds: monotonic_deadline(new_until, clock)?,
+            established_flows_until_monotonic_seconds: monotonic_deadline(
+                established_until,
+                clock,
+            )?,
+        };
+        match address {
+            IpAddr::V4(address) => state.ipv4_destinations.push((
+                32,
+                EgressIpv4DestinationData {
+                    intent_index,
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: address.octets(),
+                },
+                value,
+            )),
+            IpAddr::V6(address) => state.ipv6_destinations.push((
+                128,
+                EgressIpv6DestinationData {
+                    intent_index,
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: address.octets(),
+                },
+                value,
+            )),
+        }
+    }
+    Ok(())
+}
+
+fn monotonic_deadline(
+    unix_deadline: u64,
+    clock: EgressDataplaneClock,
+) -> Result<u32, EgressDataplaneError> {
+    let delta = unix_deadline.saturating_sub(clock.unix_seconds);
+    let delta = u32::try_from(delta).map_err(|_| EgressDataplaneError::Deadline)?;
+    let deadline = clock
+        .monotonic_seconds
+        .checked_add(delta)
+        .map(|deadline| {
+            // Both clocks are supplied with whole-second precision. Close one
+            // second early so sampling phase can never extend DNS authority.
+            if delta == 0 {
+                deadline
+            } else {
+                deadline.saturating_sub(1)
+            }
+        })
+        .ok_or(EgressDataplaneError::Deadline)?;
+    if deadline == EGRESS_DESTINATION_STATIC_DEADLINE {
+        return Err(EgressDataplaneError::Deadline);
+    }
+    Ok(deadline)
 }
 
 fn push_catch_all_destinations(
@@ -1115,9 +1328,10 @@ mod tests {
     use crate::distribution::test_support::{advertisement, fixture, node, principal};
     use crate::{
         AdmittedEgressProjection, EGRESS_PROTOCOL_TCP, EgressAddressLease, EgressBehaviorContract,
-        EgressFlowProof, EgressFqdnDestinationSpec, EgressFqdnPattern, EgressGatewayFact,
+        EgressDnsAnswer, EgressDnsObservation, EgressDnsObservationSource, EgressFlowProof,
+        EgressFqdnDestinationSpec, EgressFqdnPattern, EgressFqdnPolicy, EgressGatewayFact,
         EgressGatewayProjection, EgressHaCandidate, EgressNodeProjection, EgressOriginalFlow,
-        EgressProviderRef, compile_egress_ha_plan,
+        EgressProviderRef, compile_egress_fqdn_snapshot, compile_egress_ha_plan,
     };
 
     fn ip(value: &str) -> IpAddr {
@@ -1431,6 +1645,106 @@ mod tests {
         assert_eq!(gateway_state.ipv4_destinations[0].0, 0);
         assert_eq!(gateway_state.ipv6_destinations[0].0, 0);
         assert_eq!(gateway_state.config.destination_count, 2);
+    }
+
+    #[test]
+    fn plr_snapshot_lowers_to_exact_temporal_authority_plus_dual_stack_deny() {
+        const NOW: u64 = 1_000_000;
+        let (mut model, mut facts, _) = fixture();
+        let spec = EgressFqdnDestinationSpec {
+            patterns: vec![EgressFqdnPattern::Exact("api.example.test".to_owned())],
+            view: crate::DEFAULT_EGRESS_FQDN_VIEW.to_owned(),
+            required_observers: 1,
+            max_addresses: 8,
+            max_ttl_seconds: 300,
+            established_flow_grace_seconds: 30,
+        };
+        let address: IpAddr = "203.0.113.77".parse().unwrap();
+        let snapshot = compile_egress_fqdn_snapshot(
+            EgressFqdnPolicy {
+                revision: Revision::new(9),
+                owner: model.intents[0].owner.clone(),
+                patterns: spec.patterns.clone(),
+                view: spec.view.clone(),
+                required_observers: spec.required_observers,
+                max_addresses: spec.max_addresses,
+                max_ttl_seconds: spec.max_ttl_seconds,
+                established_flow_grace_seconds: spec.established_flow_grace_seconds,
+            },
+            vec![EgressDnsObservation {
+                source: EgressDnsObservationSource {
+                    observer_uid: "worker-a-uid".to_owned(),
+                    resolver: "10.96.0.10".parse().unwrap(),
+                    view: spec.view.clone(),
+                    source_epoch: 1,
+                },
+                observation_revision: Revision::new(1),
+                query_name: "api.example.test".to_owned(),
+                canonical_chain: vec!["api.example.test".to_owned()],
+                answers: vec![EgressDnsAnswer {
+                    address,
+                    ttl_seconds: 60,
+                }],
+                observed_at_unix_seconds: NOW,
+            }],
+            NOW,
+        )
+        .unwrap()
+        .snapshot;
+        model.intents[0].fqdn = Some(spec);
+        model.intents[0].destinations = EgressDestinations::Fqdn(snapshot);
+        facts.gateways.push(EgressGatewayFact {
+            intent_uid: "intent-uid".to_owned(),
+            rank: 1,
+            node: node("gateway-b"),
+            lease_epoch: 7,
+            ready: true,
+            reachable: true,
+        });
+        let contract =
+            EgressBehaviorContract::issue(&model, &facts, node("worker-a"), Revision::new(20))
+                .unwrap();
+        let projection = EgressNodeProjection::issue_with_ha(
+            &principal("worker-a"),
+            &advertisement(),
+            10,
+            Revision::new(4),
+            contract,
+            vec![ha_plan(&model, &facts)],
+        )
+        .unwrap()
+        .admit(&principal("worker-a"), &advertisement(), &model, &facts)
+        .unwrap();
+        let host = EgressGatewayHostBank::compile(&projection).unwrap();
+        let state = compile_egress_dataplane_at(
+            &host,
+            &guard(&projection, true),
+            &paths(&projection),
+            1,
+            EgressDataplaneClock {
+                unix_seconds: NOW,
+                monotonic_seconds: 10_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.sources[0].1.admission, EGRESS_ADMISSION_ACTIVE);
+        assert_eq!(state.ipv4_destinations.len(), 2);
+        assert_eq!(state.ipv6_destinations.len(), 1);
+        let (_, data, value) = state
+            .ipv4_destinations
+            .iter()
+            .find(|(prefix, _, _)| *prefix == 32)
+            .unwrap();
+        assert_eq!(data.destination_address, [203, 0, 113, 77]);
+        assert_eq!(value.new_flows_until_monotonic_seconds, 10_059);
+        assert_eq!(value.established_flows_until_monotonic_seconds, 10_089);
+        assert!(state.ipv4_destinations.iter().any(|(prefix, _, value)| {
+            *prefix == 0 && value.new_flows_until_monotonic_seconds == 0
+        }));
+        assert!(
+            compile_egress_dataplane(&host, &guard(&projection, true), &paths(&projection), 0)
+                .is_err()
+        );
     }
 
     #[test]
