@@ -5,6 +5,7 @@ resources:
   - service-account.yaml
   - rbac.yaml
   - internet-classifier-rbac.yaml
+  - reachability-observer-rbac.yaml
   - agent-report-store.yaml
   - flow-history-store.yaml
   - topology-history-store.yaml

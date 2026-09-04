@@ -657,9 +657,18 @@ conflicting, partial, foreign, missing, or expired views deny closed; withdrawal
 requires the same diverse complete evidence of absence. Only an opaque result
 constructed or independently replayed from the complete evidence set can reach
 the consumer deadline check. `make
-egress-reachability-contract-test` and ADR 0148 verify 8.8a. Authenticated
-durable evidence ingestion is next in 8.8b, followed by the live static/native,
-BGP, and BFD provider gates.
+egress-reachability-contract-test` and ADR 0148 verify 8.8a. Slice 8.8b adds
+controller-owned cluster plans, namespaced status-only observer identities, and
+a canonical durable evidence ledger that preserves current inputs, retained
+replay positions, exact assessments, and explanation provenance. New evidence
+is persisted before it can change an acknowledgement; absolute deadlines deny
+independently and are also rematerialized without a Kubernetes event. Exact
+desired/plan replay bridges only verified Ready or Withdrawn authority into the
+existing gateway and safe-forgetting transactions. The two-failure-domain Kind
+gate proves least-privilege RBAC, restart recovery, autonomous expiry,
+replay/mutation rejection, higher-revision recovery, and cleanup under `make
+egress-reachability-lifecycle-test`; ADR 0149. The live static/native, BGP, and
+BFD provider gates remain next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

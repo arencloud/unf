@@ -228,6 +228,106 @@ pub enum EgressInternetClass {
     NonInternet,
 }
 
+/// Controller-owned, lease-bound DQR plan. Observers may read this resource but
+/// receive no permission to mutate it.
+#[derive(CustomResource, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "network.unf.io",
+    version = "v1alpha1",
+    kind = "EgressReachabilityPlan",
+    plural = "egressreachabilityplans",
+    shortname = "unferp"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressReachabilityPlanSpec {
+    #[schemars(range(min = 1))]
+    pub revision: u64,
+    #[schemars(range(min = 1))]
+    pub desired_revision: u64,
+    #[schemars(range(min = 1))]
+    pub allocation_revision: u64,
+    pub owner_name: String,
+    pub owner_uid: String,
+    pub provider: EgressProvider,
+    #[schemars(range(min = 1))]
+    pub lease_epoch: u64,
+    pub action: EgressReachabilityAction,
+    pub addresses: Vec<String>,
+    pub expected_paths: Vec<EgressReachabilityPath>,
+    #[schemars(range(min = 1, max = 16))]
+    pub minimum_paths_per_address: u16,
+    #[schemars(range(min = 1, max = 16))]
+    pub maximum_paths_per_address: u16,
+    pub vantages: Vec<EgressReachabilityVantage>,
+    #[schemars(range(min = 1, max = 300))]
+    pub max_observation_age_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "PascalCase")]
+pub enum EgressReachabilityAction {
+    Ensure,
+    Withdraw,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressReachabilityPath {
+    pub gateway_uid: String,
+    pub forwarding_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressReachabilityVantage {
+    pub name: String,
+    #[schemars(range(min = 1, max = 16))]
+    pub minimum_failure_domains: u16,
+}
+
+/// Controller-owned observer identity plus observer-owned status evidence. A
+/// `RoleBinding` scopes one observer `ServiceAccount` to its dedicated Namespace;
+/// it may update only this resource's status subresource.
+#[derive(CustomResource, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "network.unf.io",
+    version = "v1alpha1",
+    kind = "EgressReachabilityObservation",
+    plural = "egressreachabilityobservations",
+    namespaced,
+    status = "EgressReachabilityObservationStatus",
+    shortname = "unfero"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressReachabilityObservationSpec {
+    pub plan_name: String,
+    pub plan: EgressReachabilityPlanSpec,
+    pub observer: String,
+    pub failure_domain: String,
+    pub vantage: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressReachabilityObservationStatus {
+    #[schemars(range(min = 1))]
+    pub source_epoch: u64,
+    #[schemars(range(min = 1))]
+    pub revision: u64,
+    pub plan_digest: String,
+    pub observed_at_unix_seconds: u64,
+    pub valid_until_unix_seconds: u64,
+    pub routes: Vec<EgressReachabilityRouteObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressReachabilityRouteObservation {
+    pub address: String,
+    #[serde(default)]
+    pub paths: Vec<EgressReachabilityPath>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "PascalCase")]
 pub enum EgressInternetFallback {
@@ -349,15 +449,17 @@ mod tests {
     }
 
     #[test]
-    fn generated_egress_crds_are_cluster_scoped_and_structural() {
-        for crd in [
-            EgressPool::crd(),
-            EgressPolicy::crd(),
-            EgressInternetClassification::crd(),
+    fn generated_egress_crds_have_explicit_scope_and_structural_schemas() {
+        for (crd, scope) in [
+            (EgressPool::crd(), "Cluster"),
+            (EgressPolicy::crd(), "Cluster"),
+            (EgressInternetClassification::crd(), "Cluster"),
+            (EgressReachabilityPlan::crd(), "Cluster"),
+            (EgressReachabilityObservation::crd(), "Namespaced"),
         ] {
             let value = serde_json::to_value(crd).expect("CRD serializes");
             assert_eq!(value["spec"]["group"], "network.unf.io");
-            assert_eq!(value["spec"]["scope"], "Cluster");
+            assert_eq!(value["spec"]["scope"], scope);
             assert!(value["spec"]["versions"][0]["schema"]["openAPIV3Schema"].is_object());
         }
     }
@@ -388,6 +490,16 @@ mod tests {
                     "../../../deploy/crds/network.unf.io_egressinternetclassifications.yaml"
                 ),
                 EgressInternetClassification::crd(),
+            ),
+            (
+                include_str!("../../../deploy/crds/network.unf.io_egressreachabilityplans.yaml"),
+                EgressReachabilityPlan::crd(),
+            ),
+            (
+                include_str!(
+                    "../../../deploy/crds/network.unf.io_egressreachabilityobservations.yaml"
+                ),
+                EgressReachabilityObservation::crd(),
             ),
         ] {
             let checked_in: serde_json::Value =

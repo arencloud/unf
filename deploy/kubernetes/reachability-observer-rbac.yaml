@@ -1,0 +1,14 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: unf-reachability-observer
+rules:
+  # Bind this ClusterRole with a namespaced RoleBinding. Each independently
+  # failing observer gets a dedicated Namespace containing only its
+  # controller-created identity object.
+  - apiGroups: ["network.unf.io"]
+    resources: ["egressreachabilityobservations"]
+    verbs: ["get"]
+  - apiGroups: ["network.unf.io"]
+    resources: ["egressreachabilityobservations/status"]
+    verbs: ["get", "update", "patch"]

@@ -635,6 +635,15 @@ matrix is maintained in the
   foreign, missing, and expired evidence denies closed; verified withdrawal
   requires the same diverse empty view under `make
   egress-reachability-contract-test`; ADR 0148.
+- Phase 8.8b verifies authenticated durable DQR lifecycle. Controller-owned
+  plans and namespaced observer identities expose only a status publication
+  surface to independently bound observers. Exact embedded-plan replay,
+  transactional relist, retained monotonic positions, canonical checkpoint
+  recovery, persistence-before-acknowledgement, and autonomous expiry feed the
+  existing gateway and safe-forgetting transactions. A two-failure-domain Kind
+  gate proves RBAC, restart, denial, replay/mutation rejection, recovery, and
+  cleanup under `make egress-reachability-lifecycle-test`; ADR 0149. Route
+  mutation and live static/native activation remain milestone 8.8c.
 - Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
   ServiceAccount selectors; canonical destinations and non-overlapping
   dual-stack pools; pool-family/multiple-address intent; strict OpenShift

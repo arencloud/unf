@@ -30,6 +30,7 @@ mod internet;
 mod internet_store;
 mod proof;
 mod reachability;
+mod reachability_store;
 mod safe_forgetting;
 
 pub use allocation::*;
@@ -50,6 +51,7 @@ pub use internet::*;
 pub use internet_store::*;
 pub use proof::*;
 pub use reachability::*;
+pub use reachability_store::*;
 pub use safe_forgetting::*;
 
 pub const DEFAULT_EGRESS_INTENT_PRIORITY: u32 = 1_000;

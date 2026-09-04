@@ -13,6 +13,7 @@
 .PHONY: egress-internet-classification-test
 .PHONY: egress-internet-lifecycle-test
 .PHONY: egress-reachability-contract-test
+.PHONY: egress-reachability-lifecycle-test
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -274,6 +275,14 @@ egress-reachability-contract-test: egress-internet-lifecycle-test
 	hack/verify-egress-reachability-contract.sh
 	cargo test -p unf-egress reachability::tests --no-fail-fast
 	cargo clippy -p unf-egress --all-targets --all-features -- -D warnings
+
+egress-reachability-lifecycle-test: egress-reachability-contract-test service-kind-load
+	hack/verify-egress-reachability-lifecycle.sh
+	bash -n hack/verify-kind-egress-reachability-lifecycle.sh
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) apply -k deploy/kind-service-fabric
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout restart deployment/unf-controller -n unf-system
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout status deployment/unf-controller -n unf-system --timeout=180s
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) hack/verify-kind-egress-reachability-lifecycle.sh
 
 test:
 	cargo test --workspace
@@ -563,6 +572,8 @@ generate-crds:
 	cargo run -p unf-api --example crdgen -- egress-pool > deploy/crds/network.unf.io_egresspools.yaml
 	cargo run -p unf-api --example crdgen -- egress-policy > deploy/crds/network.unf.io_egresspolicies.yaml
 	cargo run -p unf-api --example crdgen -- egress-internet-classification > deploy/crds/network.unf.io_egressinternetclassifications.yaml
+	cargo run -p unf-api --example crdgen -- egress-reachability-plan > deploy/crds/network.unf.io_egressreachabilityplans.yaml
+	cargo run -p unf-api --example crdgen -- egress-reachability-observation > deploy/crds/network.unf.io_egressreachabilityobservations.yaml
 
 controller:
 	cargo build -p unf-controller

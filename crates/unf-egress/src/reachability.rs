@@ -15,8 +15,9 @@ use thiserror::Error;
 use unf_common::Revision;
 
 use crate::{
-    EgressGatewayAction, EgressIntentOwner, EgressProviderRef, MAX_EGRESS_ADDRESSES_PER_INTENT,
-    MAX_EGRESS_GATEWAY_NODES,
+    EGRESS_GATEWAY_ACK_SCHEMA_VERSION, EgressGatewayAction, EgressGatewayDesired,
+    EgressIntentOwner, EgressProviderOutcome, EgressProviderRef, EgressReachabilityAcknowledgement,
+    MAX_EGRESS_ADDRESSES_PER_INTENT, MAX_EGRESS_GATEWAY_NODES,
 };
 
 pub const EGRESS_REACHABILITY_SCHEMA_VERSION: u16 = 1;
@@ -204,6 +205,8 @@ pub enum EgressReachabilityError {
     InvalidAssessment,
     #[error("egress reachability assessment digest does not match")]
     AssessmentDigestMismatch,
+    #[error("egress reachability plan does not match gateway desired state")]
+    GatewayDesiredMismatch,
     #[error("egress reachability canonical encoding failed: {0}")]
     Encoding(String),
 }
@@ -553,6 +556,77 @@ pub fn egress_reachability_verdict_at(
     }
 }
 
+/// Bridges independently verified DQR authority into the existing
+/// lease-fenced gateway transaction. A non-authoritative assessment emits an
+/// explicit higher-revision rejection; it never preserves Ready by omission.
+///
+/// # Errors
+///
+/// Rejects a plan that is not an exact projection of gateway desired state,
+/// invalid evidence, or a zero acknowledgement revision.
+pub fn compile_egress_reachability_acknowledgement(
+    desired: &EgressGatewayDesired,
+    plan: &EgressReachabilityPlan,
+    assessment: &VerifiedEgressReachabilityAssessment,
+    acknowledgement_revision: Revision,
+    now_unix_seconds: u64,
+) -> Result<EgressReachabilityAcknowledgement, EgressReachabilityError> {
+    let plan = verify_egress_reachability_plan(plan.clone())?;
+    let desired_gateway_uids = desired
+        .nodes
+        .iter()
+        .map(|node| node.uid.as_str())
+        .collect::<BTreeSet<_>>();
+    let plan_gateway_uids = plan
+        .expected_paths
+        .iter()
+        .map(|path| path.gateway_uid.as_str())
+        .collect::<BTreeSet<_>>();
+    if acknowledgement_revision == Revision::INITIAL
+        || plan.desired_revision != desired.revision
+        || plan.allocation_revision != desired.allocation_revision
+        || plan.owner != desired.owner
+        || plan.provider != desired.provider
+        || plan.lease_epoch != desired.lease_epoch
+        || plan.action != desired.action
+        || plan.addresses != desired.addresses
+        || plan_gateway_uids != desired_gateway_uids
+    {
+        return Err(EgressReachabilityError::GatewayDesiredMismatch);
+    }
+    let verdict = egress_reachability_verdict_at(&plan, assessment, now_unix_seconds)?;
+    let (outcome, error) = match (desired.action, verdict) {
+        (EgressGatewayAction::Ensure, EgressReachabilityVerdict::Ready) => {
+            (EgressProviderOutcome::Ready, None)
+        }
+        (EgressGatewayAction::Withdraw, EgressReachabilityVerdict::Withdrawn) => {
+            (EgressProviderOutcome::Withdrawn, None)
+        }
+        _ => (
+            EgressProviderOutcome::Rejected,
+            Some(
+                if now_unix_seconds >= assessment.authority_until_unix_seconds {
+                    "dqr:ExpiredAuthority".to_owned()
+                } else {
+                    format!("dqr:{:?}", assessment.reason)
+                },
+            ),
+        ),
+    };
+    Ok(EgressReachabilityAcknowledgement {
+        schema_version: EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
+        revision: acknowledgement_revision,
+        desired_revision: desired.revision,
+        allocation_revision: desired.allocation_revision,
+        owner: desired.owner.clone(),
+        provider: desired.provider.clone(),
+        lease_epoch: desired.lease_epoch,
+        outcome,
+        addresses: desired.addresses.clone(),
+        error,
+    })
+}
+
 fn seal_assessment(
     mut assessment: EgressReachabilityAssessment,
 ) -> Result<EgressReachabilityAssessment, EgressReachabilityError> {
@@ -758,6 +832,27 @@ mod tests {
         .unwrap()
     }
 
+    fn desired(plan: &EgressReachabilityPlan) -> EgressGatewayDesired {
+        EgressGatewayDesired {
+            schema_version: crate::EGRESS_GATEWAY_DESIRED_SCHEMA_VERSION,
+            revision: plan.desired_revision,
+            allocation_revision: plan.allocation_revision,
+            owner: plan.owner.clone(),
+            provider: plan.provider.clone(),
+            lease_epoch: plan.lease_epoch,
+            action: plan.action,
+            addresses: plan.addresses.clone(),
+            nodes: ["gateway-a", "gateway-b"]
+                .into_iter()
+                .map(|uid| crate::EgressNode {
+                    name: uid.to_owned(),
+                    uid: uid.to_owned(),
+                    capabilities: BTreeSet::new(),
+                })
+                .collect(),
+        }
+    }
+
     fn observation(
         plan: &EgressReachabilityPlan,
         vantage: &str,
@@ -950,6 +1045,36 @@ mod tests {
         let refreshed = assess_egress_reachability(plan, observations, NOW + 56).unwrap();
         assert_eq!(refreshed.verdict, EgressReachabilityVerdict::DenyClosed);
         assert_eq!(refreshed.reason, EgressReachabilityReason::ExpiredEvidence);
+    }
+
+    #[test]
+    fn verified_assessment_bridges_to_ack_and_expiry_revokes_readiness() {
+        let plan = plan(EgressGatewayAction::Ensure);
+        let desired = desired(&plan);
+        let assessment =
+            assess_egress_reachability(plan.clone(), quorum(&plan, &plan.expected_paths), NOW + 1)
+                .unwrap();
+        let ready = compile_egress_reachability_acknowledgement(
+            &desired,
+            &plan,
+            &assessment,
+            Revision::new(30),
+            NOW + 2,
+        )
+        .unwrap();
+        assert_eq!(ready.outcome, EgressProviderOutcome::Ready);
+        assert!(ready.error.is_none());
+
+        let expired = compile_egress_reachability_acknowledgement(
+            &desired,
+            &plan,
+            &assessment,
+            Revision::new(31),
+            NOW + 45,
+        )
+        .unwrap();
+        assert_eq!(expired.outcome, EgressProviderOutcome::Rejected);
+        assert_eq!(expired.error.as_deref(), Some("dqr:ExpiredAuthority"));
     }
 
     #[test]

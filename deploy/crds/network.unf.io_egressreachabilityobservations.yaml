@@ -1,0 +1,201 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: egressreachabilityobservations.network.unf.io
+spec:
+  group: network.unf.io
+  names:
+    kind: EgressReachabilityObservation
+    plural: egressreachabilityobservations
+    shortNames:
+    - unfero
+    singular: egressreachabilityobservation
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for EgressReachabilityObservationSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Controller-owned observer identity plus observer-owned status evidence. A
+              `RoleBinding` scopes one observer `ServiceAccount` to its dedicated Namespace;
+              it may update only this resource's status subresource.
+            properties:
+              failureDomain:
+                type: string
+              observer:
+                type: string
+              plan:
+                description: |-
+                  Controller-owned, lease-bound DQR plan. Observers may read this resource but
+                  receive no permission to mutate it.
+                properties:
+                  action:
+                    enum:
+                    - Ensure
+                    - Withdraw
+                    type: string
+                  addresses:
+                    items:
+                      type: string
+                    type: array
+                  allocationRevision:
+                    format: uint64
+                    minimum: 1.0
+                    type: integer
+                  desiredRevision:
+                    format: uint64
+                    minimum: 1.0
+                    type: integer
+                  expectedPaths:
+                    items:
+                      properties:
+                        forwardingIdentity:
+                          type: string
+                        gatewayUid:
+                          type: string
+                      required:
+                      - forwardingIdentity
+                      - gatewayUid
+                      type: object
+                    type: array
+                  leaseEpoch:
+                    format: uint64
+                    minimum: 1.0
+                    type: integer
+                  maxObservationAgeSeconds:
+                    format: uint64
+                    maximum: 300.0
+                    minimum: 1.0
+                    type: integer
+                  maximumPathsPerAddress:
+                    format: uint16
+                    maximum: 16.0
+                    minimum: 1.0
+                    type: integer
+                  minimumPathsPerAddress:
+                    format: uint16
+                    maximum: 16.0
+                    minimum: 1.0
+                    type: integer
+                  ownerName:
+                    type: string
+                  ownerUid:
+                    type: string
+                  provider:
+                    properties:
+                      instance:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - instance
+                    - name
+                    type: object
+                  revision:
+                    format: uint64
+                    minimum: 1.0
+                    type: integer
+                  vantages:
+                    items:
+                      properties:
+                        minimumFailureDomains:
+                          format: uint16
+                          maximum: 16.0
+                          minimum: 1.0
+                          type: integer
+                        name:
+                          type: string
+                      required:
+                      - minimumFailureDomains
+                      - name
+                      type: object
+                    type: array
+                required:
+                - action
+                - addresses
+                - allocationRevision
+                - desiredRevision
+                - expectedPaths
+                - leaseEpoch
+                - maxObservationAgeSeconds
+                - maximumPathsPerAddress
+                - minimumPathsPerAddress
+                - ownerName
+                - ownerUid
+                - provider
+                - revision
+                - vantages
+                type: object
+              planName:
+                type: string
+              vantage:
+                type: string
+            required:
+            - failureDomain
+            - observer
+            - plan
+            - planName
+            - vantage
+            type: object
+          status:
+            nullable: true
+            properties:
+              observedAtUnixSeconds:
+                format: uint64
+                minimum: 0.0
+                type: integer
+              planDigest:
+                type: string
+              revision:
+                format: uint64
+                minimum: 1.0
+                type: integer
+              routes:
+                items:
+                  properties:
+                    address:
+                      type: string
+                    paths:
+                      default: []
+                      items:
+                        properties:
+                          forwardingIdentity:
+                            type: string
+                          gatewayUid:
+                            type: string
+                        required:
+                        - forwardingIdentity
+                        - gatewayUid
+                        type: object
+                      type: array
+                  required:
+                  - address
+                  type: object
+                type: array
+              sourceEpoch:
+                format: uint64
+                minimum: 1.0
+                type: integer
+              validUntilUnixSeconds:
+                format: uint64
+                minimum: 0.0
+                type: integer
+            required:
+            - observedAtUnixSeconds
+            - planDigest
+            - revision
+            - routes
+            - sourceEpoch
+            - validUntilUnixSeconds
+            type: object
+        required:
+        - spec
+        title: EgressReachabilityObservation
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

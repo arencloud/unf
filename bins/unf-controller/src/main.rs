@@ -33,7 +33,11 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use unf_api::{EgressInternetClassification, EgressPolicy, EgressPool, SecurityPolicy};
+use unf_api::{
+    EgressInternetClassification, EgressPolicy, EgressPool,
+    EgressReachabilityObservation as ApiEgressReachabilityObservation,
+    EgressReachabilityPlan as ApiEgressReachabilityPlan, SecurityPolicy,
+};
 use unf_common::{
     BackendId, IdentityId, PolicyAction, PolicyDirection, PolicyId, PolicyReason, Protocol,
     Revision, ServiceId, Verdict,
@@ -53,9 +57,9 @@ use unf_egress::{
     EgressIntentOwner, EgressInternetClassificationStore, EgressInternetStoreCheckpoint,
     EgressModel, EgressNode, EgressNodeProjectionEnvelope, EgressProjectionRecipient,
     EgressProviderOutcome, EgressProviderRef, EgressReachabilityAcknowledgement,
-    EgressSafeReleaseAuthority, EgressSourceActivationGrant,
-    EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
-    EgressSourceRetirementChallenges,
+    EgressReachabilityEvidenceStore, EgressReachabilityStoreCheckpoint, EgressSafeReleaseAuthority,
+    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
+    EgressSourceRetirementChallenges, compile_egress_reachability_acknowledgement,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -142,6 +146,7 @@ const EGRESS_DESIRED_STORE_NAME: &str = "unf-egress-desired-state";
 const EGRESS_DESIRED_STORE_KEY: &str = "desired.json";
 const EGRESS_FQDN_OBSERVATION_STORE_KEY: &str = "fqdn-observations.json";
 const EGRESS_INTERNET_CLASSIFICATION_STORE_KEY: &str = "internet-classifications.json";
+const EGRESS_REACHABILITY_STORE_KEY: &str = "reachability-evidence.json";
 const EGRESS_DESIRED_STORE_DATA_LIMIT: usize = 900_000;
 const EGRESS_DESIRED_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const EGRESS_CONTROL_PLANE_STORE_NAME: &str = "unf-egress-control-plane";
@@ -151,6 +156,9 @@ const NATIVE_EGRESS_POOL_SOURCE_PREFIX: &str = "native:egresspool/";
 const NATIVE_EGRESS_POLICY_SOURCE_PREFIX: &str = "native:egresspolicy/";
 const NATIVE_EGRESS_INTERNET_CLASSIFICATION_SOURCE_PREFIX: &str =
     "native:egressinternetclassification/";
+const NATIVE_EGRESS_REACHABILITY_PLAN_SOURCE_PREFIX: &str = "native:reachability-plan/";
+const NATIVE_EGRESS_REACHABILITY_OBSERVATION_SOURCE_PREFIX: &str =
+    "native:reachability-observation/";
 const OPENSHIFT_EGRESS_IP_SOURCE_PREFIX: &str = "openshift:egressip/";
 const FLOW_HISTORY_STORE_NAME: &str = "unf-flow-history";
 const FLOW_HISTORY_STORE_KEY: &str = "flows.json";
@@ -319,6 +327,8 @@ struct ControllerState {
     egress_desired: Mutex<EgressDesiredStore>,
     egress_fqdn_observations: Mutex<EgressFqdnObservationLedger>,
     egress_internet_classifications: Mutex<EgressInternetClassificationStore>,
+    egress_reachability: Mutex<EgressReachabilityEvidenceStore>,
+    egress_reachability_pending: AtomicBool,
     egress_fqdn_materialization: Mutex<Option<EgressFqdnMaterialization>>,
     egress_desired_dirty: AtomicBool,
     egress_desired_store: Option<Api<ConfigMap>>,
@@ -1547,6 +1557,8 @@ fn new_state_with_client_and_selector(
         egress_desired: Mutex::new(EgressDesiredStore::default()),
         egress_fqdn_observations: Mutex::new(EgressFqdnObservationLedger::default()),
         egress_internet_classifications: Mutex::new(EgressInternetClassificationStore::default()),
+        egress_reachability: Mutex::new(EgressReachabilityEvidenceStore::default()),
+        egress_reachability_pending: AtomicBool::new(false),
         egress_fqdn_materialization: Mutex::new(None),
         egress_desired_dirty: AtomicBool::new(false),
         egress_desired_store: config_map_store.clone(),
@@ -2221,6 +2233,17 @@ async fn restore_egress_desired_state(state: &ControllerState) -> Result<()> {
     } else {
         info!("durable internet-classifier store is empty");
     }
+    if let Some(encoded) = data.and_then(|data| data.get(EGRESS_REACHABILITY_STORE_KEY)) {
+        let checkpoint: EgressReachabilityStoreCheckpoint =
+            serde_json::from_str(encoded).context("decode durable DQR reachability checkpoint")?;
+        let restored = EgressReachabilityEvidenceStore::restore(&checkpoint, unix_time_seconds())
+            .context("validate durable DQR reachability checkpoint")?;
+        let revision = restored.revision().get();
+        *mutex_lock(&state.egress_reachability) = restored;
+        info!(revision, "restored durable DQR reachability evidence");
+    } else {
+        info!("durable DQR reachability store is empty");
+    }
     Ok(())
 }
 
@@ -2240,6 +2263,8 @@ fn spawn_egress_persistence(
                     break;
                 }
                 _ = interval.tick() => {
+                    retry_pending_egress_reachability(&state).await;
+                    refresh_due_egress_reachability(&state).await;
                     persist_egress_desired_if_dirty(&state).await;
                     persist_egress_control_plane_if_dirty(&state).await;
                 }
@@ -2277,13 +2302,19 @@ async fn persist_egress_desired_state(state: &ControllerState) -> Result<()> {
         .context("compile durable internet-classifier checkpoint")?;
     let internet_encoded = serde_json::to_string(&internet_checkpoint)
         .context("encode durable internet-classifier checkpoint")?;
+    let reachability_checkpoint = mutex_lock(&state.egress_reachability)
+        .checkpoint(unix_time_seconds())
+        .context("compile durable DQR reachability checkpoint")?;
+    let reachability_encoded = serde_json::to_string(&reachability_checkpoint)
+        .context("encode durable DQR reachability checkpoint")?;
     let total_len = encoded
         .len()
         .saturating_add(fqdn_encoded.len())
-        .saturating_add(internet_encoded.len());
+        .saturating_add(internet_encoded.len())
+        .saturating_add(reachability_encoded.len());
     if total_len > EGRESS_DESIRED_STORE_DATA_LIMIT {
         return Err(anyhow!(
-            "durable egress desired, FQDN, and internet-classifier state requires {total_len} bytes; ConfigMap limit is {EGRESS_DESIRED_STORE_DATA_LIMIT}"
+            "durable egress desired, FQDN, internet-classifier, and DQR reachability state requires {total_len} bytes; ConfigMap limit is {EGRESS_DESIRED_STORE_DATA_LIMIT}"
         ));
     }
     let patch = serde_json::json!({
@@ -2297,6 +2328,7 @@ async fn persist_egress_desired_state(state: &ControllerState) -> Result<()> {
             (EGRESS_DESIRED_STORE_KEY): encoded,
             (EGRESS_FQDN_OBSERVATION_STORE_KEY): fqdn_encoded,
             (EGRESS_INTERNET_CLASSIFICATION_STORE_KEY): internet_encoded,
+            (EGRESS_REACHABILITY_STORE_KEY): reachability_encoded,
         },
     });
     api.patch(
@@ -3086,6 +3118,13 @@ fn spawn_watchers(
         .await;
     });
 
+    spawn_egress_reachability_watchers(
+        tasks,
+        client.clone(),
+        Arc::clone(&state),
+        cancellation.clone(),
+    );
+
     let openshift_egress_state = Arc::clone(&state);
     let openshift_egress_cancel = cancellation.clone();
     let egress_ip_resource = ApiResource::from_gvk_with_plural(
@@ -3116,6 +3155,25 @@ fn spawn_watchers(
             network_policy_cancel,
         )
         .await;
+    });
+}
+
+fn spawn_egress_reachability_watchers(
+    tasks: &mut JoinSet<()>,
+    client: Client,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    let plan_state = Arc::clone(&state);
+    let plan_cancel = cancellation.clone();
+    let plan_api = Api::<ApiEgressReachabilityPlan>::all(client.clone());
+    tasks.spawn(async move {
+        watch_egress_reachability_plans(plan_api, plan_state, plan_cancel).await;
+    });
+
+    let observation_api = Api::<ApiEgressReachabilityObservation>::all(client);
+    tasks.spawn(async move {
+        watch_egress_reachability_observations(observation_api, state, cancellation).await;
     });
 }
 
@@ -3715,6 +3773,252 @@ async fn record_egress_internet_classification_result(
     }
 }
 
+async fn watch_egress_reachability_plans(
+    api: Api<ApiEgressReachabilityPlan>,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    let stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    tokio::pin!(stream);
+    let mut initializing = None::<BTreeMap<String, unf_egress::EgressReachabilityPlan>>;
+    let mut initialization_failed = false;
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            item = stream.try_next() => match item {
+                Ok(Some(Event::Init)) => {
+                    initializing = Some(BTreeMap::new());
+                    initialization_failed = false;
+                }
+                Ok(Some(Event::InitApply(resource))) => {
+                    let key = native_egress_reachability_plan_key(&resource.name_any());
+                    match egress_api::translate_egress_reachability_plan(&resource) {
+                        Ok(plan) => {
+                            if let Some(replacement) = initializing.as_mut() {
+                                replacement.insert(key, plan);
+                            } else {
+                                let result = mutex_lock(&state.egress_reachability)
+                                    .apply_plan(key, plan)
+                                    .map_err(|error| error.to_string());
+                                record_egress_reachability_result(&state, result).await;
+                            }
+                        }
+                        Err(error) => {
+                            initialization_failed = true;
+                            state.metrics.errors.inc();
+                            warn!(%error, %key, "DQR plan initialization rejected; retaining durable state");
+                        }
+                    }
+                }
+                Ok(Some(Event::InitDone)) => {
+                    if let Some(replacement) = initializing.take()
+                        && !std::mem::take(&mut initialization_failed)
+                    {
+                        let result = mutex_lock(&state.egress_reachability)
+                            .replace_plans(replacement)
+                            .map_err(|error| error.to_string());
+                        record_egress_reachability_result(&state, result).await;
+                    }
+                }
+                Ok(Some(Event::Apply(resource))) => {
+                    let key = native_egress_reachability_plan_key(&resource.name_any());
+                    match egress_api::translate_egress_reachability_plan(&resource) {
+                        Ok(plan) => {
+                            let result = mutex_lock(&state.egress_reachability)
+                                .apply_plan(key, plan)
+                                .map_err(|error| error.to_string());
+                            record_egress_reachability_result(&state, result).await;
+                        }
+                        Err(error) => {
+                            state.metrics.errors.inc();
+                            warn!(%error, %key, "DQR plan rejected; retaining durable state");
+                        }
+                    }
+                }
+                Ok(Some(Event::Delete(resource))) => {
+                    let key = native_egress_reachability_plan_key(&resource.name_any());
+                    let result = mutex_lock(&state.egress_reachability)
+                        .remove_plan(&key)
+                        .map_err(|error| error.to_string());
+                    record_egress_reachability_result(&state, result).await;
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, "EgressReachabilityPlan watch error");
+                }
+            }
+        }
+    }
+}
+
+async fn watch_egress_reachability_observations(
+    api: Api<ApiEgressReachabilityObservation>,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    let stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    tokio::pin!(stream);
+    let mut initializing =
+        None::<BTreeMap<String, unf_egress::EgressReachabilityObservationRecord>>;
+    let mut initialization_failed = false;
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            item = stream.try_next() => match item {
+                Ok(Some(Event::Init)) => {
+                    initializing = Some(BTreeMap::new());
+                    initialization_failed = false;
+                }
+                Ok(Some(Event::InitApply(resource))) => {
+                    match egress_api::translate_egress_reachability_observation(&resource) {
+                        Ok(record) => {
+                            if let Some(replacement) = initializing.as_mut() {
+                                replacement.insert(record.source_key.clone(), record);
+                            } else {
+                                let result = mutex_lock(&state.egress_reachability)
+                                    .apply_observation(record)
+                                    .map_err(|error| error.to_string());
+                                record_egress_reachability_result(&state, result).await;
+                            }
+                        }
+                        Err(egress_api::NativeEgressApiError::MissingReachabilityStatus(_)) => {}
+                        Err(error) => {
+                            initialization_failed = true;
+                            state.metrics.errors.inc();
+                            warn!(%error, "DQR observation initialization rejected; retaining durable state");
+                        }
+                    }
+                }
+                Ok(Some(Event::InitDone)) => {
+                    if let Some(replacement) = initializing.take()
+                        && !std::mem::take(&mut initialization_failed)
+                    {
+                        let result = mutex_lock(&state.egress_reachability)
+                            .replace_observations(replacement)
+                            .map_err(|error| error.to_string());
+                        record_egress_reachability_result(&state, result).await;
+                    }
+                }
+                Ok(Some(Event::Apply(resource))) => {
+                    match egress_api::translate_egress_reachability_observation(&resource) {
+                        Ok(record) => {
+                            let result = mutex_lock(&state.egress_reachability)
+                                .apply_observation(record)
+                                .map_err(|error| error.to_string());
+                            record_egress_reachability_result(&state, result).await;
+                        }
+                        Err(egress_api::NativeEgressApiError::MissingReachabilityStatus(_)) => {
+                            let key = native_egress_reachability_observation_key(&resource);
+                            let result = mutex_lock(&state.egress_reachability)
+                                .remove_observation(&key)
+                                .map_err(|error| error.to_string());
+                            record_egress_reachability_result(&state, result).await;
+                        }
+                        Err(error) => {
+                            state.metrics.errors.inc();
+                            warn!(%error, "DQR observation rejected; retaining durable state");
+                        }
+                    }
+                }
+                Ok(Some(Event::Delete(resource))) => {
+                    let key = native_egress_reachability_observation_key(&resource);
+                    let result = mutex_lock(&state.egress_reachability)
+                        .remove_observation(&key)
+                        .map_err(|error| error.to_string());
+                    record_egress_reachability_result(&state, result).await;
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, "EgressReachabilityObservation watch error");
+                }
+            }
+        }
+    }
+}
+
+async fn record_egress_reachability_result(state: &ControllerState, result: Result<bool, String>) {
+    match result {
+        Ok(false) => {}
+        Ok(true) => {
+            state
+                .egress_reachability_pending
+                .store(true, Ordering::Release);
+            state.egress_desired_dirty.store(true, Ordering::Release);
+            retry_pending_egress_reachability(state).await;
+        }
+        Err(error) => {
+            state.metrics.errors.inc();
+            warn!(%error, "DQR publication rejected; retaining durable state");
+        }
+    }
+}
+
+async fn retry_pending_egress_reachability(state: &ControllerState) {
+    if !state.egress_reachability_pending.load(Ordering::Acquire) {
+        return;
+    }
+    let revision = {
+        let mut reachability = mutex_lock(&state.egress_reachability);
+        if let Err(error) = reachability.materialize(unix_time_seconds()) {
+            state.metrics.errors.inc();
+            warn!(error = ?error, "DQR materialization rejected; retaining last distribution and retrying");
+            return;
+        }
+        reachability.revision()
+    };
+    if let Err(error) = persist_egress_desired_state(state).await {
+        state.metrics.errors.inc();
+        warn!(error = ?error, "DQR checkpoint failed; retaining last distribution and retrying");
+        return;
+    }
+    {
+        let reachability = mutex_lock(&state.egress_reachability);
+        if reachability.revision() != revision {
+            return;
+        }
+        state
+            .egress_reachability_pending
+            .store(false, Ordering::Release);
+    }
+    if let Err(error) = reconcile_egress_control_plane(state) {
+        state
+            .egress_reachability_pending
+            .store(true, Ordering::Release);
+        state.metrics.errors.inc();
+        warn!(error = ?error, "DQR reconciliation rejected; retaining last distribution and retrying");
+        return;
+    }
+    persist_egress_control_plane_if_dirty(state).await;
+}
+
+async fn refresh_due_egress_reachability(state: &ControllerState) {
+    let now = unix_time_seconds();
+    let due = mutex_lock(&state.egress_reachability)
+        .next_refresh_at_unix_seconds()
+        .is_some_and(|deadline| now >= deadline);
+    if !due {
+        return;
+    }
+    let before = mutex_lock(&state.egress_reachability).revision();
+    let result = mutex_lock(&state.egress_reachability).materialize(now);
+    let after = mutex_lock(&state.egress_reachability).revision();
+    if let Err(error) = result {
+        state.metrics.errors.inc();
+        warn!(error = ?error, "scheduled DQR expiry materialization failed");
+        return;
+    }
+    if after == before {
+        return;
+    }
+    state
+        .egress_reachability_pending
+        .store(true, Ordering::Release);
+    state.egress_desired_dirty.store(true, Ordering::Release);
+    retry_pending_egress_reachability(state).await;
+}
+
 fn apply_egress_policy_event(state: &ControllerState, event: Event<EgressPolicy>) {
     match event {
         Event::Apply(policy) => apply_egress_policy(state, &policy),
@@ -3857,6 +4161,16 @@ fn reconcile_egress_control_plane_locked(state: &ControllerState) -> Result<()> 
     };
     let current_control_checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
     let candidates = live_egress_ha_candidates(state, &current_control_checkpoint)?;
+    let (dqr_revision, dqr_plans, dqr_assessments) = {
+        let reachability = mutex_lock(&state.egress_reachability);
+        (
+            reachability.revision(),
+            reachability.current_plan_records(),
+            reachability
+                .verified_assessments()
+                .context("verify retained DQR reachability assessments")?,
+        )
+    };
     let mut control_plane = mutex_lock(&state.egress_control_plane);
     let before = control_plane.checkpoint();
     let mut next = control_plane.clone();
@@ -3883,6 +4197,10 @@ fn reconcile_egress_control_plane_locked(state: &ControllerState) -> Result<()> 
     }
     acknowledge_static_egress_reachability(&mut next)
         .context("acknowledge explicit static egress reachability")?;
+    if !state.egress_reachability_pending.load(Ordering::Acquire) {
+        acknowledge_dqr_egress_reachability(&mut next, dqr_revision, &dqr_plans, &dqr_assessments)
+            .context("bridge verified DQR reachability")?;
+    }
     let changed = next.checkpoint() != before;
     *control_plane = next;
     drop(control_plane);
@@ -3900,6 +4218,58 @@ fn reconcile_egress_control_plane_locked(state: &ControllerState) -> Result<()> 
         );
     }
     Ok(())
+}
+
+fn acknowledge_dqr_egress_reachability(
+    control_plane: &mut EgressControlPlane,
+    revision: Revision,
+    plans: &[unf_egress::EgressReachabilityPlanRecord],
+    assessments: &BTreeMap<EgressIntentOwner, unf_egress::VerifiedEgressReachabilityAssessment>,
+) -> Result<bool> {
+    if revision == Revision::INITIAL {
+        return Ok(false);
+    }
+    let mut changed = false;
+    for record in control_plane.checkpoint().gateways.records {
+        if record.desired.provider.name == "static" {
+            continue;
+        }
+        let plan = plans
+            .iter()
+            .find(|candidate| candidate.plan.owner == record.desired.owner)
+            .map(|candidate| &candidate.plan);
+        let acknowledgement = match (plan, assessments.get(&record.desired.owner)) {
+            (Some(plan), Some(assessment)) => compile_egress_reachability_acknowledgement(
+                &record.desired,
+                plan,
+                assessment,
+                revision,
+                unix_time_seconds(),
+            )
+            .unwrap_or_else(|_| rejected_dqr_acknowledgement(&record.desired, revision)),
+            _ => rejected_dqr_acknowledgement(&record.desired, revision),
+        };
+        changed |= control_plane.acknowledge_reachability(acknowledgement)?;
+    }
+    Ok(changed)
+}
+
+fn rejected_dqr_acknowledgement(
+    desired: &unf_egress::EgressGatewayDesired,
+    revision: Revision,
+) -> EgressReachabilityAcknowledgement {
+    EgressReachabilityAcknowledgement {
+        schema_version: EGRESS_GATEWAY_ACK_SCHEMA_VERSION,
+        revision,
+        desired_revision: desired.revision,
+        allocation_revision: desired.allocation_revision,
+        owner: desired.owner.clone(),
+        provider: desired.provider.clone(),
+        lease_epoch: desired.lease_epoch,
+        outcome: EgressProviderOutcome::Rejected,
+        addresses: desired.addresses.clone(),
+        error: Some("dqr:MissingOrInvalidAuthority".to_owned()),
+    }
 }
 
 fn acknowledge_static_egress_reachability(control_plane: &mut EgressControlPlane) -> Result<bool> {
@@ -4391,6 +4761,20 @@ fn native_egress_policy_key(name: &str) -> String {
 
 fn native_egress_internet_classification_key(name: &str) -> String {
     format!("{NATIVE_EGRESS_INTERNET_CLASSIFICATION_SOURCE_PREFIX}{name}")
+}
+
+fn native_egress_reachability_plan_key(name: &str) -> String {
+    format!("{NATIVE_EGRESS_REACHABILITY_PLAN_SOURCE_PREFIX}{name}")
+}
+
+fn native_egress_reachability_observation_key(
+    resource: &ApiEgressReachabilityObservation,
+) -> String {
+    format!(
+        "{NATIVE_EGRESS_REACHABILITY_OBSERVATION_SOURCE_PREFIX}{}/{}",
+        resource.namespace().unwrap_or_default(),
+        resource.name_any()
+    )
 }
 
 async fn watch_openshift_egress_ips(

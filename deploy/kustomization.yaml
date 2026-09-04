@@ -5,4 +5,6 @@ resources:
   - crds/network.unf.io_egresspools.yaml
   - crds/network.unf.io_egresspolicies.yaml
   - crds/network.unf.io_egressinternetclassifications.yaml
+  - crds/network.unf.io_egressreachabilityplans.yaml
+  - crds/network.unf.io_egressreachabilityobservations.yaml
   - kubernetes

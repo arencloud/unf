@@ -10,6 +10,10 @@ use unf_api::{
     EgressAddressFamily as ApiAddressFamily, EgressDestinations as ApiEgressDestinations,
     EgressInternetClass as ApiInternetClass, EgressInternetClassification,
     EgressInternetFallback as ApiInternetFallback, EgressPolicy, EgressPool,
+    EgressReachabilityAction as ApiReachabilityAction,
+    EgressReachabilityObservation as ApiReachabilityObservation,
+    EgressReachabilityPlan as ApiReachabilityPlan,
+    EgressReachabilityPlanSpec as ApiReachabilityPlanSpec,
 };
 use unf_common::Revision;
 use unf_egress::{
@@ -19,8 +23,13 @@ use unf_egress::{
     EgressInternetClassification as DomainInternetClassification,
     EgressInternetClassificationDigest, EgressInternetClassificationRule,
     EgressInternetDestinationSpec, EgressInternetFallback, EgressModelError, EgressProviderRef,
-    EgressSourceSelector, IpPrefix, LabelExpression, LabelExpressionOperator, LabelSelector,
-    normalize_intent, normalize_pools, seal_egress_internet_classification,
+    EgressReachabilityObservation, EgressReachabilityObservationDigest,
+    EgressReachabilityObservationRecord, EgressReachabilityObserver, EgressReachabilityPath,
+    EgressReachabilityPlan, EgressReachabilityPlanDigest, EgressReachabilityRouteObservation,
+    EgressReachabilityVantage, EgressSourceSelector, IpPrefix, LabelExpression,
+    LabelExpressionOperator, LabelSelector, normalize_intent, normalize_pools,
+    seal_egress_internet_classification, seal_egress_reachability_observation,
+    seal_egress_reachability_plan,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -45,6 +54,16 @@ pub enum NativeEgressApiError {
     InvalidFqdn { name: String, value: String },
     #[error("EgressPolicy {name:?} has invalid DNS resolver address {value:?}")]
     InvalidDnsResolver { name: String, value: String },
+    #[error("{kind} {name:?} has invalid IP address {value:?}")]
+    InvalidAddress {
+        kind: &'static str,
+        name: String,
+        value: String,
+    },
+    #[error("EgressReachabilityObservation {0:?} has no published status")]
+    MissingReachabilityStatus(String),
+    #[error("EgressReachabilityObservation {0:?} names a foreign plan digest")]
+    ForeignReachabilityPlan(String),
     #[error("native egress resource cannot be normalized: {0}")]
     InvalidModel(String),
 }
@@ -115,6 +134,153 @@ pub fn translate_egress_internet_classification(
         digest: EgressInternetClassificationDigest([0; 32]),
     })
     .map_err(|error| NativeEgressApiError::InvalidModel(error.to_string()))
+}
+
+pub fn translate_egress_reachability_plan(
+    resource: &ApiReachabilityPlan,
+) -> Result<EgressReachabilityPlan, NativeEgressApiError> {
+    translate_egress_reachability_plan_spec(&resource.name_any(), &resource.spec)
+}
+
+pub fn translate_egress_reachability_observation(
+    resource: &ApiReachabilityObservation,
+) -> Result<EgressReachabilityObservationRecord, NativeEgressApiError> {
+    let name = resource.name_any();
+    let namespace = resource.namespace().unwrap_or_default();
+    let plan =
+        translate_egress_reachability_plan_spec(&resource.spec.plan_name, &resource.spec.plan)?;
+    let status = resource
+        .status
+        .as_ref()
+        .ok_or_else(|| NativeEgressApiError::MissingReachabilityStatus(name.clone()))?;
+    if status.plan_digest != digest_hex(&plan.digest.0) {
+        return Err(NativeEgressApiError::ForeignReachabilityPlan(name));
+    }
+    let routes = status
+        .routes
+        .iter()
+        .map(|route| {
+            Ok(EgressReachabilityRouteObservation {
+                address: parse_address(
+                    "EgressReachabilityObservation",
+                    &resource.name_any(),
+                    &route.address,
+                )?,
+                paths: route
+                    .paths
+                    .iter()
+                    .map(|path| EgressReachabilityPath {
+                        gateway_uid: path.gateway_uid.clone(),
+                        forwarding_identity: path.forwarding_identity.clone(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, NativeEgressApiError>>()?;
+    let observation = seal_egress_reachability_observation(
+        &plan,
+        EgressReachabilityObservation {
+            schema_version: unf_egress::EGRESS_REACHABILITY_SCHEMA_VERSION,
+            algorithm: unf_egress::EGRESS_REACHABILITY_ALGORITHM_DIVERSITY_QUORUM_V1.to_owned(),
+            plan_digest: plan.digest,
+            observer: EgressReachabilityObserver {
+                name: resource.spec.observer.clone(),
+                failure_domain: resource.spec.failure_domain.clone(),
+                vantage: resource.spec.vantage.clone(),
+            },
+            source_epoch: status.source_epoch,
+            revision: Revision::new(status.revision),
+            observed_at_unix_seconds: status.observed_at_unix_seconds,
+            valid_until_unix_seconds: status.valid_until_unix_seconds,
+            routes,
+            digest: EgressReachabilityObservationDigest([0; 32]),
+        },
+    )
+    .map_err(|error| NativeEgressApiError::InvalidModel(error.to_string()))?;
+    Ok(EgressReachabilityObservationRecord {
+        source_key: format!("native:reachability-observation/{namespace}/{name}"),
+        plan_source_key: format!("native:reachability-plan/{}", resource.spec.plan_name),
+        plan,
+        observation,
+    })
+}
+
+fn translate_egress_reachability_plan_spec(
+    name: &str,
+    spec: &ApiReachabilityPlanSpec,
+) -> Result<EgressReachabilityPlan, NativeEgressApiError> {
+    let addresses = spec
+        .addresses
+        .iter()
+        .map(|value| parse_address("EgressReachabilityPlan", name, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    seal_egress_reachability_plan(EgressReachabilityPlan {
+        schema_version: unf_egress::EGRESS_REACHABILITY_SCHEMA_VERSION,
+        algorithm: unf_egress::EGRESS_REACHABILITY_ALGORITHM_DIVERSITY_QUORUM_V1.to_owned(),
+        revision: Revision::new(spec.revision),
+        desired_revision: Revision::new(spec.desired_revision),
+        allocation_revision: Revision::new(spec.allocation_revision),
+        owner: EgressIntentOwner {
+            scope: EgressIntentScope::Cluster,
+            name: spec.owner_name.clone(),
+            uid: spec.owner_uid.clone(),
+        },
+        provider: EgressProviderRef {
+            name: spec.provider.name.clone(),
+            instance: spec.provider.instance.clone(),
+        },
+        lease_epoch: spec.lease_epoch,
+        action: match spec.action {
+            ApiReachabilityAction::Ensure => unf_egress::EgressGatewayAction::Ensure,
+            ApiReachabilityAction::Withdraw => unf_egress::EgressGatewayAction::Withdraw,
+        },
+        addresses,
+        expected_paths: spec
+            .expected_paths
+            .iter()
+            .map(|path| EgressReachabilityPath {
+                gateway_uid: path.gateway_uid.clone(),
+                forwarding_identity: path.forwarding_identity.clone(),
+            })
+            .collect(),
+        minimum_paths_per_address: spec.minimum_paths_per_address,
+        maximum_paths_per_address: spec.maximum_paths_per_address,
+        vantages: spec
+            .vantages
+            .iter()
+            .map(|vantage| EgressReachabilityVantage {
+                name: vantage.name.clone(),
+                minimum_failure_domains: vantage.minimum_failure_domains,
+            })
+            .collect(),
+        max_observation_age_seconds: spec.max_observation_age_seconds,
+        digest: EgressReachabilityPlanDigest([0; 32]),
+    })
+    .map_err(|error| NativeEgressApiError::InvalidModel(error.to_string()))
+}
+
+fn parse_address(
+    kind: &'static str,
+    name: &str,
+    value: &str,
+) -> Result<IpAddr, NativeEgressApiError> {
+    value
+        .parse::<IpAddr>()
+        .map_err(|_| NativeEgressApiError::InvalidAddress {
+            kind,
+            name: name.to_owned(),
+            value: value.to_owned(),
+        })
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 pub fn translate_egress_policy(
@@ -427,6 +593,83 @@ mod tests {
         let model = unf_egress::normalize_model(vec![pool], vec![intent]).unwrap();
         assert_eq!(model.pools.len(), 1);
         assert_eq!(model.intents.len(), 1);
+    }
+
+    #[test]
+    fn dqr_plan_and_namespaced_status_translate_to_one_sealed_evidence_record() {
+        let plan_resource: ApiReachabilityPlan = serde_json::from_value(serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "EgressReachabilityPlan",
+            "metadata": {"name": "finance"},
+            "spec": {
+                "revision": 9,
+                "desiredRevision": 8,
+                "allocationRevision": 7,
+                "ownerName": "finance",
+                "ownerUid": "finance-uid",
+                "provider": {"name": "bgp", "instance": "edge"},
+                "leaseEpoch": 4,
+                "action": "Ensure",
+                "addresses": ["2001:db8::10", "192.0.2.10"],
+                "expectedPaths": [{
+                    "gatewayUid": "gateway-a",
+                    "forwardingIdentity": "edge-a"
+                }],
+                "minimumPathsPerAddress": 1,
+                "maximumPathsPerAddress": 1,
+                "vantages": [{"name": "outside", "minimumFailureDomains": 2}],
+                "maxObservationAgeSeconds": 60
+            }
+        }))
+        .unwrap();
+        let plan = translate_egress_reachability_plan(&plan_resource).unwrap();
+        let plan_spec = serde_json::to_value(&plan_resource.spec).unwrap();
+        let observation: ApiReachabilityObservation = serde_json::from_value(serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "EgressReachabilityObservation",
+            "metadata": {"name": "edge-a", "namespace": "unf-observer-a"},
+            "spec": {
+                "planName": "finance",
+                "plan": plan_spec,
+                "observer": "edge-a",
+                "failureDomain": "rack-a",
+                "vantage": "outside"
+            },
+            "status": {
+                "sourceEpoch": 3,
+                "revision": 11,
+                "planDigest": digest_hex(&plan.digest.0),
+                "observedAtUnixSeconds": 1000,
+                "validUntilUnixSeconds": 1050,
+                "routes": [
+                    {"address": "2001:db8::10", "paths": [{
+                        "gatewayUid": "gateway-a", "forwardingIdentity": "edge-a"
+                    }]},
+                    {"address": "192.0.2.10", "paths": [{
+                        "gatewayUid": "gateway-a", "forwardingIdentity": "edge-a"
+                    }]}
+                ]
+            }
+        }))
+        .unwrap();
+        let translated = translate_egress_reachability_observation(&observation).unwrap();
+        assert_eq!(translated.plan, plan);
+        assert_eq!(
+            translated.source_key,
+            "native:reachability-observation/unf-observer-a/edge-a"
+        );
+        assert_eq!(
+            translated.plan_source_key,
+            "native:reachability-plan/finance"
+        );
+        assert_eq!(translated.observation.observer.failure_domain, "rack-a");
+
+        let mut missing = observation;
+        missing.status = None;
+        assert!(matches!(
+            translate_egress_reachability_observation(&missing),
+            Err(NativeEgressApiError::MissingReachabilityStatus(_))
+        ));
     }
 
     #[test]
