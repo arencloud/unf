@@ -406,14 +406,14 @@ worker-agent replacement, exact cleanup, five-agent convergence, and unchanged
 `insights`/`network` unhealthy baseline passed
 `hack/verify-openshift-service-selection.sh`; ADR 0112.
 Phase 8 begins an identity-aware enterprise egress fabric. Milestones 8.1
-through 8.6 and slices 8.7a–8.7c are verified. Source-side security policy precedes steering and NAT, while
+through 8.6 and slices 8.7a–8.7d are verified. Source-side security policy precedes steering and NAT, while
 `unf-egress` now canonically validates bounded Namespace, workload, and
 ServiceAccount selectors, destinations, non-overlapping dual-stack pools, and
 pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
 is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
-and ADRs 0113–0144 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+and ADRs 0113–0145 track the work. Milestone 8.2a now adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -618,9 +618,16 @@ firewall stores conservative monotonic new-flow and established-flow deadlines
 in egress ABI v4: source tuple memory and persistent gateway NAT state expire
 even while the controller is unavailable. AFT schema v2 carries portable UNIX
 deadlines and safely re-anchors them on the standby Node. Real-kernel packet
-tests pass `make egress-fqdn-dataplane-test`; ADR 0144. Wildcard/custom-view
-observation, a live multi-Node DNS lifecycle, internet fallback, operations,
-and platform qualification remain explicit later 8.7 slices.
+tests pass `make egress-fqdn-dataplane-test`; ADR 0144.
+Phase 8.7d adds Explicit DNS Discovery Authority: wildcard members are concrete
+bounded `discoveryNames`, custom views bind `resolverAddresses`, and PLR rejects
+evidence outside either commitment. Independent per-view producers never query
+`*` and issue final authenticated empty batches. The three-Node Kind gate proves
+two-observer custom-view A/AAAA quorum, dual-stack traffic, observer replacement,
+two activation grants for cross-Node replicas sharing one safely coalesced
+gateway identity, authoritative-empty denial, recovery, and final withdrawal
+under `make egress-fqdn-lifecycle-test`; ADR 0145. DNSSEC, passive capture, internet
+classification, operations, scale, and OpenShift qualification remain separate.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

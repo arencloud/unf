@@ -18,6 +18,8 @@ use crate::{EgressDestinations, EgressIntentOwner, EgressIntentScope};
 pub const EGRESS_FQDN_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 pub const EGRESS_FQDN_ALGORITHM_PROVENANCE_LEASED_RESOLUTION_V1: u16 = 1;
 pub const MAX_EGRESS_FQDN_PATTERNS: usize = 256;
+pub const MAX_EGRESS_FQDN_DISCOVERY_NAMES: usize = 256;
+pub const MAX_EGRESS_FQDN_RESOLVERS: usize = 16;
 pub const MAX_EGRESS_FQDN_OBSERVATIONS: usize = 4_096;
 pub const MAX_EGRESS_FQDN_ANSWERS_PER_OBSERVATION: usize = 64;
 pub const MAX_EGRESS_FQDN_CNAME_DEPTH: usize = 16;
@@ -96,6 +98,8 @@ impl EgressFqdnPattern {
 pub struct EgressFqdnDestinationSpec {
     pub patterns: Vec<EgressFqdnPattern>,
     pub view: String,
+    pub discovery_names: Vec<String>,
+    pub resolver_addresses: Vec<IpAddr>,
     pub required_observers: u16,
     pub max_addresses: u16,
     pub max_ttl_seconds: u32,
@@ -135,6 +139,48 @@ pub fn normalize_egress_fqdn_destination_spec(
     if !valid_token(&spec.view) {
         return Err(EgressFqdnError::InvalidPolicy("DNS view is invalid"));
     }
+    if spec.discovery_names.len() > MAX_EGRESS_FQDN_DISCOVERY_NAMES {
+        return Err(EgressFqdnError::InvalidPolicy(
+            "wildcard discovery-name set exceeds its bound",
+        ));
+    }
+    spec.discovery_names = spec
+        .discovery_names
+        .iter()
+        .map(|name| normalize_dns_name(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    spec.discovery_names.sort_unstable();
+    if spec
+        .discovery_names
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+        || spec
+            .discovery_names
+            .iter()
+            .any(|name| !spec.patterns.iter().any(|pattern| pattern.matches(name)))
+    {
+        return Err(EgressFqdnError::InvalidPolicy(
+            "discovery names must be unique members of the policy patterns",
+        ));
+    }
+    if spec.resolver_addresses.len() > MAX_EGRESS_FQDN_RESOLVERS
+        || spec.resolver_addresses.iter().any(IpAddr::is_unspecified)
+    {
+        return Err(EgressFqdnError::InvalidPolicy(
+            "resolver address set is invalid or exceeds its bound",
+        ));
+    }
+    spec.resolver_addresses.sort_unstable();
+    if spec
+        .resolver_addresses
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+        || (spec.view != DEFAULT_EGRESS_FQDN_VIEW && spec.resolver_addresses.is_empty())
+    {
+        return Err(EgressFqdnError::InvalidPolicy(
+            "custom views require a unique explicit resolver-address set",
+        ));
+    }
     if spec.required_observers == 0 || spec.required_observers > MAX_EGRESS_FQDN_OBSERVERS {
         return Err(EgressFqdnError::InvalidPolicy("observer quorum is invalid"));
     }
@@ -163,6 +209,11 @@ pub struct EgressFqdnPolicy {
     /// An explicit resolver/tenant view. Observations from other views never
     /// contribute to this policy's quorum.
     pub view: String,
+    /// Exact wildcard members authorized for observation. This prevents a
+    /// wildcard suffix from becoming an implicit enumeration capability.
+    pub discovery_names: Vec<String>,
+    /// Resolver identities allowed to contribute evidence for this view.
+    pub resolver_addresses: Vec<IpAddr>,
     pub required_observers: u16,
     pub max_addresses: u16,
     pub max_ttl_seconds: u32,
@@ -270,6 +321,8 @@ pub fn materialize_egress_fqdn_model(
             owner: intent.owner.clone(),
             patterns: spec.patterns,
             view: spec.view.clone(),
+            discovery_names: spec.discovery_names.clone(),
+            resolver_addresses: spec.resolver_addresses.clone(),
             required_observers: spec.required_observers,
             max_addresses: spec.max_addresses,
             max_ttl_seconds: spec.max_ttl_seconds,
@@ -281,7 +334,7 @@ pub fn materialize_egress_fqdn_model(
             now_unix_seconds,
         )?;
         reports.insert(intent.owner.clone(), compiled.report);
-        intent.destinations = EgressDestinations::Fqdn(compiled.snapshot);
+        intent.destinations = EgressDestinations::Fqdn(Box::new(compiled.snapshot));
     }
     Ok((model, reports))
 }
@@ -302,7 +355,9 @@ pub struct EgressFqdnCompilationReport {
     pub accepted_observations: u32,
     pub authoritative_empty_observations: u32,
     pub wrong_view_observations: u32,
+    pub wrong_resolver_observations: u32,
     pub unmatched_name_observations: u32,
+    pub unauthorized_name_observations: u32,
     pub zero_ttl_answers: u32,
     pub below_quorum_destinations: u32,
     pub admitted_destinations: u32,
@@ -440,12 +495,24 @@ fn collect_observations(
             report.wrong_view_observations += 1;
             continue;
         }
+        if !policy.resolver_addresses.is_empty()
+            && !policy
+                .resolver_addresses
+                .contains(&observation.source.resolver)
+        {
+            report.wrong_resolver_observations += 1;
+            continue;
+        }
         if !policy
             .patterns
             .iter()
             .any(|pattern| pattern.matches(&observation.query_name))
         {
             report.unmatched_name_observations += 1;
+            continue;
+        }
+        if !observation_name_is_authorized(policy, &observation.query_name) {
+            report.unauthorized_name_observations += 1;
             continue;
         }
         report.accepted_observations += 1;
@@ -644,6 +711,8 @@ fn normalize_policy(mut policy: EgressFqdnPolicy) -> Result<EgressFqdnPolicy, Eg
     let spec = normalize_egress_fqdn_destination_spec(EgressFqdnDestinationSpec {
         patterns: policy.patterns,
         view: policy.view,
+        discovery_names: policy.discovery_names,
+        resolver_addresses: policy.resolver_addresses,
         required_observers: policy.required_observers,
         max_addresses: policy.max_addresses,
         max_ttl_seconds: policy.max_ttl_seconds,
@@ -651,6 +720,8 @@ fn normalize_policy(mut policy: EgressFqdnPolicy) -> Result<EgressFqdnPolicy, Eg
     })?;
     policy.patterns = spec.patterns;
     policy.view = spec.view;
+    policy.discovery_names = spec.discovery_names;
+    policy.resolver_addresses = spec.resolver_addresses;
     policy.required_observers = spec.required_observers;
     policy.max_addresses = spec.max_addresses;
     policy.max_ttl_seconds = spec.max_ttl_seconds;
@@ -744,9 +815,12 @@ fn verify_lease(
         .filter(|pattern| pattern.matches(&lease.query_name))
         .cloned()
         .collect::<Vec<_>>();
-    if matched_patterns.is_empty() || matched_patterns != lease.matched_patterns {
+    if matched_patterns.is_empty()
+        || matched_patterns != lease.matched_patterns
+        || !observation_name_is_authorized(policy, &lease.query_name)
+    {
         return Err(EgressFqdnError::InvalidSnapshot(
-            "matched-pattern proof is invalid",
+            "matched-pattern or discovery-authority proof is invalid",
         ));
     }
     if lease.provenance.len() < usize::from(policy.required_observers)
@@ -764,6 +838,10 @@ fn verify_lease(
             || !valid_token(&evidence.source.view)
             || evidence.source.view != policy.view
             || evidence.source.resolver.is_unspecified()
+            || (!policy.resolver_addresses.is_empty()
+                && !policy
+                    .resolver_addresses
+                    .contains(&evidence.source.resolver))
             || evidence.source.source_epoch == 0
             || evidence.observation_revision.0 == 0
             || evidence.canonical_chain.is_empty()
@@ -805,6 +883,17 @@ fn verify_lease(
         ));
     }
     Ok(())
+}
+
+fn observation_name_is_authorized(policy: &EgressFqdnPolicy, query_name: &str) -> bool {
+    policy
+        .patterns
+        .iter()
+        .any(|pattern| matches!(pattern, EgressFqdnPattern::Exact(name) if name == query_name))
+        || policy
+            .discovery_names
+            .binary_search_by(|candidate| candidate.as_str().cmp(query_name))
+            .is_ok()
 }
 
 fn snapshot_digest(
@@ -879,6 +968,17 @@ mod tests {
                 EgressFqdnPattern::parse("api.partner.test").unwrap(),
             ],
             view: "finance/production".to_owned(),
+            discovery_names: [
+                "api.bank.example",
+                "one.bank.example",
+                "same.bank.example",
+                "two.bank.example",
+                "v6.bank.example",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            resolver_addresses: vec![IpAddr::V4(Ipv4Addr::new(10, 96, 0, 10))],
             required_observers: 2,
             max_addresses: 8,
             max_ttl_seconds: 300,
@@ -926,6 +1026,89 @@ mod tests {
         assert!(EgressFqdnPattern::parse("*.*.example.com").is_err());
         assert!(EgressFqdnPattern::parse("*.com").is_err());
         assert!(EgressFqdnPattern::parse("café.example").is_err());
+    }
+
+    #[test]
+    fn wildcard_discovery_and_custom_resolver_authority_are_bounded() {
+        let normalized = normalize_egress_fqdn_destination_spec(EgressFqdnDestinationSpec {
+            patterns: vec![EgressFqdnPattern::parse("*.Bank.Example.").unwrap()],
+            view: "finance/production".to_owned(),
+            discovery_names: vec![
+                "PAYMENTS.BANK.EXAMPLE.".to_owned(),
+                "api.bank.example".to_owned(),
+            ],
+            resolver_addresses: vec![
+                "2001:db8::53".parse().unwrap(),
+                "10.96.0.53".parse().unwrap(),
+            ],
+            required_observers: 2,
+            max_addresses: 8,
+            max_ttl_seconds: 60,
+            established_flow_grace_seconds: 5,
+        })
+        .unwrap();
+        assert_eq!(
+            normalized.discovery_names,
+            ["api.bank.example", "payments.bank.example"]
+        );
+        assert_eq!(
+            normalized.resolver_addresses,
+            [
+                "10.96.0.53".parse::<IpAddr>().unwrap(),
+                "2001:db8::53".parse::<IpAddr>().unwrap()
+            ]
+        );
+
+        let mut missing_resolver = normalized.clone();
+        missing_resolver.resolver_addresses.clear();
+        assert!(normalize_egress_fqdn_destination_spec(missing_resolver).is_err());
+        let mut foreign_name = normalized;
+        foreign_name.discovery_names = vec!["api.partner.test".to_owned()];
+        assert!(normalize_egress_fqdn_destination_spec(foreign_name).is_err());
+    }
+
+    #[test]
+    fn wildcard_evidence_requires_declared_name_and_resolver_authority() {
+        let mut policy = policy();
+        policy.required_observers = 1;
+        policy.discovery_names = vec!["api.bank.example".to_owned()];
+        let address = "203.0.113.80".parse().unwrap();
+        let mut wrong_resolver = observation(
+            "node-a",
+            "finance/production",
+            "api.bank.example",
+            address,
+            60,
+            NOW,
+        );
+        wrong_resolver.source.resolver = "10.96.0.99".parse().unwrap();
+        let unauthorized = observation(
+            "node-b",
+            "finance/production",
+            "rogue.bank.example",
+            address,
+            60,
+            NOW,
+        );
+        let authorized = observation(
+            "node-c",
+            "finance/production",
+            "api.bank.example",
+            address,
+            60,
+            NOW,
+        );
+        let compiled = compile_egress_fqdn_snapshot(
+            policy,
+            vec![wrong_resolver, unauthorized, authorized],
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(compiled.report.wrong_resolver_observations, 1);
+        assert_eq!(compiled.report.unauthorized_name_observations, 1);
+        assert_eq!(compiled.report.accepted_observations, 1);
+        assert_eq!(compiled.snapshot.leases.len(), 1);
+        assert_eq!(compiled.snapshot.leases[0].query_name, "api.bank.example");
     }
 
     #[test]
@@ -1254,6 +1437,8 @@ mod tests {
         let spec = EgressFqdnDestinationSpec {
             patterns: policy().patterns,
             view: "finance/production".to_owned(),
+            discovery_names: policy().discovery_names,
+            resolver_addresses: policy().resolver_addresses,
             required_observers: 2,
             max_addresses: 8,
             max_ttl_seconds: 300,

@@ -22,22 +22,34 @@ spec:
               destinations:
                 default:
                   dns:
+                    discoveryNames: []
                     establishedFlowGraceSeconds: 30
                     maxAddresses: 256
                     maxTtlSeconds: 300
                     requiredObservers: 1
+                    resolverAddresses: []
                     view: cluster-default
                   fqdn: []
                   networks: []
                 properties:
                   dns:
                     default:
+                      discoveryNames: []
                       establishedFlowGraceSeconds: 30
                       maxAddresses: 256
                       maxTtlSeconds: 300
                       requiredObservers: 1
+                      resolverAddresses: []
                       view: cluster-default
                     properties:
+                      discoveryNames:
+                        default: []
+                        description: |-
+                          Concrete names that authorize bounded observation for wildcard
+                          patterns. Exact FQDN patterns are observed without repeating them here.
+                        items:
+                          type: string
+                        type: array
                       establishedFlowGraceSeconds:
                         default: 30
                         format: uint32
@@ -62,6 +74,15 @@ spec:
                         maximum: 16.0
                         minimum: 1.0
                         type: integer
+                      resolverAddresses:
+                        default: []
+                        description: |-
+                          Resolver IPs that are authoritative for this named view. A custom view
+                          must declare at least one address; the default view may use the Node's
+                          configured resolver when this list is empty.
+                        items:
+                          type: string
+                        type: array
                       view:
                         default: cluster-default
                         type: string

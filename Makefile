@@ -9,6 +9,7 @@
 .PHONY: egress-fqdn-evidence-test
 .PHONY: egress-fqdn-control-test
 .PHONY: egress-fqdn-dataplane-test
+.PHONY: egress-fqdn-lifecycle-test
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -247,6 +248,16 @@ egress-fqdn-control-test: egress-fqdn-evidence-test
 egress-fqdn-dataplane-test: egress-fqdn-control-test
 	hack/verify-egress-fqdn-dataplane.sh
 	cargo clippy -p unf-agent -p unf-controller -p unf-ebpf-common -p unf-egress --all-targets --all-features -- -D warnings
+
+egress-fqdn-lifecycle-test: egress-fqdn-dataplane-test service-kind-load
+	hack/verify-egress-fqdn-discovery.sh
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) apply -k deploy/kind-service-fabric
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout restart deployment/unf-controller daemonset/unf-agent -n unf-system
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout status deployment/unf-controller -n unf-system --timeout=180s
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout status daemonset/unf-agent -n unf-system --timeout=180s
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) hack/migrate-kind-bpf-abi-v15.sh
+	bash -n hack/verify-kind-egress-fqdn-lifecycle.sh
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) UNF_TEST_TOOLS_IMAGE=$(TEST_TOOLS_IMAGE) hack/verify-kind-egress-fqdn-lifecycle.sh
 
 test:
 	cargo test --workspace

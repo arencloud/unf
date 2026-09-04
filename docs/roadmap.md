@@ -606,6 +606,13 @@ matrix is maintained in the
   unchanged unless explicit admitted intent owns the flow.
 - FQDN controls use bounded TTL/staleness/provenance-aware address sets; DNS
   names and answers never become workload identity.
+- Phase 8.7d verifies explicit wildcard discovery names and resolver-address
+  authority per view. Two Node-owned batches must form quorum before dual-stack
+  authority exists. Equivalent contracts from replicas sharing one identity
+  retain per-Node provenance and coalesce into one gateway behavior; conflicts
+  fail closed. Two source activation grants, authoritative empty state, observer
+  replacement, recovery, and final withdrawal pass the dedicated Kind lifecycle
+  gate (ADR 0145).
 - Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
   ServiceAccount selectors; canonical destinations and non-overlapping
   dual-stack pools; pool-family/multiple-address intent; strict OpenShift

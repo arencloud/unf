@@ -36,6 +36,8 @@ pub enum NativeEgressApiError {
     AmbiguousDestinations(String),
     #[error("EgressPolicy {name:?} has invalid FQDN pattern {value:?}")]
     InvalidFqdn { name: String, value: String },
+    #[error("EgressPolicy {name:?} has invalid DNS resolver address {value:?}")]
+    InvalidDnsResolver { name: String, value: String },
     #[error("native egress resource cannot be normalized: {0}")]
     InvalidModel(String),
 }
@@ -188,11 +190,25 @@ fn translate_destinations(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let resolver_addresses = controls
+                .resolver_addresses
+                .iter()
+                .map(|value| {
+                    value
+                        .parse::<IpAddr>()
+                        .map_err(|_| NativeEgressApiError::InvalidDnsResolver {
+                            name: name.to_owned(),
+                            value: value.clone(),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             (
                 DomainDestinations::DenyAll,
                 Some(EgressFqdnDestinationSpec {
                     patterns,
                     view: controls.view.clone(),
+                    discovery_names: controls.discovery_names.clone(),
+                    resolver_addresses,
                     required_observers: controls.required_observers,
                     max_addresses: controls.max_addresses,
                     max_ttl_seconds: controls.max_ttl_seconds,
@@ -376,6 +392,8 @@ mod tests {
                     "fqdn": ["API.PARTNER.TEST.", "*.bank.example"],
                     "dns": {
                         "view": "finance/production",
+                        "discoveryNames": ["payments.bank.example"],
+                        "resolverAddresses": ["10.96.0.53", "2001:db8::53"],
                         "requiredObservers": 2,
                         "maxAddresses": 128,
                         "maxTtlSeconds": 120,
@@ -396,6 +414,14 @@ mod tests {
         );
         assert_eq!(fqdn.required_observers, 2);
         assert_eq!(fqdn.max_ttl_seconds, 120);
+        assert_eq!(fqdn.discovery_names, ["payments.bank.example"]);
+        assert_eq!(
+            fqdn.resolver_addresses,
+            [
+                "10.96.0.53".parse::<IpAddr>().unwrap(),
+                "2001:db8::53".parse::<IpAddr>().unwrap()
+            ]
+        );
 
         let ambiguous: EgressPolicy = serde_json::from_value(serde_json::json!({
             "apiVersion": "network.unf.io/v1alpha1",

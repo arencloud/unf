@@ -5,7 +5,7 @@
 //! canonical behavior contract and requires independent replay before host
 //! state can be compiled.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -506,7 +506,7 @@ pub enum EgressDistributionError {
     GatewayProjectionTooLarge,
     #[error("egress gateway projection source contracts are duplicated or noncanonical")]
     InvalidGatewayContractOrder,
-    #[error("egress gateway projection contains a duplicate source identity")]
+    #[error("egress gateway projection contains conflicting behavior for one source identity")]
     DuplicateGatewayIdentity,
     #[error("egress gateway is not a ready, reachable candidate for every projected contract")]
     GatewayNotSelected,
@@ -848,7 +848,7 @@ impl EgressGatewayProjection {
         }
         let mut previous_node: Option<&str> = None;
         let mut total_plans = 0_usize;
-        let mut identities = BTreeSet::new();
+        let mut identities = BTreeMap::new();
         for contract in &self.source_contracts {
             contract.verify_integrity()?;
             if contract.schema_version != self.negotiated.contract_schema
@@ -864,7 +864,9 @@ impl EgressGatewayProjection {
                 return Err(EgressDistributionError::GatewayProjectionTooLarge);
             }
             for plan in &contract.plans {
-                if !identities.insert(plan.source.identity) {
+                if let Some(previous) = identities.insert(plan.source.identity, plan)
+                    && !gateway_identity_behavior_matches(previous, plan)
+                {
                     return Err(EgressDistributionError::DuplicateGatewayIdentity);
                 }
             }
@@ -909,6 +911,29 @@ impl EgressGatewayProjection {
         hasher.update(material);
         Ok(EgressGatewayProjectionDigest(hasher.finalize().into()))
     }
+}
+
+// One identity can legitimately have replicas on several source Nodes. The
+// gateway needs every Node-bound contract as provenance, but only one
+// identity-keyed dataplane behavior. Admit the replicas only when every field
+// that can affect policy, address, gateway, or revision behavior is identical.
+fn gateway_identity_behavior_matches(
+    left: &crate::EgressBehaviorPlan,
+    right: &crate::EgressBehaviorPlan,
+) -> bool {
+    left.source.identity == right.source.identity
+        && left.source.namespace == right.source.namespace
+        && left.source.service_account == right.source.service_account
+        && left.source.namespace_labels == right.source.namespace_labels
+        && left.source.workload_labels == right.source.workload_labels
+        && left.source.intent_uid == right.source.intent_uid
+        && left.intent == right.intent
+        && left.destinations == right.destinations
+        && left.policy == right.policy
+        && left.allocation == right.allocation
+        && left.gateways == right.gateways
+        && left.required_capabilities == right.required_capabilities
+        && left.revisions == right.revisions
 }
 
 /// Monotonic last-known-good selected-gateway projection ownership. Explicit
@@ -1333,6 +1358,30 @@ pub(crate) mod test_support {
         .admit(&principal("worker-a"), &advertisement(), &model, &facts)
         .expect("admit variant projection")
     }
+
+    pub fn admitted_replica(revision: u64, policy_variant: bool) -> AdmittedEgressProjection {
+        let (model, mut facts, _) = fixture();
+        let source_node = node("worker-b");
+        facts.sources[0].workload = "ledger-replica".to_owned();
+        facts.sources[0].workload_uid = "ledger-replica-uid".to_owned();
+        facts.sources[0].node = source_node.clone();
+        if policy_variant {
+            facts.policies[0].policy_ids = vec![PolicyId::new(4)];
+        }
+        let contract =
+            EgressBehaviorContract::issue(&model, &facts, source_node, Revision::new(20))
+                .expect("valid replica contract");
+        EgressNodeProjection::issue(
+            &principal("worker-b"),
+            &advertisement(),
+            10,
+            Revision::new(revision),
+            contract,
+        )
+        .expect("issue replica projection")
+        .admit(&principal("worker-b"), &advertisement(), &model, &facts)
+        .expect("admit replica projection")
+    }
 }
 
 #[cfg(test)]
@@ -1559,6 +1608,35 @@ mod tests {
                 &[source.clone(), source],
             ),
             Err(EgressDistributionError::InvalidGatewayContractOrder)
+        );
+    }
+
+    #[test]
+    fn gateway_projection_retains_equivalent_replica_provenance_and_rejects_conflicts() {
+        let source = admitted(4);
+        let replica = admitted_replica(4, false);
+        let projection = EgressGatewayProjection::issue(
+            &principal("gateway-a"),
+            &advertisement(),
+            10,
+            Revision::new(5),
+            &[source.clone(), replica],
+        )
+        .expect("equivalent identity replicas are safe to aggregate");
+        assert_eq!(projection.source_contracts.len(), 2);
+        projection
+            .admit(&principal("gateway-a"), &advertisement())
+            .expect("replica provenance remains independently admissible");
+
+        assert_eq!(
+            EgressGatewayProjection::issue(
+                &principal("gateway-a"),
+                &advertisement(),
+                10,
+                Revision::new(6),
+                &[source, admitted_replica(4, true)],
+            ),
+            Err(EgressDistributionError::DuplicateGatewayIdentity)
         );
     }
 

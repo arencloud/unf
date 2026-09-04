@@ -198,6 +198,18 @@ while Phase 8.7c advances the same-size layouts to egress ABI v4 temporal
 semantics. Neither representation is interchangeable; ADRs 0117, 0120, 0126,
 and 0144.
 
+Phase 8.7d keeps DNS discovery authority in the normalized model rather than in
+ephemeral producer configuration. Concrete wildcard `discoveryNames` and each
+view's `resolverAddresses` are canonical digest inputs. Agent batches remain
+keyed by authenticated Node UID and view, while PLR independently rejects a
+query name or resolver outside those exact sets. Resolver selection therefore
+cannot silently alter authority without a desired-state revision; ADR 0145.
+The same milestone distinguishes source-Node provenance from identity-keyed
+gateway state: equivalent replica contracts remain individually acknowledged
+and activation-grant-bound, then deterministically coalesce to one gateway NAT
+behavior. Any policy, destination, allocation, gateway, capability, or revision
+disagreement for that identity rejects the complete projection.
+
 Phase 8.4a adds an identity-indexed egress admission state machine outside the
 packet ABI. Explicit intent is installed as `Fenced` before it can become
 `Active`; withdrawal returns through the fence before an owner-matched release

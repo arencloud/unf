@@ -422,7 +422,7 @@ jq -e '(.haPromotions | length) == 1
     and .haPromotions[0].replacementStaged == false' <<<"${abrupt_state}" >/dev/null
 if probe abrupt-fenced; then
     echo "abrupt failure did not fence the complete managed source" >&2
-    exit 1
+    false
 fi
 "${runtime[@]}" unpause "${paused_node}" >/dev/null
 paused_node=

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -10,9 +9,9 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 use unf_common::Revision;
 use unf_egress::{
-    DEFAULT_EGRESS_FQDN_VIEW, EGRESS_FQDN_OBSERVATION_BATCH_SCHEMA_VERSION, EgressDnsAnswer,
-    EgressDnsObservation, EgressDnsObservationSource, EgressFqdnObservationBatch,
-    MAX_EGRESS_FQDN_CNAME_DEPTH, MAX_EGRESS_FQDN_OBSERVATIONS,
+    EGRESS_FQDN_OBSERVATION_BATCH_SCHEMA_VERSION, EgressDnsAnswer, EgressDnsObservation,
+    EgressDnsObservationSource, EgressFqdnObservationBatch, MAX_EGRESS_FQDN_CNAME_DEPTH,
+    MAX_EGRESS_FQDN_OBSERVATIONS,
 };
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -22,9 +21,11 @@ const MAX_REFRESH_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub struct FqdnObserver {
+    view: String,
     source_epoch: u64,
     batch_revision: Revision,
     targets: BTreeSet<String>,
+    resolver: Option<SocketAddr>,
     next_refresh_unix_seconds: u64,
 }
 
@@ -36,13 +37,20 @@ struct ParsedDns {
 
 impl FqdnObserver {
     #[must_use]
-    pub fn new(source_epoch: u64) -> Self {
+    pub fn new(source_epoch: u64, view: String) -> Self {
         Self {
+            view,
             source_epoch: source_epoch.max(1),
             batch_revision: Revision::INITIAL,
             targets: BTreeSet::new(),
+            resolver: None,
             next_refresh_unix_seconds: 0,
         }
+    }
+
+    #[must_use]
+    pub const fn resolver(&self) -> Option<SocketAddr> {
+        self.resolver
     }
 
     /// Produces one complete replacement batch. A failed lookup returns an
@@ -53,12 +61,15 @@ impl FqdnObserver {
         observer_node_uid: &str,
         targets: BTreeSet<String>,
         now_unix_seconds: u64,
-        resolv_conf: &Path,
+        resolver: SocketAddr,
     ) -> Result<Option<EgressFqdnObservationBatch>> {
         if targets.len() > MAX_EGRESS_FQDN_OBSERVATIONS {
             bail!("exact FQDN observation target set exceeds its atomic batch bound");
         }
-        if targets == self.targets && now_unix_seconds < self.next_refresh_unix_seconds {
+        if targets == self.targets
+            && self.resolver == Some(resolver)
+            && now_unix_seconds < self.next_refresh_unix_seconds
+        {
             return Ok(None);
         }
         let next_revision = self.batch_revision.next();
@@ -77,12 +88,11 @@ impl FqdnObserver {
                 observer_node_uid: observer_node_uid.to_owned(),
                 source_epoch: self.source_epoch,
                 batch_revision: next_revision,
-                view: DEFAULT_EGRESS_FQDN_VIEW.to_owned(),
+                view: self.view.clone(),
                 collected_at_unix_seconds: now_unix_seconds,
                 observations: Vec::new(),
             }));
         }
-        let resolver = resolver_from_resolv_conf(resolv_conf)?;
         let mut observations = Vec::with_capacity(targets.len());
         let mut minimum_ttl = u32::MAX;
         for query_name in &targets {
@@ -94,7 +104,7 @@ impl FqdnObserver {
                 source: EgressDnsObservationSource {
                     observer_uid: observer_node_uid.to_owned(),
                     resolver: resolver.ip(),
-                    view: DEFAULT_EGRESS_FQDN_VIEW.to_owned(),
+                    view: self.view.clone(),
                     source_epoch: self.source_epoch,
                 },
                 observation_revision: next_revision,
@@ -114,18 +124,19 @@ impl FqdnObserver {
             observer_node_uid: observer_node_uid.to_owned(),
             source_epoch: self.source_epoch,
             batch_revision: next_revision,
-            view: DEFAULT_EGRESS_FQDN_VIEW.to_owned(),
+            view: self.view.clone(),
             collected_at_unix_seconds: now_unix_seconds,
             observations,
         };
         self.batch_revision = next_revision;
         self.targets = targets;
+        self.resolver = Some(resolver);
         self.next_refresh_unix_seconds = now_unix_seconds.saturating_add(refresh);
         Ok(Some(batch))
     }
 }
 
-fn resolver_from_resolv_conf(path: &Path) -> Result<SocketAddr> {
+pub(crate) fn resolver_from_resolv_conf(path: &std::path::Path) -> Result<SocketAddr> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("read DNS resolver configuration {}", path.display()))?;
     content
@@ -422,11 +433,43 @@ fn transaction_id(name: &str, revision: u64, query_type: u16) -> u16 {
 mod tests {
     use super::*;
 
+    async fn spawn_dual_stack_dns_fixture() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut request = [0_u8; 512];
+            for _ in 0..2 {
+                let (length, peer) = socket.recv_from(&mut request).await.unwrap();
+                let mut response = request[..length].to_vec();
+                response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+                response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+                let query_type = u16::from_be_bytes([response[length - 4], response[length - 3]]);
+                response.extend_from_slice(&[0xc0, 0x0c]);
+                response.extend_from_slice(&query_type.to_be_bytes());
+                response.extend_from_slice(&1_u16.to_be_bytes());
+                response.extend_from_slice(&20_u32.to_be_bytes());
+                match query_type {
+                    1 => response.extend_from_slice(&[0, 4, 192, 0, 2, 80]),
+                    28 => {
+                        response.extend_from_slice(&16_u16.to_be_bytes());
+                        response.extend_from_slice(
+                            &"2001:db8::80".parse::<Ipv6Addr>().unwrap().octets(),
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                socket.send_to(&response, peer).await.unwrap();
+            }
+        });
+        (address, task)
+    }
+
     #[tokio::test]
     async fn removing_the_last_target_publishes_one_authoritative_empty_batch() {
-        let mut observer = FqdnObserver::new(17);
+        let mut observer = FqdnObserver::new(17, "finance/production".to_owned());
         observer.batch_revision = Revision::new(4);
         observer.targets.insert("api.example.test".to_owned());
+        observer.resolver = Some("192.0.2.53:53".parse().unwrap());
         observer.next_refresh_unix_seconds = 10_000;
 
         let batch = observer
@@ -434,13 +477,14 @@ mod tests {
                 "node-uid-a",
                 BTreeSet::new(),
                 100,
-                Path::new("/path/is/not/read"),
+                "192.0.2.53:53".parse().unwrap(),
             )
             .await
             .unwrap()
             .expect("last-target removal must be authoritative");
         assert_eq!(batch.batch_revision, Revision::new(5));
         assert!(batch.observations.is_empty());
+        assert_eq!(batch.view, "finance/production");
         assert!(observer.targets.is_empty());
         assert_eq!(observer.next_refresh_unix_seconds, 0);
 
@@ -450,12 +494,44 @@ mod tests {
                     "node-uid-a",
                     BTreeSet::new(),
                     101,
-                    Path::new("/path/is/not/read"),
+                    "192.0.2.53:53".parse().unwrap(),
                 )
                 .await
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn custom_view_observation_uses_its_bound_resolver_and_dual_stack_answers() {
+        let (resolver, server) = spawn_dual_stack_dns_fixture().await;
+        let mut observer = FqdnObserver::new(19, "finance/production".to_owned());
+        let batch = observer
+            .observe(
+                "node-uid-a",
+                BTreeSet::from(["payments.bank.example".to_owned()]),
+                1_000,
+                resolver,
+            )
+            .await
+            .unwrap()
+            .expect("first custom-view observation");
+        server.await.unwrap();
+        assert_eq!(batch.view, "finance/production");
+        assert_eq!(batch.observations.len(), 1);
+        assert_eq!(batch.observations[0].source.resolver, resolver.ip());
+        assert_eq!(
+            batch.observations[0]
+                .answers
+                .iter()
+                .map(|answer| answer.address)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "192.0.2.80".parse().unwrap(),
+                "2001:db8::80".parse().unwrap()
+            ])
+        );
+        assert_eq!(observer.next_refresh_unix_seconds, 1_010);
     }
 
     #[test]

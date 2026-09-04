@@ -549,8 +549,15 @@ fn compile_egress_gateway_dataplane_inner(
                 continue;
             };
             let identity = plan.source.identity;
-            if identity.get() == 0 || !identities.insert(identity) {
+            if identity.get() == 0 {
                 return Err(EgressDataplaneError::InvalidHostBank);
+            }
+            // The admitted projection may retain several independently
+            // verified source-Node contracts for replicas that share one
+            // identity. Its structural verifier proved their gateway behavior
+            // equivalent, so lower exactly one canonical identity entry.
+            if !identities.insert(identity) {
+                continue;
             }
             let local_index =
                 u16::try_from(local_index).map_err(|_| EgressDataplaneError::CandidateIndex)?;
@@ -1325,7 +1332,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::distribution::test_support::{advertisement, fixture, node, principal};
+    use crate::distribution::test_support::{
+        admitted, admitted_replica, advertisement, fixture, node, principal,
+    };
     use crate::{
         AdmittedEgressProjection, EGRESS_PROTOCOL_TCP, EgressAddressLease, EgressBehaviorContract,
         EgressDnsAnswer, EgressDnsObservation, EgressDnsObservationSource, EgressFlowProof,
@@ -1399,6 +1408,8 @@ mod tests {
         model.intents[0].fqdn = Some(EgressFqdnDestinationSpec {
             patterns: vec![EgressFqdnPattern::Exact("api.example.test".to_owned())],
             view: crate::DEFAULT_EGRESS_FQDN_VIEW.to_owned(),
+            discovery_names: Vec::new(),
+            resolver_addresses: Vec::new(),
             required_observers: crate::DEFAULT_EGRESS_FQDN_REQUIRED_OBSERVERS,
             max_addresses: crate::DEFAULT_EGRESS_FQDN_MAX_ADDRESSES,
             max_ttl_seconds: crate::DEFAULT_EGRESS_FQDN_MAX_TTL_SECONDS,
@@ -1502,6 +1513,32 @@ mod tests {
             .map(|(key, _)| key.intent_index)
             .collect::<BTreeSet<_>>();
         assert_eq!(namespaces, BTreeSet::from([42, 43]));
+    }
+
+    #[test]
+    fn gateway_nat_bank_coalesces_equivalent_cross_node_identity_replicas() {
+        let gateway_principal = principal("gateway-a");
+        let admitted = EgressGatewayProjection::issue(
+            &gateway_principal,
+            &advertisement(),
+            10,
+            Revision::new(9),
+            &[admitted(4), admitted_replica(4, false)],
+        )
+        .expect("replica gateway projection")
+        .admit(&gateway_principal, &advertisement())
+        .expect("admitted replica gateway projection");
+        let state = compile_egress_gateway_dataplane(&admitted, 1)
+            .expect("coalesced identity-keyed gateway NAT bank");
+        assert_eq!(state.sources.len(), 1);
+        assert_eq!(state.ipv4_destinations.len(), 1);
+        assert_eq!(state.ipv6_destinations.len(), 1);
+        assert_eq!(state.addresses.len(), 2);
+        assert_eq!(state.gateways.len(), 2);
+        assert_eq!(
+            state.selections.len(),
+            usize::from(EGRESS_SELECTION_TABLE_SIZE) * 2
+        );
     }
 
     fn guard(projection: &AdmittedEgressProjection, active: bool) -> EgressAdmissionGuard {
@@ -1654,6 +1691,8 @@ mod tests {
         let spec = EgressFqdnDestinationSpec {
             patterns: vec![EgressFqdnPattern::Exact("api.example.test".to_owned())],
             view: crate::DEFAULT_EGRESS_FQDN_VIEW.to_owned(),
+            discovery_names: Vec::new(),
+            resolver_addresses: Vec::new(),
             required_observers: 1,
             max_addresses: 8,
             max_ttl_seconds: 300,
@@ -1666,6 +1705,8 @@ mod tests {
                 owner: model.intents[0].owner.clone(),
                 patterns: spec.patterns.clone(),
                 view: spec.view.clone(),
+                discovery_names: spec.discovery_names.clone(),
+                resolver_addresses: spec.resolver_addresses.clone(),
                 required_observers: spec.required_observers,
                 max_addresses: spec.max_addresses,
                 max_ttl_seconds: spec.max_ttl_seconds,
@@ -1692,7 +1733,7 @@ mod tests {
         .unwrap()
         .snapshot;
         model.intents[0].fqdn = Some(spec);
-        model.intents[0].destinations = EgressDestinations::Fqdn(snapshot);
+        model.intents[0].destinations = EgressDestinations::Fqdn(Box::new(snapshot));
         facts.gateways.push(EgressGatewayFact {
             intent_uid: "intent-uid".to_owned(),
             rank: 1,

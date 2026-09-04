@@ -177,6 +177,15 @@ pub struct EgressDestinations {
 pub struct EgressDnsControls {
     #[serde(default = "default_egress_dns_view")]
     pub view: String,
+    /// Concrete names that authorize bounded observation for wildcard
+    /// patterns. Exact FQDN patterns are observed without repeating them here.
+    #[serde(default)]
+    pub discovery_names: Vec<String>,
+    /// Resolver IPs that are authoritative for this named view. A custom view
+    /// must declare at least one address; the default view may use the Node's
+    /// configured resolver when this list is empty.
+    #[serde(default)]
+    pub resolver_addresses: Vec<String>,
     #[serde(default = "default_egress_dns_required_observers")]
     #[schemars(range(min = 1, max = 16))]
     pub required_observers: u16,
@@ -195,6 +204,8 @@ impl Default for EgressDnsControls {
     fn default() -> Self {
         Self {
             view: default_egress_dns_view(),
+            discovery_names: Vec::new(),
+            resolver_addresses: Vec::new(),
             required_observers: default_egress_dns_required_observers(),
             max_addresses: default_egress_dns_max_addresses(),
             max_ttl_seconds: default_egress_dns_max_ttl_seconds(),

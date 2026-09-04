@@ -124,7 +124,7 @@ mod cni_server;
 mod fqdn_observer;
 
 use cni_server::CniTransactionServer;
-use fqdn_observer::FqdnObserver;
+use fqdn_observer::{FqdnObserver, resolver_from_resolv_conf};
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
 const FLOW_EXPORT_PENDING_CAPACITY: usize = 2_048;
@@ -940,7 +940,7 @@ struct EgressSynchronizer {
     ha_activations:
         BTreeMap<EgressIntentOwner, (EgressHaActivationAuthority, EgressHaContinuityCutover)>,
     clock_anchor: Option<EgressDataplaneClock>,
-    fqdn_observer: Option<FqdnObserver>,
+    fqdn_observers: BTreeMap<String, FqdnObserver>,
     path_provider: Option<NativeEgressPathProvider>,
     node_name: String,
     controller_url: Option<String>,
@@ -7003,7 +7003,7 @@ fn new_synchronizers(
             ha_replicas: BTreeMap::new(),
             ha_activations: BTreeMap::new(),
             clock_anchor: None,
-            fqdn_observer: None,
+            fqdn_observers: BTreeMap::new(),
             path_provider: egress_path_provider,
             node_name,
             controller_url,
@@ -9230,7 +9230,8 @@ async fn synchronize_egress_source(
     let controller_url = synchronizer
         .controller_url
         .as_deref()
-        .context("egress synchronization requires a controller URL")?;
+        .context("egress synchronization requires a controller URL")?
+        .to_owned();
     let advertisement = egress_agent_advertisement();
     let response = synchronizer
         .client
@@ -9244,6 +9245,24 @@ async fn synchronize_egress_source(
     if response.status() == reqwest::StatusCode::NO_CONTENT {
         let changed = fence_active_egress_dataplane(synchronizer)
             .context("fence egress state after source authority withdrawal")?;
+        if !synchronizer.fqdn_observers.is_empty() {
+            let node = fetch_node_port_node_snapshot(
+                &controller_url,
+                &synchronizer.client,
+                &synchronizer.agent_token_path,
+            )
+            .await?
+            .validate_and_normalize()
+            .context("validate local Node identity for FQDN withdrawal")?;
+            if node.node_name != synchronizer.node_name {
+                bail!("controller returned foreign Node identity during FQDN withdrawal");
+            }
+            if let Err(error) =
+                publish_fqdn_observations(synchronizer, &node.node_uid, BTreeMap::new()).await
+            {
+                warn!(%error, "final FQDN observation withdrawal was not published; existing leases remain bounded by TTL");
+            }
+        }
         publish_egress_source_retirement_evidence(synchronizer).await?;
         return Ok(changed);
     }
@@ -9253,9 +9272,9 @@ async fn synchronize_egress_source(
         .json()
         .await
         .context("decode egress source projection envelope")?;
-    let observation_targets = exact_fqdn_observation_targets(&envelope);
+    let observation_targets = fqdn_observation_targets(&envelope, Path::new("/etc/resolv.conf"))?;
     let node = fetch_node_port_node_snapshot(
-        controller_url,
+        &controller_url,
         &synchronizer.client,
         &synchronizer.agent_token_path,
     )
@@ -9336,7 +9355,16 @@ async fn synchronize_egress_source(
     Ok(true)
 }
 
-fn exact_fqdn_observation_targets(envelope: &EgressNodeProjectionEnvelope) -> BTreeSet<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FqdnObservationTargetSet {
+    resolver: SocketAddr,
+    names: BTreeSet<String>,
+}
+
+fn fqdn_observation_targets(
+    envelope: &EgressNodeProjectionEnvelope,
+    resolv_conf: &Path,
+) -> Result<BTreeMap<String, FqdnObservationTargetSet>> {
     let owners = envelope
         .projection
         .contract
@@ -9344,27 +9372,59 @@ fn exact_fqdn_observation_targets(envelope: &EgressNodeProjectionEnvelope) -> BT
         .iter()
         .map(|plan| &plan.intent)
         .collect::<BTreeSet<_>>();
-    envelope
+    let mut result = BTreeMap::<String, FqdnObservationTargetSet>::new();
+    for spec in envelope
         .model
         .intents
         .iter()
         .filter(|intent| owners.contains(&intent.owner))
         .filter_map(|intent| intent.fqdn.as_ref())
-        .filter(|spec| spec.view == unf_egress::DEFAULT_EGRESS_FQDN_VIEW)
-        .flat_map(|spec| &spec.patterns)
-        .filter_map(|pattern| match pattern {
+    {
+        let mut names = spec
+            .discovery_names
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        names.extend(spec.patterns.iter().filter_map(|pattern| match pattern {
             EgressFqdnPattern::Exact(name) => Some(name.clone()),
             EgressFqdnPattern::WildcardSuffix(_) => None,
-        })
-        .collect()
+        }));
+        if names.is_empty() {
+            continue;
+        }
+        let resolver = if let Some(address) = spec.resolver_addresses.first().copied() {
+            SocketAddr::new(address, 53)
+        } else if spec.view == unf_egress::DEFAULT_EGRESS_FQDN_VIEW {
+            resolver_from_resolv_conf(resolv_conf)?
+        } else {
+            bail!("custom FQDN resolver view has no explicit resolver authority");
+        };
+        let target = result
+            .entry(spec.view.clone())
+            .or_insert_with(|| FqdnObservationTargetSet {
+                resolver,
+                names: BTreeSet::new(),
+            });
+        if target.resolver != resolver {
+            bail!(
+                "FQDN view {:?} has conflicting resolver authority on one Node",
+                spec.view
+            );
+        }
+        target.names.extend(names);
+        if target.names.len() > unf_egress::MAX_EGRESS_FQDN_OBSERVATIONS {
+            bail!("FQDN view observation target set exceeds its atomic batch bound");
+        }
+    }
+    Ok(result)
 }
 
 async fn publish_fqdn_observations(
     synchronizer: &mut EgressSynchronizer,
     observer_node_uid: &str,
-    targets: BTreeSet<String>,
+    targets: BTreeMap<String, FqdnObservationTargetSet>,
 ) -> Result<bool> {
-    if targets.is_empty() && synchronizer.fqdn_observer.is_none() {
+    if targets.is_empty() && synchronizer.fqdn_observers.is_empty() {
         return Ok(false);
     }
     let controller_url = synchronizer
@@ -9378,48 +9438,74 @@ async fn publish_fqdn_observations(
         .duration_since(UNIX_EPOCH)
         .context("system clock precedes UNIX epoch")?
         .as_secs();
-    if synchronizer.fqdn_observer.is_none() {
-        let source_epoch = u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context("system clock precedes UNIX epoch")?
-                .as_nanos(),
-        )
-        .unwrap_or(u64::MAX);
-        synchronizer.fqdn_observer = Some(FqdnObserver::new(source_epoch));
+    let source_epoch = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock precedes UNIX epoch")?
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX);
+    let views = targets
+        .keys()
+        .chain(synchronizer.fqdn_observers.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut changed = false;
+    for view in views {
+        let removing = !targets.contains_key(&view);
+        if !synchronizer.fqdn_observers.contains_key(&view) {
+            synchronizer
+                .fqdn_observers
+                .insert(view.clone(), FqdnObserver::new(source_epoch, view.clone()));
+        }
+        let target = targets.get(&view);
+        let resolver = target
+            .map(|target| target.resolver)
+            .or_else(|| {
+                synchronizer
+                    .fqdn_observers
+                    .get(&view)
+                    .and_then(FqdnObserver::resolver)
+            })
+            .context("withdrawn FQDN view has no prior resolver authority")?;
+        let names = target
+            .map(|target| target.names.clone())
+            .unwrap_or_default();
+        let observer = synchronizer
+            .fqdn_observers
+            .get_mut(&view)
+            .expect("initialized FQDN view observer");
+        let previous = observer.clone();
+        let Some(batch) = observer
+            .observe(observer_node_uid, names, now_unix_seconds, resolver)
+            .await?
+        else {
+            continue;
+        };
+        let result = client
+            .post(format!(
+                "{controller_url}/v1/state/egress-fqdn-observations"
+            ))
+            .bearer_auth(&token)
+            .json(&batch)
+            .send()
+            .await
+            .context("publish complete FQDN observation batch")?
+            .error_for_status()
+            .context("controller rejected complete FQDN observation batch");
+        if let Err(error) = result {
+            *synchronizer
+                .fqdn_observers
+                .get_mut(&view)
+                .expect("FQDN observer remains present after publication") = previous;
+            return Err(error);
+        }
+        changed = true;
+        if removing {
+            synchronizer.fqdn_observers.remove(&view);
+        }
     }
-    let observer = synchronizer
-        .fqdn_observer
-        .as_mut()
-        .expect("initialized FQDN observer");
-    let previous = observer.clone();
-    let Some(batch) = observer
-        .observe(
-            observer_node_uid,
-            targets,
-            now_unix_seconds,
-            Path::new("/etc/resolv.conf"),
-        )
-        .await?
-    else {
-        return Ok(false);
-    };
-    let result = client
-        .post(format!(
-            "{controller_url}/v1/state/egress-fqdn-observations"
-        ))
-        .bearer_auth(token)
-        .json(&batch)
-        .send()
-        .await
-        .context("publish complete FQDN observation batch")?
-        .error_for_status()
-        .context("controller rejected complete FQDN observation batch");
-    if let Err(error) = result {
-        *observer = previous;
-        return Err(error);
-    }
-    Ok(true)
+    Ok(changed)
 }
 
 async fn activate_current_egress_source(
@@ -17151,7 +17237,7 @@ mod tests {
             ha_replicas: BTreeMap::new(),
             ha_activations: BTreeMap::new(),
             clock_anchor: None,
-            fqdn_observer: None,
+            fqdn_observers: BTreeMap::new(),
             path_provider: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
@@ -17377,7 +17463,7 @@ mod tests {
             ha_replicas: BTreeMap::new(),
             ha_activations: BTreeMap::new(),
             clock_anchor: None,
-            fqdn_observer: None,
+            fqdn_observers: BTreeMap::new(),
             path_provider: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,

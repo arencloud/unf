@@ -8,6 +8,7 @@ COPY images/ipv6-extension-probe.c /tmp/ipv6-extension-probe.c
 COPY images/bpf-map-pressure.c /tmp/bpf-map-pressure.c
 COPY images/http-flow-receiver.c /tmp/http-flow-receiver.c
 COPY images/udp-echo.c /tmp/udp-echo.c
+COPY images/dns-fixture.c /tmp/dns-fixture.c
 RUN gcc -std=c11 -O2 -Wall -Wextra -Werror \
     -o /usr/local/bin/unf-ipv6-extension-probe /tmp/ipv6-extension-probe.c \
     && gcc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -15,7 +16,9 @@ RUN gcc -std=c11 -O2 -Wall -Wextra -Werror \
     && gcc -std=c11 -O2 -Wall -Wextra -Werror \
     -o /usr/local/bin/unf-flow-receiver /tmp/http-flow-receiver.c \
     && gcc -std=c11 -O2 -Wall -Wextra -Werror \
-    -o /usr/local/bin/unf-udp-echo /tmp/udp-echo.c
+    -o /usr/local/bin/unf-udp-echo /tmp/udp-echo.c \
+    && gcc -std=c11 -O2 -Wall -Wextra -Werror \
+    -o /usr/local/bin/unf-dns-fixture /tmp/dns-fixture.c
 
 FROM docker.io/library/debian:bookworm-slim
 
@@ -31,5 +34,7 @@ COPY --from=probe-builder /usr/local/bin/unf-flow-receiver \
   /usr/local/bin/unf-flow-receiver
 COPY --from=probe-builder /usr/local/bin/unf-udp-echo \
   /usr/local/bin/unf-udp-echo
+COPY --from=probe-builder /usr/local/bin/unf-dns-fixture \
+  /usr/local/bin/unf-dns-fixture
 
 ENTRYPOINT ["/usr/bin/socat"]

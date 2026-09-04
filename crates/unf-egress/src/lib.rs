@@ -215,7 +215,7 @@ pub enum EgressDestinations {
     Networks(Vec<IpPrefix>),
     /// Independently replayable DNS evidence materialized by the controller.
     /// Native API translation never accepts this internal form directly.
-    Fqdn(EgressFqdnSnapshot),
+    Fqdn(Box<EgressFqdnSnapshot>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -417,11 +417,13 @@ pub fn normalize_intent(mut intent: EgressIntent) -> Result<EgressIntent, Egress
             ));
         }
         if let EgressDestinations::Fqdn(snapshot) = &intent.destinations {
-            let verified = verify_egress_fqdn_snapshot(snapshot.clone())
+            let verified = verify_egress_fqdn_snapshot(snapshot.as_ref().clone())
                 .map_err(|_| invalid_intent(&intent, "materialized FQDN snapshot is invalid"))?;
             if verified.snapshot().policy.owner != intent.owner
                 || verified.snapshot().policy.patterns != fqdn.patterns
                 || verified.snapshot().policy.view != fqdn.view
+                || verified.snapshot().policy.discovery_names != fqdn.discovery_names
+                || verified.snapshot().policy.resolver_addresses != fqdn.resolver_addresses
                 || verified.snapshot().policy.required_observers != fqdn.required_observers
                 || verified.snapshot().policy.max_addresses != fqdn.max_addresses
                 || verified.snapshot().policy.max_ttl_seconds != fqdn.max_ttl_seconds
