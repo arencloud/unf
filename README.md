@@ -406,14 +406,14 @@ worker-agent replacement, exact cleanup, five-agent convergence, and unchanged
 `insights`/`network` unhealthy baseline passed
 `hack/verify-openshift-service-selection.sh`; ADR 0112.
 Phase 8 begins an identity-aware enterprise egress fabric. Milestones 8.1
-through 8.5 are verified. Source-side security policy precedes steering and NAT, while
+through 8.6 and slice 8.7a are verified. Source-side security policy precedes steering and NAT, while
 `unf-egress` now canonically validates bounded Namespace, workload, and
 ServiceAccount selectors, destinations, non-overlapping dual-stack pools, and
 pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
 is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
-and ADRs 0113–0141 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+and ADRs 0113–0142 track the work. Milestone 8.2a now adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -591,6 +591,20 @@ Kubernetes NotReady signal never served as fence authority. `make
 egress-ha-kind-test` and ADR 0141 complete milestone 8.6 at this bounded Kind
 scope; production availability/scale, OpenShift qualification, and non-static
 reachability providers remain separate gates.
+Phase 8.7a introduces Provenance-Leased Resolution (PLR) for bounded FQDN
+destination evidence. Exact and label-bounded wildcard queries compile into
+short-lived address leases only after an explicit resolver-view-scoped quorum
+of distinct observers. The quorum-th latest capped expiry controls new flows;
+an optional bounded tail admits established flows only. Complete CNAME,
+observer, resolver, epoch, revision, TTL, and timestamp provenance supports
+independent replay and explanation. Split-horizon answers never merge, zero-TTL
+and below-quorum answers grant nothing, and capacity overflow rejects the whole
+snapshot instead of silently evicting entries. DNS remains address evidence,
+not workload or application identity, and no unrestricted IP fallback is
+inferred. Eight focused tests and strict Clippy pass under
+`make egress-fqdn-evidence-test`; ADR 0142. Native policy fields, trusted live
+observation, durable refresh, transactional maps, packet enforcement, and
+platform qualification remain explicit later 8.7 slices.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
