@@ -243,7 +243,17 @@ full contract/lease/digest/witness chain, reserves reverse then forward state
 without overwrite, and performs checksum-safe family-specific translation.
 Production watched-state joining, live release-evidence transport, sparse NAT
 events, and a complete dual-stack Kind lifecycle now close milestone 8.5.
-ADRs 0119–0135 record the verified boundary; measured HA/failover begins 8.6.
+Phase 8.6 adds live proof-gated HA without changing the persistent ABI-v14 map
+set. Runtime-only `SERVICE_DATAPLANE_TAIL_CALLS_V2` has eight slots, separating
+IPv4/IPv6 source classifiers from gateway NAT classifiers so a Node acting in
+both roles can pass non-owned gateway traffic to source steering without
+exceeding verifier stack depth or recursively re-steering gateway ingress.
+Complete forward/reverse AFT pairs are snapshotted from the persistent
+connection LRU, imported and read back on the standby, then activated only by a
+source-specific sealed cutover. Existing attached programs retain their prior
+pinned dispatcher during rolling replacement. ADRs 0119–0141 record the
+verified boundary; production availability/scale and platform qualification
+remain separate gates.
 
 The legacy netlink path, encrypted internal transport, and IPv4/IPv6 policy
 provenance now have repeatable evidence on separate OpenShift 4.22 IPv4-only and

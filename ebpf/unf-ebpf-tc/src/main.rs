@@ -28,7 +28,7 @@ use unf_ebpf_common::{
     EGRESS_EVENT_REASON_PAIR_STORE_FAILED, EGRESS_EVENT_REASON_PORT_EXHAUSTED,
     EGRESS_EVENT_REASON_REWRITE_FAILED, EGRESS_EVENT_REASON_TRANSLATION_CREATED,
     EGRESS_MAP_ABI_VERSION,
-    EGRESS_PATH_DIRECT_NEIGHBOR, FLOW_ABI_VERSION, FlowEvent,
+    EGRESS_PATH_DIRECT_NEIGHBOR, EGRESS_PATH_LOCAL_GATEWAY, FLOW_ABI_VERSION, FlowEvent,
     IDENTITY_BANK_COUNT,
     IDENTITY_MAP_ABI_VERSION, IPV6_EXTENSION_BYTE_LIMIT, IPV6_EXTENSION_HEADER_LIMIT,
     IPV6_NEXT_HEADER_HOP_BY_HOP, IdentityMapConfig, IdentityMapValue, Ipv4IdentityKey,
@@ -108,6 +108,8 @@ const SERVICE_DSR_TAIL_V4: u32 = 2;
 const SERVICE_DSR_TAIL_V6: u32 = 3;
 const EGRESS_GATEWAY_TAIL_V4: u32 = 4;
 const EGRESS_GATEWAY_TAIL_V6: u32 = 5;
+const EGRESS_SOURCE_TAIL_V4: u32 = 6;
+const EGRESS_SOURCE_TAIL_V6: u32 = 7;
 const SERVICE_POLICY_DISPATCH_V4: i32 = -1_001;
 const SERVICE_POLICY_DISPATCH_V6: i32 = -1_002;
 const EGRESS_GATEWAY_NOT_OWNED: i32 = -1_003;
@@ -428,7 +430,7 @@ static SERVICE_POST_LOOKUP_SCRATCH: PerCpuArray<u8> = PerCpuArray::with_max_entr
 /// from the bounded main classifiers. The agent loads all four targets before
 /// attaching either hook.
 #[map]
-static SERVICE_DATAPLANE_TAIL_CALLS: ProgramArray = ProgramArray::with_max_entries(6, 0);
+static SERVICE_DATAPLANE_TAIL_CALLS_V2: ProgramArray = ProgramArray::with_max_entries(8, 0);
 
 #[classifier]
 pub fn unf_observe_ingress(ctx: TcContext) -> i32 {
@@ -440,14 +442,14 @@ pub fn unf_observe_ingress(ctx: TcContext) -> i32 {
         // SAFETY: index 0 is a TC classifier over this exact context and the
         // agent installs it before attaching the main hook.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_POLICY_TAIL_V4) };
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V4) };
         return TC_ACT_SHOT;
     }
     if action == SERVICE_POLICY_DISPATCH_V6 {
         // SAFETY: index 1 is a TC classifier over this exact context and the
         // agent installs it before attaching the main hook.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_POLICY_TAIL_V6) };
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V6) };
         return TC_ACT_SHOT;
     }
     action
@@ -462,14 +464,14 @@ pub fn unf_observe_egress(ctx: TcContext) -> i32 {
         // SAFETY: index 0 is a TC classifier over this exact context and the
         // agent installs it before attaching the main hook.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_POLICY_TAIL_V4) };
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V4) };
         return TC_ACT_SHOT;
     }
     if action == SERVICE_POLICY_DISPATCH_V6 {
         // SAFETY: index 1 is a TC classifier over this exact context and the
         // agent installs it before attaching the main hook.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_POLICY_TAIL_V6) };
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_POLICY_TAIL_V6) };
         return TC_ACT_SHOT;
     }
     action
@@ -621,7 +623,7 @@ pub fn unf_policy_v4(ctx: TcContext) -> i32 {
     if gateway_egress_maybe_owned(observation) {
         // SAFETY: index 4 is the verifier-isolated IPv4 gateway NAT stage.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, EGRESS_GATEWAY_TAIL_V4) };
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_GATEWAY_TAIL_V4) };
         return TC_ACT_SHOT;
     }
     let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
@@ -633,7 +635,7 @@ pub fn unf_policy_v4(ctx: TcContext) -> i32 {
             // SAFETY: index 2 is a TC classifier over this exact context and
             // the agent installs it before attaching the main hook.
             #[allow(unsafe_code)]
-            unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_DSR_TAIL_V4) };
+            unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V4) };
             return dsr_route_failed();
         }
         if !observation.enforce && post_lookup & SERVICE_POST_LOOKUP_REROUTE_HOST != 0 {
@@ -661,7 +663,7 @@ pub fn unf_policy_v6(ctx: TcContext) -> i32 {
     if gateway_egress_maybe_owned(observation) {
         // SAFETY: index 5 is the verifier-isolated IPv6 gateway NAT stage.
         #[allow(unsafe_code)]
-        unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, EGRESS_GATEWAY_TAIL_V6) };
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_GATEWAY_TAIL_V6) };
         return TC_ACT_SHOT;
     }
     let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
@@ -673,7 +675,7 @@ pub fn unf_policy_v6(ctx: TcContext) -> i32 {
             // SAFETY: index 3 is a TC classifier over this exact context and
             // the agent installs it before attaching the main hook.
             #[allow(unsafe_code)]
-            unsafe { SERVICE_DATAPLANE_TAIL_CALLS.tail_call(&ctx, SERVICE_DSR_TAIL_V6) };
+            unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V6) };
             return dsr_route_failed();
         }
         if !observation.enforce && post_lookup & SERVICE_POST_LOOKUP_REROUTE_HOST != 0 {
@@ -718,7 +720,19 @@ pub fn unf_egress_gateway_v4(ctx: TcContext) -> i32 {
     // immediately before its non-returning tail call.
     #[allow(unsafe_code)]
     let observation = unsafe { &*observation_ptr };
-    gateway_egress_action::<false>(&ctx, observation).unwrap_or(TC_ACT_PIPE)
+    if let Some(action) = gateway_egress_action::<false>(&ctx, observation) {
+        return action;
+    }
+    // A source may also be one member of the gateway set. If this flow is
+    // assigned to another member, enter a verifier-isolated source stage.
+    // Non-enforcing gateway ingress must never re-steer.
+    if observation.enforce {
+        // SAFETY: index 6 is the dedicated IPv4 source classifier.
+        #[allow(unsafe_code)]
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_SOURCE_TAIL_V4) };
+        return TC_ACT_SHOT;
+    }
+    TC_ACT_PIPE
 }
 
 #[classifier]
@@ -730,7 +744,39 @@ pub fn unf_egress_gateway_v6(ctx: TcContext) -> i32 {
     // instruction and combined-stack limits independently of policy lookup.
     #[allow(unsafe_code)]
     let observation = unsafe { &*observation_ptr };
-    gateway_egress_action::<true>(&ctx, observation).unwrap_or(TC_ACT_PIPE)
+    if let Some(action) = gateway_egress_action::<true>(&ctx, observation) {
+        return action;
+    }
+    if observation.enforce {
+        // SAFETY: index 7 is the dedicated IPv6 source classifier.
+        #[allow(unsafe_code)]
+        unsafe { SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, EGRESS_SOURCE_TAIL_V6) };
+        return TC_ACT_SHOT;
+    }
+    TC_ACT_PIPE
+}
+
+#[classifier]
+pub fn unf_egress_source_v4(ctx: TcContext) -> i32 {
+    let Some(observation_ptr) = FLOW_OBSERVATION_SCRATCH.get_ptr(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: the gateway classifier initialized this CPU-local observation
+    // before the non-returning tail call.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &*observation_ptr };
+    source_egress_action(&ctx, observation).unwrap_or(TC_ACT_PIPE)
+}
+
+#[classifier]
+pub fn unf_egress_source_v6(ctx: TcContext) -> i32 {
+    let Some(observation_ptr) = FLOW_OBSERVATION_SCRATCH.get_ptr(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: as above; the family-specific symbol isolates verifier stacks.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &*observation_ptr };
+    source_egress_action(&ctx, observation).unwrap_or(TC_ACT_PIPE)
 }
 
 #[inline(always)]
@@ -4531,7 +4577,6 @@ fn create_gateway_connection<const IPV6: bool>(
         || scratch.selection.selection_witness == [0; 16]
         || scratch.selection.address_index >= scratch.source.address_count
         || scratch.selection.primary_gateway_index >= scratch.source.gateway_count
-        || scratch.selection.primary_gateway_index != local_gateway_index
         || scratch.selection.standby_gateway_index >= scratch.source.gateway_count
         || scratch.selection.flags & !unf_ebpf_common::EGRESS_SELECTION_FLAG_STANDBY != 0
         || (scratch.selection.flags == 0
@@ -4543,6 +4588,9 @@ fn create_gateway_connection<const IPV6: bool>(
         || scratch.selection.reserved != [0; 6]
     {
         return TC_ACT_SHOT;
+    }
+    if scratch.selection.primary_gateway_index != local_gateway_index {
+        return EGRESS_GATEWAY_NOT_OWNED;
     }
     let address_key = EgressCandidateKey {
         intent_index: scratch.source.intent_index,
@@ -5016,7 +5064,10 @@ fn valid_egress_gateway(
         && gateway.contract_revision == source.contract_revision
         && gateway.lease_epoch == source.lease_epoch
         && gateway.path_revision == config.path_revision
-        && gateway.path_mode == EGRESS_PATH_DIRECT_NEIGHBOR
+        && matches!(
+            gateway.path_mode,
+            EGRESS_PATH_DIRECT_NEIGHBOR | EGRESS_PATH_LOCAL_GATEWAY
+        )
         && gateway.output_interface != 0
         && (1280..=65_535).contains(&gateway.mtu)
         && gateway.gateway_digest != [0; 16]
@@ -5037,6 +5088,11 @@ fn valid_egress_family_address(address: [u8; 16], family: AddressFamily) -> bool
 
 #[inline(always)]
 fn redirect_egress_neighbor(gateway: &EgressGatewayValue, family: AddressFamily) -> i32 {
+    // Same-node traffic must already have entered the gateway-NAT tail stage.
+    // A local sentinel reaching remote steering proves incoherent map state.
+    if gateway.path_mode == EGRESS_PATH_LOCAL_GATEWAY {
+        return TC_ACT_SHOT;
+    }
     let Some(lookup_ptr) = FIB_LOOKUP_SCRATCH.get_ptr_mut(0) else {
         return TC_ACT_SHOT;
     };

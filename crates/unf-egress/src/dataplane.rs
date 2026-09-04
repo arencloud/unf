@@ -14,12 +14,12 @@ use unf_common::{IdentityId, Revision};
 use unf_ebpf_common::{
     AddressFamily as BpfAddressFamily, EGRESS_ADMISSION_ACTIVE, EGRESS_ADMISSION_FENCED,
     EGRESS_BANK_COUNT, EGRESS_CONFIG_FLAG_GATEWAY_NAT, EGRESS_MAP_ABI_VERSION,
-    EGRESS_PATH_DIRECT_NEIGHBOR, EGRESS_PATH_TUNNEL, EGRESS_SELECTION_FLAG_STANDBY,
-    EGRESS_SELECTION_TABLE_SIZE, EGRESS_SOURCE_FLAG_GATEWAY_NAT, EGRESS_SOURCE_FLAG_IPV4,
-    EGRESS_SOURCE_FLAG_IPV6, EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY, EgressAddressValue,
-    EgressCandidateKey, EgressDestinationValue, EgressGatewayValue, EgressIpv4DestinationData,
-    EgressIpv6DestinationData, EgressMapConfig, EgressSelectionKey, EgressSelectionValue,
-    EgressSourceKey, EgressSourceValue,
+    EGRESS_PATH_DIRECT_NEIGHBOR, EGRESS_PATH_LOCAL_GATEWAY, EGRESS_PATH_TUNNEL,
+    EGRESS_SELECTION_FLAG_STANDBY, EGRESS_SELECTION_TABLE_SIZE, EGRESS_SOURCE_FLAG_GATEWAY_NAT,
+    EGRESS_SOURCE_FLAG_IPV4, EGRESS_SOURCE_FLAG_IPV6, EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY,
+    EgressAddressValue, EgressCandidateKey, EgressDestinationValue, EgressGatewayValue,
+    EgressIpv4DestinationData, EgressIpv6DestinationData, EgressMapConfig, EgressSelectionKey,
+    EgressSelectionValue, EgressSourceKey, EgressSourceValue,
 };
 
 use crate::{
@@ -44,6 +44,7 @@ pub const MAX_EGRESS_DATAPLANE_DESTINATIONS: usize =
 pub enum EgressPathMode {
     DirectNeighbor,
     Tunnel,
+    LocalGateway,
 }
 
 impl EgressPathMode {
@@ -51,6 +52,7 @@ impl EgressPathMode {
         match self {
             Self::DirectNeighbor => EGRESS_PATH_DIRECT_NEIGHBOR,
             Self::Tunnel => EGRESS_PATH_TUNNEL,
+            Self::LocalGateway => EGRESS_PATH_LOCAL_GATEWAY,
         }
     }
 }
@@ -138,7 +140,7 @@ impl EgressPathCertificate {
             || self.source.uid.is_empty()
             || self.gateway.name.is_empty()
             || self.gateway.uid.is_empty()
-            || self.source == self.gateway
+            || (self.source == self.gateway) != (self.mode == EgressPathMode::LocalGateway)
             || self.path_revision == Revision::INITIAL
             || self.lease_epoch == 0
             || self.output_interface == 0
@@ -147,6 +149,8 @@ impl EgressPathCertificate {
             || family(self.next_hop_address) != self.address_family
             || unusable(self.transport_address)
             || unusable(self.next_hop_address)
+            || (self.mode == EgressPathMode::LocalGateway
+                && self.transport_address != self.next_hop_address)
         {
             return Err(EgressDataplaneError::InvalidPath);
         }
@@ -1528,5 +1532,36 @@ mod tests {
             .expect("object")
             .insert("trusted".to_owned(), serde_json::json!(true));
         assert!(serde_json::from_value::<EgressPathCertificate>(value).is_err());
+
+        let source = host.contract.node.clone();
+        let local = EgressPathCertificate::issue(
+            source.clone(),
+            source.clone(),
+            AddressFamily::Ipv4,
+            ip("10.0.0.1"),
+            ip("10.0.0.1"),
+            2,
+            1_500,
+            EgressPathMode::LocalGateway,
+            Revision::new(30),
+            7,
+        )
+        .expect("same-Node fast path is explicit and sealed");
+        assert!(local.verify_integrity().is_ok());
+        assert!(
+            EgressPathCertificate::issue(
+                source.clone(),
+                source,
+                AddressFamily::Ipv4,
+                ip("10.0.0.1"),
+                ip("10.0.0.1"),
+                2,
+                1_500,
+                EgressPathMode::DirectNeighbor,
+                Revision::new(30),
+                7,
+            )
+            .is_err()
+        );
     }
 }

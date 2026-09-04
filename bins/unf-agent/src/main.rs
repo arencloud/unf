@@ -62,13 +62,18 @@ use unf_ebpf_common::{
 use unf_egress::{
     AddressFamily as EgressAddressFamily, AdmittedEgressGatewayAddressProjection,
     AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
-    EGRESS_DISTRIBUTION_SCHEMA_VERSION, EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard,
-    EgressAgentAdvertisement, EgressCapability, EgressDataplaneState,
-    EgressGatewayAddressAcknowledgement, EgressGatewayAddressProjection,
-    EgressGatewayApplicationAcknowledgement, EgressGatewayDrainEvidence, EgressGatewayHostBank,
-    EgressGatewayProjection, EgressGatewayProjectionLedger, EgressGatewayRetirementChallenges,
-    EgressNodeProjectionEnvelope, EgressPathCertificate, EgressPathMode, EgressProjectionLedger,
-    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
+    EGRESS_DISTRIBUTION_SCHEMA_VERSION, EGRESS_HA_PROMOTION_SCHEMA_VERSION,
+    EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard, EgressAgentAdvertisement,
+    EgressCapability, EgressDataplaneState, EgressGatewayAddressAcknowledgement,
+    EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
+    EgressGatewayDrainEvidence, EgressGatewayHostBank, EgressGatewayProjection,
+    EgressGatewayProjectionLedger, EgressGatewayRetirementChallenges, EgressHaActivationAuthority,
+    EgressHaAgentChallenge, EgressHaAgentChallenges, EgressHaAgentEvidence,
+    EgressHaContinuityCutover, EgressHaDigest, EgressHaFlowTwin, EgressHaFlowTwinOperation,
+    EgressHaFlowTwinStream, EgressHaOldOwnerRevocationEvidence, EgressHaSourceActivationEvidence,
+    EgressIntentOwner, EgressNodeProjectionEnvelope, EgressPathCertificate, EgressPathMode,
+    EgressProjectionLedger, EgressProjectionRecipient, EgressSourceActivationGrant,
+    EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
     EgressSourceRetirementChallenges, compile_egress_dataplane, compile_egress_gateway_dataplane,
 };
 use unf_ipam::{
@@ -135,15 +140,18 @@ const SELECTION_CONTRACT_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 const SELECTION_BANK_COUNT: u8 = 2;
 const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
 const BLOCKED_TRANSITION_REPORTING_WINDOW: Duration = Duration::from_secs(30);
-const DATAPLANE_TAIL_PROGRAM_NAMES: [&str; 6] = [
+const DATAPLANE_TAIL_PROGRAM_NAMES: [&str; 8] = [
     "unf_policy_v4",
     "unf_policy_v6",
     "unf_dsr_v4",
     "unf_dsr_v6",
     "unf_egress_gateway_v4",
     "unf_egress_gateway_v6",
+    "unf_egress_source_v4",
+    "unf_egress_source_v6",
 ];
-const DATAPLANE_TAIL_CALL_MAP_NAME: &str = "SERVICE_DATAPLANE_TAIL_CALLS";
+const DATAPLANE_TAIL_CALL_MAP_NAME: &str = "SERVICE_DATAPLANE_TAIL_CALLS_V2";
+const LEGACY_DATAPLANE_TAIL_CALL_MAP_NAME: &str = "SERVICE_DATAPLANE_TAIL_CALLS";
 const BUILD_REVISION: &str = match option_env!("UNF_BUILD_REVISION") {
     Some(revision) => revision,
     None => "unknown",
@@ -921,6 +929,10 @@ struct EgressSynchronizer {
     ledger: EgressProjectionLedger,
     gateway_ledger: EgressGatewayProjectionLedger,
     applied_authority: Option<EgressAppliedAuthority>,
+    gateway_owned_addresses: BTreeSet<IpAddr>,
+    ha_replicas: BTreeMap<(EgressHaDigest, String, String), EgressHaFlowTwinStream>,
+    ha_activations:
+        BTreeMap<EgressIntentOwner, (EgressHaActivationAuthority, EgressHaContinuityCutover)>,
     path_provider: Option<NativeEgressPathProvider>,
     node_name: String,
     controller_url: Option<String>,
@@ -945,6 +957,7 @@ impl NativeEgressPathProvider {
         &self,
         source: &unf_egress::AdmittedEgressProjection,
         state: &AgentState,
+        local_node: &NodePortNodeSnapshot,
     ) -> Result<Vec<EgressPathCertificate>> {
         let snapshot = mutex_lock(&state.applied_remote_routes)
             .clone()
@@ -957,6 +970,9 @@ impl NativeEgressPathProvider {
             plan.source.node.name != snapshot.node_name || plan.source.node.uid != snapshot.node_uid
         }) {
             bail!("egress source contract does not match remote-route Node provenance");
+        }
+        if local_node.node_name != snapshot.node_name || local_node.node_uid != snapshot.node_uid {
+            bail!("egress local transport does not match remote-route Node provenance");
         }
         let local = NodeBlockSnapshot {
             schema_version: NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION,
@@ -986,8 +1002,9 @@ impl NativeEgressPathProvider {
             &self.ipv6_interface,
             self.ipv6_output_interface,
         )?;
-        let certificates =
-            build_egress_path_certificates(self, source, &snapshot, ipv4_mtu, ipv6_mtu)?;
+        let certificates = build_egress_path_certificates(
+            self, source, &snapshot, local_node, ipv4_mtu, ipv6_mtu,
+        )?;
         if mutex_lock(&state.applied_remote_routes).as_ref() != Some(&snapshot) {
             bail!("remote-route snapshot changed during egress path acquisition");
         }
@@ -999,6 +1016,7 @@ fn build_egress_path_certificates(
     provider: &NativeEgressPathProvider,
     source: &unf_egress::AdmittedEgressProjection,
     snapshot: &RemoteRouteSnapshot,
+    local_node: &NodePortNodeSnapshot,
     ipv4_mtu: u32,
     ipv6_mtu: u32,
 ) -> Result<Vec<EgressPathCertificate>> {
@@ -1028,6 +1046,30 @@ fn build_egress_path_certificates(
             })
             .collect::<BTreeSet<_>>();
         for gateway in &behavior.gateways {
+            if gateway.node == behavior.source.node {
+                for certificate in local_egress_path_certificates(
+                    provider,
+                    &behavior.source.node,
+                    &gateway.node,
+                    gateway.lease_epoch,
+                    &families,
+                    snapshot.revision,
+                    local_node,
+                    ipv4_mtu,
+                    ipv6_mtu,
+                )? {
+                    certificates.insert(
+                        (
+                            behavior.source.node.uid.clone(),
+                            gateway.node.uid.clone(),
+                            certificate.address_family,
+                            gateway.lease_epoch,
+                        ),
+                        certificate,
+                    );
+                }
+                continue;
+            }
             let remote = remotes
                 .get(&(gateway.node.name.as_str(), gateway.node.uid.as_str()))
                 .with_context(|| {
@@ -1075,6 +1117,55 @@ fn build_egress_path_certificates(
         }
     }
     Ok(certificates.into_values().collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_egress_path_certificates(
+    provider: &NativeEgressPathProvider,
+    source: &unf_egress::EgressNode,
+    gateway: &unf_egress::EgressNode,
+    lease_epoch: u64,
+    families: &BTreeSet<EgressAddressFamily>,
+    path_revision: u64,
+    local_node: &NodePortNodeSnapshot,
+    ipv4_mtu: u32,
+    ipv6_mtu: u32,
+) -> Result<Vec<EgressPathCertificate>> {
+    families
+        .iter()
+        .map(|family| {
+            let (output_interface, mtu) = match family {
+                EgressAddressFamily::Ipv4 => (provider.ipv4_output_interface, ipv4_mtu),
+                EgressAddressFamily::Ipv6 => (provider.ipv6_output_interface, ipv6_mtu),
+            };
+            let transport = local_node
+                .addresses
+                .iter()
+                .find(|address| {
+                    address.kind == unf_service::NodeAddressKind::Internal
+                        && matches!(
+                            (family, address.address),
+                            (EgressAddressFamily::Ipv4, IpAddr::V4(_))
+                                | (EgressAddressFamily::Ipv6, IpAddr::V6(_))
+                        )
+                })
+                .map(|address| address.address)
+                .context("local gateway has no exact internal transport address")?;
+            EgressPathCertificate::issue(
+                source.clone(),
+                gateway.clone(),
+                *family,
+                transport,
+                transport,
+                output_interface,
+                mtu,
+                EgressPathMode::LocalGateway,
+                Revision::new(path_revision),
+                lease_epoch,
+            )
+            .context("seal exact same-node egress fast path")
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5636,6 +5727,7 @@ fn inspect_cleanup_program_directory(
 
 fn recognized_tail_program_pin_name(name: &str) -> bool {
     name == DATAPLANE_TAIL_CALL_MAP_NAME
+        || name == LEGACY_DATAPLANE_TAIL_CALL_MAP_NAME
         || DATAPLANE_TAIL_PROGRAM_NAMES.iter().any(|program| {
             name == *program
                 || name
@@ -6898,6 +6990,9 @@ fn new_synchronizers(
             ledger: EgressProjectionLedger::default(),
             gateway_ledger: EgressGatewayProjectionLedger::default(),
             applied_authority: None,
+            gateway_owned_addresses: BTreeSet::new(),
+            ha_replicas: BTreeMap::new(),
+            ha_activations: BTreeMap::new(),
             path_provider: egress_path_provider,
             node_name,
             controller_url,
@@ -8425,7 +8520,16 @@ async fn synchronize_egress(
     state: &AgentState,
 ) -> Result<bool> {
     let gateway_address_result = synchronize_egress_gateway_addresses(synchronizer, state).await;
-    let source_result = synchronize_egress_source(synchronizer, state).await;
+    let ha_result = if gateway_address_result.is_ok() {
+        synchronize_egress_ha(synchronizer, state).await
+    } else {
+        Ok(false)
+    };
+    let source_result = if ha_result.is_ok() {
+        synchronize_egress_source(synchronizer, state).await
+    } else {
+        Ok(false)
+    };
     let gateway_result = synchronize_egress_gateway(synchronizer, state).await;
     if (gateway_address_result.is_err() || source_result.is_err() || gateway_result.is_err())
         && let Err(error) = fence_active_egress_dataplane(synchronizer)
@@ -8433,12 +8537,27 @@ async fn synchronize_egress(
         return Err(error)
             .context("egress synchronization failed and active state could not be fenced");
     }
-    match (gateway_address_result, source_result, gateway_result) {
-        (Ok(address), Ok(source), Ok(gateway)) => Ok(address || source || gateway),
-        (address, source, gateway) => {
+    if ha_result.is_err()
+        && let Err(error) = fence_active_egress_source(synchronizer)
+    {
+        return Err(error).context(
+            "HA synchronization failed and source state could not be fenced without erasing gateway continuity",
+        );
+    }
+    match (
+        gateway_address_result,
+        ha_result,
+        source_result,
+        gateway_result,
+    ) {
+        (Ok(address), Ok(ha), Ok(source), Ok(gateway)) => Ok(address || ha || source || gateway),
+        (address, ha, source, gateway) => {
             let mut failures = Vec::new();
             if let Err(error) = address {
                 failures.push(format!("gateway address ownership: {error:#}"));
+            }
+            if let Err(error) = ha {
+                failures.push(format!("HA promotion: {error:#}"));
             }
             if let Err(error) = source {
                 failures.push(format!("source distribution: {error:#}"));
@@ -8455,7 +8574,7 @@ async fn synchronize_egress(
 }
 
 async fn synchronize_egress_gateway_addresses(
-    synchronizer: &EgressSynchronizer,
+    synchronizer: &mut EgressSynchronizer,
     state: &AgentState,
 ) -> Result<bool> {
     let controller_url = synchronizer
@@ -8507,6 +8626,8 @@ async fn synchronize_egress_gateway_addresses(
     let acknowledgement =
         apply_egress_gateway_address_projection(&admitted, node.node_uid, ipv6_proxy_uplink)
             .await?;
+    synchronizer.gateway_owned_addresses =
+        acknowledgement.owned_addresses.iter().copied().collect();
     synchronizer
         .client
         .current()
@@ -8621,6 +8742,462 @@ async fn apply_egress_gateway_address_projection(
     .context("build exact gateway-address application evidence")
 }
 
+#[allow(clippy::too_many_lines)]
+async fn synchronize_egress_ha(
+    synchronizer: &mut EgressSynchronizer,
+    state: &AgentState,
+) -> Result<bool> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("HA synchronization requires a controller URL")?;
+    let response = authenticated_get(
+        &synchronizer.client,
+        format!("{controller_url}/v1/state/egress-ha"),
+        &synchronizer.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request authenticated HA challenges")?;
+    let challenges: EgressHaAgentChallenges = response
+        .error_for_status()
+        .context("controller rejected HA challenge request")?
+        .json()
+        .await
+        .context("decode HA challenge set")?;
+    challenges.verify().context("verify HA challenge set")?;
+    if challenges.recipient.node_name != synchronizer.node_name {
+        bail!("HA challenge set belongs to another Node");
+    }
+    let node = fetch_node_port_node_snapshot(
+        controller_url,
+        &synchronizer.client,
+        &synchronizer.agent_token_path,
+    )
+    .await?
+    .validate_and_normalize()
+    .context("validate authoritative local Node identity for HA")?;
+    if node.node_name != challenges.recipient.node_name
+        || node.node_uid != challenges.recipient.node_uid
+    {
+        bail!("HA challenge recipient does not match current Node identity");
+    }
+    let principal = authenticated_egress_principal(synchronizer, state, node.node_uid.clone());
+    if principal.node_uid != challenges.recipient.node_uid {
+        bail!("HA principal does not match challenge recipient");
+    }
+
+    let mut changed = false;
+    for challenge in challenges.challenges {
+        verify_live_ha_plan(&challenges.certified_plans, &challenge)?;
+        let evidence = match challenge {
+            EgressHaAgentChallenge::SourceFence { manifest } => {
+                changed |= fence_active_egress_source(synchronizer)
+                    .context("install HA source fence without erasing gateway state")?;
+                Some(EgressHaAgentEvidence::SourceFence(
+                    unf_egress::EgressHaSourceFenceEvidence {
+                        schema_version: EGRESS_HA_PROMOTION_SCHEMA_VERSION,
+                        controller_epoch: manifest.controller_epoch,
+                        promotion_epoch: manifest.promotion_epoch,
+                        recipient: challenges.recipient.clone(),
+                        manifest_digest: manifest.manifest_digest,
+                        active_plan_digest: manifest.active_plan_digest,
+                        fenced_shards: manifest
+                            .handoffs
+                            .iter()
+                            .map(|handoff| handoff.shard_index)
+                            .collect(),
+                        inactive_bank: synchronizer.active_bank ^ 1,
+                    },
+                ))
+            }
+            EgressHaAgentChallenge::PrimarySnapshot {
+                manifest,
+                standby_gateway,
+                shard_indexes,
+            } => Some(EgressHaAgentEvidence::FlowTwinStream(
+                snapshot_ha_flow_twin_stream(
+                    &synchronizer.connections,
+                    &manifest,
+                    standby_gateway,
+                    shard_indexes,
+                )?,
+            )),
+            EgressHaAgentChallenge::OldOwnerRevocation { manifest } => {
+                let affected = manifest
+                    .handoffs
+                    .iter()
+                    .flat_map(|handoff| handoff.addresses.iter().copied())
+                    .collect::<BTreeSet<_>>();
+                if !affected.is_subset(&synchronizer.gateway_owned_addresses) {
+                    bail!("HA revocation does not start from exact acknowledged ownership");
+                }
+                let retained = synchronizer
+                    .gateway_owned_addresses
+                    .difference(&affected)
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                let mut previous = GatewayAddressPlan::new(
+                    challenges.recipient.node_uid.clone(),
+                    1_500,
+                    synchronizer
+                        .gateway_owned_addresses
+                        .iter()
+                        .copied()
+                        .collect(),
+                )?;
+                let mut desired = GatewayAddressPlan::new(
+                    challenges.recipient.node_uid.clone(),
+                    1_500,
+                    retained.iter().copied().collect(),
+                )?;
+                if let Some(provider) = &synchronizer.path_provider {
+                    previous = previous.with_ipv6_proxy_uplink(
+                        provider.ipv6_interface.clone(),
+                        provider.ipv6_output_interface,
+                    )?;
+                    desired = desired.with_ipv6_proxy_uplink(
+                        provider.ipv6_interface.clone(),
+                        provider.ipv6_output_interface,
+                    )?;
+                }
+                let readback = desired
+                    .transition_from(&previous)
+                    .await
+                    .context("revoke HA old-owner addresses and read back kernel state")?;
+                let readback_addresses = readback
+                    .addresses
+                    .into_iter()
+                    .map(|address| address.address)
+                    .collect::<BTreeSet<_>>();
+                if readback_addresses != retained {
+                    bail!("HA old-owner readback differs from exact retained set");
+                }
+                synchronizer.gateway_owned_addresses = retained;
+                changed = true;
+                Some(EgressHaAgentEvidence::OldOwnerRevocation(
+                    EgressHaOldOwnerRevocationEvidence {
+                        schema_version: EGRESS_HA_PROMOTION_SCHEMA_VERSION,
+                        controller_epoch: manifest.controller_epoch,
+                        promotion_epoch: manifest.promotion_epoch,
+                        gateway: manifest.failed_gateway,
+                        manifest_digest: manifest.manifest_digest,
+                        absent_addresses: affected.into_iter().collect(),
+                        kernel_revision: manifest.authority_revision,
+                    },
+                ))
+            }
+            EgressHaAgentChallenge::StandbyReplica { manifest, stream } => {
+                stream
+                    .verify(&manifest)
+                    .context("verify HA replica stream")?;
+                import_ha_flow_twin_stream(synchronizer, &stream)
+                    .context("import and read back HA replica in the persistent BPF map")?;
+                let key = (
+                    stream.owner_plan_digest,
+                    stream.primary_gateway.uid.clone(),
+                    stream.standby_gateway.uid.clone(),
+                );
+                synchronizer
+                    .ha_replicas
+                    .insert(key, stream.as_ref().clone());
+                changed = true;
+                Some(EgressHaAgentEvidence::FlowTwinAcknowledgement(
+                    stream
+                        .acknowledge(&manifest, Revision::new(stream.sequence.saturating_add(1)))
+                        .context("read back exact HA replica snapshot")?,
+                ))
+            }
+            EgressHaAgentChallenge::SourceActivation { authority, cutover } => {
+                authority
+                    .verify()
+                    .context("verify HA activation authority")?;
+                cutover
+                    .verify(&authority)
+                    .context("verify HA continuity cutover")?;
+                synchronizer
+                    .ha_activations
+                    .insert(authority.manifest.owner.clone(), (*authority, *cutover));
+                changed = true;
+                None
+            }
+        };
+        if let Some(evidence) = evidence {
+            post_egress_ha_evidence(synchronizer, &evidence).await?;
+        }
+    }
+    Ok(changed)
+}
+
+fn verify_live_ha_plan(
+    certified_plans: &[unf_egress::EgressHaPlan],
+    challenge: &EgressHaAgentChallenge,
+) -> Result<()> {
+    let manifest = match challenge {
+        EgressHaAgentChallenge::SourceFence { manifest }
+        | EgressHaAgentChallenge::PrimarySnapshot { manifest, .. }
+        | EgressHaAgentChallenge::OldOwnerRevocation { manifest }
+        | EgressHaAgentChallenge::StandbyReplica { manifest, .. } => manifest.as_ref(),
+        EgressHaAgentChallenge::SourceActivation { authority, .. } => &authority.manifest,
+    };
+    let plan = certified_plans
+        .iter()
+        .find(|plan| plan.plan_digest == manifest.active_plan_digest)
+        .context("HA challenge has no self-contained certified plan")?;
+    manifest
+        .verify(plan)
+        .context("replay HA promotion manifest against local plan")
+}
+
+async fn post_egress_ha_evidence(
+    synchronizer: &EgressSynchronizer,
+    evidence: &EgressHaAgentEvidence,
+) -> Result<()> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("HA evidence requires a controller URL")?;
+    synchronizer
+        .client
+        .current()
+        .post(format!("{controller_url}/v1/state/egress-ha-evidence"))
+        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+        .json(evidence)
+        .send()
+        .await
+        .context("publish authenticated HA evidence")?
+        .error_for_status()
+        .context("controller rejected HA evidence")?;
+    Ok(())
+}
+
+fn snapshot_ha_flow_twin_stream(
+    connections: &AyaHashMap<MapData, [u8; 44], [u8; 208]>,
+    manifest: &unf_egress::EgressHaPromotionManifest,
+    standby_gateway: unf_egress::EgressNode,
+    shard_indexes: Vec<u16>,
+) -> Result<EgressHaFlowTwinStream> {
+    let snapshot = snapshot_egress_connections(connections)?;
+    let address_shards = manifest
+        .handoffs
+        .iter()
+        .filter(|handoff| {
+            handoff.new_gateway == standby_gateway && shard_indexes.contains(&handoff.shard_index)
+        })
+        .flat_map(|handoff| {
+            handoff
+                .addresses
+                .iter()
+                .copied()
+                .map(|address| (address, handoff.shard_index))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut stream = EgressHaFlowTwinStream::issue(
+        manifest,
+        manifest.failed_gateway.clone(),
+        standby_gateway,
+        shard_indexes,
+        manifest.promotion_epoch,
+    )?;
+    for (key, value) in &snapshot {
+        validate_recovered_egress_connection(key, value)?;
+        if key[42] != unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD {
+            continue;
+        }
+        let egress_address = decode_egress_connection_ip(&value[56..72], value[203])?;
+        let Some(shard_index) = address_shards.get(&egress_address).copied() else {
+            continue;
+        };
+        let mut reverse_key = [0_u8; 44];
+        reverse_key[0..16].copy_from_slice(&value[40..56]);
+        reverse_key[16..32].copy_from_slice(&value[56..72]);
+        reverse_key[32..34].copy_from_slice(&value[190..192]);
+        reverse_key[34..36].copy_from_slice(&value[192..194]);
+        reverse_key[40] = value[202];
+        reverse_key[41] = value[203];
+        reverse_key[42] = unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE;
+        if snapshot.get(&reverse_key) != Some(value) {
+            bail!("HA snapshot found an incomplete forward/reverse NAT pair");
+        }
+        let record = EgressHaFlowTwin::issue(
+            shard_index,
+            IdentityId::new(u32::from_ne_bytes(value[184..188].try_into()?)),
+            value[202],
+            decode_egress_connection_ip(&value[24..40], value[203])?,
+            decode_egress_connection_ip(&value[40..56], value[203])?,
+            u16::from_be_bytes(value[188..190].try_into()?),
+            u16::from_be_bytes(value[190..192].try_into()?),
+            egress_address,
+            u16::from_be_bytes(value[192..194].try_into()?),
+            Revision::new(u64::from_ne_bytes(value[8..16].try_into()?)),
+            unf_egress::EgressContractDigest(value[120..152].try_into()?),
+            value[104..120].try_into()?,
+            u64::from_ne_bytes(value[16..24].try_into()?),
+            u64::from_ne_bytes(value[0..8].try_into()?),
+        )?;
+        let delta = stream.next_delta(EgressHaFlowTwinOperation::Upsert(record))?;
+        stream.apply(manifest, &delta)?;
+    }
+    Ok(stream)
+}
+
+fn decode_egress_connection_ip(bytes: &[u8], family: u8) -> Result<IpAddr> {
+    match family {
+        4 if bytes[4..16] == [0; 12] => Ok(IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(
+            &bytes[0..4],
+        )?))),
+        6 => Ok(IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(bytes)?))),
+        _ => bail!("invalid egress connection address family"),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn import_ha_flow_twin_stream(
+    synchronizer: &mut EgressSynchronizer,
+    stream: &EgressHaFlowTwinStream,
+) -> Result<()> {
+    let active =
+        synchronizer.gateway_nat_banks[usize::from(synchronizer.gateway_nat_active_bank)].clone();
+    for record in &stream.records {
+        let family = if record.egress_address.is_ipv4() {
+            4_u8
+        } else {
+            6_u8
+        };
+        let identity = record.source_identity.get();
+        let source = active
+            .sources
+            .iter()
+            .find(|(key, value)| {
+                u32::from_ne_bytes(key[0..4].try_into().expect("fixed source identity")) == identity
+                    && value[64..96] == record.contract_digest.0
+            })
+            .map(|(_, value)| value)
+            .context("HA replica has no exact gateway source contract")?;
+        let intent_index = u32::from_ne_bytes(
+            source[112..116]
+                .try_into()
+                .expect("fixed source intent index"),
+        );
+        let address_bytes = encode_connection_ip(record.egress_address);
+        let (address_index, _) = active
+            .addresses
+            .iter()
+            .find(|(key, value)| {
+                u32::from_ne_bytes(key[0..4].try_into().expect("fixed address intent"))
+                    == intent_index
+                    && key[6] == family
+                    && value[16..32] == address_bytes
+                    && u64::from_ne_bytes(value[0..8].try_into().expect("fixed address lease"))
+                        == record.lease_epoch
+            })
+            .map(|(key, value)| {
+                (
+                    u16::from_ne_bytes(key[4..6].try_into().expect("fixed address index")),
+                    value,
+                )
+            })
+            .context("HA replica egress address is absent from the gateway contract")?;
+        let local_gateway_index = u16::from_ne_bytes(
+            source[124..126]
+                .try_into()
+                .expect("fixed local gateway index"),
+        );
+        let gateway = active
+            .gateways
+            .iter()
+            .find(|(key, _)| {
+                u32::from_ne_bytes(key[0..4].try_into().expect("fixed gateway intent"))
+                    == intent_index
+                    && u16::from_ne_bytes(key[4..6].try_into().expect("fixed gateway index"))
+                        == local_gateway_index
+                    && key[6] == family
+            })
+            .map(|(_, value)| value)
+            .context("HA replica has no exact local gateway contract")?;
+        let mut value = [0_u8; 208];
+        value[0..8].copy_from_slice(&record.last_seen_ns.to_ne_bytes());
+        value[8..16].copy_from_slice(&record.contract_revision.get().to_ne_bytes());
+        value[16..24].copy_from_slice(&record.lease_epoch.to_ne_bytes());
+        value[24..40].copy_from_slice(&encode_connection_ip(record.original_source_address));
+        value[40..56].copy_from_slice(&encode_connection_ip(record.original_destination_address));
+        value[56..72].copy_from_slice(&address_bytes);
+        value[72..88].copy_from_slice(&address_bytes);
+        value[88..104].copy_from_slice(&address_bytes);
+        value[104..120].copy_from_slice(&record.proof_witness);
+        value[120..152].copy_from_slice(&record.contract_digest.0);
+        value[152..168].copy_from_slice(&gateway[56..72]);
+        value[168..184].copy_from_slice(&gateway[56..72]);
+        value[184..188].copy_from_slice(&identity.to_ne_bytes());
+        value[188..190].copy_from_slice(&record.original_source_port.to_be_bytes());
+        value[190..192].copy_from_slice(&record.original_destination_port.to_be_bytes());
+        value[192..194].copy_from_slice(&record.translated_source_port.to_be_bytes());
+        value[194..196].copy_from_slice(&address_index.to_ne_bytes());
+        value[196..198].copy_from_slice(&local_gateway_index.to_ne_bytes());
+        value[198..200].copy_from_slice(&local_gateway_index.to_ne_bytes());
+        value[200..202].copy_from_slice(&EGRESS_MAP_ABI_VERSION.to_ne_bytes());
+        value[202] = record.protocol;
+        value[203] = family;
+        value[204..206].copy_from_slice(
+            &unf_ebpf_common::EGRESS_CONNECTION_FLAG_STANDBY_CERTIFIED.to_ne_bytes(),
+        );
+
+        let forward = encode_ha_connection_key(record, false);
+        let reverse = encode_ha_connection_key(record, true);
+        for key in [forward, reverse] {
+            if let Ok(existing) = synchronizer.connections.get(&key, 0)
+                && existing != value
+            {
+                bail!("HA replica collides with an existing different NAT mapping");
+            }
+            synchronizer
+                .connections
+                .insert(key, value, 0)
+                .context("insert HA connection twin")?;
+            if synchronizer.connections.get(&key, 0)? != value {
+                bail!("HA connection twin failed exact BPF readback");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_ha_connection_key(record: &EgressHaFlowTwin, reverse: bool) -> [u8; 44] {
+    let mut key = [0_u8; 44];
+    if reverse {
+        key[0..16].copy_from_slice(&encode_connection_ip(record.original_destination_address));
+        key[16..32].copy_from_slice(&encode_connection_ip(record.egress_address));
+        key[32..34].copy_from_slice(&record.original_destination_port.to_be_bytes());
+        key[34..36].copy_from_slice(&record.translated_source_port.to_be_bytes());
+        key[42] = unf_ebpf_common::EGRESS_CONNECTION_ROLE_REVERSE;
+    } else {
+        key[0..16].copy_from_slice(&encode_connection_ip(record.original_source_address));
+        key[16..32].copy_from_slice(&encode_connection_ip(record.original_destination_address));
+        key[32..34].copy_from_slice(&record.original_source_port.to_be_bytes());
+        key[34..36].copy_from_slice(&record.original_destination_port.to_be_bytes());
+        key[36..40].copy_from_slice(&record.source_identity.get().to_ne_bytes());
+        key[42] = unf_ebpf_common::EGRESS_CONNECTION_ROLE_FORWARD;
+    }
+    key[40] = record.protocol;
+    key[41] = if record.egress_address.is_ipv4() {
+        4
+    } else {
+        6
+    };
+    key
+}
+
+fn encode_connection_ip(address: IpAddr) -> [u8; 16] {
+    match address {
+        IpAddr::V4(address) => {
+            let mut encoded = [0_u8; 16];
+            encoded[0..4].copy_from_slice(&address.octets());
+            encoded
+        }
+        IpAddr::V6(address) => address.octets(),
+    }
+}
+
 async fn synchronize_egress_source(
     synchronizer: &mut EgressSynchronizer,
     state: &AgentState,
@@ -8666,7 +9243,7 @@ async fn synchronize_egress_source(
             synchronizer.node_name
         );
     }
-    let principal = authenticated_egress_principal(synchronizer, state, node.node_uid);
+    let principal = authenticated_egress_principal(synchronizer, state, node.node_uid.clone());
     let admitted = envelope
         .admit(&principal, &advertisement)
         .context("independently replay egress source projection")?;
@@ -8682,7 +9259,7 @@ async fn synchronize_egress_source(
             .sources
             .len();
         acknowledge_current_egress_source(synchronizer, &admitted, source_count).await?;
-        return activate_current_egress_source(synchronizer, state, &admitted).await;
+        return activate_current_egress_source(synchronizer, state, &admitted, &node).await;
     }
     let mut next_ledger = synchronizer.ledger.clone();
     next_ledger
@@ -8726,19 +9303,21 @@ async fn activate_current_egress_source(
     synchronizer: &mut EgressSynchronizer,
     state: &AgentState,
     admitted: &unf_egress::AdmittedEgressProjection,
+    local_node: &NodePortNodeSnapshot,
 ) -> Result<bool> {
     let Some(grant) = fetch_egress_source_activation_grant(synchronizer).await? else {
-        return fence_active_egress_dataplane(synchronizer)
-            .context("fence egress state while gateway readiness is incomplete");
+        return fence_active_egress_source(synchronizer)
+            .context("fence source egress while gateway or HA readiness is incomplete");
     };
     grant
         .verify(admitted)
         .context("verify controller egress source activation grant")?;
+    let target_bank = ha_source_target_bank(synchronizer, admitted)?;
     let provider = synchronizer
         .path_provider
         .as_ref()
         .context("egress activation requires native dual-stack route ownership")?;
-    let paths = provider.acquire(admitted, state).await?;
+    let paths = provider.acquire(admitted, state, local_node).await?;
     let host = EgressGatewayHostBank::compile(admitted)
         .context("compile admitted egress host bank for activation")?;
     let mut guard = EgressAdmissionGuard::default();
@@ -8760,12 +9339,28 @@ async fn activate_current_egress_source(
     if encode_egress_dataplane(&current)?
         == synchronizer.banks[usize::from(synchronizer.active_bank)]
     {
+        publish_ha_source_activation_evidence(synchronizer, admitted).await?;
         return Ok(false);
     }
-    let bank = synchronizer.active_bank ^ 1;
+    if target_bank == Some(synchronizer.active_bank) {
+        let bridge_bank = synchronizer.active_bank ^ 1;
+        let bridge = compile_fenced_egress_bank(
+            &synchronizer.banks[usize::from(synchronizer.active_bank)],
+            bridge_bank,
+            true,
+        )?
+        .context("HA target bank is active but cannot be re-banked")?;
+        apply_encoded_egress_bank(synchronizer, bridge)
+            .context("atomically move the HA fence off its target bank")?;
+    }
+    let bank = target_bank.unwrap_or(synchronizer.active_bank ^ 1);
+    if bank == synchronizer.active_bank {
+        bail!("HA activation target bank did not become inactive");
+    }
     let candidate = compile_egress_dataplane(&host, &guard, &paths, bank)
         .context("compile certified active egress dataplane candidate")?;
     apply_egress_dataplane(synchronizer, &candidate)?;
+    publish_ha_source_activation_evidence(synchronizer, admitted).await?;
     info!(
         controller_epoch = host.controller_epoch,
         projection_revision = host.projection_revision.get(),
@@ -8777,6 +9372,75 @@ async fn activate_current_egress_source(
         "activated egress sources after gateway and local-path proof"
     );
     Ok(true)
+}
+
+async fn publish_ha_source_activation_evidence(
+    synchronizer: &mut EgressSynchronizer,
+    admitted: &unf_egress::AdmittedEgressProjection,
+) -> Result<()> {
+    let recipient = admitted.projection().recipient.clone();
+    let owners = admitted
+        .projection()
+        .contract
+        .plans
+        .iter()
+        .map(|plan| plan.intent.clone())
+        .collect::<BTreeSet<_>>();
+    let bundles = synchronizer
+        .ha_activations
+        .iter()
+        .filter(|(owner, _)| owners.contains(owner))
+        .map(|(owner, bundle)| (owner.clone(), bundle.clone()))
+        .collect::<Vec<_>>();
+    for (owner, (authority, cutover)) in bundles {
+        let evidence = EgressHaSourceActivationEvidence::issue(
+            &authority,
+            &cutover,
+            recipient.clone(),
+            admitted.projection().revision,
+            synchronizer.active_bank,
+        )
+        .context("build exact HA source activation readback")?;
+        post_egress_ha_evidence(
+            synchronizer,
+            &EgressHaAgentEvidence::SourceActivation(evidence),
+        )
+        .await?;
+        synchronizer.ha_activations.remove(&owner);
+    }
+    Ok(())
+}
+
+fn ha_source_target_bank(
+    synchronizer: &EgressSynchronizer,
+    admitted: &unf_egress::AdmittedEgressProjection,
+) -> Result<Option<u8>> {
+    let recipient = &admitted.projection().recipient;
+    let owners = admitted
+        .projection()
+        .contract
+        .plans
+        .iter()
+        .map(|plan| &plan.intent)
+        .collect::<BTreeSet<_>>();
+    let mut targets = BTreeSet::new();
+    for owner in owners {
+        let Some((authority, cutover)) = synchronizer.ha_activations.get(owner) else {
+            continue;
+        };
+        authority.verify().context("replay stored HA authority")?;
+        cutover
+            .verify(authority)
+            .context("replay stored HA cutover")?;
+        if !authority.manifest.sources.contains(recipient) {
+            bail!("stored HA activation belongs to another source Node");
+        }
+        targets.insert(cutover.target_source_bank);
+    }
+    if targets.len() > 1 {
+        bail!("concurrent HA promotions require conflicting atomic source banks");
+    }
+    Ok(targets.into_iter().next())
 }
 
 async fn fetch_egress_source_activation_grant(
@@ -8950,9 +9614,6 @@ async fn publish_egress_source_acknowledgement(
 async fn publish_egress_source_retirement_evidence(
     synchronizer: &EgressSynchronizer,
 ) -> Result<()> {
-    let Some(admitted) = synchronizer.ledger.current() else {
-        return Ok(());
-    };
     let controller_url = synchronizer
         .controller_url
         .as_deref()
@@ -8975,13 +9636,42 @@ async fn publish_egress_source_retirement_evidence(
         .verify()
         .context("verify egress source retirement challenges")?;
     for manifest in &challenges.manifests {
-        let evidence = EgressSourceFenceEvidence::issue_for_challenge(
-            &challenges,
-            manifest,
-            admitted,
-            synchronizer.active_bank,
-        )
-        .context("build destination-preserving source-fence evidence")?;
+        let evidence = if let Some(admitted) = synchronizer.ledger.current() {
+            EgressSourceFenceEvidence::issue_for_challenge(
+                &challenges,
+                manifest,
+                admitted,
+                synchronizer.active_bank,
+            )
+            .context("build destination-preserving source-fence evidence")?
+        } else {
+            let recipients = manifest
+                .sources
+                .iter()
+                .filter(|source| source.recipient.node_name == synchronizer.node_name)
+                .map(|source| source.recipient.clone())
+                .collect::<BTreeSet<_>>();
+            if recipients.len() != 1 {
+                bail!("retirement manifest does not identify exactly one current source recipient");
+            }
+            let recipient = recipients
+                .into_iter()
+                .next()
+                .expect("one source recipient was verified");
+            verify_recovered_egress_source_fence(
+                &synchronizer.banks[usize::from(synchronizer.active_bank)],
+                manifest,
+                &recipient,
+                synchronizer.active_bank,
+            )?;
+            EgressSourceFenceEvidence::issue_recovered_for_challenge(
+                &challenges,
+                manifest,
+                recipient,
+                synchronizer.active_bank,
+            )
+            .context("reconstruct restart-safe source-fence evidence")?
+        };
         synchronizer
             .client
             .current()
@@ -8993,6 +9683,44 @@ async fn publish_egress_source_retirement_evidence(
             .context("publish authenticated egress source-fence evidence")?
             .error_for_status()
             .context("controller rejected egress source-fence evidence")?;
+    }
+    Ok(())
+}
+
+fn verify_recovered_egress_source_fence(
+    active: &EncodedEgressBank,
+    manifest: &unf_egress::EgressRetirementManifest,
+    recipient: &EgressProjectionRecipient,
+    active_bank: u8,
+) -> Result<()> {
+    egress_bank(active_bank)?;
+    let sources = manifest
+        .sources
+        .iter()
+        .filter(|source| &source.recipient == recipient)
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        bail!("retirement manifest contains no source for the authenticated recipient");
+    }
+    for source in sources {
+        let mut key = [0_u8; 8];
+        key[0..4].copy_from_slice(&source.source_identity.get().to_ne_bytes());
+        key[4] = active_bank;
+        let value = active
+            .sources
+            .get(&key)
+            .context("retiring source is absent from the recovered active bank")?;
+        validate_recovered_egress_source(key, value)?;
+        let lease_epoch = u64::from_ne_bytes(value[0..8].try_into().expect("fixed lease epoch"));
+        let contract_revision =
+            u64::from_ne_bytes(value[8..16].try_into().expect("fixed contract revision"));
+        if value[122] != unf_ebpf_common::EGRESS_ADMISSION_FENCED
+            || lease_epoch != manifest.lease_epoch
+            || contract_revision != source.contract_revision.get()
+            || value[64..96] != source.contract_digest.0
+        {
+            bail!("recovered source fence does not match the sealed retirement manifest");
+        }
     }
     Ok(())
 }
@@ -9517,12 +10245,7 @@ fn apply_encoded_egress_bank(
 }
 
 fn fence_active_egress_dataplane(egress: &mut EgressSynchronizer) -> Result<bool> {
-    let active = &egress.banks[usize::from(egress.active_bank)];
-    let bank = egress.active_bank ^ 1;
-    let Some(desired) = compile_fenced_egress_bank(active, bank)? else {
-        return Ok(false);
-    };
-    apply_encoded_egress_bank(egress, desired)?;
+    let changed = fence_active_egress_source(egress)?;
     let connection_keys = egress
         .connections
         .iter()
@@ -9533,12 +10256,23 @@ fn fence_active_egress_dataplane(egress: &mut EgressSynchronizer) -> Result<bool
     for key in connection_keys {
         egress.connections.remove(&key)?;
     }
+    Ok(changed)
+}
+
+fn fence_active_egress_source(egress: &mut EgressSynchronizer) -> Result<bool> {
+    let active = &egress.banks[usize::from(egress.active_bank)];
+    let bank = egress.active_bank ^ 1;
+    let Some(desired) = compile_fenced_egress_bank(active, bank, false)? else {
+        return Ok(false);
+    };
+    apply_encoded_egress_bank(egress, desired)?;
     Ok(true)
 }
 
 fn compile_fenced_egress_bank(
     active: &EncodedEgressBank,
     bank: u8,
+    force_rebank: bool,
 ) -> Result<Option<EncodedEgressBank>> {
     egress_bank(bank)?;
     let needs_fence = active
@@ -9548,7 +10282,7 @@ fn compile_fenced_egress_bank(
         || !active.addresses.is_empty()
         || !active.gateways.is_empty()
         || !active.selections.is_empty();
-    if !needs_fence {
+    if !needs_fence && !force_rebank {
         return Ok(None);
     }
     let mut desired = active.clone();
@@ -14585,14 +15319,24 @@ mod tests {
                 ],
                 lease_epoch: 11,
             }],
-            gateways: vec![unf_egress::EgressGatewayFact {
-                intent_uid: "payments-uid".to_owned(),
-                rank: 0,
-                node: node("worker-b"),
-                lease_epoch: 11,
-                ready: true,
-                reachable: true,
-            }],
+            gateways: vec![
+                unf_egress::EgressGatewayFact {
+                    intent_uid: "payments-uid".to_owned(),
+                    rank: 0,
+                    node: source_node.clone(),
+                    lease_epoch: 11,
+                    ready: true,
+                    reachable: true,
+                },
+                unf_egress::EgressGatewayFact {
+                    intent_uid: "payments-uid".to_owned(),
+                    rank: 1,
+                    node: node("worker-b"),
+                    lease_epoch: 11,
+                    ready: true,
+                    reachable: true,
+                },
+            ],
         };
         let contract = unf_egress::EgressBehaviorContract::issue(
             &model,
@@ -14629,6 +15373,23 @@ mod tests {
     fn dual_stack_egress_paths_bind_route_provenance_interface_and_mtu() {
         let source = egress_path_test_source();
         let (_, snapshot) = route_test_snapshots();
+        let local_node = NodePortNodeSnapshot {
+            schema_version: unf_service::NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
+            source_epoch: 9,
+            revision: Revision::new(7),
+            node_name: "worker-a".to_owned(),
+            node_uid: "worker-a-uid".to_owned(),
+            addresses: vec![
+                unf_service::ServiceNodeAddress {
+                    address: "192.0.2.1".parse().unwrap(),
+                    kind: unf_service::NodeAddressKind::Internal,
+                },
+                unf_service::ServiceNodeAddress {
+                    address: "fdff::1".parse().unwrap(),
+                    kind: unf_service::NodeAddressKind::Internal,
+                },
+            ],
+        };
         let provider = NativeEgressPathProvider {
             ipv4_interface: "eth4".to_owned(),
             ipv6_interface: "eth6".to_owned(),
@@ -14638,33 +15399,99 @@ mod tests {
             ipv6_onlink: false,
             sys_class_net: PathBuf::from("/unused"),
         };
-        let paths = build_egress_path_certificates(&provider, &source, &snapshot, 1500, 9000)
-            .expect("dual-stack paths derive from exact route ownership");
-        assert_eq!(paths.len(), 2);
+        let paths =
+            build_egress_path_certificates(&provider, &source, &snapshot, &local_node, 1500, 9000)
+                .expect("dual-stack paths derive from exact route ownership");
+        assert_eq!(paths.len(), 4);
         assert!(paths.iter().all(|path| {
             path.source.name == "worker-a"
-                && path.gateway.name == "worker-b"
                 && path.path_revision == Revision::new(7)
                 && path.lease_epoch == 11
                 && path.transport_address == path.next_hop_address
                 && path.verify_integrity().is_ok()
         }));
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| path.mode == EgressPathMode::LocalGateway)
+                .count(),
+            2
+        );
         let ipv4 = paths
             .iter()
-            .find(|path| path.address_family == EgressAddressFamily::Ipv4)
+            .find(|path| {
+                path.gateway.name == "worker-b" && path.address_family == EgressAddressFamily::Ipv4
+            })
             .unwrap();
         assert_eq!(ipv4.output_interface, 3);
         assert_eq!(ipv4.mtu, 1500);
         let ipv6 = paths
             .iter()
-            .find(|path| path.address_family == EgressAddressFamily::Ipv6)
+            .find(|path| {
+                path.gateway.name == "worker-b" && path.address_family == EgressAddressFamily::Ipv6
+            })
             .unwrap();
         assert_eq!(ipv6.output_interface, 4);
         assert_eq!(ipv6.mtu, 9000);
 
         let mut missing = snapshot;
         missing.remote_nodes.clear();
-        assert!(build_egress_path_certificates(&provider, &source, &missing, 1500, 9000).is_err());
+        assert!(
+            build_egress_path_certificates(&provider, &source, &missing, &local_node, 1500, 9000,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recovered_source_retirement_requires_exact_fenced_bpf_readback() {
+        let admitted = egress_path_test_source();
+        let projection = admitted.projection();
+        let plan = &projection.contract.plans[0];
+        let desired = unf_egress::EgressGatewayDesired {
+            schema_version: unf_egress::EGRESS_GATEWAY_DESIRED_SCHEMA_VERSION,
+            revision: Revision::new(12),
+            allocation_revision: plan.revisions.allocation,
+            owner: plan.intent.clone(),
+            provider: plan
+                .allocation
+                .pool
+                .as_ref()
+                .expect("pooled fixture")
+                .provider
+                .clone(),
+            lease_epoch: plan.allocation.lease_epoch,
+            action: unf_egress::EgressGatewayAction::Withdraw,
+            addresses: plan.allocation.addresses.clone(),
+            nodes: plan
+                .gateways
+                .iter()
+                .map(|gateway| gateway.node.clone())
+                .collect(),
+        };
+        let manifest =
+            unf_egress::EgressRetirementManifest::issue(&desired, std::slice::from_ref(&admitted))
+                .expect("seal retirement manifest");
+        let host = EgressGatewayHostBank::compile(&admitted).expect("compile admitted host bank");
+        let mut guard = EgressAdmissionGuard::default();
+        guard
+            .fence(
+                plan.source.identity,
+                plan.intent.clone(),
+                plan.revisions.intent,
+            )
+            .expect("fence retiring source");
+        let state = compile_egress_dataplane(&host, &guard, &[], 1)
+            .expect("compile destination-preserving fenced bank");
+        let mut encoded = encode_egress_dataplane(&state).expect("encode fenced bank");
+        verify_recovered_egress_source_fence(&encoded, &manifest, &projection.recipient, 1)
+            .expect("accept exact persistent source fence");
+
+        encoded.sources.values_mut().next().expect("source exists")[122] =
+            unf_ebpf_common::EGRESS_ADMISSION_ACTIVE;
+        assert!(
+            verify_recovered_egress_source_fence(&encoded, &manifest, &projection.recipient, 1,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -14710,6 +15537,23 @@ mod tests {
     fn active_egress_bank_compiles_to_destination_preserving_fences() {
         let source = egress_path_test_source();
         let (_, snapshot) = route_test_snapshots();
+        let local_node = NodePortNodeSnapshot {
+            schema_version: unf_service::NODE_PORT_NODE_SNAPSHOT_SCHEMA_VERSION,
+            source_epoch: 9,
+            revision: Revision::new(7),
+            node_name: "worker-a".to_owned(),
+            node_uid: "worker-a-uid".to_owned(),
+            addresses: vec![
+                unf_service::ServiceNodeAddress {
+                    address: "192.0.2.1".parse().unwrap(),
+                    kind: unf_service::NodeAddressKind::Internal,
+                },
+                unf_service::ServiceNodeAddress {
+                    address: "fdff::1".parse().unwrap(),
+                    kind: unf_service::NodeAddressKind::Internal,
+                },
+            ],
+        };
         let provider = NativeEgressPathProvider {
             ipv4_interface: "eth4".to_owned(),
             ipv6_interface: "eth6".to_owned(),
@@ -14720,7 +15564,8 @@ mod tests {
             sys_class_net: PathBuf::from("/unused"),
         };
         let paths =
-            build_egress_path_certificates(&provider, &source, &snapshot, 1500, 1500).unwrap();
+            build_egress_path_certificates(&provider, &source, &snapshot, &local_node, 1500, 1500)
+                .unwrap();
         let host = EgressGatewayHostBank::compile(&source).unwrap();
         let identity = host.contract.plans[0].source.identity;
         let mut guard = EgressAdmissionGuard::default();
@@ -14732,7 +15577,7 @@ mod tests {
         let active = compile_egress_dataplane(&host, &guard, &paths, 1).unwrap();
         let encoded = encode_egress_dataplane(&active).unwrap();
         let destination_count = encoded.ipv4_destinations.len() + encoded.ipv6_destinations.len();
-        let fenced = compile_fenced_egress_bank(&encoded, 0)
+        let fenced = compile_fenced_egress_bank(&encoded, 0, false)
             .unwrap()
             .expect("active bank requires fencing");
         assert!(fenced.sources.values().all(|value| {
@@ -14751,7 +15596,16 @@ mod tests {
             0
         );
         assert_eq!(fenced.config[50], 0);
-        assert!(compile_fenced_egress_bank(&fenced, 1).unwrap().is_none());
+        assert!(
+            compile_fenced_egress_bank(&fenced, 1, false)
+                .unwrap()
+                .is_none()
+        );
+        let rebanked = compile_fenced_egress_bank(&fenced, 1, true)
+            .unwrap()
+            .expect("HA bridge forces an already-fenced bank onto a new index");
+        assert_eq!(rebanked.config[50], 1);
+        assert!(rebanked.sources.keys().all(|key| key[4] == 1));
     }
 
     #[allow(clippy::default_trait_access)]
@@ -16108,6 +16962,9 @@ mod tests {
             ledger: EgressProjectionLedger::default(),
             gateway_ledger: EgressGatewayProjectionLedger::default(),
             applied_authority: None,
+            gateway_owned_addresses: BTreeSet::new(),
+            ha_replicas: BTreeMap::new(),
+            ha_activations: BTreeMap::new(),
             path_provider: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
@@ -16330,6 +17187,9 @@ mod tests {
             ledger: EgressProjectionLedger::default(),
             gateway_ledger: EgressGatewayProjectionLedger::default(),
             applied_authority: None,
+            gateway_owned_addresses: BTreeSet::new(),
+            ha_replicas: BTreeMap::new(),
+            ha_activations: BTreeMap::new(),
             path_provider: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,

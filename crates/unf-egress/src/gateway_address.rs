@@ -814,6 +814,42 @@ mod tests {
     }
 
     #[test]
+    fn ha_withdrawal_projects_the_frozen_active_shard_ownership() {
+        let mut registry = EgressGatewayRegistry::default();
+        let payments = lease(
+            "payments",
+            &["192.0.2.20", "192.0.2.21", "2001:db8::20", "2001:db8::21"],
+            1,
+        );
+        let desired = registry
+            .ensure(&payments, vec![node("a"), node("b")])
+            .unwrap();
+        let candidates = ["a", "b"]
+            .into_iter()
+            .map(|name| EgressHaCandidate {
+                node: node(name),
+                capacity_units: 1,
+                failure_domains: std::collections::BTreeMap::new(),
+            })
+            .collect();
+        let plan = compile_egress_ha_plan(&payments, candidates, None, desired.revision).unwrap();
+        let withdrawing = registry.withdraw(&payments.intent.owner).unwrap();
+        assert!(plan.revision < withdrawing.revision);
+
+        let projection = EgressGatewayAddressProjection::issue_exclusive_with_releases(
+            &principal("a"),
+            7,
+            registry.checkpoint(),
+            vec![plan],
+            Vec::new(),
+        )
+        .expect("withdrawal keeps exact prior HA ownership");
+        assert_eq!(projection.leases.len(), 1);
+        assert_eq!(projection.leases[0].action, EgressGatewayAction::Withdraw);
+        assert_eq!(projection.ha_ownership.len(), 1);
+    }
+
+    #[test]
     fn replacement_node_uid_cannot_admit_stale_address_authority() {
         let mut registry = EgressGatewayRegistry::default();
         registry

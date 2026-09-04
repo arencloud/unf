@@ -15,13 +15,15 @@ use thiserror::Error;
 use unf_common::Revision;
 
 use crate::{
-    EgressHaAssignment, EgressHaContingency, EgressHaDigest, EgressHaPlan, EgressIntentOwner,
+    EgressHaAssignment, EgressHaContingency, EgressHaContinuityCutover, EgressHaDigest,
+    EgressHaFlowTwinAcknowledgement, EgressHaFlowTwinStream, EgressHaPlan, EgressIntentOwner,
     EgressNode, EgressProjectionRecipient, MAX_EGRESS_CONTRACT_PLANS,
 };
 
 pub const EGRESS_HA_PROMOTION_SCHEMA_VERSION: u16 = 1;
+pub const EGRESS_HA_TRANSPORT_SCHEMA_VERSION: u16 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EgressHaPromotionDigest(pub [u8; 32]);
 
@@ -114,6 +116,22 @@ pub struct EgressHaGatewayAcquisitionEvidence {
     pub kernel_revision: Revision,
 }
 
+/// Exact source-bank readback after consuming the complete activation bundle.
+/// This is the terminal witness that permits durable promotion finalization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressHaSourceActivationEvidence {
+    pub schema_version: u16,
+    pub controller_epoch: u64,
+    pub promotion_epoch: u64,
+    pub recipient: EgressProjectionRecipient,
+    pub manifest_digest: EgressHaPromotionDigest,
+    pub authority_digest: EgressHaPromotionDigest,
+    pub cutover_digest: crate::EgressHaContinuityDigest,
+    pub projection_revision: Revision,
+    pub active_bank: u8,
+}
+
 /// Compare-and-swap readback from the independent reachability provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -154,6 +172,57 @@ pub struct EgressHaPromotionCheckpoint {
     pub old_owner_fence: Option<EgressHaOldOwnerFenceEvidence>,
     pub acquisitions: Vec<EgressHaGatewayAcquisitionEvidence>,
     pub reachability: Option<EgressHaReachabilityHandoffEvidence>,
+}
+
+/// One authenticated, Node-UID-bound live operation. The controller derives
+/// these challenges exclusively from durable promotion state; agents never
+/// infer a transition from health or from a desired ownership projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "kind")]
+pub enum EgressHaAgentChallenge {
+    SourceFence {
+        manifest: Box<EgressHaPromotionManifest>,
+    },
+    PrimarySnapshot {
+        manifest: Box<EgressHaPromotionManifest>,
+        standby_gateway: EgressNode,
+        shard_indexes: Vec<u16>,
+    },
+    OldOwnerRevocation {
+        manifest: Box<EgressHaPromotionManifest>,
+    },
+    StandbyReplica {
+        manifest: Box<EgressHaPromotionManifest>,
+        stream: Box<EgressHaFlowTwinStream>,
+    },
+    SourceActivation {
+        authority: Box<EgressHaActivationAuthority>,
+        cutover: Box<EgressHaContinuityCutover>,
+    },
+}
+
+/// Complete challenge set for one authenticated agent incarnation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressHaAgentChallenges {
+    pub schema_version: u16,
+    pub controller_epoch: u64,
+    pub recipient: EgressProjectionRecipient,
+    pub certified_plans: Vec<EgressHaPlan>,
+    pub challenges: Vec<EgressHaAgentChallenge>,
+}
+
+/// Evidence accepted by the authenticated live transport. Infrastructure
+/// fencing is intentionally absent: only a separately authenticated provider
+/// integration may submit that authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "kind")]
+pub enum EgressHaAgentEvidence {
+    SourceFence(EgressHaSourceFenceEvidence),
+    FlowTwinStream(EgressHaFlowTwinStream),
+    OldOwnerRevocation(EgressHaOldOwnerRevocationEvidence),
+    FlowTwinAcknowledgement(EgressHaFlowTwinAcknowledgement),
+    SourceActivation(EgressHaSourceActivationEvidence),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +342,226 @@ impl EgressHaPromotionManifest {
             Err(EgressHaPromotionError::InvalidAuthority)
         }
     }
+}
+
+impl EgressHaAgentChallenges {
+    /// Seals and validates a complete challenge response for one exact agent.
+    ///
+    /// # Errors
+    ///
+    /// Rejects foreign recipients, epochs, malformed streams, duplicate
+    /// operations, or a challenge that is not authorized by its manifest.
+    pub fn issue(
+        controller_epoch: u64,
+        recipient: EgressProjectionRecipient,
+        certified_plans: Vec<EgressHaPlan>,
+        challenges: Vec<EgressHaAgentChallenge>,
+    ) -> Result<Self, EgressHaPromotionError> {
+        let result = Self {
+            schema_version: EGRESS_HA_TRANSPORT_SCHEMA_VERSION,
+            controller_epoch,
+            recipient,
+            certified_plans,
+            challenges,
+        };
+        result.verify()?;
+        Ok(result)
+    }
+
+    /// Replays every live challenge against its embedded immutable authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, foreign, duplicated, or noncanonical challenges.
+    pub fn verify(&self) -> Result<(), EgressHaPromotionError> {
+        if self.schema_version != EGRESS_HA_TRANSPORT_SCHEMA_VERSION
+            || self.controller_epoch == 0
+            || self.recipient.node_name.is_empty()
+            || self.recipient.node_uid.is_empty()
+            || self.certified_plans.len() > MAX_EGRESS_CONTRACT_PLANS
+            || self
+                .certified_plans
+                .windows(2)
+                .any(|pair| pair[0].owner >= pair[1].owner)
+            || self.challenges.len() > MAX_EGRESS_CONTRACT_PLANS
+        {
+            return Err(EgressHaPromotionError::InvalidAuthority);
+        }
+        let mut identities = BTreeSet::new();
+        for plan in &self.certified_plans {
+            plan.verify_integrity()
+                .map_err(|_| EgressHaPromotionError::InvalidAuthority)?;
+        }
+        for challenge in &self.challenges {
+            let identity = match challenge {
+                EgressHaAgentChallenge::SourceFence { manifest } => {
+                    verify_transport_manifest(manifest, self.controller_epoch)?;
+                    if !manifest.sources.contains(&self.recipient) {
+                        return Err(EgressHaPromotionError::EvidenceMismatch);
+                    }
+                    (manifest.manifest_digest, 0_u8, String::new())
+                }
+                EgressHaAgentChallenge::PrimarySnapshot {
+                    manifest,
+                    standby_gateway,
+                    shard_indexes,
+                } => {
+                    verify_transport_manifest(manifest, self.controller_epoch)?;
+                    if manifest.failed_gateway.name != self.recipient.node_name
+                        || manifest.failed_gateway.uid != self.recipient.node_uid
+                        || shard_indexes.is_empty()
+                        || shard_indexes.windows(2).any(|pair| pair[0] >= pair[1])
+                        || handoff_shards(manifest, &manifest.failed_gateway, standby_gateway)
+                            != *shard_indexes
+                    {
+                        return Err(EgressHaPromotionError::EvidenceMismatch);
+                    }
+                    (manifest.manifest_digest, 1_u8, standby_gateway.uid.clone())
+                }
+                EgressHaAgentChallenge::OldOwnerRevocation { manifest } => {
+                    verify_transport_manifest(manifest, self.controller_epoch)?;
+                    if manifest.failed_gateway.name != self.recipient.node_name
+                        || manifest.failed_gateway.uid != self.recipient.node_uid
+                    {
+                        return Err(EgressHaPromotionError::EvidenceMismatch);
+                    }
+                    (manifest.manifest_digest, 2_u8, String::new())
+                }
+                EgressHaAgentChallenge::StandbyReplica { manifest, stream } => {
+                    verify_transport_manifest(manifest, self.controller_epoch)?;
+                    stream
+                        .verify(manifest)
+                        .map_err(|_| EgressHaPromotionError::EvidenceMismatch)?;
+                    if stream.standby_gateway.name != self.recipient.node_name
+                        || stream.standby_gateway.uid != self.recipient.node_uid
+                    {
+                        return Err(EgressHaPromotionError::EvidenceMismatch);
+                    }
+                    (
+                        manifest.manifest_digest,
+                        3_u8,
+                        stream.primary_gateway.uid.clone(),
+                    )
+                }
+                EgressHaAgentChallenge::SourceActivation { authority, cutover } => {
+                    authority.verify()?;
+                    cutover
+                        .verify(authority)
+                        .map_err(|_| EgressHaPromotionError::EvidenceMismatch)?;
+                    let manifest = &authority.manifest;
+                    verify_transport_manifest(manifest, self.controller_epoch)?;
+                    if !manifest.sources.contains(&self.recipient) {
+                        return Err(EgressHaPromotionError::EvidenceMismatch);
+                    }
+                    (manifest.manifest_digest, 4_u8, String::new())
+                }
+            };
+            let manifest = match challenge {
+                EgressHaAgentChallenge::SourceFence { manifest }
+                | EgressHaAgentChallenge::PrimarySnapshot { manifest, .. }
+                | EgressHaAgentChallenge::OldOwnerRevocation { manifest }
+                | EgressHaAgentChallenge::StandbyReplica { manifest, .. } => manifest.as_ref(),
+                EgressHaAgentChallenge::SourceActivation { authority, .. } => &authority.manifest,
+            };
+            let plan = self
+                .certified_plans
+                .iter()
+                .find(|plan| plan.owner == manifest.owner)
+                .ok_or(EgressHaPromotionError::InvalidAuthority)?;
+            manifest.verify(plan)?;
+            if !identities.insert(identity) {
+                return Err(EgressHaPromotionError::EvidenceOrder);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl EgressHaSourceActivationEvidence {
+    /// Binds one active source-bank readback to its exact authority and cutover.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a foreign source, stale projection, or wrong target bank.
+    pub fn issue(
+        authority: &EgressHaActivationAuthority,
+        cutover: &EgressHaContinuityCutover,
+        recipient: EgressProjectionRecipient,
+        projection_revision: Revision,
+        active_bank: u8,
+    ) -> Result<Self, EgressHaPromotionError> {
+        authority.verify()?;
+        cutover
+            .verify(authority)
+            .map_err(|_| EgressHaPromotionError::EvidenceMismatch)?;
+        if !authority.manifest.sources.contains(&recipient)
+            || projection_revision == Revision::INITIAL
+            || active_bank != cutover.target_source_bank
+        {
+            return Err(EgressHaPromotionError::EvidenceMismatch);
+        }
+        Ok(Self {
+            schema_version: EGRESS_HA_PROMOTION_SCHEMA_VERSION,
+            controller_epoch: authority.manifest.controller_epoch,
+            promotion_epoch: authority.manifest.promotion_epoch,
+            recipient,
+            manifest_digest: authority.manifest.manifest_digest,
+            authority_digest: authority.authority_digest,
+            cutover_digest: cutover.cutover_digest,
+            projection_revision,
+            active_bank,
+        })
+    }
+
+    /// Replays this witness against its complete source activation bundle.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any stale, mutated, or foreign field.
+    pub fn verify(
+        &self,
+        authority: &EgressHaActivationAuthority,
+        cutover: &EgressHaContinuityCutover,
+    ) -> Result<(), EgressHaPromotionError> {
+        let expected = Self::issue(
+            authority,
+            cutover,
+            self.recipient.clone(),
+            self.projection_revision,
+            self.active_bank,
+        )?;
+        if &expected == self {
+            Ok(())
+        } else {
+            Err(EgressHaPromotionError::EvidenceMismatch)
+        }
+    }
+}
+
+fn verify_transport_manifest(
+    manifest: &EgressHaPromotionManifest,
+    controller_epoch: u64,
+) -> Result<(), EgressHaPromotionError> {
+    if manifest.schema_version != EGRESS_HA_PROMOTION_SCHEMA_VERSION
+        || manifest.controller_epoch != controller_epoch
+        || manifest.manifest_digest == EgressHaPromotionDigest([0; 32])
+    {
+        return Err(EgressHaPromotionError::InvalidAuthority);
+    }
+    Ok(())
+}
+
+fn handoff_shards(
+    manifest: &EgressHaPromotionManifest,
+    primary: &EgressNode,
+    standby: &EgressNode,
+) -> Vec<u16> {
+    manifest
+        .handoffs
+        .iter()
+        .filter(|handoff| &handoff.old_gateway == primary && &handoff.new_gateway == standby)
+        .map(|handoff| handoff.shard_index)
+        .collect()
 }
 
 impl EgressHaPromotionCoordinator {

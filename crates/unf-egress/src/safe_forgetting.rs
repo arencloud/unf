@@ -450,6 +450,49 @@ impl EgressSourceFenceEvidence {
         )
     }
 
+    /// Reconstructs a source-fence witness after an agent restart from the
+    /// controller-retained manifest. The caller must first read back the
+    /// active dataplane bank and prove that every returned source is fenced
+    /// with the exact lease epoch, contract revision, and contract digest.
+    ///
+    /// `projection_revision` is the sealed withdrawal revision in this
+    /// recovery form because the original projection envelope is deliberately
+    /// not treated as durable agent authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a foreign recipient, malformed challenge, invalid bank, or a
+    /// manifest that contains no source owned by the recipient.
+    pub fn issue_recovered_for_challenge(
+        challenges: &EgressSourceRetirementChallenges,
+        manifest: &EgressRetirementManifest,
+        recipient: EgressProjectionRecipient,
+        active_bank: u8,
+    ) -> Result<Self, EgressSafeForgettingError> {
+        challenges.verify()?;
+        if !challenges.manifests.contains(manifest) || active_bank >= 2 {
+            return Err(EgressSafeForgettingError::EvidenceMismatch);
+        }
+        let sources = manifest
+            .sources
+            .iter()
+            .filter(|source| source.recipient == recipient)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut evidence = Self {
+            schema_version: EGRESS_SAFE_FORGETTING_SCHEMA_VERSION,
+            controller_epoch: challenges.controller_epoch,
+            projection_revision: manifest.desired_revision,
+            recipient,
+            active_bank,
+            sources,
+            evidence_digest: EgressRetirementDigest([0; 32]),
+        };
+        evidence.validate()?;
+        evidence.evidence_digest = evidence.digest()?;
+        Ok(evidence)
+    }
+
     fn issue_for_owner(
         owner: &EgressIntentOwner,
         lease_epoch: u64,
@@ -1016,6 +1059,51 @@ mod tests {
                 vec![fence],
                 vec![gateway],
                 reachability(&desired),
+            ),
+            Err(EgressSafeForgettingError::EvidenceMismatch)
+        );
+    }
+
+    #[test]
+    fn restart_recovery_reissues_only_the_manifest_bound_source_fence() {
+        let (desired, admitted) = withdrawal();
+        let manifest = EgressRetirementManifest::issue(&desired, std::slice::from_ref(&admitted))
+            .expect("seal durable retirement manifest");
+        let challenges = EgressSourceRetirementChallenges::issue(17, vec![manifest.clone()])
+            .expect("issue current-epoch source challenge");
+        let recipient = admitted.projection().recipient.clone();
+        let evidence = EgressSourceFenceEvidence::issue_recovered_for_challenge(
+            &challenges,
+            &manifest,
+            recipient.clone(),
+            1,
+        )
+        .expect("reconstruct evidence after projection memory is lost");
+        assert_eq!(evidence.controller_epoch, 17);
+        assert_eq!(evidence.projection_revision, desired.revision);
+        assert_eq!(evidence.recipient, recipient);
+        assert_eq!(evidence.sources, manifest.sources);
+        evidence.verify().expect("recovered evidence is sealed");
+
+        let foreign = EgressProjectionRecipient {
+            node_name: "foreign".to_owned(),
+            node_uid: "foreign-uid".to_owned(),
+        };
+        assert_eq!(
+            EgressSourceFenceEvidence::issue_recovered_for_challenge(
+                &challenges,
+                &manifest,
+                foreign,
+                1,
+            ),
+            Err(EgressSafeForgettingError::EvidenceMismatch)
+        );
+        assert_eq!(
+            EgressSourceFenceEvidence::issue_recovered_for_challenge(
+                &challenges,
+                &manifest,
+                admitted.projection().recipient.clone(),
+                2,
             ),
             Err(EgressSafeForgettingError::EvidenceMismatch)
         );

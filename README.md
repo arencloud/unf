@@ -413,7 +413,7 @@ pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
 is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
-and ADRs 0113–0130 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+and ADRs 0113–0141 track the work. Milestone 8.2a now adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -577,8 +577,20 @@ plan, source/old-owner fences, staged survivor placement, replacement readback,
 reachability CAS, acknowledged flow twins, and source-specific inactive-bank
 cutovers into one restart-replayable ordered transaction. Kubernetes health
 cannot advance it, and the three-gateway adversarial gate passes `make
-egress-ha-transaction-test`; ADR 0140. Authenticated promotion transport and
-measured failover remain before 8.6 can claim availability.
+egress-ha-transaction-test`; ADR 0140. Milestone 8.6f closes the live path:
+authenticated Node-UID-bound challenges drive source fencing, complete AFT
+snapshot/import/readback, exact old-owner revocation, replacement address and
+reachability acquisition, mandated-bank source activation, and terminal durable
+finalization. Checkpoint-v5 canonically persists structured source cutovers and
+terminal activation, while a verifier-isolated V2 tail-call dispatcher permits
+one Node to act as source and gateway without bypassing either role. The
+three-Node dual-stack kube-proxy-free Kind gate recorded 45 acknowledged flow
+twins, a 10.860-second graceful promotion with one bounded probe failure,
+exclusive ownership, stable rejoin, and an 80.428-second abrupt recovery whose
+Kubernetes NotReady signal never served as fence authority. `make
+egress-ha-kind-test` and ADR 0141 complete milestone 8.6 at this bounded Kind
+scope; production availability/scale, OpenShift qualification, and non-static
+reachability providers remain separate gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

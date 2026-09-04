@@ -48,8 +48,9 @@ use unf_egress::{
     EgressGatewayAcknowledgement, EgressGatewayAddressAcknowledgement,
     EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
     EgressGatewayDrainEvidence, EgressGatewayProjection, EgressGatewayRetirementChallenges,
-    EgressHaCandidate, EgressHaPlan, EgressIntent, EgressIntentOwner, EgressModel, EgressNode,
-    EgressNodeProjectionEnvelope, EgressProviderOutcome, EgressProviderRef,
+    EgressHaAgentChallenges, EgressHaAgentEvidence, EgressHaCandidate, EgressHaPlan, EgressIntent,
+    EgressIntentOwner, EgressModel, EgressNode, EgressNodeProjectionEnvelope,
+    EgressProjectionRecipient, EgressProviderOutcome, EgressProviderRef,
     EgressReachabilityAcknowledgement, EgressSafeReleaseAuthority, EgressSourceActivationGrant,
     EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
     EgressSourceRetirementChallenges,
@@ -1202,6 +1203,11 @@ async fn spawn_internal_api(
         .route(
             "/v1/state/egress-source-activation",
             get(egress_source_activation),
+        )
+        .route("/v1/state/egress-ha", get(egress_ha_challenges))
+        .route(
+            "/v1/state/egress-ha-evidence",
+            post(ingest_egress_ha_evidence),
         )
         .route(
             "/v1/state/egress-source-ack",
@@ -4341,6 +4347,9 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             if let Err(error) = reconcile_egress_control_plane(state) {
                 state.metrics.errors.inc();
                 warn!(%error, "Node deletion egress reconciliation rejected; retaining last-known-good state");
+            } else if let Err(error) = begin_requested_egress_ha_drains(state) {
+                state.metrics.errors.inc();
+                warn!(%error, "deleted-Node HA investigation rejected; retaining durable ownership");
             }
         }
         Event::Init => {
@@ -4387,6 +4396,9 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             if let Err(error) = reconcile_egress_control_plane(state) {
                 state.metrics.errors.inc();
                 warn!(%error, "Node relist egress reconciliation rejected; retaining last-known-good state");
+            } else if let Err(error) = begin_requested_egress_ha_drains(state) {
+                state.metrics.errors.inc();
+                warn!(%error, "Node relist HA drain trigger rejected; retaining durable ownership");
             }
         }
     }
@@ -4423,9 +4435,14 @@ fn reconcile_node(state: &ControllerState, node: &Node, initializing: bool) {
     if gateways_changed {
         bump_policy_revision(state);
     }
-    if !initializing && let Err(error) = reconcile_egress_control_plane(state) {
-        state.metrics.errors.inc();
-        warn!(%error, "Node egress reconciliation rejected; retaining last-known-good state");
+    if !initializing {
+        if let Err(error) = reconcile_egress_control_plane(state) {
+            state.metrics.errors.inc();
+            warn!(%error, "Node egress reconciliation rejected; retaining last-known-good state");
+        } else if let Err(error) = begin_requested_egress_ha_drains(state) {
+            state.metrics.errors.inc();
+            warn!(%error, "HA drain trigger rejected; retaining durable ownership");
+        }
     }
 }
 
@@ -7112,6 +7129,151 @@ async fn egress_source_activation(
     }
 }
 
+async fn egress_ha_challenges(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<EgressHaAgentChallenges>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    let principal = egress_principal_for(&state, &agent)?;
+    let recipient = EgressProjectionRecipient {
+        node_name: principal.node_name,
+        node_uid: principal.node_uid,
+    };
+    let challenges = mutex_lock(&state.egress_control_plane)
+        .ha_agent_challenges(recipient, state.identity_epoch)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(Json(challenges))
+}
+
+async fn ingest_egress_ha_evidence(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(evidence): Json<EgressHaAgentEvidence>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    ingest_egress_ha_evidence_for(&state, &agent, evidence)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[allow(clippy::too_many_lines)]
+fn ingest_egress_ha_evidence_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    evidence: EgressHaAgentEvidence,
+) -> Result<(), ApiError> {
+    let principal = egress_principal_for(state, agent)?;
+    if !agent_application_is_current(state, agent) {
+        return Err(ApiError::forbidden(
+            "HA evidence does not match the current authenticated agent Pod",
+        ));
+    }
+    let recipient = EgressProjectionRecipient {
+        node_name: principal.node_name,
+        node_uid: principal.node_uid,
+    };
+    let _guard = mutex_lock(&state.egress_distribution_guard);
+    let mut control = mutex_lock(&state.egress_control_plane);
+    match evidence {
+        EgressHaAgentEvidence::SourceFence(evidence) => {
+            if evidence.recipient != recipient {
+                return Err(ApiError::forbidden(
+                    "HA source-fence evidence belongs to another Node",
+                ));
+            }
+            control
+                .admit_ha_source_fence(evidence)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        }
+        EgressHaAgentEvidence::FlowTwinStream(stream) => {
+            if stream.primary_gateway.name != recipient.node_name
+                || stream.primary_gateway.uid != recipient.node_uid
+            {
+                return Err(ApiError::forbidden(
+                    "HA flow snapshot belongs to another primary gateway",
+                ));
+            }
+            control
+                .admit_ha_flow_twin_stream(stream)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        }
+        EgressHaAgentEvidence::OldOwnerRevocation(evidence) => {
+            if evidence.gateway.name != recipient.node_name
+                || evidence.gateway.uid != recipient.node_uid
+            {
+                return Err(ApiError::forbidden(
+                    "HA revocation evidence belongs to another old owner",
+                ));
+            }
+            let old_owner_node = evidence.gateway.name.clone();
+            let owner = control
+                .checkpoint()
+                .ha_promotions
+                .iter()
+                .find(|promotion| {
+                    promotion.coordinator.manifest.manifest_digest == evidence.manifest_digest
+                })
+                .map(|promotion| promotion.coordinator.manifest.owner.clone())
+                .ok_or_else(|| ApiError::bad_request("unknown HA promotion evidence"))?;
+            control
+                .admit_ha_old_owner_revocation(evidence)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            control
+                .stage_ha_replacement(&owner)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            acknowledge_static_egress_reachability(&mut control)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            write_lock(&state.egress_gateway_address_applications).remove(&old_owner_node);
+            write_lock(&state.egress_pending_gateway_addresses).remove(&old_owner_node);
+            reset_egress_contract_distributions_locked(state);
+        }
+        EgressHaAgentEvidence::FlowTwinAcknowledgement(acknowledgement) => {
+            if acknowledgement.standby_gateway.name != recipient.node_name
+                || acknowledgement.standby_gateway.uid != recipient.node_uid
+            {
+                return Err(ApiError::forbidden(
+                    "HA replica acknowledgement belongs to another standby gateway",
+                ));
+            }
+            control
+                .admit_ha_flow_twin_acknowledgement(acknowledgement)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        }
+        EgressHaAgentEvidence::SourceActivation(evidence) => {
+            if evidence.recipient != recipient {
+                return Err(ApiError::forbidden(
+                    "HA source activation evidence belongs to another Node",
+                ));
+            }
+            let owner = control
+                .checkpoint()
+                .ha_promotions
+                .iter()
+                .find(|promotion| {
+                    promotion.coordinator.manifest.manifest_digest == evidence.manifest_digest
+                })
+                .map(|promotion| promotion.coordinator.manifest.owner.clone())
+                .ok_or_else(|| ApiError::bad_request("unknown HA activation evidence"))?;
+            control
+                .admit_ha_source_activation(evidence)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            let complete = control.ha_promotion(&owner).is_some_and(|promotion| {
+                promotion.source_activations.len() == promotion.coordinator.manifest.sources.len()
+            });
+            if complete {
+                control
+                    .finalize_ha_promotion(&owner)
+                    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+                info!(owner = %owner.name, "finalized proof-complete egress HA promotion");
+            }
+        }
+    }
+    advance_egress_ha_transactions(state, &mut control)?;
+    state
+        .egress_control_plane_dirty
+        .store(true, Ordering::Release);
+    Ok(())
+}
+
 async fn egress_gateway_projection(
     State(state): State<Arc<ControllerState>>,
     headers: HeaderMap,
@@ -7148,7 +7310,7 @@ fn egress_gateway_address_projection_for(
         return Ok(None);
     }
     let authorities = read_lock(&state.egress_release_authorities);
-    let release_revisions = checkpoint
+    let authorized_release_revisions = checkpoint
         .records
         .iter()
         .filter(|record| {
@@ -7163,15 +7325,39 @@ fn egress_gateway_address_projection_for(
                 })
         })
         .map(|record| record.desired.revision)
-        .collect();
+        .collect::<BTreeSet<_>>();
     drop(authorities);
-    let previous_owned_addresses = read_lock(&state.egress_gateway_address_applications)
+    let mut previous_owned_addresses = read_lock(&state.egress_gateway_address_applications)
         .get(&agent.node_name)
         .filter(|application| {
             application.agent == *agent && agent_application_is_current(state, &application.agent)
         })
         .map(|application| application.acknowledgement.owned_addresses.clone())
         .unwrap_or_default();
+    let baseline = EgressGatewayAddressProjection::issue_exclusive_transition_with_releases(
+        &principal,
+        state.identity_epoch,
+        checkpoint.clone(),
+        plans.clone(),
+        previous_owned_addresses.clone(),
+        Vec::new(),
+    )
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    let release_revisions = baseline
+        .leases
+        .iter()
+        .filter(|lease| authorized_release_revisions.contains(&lease.revision))
+        .map(|lease| lease.revision)
+        .collect::<Vec<_>>();
+    if previous_owned_addresses.is_empty() && !release_revisions.is_empty() {
+        previous_owned_addresses = baseline
+            .leases
+            .iter()
+            .flat_map(|lease| lease.addresses.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
     let projection = EgressGatewayAddressProjection::issue_exclusive_transition_with_releases(
         &principal,
         state.identity_epoch,
@@ -7237,6 +7423,14 @@ fn acknowledge_egress_gateway_address_application_for(
             acknowledgement: acknowledgement.clone(),
         },
     );
+    {
+        let mut control = mutex_lock(&state.egress_control_plane);
+        if advance_egress_ha_transactions(state, &mut control)? {
+            state
+                .egress_control_plane_dirty
+                .store(true, Ordering::Release);
+        }
+    }
     acknowledge_ready_gateway_address_quorums(state)?;
     Ok(())
 }
@@ -7331,6 +7525,141 @@ fn acknowledge_ready_gateway_address_quorums(state: &ControllerState) -> Result<
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
+fn advance_egress_ha_transactions(
+    state: &ControllerState,
+    control: &mut EgressControlPlane,
+) -> Result<bool, ApiError> {
+    let mut changed = false;
+    let applications = read_lock(&state.egress_gateway_address_applications);
+    let checkpoint = control.checkpoint();
+    for promotion in checkpoint.ha_promotions {
+        if !promotion.replacement_staged {
+            continue;
+        }
+        let manifest = &promotion.coordinator.manifest;
+        let existing = promotion
+            .coordinator
+            .acquisitions
+            .iter()
+            .map(|evidence| evidence.gateway.clone())
+            .collect::<BTreeSet<_>>();
+        let expected = manifest
+            .handoffs
+            .iter()
+            .map(|handoff| handoff.new_gateway.clone())
+            .collect::<BTreeSet<_>>();
+        for gateway in expected.difference(&existing) {
+            let Some(application) = applications.get(&gateway.name) else {
+                continue;
+            };
+            if application.acknowledgement.recipient.node_uid != gateway.uid
+                || !agent_application_is_current(state, &application.agent)
+            {
+                continue;
+            }
+            let addresses = manifest
+                .handoffs
+                .iter()
+                .filter(|handoff| handoff.new_gateway == *gateway)
+                .flat_map(|handoff| handoff.addresses.iter().copied())
+                .collect::<BTreeSet<_>>();
+            if !addresses.iter().all(|address| {
+                application
+                    .acknowledgement
+                    .owned_addresses
+                    .contains(address)
+            }) {
+                continue;
+            }
+            control
+                .admit_ha_gateway_acquisition(unf_egress::EgressHaGatewayAcquisitionEvidence {
+                    schema_version: unf_egress::EGRESS_HA_PROMOTION_SCHEMA_VERSION,
+                    controller_epoch: manifest.controller_epoch,
+                    promotion_epoch: manifest.promotion_epoch,
+                    gateway: gateway.clone(),
+                    manifest_digest: manifest.manifest_digest,
+                    owned_addresses: addresses.into_iter().collect(),
+                    kernel_revision: application.acknowledgement.projection_revision,
+                })
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            changed = true;
+        }
+
+        let current = control
+            .ha_promotion(&manifest.owner)
+            .cloned()
+            .ok_or_else(|| ApiError::internal("HA transaction disappeared while advancing"))?;
+        let acquisition_nodes = current
+            .coordinator
+            .acquisitions
+            .iter()
+            .map(|evidence| evidence.gateway.clone())
+            .collect::<BTreeSet<_>>();
+        if current.coordinator.reachability.is_none() && acquisition_nodes == expected {
+            let gateway_record = control
+                .checkpoint()
+                .gateways
+                .records
+                .into_iter()
+                .find(|record| record.desired.owner == manifest.owner)
+                .ok_or_else(|| ApiError::internal("HA replacement has no gateway record"))?;
+            let Some(reachability) = gateway_record.reachability.filter(|acknowledgement| {
+                acknowledgement.outcome == EgressProviderOutcome::Ready
+                    && acknowledgement.provider.name == "static"
+            }) else {
+                continue;
+            };
+            control
+                .admit_ha_reachability_handoff(unf_egress::EgressHaReachabilityHandoffEvidence {
+                    schema_version: unf_egress::EGRESS_HA_PROMOTION_SCHEMA_VERSION,
+                    controller_epoch: manifest.controller_epoch,
+                    promotion_epoch: manifest.promotion_epoch,
+                    manifest_digest: manifest.manifest_digest,
+                    expected_plan_digest: manifest.active_plan_digest,
+                    installed_plan_digest: manifest.contingency_digest,
+                    handoffs: manifest.handoffs.clone(),
+                    provider: "static-l2-cas".to_owned(),
+                    provider_revision: reachability.revision.get(),
+                    compare_and_swap_applied: true,
+                })
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            changed = true;
+        }
+
+        let current = control
+            .ha_promotion(&manifest.owner)
+            .cloned()
+            .ok_or_else(|| ApiError::internal("HA transaction disappeared before cutover"))?;
+        if control.ha_activation_authority(&manifest.owner).is_ok()
+            && current.flow_streams.len() == current.flow_acknowledgements.len()
+        {
+            let cutoff_ns = current
+                .flow_streams
+                .iter()
+                .flat_map(|stream| &stream.records)
+                .map(|record| record.last_seen_ns)
+                .max()
+                .unwrap_or(1);
+            for source in &manifest.sources {
+                if !current.cutovers.contains_key(source) {
+                    control
+                        .seal_ha_source_cutover(&manifest.owner, source, cutoff_ns)
+                        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+                    changed = true;
+                }
+            }
+            if manifest.sources.is_empty() {
+                control
+                    .finalize_ha_promotion(&manifest.owner)
+                    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
 fn live_egress_ha_candidates(
     state: &ControllerState,
     checkpoint: &EgressControlPlaneCheckpoint,
@@ -7402,6 +7731,103 @@ fn live_egress_ha_candidates(
 }
 
 const EGRESS_HA_CAPACITY_LABEL: &str = "network.unf.io/egress-capacity";
+const EGRESS_HA_DRAIN_LABEL: &str = "network.unf.io/egress-drain";
+
+fn begin_requested_egress_ha_drains(state: &ControllerState) -> Result<bool> {
+    let nodes = read_lock(&state.nodes);
+    let source_distributions = read_lock(&state.egress_source_distributions);
+    let mut control = mutex_lock(&state.egress_control_plane);
+    let checkpoint = control.checkpoint();
+    let mut requests = Vec::new();
+    for plan in &checkpoint.ha_plans {
+        if checkpoint
+            .ha_promotions
+            .iter()
+            .any(|promotion| promotion.coordinator.manifest.owner == plan.owner)
+        {
+            continue;
+        }
+        let draining = plan
+            .assignments
+            .iter()
+            .map(|assignment| &assignment.gateway)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|gateway| {
+                nodes.get(&gateway.name).is_none_or(|node| {
+                    !node.ready
+                        || node
+                            .labels
+                            .get(EGRESS_HA_DRAIN_LABEL)
+                            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if draining.len() > 1 {
+            anyhow::bail!(
+                "intent {} requests more than one simultaneous HA gateway drain",
+                plan.owner.name
+            );
+        }
+        let Some(failed) = draining.into_iter().next() else {
+            continue;
+        };
+        let sources = source_distributions
+            .values()
+            .filter(|distribution| {
+                distribution
+                    .contract
+                    .plans
+                    .iter()
+                    .any(|contract| contract.intent == plan.owner)
+            })
+            .map(|distribution| EgressProjectionRecipient {
+                node_name: distribution.contract.node.name.clone(),
+                node_uid: distribution.contract.node.uid.clone(),
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        requests.push((plan.owner.clone(), failed.uid, sources));
+    }
+    drop(source_distributions);
+    drop(nodes);
+    if requests.is_empty() {
+        return Ok(false);
+    }
+    let mut next_epoch = checkpoint
+        .ha_promotions
+        .iter()
+        .map(|promotion| promotion.coordinator.manifest.promotion_epoch)
+        .max()
+        .unwrap_or(checkpoint.gateways.revision.get())
+        .saturating_add(1)
+        .max(1);
+    for (owner, failed_uid, sources) in requests {
+        let manifest = control.begin_ha_promotion(
+            &owner,
+            &failed_uid,
+            sources,
+            state.identity_epoch,
+            next_epoch,
+            checkpoint.gateways.revision.next(),
+        )?;
+        info!(
+            owner = %owner.name,
+            failed_gateway = %manifest.failed_gateway.name,
+            promotion_epoch = manifest.promotion_epoch,
+            source_count = manifest.sources.len(),
+            handoff_count = manifest.handoffs.len(),
+            "started explicit proof-carrying egress HA drain"
+        );
+        next_epoch = next_epoch.saturating_add(1);
+    }
+    state
+        .egress_control_plane_dirty
+        .store(true, Ordering::Release);
+    Ok(true)
+}
 
 fn egress_ha_capacity(name: &str, labels: &BTreeMap<String, String>) -> Result<u16> {
     labels
@@ -7756,6 +8182,18 @@ fn egress_source_activation_grant(
         || !agent_application_is_current(state, &pending_source.agent)
         || requesting_agent.is_some_and(|agent| *agent != pending_source.agent)
     {
+        return Ok(None);
+    }
+    let recipient = &source.projection().recipient;
+    let promotion_blocks_activation = mutex_lock(&state.egress_control_plane)
+        .checkpoint()
+        .ha_promotions
+        .iter()
+        .any(|promotion| {
+            promotion.coordinator.manifest.sources.contains(recipient)
+                && !promotion.cutovers.contains_key(recipient)
+        });
+    if promotion_blocks_activation {
         return Ok(None);
     }
     let pending_gateways = read_lock(&state.egress_pending_gateway_applications);
@@ -11047,6 +11485,10 @@ mod tests {
             release_projection.release_authorized_desired_revisions,
             vec![withdrawing.revision]
         );
+        assert_eq!(
+            release_projection.previous_owned_addresses,
+            withdrawing.addresses
+        );
         let pending_release = read_lock(&state.egress_pending_gateway_addresses)["gateway-a"]
             .projection
             .clone();
@@ -11175,6 +11617,93 @@ mod tests {
                 .as_ref()
                 .map(|ack| ack.outcome),
             Some(EgressProviderOutcome::Ready)
+        );
+    }
+
+    #[test]
+    fn explicit_ha_drain_starts_one_durable_node_uid_bound_transaction() {
+        let state = new_state(true);
+        let advertisement = egress_advertisement();
+        let distribution = gateway_source_distribution(&advertisement);
+        let owner = distribution.model.intents[0].owner.clone();
+        write_lock(&state.egress_source_distributions)
+            .insert("worker-a".to_owned(), distribution.clone());
+        let candidates = ["gateway-a", "gateway-b", "gateway-c"]
+            .into_iter()
+            .map(|name| {
+                write_lock(&state.nodes).insert(
+                    name.to_owned(),
+                    TopologyNode {
+                        name: name.to_owned(),
+                        ready: true,
+                        labels: BTreeMap::from([
+                            (
+                                PRIMARY_CNI_NODE_LABEL.to_owned(),
+                                PRIMARY_CNI_NODE_LABEL_VALUE.to_owned(),
+                            ),
+                            (
+                                EGRESS_GATEWAY_NODE_LABEL.to_owned(),
+                                EGRESS_GATEWAY_NODE_LABEL_VALUE.to_owned(),
+                            ),
+                        ]),
+                    },
+                );
+                EgressHaCandidate {
+                    node: EgressNode {
+                        name: name.to_owned(),
+                        uid: format!("{name}-uid"),
+                        capabilities: advertisement.capabilities.clone(),
+                    },
+                    capacity_units: 1,
+                    failure_domains: BTreeMap::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        mutex_lock(&state.egress_control_plane)
+            .reconcile_with_ha_candidates(
+                Revision::new(1),
+                distribution.model,
+                &BTreeMap::from([(
+                    owner.clone(),
+                    EgressProviderRef {
+                        name: "static".to_owned(),
+                        instance: "test".to_owned(),
+                    },
+                )]),
+                candidates,
+            )
+            .expect("compile three-gateway HA plan");
+        let failed = mutex_lock(&state.egress_control_plane)
+            .checkpoint()
+            .ha_plans[0]
+            .assignments[0]
+            .gateway
+            .clone();
+        write_lock(&state.nodes)
+            .get_mut(&failed.name)
+            .unwrap()
+            .labels
+            .insert(EGRESS_HA_DRAIN_LABEL.to_owned(), "true".to_owned());
+
+        assert!(begin_requested_egress_ha_drains(&state).expect("start explicit drain"));
+        assert!(!begin_requested_egress_ha_drains(&state).expect("idempotent drain replay"));
+        let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
+        assert_eq!(checkpoint.ha_promotions.len(), 1);
+        let manifest = &checkpoint.ha_promotions[0].coordinator.manifest;
+        assert_eq!(manifest.failed_gateway, failed);
+        assert_eq!(
+            manifest.sources,
+            vec![EgressProjectionRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "worker-a-uid".to_owned(),
+            }]
+        );
+        assert!(state.egress_control_plane_dirty.load(Ordering::Acquire));
+        assert_eq!(
+            EgressControlPlane::restore(checkpoint.clone())
+                .expect("promotion restart replay")
+                .checkpoint(),
+            checkpoint
         );
     }
 

@@ -29,6 +29,9 @@ pub const EGRESS_ADMISSION_FENCED: u8 = 1;
 pub const EGRESS_ADMISSION_ACTIVE: u8 = 2;
 pub const EGRESS_PATH_DIRECT_NEIGHBOR: u8 = 1;
 pub const EGRESS_PATH_TUNNEL: u8 = 2;
+/// The source and gateway are the same exact Node incarnation. Gateway NAT
+/// consumes this traffic before remote steering; reaching redirect is unsafe.
+pub const EGRESS_PATH_LOCAL_GATEWAY: u8 = 3;
 pub const EGRESS_SOURCE_FLAG_IPV4: u8 = 1;
 pub const EGRESS_SOURCE_FLAG_IPV6: u8 = 1 << 1;
 pub const EGRESS_SOURCE_FLAG_PRECERTIFIED_STANDBY: u8 = 1 << 2;
@@ -969,7 +972,10 @@ pub const fn egress_admission_is_valid(admission: u8) -> bool {
 
 #[must_use]
 pub const fn egress_path_mode_is_valid(mode: u8) -> bool {
-    matches!(mode, EGRESS_PATH_DIRECT_NEIGHBOR | EGRESS_PATH_TUNNEL)
+    matches!(
+        mode,
+        EGRESS_PATH_DIRECT_NEIGHBOR | EGRESS_PATH_TUNNEL | EGRESS_PATH_LOCAL_GATEWAY
+    )
 }
 
 /// Keeps the egress event vocabulary closed so userspace cannot interpret an

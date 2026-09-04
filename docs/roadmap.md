@@ -711,7 +711,7 @@ matrix is maintained in the
   reuse, final release, and retained diagnostics under `make
   egress-kind-lifecycle-test`; ADR 0135. Measured HA/failover and the later
   Phase 8 platform milestones remain.
-- Milestone 8.6 is in progress. Its first verified slice introduces
+- Milestone 8.6 is verified. Its first slice introduces
   Continuity-Certified Rendezvous (CCR): same-ordinal IPv4/IPv6 addresses form
   exclusive ownership shards; exact integer capacity targets bound imbalance;
   the compiler retains the mathematical maximum prior ownership; and
@@ -730,7 +730,17 @@ matrix is maintained in the
   exact standby watermark/readback permits only live lease- and shard-valid
   pairs into a promotion-bound atomic cutover. The asynchronous unacknowledged
   tail remains explicit and measurable under `make egress-ha-continuity-test`;
-  ADR 0138. Watched live integration and measured failure/drain behavior remain.
+  ADR 0138. Checkpoint-v3/v4 then aligns exclusive shard ownership with the
+  packet proof and makes the complete promotion transaction restart-replayable;
+  ADRs 0139–0140. The closing authenticated live path uses checkpoint-v5,
+  canonical source-cutover persistence, exact AFT BPF snapshot/import/readback,
+  old-owner revocation, replacement acquisition, reachability CAS, and atomic
+  source-bank activation. A verifier-isolated tail dispatcher supports mixed
+  source/gateway Nodes. `make egress-ha-kind-test` recorded 45 acknowledged
+  twins, 10.860-second graceful promotion, exclusive ownership, stable rejoin,
+  and 80.428-second abrupt recovery without treating Kubernetes health as fence
+  authority; ADR 0141. Production availability/scale and OpenShift remain
+  independent gates.
 - Production BGP/EVPN/ECMP/BFD, cloud adapters, cross-cluster egress,
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale

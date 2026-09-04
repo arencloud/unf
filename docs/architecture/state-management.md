@@ -262,5 +262,11 @@ exclusive dual-stack address shards, active assignments, and one complete
 contingency per candidate. Membership, each contingency, and the whole plan
 have separate digests. Replayers recompute assignments and verify that observed
 ownership movement equals its mathematical lower bound; digests alone are not
-authority. Promotion state remains a later, separately fenced transaction; ADR
-0136.
+authority. Checkpoint-v5 now persists the separately fenced promotion
+transaction: prior plan, source and old-owner fences, staged replacement,
+address/reachability readbacks, AFT streams and acknowledgements, canonical
+structured-recipient cutovers, and terminal source activation. JSON persistence
+uses a sorted entry list because structured Node identities cannot safely be
+object keys; restore also accepts the only valid legacy representation, an
+empty object. The live controller reissues incomplete challenges after restart
+and finalizes only after exact active-bank source evidence; ADRs 0136–0141.
