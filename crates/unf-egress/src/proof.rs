@@ -516,6 +516,15 @@ fn validate_flow(
             .leases
             .iter()
             .any(|lease| lease.address == flow.destination_address),
+        EgressDestinations::Internet(snapshot) => {
+            let verified = crate::verify_egress_internet_snapshot(snapshot.as_ref().clone())
+                .map_err(|_| EgressProofError::DestinationMismatch)?;
+            crate::classify_egress_internet_destination(
+                &verified,
+                flow.destination_address,
+                snapshot.compiled_at_unix_seconds,
+            ) == crate::EgressInternetDecision::Internet
+        }
     };
     if !allowed {
         return Err(EgressProofError::DestinationMismatch);

@@ -613,6 +613,13 @@ matrix is maintained in the
   fail closed. Two source activation grants, authoritative empty state, observer
   replacement, recovery, and final withdrawal pass the dedicated Kind lifecycle
   gate (ADR 0145).
+- Phase 8.7e verifies Authority-Carved Internet classification. Complete
+  provider-neutral dual-stack prefix evidence binds classifier epoch/revision,
+  validity, and per-rule provenance; unknown space denies and bounded policy
+  exceptions are absolute even against a more-specific provider allow. `Deny`
+  is the default fallback; opt-in last-known-good snapshots link the exact prior
+  digest and expire autonomously. Source and gateway map compilers replay the
+  same decision under `make egress-internet-classification-test`; ADR 0146.
 - Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
   ServiceAccount selectors; canonical destinations and non-overlapping
   dual-stack pools; pool-family/multiple-address intent; strict OpenShift

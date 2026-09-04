@@ -1271,6 +1271,7 @@ pub(crate) mod test_support {
                 source: EgressSourceSelector::default(),
                 destinations: EgressDestinations::Any,
                 fqdn: None,
+                internet: None,
                 addresses: EgressAddressRequest::Pool {
                     name: "finance".to_owned(),
                     families: vec![AddressFamily::Ipv4, AddressFamily::Ipv6],

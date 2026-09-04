@@ -26,6 +26,7 @@ mod ha;
 mod ha_continuity;
 mod ha_promotion;
 mod host_state;
+mod internet;
 mod proof;
 mod safe_forgetting;
 
@@ -43,6 +44,7 @@ pub use ha::*;
 pub use ha_continuity::*;
 pub use ha_promotion::*;
 pub use host_state::*;
+pub use internet::*;
 pub use proof::*;
 pub use safe_forgetting::*;
 
@@ -216,6 +218,8 @@ pub enum EgressDestinations {
     /// Independently replayable DNS evidence materialized by the controller.
     /// Native API translation never accepts this internal form directly.
     Fqdn(Box<EgressFqdnSnapshot>),
+    /// Independently replayable provider-neutral internet classification.
+    Internet(Box<EgressInternetSnapshot>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -271,6 +275,8 @@ pub struct EgressIntent {
     pub destinations: EgressDestinations,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fqdn: Option<EgressFqdnDestinationSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internet: Option<EgressInternetDestinationSpec>,
     pub addresses: EgressAddressRequest,
 }
 
@@ -404,12 +410,20 @@ pub fn normalize_intent(mut intent: EgressIntent) -> Result<EgressIntent, Egress
         ));
     }
     normalize_destinations(&intent.owner.name, &mut intent.destinations)?;
+    if intent.fqdn.is_some() && intent.internet.is_some() {
+        return Err(invalid_intent(
+            &intent,
+            "FQDN and internet destinations are mutually exclusive",
+        ));
+    }
     if let Some(fqdn) = intent.fqdn.take() {
         let fqdn = normalize_egress_fqdn_destination_spec(fqdn)
             .map_err(|_| invalid_intent(&intent, "FQDN destination specification is invalid"))?;
         if matches!(
             intent.destinations,
-            EgressDestinations::Any | EgressDestinations::Networks(_)
+            EgressDestinations::Any
+                | EgressDestinations::Networks(_)
+                | EgressDestinations::Internet(_)
         ) {
             return Err(invalid_intent(
                 &intent,
@@ -437,14 +451,49 @@ pub fn normalize_intent(mut intent: EgressIntent) -> Result<EgressIntent, Egress
             }
         }
         intent.fqdn = Some(fqdn);
+    } else if let Some(internet) = intent.internet.take() {
+        normalize_internet_intent(&mut intent, internet)?;
     } else if matches!(intent.destinations, EgressDestinations::DenyAll) {
         return Err(invalid_intent(
             &intent,
-            "deny-all destination requires an unresolved FQDN specification",
+            "deny-all destination requires an unresolved dynamic destination specification",
         ));
     }
     normalize_address_request(&intent.owner.name, &mut intent.addresses)?;
     Ok(intent)
+}
+
+fn normalize_internet_intent(
+    intent: &mut EgressIntent,
+    internet: EgressInternetDestinationSpec,
+) -> Result<(), EgressModelError> {
+    let internet = normalize_egress_internet_destination_spec(internet)
+        .map_err(|_| invalid_intent(intent, "internet destination specification is invalid"))?;
+    if matches!(
+        intent.destinations,
+        EgressDestinations::Any | EgressDestinations::Networks(_) | EgressDestinations::Fqdn(_)
+    ) {
+        return Err(invalid_intent(
+            intent,
+            "internet destinations cannot be combined with other destinations",
+        ));
+    }
+    if let EgressDestinations::Internet(snapshot) = &intent.destinations {
+        let verified = verify_egress_internet_snapshot(snapshot.as_ref().clone())
+            .map_err(|_| invalid_intent(intent, "materialized internet snapshot is invalid"))?;
+        if verified.snapshot().policy.owner != intent.owner
+            || verified.snapshot().policy.classifier != internet.classifier
+            || verified.snapshot().policy.exceptions != internet.exceptions
+            || verified.snapshot().policy.fallback != internet.fallback
+        {
+            return Err(invalid_intent(
+                intent,
+                "materialized internet snapshot does not match its intent",
+            ));
+        }
+    }
+    intent.internet = Some(internet);
+    Ok(())
 }
 
 /// Validates and deterministically orders a complete intent set.
@@ -792,6 +841,7 @@ mod tests {
             source: EgressSourceSelector::default(),
             destinations: EgressDestinations::Any,
             fqdn: None,
+            internet: None,
             addresses: EgressAddressRequest::Pool {
                 name: "finance".to_owned(),
                 families: vec![AddressFamily::Ipv6, AddressFamily::Ipv4],

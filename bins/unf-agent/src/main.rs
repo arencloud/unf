@@ -15546,6 +15546,7 @@ mod tests {
                 source: unf_egress::EgressSourceSelector::default(),
                 destinations: unf_egress::EgressDestinations::Any,
                 fqdn: None,
+                internet: None,
                 addresses: unf_egress::EgressAddressRequest::Pool {
                     name: "public".to_owned(),
                     families: vec![EgressAddressFamily::Ipv4, EgressAddressFamily::Ipv6],

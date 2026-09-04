@@ -8,14 +8,14 @@ use kube::ResourceExt;
 use thiserror::Error;
 use unf_api::{
     EgressAddressFamily as ApiAddressFamily, EgressDestinations as ApiEgressDestinations,
-    EgressPolicy, EgressPool,
+    EgressInternetFallback as ApiInternetFallback, EgressPolicy, EgressPool,
 };
 use unf_egress::{
     AddressFamily, EgressAddressPool, EgressAddressRequest,
     EgressDestinations as DomainDestinations, EgressFqdnDestinationSpec, EgressFqdnPattern,
-    EgressIntent, EgressIntentOwner, EgressIntentScope, EgressModelError, EgressProviderRef,
-    EgressSourceSelector, IpPrefix, LabelExpression, LabelExpressionOperator, LabelSelector,
-    normalize_intent, normalize_pools,
+    EgressIntent, EgressIntentOwner, EgressIntentScope, EgressInternetDestinationSpec,
+    EgressInternetFallback, EgressModelError, EgressProviderRef, EgressSourceSelector, IpPrefix,
+    LabelExpression, LabelExpressionOperator, LabelSelector, normalize_intent, normalize_pools,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -32,8 +32,10 @@ pub enum NativeEgressApiError {
     UnsupportedSelectorOperator { name: String, operator: String },
     #[error("EgressPolicy {0:?} must select exactly one pool or explicit address set")]
     InvalidAddressSelection(String),
-    #[error("EgressPolicy {0:?} cannot combine network and FQDN destinations")]
+    #[error("EgressPolicy {0:?} must choose only one network, FQDN, or internet destination kind")]
     AmbiguousDestinations(String),
+    #[error("EgressPolicy {0:?} has an invalid internet fallback configuration")]
+    InvalidInternetFallback(String),
     #[error("EgressPolicy {name:?} has invalid FQDN pattern {value:?}")]
     InvalidFqdn { name: String, value: String },
     #[error("EgressPolicy {name:?} has invalid DNS resolver address {value:?}")]
@@ -87,7 +89,7 @@ pub fn translate_egress_policy(
             kind: "EgressPolicy",
             name: name.clone(),
         })?;
-    let (destinations, fqdn) = translate_destinations(&name, &policy.spec.destinations)?;
+    let (destinations, fqdn, internet) = translate_destinations(&name, &policy.spec.destinations)?;
     let selection = &policy.spec.egress;
     let (addresses, provider) = match (
         selection.pool.as_deref(),
@@ -153,6 +155,7 @@ pub fn translate_egress_policy(
         },
         destinations,
         fqdn,
+        internet,
         addresses,
     })
     .map_err(|error| model_error(&error))?;
@@ -162,13 +165,21 @@ pub fn translate_egress_policy(
 fn translate_destinations(
     name: &str,
     destinations: &ApiEgressDestinations,
-) -> Result<(DomainDestinations, Option<EgressFqdnDestinationSpec>), NativeEgressApiError> {
+) -> Result<
+    (
+        DomainDestinations,
+        Option<EgressFqdnDestinationSpec>,
+        Option<EgressInternetDestinationSpec>,
+    ),
+    NativeEgressApiError,
+> {
     let translated = match (
         destinations.networks.is_empty(),
         destinations.fqdn.is_empty(),
+        destinations.internet.as_ref(),
     ) {
-        (true, true) => (DomainDestinations::Any, None),
-        (false, true) => (
+        (true, true, None) => (DomainDestinations::Any, None, None),
+        (false, true, None) => (
             DomainDestinations::Networks(
                 destinations
                     .networks
@@ -177,8 +188,9 @@ fn translate_destinations(
                     .collect::<Result<Vec<_>, _>>()?,
             ),
             None,
+            None,
         ),
-        (true, false) => {
+        (true, false, None) => {
             let controls = &destinations.dns;
             let patterns = destinations
                 .fqdn
@@ -214,9 +226,42 @@ fn translate_destinations(
                     max_ttl_seconds: controls.max_ttl_seconds,
                     established_flow_grace_seconds: controls.established_flow_grace_seconds,
                 }),
+                None,
             )
         }
-        (false, false) => {
+        (true, true, Some(internet)) => {
+            let exceptions = internet
+                .exceptions
+                .iter()
+                .map(|value| parse_prefix("EgressPolicy", name, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let fallback = match (internet.fallback, internet.max_staleness_seconds) {
+                (ApiInternetFallback::Deny, 0) => EgressInternetFallback::Deny,
+                (ApiInternetFallback::LastKnownGood, seconds) if seconds > 0 => {
+                    EgressInternetFallback::LastKnownGood {
+                        max_staleness_seconds: seconds,
+                    }
+                }
+                _ => {
+                    return Err(NativeEgressApiError::InvalidInternetFallback(
+                        name.to_owned(),
+                    ));
+                }
+            };
+            (
+                DomainDestinations::DenyAll,
+                None,
+                Some(EgressInternetDestinationSpec {
+                    classifier: EgressProviderRef {
+                        name: internet.classifier.name.clone(),
+                        instance: internet.classifier.instance.clone(),
+                    },
+                    exceptions,
+                    fallback,
+                }),
+            )
+        }
+        _ => {
             return Err(NativeEgressApiError::AmbiguousDestinations(name.to_owned()));
         }
     };
@@ -440,6 +485,53 @@ mod tests {
         assert!(matches!(
             translate_egress_policy(&ambiguous),
             Err(NativeEgressApiError::AmbiguousDestinations(_))
+        ));
+    }
+
+    #[test]
+    fn native_internet_translation_requires_explicit_bounded_fallback() {
+        let policy: EgressPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "EgressPolicy",
+            "metadata": {"name": "public-access", "uid": "internet-uid"},
+            "spec": {
+                "target": {"namespaceSelector": {"matchLabels": {"team": "finance"}}},
+                "destinations": {
+                    "internet": {
+                        "classifier": {"name": "route-authority", "instance": "global-v1"},
+                        "exceptions": ["203.0.113.0/24", "2001:db8:42::/48"],
+                        "fallback": "LastKnownGood",
+                        "maxStalenessSeconds": 300
+                    }
+                },
+                "egress": {"pool": "finance", "families": ["IPv4", "IPv6"]}
+            }
+        }))
+        .unwrap();
+        let (intent, provider) = translate_egress_policy(&policy).unwrap();
+        assert!(provider.is_none());
+        assert_eq!(intent.destinations, DomainDestinations::DenyAll);
+        let internet = intent.internet.unwrap();
+        assert_eq!(internet.classifier.name, "route-authority");
+        assert_eq!(internet.exceptions[0].prefix_len, 24);
+        assert_eq!(
+            internet.fallback,
+            EgressInternetFallback::LastKnownGood {
+                max_staleness_seconds: 300
+            }
+        );
+
+        let mut invalid = policy;
+        invalid
+            .spec
+            .destinations
+            .internet
+            .as_mut()
+            .unwrap()
+            .max_staleness_seconds = 0;
+        assert!(matches!(
+            translate_egress_policy(&invalid),
+            Err(NativeEgressApiError::InvalidInternetFallback(_))
         ));
     }
 }

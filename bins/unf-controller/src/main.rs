@@ -11309,6 +11309,7 @@ mod tests {
             source: unf_egress::EgressSourceSelector::default(),
             destinations: unf_egress::EgressDestinations::Any,
             fqdn: None,
+            internet: None,
             addresses: unf_egress::EgressAddressRequest::Explicit {
                 addresses: vec!["192.0.2.40".parse().expect("address")],
             },

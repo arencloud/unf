@@ -382,7 +382,7 @@ fn compile_egress_dataplane_inner(
                     ));
                 }
             };
-            if matches!(template.destinations, EgressDestinations::DenyAll) {
+            if destination_is_deny_closed(&template.destinations, clock) {
                 admission = EGRESS_ADMISSION_FENCED;
                 active_state = None;
             } else if active_state.is_some() {
@@ -588,7 +588,7 @@ fn compile_egress_gateway_dataplane_inner(
                     gateway_count: u16::try_from(plan.gateways.len())
                         .map_err(|_| EgressDataplaneError::CandidateIndex)?,
                     schema_version: EGRESS_MAP_ABI_VERSION,
-                    admission: if matches!(plan.destinations, EgressDestinations::DenyAll) {
+                    admission: if destination_is_deny_closed(&plan.destinations, clock) {
                         EGRESS_ADMISSION_FENCED
                     } else {
                         EGRESS_ADMISSION_ACTIVE
@@ -774,6 +774,18 @@ fn compile_gateway_destinations(
             )?;
             return Ok(());
         }
+        EgressDestinations::Internet(snapshot) => {
+            compile_internet_destinations(
+                state,
+                namespace,
+                bank,
+                contract_revision,
+                intent_digest,
+                snapshot,
+                clock.ok_or(EgressDataplaneError::MissingClock)?,
+            )?;
+            return Ok(());
+        }
     };
     for prefix in networks {
         if !prefix.is_canonical() {
@@ -803,6 +815,32 @@ fn compile_gateway_destinations(
         }
     }
     Ok(())
+}
+
+fn destination_is_deny_closed(
+    destinations: &EgressDestinations,
+    clock: Option<EgressDataplaneClock>,
+) -> bool {
+    match destinations {
+        EgressDestinations::DenyAll => true,
+        EgressDestinations::Internet(snapshot) => {
+            matches!(
+                snapshot.authority,
+                crate::EgressInternetAuthority::DenyClosed
+            ) || clock
+                .is_none_or(|clock| clock.unix_seconds >= snapshot.authority_until_unix_seconds)
+                || snapshot
+                    .classification
+                    .as_ref()
+                    .is_none_or(|classification| {
+                        !classification
+                            .rules
+                            .iter()
+                            .any(|rule| rule.class == crate::EgressInternetClass::Internet)
+                    })
+        }
+        _ => false,
+    }
 }
 
 fn compile_intent_destinations(
@@ -878,6 +916,15 @@ fn compile_intent_destinations(
             }
         }
         EgressDestinations::Fqdn(snapshot) => compile_fqdn_destinations(
+            state,
+            intent_index,
+            bank,
+            contract_revision,
+            intent_digest,
+            snapshot,
+            clock.ok_or(EgressDataplaneError::MissingClock)?,
+        )?,
+        EgressDestinations::Internet(snapshot) => compile_internet_destinations(
             state,
             intent_index,
             bank,
@@ -969,6 +1016,100 @@ fn compile_fqdn_destinations(
             )),
             IpAddr::V6(address) => state.ipv6_destinations.push((
                 128,
+                EgressIpv6DestinationData {
+                    intent_index,
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: address.octets(),
+                },
+                value,
+            )),
+        }
+    }
+    Ok(())
+}
+
+fn compile_internet_destinations(
+    state: &mut EgressDataplaneState,
+    intent_index: u32,
+    bank: u8,
+    contract_revision: u64,
+    intent_digest: [u8; 16],
+    snapshot: &crate::EgressInternetSnapshot,
+    clock: EgressDataplaneClock,
+) -> Result<(), EgressDataplaneError> {
+    let verified = crate::verify_egress_internet_snapshot(snapshot.clone())
+        .map_err(|_| EgressDataplaneError::InvalidHostBank)?;
+    let mut decisions = BTreeMap::<crate::IpPrefix, crate::EgressInternetClass>::new();
+    if let Some(classification) = &verified.snapshot().classification {
+        decisions.extend(
+            classification
+                .rules
+                .iter()
+                .filter(|rule| {
+                    !verified
+                        .snapshot()
+                        .policy
+                        .exceptions
+                        .iter()
+                        .any(|exception| {
+                            exception.family() == rule.prefix.family()
+                                && exception.prefix_len <= rule.prefix.prefix_len
+                                && exception.contains(rule.prefix.address)
+                        })
+                })
+                .map(|rule| (rule.prefix, rule.class)),
+        );
+    }
+    for exception in &verified.snapshot().policy.exceptions {
+        decisions.insert(*exception, crate::EgressInternetClass::NonInternet);
+    }
+    decisions
+        .entry(crate::IpPrefix {
+            address: "0.0.0.0".parse().expect("constant IPv4 address"),
+            prefix_len: 0,
+        })
+        .or_insert(crate::EgressInternetClass::NonInternet);
+    decisions
+        .entry(crate::IpPrefix {
+            address: "::".parse().expect("constant IPv6 address"),
+            prefix_len: 0,
+        })
+        .or_insert(crate::EgressInternetClass::NonInternet);
+
+    let allow_deadline = if decisions
+        .values()
+        .any(|class| *class == crate::EgressInternetClass::Internet)
+    {
+        monotonic_deadline(verified.snapshot().authority_until_unix_seconds, clock)?
+    } else {
+        EGRESS_DESTINATION_DENY_DEADLINE
+    };
+    let allow = EgressDestinationValue {
+        contract_revision,
+        intent_digest,
+        new_flows_until_monotonic_seconds: allow_deadline,
+        established_flows_until_monotonic_seconds: allow_deadline,
+    };
+    let deny = deny_destination_value(contract_revision, intent_digest);
+    for (prefix, class) in decisions {
+        let value = match class {
+            crate::EgressInternetClass::Internet => allow,
+            crate::EgressInternetClass::NonInternet => deny,
+        };
+        match prefix.address {
+            IpAddr::V4(address) => state.ipv4_destinations.push((
+                u32::from(prefix.prefix_len),
+                EgressIpv4DestinationData {
+                    intent_index,
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: address.octets(),
+                },
+                value,
+            )),
+            IpAddr::V6(address) => state.ipv6_destinations.push((
+                u32::from(prefix.prefix_len),
                 EgressIpv6DestinationData {
                     intent_index,
                     bank,
@@ -1336,11 +1477,16 @@ mod tests {
         admitted, admitted_replica, advertisement, fixture, node, principal,
     };
     use crate::{
-        AdmittedEgressProjection, EGRESS_PROTOCOL_TCP, EgressAddressLease, EgressBehaviorContract,
-        EgressDnsAnswer, EgressDnsObservation, EgressDnsObservationSource, EgressFlowProof,
-        EgressFqdnDestinationSpec, EgressFqdnPattern, EgressFqdnPolicy, EgressGatewayFact,
-        EgressGatewayProjection, EgressHaCandidate, EgressNodeProjection, EgressOriginalFlow,
-        EgressProviderRef, compile_egress_fqdn_snapshot, compile_egress_ha_plan,
+        AdmittedEgressProjection, EGRESS_INTERNET_CLASSIFICATION_ALGORITHM_AUTHORITY_CARVING_V1,
+        EGRESS_INTERNET_CLASSIFICATION_SCHEMA_VERSION, EGRESS_PROTOCOL_TCP, EgressAddressLease,
+        EgressBehaviorContract, EgressDnsAnswer, EgressDnsObservation, EgressDnsObservationSource,
+        EgressFlowProof, EgressFqdnDestinationSpec, EgressFqdnPattern, EgressFqdnPolicy,
+        EgressGatewayFact, EgressGatewayProjection, EgressHaCandidate, EgressInternetClass,
+        EgressInternetClassification, EgressInternetClassificationDigest,
+        EgressInternetClassificationRule, EgressInternetDestinationSpec, EgressInternetFallback,
+        EgressNodeProjection, EgressOriginalFlow, EgressProviderRef, compile_egress_fqdn_snapshot,
+        compile_egress_ha_plan, materialize_egress_internet_snapshot,
+        seal_egress_internet_classification,
     };
 
     fn ip(value: &str) -> IpAddr {
@@ -1786,6 +1932,214 @@ mod tests {
             compile_egress_dataplane(&host, &guard(&projection, true), &paths(&projection), 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn internet_authority_lowers_to_temporal_dual_stack_lpm_with_absolute_exceptions() {
+        const NOW: u64 = 1_000_000;
+        let (mut model, mut facts, _) = fixture();
+        let classifier = EgressProviderRef {
+            name: "route-authority".to_owned(),
+            instance: "global-v1".to_owned(),
+        };
+        let spec = EgressInternetDestinationSpec {
+            classifier: classifier.clone(),
+            exceptions: vec![crate::IpPrefix {
+                address: ip("203.0.113.0"),
+                prefix_len: 24,
+            }],
+            fallback: EgressInternetFallback::Deny,
+        };
+        let classification = seal_egress_internet_classification(EgressInternetClassification {
+            schema_version: EGRESS_INTERNET_CLASSIFICATION_SCHEMA_VERSION,
+            algorithm: EGRESS_INTERNET_CLASSIFICATION_ALGORITHM_AUTHORITY_CARVING_V1,
+            revision: Revision::new(7),
+            source: classifier,
+            source_epoch: 2,
+            observed_at_unix_seconds: NOW,
+            valid_until_unix_seconds: NOW + 100,
+            rules: vec![
+                EgressInternetClassificationRule {
+                    prefix: crate::IpPrefix {
+                        address: ip("0.0.0.0"),
+                        prefix_len: 0,
+                    },
+                    class: EgressInternetClass::Internet,
+                    provenance: "rpki:42".to_owned(),
+                },
+                EgressInternetClassificationRule {
+                    prefix: crate::IpPrefix {
+                        address: ip("10.0.0.0"),
+                        prefix_len: 8,
+                    },
+                    class: EgressInternetClass::NonInternet,
+                    provenance: "cluster-private:3".to_owned(),
+                },
+                EgressInternetClassificationRule {
+                    prefix: crate::IpPrefix {
+                        address: ip("203.0.113.128"),
+                        prefix_len: 25,
+                    },
+                    class: EgressInternetClass::Internet,
+                    provenance: "provider-more-specific:9".to_owned(),
+                },
+                EgressInternetClassificationRule {
+                    prefix: crate::IpPrefix {
+                        address: ip("::"),
+                        prefix_len: 0,
+                    },
+                    class: EgressInternetClass::Internet,
+                    provenance: "rpki:42".to_owned(),
+                },
+                EgressInternetClassificationRule {
+                    prefix: crate::IpPrefix {
+                        address: ip("fd00::"),
+                        prefix_len: 8,
+                    },
+                    class: EgressInternetClass::NonInternet,
+                    provenance: "cluster-private:3".to_owned(),
+                },
+            ],
+            digest: EgressInternetClassificationDigest([0; 32]),
+        })
+        .unwrap();
+        let snapshot = materialize_egress_internet_snapshot(
+            Revision::new(9),
+            model.intents[0].owner.clone(),
+            spec.clone(),
+            Some(classification),
+            None,
+            NOW,
+        )
+        .unwrap();
+        model.intents[0].internet = Some(spec);
+        model.intents[0].destinations =
+            EgressDestinations::Internet(Box::new(snapshot.snapshot().clone()));
+        facts.gateways.push(EgressGatewayFact {
+            intent_uid: "intent-uid".to_owned(),
+            rank: 1,
+            node: node("gateway-b"),
+            lease_epoch: 7,
+            ready: true,
+            reachable: true,
+        });
+        let contract =
+            EgressBehaviorContract::issue(&model, &facts, node("worker-a"), Revision::new(20))
+                .unwrap();
+        let projection = EgressNodeProjection::issue_with_ha(
+            &principal("worker-a"),
+            &advertisement(),
+            10,
+            Revision::new(4),
+            contract,
+            vec![ha_plan(&model, &facts)],
+        )
+        .unwrap()
+        .admit(&principal("worker-a"), &advertisement(), &model, &facts)
+        .unwrap();
+        let host = EgressGatewayHostBank::compile(&projection).unwrap();
+        let clock = EgressDataplaneClock {
+            unix_seconds: NOW,
+            monotonic_seconds: 10_000,
+        };
+        let source = compile_egress_dataplane_at(
+            &host,
+            &guard(&projection, true),
+            &paths(&projection),
+            1,
+            clock,
+        )
+        .unwrap();
+        assert_eq!(source.sources[0].1.admission, EGRESS_ADMISSION_ACTIVE);
+        assert!(
+            source
+                .ipv4_destinations
+                .iter()
+                .any(|(prefix, data, value)| {
+                    *prefix == 0
+                        && data.destination_address == [0; 4]
+                        && value.new_flows_until_monotonic_seconds == 10_099
+                })
+        );
+        assert!(
+            source
+                .ipv4_destinations
+                .iter()
+                .any(|(prefix, data, value)| {
+                    *prefix == 8
+                        && data.destination_address == [10, 0, 0, 0]
+                        && value.new_flows_until_monotonic_seconds == 0
+                })
+        );
+        assert!(
+            source
+                .ipv4_destinations
+                .iter()
+                .any(|(prefix, data, value)| {
+                    *prefix == 24
+                        && data.destination_address == [203, 0, 113, 0]
+                        && value.new_flows_until_monotonic_seconds == 0
+                })
+        );
+        assert!(
+            !source
+                .ipv4_destinations
+                .iter()
+                .any(|(prefix, _, _)| *prefix == 25)
+        );
+        assert!(
+            source
+                .ipv6_destinations
+                .iter()
+                .any(|(prefix, data, value)| {
+                    *prefix == 8
+                        && data.destination_address
+                            == [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                        && value.new_flows_until_monotonic_seconds == 0
+                })
+        );
+
+        let gateway_principal = principal("gateway-a");
+        let gateway = EgressGatewayProjection::issue(
+            &gateway_principal,
+            &advertisement(),
+            10,
+            Revision::new(9),
+            &[projection],
+        )
+        .unwrap()
+        .admit(&gateway_principal, &advertisement())
+        .unwrap();
+        let gateway_state = compile_egress_gateway_dataplane_at(&gateway, 1, clock).unwrap();
+        assert_eq!(
+            gateway_state.ipv4_destinations.len(),
+            source.ipv4_destinations.len()
+        );
+        assert_eq!(
+            gateway_state.ipv6_destinations.len(),
+            source.ipv6_destinations.len()
+        );
+        for (gateway, source) in gateway_state
+            .ipv4_destinations
+            .iter()
+            .zip(&source.ipv4_destinations)
+        {
+            assert_eq!(
+                (gateway.0, gateway.1.destination_address, gateway.2),
+                (source.0, source.1.destination_address, source.2,)
+            );
+        }
+        for (gateway, source) in gateway_state
+            .ipv6_destinations
+            .iter()
+            .zip(&source.ipv6_destinations)
+        {
+            assert_eq!(
+                (gateway.0, gateway.1.destination_address, gateway.2),
+                (source.0, source.1.destination_address, source.2,)
+            );
+        }
     }
 
     #[test]

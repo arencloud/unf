@@ -406,14 +406,14 @@ worker-agent replacement, exact cleanup, five-agent convergence, and unchanged
 `insights`/`network` unhealthy baseline passed
 `hack/verify-openshift-service-selection.sh`; ADR 0112.
 Phase 8 begins an identity-aware enterprise egress fabric. Milestones 8.1
-through 8.6 and slices 8.7a–8.7d are verified. Source-side security policy precedes steering and NAT, while
+through 8.6 and slices 8.7a–8.7e are verified. Source-side security policy precedes steering and NAT, while
 `unf-egress` now canonically validates bounded Namespace, workload, and
 ServiceAccount selectors, destinations, non-overlapping dual-stack pools, and
 pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
 is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
-and ADRs 0113–0145 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+and ADRs 0113–0146 track the work. Milestone 8.2a now adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -626,8 +626,17 @@ evidence outside either commitment. Independent per-view producers never query
 two-observer custom-view A/AAAA quorum, dual-stack traffic, observer replacement,
 two activation grants for cross-Node replicas sharing one safely coalesced
 gateway identity, authoritative-empty denial, recovery, and final withdrawal
-under `make egress-fqdn-lifecycle-test`; ADR 0145. DNSSEC, passive capture, internet
-classification, operations, scale, and OpenShift qualification remain separate.
+under `make egress-fqdn-lifecycle-test`; ADR 0145. DNSSEC and passive capture
+remain separate. Phase 8.7e
+adds Authority-Carved Internet classification: native policy names a
+provider-neutral classifier, absolute CIDR exceptions, and either default
+fail-closed behavior or an explicitly bounded last-known-good interval. Complete
+dual-stack prefix evidence commits provider epoch/revision, validity, and
+per-rule provenance. Unknown space denies, policy exceptions cannot be
+overridden by a more-specific provider allow, and source/gateway eBPF maps share
+one autonomously expiring replayed decision. `make
+egress-internet-classification-test` and ADR 0146 verify this contract;
+authenticated durable classifier ingestion and its live lifecycle are next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

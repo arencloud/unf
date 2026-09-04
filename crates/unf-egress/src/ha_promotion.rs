@@ -1137,6 +1137,7 @@ mod tests {
                 source: EgressSourceSelector::default(),
                 destinations: EgressDestinations::Any,
                 fqdn: None,
+                internet: None,
                 addresses: EgressAddressRequest::Pool {
                     name: "public".to_owned(),
                     families: vec![AddressFamily::Ipv4, AddressFamily::Ipv6],

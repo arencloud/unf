@@ -1452,6 +1452,7 @@ mod tests {
                 source: crate::EgressSourceSelector::default(),
                 destinations: EgressDestinations::DenyAll,
                 fqdn: Some(spec),
+                internet: None,
                 addresses: crate::EgressAddressRequest::Explicit {
                     addresses: vec!["198.51.100.10".parse().unwrap()],
                 },

@@ -100,6 +100,7 @@ pub fn translate_openshift_egress_ip(
         },
         destinations: EgressDestinations::Any,
         fqdn: None,
+        internet: None,
         addresses: EgressAddressRequest::Explicit { addresses },
     })
     .map_err(|source| OpenShiftEgressIpError::InvalidModel {

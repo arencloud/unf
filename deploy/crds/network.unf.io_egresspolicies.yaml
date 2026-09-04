@@ -30,6 +30,7 @@ spec:
                     resolverAddresses: []
                     view: cluster-default
                   fqdn: []
+                  internet: null
                   networks: []
                 properties:
                   dns:
@@ -92,6 +93,43 @@ spec:
                     items:
                       type: string
                     type: array
+                  internet:
+                    description: |-
+                      Provider-classified internet address space. This is mutually exclusive
+                      with `networks` and `fqdn`.
+                    nullable: true
+                    properties:
+                      classifier:
+                        properties:
+                          instance:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - instance
+                        - name
+                        type: object
+                      exceptions:
+                        default: []
+                        items:
+                          type: string
+                        type: array
+                      fallback:
+                        default: Deny
+                        enum:
+                        - Deny
+                        - LastKnownGood
+                        type: string
+                      maxStalenessSeconds:
+                        default: 0
+                        description: Required only for `LastKnownGood`; zero is canonical for `Deny`.
+                        format: uint64
+                        maximum: 3600.0
+                        minimum: 0.0
+                        type: integer
+                    required:
+                    - classifier
+                    type: object
                   networks:
                     default: []
                     items:

@@ -402,6 +402,7 @@ mod tests {
             source: EgressSourceSelector::default(),
             destinations: EgressDestinations::Any,
             fqdn: None,
+            internet: None,
             addresses: EgressAddressRequest::Pool {
                 name: "finance".to_owned(),
                 families: vec![AddressFamily::Ipv4],

@@ -10,6 +10,7 @@
 .PHONY: egress-fqdn-control-test
 .PHONY: egress-fqdn-dataplane-test
 .PHONY: egress-fqdn-lifecycle-test
+.PHONY: egress-internet-classification-test
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -258,6 +259,9 @@ egress-fqdn-lifecycle-test: egress-fqdn-dataplane-test service-kind-load
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) hack/migrate-kind-bpf-abi-v15.sh
 	bash -n hack/verify-kind-egress-fqdn-lifecycle.sh
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) UNF_TEST_TOOLS_IMAGE=$(TEST_TOOLS_IMAGE) hack/verify-kind-egress-fqdn-lifecycle.sh
+
+egress-internet-classification-test: egress-fqdn-lifecycle-test
+	hack/verify-egress-internet-classification.sh
 
 test:
 	cargo test --workspace

@@ -694,6 +694,7 @@ mod tests {
                 source: EgressSourceSelector::default(),
                 destinations: EgressDestinations::Any,
                 fqdn: None,
+                internet: None,
                 addresses: EgressAddressRequest::Explicit {
                     addresses: vec![ip(address)],
                 },

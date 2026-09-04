@@ -168,8 +168,34 @@ pub struct EgressDestinations {
     pub networks: Vec<String>,
     #[serde(default)]
     pub fqdn: Vec<String>,
+    /// Provider-classified internet address space. This is mutually exclusive
+    /// with `networks` and `fqdn`.
+    #[serde(default)]
+    pub internet: Option<EgressInternetControls>,
     #[serde(default)]
     pub dns: EgressDnsControls,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressInternetControls {
+    pub classifier: EgressProvider,
+    #[serde(default)]
+    pub exceptions: Vec<String>,
+    #[serde(default)]
+    pub fallback: EgressInternetFallback,
+    /// Required only for `LastKnownGood`; zero is canonical for `Deny`.
+    #[serde(default)]
+    #[schemars(range(max = 3600))]
+    pub max_staleness_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "PascalCase")]
+pub enum EgressInternetFallback {
+    #[default]
+    Deny,
+    LastKnownGood,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -343,6 +369,7 @@ spec:
         assert_eq!(policy.spec.priority, 1_000);
         assert!(policy.spec.destinations.networks.is_empty());
         assert!(policy.spec.destinations.fqdn.is_empty());
+        assert!(policy.spec.destinations.internet.is_none());
         assert_eq!(policy.spec.destinations.dns, EgressDnsControls::default());
     }
 
