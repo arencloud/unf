@@ -26,8 +26,9 @@ authoritative state remains in [project-status.md](../project-status.md).
 | 8.6d | Durable exclusive ownership and proof alignment | **Verified** | Checkpoint-v3 persists replay-checked CCR plans and freezes membership across health changes. Exact-Node address projections carry only assigned shards plus prior acknowledged state for rollback-safe subset/superset transitions; proof, source, and gateway compilers share CCR selection algorithm v3 and bind the plan digest. Standby certification is withheld until replica readback under `make egress-ha-live-ownership-test`; ADR 0139 |
 | 8.6e | Durable promotion transaction | **Verified** | Checkpoint-v4 replays the exact previous plan and every source fence, old-owner/infrastructure fence, staged survivor plan, acquisition, reachability CAS, flow-twin stream/readback, and source-specific bank-bound cutover in order. Health is not evidence and premature staging fails closed under `make egress-ha-transaction-test`; ADR 0140 |
 | 8.6f | Authenticated live promotion and measured recovery | **Verified** | Checkpoint-v5 persists terminal source activation and uses a canonical structured-recipient cutover encoding. Agents recover exact source retirement evidence, snapshot and import AFT pairs with BPF readback, revoke old ownership, acquire replacements, and activate the mandated source bank. A verifier-isolated V2 tail-call dispatcher supports Nodes acting as both source and gateway. The repeatable Kind gate observed 45 acknowledged twins, a 10.860-second graceful drain, bounded probe disruption, and an 80.428-second abrupt recovery without treating health as fence authority; ADR 0141 |
-| 8.7 | FQDN and internet-access controls | **In progress** | 8.7a verifies the provider-neutral temporal evidence contract. Native API/defaults, authenticated observation and durable refresh, transactional source/gateway lowering, live dual-stack enforcement, internet classification/fallback, explanation/simulation/recovery, and platform qualification remain |
+| 8.7 | FQDN and internet-access controls | **In progress** | 8.7a–8.7b verify the provider-neutral temporal evidence contract, native API/defaults, loss-explicit authenticated observation ownership, durable replay, and unresolved dual-stack fencing. Agent observation production, PLR-to-map refresh, live packets, internet classification/fallback, explanation/simulation/recovery, and platform qualification remain |
 | 8.7a | Provenance-Leased Resolution contract | **Verified** | Schema-v1 view-scoped distinct-observer quorum compiles exact/label-bounded wildcard queries into TTL-capped new-flow and established-drain leases. Complete provenance, deterministic digest/replay, zero-TTL denial, and atomic capacity rejection pass `make egress-fqdn-evidence-test`; ADR 0142 |
+| 8.7b | Native intent and durable observation ledger | **Verified** | Native `EgressPolicy` exposes mutually exclusive network/FQDN destinations and bounded resolver-view/quorum/capacity/TTL/grace defaults. Current Pod/Node-bound complete batches distinguish authoritative empty from loss, reject replay mutation/regression, and survive canonical digest-checked ConfigMap recovery. Unresolved intent installs IPv4/IPv6 catch-all ownership and remains fenced even under active admission; `make egress-fqdn-control-test`; ADR 0143 |
 | 8.8 | Reachability and advertisement providers | **Planned** | Static/native development provider first; BGP advertisement remains a replaceable provider with independent route-policy, ECMP, graceful-restart, BFD, and production qualification gates |
 | 8.9 | Operations, simulation, upgrade, and recovery | **Planned** | Fixed-cardinality metrics/status, NAT and failover history, allocation/gateway/policy explanation, read-only simulation, controller/provider/agent recovery, compatibility, and exact cleanup |
 | 8.10 | Kube-proxy-free Kind qualification | **Planned** | Exact committed dual-stack multi-Node lifecycle covering policy, allocation, steering/NAT, HA, recovery, provenance, cleanup, and rollback with immutable evidence |
@@ -125,11 +126,11 @@ HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.7b adds native API/defaulting plus authenticated, durable DNS
-observation and refresh state around the verified PLR contract. It must preserve
-resolver-view isolation and monotonic source epochs across restart, distinguish
-an empty valid answer from observation loss, withdraw expired authority without
-partial updates, and keep explicit network/internet fallback separate. Later
-8.7 slices lower verified leases transactionally, prove live dual-stack
-enforcement, and integrate explanation, simulation, recovery, and platform
+Milestone 8.7c connects a Node-local observation producer and the durable ledger
+to PLR, then transactionally refreshes source and gateway destination banks from
+one independently verified lease snapshot. It must atomically add and withdraw
+IPv4/IPv6 authority as TTL/quorum changes, preserve only explicitly bounded
+established flows, expose refresh loss without extending authority, and keep
+network/internet fallback separate. Later 8.7 slices prove live dual-stack
+enforcement and integrate explanation, simulation, recovery, and platform
 qualification without weakening the verified 8.6 HA path.

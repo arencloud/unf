@@ -7,6 +7,7 @@
 .PHONY: egress-ha-transaction-test
 .PHONY: egress-ha-kind-test
 .PHONY: egress-fqdn-evidence-test
+.PHONY: egress-fqdn-control-test
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -228,6 +229,14 @@ egress-fqdn-evidence-test: egress-ha-kind-test
 	hack/verify-egress-fqdn-evidence.sh
 	cargo test -p unf-egress fqdn --no-fail-fast
 	cargo clippy -p unf-egress --all-targets --all-features -- -D warnings
+
+egress-fqdn-control-test: egress-fqdn-evidence-test
+	hack/verify-egress-fqdn-control.sh
+	cargo test -p unf-api --no-fail-fast
+	cargo test -p unf-egress fqdn --no-fail-fast
+	cargo test -p unf-controller egress_api --no-fail-fast
+	cargo test -p unf-controller authenticated_fqdn_observation_batches_are_durable_monotonic_and_node_bound
+	cargo clippy -p unf-api -p unf-controller -p unf-egress --all-targets --all-features -- -D warnings
 
 test:
 	cargo test --workspace

@@ -45,6 +45,7 @@ use unf_egress::{
     EgressAgentAdvertisement, EgressBehaviorContract, EgressCapability, EgressContractFacts,
     EgressContractRevisions, EgressControlPlane, EgressControlPlaneCheckpoint,
     EgressDesiredCheckpoint, EgressDesiredStore, EgressDistributionError,
+    EgressFqdnObservationBatch, EgressFqdnObservationCheckpoint, EgressFqdnObservationLedger,
     EgressGatewayAcknowledgement, EgressGatewayAddressAcknowledgement,
     EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
     EgressGatewayDrainEvidence, EgressGatewayProjection, EgressGatewayRetirementChallenges,
@@ -138,6 +139,7 @@ const AGENT_REPORT_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_REPORT_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
 const EGRESS_DESIRED_STORE_NAME: &str = "unf-egress-desired-state";
 const EGRESS_DESIRED_STORE_KEY: &str = "desired.json";
+const EGRESS_FQDN_OBSERVATION_STORE_KEY: &str = "fqdn-observations.json";
 const EGRESS_DESIRED_STORE_DATA_LIMIT: usize = 900_000;
 const EGRESS_DESIRED_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const EGRESS_CONTROL_PLANE_STORE_NAME: &str = "unf-egress-control-plane";
@@ -302,6 +304,7 @@ struct ControllerState {
     pods: RwLock<BTreeMap<String, PodRecord>>,
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
     egress_desired: Mutex<EgressDesiredStore>,
+    egress_fqdn_observations: Mutex<EgressFqdnObservationLedger>,
     egress_desired_dirty: AtomicBool,
     egress_desired_store: Option<Api<ConfigMap>>,
     egress_control_plane: Mutex<EgressControlPlane>,
@@ -1201,6 +1204,10 @@ async fn spawn_internal_api(
         .route("/v1/state/remote-routes", get(remote_route_snapshot))
         .route("/v1/state/egress-source", post(egress_source_projection))
         .route(
+            "/v1/state/egress-fqdn-observations",
+            post(ingest_egress_fqdn_observations),
+        )
+        .route(
             "/v1/state/egress-source-activation",
             get(egress_source_activation),
         )
@@ -1523,6 +1530,7 @@ fn new_state_with_client_and_selector(
         pods: RwLock::new(BTreeMap::new()),
         nodes: RwLock::new(BTreeMap::new()),
         egress_desired: Mutex::new(EgressDesiredStore::default()),
+        egress_fqdn_observations: Mutex::new(EgressFqdnObservationLedger::default()),
         egress_desired_dirty: AtomicBool::new(false),
         egress_desired_store: config_map_store.clone(),
         egress_control_plane: Mutex::new(EgressControlPlane::default()),
@@ -2156,26 +2164,34 @@ async fn restore_egress_desired_state(state: &ControllerState) -> Result<()> {
         .get(EGRESS_DESIRED_STORE_NAME)
         .await
         .with_context(|| format!("read ConfigMap unf-system/{EGRESS_DESIRED_STORE_NAME}"))?;
-    let Some(encoded) = config_map
-        .data
-        .as_ref()
-        .and_then(|data| data.get(EGRESS_DESIRED_STORE_KEY))
-    else {
+    let data = config_map.data.as_ref();
+    if let Some(encoded) = data.and_then(|data| data.get(EGRESS_DESIRED_STORE_KEY)) {
+        let checkpoint: EgressDesiredCheckpoint = serde_json::from_str(encoded)
+            .context("decode durable egress desired-state checkpoint")?;
+        let restored = EgressDesiredStore::restore(checkpoint)
+            .context("validate durable egress desired-state checkpoint")?;
+        let revision = restored.revision().get();
+        let pools = restored.model().pools.len();
+        let intents = restored.model().intents.len();
+        *mutex_lock(&state.egress_desired) = restored;
+        info!(
+            revision,
+            pools, intents, "restored durable egress desired state"
+        );
+    } else {
         info!("durable egress desired-state store is empty");
-        return Ok(());
-    };
-    let checkpoint: EgressDesiredCheckpoint =
-        serde_json::from_str(encoded).context("decode durable egress desired-state checkpoint")?;
-    let restored = EgressDesiredStore::restore(checkpoint)
-        .context("validate durable egress desired-state checkpoint")?;
-    let revision = restored.revision().get();
-    let pools = restored.model().pools.len();
-    let intents = restored.model().intents.len();
-    *mutex_lock(&state.egress_desired) = restored;
-    info!(
-        revision,
-        pools, intents, "restored durable egress desired state"
-    );
+    }
+    if let Some(encoded) = data.and_then(|data| data.get(EGRESS_FQDN_OBSERVATION_STORE_KEY)) {
+        let checkpoint: EgressFqdnObservationCheckpoint =
+            serde_json::from_str(encoded).context("decode durable FQDN observation checkpoint")?;
+        let restored = EgressFqdnObservationLedger::restore(checkpoint, unix_time_seconds())
+            .context("validate durable FQDN observation checkpoint")?;
+        let revision = restored.revision().get();
+        *mutex_lock(&state.egress_fqdn_observations) = restored;
+        info!(revision, "restored durable FQDN observations");
+    } else {
+        info!("durable FQDN observation store is empty");
+    }
     Ok(())
 }
 
@@ -2222,11 +2238,15 @@ async fn persist_egress_desired_state(state: &ControllerState) -> Result<()> {
     let checkpoint = mutex_lock(&state.egress_desired).checkpoint();
     let encoded = serde_json::to_string(&checkpoint)
         .context("encode durable egress desired-state checkpoint")?;
-    if encoded.len() > EGRESS_DESIRED_STORE_DATA_LIMIT {
+    let fqdn_checkpoint = mutex_lock(&state.egress_fqdn_observations)
+        .checkpoint(unix_time_seconds())
+        .context("compile durable FQDN observation checkpoint")?;
+    let fqdn_encoded = serde_json::to_string(&fqdn_checkpoint)
+        .context("encode durable FQDN observation checkpoint")?;
+    let total_len = encoded.len().saturating_add(fqdn_encoded.len());
+    if total_len > EGRESS_DESIRED_STORE_DATA_LIMIT {
         return Err(anyhow!(
-            "durable egress desired state requires {} bytes; ConfigMap limit is {}",
-            encoded.len(),
-            EGRESS_DESIRED_STORE_DATA_LIMIT
+            "durable egress desired and FQDN state requires {total_len} bytes; ConfigMap limit is {EGRESS_DESIRED_STORE_DATA_LIMIT}"
         ));
     }
     let patch = serde_json::json!({
@@ -2238,6 +2258,7 @@ async fn persist_egress_desired_state(state: &ControllerState) -> Result<()> {
         },
         "data": {
             (EGRESS_DESIRED_STORE_KEY): encoded,
+            (EGRESS_FQDN_OBSERVATION_STORE_KEY): fqdn_encoded,
         },
     });
     api.patch(
@@ -6951,6 +6972,37 @@ async fn egress_source_projection(
     }
 }
 
+async fn ingest_egress_fqdn_observations(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(batch): Json<EgressFqdnObservationBatch>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    ingest_egress_fqdn_observations_for(&state, &agent, batch, unix_time_seconds())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn ingest_egress_fqdn_observations_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    batch: EgressFqdnObservationBatch,
+    now_unix_seconds: u64,
+) -> Result<bool, ApiError> {
+    if !agent_application_is_current(state, agent) {
+        return Err(ApiError::forbidden(
+            "FQDN observation batch does not match the current authenticated agent Pod",
+        ));
+    }
+    let principal = egress_principal_for(state, agent)?;
+    let changed = mutex_lock(&state.egress_fqdn_observations)
+        .apply(&principal, batch, now_unix_seconds)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if changed {
+        state.egress_desired_dirty.store(true, Ordering::Release);
+    }
+    Ok(changed)
+}
+
 fn egress_source_projection_for(
     state: &ControllerState,
     agent: &AuthenticatedAgent,
@@ -11010,6 +11062,12 @@ fn unix_time_millis() -> u64 {
         })
 }
 
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11064,6 +11122,115 @@ mod tests {
         }
     }
 
+    fn egress_fqdn_batch(
+        node_uid: &str,
+        revision: u64,
+        observations: Vec<unf_egress::EgressDnsObservation>,
+    ) -> EgressFqdnObservationBatch {
+        EgressFqdnObservationBatch {
+            schema_version: unf_egress::EGRESS_FQDN_OBSERVATION_BATCH_SCHEMA_VERSION,
+            observer_node_uid: node_uid.to_owned(),
+            source_epoch: 7,
+            batch_revision: Revision::new(revision),
+            view: unf_egress::DEFAULT_EGRESS_FQDN_VIEW.to_owned(),
+            collected_at_unix_seconds: 2_000_000,
+            observations,
+        }
+    }
+
+    fn egress_fqdn_observation(node_uid: &str, revision: u64) -> unf_egress::EgressDnsObservation {
+        unf_egress::EgressDnsObservation {
+            source: unf_egress::EgressDnsObservationSource {
+                observer_uid: node_uid.to_owned(),
+                resolver: "10.96.0.10".parse().expect("resolver address"),
+                view: unf_egress::DEFAULT_EGRESS_FQDN_VIEW.to_owned(),
+                source_epoch: 7,
+            },
+            observation_revision: Revision::new(revision),
+            query_name: "api.example.test".to_owned(),
+            canonical_chain: vec!["api.example.test".to_owned()],
+            answers: vec![unf_egress::EgressDnsAnswer {
+                address: "203.0.113.42".parse().expect("answer address"),
+                ttl_seconds: 60,
+            }],
+            observed_at_unix_seconds: 2_000_000,
+        }
+    }
+
+    #[test]
+    fn authenticated_fqdn_observation_batches_are_durable_monotonic_and_node_bound() {
+        let state = new_state(true);
+        let agent = authenticated_egress_agent("worker-a");
+        record_current_egress_agents(&state, &[&agent]);
+        write_lock(&state.node_port_nodes).insert(
+            agent.node_name.clone(),
+            NodePortNodeRecord {
+                node_uid: "worker-a-uid".to_owned(),
+                revision: Revision::new(1),
+                addresses: Vec::new(),
+            },
+        );
+        state.egress_desired_dirty.store(false, Ordering::Release);
+
+        let first = egress_fqdn_batch(
+            "worker-a-uid",
+            1,
+            vec![egress_fqdn_observation("worker-a-uid", 1)],
+        );
+        assert!(
+            ingest_egress_fqdn_observations_for(&state, &agent, first.clone(), 2_000_000)
+                .expect("current agent batch")
+        );
+        assert!(state.egress_desired_dirty.load(Ordering::Acquire));
+        assert!(
+            !ingest_egress_fqdn_observations_for(&state, &agent, first.clone(), 2_000_000)
+                .expect("exact replay is idempotent")
+        );
+
+        let mut mutation = first;
+        mutation.collected_at_unix_seconds += 1;
+        assert_eq!(
+            ingest_egress_fqdn_observations_for(&state, &agent, mutation, 2_000_001)
+                .expect_err("same-position mutation must fail")
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        let mut replacement = agent.clone();
+        replacement.pod_uid = "replacement-pod-uid".to_owned();
+        assert_eq!(
+            ingest_egress_fqdn_observations_for(
+                &state,
+                &replacement,
+                egress_fqdn_batch("worker-a-uid", 2, Vec::new()),
+                2_000_000,
+            )
+            .expect_err("replacement Pod must not inherit observation ownership")
+            .status,
+            StatusCode::FORBIDDEN
+        );
+
+        assert!(
+            ingest_egress_fqdn_observations_for(
+                &state,
+                &agent,
+                egress_fqdn_batch("worker-a-uid", 2, Vec::new()),
+                2_000_000,
+            )
+            .expect("authoritative empty replacement")
+        );
+        let checkpoint = mutex_lock(&state.egress_fqdn_observations)
+            .checkpoint(2_000_000)
+            .expect("durable checkpoint");
+        let restored = EgressFqdnObservationLedger::restore(checkpoint.clone(), 2_000_000)
+            .expect("restart replay");
+        assert_eq!(restored.checkpoint(2_000_000).unwrap(), checkpoint);
+        assert!(
+            restored
+                .observations_for_view(unf_egress::DEFAULT_EGRESS_FQDN_VIEW)
+                .is_empty()
+        );
+    }
+
     fn gateway_source_distribution(
         advertisement: &EgressAgentAdvertisement,
     ) -> EgressSourceDistribution {
@@ -11076,6 +11243,7 @@ mod tests {
             priority: 100,
             source: unf_egress::EgressSourceSelector::default(),
             destinations: unf_egress::EgressDestinations::Any,
+            fqdn: None,
             addresses: unf_egress::EgressAddressRequest::Explicit {
                 addresses: vec!["192.0.2.40".parse().expect("address")],
             },

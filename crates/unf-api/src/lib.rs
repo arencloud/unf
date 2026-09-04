@@ -166,6 +166,61 @@ pub struct EgressTarget {
 pub struct EgressDestinations {
     #[serde(default)]
     pub networks: Vec<String>,
+    #[serde(default)]
+    pub fqdn: Vec<String>,
+    #[serde(default)]
+    pub dns: EgressDnsControls,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressDnsControls {
+    #[serde(default = "default_egress_dns_view")]
+    pub view: String,
+    #[serde(default = "default_egress_dns_required_observers")]
+    #[schemars(range(min = 1, max = 16))]
+    pub required_observers: u16,
+    #[serde(default = "default_egress_dns_max_addresses")]
+    #[schemars(range(min = 1, max = 4096))]
+    pub max_addresses: u16,
+    #[serde(default = "default_egress_dns_max_ttl_seconds")]
+    #[schemars(range(min = 1, max = 604_800))]
+    pub max_ttl_seconds: u32,
+    #[serde(default = "default_egress_dns_established_grace_seconds")]
+    #[schemars(range(max = 3600))]
+    pub established_flow_grace_seconds: u32,
+}
+
+impl Default for EgressDnsControls {
+    fn default() -> Self {
+        Self {
+            view: default_egress_dns_view(),
+            required_observers: default_egress_dns_required_observers(),
+            max_addresses: default_egress_dns_max_addresses(),
+            max_ttl_seconds: default_egress_dns_max_ttl_seconds(),
+            established_flow_grace_seconds: default_egress_dns_established_grace_seconds(),
+        }
+    }
+}
+
+fn default_egress_dns_view() -> String {
+    "cluster-default".to_owned()
+}
+
+const fn default_egress_dns_required_observers() -> u16 {
+    1
+}
+
+const fn default_egress_dns_max_addresses() -> u16 {
+    256
+}
+
+const fn default_egress_dns_max_ttl_seconds() -> u32 {
+    300
+}
+
+const fn default_egress_dns_established_grace_seconds() -> u32 {
+    30
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -276,6 +331,8 @@ spec:
         let policy: EgressPolicy = serde_yaml::from_str(yaml).expect("valid policy");
         assert_eq!(policy.spec.priority, 1_000);
         assert!(policy.spec.destinations.networks.is_empty());
+        assert!(policy.spec.destinations.fqdn.is_empty());
+        assert_eq!(policy.spec.destinations.dns, EgressDnsControls::default());
     }
 
     #[test]

@@ -99,6 +99,7 @@ pub fn translate_openshift_egress_ip(
             service_accounts: BTreeSet::new(),
         },
         destinations: EgressDestinations::Any,
+        fqdn: None,
         addresses: EgressAddressRequest::Explicit { addresses },
     })
     .map_err(|source| OpenShiftEgressIpError::InvalidModel {

@@ -314,7 +314,7 @@ pub fn compile_egress_dataplane(
 
         let mut active = Vec::new();
         for plan in &plans {
-            let (admission, active_state) = match guard.decision(plan.source.identity) {
+            let (mut admission, mut active_state) = match guard.decision(plan.source.identity) {
                 EgressAdmissionDecision::Native => {
                     return Err(EgressDataplaneError::AdmissionMissing(plan.source.identity));
                 }
@@ -333,7 +333,6 @@ pub fn compile_egress_dataplane(
                         && value.contract_digest == host.contract.contract_digest
                         && value.lease_epoch == plan.allocation.lease_epoch =>
                 {
-                    active.push(plan.source.identity);
                     (EGRESS_ADMISSION_ACTIVE, Some(value))
                 }
                 _ => {
@@ -342,6 +341,12 @@ pub fn compile_egress_dataplane(
                     ));
                 }
             };
+            if matches!(template.destinations, EgressDestinations::DenyAll) {
+                admission = EGRESS_ADMISSION_FENCED;
+                active_state = None;
+            } else if active_state.is_some() {
+                active.push(plan.source.identity);
+            }
             let flags = family_flags(template, active_state.is_some() && has_standby(template));
             state.sources.push((
                 EgressSourceKey {
@@ -504,7 +509,11 @@ pub fn compile_egress_gateway_dataplane(
                     gateway_count: u16::try_from(plan.gateways.len())
                         .map_err(|_| EgressDataplaneError::CandidateIndex)?,
                     schema_version: EGRESS_MAP_ABI_VERSION,
-                    admission: EGRESS_ADMISSION_ACTIVE,
+                    admission: if matches!(plan.destinations, EgressDestinations::DenyAll) {
+                        EGRESS_ADMISSION_FENCED
+                    } else {
+                        EGRESS_ADMISSION_ACTIVE
+                    },
                     flags: family_flags(plan, has_standby(plan)) | EGRESS_SOURCE_FLAG_GATEWAY_NAT,
                     reserved,
                 },
@@ -645,6 +654,10 @@ fn compile_gateway_destinations(
         reserved: [0; 4],
     };
     let networks = match &plan.destinations {
+        EgressDestinations::DenyAll => {
+            push_catch_all_destinations(state, namespace, bank, value);
+            return Ok(());
+        }
         EgressDestinations::Any => {
             state.ipv4_destinations.push((
                 0,
@@ -716,6 +729,9 @@ fn compile_intent_destinations(
         reserved: [0; 4],
     };
     match &plan.destinations {
+        EgressDestinations::DenyAll => {
+            push_catch_all_destinations(state, intent_index, bank, value);
+        }
         EgressDestinations::Any => {
             state.ipv4_destinations.push((
                 0,
@@ -769,6 +785,34 @@ fn compile_intent_destinations(
         }
     }
     Ok(())
+}
+
+fn push_catch_all_destinations(
+    state: &mut EgressDataplaneState,
+    intent_index: u32,
+    bank: u8,
+    value: EgressDestinationValue,
+) {
+    state.ipv4_destinations.push((
+        0,
+        EgressIpv4DestinationData {
+            intent_index,
+            bank,
+            reserved: [0; 3],
+            destination_address: [0; 4],
+        },
+        value,
+    ));
+    state.ipv6_destinations.push((
+        0,
+        EgressIpv6DestinationData {
+            intent_index,
+            bank,
+            reserved: [0; 3],
+            destination_address: [0; 16],
+        },
+        value,
+    ));
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1071,8 +1115,9 @@ mod tests {
     use crate::distribution::test_support::{advertisement, fixture, node, principal};
     use crate::{
         AdmittedEgressProjection, EGRESS_PROTOCOL_TCP, EgressAddressLease, EgressBehaviorContract,
-        EgressFlowProof, EgressGatewayFact, EgressGatewayProjection, EgressHaCandidate,
-        EgressNodeProjection, EgressOriginalFlow, EgressProviderRef, compile_egress_ha_plan,
+        EgressFlowProof, EgressFqdnDestinationSpec, EgressFqdnPattern, EgressGatewayFact,
+        EgressGatewayProjection, EgressHaCandidate, EgressNodeProjection, EgressOriginalFlow,
+        EgressProviderRef, compile_egress_ha_plan,
     };
 
     fn ip(value: &str) -> IpAddr {
@@ -1132,6 +1177,42 @@ mod tests {
         .expect("source projection")
         .admit(&principal("worker-a"), &advertisement(), &model, &facts)
         .expect("admitted source")
+    }
+
+    fn unresolved_fqdn_projection() -> AdmittedEgressProjection {
+        let (mut model, mut facts, _) = fixture();
+        model.intents[0].destinations = EgressDestinations::DenyAll;
+        model.intents[0].fqdn = Some(EgressFqdnDestinationSpec {
+            patterns: vec![EgressFqdnPattern::Exact("api.example.test".to_owned())],
+            view: crate::DEFAULT_EGRESS_FQDN_VIEW.to_owned(),
+            required_observers: crate::DEFAULT_EGRESS_FQDN_REQUIRED_OBSERVERS,
+            max_addresses: crate::DEFAULT_EGRESS_FQDN_MAX_ADDRESSES,
+            max_ttl_seconds: crate::DEFAULT_EGRESS_FQDN_MAX_TTL_SECONDS,
+            established_flow_grace_seconds: crate::DEFAULT_EGRESS_FQDN_ESTABLISHED_GRACE_SECONDS,
+        });
+        facts.gateways.push(EgressGatewayFact {
+            intent_uid: "intent-uid".to_owned(),
+            rank: 1,
+            node: node("gateway-b"),
+            lease_epoch: 7,
+            ready: true,
+            reachable: true,
+        });
+        let contract =
+            EgressBehaviorContract::issue(&model, &facts, node("worker-a"), Revision::new(20))
+                .expect("unresolved FQDN contract");
+        let ha_plan = ha_plan(&model, &facts);
+        EgressNodeProjection::issue_with_ha(
+            &principal("worker-a"),
+            &advertisement(),
+            10,
+            Revision::new(4),
+            contract,
+            vec![ha_plan],
+        )
+        .expect("unresolved FQDN projection")
+        .admit(&principal("worker-a"), &advertisement(), &model, &facts)
+        .expect("admitted unresolved FQDN source")
     }
 
     fn two_source_projection() -> AdmittedEgressProjection {
@@ -1311,6 +1392,45 @@ mod tests {
         assert_eq!(state.ipv6_destinations.len(), 1);
         assert_eq!(state.config.destination_count, 2);
         assert_eq!(state.config.path_revision, 0);
+    }
+
+    #[test]
+    fn unresolved_fqdn_owns_both_families_and_fences_even_an_active_guard() {
+        let projection = unresolved_fqdn_projection();
+        let host = EgressGatewayHostBank::compile(&projection).expect("host bank");
+        let state = compile_egress_dataplane(&host, &guard(&projection, true), &[], 1)
+            .expect("fail-closed unresolved FQDN state");
+        assert_eq!(state.sources.len(), 1);
+        assert_eq!(state.sources[0].1.admission, EGRESS_ADMISSION_FENCED);
+        assert!(state.addresses.is_empty());
+        assert!(state.gateways.is_empty());
+        assert!(state.selections.is_empty());
+        assert_eq!(state.ipv4_destinations[0].0, 0);
+        assert_eq!(state.ipv6_destinations[0].0, 0);
+        assert_eq!(state.config.destination_count, 2);
+        assert_eq!(state.config.path_revision, 0);
+
+        let gateway_principal = principal("gateway-a");
+        let gateway = EgressGatewayProjection::issue(
+            &gateway_principal,
+            &advertisement(),
+            10,
+            Revision::new(9),
+            &[projection],
+        )
+        .expect("gateway projection")
+        .admit(&gateway_principal, &advertisement())
+        .expect("admitted gateway projection");
+        let gateway_state =
+            compile_egress_gateway_dataplane(&gateway, 1).expect("gateway fail-closed bank");
+        assert_eq!(gateway_state.sources.len(), 1);
+        assert_eq!(
+            gateway_state.sources[0].1.admission,
+            EGRESS_ADMISSION_FENCED
+        );
+        assert_eq!(gateway_state.ipv4_destinations[0].0, 0);
+        assert_eq!(gateway_state.ipv6_destinations[0].0, 0);
+        assert_eq!(gateway_state.config.destination_count, 2);
     }
 
     #[test]

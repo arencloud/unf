@@ -1245,6 +1245,7 @@ pub(crate) mod test_support {
                 priority: DEFAULT_EGRESS_INTENT_PRIORITY,
                 source: EgressSourceSelector::default(),
                 destinations: EgressDestinations::Any,
+                fqdn: None,
                 addresses: EgressAddressRequest::Pool {
                     name: "finance".to_owned(),
                     families: vec![AddressFamily::Ipv4, AddressFamily::Ipv6],

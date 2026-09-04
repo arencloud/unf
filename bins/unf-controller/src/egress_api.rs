@@ -6,12 +6,16 @@ use std::net::IpAddr;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector as KubernetesLabelSelector;
 use kube::ResourceExt;
 use thiserror::Error;
-use unf_api::{EgressAddressFamily as ApiAddressFamily, EgressPolicy, EgressPool};
+use unf_api::{
+    EgressAddressFamily as ApiAddressFamily, EgressDestinations as ApiEgressDestinations,
+    EgressPolicy, EgressPool,
+};
 use unf_egress::{
     AddressFamily, EgressAddressPool, EgressAddressRequest,
-    EgressDestinations as DomainDestinations, EgressIntent, EgressIntentOwner, EgressIntentScope,
-    EgressModelError, EgressProviderRef, EgressSourceSelector, IpPrefix, LabelExpression,
-    LabelExpressionOperator, LabelSelector, normalize_intent, normalize_pools,
+    EgressDestinations as DomainDestinations, EgressFqdnDestinationSpec, EgressFqdnPattern,
+    EgressIntent, EgressIntentOwner, EgressIntentScope, EgressModelError, EgressProviderRef,
+    EgressSourceSelector, IpPrefix, LabelExpression, LabelExpressionOperator, LabelSelector,
+    normalize_intent, normalize_pools,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -28,6 +32,10 @@ pub enum NativeEgressApiError {
     UnsupportedSelectorOperator { name: String, operator: String },
     #[error("EgressPolicy {0:?} must select exactly one pool or explicit address set")]
     InvalidAddressSelection(String),
+    #[error("EgressPolicy {0:?} cannot combine network and FQDN destinations")]
+    AmbiguousDestinations(String),
+    #[error("EgressPolicy {name:?} has invalid FQDN pattern {value:?}")]
+    InvalidFqdn { name: String, value: String },
     #[error("native egress resource cannot be normalized: {0}")]
     InvalidModel(String),
 }
@@ -77,19 +85,7 @@ pub fn translate_egress_policy(
             kind: "EgressPolicy",
             name: name.clone(),
         })?;
-    let destinations = if policy.spec.destinations.networks.is_empty() {
-        DomainDestinations::Any
-    } else {
-        DomainDestinations::Networks(
-            policy
-                .spec
-                .destinations
-                .networks
-                .iter()
-                .map(|value| parse_prefix("EgressPolicy", &name, value))
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-    };
+    let (destinations, fqdn) = translate_destinations(&name, &policy.spec.destinations)?;
     let selection = &policy.spec.egress;
     let (addresses, provider) = match (
         selection.pool.as_deref(),
@@ -154,10 +150,61 @@ pub fn translate_egress_policy(
                 .collect::<BTreeSet<_>>(),
         },
         destinations,
+        fqdn,
         addresses,
     })
     .map_err(|error| model_error(&error))?;
     Ok((intent, provider))
+}
+
+fn translate_destinations(
+    name: &str,
+    destinations: &ApiEgressDestinations,
+) -> Result<(DomainDestinations, Option<EgressFqdnDestinationSpec>), NativeEgressApiError> {
+    let translated = match (
+        destinations.networks.is_empty(),
+        destinations.fqdn.is_empty(),
+    ) {
+        (true, true) => (DomainDestinations::Any, None),
+        (false, true) => (
+            DomainDestinations::Networks(
+                destinations
+                    .networks
+                    .iter()
+                    .map(|value| parse_prefix("EgressPolicy", name, value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None,
+        ),
+        (true, false) => {
+            let controls = &destinations.dns;
+            let patterns = destinations
+                .fqdn
+                .iter()
+                .map(|value| {
+                    EgressFqdnPattern::parse(value).map_err(|_| NativeEgressApiError::InvalidFqdn {
+                        name: name.to_owned(),
+                        value: value.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (
+                DomainDestinations::DenyAll,
+                Some(EgressFqdnDestinationSpec {
+                    patterns,
+                    view: controls.view.clone(),
+                    required_observers: controls.required_observers,
+                    max_addresses: controls.max_addresses,
+                    max_ttl_seconds: controls.max_ttl_seconds,
+                    established_flow_grace_seconds: controls.established_flow_grace_seconds,
+                }),
+            )
+        }
+        (false, false) => {
+            return Err(NativeEgressApiError::AmbiguousDestinations(name.to_owned()));
+        }
+    };
+    Ok(translated)
 }
 
 fn translate_selector(
@@ -314,6 +361,59 @@ mod tests {
         assert!(matches!(
             translate_egress_pool(&pool),
             Err(NativeEgressApiError::InvalidCidr { .. })
+        ));
+    }
+
+    #[test]
+    fn native_fqdn_translation_is_canonical_bounded_and_initially_deny_all() {
+        let policy: EgressPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "EgressPolicy",
+            "metadata": {"name": "bank-access", "uid": "policy-uid"},
+            "spec": {
+                "target": {"namespaceSelector": {"matchLabels": {"team": "finance"}}},
+                "destinations": {
+                    "fqdn": ["API.PARTNER.TEST.", "*.bank.example"],
+                    "dns": {
+                        "view": "finance/production",
+                        "requiredObservers": 2,
+                        "maxAddresses": 128,
+                        "maxTtlSeconds": 120,
+                        "establishedFlowGraceSeconds": 15
+                    }
+                },
+                "egress": {"pool": "finance", "families": ["IPv4", "IPv6"]}
+            }
+        }))
+        .unwrap();
+        let (intent, provider) = translate_egress_policy(&policy).unwrap();
+        assert!(provider.is_none());
+        assert_eq!(intent.destinations, DomainDestinations::DenyAll);
+        let fqdn = intent.fqdn.unwrap();
+        assert_eq!(
+            fqdn.patterns[0],
+            EgressFqdnPattern::Exact("api.partner.test".to_owned())
+        );
+        assert_eq!(fqdn.required_observers, 2);
+        assert_eq!(fqdn.max_ttl_seconds, 120);
+
+        let ambiguous: EgressPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "EgressPolicy",
+            "metadata": {"name": "ambiguous", "uid": "ambiguous-uid"},
+            "spec": {
+                "target": {},
+                "destinations": {
+                    "networks": ["198.51.100.0/24"],
+                    "fqdn": ["api.example"]
+                },
+                "egress": {"pool": "finance", "families": ["IPv4"]}
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            translate_egress_policy(&ambiguous),
+            Err(NativeEgressApiError::AmbiguousDestinations(_))
         ));
     }
 }

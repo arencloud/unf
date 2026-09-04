@@ -401,6 +401,7 @@ mod tests {
             priority: 1_000,
             source: EgressSourceSelector::default(),
             destinations: EgressDestinations::Any,
+            fqdn: None,
             addresses: EgressAddressRequest::Pool {
                 name: "finance".to_owned(),
                 families: vec![AddressFamily::Ipv4],

@@ -220,6 +220,7 @@ impl EgressHaPlan {
                 priority: DEFAULT_EGRESS_INTENT_PRIORITY,
                 source: EgressSourceSelector::default(),
                 destinations: EgressDestinations::Any,
+                fqdn: None,
                 addresses: EgressAddressRequest::Explicit {
                     addresses: addresses.clone(),
                 },
@@ -877,6 +878,7 @@ mod tests {
                 priority: DEFAULT_EGRESS_INTENT_PRIORITY,
                 source: EgressSourceSelector::default(),
                 destinations: EgressDestinations::Any,
+                fqdn: None,
                 addresses: EgressAddressRequest::Pool {
                     name: "public".to_owned(),
                     families: vec![AddressFamily::Ipv4, AddressFamily::Ipv6],

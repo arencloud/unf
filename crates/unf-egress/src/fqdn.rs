@@ -26,6 +26,11 @@ pub const MAX_EGRESS_FQDN_ADDRESSES: u16 = 4_096;
 pub const MAX_EGRESS_FQDN_TTL_SECONDS: u32 = 604_800;
 pub const MAX_EGRESS_FQDN_ESTABLISHED_GRACE_SECONDS: u32 = 3_600;
 pub const MAX_EGRESS_FQDN_FUTURE_SKEW_SECONDS: u64 = 30;
+pub const DEFAULT_EGRESS_FQDN_VIEW: &str = "cluster-default";
+pub const DEFAULT_EGRESS_FQDN_REQUIRED_OBSERVERS: u16 = 1;
+pub const DEFAULT_EGRESS_FQDN_MAX_ADDRESSES: u16 = 256;
+pub const DEFAULT_EGRESS_FQDN_MAX_TTL_SECONDS: u32 = 300;
+pub const DEFAULT_EGRESS_FQDN_ESTABLISHED_GRACE_SECONDS: u32 = 30;
 
 const FQDN_DIGEST_DOMAIN: &[u8] = b"unf.egress.fqdn.provenance-leased-resolution.v1\0";
 
@@ -86,7 +91,70 @@ impl EgressFqdnPattern {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressFqdnDestinationSpec {
+    pub patterns: Vec<EgressFqdnPattern>,
+    pub view: String,
+    pub required_observers: u16,
+    pub max_addresses: u16,
+    pub max_ttl_seconds: u32,
+    pub established_flow_grace_seconds: u32,
+}
+
+/// Canonicalizes and bounds one FQDN destination specification.
+///
+/// # Errors
+///
+/// Rejects invalid/duplicate patterns, views, quorums, capacity, TTL, or drain
+/// bounds.
+pub fn normalize_egress_fqdn_destination_spec(
+    mut spec: EgressFqdnDestinationSpec,
+) -> Result<EgressFqdnDestinationSpec, EgressFqdnError> {
+    if spec.patterns.is_empty() || spec.patterns.len() > MAX_EGRESS_FQDN_PATTERNS {
+        return Err(EgressFqdnError::InvalidPolicy(
+            "pattern set is empty or unbounded",
+        ));
+    }
+    spec.patterns = spec
+        .patterns
+        .iter()
+        .map(|pattern| match pattern {
+            EgressFqdnPattern::Exact(name) => EgressFqdnPattern::parse(name),
+            EgressFqdnPattern::WildcardSuffix(suffix) => {
+                EgressFqdnPattern::parse(&format!("*.{suffix}"))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    spec.patterns.sort_unstable();
+    if spec.patterns.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(EgressFqdnError::InvalidPolicy(
+            "duplicate patterns are forbidden",
+        ));
+    }
+    if !valid_token(&spec.view) {
+        return Err(EgressFqdnError::InvalidPolicy("DNS view is invalid"));
+    }
+    if spec.required_observers == 0 || spec.required_observers > MAX_EGRESS_FQDN_OBSERVERS {
+        return Err(EgressFqdnError::InvalidPolicy("observer quorum is invalid"));
+    }
+    if spec.max_addresses == 0 || spec.max_addresses > MAX_EGRESS_FQDN_ADDRESSES {
+        return Err(EgressFqdnError::InvalidPolicy(
+            "address capacity is invalid",
+        ));
+    }
+    if spec.max_ttl_seconds == 0 || spec.max_ttl_seconds > MAX_EGRESS_FQDN_TTL_SECONDS {
+        return Err(EgressFqdnError::InvalidPolicy("TTL cap is invalid"));
+    }
+    if spec.established_flow_grace_seconds > MAX_EGRESS_FQDN_ESTABLISHED_GRACE_SECONDS {
+        return Err(EgressFqdnError::InvalidPolicy(
+            "established-flow grace is unbounded",
+        ));
+    }
+    Ok(spec)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EgressFqdnPolicy {
     pub revision: Revision,
@@ -183,6 +251,7 @@ impl VerifiedEgressFqdnSnapshot {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EgressFqdnCompilationReport {
     pub accepted_observations: u32,
+    pub authoritative_empty_observations: u32,
     pub wrong_view_observations: u32,
     pub unmatched_name_observations: u32,
     pub zero_ttl_answers: u32,
@@ -331,6 +400,9 @@ fn collect_observations(
             continue;
         }
         report.accepted_observations += 1;
+        if observation.answers.is_empty() {
+            report.authoritative_empty_observations += 1;
+        }
         add_observation_answers(policy, observation, &mut grouped, &mut report)?;
     }
     Ok((grouped, report))
@@ -520,50 +592,24 @@ fn normalize_policy(mut policy: EgressFqdnPolicy) -> Result<EgressFqdnPolicy, Eg
     {
         return Err(EgressFqdnError::InvalidPolicy("owner identity is invalid"));
     }
-    if policy.patterns.is_empty() || policy.patterns.len() > MAX_EGRESS_FQDN_PATTERNS {
-        return Err(EgressFqdnError::InvalidPolicy(
-            "pattern set is empty or unbounded",
-        ));
-    }
-    policy.patterns = policy
-        .patterns
-        .iter()
-        .map(|pattern| match pattern {
-            EgressFqdnPattern::Exact(name) => EgressFqdnPattern::parse(name),
-            EgressFqdnPattern::WildcardSuffix(suffix) => {
-                EgressFqdnPattern::parse(&format!("*.{suffix}"))
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    policy.patterns.sort_unstable();
-    if policy.patterns.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(EgressFqdnError::InvalidPolicy(
-            "duplicate patterns are forbidden",
-        ));
-    }
-    if !valid_token(&policy.view) {
-        return Err(EgressFqdnError::InvalidPolicy("DNS view is invalid"));
-    }
-    if policy.required_observers == 0 || policy.required_observers > MAX_EGRESS_FQDN_OBSERVERS {
-        return Err(EgressFqdnError::InvalidPolicy("observer quorum is invalid"));
-    }
-    if policy.max_addresses == 0 || policy.max_addresses > MAX_EGRESS_FQDN_ADDRESSES {
-        return Err(EgressFqdnError::InvalidPolicy(
-            "address capacity is invalid",
-        ));
-    }
-    if policy.max_ttl_seconds == 0 || policy.max_ttl_seconds > MAX_EGRESS_FQDN_TTL_SECONDS {
-        return Err(EgressFqdnError::InvalidPolicy("TTL cap is invalid"));
-    }
-    if policy.established_flow_grace_seconds > MAX_EGRESS_FQDN_ESTABLISHED_GRACE_SECONDS {
-        return Err(EgressFqdnError::InvalidPolicy(
-            "established-flow grace is unbounded",
-        ));
-    }
+    let spec = normalize_egress_fqdn_destination_spec(EgressFqdnDestinationSpec {
+        patterns: policy.patterns,
+        view: policy.view,
+        required_observers: policy.required_observers,
+        max_addresses: policy.max_addresses,
+        max_ttl_seconds: policy.max_ttl_seconds,
+        established_flow_grace_seconds: policy.established_flow_grace_seconds,
+    })?;
+    policy.patterns = spec.patterns;
+    policy.view = spec.view;
+    policy.required_observers = spec.required_observers;
+    policy.max_addresses = spec.max_addresses;
+    policy.max_ttl_seconds = spec.max_ttl_seconds;
+    policy.established_flow_grace_seconds = spec.established_flow_grace_seconds;
     Ok(policy)
 }
 
-fn normalize_observation(
+pub(crate) fn normalize_observation(
     mut observation: EgressDnsObservation,
     max_ttl_seconds: u32,
     now_unix_seconds: u64,

@@ -21,8 +21,56 @@ spec:
             properties:
               destinations:
                 default:
+                  dns:
+                    establishedFlowGraceSeconds: 30
+                    maxAddresses: 256
+                    maxTtlSeconds: 300
+                    requiredObservers: 1
+                    view: cluster-default
+                  fqdn: []
                   networks: []
                 properties:
+                  dns:
+                    default:
+                      establishedFlowGraceSeconds: 30
+                      maxAddresses: 256
+                      maxTtlSeconds: 300
+                      requiredObservers: 1
+                      view: cluster-default
+                    properties:
+                      establishedFlowGraceSeconds:
+                        default: 30
+                        format: uint32
+                        maximum: 3600.0
+                        minimum: 0.0
+                        type: integer
+                      maxAddresses:
+                        default: 256
+                        format: uint16
+                        maximum: 4096.0
+                        minimum: 1.0
+                        type: integer
+                      maxTtlSeconds:
+                        default: 300
+                        format: uint32
+                        maximum: 604800.0
+                        minimum: 1.0
+                        type: integer
+                      requiredObservers:
+                        default: 1
+                        format: uint16
+                        maximum: 16.0
+                        minimum: 1.0
+                        type: integer
+                      view:
+                        default: cluster-default
+                        type: string
+                    type: object
+                  fqdn:
+                    default: []
+                    items:
+                      type: string
+                    type: array
                   networks:
                     default: []
                     items:

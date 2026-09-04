@@ -15275,6 +15275,7 @@ mod tests {
                 priority: unf_egress::DEFAULT_EGRESS_INTENT_PRIORITY,
                 source: unf_egress::EgressSourceSelector::default(),
                 destinations: unf_egress::EgressDestinations::Any,
+                fqdn: None,
                 addresses: unf_egress::EgressAddressRequest::Pool {
                     name: "public".to_owned(),
                     families: vec![EgressAddressFamily::Ipv4, EgressAddressFamily::Ipv6],

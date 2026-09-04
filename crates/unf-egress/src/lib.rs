@@ -19,6 +19,7 @@ mod dataplane;
 mod desired;
 mod distribution;
 mod fqdn;
+mod fqdn_observation;
 mod gateway;
 mod gateway_address;
 mod ha;
@@ -35,6 +36,7 @@ pub use dataplane::*;
 pub use desired::*;
 pub use distribution::*;
 pub use fqdn::*;
+pub use fqdn_observation::*;
 pub use gateway::*;
 pub use gateway_address::*;
 pub use ha::*;
@@ -208,6 +210,7 @@ impl EgressSourceSelector {
     content = "networks"
 )]
 pub enum EgressDestinations {
+    DenyAll,
     Any,
     Networks(Vec<IpPrefix>),
 }
@@ -263,6 +266,8 @@ pub struct EgressIntent {
     pub priority: u32,
     pub source: EgressSourceSelector,
     pub destinations: EgressDestinations,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fqdn: Option<EgressFqdnDestinationSpec>,
     pub addresses: EgressAddressRequest,
 }
 
@@ -396,6 +401,22 @@ pub fn normalize_intent(mut intent: EgressIntent) -> Result<EgressIntent, Egress
         ));
     }
     normalize_destinations(&intent.owner.name, &mut intent.destinations)?;
+    if let Some(fqdn) = intent.fqdn.take() {
+        let fqdn = normalize_egress_fqdn_destination_spec(fqdn)
+            .map_err(|_| invalid_intent(&intent, "FQDN destination specification is invalid"))?;
+        if matches!(intent.destinations, EgressDestinations::Any) {
+            return Err(invalid_intent(
+                &intent,
+                "FQDN destinations cannot silently broaden to any destination",
+            ));
+        }
+        intent.fqdn = Some(fqdn);
+    } else if matches!(intent.destinations, EgressDestinations::DenyAll) {
+        return Err(invalid_intent(
+            &intent,
+            "deny-all destination requires an unresolved FQDN specification",
+        ));
+    }
     normalize_address_request(&intent.owner.name, &mut intent.addresses)?;
     Ok(intent)
 }
@@ -744,6 +765,7 @@ mod tests {
             priority: DEFAULT_EGRESS_INTENT_PRIORITY,
             source: EgressSourceSelector::default(),
             destinations: EgressDestinations::Any,
+            fqdn: None,
             addresses: EgressAddressRequest::Pool {
                 name: "finance".to_owned(),
                 families: vec![AddressFamily::Ipv6, AddressFamily::Ipv4],

@@ -507,6 +507,7 @@ fn validate_flow(
         return Err(EgressProofError::UnknownPlan(flow.identity));
     }
     let allowed = match &plan.destinations {
+        EgressDestinations::DenyAll => false,
         EgressDestinations::Any => true,
         EgressDestinations::Networks(networks) => networks
             .iter()

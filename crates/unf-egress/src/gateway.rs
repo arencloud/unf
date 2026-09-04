@@ -693,6 +693,7 @@ mod tests {
                 priority: DEFAULT_EGRESS_INTENT_PRIORITY,
                 source: EgressSourceSelector::default(),
                 destinations: EgressDestinations::Any,
+                fqdn: None,
                 addresses: EgressAddressRequest::Explicit {
                     addresses: vec![ip(address)],
                 },
