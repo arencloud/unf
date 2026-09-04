@@ -628,6 +628,13 @@ matrix is maintained in the
   loss, early-LKG, restart, autonomous expiry, replay/mutation rejection, and
   higher-revision recovery under `make egress-internet-lifecycle-test`; ADR
   0147.
+- Phase 8.8a verifies Diversity-Quorum Reachability. Exact digest-sealed
+  lease/path plans require complete finite IPv4/IPv6 route observations across
+  every declared vantage, count independent failure domains rather than
+  replicas, and require exact path agreement. Correlated, conflicting, partial,
+  foreign, missing, and expired evidence denies closed; verified withdrawal
+  requires the same diverse empty view under `make
+  egress-reachability-contract-test`; ADR 0148.
 - Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
   ServiceAccount selectors; canonical destinations and non-overlapping
   dual-stack pools; pool-family/multiple-address intent; strict OpenShift

@@ -12,6 +12,7 @@
 .PHONY: egress-fqdn-lifecycle-test
 .PHONY: egress-internet-classification-test
 .PHONY: egress-internet-lifecycle-test
+.PHONY: egress-reachability-contract-test
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -268,6 +269,11 @@ egress-internet-lifecycle-test: egress-internet-classification-test service-kind
 	hack/verify-egress-internet-lifecycle.sh
 	bash -n hack/verify-kind-egress-internet-lifecycle.sh
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) UNF_TEST_TOOLS_IMAGE=$(TEST_TOOLS_IMAGE) hack/verify-kind-egress-internet-lifecycle.sh
+
+egress-reachability-contract-test: egress-internet-lifecycle-test
+	hack/verify-egress-reachability-contract.sh
+	cargo test -p unf-egress reachability::tests --no-fail-fast
+	cargo clippy -p unf-egress --all-targets --all-features -- -D warnings
 
 test:
 	cargo test --workspace

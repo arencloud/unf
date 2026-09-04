@@ -646,7 +646,20 @@ authority still expires autonomously. The three-Node dual-stack Kind gate also
 proves agent publish denial, absolute exceptions, provider-negative and unknown
 denial, replay/mutation rejection, higher-revision recovery, and exact cleanup
 under `make egress-internet-lifecycle-test`; ADR 0147. Milestone 8.8,
-provider-neutral reachability and advertisement providers, is next.
+provider-neutral reachability and advertisement providers, is now in progress.
+Its first verified slice introduces Diversity-Quorum Reachability (DQR): a
+provider may mutate routes but cannot certify its own success. Digest-sealed
+plans bind the exact allocation lease, IPv4/IPv6 addresses, permitted
+gateway/forwarding identities, ECMP bounds, network vantages, and finite
+evidence lifetime. Complete observers count by independent failure domain—not
+replica count—and must agree exactly within every vantage. Correlated-only,
+conflicting, partial, foreign, missing, or expired views deny closed; withdrawal
+requires the same diverse complete evidence of absence. Only an opaque result
+constructed or independently replayed from the complete evidence set can reach
+the consumer deadline check. `make
+egress-reachability-contract-test` and ADR 0148 verify 8.8a. Authenticated
+durable evidence ingestion is next in 8.8b, followed by the live static/native,
+BGP, and BFD provider gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
