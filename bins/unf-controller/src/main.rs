@@ -5391,7 +5391,7 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             if let Err(error) = reconcile_egress_control_plane(state) {
                 state.metrics.errors.inc();
                 warn!(%error, "Node deletion egress reconciliation rejected; retaining last-known-good state");
-            } else if let Err(error) = begin_requested_egress_ha_drains(state) {
+            } else if let Err(error) = reconcile_requested_egress_ha(state) {
                 state.metrics.errors.inc();
                 warn!(%error, "deleted-Node HA investigation rejected; retaining durable ownership");
             }
@@ -5440,7 +5440,7 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             if let Err(error) = reconcile_egress_control_plane(state) {
                 state.metrics.errors.inc();
                 warn!(%error, "Node relist egress reconciliation rejected; retaining last-known-good state");
-            } else if let Err(error) = begin_requested_egress_ha_drains(state) {
+            } else if let Err(error) = reconcile_requested_egress_ha(state) {
                 state.metrics.errors.inc();
                 warn!(%error, "Node relist HA drain trigger rejected; retaining durable ownership");
             }
@@ -5483,7 +5483,7 @@ fn reconcile_node(state: &ControllerState, node: &Node, initializing: bool) {
         if let Err(error) = reconcile_egress_control_plane(state) {
             state.metrics.errors.inc();
             warn!(%error, "Node egress reconciliation rejected; retaining last-known-good state");
-        } else if let Err(error) = begin_requested_egress_ha_drains(state) {
+        } else if let Err(error) = reconcile_requested_egress_ha(state) {
             state.metrics.errors.inc();
             warn!(%error, "HA drain trigger rejected; retaining durable ownership");
         }
@@ -8943,6 +8943,52 @@ fn live_egress_ha_candidates(
 
 const EGRESS_HA_CAPACITY_LABEL: &str = "network.unf.io/egress-capacity";
 const EGRESS_HA_DRAIN_LABEL: &str = "network.unf.io/egress-drain";
+
+fn reconcile_requested_egress_ha(state: &ControllerState) -> Result<bool> {
+    let recovered = cancel_recovered_egress_ha_investigations(state)?;
+    Ok(begin_requested_egress_ha_drains(state)? || recovered)
+}
+
+fn cancel_recovered_egress_ha_investigations(state: &ControllerState) -> Result<bool> {
+    let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
+    let nodes = read_lock(&state.nodes);
+    let node_uids = read_lock(&state.node_port_nodes);
+    let recovered = checkpoint
+        .ha_promotions
+        .iter()
+        .filter(|promotion| {
+            nodes
+                .get(&promotion.coordinator.manifest.failed_gateway.name)
+                .is_some_and(|node| {
+                    node.ready
+                        && node_uids.get(&node.name).is_some_and(|record| {
+                            record.node_uid == promotion.coordinator.manifest.failed_gateway.uid
+                        })
+                        && !node
+                            .labels
+                            .get(EGRESS_HA_DRAIN_LABEL)
+                            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+                })
+        })
+        .map(|promotion| promotion.coordinator.manifest.owner.clone())
+        .collect::<Vec<_>>();
+    drop(nodes);
+    drop(node_uids);
+    if recovered.is_empty() {
+        return Ok(false);
+    }
+    let mut control = mutex_lock(&state.egress_control_plane);
+    for owner in &recovered {
+        control.cancel_recovered_ha_investigation(owner)?;
+        info!(owner = %owner.name, "canceled recovered egress HA investigation before ownership change");
+    }
+    drop(control);
+    reset_egress_contract_distributions_locked(state);
+    state
+        .egress_control_plane_dirty
+        .store(true, Ordering::Release);
+    Ok(true)
+}
 
 fn begin_requested_egress_ha_drains(state: &ControllerState) -> Result<bool> {
     let nodes = read_lock(&state.nodes);
@@ -13831,34 +13877,7 @@ mod tests {
             .insert("worker-a".to_owned(), distribution.clone());
         let candidates = ["gateway-a", "gateway-b", "gateway-c"]
             .into_iter()
-            .map(|name| {
-                write_lock(&state.nodes).insert(
-                    name.to_owned(),
-                    TopologyNode {
-                        name: name.to_owned(),
-                        ready: true,
-                        labels: BTreeMap::from([
-                            (
-                                PRIMARY_CNI_NODE_LABEL.to_owned(),
-                                PRIMARY_CNI_NODE_LABEL_VALUE.to_owned(),
-                            ),
-                            (
-                                EGRESS_GATEWAY_NODE_LABEL.to_owned(),
-                                EGRESS_GATEWAY_NODE_LABEL_VALUE.to_owned(),
-                            ),
-                        ]),
-                    },
-                );
-                EgressHaCandidate {
-                    node: EgressNode {
-                        name: name.to_owned(),
-                        uid: format!("{name}-uid"),
-                        capabilities: advertisement.capabilities.clone(),
-                    },
-                    capacity_units: 1,
-                    failure_domains: BTreeMap::new(),
-                }
-            })
+            .map(|name| insert_ha_gateway_node(&state, &advertisement, name))
             .collect::<Vec<_>>();
         mutex_lock(&state.egress_control_plane)
             .reconcile_with_ha_candidates(
@@ -13906,6 +13925,64 @@ mod tests {
                 .checkpoint(),
             checkpoint
         );
+        write_lock(&state.nodes)
+            .get_mut(&failed.name)
+            .unwrap()
+            .labels
+            .remove(EGRESS_HA_DRAIN_LABEL);
+        assert!(
+            reconcile_requested_egress_ha(&state)
+                .expect("cancel the source-fenced transient investigation")
+        );
+        assert!(
+            mutex_lock(&state.egress_control_plane)
+                .checkpoint()
+                .ha_promotions
+                .is_empty(),
+            "exact Node-UID recovery restores the prior certified plan"
+        );
+    }
+
+    fn insert_ha_gateway_node(
+        state: &ControllerState,
+        advertisement: &EgressAgentAdvertisement,
+        name: &str,
+    ) -> EgressHaCandidate {
+        let uid = format!("{name}-uid");
+        write_lock(&state.node_port_nodes).insert(
+            name.to_owned(),
+            NodePortNodeRecord {
+                node_uid: uid.clone(),
+                revision: Revision::new(1),
+                addresses: Vec::new(),
+            },
+        );
+        write_lock(&state.nodes).insert(
+            name.to_owned(),
+            TopologyNode {
+                name: name.to_owned(),
+                ready: true,
+                labels: BTreeMap::from([
+                    (
+                        PRIMARY_CNI_NODE_LABEL.to_owned(),
+                        PRIMARY_CNI_NODE_LABEL_VALUE.to_owned(),
+                    ),
+                    (
+                        EGRESS_GATEWAY_NODE_LABEL.to_owned(),
+                        EGRESS_GATEWAY_NODE_LABEL_VALUE.to_owned(),
+                    ),
+                ]),
+            },
+        );
+        EgressHaCandidate {
+            node: EgressNode {
+                name: name.to_owned(),
+                uid,
+                capabilities: advertisement.capabilities.clone(),
+            },
+            capacity_units: 1,
+            failure_domains: BTreeMap::new(),
+        }
     }
 
     fn acknowledge_gateway_projection(

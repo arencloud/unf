@@ -590,6 +590,39 @@ impl EgressControlPlane {
         self.ha_promotions.get(owner)
     }
 
+    /// Cancels a recovered failure investigation before any ownership change.
+    ///
+    /// Source fences and flow-twin observations are reversible safety evidence;
+    /// an old-owner fence, replacement staging, acquisition, reachability
+    /// handoff, cutover, or activation is not. This boundary lets a transiently
+    /// unavailable gateway restore the certified prior plan without permitting
+    /// split ownership.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown transaction or any transaction that crossed the
+    /// ownership-change boundary.
+    pub fn cancel_recovered_ha_investigation(
+        &mut self,
+        owner: &EgressIntentOwner,
+    ) -> Result<(), EgressControlPlaneError> {
+        let promotion = self
+            .ha_promotions
+            .get(owner)
+            .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
+        if promotion.coordinator.old_owner_fence.is_some()
+            || promotion.replacement_staged
+            || !promotion.coordinator.acquisitions.is_empty()
+            || promotion.coordinator.reachability.is_some()
+            || !promotion.cutovers.is_empty()
+            || !promotion.source_activations.is_empty()
+        {
+            return Err(EgressHaPromotionError::EvidenceOrder.into());
+        }
+        self.ha_promotions.remove(owner);
+        Ok(())
+    }
+
     /// Derives the exact next live operations for one authenticated agent from
     /// durable transaction state. Empty output is a valid fail-closed wait.
     ///
@@ -1656,6 +1689,12 @@ mod tests {
                 inactive_bank: 1,
             })
             .unwrap();
+        let mut transient_recovery = control.clone();
+        transient_recovery
+            .cancel_recovered_ha_investigation(&plan.owner)
+            .expect("source-only fencing is safely reversible on exact gateway recovery");
+        assert!(transient_recovery.checkpoint().ha_promotions.is_empty());
+        assert_eq!(transient_recovery.checkpoint().ha_plans, vec![plan.clone()]);
         let primary_challenges = control
             .ha_agent_challenges(recipient(&failed), 41)
             .expect("source fence releases exact snapshot challenges");
@@ -1695,6 +1734,12 @@ mod tests {
         unsafe_fence.fence_token = "power-off-991".to_owned();
         control.admit_ha_infrastructure_fence(unsafe_fence).unwrap();
         assert!(control.stage_ha_replacement(&plan.owner).unwrap());
+        assert!(
+            control
+                .cancel_recovered_ha_investigation(&plan.owner)
+                .is_err(),
+            "replacement staging crosses the irreversible ownership boundary"
+        );
         assert!(!control.stage_ha_replacement(&plan.owner).unwrap());
         let staged = control.checkpoint();
         assert!(!staged.gateways.records[0].desired.nodes.contains(&failed));
