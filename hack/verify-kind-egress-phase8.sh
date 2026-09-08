@@ -105,7 +105,7 @@ run_component() {
         "${evidence_variable}=${evidence}" "${project_root}/${script}"
     completed=$(date +%s)
     duration=$((completed - started))
-    jq -e --arg revision "${runtime_revision}" --arg context "${context}" '
+    jq -e --arg revision "${qualification_revision}" --arg context "${context}" '
       .schemaVersion == 1 and .revision == $revision and .context == $context
     ' "${evidence}" >/dev/null
     hash=$(sha256sum "${evidence}" | cut -d ' ' -f1)
