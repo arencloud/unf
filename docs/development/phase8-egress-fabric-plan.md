@@ -1,6 +1,6 @@
 # Phase 8 identity-aware egress-fabric execution plan
 
-Last reviewed: **2026-09-05**
+Last reviewed: **2026-09-08**
 
 Phase 8 implements master-prompt §24 as a provider-neutral enterprise egress
 fabric. It builds on the verified source-side NetworkPolicy egress engine and
@@ -33,10 +33,10 @@ authoritative state remains in [project-status.md](../project-status.md).
 | 8.7d | Explicit wildcard discovery and live DNS lifecycle | **Verified** | Explicit bounded discovery names and resolver-address allowlists separate suffix policy, name discovery, resolver view, and packet authority. The agent produces independent complete batches per view and final empty withdrawals; PLR replay rejects undeclared wildcard members and foreign resolvers. Equivalent cross-Node replica contracts retain independent provenance but coalesce to one identity-keyed gateway behavior; conflicts fail closed. A three-Node Kind gate requires two observer/source Nodes, two activation grants, custom-view A/AAAA quorum, dual-stack traffic, observer epoch replacement, authoritative-empty denial, recovery, and final withdrawal under `make egress-fqdn-lifecycle-test`; ADR 0145 |
 | 8.7e | Authority-Carved Internet classification | **Verified** | A native mutually exclusive internet selector names a classifier, policy exceptions, and default-deny or bounded last-known-good behavior. Schema/algorithm-v1 complete prefix evidence binds provider, epoch/revision, validity, per-rule provenance, and digest. Unknown space denies; most-specific provider decisions apply before absolute policy subtraction; replay rejects mutation/regression. Source and gateway lower identical deadline-bound dual-stack LPM maps and fence deny-closed authority under `make egress-internet-classification-test`; ADR 0146 |
 | 8.7f | Authenticated durable classifier lifecycle | **Verified** | A cluster-scoped classifier API, opt-in unbound publisher role, transactional relist, and canonical SHA-256 checkpoint preserve current publications, replay positions, and exact per-intent snapshots. Persistence precedes replacement distribution; loss enters digest-linked bounded LKG even before source validity expires, controller restart preserves it, and packet deadlines deny autonomously. A dedicated three-Node kube-proxy-free dual-stack Kind gate proves publisher/agent RBAC, positive/negative/exception/unknown traffic, loss, restart, expiry, replay/mutation rejection, higher-revision recovery, and cleanup under `make egress-internet-lifecycle-test`; ADR 0147 |
-| 8.8 | Reachability and advertisement providers | **In progress** | 8.8a–8.8b verify provider-neutral Diversity-Quorum Reachability plus authenticated status-only observers, durable replay-resistant evidence, persistence-before-acknowledgement, restart recovery, and autonomous expiry. Live provider activation, production routing implementations, and platform qualification remain |
+| 8.8 | Reachability and advertisement providers | **In progress** | 8.8a–8.8c verify provider-neutral Diversity-Quorum Reachability, authenticated durable observers, and the live native reference-provider lifecycle. Production BGP/BFD implementations and platform qualification remain |
 | 8.8a | Diversity-Quorum Reachability contract | **Verified** | Canonical SHA-256 plans bind owner/provider/revisions/lease/action, exact dual-stack addresses and permitted forwarding identities, ECMP bounds, required vantages, and evidence lifetime. Complete observer views count distinct failure domains rather than replicas; exact within-vantage agreement is mandatory for Ready or Withdrawn, while missing/correlated/conflicting/partial/foreign/expired evidence denies closed under `make egress-reachability-contract-test`; ADR 0148 |
 | 8.8b | Authenticated durable reachability lifecycle | **Verified** | Controller-owned cluster plans and namespaced observer identities expose a status-only unbound role. Exact embedded-plan replay, transactional relist, retained positions, SHA-256 checkpoint recovery, persistence barriers, scheduled expiry, acknowledgement/safe-release bridging, and a two-failure-domain restart/replay/recovery/cleanup Kind lifecycle pass `make egress-reachability-lifecycle-test`; ADR 0149 |
-| 8.8c | Static/native live reference provider | **Planned** | Replace controller self-acknowledgement with an explicit provider receipt plus independent Node/fabric observers and verify dual-stack activation, conflict, expiry, withdrawal, restart, and exact cleanup in Kind |
+| 8.8c | Native live reference provider | **Verified** | The controller materializes and garbage-collects exact lease-bound `native` DQR plans. An agent serves nonce-bound, digest-sealed kernel-ownership probes over a deliberate dual-stack listener, but cannot publish authoritative evidence. One provider receipt plus two separately authorized fabric failure domains is mandatory. `make egress-native-reachability-test` proves real external IPv4/IPv6 static-route activation, wrong-view denial, finite-evidence fencing/recovery, restart, observed route withdrawal, safe reuse, and exact cleanup; ADR 0150 |
 | 8.8d | BGP provider and routing policy | **Planned** | Integrate an evaluated routing stack rather than inventing BGP; support bounded dual-stack peers, policy, ECMP, graceful restart, readback, scoped rollback, and DQR observer evidence |
 | 8.8e | BFD and failure-correlation integration | **Planned** | Treat BFD as bounded liveness evidence rather than ownership, correlate it with route and dataplane witnesses, and prove deterministic degradation/failover without allowing one control-plane domain to self-quorum |
 | 8.9 | Operations, simulation, upgrade, and recovery | **Planned** | Fixed-cardinality metrics/status, NAT and failover history, allocation/gateway/policy explanation, read-only simulation, controller/provider/agent recovery, compatibility, and exact cleanup |
@@ -135,10 +135,9 @@ HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.8c replaces the development-only `static` self-acknowledgement with
-an explicit provider receipt and independent Node/fabric observers. It must
-prove real dual-stack route/address activation, conflict and expiry denial,
-positive withdrawal, restart, and exact cleanup in Kind while retaining the
-8.8b persistence and authentication invariants. BGP and BFD remain independent
-8.8d–8.8e gates. Operations, scale, and platform qualification remain in
-milestones 8.9–8.11.
+Milestone 8.8d integrates an evaluated production BGP stack behind the same DQR
+boundary. It must support bounded dual-stack peers and policy, ECMP, graceful
+restart, exact RIB/FIB readback, scoped rollback, and independent external
+observation without treating session state as reachability. BFD remains the
+independent 8.8e correlation gate. Operations, scale, and platform qualification
+remain milestones 8.9–8.11.

@@ -667,8 +667,18 @@ desired/plan replay bridges only verified Ready or Withdrawn authority into the
 existing gateway and safe-forgetting transactions. The two-failure-domain Kind
 gate proves least-privilege RBAC, restart recovery, autonomous expiry,
 replay/mutation rejection, higher-revision recovery, and cleanup under `make
-egress-reachability-lifecycle-test`; ADR 0149. The live static/native, BGP, and
-BFD provider gates remain next.
+egress-reachability-lifecycle-test`; ADR 0149. Slice 8.8c then removes
+self-attestation from the live reference path. The controller automatically
+owns exact lease-bound `native` plans; agents expose a nonce-bound proof only
+for addresses present in their latest kernel readback, while one provider
+receipt and two independently authorized fabric failure domains must agree
+before activation. The probe is deliberately non-authoritative: only durable
+DQR evidence can unlock traffic. The dual-stack Kind lifecycle proves real
+external route mutation, conflicting-view denial, autonomous expiry fencing,
+restart recovery, positive route withdrawal, safe address reuse, and exact
+cleanup under `make egress-native-reachability-test`; ADR 0150. The legacy
+explicit `static` self-acknowledgement remains compatibility-only for earlier
+gates; BGP and BFD are the next production-provider slices.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

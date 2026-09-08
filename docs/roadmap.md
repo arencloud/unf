@@ -642,8 +642,15 @@ matrix is maintained in the
   recovery, persistence-before-acknowledgement, and autonomous expiry feed the
   existing gateway and safe-forgetting transactions. A two-failure-domain Kind
   gate proves RBAC, restart, denial, replay/mutation rejection, recovery, and
-  cleanup under `make egress-reachability-lifecycle-test`; ADR 0149. Route
-  mutation and live static/native activation remain milestone 8.8c.
+  cleanup under `make egress-reachability-lifecycle-test`; ADR 0149.
+- Phase 8.8c verifies the live native reference provider. The controller owns
+  exact lease-bound DQR plans and cleanup; agents answer nonce-bound probes only
+  for kernel-read-back addresses, but cannot authorize themselves. One explicit
+  provider receipt and two separately authorized fabric failure domains must
+  agree. The dual-stack Kind lifecycle proves real external route mutation,
+  wrong-view denial, expiry fencing/recovery, restart, positive withdrawal,
+  safe reuse, and exact cleanup under `make egress-native-reachability-test`;
+  ADR 0150. Production BGP and BFD remain independent 8.8d–8.8e gates.
 - Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
   ServiceAccount selectors; canonical destinations and non-overlapping
   dual-stack pools; pool-family/multiple-address intent; strict OpenShift

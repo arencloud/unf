@@ -4,7 +4,9 @@ metadata:
   name: production-egress
 spec:
   provider:
-    name: static
+    # The native reference provider requires DQR provider/fabric observations;
+    # it never self-acknowledges reachability.
+    name: native
     instance: datacenter-a
   prefixes:
     - 192.0.2.64/28

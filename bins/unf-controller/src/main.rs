@@ -22,7 +22,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{ListParams, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, ResourceExt};
@@ -34,9 +34,13 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use unf_api::{
-    EgressInternetClassification, EgressPolicy, EgressPool,
+    EgressInternetClassification, EgressPolicy, EgressPool, EgressProvider as ApiEgressProvider,
+    EgressReachabilityAction as ApiEgressReachabilityAction,
     EgressReachabilityObservation as ApiEgressReachabilityObservation,
-    EgressReachabilityPlan as ApiEgressReachabilityPlan, SecurityPolicy,
+    EgressReachabilityPath as ApiEgressReachabilityPath,
+    EgressReachabilityPlan as ApiEgressReachabilityPlan,
+    EgressReachabilityPlanSpec as ApiEgressReachabilityPlanSpec,
+    EgressReachabilityVantage as ApiEgressReachabilityVantage, SecurityPolicy,
 };
 use unf_common::{
     BackendId, IdentityId, PolicyAction, PolicyDirection, PolicyId, PolicyReason, Protocol,
@@ -159,6 +163,9 @@ const NATIVE_EGRESS_INTERNET_CLASSIFICATION_SOURCE_PREFIX: &str =
 const NATIVE_EGRESS_REACHABILITY_PLAN_SOURCE_PREFIX: &str = "native:reachability-plan/";
 const NATIVE_EGRESS_REACHABILITY_OBSERVATION_SOURCE_PREFIX: &str =
     "native:reachability-observation/";
+const MANAGED_NATIVE_REACHABILITY_LABEL: &str = "network.unf.io/managed-native-reachability";
+const NATIVE_EGRESS_REACHABILITY_PROVIDER: &str = "native";
+const NATIVE_EGRESS_REACHABILITY_OBSERVATION_AGE_SECONDS: u64 = 120;
 const OPENSHIFT_EGRESS_IP_SOURCE_PREFIX: &str = "openshift:egressip/";
 const FLOW_HISTORY_STORE_NAME: &str = "unf-flow-history";
 const FLOW_HISTORY_STORE_KEY: &str = "flows.json";
@@ -328,6 +335,7 @@ struct ControllerState {
     egress_fqdn_observations: Mutex<EgressFqdnObservationLedger>,
     egress_internet_classifications: Mutex<EgressInternetClassificationStore>,
     egress_reachability: Mutex<EgressReachabilityEvidenceStore>,
+    egress_reachability_plan_api: Option<Api<ApiEgressReachabilityPlan>>,
     egress_reachability_pending: AtomicBool,
     egress_fqdn_materialization: Mutex<Option<EgressFqdnMaterialization>>,
     egress_desired_dirty: AtomicBool,
@@ -1547,6 +1555,9 @@ fn new_state_with_client_and_selector(
     let config_map_store = token_review_client
         .clone()
         .map(|client| Api::<ConfigMap>::namespaced(client, "unf-system"));
+    let egress_reachability_plan_api = token_review_client
+        .clone()
+        .map(Api::<ApiEgressReachabilityPlan>::all);
     ControllerState {
         ready: AtomicBool::new(offline),
         identity_epoch: controller_epoch(),
@@ -1558,6 +1569,7 @@ fn new_state_with_client_and_selector(
         egress_fqdn_observations: Mutex::new(EgressFqdnObservationLedger::default()),
         egress_internet_classifications: Mutex::new(EgressInternetClassificationStore::default()),
         egress_reachability: Mutex::new(EgressReachabilityEvidenceStore::default()),
+        egress_reachability_plan_api,
         egress_reachability_pending: AtomicBool::new(false),
         egress_fqdn_materialization: Mutex::new(None),
         egress_desired_dirty: AtomicBool::new(false),
@@ -2263,6 +2275,7 @@ fn spawn_egress_persistence(
                     break;
                 }
                 _ = interval.tick() => {
+                    reconcile_native_egress_reachability_plans(&state).await;
                     retry_pending_egress_reachability(&state).await;
                     refresh_due_egress_reachability(&state).await;
                     persist_egress_desired_if_dirty(&state).await;
@@ -2271,6 +2284,144 @@ fn spawn_egress_persistence(
             }
         }
     });
+}
+
+async fn reconcile_native_egress_reachability_plans(state: &ControllerState) {
+    if let Err(error) = try_reconcile_native_egress_reachability_plans(state).await {
+        state.metrics.errors.inc();
+        warn!(%error, "native egress reachability-plan reconciliation failed closed");
+    }
+}
+
+/// Materializes the exact native provider contract from durable gateway
+/// desired state. The controller owns plan creation and deletion; provider and
+/// fabric identities are deliberately limited to observation status.
+async fn try_reconcile_native_egress_reachability_plans(state: &ControllerState) -> Result<()> {
+    let Some(api) = state.egress_reachability_plan_api.as_ref() else {
+        return Ok(());
+    };
+    let records = mutex_lock(&state.egress_control_plane)
+        .checkpoint()
+        .gateways
+        .records;
+    let desired = records
+        .into_iter()
+        .filter(|record| record.desired.provider.name == NATIVE_EGRESS_REACHABILITY_PROVIDER)
+        .map(|record| {
+            let name = managed_native_reachability_plan_name(&record.desired.owner);
+            (name, record.desired)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for (name, gateway) in &desired {
+        let spec = native_reachability_plan_spec(gateway)?;
+        let patch = serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "EgressReachabilityPlan",
+            "metadata": {
+                "name": name,
+                "labels": {
+                    (MANAGED_NATIVE_REACHABILITY_LABEL): "true",
+                    "network.unf.io/reachability-provider": NATIVE_EGRESS_REACHABILITY_PROVIDER,
+                },
+            },
+            "spec": spec,
+        });
+        api.patch(
+            name,
+            &PatchParams::apply("unf-controller-native-reachability").force(),
+            &Patch::Apply(&patch),
+        )
+        .await
+        .with_context(|| format!("apply native EgressReachabilityPlan {name}"))?;
+    }
+
+    let managed = api
+        .list(&ListParams::default().labels(&format!("{MANAGED_NATIVE_REACHABILITY_LABEL}=true")))
+        .await
+        .context("list controller-managed native EgressReachabilityPlans")?;
+    for stale in managed
+        .items
+        .into_iter()
+        .map(|resource| resource.name_any())
+        .filter(|name| !desired.contains_key(name))
+    {
+        api.delete(&stale, &DeleteParams::default())
+            .await
+            .with_context(|| format!("delete stale native EgressReachabilityPlan {stale}"))?;
+    }
+    Ok(())
+}
+
+fn native_reachability_plan_spec(
+    desired: &unf_egress::EgressGatewayDesired,
+) -> Result<ApiEgressReachabilityPlanSpec> {
+    if desired.nodes.is_empty() {
+        return Err(anyhow!(
+            "native gateway desired state for {} has no expected path",
+            desired.owner.name
+        ));
+    }
+    let maximum_paths_per_address = u16::try_from(desired.nodes.len())
+        .context("native gateway path cardinality exceeds the API bound")?;
+    // Keep the provider-contract generation in the independent plan revision.
+    // This makes a controller-owned quorum/freshness migration monotonic even
+    // when the underlying gateway desired revision is unchanged.
+    let plan_revision = desired
+        .revision
+        .get()
+        .checked_mul(2)
+        .and_then(|revision| revision.checked_add(1))
+        .context("native reachability plan revision overflow")?;
+    Ok(ApiEgressReachabilityPlanSpec {
+        revision: plan_revision,
+        desired_revision: desired.revision.get(),
+        allocation_revision: desired.allocation_revision.get(),
+        owner_name: desired.owner.name.clone(),
+        owner_uid: desired.owner.uid.clone(),
+        provider: ApiEgressProvider {
+            name: desired.provider.name.clone(),
+            instance: desired.provider.instance.clone(),
+        },
+        lease_epoch: desired.lease_epoch,
+        action: match desired.action {
+            unf_egress::EgressGatewayAction::Ensure => ApiEgressReachabilityAction::Ensure,
+            unf_egress::EgressGatewayAction::Withdraw => ApiEgressReachabilityAction::Withdraw,
+        },
+        addresses: desired.addresses.iter().map(ToString::to_string).collect(),
+        expected_paths: desired
+            .nodes
+            .iter()
+            .map(|node| ApiEgressReachabilityPath {
+                gateway_uid: node.uid.clone(),
+                forwarding_identity: format!("native-node/{}", node.uid),
+            })
+            .collect(),
+        minimum_paths_per_address: 1,
+        maximum_paths_per_address,
+        vantages: vec![
+            ApiEgressReachabilityVantage {
+                name: "fabric".to_owned(),
+                minimum_failure_domains: 2,
+            },
+            ApiEgressReachabilityVantage {
+                name: "provider".to_owned(),
+                minimum_failure_domains: 1,
+            },
+        ],
+        max_observation_age_seconds: NATIVE_EGRESS_REACHABILITY_OBSERVATION_AGE_SECONDS,
+    })
+}
+
+fn managed_native_reachability_plan_name(owner: &EgressIntentOwner) -> String {
+    let owner_name = owner.name.chars().take(200).collect::<String>();
+    let owner_uid = owner
+        .uid
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(36)
+        .collect::<String>();
+    format!("unf-native-{owner_name}-{owner_uid}")
 }
 
 async fn persist_egress_desired_if_dirty(state: &ControllerState) {
@@ -11728,6 +11879,78 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_reachability_plan_requires_provider_receipt_and_two_fabric_domains() {
+        let desired = unf_egress::EgressGatewayDesired {
+            schema_version: unf_egress::EGRESS_GATEWAY_DESIRED_SCHEMA_VERSION,
+            revision: Revision::new(11),
+            allocation_revision: Revision::new(9),
+            owner: EgressIntentOwner {
+                scope: unf_egress::EgressIntentScope::Cluster,
+                name: "payments-egress".to_owned(),
+                uid: "policy-uid-a".to_owned(),
+            },
+            provider: EgressProviderRef {
+                name: NATIVE_EGRESS_REACHABILITY_PROVIDER.to_owned(),
+                instance: "edge-a".to_owned(),
+            },
+            lease_epoch: 7,
+            action: unf_egress::EgressGatewayAction::Ensure,
+            addresses: vec![
+                "192.0.2.240".parse().unwrap(),
+                "2001:db8::240".parse().unwrap(),
+            ],
+            nodes: vec![EgressNode {
+                name: "worker-a".to_owned(),
+                uid: "node-uid-a".to_owned(),
+                capabilities: BTreeSet::new(),
+            }],
+        };
+
+        let spec = native_reachability_plan_spec(&desired).unwrap();
+        assert_eq!(spec.revision, 23);
+        assert_eq!(spec.desired_revision, 11);
+        assert_eq!(spec.minimum_paths_per_address, 1);
+        assert_eq!(spec.maximum_paths_per_address, 1);
+        assert_eq!(
+            spec.vantages,
+            vec![
+                ApiEgressReachabilityVantage {
+                    name: "fabric".to_owned(),
+                    minimum_failure_domains: 2,
+                },
+                ApiEgressReachabilityVantage {
+                    name: "provider".to_owned(),
+                    minimum_failure_domains: 1,
+                },
+            ]
+        );
+        let resource = ApiEgressReachabilityPlan::new("managed", spec);
+        let translated = egress_api::translate_egress_reachability_plan(&resource).unwrap();
+        assert_eq!(translated.owner, desired.owner);
+        assert_eq!(translated.addresses, desired.addresses);
+        assert_eq!(translated.expected_paths[0].gateway_uid, "node-uid-a");
+        assert_eq!(
+            translated.expected_paths[0].forwarding_identity,
+            "native-node/node-uid-a"
+        );
+    }
+
+    #[test]
+    fn native_reachability_plan_names_are_bounded_and_recreation_safe() {
+        let owner = EgressIntentOwner {
+            scope: unf_egress::EgressIntentScope::Cluster,
+            name: "a".repeat(253),
+            uid: "11111111-2222-3333-4444-555555555555".to_owned(),
+        };
+        let first = managed_native_reachability_plan_name(&owner);
+        let mut recreated = owner;
+        recreated.uid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+        let second = managed_native_reachability_plan_name(&recreated);
+        assert!(first.len() <= 253);
+        assert_ne!(first, second);
+    }
 
     fn egress_advertisement() -> EgressAgentAdvertisement {
         EgressAgentAdvertisement {

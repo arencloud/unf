@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -75,9 +75,12 @@ use unf_egress::{
     EgressHaFlowTwinOperation, EgressHaFlowTwinStream, EgressHaOldOwnerRevocationEvidence,
     EgressHaSourceActivationEvidence, EgressIntentOwner, EgressNodeProjectionEnvelope,
     EgressPathCertificate, EgressPathMode, EgressProjectionLedger, EgressProjectionRecipient,
-    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
-    EgressSourceRetirementChallenges, compile_egress_dataplane_at,
-    compile_egress_gateway_dataplane_at,
+    EgressReachabilityPlanDigest, EgressSourceActivationGrant,
+    EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
+    EgressSourceRetirementChallenges, NativeEgressReachabilityChallenge,
+    NativeEgressReachabilityNonce, compile_egress_dataplane_at,
+    compile_egress_gateway_dataplane_at, decode_native_egress_reachability_hex,
+    issue_native_egress_reachability_probe,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -776,6 +779,8 @@ struct AgentState {
     node_name: String,
     pod_name: String,
     pod_uid: String,
+    native_reachability_node_uid: Mutex<Option<String>>,
+    native_reachability_owned_addresses: Mutex<BTreeSet<IpAddr>>,
     ready: AtomicBool,
     bpf_loaded: AtomicBool,
     observed_flows: AtomicU64,
@@ -1674,20 +1679,30 @@ async fn main() -> Result<()> {
         .route("/metrics", get(metrics))
         .route("/v1/version", get(version))
         .route("/v1/status", get(status))
+        .route(
+            "/v1/egress-reachability/probe",
+            get(native_egress_reachability_probe),
+        )
         .with_state(Arc::clone(&state));
-    let listener = tokio::net::TcpListener::bind(args.listen)
+    let listeners = bind_agent_api(args.listen)
         .await
         .with_context(|| format!("bind agent API to {}", args.listen))?;
-    info!(address = %args.listen, "agent API listening");
-    let shutdown = cancellation.clone();
-    tasks.spawn(async move {
-        if let Err(error) = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown.cancelled_owned())
-            .await
-        {
-            error!(%error, "agent API server failed");
-        }
-    });
+    for listener in listeners {
+        let address = listener
+            .local_addr()
+            .context("read agent listener address")?;
+        info!(%address, "agent API listening");
+        let shutdown = cancellation.clone();
+        let listener_app = app.clone();
+        tasks.spawn(async move {
+            if let Err(error) = axum::serve(listener, listener_app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+            {
+                error!(%error, "agent API server failed");
+            }
+        });
+    }
 
     let service_failure = tokio::select! {
         result = tokio::signal::ctrl_c() => {
@@ -1697,6 +1712,42 @@ async fn main() -> Result<()> {
         failure = service_failure_rx.recv(), if supervised_service_configured => failure,
     };
     finish_agent_tasks(cancellation, tasks, service_failure, &state).await
+}
+
+async fn bind_agent_api(address: SocketAddr) -> Result<Vec<tokio::net::TcpListener>> {
+    let primary = tokio::net::TcpListener::bind(address)
+        .await
+        .context("bind configured agent listener")?;
+    let mut listeners = vec![primary];
+    if address.ip() == IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
+        let ipv6_address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), address.port());
+        match bind_ipv6_agent_listener(ipv6_address, true) {
+            Ok(listener) => listeners.push(listener),
+            Err(error) => {
+                warn!(%error, "IPv6 agent API listener unavailable; retaining configured IPv4 listener");
+            }
+        }
+    }
+    Ok(listeners)
+}
+
+fn bind_ipv6_agent_listener(address: SocketAddr, only_v6: bool) -> Result<tokio::net::TcpListener> {
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(SocketProtocol::TCP))
+        .context("create IPv6 agent listener")?;
+    socket
+        .set_only_v6(only_v6)
+        .context("set IPv6-only agent listener behavior")?;
+    socket
+        .set_reuse_address(true)
+        .context("set agent listener address reuse")?;
+    socket
+        .set_nonblocking(true)
+        .context("set agent listener nonblocking")?;
+    socket
+        .bind(&address.into())
+        .context("bind IPv6 agent listener")?;
+    socket.listen(1_024).context("listen on agent socket")?;
+    tokio::net::TcpListener::from_std(socket.into()).context("adopt IPv6 agent listener")
 }
 
 fn spawn_remote_route_task(
@@ -5985,6 +6036,8 @@ fn new_state(
         node_name,
         pod_name,
         pod_uid,
+        native_reachability_node_uid: Mutex::new(None),
+        native_reachability_owned_addresses: Mutex::new(BTreeSet::new()),
         ready: AtomicBool::new(false),
         bpf_loaded: AtomicBool::new(false),
         observed_flows: AtomicU64::new(0),
@@ -8640,11 +8693,17 @@ async fn synchronize_egress_gateway_addresses(
             provider.ipv6_output_interface,
         )
     });
-    let acknowledgement =
-        apply_egress_gateway_address_projection(&admitted, node.node_uid, ipv6_proxy_uplink)
-            .await?;
+    let acknowledgement = apply_egress_gateway_address_projection(
+        &admitted,
+        node.node_uid.clone(),
+        ipv6_proxy_uplink,
+    )
+    .await?;
     synchronizer.gateway_owned_addresses =
         acknowledgement.owned_addresses.iter().copied().collect();
+    *mutex_lock(&state.native_reachability_node_uid) = Some(node.node_uid.clone());
+    mutex_lock(&state.native_reachability_owned_addresses)
+        .clone_from(&synchronizer.gateway_owned_addresses);
     synchronizer
         .client
         .current()
@@ -15110,6 +15169,71 @@ const fn select_tc_attachment_mode(
 
 async fn health() -> &'static str {
     "ok\n"
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeEgressReachabilityProbeQuery {
+    plan_digest: String,
+    desired_revision: u64,
+    lease_epoch: u64,
+    address: IpAddr,
+    nonce: String,
+}
+
+/// Returns a nonce-bound proof only for an address present in the agent's
+/// latest kernel-read-back gateway ownership set. DQR observers must still
+/// verify the external route independently; this endpoint grants no authority.
+async fn native_egress_reachability_probe(
+    State(state): State<Arc<AgentState>>,
+    Query(query): Query<NativeEgressReachabilityProbeQuery>,
+) -> Response {
+    match build_native_egress_reachability_probe(&state, &query) {
+        Ok(probe) => Json(probe).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+fn build_native_egress_reachability_probe(
+    state: &AgentState,
+    query: &NativeEgressReachabilityProbeQuery,
+) -> Result<unf_egress::NativeEgressReachabilityProbe, StatusCode> {
+    let Ok(plan_digest) = decode_native_egress_reachability_hex(&query.plan_digest) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let Ok(nonce) = decode_native_egress_reachability_hex(&query.nonce) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    if !mutex_lock(&state.native_reachability_owned_addresses).contains(&query.address) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(node_uid) = mutex_lock(&state.native_reachability_node_uid).clone() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let challenge = NativeEgressReachabilityChallenge {
+        schema_version: unf_egress::NATIVE_EGRESS_REACHABILITY_PROBE_SCHEMA_VERSION,
+        plan_digest: EgressReachabilityPlanDigest(plan_digest),
+        desired_revision: Revision::new(query.desired_revision),
+        lease_epoch: query.lease_epoch,
+        address: query.address,
+        nonce: NativeEgressReachabilityNonce(nonce),
+    };
+    issue_native_egress_reachability_probe(
+        challenge,
+        state.node_name.clone(),
+        node_uid,
+        state.pod_name.clone(),
+        state.pod_uid.clone(),
+        current_unix_time_seconds(),
+    )
+    .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn current_unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 async fn ready(State(state): State<Arc<AgentState>>) -> Response {
@@ -21613,6 +21737,34 @@ mod tests {
             "test-pod-uid".to_owned(),
             VersionTransition::Normal,
         )
+    }
+
+    #[test]
+    fn native_reachability_probe_requires_current_kernel_owned_address() {
+        let state = test_agent_state();
+        let query = || NativeEgressReachabilityProbeQuery {
+            plan_digest: "07".repeat(32),
+            desired_revision: 8,
+            lease_epoch: 9,
+            address: "192.0.2.240".parse().unwrap(),
+            nonce: "0b".repeat(32),
+        };
+        assert_eq!(
+            build_native_egress_reachability_probe(&state, &query()).unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
+
+        mutex_lock(&state.native_reachability_owned_addresses).insert(query().address);
+        assert_eq!(
+            build_native_egress_reachability_probe(&state, &query()).unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        *mutex_lock(&state.native_reachability_node_uid) = Some("node-uid-a".to_owned());
+        let probe = build_native_egress_reachability_probe(&state, &query()).unwrap();
+        assert_eq!(probe.node_uid, "node-uid-a");
+        assert_eq!(probe.challenge.address, query().address);
+        assert_eq!(probe.challenge.lease_epoch, 9);
+        assert_eq!(probe.challenge.desired_revision, Revision::new(8));
     }
 
     #[test]
