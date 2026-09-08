@@ -110,14 +110,15 @@ use unf_state::{
     FlowHistoryCheckpoint, FlowHistoryEntry, FlowHistoryQuerySummary, FlowHistorySnapshot,
     FlowHistoryStore, IdentityRegistry, IdentityStateSnapshot, Ipv4PolicyMapEntry,
     Ipv4PolicyMapKey, Ipv6PolicyMapEntry, Ipv6PolicyMapKey, NetworkIdentity,
-    POLICY_SNAPSHOT_SCHEMA_VERSION, PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION,
-    PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION, PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION,
-    PolicyDecisionRecord, PolicyStateSnapshot, RevisionSet, ServiceAffinityOutcome,
-    ServiceForwardingModeOutcome, ServiceFrontendKind, ServiceSelectionAlgorithmOutcome,
-    ServiceSelectionTier, TOPOLOGY_HISTORY_CAPACITY, TOPOLOGY_SNAPSHOT_SCHEMA_VERSION,
-    TopologyHistoryCheckpoint, TopologyHistorySnapshot, TopologyHistoryStore, TopologyNode,
-    TopologyService, TopologyServiceBackend, TopologyServiceBackendPort, TopologyServicePort,
-    TopologyStateSnapshot, TopologyWorkload, provisional_identity_id,
+    POLICY_SNAPSHOT_SCHEMA_VERSION, PRE_EGRESS_CHRONICLE_FLOW_EXPORT_SCHEMA_VERSION,
+    PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION, PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION,
+    PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION, PolicyDecisionRecord, PolicyStateSnapshot,
+    RevisionSet, ServiceAffinityOutcome, ServiceForwardingModeOutcome, ServiceFrontendKind,
+    ServiceSelectionAlgorithmOutcome, ServiceSelectionTier, TOPOLOGY_HISTORY_CAPACITY,
+    TOPOLOGY_SNAPSHOT_SCHEMA_VERSION, TopologyHistoryCheckpoint, TopologyHistorySnapshot,
+    TopologyHistoryStore, TopologyNode, TopologyService, TopologyServiceBackend,
+    TopologyServiceBackendPort, TopologyServicePort, TopologyStateSnapshot, TopologyWorkload,
+    provisional_identity_id,
 };
 
 mod egress_api;
@@ -1152,6 +1153,7 @@ async fn main() -> Result<()> {
         .route("/v1/topology", get(topology))
         .route("/v1/topology/history", get(topology_history))
         .route("/v1/flows", get(flow_history))
+        .route("/v1/egress/history", get(egress_history))
         .route("/v1/services/explain", get(explain_service))
         .route("/v1/services/clusterip/simulate", get(simulate_cluster_ip))
         .route("/v1/services/nodeport/simulate", get(simulate_node_port))
@@ -3088,12 +3090,14 @@ fn validate_flow_history_checkpoint(
             schema_version: checkpoint.schema_version.min(FLOW_EXPORT_SCHEMA_VERSION),
             node_name,
             dropped_events: 0,
+            egress_ring_dropped_events: 0,
             entries: vec![FlowExportRecord {
                 key: entry.key.clone(),
                 policy_revision: entry.policy_revision,
                 decision: entry.decision,
                 shadow: entry.shadow,
                 service: entry.service,
+                egress: entry.egress,
                 observed_events: entry.observed_events,
             }],
         };
@@ -9671,6 +9675,36 @@ async fn flow_history(
     )))
 }
 
+async fn egress_history(
+    State(state): State<Arc<ControllerState>>,
+    Query(query): Query<FlowHistoryQuery>,
+) -> Result<Json<FlowHistorySnapshot>, ApiError> {
+    let limit = validate_flow_history_query(&query)?;
+    let _policy_state_guard = read_lock(&state.policy_state_guard);
+    let mut snapshot = flow_history_snapshot_window(
+        &state,
+        query.since_unix_ms,
+        query.until_unix_ms,
+        FLOW_HISTORY_CAPACITY,
+    );
+    snapshot.retained_flows = snapshot.egress_evidence.retained_outcomes;
+    snapshot.retained_observations = snapshot.egress_evidence.retained_observations;
+    snapshot.entries.retain(|entry| entry.egress.is_some());
+    let matched_flows = snapshot.entries.len();
+    let matched_observations = snapshot
+        .entries
+        .iter()
+        .map(|entry| entry.observed_events)
+        .fold(0_u64, u64::saturating_add);
+    snapshot.entries.truncate(limit);
+    snapshot.query.matched_flows = matched_flows;
+    snapshot.query.matched_observations = matched_observations;
+    snapshot.query.returned_flows = snapshot.entries.len();
+    snapshot.query.truncated = snapshot.entries.len() < matched_flows;
+    snapshot.query.limit = limit;
+    Ok(Json(snapshot))
+}
+
 async fn explain_service(
     State(state): State<Arc<ControllerState>>,
     Query(query): Query<ServiceExplainQuery>,
@@ -10382,12 +10416,15 @@ fn ingest_flow_batch(
 fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
     if !matches!(
         batch.schema_version,
-        PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION | FLOW_EXPORT_SCHEMA_VERSION
+        PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION
+            | PRE_EGRESS_CHRONICLE_FLOW_EXPORT_SCHEMA_VERSION
+            | FLOW_EXPORT_SCHEMA_VERSION
     ) {
         return Err(ApiError::bad_request(format!(
-            "unsupported flow export schema {}; expected {} or {}",
+            "unsupported flow export schema {}; expected {}, {}, or {}",
             batch.schema_version,
             PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION,
+            PRE_EGRESS_CHRONICLE_FLOW_EXPORT_SCHEMA_VERSION,
             FLOW_EXPORT_SCHEMA_VERSION
         )));
     }
@@ -10432,12 +10469,14 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
                 "TCP/UDP/SCTP flow export destination_port must be greater than zero",
             ));
         }
-        if let Some(service) = entry.service {
+        if let Some(egress) = entry.egress {
+            validate_egress_flow_export(batch.schema_version, entry, egress)?;
+        } else if let Some(service) = entry.service {
             validate_service_flow_export(batch.schema_version, entry, service)?;
         } else {
-            if entry.key.service.is_some() {
+            if entry.key.service.is_some() || entry.key.egress.is_some() {
                 return Err(ApiError::bad_request(
-                    "policy flow export must not contain a service history key",
+                    "policy flow export must not contain a service or egress history key",
                 ));
             }
             let selected_identity = match entry.key.direction {
@@ -10456,6 +10495,34 @@ fn validate_flow_export_batch(batch: &FlowExportBatch) -> Result<(), ApiError> {
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_egress_flow_export(
+    schema_version: u16,
+    entry: &FlowExportRecord,
+    outcome: unf_state::EgressFlowOutcome,
+) -> Result<(), ApiError> {
+    let valid = schema_version == FLOW_EXPORT_SCHEMA_VERSION
+        && entry.key.egress.as_ref().is_some_and(|egress| {
+            let verdict_matches = matches!(
+                (egress.action, entry.decision.verdict),
+                (1, Verdict::Allow) | (2, Verdict::Deny) | (3, Verdict::Audit)
+            );
+            verdict_matches && unf_state::egress_flow_witness_is_valid(&entry.key, egress, &outcome)
+        })
+        && entry.key.service.is_none()
+        && entry.service.is_none()
+        && entry.policy_revision.get() == 0
+        && entry.decision.reason == 0
+        && entry.decision.policy_id.is_none()
+        && entry.decision.rule_id.is_none()
+        && entry.shadow.is_none();
+    if !valid {
+        return Err(ApiError::bad_request(
+            "egress flow export contains inconsistent causal provenance",
+        ));
     }
     Ok(())
 }
@@ -10489,16 +10556,16 @@ fn validate_service_flow_export(
             && key.selection_algorithm == service.selection_algorithm
             && key.forwarding_mode == service.forwarding_mode
     });
-    let decision_witness_valid = if schema_version == FLOW_EXPORT_SCHEMA_VERSION {
-        service.selection_tier != ServiceSelectionTier::Unknown
-            && service.affinity_outcome != ServiceAffinityOutcome::Unknown
-            && service.selection_algorithm != ServiceSelectionAlgorithmOutcome::Unknown
-            && service.forwarding_mode != ServiceForwardingModeOutcome::Unknown
-    } else {
+    let decision_witness_valid = if schema_version == PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION {
         service.selection_tier == ServiceSelectionTier::Unknown
             && service.affinity_outcome == ServiceAffinityOutcome::Unknown
             && service.selection_algorithm == ServiceSelectionAlgorithmOutcome::Unknown
             && service.forwarding_mode == ServiceForwardingModeOutcome::Unknown
+    } else {
+        service.selection_tier != ServiceSelectionTier::Unknown
+            && service.affinity_outcome != ServiceAffinityOutcome::Unknown
+            && service.selection_algorithm != ServiceSelectionAlgorithmOutcome::Unknown
+            && service.forwarding_mode != ServiceForwardingModeOutcome::Unknown
     };
     if !service_key_matches
         || !decision_witness_valid
@@ -10517,6 +10584,8 @@ fn validate_service_flow_export(
         || entry.decision.policy_id.is_some()
         || entry.decision.rule_id.is_some()
         || entry.shadow.is_some()
+        || entry.key.egress.is_some()
+        || entry.egress.is_some()
     {
         return Err(ApiError::bad_request(
             "service flow export contains inconsistent dataplane provenance",
@@ -14573,6 +14642,7 @@ mod tests {
             schema_version: FLOW_EXPORT_SCHEMA_VERSION,
             node_name: "worker-a".to_owned(),
             dropped_events: 2,
+            egress_ring_dropped_events: 0,
             entries: vec![unf_state::FlowExportRecord {
                 key: unf_state::FlowHistoryKey {
                     direction: PolicyDirection::Ingress,
@@ -14585,6 +14655,7 @@ mod tests {
                     protocol: 6,
                     destination_port: 8080,
                     service: None,
+                    egress: None,
                 },
                 policy_revision: Revision::new(7),
                 decision: unf_state::FlowExportDecision {
@@ -14595,6 +14666,7 @@ mod tests {
                 },
                 shadow: None,
                 service: None,
+                egress: None,
                 observed_events,
             }],
         }
@@ -16155,7 +16227,8 @@ mod tests {
         assert_eq!(PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION, 7);
         assert_eq!(AGENT_STATUS_SCHEMA_VERSION, 8);
         assert_eq!(PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION, 5);
-        assert_eq!(FLOW_EXPORT_SCHEMA_VERSION, 6);
+        assert_eq!(PRE_EGRESS_CHRONICLE_FLOW_EXPORT_SCHEMA_VERSION, 6);
+        assert_eq!(FLOW_EXPORT_SCHEMA_VERSION, 7);
         let report = converged_agent_report(7);
         let mut legacy = serde_json::to_value(&report).unwrap();
         for field in [
@@ -17047,6 +17120,68 @@ mod tests {
         assert_eq!(external_metrics.enqueued_batches.get(), 1);
     }
 
+    #[tokio::test]
+    async fn egress_chronicle_is_loss_explicit_filtered_and_proof_bound() {
+        let state = Arc::new(new_state(true));
+        let mut egress_nat = flow_batch(1);
+        egress_nat.egress_ring_dropped_events = 3;
+        let entry = &mut egress_nat.entries[0];
+        entry.key.direction = PolicyDirection::Egress;
+        entry.key.destination_identity = IdentityId::default();
+        entry.key.egress = Some(unf_state::EgressFlowKey {
+            contract_revision: 23,
+            lease_epoch: 29,
+            original_source_port: 40_000,
+            translated_source_port: 50_000,
+            egress_ipv4: Some("192.0.2.10".parse().unwrap()),
+            egress_ipv6: None,
+            address_index: 2,
+            primary_gateway_index: 3,
+            standby_gateway_index: 4,
+            gateway_digest: [0x11; 16],
+            standby_gateway_digest: [0x22; 16],
+            proof_witness: [0x33; 16],
+            action: 1,
+            reason: 1,
+            flags: 0,
+        });
+        entry.policy_revision = Revision::default();
+        entry.decision.reason = 0;
+        entry.decision.policy_id = None;
+        entry.decision.rule_id = None;
+        entry.egress = Some(unf_state::EgressFlowOutcome {
+            first_dataplane_timestamp_ns: 1_000,
+            last_dataplane_timestamp_ns: 1_000,
+        });
+        validate_flow_export_batch(&egress_nat)
+            .expect("complete proof-bound egress NAT evidence is accepted");
+        ingest_flow_batch(&state, egress_nat.clone()).expect("egress history is ingested");
+        let snapshot = egress_history(
+            State(Arc::clone(&state)),
+            Query(FlowHistoryQuery::default()),
+        )
+        .await
+        .expect("egress history endpoint")
+        .0;
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.retained_flows, 1);
+        assert_eq!(snapshot.retained_observations, 1);
+        assert_eq!(snapshot.egress_evidence.retained_outcomes, 1);
+        assert_eq!(
+            snapshot.egress_evidence.completeness,
+            unf_state::EgressEvidenceCompleteness::LossObserved
+        );
+        assert!(!snapshot.egress_evidence.private_nat_state_inferred);
+
+        egress_nat.entries[0]
+            .key
+            .egress
+            .as_mut()
+            .expect("egress witness")
+            .proof_witness = [0; 16];
+        assert!(validate_flow_export_batch(&egress_nat).is_err());
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn service_flow_ingestion_validates_bounded_dataplane_provenance() {
@@ -17113,7 +17248,7 @@ mod tests {
         let mut history = FlowHistoryStore::with_capacity(1);
         assert!(history.ingest(legacy.clone(), 1_000));
         let mut legacy_checkpoint = history.checkpoint(1);
-        legacy_checkpoint.schema_version = unf_state::FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION - 1;
+        legacy_checkpoint.schema_version = 5;
         validate_flow_history_checkpoint(&legacy_checkpoint, 1_000)
             .expect("schema-v5 durable service history validates under its recorded contract");
         let mut mislabeled_checkpoint = legacy_checkpoint.clone();

@@ -684,7 +684,7 @@ fn print_table(value: &Value) {
     }
     if matches!(
         value.get("schema_version").and_then(Value::as_u64),
-        Some(1..=6)
+        Some(1..=8)
     ) && value.get("retained_flows").is_some()
         && value.get("entries").is_some()
     {
@@ -1095,6 +1095,7 @@ fn print_flow_history_table(value: &Value) {
         number_field(value, "durable_omitted_flows"),
         number_field(value, "durable_omitted_observations")
     );
+    print_egress_evidence_summary(value);
     if let Some(query) = value.get("query") {
         println!(
             "query                    since={} until={} matched={} observations={} returned={} truncated={}",
@@ -1114,6 +1115,9 @@ fn print_flow_history_table(value: &Value) {
             let key = &entry["key"];
             let sources = joined_strings(&entry["source_workloads"]);
             let destinations = joined_strings(&entry["destination_workloads"]);
+            if print_egress_history_entry(entry, key) {
+                continue;
+            }
             if let Some(service) = entry.get("service").filter(|value| !value.is_null()) {
                 println!(
                     "service outcome          id={} kind={} {} -> {} {}/{} action={} reason={} backend={} observations={} nodes={}",
@@ -1154,6 +1158,52 @@ fn print_flow_history_table(value: &Value) {
             println!("flows omitted            {}", entries.len() - 50);
         }
     }
+}
+
+fn print_egress_evidence_summary(value: &Value) {
+    let Some(evidence) = value.get("egress_evidence") else {
+        return;
+    };
+    println!(
+        "egress evidence          completeness={} outcomes={} observations={} kernel_dropped={} exporter_dropped={} private_nat_inferred={}",
+        text_field(evidence, "completeness"),
+        number_field(evidence, "retained_outcomes"),
+        number_field(evidence, "retained_observations"),
+        number_field(evidence, "kernel_ring_dropped_events"),
+        number_field(evidence, "agent_export_dropped_events"),
+        evidence
+            .get("private_nat_state_inferred")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+}
+
+fn print_egress_history_entry(entry: &Value, key: &Value) -> bool {
+    let Some(egress) = entry.get("egress").filter(|value| !value.is_null()) else {
+        return false;
+    };
+    let Some(witness) = key.get("egress").filter(|value| !value.is_null()) else {
+        return false;
+    };
+    println!(
+        "egress outcome           {}:{} -> {} {}/{} translated={}:{} contract={} lease={} action={} reason={} observations={} kernel_time={}..{} nodes={}",
+        flow_address(key, "source_ipv4", "source_ipv6"),
+        number_field(witness, "original_source_port"),
+        flow_address(key, "destination_ipv4", "destination_ipv6"),
+        protocol_label(number_field(key, "protocol")),
+        number_field(key, "destination_port"),
+        flow_address(witness, "egress_ipv4", "egress_ipv6"),
+        number_field(witness, "translated_source_port"),
+        number_field(witness, "contract_revision"),
+        number_field(witness, "lease_epoch"),
+        number_field(witness, "action"),
+        number_field(witness, "reason"),
+        number_field(entry, "observed_events"),
+        number_field(egress, "first_dataplane_timestamp_ns"),
+        number_field(egress, "last_dataplane_timestamp_ns"),
+        joined_strings(&entry["reporting_nodes"]),
+    );
+    true
 }
 
 fn print_topology_history_table(value: &Value) {

@@ -10,6 +10,7 @@ use unf_common::{
     PolicyReason, Revision, RuleId, SELECTION_CONTRACT_SCHEMA_VERSION,
     SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceId, Verdict,
 };
+use unf_ebpf_common::egress_event_action_reason_is_valid;
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
@@ -18,9 +19,10 @@ pub const TOPOLOGY_HISTORY_SCHEMA_VERSION: u16 = 1;
 pub const TOPOLOGY_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 pub const TOPOLOGY_HISTORY_CAPACITY: usize = 32;
 pub const PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION: u16 = 5;
-pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 6;
-pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 7;
-pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 6;
+pub const PRE_EGRESS_CHRONICLE_FLOW_EXPORT_SCHEMA_VERSION: u16 = 6;
+pub const FLOW_EXPORT_SCHEMA_VERSION: u16 = 7;
+pub const FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION: u16 = 8;
+pub const FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION: u16 = 7;
 pub const SHADOW_IMPACT_SCHEMA_VERSION: u16 = 1;
 pub const PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION: u16 = 6;
 pub const PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION: u16 = 7;
@@ -375,6 +377,38 @@ pub struct FlowHistoryKey {
     pub destination_port: u16,
     #[serde(default)]
     pub service: Option<ServiceFlowKey>,
+    #[serde(default)]
+    pub egress: Option<EgressFlowKey>,
+}
+
+/// Immutable causal witnesses for one observed egress NAT lifecycle outcome.
+///
+/// This is deliberately part of the history key: observations carrying a
+/// different contract, lease, gateway, address, or proof can never be merged
+/// into a deceptively equivalent flow.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EgressFlowKey {
+    pub contract_revision: u64,
+    pub lease_epoch: u64,
+    pub original_source_port: u16,
+    pub translated_source_port: u16,
+    pub egress_ipv4: Option<Ipv4Addr>,
+    pub egress_ipv6: Option<Ipv6Addr>,
+    pub address_index: u16,
+    pub primary_gateway_index: u16,
+    pub standby_gateway_index: u16,
+    pub gateway_digest: [u8; 16],
+    pub standby_gateway_digest: [u8; 16],
+    pub proof_witness: [u8; 16],
+    pub action: u8,
+    pub reason: u8,
+    pub flags: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressFlowOutcome {
+    pub first_dataplane_timestamp_ns: u64,
+    pub last_dataplane_timestamp_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,6 +427,8 @@ pub struct FlowExportRecord {
     pub shadow: Option<FlowExportDecision>,
     #[serde(default)]
     pub service: Option<ServiceFlowOutcome>,
+    #[serde(default)]
+    pub egress: Option<EgressFlowOutcome>,
     pub observed_events: u64,
 }
 
@@ -424,6 +460,11 @@ pub struct FlowExportBatch {
     pub schema_version: u16,
     pub node_name: String,
     pub dropped_events: u64,
+    /// Cumulative eBPF egress-ring reservations that could not be submitted.
+    /// This is separate from userspace export loss so absence is never
+    /// interpreted as proof that no NAT lifecycle event occurred.
+    #[serde(default)]
+    pub egress_ring_dropped_events: u64,
     pub entries: Vec<FlowExportRecord>,
 }
 
@@ -437,6 +478,8 @@ pub struct FlowHistoryEntry {
     pub shadow: Option<FlowExportDecision>,
     #[serde(default)]
     pub service: Option<ServiceFlowOutcome>,
+    #[serde(default)]
+    pub egress: Option<EgressFlowOutcome>,
     pub observed_events: u64,
     pub first_received_unix_ms: u64,
     pub last_received_unix_ms: u64,
@@ -454,11 +497,76 @@ pub struct FlowHistorySnapshot {
     pub evicted_flows: u64,
     pub evicted_observations: u64,
     pub agent_dropped_events: u64,
+    #[serde(default)]
+    pub egress_ring_dropped_events: u64,
+    #[serde(default)]
+    pub egress_evidence: EgressEvidenceSummary,
     pub durable_checkpointed_flows: usize,
     pub durable_omitted_flows: usize,
     pub durable_omitted_observations: u64,
     pub query: FlowHistoryQuerySummary,
     pub entries: Vec<FlowHistoryEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressEvidenceCompleteness {
+    #[default]
+    Complete,
+    LossObserved,
+    HistoryEvicted,
+    DurableHistoryOmitted,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressEvidenceSummary {
+    pub completeness: EgressEvidenceCompleteness,
+    pub retained_outcomes: usize,
+    pub retained_observations: u64,
+    pub agent_export_dropped_events: u64,
+    pub kernel_ring_dropped_events: u64,
+    pub history_evicted_flows: u64,
+    pub history_evicted_observations: u64,
+    pub durable_omitted_flows: usize,
+    pub durable_omitted_observations: u64,
+    pub private_nat_state_inferred: bool,
+}
+
+#[must_use]
+pub fn egress_flow_witness_is_valid(
+    key: &FlowHistoryKey,
+    egress: &EgressFlowKey,
+    outcome: &EgressFlowOutcome,
+) -> bool {
+    let ipv4 = key.source_ipv4.is_some()
+        && key.destination_ipv4.is_some()
+        && egress.egress_ipv4.is_some()
+        && key.source_ipv6.is_none()
+        && key.destination_ipv6.is_none()
+        && egress.egress_ipv6.is_none();
+    let ipv6 = key.source_ipv6.is_some()
+        && key.destination_ipv6.is_some()
+        && egress.egress_ipv6.is_some()
+        && key.source_ipv4.is_none()
+        && key.destination_ipv4.is_none()
+        && egress.egress_ipv4.is_none();
+    (ipv4 ^ ipv6)
+        && key.direction == PolicyDirection::Egress
+        && key.source_identity.get() != 0
+        && key.destination_identity.get() == 0
+        && key.service.is_none()
+        && egress.contract_revision != 0
+        && egress.lease_epoch != 0
+        && (!matches!(key.protocol, 6 | 17 | 132)
+            || (egress.original_source_port != 0
+                && key.destination_port != 0
+                && (egress.action != 1 || egress.translated_source_port != 0)))
+        && egress.gateway_digest.iter().any(|byte| *byte != 0)
+        && egress.standby_gateway_digest.iter().any(|byte| *byte != 0)
+        && egress.proof_witness.iter().any(|byte| *byte != 0)
+        && egress_event_action_reason_is_valid(egress.action, egress.reason)
+        && outcome.first_dataplane_timestamp_ns != 0
+        && outcome.last_dataplane_timestamp_ns >= outcome.first_dataplane_timestamp_ns
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -683,6 +791,10 @@ pub struct FlowHistoryCheckpoint {
     pub evicted_observations: u64,
     pub agent_dropped_events: u64,
     pub agent_last_dropped_events: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub egress_ring_dropped_events: u64,
+    #[serde(default)]
+    pub agent_last_egress_ring_dropped_events: BTreeMap<String, u64>,
     pub omitted_flows: usize,
     pub omitted_observations: u64,
     pub entries: Vec<FlowHistoryEntry>,
@@ -704,6 +816,10 @@ pub enum FlowHistoryCheckpointError {
     MissingReportingNode,
     #[error("legacy flow-history checkpoint contains advanced service-selection witnesses")]
     InvalidLegacyServiceWitness,
+    #[error("legacy flow-history checkpoint contains egress chronicle witnesses")]
+    InvalidLegacyEgressWitness,
+    #[error("flow-history checkpoint contains inconsistent egress chronicle witnesses")]
+    InvalidEgressWitness,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -723,6 +839,8 @@ pub struct FlowHistoryStore {
     evicted_observations: u64,
     agent_dropped_events: u64,
     agent_last_dropped_events: BTreeMap<String, u64>,
+    egress_ring_dropped_events: u64,
+    agent_last_egress_ring_dropped_events: BTreeMap<String, u64>,
     durable_omitted_flows: usize,
     durable_omitted_observations: u64,
 }
@@ -744,6 +862,8 @@ impl FlowHistoryStore {
             evicted_observations: 0,
             agent_dropped_events: 0,
             agent_last_dropped_events: BTreeMap::new(),
+            egress_ring_dropped_events: 0,
+            agent_last_egress_ring_dropped_events: BTreeMap::new(),
             durable_omitted_flows: 0,
             durable_omitted_observations: 0,
         }
@@ -753,6 +873,7 @@ impl FlowHistoryStore {
         let FlowExportBatch {
             node_name,
             dropped_events,
+            egress_ring_dropped_events,
             entries,
             ..
         } = batch;
@@ -766,7 +887,19 @@ impl FlowHistoryStore {
             dropped_events
         };
         self.agent_dropped_events = self.agent_dropped_events.saturating_add(new_drops);
-        let mut changed = new_drops != 0;
+        let previous_egress_ring_drops = self
+            .agent_last_egress_ring_dropped_events
+            .insert(node_name.clone(), egress_ring_dropped_events)
+            .unwrap_or(0);
+        let new_egress_ring_drops = if egress_ring_dropped_events >= previous_egress_ring_drops {
+            egress_ring_dropped_events - previous_egress_ring_drops
+        } else {
+            egress_ring_dropped_events
+        };
+        self.egress_ring_dropped_events = self
+            .egress_ring_dropped_events
+            .saturating_add(new_egress_ring_drops);
+        let mut changed = new_drops != 0 || new_egress_ring_drops != 0;
         for record in entries {
             changed = true;
             if let Some(retained) = self.entries.get_mut(&record.key) {
@@ -774,6 +907,17 @@ impl FlowHistoryStore {
                 retained.record.decision = record.decision;
                 retained.record.shadow = record.shadow;
                 retained.record.service = record.service;
+                retained.record.egress = match (retained.record.egress, record.egress) {
+                    (Some(previous), Some(current)) => Some(EgressFlowOutcome {
+                        first_dataplane_timestamp_ns: previous
+                            .first_dataplane_timestamp_ns
+                            .min(current.first_dataplane_timestamp_ns),
+                        last_dataplane_timestamp_ns: previous
+                            .last_dataplane_timestamp_ns
+                            .max(current.last_dataplane_timestamp_ns),
+                    }),
+                    (_, current) => current,
+                };
                 retained.record.observed_events = retained
                     .record
                     .observed_events
@@ -837,6 +981,15 @@ impl FlowHistoryStore {
             .values()
             .map(|retained| retained.record.observed_events)
             .fold(0_u64, u64::saturating_add);
+        let retained_egress: Vec<_> = self
+            .entries
+            .values()
+            .filter(|retained| retained.record.egress.is_some())
+            .collect();
+        let retained_egress_observations = retained_egress
+            .iter()
+            .map(|retained| retained.record.observed_events)
+            .fold(0_u64, u64::saturating_add);
         let mut matched: Vec<_> = self
             .entries
             .values()
@@ -867,12 +1020,33 @@ impl FlowHistoryStore {
                 decision: retained.record.decision,
                 shadow: retained.record.shadow,
                 service: retained.record.service,
+                egress: retained.record.egress,
                 observed_events: retained.record.observed_events,
                 first_received_unix_ms: retained.first_received_unix_ms,
                 last_received_unix_ms: retained.last_received_unix_ms,
                 reporting_nodes: retained.reporting_nodes.iter().cloned().collect(),
             })
             .collect();
+        let egress_evidence = EgressEvidenceSummary {
+            completeness: if self.durable_omitted_flows != 0 {
+                EgressEvidenceCompleteness::DurableHistoryOmitted
+            } else if self.evicted_flows != 0 {
+                EgressEvidenceCompleteness::HistoryEvicted
+            } else if self.agent_dropped_events != 0 || self.egress_ring_dropped_events != 0 {
+                EgressEvidenceCompleteness::LossObserved
+            } else {
+                EgressEvidenceCompleteness::Complete
+            },
+            retained_outcomes: retained_egress.len(),
+            retained_observations: retained_egress_observations,
+            agent_export_dropped_events: self.agent_dropped_events,
+            kernel_ring_dropped_events: self.egress_ring_dropped_events,
+            history_evicted_flows: self.evicted_flows,
+            history_evicted_observations: self.evicted_observations,
+            durable_omitted_flows: self.durable_omitted_flows,
+            durable_omitted_observations: self.durable_omitted_observations,
+            private_nat_state_inferred: false,
+        };
         FlowHistorySnapshot {
             schema_version: FLOW_HISTORY_SNAPSHOT_SCHEMA_VERSION,
             source_epoch,
@@ -883,6 +1057,8 @@ impl FlowHistoryStore {
             evicted_flows: self.evicted_flows,
             evicted_observations: self.evicted_observations,
             agent_dropped_events: self.agent_dropped_events,
+            egress_ring_dropped_events: self.egress_ring_dropped_events,
+            egress_evidence,
             durable_checkpointed_flows: 0,
             durable_omitted_flows: self.durable_omitted_flows,
             durable_omitted_observations: self.durable_omitted_observations,
@@ -914,6 +1090,10 @@ impl FlowHistoryStore {
             evicted_observations: self.evicted_observations,
             agent_dropped_events: self.agent_dropped_events,
             agent_last_dropped_events: self.agent_last_dropped_events.clone(),
+            egress_ring_dropped_events: self.egress_ring_dropped_events,
+            agent_last_egress_ring_dropped_events: self
+                .agent_last_egress_ring_dropped_events
+                .clone(),
             omitted_flows: self
                 .durable_omitted_flows
                 .saturating_add(self.entries.len().saturating_sub(snapshot.entries.len())),
@@ -944,7 +1124,8 @@ impl FlowHistoryStore {
         }
         let migrate_legacy_clock_regression =
             checkpoint.schema_version < FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION;
-        let migrate_legacy_service_witness =
+        let migrate_legacy_service_witness = checkpoint.schema_version < 6;
+        let legacy_egress_witness =
             checkpoint.schema_version < FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION;
         if checkpoint.entries.len() > capacity {
             return Err(FlowHistoryCheckpointError::CapacityExceeded {
@@ -982,6 +1163,7 @@ impl FlowHistoryStore {
                     service.forwarding_mode = ServiceForwardingModeOutcome::Nat;
                 }
             }
+            validate_checkpoint_egress_witness(&entry, legacy_egress_witness)?;
             if entry.first_received_unix_ms == 0 {
                 return Err(FlowHistoryCheckpointError::InvalidTimestamps);
             }
@@ -1009,6 +1191,7 @@ impl FlowHistoryStore {
                     decision: entry.decision,
                     shadow: entry.shadow,
                     service: entry.service,
+                    egress: entry.egress,
                     observed_events: entry.observed_events,
                 },
                 first_received_unix_ms: entry.first_received_unix_ms,
@@ -1027,6 +1210,8 @@ impl FlowHistoryStore {
             evicted_observations: checkpoint.evicted_observations,
             agent_dropped_events: checkpoint.agent_dropped_events,
             agent_last_dropped_events: checkpoint.agent_last_dropped_events,
+            egress_ring_dropped_events: checkpoint.egress_ring_dropped_events,
+            agent_last_egress_ring_dropped_events: checkpoint.agent_last_egress_ring_dropped_events,
             durable_omitted_flows: checkpoint.omitted_flows,
             durable_omitted_observations: checkpoint.omitted_observations,
         })
@@ -1035,6 +1220,22 @@ impl FlowHistoryStore {
     #[must_use]
     pub const fn revision(&self) -> Revision {
         self.revision
+    }
+}
+
+fn validate_checkpoint_egress_witness(
+    entry: &FlowHistoryEntry,
+    legacy: bool,
+) -> Result<(), FlowHistoryCheckpointError> {
+    if legacy && (entry.key.egress.is_some() || entry.egress.is_some()) {
+        return Err(FlowHistoryCheckpointError::InvalidLegacyEgressWitness);
+    }
+    match (entry.key.egress.as_ref(), entry.egress.as_ref()) {
+        (None, None) => Ok(()),
+        (Some(key), Some(outcome)) if egress_flow_witness_is_valid(&entry.key, key, outcome) => {
+            Ok(())
+        }
+        _ => Err(FlowHistoryCheckpointError::InvalidEgressWitness),
     }
 }
 
@@ -2076,6 +2277,7 @@ mod tests {
                 protocol: 6,
                 destination_port: port,
                 service: None,
+                egress: None,
             },
             policy_revision: Revision::new(7),
             decision: FlowExportDecision {
@@ -2086,8 +2288,114 @@ mod tests {
             },
             shadow: None,
             service: None,
+            egress: None,
             observed_events: observations,
         }
+    }
+
+    fn egress_record(timestamp_ns: u64) -> FlowExportRecord {
+        FlowExportRecord {
+            key: FlowHistoryKey {
+                direction: PolicyDirection::Egress,
+                source_identity: IdentityId::new(41),
+                destination_identity: IdentityId::new(0),
+                source_ipv4: Some(Ipv4Addr::new(10, 42, 0, 7)),
+                destination_ipv4: Some(Ipv4Addr::new(198, 51, 100, 9)),
+                source_ipv6: None,
+                destination_ipv6: None,
+                protocol: 6,
+                destination_port: 443,
+                service: None,
+                egress: Some(EgressFlowKey {
+                    contract_revision: 23,
+                    lease_epoch: 29,
+                    original_source_port: 40_000,
+                    translated_source_port: 50_000,
+                    egress_ipv4: Some(Ipv4Addr::new(192, 0, 2, 10)),
+                    egress_ipv6: None,
+                    address_index: 2,
+                    primary_gateway_index: 3,
+                    standby_gateway_index: 4,
+                    gateway_digest: [0x11; 16],
+                    standby_gateway_digest: [0x22; 16],
+                    proof_witness: [0x33; 16],
+                    action: 1,
+                    reason: 1,
+                    flags: 0,
+                }),
+            },
+            policy_revision: Revision::default(),
+            decision: FlowExportDecision {
+                verdict: Verdict::Allow,
+                reason: 0,
+                policy_id: None,
+                rule_id: None,
+            },
+            shadow: None,
+            service: None,
+            egress: Some(EgressFlowOutcome {
+                first_dataplane_timestamp_ns: timestamp_ns,
+                last_dataplane_timestamp_ns: timestamp_ns,
+            }),
+            observed_events: 1,
+        }
+    }
+
+    #[test]
+    fn causal_egress_chronicle_preserves_witnesses_loss_and_restart_baselines() {
+        let mut store = FlowHistoryStore::with_capacity(4);
+        for (timestamp_ns, received_unix_ms, ring_drops) in [(1_000, 100, 2), (2_000, 200, 5)] {
+            assert!(store.ingest(
+                FlowExportBatch {
+                    schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                    node_name: "worker-a".to_owned(),
+                    dropped_events: 0,
+                    egress_ring_dropped_events: ring_drops,
+                    entries: vec![egress_record(timestamp_ns)],
+                },
+                received_unix_ms,
+            ));
+        }
+
+        let snapshot = store.snapshot(17);
+        assert_eq!(snapshot.egress_evidence.retained_outcomes, 1);
+        assert_eq!(snapshot.egress_evidence.retained_observations, 2);
+        assert_eq!(snapshot.egress_evidence.kernel_ring_dropped_events, 5);
+        assert_eq!(
+            snapshot.egress_evidence.completeness,
+            EgressEvidenceCompleteness::LossObserved
+        );
+        assert!(!snapshot.egress_evidence.private_nat_state_inferred);
+        let outcome = snapshot.entries[0].egress.expect("egress evidence");
+        assert_eq!(outcome.first_dataplane_timestamp_ns, 1_000);
+        assert_eq!(outcome.last_dataplane_timestamp_ns, 2_000);
+
+        let checkpoint = store.checkpoint(4);
+        let mut legacy = checkpoint.clone();
+        legacy.schema_version = PRE_EGRESS_CHRONICLE_FLOW_EXPORT_SCHEMA_VERSION;
+        assert_eq!(
+            FlowHistoryStore::from_checkpoint(legacy, 4),
+            Err(FlowHistoryCheckpointError::InvalidLegacyEgressWitness)
+        );
+        let mut restored = FlowHistoryStore::from_checkpoint(checkpoint, 4)
+            .expect("causal egress history restores");
+        assert!(restored.ingest(
+            FlowExportBatch {
+                schema_version: FLOW_EXPORT_SCHEMA_VERSION,
+                node_name: "worker-a".to_owned(),
+                dropped_events: 0,
+                egress_ring_dropped_events: 6,
+                entries: Vec::new(),
+            },
+            300,
+        ));
+        assert_eq!(
+            restored
+                .snapshot(17)
+                .egress_evidence
+                .kernel_ring_dropped_events,
+            6
+        );
     }
 
     #[test]
@@ -2098,6 +2406,7 @@ mod tests {
                 schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                 node_name: "worker-a".to_owned(),
                 dropped_events: 3,
+                egress_ring_dropped_events: 0,
                 entries: vec![flow_record(1, 2, 8080, 4)],
             },
             100,
@@ -2107,6 +2416,7 @@ mod tests {
                 schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                 node_name: "worker-b".to_owned(),
                 dropped_events: 1,
+                egress_ring_dropped_events: 0,
                 entries: vec![flow_record(1, 2, 8080, 6)],
             },
             200,
@@ -2131,6 +2441,7 @@ mod tests {
             schema_version: FLOW_EXPORT_SCHEMA_VERSION,
             node_name: "worker-a".to_owned(),
             dropped_events: 0,
+            egress_ring_dropped_events: 0,
             entries: vec![flow_record(1, 2, 8080, 1)],
         };
         assert!(store.ingest(first.clone(), 200));
@@ -2242,6 +2553,7 @@ mod tests {
                 schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                 node_name: "worker-a".to_owned(),
                 dropped_events: 0,
+                egress_ring_dropped_events: 0,
                 entries: vec![record, failure],
             },
             100,
@@ -2253,7 +2565,7 @@ mod tests {
     fn flow_history_migrates_pre_selection_service_witnesses() {
         let checkpoint = service_history_checkpoint();
         let mut legacy = checkpoint.clone();
-        legacy.schema_version = FLOW_HISTORY_CHECKPOINT_SCHEMA_VERSION - 1;
+        legacy.schema_version = 5;
         for entry in &mut legacy.entries {
             if let Some(service) = entry.key.service.as_mut() {
                 service.selection_tier = ServiceSelectionTier::Unknown;
@@ -2348,6 +2660,7 @@ mod tests {
                 schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                 node_name: "worker-a".to_owned(),
                 dropped_events: 0,
+                egress_ring_dropped_events: 0,
                 entries: vec![record],
             },
             100,
@@ -2413,6 +2726,7 @@ mod tests {
                 schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                 node_name: "worker-a".to_owned(),
                 dropped_events: 0,
+                egress_ring_dropped_events: 0,
                 entries: vec![record],
             },
             100,
@@ -2476,6 +2790,7 @@ mod tests {
                 schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                 node_name: "worker-a".to_owned(),
                 dropped_events: 0,
+                egress_ring_dropped_events: 0,
                 entries: vec![ingress, egress],
             },
             100,
@@ -2507,6 +2822,7 @@ mod tests {
                     schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                     node_name: "worker-a".to_owned(),
                     dropped_events: 0,
+                    egress_ring_dropped_events: 0,
                     entries: vec![flow_record(1, 2, port, u64::from(port - 8079))],
                 },
                 received,
@@ -2529,6 +2845,7 @@ mod tests {
                     schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                     node_name: "worker-a".to_owned(),
                     dropped_events: 0,
+                    egress_ring_dropped_events: 0,
                     entries: vec![flow_record(1, 2, port, u64::from(port - 8079))],
                 },
                 received,
@@ -2566,6 +2883,7 @@ mod tests {
                 schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                 node_name: "worker-a".to_owned(),
                 dropped_events: 0,
+                egress_ring_dropped_events: 0,
                 entries: vec![would_deny, unchanged],
             },
             100,
@@ -2624,6 +2942,7 @@ mod tests {
                     schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                     node_name: "worker-a".to_owned(),
                     dropped_events: 3,
+                    egress_ring_dropped_events: 0,
                     entries: vec![flow_record(1, 2, port, u64::from(port - 8079))],
                 },
                 received,
@@ -2648,6 +2967,7 @@ mod tests {
                 schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                 node_name: "worker-a".to_owned(),
                 dropped_events: 4,
+                egress_ring_dropped_events: 0,
                 entries: Vec::new(),
             },
             400,
@@ -2677,6 +2997,7 @@ mod tests {
                 schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                 node_name: "worker-a".to_owned(),
                 dropped_events: 0,
+                egress_ring_dropped_events: 0,
                 entries: vec![flow_record(1, 2, 8080, 7)],
             },
             100,

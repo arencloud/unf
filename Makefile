@@ -15,7 +15,7 @@
 .PHONY: egress-reachability-contract-test
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
-.PHONY: egress-bgp-test egress-bfd-test egress-bgp-image
+.PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-bgp-image
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -313,6 +313,16 @@ egress-bfd-test: egress-bgp-image
 	cargo test -p unf-agent bgp --no-fail-fast
 	cargo test -p unf-gobgp --all-targets --all-features --no-fail-fast
 	cargo clippy -p unf-egress -p unf-gobgp -p unf-agent -p unf-controller --all-targets --all-features -- -D warnings
+
+egress-operations-history-test:
+	cargo test -p unf-state causal_egress_chronicle_preserves_witnesses_loss_and_restart_baselines
+	cargo test -p unf-agent egress_event_decoder_requires_exact_proof_bound_nat_evidence
+	cargo test -p unf-agent loss_only_egress_ring_updates_trigger_an_export_batch
+	cargo test -p unf-controller flow_ingestion_is_validated_revisioned_and_enriched
+	cargo test -p unf-controller egress_chronicle_is_loss_explicit_filtered_and_proof_bound
+	cargo test -p unf-controller service_flow_ingestion_validates_bounded_dataplane_provenance
+	cargo test -p unfctl flows_command_parses
+	cargo clippy -p unf-state -p unf-agent -p unf-controller -p unfctl --all-targets --all-features -- -D warnings
 
 test:
 	cargo test --workspace

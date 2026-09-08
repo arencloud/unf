@@ -113,17 +113,17 @@ use unf_service::{
     compile_service_selection_dataplane, has_advanced_selection_intent,
 };
 use unf_state::{
-    AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility,
-    EgressIpv4PolicyMapEntry, EgressIpv6PolicyMapEntry, FLOW_EXPORT_BATCH_LIMIT,
+    AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility, EgressFlowKey,
+    EgressFlowOutcome, EgressIpv4PolicyMapEntry, EgressIpv6PolicyMapEntry, FLOW_EXPORT_BATCH_LIMIT,
     FLOW_EXPORT_SCHEMA_VERSION, FlowExportBatch, FlowExportDecision, FlowExportRecord,
     FlowHistoryKey, IDENTITY_SNAPSHOT_SCHEMA_VERSION, IdentityStateSnapshot, Ipv4IdentityMapping,
     Ipv4PolicyMapEntry, Ipv6IdentityMapping, Ipv6PolicyMapEntry, PERSISTENT_BPF_STATE_ABI_VERSION,
     POLICY_MAP_BANK_ENTRY_LIMIT, POLICY_SNAPSHOT_SCHEMA_VERSION,
-    PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION, PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION,
-    PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION, PolicyDecisionRecord, PolicyMapEntry,
-    PolicyStateSnapshot, ServiceAffinityOutcome, ServiceFlowKey, ServiceFlowOutcome,
-    ServiceForwardingModeOutcome, ServiceFrontendKind, ServiceSelectionAlgorithmOutcome,
-    ServiceSelectionTier, VersionTransition,
+    PRE_EGRESS_CHRONICLE_FLOW_EXPORT_SCHEMA_VERSION, PRE_OPERATIONS_AGENT_STATUS_SCHEMA_VERSION,
+    PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION, PRE_SELECTION_AGENT_STATUS_SCHEMA_VERSION,
+    PolicyDecisionRecord, PolicyMapEntry, PolicyStateSnapshot, ServiceAffinityOutcome,
+    ServiceFlowKey, ServiceFlowOutcome, ServiceForwardingModeOutcome, ServiceFrontendKind,
+    ServiceSelectionAlgorithmOutcome, ServiceSelectionTier, VersionTransition,
 };
 
 mod cni_server;
@@ -895,6 +895,7 @@ struct AgentState {
     applied_remote_routes: Mutex<Option<RemoteRouteSnapshot>>,
     queued_flow_exports: AtomicU64,
     dropped_flow_exports: AtomicU64,
+    egress_ring_dropped_events: AtomicU64,
     exported_flow_events: AtomicU64,
     tc_attachment_mode: AtomicU64,
     version_transition: AtomicU64,
@@ -6172,6 +6173,7 @@ fn new_state(
         applied_remote_routes: Mutex::new(None),
         queued_flow_exports: AtomicU64::new(0),
         dropped_flow_exports: AtomicU64::new(0),
+        egress_ring_dropped_events: AtomicU64::new(0),
         exported_flow_events: AtomicU64::new(0),
         tc_attachment_mode: AtomicU64::new(TcAttachmentMode::None as u64),
         version_transition: AtomicU64::new(version_transition_code(VersionTransition::Normal)),
@@ -7381,7 +7383,9 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
     .collect::<Vec<_>>();
     if !matches!(
         controller.flow_export_schema_version,
-        PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION | FLOW_EXPORT_SCHEMA_VERSION
+        PRE_OPERATIONS_FLOW_EXPORT_SCHEMA_VERSION
+            | PRE_EGRESS_CHRONICLE_FLOW_EXPORT_SCHEMA_VERSION
+            | FLOW_EXPORT_SCHEMA_VERSION
     ) {
         mismatches.push(format!(
             "flow-export schema controller={} agent={}",
@@ -12683,7 +12687,7 @@ async fn consume_events(
                     );
                 }
                 drain_service_events(&mut service_ring, state, flow_export_sender);
-                drain_egress_events(&mut egress_ring, state);
+                drain_egress_events(&mut egress_ring, state, flow_export_sender);
             }
         }
     }
@@ -12724,13 +12728,20 @@ fn drain_service_events(
     }
 }
 
-fn drain_egress_events(ring: &mut RingBuf<MapData>, state: &AgentState) {
+fn drain_egress_events(
+    ring: &mut RingBuf<MapData>,
+    state: &AgentState,
+    flow_export_sender: Option<&mpsc::Sender<FlowExportRecord>>,
+) {
     while let Some(item) = ring.next() {
         let Some(event) = decode_egress_event(&item) else {
             state.metrics.invalid_egress_events.inc();
             continue;
         };
         state.metrics.egress_dataplane_events.inc();
+        if let Some(sender) = flow_export_sender {
+            enqueue_flow_export(sender, state, egress_flow_export_record(&event));
+        }
         match event.action {
             EGRESS_EVENT_ACTION_CREATE => {
                 state.metrics.egress_nat_creations.inc();
@@ -12795,6 +12806,9 @@ fn refresh_egress_event_loss(
         .metrics
         .egress_event_ring_drops
         .inc_by(drops.saturating_sub(*observed_drops));
+    state
+        .egress_ring_dropped_events
+        .store(drops, Ordering::Release);
     *observed_attempts = attempts;
     *observed_drops = drops;
 }
@@ -12848,6 +12862,7 @@ fn flow_export_record(event: &FlowEvent) -> FlowExportRecord {
             protocol: event.flow.protocol,
             destination_port: u16::from_be_bytes(event.flow.destination_port),
             service: None,
+            egress: None,
         },
         policy_revision: Revision::new(event.policy_revision),
         decision: FlowExportDecision {
@@ -12863,6 +12878,7 @@ fn flow_export_record(event: &FlowEvent) -> FlowExportRecord {
             rule_id: rule_id_for_reason(event.shadow_rule_id, event.shadow_reason),
         }),
         service: None,
+        egress: None,
         observed_events: 1,
     }
 }
@@ -12894,6 +12910,7 @@ fn service_flow_export_record(event: &ServiceEvent) -> FlowExportRecord {
                 selection_algorithm: service_event_selection_algorithm(event),
                 forwarding_mode: service_event_forwarding_mode(event),
             }),
+            egress: None,
         },
         policy_revision: Revision::default(),
         decision: FlowExportDecision {
@@ -12923,6 +12940,62 @@ fn service_flow_export_record(event: &ServiceEvent) -> FlowExportRecord {
             affinity_outcome: service_event_affinity_outcome(event),
             selection_algorithm: service_event_selection_algorithm(event),
             forwarding_mode: service_event_forwarding_mode(event),
+        }),
+        egress: None,
+        observed_events: 1,
+    }
+}
+
+fn egress_flow_export_record(event: &EgressEvent) -> FlowExportRecord {
+    let egress_ipv4 = event_ipv4(event.address_family, event.egress_address);
+    let egress_ipv6 = event_ipv6(event.address_family, event.egress_address);
+    FlowExportRecord {
+        key: FlowHistoryKey {
+            direction: PolicyDirection::Egress,
+            source_identity: event.source_identity,
+            destination_identity: IdentityId::new(0),
+            source_ipv4: event_ipv4(event.address_family, event.original_source_address),
+            destination_ipv4: event_ipv4(event.address_family, event.original_destination_address),
+            source_ipv6: event_ipv6(event.address_family, event.original_source_address),
+            destination_ipv6: event_ipv6(event.address_family, event.original_destination_address),
+            protocol: event.protocol,
+            destination_port: u16::from_be_bytes(event.original_destination_port),
+            service: None,
+            egress: Some(EgressFlowKey {
+                contract_revision: event.contract_revision,
+                lease_epoch: event.lease_epoch,
+                original_source_port: u16::from_be_bytes(event.original_source_port),
+                translated_source_port: u16::from_be_bytes(event.translated_source_port),
+                egress_ipv4,
+                egress_ipv6,
+                address_index: event.address_index,
+                primary_gateway_index: event.primary_gateway_index,
+                standby_gateway_index: event.standby_gateway_index,
+                gateway_digest: event.gateway_digest,
+                standby_gateway_digest: event.standby_gateway_digest,
+                proof_witness: event.proof_witness,
+                action: event.action,
+                reason: event.reason,
+                flags: event.flags,
+            }),
+        },
+        policy_revision: Revision::default(),
+        decision: FlowExportDecision {
+            verdict: match event.action {
+                EGRESS_EVENT_ACTION_CREATE => Verdict::Allow,
+                EGRESS_EVENT_ACTION_DROP => Verdict::Deny,
+                EGRESS_EVENT_ACTION_EXPIRE => Verdict::Audit,
+                _ => unreachable!("validated egress event action"),
+            },
+            reason: 0,
+            policy_id: None,
+            rule_id: None,
+        },
+        shadow: None,
+        service: None,
+        egress: Some(EgressFlowOutcome {
+            first_dataplane_timestamp_ns: event.timestamp_ns,
+            last_dataplane_timestamp_ns: event.timestamp_ns,
         }),
         observed_events: 1,
     }
@@ -13214,6 +13287,7 @@ async fn export_flow_batches(
     let mut pending = BTreeMap::new();
     let mut last_exported_key = None;
     let mut last_reported_drops = 0_u64;
+    let mut last_reported_egress_ring_drops = 0_u64;
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
@@ -13233,7 +13307,16 @@ async fn export_flow_batches(
             },
             _ = interval.tick() => {
                 let dropped_events = state.dropped_flow_exports.load(Ordering::Relaxed);
-                if pending.is_empty() && dropped_events == last_reported_drops {
+                let egress_ring_dropped_events = state
+                    .egress_ring_dropped_events
+                    .load(Ordering::Acquire);
+                if !flow_export_due(
+                    !pending.is_empty(),
+                    dropped_events,
+                    last_reported_drops,
+                    egress_ring_dropped_events,
+                    last_reported_egress_ring_drops,
+                ) {
                     continue;
                 }
                 let entries = pending_flow_batch(
@@ -13245,6 +13328,7 @@ async fn export_flow_batches(
                     schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                     node_name: config.node_name.clone(),
                     dropped_events,
+                    egress_ring_dropped_events,
                     entries: entries.clone(),
                 };
                 let token = match read_agent_token(&config.token_path) {
@@ -13277,6 +13361,7 @@ async fn export_flow_batches(
                         state.exported_flow_events.fetch_add(exported, Ordering::Relaxed);
                         state.metrics.telemetry_exported_events.inc_by(exported);
                         last_reported_drops = dropped_events;
+                        last_reported_egress_ring_drops = egress_ring_dropped_events;
                     }
                     Err(error) => {
                         state.metrics.telemetry_export_errors.inc();
@@ -13286,6 +13371,18 @@ async fn export_flow_batches(
             }
         }
     }
+}
+
+const fn flow_export_due(
+    has_pending: bool,
+    dropped_events: u64,
+    last_reported_drops: u64,
+    egress_ring_dropped_events: u64,
+    last_reported_egress_ring_drops: u64,
+) -> bool {
+    has_pending
+        || dropped_events != last_reported_drops
+        || egress_ring_dropped_events != last_reported_egress_ring_drops
 }
 
 fn pending_flow_batch(
@@ -13573,6 +13670,17 @@ fn aggregate_pending_flow(
         existing.decision = record.decision;
         existing.shadow = record.shadow;
         existing.service = record.service;
+        existing.egress = match (existing.egress, record.egress) {
+            (Some(previous), Some(current)) => Some(EgressFlowOutcome {
+                first_dataplane_timestamp_ns: previous
+                    .first_dataplane_timestamp_ns
+                    .min(current.first_dataplane_timestamp_ns),
+                last_dataplane_timestamp_ns: previous
+                    .last_dataplane_timestamp_ns
+                    .max(current.last_dataplane_timestamp_ns),
+            }),
+            (_, current) => current,
+        };
         existing.observed_events = existing
             .observed_events
             .saturating_add(record.observed_events);
@@ -21912,6 +22020,30 @@ mod tests {
         assert_eq!(event.source_identity.get(), 37);
         assert_eq!(event.egress_address[..4], [192, 0, 2, 10]);
         assert_eq!(u16::from_be_bytes(event.translated_source_port), 50_000);
+        let record = egress_flow_export_record(&event);
+        assert_eq!(record.key.direction, PolicyDirection::Egress);
+        assert_eq!(record.key.source_identity.get(), 37);
+        assert_eq!(record.key.destination_identity.get(), 0);
+        assert_eq!(record.key.source_ipv4, Some(Ipv4Addr::new(10, 42, 0, 7)));
+        assert_eq!(
+            record.key.destination_ipv4,
+            Some(Ipv4Addr::new(198, 51, 100, 9))
+        );
+        let witness = record.key.egress.as_ref().expect("causal witness");
+        assert_eq!(witness.contract_revision, 23);
+        assert_eq!(witness.lease_epoch, 29);
+        assert_eq!(witness.egress_ipv4, Some(Ipv4Addr::new(192, 0, 2, 10)));
+        assert_eq!(witness.gateway_digest, [0x11; 16]);
+        assert_eq!(witness.standby_gateway_digest, [0x22; 16]);
+        assert_eq!(witness.proof_witness, [0x33; 16]);
+        assert_eq!(
+            record
+                .egress
+                .expect("egress timestamps")
+                .first_dataplane_timestamp_ns,
+            19
+        );
+        assert_eq!(record.decision.verdict, Verdict::Allow);
 
         let mut invalid = bytes;
         invalid[143] = unf_ebpf_common::EGRESS_EVENT_REASON_REWRITE_FAILED;
@@ -22357,6 +22489,7 @@ mod tests {
                 protocol: 6,
                 destination_port: port,
                 service: None,
+                egress: None,
             },
             policy_revision: Revision::new(7),
             decision: FlowExportDecision {
@@ -22367,6 +22500,7 @@ mod tests {
             },
             shadow: None,
             service: None,
+            egress: None,
             observed_events: 1,
         }
     }
@@ -22427,6 +22561,14 @@ mod tests {
             [8082, 8080]
         );
         assert!(pending_flow_batch(&pending, None, 0).is_empty());
+    }
+
+    #[test]
+    fn loss_only_egress_ring_updates_trigger_an_export_batch() {
+        assert!(!flow_export_due(false, 3, 3, 5, 5));
+        assert!(flow_export_due(false, 3, 3, 6, 5));
+        assert!(flow_export_due(false, 4, 3, 5, 5));
+        assert!(flow_export_due(true, 3, 3, 5, 5));
     }
 
     #[test]

@@ -465,6 +465,7 @@ mod tests {
                 schema_version: FLOW_EXPORT_SCHEMA_VERSION,
                 node_name: "worker-a".to_owned(),
                 dropped_events: 0,
+                egress_ring_dropped_events: 0,
                 entries: vec![FlowExportRecord {
                     key: FlowHistoryKey {
                         direction: PolicyDirection::Egress,
@@ -477,6 +478,7 @@ mod tests {
                         protocol: 6,
                         destination_port: 443,
                         service: None,
+                        egress: None,
                     },
                     policy_revision: Revision::new(7),
                     decision: FlowExportDecision {
@@ -487,6 +489,7 @@ mod tests {
                     },
                     shadow: None,
                     service: None,
+                    egress: None,
                     observed_events,
                 }],
             },

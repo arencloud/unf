@@ -39,7 +39,10 @@ authoritative state remains in [project-status.md](../project-status.md).
 | 8.8c | Native live reference provider | **Verified** | The controller materializes and garbage-collects exact lease-bound `native` DQR plans. An agent serves nonce-bound, digest-sealed kernel-ownership probes over a deliberate dual-stack listener, but cannot publish authoritative evidence. One provider receipt plus two separately authorized fabric failure domains is mandatory. `make egress-native-reachability-test` proves real external IPv4/IPv6 static-route activation, wrong-view denial, finite-evidence fencing/recovery, restart, observed route withdrawal, safe reuse, and exact cleanup; ADR 0150 |
 | 8.8d | BGP provider and routing policy | **Verified** | GoBGP v4.9.0 typed gRPC provides bounded dual-AFI peers, GTSM, prefix limits, ECMP, graceful restart, and exact RIB readback behind digest-sealed default-deny export policy. Causal Route Capsules bind every path to owner/lease/gateway/DQR identity; transactional blast-radius limits, scoped rollback, authenticated agent distribution, durable RIB replay, and a live two-gateway/two-fabric-domain gate pass `make egress-bgp-test`; ADR 0151 |
 | 8.8e | BFD and failure-correlation integration | **Verified** | Bounded native GoBGP BFD configuration/readback is digest-sealed and delivered through authenticated exact-Node evidence. The default Causal Failure Lattice collapses shared dependencies, requires two evidence planes for exact-path suppression, applies recovery holds/flap budgets, and can request source fencing but never promotion. A real four-speaker IPv4/IPv6 BFD fault gate plus deterministic recovery/adversarial tests pass `make egress-bfd-test`; ADR 0152 |
-| 8.9 | Operations, simulation, upgrade, and recovery | **Planned** | Fixed-cardinality metrics/status, NAT and failover history, allocation/gateway/policy explanation, read-only simulation, controller/provider/agent recovery, compatibility, and exact cleanup |
+| 8.9 | Operations, simulation, upgrade, and recovery | **In progress** | 8.9a is Verified; explanation, simulation, failover history, upgrade/recovery, compatibility, and cleanup remain in 8.9b–8.9c |
+| 8.9a | Causal Egress Chronicle | **Verified** | Flow export v7 carries sparse NAT lifecycle outcomes with exact contract/lease/address/gateway/proof witnesses and cumulative kernel-ring loss. Authenticated ingestion rejects incomplete provenance; bounded history/checkpoint v7 survives restart; `/v1/egress/history` exposes explicit `complete`, `loss_observed`, `history_evicted`, or `durable_history_omitted` evidence without inferring private NAT state; `make egress-operations-history-test`; ADR 0153 |
+| 8.9b | Causal explanation, failover history, and counterfactual simulation | **Planned** | Join allocation, gateway, policy, contract, reachability, NAT, and HA evidence; expose fixed-cardinality status and a read-only simulation that labels every unknowable result instead of guessing |
+| 8.9c | Upgrade, recovery, compatibility, and exact cleanup | **Planned** | Controller/provider/agent restart, adjacent schemas, last-known-good recovery, exact version-scoped cleanup, and rollback evidence |
 | 8.10 | Kube-proxy-free Kind qualification | **Planned** | Exact committed dual-stack multi-Node lifecycle covering policy, allocation, steering/NAT, HA, recovery, provenance, cleanup, and rollback with immutable evidence |
 | 8.11 | OpenShift qualification | **Planned** | Independent digest-pinned cl02 RHCOS/SELinux/CRI-O gate covering cross-worker dual-stack egress, source addresses, failover, recovery, exact cleanup, convergence, and ClusterOperator comparison |
 
@@ -127,17 +130,17 @@ to native routing or a different source address.
 
 ## Explicit exclusions
 
-Phase 8 does not silently claim production BGP/EVPN/ECMP/BFD, cloud-provider
-adapters, cross-cluster egress, overlapping-CIDR translation, WireGuard,
+Phase 8 does not silently claim EVPN, BFD authentication or IPv6 BFD transport,
+cloud-provider adapters, cross-cluster egress, overlapping-CIDR translation, WireGuard,
 application identity from DNS, L7 proxying, Gateway API, SCTP egress NAT,
 fragments, generic NAT `RELATED`, arbitrary ICMP error translation, production
 HA, availability, or scale. Those require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 8.8d integrates an evaluated production BGP stack behind the same DQR
-boundary. It must support bounded dual-stack peers and policy, ECMP, graceful
-restart, exact RIB/FIB readback, scoped rollback, and independent external
-observation without treating session state as reachability. BFD remains the
-independent 8.8e correlation gate. Operations, scale, and platform qualification
-remain milestones 8.9–8.11.
+Milestone 8.9b builds a causal egress explanation and counterfactual simulator
+over the 8.9a Chronicle and authoritative allocation, contract, gateway,
+reachability, policy, and HA stores. It must make observed, derived, unavailable,
+expired, and loss-affected evidence distinct; retain bounded failover history;
+and remain structurally incapable of granting ownership, reachability, NAT, or
+promotion authority. Upgrade/recovery and platform qualification remain 8.9c–8.11.
