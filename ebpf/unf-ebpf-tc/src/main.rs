@@ -4938,10 +4938,10 @@ fn local_source_fence_action(observation: &FlowObservation) -> Option<i32> {
         bank: config.active_bank,
         reserved: [0; 3],
     };
-    // SAFETY: the fixed-layout value is copied immediately and does not escape
-    // this non-preemptible invocation.
+    // SAFETY: the fixed-layout reference is read only during this
+    // non-preemptible invocation and never escapes the map lookup.
     #[allow(unsafe_code)]
-    let source = unsafe { EGRESS_SOURCES.get(&source_key).copied() };
+    let source = unsafe { EGRESS_SOURCES.get(&source_key) };
     let Some(source) = source else {
         return if egress_source_exists(observation.source_identity) {
             Some(TC_ACT_SHOT)
@@ -4949,8 +4949,9 @@ fn local_source_fence_action(observation: &FlowObservation) -> Option<i32> {
             None
         };
     };
-    if !valid_egress_source(&source, &config, observation.address_family)
-        || source.admission == EGRESS_ADMISSION_FENCED
+    if source.schema_version != EGRESS_MAP_ABI_VERSION
+        || source.contract_revision != config.contract_revision
+        || source.admission != EGRESS_ADMISSION_ACTIVE
     {
         return Some(TC_ACT_SHOT);
     }
