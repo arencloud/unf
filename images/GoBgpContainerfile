@@ -1,0 +1,14 @@
+ARG GO_IMAGE=docker.io/library/golang:1.25.1-bookworm
+FROM ${GO_IMAGE} AS builder
+
+ARG GOBGP_VERSION=v4.9.0
+RUN CGO_ENABLED=0 go install "github.com/osrg/gobgp/v4/cmd/gobgpd@${GOBGP_VERSION}" \
+    && CGO_ENABLED=0 go install "github.com/osrg/gobgp/v4/cmd/gobgp@${GOBGP_VERSION}"
+
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /go/bin/gobgpd /usr/local/bin/gobgpd
+COPY --from=builder /go/bin/gobgp /usr/local/bin/gobgp
+ENTRYPOINT ["/usr/local/bin/gobgpd"]

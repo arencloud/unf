@@ -166,6 +166,8 @@ const NATIVE_EGRESS_REACHABILITY_OBSERVATION_SOURCE_PREFIX: &str =
 const MANAGED_NATIVE_REACHABILITY_LABEL: &str = "network.unf.io/managed-native-reachability";
 const NATIVE_EGRESS_REACHABILITY_PROVIDER: &str = "native";
 const NATIVE_EGRESS_REACHABILITY_OBSERVATION_AGE_SECONDS: u64 = 120;
+const MANAGED_BGP_REACHABILITY_LABEL: &str = "network.unf.io/managed-bgp-reachability";
+const BGP_EGRESS_REACHABILITY_PROVIDER: &str = "bgp";
 const OPENSHIFT_EGRESS_IP_SOURCE_PREFIX: &str = "openshift:egressip/";
 const FLOW_HISTORY_STORE_NAME: &str = "unf-flow-history";
 const FLOW_HISTORY_STORE_KEY: &str = "flows.json";
@@ -1266,6 +1268,10 @@ async fn spawn_internal_api(
             get(egress_gateway_address_projection),
         )
         .route(
+            "/v1/state/egress-bgp-plans",
+            get(egress_bgp_reachability_plans),
+        )
+        .route(
             "/v1/state/egress-gateway-address-ack",
             post(acknowledge_egress_gateway_address_application),
         )
@@ -2276,6 +2282,7 @@ fn spawn_egress_persistence(
                 }
                 _ = interval.tick() => {
                     reconcile_native_egress_reachability_plans(&state).await;
+                    reconcile_bgp_egress_reachability_plans(&state).await;
                     retry_pending_egress_reachability(&state).await;
                     refresh_due_egress_reachability(&state).await;
                     persist_egress_desired_if_dirty(&state).await;
@@ -2422,6 +2429,126 @@ fn managed_native_reachability_plan_name(owner: &EgressIntentOwner) -> String {
         .take(36)
         .collect::<String>();
     format!("unf-native-{owner_name}-{owner_uid}")
+}
+
+async fn reconcile_bgp_egress_reachability_plans(state: &ControllerState) {
+    if let Err(error) = try_reconcile_bgp_egress_reachability_plans(state).await {
+        state.metrics.errors.inc();
+        warn!(%error, "BGP egress reachability-plan reconciliation failed closed");
+    }
+}
+
+/// Owns the BGP DQR boundary independently from any routing daemon. An
+/// Adj-RIB-Out receipt is necessary but cannot replace diverse external fabric
+/// observation.
+async fn try_reconcile_bgp_egress_reachability_plans(state: &ControllerState) -> Result<()> {
+    let Some(api) = state.egress_reachability_plan_api.as_ref() else {
+        return Ok(());
+    };
+    let desired = mutex_lock(&state.egress_control_plane)
+        .checkpoint()
+        .gateways
+        .records
+        .into_iter()
+        .filter(|record| record.desired.provider.name == BGP_EGRESS_REACHABILITY_PROVIDER)
+        .map(|record| {
+            let name = managed_bgp_reachability_plan_name(&record.desired.owner);
+            (name, record.desired)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for (name, gateway) in &desired {
+        let spec = bgp_reachability_plan_spec(gateway)?;
+        let patch = serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "EgressReachabilityPlan",
+            "metadata": {
+                "name": name,
+                "labels": {
+                    (MANAGED_BGP_REACHABILITY_LABEL): "true",
+                    "network.unf.io/reachability-provider": BGP_EGRESS_REACHABILITY_PROVIDER,
+                },
+            },
+            "spec": spec,
+        });
+        api.patch(
+            name,
+            &PatchParams::apply("unf-controller-bgp-reachability").force(),
+            &Patch::Apply(&patch),
+        )
+        .await
+        .with_context(|| format!("apply BGP EgressReachabilityPlan {name}"))?;
+    }
+
+    let managed = api
+        .list(&ListParams::default().labels(&format!("{MANAGED_BGP_REACHABILITY_LABEL}=true")))
+        .await
+        .context("list controller-managed BGP EgressReachabilityPlans")?;
+    for stale in managed
+        .items
+        .into_iter()
+        .map(|resource| resource.name_any())
+        .filter(|name| !desired.contains_key(name))
+    {
+        api.delete(&stale, &DeleteParams::default())
+            .await
+            .with_context(|| format!("delete stale BGP EgressReachabilityPlan {stale}"))?;
+    }
+    Ok(())
+}
+
+fn bgp_reachability_plan_spec(
+    desired: &unf_egress::EgressGatewayDesired,
+) -> Result<ApiEgressReachabilityPlanSpec> {
+    let plan = unf_egress::derive_egress_bgp_reachability_plan(desired)
+        .context("derive exact BGP reachability plan")?;
+    Ok(ApiEgressReachabilityPlanSpec {
+        revision: plan.revision.get(),
+        desired_revision: plan.desired_revision.get(),
+        allocation_revision: plan.allocation_revision.get(),
+        owner_name: plan.owner.name,
+        owner_uid: plan.owner.uid,
+        provider: ApiEgressProvider {
+            name: plan.provider.name,
+            instance: plan.provider.instance,
+        },
+        lease_epoch: plan.lease_epoch,
+        action: match plan.action {
+            unf_egress::EgressGatewayAction::Ensure => ApiEgressReachabilityAction::Ensure,
+            unf_egress::EgressGatewayAction::Withdraw => ApiEgressReachabilityAction::Withdraw,
+        },
+        addresses: plan.addresses.iter().map(ToString::to_string).collect(),
+        expected_paths: plan
+            .expected_paths
+            .into_iter()
+            .map(|path| ApiEgressReachabilityPath {
+                gateway_uid: path.gateway_uid,
+                forwarding_identity: path.forwarding_identity,
+            })
+            .collect(),
+        minimum_paths_per_address: plan.minimum_paths_per_address,
+        maximum_paths_per_address: plan.maximum_paths_per_address,
+        vantages: plan
+            .vantages
+            .into_iter()
+            .map(|vantage| ApiEgressReachabilityVantage {
+                name: vantage.name,
+                minimum_failure_domains: vantage.minimum_failure_domains,
+            })
+            .collect(),
+        max_observation_age_seconds: plan.max_observation_age_seconds,
+    })
+}
+
+fn managed_bgp_reachability_plan_name(owner: &EgressIntentOwner) -> String {
+    let owner_name = owner.name.chars().take(203).collect::<String>();
+    let owner_uid = owner
+        .uid
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(36)
+        .collect::<String>();
+    format!("unf-bgp-{owner_name}-{owner_uid}")
 }
 
 async fn persist_egress_desired_if_dirty(state: &ControllerState) {
@@ -8132,6 +8259,37 @@ async fn egress_gateway_address_projection(
     }
 }
 
+async fn egress_bgp_reachability_plans(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    let principal = egress_principal_for(&state, &agent)?;
+    let mut plans =
+        mutex_lock(&state.egress_control_plane)
+            .checkpoint()
+            .gateways
+            .records
+            .into_iter()
+            .filter(|record| {
+                record.desired.provider.name == BGP_EGRESS_REACHABILITY_PROVIDER
+                    && record.desired.nodes.iter().any(|node| {
+                        node.name == principal.node_name && node.uid == principal.node_uid
+                    })
+            })
+            .map(|record| {
+                unf_egress::derive_egress_bgp_reachability_plan(&record.desired)
+                    .map_err(|error| ApiError::internal(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    plans.sort_by(|left, right| left.owner.cmp(&right.owner));
+    if plans.is_empty() {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Ok(Json(plans).into_response())
+    }
+}
+
 fn egress_gateway_address_projection_for(
     state: &ControllerState,
     agent: &AuthenticatedAgent,
@@ -11948,6 +12106,86 @@ mod tests {
         let mut recreated = owner;
         recreated.uid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
         let second = managed_native_reachability_plan_name(&recreated);
+        assert!(first.len() <= 253);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn bgp_reachability_plan_requires_adj_rib_out_and_diverse_fabric_proof() {
+        let desired = unf_egress::EgressGatewayDesired {
+            schema_version: unf_egress::EGRESS_GATEWAY_DESIRED_SCHEMA_VERSION,
+            revision: Revision::new(13),
+            allocation_revision: Revision::new(8),
+            owner: EgressIntentOwner {
+                scope: unf_egress::EgressIntentScope::Cluster,
+                name: "payments-egress".to_owned(),
+                uid: "policy-uid-b".to_owned(),
+            },
+            provider: EgressProviderRef {
+                name: BGP_EGRESS_REACHABILITY_PROVIDER.to_owned(),
+                instance: "fabric-a".to_owned(),
+            },
+            lease_epoch: 17,
+            action: unf_egress::EgressGatewayAction::Ensure,
+            addresses: vec![
+                "192.0.2.241".parse().unwrap(),
+                "2001:db8::241".parse().unwrap(),
+            ],
+            nodes: vec![
+                EgressNode {
+                    name: "worker-a".to_owned(),
+                    uid: "node-uid-a".to_owned(),
+                    capabilities: BTreeSet::new(),
+                },
+                EgressNode {
+                    name: "worker-b".to_owned(),
+                    uid: "node-uid-b".to_owned(),
+                    capabilities: BTreeSet::new(),
+                },
+            ],
+        };
+
+        let spec = bgp_reachability_plan_spec(&desired).unwrap();
+        assert_eq!(spec.revision, 27);
+        assert_eq!(spec.minimum_paths_per_address, 1);
+        assert_eq!(spec.maximum_paths_per_address, 2);
+        assert_eq!(
+            spec.vantages,
+            vec![
+                ApiEgressReachabilityVantage {
+                    name: "adj-rib-out".to_owned(),
+                    minimum_failure_domains: 1,
+                },
+                ApiEgressReachabilityVantage {
+                    name: "fabric".to_owned(),
+                    minimum_failure_domains: 2,
+                },
+            ]
+        );
+        assert_eq!(
+            spec.expected_paths
+                .iter()
+                .map(|path| path.forwarding_identity.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bgp-node/node-uid-a", "bgp-node/node-uid-b"]
+        );
+        let resource = ApiEgressReachabilityPlan::new("managed-bgp", spec);
+        let translated = egress_api::translate_egress_reachability_plan(&resource).unwrap();
+        assert_eq!(translated.owner, desired.owner);
+        assert_eq!(translated.addresses, desired.addresses);
+    }
+
+    #[test]
+    fn bgp_reachability_plan_names_are_bounded_and_recreation_safe() {
+        let owner = EgressIntentOwner {
+            scope: unf_egress::EgressIntentScope::Cluster,
+            name: "b".repeat(253),
+            uid: "11111111-2222-3333-4444-555555555555".to_owned(),
+        };
+        let first = managed_bgp_reachability_plan_name(&owner);
+        let mut recreated = owner;
+        recreated.uid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+        let second = managed_bgp_reachability_plan_name(&recreated);
         assert!(first.len() <= 253);
         assert_ne!(first, second);
     }

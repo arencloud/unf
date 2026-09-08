@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod allocation;
+mod bgp;
 mod contract;
 mod control_plane;
 mod dataplane;
@@ -35,6 +36,7 @@ mod reachability_store;
 mod safe_forgetting;
 
 pub use allocation::*;
+pub use bgp::*;
 pub use contract::*;
 pub use control_plane::*;
 pub use dataplane::*;

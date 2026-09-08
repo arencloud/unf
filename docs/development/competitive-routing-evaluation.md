@@ -37,6 +37,7 @@ Every routing provider must preserve these common contracts:
 Milestone 6.6b verifies provider-neutral intent and the native static lifecycle;
 6.6c verifies complete snapshot distribution, durable last-known-good recovery,
 atomic replacement, stale retirement, and acknowledgements for that native
-backend. UNF does not yet claim BGP, overlay, VRF, ECMP, multi-cluster, service
-advertisement, or comparative superiority. Those capabilities require their own
+backend. UNF now verifies bounded dual-stack BGP and ECMP egress advertisement
+through the Phase 8.8d GoBGP adapter, but does not yet claim overlay, VRF,
+multi-cluster, Service advertisement, or comparative superiority. Those capabilities require their own
 implementations and repeatable qualification gates.

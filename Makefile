@@ -15,6 +15,7 @@
 .PHONY: egress-reachability-contract-test
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
+.PHONY: egress-bgp-test egress-bgp-image
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -27,6 +28,7 @@ UNF_KIND_CONTROL_PLANE_NODE ?= $(KIND_NAME)-control-plane
 UNF_KIND_WORKER_NODE ?= $(KIND_NAME)-worker
 UNF_POLICY_TRANSITION_ATTEMPTS ?= 30
 TEST_TOOLS_IMAGE := localhost/unf-test-tools:ipv6-ext-v1
+GOBGP_IMAGE := localhost/unf-gobgp:v4.9.0
 UNF_BUILD_REVISION ?= $(shell git describe --always --dirty --abbrev=40 2>/dev/null || echo unknown)
 UNF_UPGRADE_BASELINE_REF ?= HEAD^
 UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE ?= localhost/unf-controller:upgrade-n
@@ -294,6 +296,14 @@ egress-native-reachability-test: egress-reachability-lifecycle-test service-kind
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout status deployment/unf-controller -n unf-system --timeout=180s
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout status daemonset/unf-agent -n unf-system --timeout=180s
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) UNF_TEST_TOOLS_IMAGE=$(TEST_TOOLS_IMAGE) hack/verify-kind-egress-native-reachability.sh
+
+egress-bgp-test: egress-native-reachability-test egress-bgp-image
+	hack/verify-egress-bgp.sh
+	cargo test -p unf-egress bgp --no-fail-fast
+	cargo test -p unf-controller bgp --no-fail-fast
+	cargo test -p unf-agent bgp --no-fail-fast
+	cargo test -p unf-gobgp --all-targets --all-features --no-fail-fast
+	cargo clippy -p unf-egress -p unf-gobgp -p unf-agent -p unf-controller --all-targets --all-features -- -D warnings
 
 test:
 	cargo test --workspace
@@ -654,6 +664,9 @@ images: artifacts
 	podman build --build-arg UNF_BUILD_REVISION=$(UNF_BUILD_REVISION) --build-arg UNF_PACKAGE=unf-agent --tag localhost/unf-agent:dev --file images/Containerfile .
 	podman build --tag $(TEST_TOOLS_IMAGE) --file images/SctpTestContainerfile .
 	podman run --rm --entrypoint sh $(TEST_TOOLS_IMAGE) -ec 'command -v bpftool >/dev/null && command -v jq >/dev/null'
+
+egress-bgp-image:
+	podman build --tag $(GOBGP_IMAGE) --file images/GoBgpContainerfile .
 
 upgrade-baseline-images:
 	UNF_UPGRADE_BASELINE_REF=$(UNF_UPGRADE_BASELINE_REF) UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE=$(UNF_UPGRADE_BASELINE_CONTROLLER_IMAGE) UNF_UPGRADE_BASELINE_AGENT_IMAGE=$(UNF_UPGRADE_BASELINE_AGENT_IMAGE) hack/build-upgrade-baseline-images.sh

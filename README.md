@@ -678,7 +678,18 @@ external route mutation, conflicting-view denial, autonomous expiry fencing,
 restart recovery, positive route withdrawal, safe address reuse, and exact
 cleanup under `make egress-native-reachability-test`; ADR 0150. The legacy
 explicit `static` self-acknowledgement remains compatibility-only for earlier
-gates; BGP and BFD are the next production-provider slices.
+gates. Slice 8.8d adds a pinned GoBGP v4.9.0 typed-gRPC adapter rather than a
+new protocol implementation. Digest-sealed node policy bounds peers, AFIs,
+prefixes, ECMP, graceful restart, total routes, and transaction blast radius;
+local and every relevant Adj-RIB-Out must read back exactly before persistence.
+Each route carries a default-on Causal Route Capsule binding the owner, lease,
+gateway, next hop, and DQR plan, preventing a stale advertisement from
+impersonating a reused IP. The live four-speaker dual-stack gate verifies two
+gateway paths at two independent external fabric domains, stale-capsule denial,
+finite DQR authority, partial and complete withdrawal, scoped rollback, durable
+RIB reconstruction, and cleanup under `make egress-bgp-test`; ADR 0151. BFD is
+the next independent provider-correlation slice. See the [BGP provider guide](docs/development/egress-bgp-provider.md)
+for the sealed node policy and opt-in agent wiring.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

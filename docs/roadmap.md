@@ -650,7 +650,16 @@ matrix is maintained in the
   agree. The dual-stack Kind lifecycle proves real external route mutation,
   wrong-view denial, expiry fencing/recovery, restart, positive withdrawal,
   safe reuse, and exact cleanup under `make egress-native-reachability-test`;
-  ADR 0150. Production BGP and BFD remain independent 8.8d–8.8e gates.
+  ADR 0150.
+- Phase 8.8d verifies causal-constrained BGP convergence. A pinned GoBGP typed
+  gRPC adapter applies digest-sealed default-deny export policy, bounded peers,
+  ECMP, graceful restart, and exact RIB readback. Every route carries a Causal
+  Route Capsule binding its owner, lease, gateway, and DQR plan; persistence
+  failure rolls back only the transaction and durable snapshots reconstruct a
+  missing daemon RIB. A live dual-stack four-speaker gate proves two independent
+  gateway paths at two fabric failure domains, stale-capsule rejection, finite
+  DQR authority, partial/complete withdrawal, recovery, and cleanup under `make
+  egress-bgp-test`; ADR 0151. BFD remains the independent 8.8e gate.
 - Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
   ServiceAccount selectors; canonical destinations and non-overlapping
   dual-stack pools; pool-family/multiple-address intent; strict OpenShift

@@ -66,22 +66,24 @@ use unf_egress::{
     AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
     EGRESS_DISTRIBUTION_SCHEMA_VERSION, EGRESS_HA_PROMOTION_SCHEMA_VERSION,
     EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard, EgressAgentAdvertisement,
-    EgressCapability, EgressDataplaneClock, EgressDataplaneState, EgressFqdnPattern,
-    EgressGatewayAddressAcknowledgement, EgressGatewayAddressProjection,
-    EgressGatewayApplicationAcknowledgement, EgressGatewayDrainEvidence, EgressGatewayHostBank,
-    EgressGatewayProjection, EgressGatewayProjectionLedger, EgressGatewayRetirementChallenges,
-    EgressHaActivationAuthority, EgressHaAgentChallenge, EgressHaAgentChallenges,
-    EgressHaAgentEvidence, EgressHaContinuityCutover, EgressHaDigest, EgressHaFlowTwin,
-    EgressHaFlowTwinOperation, EgressHaFlowTwinStream, EgressHaOldOwnerRevocationEvidence,
-    EgressHaSourceActivationEvidence, EgressIntentOwner, EgressNodeProjectionEnvelope,
-    EgressPathCertificate, EgressPathMode, EgressProjectionLedger, EgressProjectionRecipient,
-    EgressReachabilityPlanDigest, EgressSourceActivationGrant,
-    EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
+    EgressBgpConfig, EgressBgpSnapshot, EgressCapability, EgressDataplaneClock,
+    EgressDataplaneState, EgressFqdnPattern, EgressGatewayAddressAcknowledgement,
+    EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
+    EgressGatewayDrainEvidence, EgressGatewayHostBank, EgressGatewayProjection,
+    EgressGatewayProjectionLedger, EgressGatewayRetirementChallenges, EgressHaActivationAuthority,
+    EgressHaAgentChallenge, EgressHaAgentChallenges, EgressHaAgentEvidence,
+    EgressHaContinuityCutover, EgressHaDigest, EgressHaFlowTwin, EgressHaFlowTwinOperation,
+    EgressHaFlowTwinStream, EgressHaOldOwnerRevocationEvidence, EgressHaSourceActivationEvidence,
+    EgressIntentOwner, EgressNodeProjectionEnvelope, EgressPathCertificate, EgressPathMode,
+    EgressProjectionLedger, EgressProjectionRecipient, EgressReachabilityPlanDigest,
+    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
     EgressSourceRetirementChallenges, NativeEgressReachabilityChallenge,
     NativeEgressReachabilityNonce, compile_egress_dataplane_at,
     compile_egress_gateway_dataplane_at, decode_native_egress_reachability_hex,
-    issue_native_egress_reachability_probe,
+    issue_native_egress_reachability_probe, prepare_egress_bgp_transaction, seal_egress_bgp_route,
+    seal_egress_bgp_snapshot, verify_egress_bgp_config, verify_egress_reachability_plan,
 };
+use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
     NodeBlockSnapshot,
@@ -141,6 +143,7 @@ const DEFAULT_CNI_STATUS_LEASE_PATH: &str = "/run/unf/cni-status.lease";
 const DEFAULT_SERVICE_STATE_PATH: &str = "/var/lib/unf/cni/v1/service-snapshot.json";
 const DEFAULT_LOAD_BALANCER_REACHABILITY_STATE_PATH: &str =
     "/var/lib/unf/cni/v1/load-balancer-reachability.json";
+const DEFAULT_EGRESS_BGP_STATE_PATH: &str = "/var/lib/unf/cni/v1/egress-bgp.json";
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -465,6 +468,23 @@ struct Args {
         default_value = DEFAULT_LOAD_BALANCER_REACHABILITY_STATE_PATH
     )]
     load_balancer_reachability_state_path: PathBuf,
+    /// Exact local-speaker configuration. BGP remains disabled when absent.
+    #[arg(long, env = "UNF_EGRESS_BGP_CONFIG_PATH")]
+    egress_bgp_config_path: Option<PathBuf>,
+    /// Typed local `GoBGP` gRPC endpoint used only with BGP configuration.
+    #[arg(
+        long,
+        env = "UNF_EGRESS_BGP_ENDPOINT",
+        default_value = "http://127.0.0.1:50051"
+    )]
+    egress_bgp_endpoint: String,
+    /// Durable last verified BGP advertisement snapshot.
+    #[arg(
+        long,
+        env = "UNF_EGRESS_BGP_STATE_PATH",
+        default_value = DEFAULT_EGRESS_BGP_STATE_PATH
+    )]
+    egress_bgp_state_path: PathBuf,
     #[arg(long, env = "UNF_NODE_NAME", default_value = "unknown")]
     node_name: String,
     #[arg(long, env = "UNF_POD_NAME", default_value = "unknown")]
@@ -947,11 +967,20 @@ struct EgressSynchronizer {
     clock_anchor: Option<EgressDataplaneClock>,
     fqdn_observers: BTreeMap<String, FqdnObserver>,
     path_provider: Option<NativeEgressPathProvider>,
+    bgp: Option<EgressBgpSynchronizer>,
     node_name: String,
     controller_url: Option<String>,
     client: ReloadingControllerClient,
     agent_token_path: PathBuf,
     interval: Duration,
+}
+
+#[derive(Debug)]
+struct EgressBgpSynchronizer {
+    config: EgressBgpConfig,
+    endpoint: String,
+    state_path: PathBuf,
+    applied: EgressBgpSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1378,6 +1407,9 @@ struct DataplaneConfig {
     service_sync_interval: Duration,
     service_state_path: PathBuf,
     load_balancer_reachability_state_path: PathBuf,
+    egress_bgp_config_path: Option<PathBuf>,
+    egress_bgp_endpoint: String,
+    egress_bgp_state_path: PathBuf,
     node_name: String,
     agent_token_path: PathBuf,
     flow_export_interval: Duration,
@@ -1629,6 +1661,9 @@ async fn main() -> Result<()> {
             let service_state_path = args.service_state_path.clone();
             let load_balancer_reachability_state_path =
                 args.load_balancer_reachability_state_path.clone();
+            let egress_bgp_config_path = args.egress_bgp_config_path.clone();
+            let egress_bgp_endpoint = args.egress_bgp_endpoint.clone();
+            let egress_bgp_state_path = args.egress_bgp_state_path.clone();
             let node_name = args.node_name.clone();
             let agent_token_path = args.agent_token_path.clone();
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
@@ -1648,6 +1683,9 @@ async fn main() -> Result<()> {
                     service_sync_interval,
                     service_state_path,
                     load_balancer_reachability_state_path,
+                    egress_bgp_config_path,
+                    egress_bgp_endpoint,
+                    egress_bgp_state_path,
                     node_name,
                     agent_token_path,
                     flow_export_interval,
@@ -6629,6 +6667,11 @@ async fn run_dataplane(
     let service_maps = take_service_maps(&mut ebpf)?;
     let egress_maps = take_egress_maps(&mut ebpf)?;
     let controller_management_port = controller_url.as_deref().map(controller_port).transpose()?;
+    let egress_bgp = initialize_egress_bgp(
+        config.egress_bgp_config_path.as_deref(),
+        &config.egress_bgp_endpoint,
+        &config.egress_bgp_state_path,
+    )?;
     let (mut identities, mut policies, mut services, mut egress) = new_synchronizers(
         identity_maps,
         policy_maps,
@@ -6644,6 +6687,7 @@ async fn run_dataplane(
         config.load_balancer_reachability_state_path.clone(),
         config.node_name.clone(),
         config.egress_path_provider.clone(),
+        egress_bgp,
     );
     let recovered = recover_persistent_dataplane(
         &mut identities,
@@ -6911,6 +6955,7 @@ fn new_synchronizers(
     load_balancer_state_path: PathBuf,
     node_name: String,
     egress_path_provider: Option<NativeEgressPathProvider>,
+    egress_bgp: Option<EgressBgpSynchronizer>,
 ) -> (
     IdentitySynchronizer,
     PolicySynchronizer,
@@ -7058,6 +7103,7 @@ fn new_synchronizers(
             clock_anchor: None,
             fqdn_observers: BTreeMap::new(),
             path_provider: egress_path_provider,
+            bgp: egress_bgp,
             node_name,
             controller_url,
             client,
@@ -8585,6 +8631,51 @@ fn egress_agent_advertisement() -> EgressAgentAdvertisement {
     }
 }
 
+fn initialize_egress_bgp(
+    config_path: Option<&Path>,
+    endpoint: &str,
+    state_path: &Path,
+) -> Result<Option<EgressBgpSynchronizer>> {
+    let Some(config_path) = config_path else {
+        return Ok(None);
+    };
+    if !config_path.is_absolute() {
+        bail!("egress BGP configuration path must be absolute");
+    }
+    reject_node_block_symlinks(config_path)?;
+    let metadata = fs::metadata(config_path)
+        .with_context(|| format!("inspect egress BGP configuration {}", config_path.display()))?;
+    if !metadata.is_file() || metadata.len() > MAX_DURABLE_STATE_BYTES {
+        bail!("egress BGP configuration must be a regular file no larger than 64 MiB");
+    }
+    let config: EgressBgpConfig = serde_json::from_slice(&fs::read(config_path)?)
+        .context("decode egress BGP configuration")?;
+    let config = verify_egress_bgp_config(config).context("verify egress BGP configuration")?;
+    let applied = match fs::symlink_metadata(state_path) {
+        Ok(_) => {
+            let snapshot: EgressBgpSnapshot = load_secure_json(state_path, "egress BGP")?;
+            let replayed =
+                seal_egress_bgp_snapshot(&config, snapshot.revision, snapshot.routes.clone())
+                    .context("verify durable egress BGP snapshot")?;
+            if replayed != snapshot {
+                bail!("durable egress BGP snapshot digest does not match");
+            }
+            replayed
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            seal_egress_bgp_snapshot(&config, Revision::new(1), Vec::new())
+                .context("initialize empty egress BGP snapshot")?
+        }
+        Err(error) => return Err(error).context("inspect durable egress BGP snapshot"),
+    };
+    Ok(Some(EgressBgpSynchronizer {
+        config,
+        endpoint: endpoint.to_owned(),
+        state_path: state_path.to_path_buf(),
+        applied,
+    }))
+}
+
 async fn synchronize_egress(
     synchronizer: &mut EgressSynchronizer,
     state: &AgentState,
@@ -8704,6 +8795,19 @@ async fn synchronize_egress_gateway_addresses(
     *mutex_lock(&state.native_reachability_node_uid) = Some(node.node_uid.clone());
     mutex_lock(&state.native_reachability_owned_addresses)
         .clone_from(&synchronizer.gateway_owned_addresses);
+    if synchronizer.bgp.is_some() {
+        let plans = fetch_egress_bgp_reachability_plans(
+            controller_url,
+            &synchronizer.client,
+            &synchronizer.agent_token_path,
+        )
+        .await?;
+        let bgp = synchronizer
+            .bgp
+            .as_mut()
+            .context("BGP synchronizer disappeared during reconciliation")?;
+        synchronize_egress_bgp(bgp, &admitted, &plans).await?;
+    }
     synchronizer
         .client
         .current()
@@ -8725,6 +8829,151 @@ async fn synchronize_egress_gateway_addresses(
         released_leases = acknowledgement.released_desired_revisions.len(),
         interface_index = acknowledgement.interface_index,
         "applied lease-fenced gateway address ownership"
+    );
+    Ok(true)
+}
+
+async fn fetch_egress_bgp_reachability_plans(
+    controller_url: &str,
+    client: &ReloadingControllerClient,
+    token_path: &Path,
+) -> Result<Vec<unf_egress::EgressReachabilityPlan>> {
+    let response = authenticated_get(
+        client,
+        format!("{controller_url}/v1/state/egress-bgp-plans"),
+        token_path,
+    )?
+    .send()
+    .await
+    .context("request exact BGP reachability plans")?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(Vec::new());
+    }
+    response
+        .error_for_status()
+        .context("controller rejected BGP reachability-plan request")?
+        .json()
+        .await
+        .context("decode BGP reachability plans")
+}
+
+#[allow(clippy::too_many_lines)]
+async fn synchronize_egress_bgp(
+    synchronizer: &mut EgressBgpSynchronizer,
+    projection: &AdmittedEgressGatewayAddressProjection,
+    plans: &[unf_egress::EgressReachabilityPlan],
+) -> Result<bool> {
+    let plans = plans
+        .iter()
+        .cloned()
+        .map(verify_egress_reachability_plan)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("verify controller-issued BGP reachability plans")?;
+    let plan_by_owner = plans
+        .iter()
+        .map(|plan| (plan.owner.clone(), plan))
+        .collect::<BTreeMap<_, _>>();
+    let mut routes = Vec::new();
+    for lease in &projection.projection().leases {
+        if lease.provider.name != "bgp" {
+            continue;
+        }
+        let plan = plan_by_owner
+            .get(&lease.owner)
+            .context("BGP lease has no exact controller-issued reachability plan")?;
+        if plan.desired_revision != lease.revision
+            || plan.allocation_revision != lease.allocation_revision
+            || plan.lease_epoch != lease.lease_epoch
+            || plan.provider != lease.provider
+        {
+            bail!("BGP reachability plan does not match the local gateway lease");
+        }
+        if lease.action == unf_egress::EgressGatewayAction::Withdraw {
+            continue;
+        }
+        let recipient = &projection.projection().recipient;
+        if !lease
+            .nodes
+            .iter()
+            .any(|node| node.name == recipient.node_name && node.uid == recipient.node_uid)
+        {
+            bail!("BGP lease does not contain the authenticated local gateway");
+        }
+        for address in &lease.addresses {
+            routes.push(seal_egress_bgp_route(
+                &synchronizer.config,
+                lease.owner.clone(),
+                lease.provider.clone(),
+                lease.revision,
+                lease.lease_epoch,
+                *address,
+                recipient.node_name.clone(),
+                recipient.node_uid.clone(),
+                plan.digest,
+            )?);
+        }
+    }
+    let revision = projection
+        .projection()
+        .revision
+        .get()
+        .checked_mul(2)
+        .and_then(|revision| revision.checked_add(1))
+        .map(Revision::new)
+        .context("BGP advertisement snapshot revision overflow")?;
+    let desired = seal_egress_bgp_snapshot(&synchronizer.config, revision, routes)?;
+    if desired.revision == synchronizer.applied.revision {
+        if desired == synchronizer.applied {
+            let mut adapter = GoBgpAdapter::connect(&synchronizer.endpoint)
+                .await
+                .context("connect to local GoBGP for durable replay")?;
+            adapter
+                .reconcile_speaker(&synchronizer.config)
+                .await
+                .context("reconcile local GoBGP speaker for durable replay")?;
+            adapter
+                .reconcile_snapshot(&synchronizer.config, &synchronizer.applied)
+                .await
+                .context("replay and read back durable BGP snapshot")?;
+            return Ok(false);
+        }
+        bail!("same BGP advertisement revision mutated");
+    }
+    if desired.revision < synchronizer.applied.revision {
+        bail!("BGP advertisement revision regressed");
+    }
+    let transaction = prepare_egress_bgp_transaction(
+        &synchronizer.config,
+        synchronizer.applied.clone(),
+        desired,
+    )?;
+    let mut adapter = GoBgpAdapter::connect(&synchronizer.endpoint)
+        .await
+        .context("connect to local GoBGP")?;
+    adapter
+        .reconcile_speaker(&synchronizer.config)
+        .await
+        .context("reconcile local GoBGP speaker")?;
+    let applied = adapter
+        .apply_transaction(&synchronizer.config, &transaction)
+        .await
+        .context("apply and read back BGP route transaction")?;
+    if let Err(error) = persist_secure_json(&synchronizer.state_path, &applied, "egress BGP") {
+        let rollback = adapter
+            .rollback_transaction(&synchronizer.config, &transaction)
+            .await;
+        return match rollback {
+            Ok(()) => Err(error).context("persist verified egress BGP snapshot"),
+            Err(rollback) => Err(anyhow!(
+                "persist verified egress BGP snapshot failed ({error}); scoped GoBGP rollback also failed ({rollback})"
+            )),
+        };
+    }
+    synchronizer.applied = applied;
+    info!(
+        revision = synchronizer.applied.revision.get(),
+        routes = synchronizer.applied.routes.len(),
+        "committed exact Causal Route Capsule BGP snapshot"
     );
     Ok(true)
 }
@@ -15307,6 +15556,73 @@ mod tests {
     use unf_route::{RemoteNodeIntent, RemoteRouteSnapshotNode};
 
     #[test]
+    fn bgp_configuration_initializes_a_verified_empty_durable_snapshot() {
+        use unf_egress::{
+            EGRESS_BGP_ALGORITHM, EGRESS_BGP_SCHEMA_VERSION, EgressBgpAddressFamily,
+            EgressBgpConfigDigest, EgressBgpGracefulRestart, EgressBgpPeer, EgressBgpPrefix,
+            seal_egress_bgp_config,
+        };
+
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("egress-bgp.json");
+        let state_path = directory.path().join("egress-bgp-state.json");
+        let config = seal_egress_bgp_config(EgressBgpConfig {
+            schema_version: EGRESS_BGP_SCHEMA_VERSION,
+            algorithm: EGRESS_BGP_ALGORITHM.to_owned(),
+            revision: Revision::new(1),
+            instance: "fabric-a".to_owned(),
+            local_asn: 64_512,
+            router_id: "192.0.2.10".parse().unwrap(),
+            ipv4_next_hop: Some("198.51.100.10".parse().unwrap()),
+            ipv6_next_hop: Some("2001:db8:100::10".parse().unwrap()),
+            peers: vec![EgressBgpPeer {
+                name: "tor-a".to_owned(),
+                address: "198.51.100.1".parse().unwrap(),
+                remote_asn: 64_513,
+                failure_domain: "rack-a".to_owned(),
+                families: BTreeSet::from([
+                    EgressBgpAddressFamily::Ipv4,
+                    EgressBgpAddressFamily::Ipv6,
+                ]),
+                multihop_ttl: 1,
+                maximum_received_prefixes: 1_024,
+            }],
+            permitted_export_prefixes: vec![EgressBgpPrefix {
+                address: "192.0.2.0".parse().unwrap(),
+                length: 24,
+            }],
+            maximum_changed_prefixes: 16,
+            maximum_total_prefixes: 256,
+            maximum_paths_per_prefix: 4,
+            graceful_restart: EgressBgpGracefulRestart {
+                restart_seconds: 30,
+                stale_path_seconds: 90,
+            },
+            digest: EgressBgpConfigDigest([0; 32]),
+        })
+        .unwrap();
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let synchronizer =
+            initialize_egress_bgp(Some(&config_path), "http://127.0.0.1:50051", &state_path)
+                .unwrap()
+                .unwrap();
+        assert_eq!(synchronizer.config, config);
+        assert_eq!(synchronizer.applied.revision, Revision::new(1));
+        assert!(synchronizer.applied.routes.is_empty());
+
+        let mut tampered = config;
+        tampered.maximum_total_prefixes += 1;
+        fs::write(&config_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(
+            initialize_egress_bgp(Some(&config_path), "http://127.0.0.1:50051", &state_path,)
+                .unwrap_err()
+                .to_string()
+                .contains("verify egress BGP configuration")
+        );
+    }
+
+    #[test]
     fn cni_node_block_arguments_support_manual_or_controller_distribution() {
         let defaults = Args::try_parse_from(["unf-agent"]).expect("default arguments parse");
         assert_eq!(defaults.cni_socket, None);
@@ -17364,6 +17680,7 @@ mod tests {
             clock_anchor: None,
             fqdn_observers: BTreeMap::new(),
             path_provider: None,
+            bgp: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
@@ -17590,6 +17907,7 @@ mod tests {
             clock_anchor: None,
             fqdn_observers: BTreeMap::new(),
             path_provider: None,
+            bgp: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
             client: ReloadingControllerClient::without_custom_trust(
