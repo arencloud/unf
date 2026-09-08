@@ -347,7 +347,11 @@ egress-upgrade-recovery-test: egress-operations-causal-test
 	cargo clippy -p unf-state -p unf-egress -p unf-controller -p unf-agent --all-targets --all-features -- -D warnings
 
 egress-phase8-kind-test: egress-upgrade-recovery-test primary-cni-installer-test cli service-kind-load
-	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) hack/configure-kind-primary-cni.sh
+	@if KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) get nodes -o json | jq -e '(.items | length) == 3 and all(.items[]; .metadata.labels["network.unf.io/primary-cni"] == "enabled")' >/dev/null; then \
+		echo "exact three-Node UNF primary-CNI installation already active"; \
+	else \
+		KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) hack/configure-kind-primary-cni.sh; \
+	fi
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) UNF_INTERNAL_TLS_DIR=$(CURDIR)/.tools/kind-service-internal-tls hack/configure-internal-tls.sh
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) apply -k deploy/kind-service-fabric
 	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) hack/configure-kind-service-bootstrap.sh
