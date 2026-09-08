@@ -687,8 +687,14 @@ gateway, next hop, and DQR plan, preventing a stale advertisement from
 impersonating a reused IP. The live four-speaker dual-stack gate verifies two
 gateway paths at two independent external fabric domains, stale-capsule denial,
 finite DQR authority, partial and complete withdrawal, scoped rollback, durable
-RIB reconstruction, and cleanup under `make egress-bgp-test`; ADR 0151. BFD is
-the next independent provider-correlation slice. See the [BGP provider guide](docs/development/egress-bgp-provider.md)
+RIB reconstruction, and cleanup under `make egress-bgp-test`; ADR 0151. Phase
+8.8e adds bounded native GoBGP BFD and the default Causal Failure Lattice (CFL):
+authenticated digest-sealed liveness is correlated with route/dataplane planes,
+shared dependencies collapse into one incident, and recovery holds plus flap
+budgets prevent optimistic restoration. BFD alone cannot suppress, fence,
+promote, or claim ownership. `make egress-bfd-test` injects a real gateway fault,
+withdraws protected IPv4/IPv6 routes, and preserves the independent path. IPv6
+BFD transport itself remains fail-closed and unqualified; ADR 0152. See the [BGP provider guide](docs/development/egress-bgp-provider.md)
 for the sealed node policy and opt-in agent wiring.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

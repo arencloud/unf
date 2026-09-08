@@ -50,8 +50,8 @@ use unf_egress::{
     AdmittedEgressGatewayAddressProjection, AdmittedEgressGatewayProjection,
     AdmittedEgressProjection, AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT,
     EGRESS_AGENT_TOKEN_AUDIENCE, EGRESS_GATEWAY_ACK_SCHEMA_VERSION, EgressAddressPool,
-    EgressAgentAdvertisement, EgressBehaviorContract, EgressCapability, EgressContractFacts,
-    EgressContractRevisions, EgressControlPlane, EgressControlPlaneCheckpoint,
+    EgressAgentAdvertisement, EgressBehaviorContract, EgressBfdEvidenceReport, EgressCapability,
+    EgressContractFacts, EgressContractRevisions, EgressControlPlane, EgressControlPlaneCheckpoint,
     EgressDesiredCheckpoint, EgressDesiredStore, EgressDistributionError,
     EgressFqdnObservationBatch, EgressFqdnObservationCheckpoint, EgressFqdnObservationLedger,
     EgressGatewayAcknowledgement, EgressGatewayAddressAcknowledgement,
@@ -64,6 +64,7 @@ use unf_egress::{
     EgressReachabilityEvidenceStore, EgressReachabilityStoreCheckpoint, EgressSafeReleaseAuthority,
     EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
     EgressSourceRetirementChallenges, compile_egress_reachability_acknowledgement,
+    verify_egress_bfd_evidence_report,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -337,6 +338,7 @@ struct ControllerState {
     egress_fqdn_observations: Mutex<EgressFqdnObservationLedger>,
     egress_internet_classifications: Mutex<EgressInternetClassificationStore>,
     egress_reachability: Mutex<EgressReachabilityEvidenceStore>,
+    egress_bfd_evidence: RwLock<BTreeMap<String, EgressBfdEvidenceReport>>,
     egress_reachability_plan_api: Option<Api<ApiEgressReachabilityPlan>>,
     egress_reachability_pending: AtomicBool,
     egress_fqdn_materialization: Mutex<Option<EgressFqdnMaterialization>>,
@@ -1271,6 +1273,7 @@ async fn spawn_internal_api(
             "/v1/state/egress-bgp-plans",
             get(egress_bgp_reachability_plans),
         )
+        .route("/v1/state/egress-bfd", post(ingest_egress_bfd_evidence))
         .route(
             "/v1/state/egress-gateway-address-ack",
             post(acknowledge_egress_gateway_address_application),
@@ -1575,6 +1578,7 @@ fn new_state_with_client_and_selector(
         egress_fqdn_observations: Mutex::new(EgressFqdnObservationLedger::default()),
         egress_internet_classifications: Mutex::new(EgressInternetClassificationStore::default()),
         egress_reachability: Mutex::new(EgressReachabilityEvidenceStore::default()),
+        egress_bfd_evidence: RwLock::new(BTreeMap::new()),
         egress_reachability_plan_api,
         egress_reachability_pending: AtomicBool::new(false),
         egress_fqdn_materialization: Mutex::new(None),
@@ -8290,6 +8294,64 @@ async fn egress_bgp_reachability_plans(
     }
 }
 
+async fn ingest_egress_bfd_evidence(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(report): Json<EgressBfdEvidenceReport>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    ingest_egress_bfd_evidence_for(&state, &agent, report, unix_time_seconds())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn ingest_egress_bfd_evidence_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    report: EgressBfdEvidenceReport,
+    now_unix_seconds: u64,
+) -> Result<bool, ApiError> {
+    if !agent_application_is_current(state, agent) {
+        return Err(ApiError::forbidden(
+            "BFD evidence does not match the current authenticated agent Pod",
+        ));
+    }
+    let principal = egress_principal_for(state, agent)?;
+    let report = verify_egress_bfd_evidence_report(report)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if report.snapshot.node_name != principal.node_name
+        || report.snapshot.node_uid != principal.node_uid
+    {
+        return Err(ApiError::forbidden(
+            "BFD evidence does not match the authenticated Node identity",
+        ));
+    }
+    if report.snapshot.observed_at_unix_seconds > now_unix_seconds.saturating_add(30)
+        || now_unix_seconds.saturating_sub(report.snapshot.observed_at_unix_seconds) > 300
+    {
+        return Err(ApiError::bad_request(
+            "BFD evidence is outside the finite admission window",
+        ));
+    }
+    let mut evidence = write_lock(&state.egress_bfd_evidence);
+    if let Some(previous) = evidence.get(&principal.node_name) {
+        let previous_position = (previous.snapshot.source_epoch, previous.snapshot.revision);
+        let current_position = (report.snapshot.source_epoch, report.snapshot.revision);
+        if current_position < previous_position {
+            return Err(ApiError::bad_request("BFD evidence position regressed"));
+        }
+        if current_position == previous_position {
+            if previous == &report {
+                return Ok(false);
+            }
+            return Err(ApiError::bad_request(
+                "BFD evidence mutated at the same source position",
+            ));
+        }
+    }
+    evidence.insert(principal.node_name, report);
+    Ok(true)
+}
+
 fn egress_gateway_address_projection_for(
     state: &ControllerState,
     agent: &AuthenticatedAgent,
@@ -12176,6 +12238,55 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_bfd_evidence_is_node_bound_monotonic_and_idempotent() {
+        let state = new_state(true);
+        let agent = authenticated_egress_agent("worker-a");
+        write_lock(&state.pods).insert(
+            format!("unf-system/{}", agent.pod_name),
+            PodRecord {
+                namespace: "unf-system".to_owned(),
+                name: agent.pod_name.clone(),
+                uid: agent.pod_uid.clone(),
+                node_name: Some("worker-a".to_owned()),
+                host_network: true,
+                endpoint: Endpoint {
+                    identity: IdentityId::new(1),
+                    namespace: "unf-system".to_owned(),
+                    namespace_labels: BTreeMap::new(),
+                    service_account: EGRESS_AGENT_SERVICE_ACCOUNT.to_owned(),
+                    application: Some("unf-agent".to_owned()),
+                    labels: BTreeMap::new(),
+                    named_ports: BTreeMap::new(),
+                },
+                ipv4_addresses: BTreeSet::new(),
+                ipv6_addresses: BTreeSet::new(),
+            },
+        );
+        write_lock(&state.node_port_nodes).insert(
+            "worker-a".to_owned(),
+            NodePortNodeRecord {
+                node_uid: "node-uid-a".to_owned(),
+                revision: Revision::new(1),
+                addresses: Vec::new(),
+            },
+        );
+
+        let first = bfd_evidence_report("node-uid-a", 1, unf_egress::EgressBfdSessionState::Up);
+        assert!(ingest_egress_bfd_evidence_for(&state, &agent, first.clone(), 10_000).unwrap());
+        assert!(!ingest_egress_bfd_evidence_for(&state, &agent, first, 10_000).unwrap());
+
+        let same_position_mutation =
+            bfd_evidence_report("node-uid-a", 1, unf_egress::EgressBfdSessionState::Down);
+        assert!(
+            ingest_egress_bfd_evidence_for(&state, &agent, same_position_mutation, 10_000).is_err()
+        );
+        let next = bfd_evidence_report("node-uid-a", 2, unf_egress::EgressBfdSessionState::Down);
+        assert!(ingest_egress_bfd_evidence_for(&state, &agent, next, 10_000).unwrap());
+        let foreign = bfd_evidence_report("node-uid-b", 3, unf_egress::EgressBfdSessionState::Down);
+        assert!(ingest_egress_bfd_evidence_for(&state, &agent, foreign, 10_000).is_err());
+    }
+
+    #[test]
     fn bgp_reachability_plan_names_are_bounded_and_recreation_safe() {
         let owner = EgressIntentOwner {
             scope: unf_egress::EgressIntentScope::Cluster,
@@ -12213,6 +12324,83 @@ mod tests {
             pod_uid: format!("unf-agent-{node}-uid"),
             audience: EGRESS_AGENT_TOKEN_AUDIENCE.to_owned(),
         }
+    }
+
+    fn bfd_evidence_report(
+        node_uid: &str,
+        revision: u64,
+        state: unf_egress::EgressBfdSessionState,
+    ) -> EgressBfdEvidenceReport {
+        let config = unf_egress::seal_egress_bgp_config(unf_egress::EgressBgpConfig {
+            schema_version: unf_egress::EGRESS_BGP_SCHEMA_VERSION,
+            algorithm: unf_egress::EGRESS_BGP_ALGORITHM.to_owned(),
+            revision: Revision::new(1),
+            instance: "edge".to_owned(),
+            local_asn: 64_512,
+            router_id: "192.0.2.10".parse().unwrap(),
+            ipv4_next_hop: Some("192.0.2.10".parse().unwrap()),
+            ipv6_next_hop: None,
+            peers: vec![unf_egress::EgressBgpPeer {
+                name: "fabric-a".to_owned(),
+                address: "192.0.2.20".parse().unwrap(),
+                remote_asn: 64_513,
+                failure_domain: "rack-a".to_owned(),
+                families: BTreeSet::from([unf_egress::EgressBgpAddressFamily::Ipv4]),
+                multihop_ttl: 1,
+                maximum_received_prefixes: 100,
+                bfd: Some(unf_egress::EgressBgpBfdConfig {
+                    port: unf_egress::EGRESS_BFD_SINGLE_HOP_PORT,
+                    desired_minimum_tx_interval_microseconds: 300_000,
+                    required_minimum_receive_interval_microseconds: 300_000,
+                    detection_multiplier: 3,
+                }),
+            }],
+            permitted_export_prefixes: vec![unf_egress::EgressBgpPrefix {
+                address: "192.0.2.0".parse().unwrap(),
+                length: 24,
+            }],
+            maximum_changed_prefixes: 10,
+            maximum_total_prefixes: 100,
+            maximum_paths_per_prefix: 1,
+            graceful_restart: unf_egress::EgressBgpGracefulRestart {
+                restart_seconds: 30,
+                stale_path_seconds: 90,
+            },
+            digest: unf_egress::EgressBgpConfigDigest([0; 32]),
+        })
+        .unwrap();
+        let snapshot = unf_egress::seal_egress_bfd_snapshot(
+            &config,
+            unf_egress::EgressBfdSnapshot {
+                schema_version: unf_egress::EGRESS_BFD_EVIDENCE_SCHEMA_VERSION,
+                algorithm: unf_egress::EGRESS_BFD_EVIDENCE_ALGORITHM.to_owned(),
+                config_digest: config.digest,
+                node_name: "worker-a".to_owned(),
+                node_uid: node_uid.to_owned(),
+                source_epoch: 7,
+                revision: Revision::new(revision),
+                observed_at_unix_seconds: 10_000,
+                sessions: vec![unf_egress::EgressBfdSessionEvidence {
+                    peer_name: "fabric-a".to_owned(),
+                    peer_address: "192.0.2.20".parse().unwrap(),
+                    failure_domain: "rack-a".to_owned(),
+                    state,
+                    remote_state: state,
+                    local_diagnostic: unf_egress::EgressBfdDiagnostic::None,
+                    remote_diagnostic: unf_egress::EgressBfdDiagnostic::None,
+                    failure_transitions: u64::from(
+                        state == unf_egress::EgressBfdSessionState::Down,
+                    ),
+                    local_discriminator: 11,
+                    remote_discriminator: 12,
+                    transmitted_packets: 20,
+                    received_packets: 19,
+                }],
+                digest: unf_egress::EgressBfdSnapshotDigest([0; 32]),
+            },
+        )
+        .unwrap();
+        EgressBfdEvidenceReport { config, snapshot }
     }
 
     fn egress_fqdn_batch(

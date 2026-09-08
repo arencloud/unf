@@ -45,7 +45,13 @@ Start from a document like this, with an all-zero placeholder digest:
       "failureDomain": "rack-a",
       "families": ["Ipv4", "Ipv6"],
       "multihopTtl": 1,
-      "maximumReceivedPrefixes": 1024
+      "maximumReceivedPrefixes": 1024,
+      "bfd": {
+        "port": 3784,
+        "desiredMinimumTxIntervalMicroseconds": 300000,
+        "requiredMinimumReceiveIntervalMicroseconds": 300000,
+        "detectionMultiplier": 3
+      }
     },
     {
       "name": "tor-b",
@@ -54,7 +60,13 @@ Start from a document like this, with an all-zero placeholder digest:
       "failureDomain": "rack-b",
       "families": ["Ipv4", "Ipv6"],
       "multihopTtl": 1,
-      "maximumReceivedPrefixes": 1024
+      "maximumReceivedPrefixes": 1024,
+      "bfd": {
+        "port": 3784,
+        "desiredMinimumTxIntervalMicroseconds": 300000,
+        "requiredMinimumReceiveIntervalMicroseconds": 300000,
+        "detectionMultiplier": 3
+      }
     }
   ],
   "permittedExportPrefixes": [
@@ -98,8 +110,22 @@ Single-hop sessions use GTSM, peer drift is rejected, and UNF owns only peers
 whose description starts with `unf/egress-bgp/`. The current schema does not
 transport TCP-AO or TCP-MD5 secrets. Use a protected routing segment and do not
 claim cryptographically authenticated BGP until a dedicated secret-delivery
-milestone lands. BFD, EVPN, scale qualification, full Kind platform
+milestone lands.
+
+BFD is optional per peer because unilateral activation breaks a valid session.
+When configured it is restricted to IPv4 single-hop UDP 3784, bounded 100 ms–10 s
+intervals, and multiplier 2–50. Use conservative production timers. GoBGP's
+current native implementation has no BFD authentication, echo, or demand mode.
+The agent publishes exact digest-sealed state through its authenticated Node-UID
+channel; the default Causal Failure Lattice treats it only as fast liveness,
+collapses shared causal dependencies, and requires an independent route or
+dataplane plane before recommending path suppression. It never authorizes
+ownership or promotion. One BFD transport can protect both negotiated route
+families. IPv6 BFD transport is rejected because its GoBGP v4.9 live fixture did
+not establish; EVPN, scale qualification, full Kind platform
 qualification, and OpenShift qualification remain separate tracked work.
 
 The route transaction, Causal Route Capsule, evidence, rollback, and recovery
 rationale is in [ADR 0151](../adr/0151-causal-constrained-bgp-convergence.md).
+The BFD authority boundary and Causal Failure Lattice are in
+[ADR 0152](../adr/0152-causal-failure-lattice.md).

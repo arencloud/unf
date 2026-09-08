@@ -3,21 +3,26 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::net::Ipv4Addr;
 
 use tokio::time::{Duration, Instant, sleep};
 use unf_common::Revision;
 use unf_egress::{
-    EGRESS_BGP_ALGORITHM, EGRESS_BGP_SCHEMA_VERSION,
+    EGRESS_BFD_SINGLE_HOP_PORT, EGRESS_BGP_ALGORITHM, EGRESS_BGP_SCHEMA_VERSION,
     EGRESS_REACHABILITY_ALGORITHM_DIVERSITY_QUORUM_V1, EGRESS_REACHABILITY_SCHEMA_VERSION,
-    EgressBgpAddressFamily, EgressBgpConfig, EgressBgpConfigDigest, EgressBgpGracefulRestart,
-    EgressBgpLargeCommunity, EgressBgpPeer, EgressBgpPrefix, EgressBgpRoute, EgressCapability,
-    EgressGatewayAction, EgressGatewayDesired, EgressIntentOwner, EgressIntentScope, EgressNode,
-    EgressProviderRef, EgressReachabilityObservation, EgressReachabilityObservationDigest,
-    EgressReachabilityObserver, EgressReachabilityPath, EgressReachabilityRouteObservation,
-    EgressReachabilityVerdict, assess_egress_reachability, derive_egress_bgp_reachability_plan,
-    prepare_egress_bgp_transaction, seal_egress_bgp_config, seal_egress_bgp_route,
-    seal_egress_bgp_snapshot, seal_egress_reachability_observation,
+    EgressBfdSessionEvidence, EgressBfdSessionState, EgressBgpAddressFamily, EgressBgpBfdConfig,
+    EgressBgpConfig, EgressBgpConfigDigest, EgressBgpGracefulRestart, EgressBgpLargeCommunity,
+    EgressBgpPeer, EgressBgpPrefix, EgressBgpRoute, EgressCapability, EgressFailureCorrelationPlan,
+    EgressFailureObserver, EgressFailurePlane, EgressFailureRecommendation, EgressFailureSignal,
+    EgressFailureSignalDigest, EgressFailureSignalState, EgressGatewayAction, EgressGatewayDesired,
+    EgressIntentOwner, EgressIntentScope, EgressNode, EgressProviderRef,
+    EgressReachabilityObservation, EgressReachabilityObservationDigest, EgressReachabilityObserver,
+    EgressReachabilityPath, EgressReachabilityRouteObservation, EgressReachabilityVerdict,
+    assess_egress_failures, assess_egress_reachability, derive_egress_bgp_reachability_plan,
+    derive_egress_failure_correlation_plan, prepare_egress_bgp_transaction, seal_egress_bgp_config,
+    seal_egress_bgp_route, seal_egress_bgp_snapshot, seal_egress_failure_signal,
+    seal_egress_reachability_observation,
 };
 use unf_gobgp::GoBgpAdapter;
 
@@ -160,6 +165,109 @@ async fn main() -> Result<(), DynError> {
     }
     eprintln!("independent evidence compiled to finite DQR authority");
 
+    if let Ok(marker) = env::var("UNF_BGP_FAILURE_MARKER") {
+        fs::write(&marker, b"healthy\n")?;
+        eprintln!("healthy BFD/RIB state published; waiting for gateway-a failure");
+        wait_for_visibility(
+            &mut fabric_a,
+            &mut fabric_b,
+            routes_a.iter().collect::<Vec<_>>().as_slice(),
+            false,
+        )
+        .await?;
+        wait_for_visibility(
+            &mut fabric_a,
+            &mut fabric_b,
+            routes_b.iter().collect::<Vec<_>>().as_slice(),
+            true,
+        )
+        .await?;
+        let now = 2_000;
+        let (failed_a, failed_b) = wait_for_bfd_down(
+            &mut fabric_a,
+            &mut fabric_b,
+            &fabric_a_config,
+            &fabric_b_config,
+            "gateway-a",
+            now,
+        )
+        .await?;
+        eprintln!(
+            "post-failure BFD readback: fabric-a={:?} fabric-b={:?}",
+            failed_a.state, failed_b.state
+        );
+        if failed_a.state != EgressBfdSessionState::Down
+            || failed_b.state != EgressBfdSessionState::Down
+        {
+            return Err("both independent fabrics did not observe BFD Down".into());
+        }
+        let correlation = derive_egress_failure_correlation_plan(&plan, 30, 5, 8)?;
+        let path_a = plan
+            .expected_paths
+            .iter()
+            .find(|path| path.gateway_uid == "gateway-a-uid")
+            .ok_or("DQR plan has no gateway-a path")?;
+        let dependency = "gateway/gateway-a-uid";
+        let failure_signals = vec![
+            failure_signal(
+                &correlation,
+                path_a,
+                EgressFailurePlane::FastLiveness,
+                "fabric-a-bfd",
+                "rack-a",
+                dependency,
+                EgressFailureSignalState::Down,
+                failed_a.failure_transitions,
+                now,
+            )?,
+            failure_signal(
+                &correlation,
+                path_a,
+                EgressFailurePlane::FastLiveness,
+                "fabric-b-bfd",
+                "rack-b",
+                dependency,
+                EgressFailureSignalState::Down,
+                failed_b.failure_transitions,
+                now,
+            )?,
+            failure_signal(
+                &correlation,
+                path_a,
+                EgressFailurePlane::RouteControl,
+                "external-rib",
+                "dual-fabric-rib",
+                dependency,
+                EgressFailureSignalState::Down,
+                1,
+                now,
+            )?,
+        ];
+        let correlated = assess_egress_failures(correlation, failure_signals, now)?;
+        if correlated.recommendation != EgressFailureRecommendation::SuppressPaths
+            || correlated.suppressed_paths != [path_a.clone()]
+            || correlated.incidents.len() != 1
+        {
+            return Err("CFL did not isolate exactly one causally correlated failed path".into());
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "schemaVersion": 1,
+                "result": "verified",
+                "bfdTransport": "IPv4",
+                "protectedRouteFamilies": ["IPv4", "IPv6"],
+                "failedGateway": "gateway-a-uid",
+                "survivingGateway": "gateway-b-uid",
+                "causalIncidents": correlated.incidents.len(),
+                "recommendation": correlated.recommendation,
+                "promotionAuthority": false,
+                "assessmentDigest": correlated.digest.0,
+            })
+        );
+        return Ok(());
+    }
+
     let empty_a = seal_egress_bgp_snapshot(&gateway_a_config, Revision::new(3), Vec::new())?;
     let rollback_a = prepare_egress_bgp_transaction(&gateway_a_config, snapshot_a, empty_a)?;
     gateway_a
@@ -292,7 +400,50 @@ fn peer(name: &str, address: &str, remote_asn: u32, failure_domain: &str) -> Egr
         families: BTreeSet::from([EgressBgpAddressFamily::Ipv4, EgressBgpAddressFamily::Ipv6]),
         multihop_ttl: 1,
         maximum_received_prefixes: 64,
+        bfd: Some(EgressBgpBfdConfig {
+            port: EGRESS_BFD_SINGLE_HOP_PORT,
+            desired_minimum_tx_interval_microseconds: 300_000,
+            required_minimum_receive_interval_microseconds: 300_000,
+            detection_multiplier: 3,
+        }),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn failure_signal(
+    plan: &EgressFailureCorrelationPlan,
+    path: &EgressReachabilityPath,
+    plane: EgressFailurePlane,
+    observer: &str,
+    failure_domain: &str,
+    dependency: &str,
+    state: EgressFailureSignalState,
+    transitions: u64,
+    now: u64,
+) -> Result<EgressFailureSignal, DynError> {
+    Ok(seal_egress_failure_signal(
+        plan,
+        EgressFailureSignal {
+            schema_version: unf_egress::EGRESS_FAILURE_CORRELATION_SCHEMA_VERSION,
+            algorithm: unf_egress::EGRESS_FAILURE_CORRELATION_ALGORITHM.to_owned(),
+            plan_digest: plan.digest,
+            path: path.clone(),
+            observer: EgressFailureObserver {
+                name: observer.to_owned(),
+                failure_domain: failure_domain.to_owned(),
+                plane,
+            },
+            dependencies: vec![dependency.to_owned()],
+            source_epoch: 1,
+            revision: Revision::new(1),
+            observed_at_unix_seconds: now,
+            valid_until_unix_seconds: now + 30,
+            stable_since_unix_seconds: now.saturating_sub(1),
+            transitions_in_window: u16::try_from(transitions).unwrap_or(u16::MAX),
+            state,
+            digest: EgressFailureSignalDigest([0; 32]),
+        },
+    )?)
 }
 
 fn speaker_config(
@@ -420,6 +571,62 @@ async fn wait_for_visibility(
             return Err("external BGP RIB did not converge before its deadline".into());
         }
         sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_bfd_down(
+    fabric_a: &mut GoBgpAdapter,
+    fabric_b: &mut GoBgpAdapter,
+    config_a: &EgressBgpConfig,
+    config_b: &EgressBgpConfig,
+    peer_name: &str,
+    observed_at: u64,
+) -> Result<(EgressBfdSessionEvidence, EgressBfdSessionEvidence), DynError> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut revision = 1_u64;
+    loop {
+        let (snapshot_a, snapshot_b) = tokio::try_join!(
+            fabric_a.read_bfd_snapshot(
+                config_a,
+                "fabric-a".to_owned(),
+                "fabric-a-uid".to_owned(),
+                1,
+                Revision::new(revision),
+                observed_at,
+            ),
+            fabric_b.read_bfd_snapshot(
+                config_b,
+                "fabric-b".to_owned(),
+                "fabric-b-uid".to_owned(),
+                1,
+                Revision::new(revision),
+                observed_at,
+            ),
+        )?;
+        let state_a = snapshot_a
+            .sessions
+            .into_iter()
+            .find(|session| session.peer_name == peer_name)
+            .ok_or("fabric-a has no requested BFD evidence")?;
+        let state_b = snapshot_b
+            .sessions
+            .into_iter()
+            .find(|session| session.peer_name == peer_name)
+            .ok_or("fabric-b has no requested BFD evidence")?;
+        if state_a.state == EgressBfdSessionState::Down
+            && state_b.state == EgressBfdSessionState::Down
+        {
+            return Ok((state_a, state_b));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "BFD did not converge Down: fabric-a={:?}, fabric-b={:?}",
+                state_a.state, state_b.state
+            )
+            .into());
+        }
+        revision += 1;
+        sleep(Duration::from_millis(100)).await;
     }
 }
 

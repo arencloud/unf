@@ -66,17 +66,18 @@ use unf_egress::{
     AuthenticatedEgressAgent, EGRESS_AGENT_SERVICE_ACCOUNT, EGRESS_AGENT_TOKEN_AUDIENCE,
     EGRESS_DISTRIBUTION_SCHEMA_VERSION, EGRESS_HA_PROMOTION_SCHEMA_VERSION,
     EGRESS_HOST_STATE_SCHEMA_VERSION, EgressAdmissionGuard, EgressAgentAdvertisement,
-    EgressBgpConfig, EgressBgpSnapshot, EgressCapability, EgressDataplaneClock,
-    EgressDataplaneState, EgressFqdnPattern, EgressGatewayAddressAcknowledgement,
-    EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
-    EgressGatewayDrainEvidence, EgressGatewayHostBank, EgressGatewayProjection,
-    EgressGatewayProjectionLedger, EgressGatewayRetirementChallenges, EgressHaActivationAuthority,
-    EgressHaAgentChallenge, EgressHaAgentChallenges, EgressHaAgentEvidence,
-    EgressHaContinuityCutover, EgressHaDigest, EgressHaFlowTwin, EgressHaFlowTwinOperation,
-    EgressHaFlowTwinStream, EgressHaOldOwnerRevocationEvidence, EgressHaSourceActivationEvidence,
-    EgressIntentOwner, EgressNodeProjectionEnvelope, EgressPathCertificate, EgressPathMode,
-    EgressProjectionLedger, EgressProjectionRecipient, EgressReachabilityPlanDigest,
-    EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
+    EgressBfdEvidenceReport, EgressBgpConfig, EgressBgpSnapshot, EgressCapability,
+    EgressDataplaneClock, EgressDataplaneState, EgressFqdnPattern,
+    EgressGatewayAddressAcknowledgement, EgressGatewayAddressProjection,
+    EgressGatewayApplicationAcknowledgement, EgressGatewayDrainEvidence, EgressGatewayHostBank,
+    EgressGatewayProjection, EgressGatewayProjectionLedger, EgressGatewayRetirementChallenges,
+    EgressHaActivationAuthority, EgressHaAgentChallenge, EgressHaAgentChallenges,
+    EgressHaAgentEvidence, EgressHaContinuityCutover, EgressHaDigest, EgressHaFlowTwin,
+    EgressHaFlowTwinOperation, EgressHaFlowTwinStream, EgressHaOldOwnerRevocationEvidence,
+    EgressHaSourceActivationEvidence, EgressIntentOwner, EgressNodeProjectionEnvelope,
+    EgressPathCertificate, EgressPathMode, EgressProjectionLedger, EgressProjectionRecipient,
+    EgressReachabilityPlanDigest, EgressSourceActivationGrant,
+    EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
     EgressSourceRetirementChallenges, NativeEgressReachabilityChallenge,
     NativeEgressReachabilityNonce, compile_egress_dataplane_at,
     compile_egress_gateway_dataplane_at, decode_native_egress_reachability_hex,
@@ -981,6 +982,8 @@ struct EgressBgpSynchronizer {
     endpoint: String,
     state_path: PathBuf,
     applied: EgressBgpSnapshot,
+    bfd_source_epoch: u64,
+    bfd_revision: Revision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8673,6 +8676,8 @@ fn initialize_egress_bgp(
         endpoint: endpoint.to_owned(),
         state_path: state_path.to_path_buf(),
         applied,
+        bfd_source_epoch: current_unix_time_milliseconds().max(1),
+        bfd_revision: Revision::INITIAL,
     }))
 }
 
@@ -8734,6 +8739,7 @@ async fn synchronize_egress(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn synchronize_egress_gateway_addresses(
     synchronizer: &mut EgressSynchronizer,
     state: &AgentState,
@@ -8807,6 +8813,15 @@ async fn synchronize_egress_gateway_addresses(
             .as_mut()
             .context("BGP synchronizer disappeared during reconciliation")?;
         synchronize_egress_bgp(bgp, &admitted, &plans).await?;
+        publish_egress_bfd_evidence(
+            bgp,
+            controller_url,
+            &synchronizer.client,
+            &synchronizer.agent_token_path,
+            node.node_name.clone(),
+            node.node_uid.clone(),
+        )
+        .await?;
     }
     synchronizer
         .client
@@ -8855,6 +8870,60 @@ async fn fetch_egress_bgp_reachability_plans(
         .json()
         .await
         .context("decode BGP reachability plans")
+}
+
+async fn publish_egress_bfd_evidence(
+    synchronizer: &mut EgressBgpSynchronizer,
+    controller_url: &str,
+    client: &ReloadingControllerClient,
+    token_path: &Path,
+    node_name: String,
+    node_uid: String,
+) -> Result<()> {
+    if synchronizer
+        .config
+        .peers
+        .iter()
+        .all(|peer| peer.bfd.is_none())
+    {
+        return Ok(());
+    }
+    let revision = synchronizer
+        .bfd_revision
+        .get()
+        .checked_add(1)
+        .map(Revision::new)
+        .context("BFD evidence revision overflow")?;
+    let mut adapter = GoBgpAdapter::connect(&synchronizer.endpoint)
+        .await
+        .context("connect to local GoBGP for BFD evidence")?;
+    let snapshot = adapter
+        .read_bfd_snapshot(
+            &synchronizer.config,
+            node_name,
+            node_uid,
+            synchronizer.bfd_source_epoch,
+            revision,
+            current_unix_time_seconds(),
+        )
+        .await
+        .context("read exact BFD evidence")?;
+    let report = EgressBfdEvidenceReport {
+        config: synchronizer.config.clone(),
+        snapshot,
+    };
+    client
+        .current()
+        .post(format!("{controller_url}/v1/state/egress-bfd"))
+        .bearer_auth(read_agent_token(token_path)?)
+        .json(&report)
+        .send()
+        .await
+        .context("publish authenticated BFD evidence")?
+        .error_for_status()
+        .context("controller rejected BFD evidence")?;
+    synchronizer.bfd_revision = revision;
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -15485,6 +15554,14 @@ fn current_unix_time_seconds() -> u64 {
         .as_secs()
 }
 
+fn current_unix_time_milliseconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 async fn ready(State(state): State<Arc<AgentState>>) -> Response {
     if state.ready.load(Ordering::Acquire) {
         (StatusCode::OK, "ready\n").into_response()
@@ -15586,6 +15663,7 @@ mod tests {
                 ]),
                 multihop_ttl: 1,
                 maximum_received_prefixes: 1_024,
+                bfd: None,
             }],
             permitted_export_prefixes: vec![EgressBgpPrefix {
                 address: "192.0.2.0".parse().unwrap(),

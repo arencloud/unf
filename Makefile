@@ -15,7 +15,7 @@
 .PHONY: egress-reachability-contract-test
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
-.PHONY: egress-bgp-test egress-bgp-image
+.PHONY: egress-bgp-test egress-bfd-test egress-bgp-image
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -301,6 +301,15 @@ egress-bgp-test: egress-native-reachability-test egress-bgp-image
 	hack/verify-egress-bgp.sh
 	cargo test -p unf-egress bgp --no-fail-fast
 	cargo test -p unf-controller bgp --no-fail-fast
+	cargo test -p unf-agent bgp --no-fail-fast
+	cargo test -p unf-gobgp --all-targets --all-features --no-fail-fast
+	cargo clippy -p unf-egress -p unf-gobgp -p unf-agent -p unf-controller --all-targets --all-features -- -D warnings
+
+egress-bfd-test: egress-bgp-image
+	hack/verify-egress-bfd.sh
+	cargo test -p unf-egress bfd --no-fail-fast
+	cargo test -p unf-egress failure_correlation --no-fail-fast
+	cargo test -p unf-controller bfd --no-fail-fast
 	cargo test -p unf-agent bgp --no-fail-fast
 	cargo test -p unf-gobgp --all-targets --all-features --no-fail-fast
 	cargo clippy -p unf-egress -p unf-gobgp -p unf-agent -p unf-controller --all-targets --all-features -- -D warnings

@@ -659,7 +659,16 @@ matrix is maintained in the
   missing daemon RIB. A live dual-stack four-speaker gate proves two independent
   gateway paths at two fabric failure domains, stale-capsule rejection, finite
   DQR authority, partial/complete withdrawal, recovery, and cleanup under `make
-  egress-bgp-test`; ADR 0151. BFD remains the independent 8.8e gate.
+  egress-bgp-test`; ADR 0151.
+- Phase 8.8e verifies bounded BFD and dependency-aware failure correlation. The
+  default Causal Failure Lattice binds authenticated Node-UID evidence to the
+  exact DQR path set, transitively collapses shared fault dependencies, requires
+  two distinct evidence planes before exact-path suppression, and uses a
+  recovery hold plus flap budget. All-path loss can request source fencing but
+  the schema cannot authorize ownership or promotion. A live four-speaker gate
+  injects a real gateway failure, withdraws both protected route families, and
+  preserves the independent path under `make egress-bfd-test`. IPv6 BFD
+  transport remains explicitly unqualified and rejected; ADR 0152.
 - Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
   ServiceAccount selectors; canonical destinations and non-overlapping
   dual-stack pools; pool-family/multiple-address intent; strict OpenShift

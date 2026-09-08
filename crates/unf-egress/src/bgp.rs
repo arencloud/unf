@@ -32,6 +32,11 @@ pub const MAX_EGRESS_BGP_PREFIXES: usize = MAX_EGRESS_INTENTS * MAX_EGRESS_ADDRE
 pub const MAX_EGRESS_BGP_PREFIXES_PER_TRANSACTION: usize = 4_096;
 pub const MAX_EGRESS_BGP_GRACEFUL_RESTART_SECONDS: u16 = 300;
 pub const MAX_EGRESS_BGP_STALE_PATH_SECONDS: u16 = 900;
+pub const EGRESS_BFD_SINGLE_HOP_PORT: u16 = 3_784;
+pub const MIN_EGRESS_BFD_INTERVAL_MICROSECONDS: u32 = 100_000;
+pub const MAX_EGRESS_BFD_INTERVAL_MICROSECONDS: u32 = 10_000_000;
+pub const MIN_EGRESS_BFD_DETECTION_MULTIPLIER: u8 = 2;
+pub const MAX_EGRESS_BFD_DETECTION_MULTIPLIER: u8 = 50;
 pub const EGRESS_BGP_REACHABILITY_OBSERVATION_AGE_SECONDS: u64 = 90;
 
 const CONFIG_DIGEST_DOMAIN: &[u8] = b"unf.egress.bgp.config.v1\0";
@@ -143,6 +148,19 @@ pub struct EgressBgpPeer {
     pub families: BTreeSet<EgressBgpAddressFamily>,
     pub multihop_ttl: u8,
     pub maximum_received_prefixes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bfd: Option<EgressBgpBfdConfig>,
+}
+
+/// Bounded single-hop asynchronous BFD policy. Absence is deliberately
+/// disabled because enabling BFD unilaterally would tear down a valid BGP peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressBgpBfdConfig {
+    pub port: u16,
+    pub desired_minimum_tx_interval_microseconds: u32,
+    pub required_minimum_receive_interval_microseconds: u32,
+    pub detection_multiplier: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +375,19 @@ pub fn seal_egress_bgp_config(
             || peer.families.is_empty()
             || peer.multihop_ttl == 0
             || peer.maximum_received_prefixes == 0
+            || peer.bfd.as_ref().is_some_and(|bfd| {
+                !peer.address.is_ipv4()
+                    || peer.multihop_ttl != 1
+                    || bfd.port != EGRESS_BFD_SINGLE_HOP_PORT
+                    || !(MIN_EGRESS_BFD_INTERVAL_MICROSECONDS
+                        ..=MAX_EGRESS_BFD_INTERVAL_MICROSECONDS)
+                        .contains(&bfd.desired_minimum_tx_interval_microseconds)
+                    || !(MIN_EGRESS_BFD_INTERVAL_MICROSECONDS
+                        ..=MAX_EGRESS_BFD_INTERVAL_MICROSECONDS)
+                        .contains(&bfd.required_minimum_receive_interval_microseconds)
+                    || !(MIN_EGRESS_BFD_DETECTION_MULTIPLIER..=MAX_EGRESS_BFD_DETECTION_MULTIPLIER)
+                        .contains(&bfd.detection_multiplier)
+            })
     }) || config.permitted_export_prefixes.iter().any(|prefix| {
         !prefix.is_canonical() || prefix.length == 0 || invalid_unicast(prefix.address)
     }) {
@@ -807,6 +838,7 @@ mod tests {
                 families: BTreeSet::from([EgressBgpAddressFamily::Ipv4]),
                 multihop_ttl: 1,
                 maximum_received_prefixes: 1_024,
+                bfd: None,
             }],
             permitted_export_prefixes: vec![
                 EgressBgpPrefix {
@@ -905,6 +937,54 @@ mod tests {
         assert_eq!(
             verify_egress_bgp_config(tampered).unwrap_err(),
             EgressBgpError::ConfigDigestMismatch
+        );
+    }
+
+    #[test]
+    fn bfd_is_explicit_bounded_and_single_hop_only() {
+        let mut valid = config(8);
+        valid.peers[0].bfd = Some(EgressBgpBfdConfig {
+            port: EGRESS_BFD_SINGLE_HOP_PORT,
+            desired_minimum_tx_interval_microseconds: 300_000,
+            required_minimum_receive_interval_microseconds: 300_000,
+            detection_multiplier: 3,
+        });
+        valid.digest = EgressBgpConfigDigest([0; 32]);
+        let valid = seal_egress_bgp_config(valid).unwrap();
+        assert!(verify_egress_bgp_config(valid.clone()).is_ok());
+
+        let mut multihop = valid.clone();
+        multihop.peers[0].multihop_ttl = 2;
+        multihop.digest = EgressBgpConfigDigest([0; 32]);
+        assert_eq!(
+            seal_egress_bgp_config(multihop),
+            Err(EgressBgpError::InvalidConfig)
+        );
+
+        let mut too_fast = valid;
+        too_fast.peers[0]
+            .bfd
+            .as_mut()
+            .unwrap()
+            .desired_minimum_tx_interval_microseconds = MIN_EGRESS_BFD_INTERVAL_MICROSECONDS - 1;
+        too_fast.digest = EgressBgpConfigDigest([0; 32]);
+        assert_eq!(
+            seal_egress_bgp_config(too_fast),
+            Err(EgressBgpError::InvalidConfig)
+        );
+
+        let mut ipv6_transport = config(8);
+        ipv6_transport.peers[0].address = "2001:db8::1".parse().unwrap();
+        ipv6_transport.peers[0].bfd = Some(EgressBgpBfdConfig {
+            port: EGRESS_BFD_SINGLE_HOP_PORT,
+            desired_minimum_tx_interval_microseconds: 300_000,
+            required_minimum_receive_interval_microseconds: 300_000,
+            detection_multiplier: 3,
+        });
+        ipv6_transport.digest = EgressBgpConfigDigest([0; 32]);
+        assert_eq!(
+            seal_egress_bgp_config(ipv6_transport),
+            Err(EgressBgpError::InvalidConfig)
         );
     }
 

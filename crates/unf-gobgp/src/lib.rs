@@ -8,11 +8,15 @@ use thiserror::Error;
 use tokio::time::{Duration, Instant, sleep};
 use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
+use unf_common::Revision;
 use unf_egress::{
-    EgressBgpAddressFamily, EgressBgpConfig, EgressBgpError, EgressBgpLargeCommunity,
-    EgressBgpRoute, EgressBgpRouteReadback, EgressBgpSnapshot, EgressBgpTransaction,
-    prepare_egress_bgp_transaction, rollback_snapshot, seal_egress_bgp_snapshot,
-    verify_egress_bgp_config, verify_egress_bgp_readback,
+    EGRESS_BFD_EVIDENCE_ALGORITHM, EGRESS_BFD_EVIDENCE_SCHEMA_VERSION, EgressBfdDiagnostic,
+    EgressBfdEvidenceError, EgressBfdSessionEvidence, EgressBfdSessionState, EgressBfdSnapshot,
+    EgressBfdSnapshotDigest, EgressBgpAddressFamily, EgressBgpConfig, EgressBgpError,
+    EgressBgpLargeCommunity, EgressBgpRoute, EgressBgpRouteReadback, EgressBgpSnapshot,
+    EgressBgpTransaction, prepare_egress_bgp_transaction, rollback_snapshot,
+    seal_egress_bfd_snapshot, seal_egress_bgp_snapshot, verify_egress_bgp_config,
+    verify_egress_bgp_readback,
 };
 
 #[allow(clippy::all, clippy::pedantic)]
@@ -40,6 +44,8 @@ pub enum GoBgpAdapterError {
     PeersNotEstablished,
     #[error(transparent)]
     Contract(#[from] EgressBgpError),
+    #[error(transparent)]
+    BfdEvidence(#[from] EgressBfdEvidenceError),
 }
 
 /// Typed adapter around an independently versioned `GoBGP` daemon. It owns only
@@ -103,6 +109,94 @@ impl GoBgpAdapter {
         }
         self.reconcile_peers(&config).await?;
         self.wait_for_peers(&config, Duration::from_secs(60)).await
+    }
+
+    /// Reads a complete digest-sealed BFD snapshot for every BFD-enabled peer.
+    /// The record is liveness evidence only and carries no failover authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing peers, absent/malformed BFD state, or configuration
+    /// drift instead of silently treating incomplete state as healthy.
+    pub async fn read_bfd_snapshot(
+        &mut self,
+        config: &EgressBgpConfig,
+        node_name: String,
+        node_uid: String,
+        source_epoch: u64,
+        revision: Revision,
+        observed_at_unix_seconds: u64,
+    ) -> Result<EgressBfdSnapshot, GoBgpAdapterError> {
+        let config = verify_egress_bgp_config(config.clone())?;
+        let mut stream = self
+            .client
+            .list_peer(api::ListPeerRequest {
+                address: String::new(),
+                enable_advertised: false,
+            })
+            .await?
+            .into_inner();
+        let mut current = BTreeMap::new();
+        while let Some(response) = stream.try_next().await? {
+            let peer = response.peer.ok_or(GoBgpAdapterError::MalformedReadback)?;
+            let address = peer
+                .conf
+                .as_ref()
+                .map(|conf| conf.neighbor_address.clone())
+                .ok_or(GoBgpAdapterError::MalformedReadback)?;
+            current.insert(address, peer);
+        }
+        let sessions = config
+            .peers
+            .iter()
+            .filter(|peer| peer.bfd.is_some())
+            .map(|expected| {
+                let peer = current
+                    .get(&expected.address.to_string())
+                    .ok_or(GoBgpAdapterError::MalformedReadback)?;
+                if !bfd_peer_matches(peer, expected, &config) {
+                    return Err(GoBgpAdapterError::StateConflict);
+                }
+                let state = peer
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.bfd_state.as_ref())
+                    .ok_or(GoBgpAdapterError::MalformedReadback)?;
+                let counters = state
+                    .bfd_async
+                    .as_ref()
+                    .ok_or(GoBgpAdapterError::MalformedReadback)?;
+                Ok(EgressBfdSessionEvidence {
+                    peer_name: expected.name.clone(),
+                    peer_address: expected.address,
+                    failure_domain: expected.failure_domain.clone(),
+                    state: bfd_session_state(state.session_state)?,
+                    remote_state: bfd_session_state(state.remote_session_state)?,
+                    local_diagnostic: bfd_diagnostic(state.local_diagnostic_code)?,
+                    remote_diagnostic: bfd_diagnostic(state.remote_diagnostic_code)?,
+                    failure_transitions: state.failure_transitions,
+                    local_discriminator: state.local_discriminator,
+                    remote_discriminator: state.remote_discriminator,
+                    transmitted_packets: counters.transmitted_packets,
+                    received_packets: counters.received_packets,
+                })
+            })
+            .collect::<Result<Vec<_>, GoBgpAdapterError>>()?;
+        Ok(seal_egress_bfd_snapshot(
+            &config,
+            EgressBfdSnapshot {
+                schema_version: EGRESS_BFD_EVIDENCE_SCHEMA_VERSION,
+                algorithm: EGRESS_BFD_EVIDENCE_ALGORITHM.to_owned(),
+                config_digest: config.digest,
+                node_name,
+                node_uid,
+                source_epoch,
+                revision,
+                observed_at_unix_seconds,
+                sessions,
+                digest: EgressBfdSnapshotDigest([0; 32]),
+            },
+        )?)
     }
 
     async fn start_bgp(&mut self, config: &EgressBgpConfig) -> Result<(), GoBgpAdapterError> {
@@ -316,9 +410,20 @@ impl GoBgpAdapter {
                     .as_ref()
                     .map(|conf| conf.neighbor_address.clone())
                     .ok_or(GoBgpAdapterError::MalformedReadback)?;
-                if peer.state.as_ref().is_some_and(|state| {
+                let expected = config
+                    .peers
+                    .iter()
+                    .find(|expected| expected.address.to_string() == address);
+                let ready = peer.state.as_ref().is_some_and(|state| {
                     state.session_state == api::peer_state::SessionState::Established as i32
-                }) {
+                        && expected.is_some_and(|expected| {
+                            expected.bfd.is_none()
+                                || state.bfd_state.as_ref().is_some_and(|bfd| {
+                                    bfd.session_state == api::BfdSessionState::Up as i32
+                                })
+                        })
+                });
+                if ready {
                     established.insert(address);
                 }
             }
@@ -668,7 +773,13 @@ fn api_peer(peer: &unf_egress::EgressBgpPeer, config: &EgressBgpConfig) -> api::
             enabled: peer.multihop_ttl == 1,
             ttl_min: 255,
         }),
-        bfd: None,
+        bfd: peer.bfd.map(|bfd| api::BfdPeerConfig {
+            enabled: true,
+            port: u32::from(bfd.port),
+            desired_minimum_tx_interval: bfd.desired_minimum_tx_interval_microseconds,
+            required_minimum_receive: bfd.required_minimum_receive_interval_microseconds,
+            detection_multiplier: u32::from(bfd.detection_multiplier),
+        }),
     }
 }
 
@@ -693,6 +804,7 @@ fn peer_matches(
             .as_ref()
             .is_some_and(|ttl| ttl.enabled == (expected.multihop_ttl == 1) && ttl.ttl_min == 255)
         && graceful_restart_matches(actual.graceful_restart.as_ref(), config)
+        && bfd_config_matches(actual.bfd.as_ref(), expected.bfd.as_ref())
         && actual.afi_safis.len() == expected.families.len()
         && expected.families.iter().all(|family| {
             actual
@@ -700,6 +812,74 @@ fn peer_matches(
                 .iter()
                 .any(|afi| afi_safi_matches(afi, *family, expected, config))
         })
+}
+
+fn bfd_config_matches(
+    actual: Option<&api::BfdPeerConfig>,
+    expected: Option<&unf_egress::EgressBgpBfdConfig>,
+) -> bool {
+    match (actual, expected) {
+        (None, None) => true,
+        (Some(actual), Some(expected)) => {
+            actual.enabled
+                && actual.port == u32::from(expected.port)
+                && actual.desired_minimum_tx_interval
+                    == expected.desired_minimum_tx_interval_microseconds
+                && actual.required_minimum_receive
+                    == expected.required_minimum_receive_interval_microseconds
+                && actual.detection_multiplier == u32::from(expected.detection_multiplier)
+        }
+        _ => false,
+    }
+}
+
+fn bfd_peer_matches(
+    actual: &api::Peer,
+    expected: &unf_egress::EgressBgpPeer,
+    config: &EgressBgpConfig,
+) -> bool {
+    actual.conf.as_ref().is_some_and(|conf| {
+        conf.description == format!("{MANAGED_PEER_DESCRIPTION_PREFIX}{}", expected.name)
+            && conf.local_asn == config.local_asn
+            && conf.neighbor_address == expected.address.to_string()
+            && conf.peer_asn == expected.remote_asn
+    }) && bfd_config_matches(actual.bfd.as_ref(), expected.bfd.as_ref())
+}
+
+fn bfd_session_state(value: i32) -> Result<EgressBfdSessionState, GoBgpAdapterError> {
+    match api::BfdSessionState::try_from(value).map_err(|_| GoBgpAdapterError::MalformedReadback)? {
+        api::BfdSessionState::Unspecified => Ok(EgressBfdSessionState::Unknown),
+        api::BfdSessionState::Up => Ok(EgressBfdSessionState::Up),
+        api::BfdSessionState::Down => Ok(EgressBfdSessionState::Down),
+        api::BfdSessionState::AdminDown => Ok(EgressBfdSessionState::AdminDown),
+        api::BfdSessionState::Init => Ok(EgressBfdSessionState::Init),
+    }
+}
+
+fn bfd_diagnostic(value: i32) -> Result<EgressBfdDiagnostic, GoBgpAdapterError> {
+    match api::BfdDiagnosticCode::try_from(value)
+        .map_err(|_| GoBgpAdapterError::MalformedReadback)?
+    {
+        api::BfdDiagnosticCode::NoDiagnostic => Ok(EgressBfdDiagnostic::None),
+        api::BfdDiagnosticCode::DetectionTimeout => Ok(EgressBfdDiagnostic::DetectionTimeout),
+        api::BfdDiagnosticCode::EchoFailed => Ok(EgressBfdDiagnostic::EchoFailed),
+        api::BfdDiagnosticCode::NeighborSignaledSessionDown => {
+            Ok(EgressBfdDiagnostic::NeighborSignaledDown)
+        }
+        api::BfdDiagnosticCode::ForwardingPlaneReset => {
+            Ok(EgressBfdDiagnostic::ForwardingPlaneReset)
+        }
+        api::BfdDiagnosticCode::PathDown => Ok(EgressBfdDiagnostic::PathDown),
+        api::BfdDiagnosticCode::ConcatenatedPathDown => {
+            Ok(EgressBfdDiagnostic::ConcatenatedPathDown)
+        }
+        api::BfdDiagnosticCode::AdministrativelyDown => {
+            Ok(EgressBfdDiagnostic::AdministrativelyDown)
+        }
+        api::BfdDiagnosticCode::ReverseConcatenatedPathDown => {
+            Ok(EgressBfdDiagnostic::ReverseConcatenatedPathDown)
+        }
+    }
 }
 
 fn graceful_restart_matches(
@@ -924,10 +1104,11 @@ mod tests {
 
     use unf_common::Revision;
     use unf_egress::{
-        EGRESS_BGP_ALGORITHM, EGRESS_BGP_SCHEMA_VERSION, EgressBgpCausalRouteCapsule,
-        EgressBgpConfigDigest, EgressBgpGracefulRestart, EgressBgpPeer, EgressBgpPrefix,
-        EgressBgpRouteDigest, EgressIntentOwner, EgressIntentScope, EgressProviderRef,
-        EgressReachabilityPlanDigest, seal_egress_bgp_config, seal_egress_bgp_route,
+        EGRESS_BFD_SINGLE_HOP_PORT, EGRESS_BGP_ALGORITHM, EGRESS_BGP_SCHEMA_VERSION,
+        EgressBgpBfdConfig, EgressBgpCausalRouteCapsule, EgressBgpConfigDigest,
+        EgressBgpGracefulRestart, EgressBgpPeer, EgressBgpPrefix, EgressBgpRouteDigest,
+        EgressIntentOwner, EgressIntentScope, EgressProviderRef, EgressReachabilityPlanDigest,
+        seal_egress_bgp_config, seal_egress_bgp_route,
     };
 
     use super::*;
@@ -953,6 +1134,7 @@ mod tests {
                 ]),
                 multihop_ttl: 1,
                 maximum_received_prefixes: 1_024,
+                bfd: None,
             }],
             permitted_export_prefixes: vec![EgressBgpPrefix {
                 address: "192.0.2.0".parse().unwrap(),
@@ -1018,6 +1200,30 @@ mod tests {
             .as_mut()
             .unwrap()
             .max_prefixes += 1;
+        assert!(!peer_matches(&actual, &config.peers[0], &config));
+    }
+
+    #[test]
+    fn typed_peer_preserves_bounded_bfd_and_detects_timer_drift() {
+        let mut raw = config();
+        raw.peers[0].bfd = Some(EgressBgpBfdConfig {
+            port: EGRESS_BFD_SINGLE_HOP_PORT,
+            desired_minimum_tx_interval_microseconds: 300_000,
+            required_minimum_receive_interval_microseconds: 500_000,
+            detection_multiplier: 3,
+        });
+        raw.digest = EgressBgpConfigDigest([0; 32]);
+        let config = seal_egress_bgp_config(raw).unwrap();
+        let mut actual = api_peer(&config.peers[0], &config);
+        let bfd = actual.bfd.as_ref().unwrap();
+        assert!(bfd.enabled);
+        assert_eq!(bfd.port, 3_784);
+        assert_eq!(bfd.desired_minimum_tx_interval, 300_000);
+        assert_eq!(bfd.required_minimum_receive, 500_000);
+        assert_eq!(bfd.detection_multiplier, 3);
+        assert!(peer_matches(&actual, &config.peers[0], &config));
+
+        actual.bfd.as_mut().unwrap().detection_multiplier = 4;
         assert!(!peer_matches(&actual, &config.peers[0], &config));
     }
 }
