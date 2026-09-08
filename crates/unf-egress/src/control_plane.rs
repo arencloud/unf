@@ -13,6 +13,7 @@ use crate::{
     EgressHaActivationAuthority, EgressHaAgentChallenge, EgressHaAgentChallenges,
     EgressHaCandidate, EgressHaContinuityCutover, EgressHaContinuityError, EgressHaError,
     EgressHaFlowTwinAcknowledgement, EgressHaFlowTwinStream, EgressHaGatewayAcquisitionEvidence,
+    EgressHaHistory, EgressHaHistoryCheckpoint, EgressHaHistoryError,
     EgressHaInfrastructureFenceEvidence, EgressHaOldOwnerRevocationEvidence, EgressHaPlan,
     EgressHaPromotionCheckpoint, EgressHaPromotionCoordinator, EgressHaPromotionError,
     EgressHaPromotionManifest, EgressHaPromotionPhase, EgressHaReachabilityHandoffEvidence,
@@ -23,7 +24,7 @@ use crate::{
     compile_egress_ha_plan, normalize_model,
 };
 
-pub const EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION: u16 = 5;
+pub const EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION: u16 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -37,6 +38,8 @@ pub struct EgressControlPlaneCheckpoint {
     pub ha_plans: Vec<EgressHaPlan>,
     #[serde(default)]
     pub ha_promotions: Vec<EgressHaControlPlanePromotion>,
+    #[serde(default)]
+    pub ha_history: EgressHaHistoryCheckpoint,
     pub retirements: Vec<EgressRetirementManifest>,
 }
 
@@ -153,6 +156,8 @@ pub enum EgressControlPlaneError {
     HaPromotion(#[from] EgressHaPromotionError),
     #[error(transparent)]
     HaContinuity(#[from] EgressHaContinuityError),
+    #[error(transparent)]
+    HaHistory(#[from] EgressHaHistoryError),
     #[error("durable HA plan set is missing, duplicated, or cross-domain incoherent")]
     InvalidHaCheckpoint,
     #[error(transparent)]
@@ -173,6 +178,7 @@ pub struct EgressControlPlane {
     gateways: EgressGatewayRegistry,
     ha_plans: BTreeMap<EgressIntentOwner, EgressHaPlan>,
     ha_promotions: BTreeMap<EgressIntentOwner, EgressHaControlPlanePromotion>,
+    ha_history: EgressHaHistory,
     retirements: BTreeMap<EgressIntentOwner, EgressRetirementManifest>,
 }
 
@@ -188,6 +194,7 @@ impl Default for EgressControlPlane {
             gateways: EgressGatewayRegistry::default(),
             ha_plans: BTreeMap::new(),
             ha_promotions: BTreeMap::new(),
+            ha_history: EgressHaHistory::default(),
             retirements: BTreeMap::new(),
         }
     }
@@ -234,7 +241,7 @@ impl EgressControlPlane {
     ) -> Result<Self, EgressControlPlaneError> {
         if !matches!(
             checkpoint.schema_version,
-            2 | 3 | 4 | EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION
+            2 | 3 | 4 | 5 | EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION
         ) || matches!(checkpoint.schema_version, 2 | 3) && !checkpoint.ha_promotions.is_empty()
             || checkpoint.schema_version == 2 && !checkpoint.ha_plans.is_empty()
         {
@@ -242,6 +249,11 @@ impl EgressControlPlane {
                 actual: checkpoint.schema_version,
                 expected: EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION,
             });
+        }
+        if checkpoint.schema_version < EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION
+            && checkpoint.ha_history != EgressHaHistoryCheckpoint::default()
+        {
+            return Err(EgressControlPlaneError::InvalidHaCheckpoint);
         }
         let original_model = checkpoint.desired_model;
         let desired_model =
@@ -326,6 +338,7 @@ impl EgressControlPlane {
                 return Err(EgressControlPlaneError::RetirementManifestConflict(owner));
             }
         }
+        let ha_history = EgressHaHistory::restore(checkpoint.ha_history)?;
         validate_cross_state(&allocator, &gateways)?;
         Ok(Self {
             desired_revision: checkpoint.desired_revision,
@@ -334,6 +347,7 @@ impl EgressControlPlane {
             gateways,
             ha_plans,
             ha_promotions,
+            ha_history,
             retirements,
         })
     }
@@ -1027,6 +1041,7 @@ impl EgressControlPlane {
     pub fn finalize_ha_promotion(
         &mut self,
         owner: &EgressIntentOwner,
+        completed_unix_ms: u64,
     ) -> Result<(), EgressControlPlaneError> {
         let promotion = self
             .ha_promotions
@@ -1047,6 +1062,12 @@ impl EgressControlPlane {
         if expected != actual || promotion.cutovers.len() != expected.len() {
             return Err(EgressHaPromotionError::EvidenceOrder.into());
         }
+        let promotion = promotion.clone();
+        self.ha_history.append_completed(
+            &promotion,
+            self.ha_plans.get(owner),
+            completed_unix_ms,
+        )?;
         self.ha_promotions.remove(owner);
         Ok(())
     }
@@ -1207,6 +1228,7 @@ impl EgressControlPlane {
             gateways: self.gateways.checkpoint(),
             ha_plans: self.ha_plans.values().cloned().collect(),
             ha_promotions: self.ha_promotions.values().cloned().collect(),
+            ha_history: self.ha_history.checkpoint(),
             retirements: self.retirements.values().cloned().collect(),
         }
     }
@@ -1768,8 +1790,45 @@ mod tests {
                 .checkpoint(),
             final_checkpoint
         );
-        control.finalize_ha_promotion(&plan.owner).unwrap();
-        assert!(control.checkpoint().ha_promotions.is_empty());
+        let promotion_for_history = control.ha_promotion(&plan.owner).unwrap().clone();
+        control.finalize_ha_promotion(&plan.owner, 1_000).unwrap();
+        let completed = control.checkpoint();
+        assert!(completed.ha_promotions.is_empty());
+        assert_eq!(completed.ha_history.revision, 1);
+        assert_eq!(completed.ha_history.records.len(), 1);
+        assert_eq!(completed.ha_history.records[0].completed_unix_ms, 1_000);
+        assert_eq!(completed.ha_history.records[0].owner, plan.owner);
+        assert_eq!(completed.ha_history.records[0].source_count, 1);
+        assert_eq!(
+            EgressControlPlane::restore(completed.clone())
+                .unwrap()
+                .checkpoint(),
+            completed
+        );
+        let mut mutated = completed;
+        mutated.ha_history.records[0].acknowledged_flow_twins += 1;
+        assert!(EgressControlPlane::restore(mutated).is_err());
+
+        let mut bounded = EgressHaHistory::default();
+        for completed_unix_ms in 1..=(crate::EGRESS_HA_HISTORY_CAPACITY as u64 + 1) {
+            bounded
+                .append_completed(&promotion_for_history, None, completed_unix_ms)
+                .unwrap();
+        }
+        let bounded = bounded.checkpoint();
+        assert_eq!(bounded.records.len(), crate::EGRESS_HA_HISTORY_CAPACITY);
+        assert_eq!(bounded.evicted_records, 1);
+        assert_ne!(
+            bounded.anchor_digest,
+            crate::EgressHaHistoryDigest::default()
+        );
+        assert_eq!(
+            EgressHaHistory::restore(bounded)
+                .unwrap()
+                .checkpoint()
+                .revision,
+            257
+        );
     }
 
     #[test]

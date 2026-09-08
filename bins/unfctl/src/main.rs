@@ -67,6 +67,45 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Show bounded, loss-explicit egress NAT lifecycle history.
+    EgressHistory {
+        #[arg(long, value_parser = parse_duration_millis, conflicts_with = "since_unix_ms")]
+        last: Option<u64>,
+        #[arg(long)]
+        since_unix_ms: Option<u64>,
+        #[arg(long)]
+        until_unix_ms: Option<u64>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Show tamper-evident terminal egress failover history.
+    EgressFailovers,
+    /// Explain one egress tuple from current authoritative and observed evidence.
+    EgressExplain {
+        /// Source pod as namespace/name.
+        #[arg(long)]
+        from: String,
+        /// Destination IP address.
+        #[arg(long)]
+        destination: IpAddr,
+        #[arg(long, value_enum, default_value = "tcp")]
+        protocol: Protocol,
+        #[arg(long)]
+        port: u16,
+    },
+    /// Evaluate one egress tuple without changing desired or operational state.
+    EgressSimulate {
+        /// Source pod as namespace/name.
+        #[arg(long)]
+        from: String,
+        /// Destination IP address.
+        #[arg(long)]
+        destination: IpAddr,
+        #[arg(long, value_enum, default_value = "tcp")]
+        protocol: Protocol,
+        #[arg(long)]
+        port: u16,
+    },
     /// Correlate a Service/backend with current intent and observed dataplane outcomes.
     ServiceExplain {
         /// Stable service ID reported by agent status, flow history, or metrics.
@@ -275,6 +314,14 @@ struct ExplainRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct EgressOperationsRequest<'a> {
+    from: &'a str,
+    destination: IpAddr,
+    protocol: Protocol,
+    port: u16,
+}
+
+#[derive(Debug, Serialize)]
 struct PolicySimulationRequest<'a> {
     policy: &'a Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -341,6 +388,67 @@ async fn run() -> Result<()> {
                 *since_unix_ms,
                 *until_unix_ms,
                 *limit,
+            )
+            .await?
+        }
+        Command::EgressHistory {
+            last,
+            since_unix_ms,
+            until_unix_ms,
+            limit,
+        } => {
+            let (since_unix_ms, until_unix_ms) =
+                resolve_time_window(*last, *since_unix_ms, *until_unix_ms, unix_time_millis()?)?;
+            get_json(
+                &client,
+                &flow_history_url_for_path(
+                    &cli.controller_url,
+                    "/v1/egress/history",
+                    since_unix_ms,
+                    until_unix_ms,
+                    *limit,
+                ),
+            )
+            .await?
+        }
+        Command::EgressFailovers => {
+            get_json(
+                &client,
+                &format!("{}/v1/egress/failovers", cli.controller_url),
+            )
+            .await?
+        }
+        Command::EgressExplain {
+            from,
+            destination,
+            protocol,
+            port,
+        } => {
+            egress_operations_value(
+                &client,
+                &cli.controller_url,
+                "/v1/egress/explain",
+                from,
+                *destination,
+                *protocol,
+                *port,
+            )
+            .await?
+        }
+        Command::EgressSimulate {
+            from,
+            destination,
+            protocol,
+            port,
+        } => {
+            egress_operations_value(
+                &client,
+                &cli.controller_url,
+                "/v1/egress/simulate",
+                from,
+                *destination,
+                *protocol,
+                *port,
             )
             .await?
         }
@@ -534,6 +642,31 @@ async fn explanation_value(
     .await
 }
 
+async fn egress_operations_value(
+    client: &reqwest::Client,
+    controller_url: &str,
+    path: &str,
+    from: &str,
+    destination: IpAddr,
+    protocol: Protocol,
+    port: u16,
+) -> Result<Value> {
+    if port == 0 {
+        bail!("port must be between 1 and 65535");
+    }
+    post_json(
+        client,
+        &format!("{controller_url}{path}"),
+        &EgressOperationsRequest {
+            from,
+            destination,
+            protocol,
+            port,
+        },
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn topology_history_value(
     client: &reqwest::Client,
@@ -672,6 +805,20 @@ fn print_value(value: &Value, output: Output) -> Result<()> {
 }
 
 fn print_table(value: &Value) {
+    if value.get("mode").is_some()
+        && value.get("evidence").is_some()
+        && value.get("private_nat_state_inferred").is_some()
+    {
+        print_egress_operations_table(value);
+        return;
+    }
+    if value.get("anchor_digest").is_some()
+        && value.get("evicted_records").is_some()
+        && value.get("records").is_some()
+    {
+        print_egress_failovers_table(value);
+        return;
+    }
     if value.get("current_service").is_some() && value.get("outcomes").is_some() {
         print_service_explanation_table(value);
         return;
@@ -737,6 +884,75 @@ fn print_table(value: &Value) {
         }
     } else {
         println!("{value}");
+    }
+}
+
+fn print_egress_operations_table(value: &Value) {
+    println!("Egress {}", text_field(value, "mode"));
+    println!(
+        "tuple                    {} ({}) -> {} {}/{}",
+        text_field(&value["source"], "reference"),
+        text_field(value, "source_address"),
+        text_field(value, "destination"),
+        text_field(value, "protocol"),
+        number_field(value, "port")
+    );
+    println!(
+        "result                   outcome={} intent={} priority={} private_nat_inferred={}",
+        text_field(value, "outcome"),
+        value
+            .get("selected_intent")
+            .filter(|item| !item.is_null())
+            .map_or_else(|| "native".to_owned(), Value::to_string),
+        optional_number_field(value, "selected_priority"),
+        value
+            .get("private_nat_state_inferred")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    println!(
+        "chronicle                outcomes={} observations={}",
+        number_field(value, "matched_chronicle_outcomes"),
+        number_field(value, "matched_chronicle_observations")
+    );
+    if let Some(evidence) = value.get("evidence").and_then(Value::as_array) {
+        for layer in evidence {
+            println!(
+                "evidence                 {:18} {:14} rev={} {}",
+                text_field(layer, "layer"),
+                text_field(layer, "state"),
+                optional_number_field(layer, "revision"),
+                text_field(layer, "detail")
+            );
+        }
+    }
+}
+
+fn print_egress_failovers_table(value: &Value) {
+    println!("Egress Failover History");
+    println!(
+        "history                  revision={} retained={} evicted={}",
+        number_field(value, "revision"),
+        value["records"].as_array().map_or(0, Vec::len),
+        number_field(value, "evicted_records")
+    );
+    if let Some(records) = value.get("records").and_then(Value::as_array) {
+        for record in records {
+            println!(
+                "failover                 sequence={} owner={} failed_gateway={} completed_ms={} sources={}/{} shards={}",
+                number_field(record, "sequence"),
+                record
+                    .get("owner")
+                    .map_or_else(|| "-".to_owned(), Value::to_string),
+                record
+                    .get("failed_gateway")
+                    .map_or_else(|| "-".to_owned(), Value::to_string),
+                number_field(record, "completed_unix_ms"),
+                number_field(record, "activated_source_count"),
+                number_field(record, "source_count"),
+                number_field(record, "moved_shards")
+            );
+        }
     }
 }
 
@@ -1340,6 +1556,22 @@ fn flow_history_url(
     until_unix_ms: Option<u64>,
     limit: Option<usize>,
 ) -> String {
+    flow_history_url_for_path(
+        controller_url,
+        "/v1/flows",
+        since_unix_ms,
+        until_unix_ms,
+        limit,
+    )
+}
+
+fn flow_history_url_for_path(
+    controller_url: &str,
+    path: &str,
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    limit: Option<usize>,
+) -> String {
     let mut parameters = Vec::new();
     if let Some(value) = since_unix_ms {
         parameters.push(format!("since_unix_ms={value}"));
@@ -1350,7 +1582,7 @@ fn flow_history_url(
     if let Some(value) = limit {
         parameters.push(format!("limit={value}"));
     }
-    let base = format!("{controller_url}/v1/flows");
+    let base = format!("{controller_url}{path}");
     if parameters.is_empty() {
         base
     } else {
@@ -1923,6 +2155,55 @@ mod tests {
                 Some(25)
             ),
             "http://controller/v1/flows?since_unix_ms=1100000&until_unix_ms=2000000&limit=25"
+        );
+    }
+
+    #[test]
+    fn egress_operations_commands_and_history_paths_parse() {
+        let explain = Cli::try_parse_from([
+            "unfctl",
+            "egress-explain",
+            "--from",
+            "payments/ledger-0",
+            "--destination",
+            "2001:db8::20",
+            "--protocol",
+            "udp",
+            "--port",
+            "53",
+        ])
+        .expect("egress explain command parses");
+        assert!(matches!(
+            explain.command,
+            Command::EgressExplain {
+                from,
+                destination,
+                protocol: Protocol::Udp,
+                port: 53,
+            } if from == "payments/ledger-0"
+                && destination == "2001:db8::20".parse::<IpAddr>().unwrap()
+        ));
+        let simulate = Cli::try_parse_from([
+            "unfctl",
+            "egress-simulate",
+            "--from",
+            "payments/ledger-0",
+            "--destination",
+            "198.51.100.20",
+            "--port",
+            "443",
+        ])
+        .expect("egress simulation command parses");
+        assert!(matches!(simulate.command, Command::EgressSimulate { .. }));
+        assert_eq!(
+            flow_history_url_for_path(
+                "http://controller",
+                "/v1/egress/history",
+                Some(10),
+                Some(20),
+                Some(5),
+            ),
+            "http://controller/v1/egress/history?since_unix_ms=10&until_unix_ms=20&limit=5"
         );
     }
 

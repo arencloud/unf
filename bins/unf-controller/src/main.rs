@@ -52,19 +52,20 @@ use unf_egress::{
     EGRESS_AGENT_TOKEN_AUDIENCE, EGRESS_GATEWAY_ACK_SCHEMA_VERSION, EgressAddressPool,
     EgressAgentAdvertisement, EgressBehaviorContract, EgressBfdEvidenceReport, EgressCapability,
     EgressContractFacts, EgressContractRevisions, EgressControlPlane, EgressControlPlaneCheckpoint,
-    EgressDesiredCheckpoint, EgressDesiredStore, EgressDistributionError,
+    EgressDesiredCheckpoint, EgressDesiredStore, EgressDestinations, EgressDistributionError,
     EgressFqdnObservationBatch, EgressFqdnObservationCheckpoint, EgressFqdnObservationLedger,
     EgressGatewayAcknowledgement, EgressGatewayAddressAcknowledgement,
     EgressGatewayAddressProjection, EgressGatewayApplicationAcknowledgement,
     EgressGatewayDrainEvidence, EgressGatewayProjection, EgressGatewayRetirementChallenges,
-    EgressHaAgentChallenges, EgressHaAgentEvidence, EgressHaCandidate, EgressHaPlan, EgressIntent,
-    EgressIntentOwner, EgressInternetClassificationStore, EgressInternetStoreCheckpoint,
-    EgressModel, EgressNode, EgressNodeProjectionEnvelope, EgressProjectionRecipient,
-    EgressProviderOutcome, EgressProviderRef, EgressReachabilityAcknowledgement,
-    EgressReachabilityEvidenceStore, EgressReachabilityStoreCheckpoint, EgressSafeReleaseAuthority,
+    EgressHaAgentChallenges, EgressHaAgentEvidence, EgressHaCandidate, EgressHaHistoryRecord,
+    EgressHaPlan, EgressIntent, EgressIntentOwner, EgressInternetClassificationStore,
+    EgressInternetDecision, EgressInternetStoreCheckpoint, EgressModel, EgressNode,
+    EgressNodeProjectionEnvelope, EgressProjectionRecipient, EgressProviderOutcome,
+    EgressProviderRef, EgressReachabilityAcknowledgement, EgressReachabilityEvidenceStore,
+    EgressReachabilityStoreCheckpoint, EgressReachabilityVerdict, EgressSafeReleaseAuthority,
     EgressSourceActivationGrant, EgressSourceApplicationAcknowledgement, EgressSourceFenceEvidence,
     EgressSourceRetirementChallenges, compile_egress_reachability_acknowledgement,
-    verify_egress_bfd_evidence_report,
+    verify_egress_bfd_evidence_report, verify_egress_internet_snapshot,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -647,6 +648,18 @@ struct StatusBody {
     egress_source_applications: usize,
     egress_gateway_applications: usize,
     egress_activation_ready_sources: usize,
+    egress_intents: usize,
+    egress_allocations: usize,
+    egress_gateway_records: usize,
+    egress_ready_gateways: usize,
+    egress_reachability_assessments: usize,
+    egress_ha_plans: usize,
+    egress_active_failovers: usize,
+    egress_retained_failovers: usize,
+    egress_evicted_failovers: u64,
+    egress_chronicle_outcomes: usize,
+    egress_chronicle_observations: u64,
+    egress_chronicle_completeness: unf_state::EgressEvidenceCompleteness,
     identities: usize,
     indexed_pod_ips: usize,
     retained_flows: usize,
@@ -704,6 +717,74 @@ struct ExplainResponse {
     decision: unf_policy::PolicyDecision,
     policy_revision: Revision,
     dataplane_enforcement: bool,
+    note: &'static str,
+}
+
+const EGRESS_OPERATIONS_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Deserialize)]
+struct EgressOperationsRequest {
+    from: String,
+    destination: IpAddr,
+    protocol: RequestProtocol,
+    port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EgressOperationsMode {
+    Explain,
+    Counterfactual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EgressOperationsOutcome {
+    PolicyDenied,
+    NativeRouting,
+    Fenced,
+    Eligible,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EgressEvidenceState {
+    Authoritative,
+    Observed,
+    Derived,
+    Expired,
+    Unavailable,
+    LossAffected,
+}
+
+#[derive(Debug, Serialize)]
+struct EgressEvidenceLayer {
+    layer: &'static str,
+    state: EgressEvidenceState,
+    revision: Option<u64>,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EgressOperationsResponse {
+    schema_version: u16,
+    mode: EgressOperationsMode,
+    source: ResolvedEndpoint,
+    source_address: IpAddr,
+    destination: IpAddr,
+    protocol: &'static str,
+    port: u16,
+    policy_decision: unf_policy::PolicyDecision,
+    selected_intent: Option<EgressIntentOwner>,
+    selected_priority: Option<u32>,
+    outcome: EgressOperationsOutcome,
+    evidence: Vec<EgressEvidenceLayer>,
+    candidate_egress_addresses: Vec<IpAddr>,
+    candidate_gateways: Vec<String>,
+    matched_chronicle_outcomes: usize,
+    matched_chronicle_observations: u64,
+    latest_failover: Option<EgressHaHistoryRecord>,
+    private_nat_state_inferred: bool,
     note: &'static str,
 }
 
@@ -1154,6 +1235,9 @@ async fn main() -> Result<()> {
         .route("/v1/topology/history", get(topology_history))
         .route("/v1/flows", get(flow_history))
         .route("/v1/egress/history", get(egress_history))
+        .route("/v1/egress/failovers", get(egress_failover_history))
+        .route("/v1/egress/explain", post(explain_egress))
+        .route("/v1/egress/simulate", post(simulate_egress))
         .route("/v1/services/explain", get(explain_service))
         .route("/v1/services/clusterip/simulate", get(simulate_cluster_ip))
         .route("/v1/services/nodeport/simulate", get(simulate_node_port))
@@ -6662,6 +6746,7 @@ fn requested_selection_contract_schema(query: &ServiceSchemaQuery) -> Result<u16
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<StatusBody>, ApiError> {
     let (
         _,
@@ -6702,6 +6787,24 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
     ) = compiled_service_counts(&state);
     let (egress_source_applications, egress_gateway_applications, egress_activation_ready_sources) =
         egress_application_counts(&state);
+    let egress_control = mutex_lock(&state.egress_control_plane).checkpoint();
+    let egress_ready_gateways = egress_control
+        .gateways
+        .records
+        .iter()
+        .filter(|record| {
+            record.gateway.as_ref().is_some_and(|acknowledgement| {
+                acknowledgement.outcome == EgressProviderOutcome::Ready
+            }) && record.reachability.as_ref().is_some_and(|acknowledgement| {
+                acknowledgement.outcome == EgressProviderOutcome::Ready
+            })
+        })
+        .count();
+    let egress_reachability_assessments = mutex_lock(&state.egress_reachability)
+        .checkpoint(unix_time_seconds())
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .assessments
+        .len();
     Ok(Json(StatusBody {
         component: "unf-controller",
         healthy: true,
@@ -6743,6 +6846,18 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
         egress_source_applications,
         egress_gateway_applications,
         egress_activation_ready_sources,
+        egress_intents: egress_control.desired_model.intents.len(),
+        egress_allocations: egress_control.allocation.leases.len(),
+        egress_gateway_records: egress_control.gateways.records.len(),
+        egress_ready_gateways,
+        egress_reachability_assessments,
+        egress_ha_plans: egress_control.ha_plans.len(),
+        egress_active_failovers: egress_control.ha_promotions.len(),
+        egress_retained_failovers: egress_control.ha_history.records.len(),
+        egress_evicted_failovers: egress_control.ha_history.evicted_records,
+        egress_chronicle_outcomes: history.egress_evidence.retained_outcomes,
+        egress_chronicle_observations: history.egress_evidence.retained_observations,
+        egress_chronicle_completeness: history.egress_evidence.completeness,
         identities: identity_count,
         indexed_pod_ips,
         retained_flows: history.retained_flows,
@@ -6757,7 +6872,7 @@ async fn status(State(state): State<Arc<ControllerState>>) -> Result<Json<Status
             "desired state and identity allocations are currently in-memory only",
             "agent acknowledgements and the newest bounded flow history use separate single-controller ConfigMap checkpoints",
             "service translation is bounded to IPv4/IPv6 TCP/UDP ClusterIP, NodePort Cluster/Local, and explicit-class LoadBalancer Cluster/Local on qualified primary-CNI tuples; session affinity, internalTrafficPolicy, topology-aware selection, Maglev, DSR, SCTP, fragments, and host-origin NodePort remain unqualified",
-            "egress source activation requires current single-controller gateway applications plus independent source-local native route proof; gateway NAT remains unavailable",
+            "egress source activation requires current gateway application and independent source-local route proof; SCTP NAT, fragments, generic RELATED state, and arbitrary ICMP error translation remain excluded",
         ],
     }))
 }
@@ -8231,7 +8346,7 @@ fn ingest_egress_ha_evidence_for(
             });
             if complete {
                 control
-                    .finalize_ha_promotion(&owner)
+                    .finalize_ha_promotion(&owner, unix_time_millis())
                     .map_err(|error| ApiError::bad_request(error.to_string()))?;
                 info!(owner = %owner.name, "finalized proof-complete egress HA promotion");
             }
@@ -8710,7 +8825,7 @@ fn advance_egress_ha_transactions(
             }
             if manifest.sources.is_empty() {
                 control
-                    .finalize_ha_promotion(&manifest.owner)
+                    .finalize_ha_promotion(&manifest.owner, unix_time_millis())
                     .map_err(|error| ApiError::bad_request(error.to_string()))?;
                 changed = true;
             }
@@ -9703,6 +9818,536 @@ async fn egress_history(
     snapshot.query.truncated = snapshot.entries.len() < matched_flows;
     snapshot.query.limit = limit;
     Ok(Json(snapshot))
+}
+
+async fn egress_failover_history(
+    State(state): State<Arc<ControllerState>>,
+) -> Json<unf_egress::EgressHaHistoryCheckpoint> {
+    Json(
+        mutex_lock(&state.egress_control_plane)
+            .checkpoint()
+            .ha_history,
+    )
+}
+
+async fn explain_egress(
+    State(state): State<Arc<ControllerState>>,
+    Json(request): Json<EgressOperationsRequest>,
+) -> Result<Json<EgressOperationsResponse>, ApiError> {
+    egress_operations_response(&state, &request, EgressOperationsMode::Explain).map(Json)
+}
+
+async fn simulate_egress(
+    State(state): State<Arc<ControllerState>>,
+    Json(request): Json<EgressOperationsRequest>,
+) -> Result<Json<EgressOperationsResponse>, ApiError> {
+    egress_operations_response(&state, &request, EgressOperationsMode::Counterfactual).map(Json)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestinationEvidence {
+    Matches,
+    Expired,
+    DoesNotMatch,
+}
+
+#[allow(clippy::too_many_lines)]
+fn egress_operations_response(
+    state: &ControllerState,
+    request: &EgressOperationsRequest,
+    mode: EgressOperationsMode,
+) -> Result<EgressOperationsResponse, ApiError> {
+    if request.port == 0 {
+        return Err(ApiError::bad_request("port must be between 1 and 65535"));
+    }
+    let _policy_state_guard = read_lock(&state.policy_state_guard);
+    let pods = read_lock(&state.pods);
+    let source = pods
+        .get(&request.from)
+        .ok_or_else(|| ApiError::not_found(format!("source pod {} not found", request.from)))?;
+    let source_address = match request.destination {
+        IpAddr::V4(_) => source.ipv4_addresses.iter().next().copied().map(IpAddr::V4),
+        IpAddr::V6(_) => source.ipv6_addresses.iter().next().copied().map(IpAddr::V6),
+    }
+    .ok_or_else(|| {
+        ApiError::unprocessable("source Pod has no address in the destination address family")
+    })?;
+    let namespaces = read_lock(&state.namespaces);
+    let source_endpoint = endpoint_with_namespace_labels(&source.endpoint, &namespaces);
+    let destination_endpoint = Endpoint {
+        identity: IdentityId::new(0),
+        namespace: String::new(),
+        namespace_labels: BTreeMap::new(),
+        service_account: String::new(),
+        application: None,
+        labels: BTreeMap::new(),
+        named_ports: BTreeMap::new(),
+    };
+    let protocol = request_protocol(request.protocol);
+    let (source_ipv4, source_ipv6) = match source_address {
+        IpAddr::V4(address) => (Some(address), None),
+        IpAddr::V6(address) => (None, Some(address)),
+    };
+    let destination_addresses = match request.destination {
+        IpAddr::V4(address) => DestinationAddresses {
+            ipv4: Some(address),
+            ipv6: None,
+        },
+        IpAddr::V6(address) => DestinationAddresses {
+            ipv4: None,
+            ipv6: Some(address),
+        },
+    };
+    let policy_decision = evaluate_for_direction_with_addresses(
+        &compiled_policies(state),
+        PolicyDirection::Egress,
+        Flow {
+            source: &source_endpoint,
+            destination: &destination_endpoint,
+            protocol,
+            destination_port: request.port,
+            source_ipv4,
+            source_ipv6,
+        },
+        destination_addresses,
+    );
+    let policy_revision = mutex_lock(&state.revisions).policy;
+    let control = mutex_lock(&state.egress_control_plane).checkpoint();
+    let now = unix_time_seconds();
+    let mut saw_expired_destination = false;
+    let selected = control.desired_model.intents.iter().find(|intent| {
+        let scope_matches = match &intent.owner.scope {
+            unf_egress::EgressIntentScope::Cluster => true,
+            unf_egress::EgressIntentScope::Namespace(namespace) => namespace == &source.namespace,
+        };
+        if !scope_matches
+            || !intent.source.matches(
+                &source_endpoint.namespace_labels,
+                &source_endpoint.labels,
+                &source_endpoint.service_account,
+            )
+        {
+            return false;
+        }
+        match egress_destination_evidence(&intent.destinations, request.destination, now) {
+            DestinationEvidence::Matches => true,
+            DestinationEvidence::Expired => {
+                saw_expired_destination = true;
+                false
+            }
+            DestinationEvidence::DoesNotMatch => false,
+        }
+    });
+
+    let mut evidence = vec![EgressEvidenceLayer {
+        layer: "network_policy",
+        state: EgressEvidenceState::Authoritative,
+        revision: Some(policy_revision.get()),
+        detail: format!("{:?}", policy_decision.verdict).to_lowercase(),
+    }];
+    let selected_owner = selected.map(|intent| intent.owner.clone());
+    evidence.push(EgressEvidenceLayer {
+        layer: "intent",
+        state: if selected.is_some() {
+            EgressEvidenceState::Authoritative
+        } else if saw_expired_destination {
+            EgressEvidenceState::Expired
+        } else {
+            EgressEvidenceState::Unavailable
+        },
+        revision: Some(control.desired_revision.get()),
+        detail: selected.map_or_else(
+            || {
+                if saw_expired_destination {
+                    "matching temporal destination evidence expired".to_owned()
+                } else {
+                    "no explicit intent; native routing remains authoritative".to_owned()
+                }
+            },
+            |intent| {
+                format!(
+                    "selected priority {} owner {}",
+                    intent.priority, intent.owner.name
+                )
+            },
+        ),
+    });
+
+    let lease = selected.and_then(|intent| {
+        control
+            .allocation
+            .leases
+            .iter()
+            .find(|lease| lease.intent.owner == intent.owner)
+    });
+    evidence.push(EgressEvidenceLayer {
+        layer: "allocation",
+        state: if lease.is_some() {
+            EgressEvidenceState::Authoritative
+        } else {
+            EgressEvidenceState::Unavailable
+        },
+        revision: Some(control.allocation.revision.get()),
+        detail: lease.map_or_else(
+            || "no lease for the selected intent".to_owned(),
+            |lease| {
+                format!(
+                    "lease epoch {} owns {} address(es)",
+                    lease.lease_epoch,
+                    lease.addresses.len()
+                )
+            },
+        ),
+    });
+    let gateway = selected.and_then(|intent| {
+        control
+            .gateways
+            .records
+            .iter()
+            .find(|record| record.desired.owner == intent.owner)
+    });
+    let gateway_ownership_ready = gateway.is_some_and(|record| {
+        record
+            .gateway
+            .as_ref()
+            .is_some_and(|acknowledgement| acknowledgement.outcome == EgressProviderOutcome::Ready)
+    });
+    let reachability_ack_ready = gateway.is_some_and(|record| {
+        record
+            .reachability
+            .as_ref()
+            .is_some_and(|acknowledgement| acknowledgement.outcome == EgressProviderOutcome::Ready)
+    });
+    evidence.push(EgressEvidenceLayer {
+        layer: "gateway",
+        state: if gateway_ownership_ready {
+            EgressEvidenceState::Observed
+        } else {
+            EgressEvidenceState::Unavailable
+        },
+        revision: Some(control.gateways.revision.get()),
+        detail: gateway.map_or_else(
+            || "no lease-fenced gateway record".to_owned(),
+            |record| {
+                format!(
+                    "{} selected gateway node(s); ownership_ready={gateway_ownership_ready}",
+                    record.desired.nodes.len()
+                )
+            },
+        ),
+    });
+
+    let contract = source.node_name.as_deref().and_then(|node| {
+        read_lock(&state.egress_source_distributions)
+            .get(node)
+            .and_then(|distribution| {
+                selected.and_then(|intent| {
+                    distribution
+                        .contract
+                        .plans
+                        .iter()
+                        .any(|plan| {
+                            plan.intent == intent.owner
+                                && plan.source.identity == source.endpoint.identity
+                        })
+                        .then_some((
+                            distribution.contract.contract_revision,
+                            distribution.contract.plans.len(),
+                        ))
+                })
+            })
+    });
+    evidence.push(EgressEvidenceLayer {
+        layer: "contract",
+        state: if contract.is_some() {
+            EgressEvidenceState::Authoritative
+        } else {
+            EgressEvidenceState::Unavailable
+        },
+        revision: contract.map(|(revision, _)| revision.get()),
+        detail: contract.map_or_else(
+            || "no source-local contract contains this identity and intent".to_owned(),
+            |(_, plans)| format!("digest-bound source contract contains {plans} plan(s)"),
+        ),
+    });
+
+    let reachability = mutex_lock(&state.egress_reachability)
+        .checkpoint(now)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let reachability_plan = selected.and_then(|intent| {
+        reachability
+            .current_plans
+            .iter()
+            .find(|record| record.plan.owner == intent.owner)
+            .map(|record| &record.plan)
+    });
+    let reachability_assessment = reachability_plan.and_then(|plan| {
+        reachability
+            .assessments
+            .iter()
+            .find(|assessment| assessment.plan_digest == plan.digest)
+    });
+    let reachability_current = reachability_ack_ready
+        && reachability_plan.is_none_or(|_| {
+            reachability_assessment.is_some_and(|assessment| {
+                now < assessment.authority_until_unix_seconds
+                    && assessment.verdict == EgressReachabilityVerdict::Ready
+            })
+        });
+    let reachability_state = reachability_assessment.map_or_else(
+        || {
+            if reachability_ack_ready {
+                EgressEvidenceState::Observed
+            } else {
+                EgressEvidenceState::Unavailable
+            }
+        },
+        |assessment| {
+            if now >= assessment.authority_until_unix_seconds {
+                EgressEvidenceState::Expired
+            } else {
+                EgressEvidenceState::Observed
+            }
+        },
+    );
+    evidence.push(EgressEvidenceLayer {
+        layer: "reachability",
+        state: reachability_state,
+        revision: Some(reachability.revision.get()),
+        detail: reachability_assessment.map_or_else(
+            || {
+                if reachability_ack_ready {
+                    "lease-fenced provider acknowledgement is Ready; no DQR plan applies".to_owned()
+                } else {
+                    "no current reachability acknowledgement for the selected intent".to_owned()
+                }
+            },
+            |assessment| format!("{:?}: {:?}", assessment.verdict, assessment.reason),
+        ),
+    });
+
+    let source_ready = source
+        .node_name
+        .as_deref()
+        .is_some_and(|node| egress_source_activation_ready(state, node));
+    evidence.push(EgressEvidenceLayer {
+        layer: "source_activation",
+        state: if source_ready {
+            EgressEvidenceState::Observed
+        } else {
+            EgressEvidenceState::Unavailable
+        },
+        revision: None,
+        detail: if source_ready {
+            "source node holds a current digest-bound activation grant".to_owned()
+        } else {
+            "source node has no current activation grant".to_owned()
+        },
+    });
+
+    let history = mutex_lock(&state.flow_history).snapshot(state.identity_epoch);
+    let matches_flow = |entry: &&FlowHistoryEntry| {
+        entry.key.source_identity == source.endpoint.identity
+            && entry.key.protocol == protocol as u8
+            && entry.key.destination_port == request.port
+            && match request.destination {
+                IpAddr::V4(address) => entry.key.destination_ipv4 == Some(address),
+                IpAddr::V6(address) => entry.key.destination_ipv6 == Some(address),
+            }
+            && entry.egress.is_some()
+    };
+    let matched_chronicle_outcomes = history.entries.iter().filter(matches_flow).count();
+    let matched_chronicle_observations = history
+        .entries
+        .iter()
+        .filter(matches_flow)
+        .map(|entry| entry.observed_events)
+        .fold(0_u64, u64::saturating_add);
+    let chronicle_state = match history.egress_evidence.completeness {
+        unf_state::EgressEvidenceCompleteness::Complete => {
+            if matched_chronicle_outcomes == 0 {
+                EgressEvidenceState::Unavailable
+            } else {
+                EgressEvidenceState::Observed
+            }
+        }
+        _ => EgressEvidenceState::LossAffected,
+    };
+    evidence.push(EgressEvidenceLayer {
+        layer: "chronicle",
+        state: chronicle_state,
+        revision: Some(history.revision.get()),
+        detail: format!(
+            "{matched_chronicle_outcomes} retained outcomes, {matched_chronicle_observations} observations; completeness={:?}",
+            history.egress_evidence.completeness
+        ),
+    });
+
+    let active_failover = selected_owner.as_ref().is_some_and(|owner| {
+        control
+            .ha_promotions
+            .iter()
+            .any(|promotion| &promotion.coordinator.manifest.owner == owner)
+    });
+    let latest_failover = selected_owner.as_ref().and_then(|owner| {
+        control
+            .ha_history
+            .records
+            .iter()
+            .rev()
+            .find(|record| &record.owner == owner)
+            .cloned()
+    });
+    evidence.push(EgressEvidenceLayer {
+        layer: "failover",
+        state: if active_failover {
+            EgressEvidenceState::Authoritative
+        } else if control.ha_history.evicted_records != 0 {
+            EgressEvidenceState::LossAffected
+        } else if latest_failover.is_some() {
+            EgressEvidenceState::Observed
+        } else {
+            EgressEvidenceState::Unavailable
+        },
+        revision: Some(control.ha_history.revision),
+        detail: format!(
+            "active={active_failover}; {} retained and {} evicted terminal failover record(s)",
+            control.ha_history.records.len(),
+            control.ha_history.evicted_records
+        ),
+    });
+    evidence.push(EgressEvidenceLayer {
+        layer: "counterfactual",
+        state: EgressEvidenceState::Derived,
+        revision: None,
+        detail: "eligibility is derived from immutable snapshots; private NAT state and translated ports are never inferred".to_owned(),
+    });
+
+    let protocol_supported = matches!(
+        request.protocol,
+        RequestProtocol::Tcp | RequestProtocol::Udp
+    );
+    evidence.push(EgressEvidenceLayer {
+        layer: "transport",
+        state: if protocol_supported {
+            EgressEvidenceState::Derived
+        } else {
+            EgressEvidenceState::Unavailable
+        },
+        revision: None,
+        detail: if protocol_supported {
+            "transport is supported by the current egress NAT contract".to_owned()
+        } else {
+            "SCTP egress NAT is explicitly unsupported and remains deny-closed".to_owned()
+        },
+    });
+
+    let policy_allowed = policy_decision.verdict != Verdict::Deny;
+    let outcome = if !policy_allowed {
+        EgressOperationsOutcome::PolicyDenied
+    } else if selected.is_none() && !saw_expired_destination {
+        EgressOperationsOutcome::NativeRouting
+    } else if lease.is_some()
+        && gateway_ownership_ready
+        && reachability_current
+        && contract.is_some()
+        && source_ready
+        && !active_failover
+        && protocol_supported
+    {
+        EgressOperationsOutcome::Eligible
+    } else {
+        EgressOperationsOutcome::Fenced
+    };
+    Ok(EgressOperationsResponse {
+        schema_version: EGRESS_OPERATIONS_SCHEMA_VERSION,
+        mode,
+        source: resolved(source),
+        source_address,
+        destination: request.destination,
+        protocol: match request.protocol {
+            RequestProtocol::Tcp => "tcp",
+            RequestProtocol::Udp => "udp",
+            RequestProtocol::Sctp => "sctp",
+        },
+        port: request.port,
+        policy_decision,
+        selected_intent: selected_owner,
+        selected_priority: selected.map(|intent| intent.priority),
+        outcome,
+        evidence,
+        candidate_egress_addresses: lease.map_or_else(Vec::new, |lease| lease.addresses.clone()),
+        candidate_gateways: gateway.map_or_else(Vec::new, |record| {
+            record
+                .desired
+                .nodes
+                .iter()
+                .map(|node| node.name.clone())
+                .collect()
+        }),
+        matched_chronicle_outcomes,
+        matched_chronicle_observations,
+        latest_failover,
+        private_nat_state_inferred: false,
+        note: "read-only evidence-complete counterfactual; eligible is not a grant and does not predict a translated source port",
+    })
+}
+
+fn request_protocol(protocol: RequestProtocol) -> Protocol {
+    match protocol {
+        RequestProtocol::Tcp => Protocol::Tcp,
+        RequestProtocol::Udp => Protocol::Udp,
+        RequestProtocol::Sctp => Protocol::Sctp,
+    }
+}
+
+fn egress_destination_evidence(
+    destinations: &EgressDestinations,
+    address: IpAddr,
+    now_unix_seconds: u64,
+) -> DestinationEvidence {
+    match destinations {
+        EgressDestinations::DenyAll => DestinationEvidence::DoesNotMatch,
+        EgressDestinations::Any => DestinationEvidence::Matches,
+        EgressDestinations::Networks(networks) => {
+            if networks.iter().any(|network| network.contains(address)) {
+                DestinationEvidence::Matches
+            } else {
+                DestinationEvidence::DoesNotMatch
+            }
+        }
+        EgressDestinations::Fqdn(snapshot) => snapshot
+            .leases
+            .iter()
+            .filter(|lease| lease.address == address)
+            .map(|lease| {
+                if now_unix_seconds < lease.new_flows_until_unix_seconds {
+                    DestinationEvidence::Matches
+                } else {
+                    DestinationEvidence::Expired
+                }
+            })
+            .max_by_key(|evidence| match evidence {
+                DestinationEvidence::Matches => 2,
+                DestinationEvidence::Expired => 1,
+                DestinationEvidence::DoesNotMatch => 0,
+            })
+            .unwrap_or(DestinationEvidence::DoesNotMatch),
+        EgressDestinations::Internet(snapshot) => {
+            verify_egress_internet_snapshot((**snapshot).clone()).map_or(
+                DestinationEvidence::DoesNotMatch,
+                |verified| match unf_egress::classify_egress_internet_destination(
+                    &verified,
+                    address,
+                    now_unix_seconds,
+                ) {
+                    EgressInternetDecision::Internet => DestinationEvidence::Matches,
+                    EgressInternetDecision::AuthorityExpired => DestinationEvidence::Expired,
+                    _ => DestinationEvidence::DoesNotMatch,
+                },
+            )
+        }
+    }
 }
 
 async fn explain_service(
@@ -13379,6 +14024,89 @@ mod tests {
             }
         }))
         .expect("valid test EgressPolicy")
+    }
+
+    #[test]
+    fn egress_counterfactual_is_read_only_and_labels_missing_authority() {
+        let state = new_state(true);
+        write_lock(&state.namespaces).insert(
+            "payments".to_owned(),
+            BTreeMap::from([
+                (
+                    "kubernetes.io/metadata.name".to_owned(),
+                    "payments".to_owned(),
+                ),
+                ("team".to_owned(), "finance".to_owned()),
+            ]),
+        );
+        write_lock(&state.pods).insert(
+            "payments/ledger-0".to_owned(),
+            PodRecord {
+                namespace: "payments".to_owned(),
+                name: "ledger-0".to_owned(),
+                uid: "ledger-0-uid".to_owned(),
+                node_name: Some("worker-source".to_owned()),
+                host_network: false,
+                endpoint: Endpoint {
+                    identity: IdentityId::new(42),
+                    namespace: "payments".to_owned(),
+                    namespace_labels: BTreeMap::new(),
+                    service_account: "settlement".to_owned(),
+                    application: Some("ledger".to_owned()),
+                    labels: BTreeMap::from([("app".to_owned(), "ledger".to_owned())]),
+                    named_ports: BTreeMap::new(),
+                },
+                ipv4_addresses: BTreeSet::from(["10.244.0.10".parse().unwrap()]),
+                ipv6_addresses: BTreeSet::new(),
+            },
+        );
+        apply_egress_pool_event(&state, Event::Apply(native_egress_pool("192.0.2.0/24")));
+        apply_egress_policy_event(&state, Event::Apply(native_egress_policy()));
+        let before = mutex_lock(&state.egress_control_plane).checkpoint();
+        let response = egress_operations_response(
+            &state,
+            &EgressOperationsRequest {
+                from: "payments/ledger-0".to_owned(),
+                destination: "198.51.100.20".parse().unwrap(),
+                protocol: RequestProtocol::Tcp,
+                port: 443,
+            },
+            EgressOperationsMode::Counterfactual,
+        )
+        .expect("derive read-only egress counterfactual");
+        assert_eq!(response.mode, EgressOperationsMode::Counterfactual);
+        assert_eq!(response.outcome, EgressOperationsOutcome::Fenced);
+        assert_eq!(
+            response
+                .selected_intent
+                .as_ref()
+                .map(|owner| owner.name.as_str()),
+            Some("finance")
+        );
+        assert!(!response.private_nat_state_inferred);
+        assert!(response.evidence.iter().any(|layer| {
+            layer.layer == "source_activation"
+                && matches!(layer.state, EgressEvidenceState::Unavailable)
+        }));
+        assert_eq!(
+            mutex_lock(&state.egress_control_plane).checkpoint(),
+            before,
+            "simulation must not mutate authority state"
+        );
+
+        let native = egress_operations_response(
+            &state,
+            &EgressOperationsRequest {
+                from: "payments/ledger-0".to_owned(),
+                destination: "203.0.113.20".parse().unwrap(),
+                protocol: RequestProtocol::Tcp,
+                port: 443,
+            },
+            EgressOperationsMode::Explain,
+        )
+        .expect("explain unmatched native tuple");
+        assert_eq!(native.outcome, EgressOperationsOutcome::NativeRouting);
+        assert!(native.selected_intent.is_none());
     }
 
     #[test]

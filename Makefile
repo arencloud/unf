@@ -15,7 +15,7 @@
 .PHONY: egress-reachability-contract-test
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
-.PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-bgp-image
+.PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-bgp-image
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -323,6 +323,13 @@ egress-operations-history-test:
 	cargo test -p unf-controller service_flow_ingestion_validates_bounded_dataplane_provenance
 	cargo test -p unfctl flows_command_parses
 	cargo clippy -p unf-state -p unf-agent -p unf-controller -p unfctl --all-targets --all-features -- -D warnings
+
+egress-operations-causal-test: egress-operations-history-test
+	hack/verify-egress-operations-causal.sh
+	cargo test -p unf-egress ha_promotion_is_durable_ordered_and_never_health_authorized
+	cargo test -p unf-controller egress_counterfactual_is_read_only_and_labels_missing_authority
+	cargo test -p unfctl egress_operations_commands_and_history_paths_parse
+	cargo clippy -p unf-egress -p unf-controller -p unfctl --all-targets --all-features -- -D warnings
 
 test:
 	cargo test --workspace

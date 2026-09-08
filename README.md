@@ -413,7 +413,7 @@ pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
 is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
-and ADRs 0113–0147 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+and ADRs 0113–0154 track the work. Milestone 8.2a now adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -696,6 +696,17 @@ promote, or claim ownership. `make egress-bfd-test` injects a real gateway fault
 withdraws protected IPv4/IPv6 routes, and preserves the independent path. IPv6
 BFD transport itself remains fail-closed and unqualified; ADR 0152. See the [BGP provider guide](docs/development/egress-bgp-provider.md)
 for the sealed node policy and opt-in agent wiring.
+Milestone 8.9 now exposes a loss-explicit Causal Egress Chronicle plus an
+evidence-complete counterfactual. `unfctl egress-explain` and
+`egress-simulate` join the exact policy, intent, allocation, gateway, contract,
+reachability, source-activation, NAT-observation, transport, and HA snapshots,
+classifying each layer as authoritative, observed, derived, expired,
+unavailable, or loss-affected. They distinguish denial, native routing,
+fail-closed fencing, and eligibility but cannot grant authority or invent a
+private NAT mapping. Completed HA transactions enter a bounded hash-chained
+ledger with explicit eviction anchoring, available through `unfctl
+egress-failovers`; `make egress-operations-history-test` and `make
+egress-operations-causal-test` verify ADRs 0153–0154.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
