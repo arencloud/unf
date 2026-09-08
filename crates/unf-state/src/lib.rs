@@ -10,7 +10,9 @@ use unf_common::{
     PolicyReason, Revision, RuleId, SELECTION_CONTRACT_SCHEMA_VERSION,
     SERVICE_SNAPSHOT_SCHEMA_VERSION, ServiceId, Verdict,
 };
-use unf_ebpf_common::egress_event_action_reason_is_valid;
+use unf_ebpf_common::{
+    EGRESS_EVENT_ABI_VERSION, EGRESS_MAP_ABI_VERSION, egress_event_action_reason_is_valid,
+};
 
 pub const IDENTITY_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const POLICY_SNAPSHOT_SCHEMA_VERSION: u16 = 4;
@@ -49,6 +51,17 @@ pub struct ComponentCompatibility {
     pub selection_contract_schema_version: u16,
     #[serde(default)]
     pub load_balancer_reachability_schema_version: u16,
+    /// Zero is an adjacent response predating explicit egress compatibility.
+    #[serde(default)]
+    pub egress_distribution_schema_version: u16,
+    #[serde(default)]
+    pub egress_host_state_schema_version: u16,
+    #[serde(default)]
+    pub egress_ha_promotion_schema_version: u16,
+    #[serde(default)]
+    pub egress_map_schema_version: u16,
+    #[serde(default)]
+    pub egress_event_schema_version: u16,
     pub agent_status_schema_version: u16,
     pub flow_export_schema_version: u16,
 }
@@ -67,6 +80,11 @@ impl ComponentCompatibility {
             service_snapshot_schema_version: SERVICE_SNAPSHOT_SCHEMA_VERSION,
             selection_contract_schema_version: SELECTION_CONTRACT_SCHEMA_VERSION,
             load_balancer_reachability_schema_version: LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION,
+            egress_distribution_schema_version: 0,
+            egress_host_state_schema_version: 0,
+            egress_ha_promotion_schema_version: 0,
+            egress_map_schema_version: EGRESS_MAP_ABI_VERSION,
+            egress_event_schema_version: EGRESS_EVENT_ABI_VERSION,
             agent_status_schema_version: AGENT_STATUS_SCHEMA_VERSION,
             flow_export_schema_version: FLOW_EXPORT_SCHEMA_VERSION,
         }
@@ -1963,6 +1981,17 @@ mod tests {
         assert_eq!(
             compatibility.load_balancer_reachability_schema_version,
             LOAD_BALANCER_REACHABILITY_SCHEMA_VERSION
+        );
+        assert_eq!(compatibility.egress_distribution_schema_version, 0);
+        assert_eq!(compatibility.egress_host_state_schema_version, 0);
+        assert_eq!(compatibility.egress_ha_promotion_schema_version, 0);
+        assert_eq!(
+            compatibility.egress_map_schema_version,
+            EGRESS_MAP_ABI_VERSION
+        );
+        assert_eq!(
+            compatibility.egress_event_schema_version,
+            EGRESS_EVENT_ABI_VERSION
         );
         assert_eq!(
             compatibility.flow_export_schema_version,

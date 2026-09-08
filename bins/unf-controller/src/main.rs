@@ -2734,18 +2734,14 @@ async fn restore_egress_control_plane(state: &ControllerState) -> Result<()> {
         serde_json::from_str(encoded).context("decode durable egress control-plane checkpoint")?;
     let restored = EgressControlPlane::restore(checkpoint)
         .context("validate durable egress control-plane checkpoint")?;
-    let desired_revision = restored.checkpoint().desired_revision;
-    let watched_revision = mutex_lock(&state.egress_desired).revision();
-    if desired_revision > watched_revision {
-        return Err(anyhow!(
-            "egress control-plane desired revision {} is ahead of durable watched revision {}",
-            desired_revision.get(),
-            watched_revision.get()
-        ));
-    }
     let checkpoint = restored.checkpoint();
+    let recovery = {
+        let watched = mutex_lock(&state.egress_desired);
+        classify_egress_recovery(&checkpoint, watched.revision(), watched.model())?
+    };
     info!(
-        desired_revision = desired_revision.get(),
+        desired_revision = checkpoint.desired_revision.get(),
+        recovery = ?recovery,
         allocations = checkpoint.allocation.leases.len(),
         gateways = checkpoint.gateways.records.len(),
         "restored durable egress control plane"
@@ -2755,6 +2751,37 @@ async fn restore_egress_control_plane(state: &ControllerState) -> Result<()> {
     }
     *mutex_lock(&state.egress_control_plane) = restored;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EgressRecoveryDisposition {
+    Exact,
+    ReconcileForward,
+}
+
+fn classify_egress_recovery(
+    checkpoint: &EgressControlPlaneCheckpoint,
+    watched_revision: Revision,
+    watched_model: &EgressModel,
+) -> Result<EgressRecoveryDisposition> {
+    if checkpoint.desired_revision > watched_revision {
+        return Err(anyhow!(
+            "egress control-plane desired revision {} is ahead of durable watched revision {}",
+            checkpoint.desired_revision.get(),
+            watched_revision.get()
+        ));
+    }
+    if checkpoint.desired_revision == watched_revision {
+        if &checkpoint.desired_model != watched_model {
+            return Err(anyhow!(
+                "egress checkpoints disagree at durable desired revision {}",
+                watched_revision.get()
+            ));
+        }
+        Ok(EgressRecoveryDisposition::Exact)
+    } else {
+        Ok(EgressRecoveryDisposition::ReconcileForward)
+    }
 }
 
 async fn persist_egress_control_plane_if_dirty(state: &ControllerState) {
@@ -6681,7 +6708,17 @@ async fn version(
 }
 
 fn component_compatibility() -> ComponentCompatibility {
-    ComponentCompatibility::current("unf-controller", env!("CARGO_PKG_VERSION"), BUILD_REVISION)
+    let mut compatibility = ComponentCompatibility::current(
+        "unf-controller",
+        env!("CARGO_PKG_VERSION"),
+        BUILD_REVISION,
+    );
+    compatibility.egress_distribution_schema_version =
+        unf_egress::EGRESS_DISTRIBUTION_SCHEMA_VERSION;
+    compatibility.egress_host_state_schema_version = unf_egress::EGRESS_HOST_STATE_SCHEMA_VERSION;
+    compatibility.egress_ha_promotion_schema_version =
+        unf_egress::EGRESS_HA_PROMOTION_SCHEMA_VERSION;
+    compatibility
 }
 
 fn requested_service_schema(query: &ServiceSchemaQuery) -> Result<u16, ApiError> {
@@ -14379,6 +14416,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn egress_restart_requires_cross_checkpoint_causal_coherence() {
+        let state = new_state(true);
+        apply_egress_pool_event(&state, Event::Apply(native_egress_pool("192.0.2.0/24")));
+        apply_egress_policy_event(&state, Event::Apply(native_egress_policy()));
+        let checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
+        let desired = mutex_lock(&state.egress_desired);
+        assert_eq!(
+            classify_egress_recovery(&checkpoint, desired.revision(), desired.model()).unwrap(),
+            EgressRecoveryDisposition::Exact
+        );
+        assert_eq!(
+            classify_egress_recovery(
+                &checkpoint,
+                Revision::new(desired.revision().get() + 1),
+                desired.model(),
+            )
+            .unwrap(),
+            EgressRecoveryDisposition::ReconcileForward,
+            "desired state persisted first is advanced through normal reconciliation"
+        );
+
+        let mut ahead = checkpoint.clone();
+        ahead.desired_revision = Revision::new(desired.revision().get() + 1);
+        assert!(
+            classify_egress_recovery(&ahead, desired.revision(), desired.model()).is_err(),
+            "derived authority cannot lead its durable desired source"
+        );
+        let mut divergent = checkpoint;
+        divergent.desired_model.intents[0].priority += 1;
+        assert!(
+            classify_egress_recovery(&divergent, desired.revision(), desired.model()).is_err(),
+            "same-position mutation must fail restart instead of becoming last-known-good"
+        );
+    }
+
     fn openshift_egress_ip(name: &str, address: &str) -> DynamicObject {
         let resource = ApiResource::from_gvk_with_plural(
             &GroupVersionKind::gvk("k8s.ovn.org", "v1", "EgressIP"),
@@ -14452,6 +14525,20 @@ mod tests {
             version.selection_contract_schema_version,
             SELECTION_CONTRACT_SCHEMA_VERSION
         );
+        assert_eq!(
+            version.egress_distribution_schema_version,
+            unf_egress::EGRESS_DISTRIBUTION_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.egress_host_state_schema_version,
+            unf_egress::EGRESS_HOST_STATE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.egress_ha_promotion_schema_version,
+            unf_egress::EGRESS_HA_PROMOTION_SCHEMA_VERSION
+        );
+        assert_ne!(version.egress_map_schema_version, 0);
+        assert_ne!(version.egress_event_schema_version, 0);
     }
 
     #[test]

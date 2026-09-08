@@ -15,7 +15,7 @@
 .PHONY: egress-reachability-contract-test
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
-.PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-bgp-image
+.PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-upgrade-recovery-test egress-bgp-image
 .NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -330,6 +330,21 @@ egress-operations-causal-test: egress-operations-history-test
 	cargo test -p unf-controller egress_counterfactual_is_read_only_and_labels_missing_authority
 	cargo test -p unfctl egress_operations_commands_and_history_paths_parse
 	cargo clippy -p unf-egress -p unf-controller -p unfctl --all-targets --all-features -- -D warnings
+
+egress-upgrade-recovery-test: egress-operations-causal-test
+	hack/verify-egress-upgrade-recovery.sh
+	cargo test -p unf-state component_compatibility_fixes_the_upgrade_contract
+	cargo test -p unf-egress desired_revision_atomically_allocates_and_orders_gateway_intent
+	cargo test -p unf-egress ha_promotion_is_durable_ordered_and_never_health_authorized
+	cargo test -p unf-egress checkpoint_replays_exact_assessment_and_rejects_inner_mutation
+	cargo test -p unf-controller egress_restart_requires_cross_checkpoint_causal_coherence
+	cargo test -p unf-controller component_version_exposes_the_controller_compatibility_tuple
+	cargo test -p unf-agent controller_preflight_accepts_the_bounded_service_schema_transition
+	cargo test -p unf-agent egress_persistent_authority_rejects_regression_and_same_revision_mutation
+	cargo test -p unf-agent recovered_egress_connections_require_exact_bidirectional_tuples_and_proofs
+	cargo test -p unf-agent bgp_configuration_initializes_a_verified_empty_durable_snapshot
+	cargo test -p unf-agent phase8_current_cleanup_is_exact_atomic_in_scope_and_rollback_safe
+	cargo clippy -p unf-state -p unf-egress -p unf-controller -p unf-agent --all-targets --all-features -- -D warnings
 
 test:
 	cargo test --workspace

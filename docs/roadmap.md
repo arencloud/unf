@@ -669,6 +669,18 @@ matrix is maintained in the
   injects a real gateway failure, withdraws both protected route families, and
   preserves the independent path under `make egress-bfd-test`. IPv6 BFD
   transport remains explicitly unqualified and rejected; ADR 0152.
+- Phase 8.9a–8.9b verify loss-explicit causal operations. The Chronicle retains
+  exact NAT witnesses and explicit loss barriers; explanation and simulation
+  join policy, intent, allocation, gateway, contract, reachability, source
+  activation, observations, transport, and HA without inferring private NAT
+  state. Terminal failovers enter a bounded hash-chained ledger under `make
+  egress-operations-causal-test`; ADRs 0153–0154.
+- Phase 8.9c verifies the Causal Egress Recovery Vector. Additive compatibility
+  fields expose every egress wire/map contract; restart rejects derived-ahead
+  and same-revision-divergent state, accepts only desired-ahead reconciliation,
+  migrates checkpoint v5, refuses evidence-losing rollback, and removes only an
+  explicitly authorized exact ABI directory under `make
+  egress-upgrade-recovery-test`; ADR 0155.
 - Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
   ServiceAccount selectors; canonical destinations and non-overlapping
   dual-stack pools; pool-family/multiple-address intent; strict OpenShift

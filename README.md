@@ -707,6 +707,15 @@ private NAT mapping. Completed HA transactions enter a bounded hash-chained
 ledger with explicit eviction anchoring, available through `unfctl
 egress-failovers`; `make egress-operations-history-test` and `make
 egress-operations-causal-test` verify ADRs 0153–0154.
+Phase 8.9c adds a Causal Egress Recovery Vector to `/v1/version`, covering the
+egress distribution, host-state, HA-promotion, map, and event schemas before
+persistent BPF state is opened. Adjacent responses predating those additive
+fields remain accepted only behind exact per-payload validation; any advertised
+drift fails preflight. Restart rejects derived state ahead of desired state and
+same-revision model divergence, while desired-ahead persistence can only
+reconcile forward. Checkpoint-v5 migration, evidence-preserving rollback
+refusal, provider/agent last-known-good replay, and exact current-v15 cleanup
+pass `make egress-upgrade-recovery-test`; ADR 0155.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

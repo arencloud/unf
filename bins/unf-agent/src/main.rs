@@ -7348,6 +7348,11 @@ async fn preflight_controller_compatibility(
         policy_snapshot_schema_version = compatibility.policy_snapshot_schema_version,
         service_snapshot_schema_version = compatibility.service_snapshot_schema_version,
         selection_contract_schema_version = compatibility.selection_contract_schema_version,
+        egress_distribution_schema_version = compatibility.egress_distribution_schema_version,
+        egress_host_state_schema_version = compatibility.egress_host_state_schema_version,
+        egress_ha_promotion_schema_version = compatibility.egress_ha_promotion_schema_version,
+        egress_map_schema_version = compatibility.egress_map_schema_version,
+        egress_event_schema_version = compatibility.egress_event_schema_version,
         "controller compatibility preflight passed before persistent BPF state access"
     );
     Ok(())
@@ -7429,6 +7434,7 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
             local.load_balancer_reachability_schema_version
         ));
     }
+    collect_egress_compatibility_mismatches(controller, &local, &mut mismatches);
     if controller.component != "unf-controller" {
         bail!(
             "incompatible controller compatibility response: component={}; expected unf-controller",
@@ -7442,6 +7448,44 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
         );
     }
     Ok(())
+}
+
+fn collect_egress_compatibility_mismatches(
+    controller: &ComponentCompatibility,
+    local: &ComponentCompatibility,
+    mismatches: &mut Vec<String>,
+) {
+    for (name, remote, expected) in [
+        (
+            "egress distribution schema",
+            controller.egress_distribution_schema_version,
+            local.egress_distribution_schema_version,
+        ),
+        (
+            "egress host-state schema",
+            controller.egress_host_state_schema_version,
+            local.egress_host_state_schema_version,
+        ),
+        (
+            "egress HA promotion schema",
+            controller.egress_ha_promotion_schema_version,
+            local.egress_ha_promotion_schema_version,
+        ),
+        (
+            "egress map schema",
+            controller.egress_map_schema_version,
+            local.egress_map_schema_version,
+        ),
+        (
+            "egress event schema",
+            controller.egress_event_schema_version,
+            local.egress_event_schema_version,
+        ),
+    ] {
+        if remote != 0 && remote != expected {
+            mismatches.push(format!("{name} controller={remote} agent={expected}"));
+        }
+    }
 }
 
 async fn await_background_task(task: Option<tokio::task::JoinHandle<()>>, name: &'static str) {
@@ -15694,7 +15738,12 @@ async fn version() -> Json<ComponentCompatibility> {
 }
 
 fn component_compatibility() -> ComponentCompatibility {
-    ComponentCompatibility::current("unf-agent", env!("CARGO_PKG_VERSION"), BUILD_REVISION)
+    let mut compatibility =
+        ComponentCompatibility::current("unf-agent", env!("CARGO_PKG_VERSION"), BUILD_REVISION);
+    compatibility.egress_distribution_schema_version = EGRESS_DISTRIBUTION_SCHEMA_VERSION;
+    compatibility.egress_host_state_schema_version = EGRESS_HOST_STATE_SCHEMA_VERSION;
+    compatibility.egress_ha_promotion_schema_version = EGRESS_HA_PROMOTION_SCHEMA_VERSION;
+    compatibility
 }
 
 async fn status(State(state): State<Arc<AgentState>>) -> Json<AgentStatus> {
@@ -21678,6 +21727,54 @@ mod tests {
     }
 
     #[test]
+    fn phase8_current_cleanup_is_exact_atomic_in_scope_and_rollback_safe() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("unf");
+        let current = root.join(format!("v{CURRENT_BPF_ABI_VERSION}"));
+        let historical = root.join(format!("v{}", CURRENT_BPF_ABI_VERSION - 1));
+        fs::create_dir_all(current.join("links")).unwrap();
+        fs::create_dir_all(current.join("programs")).unwrap();
+        fs::create_dir_all(&historical).unwrap();
+        for name in PERSISTENT_MAP_NAMES {
+            fs::write(current.join(name), []).unwrap();
+        }
+        fs::write(current.join("links/tcx-ingress-7"), []).unwrap();
+        fs::write(current.join("links/tcx-egress-7"), []).unwrap();
+        fs::write(
+            current.join(format!("programs/{DATAPLANE_TAIL_CALL_MAP_NAME}")),
+            [],
+        )
+        .unwrap();
+        for program in DATAPLANE_TAIL_PROGRAM_NAMES {
+            fs::write(current.join(format!("programs/{program}")), []).unwrap();
+        }
+        fs::write(historical.join("EGRESS_CONFIG"), []).unwrap();
+        fs::write(root.join("operator-owned"), []).unwrap();
+
+        let unknown = current.join("foreign-pin");
+        fs::write(&unknown, []).unwrap();
+        assert!(
+            plan_abi_cleanup(&root, CURRENT_BPF_ABI_VERSION, true).is_err(),
+            "foreign content must reject the whole cleanup plan"
+        );
+        assert!(current.join("EGRESS_CONFIG").exists());
+        fs::remove_file(unknown).unwrap();
+
+        let plan = plan_abi_cleanup(&root, CURRENT_BPF_ABI_VERSION, true)
+            .expect("exact current Phase 8 ownership is recognized");
+        assert_eq!(plan.map_pins.len(), PERSISTENT_MAP_NAMES.len());
+        assert_eq!(plan.link_pins.len(), 2);
+        assert_eq!(
+            plan.program_pins.len(),
+            DATAPLANE_TAIL_PROGRAM_NAMES.len() + 1
+        );
+        execute_abi_cleanup(&plan).expect("execute exact current Phase 8 cleanup");
+        assert!(!current.exists());
+        assert!(historical.join("EGRESS_CONFIG").exists());
+        assert!(root.join("operator-owned").exists());
+    }
+
+    #[test]
     fn recovered_egress_connections_require_exact_bidirectional_tuples_and_proofs() {
         let source = [10, 0, 0, 8];
         let destination = [203, 0, 113, 9];
@@ -22317,6 +22414,23 @@ mod tests {
             version.selection_contract_schema_version,
             SELECTION_CONTRACT_SCHEMA_VERSION
         );
+        assert_eq!(
+            version.egress_distribution_schema_version,
+            EGRESS_DISTRIBUTION_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.egress_host_state_schema_version,
+            EGRESS_HOST_STATE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.egress_ha_promotion_schema_version,
+            EGRESS_HA_PROMOTION_SCHEMA_VERSION
+        );
+        assert_eq!(version.egress_map_schema_version, EGRESS_MAP_ABI_VERSION);
+        assert_eq!(
+            version.egress_event_schema_version,
+            EGRESS_EVENT_ABI_VERSION
+        );
     }
 
     #[test]
@@ -22345,6 +22459,41 @@ mod tests {
         assert!(ensure_controller_compatibility(&controller).is_ok());
         controller.load_balancer_reachability_schema_version =
             unf_loadbalancer::NODE_REACHABILITY_SCHEMA_VERSION;
+
+        controller.egress_distribution_schema_version = EGRESS_DISTRIBUTION_SCHEMA_VERSION;
+        controller.egress_host_state_schema_version = EGRESS_HOST_STATE_SCHEMA_VERSION;
+        controller.egress_ha_promotion_schema_version = EGRESS_HA_PROMOTION_SCHEMA_VERSION;
+        assert!(ensure_controller_compatibility(&controller).is_ok());
+
+        let mut adjacent = serde_json::to_value(&controller).unwrap();
+        let adjacent = adjacent.as_object_mut().unwrap();
+        for field in [
+            "egress_distribution_schema_version",
+            "egress_host_state_schema_version",
+            "egress_ha_promotion_schema_version",
+            "egress_map_schema_version",
+            "egress_event_schema_version",
+        ] {
+            adjacent.remove(field);
+        }
+        let adjacent: ComponentCompatibility =
+            serde_json::from_value(serde_json::Value::Object(adjacent.clone())).unwrap();
+        assert_eq!(adjacent.egress_distribution_schema_version, 0);
+        assert!(
+            ensure_controller_compatibility(&adjacent).is_ok(),
+            "an adjacent response without additive egress fields remains payload-fenced"
+        );
+
+        controller.egress_distribution_schema_version += 1;
+        let error = ensure_controller_compatibility(&controller)
+            .expect_err("a foreign egress distribution schema is rejected");
+        assert!(error.to_string().contains("egress distribution schema"));
+        controller.egress_distribution_schema_version = EGRESS_DISTRIBUTION_SCHEMA_VERSION;
+        controller.egress_map_schema_version += 1;
+        let error = ensure_controller_compatibility(&controller)
+            .expect_err("a foreign egress map schema is rejected");
+        assert!(error.to_string().contains("egress map schema"));
+        controller.egress_map_schema_version -= 1;
 
         controller.policy_snapshot_schema_version += 1;
         let error = ensure_controller_compatibility(&controller)

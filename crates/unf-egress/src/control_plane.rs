@@ -1573,6 +1573,17 @@ mod tests {
             migrated.checkpoint().schema_version,
             EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION
         );
+        let mut v5 = serde_json::to_value(&checkpoint).unwrap();
+        v5["schemaVersion"] = serde_json::json!(5);
+        v5.as_object_mut().unwrap().remove("haHistory");
+        let migrated = EgressControlPlane::restore(serde_json::from_value(v5).unwrap()).unwrap();
+        assert_eq!(migrated.checkpoint().ha_history.revision, 0);
+        let mut future = checkpoint.clone();
+        future.schema_version = EGRESS_CONTROL_PLANE_CHECKPOINT_SCHEMA_VERSION + 1;
+        assert!(matches!(
+            EgressControlPlane::restore(future),
+            Err(EgressControlPlaneError::UnsupportedSchema { .. })
+        ));
 
         let mut mutated = checkpoint;
         mutated.ha_plans[0].assignments[0].gateway = node("foreign");
@@ -1805,9 +1816,15 @@ mod tests {
                 .checkpoint(),
             completed
         );
-        let mut mutated = completed;
+        let mut mutated = completed.clone();
         mutated.ha_history.records[0].acknowledged_flow_twins += 1;
         assert!(EgressControlPlane::restore(mutated).is_err());
+        let mut mislabeled_rollback = completed;
+        mislabeled_rollback.schema_version = 5;
+        assert!(
+            EgressControlPlane::restore(mislabeled_rollback).is_err(),
+            "rollback cannot silently discard terminal failover history"
+        );
 
         let mut bounded = EgressHaHistory::default();
         for completed_unix_ms in 1..=(crate::EGRESS_HA_HISTORY_CAPACITY as u64 + 1) {
