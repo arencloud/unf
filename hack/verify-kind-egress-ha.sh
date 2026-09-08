@@ -158,10 +158,15 @@ probe() {
 
 seed_continuity_flow() {
     local response= peer=
-    for _ in $(seq 1 5); do
+    "${kc[@]}" -n "${namespace}" exec managed -- sh -ec \
+        "rm -f /tmp/unf-ha-continuity.out /tmp/unf-ha-continuity.pid; \
+        nohup sh -ec 'while :; do printf tcp-continuity-seed; sleep 1; done | \
+        socat -T 310 - TCP4:${external_v4}:18082' \
+        >/tmp/unf-ha-continuity.out 2>&1 </dev/null & \
+        echo \$! >/tmp/unf-ha-continuity.pid"
+    for _ in $(seq 1 20); do
         response=$("${kc[@]}" -n "${namespace}" exec managed -- sh -ec \
-            "printf 'tcp-continuity-seed' | socat -T 4 - TCP4:${external_v4}:18082" \
-            2>/dev/null || true)
+            'cat /tmp/unf-ha-continuity.out 2>/dev/null || true' 2>/dev/null || true)
         peer=$(sed -n 's/^SOCAT_PEERADDR=//p' <<<"${response}" | head -n1)
         peer=$(normalize_observed_ipv4 "${peer}" || true)
         if [[ ${response} == *"tcp-continuity-seed" && -n ${peer} ]]; then

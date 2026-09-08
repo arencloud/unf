@@ -738,6 +738,9 @@ pub fn unf_egress_gateway_v4(ctx: TcContext) -> i32 {
     // immediately before its non-returning tail call.
     #[allow(unsafe_code)]
     let observation = unsafe { &*observation_ptr };
+    if let Some(action) = local_source_fence_action(observation) {
+        return action;
+    }
     if let Some(action) = gateway_egress_action::<false>(&ctx, observation) {
         return action;
     }
@@ -764,6 +767,9 @@ pub fn unf_egress_gateway_v6(ctx: TcContext) -> i32 {
     // instruction and combined-stack limits independently of policy lookup.
     #[allow(unsafe_code)]
     let observation = unsafe { &*observation_ptr };
+    if let Some(action) = local_source_fence_action(observation) {
+        return action;
+    }
     if let Some(action) = gateway_egress_action::<true>(&ctx, observation) {
         return action;
     }
@@ -4906,6 +4912,49 @@ fn admit_source_fqdn_flow(
         destination.established_flows_until_monotonic_seconds;
     state.intent_digest = destination.intent_digest;
     EGRESS_FQDN_CONNECTIONS.insert(flow, state, 0).is_ok()
+}
+
+/// A Node may be both the source and one of its selected gateways. Local
+/// traffic reaches the gateway classifier first, so consult the independent
+/// source bank before gateway NAT can consume it. This makes a source-only HA
+/// fence authoritative without disturbing transit traffic for other Nodes.
+#[inline(always)]
+fn local_source_fence_action(observation: &FlowObservation) -> Option<i32> {
+    if !observation.enforce
+        || observation.source_identity.get() == 0
+        || !matches!(observation.protocol, PROTOCOL_TCP | PROTOCOL_UDP)
+    {
+        return None;
+    }
+    let Some(config) = active_egress_config() else {
+        return if egress_source_exists(observation.source_identity) {
+            Some(TC_ACT_SHOT)
+        } else {
+            None
+        };
+    };
+    let source_key = EgressSourceKey {
+        source_identity: observation.source_identity,
+        bank: config.active_bank,
+        reserved: [0; 3],
+    };
+    // SAFETY: the fixed-layout value is copied immediately and does not escape
+    // this non-preemptible invocation.
+    #[allow(unsafe_code)]
+    let source = unsafe { EGRESS_SOURCES.get(&source_key).copied() };
+    let Some(source) = source else {
+        return if egress_source_exists(observation.source_identity) {
+            Some(TC_ACT_SHOT)
+        } else {
+            None
+        };
+    };
+    if !valid_egress_source(&source, &config, observation.address_family)
+        || source.admission == EGRESS_ADMISSION_FENCED
+    {
+        return Some(TC_ACT_SHOT);
+    }
+    None
 }
 
 /// Returns `None` only when the source identity or destination is not owned by
