@@ -667,14 +667,14 @@ rg --fixed-strings --quiet "${egress_v4}" <<<"${gateway_logs}"
 rg --fixed-strings --quiet "${egress_v6}" <<<"${gateway_logs}"
 for _ in $(seq 1 30); do
     operations_history=$(controller_raw '/v1/egress/history?limit=64' 2>/dev/null || true)
-    if jq -e '.schema_version == 7 and .egress_evidence.retained_outcomes >= 2
+    if jq -e '.schema_version == 8 and .egress_evidence.retained_outcomes >= 2
         and .egress_evidence.private_nat_state_inferred == false' \
         <<<"${operations_history}" >/dev/null 2>&1; then
         break
     fi
     sleep 1
 done
-jq -e '.schema_version == 7 and .egress_evidence.retained_outcomes >= 2
+jq -e '.schema_version == 8 and .egress_evidence.retained_outcomes >= 2
     and .egress_evidence.private_nat_state_inferred == false' \
     <<<"${operations_history}" >/dev/null
 
