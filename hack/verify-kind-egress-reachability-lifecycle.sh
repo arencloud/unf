@@ -224,11 +224,15 @@ clean_state=$(wait_for_state '(.currentPlans | length) == 0 and (.currentObserva
 
 mkdir -p "$(dirname "${artifact}")"
 jq -n \
+    --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg revision "$(git -C "${project_root}" rev-parse HEAD)" \
+    --arg context "${context}" \
     --argjson readyRevision "${ready_revision}" \
     --argjson expiredRevision "${expired_revision}" \
     --argjson recoveredRevision "$(jq -er '.revision' <<<"${recovered_state}")" \
     --arg planDigest "${plan_digest}" \
-    '{schemaVersion:1,milestone:"8.8b",algorithm:"diversity-quorum-reachability-v1",
+    '{schemaVersion:1,milestone:"8.8b",generatedAt:$generatedAt,revision:$revision,
+      context:$context,algorithm:"diversity-quorum-reachability-v1",
       rbac:{statusOnly:true,dedicatedObserverNamespaces:2,agentDenied:true},
       lifecycle:{readyRevision:$readyRevision,restartRecovered:true,
         autonomousExpiryRevision:$expiredRevision,replayRejected:true,

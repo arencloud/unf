@@ -15,8 +15,8 @@
 .PHONY: egress-reachability-contract-test
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
-.PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-upgrade-recovery-test egress-bgp-image
-.NOTPARALLEL: kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
+.PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-upgrade-recovery-test egress-phase8-kind-test egress-bgp-image
+.NOTPARALLEL: egress-phase8-kind-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
 KIND_PROVIDER ?= podman
@@ -345,6 +345,18 @@ egress-upgrade-recovery-test: egress-operations-causal-test
 	cargo test -p unf-agent bgp_configuration_initializes_a_verified_empty_durable_snapshot
 	cargo test -p unf-agent phase8_current_cleanup_is_exact_atomic_in_scope_and_rollback_safe
 	cargo clippy -p unf-state -p unf-egress -p unf-controller -p unf-agent --all-targets --all-features -- -D warnings
+
+egress-phase8-kind-test: egress-upgrade-recovery-test primary-cni-installer-test cli service-kind-load
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) hack/configure-kind-primary-cni.sh
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) UNF_INTERNAL_TLS_DIR=$(CURDIR)/.tools/kind-service-internal-tls hack/configure-internal-tls.sh
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) apply -k deploy/kind-service-fabric
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) hack/configure-kind-service-bootstrap.sh
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout restart deployment/unf-controller daemonset/unf-agent -n unf-system
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout status deployment/unf-controller -n unf-system --timeout=180s
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) kubectl --context $(SERVICE_KUBE_CONTEXT) rollout status daemonset/unf-agent -n unf-system --timeout=180s
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) hack/migrate-kind-bpf-abi-v15.sh
+	bash -n hack/verify-kind-egress-phase8.sh
+	KUBECONFIG=$(SERVICE_KIND_KUBECONFIG) KUBE_CONTEXT=$(SERVICE_KUBE_CONTEXT) KIND_PROVIDER=$(KIND_PROVIDER) UNF_TEST_TOOLS_IMAGE=$(TEST_TOOLS_IMAGE) UNF_PHASE8_RUNTIME_REVISION=$(UNF_BUILD_REVISION) hack/verify-kind-egress-phase8.sh
 
 test:
 	cargo test --workspace

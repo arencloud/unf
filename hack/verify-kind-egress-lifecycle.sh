@@ -305,6 +305,15 @@ controller_raw() {
     "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${pod}:9962/proxy${path}"
 }
 
+controller_post() {
+    local path=$1 pod
+    pod=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller \
+        -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name' \
+        | head -n 1)
+    [[ -n ${pod} ]]
+    "${kc[@]}" create --raw "/api/v1/namespaces/unf-system/pods/${pod}:9962/proxy${path}" -f -
+}
+
 gateway_agent() {
     "${kc[@]}" -n unf-system get pods --field-selector "spec.nodeName=${gateway_node}" \
         -o json | jq -r '.items[] | select(.metadata.name | startswith("unf-agent-")) | .metadata.name' \
@@ -601,6 +610,29 @@ initial_epoch=$(jq -er '.allocation.leases[0].leaseEpoch' <<<"${initial_state}")
 traffic_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 native_peer_matrix
 managed_udp_matrix initial
+operations_v4_request=$(jq -nc --arg from "${namespace}/managed" \
+    --arg destination "${external_v4}" \
+    '{from:$from,destination:$destination,protocol:"udp",port:18080}')
+operations_v6_request=$(jq -nc --arg from "${namespace}/managed" \
+    --arg destination "${external_v6}" \
+    '{from:$from,destination:$destination,protocol:"udp",port:18080}')
+operations_explain_v4=$(controller_post /v1/egress/explain <<<"${operations_v4_request}")
+operations_explain_v6=$(controller_post /v1/egress/explain <<<"${operations_v6_request}")
+operations_simulate_v4=$(controller_post /v1/egress/simulate <<<"${operations_v4_request}")
+operations_simulate_v6=$(controller_post /v1/egress/simulate <<<"${operations_v6_request}")
+for response in "${operations_explain_v4}" "${operations_explain_v6}" \
+    "${operations_simulate_v4}" "${operations_simulate_v6}"; do
+    jq -e --arg owner "${policy}" '
+        .schema_version == 1 and .outcome == "eligible"
+        and .selected_intent.name == $owner
+        and (.candidate_egress_addresses | length) == 2
+        and (.candidate_gateways | length) >= 1
+        and .private_nat_state_inferred == false
+        and ([.evidence[].layer] | unique | length) == (.evidence | length)
+        and ([.evidence[].layer] | index("counterfactual")) != null
+        and ([.evidence[].layer] | index("transport")) != null
+    ' <<<"${response}" >/dev/null
+done
 gateway_pod=$(gateway_agent)
 for _ in $(seq 1 30); do
     gateway_logs=$("${kc[@]}" -n unf-system logs "${gateway_pod}" --since-time="${traffic_since}" 2>/dev/null || true)
@@ -613,6 +645,18 @@ for _ in $(seq 1 30); do
 done
 rg --fixed-strings --quiet "${egress_v4}" <<<"${gateway_logs}"
 rg --fixed-strings --quiet "${egress_v6}" <<<"${gateway_logs}"
+for _ in $(seq 1 30); do
+    operations_history=$(controller_raw '/v1/egress/history?limit=64' 2>/dev/null || true)
+    if jq -e '.schema_version == 7 and .egress_evidence.retained_outcomes >= 2
+        and .egress_evidence.private_nat_state_inferred == false' \
+        <<<"${operations_history}" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+jq -e '.schema_version == 7 and .egress_evidence.retained_outcomes >= 2
+    and .egress_evidence.private_nat_state_inferred == false' \
+    <<<"${operations_history}" >/dev/null
 
 qualification_stage=restart-recovery
 if [[ ${native_reachability} == true ]]; then
@@ -769,6 +813,11 @@ jq -n \
     --argjson controllerRestartStatus "${restart_status}" \
     --argjson agentRestartStatus "${agent_restart_status}" \
     --argjson reusedStatus "${reused_status}" \
+    --argjson operationsExplainV4 "${operations_explain_v4}" \
+    --argjson operationsExplainV6 "${operations_explain_v6}" \
+    --argjson operationsSimulateV4 "${operations_simulate_v4}" \
+    --argjson operationsSimulateV6 "${operations_simulate_v6}" \
+    --argjson operationsHistory "${operations_history}" \
     '{schemaVersion:1,milestone:$milestone,generatedAt:$generatedAt,revision:$revision,context:$context,
       kubernetesVersion:$kubernetesVersion,kubeProxyPresent:false,
       topology:{sourceNode:$sourceNode,gatewayNode:$gatewayNode},
@@ -783,12 +832,17 @@ jq -n \
         safeReuseMonotonic:($reusedEpoch > $initialEpoch),finalReleaseComplete:true},
       status:{initial:$initialStatus,controllerRestart:$controllerRestartStatus,
         agentRestart:$agentRestartStatus,reused:$reusedStatus},
+      operations:{explain:{ipv4:$operationsExplainV4,ipv6:$operationsExplainV6},
+        simulate:{ipv4:$operationsSimulateV4,ipv6:$operationsSimulateV6},
+        chronicle:$operationsHistory},
       images:$images,diagnostics:$diagnostics,
       verified:(["exclusive UNF primary CNI","watched dual-stack EgressPool and EgressPolicy",
         "explicit Ready gateway selection","exact Node-UID-bound address ownership",
         "proxy-NDP IPv6 ownership","bilateral source and gateway activation",
         "policy-first dual-stack source steering","IPv4 and IPv6 UDP gateway NAT and reverse traffic",
         "exact sparse NAT witnesses","unrelated native egress source preservation",
+        "dual-stack evidence-complete explanation and non-authoritative simulation",
+        "loss-explicit Causal Egress Chronicle without private NAT inference",
         "controller restart recovery","agent restart and address readback recovery",
         "source fencing","lease-specific NAT drain","reachability withdrawal",
         "host address and proxy removal","Proof of Safe Forgetting release",
