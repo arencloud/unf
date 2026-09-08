@@ -131,6 +131,9 @@ for command in kubectl jq; do command -v "${command}" >/dev/null; done
 "${kc[@]}" get clusterrole unf-reachability-observer >/dev/null
 [[ $("${kc[@]}" get egressreachabilityplans.network.unf.io -o json | jq '.items | length') == 0 ]]
 [[ $("${kc[@]}" get egressreachabilityobservations.network.unf.io -A -o json | jq '.items | length') == 0 ]]
+baseline_state=$(reachability_state)
+baseline_latest_plan_keys=$(jq -c '[.latestPlans[].sourceKey] | unique | sort' <<<"${baseline_state}")
+baseline_latest_observation_keys=$(jq -c '[.latestObservations[].sourceKey] | unique | sort' <<<"${baseline_state}")
 
 stage=identity-rbac
 for namespace in "${observer_a_namespace}" "${observer_b_namespace}"; do
@@ -219,8 +222,17 @@ stage=exact-cleanup
 "${kc[@]}" -n "${observer_b_namespace}" delete egressreachabilityobservation witness --wait=true >/dev/null
 "${kc[@]}" delete egressreachabilityplan "${plan_name}" --wait=true >/dev/null
 clean_state=$(wait_for_state '(.currentPlans | length) == 0 and (.currentObservations | length) == 0 and (.assessments | length) == 0')
-[[ $(jq '.latestPlans | length' <<<"${clean_state}") == 1 ]]
-[[ $(jq '.latestObservations | length' <<<"${clean_state}") == 2 ]]
+expected_latest_plan_keys=$(jq -nc \
+    --argjson baseline "${baseline_latest_plan_keys}" \
+    --arg key "native:reachability-plan/${plan_name}" \
+    '$baseline + [$key] | unique | sort')
+expected_latest_observation_keys=$(jq -nc \
+    --argjson baseline "${baseline_latest_observation_keys}" \
+    --arg observerA "native:reachability-observation/${observer_a_namespace}/witness" \
+    --arg observerB "native:reachability-observation/${observer_b_namespace}/witness" \
+    '$baseline + [$observerA, $observerB] | unique | sort')
+[[ $(jq -c '[.latestPlans[].sourceKey] | unique | sort' <<<"${clean_state}") == "${expected_latest_plan_keys}" ]]
+[[ $(jq -c '[.latestObservations[].sourceKey] | unique | sort' <<<"${clean_state}") == "${expected_latest_observation_keys}" ]]
 
 mkdir -p "$(dirname "${artifact}")"
 jq -n \
