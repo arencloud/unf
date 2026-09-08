@@ -28,6 +28,8 @@ diagnostics_dir=${UNF_EGRESS_KIND_DIAGNOSTICS:-"${project_root}/.artifacts/phase
 qualification_stage=preflight
 resources_created=false
 diagnostics_collected=false
+controller_forward_pid=
+controller_port=$((21000 + started_unix_seconds % 10000))
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
 runtime=(sudo "${container_runtime}")
 
@@ -66,6 +68,10 @@ report_failure() {
 }
 
 cleanup() {
+    if [[ -n ${controller_forward_pid} ]]; then
+        kill "${controller_forward_pid}" >/dev/null 2>&1 || true
+        wait "${controller_forward_pid}" 2>/dev/null || true
+    fi
     if [[ ${resources_created} == true ]]; then
         "${kc[@]}" delete egresspolicy.network.unf.io "${policy}" --ignore-not-found \
             --wait=false >/dev/null 2>&1 || true
@@ -90,7 +96,7 @@ cleanup() {
 trap report_failure ERR
 trap cleanup EXIT
 
-for command in kubectl jq rg sha256sum sudo "${container_runtime}"; do
+for command in curl kubectl jq rg sha256sum sudo "${container_runtime}"; do
     command -v "${command}" >/dev/null 2>&1 || {
         echo "${command} is required for Phase 8.5 Kind egress qualification" >&2
         exit 1
@@ -306,12 +312,10 @@ controller_raw() {
 }
 
 controller_post() {
-    local path=$1 pod
-    pod=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller \
-        -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name' \
-        | head -n 1)
-    [[ -n ${pod} ]]
-    "${kc[@]}" create --raw "/api/v1/namespaces/unf-system/pods/${pod}:9962/proxy${path}" -f -
+    local path=$1
+    curl --fail --silent --show-error --max-time 10 \
+        --request POST --header 'Content-Type: application/json' --data-binary @- \
+        "http://127.0.0.1:${controller_port}${path}"
 }
 
 gateway_agent() {
@@ -610,6 +614,19 @@ initial_epoch=$(jq -er '.allocation.leases[0].leaseEpoch' <<<"${initial_state}")
 traffic_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 native_peer_matrix
 managed_udp_matrix initial
+controller_pod=$("${kc[@]}" -n unf-system get pods \
+    -l app.kubernetes.io/name=unf-controller -o jsonpath='{.items[0].metadata.name}')
+"${kc[@]}" -n unf-system port-forward "pod/${controller_pod}" \
+    "${controller_port}:9962" >"${diagnostics_dir}-port-forward.log" 2>&1 &
+controller_forward_pid=$!
+for _ in $(seq 1 60); do
+    if curl --fail --silent --show-error --max-time 2 \
+        "http://127.0.0.1:${controller_port}/readyz" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+kill -0 "${controller_forward_pid}"
 operations_v4_request=$(jq -nc --arg from "${namespace}/managed" \
     --arg destination "${external_v4}" \
     '{from:$from,destination:$destination,protocol:"udp",port:18080}')
@@ -620,6 +637,9 @@ operations_explain_v4=$(controller_post /v1/egress/explain <<<"${operations_v4_r
 operations_explain_v6=$(controller_post /v1/egress/explain <<<"${operations_v6_request}")
 operations_simulate_v4=$(controller_post /v1/egress/simulate <<<"${operations_v4_request}")
 operations_simulate_v6=$(controller_post /v1/egress/simulate <<<"${operations_v6_request}")
+kill "${controller_forward_pid}"
+wait "${controller_forward_pid}" 2>/dev/null || true
+controller_forward_pid=
 for response in "${operations_explain_v4}" "${operations_explain_v6}" \
     "${operations_simulate_v4}" "${operations_simulate_v6}"; do
     jq -e --arg owner "${policy}" '
