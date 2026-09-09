@@ -5,6 +5,7 @@
 //! authority. Kernel mutation, BPF state, packet processing, and Kubernetes
 //! adapters deliberately live outside this crate.
 
+mod activation_latch;
 mod fast_path;
 mod fast_path_transaction;
 mod generation_distribution;
@@ -12,6 +13,7 @@ mod kernel_provider;
 mod key_authority;
 mod route_authority;
 
+pub use activation_latch::*;
 pub use fast_path::*;
 pub use fast_path_transaction::*;
 pub use generation_distribution::*;

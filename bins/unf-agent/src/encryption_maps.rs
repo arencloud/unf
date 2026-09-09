@@ -9,7 +9,6 @@ use anyhow::{Context, Result, bail};
 use aya::Ebpf;
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, IterableMap, MapData};
 use tracing::info;
-use unf_common::Revision;
 use unf_ebpf_common::{
     ENCRYPTION_BANK_COUNT, ENCRYPTION_CONNECTION_MAP_CAPACITY, ENCRYPTION_DECISION_MAP_CAPACITY,
     ENCRYPTION_DISPOSITION_NATIVE, ENCRYPTION_DISPOSITION_REQUIRED,
@@ -19,8 +18,9 @@ use unf_ebpf_common::{
     EncryptionTransportValue, encryption_route_mark,
 };
 use unf_encryption::{
-    EncryptionFastPathState, EncryptionRoutePublicationPermit, FastPathMapCheckpoint,
-    FastPathMapRecoveryAction, FastPathMapTransactionPhase, FastPathPublishedGeneration,
+    EncryptionActivationLatch, EncryptionActivationMode, EncryptionFastPathState,
+    FastPathMapCheckpoint, FastPathMapRecoveryAction, FastPathMapTransactionPhase,
+    FastPathPublishedGeneration,
 };
 
 use super::{load_secure_json, persist_secure_json, reject_node_block_symlinks};
@@ -56,6 +56,8 @@ pub(super) struct EncryptionMapSynchronizer {
     maps: EncryptionMaps,
     state_path: PathBuf,
     active: Option<FastPathMapCheckpoint>,
+    pending: Option<FastPathMapCheckpoint>,
+    requires_local_revalidation: bool,
 }
 
 impl EncryptionMapSynchronizer {
@@ -71,6 +73,8 @@ impl EncryptionMapSynchronizer {
             maps,
             state_path,
             active: None,
+            pending: None,
+            requires_local_revalidation: false,
         };
         synchronizer.validate_shapes()?;
         synchronizer.validate_all_entries()?;
@@ -97,14 +101,16 @@ impl EncryptionMapSynchronizer {
             {
                 bail!("pending encryption checkpoint does not bind the current generation");
             }
-            synchronizer.recover_pending(current.as_ref(), checkpoint.clone(), &pending_path)?;
-            synchronizer.active = load_optional_checkpoint(
-                &synchronizer.state_path,
-                "recovered encryption fast path",
-            )?;
+            // A serialized checkpoint cannot replace the Node-local route
+            // permit. Keep every unfinished crash boundary inert until a new
+            // tri-plane latch revalidates the exact transaction.
+            synchronizer.active = current;
+            synchronizer.pending = Some(checkpoint.clone());
+            synchronizer.requires_local_revalidation = true;
         } else if let Some(checkpoint) = current {
             synchronizer.require_exact_published(&checkpoint)?;
             synchronizer.active = Some(checkpoint);
+            synchronizer.requires_local_revalidation = true;
         } else {
             synchronizer.require_quiescent()?;
         }
@@ -127,35 +133,74 @@ impl EncryptionMapSynchronizer {
         Ok(synchronizer)
     }
 
-    /// Stages and publishes one generation through the durable CCV checkpoint.
-    /// Controller distribution calls this boundary in the next encryption
-    /// slice; keeping it here makes map mutation impossible without the mirror.
+    pub(super) const fn requires_local_revalidation(&self) -> bool {
+        self.requires_local_revalidation
+    }
+
+    /// Consumes the single-use controller/kernel/map activation latch, then
+    /// stages and publishes its exact durable CCV checkpoint.
     #[allow(dead_code)]
-    pub(super) fn apply(
-        &mut self,
-        transaction_revision: Revision,
-        desired: &EncryptionFastPathState,
-        route_permit: &EncryptionRoutePublicationPermit,
-    ) -> Result<()> {
-        route_permit
-            .verify_for(desired)
-            .context("verify route-before-authority publication permit")?;
+    pub(super) fn apply(&mut self, latch: EncryptionActivationLatch) -> Result<()> {
         let prior = self
             .active
             .as_ref()
             .map(|checkpoint| checkpoint.transaction.desired.published);
-        let pending_path = pending_checkpoint_path(&self.state_path)?;
-        match fs::symlink_metadata(&pending_path) {
-            Ok(_) => bail!("pending encryption transaction must be recovered before a new apply"),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("inspect pending encryption transaction"),
+        let witness = latch.witness();
+        let material = latch
+            .open(prior, self.pending.as_ref())
+            .context("open tri-plane encryption activation latch")?;
+        let (distributed_checkpoint, desired, route_permit, mode) = material.into_parts();
+        route_permit
+            .verify_for(&desired)
+            .context("reverify route-before-authority publication permit")?;
+        if mode == EncryptionActivationMode::RevalidateCurrent {
+            if self.pending.is_some() {
+                bail!("current-generation revalidation cannot bypass a pending transaction");
+            }
+            let active = self
+                .active
+                .as_ref()
+                .context("current-generation revalidation has no active checkpoint")?;
+            self.require_exact_published(active)?;
+            self.requires_local_revalidation = false;
+            info!(
+                activation_witness = ?witness.0,
+                generation = desired.config.generation,
+                "tri-plane encryption authority revalidated after restart"
+            );
+            return Ok(());
         }
-        let checkpoint = FastPathMapCheckpoint::begin(transaction_revision, desired, prior)
-            .context("begin encryption map transaction")?;
-        persist_secure_json(&pending_path, &checkpoint, "pending encryption fast path")?;
+        let pending_path = pending_checkpoint_path(&self.state_path)?;
+        let checkpoint = if self.pending.is_some() {
+            distributed_checkpoint
+        } else {
+            match fs::symlink_metadata(&pending_path) {
+                Ok(_) => bail!("untracked pending encryption transaction is quarantined"),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("inspect pending encryption transaction"),
+            }
+            persist_secure_json(
+                &pending_path,
+                &distributed_checkpoint,
+                "pending encryption fast path",
+            )?;
+            distributed_checkpoint
+        };
         let current = self.active.clone();
-        self.recover_pending(current.as_ref(), checkpoint, &pending_path)?;
+        if let Err(error) = self.recover_pending(current.as_ref(), checkpoint, &pending_path) {
+            self.pending =
+                load_optional_checkpoint(&pending_path, "failed pending encryption fast path")?;
+            self.requires_local_revalidation = true;
+            return Err(error);
+        }
         self.active = load_optional_checkpoint(&self.state_path, "applied encryption fast path")?;
+        self.pending = None;
+        self.requires_local_revalidation = false;
+        info!(
+            activation_witness = ?witness.0,
+            generation = desired.config.generation,
+            "tri-plane encryption activation committed"
+        );
         Ok(())
     }
 
@@ -841,7 +886,8 @@ mod tests {
         let maps = take_encryption_maps(&mut ebpf).expect("take typed encryption maps");
         let directory = tempdir().expect("create checkpoint directory");
         let state_path = directory.path().join("encryption-fast-path.json");
-        EncryptionMapSynchronizer::recover(maps, state_path, false)
+        let synchronizer = EncryptionMapSynchronizer::recover(maps, state_path, false)
             .expect("fresh kernel maps recover as a quiescent ABI island");
+        assert!(!synchronizer.requires_local_revalidation());
     }
 }

@@ -875,7 +875,7 @@ matrix is maintained in the
   route readback, safe MTU derivation, foreign-state refusal, injected rollback,
   replay, and positive cleanup pass `make encryption-kernel-provider-test` and
   the privileged live-kernel gate; ADR 0161. Workload selection remains 9.5.
-- Phase 9.5a–9.5g now provide the canonical coalesced compiler and Causal Epoch
+- Phase 9.5a–9.5h now provide the canonical coalesced compiler and Causal Epoch
   Lease, Causal Commit Vector, isolated fixed-shape Aya ABI, Proof-Carrying Aya
   Map Mirror with delta-minimal recovery, and Cooperative Route-Mark Lease. The
   latter gives every admitted outer `WireGuard` bypass mark a collision-free
@@ -889,9 +889,14 @@ matrix is maintained in the
   controller incarnation, and exact durable predecessor. Secure agent
   persistence occurs before cursor adoption, while the non-serializable local
   route permit cannot cross the API; `make
-  encryption-generation-distribution-test` and ADR 0168. Prepared-generation
-  production, local activation orchestration, TC consumption, verifier loading,
-  and live encrypted packets remain within milestone 9.5.
+  encryption-generation-distribution-test` and ADR 0168. The Tri-Plane Causal
+  Activation Latch then consumes only an exact join of that capsule, renewed
+  Node-local route proof, and the applied/pending Aya transaction. Restarted
+  serialized authority remains quarantined before TC attachment until proof is
+  recreated; `make encryption-activation-latch-test` and ADR 0169.
+  Prepared-generation production, live local WireGuard/route orchestration, TC
+  consumption, verifier loading, and live encrypted packets remain within
+  milestone 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,

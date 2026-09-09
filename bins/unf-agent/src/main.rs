@@ -6736,11 +6736,16 @@ async fn run_dataplane(
     let service_maps = take_service_maps(&mut ebpf)?;
     let egress_maps = take_egress_maps(&mut ebpf)?;
     let encryption_maps = take_encryption_maps(&mut ebpf)?;
-    let _encryption = EncryptionMapSynchronizer::recover(
+    let mut encryption = EncryptionMapSynchronizer::recover(
         encryption_maps,
         config.encryption_fast_path_state_path.clone(),
         encryption_pins_existed,
     )?;
+    if encryption.requires_local_revalidation() {
+        bail!(
+            "recovered encryption authority requires a fresh Node-local tri-plane activation latch before TC attachment"
+        );
+    }
     let controller_management_port = controller_url.as_deref().map(controller_port).transpose()?;
     let egress_bgp = initialize_egress_bgp(
         config.egress_bgp_config_path.as_deref(),
@@ -6835,6 +6840,7 @@ async fn run_dataplane(
         &mut services,
         &mut egress,
         &mut encryption_generations,
+        &mut encryption,
         &state,
         flow_export_sender.as_ref(),
         cancellation,
@@ -12902,6 +12908,7 @@ async fn consume_events(
     services: &mut ServiceSynchronizer,
     egress: &mut EgressSynchronizer,
     encryption_generations: &mut EncryptionGenerationSynchronizer,
+    _encryption: &mut EncryptionMapSynchronizer,
     state: &AgentState,
     flow_export_sender: Option<&mpsc::Sender<FlowExportRecord>>,
     cancellation: CancellationToken,

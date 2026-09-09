@@ -1022,18 +1022,20 @@ mod tests {
 
     use super::*;
     use crate::{
-        CausalCommitVector, EncryptionBaseline, EncryptionCapability, EncryptionContractFacts,
-        EncryptionContractRevisions, EncryptionEndpointFact, EncryptionGenerationDistributionError,
-        EncryptionGenerationRecipient, EncryptionGenerationRequest, EncryptionIntent,
-        EncryptionKeyFact, EncryptionKeyPhase, EncryptionModel, EncryptionNode, EncryptionPathFact,
-        EncryptionPolicyFact, EncryptionRouteAuthority, EncryptionRouteAuthorityError,
-        EncryptionRouteFamily, FastPathMapCheckpoint, FastPathMapRecoveryAction,
-        FastPathMapTransaction, FastPathTransactionError, IpPrefix, ManagedIdentitySelector,
-        NodeSealedGenerationCapsule, UNF_ENCRYPTION_RULE_PRIORITY_BASE,
-        UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily, UnderlayMtuObservation,
-        WireGuardEpochActivation, WireGuardKernelPlan, WireGuardKernelPlanInput,
-        WireGuardKernelSnapshotInput, WireGuardMtuEnvelope, WireGuardPeerPlan,
-        WireGuardPeerReadback, WireGuardPublicKey, WireGuardRouteReadback, WireGuardRouteScope,
+        CausalCommitVector, EncryptionActivationLatch, EncryptionActivationLatchError,
+        EncryptionActivationMode, EncryptionBaseline, EncryptionCapability,
+        EncryptionContractFacts, EncryptionContractRevisions, EncryptionEndpointFact,
+        EncryptionGenerationDistributionError, EncryptionGenerationRecipient,
+        EncryptionGenerationRequest, EncryptionIntent, EncryptionKeyFact, EncryptionKeyPhase,
+        EncryptionModel, EncryptionNode, EncryptionPathFact, EncryptionPolicyFact,
+        EncryptionRouteAuthority, EncryptionRouteAuthorityError, EncryptionRouteFamily,
+        FastPathMapCheckpoint, FastPathMapRecoveryAction, FastPathMapTransaction,
+        FastPathTransactionError, IpPrefix, ManagedIdentitySelector, NodeSealedGenerationCapsule,
+        UNF_ENCRYPTION_RULE_PRIORITY_BASE, UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily,
+        UnderlayMtuObservation, WireGuardEpochActivation, WireGuardKernelPlan,
+        WireGuardKernelPlanInput, WireGuardKernelSnapshotInput, WireGuardMtuEnvelope,
+        WireGuardPeerPlan, WireGuardPeerReadback, WireGuardPublicKey, WireGuardRouteReadback,
+        WireGuardRouteScope,
     };
 
     struct Fixture {
@@ -1679,6 +1681,127 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn tri_plane_activation_latch_joins_distribution_routes_and_exact_predecessor() {
+        let fixture = fixture(7);
+        let state = required_state(&fixture, context_at(1, 21));
+        let checkpoint = FastPathMapCheckpoint::begin(Revision::new(22), &state, None).unwrap();
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-worker-a".to_owned(),
+        };
+        let request =
+            EncryptionGenerationRequest::issue("worker-a".to_owned(), None, [5; 32]).unwrap();
+        let admitted = NodeSealedGenerationCapsule::issue(
+            100,
+            recipient.clone(),
+            &request,
+            checkpoint.clone(),
+        )
+        .unwrap()
+        .admit(&request, None)
+        .unwrap();
+        let authority =
+            EncryptionRouteAuthority::issue(&state, std::slice::from_ref(&fixture.snapshot))
+                .unwrap();
+        let permit = authority.authorize_publication(&authority.rules).unwrap();
+        let latch =
+            EncryptionActivationLatch::issue(&admitted, &recipient, None, permit.clone()).unwrap();
+        let witness = latch.witness();
+        assert_ne!(witness.0, [0; 32]);
+        let material = latch.open(None, None).unwrap();
+        assert_eq!(material.witness(), witness);
+        let (opened_checkpoint, opened_state, opened_permit, mode) = material.into_parts();
+        assert_eq!(mode, EncryptionActivationMode::PublishSuccessor);
+        assert_eq!(opened_checkpoint, checkpoint);
+        assert_eq!(opened_state, state);
+        opened_permit.verify_for(&opened_state).unwrap();
+
+        let mut quarantined = checkpoint;
+        quarantined.record_staged(&state).unwrap();
+        let resumed = EncryptionActivationLatch::issue(&admitted, &recipient, None, permit.clone())
+            .unwrap()
+            .open(None, Some(&quarantined))
+            .unwrap();
+        assert_eq!(resumed.into_parts().0, quarantined);
+
+        let revalidated = EncryptionActivationLatch::issue(
+            &admitted,
+            &recipient,
+            Some(admitted.published()),
+            permit,
+        )
+        .unwrap()
+        .open(Some(admitted.published()), None)
+        .unwrap();
+        assert_eq!(
+            revalidated.mode(),
+            EncryptionActivationMode::RevalidateCurrent
+        );
+    }
+
+    #[test]
+    fn tri_plane_activation_latch_refuses_cross_plane_or_predecessor_drift() {
+        let fixture = fixture(7);
+        let state = required_state(&fixture, context_at(1, 21));
+        let checkpoint = FastPathMapCheckpoint::begin(Revision::new(22), &state, None).unwrap();
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-worker-a".to_owned(),
+        };
+        let request =
+            EncryptionGenerationRequest::issue("worker-a".to_owned(), None, [6; 32]).unwrap();
+        let admitted =
+            NodeSealedGenerationCapsule::issue(100, recipient.clone(), &request, checkpoint)
+                .unwrap()
+                .admit(&request, None)
+                .unwrap();
+        let authority =
+            EncryptionRouteAuthority::issue(&state, std::slice::from_ref(&fixture.snapshot))
+                .unwrap();
+        let permit = authority.authorize_publication(&authority.rules).unwrap();
+
+        let replacement = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "replacement-uid".to_owned(),
+        };
+        assert!(matches!(
+            EncryptionActivationLatch::issue(&admitted, &replacement, None, permit.clone()),
+            Err(EncryptionActivationLatchError::RecipientMismatch)
+        ));
+        let mut wrong_applied = admitted.published();
+        wrong_applied.generation = Revision::new(100);
+        assert!(matches!(
+            EncryptionActivationLatch::issue(
+                &admitted,
+                &recipient,
+                Some(wrong_applied),
+                permit.clone()
+            ),
+            Err(EncryptionActivationLatchError::PredecessorMismatch)
+        ));
+
+        let other_state = required_state(&fixture, context_at(0, 23));
+        let other_checkpoint =
+            FastPathMapCheckpoint::begin(Revision::new(24), &other_state, None).unwrap();
+        let other_authority =
+            EncryptionRouteAuthority::issue(&other_state, std::slice::from_ref(&fixture.snapshot))
+                .unwrap();
+        let other_permit = other_authority
+            .authorize_publication(&other_authority.rules)
+            .unwrap();
+        assert!(matches!(
+            EncryptionActivationLatch::issue(&admitted, &recipient, None, other_permit),
+            Err(EncryptionActivationLatchError::InvalidRoutePermit(_))
+        ));
+        let renewed =
+            EncryptionActivationLatch::issue(&admitted, &recipient, None, permit).unwrap();
+        assert!(matches!(
+            renewed.open(None, Some(&other_checkpoint)),
+            Err(EncryptionActivationLatchError::PendingTransactionMismatch)
+        ));
     }
 
     #[test]

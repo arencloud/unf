@@ -811,11 +811,17 @@ durable predecessor; the agent atomically persists it as desired state before
 advancing its cursor. Route permits remain non-serializable and Node-local, so
 remote delivery cannot manufacture kernel authority. Replay, replacement,
 mutation, recovery, and no-change behavior pass
-`make encryption-generation-distribution-test`; ADR 0168. The prepared-state
-producer, local activation orchestrator, TC consumer, verifier, and live packet
+`make encryption-generation-distribution-test`; ADR 0168. The Tri-Plane Causal
+Activation Latch now makes the controller capsule, a freshly recreated local
+route permit, and the exact Aya predecessor/quarantined transaction agree at
+one consuming boundary. Serialized active or pending state cannot resume or
+reach TC attachment after restart until local kernel proof is renewed. Cross-
+plane mutation and staged-crash recovery pass
+`make encryption-activation-latch-test`; ADR 0169. The prepared-state producer,
+live local WireGuard/route orchestrator, TC consumer, verifier, and packet
 gate remain, so no workload packet yet selects the staged route table. The
 [Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0168 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0169 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
