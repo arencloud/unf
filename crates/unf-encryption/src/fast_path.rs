@@ -175,6 +175,59 @@ impl EncryptionFastPathState {
     }
 }
 
+pub(crate) struct FastPathRestoreAuthority {
+    pub generation: Revision,
+    pub policy_revision: Revision,
+    pub service_revision: Revision,
+    pub egress_revision: Revision,
+    pub bank: u8,
+    pub epoch_count: u8,
+    pub decisions: Vec<FastPathDecisionAuthority>,
+    pub transports: Vec<EncryptionTransportAuthority>,
+    pub expected_digest: EncryptionFastPathDigest,
+}
+
+pub(crate) fn restore_encryption_fast_path_state(
+    authority: FastPathRestoreAuthority,
+) -> Result<EncryptionFastPathState, FastPathError> {
+    let context = FastPathCompileContext {
+        generation: authority.generation,
+        policy_revision: authority.policy_revision,
+        service_revision: authority.service_revision,
+        egress_revision: authority.egress_revision,
+        bank: authority.bank,
+        now_unix_ms: 1,
+        now_monotonic_ns: 1,
+    };
+    let config = map_config(
+        context,
+        usize::from(authority.epoch_count),
+        &authority.decisions,
+        &authority.transports,
+    )?;
+    let decisions = lower_decisions(context, &authority.decisions);
+    let transports = lower_transports(authority.bank, &authority.transports);
+    let state_digest = state_digest(
+        context,
+        usize::from(authority.epoch_count),
+        &authority.decisions,
+        &authority.transports,
+    )?;
+    if state_digest != authority.expected_digest {
+        return Err(FastPathError::IntegrityMismatch);
+    }
+    let state = EncryptionFastPathState {
+        config,
+        decisions,
+        transports,
+        decision_authority: authority.decisions,
+        transport_authority: authority.transports,
+        state_digest,
+    };
+    state.verify_integrity()?;
+    Ok(state)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CausalEpochLease {
     pub source_identity: IdentityId,
@@ -929,12 +982,12 @@ mod tests {
         CausalCommitVector, EncryptionBaseline, EncryptionCapability, EncryptionContractFacts,
         EncryptionContractRevisions, EncryptionEndpointFact, EncryptionIntent, EncryptionKeyFact,
         EncryptionKeyPhase, EncryptionModel, EncryptionNode, EncryptionPathFact,
-        EncryptionPolicyFact, FastPathMapRecoveryAction, FastPathMapTransaction,
-        FastPathTransactionError, IpPrefix, ManagedIdentitySelector, UNF_WIREGUARD_ROUTE_PROTOCOL,
-        UnderlayAddressFamily, UnderlayMtuObservation, WireGuardEpochActivation,
-        WireGuardKernelPlan, WireGuardKernelPlanInput, WireGuardKernelSnapshotInput,
-        WireGuardMtuEnvelope, WireGuardPeerPlan, WireGuardPeerReadback, WireGuardPublicKey,
-        WireGuardRouteReadback, WireGuardRouteScope,
+        EncryptionPolicyFact, FastPathMapCheckpoint, FastPathMapRecoveryAction,
+        FastPathMapTransaction, FastPathTransactionError, IpPrefix, ManagedIdentitySelector,
+        UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily, UnderlayMtuObservation,
+        WireGuardEpochActivation, WireGuardKernelPlan, WireGuardKernelPlanInput,
+        WireGuardKernelSnapshotInput, WireGuardMtuEnvelope, WireGuardPeerPlan,
+        WireGuardPeerReadback, WireGuardPublicKey, WireGuardRouteReadback, WireGuardRouteScope,
     };
 
     struct Fixture {
@@ -1537,6 +1590,38 @@ mod tests {
                 1
             ))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn proof_carrying_map_mirror_reconstructs_exact_restart_bytes() {
+        let fixture = fixture(7);
+        let desired = required_state(&fixture, context_at(1, 21));
+        let mut checkpoint =
+            FastPathMapCheckpoint::begin(Revision::new(22), &desired, None).unwrap();
+        let encoded = serde_json::to_vec(&checkpoint).unwrap();
+        let restored: FastPathMapCheckpoint = serde_json::from_slice(&encoded).unwrap();
+        restored.verify().unwrap();
+        assert_eq!(restored.desired_state().unwrap(), desired);
+        let mut unknown: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<FastPathMapCheckpoint>(unknown).is_err());
+
+        checkpoint.record_staged(&desired).unwrap();
+        checkpoint.commit(&desired).unwrap();
+        checkpoint.verify().unwrap();
+        assert_eq!(
+            checkpoint.transaction.phase,
+            crate::FastPathMapTransactionPhase::Committed
+        );
+
+        let mut mutated = restored;
+        mutated.transport_authority[0].fwmark ^= 1;
+        assert_eq!(
+            mutated.verify(),
+            Err(FastPathTransactionError::InvalidFastPath(
+                FastPathError::IntegrityMismatch
+            ))
         );
     }
 

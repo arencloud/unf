@@ -35,8 +35,8 @@ require_text bins/unf-agent/src/main.rs \
 require_text bins/unf-agent/src/main.rs \
     'partial encryption BPF map set' \
     "partial state must fail closed"
-require_text bins/unf-agent/src/main.rs \
-    'encryption ABI island contains unverified active or residual state' \
+require_text bins/unf-agent/src/encryption_maps.rs \
+    'state without a proof-carrying checkpoint' \
     "unproven recovered authority must be quarantined"
 require_text docs/adr/0164-quarantine-first-encryption-abi-island.md \
     '**Status:** Accepted and implemented for Phase 9.5c' \

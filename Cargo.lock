@@ -3334,6 +3334,7 @@ dependencies = [
  "unf-common",
  "unf-ebpf-common",
  "unf-egress",
+ "unf-encryption",
  "unf-gobgp",
  "unf-ipam",
  "unf-link",

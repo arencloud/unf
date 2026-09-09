@@ -16,7 +16,7 @@
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
 .PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-upgrade-recovery-test egress-phase8-kind-test egress-phase8-openshift-deploy egress-phase8-openshift-test egress-bgp-image
-.PHONY: encryption-fabric-boundary-test encryption-contract-test encryption-key-authority-test encryption-kernel-provider-test encryption-kernel-provider-live-test encryption-fast-path-contract-test encryption-fast-path-transaction-test encryption-map-persistence-test
+.PHONY: encryption-fabric-boundary-test encryption-contract-test encryption-key-authority-test encryption-kernel-provider-test encryption-kernel-provider-live-test encryption-fast-path-contract-test encryption-fast-path-transaction-test encryption-map-persistence-test encryption-map-transaction-test encryption-map-backend-live-test
 .NOTPARALLEL: egress-phase8-kind-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -102,6 +102,15 @@ encryption-map-persistence-test: encryption-fast-path-transaction-test ebpf
 	hack/verify-encryption-map-persistence.sh
 	cargo test -p unf-agent encryption_pin_island
 	cargo clippy -p unf-agent --all-targets --all-features -- -D warnings
+
+encryption-map-transaction-test: encryption-map-persistence-test
+	hack/verify-encryption-map-transaction.sh
+	cargo test -p unf-encryption proof_carrying_map_mirror
+	cargo test -p unf-agent encryption_
+	cargo clippy -p unf-encryption -p unf-agent --all-targets --all-features -- -D warnings
+
+encryption-map-backend-live-test: encryption-map-transaction-test
+	hack/verify-encryption-map-backend-live.sh
 
 egress-intent-test: egress-fabric-boundary-test
 	hack/verify-egress-intent.sh

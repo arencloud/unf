@@ -41,11 +41,11 @@ NAT state to cold-start. Conversely, core ABI changes do not silently reinterpre
 encryption authority. Each island has a small exact recovery boundary and can
 advance only with its own compatibility proof.
 
-The cost is one additional version lifecycle and cleanup scope. The next 9.5
-slice must implement CCV-backed inactive-bank staging, exact map readback,
-atomic configuration publication, and total restart recovery before enabling
-the TC selector. Exact island cleanup and downgrade behavior must be included
-before Phase 9.5 can become Verified.
+The cost is one additional version lifecycle and cleanup scope. Phase 9.5d and
+ADR 0165 subsequently add CCV-backed inactive-bank staging, exact map readback,
+atomic configuration publication, and total restart recovery. Exact island
+cleanup and downgrade behavior must still be included before Phase 9.5 can
+become Verified.
 
 ## Verification
 

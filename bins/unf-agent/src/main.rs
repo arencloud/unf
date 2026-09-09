@@ -43,23 +43,22 @@ use unf_common::{IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, 
 use unf_ebpf_common::{
     EGRESS_BANK_COUNT, EGRESS_EVENT_ABI_VERSION, EGRESS_EVENT_ACTION_CREATE,
     EGRESS_EVENT_ACTION_DROP, EGRESS_EVENT_ACTION_EXPIRE, EGRESS_EVENT_COUNTER_ATTEMPTED,
-    EGRESS_EVENT_COUNTER_DROPPED, EGRESS_MAP_ABI_VERSION, ENCRYPTION_CONNECTION_MAP_CAPACITY,
-    ENCRYPTION_DECISION_MAP_CAPACITY, ENCRYPTION_MAP_ABI_VERSION,
-    ENCRYPTION_TRANSPORT_MAP_CAPACITY, EgressEvent, FLOW_ABI_VERSION, FlowEvent, FlowKey,
-    IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey, Ipv6IdentityKey, POLICY_BANK_COUNT,
-    POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
-    POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
-    SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS, SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS,
-    SERVICE_AFFINITY_OUTCOME_CREATED, SERVICE_AFFINITY_OUTCOME_NONE,
-    SERVICE_AFFINITY_OUTCOME_RESELECTED, SERVICE_AFFINITY_OUTCOME_REUSED, SERVICE_BANK_COUNT,
-    SERVICE_EVENT_ABI_VERSION, SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE,
-    SERVICE_EVENT_ACTION_TRANSLATE, SERVICE_EVENT_FRONTEND_CLUSTER_IP,
-    SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL,
-    SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER, SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL,
-    SERVICE_EVENT_REASON_NO_BACKEND, SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED,
-    SERVICE_MAP_ABI_VERSION, ServiceEvent, egress_event_action_reason_is_valid,
-    service_event_action_reason_is_valid, service_event_frontend_kind_is_valid,
-    service_selection_algorithm_is_valid, service_selection_tier_is_valid,
+    EGRESS_EVENT_COUNTER_DROPPED, EGRESS_MAP_ABI_VERSION, ENCRYPTION_MAP_ABI_VERSION, EgressEvent,
+    FLOW_ABI_VERSION, FlowEvent, FlowKey, IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey,
+    Ipv6IdentityKey, POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE,
+    POLICY_FLAG_HAS_SHADOW, POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE,
+    POLICY_MAP_ABI_VERSION, SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS,
+    SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS, SERVICE_AFFINITY_OUTCOME_CREATED,
+    SERVICE_AFFINITY_OUTCOME_NONE, SERVICE_AFFINITY_OUTCOME_RESELECTED,
+    SERVICE_AFFINITY_OUTCOME_REUSED, SERVICE_BANK_COUNT, SERVICE_EVENT_ABI_VERSION,
+    SERVICE_EVENT_ACTION_DROP, SERVICE_EVENT_ACTION_EXPIRE, SERVICE_EVENT_ACTION_TRANSLATE,
+    SERVICE_EVENT_FRONTEND_CLUSTER_IP, SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER,
+    SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
+    SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL, SERVICE_EVENT_REASON_NO_BACKEND,
+    SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED, SERVICE_MAP_ABI_VERSION, ServiceEvent,
+    egress_event_action_reason_is_valid, service_event_action_reason_is_valid,
+    service_event_frontend_kind_is_valid, service_selection_algorithm_is_valid,
+    service_selection_tier_is_valid,
 };
 #[cfg(test)]
 use unf_egress::compile_egress_dataplane;
@@ -129,9 +128,11 @@ use unf_state::{
 };
 
 mod cni_server;
+mod encryption_maps;
 mod fqdn_observer;
 
 use cni_server::CniTransactionServer;
+use encryption_maps::{EncryptionMapSynchronizer, take_encryption_maps};
 use fqdn_observer::{FqdnObserver, resolver_from_resolv_conf};
 
 const FLOW_EXPORT_CHANNEL_CAPACITY: usize = 4_096;
@@ -147,6 +148,8 @@ const DEFAULT_SERVICE_STATE_PATH: &str = "/var/lib/unf/cni/v1/service-snapshot.j
 const DEFAULT_LOAD_BALANCER_REACHABILITY_STATE_PATH: &str =
     "/var/lib/unf/cni/v1/load-balancer-reachability.json";
 const DEFAULT_EGRESS_BGP_STATE_PATH: &str = "/var/lib/unf/cni/v1/egress-bgp.json";
+const DEFAULT_ENCRYPTION_FAST_PATH_STATE_PATH: &str =
+    "/var/lib/unf/cni/v1/encryption-fast-path.json";
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -494,6 +497,13 @@ struct Args {
         default_value = DEFAULT_EGRESS_BGP_STATE_PATH
     )]
     egress_bgp_state_path: PathBuf,
+    /// Durable proof-carrying mirror for the pinned encryption map generation.
+    #[arg(
+        long,
+        env = "UNF_ENCRYPTION_FAST_PATH_STATE_PATH",
+        default_value = DEFAULT_ENCRYPTION_FAST_PATH_STATE_PATH
+    )]
+    encryption_fast_path_state_path: PathBuf,
     #[arg(long, env = "UNF_NODE_NAME", default_value = "unknown")]
     node_name: String,
     #[arg(long, env = "UNF_POD_NAME", default_value = "unknown")]
@@ -1387,12 +1397,6 @@ type ServiceMaps = (
     AyaArray<MapData, [u8; 40]>,
 );
 type ServiceAffinityMap = AyaHashMap<MapData, [u8; 40], [u8; 32]>;
-struct EncryptionMaps {
-    decisions: AyaHashMap<MapData, [u8; 12], [u8; 72]>,
-    transports: AyaHashMap<MapData, [u8; 16], [u8; 80]>,
-    config: AyaArray<MapData, [u8; 48]>,
-    connections: AyaHashMap<MapData, [u8; 40], [u8; 64]>,
-}
 type EgressMaps = (
     AyaHashMap<MapData, [u8; 8], [u8; 128]>,
     AyaLpmTrie<MapData, [u8; 12], [u8; 32]>,
@@ -1428,6 +1432,7 @@ struct DataplaneConfig {
     egress_bgp_config_path: Option<PathBuf>,
     egress_bgp_endpoint: String,
     egress_bgp_state_path: PathBuf,
+    encryption_fast_path_state_path: PathBuf,
     node_name: String,
     agent_token_path: PathBuf,
     flow_export_interval: Duration,
@@ -1682,6 +1687,7 @@ async fn main() -> Result<()> {
             let egress_bgp_config_path = args.egress_bgp_config_path.clone();
             let egress_bgp_endpoint = args.egress_bgp_endpoint.clone();
             let egress_bgp_state_path = args.egress_bgp_state_path.clone();
+            let encryption_fast_path_state_path = args.encryption_fast_path_state_path.clone();
             let node_name = args.node_name.clone();
             let agent_token_path = args.agent_token_path.clone();
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
@@ -1704,6 +1710,7 @@ async fn main() -> Result<()> {
                     egress_bgp_config_path,
                     egress_bgp_endpoint,
                     egress_bgp_state_path,
+                    encryption_fast_path_state_path,
                     node_name,
                     agent_token_path,
                     flow_export_interval,
@@ -6686,7 +6693,11 @@ async fn run_dataplane(
     let service_maps = take_service_maps(&mut ebpf)?;
     let egress_maps = take_egress_maps(&mut ebpf)?;
     let encryption_maps = take_encryption_maps(&mut ebpf)?;
-    validate_encryption_quarantine(&encryption_maps, encryption_pins_existed)?;
+    let _encryption = EncryptionMapSynchronizer::recover(
+        encryption_maps,
+        config.encryption_fast_path_state_path.clone(),
+        encryption_pins_existed,
+    )?;
     let controller_management_port = controller_url.as_deref().map(controller_port).transpose()?;
     let egress_bgp = initialize_egress_bgp(
         config.egress_bgp_config_path.as_deref(),
@@ -12529,96 +12540,6 @@ fn take_policy_maps(ebpf: &mut Ebpf) -> Result<PolicyMaps> {
         egress_ipv6_map,
         policy_config,
     ))
-}
-
-fn take_encryption_maps(ebpf: &mut Ebpf) -> Result<EncryptionMaps> {
-    let decisions = AyaHashMap::<_, [u8; 12], [u8; 72]>::try_from(
-        ebpf.take_map("ENCRYPTION_DECISIONS")
-            .context("eBPF object does not contain ENCRYPTION_DECISIONS map")?,
-    )
-    .context("open ENCRYPTION_DECISIONS map")?;
-    let transports = AyaHashMap::<_, [u8; 16], [u8; 80]>::try_from(
-        ebpf.take_map("ENCRYPTION_TRANSPORTS")
-            .context("eBPF object does not contain ENCRYPTION_TRANSPORTS map")?,
-    )
-    .context("open ENCRYPTION_TRANSPORTS map")?;
-    let config = AyaArray::<_, [u8; 48]>::try_from(
-        ebpf.take_map("ENCRYPTION_CONFIG")
-            .context("eBPF object does not contain ENCRYPTION_CONFIG map")?,
-    )
-    .context("open ENCRYPTION_CONFIG map")?;
-    let connections = AyaHashMap::<_, [u8; 40], [u8; 64]>::try_from(
-        ebpf.take_map("ENCRYPTION_CONNECTIONS")
-            .context("eBPF object does not contain ENCRYPTION_CONNECTIONS map")?,
-    )
-    .context("open ENCRYPTION_CONNECTIONS map")?;
-    Ok(EncryptionMaps {
-        decisions,
-        transports,
-        config,
-        connections,
-    })
-}
-
-/// Phase 9.5c deliberately supports only a quiescent island. Publishing a
-/// generation before the durable CCV adapter and TC consumer are wired would
-/// turn unverified state into authority, so any non-empty recovered island is
-/// quarantined by refusing startup.
-fn validate_encryption_quarantine(maps: &EncryptionMaps, pins_existed: bool) -> Result<()> {
-    validate_map_capacity(
-        "ENCRYPTION_DECISIONS",
-        maps.decisions.map(),
-        ENCRYPTION_DECISION_MAP_CAPACITY,
-    )?;
-    validate_map_capacity(
-        "ENCRYPTION_TRANSPORTS",
-        maps.transports.map(),
-        ENCRYPTION_TRANSPORT_MAP_CAPACITY,
-    )?;
-    validate_map_capacity("ENCRYPTION_CONFIG", maps.config.map(), 1)?;
-    validate_map_capacity(
-        "ENCRYPTION_CONNECTIONS",
-        maps.connections.map(),
-        ENCRYPTION_CONNECTION_MAP_CAPACITY,
-    )?;
-
-    let config = maps
-        .config
-        .get(&0, 0)
-        .context("read encryption quarantine config")?;
-    let has_decisions = maps
-        .decisions
-        .iter()
-        .next()
-        .transpose()
-        .context("inspect quarantined encryption decisions")?
-        .is_some();
-    let has_transports = maps
-        .transports
-        .iter()
-        .next()
-        .transpose()
-        .context("inspect quarantined encryption transports")?
-        .is_some();
-    let has_connections = maps
-        .connections
-        .iter()
-        .next()
-        .transpose()
-        .context("inspect quarantined encryption connections")?
-        .is_some();
-    if config != [0; 48] || has_decisions || has_transports || has_connections {
-        bail!(
-            "encryption ABI island contains unverified active or residual state; refusing startup until causal commit-vector recovery is available"
-        );
-    }
-    if pins_existed {
-        info!(
-            encryption_map_abi = ENCRYPTION_MAP_ABI_VERSION,
-            "validated quiescent encryption ABI island"
-        );
-    }
-    Ok(())
 }
 
 fn take_egress_maps(ebpf: &mut Ebpf) -> Result<EgressMaps> {

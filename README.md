@@ -787,11 +787,17 @@ foundation now places four fixed-shape maps in a separately versioned
 unchanged. Quarantine-First Activation accepts only an exact all-or-none pin
 inventory and refuses foreign, symlinked, partial, or non-quiescent recovered
 state before attach. `make encryption-map-persistence-test` passes; ADR 0164.
-CCV-backed map mutation/recovery, the TC mark/policy-route hook, verifier, and
-live packet gate remain, so no workload packet yet selects the staged route
-table. The [Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md)
-and ADRs 0158–0164 define the ordered implementation and independent
-Kind/OpenShift gates.
+The Proof-Carrying Aya Map Mirror now durably retains the complete secret-free
+authority needed to reconstruct those fixed-width records. Causal Delta Staging
+skips unchanged records, reads the inactive bank back exactly, performs one
+config flip, and resolves every prepared/staged/pointer-flipped/committed crash
+state without trusting truncated map evidence. This passes
+`make encryption-map-transaction-test`; ADR 0165. The controller distribution
+loop, TC mark/policy-route hook, verifier, and live packet gate remain, so no
+workload packet yet selects the staged route table. The
+[Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
+ADRs 0158–0165 define the ordered implementation and independent Kind/OpenShift
+gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -7,13 +7,19 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unf_common::Revision;
 
-use crate::{EncryptionFastPathDigest, EncryptionFastPathState, FastPathEpochState, FastPathError};
+use crate::{
+    EncryptionFastPathDigest, EncryptionFastPathState, EncryptionTransportAuthority,
+    FastPathDecisionAuthority, FastPathEpochState, FastPathError, FastPathRestoreAuthority,
+    restore_encryption_fast_path_state,
+};
 
 pub const CAUSAL_COMMIT_VECTOR_SCHEMA_VERSION: u16 = 1;
 pub const FAST_PATH_MAP_TRANSACTION_SCHEMA_VERSION: u16 = 1;
+pub const FAST_PATH_MAP_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 
 const COMMIT_VECTOR_DIGEST_DOMAIN: &[u8] = b"unf.encryption-causal-commit-vector.v1\0";
 const MAP_TRANSACTION_DIGEST_DOMAIN: &[u8] = b"unf.encryption-map-transaction.v1\0";
+const MAP_CHECKPOINT_DIGEST_DOMAIN: &[u8] = b"unf.encryption-map-checkpoint.v1\0";
 
 /// Serializable commitment to one complete bank. This is deliberately not a
 /// substitute for map readback; recovery must supply the observed digest.
@@ -182,6 +188,134 @@ pub struct FastPathMapTransaction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct FastPathMapTransactionDigest(pub [u8; 32]);
+
+/// Durable proof-carrying mirror for one desired map generation. Fixed-width
+/// map records are deterministically reconstructed from this authority after a
+/// restart; private keys are never present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FastPathMapCheckpoint {
+    pub schema_version: u16,
+    pub transaction: FastPathMapTransaction,
+    pub decision_authority: Vec<FastPathDecisionAuthority>,
+    pub transport_authority: Vec<EncryptionTransportAuthority>,
+    pub checkpoint_digest: FastPathMapCheckpointDigest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FastPathMapCheckpointDigest(pub [u8; 32]);
+
+impl FastPathMapCheckpoint {
+    /// Persists a complete desired-generation mirror before map mutation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid desired state or transaction monotonicity.
+    pub fn begin(
+        transaction_revision: Revision,
+        desired: &EncryptionFastPathState,
+        prior: Option<FastPathPublishedGeneration>,
+    ) -> Result<Self, FastPathTransactionError> {
+        let transaction = FastPathMapTransaction::begin(
+            transaction_revision,
+            CausalCommitVector::issue(desired)?,
+            prior,
+        )?;
+        let mut checkpoint = Self {
+            schema_version: FAST_PATH_MAP_CHECKPOINT_SCHEMA_VERSION,
+            transaction,
+            decision_authority: desired.decision_authority.clone(),
+            transport_authority: desired.transport_authority.clone(),
+            checkpoint_digest: FastPathMapCheckpointDigest([0; 32]),
+        };
+        checkpoint.checkpoint_digest = checkpoint.calculate_digest()?;
+        checkpoint.verify()?;
+        Ok(checkpoint)
+    }
+
+    /// Reconstructs the exact fixed-width desired image from durable authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any authority, lowering, count, revision, or digest drift.
+    pub fn desired_state(&self) -> Result<EncryptionFastPathState, FastPathTransactionError> {
+        let published = self.transaction.desired.published;
+        restore_encryption_fast_path_state(FastPathRestoreAuthority {
+            generation: published.generation,
+            policy_revision: published.policy_revision,
+            service_revision: published.service_revision,
+            egress_revision: published.egress_revision,
+            bank: published.bank,
+            epoch_count: published.epoch_count,
+            decisions: self.decision_authority.clone(),
+            transports: self.transport_authority.clone(),
+            expected_digest: published.state_digest,
+        })
+        .map_err(FastPathTransactionError::InvalidFastPath)
+    }
+
+    /// Advances the durable mirror only after exact inactive-bank readback.
+    ///
+    /// # Errors
+    ///
+    /// Rejects corrupt state, a wrong phase, or non-identical readback.
+    pub fn record_staged(
+        &mut self,
+        readback: &EncryptionFastPathState,
+    ) -> Result<(), FastPathTransactionError> {
+        self.verify()?;
+        if &self.desired_state()? != readback {
+            return Err(FastPathTransactionError::StagedReadbackMismatch);
+        }
+        self.transaction.record_staged(readback)?;
+        self.checkpoint_digest = self.calculate_digest()?;
+        Ok(())
+    }
+
+    /// Seals the mirror only after the published config and bank both match.
+    ///
+    /// # Errors
+    ///
+    /// Rejects corrupt state, a wrong phase, or non-identical readback.
+    pub fn commit(
+        &mut self,
+        readback: &EncryptionFastPathState,
+    ) -> Result<(), FastPathTransactionError> {
+        self.verify()?;
+        if &self.desired_state()? != readback {
+            return Err(FastPathTransactionError::PublishedReadbackMismatch);
+        }
+        self.transaction.commit(readback)?;
+        self.checkpoint_digest = self.calculate_digest()?;
+        Ok(())
+    }
+
+    /// Independently replays the checkpoint, its CCV, and the exact lowered
+    /// map image that the platform adapter must observe.
+    ///
+    /// # Errors
+    ///
+    /// Rejects schema, transaction, authority, or checkpoint mutation.
+    pub fn verify(&self) -> Result<(), FastPathTransactionError> {
+        self.transaction.verify()?;
+        let desired = self.desired_state()?;
+        if self.schema_version != FAST_PATH_MAP_CHECKPOINT_SCHEMA_VERSION
+            || FastPathPublishedGeneration::issue(&desired)? != self.transaction.desired.published
+            || CausalCommitVector::issue(&desired)? != self.transaction.desired
+            || self.checkpoint_digest != self.calculate_digest()?
+        {
+            return Err(FastPathTransactionError::InvalidMapCheckpoint);
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<FastPathMapCheckpointDigest, FastPathTransactionError> {
+        let mut canonical = self.clone();
+        canonical.checkpoint_digest = FastPathMapCheckpointDigest([0; 32]);
+        hash_canonical(MAP_CHECKPOINT_DIGEST_DOMAIN, &canonical).map(FastPathMapCheckpointDigest)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastPathMapRecoveryAction {
@@ -384,6 +518,8 @@ pub enum FastPathTransactionError {
     InvalidCommitVector,
     #[error("invalid encryption map transaction")]
     InvalidTransaction,
+    #[error("invalid encryption map checkpoint or proof-carrying mirror")]
+    InvalidMapCheckpoint,
     #[error("inactive encryption map bank differs from desired state")]
     StagedReadbackMismatch,
     #[error("published encryption map bank differs from desired state")]
