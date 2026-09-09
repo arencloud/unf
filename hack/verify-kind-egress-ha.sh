@@ -35,6 +35,7 @@ collect_diagnostics() {
     "${kc[@]}" -n unf-system logs daemonset/unf-agent --all-pods=true --prefix \
         >"${diagnostics_dir}/agents.log" 2>&1 || true
     control_plane_state >"${diagnostics_dir}/control-plane.json" 2>/dev/null || true
+    controller_status >"${diagnostics_dir}/controller-status.json" 2>/dev/null || true
     for node in "${nodes[@]:-}"; do
         "${runtime[@]}" exec "${node}" ip -o address show dev unf-egress0 \
             >"${diagnostics_dir}/${node}-egress-addresses.txt" 2>&1 || true
@@ -109,6 +110,24 @@ controller_status() {
     pod=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller -o json \
         | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name' | head -n1)
     "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${pod}:9962/proxy/v1/status"
+}
+
+wait_controller_inventory() {
+    local status=
+    for _ in $(seq 1 180); do
+        status=$(controller_status 2>/dev/null || true)
+        if jq -e --argjson expected "${#nodes[@]}" \
+            '.ready == true
+            and .healthy == true
+            and .nodes == $expected
+            and .agents.expected_agents == $expected
+            and .agents.reporting_agents == $expected
+            and .agents.all_converged == true' <<<"${status}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 normalize_observed_ipv4() {
@@ -291,6 +310,9 @@ observe_graceful_promotion() {
     done
     printf '%s\t%s\t%s\n' "${saw_promotion}" "${max_twin_records}" "${completed}"
 }
+
+qualification_stage=controller-inventory-preflight
+wait_controller_inventory
 
 qualification_stage=external-fixture
 "${runtime[@]}" run -d --name "${external_container}" --network kind \
