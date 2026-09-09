@@ -925,10 +925,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        EncryptionBaseline, EncryptionCapability, EncryptionContractFacts,
+        CausalCommitVector, EncryptionBaseline, EncryptionCapability, EncryptionContractFacts,
         EncryptionContractRevisions, EncryptionEndpointFact, EncryptionIntent, EncryptionKeyFact,
         EncryptionKeyPhase, EncryptionModel, EncryptionNode, EncryptionPathFact,
-        EncryptionPolicyFact, IpPrefix, ManagedIdentitySelector, UNF_WIREGUARD_ROUTE_PROTOCOL,
+        EncryptionPolicyFact, FastPathMapRecoveryAction, FastPathMapTransaction,
+        FastPathTransactionError, IpPrefix, ManagedIdentitySelector, UNF_WIREGUARD_ROUTE_PROTOCOL,
         UnderlayAddressFamily, UnderlayMtuObservation, WireGuardEpochActivation,
         WireGuardKernelPlan, WireGuardKernelPlanInput, WireGuardKernelSnapshotInput,
         WireGuardMtuEnvelope, WireGuardPeerPlan, WireGuardPeerReadback, WireGuardPublicKey,
@@ -1154,8 +1155,12 @@ mod tests {
     }
 
     const fn context(bank: u8) -> FastPathCompileContext {
+        context_at(bank, 20)
+    }
+
+    const fn context_at(bank: u8, generation: u64) -> FastPathCompileContext {
         FastPathCompileContext {
-            generation: Revision::new(20),
+            generation: Revision::new(generation),
             policy_revision: Revision::new(3),
             service_revision: Revision::new(30),
             egress_revision: Revision::new(40),
@@ -1175,6 +1180,31 @@ mod tests {
             egress_revision: Revision::new(40),
             now_monotonic_ns: 11_000,
         }
+    }
+
+    fn required_state(
+        fixture: &Fixture,
+        compile_context: FastPathCompileContext,
+    ) -> EncryptionFastPathState {
+        compile_encryption_fast_path(
+            compile_context,
+            &[FastPathEpochAdmission {
+                contract: &fixture.contract,
+                transaction: &fixture.transaction,
+                readback: &fixture.snapshot,
+                readiness_digest: [7; 32],
+                state: FastPathEpochState::Active,
+                drain_until_monotonic_ns: 0,
+            }],
+            &[FastPathDecisionInput {
+                source_identity: IdentityId::new(11),
+                destination_identity: IdentityId::new(21),
+                disposition: EncryptionDisposition::Required,
+                contract_epoch: Some(7),
+                plan_index: Some(0),
+            }],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1449,6 +1479,84 @@ mod tests {
                 }],
             ),
             Err(FastPathError::KernelAuthorityUnavailable)
+        );
+    }
+
+    #[test]
+    fn causal_commit_vector_makes_every_crash_boundary_total() {
+        let fixture = fixture(7);
+        let prior_state = required_state(&fixture, context_at(0, 20));
+        let desired_state = required_state(&fixture, context_at(1, 21));
+        let prior = crate::FastPathPublishedGeneration::issue(&prior_state).unwrap();
+        let vector = CausalCommitVector::issue(&desired_state).unwrap();
+        vector.verify().unwrap();
+        assert_eq!(vector.active_epoch, 7);
+        assert_eq!(vector.kernel_configuration_digests.len(), 1);
+
+        let mut transaction =
+            FastPathMapTransaction::begin(Revision::new(22), vector, Some(prior)).unwrap();
+        assert_eq!(
+            transaction.recover(Some(prior), None).unwrap(),
+            FastPathMapRecoveryAction::ClearAndRestageInactive
+        );
+        transaction.record_staged(&desired_state).unwrap();
+        assert_eq!(
+            transaction
+                .recover(Some(prior), Some(desired_state.state_digest))
+                .unwrap(),
+            FastPathMapRecoveryAction::ActivateDesired
+        );
+        let desired = transaction.desired.published;
+        assert_eq!(
+            transaction
+                .recover(Some(desired), Some(desired_state.state_digest))
+                .unwrap(),
+            FastPathMapRecoveryAction::CommitObservedDesired
+        );
+        transaction.commit(&desired_state).unwrap();
+        assert_eq!(
+            transaction
+                .recover(Some(desired), Some(desired_state.state_digest))
+                .unwrap(),
+            FastPathMapRecoveryAction::ReuseCommitted
+        );
+
+        let mut mutated = transaction.clone();
+        mutated.desired.active_epoch += 1;
+        assert_eq!(
+            mutated.verify(),
+            Err(FastPathTransactionError::InvalidCommitVector)
+        );
+        let json = serde_json::to_string(&transaction).unwrap();
+        assert!(!json.contains("private"));
+        assert!(
+            serde_json::from_str::<FastPathMapTransaction>(&json.replacen(
+                '{',
+                "{\"unknown\":true,",
+                1
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn causal_commit_rollback_requires_prior_and_positive_absence() {
+        let fixture = fixture(7);
+        let desired_state = required_state(&fixture, context_at(1, 21));
+        let vector = CausalCommitVector::issue(&desired_state).unwrap();
+        let mut transaction =
+            FastPathMapTransaction::begin(Revision::new(22), vector, None).unwrap();
+        assert!(transaction.record_rollback(None, false).is_err());
+        transaction.record_rollback(None, true).unwrap();
+        assert_eq!(
+            transaction.recover(None, None).unwrap(),
+            FastPathMapRecoveryAction::RollbackComplete
+        );
+        assert_eq!(
+            transaction
+                .recover(None, Some(EncryptionFastPathDigest([9; 32])))
+                .unwrap(),
+            FastPathMapRecoveryAction::RefuseUnknownState
         );
     }
 }

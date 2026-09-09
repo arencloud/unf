@@ -776,10 +776,16 @@ reuse, and denies immediately on policy failure, expiry, or revocation instead
 of falling back to plaintext. Canonical ordering, committed-kernel-readback
 fencing, atomic generation state, rotation, and ABI layouts pass
 `make encryption-fast-path-contract-test`; ADR 0162. The persistent map
-transaction, TC mark/policy-route hook, verifier, and live packet gate remain,
-so no workload packet yet selects the staged route table. The
+transaction contract now adds a Causal Commit Vector that binds policy,
+Service, egress, active/draining epochs, the compiled bank, and every committed
+kernel-configuration digest. Persist-before-mutate phases and exact readback
+make every pointer-flip crash boundary deterministic, while rollback requires
+the previous bank plus positive target-bank absence. This passes
+`make encryption-fast-path-transaction-test`; ADR 0163. The Aya persistence
+adapter, TC mark/policy-route hook, verifier, and live packet gate remain, so no
+workload packet yet selects the staged route table. The
 [Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0162 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0163 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

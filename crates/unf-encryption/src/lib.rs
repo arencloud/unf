@@ -6,10 +6,12 @@
 //! adapters deliberately live outside this crate.
 
 mod fast_path;
+mod fast_path_transaction;
 mod kernel_provider;
 mod key_authority;
 
 pub use fast_path::*;
+pub use fast_path_transaction::*;
 pub use kernel_provider::*;
 pub use key_authority::*;
 
