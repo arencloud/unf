@@ -95,9 +95,18 @@ pub struct EncryptionRouteAuthority {
 pub struct EncryptionRoutePublicationPermitDigest(pub [u8; 32]);
 
 /// Proof that the exact route prerequisites were read back before map publish.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, PartialEq, Eq)]
 pub struct EncryptionRoutePublicationPermit {
+    schema_version: u16,
+    generation: Revision,
+    fast_path_digest: EncryptionFastPathDigest,
+    authority_digest: EncryptionRouteAuthorityDigest,
+    permit_digest: EncryptionRoutePublicationPermitDigest,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EncryptionRoutePublicationPermitWitness {
     schema_version: u16,
     generation: Revision,
     fast_path_digest: EncryptionFastPathDigest,
@@ -335,8 +344,13 @@ impl EncryptionRoutePublicationPermit {
     fn calculate_digest(
         &self,
     ) -> Result<EncryptionRoutePublicationPermitDigest, EncryptionRouteAuthorityError> {
-        let mut canonical = self.clone();
-        canonical.permit_digest = EncryptionRoutePublicationPermitDigest([0; 32]);
+        let canonical = EncryptionRoutePublicationPermitWitness {
+            schema_version: self.schema_version,
+            generation: self.generation,
+            fast_path_digest: self.fast_path_digest,
+            authority_digest: self.authority_digest,
+            permit_digest: EncryptionRoutePublicationPermitDigest([0; 32]),
+        };
         hash_canonical(PERMIT_DIGEST_DOMAIN, &canonical).map(EncryptionRoutePublicationPermitDigest)
     }
 }

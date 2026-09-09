@@ -69,7 +69,7 @@ impl EncryptionActivationLatch {
     ///
     /// Rejects cross-Node state, a stale/skipped map predecessor, checkpoint
     /// mutation, or a route permit for any other generation/image.
-    pub fn issue(
+    pub(crate) fn issue(
         admitted: &AdmittedEncryptionGeneration,
         local_recipient: &EncryptionGenerationRecipient,
         applied: Option<FastPathPublishedGeneration>,

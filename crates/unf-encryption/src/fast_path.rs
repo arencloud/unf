@@ -1033,7 +1033,8 @@ mod tests {
         EncryptionKeyFact, EncryptionKeyPhase, EncryptionModel, EncryptionNode, EncryptionPathFact,
         EncryptionPolicyFact, EncryptionRouteAuthority, EncryptionRouteAuthorityError,
         EncryptionRouteFamily, FastPathMapCheckpoint, FastPathMapRecoveryAction,
-        FastPathMapTransaction, FastPathTransactionError, IpPrefix, ManagedIdentitySelector,
+        FastPathMapTransaction, FastPathPublishedGeneration, FastPathTransactionError, IpPrefix,
+        ManagedIdentitySelector, NodeLocalGenerationProposal, NodeLocalOrchestratorError,
         NodeSealedGenerationCapsule, PreparedNodeEncryptionGeneration,
         UNF_ENCRYPTION_RULE_PRIORITY_BASE, UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily,
         UnderlayMtuObservation, WireGuardEpochActivation, WireGuardKernelPlan,
@@ -1711,8 +1712,7 @@ mod tests {
             EncryptionRouteAuthority::issue(&state, std::slice::from_ref(&fixture.snapshot))
                 .unwrap();
         let permit = authority.authorize_publication(&authority.rules).unwrap();
-        let latch =
-            EncryptionActivationLatch::issue(&admitted, &recipient, None, permit.clone()).unwrap();
+        let latch = EncryptionActivationLatch::issue(&admitted, &recipient, None, permit).unwrap();
         let witness = latch.witness();
         assert_ne!(witness.0, [0; 32]);
         let material = latch.open(None, None).unwrap();
@@ -1725,17 +1725,22 @@ mod tests {
 
         let mut quarantined = checkpoint;
         quarantined.record_staged(&state).unwrap();
-        let resumed = EncryptionActivationLatch::issue(&admitted, &recipient, None, permit.clone())
-            .unwrap()
-            .open(None, Some(&quarantined))
-            .unwrap();
+        let resumed = EncryptionActivationLatch::issue(
+            &admitted,
+            &recipient,
+            None,
+            authority.authorize_publication(&authority.rules).unwrap(),
+        )
+        .unwrap()
+        .open(None, Some(&quarantined))
+        .unwrap();
         assert_eq!(resumed.into_parts().0, quarantined);
 
         let revalidated = EncryptionActivationLatch::issue(
             &admitted,
             &recipient,
             Some(admitted.published()),
-            permit,
+            authority.authorize_publication(&authority.rules).unwrap(),
         )
         .unwrap()
         .open(Some(admitted.published()), None)
@@ -1765,14 +1770,17 @@ mod tests {
         let authority =
             EncryptionRouteAuthority::issue(&state, std::slice::from_ref(&fixture.snapshot))
                 .unwrap();
-        let permit = authority.authorize_publication(&authority.rules).unwrap();
-
         let replacement = EncryptionGenerationRecipient {
             node_name: "worker-a".to_owned(),
             node_uid: "replacement-uid".to_owned(),
         };
         assert!(matches!(
-            EncryptionActivationLatch::issue(&admitted, &replacement, None, permit.clone()),
+            EncryptionActivationLatch::issue(
+                &admitted,
+                &replacement,
+                None,
+                authority.authorize_publication(&authority.rules).unwrap()
+            ),
             Err(EncryptionActivationLatchError::RecipientMismatch)
         ));
         let mut wrong_applied = admitted.published();
@@ -1782,7 +1790,7 @@ mod tests {
                 &admitted,
                 &recipient,
                 Some(wrong_applied),
-                permit.clone()
+                authority.authorize_publication(&authority.rules).unwrap()
             ),
             Err(EncryptionActivationLatchError::PredecessorMismatch)
         ));
@@ -1800,8 +1808,13 @@ mod tests {
             EncryptionActivationLatch::issue(&admitted, &recipient, None, other_permit),
             Err(EncryptionActivationLatchError::InvalidRoutePermit(_))
         ));
-        let renewed =
-            EncryptionActivationLatch::issue(&admitted, &recipient, None, permit).unwrap();
+        let renewed = EncryptionActivationLatch::issue(
+            &admitted,
+            &recipient,
+            None,
+            authority.authorize_publication(&authority.rules).unwrap(),
+        )
+        .unwrap();
         assert!(matches!(
             renewed.open(None, Some(&other_checkpoint)),
             Err(EncryptionActivationLatchError::PendingTransactionMismatch)
@@ -1975,6 +1988,62 @@ mod tests {
             reconciler.observe(fact),
             Err(EncryptionGenerationFactError::ForeignMembership)
         ));
+    }
+
+    #[test]
+    fn causal_proof_ladder_refuses_controller_substitution_and_reuse() {
+        let fixture = fixture(7);
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-worker-a".to_owned(),
+        };
+        let state = required_state(&fixture, context_at(1, 21));
+        let checkpoint = FastPathMapCheckpoint::begin(Revision::new(21), &state, None).unwrap();
+        let proposal = NodeLocalGenerationProposal::issue(
+            Revision::new(9),
+            recipient.clone(),
+            checkpoint.clone(),
+        )
+        .unwrap();
+        proposal.fact().verify().unwrap();
+        let request =
+            EncryptionGenerationRequest::issue(recipient.node_name.clone(), None, [9; 32]).unwrap();
+        let admitted =
+            NodeSealedGenerationCapsule::issue(100, recipient.clone(), &request, checkpoint)
+                .unwrap()
+                .admit(&request, None)
+                .unwrap();
+
+        let substituted_state = required_state(&fixture, context_at(0, 22));
+        let substituted_checkpoint =
+            FastPathMapCheckpoint::begin(Revision::new(22), &substituted_state, None).unwrap();
+        let substituted = NodeSealedGenerationCapsule::issue(
+            100,
+            recipient.clone(),
+            &request,
+            substituted_checkpoint,
+        )
+        .unwrap()
+        .admit(&request, None)
+        .unwrap();
+        assert!(matches!(
+            proposal.clone().bind_controller_admission(substituted),
+            Err(NodeLocalOrchestratorError::ControllerSubstitution)
+        ));
+
+        let controller_bound = proposal.bind_controller_admission(admitted).unwrap();
+        let authority =
+            EncryptionRouteAuthority::issue(&state, std::slice::from_ref(&fixture.snapshot))
+                .unwrap();
+        let permit = authority.authorize_publication(&authority.rules).unwrap();
+        let latch = controller_bound
+            .authorize_map_activation(None, permit)
+            .unwrap();
+        let material = latch.open(None, None).unwrap();
+        assert_eq!(
+            material.into_parts().0.transaction.desired.published,
+            FastPathPublishedGeneration::issue(&state).unwrap()
+        );
     }
 
     #[test]

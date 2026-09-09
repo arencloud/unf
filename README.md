@@ -837,11 +837,15 @@ missing members, and mixed generations cannot publish. Only unanimous exact
 membership feeds the durable frontier, and the final predecessor receipt
 retries an already prepared successor. This all-or-nothing safety property
 passes `make encryption-generation-reconciler-test`; ADR 0172. Agent-side fact
-production, the local WireGuard/route/Aya orchestrator, TC consumer/verifier,
-and live encrypted packet gate remain, so no workload packet yet selects the
-staged route table. The [Phase 9
+production is now constrained by the Capability-Typed Causal Proof Ladder: the
+controller must return the byte-exact local proposal, then a fresh consuming
+route permit is required to create the single-use Aya latch. Controller
+substitution and unsafe proof reordering fail structurally under `make
+encryption-local-proof-ladder-test`; ADR 0173. The Linux agent adapter, TC
+consumer/verifier, and live encrypted packet gate remain, so no workload packet
+yet selects the staged route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0172 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0173 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
