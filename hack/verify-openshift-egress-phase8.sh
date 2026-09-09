@@ -506,7 +506,7 @@ for _ in $(seq 1 180); do
         traffic_failures=$((traffic_failures + 1))
     fi
     if jq -e --arg gateway "${drained_gateway}" '
-        .haPlans | length == 1 and .haPlans[0].candidates | length == 2
+        (.haPlans | length) == 1 and (.haPlans[0].candidates | length) == 2
         and all(.haPlans[0].assignments[]; .gateway.name != $gateway)
         and (.haPromotions | length) == 0' <<<"${active_state}" >/dev/null 2>&1 \
         && jq -e '.egress_activation_ready_sources == 1' <<<"$(controller_raw /v1/status)" >/dev/null 2>&1; then
