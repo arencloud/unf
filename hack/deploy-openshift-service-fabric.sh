@@ -342,7 +342,13 @@ assert_agent() {
                     and (.contract.contractDigest | length) == 64" "$selection" >/dev/null
             fi
             if test "$4" -gt 0; then
-                for pin in EGRESS_CONFIG EGRESS_GATEWAY_NAT_CONFIG EGRESS_EVENTS EGRESS_EVENT_COUNTERS; do
+                # Ring-buffer telemetry is deliberately process-local. Only
+                # maps participating in durable packet/recovery state are
+                # expected to be pinned across an agent replacement.
+                for pin in EGRESS_SOURCES EGRESS_DESTINATIONS_V4 EGRESS_DESTINATIONS_V6 \
+                    EGRESS_SELECTIONS EGRESS_CONNECTIONS EGRESS_CONFIG \
+                    EGRESS_GATEWAY_NAT_SOURCES EGRESS_GATEWAY_NAT_SELECTIONS \
+                    EGRESS_GATEWAY_NAT_CONFIG; do
                     test -e "$abi_directory/$pin"
                 done
             fi
