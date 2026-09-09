@@ -576,8 +576,8 @@ node_evidence=$("${kc[@]}" get nodes -o json | jq '[.items[] | {
     containerRuntime:.status.nodeInfo.containerRuntimeVersion,podCIDRs:.spec.podCIDRs,
     internalIPs:[.status.addresses[] | select(.type == "InternalIP") | .address]}]')
 image_evidence=$("${kc[@]}" -n unf-system get pods -l 'app.kubernetes.io/name in (unf-controller,unf-agent)' -o json \
-    | jq '[.items[] | {pod:.metadata.name,node:.spec.nodeName,
-        containers:[.status.containerStatuses[] | {name,image,imageID}]}]')
+    | jq '[.items[] | {pod:.metadata.name,node:.spec.nodeName,phase:(.status.phase // "Unknown"),
+        containers:[(.status.containerStatuses // [])[] | {name,image,imageID}]}]')
 mkdir -p "$(dirname "${artifact}")"
 artifact_tmp="${artifact}.tmp.$$"
 jq -n --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg context "${context}" \

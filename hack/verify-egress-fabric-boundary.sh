@@ -61,6 +61,9 @@ require_text Makefile \
 require_text hack/verify-openshift-egress-phase8.sh \
     'OpenShift cl02 Phase 8.11 egress qualification passed' \
     "the OpenShift gate must emit an explicit terminal result"
+require_text hack/verify-openshift-egress-phase8.sh \
+    'containers:[(.status.containerStatuses // [])[] | {name,image,imageID}]' \
+    "the OpenShift evidence collector must tolerate terminal pods without runtime status"
 require_text deploy/openshift-primary-cni/egress/kustomization.yaml \
     'digest: sha256:a7945ae471ca366fdc7fa0f9b7f8df971796612ee12021120764068eb7fc10ba' \
     "the Phase 8 controller image must remain immutable"
