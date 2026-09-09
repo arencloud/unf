@@ -117,7 +117,23 @@ qualification_revision=$(git -C "${project_root}" rev-parse HEAD)
 git -C "${project_root}" merge-base --is-ancestor "${source_revision}" "${qualification_revision}"
 if [[ -z ${context} ]]; then context=$(oc --kubeconfig "${kubeconfig}" config current-context); fi
 kc=(oc --kubeconfig "${kubeconfig}" --context "${context}")
-infrastructure=$("${kc[@]}" get infrastructure cluster -o jsonpath='{.status.infrastructureName}')
+
+# A compact OpenShift control plane can briefly refuse new TLS handshakes while
+# an API endpoint rotates or recovers.  Retry read-only observations only;
+# mutations retain their single-attempt/fail-closed behavior.
+oc_read() {
+    local attempt output
+    for attempt in $(seq 1 15); do
+        if output=$("${kc[@]}" "$@" 2>/dev/null); then
+            printf '%s\n' "${output}"
+            return 0
+        fi
+        sleep 2
+    done
+    "${kc[@]}" "$@"
+}
+
+infrastructure=$(oc_read get infrastructure cluster -o jsonpath='{.status.infrastructureName}')
 if [[ -z ${expected_infrastructure} || ${expected_infrastructure} != "${infrastructure}" \
     || ${acknowledgement} != "${infrastructure}" ]]; then
     echo "refusing qualification: both OpenShift egress acknowledgements must equal ${infrastructure}" >&2
@@ -154,7 +170,7 @@ control_plane_state() {
 }
 
 unhealthy_operators() {
-    "${kc[@]}" get clusteroperators -o json | jq -c '[.items[]
+    oc_read get clusteroperators -o json | jq -c '[.items[]
         | select(any(.status.conditions[];
             (.type == "Available" and .status != "True")
             or (.type == "Degraded" and .status == "True")))
@@ -270,8 +286,8 @@ wait_for_release() {
 
 stage=platform-preflight
 baseline_unhealthy=$(unhealthy_operators)
-network=$("${kc[@]}" get network.config.openshift.io cluster -o json)
-operator_network=$("${kc[@]}" get network.operator.openshift.io cluster -o json)
+network=$(oc_read get network.config.openshift.io cluster -o json)
+operator_network=$(oc_read get network.operator.openshift.io cluster -o json)
 jq -e '.spec.networkType == "None"
     and ([.spec.clusterNetwork[].cidr | contains(":")] | any)
     and ([.spec.clusterNetwork[].cidr | contains(":") | not] | any)
@@ -279,10 +295,10 @@ jq -e '.spec.networkType == "None"
     and ([.spec.serviceNetwork[] | contains(":") | not] | any)' <<<"${network}" >/dev/null
 jq -e '.spec.defaultNetwork.type == "None" and .spec.deployKubeProxy == false' \
     <<<"${operator_network}" >/dev/null
-mapfile -t nodes < <("${kc[@]}" get nodes -l network.unf.io/primary-cni=enabled \
+mapfile -t nodes < <(oc_read get nodes -l network.unf.io/primary-cni=enabled \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
 (( ${#nodes[@]} == 5 ))
-nodes_json=$("${kc[@]}" get nodes -o json)
+nodes_json=$(oc_read get nodes -o json)
 jq -e '(.items | length) == 5 and all(.items[];
     any(.status.conditions[]; .type == "Ready" and .status == "True")
     and ([.spec.podCIDRs[] | select(contains("."))] | length) == 1
