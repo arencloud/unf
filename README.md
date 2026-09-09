@@ -841,11 +841,18 @@ production is now constrained by the Capability-Typed Causal Proof Ladder: the
 controller must return the byte-exact local proposal, then a fresh consuming
 route permit is required to create the single-use Aya latch. Controller
 substitution and unsafe proof reordering fail structurally under `make
-encryption-local-proof-ladder-test`; ADR 0173. The Linux agent adapter, TC
-consumer/verifier, and live encrypted packet gate remain, so no workload packet
-yet selects the staged route table. The [Phase 9
+encryption-local-proof-ladder-test`; ADR 0173. The Proof-Carrying Linux
+Convergence Capsule now preflights ready Node-local keys and the entire
+generation, stages real WireGuard state deterministically, accepts complete
+kernel readback in any order, then joins exact controller admission and Linux
+policy-route readback to the Aya adapter. Equivalent two-epoch observations
+produce one compact witness without making it authority; partial, foreign, or
+active-before-publication state fails `make encryption-linux-convergence-test`;
+ADR 0174. The running agent plan/fact loop, TC consumer/verifier, and live
+encrypted packet gate remain, so no workload packet yet selects the staged
+route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0173 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0174 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

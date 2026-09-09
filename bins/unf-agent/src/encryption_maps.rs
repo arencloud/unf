@@ -18,9 +18,9 @@ use unf_ebpf_common::{
     EncryptionTransportValue, encryption_route_mark,
 };
 use unf_encryption::{
-    EncryptionActivationLatch, EncryptionActivationMode, EncryptionFastPathState,
-    FastPathMapCheckpoint, FastPathMapRecoveryAction, FastPathMapTransactionPhase,
-    FastPathPublishedGeneration,
+    AdmittedEncryptionGeneration, EncryptionActivationLatch, EncryptionActivationMode,
+    EncryptionFastPathState, FastPathMapCheckpoint, FastPathMapRecoveryAction,
+    FastPathMapTransactionPhase, FastPathPublishedGeneration, LinuxPreparedLocalGeneration,
 };
 
 use super::{load_secure_json, persist_secure_json, reject_node_block_symlinks};
@@ -135,6 +135,32 @@ impl EncryptionMapSynchronizer {
 
     pub(super) const fn requires_local_revalidation(&self) -> bool {
         self.requires_local_revalidation
+    }
+
+    /// Completes the real Linux route-before-Aya transition from one exact
+    /// kernel-converged Node capability. Controller substitution and route
+    /// drift fail before this adapter can mutate the inactive map bank.
+    #[allow(dead_code)]
+    pub(super) async fn apply_linux_generation(
+        &mut self,
+        prepared: LinuxPreparedLocalGeneration,
+        admitted: AdmittedEncryptionGeneration,
+    ) -> Result<()> {
+        let prior = self
+            .active
+            .as_ref()
+            .map(|checkpoint| checkpoint.transaction.desired.published);
+        let convergence_witness = prepared.witness();
+        let latch = prepared
+            .admit_and_activate_linux(admitted, prior)
+            .await
+            .context("activate exact Node-local Linux encryption generation")?;
+        self.apply(latch)?;
+        info!(
+            convergence_witness = ?convergence_witness.0,
+            "Node-local WireGuard, policy routes, and Aya generation converged"
+        );
+        Ok(())
     }
 
     /// Consumes the single-use controller/kernel/map activation latch, then

@@ -1034,8 +1034,8 @@ mod tests {
         EncryptionPolicyFact, EncryptionRouteAuthority, EncryptionRouteAuthorityError,
         EncryptionRouteFamily, FastPathMapCheckpoint, FastPathMapRecoveryAction,
         FastPathMapTransaction, FastPathPublishedGeneration, FastPathTransactionError, IpPrefix,
-        ManagedIdentitySelector, NodeLocalGenerationProposal, NodeLocalOrchestratorError,
-        NodeSealedGenerationCapsule, PreparedNodeEncryptionGeneration,
+        LinuxPreparedLocalGeneration, ManagedIdentitySelector, NodeLocalGenerationProposal,
+        NodeLocalOrchestratorError, NodeSealedGenerationCapsule, PreparedNodeEncryptionGeneration,
         UNF_ENCRYPTION_RULE_PRIORITY_BASE, UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily,
         UnderlayMtuObservation, WireGuardEpochActivation, WireGuardKernelPlan,
         WireGuardKernelPlanInput, WireGuardKernelSnapshotInput, WireGuardMtuEnvelope,
@@ -1311,6 +1311,25 @@ mod tests {
                 plan_index: Some(0),
             }],
         )
+        .unwrap()
+    }
+
+    fn inactive_plan(fixture: &Fixture) -> WireGuardKernelPlan {
+        let plan = &fixture.transaction.plan;
+        WireGuardKernelPlan::new(WireGuardKernelPlanInput {
+            cluster_id: plan.cluster_id.clone(),
+            local_node_uid: plan.local_node_uid.clone(),
+            epoch: plan.epoch,
+            revision: plan.revision,
+            interface_name: plan.interface_name.clone(),
+            local_public_key: plan.local_public_key,
+            listen_port: plan.listen_port,
+            fwmark: plan.fwmark,
+            route_table: plan.route_table,
+            mtu_envelope: plan.mtu_envelope.clone(),
+            activation: WireGuardEpochActivation::InactiveStaged,
+            peers: plan.peers.clone(),
+        })
         .unwrap()
     }
 
@@ -2044,6 +2063,136 @@ mod tests {
             material.into_parts().0.transaction.desired.published,
             FastPathPublishedGeneration::issue(&state).unwrap()
         );
+    }
+
+    #[test]
+    fn linux_convergence_capsule_binds_the_complete_exact_kernel_cut() {
+        let current_fixture = fixture(7);
+        let state = required_state(&current_fixture, context_at(1, 21));
+        let checkpoint = FastPathMapCheckpoint::begin(Revision::new(21), &state, None).unwrap();
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-worker-a".to_owned(),
+        };
+        let prepared = LinuxPreparedLocalGeneration::bind_exact_readback(
+            Revision::new(9),
+            recipient.clone(),
+            checkpoint.clone(),
+            &[inactive_plan(&current_fixture)],
+            std::slice::from_ref(&current_fixture.snapshot),
+        )
+        .unwrap();
+        assert_ne!(prepared.witness().0, [0; 32]);
+        assert_eq!(prepared.fact().recipient, recipient);
+        assert_eq!(prepared.fact().checkpoint, checkpoint);
+
+        let replay = LinuxPreparedLocalGeneration::bind_exact_readback(
+            Revision::new(9),
+            prepared.fact().recipient.clone(),
+            prepared.fact().checkpoint.clone(),
+            &[inactive_plan(&current_fixture)],
+            std::slice::from_ref(&current_fixture.snapshot),
+        )
+        .unwrap();
+        assert_eq!(replay.witness(), prepared.witness());
+
+        let old = fixture(6);
+        let new = fixture(7);
+        let rotating = compile_encryption_fast_path(
+            context_at(1, 22),
+            &[
+                FastPathEpochAdmission {
+                    contract: &old.contract,
+                    transaction: &old.transaction,
+                    readback: &old.snapshot,
+                    readiness_digest: [6; 32],
+                    state: FastPathEpochState::Draining,
+                    drain_until_monotonic_ns: 20_000,
+                },
+                FastPathEpochAdmission {
+                    contract: &new.contract,
+                    transaction: &new.transaction,
+                    readback: &new.snapshot,
+                    readiness_digest: [7; 32],
+                    state: FastPathEpochState::Active,
+                    drain_until_monotonic_ns: 0,
+                },
+            ],
+            &[FastPathDecisionInput {
+                source_identity: IdentityId::new(11),
+                destination_identity: IdentityId::new(21),
+                disposition: EncryptionDisposition::Required,
+                contract_epoch: Some(7),
+                plan_index: Some(0),
+            }],
+        )
+        .unwrap();
+        let rotating_checkpoint =
+            FastPathMapCheckpoint::begin(Revision::new(22), &rotating, None).unwrap();
+        let first = LinuxPreparedLocalGeneration::bind_exact_readback(
+            Revision::new(9),
+            EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-worker-a".to_owned(),
+            },
+            rotating_checkpoint.clone(),
+            &[inactive_plan(&old), inactive_plan(&new)],
+            &[new.snapshot.clone(), old.snapshot.clone()],
+        )
+        .unwrap();
+        let reordered = LinuxPreparedLocalGeneration::bind_exact_readback(
+            Revision::new(9),
+            first.fact().recipient.clone(),
+            rotating_checkpoint,
+            &[inactive_plan(&new), inactive_plan(&old)],
+            &[old.snapshot, new.snapshot],
+        )
+        .unwrap();
+        assert_eq!(first.witness(), reordered.witness());
+    }
+
+    #[test]
+    fn linux_convergence_capsule_refuses_partial_foreign_or_active_staging() {
+        let fixture = fixture(7);
+        let state = required_state(&fixture, context_at(1, 21));
+        let checkpoint = FastPathMapCheckpoint::begin(Revision::new(21), &state, None).unwrap();
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-worker-a".to_owned(),
+        };
+        assert!(matches!(
+            LinuxPreparedLocalGeneration::bind_exact_readback(
+                Revision::new(9),
+                recipient.clone(),
+                checkpoint.clone(),
+                &[inactive_plan(&fixture)],
+                &[],
+            ),
+            Err(NodeLocalOrchestratorError::KernelCommitmentMismatch)
+        ));
+        assert!(matches!(
+            LinuxPreparedLocalGeneration::bind_exact_readback(
+                Revision::new(9),
+                EncryptionGenerationRecipient {
+                    node_name: recipient.node_name.clone(),
+                    node_uid: "replacement-uid".to_owned(),
+                },
+                checkpoint.clone(),
+                &[inactive_plan(&fixture)],
+                std::slice::from_ref(&fixture.snapshot),
+            ),
+            Err(NodeLocalOrchestratorError::KernelCommitmentMismatch)
+        ));
+        assert!(matches!(
+            LinuxPreparedLocalGeneration::bind_exact_readback(
+                Revision::new(9),
+                recipient,
+                checkpoint,
+                std::slice::from_ref(&fixture.transaction.plan),
+                std::slice::from_ref(&fixture.snapshot),
+            ),
+            Err(NodeLocalOrchestratorError::KernelCommitmentMismatch)
+        ));
     }
 
     #[test]

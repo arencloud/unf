@@ -376,6 +376,31 @@ impl NodeKeyAuthority {
         &self.epochs
     }
 
+    /// Returns secret authority only to the in-crate Linux convergence
+    /// orchestrator after the complete plan identity and public key match a
+    /// locally ready epoch.
+    pub(crate) fn private_key_for_kernel_plan(
+        &self,
+        plan: &crate::WireGuardKernelPlan,
+    ) -> Result<&WireGuardPrivateKey, KeyAuthorityError> {
+        self.validate()?;
+        plan.verify()
+            .map_err(|_| KeyAuthorityError::KernelPlanMismatch)?;
+        let epoch = self
+            .epochs
+            .iter()
+            .find(|candidate| candidate.epoch == plan.epoch)
+            .ok_or(KeyAuthorityError::UnknownEpoch(plan.epoch))?;
+        if self.cluster_id != plan.cluster_id
+            || self.node_uid != plan.local_node_uid
+            || epoch.public_key != plan.local_public_key
+            || epoch.phase == KeyEpochPhase::Prepared
+        {
+            return Err(KeyAuthorityError::KernelPlanMismatch);
+        }
+        Ok(&epoch.private_key)
+    }
+
     /// Generates and stages one epoch behind an exact causal peer barrier.
     ///
     /// # Errors
@@ -1487,6 +1512,8 @@ pub enum KeyAuthorityError {
     EntropyUnavailable(String),
     #[error("WireGuard private key is invalid")]
     InvalidPrivateKey,
+    #[error("kernel plan does not match a locally ready Node key epoch")]
+    KernelPlanMismatch,
     #[error("generated public key duplicates a live epoch")]
     DuplicatePublicKey,
     #[error("key lifetime is invalid or exceeds the configured bound")]
@@ -1764,6 +1791,94 @@ mod tests {
         assert_ne!(first.public_key(), second.public_key());
         assert_ne!(first.expose_for_kernel(), &[0; 32]);
         assert_eq!(format!("{first:?}"), "WireGuardPrivateKey(<redacted>)");
+    }
+
+    #[test]
+    fn kernel_plan_receives_only_the_exact_ready_local_epoch() {
+        let mut authority = authority();
+        let mut generator = FixedGenerator { next: 1 };
+        let epoch = authority
+            .prepare_epoch(
+                Revision::new(4),
+                peers(),
+                NOW,
+                NOW + 100_000,
+                &mut generator,
+            )
+            .unwrap();
+        let local_public_key = authority.epochs()[0].public_key();
+        let build_plan = |cluster_id: &str| {
+            crate::WireGuardKernelPlan::new(crate::WireGuardKernelPlanInput {
+                cluster_id: cluster_id.to_owned(),
+                local_node_uid: "node-uid-a".to_owned(),
+                epoch,
+                revision: Revision::new(5),
+                interface_name: "unfwg000000001".to_owned(),
+                local_public_key,
+                listen_port: 51_820,
+                fwmark: 0x0055_0100,
+                route_table: 20_001,
+                mtu_envelope: crate::WireGuardMtuEnvelope::derive(&[
+                    crate::UnderlayMtuObservation {
+                        peer_node_uid: "node-uid-b".to_owned(),
+                        family: crate::UnderlayAddressFamily::Ipv4,
+                        underlay_mtu: 1_500,
+                    },
+                    crate::UnderlayMtuObservation {
+                        peer_node_uid: "node-uid-c".to_owned(),
+                        family: crate::UnderlayAddressFamily::Ipv4,
+                        underlay_mtu: 1_500,
+                    },
+                ])
+                .unwrap(),
+                activation: crate::WireGuardEpochActivation::InactiveStaged,
+                peers: vec![
+                    crate::WireGuardPeerPlan {
+                        node_uid: "node-uid-b".to_owned(),
+                        public_key: WireGuardPublicKey([42; 32]),
+                        endpoint: "192.0.2.42:51820".parse().unwrap(),
+                        persistent_keepalive_seconds: 0,
+                        allowed_ips: vec![crate::IpPrefix {
+                            address: "10.42.0.0".parse().unwrap(),
+                            prefix_len: 24,
+                        }],
+                    },
+                    crate::WireGuardPeerPlan {
+                        node_uid: "node-uid-c".to_owned(),
+                        public_key: WireGuardPublicKey([43; 32]),
+                        endpoint: "192.0.2.43:51820".parse().unwrap(),
+                        persistent_keepalive_seconds: 0,
+                        allowed_ips: vec![crate::IpPrefix {
+                            address: "10.43.0.0".parse().unwrap(),
+                            prefix_len: 24,
+                        }],
+                    },
+                ],
+            })
+            .unwrap()
+        };
+        let plan = build_plan("cluster-a");
+        assert!(matches!(
+            authority.private_key_for_kernel_plan(&plan),
+            Err(KeyAuthorityError::KernelPlanMismatch)
+        ));
+        for peer in peers() {
+            let acknowledgement = acknowledgement(&authority.epochs[0], &peer, NOW + 1);
+            authority
+                .acknowledge_epoch(&peer, acknowledgement, NOW + 1)
+                .unwrap();
+        }
+        assert_eq!(
+            authority
+                .private_key_for_kernel_plan(&plan)
+                .unwrap()
+                .public_key(),
+            plan.local_public_key
+        );
+        assert!(matches!(
+            authority.private_key_for_kernel_plan(&build_plan("replacement-cluster")),
+            Err(KeyAuthorityError::KernelPlanMismatch)
+        ));
     }
 
     #[test]
