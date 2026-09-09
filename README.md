@@ -848,11 +848,17 @@ kernel readback in any order, then joins exact controller admission and Linux
 policy-route readback to the Aya adapter. Equivalent two-epoch observations
 produce one compact witness without making it authority; partial, foreign, or
 active-before-publication state fails `make encryption-linux-convergence-test`;
-ADR 0174. The running agent plan/fact loop, TC consumer/verifier, and live
-encrypted packet gate remain, so no workload packet yet selects the staged
-route table. The [Phase 9
+ADR 0174. The Echo-Sealed Agent Anti-Entropy Loop now makes that local
+capability the mandatory prerequisite for controller exchange: every retry
+publishes the exact fact first, uses a fresh predecessor-bound nonce, retains
+the single-owner capability on `204`, and persists only a byte-exact controller
+echo. With no local proof the default loop performs no blind pull. This passes
+`make encryption-agent-anti-entropy-test`; ADR 0175. The running local plan
+producer, admitted-capability activation/restart reconstruction, TC
+consumer/verifier, and live encrypted packet gate remain, so no workload packet
+yet selects the staged route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0174 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0175 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

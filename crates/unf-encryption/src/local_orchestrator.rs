@@ -230,6 +230,33 @@ impl LinuxPreparedLocalGeneration {
         self.witness
     }
 
+    /// Verifies that a remotely admitted generation is the byte-exact echo of
+    /// this Node's locally prepared fact. This check deliberately does not
+    /// consume or grant activation authority, so the same prepared capability
+    /// can survive authenticated publication retries and `204` responses.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed admission or any recipient/checkpoint substitution.
+    pub fn verify_controller_admission(
+        &self,
+        admitted: &AdmittedEncryptionGeneration,
+    ) -> Result<(), NodeLocalOrchestratorError> {
+        self.proposal
+            .fact()
+            .verify()
+            .map_err(NodeLocalOrchestratorError::InvalidFact)?;
+        admitted
+            .verify()
+            .map_err(NodeLocalOrchestratorError::InvalidAdmission)?;
+        if admitted.recipient != self.proposal.fact().recipient
+            || admitted.checkpoint != self.proposal.fact().checkpoint
+        {
+            return Err(NodeLocalOrchestratorError::ControllerSubstitution);
+        }
+        Ok(())
+    }
+
     /// Consumes exact kernel convergence, verifies the controller returned the
     /// same proposal, installs/read-backs the real Linux policy rules, and
     /// returns the only latch accepted by the Aya transaction adapter.
@@ -254,6 +281,7 @@ impl LinuxPreparedLocalGeneration {
         {
             return Err(NodeLocalOrchestratorError::ConvergenceWitnessMismatch);
         }
+        self.verify_controller_admission(&admitted)?;
         let controller_bound = self.proposal.bind_controller_admission(admitted)?;
         let permit = LinuxEncryptionRouteProvider
             .activate(&self.route_authority)

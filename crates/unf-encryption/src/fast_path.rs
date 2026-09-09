@@ -2152,6 +2152,46 @@ mod tests {
     }
 
     #[test]
+    fn linux_convergence_capsule_accepts_only_its_exact_controller_echo() {
+        let fixture = fixture(7);
+        let state = required_state(&fixture, context_at(1, 21));
+        let checkpoint = FastPathMapCheckpoint::begin(Revision::new(21), &state, None).unwrap();
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-worker-a".to_owned(),
+        };
+        let prepared = LinuxPreparedLocalGeneration::bind_exact_readback(
+            Revision::new(9),
+            recipient.clone(),
+            checkpoint.clone(),
+            &[inactive_plan(&fixture)],
+            std::slice::from_ref(&fixture.snapshot),
+        )
+        .unwrap();
+        let request =
+            EncryptionGenerationRequest::issue(recipient.node_name.clone(), None, [9; 32]).unwrap();
+        let admitted =
+            NodeSealedGenerationCapsule::issue(100, recipient.clone(), &request, checkpoint)
+                .unwrap()
+                .admit(&request, None)
+                .unwrap();
+        prepared.verify_controller_admission(&admitted).unwrap();
+
+        let substituted_state = required_state(&fixture, context_at(0, 22));
+        let substituted_checkpoint =
+            FastPathMapCheckpoint::begin(Revision::new(22), &substituted_state, None).unwrap();
+        let substituted =
+            NodeSealedGenerationCapsule::issue(100, recipient, &request, substituted_checkpoint)
+                .unwrap()
+                .admit(&request, None)
+                .unwrap();
+        assert!(matches!(
+            prepared.verify_controller_admission(&substituted),
+            Err(NodeLocalOrchestratorError::ControllerSubstitution)
+        ));
+    }
+
+    #[test]
     fn linux_convergence_capsule_refuses_partial_foreign_or_active_staging() {
         let fixture = fixture(7);
         let state = required_state(&fixture, context_at(1, 21));

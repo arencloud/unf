@@ -86,7 +86,8 @@ use unf_egress::{
     seal_egress_bgp_snapshot, verify_egress_bgp_config, verify_egress_reachability_plan,
 };
 use unf_encryption::{
-    AdmittedEncryptionGeneration, EncryptionGenerationRequest, NodeSealedGenerationCapsule,
+    AdmittedEncryptionGeneration, EncryptionGenerationFact, EncryptionGenerationRequest,
+    LinuxPreparedLocalGeneration, NodeSealedGenerationCapsule,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -1019,6 +1020,17 @@ struct EncryptionGenerationSynchronizer {
     node_name: String,
     state_path: PathBuf,
     current: Option<AdmittedEncryptionGeneration>,
+    pending: Option<PendingEncryptionGeneration>,
+}
+
+/// Volatile, single-owner generation state. Neither variant is serializable:
+/// restart must reconstruct local kernel proof instead of reviving authority.
+enum PendingEncryptionGeneration {
+    Prepared(Box<LinuxPreparedLocalGeneration>),
+    ControllerAdmitted {
+        prepared: Box<LinuxPreparedLocalGeneration>,
+        admitted: Box<AdmittedEncryptionGeneration>,
+    },
 }
 
 #[derive(Debug)]
@@ -7427,17 +7439,87 @@ impl EncryptionGenerationSynchronizer {
             node_name,
             state_path,
             current,
+            pending: None,
         })
     }
 
-    fn admit(
+    /// Installs one newly kernel-converged capability for retry-safe exchange.
+    /// A second proposal cannot replace an in-flight capability.
+    #[allow(dead_code)]
+    fn offer_prepared(&mut self, prepared: LinuxPreparedLocalGeneration) -> Result<bool> {
+        let fact = prepared.fact();
+        fact.verify().context("verify prepared encryption fact")?;
+        if fact.recipient.node_name != self.node_name {
+            bail!(
+                "prepared encryption fact targets Node {:?}, local Node is {:?}",
+                fact.recipient.node_name,
+                self.node_name
+            );
+        }
+        let expected_prior = self
+            .current
+            .as_ref()
+            .map(AdmittedEncryptionGeneration::published);
+        if fact.checkpoint.transaction.prior != expected_prior {
+            bail!("prepared encryption fact does not extend the durable desired predecessor");
+        }
+        if let Some(pending) = &self.pending {
+            let existing = match pending {
+                PendingEncryptionGeneration::Prepared(existing)
+                | PendingEncryptionGeneration::ControllerAdmitted {
+                    prepared: existing, ..
+                } => existing,
+            };
+            if existing.fact() == fact {
+                return Ok(false);
+            }
+            bail!("a different encryption generation capability is already in flight");
+        }
+        self.pending = Some(PendingEncryptionGeneration::Prepared(Box::new(prepared)));
+        Ok(true)
+    }
+
+    fn prepared_fact(&self) -> Option<&EncryptionGenerationFact> {
+        match self.pending.as_ref()? {
+            PendingEncryptionGeneration::Prepared(prepared) => Some(prepared.fact()),
+            PendingEncryptionGeneration::ControllerAdmitted { .. } => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn admitted_capability(
+        &self,
+    ) -> Option<(&LinuxPreparedLocalGeneration, &AdmittedEncryptionGeneration)> {
+        match self.pending.as_ref()? {
+            PendingEncryptionGeneration::Prepared(_) => None,
+            PendingEncryptionGeneration::ControllerAdmitted { prepared, admitted } => {
+                Some((prepared.as_ref(), admitted.as_ref()))
+            }
+        }
+    }
+
+    fn admit_exact_echo(
         &mut self,
         request: &EncryptionGenerationRequest,
         capsule: &NodeSealedGenerationCapsule,
-    ) -> Result<bool> {
+        fact: &EncryptionGenerationFact,
+    ) -> Result<AdmittedEncryptionGeneration> {
         let candidate = capsule
             .admit(request, self.current.as_ref())
             .context("admit exact encryption generation successor")?;
+        let prepared = match self.pending.as_ref() {
+            Some(PendingEncryptionGeneration::Prepared(prepared)) => prepared,
+            Some(PendingEncryptionGeneration::ControllerAdmitted { .. }) => {
+                bail!("encryption generation already has controller admission")
+            }
+            None => bail!("controller admission has no Node-local prepared capability"),
+        };
+        if prepared.fact() != fact {
+            bail!("in-flight encryption fact changed during controller exchange");
+        }
+        prepared
+            .verify_controller_admission(&candidate)
+            .context("verify byte-exact controller echo of Node-local generation")?;
         persist_secure_json(&self.state_path, &candidate, "encryption generation")?;
         info!(
             controller_epoch = candidate.controller_epoch,
@@ -7446,20 +7528,53 @@ impl EncryptionGenerationSynchronizer {
             service_revision = candidate.published().service_revision.get(),
             egress_revision = candidate.published().egress_revision.get(),
             node_uid = %candidate.recipient.node_uid,
-            "accepted Node-sealed desired encryption generation; local route proof and map activation remain pending"
+            "accepted byte-exact echo of Node-local encryption generation; local route proof and map activation remain pending in a volatile capability"
         );
-        self.current = Some(candidate);
-        Ok(true)
+        self.current = Some(candidate.clone());
+        let pending = self
+            .pending
+            .take()
+            .context("prepared encryption capability disappeared after persistence")?;
+        let PendingEncryptionGeneration::Prepared(prepared) = pending else {
+            bail!("encryption capability changed after desired-state persistence");
+        };
+        self.pending = Some(PendingEncryptionGeneration::ControllerAdmitted {
+            prepared,
+            admitted: Box::new(candidate.clone()),
+        });
+        Ok(candidate)
     }
 }
 
 async fn synchronize_encryption_generation(
     synchronizer: &mut EncryptionGenerationSynchronizer,
 ) -> Result<bool> {
+    let Some(fact) = synchronizer.prepared_fact().cloned() else {
+        return Ok(false);
+    };
+    fact.verify()
+        .context("verify Node-local generation fact before publication")?;
     let controller_url = synchronizer
         .controller_url
         .as_deref()
         .context("encryption generation synchronization has no controller URL")?;
+    let fact_response = synchronizer
+        .client
+        .current()
+        .post(format!(
+            "{controller_url}/v1/state/encryption-generation-facts"
+        ))
+        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+        .json(&fact)
+        .send()
+        .await
+        .context("publish Node-local encryption generation fact")?;
+    if fact_response.status() != StatusCode::ACCEPTED {
+        fact_response
+            .error_for_status()
+            .context("controller rejected Node-local encryption generation fact")?;
+        bail!("controller returned a non-202 response for encryption generation fact");
+    }
     let request = EncryptionGenerationRequest::fresh(
         synchronizer.node_name.clone(),
         synchronizer.current.as_ref(),
@@ -7483,7 +7598,9 @@ async fn synchronize_encryption_generation(
         .json()
         .await
         .context("decode Node-sealed encryption generation capsule")?;
-    synchronizer.admit(&request, &capsule)
+    synchronizer
+        .admit_exact_echo(&request, &capsule, &fact)
+        .map(|_| true)
 }
 
 async fn preflight_controller_compatibility(
@@ -12969,7 +13086,8 @@ async fn consume_events(
                     warn!(%error, "egress synchronization failed; active source state was fenced when possible");
                 }
             }
-            _ = encryption_interval.tick(), if encryption_generations.controller_url.is_some() => {
+            _ = encryption_interval.tick(), if encryption_generations.controller_url.is_some()
+                && encryption_generations.prepared_fact().is_some() => {
                 if let Err(error) = synchronize_encryption_generation(encryption_generations).await {
                     warn!(%error, "encryption generation synchronization failed; retaining durable desired predecessor and active local authority");
                 }
@@ -16139,27 +16257,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encryption_generation_no_change_preserves_the_durable_cursor() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new().route(
-                    "/v1/state/encryption-generation",
-                    axum::routing::post(|| async { StatusCode::NO_CONTENT }),
-                ),
-            )
-            .await
-            .unwrap();
-        });
+    async fn encryption_generation_without_local_proof_never_polls_controller() {
         let temporary = tempdir().unwrap();
-        let token_path = temporary.path().join("token");
-        fs::write(&token_path, "test-token\n").unwrap();
         let mut synchronizer = EncryptionGenerationSynchronizer::recover(
-            Some(format!("http://{address}")),
+            Some("http://127.0.0.1:1".to_owned()),
             test_controller_client(),
-            token_path,
+            temporary.path().join("missing-token"),
             Duration::from_secs(2),
             "worker-a".to_owned(),
             temporary.path().join("encryption-generation.json"),
@@ -16171,7 +16274,7 @@ mod tests {
                 .unwrap()
         );
         assert!(synchronizer.current.is_none());
-        server.abort();
+        assert!(synchronizer.pending.is_none());
     }
 
     #[test]

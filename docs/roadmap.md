@@ -875,7 +875,7 @@ matrix is maintained in the
   route readback, safe MTU derivation, foreign-state refusal, injected rollback,
   replay, and positive cleanup pass `make encryption-kernel-provider-test` and
   the privileged live-kernel gate; ADR 0161. Workload selection remains 9.5.
-- Phase 9.5a–9.5m now provide the canonical coalesced compiler and Causal Epoch
+- Phase 9.5a–9.5n now provide the canonical coalesced compiler and Causal Epoch
   Lease, Causal Commit Vector, isolated fixed-shape Aya ABI, Proof-Carrying Aya
   Map Mirror with delta-minimal recovery, and Cooperative Route-Mark Lease. The
   latter gives every admitted outer `WireGuard` bypass mark a collision-free
@@ -908,10 +908,8 @@ matrix is maintained in the
   topology/UID drift, rejects regression and same-generation equivocation, and
   publishes only when every exact Kubernetes member agrees on one generation.
   The final predecessor receipt retries a ready successor; `make
-  encryption-generation-reconciler-test` and ADR 0172. The running agent
-  plan/fact loop, TC consumption, verifier loading, and live encrypted packets
-  remain within milestone 9.5. The Capability-Typed
-  Causal Proof Ladder now makes the local proposal, exact controller return,
+  encryption-generation-reconciler-test` and ADR 0172. The Capability-Typed
+  Causal Proof Ladder then makes the local proposal, exact controller return,
   fresh route permit, and Aya latch consuming types. It rejects controller
   substitution and makes unsafe stage ordering structurally unavailable under
   `make encryption-local-proof-ladder-test`; ADR 0173. The Proof-Carrying Linux
@@ -920,8 +918,14 @@ matrix is maintained in the
   deterministic order, joins permutation-independent exact kernel readback,
   and allows controller-returned intent to reach real policy-route and Aya
   adapters only through consuming authority. Partial or foreign state remains
-  inert under `make encryption-linux-convergence-test`; ADR 0174. The running
-  agent plan/fact loop and TC consumer remain next.
+  inert under `make encryption-linux-convergence-test`; ADR 0174. The
+  Echo-Sealed Agent Anti-Entropy Loop now owns at most one volatile convergence
+  capability, publishes its authenticated fact before each nonce-bound pull,
+  retains it across retry/`204`, and persists only a byte-exact returned echo.
+  With no local capability, blind controller polling is disabled by default;
+  `make encryption-agent-anti-entropy-test` and ADR 0175. The local plan
+  producer, admitted-capability activation/restart reconstruction, TC consumer,
+  verifier loading, and live encrypted packets remain within milestone 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,
