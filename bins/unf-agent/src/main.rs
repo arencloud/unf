@@ -11792,8 +11792,21 @@ fn recover_service_state(services: &mut ServiceSynchronizer) -> Result<(Option<u
     let selected_fabric = matched
         .next()
         .context("persistent active service bank does not match any durable selection contract")?;
-    if matched.next().is_some() {
-        bail!("persistent active service bank ambiguously matches multiple selection contracts");
+    if let Some(equivalent_pending) = matched.next() {
+        let current_then_pending = matches!(
+            (&selected_fabric.selection, &equivalent_pending.selection),
+            (Some((false, _)), Some((true, _)))
+        );
+        if !current_then_pending || matched.next().is_some() {
+            bail!(
+                "persistent active service bank ambiguously matches multiple selection contracts"
+            );
+        }
+        // The kernel bank can legitimately be identical when a prepared
+        // contract changes only control-plane provenance or selects over an
+        // empty Service set. The durable current checkpoint remains the
+        // commit authority until the pending rename completes; recovery
+        // therefore rolls back the equivalent prepared checkpoint.
     }
     let RecoveredServiceFabric {
         selection: recovered_selection,
@@ -20863,6 +20876,21 @@ mod tests {
         let expected_selection_bank = synchronizer.active_selection_bank;
         assert_ne!(expected_service_bank, expected_selection_bank);
         let expected_digest = zone_b_contract.contract_digest;
+        let equivalent_pending_contract = NetworkBehaviorContract::compile(
+            &preferred,
+            Revision::new(5),
+            Revision::new(5),
+            local_selection_node(&node, Some("zone-b".to_owned())),
+        )
+        .unwrap();
+        assert_ne!(equivalent_pending_contract.contract_digest, expected_digest);
+        prepare_selection_checkpoint(
+            &synchronizer.state_path,
+            &equivalent_pending_contract,
+            &node,
+            (expected_selection_bank + 1) % SELECTION_BANK_COUNT,
+        )
+        .expect("equivalent pending selection checkpoint is durable");
         synchronizer.banks = [None, None];
         synchronizer.node_port_banks = [None, None];
         synchronizer.selection_banks = [None, None];
@@ -20886,6 +20914,11 @@ mod tests {
                 .unwrap()
                 .contract_digest,
             expected_digest
+        );
+        assert!(
+            !selection_contract_pending_path(&synchronizer.state_path)
+                .unwrap()
+                .exists()
         );
         let (action, translated) = run_tc(
             &mut ebpf,
