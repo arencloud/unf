@@ -73,7 +73,8 @@ use unf_encryption::{
     EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
     EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
-    EncryptionGenerationRequest, EncryptionKeyBootstrap, NodeKeyPublication,
+    EncryptionGenerationRequest, EncryptionKeyBootstrap, NodeKeyAttestationCut,
+    NodeKeyAttestationLedger, NodeKeyAttestationRound, NodeKeyAttestationRow, NodeKeyPublication,
     NodeKeyTransparencyLedger, NodeLocalPlanCatalog, NodeLocalPlanDistributionError,
     NodeLocalPlanRequest, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
 };
@@ -403,6 +404,7 @@ struct ControllerState {
     /// The next compiler slice populates this catalog from one causal cut.
     encryption_local_plans: Mutex<NodeLocalPlanCatalog>,
     encryption_key_transparency: Mutex<NodeKeyTransparencyLedger>,
+    encryption_key_attestations: Mutex<NodeKeyAttestationLedger>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1368,6 +1370,18 @@ async fn spawn_internal_api(
         )
         .route("/v1/state/encryption-keys", post(ingest_encryption_keys))
         .route(
+            "/v1/state/encryption-key-attestation-round",
+            get(encryption_key_attestation_round),
+        )
+        .route(
+            "/v1/state/encryption-key-attestation-rows",
+            post(ingest_encryption_key_attestation_row),
+        )
+        .route(
+            "/v1/state/encryption-key-attestation-cut",
+            get(encryption_key_attestation_cut),
+        )
+        .route(
             "/v1/state/service-selection",
             get(service_selection_contract),
         )
@@ -1798,6 +1812,7 @@ fn new_state_with_client_and_selector(
         encryption_generation_store: config_map_store.clone(),
         encryption_local_plans: Mutex::new(NodeLocalPlanCatalog::default()),
         encryption_key_transparency: Mutex::new(NodeKeyTransparencyLedger::default()),
+        encryption_key_attestations: Mutex::new(NodeKeyAttestationLedger::default()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -8156,6 +8171,32 @@ async fn ingest_encryption_keys(
     Ok(StatusCode::ACCEPTED)
 }
 
+async fn encryption_key_attestation_round(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<NodeKeyAttestationRound>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    encryption_key_attestation_round_for(&state, &agent).map(Json)
+}
+
+async fn ingest_encryption_key_attestation_row(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(row): Json<NodeKeyAttestationRow>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    ingest_encryption_key_attestation_row_for(&state, &agent, row, unix_time_millis())?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn encryption_key_attestation_cut(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<NodeKeyAttestationCut>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    encryption_key_attestation_cut_for(&state, &agent).map(Json)
+}
+
 async fn ingest_encryption_generation_fact(
     State(state): State<Arc<ControllerState>>,
     headers: HeaderMap,
@@ -8477,6 +8518,15 @@ fn ingest_encryption_keys_for(
     agent: &AuthenticatedAgent,
     publication: NodeKeyPublication,
 ) -> Result<(), ApiError> {
+    ingest_encryption_keys_for_at(state, agent, publication, unix_time_millis())
+}
+
+fn ingest_encryption_keys_for_at(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    publication: NodeKeyPublication,
+    now_unix_ms: u64,
+) -> Result<(), ApiError> {
     if !agent_application_is_current(state, agent) {
         return Err(ApiError::forbidden(
             "encryption key publication does not match the current authenticated agent Pod",
@@ -8501,18 +8551,106 @@ fn ingest_encryption_keys_for(
         node_name: member.node_name.clone(),
         node_uid: member.node_uid.clone(),
     };
-    let mut ledger = mutex_lock(&state.encryption_key_transparency);
-    ledger
-        .replace_membership(
-            state.encryption_cluster_id.clone(),
-            membership_revision,
-            members,
-        )
+    let complete_cut = {
+        let mut ledger = mutex_lock(&state.encryption_key_transparency);
+        ledger
+            .replace_membership(
+                state.encryption_cluster_id.clone(),
+                membership_revision,
+                members,
+            )
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        ledger
+            .observe(&authenticated, publication)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        ledger
+            .complete_cut()
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?
+    };
+    if let Some(complete_cut) = complete_cut {
+        mutex_lock(&state.encryption_key_attestations)
+            .begin_if_needed(&complete_cut, now_unix_ms)
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn encryption_key_attestation_round_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+) -> Result<NodeKeyAttestationRound, ApiError> {
+    if !agent_application_is_current(state, agent) {
+        return Err(ApiError::forbidden(
+            "key attestation round does not match the current authenticated agent Pod",
+        ));
+    }
+    let (membership_revision, members) = encryption_generation_membership(state)?;
+    let recipient = members
+        .iter()
+        .find(|member| member.node_name == agent.node_name)
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "authenticated agent Node is absent from key attestation membership",
+            )
+        })?;
+    let round = mutex_lock(&state.encryption_key_attestations)
+        .round()
+        .cloned()
+        .ok_or_else(|| ApiError::service_unavailable("key attestation round is not ready"))?;
+    if round.cluster_id != state.encryption_cluster_id
+        || round.membership_revision != membership_revision
+        || round.members != members
+        || round.members.binary_search(recipient).is_err()
+    {
+        return Err(ApiError::service_unavailable(
+            "key attestation round is stale for current membership",
+        ));
+    }
+    round
+        .verify()
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-    ledger
-        .observe(&authenticated, publication)
+    Ok(round)
+}
+
+fn ingest_encryption_key_attestation_row_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    row: NodeKeyAttestationRow,
+    now_unix_ms: u64,
+) -> Result<(), ApiError> {
+    let round = encryption_key_attestation_round_for(state, agent)?;
+    let recipient = round
+        .members
+        .iter()
+        .find(|member| member.node_name == agent.node_name)
+        .ok_or_else(|| ApiError::forbidden("agent is outside the key attestation round"))?;
+    let authenticated = AuthenticatedNodeIdentity {
+        cluster_id: state.encryption_cluster_id.clone(),
+        node_name: recipient.node_name.clone(),
+        node_uid: recipient.node_uid.clone(),
+    };
+    mutex_lock(&state.encryption_key_attestations)
+        .observe_row(&authenticated, row, now_unix_ms)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     Ok(())
+}
+
+fn encryption_key_attestation_cut_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+) -> Result<NodeKeyAttestationCut, ApiError> {
+    let round = encryption_key_attestation_round_for(state, agent)?;
+    let recipient = round
+        .members
+        .iter()
+        .find(|member| member.node_name == agent.node_name)
+        .ok_or_else(|| ApiError::forbidden("agent is outside the key attestation round"))?;
+    mutex_lock(&state.encryption_key_attestations)
+        .complete_cut_for(recipient)
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?
+        .ok_or_else(|| {
+            ApiError::service_unavailable("complete reciprocal key attestation matrix is not ready")
+        })
 }
 
 async fn service_selection_contract(
@@ -14009,6 +14147,7 @@ mod tests {
     #[test]
     fn encryption_key_bootstrap_and_ingestion_are_authenticated_complete_cut_scoped() {
         let state = new_state(true);
+        let now = unix_time_millis().max(1);
         let agent = authenticated_egress_agent("worker-a");
         install_authenticated_agent(&state, &agent);
         write_lock(&state.nodes).insert(
@@ -14037,12 +14176,13 @@ mod tests {
             .prepare_epoch(
                 bootstrap.membership_revision,
                 bootstrap.required_peer_uids(),
-                1_000,
-                10_000,
+                now,
+                now + 10_000,
                 &mut unf_encryption::OsWireGuardKeyGenerator,
             )
             .unwrap();
-        ingest_encryption_keys_for(&state, &agent, authority.publication().unwrap()).unwrap();
+        ingest_encryption_keys_for_at(&state, &agent, authority.publication().unwrap(), now + 1)
+            .unwrap();
         assert!(
             mutex_lock(&state.encryption_key_transparency)
                 .complete_cut()
@@ -14062,6 +14202,85 @@ mod tests {
                 .status,
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[test]
+    fn encryption_key_attestation_releases_only_an_authenticated_complete_matrix() {
+        let state = new_state(true);
+        let now = unix_time_millis().max(1);
+        let agents = [
+            authenticated_egress_agent("worker-a"),
+            authenticated_egress_agent("worker-b"),
+        ];
+        for agent in &agents {
+            install_authenticated_agent(&state, agent);
+            write_lock(&state.nodes).insert(
+                agent.node_name.clone(),
+                TopologyNode {
+                    name: agent.node_name.clone(),
+                    ready: true,
+                    labels: BTreeMap::new(),
+                },
+            );
+        }
+        mutex_lock(&state.revisions).topology = Revision::new(9);
+        let members = encryption_generation_membership(&state).unwrap().1;
+        for (agent, member) in agents.iter().zip(&members) {
+            let mut authority = unf_encryption::NodeKeyAuthority::new(
+                "test-cluster-uid".to_owned(),
+                member.node_name.clone(),
+                member.node_uid.clone(),
+            )
+            .unwrap();
+            authority
+                .prepare_epoch(
+                    Revision::new(9),
+                    members
+                        .iter()
+                        .filter(|peer| *peer != member)
+                        .map(|peer| peer.node_uid.clone())
+                        .collect(),
+                    now,
+                    now + 10_000,
+                    &mut unf_encryption::OsWireGuardKeyGenerator,
+                )
+                .unwrap();
+            ingest_encryption_keys_for_at(&state, agent, authority.publication().unwrap(), now + 1)
+                .unwrap();
+        }
+
+        let round = encryption_key_attestation_round_for(&state, &agents[0]).unwrap();
+        let first_row = round.row_for(&members[0]).unwrap();
+        assert_eq!(
+            ingest_encryption_key_attestation_row_for(
+                &state,
+                &agents[1],
+                first_row.clone(),
+                now + 2,
+            )
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+        ingest_encryption_key_attestation_row_for(&state, &agents[0], first_row, now + 2).unwrap();
+        assert_eq!(
+            encryption_key_attestation_cut_for(&state, &agents[0])
+                .unwrap_err()
+                .status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        ingest_encryption_key_attestation_row_for(
+            &state,
+            &agents[1],
+            round.row_for(&members[1]).unwrap(),
+            now + 2,
+        )
+        .unwrap();
+        for agent in &agents {
+            let cut = encryption_key_attestation_cut_for(&state, agent).unwrap();
+            cut.verify().unwrap();
+            assert_eq!(cut.acknowledgements.len(), 1);
+        }
     }
 
     #[test]

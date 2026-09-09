@@ -886,12 +886,16 @@ private keys never cross the Node boundary;
 now uses a stable `kube-system` UID cluster identity plus an exact Pod-bound
 bootstrap. Each agent creates or restores only its own mode-0600 CSPRNG key
 authority, durably prepares before publishing, and sends only public state;
-`make encryption-key-runtime-test`; ADR 0183. Mutual attestation, authoritative
-cut production, local compile, the TC consumer/verifier, and live
+`make encryption-key-runtime-test`; ADR 0183. Mutual readiness now uses a
+Reciprocal Witness Matrix: one immutable transparency round, exact authenticated
+N×(N-1) rows, complete-column release, and durable Node-local adoption prevent
+partial-fleet key advancement; `make encryption-key-attestation-test`; ADR
+0184. Authoritative plan production, local compile, the TC consumer/verifier,
+and live
 encrypted packet gate remain, so no workload packet yet selects the staged
 route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0183 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0184 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

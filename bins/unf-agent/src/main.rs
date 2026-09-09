@@ -88,9 +88,9 @@ use unf_egress::{
 use unf_encryption::{
     AdmittedEncryptionGeneration, AdmittedNodeLocalPlan, DurableNodeKeyAuthority,
     EncryptionGenerationFact, EncryptionGenerationRequest, EncryptionKeyBootstrap,
-    FileNodeKeyStateStore, LinuxPreparedLocalGeneration, NodeKeyAuthority, NodeLocalPlanRequest,
-    NodeLocalRecoveryPlan, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
-    OsWireGuardKeyGenerator,
+    FileNodeKeyStateStore, LinuxPreparedLocalGeneration, NodeKeyAttestationCut,
+    NodeKeyAttestationRound, NodeKeyAuthority, NodeLocalPlanRequest, NodeLocalRecoveryPlan,
+    NodeSealedGenerationCapsule, NodeSealedPlanCapsule, OsWireGuardKeyGenerator,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -7670,6 +7670,56 @@ impl EncryptionKeySynchronizer {
         self.authority = Some(durable);
         Ok(())
     }
+
+    fn bind_attestation_cut(
+        &mut self,
+        cut: &NodeKeyAttestationCut,
+        now_unix_ms: u64,
+    ) -> Result<bool> {
+        cut.verify()
+            .context("verify complete reciprocal key attestation cut")?;
+        let authority = self
+            .authority
+            .as_mut()
+            .context("key authority disappeared before mutual attestation")?;
+        let publication = authority
+            .authority()
+            .publication()
+            .context("verify Node-local key authority before mutual attestation")?;
+        if cut.round.cluster_id != publication.cluster_id
+            || cut.recipient.node_name != publication.node_name
+            || cut.recipient.node_uid != publication.node_uid
+        {
+            bail!("key attestation cut targets a foreign or replaced Node");
+        }
+        let target = cut
+            .round
+            .proposals
+            .iter()
+            .find(|proposal| proposal.recipient == cut.recipient)
+            .context("key attestation cut has no local proposal")?;
+        let phase = authority
+            .authority()
+            .epochs()
+            .iter()
+            .find(|epoch| epoch.epoch() == target.epoch)
+            .map(unf_encryption::LocalKeyEpoch::phase)
+            .context("key attestation cut targets an unknown local epoch")?;
+        if phase != unf_encryption::KeyEpochPhase::Prepared {
+            return Ok(false);
+        }
+        let mut changed = false;
+        for acknowledgement in &cut.acknowledgements {
+            changed |= authority
+                .acknowledge_epoch(
+                    &acknowledgement.peer_node_uid,
+                    acknowledgement.clone(),
+                    now_unix_ms,
+                )
+                .context("durably record reciprocal peer key acknowledgement")?;
+        }
+        Ok(changed)
+    }
 }
 
 fn ensure_encryption_key_directory(state_path: &Path) -> Result<()> {
@@ -7718,10 +7768,94 @@ async fn synchronize_encryption_keys(synchronizer: &mut EncryptionKeySynchronize
     .await
     .context("decode encryption key bootstrap")?;
     synchronizer.bind_bootstrap(&bootstrap)?;
+    publish_node_key_state(synchronizer, &controller_url).await?;
+
+    let response = authenticated_get(
+        &synchronizer.client,
+        format!("{controller_url}/v1/state/encryption-key-attestation-round"),
+        &synchronizer.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request reciprocal key attestation round")?;
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        return Ok(true);
+    }
+    let round: NodeKeyAttestationRound = response
+        .error_for_status()
+        .context("controller rejected reciprocal key attestation round")?
+        .json()
+        .await
+        .context("decode reciprocal key attestation round")?;
+    round
+        .verify()
+        .context("verify reciprocal key attestation round")?;
     let publication = synchronizer
         .authority
         .as_ref()
-        .context("encryption key authority disappeared after bootstrap")?
+        .context("encryption key authority disappeared after publication")?
+        .authority()
+        .publication()
+        .context("verify local key identity for reciprocal attestation")?;
+    let peer = round
+        .members
+        .iter()
+        .find(|member| {
+            member.node_name == publication.node_name && member.node_uid == publication.node_uid
+        })
+        .context("reciprocal key attestation round excludes the local Node")?;
+    let row = round
+        .row_for(peer)
+        .context("build exact reciprocal key attestation row")?;
+    let response = synchronizer
+        .client
+        .current()
+        .post(format!(
+            "{controller_url}/v1/state/encryption-key-attestation-rows"
+        ))
+        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+        .json(&row)
+        .send()
+        .await
+        .context("publish reciprocal key attestation row")?;
+    if response.status() != StatusCode::ACCEPTED {
+        response
+            .error_for_status()
+            .context("controller rejected reciprocal key attestation row")?;
+        bail!("controller returned a non-202 response for key attestation row");
+    }
+
+    let response = authenticated_get(
+        &synchronizer.client,
+        format!("{controller_url}/v1/state/encryption-key-attestation-cut"),
+        &synchronizer.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request complete reciprocal key attestation cut")?;
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        return Ok(true);
+    }
+    let cut: NodeKeyAttestationCut = response
+        .error_for_status()
+        .context("controller rejected reciprocal key attestation cut")?
+        .json()
+        .await
+        .context("decode reciprocal key attestation cut")?;
+    if synchronizer.bind_attestation_cut(&cut, current_unix_time_milliseconds())? {
+        publish_node_key_state(synchronizer, &controller_url).await?;
+    }
+    Ok(true)
+}
+
+async fn publish_node_key_state(
+    synchronizer: &EncryptionKeySynchronizer,
+    controller_url: &str,
+) -> Result<()> {
+    let publication = synchronizer
+        .authority
+        .as_ref()
+        .context("encryption key authority is unavailable for publication")?
         .authority()
         .publication()
         .context("build public-only Node key publication")?;
@@ -7740,7 +7874,7 @@ async fn synchronize_encryption_keys(synchronizer: &mut EncryptionKeySynchronize
             .context("controller rejected public-only encryption key publication")?;
         bail!("controller returned a non-202 response for encryption key publication");
     }
-    Ok(true)
+    Ok(())
 }
 
 impl EncryptionPlanSynchronizer {
@@ -17009,6 +17143,137 @@ mod tests {
         )
         .unwrap();
         assert!(recovered.bind_bootstrap(&replacement).is_err());
+    }
+
+    fn complete_reciprocal_attestation_cut(
+        members: &[unf_encryption::EncryptionGenerationRecipient],
+        publications: [unf_encryption::NodeKeyPublication; 2],
+        issued_at: u64,
+    ) -> NodeKeyAttestationCut {
+        let mut transparency = unf_encryption::NodeKeyTransparencyLedger::default();
+        transparency
+            .replace_membership("cluster-a".to_owned(), Revision::new(7), members.to_vec())
+            .unwrap();
+        for publication in publications {
+            let member = members
+                .iter()
+                .find(|member| member.node_uid == publication.node_uid)
+                .unwrap();
+            transparency
+                .observe(
+                    &unf_encryption::AuthenticatedNodeIdentity {
+                        cluster_id: "cluster-a".to_owned(),
+                        node_name: member.node_name.clone(),
+                        node_uid: member.node_uid.clone(),
+                    },
+                    publication,
+                )
+                .unwrap();
+        }
+        let mut attestations = unf_encryption::NodeKeyAttestationLedger::default();
+        attestations
+            .begin_if_needed(&transparency.complete_cut().unwrap().unwrap(), issued_at)
+            .unwrap();
+        let round = attestations.round().unwrap().clone();
+        for member in members {
+            attestations
+                .observe_row(
+                    &unf_encryption::AuthenticatedNodeIdentity {
+                        cluster_id: "cluster-a".to_owned(),
+                        node_name: member.node_name.clone(),
+                        node_uid: member.node_uid.clone(),
+                    },
+                    round.row_for(member).unwrap(),
+                    issued_at,
+                )
+                .unwrap();
+        }
+        attestations.complete_cut_for(&members[0]).unwrap().unwrap()
+    }
+
+    #[test]
+    fn reciprocal_key_attestation_is_durable_and_complete_cut_only() {
+        let temporary = tempdir().unwrap();
+        let state_path = temporary.path().join("keys").join("authority.json");
+        let members = vec![
+            unf_encryption::EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-a".to_owned(),
+            },
+            unf_encryption::EncryptionGenerationRecipient {
+                node_name: "worker-b".to_owned(),
+                node_uid: "uid-b".to_owned(),
+            },
+        ];
+        let bootstrap = EncryptionKeyBootstrap::issue(
+            11,
+            "cluster-a".to_owned(),
+            Revision::new(7),
+            members[0].clone(),
+            members.clone(),
+        )
+        .unwrap();
+        let mut synchronizer = EncryptionKeySynchronizer::new(
+            None,
+            test_controller_client(),
+            temporary.path().join("token"),
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            state_path.clone(),
+        )
+        .unwrap();
+        synchronizer.bind_bootstrap(&bootstrap).unwrap();
+
+        let mut peer = NodeKeyAuthority::new(
+            "cluster-a".to_owned(),
+            "worker-b".to_owned(),
+            "uid-b".to_owned(),
+        )
+        .unwrap();
+        let now = current_unix_time_milliseconds().max(1);
+        peer.prepare_epoch(
+            Revision::new(7),
+            BTreeSet::from(["uid-a".to_owned()]),
+            now,
+            now + 10_000,
+            &mut OsWireGuardKeyGenerator,
+        )
+        .unwrap();
+        let issued_at = current_unix_time_milliseconds().max(now);
+        let cut = complete_reciprocal_attestation_cut(
+            &members,
+            [
+                synchronizer
+                    .authority
+                    .as_ref()
+                    .unwrap()
+                    .authority()
+                    .publication()
+                    .unwrap(),
+                peer.publication().unwrap(),
+            ],
+            issued_at,
+        );
+        assert!(synchronizer.bind_attestation_cut(&cut, issued_at).unwrap());
+        assert_eq!(
+            synchronizer
+                .authority
+                .as_ref()
+                .unwrap()
+                .authority()
+                .epochs()[0]
+                .phase(),
+            unf_encryption::KeyEpochPhase::MutuallyAttested
+        );
+        assert!(!synchronizer.bind_attestation_cut(&cut, issued_at).unwrap());
+
+        let recovered = FileNodeKeyStateStore::new(state_path)
+            .restore("cluster-a", "worker-a", "uid-a")
+            .unwrap();
+        assert_eq!(
+            recovered.epochs()[0].phase(),
+            unf_encryption::KeyEpochPhase::MutuallyAttested
+        );
     }
 
     #[test]
