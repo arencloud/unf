@@ -18,7 +18,7 @@ separately revisioned. The authoritative state remains in
 | 9.2 | Encryption intent and path-contract model | **Verified** | `unf-encryption` provides a bounded canonical cluster baseline plus monotonic identity-pair intent and schema-v1 exact-source-Node Attested Encryption Path Contracts. Policy precedes public-key/epoch and bidirectional route admission; Node identities, lifetimes, capabilities, Pod CIDR `AllowedIPs`, interface/route/fwmark/MTU facts, and five revisions bind domain-separated golden digests and witnesses. Independent replay, explicit deny-only failure envelopes, mutation/property/strict-wire tests, and Clippy pass `make encryption-contract-test`; ADR 0159. No private key or runtime mutation exists |
 | 9.3 | Node key authority and epoch rotation | **Verified** | `unf-encryption` generates X25519/WireGuard keys directly from the OS CSPRNG into zeroizing memory, exposes secret material only to the future local kernel-provider boundary, and copy-persist-commits at most two epochs to a digest-checked atomic mode-0600 Node-UID-bound checkpoint. The Causal Epoch Barrier seals the exact affected-peer frontier/topology revision and requires every authenticated acknowledgement before activation; rotation, positive zero-flow/zero-route retirement, emergency revocation, public-only monotonic publication, replay/replacement fencing, restart/tamper recovery, and strict Clippy pass `make encryption-key-authority-test`; ADR 0160. No interface or packet mutation exists |
 | 9.4 | Transactional kernel WireGuard provider | **Verified** | Typed Rust generic-netlink/rtnetlink configures bounded dual-stack interfaces, complete peer sets, isolated routes, fwmarks, and derived safe MTUs. Proof-Carrying Kernel Transactions bind secret-free before/desired/readback digests and total restart actions; exact ownership aliases, sorted overlap/route indexes, injected rollback, foreign-state preservation, readback/replay, adjacent capability negotiation, and positive cleanup pass `make encryption-kernel-provider-test` plus the independently privileged `make encryption-kernel-provider-live-test`; ADR 0161. No workload packet selects the staged table |
-| 9.5 | Intent-Coalesced Cryptographic Fast Path | **Planned** | Many identity-level contracts coalesce onto bounded Node/epoch transports without losing per-flow authority. Policy and Service/egress selection precede a fixed-width eBPF transport decision; existing connection state pins an admitted epoch, new flows move atomically, kernel WireGuard performs all cryptography, and required traffic has no plaintext fallback |
+| 9.5 | Intent-Coalesced Cryptographic Fast Path | **In progress** | Phase 9.5a adds a canonical bounded compiler, explicit identity decisions, exact Node/epoch transport coalescing, fixed-width ABI, and the Causal Epoch Lease. Tests prove committed-readback/revision binding, atomic generation inputs, active/new versus draining/established behavior, revocation, and no plaintext fallback under `make encryption-fast-path-contract-test`; ADR 0162. Map persistence, TC marking, policy routes, verifier, and live traffic remain before Verified |
 | 9.6 | Bidirectional live path proof | **Planned** | Authenticated nonce-bound readback from both endpoint Nodes proves exact peer/key epoch, route/interface/MTU, kernel counters, and encrypted challenge delivery before activation. Expiry, disagreement, endpoint roaming, one-sided readiness, replay, and underlay mutation deny closed without treating a handshake timestamp alone as path proof |
 | 9.7 | Operations, upgrade, recovery, and performance | **Planned** | Fixed-cardinality status/metrics, loss-explicit history, explanation and non-authoritative simulation expose requirement, contract, epoch, peer, path, rotation, and denial provenance without secrets. Adjacent upgrade/rollback, controller/agent outage, Node replacement, exact cleanup, and committed plaintext/encrypted throughput/latency/CPU/memory/rotation measurements pass |
 | 9.8 | Kube-proxy-free Kind qualification | **Planned** | One exact committed runtime passes a multi-Node dual-stack gate for required/default and selective encryption, externally verified ciphertext-only underlay transport, Service and egress composition, rotation, failure/recovery, observability, performance capture, exact cleanup, and no-CNI rollback |
@@ -175,11 +175,11 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 9.5 implements the Intent-Coalesced Cryptographic Fast Path. It must
-compile policy-authorized identity decisions into a bounded eBPF transport
-selection after Service/egress choice, coalesce only identical Node/epoch/path
-tuples, atomically select a mutually ready epoch bank for new flows, retain the
-prior bank for bounded established-flow drain, and deny Required traffic when
-exact transport authority is unavailable. Kernel WireGuard remains the sole
-cryptographic implementation. Live two-ended encrypted path proof remains
-milestone 9.6.
+Complete milestone 9.5 by installing and transactionally persisting the new
+decision, transport, configuration, and CEL maps; invoke their bounded lookup
+after policy plus Service/egress selection in TC; preserve unrelated skb mark
+bits while selecting the exact WireGuard policy route; and pass verifier,
+restart, rotation, revocation, IPv4/IPv6, Service, egress, and live-kernel
+traffic gates. The Phase 9.5a compiler and ABI are verified by
+`make encryption-fast-path-contract-test`, but no workload packet-path claim is
+made yet. Live two-ended encrypted challenge proof remains milestone 9.6.

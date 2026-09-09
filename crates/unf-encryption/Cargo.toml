@@ -20,6 +20,7 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 unf-common = { path = "../unf-common" }
+unf-ebpf-common = { path = "../../ebpf/unf-ebpf-common" }
 x25519-dalek.workspace = true
 zeroize.workspace = true
 

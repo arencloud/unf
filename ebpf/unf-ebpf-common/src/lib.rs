@@ -61,6 +61,16 @@ pub const EGRESS_EVENT_REASON_PAIR_STORE_FAILED: u8 = 4;
 pub const EGRESS_EVENT_REASON_PORT_EXHAUSTED: u8 = 5;
 pub const EGRESS_EVENT_COUNTER_ATTEMPTED: u32 = 0;
 pub const EGRESS_EVENT_COUNTER_DROPPED: u32 = 1;
+pub const ENCRYPTION_MAP_ABI_VERSION: u16 = 1;
+pub const ENCRYPTION_BANK_COUNT: u8 = 2;
+pub const ENCRYPTION_DISPOSITION_NATIVE: u8 = 1;
+pub const ENCRYPTION_DISPOSITION_REQUIRED: u8 = 2;
+pub const ENCRYPTION_TRANSPORT_ACTIVE: u8 = 1;
+pub const ENCRYPTION_TRANSPORT_DRAINING: u8 = 2;
+pub const ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED: u8 = 1;
+pub const ENCRYPTION_DECISION_FLAG_SELECTION_BOUND: u8 = 1 << 1;
+pub const ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK: u8 = 1;
+pub const ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE: u8 = 1;
 pub const SERVICE_MAP_ABI_VERSION: u16 = 5;
 pub const SERVICE_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_MAP_ABI_VERSION: u16 = 4;
@@ -893,6 +903,140 @@ pub struct EgressMapConfig {
     pub destination_count: u32,
 }
 
+/// Identity authority selected only after policy and Service/egress resolution.
+/// Native decisions are explicit; absence can therefore fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EncryptionDecisionKey {
+    pub source_identity: IdentityId,
+    pub destination_identity: IdentityId,
+    pub bank: u8,
+    pub reserved: [u8; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EncryptionDecisionValue {
+    pub transport_id: u64,
+    pub contract_revision: u64,
+    pub policy_revision: u64,
+    pub service_revision: u64,
+    pub egress_revision: u64,
+    pub key_epoch: u64,
+    pub decision_witness: [u8; 16],
+    pub schema_version: u16,
+    pub disposition: u8,
+    pub flags: u8,
+}
+
+/// One coalesced kernel transport. The ID is content-derived in userspace and
+/// collision checked before staging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EncryptionTransportKey {
+    pub transport_id: u64,
+    pub bank: u8,
+    pub reserved: [u8; 7],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EncryptionTransportValue {
+    pub key_epoch: u64,
+    pub contract_revision: u64,
+    pub drain_until_monotonic_ns: u64,
+    pub fwmark: u32,
+    pub route_table: u32,
+    pub interface_index: u32,
+    pub mtu: u32,
+    pub kernel_configuration_digest: [u8; 16],
+    pub readiness_digest: [u8; 16],
+    pub schema_version: u16,
+    pub state: u8,
+    pub flags: u8,
+    pub reserved: [u8; 4],
+}
+
+/// One atomic selector publishes a complete inactive bank to new flows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EncryptionMapConfig {
+    pub generation: u64,
+    pub policy_revision: u64,
+    pub service_revision: u64,
+    pub egress_revision: u64,
+    pub decision_count: u32,
+    pub transport_count: u32,
+    pub schema_version: u16,
+    pub active_bank: u8,
+    pub epoch_count: u8,
+}
+
+/// Causal Epoch Lease retained for an established five-tuple. It carries the
+/// exact transport authority admitted at creation, never policy permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EncryptionFlowValue {
+    pub last_seen_monotonic_ns: u64,
+    pub transport_id: u64,
+    pub key_epoch: u64,
+    pub contract_revision: u64,
+    pub drain_until_monotonic_ns: u64,
+    pub decision_witness: [u8; 16],
+    pub schema_version: u16,
+    pub flags: u8,
+    pub reserved: [u8; 5],
+}
+
+#[must_use]
+pub const fn encryption_disposition_is_valid(disposition: u8) -> bool {
+    matches!(
+        disposition,
+        ENCRYPTION_DISPOSITION_NATIVE | ENCRYPTION_DISPOSITION_REQUIRED
+    )
+}
+
+#[must_use]
+pub const fn encryption_transport_is_usable(
+    transport: &EncryptionTransportValue,
+    established: bool,
+    now_monotonic_ns: u64,
+) -> bool {
+    if transport.schema_version != ENCRYPTION_MAP_ABI_VERSION
+        || transport.key_epoch == 0
+        || transport.contract_revision == 0
+        || transport.fwmark == 0
+        || transport.route_table == 0
+        || transport.interface_index == 0
+        || transport.mtu == 0
+        || !encryption_digest_is_nonzero(&transport.kernel_configuration_digest)
+        || !encryption_digest_is_nonzero(&transport.readiness_digest)
+        || transport.flags & ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK == 0
+    {
+        return false;
+    }
+    match transport.state {
+        ENCRYPTION_TRANSPORT_ACTIVE => true,
+        ENCRYPTION_TRANSPORT_DRAINING => {
+            established
+                && transport.drain_until_monotonic_ns != 0
+                && now_monotonic_ns <= transport.drain_until_monotonic_ns
+        }
+        _ => false,
+    }
+}
+
+const fn encryption_digest_is_nonzero(digest: &[u8; 16]) -> bool {
+    let mut index = 0;
+    while index < digest.len() {
+        if digest[index] != 0 {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 /// Forward and reverse keys both point at the same immutable translation and
 /// pre-certified standby decision for one established flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1430,6 +1574,12 @@ const _: () = assert!(core::mem::size_of::<EgressGatewayValue>() == 88);
 const _: () = assert!(core::mem::size_of::<EgressSelectionKey>() == 8);
 const _: () = assert!(core::mem::size_of::<EgressSelectionValue>() == 32);
 const _: () = assert!(core::mem::size_of::<EgressMapConfig>() == 56);
+const _: () = assert!(core::mem::size_of::<EncryptionDecisionKey>() == 12);
+const _: () = assert!(core::mem::size_of::<EncryptionDecisionValue>() == 72);
+const _: () = assert!(core::mem::size_of::<EncryptionTransportKey>() == 16);
+const _: () = assert!(core::mem::size_of::<EncryptionTransportValue>() == 80);
+const _: () = assert!(core::mem::size_of::<EncryptionMapConfig>() == 48);
+const _: () = assert!(core::mem::size_of::<EncryptionFlowValue>() == 64);
 const _: () = assert!(core::mem::size_of::<EgressConnectionKey>() == 44);
 const _: () = assert!(core::mem::size_of::<EgressFqdnConnectionValue>() == 32);
 const _: () = assert!(core::mem::size_of::<EgressConnectionValue>() == 208);
@@ -1519,6 +1669,12 @@ mod tests {
         assert_eq!(core::mem::size_of::<EgressSelectionValue>(), 32);
         assert_eq!(core::mem::align_of::<EgressMapConfig>(), 8);
         assert_eq!(core::mem::size_of::<EgressMapConfig>(), 56);
+        assert_eq!(core::mem::size_of::<EncryptionDecisionKey>(), 12);
+        assert_eq!(core::mem::size_of::<EncryptionDecisionValue>(), 72);
+        assert_eq!(core::mem::size_of::<EncryptionTransportKey>(), 16);
+        assert_eq!(core::mem::size_of::<EncryptionTransportValue>(), 80);
+        assert_eq!(core::mem::size_of::<EncryptionMapConfig>(), 48);
+        assert_eq!(core::mem::size_of::<EncryptionFlowValue>(), 64);
         assert_eq!(core::mem::align_of::<EgressConnectionKey>(), 4);
         assert_eq!(core::mem::size_of::<EgressConnectionKey>(), 44);
         assert_eq!(core::mem::align_of::<EgressConnectionValue>(), 8);
@@ -1558,6 +1714,40 @@ mod tests {
         assert_eq!(core::mem::size_of::<ServiceConnectionKey>(), 40);
         assert_eq!(core::mem::align_of::<ServiceConnectionValue>(), 8);
         assert_eq!(core::mem::size_of::<ServiceConnectionValue>(), 104);
+    }
+
+    #[test]
+    fn encryption_transport_requires_readback_and_bounded_epoch_state() {
+        let mut transport = EncryptionTransportValue {
+            key_epoch: 7,
+            contract_revision: 9,
+            drain_until_monotonic_ns: 0,
+            fwmark: 0x554e_0007,
+            route_table: 20_007,
+            interface_index: 17,
+            mtu: 1_420,
+            kernel_configuration_digest: [1; 16],
+            readiness_digest: [2; 16],
+            schema_version: ENCRYPTION_MAP_ABI_VERSION,
+            state: ENCRYPTION_TRANSPORT_ACTIVE,
+            flags: ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK,
+            reserved: [0; 4],
+        };
+        assert!(encryption_transport_is_usable(&transport, false, 100));
+        transport.state = ENCRYPTION_TRANSPORT_DRAINING;
+        transport.drain_until_monotonic_ns = 200;
+        assert!(!encryption_transport_is_usable(&transport, false, 100));
+        assert!(encryption_transport_is_usable(&transport, true, 200));
+        assert!(!encryption_transport_is_usable(&transport, true, 201));
+        transport.readiness_digest = [0; 16];
+        assert!(!encryption_transport_is_usable(&transport, true, 100));
+        assert!(encryption_disposition_is_valid(
+            ENCRYPTION_DISPOSITION_NATIVE
+        ));
+        assert!(encryption_disposition_is_valid(
+            ENCRYPTION_DISPOSITION_REQUIRED
+        ));
+        assert!(!encryption_disposition_is_valid(0));
     }
 
     #[test]

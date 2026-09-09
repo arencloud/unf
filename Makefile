@@ -16,7 +16,7 @@
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
 .PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-upgrade-recovery-test egress-phase8-kind-test egress-phase8-openshift-deploy egress-phase8-openshift-test egress-bgp-image
-.PHONY: encryption-fabric-boundary-test encryption-contract-test encryption-key-authority-test encryption-kernel-provider-test encryption-kernel-provider-live-test
+.PHONY: encryption-fabric-boundary-test encryption-contract-test encryption-key-authority-test encryption-kernel-provider-test encryption-kernel-provider-live-test encryption-fast-path-contract-test
 .NOTPARALLEL: egress-phase8-kind-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -86,6 +86,12 @@ encryption-kernel-provider-test: encryption-key-authority-test
 
 encryption-kernel-provider-live-test: encryption-kernel-provider-test
 	hack/verify-encryption-kernel-live.sh
+
+encryption-fast-path-contract-test: encryption-kernel-provider-test
+	hack/verify-encryption-fast-path-contract.sh
+	cargo test -p unf-ebpf-common
+	cargo test -p unf-encryption fast_path
+	cargo clippy -p unf-ebpf-common -p unf-encryption --all-targets --all-features -- -D warnings
 
 egress-intent-test: egress-fabric-boundary-test
 	hack/verify-egress-intent.sh

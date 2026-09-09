@@ -732,7 +732,8 @@ exact cleanup, five-agent convergence, and an unchanged `network` unhealthy
 baseline. Evidence SHA-256 is
 `a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3`;
 ADR 0157. These independent Kind and OpenShift results close Phase 8.
-Phase 9 begins the attested encryption fabric. Milestones 9.1–9.4 are verified.
+Phase 9 begins the attested encryption fabric. Milestones 9.1–9.4 are verified;
+9.5 is in progress.
 The architecture requires that source policy and Service/egress ownership precede
 encryption; kernel WireGuard owns all cryptography; private keys remain on their
 Node; and an independently replayed Attested Encryption Path Contract requires
@@ -766,10 +767,19 @@ before/desired/readback digests to deterministic restart actions, while exact
 version aliases, derived MTU, sorted conflict detection, foreign-state refusal,
 injected rollback, idempotent replay, and positive cleanup pass
 `make encryption-kernel-provider-test` and the privileged
-`make encryption-kernel-provider-live-test`; ADR 0161. No workload packet yet
-selects the staged route table; that bounded coalesced eBPF decision is 9.5. The
+`make encryption-kernel-provider-live-test`; ADR 0161. Phase 9.5a now adds the
+canonical Intent-Coalesced compiler and fixed-width eBPF ABI. Explicit identity
+decisions bind policy plus Service/egress revisions while identical exact
+Node/epoch/readback transports share one ID. Its Causal Epoch Lease preserves
+an admitted established flow across `Active -> Draining`, rejects cross-flow
+reuse, and denies immediately on policy failure, expiry, or revocation instead
+of falling back to plaintext. Canonical ordering, committed-kernel-readback
+fencing, atomic generation state, rotation, and ABI layouts pass
+`make encryption-fast-path-contract-test`; ADR 0162. The persistent map
+transaction, TC mark/policy-route hook, verifier, and live packet gate remain,
+so no workload packet yet selects the staged route table. The
 [Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0161 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0162 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
