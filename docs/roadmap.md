@@ -837,3 +837,46 @@ matrix is maintained in the
   overlapping-CIDR translation, WireGuard, L7/Gateway API, SCTP NAT, fragments,
   generic NAT `RELATED`, arbitrary ICMP translation, and production HA/scale
   remain independent gates; ADR 0113.
+
+## Phase 9 — attested encryption fabric
+
+**Gate: in progress; architecture boundary verified.** The ordered evidence
+matrix is maintained in the
+[Phase 9 encryption-fabric plan](development/phase9-attested-encryption-fabric-plan.md).
+
+- Phase 9.1 fixes policy-before-encryption precedence and kernel WireGuard as
+  the initial L3 provider. UNF manages configuration and proof in Rust but does
+  not implement cryptographic primitives or expose private keys through the
+  controller, Kubernetes APIs, telemetry, or diagnostics.
+- The Attested Encryption Path Contract binds exact source/destination cluster,
+  workload, and Node identities to policy/routing revisions, public-key epochs,
+  peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,
+  capabilities, deadlines, and compact provenance. Both endpoint agents must
+  independently replay the contract, read back owned kernel state, and complete
+  a nonce-bound encrypted challenge; handshake recency alone is insufficient.
+- The Intent-Coalesced Cryptographic Fast Path keeps authority per identity and
+  destination while sharing only an identical trust-domain/destination-Node/
+  key-epoch/path-class transport. Bounded eBPF lookup and marking select the
+  transport; all cryptography remains in kernel WireGuard. There is no tunnel,
+  peer, or userspace packet path per workload or policy.
+- Flow-Stable Epoch Rotation admits at most two epochs. New flows move only
+  after mutual evidence, established flows drain within a bounded deadline, and
+  exact positive evidence precedes old route/interface/key retirement. Required
+  traffic fails closed and never silently downgrades to plaintext.
+- Fresh Phase 9-qualified primary-CNI installations will default managed
+  cross-Node Pod paths to Required. Existing clusters retain their previously
+  qualified path until an explicitly acknowledged staged migration proves
+  complete encrypted reachability; milestone 9.1 itself changes no runtime.
+- Performance is an acceptance gate, not a slogan. Committed native-versus-
+  encrypted fixtures must report IPv4/IPv6 throughput, p50/p95/p99 latency,
+  CPU, memory, map activity, peer scale, MTU cost, convergence, drops,
+  retransmits, and rotation disruption before any advantage is claimed.
+- Milestones 9.2–9.7 implement the intent/contract model, Node-local key and
+  rotation authority, transactional WireGuard provider, coalesced fast path,
+  bidirectional live proof, secret-free operations, recovery, and benchmarks.
+  Milestones 9.8 and 9.9 then require independent kube-proxy-free dual-stack
+  Kind and five-Node OpenShift qualification; ADR 0158.
+- Cross-cluster networking, overlapping CIDRs, global services, mTLS,
+  post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
+  transparent host/control-plane encryption, and production availability/scale
+  remain separate gates.

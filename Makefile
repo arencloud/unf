@@ -16,6 +16,7 @@
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
 .PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-upgrade-recovery-test egress-phase8-kind-test egress-phase8-openshift-deploy egress-phase8-openshift-test egress-bgp-image
+.PHONY: encryption-fabric-boundary-test
 .NOTPARALLEL: egress-phase8-kind-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -64,6 +65,9 @@ build:
 
 egress-fabric-boundary-test:
 	hack/verify-egress-fabric-boundary.sh
+
+encryption-fabric-boundary-test:
+	hack/verify-encryption-fabric-boundary.sh
 
 egress-intent-test: egress-fabric-boundary-test
 	hack/verify-egress-intent.sh

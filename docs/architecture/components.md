@@ -142,6 +142,23 @@ is retained. Every single-gateway failure has a digest-bound, independently
 replayable contingency and minimum-disruption certificate. Live activation is
 deliberately separate from planning; ADR 0136.
 
+The accepted Phase 9 boundary keeps encryption intent, key authority, kernel
+transport state, path evidence, and activation as separate revisioned domains.
+A planned Kubernetes-independent encryption domain will own canonical intent
+and the Attested Encryption Path Contract; the controller will orchestrate only
+authenticated public-key/epoch state and matching endpoint evidence. Each agent
+will generate and retain its private WireGuard key locally, independently replay
+contracts, transactionally own exact interfaces/peers/AllowedIPs/routes/fwmarks/
+MTUs, and publish nonce-bound kernel/path readback without secret material.
+`unf-ebpf-tc` may eventually consume only fixed-width policy-approved
+transport/epoch decisions; it will not implement cryptography, parse keys, or
+configure WireGuard. The Intent-Coalesced Cryptographic Fast Path may share a
+Node/epoch transport only when the complete trust-domain, destination-Node,
+epoch, and path-class tuple agrees. Two-epoch rotation preserves bounded flow
+continuity but Required traffic never falls back to plaintext. ADR 0158 defines
+this architecture-only boundary; milestones 9.2–9.9 retain independent model,
+key, kernel, packet, operations/performance, Kind, and OpenShift gates.
+
 Long-running binaries supervise their API server and watcher/dataplane tasks with
 a shared cancellation token. Phase 1 state uses explicit locks around small,
 control-plane-only collections; packet processing and event records do not

@@ -732,6 +732,22 @@ exact cleanup, five-agent convergence, and an unchanged `network` unhealthy
 baseline. Evidence SHA-256 is
 `a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3`;
 ADR 0157. These independent Kind and OpenShift results close Phase 8.
+Phase 9 begins the attested encryption fabric. Milestone 9.1 is verified as an
+architecture-only boundary: source policy and Service/egress ownership precede
+encryption; kernel WireGuard owns all cryptography; private keys remain on their
+Node; and an independently replayed Attested Encryption Path Contract requires
+matching Node identities, public-key epochs, routes, MTU, kernel readback, and a
+two-ended encrypted path witness before Required traffic activates. The
+Intent-Coalesced Cryptographic Fast Path preserves per-identity authority while
+sharing bounded Node/epoch tunnels, avoiding an interface or peer per policy.
+Flow-Stable Epoch Rotation admits at most two epochs, shifts new flows only
+after mutual evidence, drains established flows for a bounded interval, and
+never falls back to plaintext. No performance claim is accepted before
+committed native-versus-encrypted measurement. Milestone 9.1 creates no keys,
+interfaces, routes, BPF state, or packet behavior; the
+[Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
+ADR 0158 define the ordered implementation and independent Kind/OpenShift
+gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
