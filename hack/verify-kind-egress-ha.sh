@@ -374,10 +374,10 @@ seed_continuity_flows
 qualification_stage=measured-graceful-drain
 mkdir -p "${diagnostics_dir}"
 [[ -n ${last_egress_v4} && -n ${last_egress_v6} ]]
-failed_gateway=$(jq -er --arg address "${last_egress_v4}" '
-    .haPlans[0] as $plan |
-    ($plan.shards[] | select(.addresses | index($address)) | .index) as $shard |
-    $plan.assignments[] | select(.shardIndex == $shard) | .gateway.name' <<<"${initial_state}")
+failed_gateway=${source_node}
+jq -e --arg gateway "${failed_gateway}" \
+    'any(.haPlans[0].assignments[]; .gateway.name == $gateway)' \
+    <<<"${initial_state}" >/dev/null
 drain_started_ms=$(date +%s%3N)
 "${kc[@]}" label node "${failed_gateway}" "${drain_label}=true" --overwrite >/dev/null
 saw_promotion=false
