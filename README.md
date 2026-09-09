@@ -717,8 +717,8 @@ reconcile forward. Checkpoint-v5 migration, evidence-preserving rollback
 refusal, provider/agent last-known-good replay, and exact current-v15 cleanup
 pass `make egress-upgrade-recovery-test`; ADR 0155.
 Phase 8.10 composes the complete egress runtime rather than inferring success
-from focused gates. Runtime `99adfd6` qualified by `db263a1` passed a
-1,015-second, three-Node dual-stack Kubernetes v1.35.0 Kind run covering watched
+from focused gates. Runtime and qualifier `7c57664` passed a 1,008-second,
+three-Node dual-stack Kubernetes v1.35.0 Kind run covering watched
 steering/NAT, measured HA, FQDN and Internet authority, DQR/native reachability,
 causal operations, restart recovery, exact cleanup, and no-CNI rollback. The
 digest-bound aggregate is `.artifacts/phase8-egress-complete-kind.json`; ADR

@@ -682,10 +682,10 @@ matrix is maintained in the
   explicitly authorized exact ABI directory under `make
   egress-upgrade-recovery-test`; ADR 0155.
 - Phase 8.10 composes the complete runtime on one three-Node dual-stack
-  kube-proxy-free Kind cluster. Runtime `99adfd6` qualified by `db263a1` passed
-  all six digest-bound lifecycle components and exact no-CNI rollback in 1,015
+  kube-proxy-free Kind cluster. Runtime and qualifier `7c57664` passed
+  all six digest-bound lifecycle components and exact no-CNI rollback in 1,008
   seconds. The aggregate SHA-256 is
-  `4cb13c79632ae661cad7b8d588b1fdac757ef7740199c68800a0b2666a060c15`;
+  `feccddf02115da33e673f108ade153e17e530e24bad9233659efe8cd598c8209`;
   ADR 0156. Independent OpenShift qualification remains in 8.11.
 - Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
   ServiceAccount selectors; canonical destinations and non-overlapping
