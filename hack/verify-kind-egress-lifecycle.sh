@@ -318,6 +318,20 @@ controller_post() {
         "http://127.0.0.1:${controller_port}${path}"
 }
 
+operations_response_ready() {
+    local response=$1
+    jq -e --arg owner "${policy}" '
+        .schema_version == 1 and .outcome == "eligible"
+        and .selected_intent.name == $owner
+        and (.candidate_egress_addresses | length) == 2
+        and (.candidate_gateways | length) >= 1
+        and .private_nat_state_inferred == false
+        and ([.evidence[].layer] | unique | length) == (.evidence | length)
+        and ([.evidence[].layer] | index("counterfactual")) != null
+        and ([.evidence[].layer] | index("transport")) != null
+    ' <<<"${response}" >/dev/null
+}
+
 gateway_agent() {
     "${kc[@]}" -n unf-system get pods --field-selector "spec.nodeName=${gateway_node}" \
         -o json | jq -r '.items[] | select(.metadata.name | startswith("unf-agent-")) | .metadata.name' \
@@ -633,25 +647,32 @@ operations_v4_request=$(jq -nc --arg from "${namespace}/managed" \
 operations_v6_request=$(jq -nc --arg from "${namespace}/managed" \
     --arg destination "${external_v6}" \
     '{from:$from,destination:$destination,protocol:"udp",port:18080}')
-operations_explain_v4=$(controller_post /v1/egress/explain <<<"${operations_v4_request}")
-operations_explain_v6=$(controller_post /v1/egress/explain <<<"${operations_v6_request}")
-operations_simulate_v4=$(controller_post /v1/egress/simulate <<<"${operations_v4_request}")
-operations_simulate_v6=$(controller_post /v1/egress/simulate <<<"${operations_v6_request}")
+for operations_convergence_attempts in $(seq 1 30); do
+    operations_explain_v4=$(controller_post /v1/egress/explain <<<"${operations_v4_request}")
+    operations_explain_v6=$(controller_post /v1/egress/explain <<<"${operations_v6_request}")
+    operations_simulate_v4=$(controller_post /v1/egress/simulate <<<"${operations_v4_request}")
+    operations_simulate_v6=$(controller_post /v1/egress/simulate <<<"${operations_v6_request}")
+    if operations_response_ready "${operations_explain_v4}" \
+        && operations_response_ready "${operations_explain_v6}" \
+        && operations_response_ready "${operations_simulate_v4}" \
+        && operations_response_ready "${operations_simulate_v6}"; then
+        break
+    fi
+    sleep 1
+done
+mkdir -p "${diagnostics_dir}"
+jq -n --argjson explainV4 "${operations_explain_v4}" \
+    --argjson explainV6 "${operations_explain_v6}" \
+    --argjson simulateV4 "${operations_simulate_v4}" \
+    --argjson simulateV6 "${operations_simulate_v6}" \
+    '{explainV4:$explainV4,explainV6:$explainV6,simulateV4:$simulateV4,simulateV6:$simulateV6}' \
+    >"${diagnostics_dir}/operations-responses.json"
 kill "${controller_forward_pid}"
 wait "${controller_forward_pid}" 2>/dev/null || true
 controller_forward_pid=
 for response in "${operations_explain_v4}" "${operations_explain_v6}" \
     "${operations_simulate_v4}" "${operations_simulate_v6}"; do
-    jq -e --arg owner "${policy}" '
-        .schema_version == 1 and .outcome == "eligible"
-        and .selected_intent.name == $owner
-        and (.candidate_egress_addresses | length) == 2
-        and (.candidate_gateways | length) >= 1
-        and .private_nat_state_inferred == false
-        and ([.evidence[].layer] | unique | length) == (.evidence | length)
-        and ([.evidence[].layer] | index("counterfactual")) != null
-        and ([.evidence[].layer] | index("transport")) != null
-    ' <<<"${response}" >/dev/null
+    operations_response_ready "${response}"
 done
 gateway_pod=$(gateway_agent)
 for _ in $(seq 1 30); do
@@ -837,6 +858,7 @@ jq -n \
     --argjson operationsExplainV6 "${operations_explain_v6}" \
     --argjson operationsSimulateV4 "${operations_simulate_v4}" \
     --argjson operationsSimulateV6 "${operations_simulate_v6}" \
+    --argjson operationsConvergenceAttempts "${operations_convergence_attempts}" \
     --argjson operationsHistory "${operations_history}" \
     '{schemaVersion:1,milestone:$milestone,generatedAt:$generatedAt,revision:$revision,context:$context,
       kubernetesVersion:$kubernetesVersion,kubeProxyPresent:false,
@@ -854,6 +876,7 @@ jq -n \
         agentRestart:$agentRestartStatus,reused:$reusedStatus},
       operations:{explain:{ipv4:$operationsExplainV4,ipv6:$operationsExplainV6},
         simulate:{ipv4:$operationsSimulateV4,ipv6:$operationsSimulateV6},
+        convergenceAttempts:$operationsConvergenceAttempts,
         chronicle:$operationsHistory},
       images:$images,diagnostics:$diagnostics,
       verified:(["exclusive UNF primary CNI","watched dual-stack EgressPool and EgressPolicy",
