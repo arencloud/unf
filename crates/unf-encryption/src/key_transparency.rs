@@ -17,8 +17,10 @@ use crate::{
 };
 
 pub const NODE_KEY_TRANSPARENCY_CUT_SCHEMA_VERSION: u16 = 1;
+pub const ENCRYPTION_KEY_BOOTSTRAP_SCHEMA_VERSION: u16 = 1;
 pub const MAX_KEY_TRANSPARENCY_MEMBERS: usize = 4_096;
 const NODE_KEY_TRANSPARENCY_CUT_DIGEST_DOMAIN: &[u8] = b"unf.node-key-transparency-cut.v1\0";
+const ENCRYPTION_KEY_BOOTSTRAP_DIGEST_DOMAIN: &[u8] = b"unf.encryption-key-bootstrap.v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -34,6 +36,24 @@ pub struct NodeKeyTransparencyCut {
     pub members: Vec<EncryptionGenerationRecipient>,
     pub publications: Vec<NodeKeyPublication>,
     pub cut_digest: NodeKeyTransparencyCutDigest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EncryptionKeyBootstrapDigest(pub [u8; 32]);
+
+/// Authenticated controller view used to bind local key creation to one exact
+/// cluster, Node UID, topology revision, and peer frontier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionKeyBootstrap {
+    pub schema_version: u16,
+    pub controller_epoch: u64,
+    pub cluster_id: String,
+    pub membership_revision: Revision,
+    pub recipient: EncryptionGenerationRecipient,
+    pub members: Vec<EncryptionGenerationRecipient>,
+    pub bootstrap_digest: EncryptionKeyBootstrapDigest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +134,74 @@ impl NodeKeyTransparencyCut {
         hasher.update(NODE_KEY_TRANSPARENCY_CUT_DIGEST_DOMAIN);
         hasher.update(encoded);
         Ok(NodeKeyTransparencyCutDigest(hasher.finalize().into()))
+    }
+}
+
+impl EncryptionKeyBootstrap {
+    /// Issues one Node-scoped bootstrap from a complete membership view.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid controller identity, membership, or a recipient absent
+    /// from the exact member cut.
+    pub fn issue(
+        controller_epoch: u64,
+        cluster_id: String,
+        membership_revision: Revision,
+        recipient: EncryptionGenerationRecipient,
+        mut members: Vec<EncryptionGenerationRecipient>,
+    ) -> Result<Self, NodeKeyTransparencyError> {
+        members.sort();
+        validate_membership(&cluster_id, membership_revision, &members)?;
+        if controller_epoch == 0 || members.binary_search(&recipient).is_err() {
+            return Err(NodeKeyTransparencyError::InvalidBootstrap);
+        }
+        let mut bootstrap = Self {
+            schema_version: ENCRYPTION_KEY_BOOTSTRAP_SCHEMA_VERSION,
+            controller_epoch,
+            cluster_id,
+            membership_revision,
+            recipient,
+            members,
+            bootstrap_digest: EncryptionKeyBootstrapDigest([0; 32]),
+        };
+        bootstrap.bootstrap_digest = bootstrap.calculate_digest()?;
+        Ok(bootstrap)
+    }
+
+    /// # Errors
+    ///
+    /// Rejects schema, identity, membership, recipient, or digest mutation.
+    pub fn verify(&self) -> Result<(), NodeKeyTransparencyError> {
+        validate_membership(&self.cluster_id, self.membership_revision, &self.members)?;
+        if self.schema_version != ENCRYPTION_KEY_BOOTSTRAP_SCHEMA_VERSION
+            || self.controller_epoch == 0
+            || self.members.binary_search(&self.recipient).is_err()
+            || self.bootstrap_digest != self.calculate_digest()?
+        {
+            return Err(NodeKeyTransparencyError::InvalidBootstrap);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn required_peer_uids(&self) -> std::collections::BTreeSet<String> {
+        self.members
+            .iter()
+            .filter(|member| *member != &self.recipient)
+            .map(|member| member.node_uid.clone())
+            .collect()
+    }
+
+    fn calculate_digest(&self) -> Result<EncryptionKeyBootstrapDigest, NodeKeyTransparencyError> {
+        let mut canonical = self.clone();
+        canonical.bootstrap_digest = EncryptionKeyBootstrapDigest([0; 32]);
+        let encoded = serde_json::to_vec(&canonical)
+            .map_err(|error| NodeKeyTransparencyError::Encoding(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(ENCRYPTION_KEY_BOOTSTRAP_DIGEST_DOMAIN);
+        hasher.update(encoded);
+        Ok(EncryptionKeyBootstrapDigest(hasher.finalize().into()))
     }
 }
 
@@ -255,6 +343,8 @@ fn validate_membership(
 
 #[derive(Debug, Error)]
 pub enum NodeKeyTransparencyError {
+    #[error("invalid authenticated encryption key bootstrap")]
+    InvalidBootstrap,
     #[error("invalid encryption key-transparency membership")]
     InvalidMembership,
     #[error("encryption key-transparency membership regressed")]

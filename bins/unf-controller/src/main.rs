@@ -68,11 +68,13 @@ use unf_egress::{
     verify_egress_bfd_evidence_report, verify_egress_internet_snapshot,
 };
 use unf_encryption::{
-    EncryptionFrontierPublishOutcome, EncryptionGenerationDistributionError,
-    EncryptionGenerationFact, EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
+    AuthenticatedNodeIdentity, EncryptionFrontierPublishOutcome,
+    EncryptionGenerationDistributionError, EncryptionGenerationFact,
+    EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
     EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
-    EncryptionGenerationRequest, NodeLocalPlanCatalog, NodeLocalPlanDistributionError,
+    EncryptionGenerationRequest, EncryptionKeyBootstrap, NodeKeyPublication,
+    NodeKeyTransparencyLedger, NodeLocalPlanCatalog, NodeLocalPlanDistributionError,
     NodeLocalPlanRequest, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
 };
 use unf_ipam::{
@@ -351,6 +353,7 @@ struct ControllerState {
     identity_epoch: u64,
     offline: bool,
     agent_node_selector: Option<String>,
+    encryption_cluster_id: String,
     pods: RwLock<BTreeMap<String, PodRecord>>,
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
     egress_desired: Mutex<EgressDesiredStore>,
@@ -399,6 +402,7 @@ struct ControllerState {
     /// Complete secret-free compiler inputs awaiting authenticated Node pulls.
     /// The next compiler slice populates this catalog from one causal cut.
     encryption_local_plans: Mutex<NodeLocalPlanCatalog>,
+    encryption_key_transparency: Mutex<NodeKeyTransparencyLedger>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1190,6 +1194,7 @@ async fn main() -> Result<()> {
         args.offline,
         client.clone(),
         args.agent_node_selector.clone(),
+        discover_encryption_cluster_id(client.as_ref()).await?,
     ));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
@@ -1357,6 +1362,11 @@ async fn spawn_internal_api(
             post(ingest_encryption_generation_fact),
         )
         .route("/v1/state/encryption-plan", post(encryption_plan))
+        .route(
+            "/v1/state/encryption-key-bootstrap",
+            get(encryption_key_bootstrap),
+        )
+        .route("/v1/state/encryption-keys", post(ingest_encryption_keys))
         .route(
             "/v1/state/service-selection",
             get(service_selection_contract),
@@ -1531,7 +1541,20 @@ fn install_crypto_provider() -> Result<()> {
 
 #[cfg(test)]
 fn new_state(offline: bool) -> ControllerState {
-    new_state_with_client_and_selector(offline, None, None)
+    new_state_with_client_and_selector(offline, None, None, "test-cluster-uid".to_owned())
+}
+
+async fn discover_encryption_cluster_id(client: Option<&Client>) -> Result<String> {
+    let Some(client) = client else {
+        return Ok("offline-unf-cluster".to_owned());
+    };
+    Api::<Namespace>::all(client.clone())
+        .get("kube-system")
+        .await
+        .context("read kube-system Namespace for stable encryption cluster identity")?
+        .metadata
+        .uid
+        .context("kube-system Namespace has no UID for encryption cluster identity")
 }
 
 fn register_flow_history_metrics(registry: &mut Registry, metrics: &ControllerMetrics) {
@@ -1657,6 +1680,7 @@ fn new_state_with_client_and_selector(
     offline: bool,
     token_review_client: Option<Client>,
     agent_node_selector: Option<String>,
+    encryption_cluster_id: String,
 ) -> ControllerState {
     let metrics = ControllerMetrics::default();
     let mut registry = Registry::default();
@@ -1730,6 +1754,7 @@ fn new_state_with_client_and_selector(
         identity_epoch: controller_epoch(),
         offline,
         agent_node_selector,
+        encryption_cluster_id,
         pods: RwLock::new(BTreeMap::new()),
         nodes: RwLock::new(BTreeMap::new()),
         egress_desired: Mutex::new(EgressDesiredStore::default()),
@@ -1772,6 +1797,7 @@ fn new_state_with_client_and_selector(
         encryption_generations_dirty: AtomicBool::new(false),
         encryption_generation_store: config_map_store.clone(),
         encryption_local_plans: Mutex::new(NodeLocalPlanCatalog::default()),
+        encryption_key_transparency: Mutex::new(NodeKeyTransparencyLedger::default()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -8112,6 +8138,24 @@ async fn encryption_plan(
     }
 }
 
+async fn encryption_key_bootstrap(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<EncryptionKeyBootstrap>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    encryption_key_bootstrap_for(&state, &agent).map(Json)
+}
+
+async fn ingest_encryption_keys(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(publication): Json<NodeKeyPublication>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    ingest_encryption_keys_for(&state, &agent, publication)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
 async fn ingest_encryption_generation_fact(
     State(state): State<Arc<ControllerState>>,
     headers: HeaderMap,
@@ -8397,6 +8441,78 @@ fn encryption_plan_for(
                 "prepared encryption plan is not a valid exact successor: {error}"
             )),
         })
+}
+
+fn encryption_key_bootstrap_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+) -> Result<EncryptionKeyBootstrap, ApiError> {
+    if !agent_application_is_current(state, agent) {
+        return Err(ApiError::forbidden(
+            "encryption key bootstrap does not match the current authenticated agent Pod",
+        ));
+    }
+    let (membership_revision, members) = encryption_generation_membership(state)?;
+    let recipient = members
+        .iter()
+        .find(|member| member.node_name == agent.node_name)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "authenticated agent Node is absent from encryption key membership",
+            )
+        })?;
+    EncryptionKeyBootstrap::issue(
+        state.identity_epoch,
+        state.encryption_cluster_id.clone(),
+        membership_revision,
+        recipient,
+        members,
+    )
+    .map_err(|error| ApiError::service_unavailable(error.to_string()))
+}
+
+fn ingest_encryption_keys_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    publication: NodeKeyPublication,
+) -> Result<(), ApiError> {
+    if !agent_application_is_current(state, agent) {
+        return Err(ApiError::forbidden(
+            "encryption key publication does not match the current authenticated agent Pod",
+        ));
+    }
+    let (membership_revision, members) = encryption_generation_membership(state)?;
+    let member = members
+        .iter()
+        .find(|member| member.node_name == agent.node_name)
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "authenticated agent Node is absent from encryption key membership",
+            )
+        })?;
+    if publication.node_name != member.node_name || publication.node_uid != member.node_uid {
+        return Err(ApiError::forbidden(
+            "encryption key publication targets a different or replaced Node",
+        ));
+    }
+    let authenticated = AuthenticatedNodeIdentity {
+        cluster_id: state.encryption_cluster_id.clone(),
+        node_name: member.node_name.clone(),
+        node_uid: member.node_uid.clone(),
+    };
+    let mut ledger = mutex_lock(&state.encryption_key_transparency);
+    ledger
+        .replace_membership(
+            state.encryption_cluster_id.clone(),
+            membership_revision,
+            members,
+        )
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    ledger
+        .observe(&authenticated, publication)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(())
 }
 
 async fn service_selection_contract(
@@ -13891,6 +14007,64 @@ mod tests {
     }
 
     #[test]
+    fn encryption_key_bootstrap_and_ingestion_are_authenticated_complete_cut_scoped() {
+        let state = new_state(true);
+        let agent = authenticated_egress_agent("worker-a");
+        install_authenticated_agent(&state, &agent);
+        write_lock(&state.nodes).insert(
+            "worker-a".to_owned(),
+            TopologyNode {
+                name: "worker-a".to_owned(),
+                ready: true,
+                labels: BTreeMap::new(),
+            },
+        );
+        mutex_lock(&state.revisions).topology = Revision::new(7);
+
+        let bootstrap = encryption_key_bootstrap_for(&state, &agent).unwrap();
+        bootstrap.verify().unwrap();
+        assert_eq!(bootstrap.cluster_id, "test-cluster-uid");
+        assert_eq!(bootstrap.recipient.node_uid, "worker-a-uid");
+        assert!(bootstrap.required_peer_uids().is_empty());
+
+        let mut authority = unf_encryption::NodeKeyAuthority::new(
+            bootstrap.cluster_id.clone(),
+            bootstrap.recipient.node_name.clone(),
+            bootstrap.recipient.node_uid.clone(),
+        )
+        .unwrap();
+        authority
+            .prepare_epoch(
+                bootstrap.membership_revision,
+                bootstrap.required_peer_uids(),
+                1_000,
+                10_000,
+                &mut unf_encryption::OsWireGuardKeyGenerator,
+            )
+            .unwrap();
+        ingest_encryption_keys_for(&state, &agent, authority.publication().unwrap()).unwrap();
+        assert!(
+            mutex_lock(&state.encryption_key_transparency)
+                .complete_cut()
+                .unwrap()
+                .is_some()
+        );
+
+        let replacement = unf_encryption::NodeKeyAuthority::new(
+            bootstrap.cluster_id,
+            bootstrap.recipient.node_name,
+            "replacement-uid".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            ingest_encryption_keys_for(&state, &agent, replacement.publication().unwrap())
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
     fn encryption_generation_frontier_checkpoint_is_durable_and_fail_closed() {
         let producer = EncryptionGenerationProducer::default();
         let checkpoint = producer.checkpoint().unwrap();
@@ -17448,6 +17622,7 @@ mod tests {
             true,
             None,
             Some("node-role.kubernetes.io/worker".to_owned()),
+            "test-cluster-uid".to_owned(),
         );
         let mut worker = node(true);
         worker

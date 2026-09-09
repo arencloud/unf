@@ -882,12 +882,16 @@ partial publication; `make encryption-plan-catalog-test`; ADR 0181.
 Node-local public epochs now join through an exact-membership transparency cut;
 topology changes clear observations and incomplete fleets expose nothing, while
 private keys never cross the Node boundary;
-`make encryption-key-transparency-test`; ADR 0182. Runtime key publication,
-authoritative cut production, local compile, the TC consumer/verifier, and live
+`make encryption-key-transparency-test`; ADR 0182. Runtime key publication
+now uses a stable `kube-system` UID cluster identity plus an exact Pod-bound
+bootstrap. Each agent creates or restores only its own mode-0600 CSPRNG key
+authority, durably prepares before publishing, and sends only public state;
+`make encryption-key-runtime-test`; ADR 0183. Mutual attestation, authoritative
+cut production, local compile, the TC consumer/verifier, and live
 encrypted packet gate remain, so no workload packet yet selects the staged
 route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0182 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0183 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

@@ -86,9 +86,11 @@ use unf_egress::{
     seal_egress_bgp_snapshot, verify_egress_bgp_config, verify_egress_reachability_plan,
 };
 use unf_encryption::{
-    AdmittedEncryptionGeneration, AdmittedNodeLocalPlan, EncryptionGenerationFact,
-    EncryptionGenerationRequest, LinuxPreparedLocalGeneration, NodeLocalPlanRequest,
+    AdmittedEncryptionGeneration, AdmittedNodeLocalPlan, DurableNodeKeyAuthority,
+    EncryptionGenerationFact, EncryptionGenerationRequest, EncryptionKeyBootstrap,
+    FileNodeKeyStateStore, LinuxPreparedLocalGeneration, NodeKeyAuthority, NodeLocalPlanRequest,
     NodeLocalRecoveryPlan, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
+    OsWireGuardKeyGenerator,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -158,6 +160,9 @@ const DEFAULT_ENCRYPTION_FAST_PATH_STATE_PATH: &str =
 const DEFAULT_ENCRYPTION_GENERATION_STATE_PATH: &str =
     "/var/lib/unf/cni/v1/encryption-generation.json";
 const DEFAULT_ENCRYPTION_PLAN_STATE_PATH: &str = "/var/lib/unf/cni/v1/encryption-plan.json";
+const DEFAULT_ENCRYPTION_KEY_STATE_PATH: &str =
+    "/var/lib/unf/cni/v1/encryption-keys/authority.json";
+const INITIAL_ENCRYPTION_KEY_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -531,6 +536,14 @@ struct Args {
         default_value = DEFAULT_ENCRYPTION_PLAN_STATE_PATH
     )]
     encryption_plan_state_path: PathBuf,
+    /// Node-local private key authority. Its parent directory and checkpoint
+    /// are restricted to mode 0700/0600.
+    #[arg(
+        long,
+        env = "UNF_ENCRYPTION_KEY_STATE_PATH",
+        default_value = DEFAULT_ENCRYPTION_KEY_STATE_PATH
+    )]
+    encryption_key_state_path: PathBuf,
     #[arg(long, env = "UNF_NODE_NAME", default_value = "unknown")]
     node_name: String,
     #[arg(long, env = "UNF_POD_NAME", default_value = "unknown")]
@@ -1044,6 +1057,19 @@ struct EncryptionPlanSynchronizer {
     node_name: String,
     state_path: PathBuf,
     current: Option<AdmittedNodeLocalPlan>,
+}
+
+type RuntimeNodeKeyAuthority =
+    DurableNodeKeyAuthority<FileNodeKeyStateStore, OsWireGuardKeyGenerator>;
+
+struct EncryptionKeySynchronizer {
+    controller_url: Option<String>,
+    client: ReloadingControllerClient,
+    agent_token_path: PathBuf,
+    interval: Duration,
+    node_name: String,
+    state_path: PathBuf,
+    authority: Option<RuntimeNodeKeyAuthority>,
 }
 
 const ENCRYPTION_RECOVERY_JOURNAL_SCHEMA_VERSION: u16 = 1;
@@ -1602,6 +1628,7 @@ struct DataplaneConfig {
     encryption_sync_interval: Duration,
     encryption_generation_state_path: PathBuf,
     encryption_plan_state_path: PathBuf,
+    encryption_key_state_path: PathBuf,
     node_name: String,
     agent_token_path: PathBuf,
     flow_export_interval: Duration,
@@ -1860,6 +1887,7 @@ async fn main() -> Result<()> {
             let encryption_sync_interval = Duration::from_secs(args.encryption_sync_seconds.max(1));
             let encryption_generation_state_path = args.encryption_generation_state_path.clone();
             let encryption_plan_state_path = args.encryption_plan_state_path.clone();
+            let encryption_key_state_path = args.encryption_key_state_path.clone();
             let node_name = args.node_name.clone();
             let agent_token_path = args.agent_token_path.clone();
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
@@ -1886,6 +1914,7 @@ async fn main() -> Result<()> {
                     encryption_sync_interval,
                     encryption_generation_state_path,
                     encryption_plan_state_path,
+                    encryption_key_state_path,
                     node_name,
                     agent_token_path,
                     flow_export_interval,
@@ -6850,6 +6879,14 @@ async fn run_dataplane(
         config.node_name.clone(),
         config.encryption_plan_state_path.clone(),
     )?;
+    let mut encryption_keys = EncryptionKeySynchronizer::new(
+        controller_url.clone(),
+        controller_client.clone(),
+        config.agent_token_path.clone(),
+        config.encryption_sync_interval,
+        config.node_name.clone(),
+        config.encryption_key_state_path.clone(),
+    )?;
     // Validate the durable controller-delivery cursor before persistent BPF
     // access. A corrupt, cross-Node, or replayed cursor must not coexist with
     // later local kernel activation.
@@ -6998,6 +7035,7 @@ async fn run_dataplane(
         &mut policies,
         &mut services,
         &mut egress,
+        &mut encryption_keys,
         &mut encryption_plans,
         &mut encryption_generations,
         &mut encryption,
@@ -7546,6 +7584,163 @@ fn authenticated_get(
         .current()
         .get(url)
         .bearer_auth(read_agent_token(token_path)?))
+}
+
+impl EncryptionKeySynchronizer {
+    fn new(
+        controller_url: Option<String>,
+        client: ReloadingControllerClient,
+        agent_token_path: PathBuf,
+        interval: Duration,
+        node_name: String,
+        state_path: PathBuf,
+    ) -> Result<Self> {
+        if !state_path.is_absolute() || state_path.file_name().is_none() {
+            bail!("encryption key state path must be an absolute file path");
+        }
+        Ok(Self {
+            controller_url,
+            client,
+            agent_token_path,
+            interval,
+            node_name,
+            state_path,
+            authority: None,
+        })
+    }
+
+    fn bind_bootstrap(&mut self, bootstrap: &EncryptionKeyBootstrap) -> Result<()> {
+        bootstrap
+            .verify()
+            .context("verify authenticated encryption key bootstrap")?;
+        if bootstrap.recipient.node_name != self.node_name {
+            bail!("encryption key bootstrap targets a different Node");
+        }
+        if let Some(authority) = &self.authority {
+            let publication = authority
+                .authority()
+                .publication()
+                .context("verify existing Node-local key authority")?;
+            if publication.cluster_id != bootstrap.cluster_id
+                || publication.node_name != bootstrap.recipient.node_name
+                || publication.node_uid != bootstrap.recipient.node_uid
+            {
+                bail!("encryption key bootstrap changed immutable Node authority");
+            }
+            return Ok(());
+        }
+
+        ensure_encryption_key_directory(&self.state_path)?;
+        let store = FileNodeKeyStateStore::new(self.state_path.clone());
+        let authority = match fs::symlink_metadata(&self.state_path) {
+            Ok(_) => store
+                .restore(
+                    &bootstrap.cluster_id,
+                    &bootstrap.recipient.node_name,
+                    &bootstrap.recipient.node_uid,
+                )
+                .context("restore exact Node-local encryption key authority")?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => NodeKeyAuthority::new(
+                bootstrap.cluster_id.clone(),
+                bootstrap.recipient.node_name.clone(),
+                bootstrap.recipient.node_uid.clone(),
+            )
+            .context("create Node-local encryption key authority")?,
+            Err(error) => return Err(error).context("inspect encryption key checkpoint"),
+        };
+        let mut durable =
+            DurableNodeKeyAuthority::create(authority, store, OsWireGuardKeyGenerator)
+                .context("bind durable Node-local encryption key authority")?;
+        if durable.authority().epochs().is_empty() {
+            let now = current_unix_time_milliseconds();
+            let valid_until = now
+                .checked_add(
+                    u64::try_from(INITIAL_ENCRYPTION_KEY_LIFETIME.as_millis()).unwrap_or(u64::MAX),
+                )
+                .context("initial encryption key lifetime overflowed")?;
+            durable
+                .prepare_epoch(
+                    bootstrap.membership_revision,
+                    bootstrap.required_peer_uids(),
+                    now,
+                    valid_until,
+                )
+                .context("durably prepare initial Node-local key epoch")?;
+        }
+        self.authority = Some(durable);
+        Ok(())
+    }
+}
+
+fn ensure_encryption_key_directory(state_path: &Path) -> Result<()> {
+    let parent = state_path
+        .parent()
+        .context("encryption key state path has no parent")?;
+    reject_node_block_symlinks(parent)?;
+    match fs::symlink_metadata(parent) {
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.permissions().mode() & 0o777 == 0o700 => {}
+        Ok(_) => bail!(
+            "encryption key state directory {} must be a mode-0700 real directory",
+            parent.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("create encryption key state directory {}", parent.display())
+            })?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            reject_node_block_symlinks(parent)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+async fn synchronize_encryption_keys(synchronizer: &mut EncryptionKeySynchronizer) -> Result<bool> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("encryption key synchronization has no controller URL")?
+        .to_owned();
+    let bootstrap: EncryptionKeyBootstrap = authenticated_get(
+        &synchronizer.client,
+        format!("{controller_url}/v1/state/encryption-key-bootstrap"),
+        &synchronizer.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request authenticated encryption key bootstrap")?
+    .error_for_status()
+    .context("controller rejected encryption key bootstrap")?
+    .json()
+    .await
+    .context("decode encryption key bootstrap")?;
+    synchronizer.bind_bootstrap(&bootstrap)?;
+    let publication = synchronizer
+        .authority
+        .as_ref()
+        .context("encryption key authority disappeared after bootstrap")?
+        .authority()
+        .publication()
+        .context("build public-only Node key publication")?;
+    let response = synchronizer
+        .client
+        .current()
+        .post(format!("{controller_url}/v1/state/encryption-keys"))
+        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+        .json(&publication)
+        .send()
+        .await
+        .context("publish public-only Node encryption key state")?;
+    if response.status() != StatusCode::ACCEPTED {
+        response
+            .error_for_status()
+            .context("controller rejected public-only encryption key publication")?;
+        bail!("controller returned a non-202 response for encryption key publication");
+    }
+    Ok(true)
 }
 
 impl EncryptionPlanSynchronizer {
@@ -13419,6 +13614,7 @@ async fn consume_events(
     policies: &mut PolicySynchronizer,
     services: &mut ServiceSynchronizer,
     egress: &mut EgressSynchronizer,
+    encryption_keys: &mut EncryptionKeySynchronizer,
     encryption_plans: &mut EncryptionPlanSynchronizer,
     encryption_generations: &mut EncryptionGenerationSynchronizer,
     encryption: &mut EncryptionMapSynchronizer,
@@ -13435,6 +13631,7 @@ async fn consume_events(
     let mut policy_interval = tokio::time::interval(policies.interval);
     let mut service_interval = tokio::time::interval(services.interval);
     let mut egress_interval = tokio::time::interval(egress.interval);
+    let mut encryption_key_interval = tokio::time::interval(encryption_keys.interval);
     let mut encryption_plan_interval = tokio::time::interval(encryption_plans.interval);
     let mut encryption_interval = tokio::time::interval(encryption_generations.interval);
     loop {
@@ -13481,6 +13678,11 @@ async fn consume_events(
             _ = egress_interval.tick(), if egress.controller_url.is_some() => {
                 if let Err(error) = synchronize_egress(egress, state).await {
                     warn!(%error, "egress synchronization failed; active source state was fenced when possible");
+                }
+            }
+            _ = encryption_key_interval.tick(), if encryption_keys.controller_url.is_some() => {
+                if let Err(error) = synchronize_encryption_keys(encryption_keys).await {
+                    warn!(%error, "encryption key publication failed; retaining Node-local key authority");
                 }
             }
             _ = encryption_plan_interval.tick(), if encryption_plans.controller_url.is_some() => {
@@ -16724,6 +16926,89 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn encryption_key_bootstrap_creates_recovers_and_uid_fences_private_authority() {
+        let temporary = tempdir().unwrap();
+        let state_path = temporary
+            .path()
+            .join("encryption-keys")
+            .join("authority.json");
+        let recipient = unf_encryption::EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-a".to_owned(),
+        };
+        let bootstrap = EncryptionKeyBootstrap::issue(
+            11,
+            "cluster-a".to_owned(),
+            Revision::new(7),
+            recipient.clone(),
+            vec![recipient],
+        )
+        .unwrap();
+        let new_synchronizer = || {
+            EncryptionKeySynchronizer::new(
+                None,
+                test_controller_client(),
+                temporary.path().join("token"),
+                Duration::from_secs(2),
+                "worker-a".to_owned(),
+                state_path.clone(),
+            )
+            .unwrap()
+        };
+        let mut first = new_synchronizer();
+        first.bind_bootstrap(&bootstrap).unwrap();
+        let first_publication = first
+            .authority
+            .as_ref()
+            .unwrap()
+            .authority()
+            .publication()
+            .unwrap();
+        assert_eq!(first_publication.epochs.len(), 1);
+        assert_eq!(
+            fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(state_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let mut recovered = new_synchronizer();
+        recovered.bind_bootstrap(&bootstrap).unwrap();
+        assert_eq!(
+            recovered
+                .authority
+                .as_ref()
+                .unwrap()
+                .authority()
+                .publication()
+                .unwrap(),
+            first_publication
+        );
+
+        let replacement = EncryptionKeyBootstrap::issue(
+            12,
+            "cluster-a".to_owned(),
+            Revision::new(8),
+            unf_encryption::EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "replacement-uid".to_owned(),
+            },
+            vec![unf_encryption::EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "replacement-uid".to_owned(),
+            }],
+        )
+        .unwrap();
+        assert!(recovered.bind_bootstrap(&replacement).is_err());
     }
 
     #[test]
