@@ -7,11 +7,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+futures.workspace = true
+genetlink.workspace = true
 getrandom.workspace = true
+netlink-packet-core.workspace = true
+netlink-packet-generic.workspace = true
+netlink-packet-wireguard.workspace = true
+rtnetlink.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 unf-common = { path = "../unf-common" }
 x25519-dalek.workspace = true
 zeroize.workspace = true

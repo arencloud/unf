@@ -56,7 +56,7 @@ impl WireGuardPrivateKey {
         &self.0
     }
 
-    fn public_key(&self) -> WireGuardPublicKey {
+    pub(crate) fn public_key(&self) -> WireGuardPublicKey {
         let secret = StaticSecret::from(*self.0);
         WireGuardPublicKey(PublicKey::from(&secret).to_bytes())
     }

@@ -840,7 +840,7 @@ matrix is maintained in the
 
 ## Phase 9 — attested encryption fabric
 
-**Gate: in progress; milestones 9.1–9.3 verified.** The ordered evidence
+**Gate: in progress; milestones 9.1–9.4 verified.** The ordered evidence
 matrix is maintained in the
 [Phase 9 encryption-fabric plan](development/phase9-attested-encryption-fabric-plan.md).
 
@@ -867,6 +867,14 @@ matrix is maintained in the
   attest/activate/drain/retire, positive drain proof, emergency revocation,
   restart recovery, and replay/replacement fencing pass
   `make encryption-key-authority-test`; ADR 0160. No kernel state changes yet.
+- Phase 9.4 adds the typed Linux WireGuard kernel provider. Canonical bounded
+  plans configure complete peer sets through generic netlink and exact links/
+  isolated dual-stack routes through rtnetlink. Proof-Carrying Kernel
+  Transactions bind secret-free before/desired/readback digests to deterministic
+  restart actions; version aliases, `O(P log P)` overlap validation, indexed
+  route readback, safe MTU derivation, foreign-state refusal, injected rollback,
+  replay, and positive cleanup pass `make encryption-kernel-provider-test` and
+  the privileged live-kernel gate; ADR 0161. Workload selection remains 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,

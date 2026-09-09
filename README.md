@@ -732,7 +732,7 @@ exact cleanup, five-agent convergence, and an unchanged `network` unhealthy
 baseline. Evidence SHA-256 is
 `a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3`;
 ADR 0157. These independent Kind and OpenShift results close Phase 8.
-Phase 9 begins the attested encryption fabric. Milestones 9.1–9.3 are verified.
+Phase 9 begins the attested encryption fabric. Milestones 9.1–9.4 are verified.
 The architecture requires that source policy and Service/egress ownership precede
 encryption; kernel WireGuard owns all cryptography; private keys remain on their
 Node; and an independently replayed Attested Encryption Path Contract requires
@@ -759,9 +759,17 @@ not stall rotation while every affected authenticated peer must acknowledge
 before activation. Public-only monotonic publication, bounded drain/retirement,
 emergency revocation, restart recovery, and replay/replacement fencing pass
 `make encryption-key-authority-test`; ADR 0160. This slice creates no interface,
-route, BPF state, or packet behavior; the
+route, BPF state, or packet behavior. The Phase 9.4 typed Linux provider now
+programs and independently reads back exact WireGuard peers plus isolated
+dual-stack routes. Its Proof-Carrying Kernel Transaction binds secret-free
+before/desired/readback digests to deterministic restart actions, while exact
+version aliases, derived MTU, sorted conflict detection, foreign-state refusal,
+injected rollback, idempotent replay, and positive cleanup pass
+`make encryption-kernel-provider-test` and the privileged
+`make encryption-kernel-provider-live-test`; ADR 0161. No workload packet yet
+selects the staged route table; that bounded coalesced eBPF decision is 9.5. The
 [Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0160 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0161 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

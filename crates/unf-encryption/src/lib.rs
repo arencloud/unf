@@ -5,8 +5,10 @@
 //! authority. Kernel mutation, BPF state, packet processing, and Kubernetes
 //! adapters deliberately live outside this crate.
 
+mod kernel_provider;
 mod key_authority;
 
+pub use kernel_provider::*;
 pub use key_authority::*;
 
 use std::collections::{BTreeMap, BTreeSet};
