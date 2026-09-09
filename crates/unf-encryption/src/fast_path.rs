@@ -12,12 +12,13 @@ use thiserror::Error;
 use unf_common::{IdentityId, Revision};
 use unf_ebpf_common::{
     ENCRYPTION_BANK_COUNT, ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED,
-    ENCRYPTION_DECISION_FLAG_SELECTION_BOUND, ENCRYPTION_DISPOSITION_NATIVE,
-    ENCRYPTION_DISPOSITION_REQUIRED, ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE,
-    ENCRYPTION_MAP_ABI_VERSION, ENCRYPTION_TRANSPORT_ACTIVE, ENCRYPTION_TRANSPORT_DRAINING,
-    ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK, EncryptionDecisionKey, EncryptionDecisionValue,
-    EncryptionFlowValue, EncryptionMapConfig, EncryptionTransportKey, EncryptionTransportValue,
-    encryption_transport_is_usable,
+    ENCRYPTION_DECISION_FLAG_SELECTION_BOUND, ENCRYPTION_DECISION_MAP_CAPACITY,
+    ENCRYPTION_DISPOSITION_NATIVE, ENCRYPTION_DISPOSITION_REQUIRED,
+    ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE, ENCRYPTION_MAP_ABI_VERSION,
+    ENCRYPTION_TRANSPORT_ACTIVE, ENCRYPTION_TRANSPORT_DRAINING,
+    ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK, ENCRYPTION_TRANSPORT_MAP_CAPACITY,
+    EncryptionDecisionKey, EncryptionDecisionValue, EncryptionFlowValue, EncryptionMapConfig,
+    EncryptionTransportKey, EncryptionTransportValue, encryption_transport_is_usable,
 };
 
 use crate::{
@@ -25,8 +26,8 @@ use crate::{
     KernelTransactionPhase, ProofCarryingKernelTransaction, WireGuardKernelSnapshot,
 };
 
-pub const MAX_FAST_PATH_DECISIONS: usize = 65_536;
-pub const MAX_FAST_PATH_TRANSPORTS: usize = 4_096;
+pub const MAX_FAST_PATH_DECISIONS: usize = ENCRYPTION_DECISION_MAP_CAPACITY as usize;
+pub const MAX_FAST_PATH_TRANSPORTS: usize = ENCRYPTION_TRANSPORT_MAP_CAPACITY as usize;
 pub const MAX_FAST_PATH_EPOCHS: usize = 2;
 
 const FAST_PATH_DIGEST_DOMAIN: &[u8] = b"unf.encryption-fast-path.v1\0";

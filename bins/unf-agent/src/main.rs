@@ -43,9 +43,11 @@ use unf_common::{IdentityId, PolicyDirection, PolicyId, PolicyReason, Revision, 
 use unf_ebpf_common::{
     EGRESS_BANK_COUNT, EGRESS_EVENT_ABI_VERSION, EGRESS_EVENT_ACTION_CREATE,
     EGRESS_EVENT_ACTION_DROP, EGRESS_EVENT_ACTION_EXPIRE, EGRESS_EVENT_COUNTER_ATTEMPTED,
-    EGRESS_EVENT_COUNTER_DROPPED, EGRESS_MAP_ABI_VERSION, EgressEvent, FLOW_ABI_VERSION, FlowEvent,
-    FlowKey, IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey, Ipv6IdentityKey,
-    POLICY_BANK_COUNT, POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
+    EGRESS_EVENT_COUNTER_DROPPED, EGRESS_MAP_ABI_VERSION, ENCRYPTION_CONNECTION_MAP_CAPACITY,
+    ENCRYPTION_DECISION_MAP_CAPACITY, ENCRYPTION_MAP_ABI_VERSION,
+    ENCRYPTION_TRANSPORT_MAP_CAPACITY, EgressEvent, FLOW_ABI_VERSION, FlowEvent, FlowKey,
+    IDENTITY_BANK_COUNT, IdentityMapValue, Ipv4IdentityKey, Ipv6IdentityKey, POLICY_BANK_COUNT,
+    POLICY_FLAG_HAS_POLICY, POLICY_FLAG_HAS_RULE, POLICY_FLAG_HAS_SHADOW,
     POLICY_FLAG_SHADOW_HAS_POLICY, POLICY_FLAG_SHADOW_HAS_RULE, POLICY_MAP_ABI_VERSION,
     SERVICE_AFFINITY_MAX_TIMEOUT_SECONDS, SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS,
     SERVICE_AFFINITY_OUTCOME_CREATED, SERVICE_AFFINITY_OUTCOME_NONE,
@@ -405,6 +407,12 @@ const PERSISTENT_MAP_NAMES: [&str; 40] = [
     "EGRESS_GATEWAY_NAT_GATEWAYS",
     "EGRESS_GATEWAY_NAT_SELECTIONS",
     "EGRESS_GATEWAY_NAT_CONFIG",
+];
+const ENCRYPTION_MAP_NAMES: [&str; 4] = [
+    "ENCRYPTION_DECISIONS",
+    "ENCRYPTION_TRANSPORTS",
+    "ENCRYPTION_CONFIG",
+    "ENCRYPTION_CONNECTIONS",
 ];
 const ABI_V14_MAP_NAMES: [&str; 40] = PERSISTENT_MAP_NAMES;
 const IDENTITY_MAP_CAPACITY: u32 = 65_536;
@@ -1379,6 +1387,12 @@ type ServiceMaps = (
     AyaArray<MapData, [u8; 40]>,
 );
 type ServiceAffinityMap = AyaHashMap<MapData, [u8; 40], [u8; 32]>;
+struct EncryptionMaps {
+    decisions: AyaHashMap<MapData, [u8; 12], [u8; 72]>,
+    transports: AyaHashMap<MapData, [u8; 16], [u8; 80]>,
+    config: AyaArray<MapData, [u8; 48]>,
+    connections: AyaHashMap<MapData, [u8; 40], [u8; 64]>,
+}
 type EgressMaps = (
     AyaHashMap<MapData, [u8; 8], [u8; 128]>,
     AyaLpmTrie<MapData, [u8; 12], [u8; 32]>,
@@ -6646,7 +6660,7 @@ async fn run_dataplane(
 
     // Compatibility is checked before this call because opening the persistent
     // map set may create pins or adopt existing kernel state.
-    let (mut ebpf, pins_existed) = load_persistent_ebpf(&config)?;
+    let (mut ebpf, pins_existed, encryption_pins_existed) = load_persistent_ebpf(&config)?;
     let flow_ring = RingBuf::try_from(
         ebpf.take_map("FLOW_EVENTS")
             .context("eBPF object does not contain FLOW_EVENTS ring buffer")?,
@@ -6671,6 +6685,8 @@ async fn run_dataplane(
     let policy_maps = take_policy_maps(&mut ebpf)?;
     let service_maps = take_service_maps(&mut ebpf)?;
     let egress_maps = take_egress_maps(&mut ebpf)?;
+    let encryption_maps = take_encryption_maps(&mut ebpf)?;
+    validate_encryption_quarantine(&encryption_maps, encryption_pins_existed)?;
     let controller_management_port = controller_url.as_deref().map(controller_port).transpose()?;
     let egress_bgp = initialize_egress_bgp(
         config.egress_bgp_config_path.as_deref(),
@@ -7496,7 +7512,7 @@ async fn await_background_task(task: Option<tokio::task::JoinHandle<()>>, name: 
     }
 }
 
-fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool)> {
+fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool, bool)> {
     if !config.bpf_pin_path.is_absolute() {
         bail!(
             "BPF pin path must be absolute: {}",
@@ -7516,6 +7532,8 @@ fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool)> {
             PERSISTENT_MAP_NAMES.len()
         );
     }
+    let (encryption_pin_path, encryption_pins_existed) =
+        prepare_encryption_pin_island(&config.bpf_pin_path)?;
 
     // A root program reference keeps the program-array map object alive, but Linux clears its
     // entries after the final userspace map descriptor closes unless the map itself is pinned.
@@ -7539,6 +7557,9 @@ fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool)> {
     for name in PERSISTENT_MAP_NAMES {
         loader.map_pin_path(name, config.bpf_pin_path.join(name));
     }
+    for name in ENCRYPTION_MAP_NAMES {
+        loader.map_pin_path(name, encryption_pin_path.join(name));
+    }
     loader.map_pin_path(
         DATAPLANE_TAIL_CALL_MAP_NAME,
         tail_program_pin_root.join(DATAPLANE_TAIL_CALL_MAP_NAME),
@@ -7546,7 +7567,83 @@ fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool)> {
     let ebpf = loader
         .load_file(&config.object)
         .with_context(|| format!("load eBPF object {}", config.object.display()))?;
-    Ok((ebpf, existing == PERSISTENT_MAP_NAMES.len()))
+    Ok((
+        ebpf,
+        existing == PERSISTENT_MAP_NAMES.len(),
+        encryption_pins_existed,
+    ))
+}
+
+fn prepare_encryption_pin_island(core_abi_path: &Path) -> Result<(PathBuf, bool)> {
+    let bpf_root = core_abi_path.parent().with_context(|| {
+        format!(
+            "persistent BPF ABI path has no parent: {}",
+            core_abi_path.display()
+        )
+    })?;
+    let encryption_root = bpf_root.join("encryption");
+    ensure_real_pin_directory(&encryption_root, "encryption pin root")?;
+    let abi_path = encryption_root.join(format!("v{ENCRYPTION_MAP_ABI_VERSION}"));
+    ensure_real_pin_directory(&abi_path, "encryption ABI pin directory")?;
+
+    let mut recognized = Vec::new();
+    let mut foreign = Vec::new();
+    for entry in fs::read_dir(&abi_path)
+        .with_context(|| format!("inspect encryption ABI island {}", abi_path.display()))?
+    {
+        let entry = entry.context("read encryption ABI pin entry")?;
+        let file_type = entry
+            .file_type()
+            .context("inspect encryption ABI pin entry type")?;
+        let recognized_name = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| ENCRYPTION_MAP_NAMES.contains(&name));
+        if recognized_name && !file_type.is_dir() && !file_type.is_symlink() {
+            recognized.push(entry.path());
+        } else {
+            foreign.push(entry.path());
+        }
+    }
+    if !foreign.is_empty() {
+        foreign.sort();
+        let paths = foreign
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("refusing foreign encryption ABI state: {paths}");
+    }
+    if !recognized.is_empty() && recognized.len() != ENCRYPTION_MAP_NAMES.len() {
+        bail!(
+            "partial encryption BPF map set in {} ({}/{} pins); refusing unsafe startup",
+            abi_path.display(),
+            recognized.len(),
+            ENCRYPTION_MAP_NAMES.len()
+        );
+    }
+    Ok((abi_path, recognized.len() == ENCRYPTION_MAP_NAMES.len()))
+}
+
+fn ensure_real_pin_directory(path: &Path, description: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => bail!("{description} must be a real directory: {}", path.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path)
+                .with_context(|| format!("create {description} {}", path.display()))?;
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("verify {description} {}", path.display()))?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                Ok(())
+            } else {
+                bail!("{description} must be a real directory: {}", path.display())
+            }
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect {description} {}", path.display()))
+        }
+    }
 }
 
 fn ensure_bpf_pin_path_abi(path: &Path) -> Result<()> {
@@ -12434,6 +12531,96 @@ fn take_policy_maps(ebpf: &mut Ebpf) -> Result<PolicyMaps> {
     ))
 }
 
+fn take_encryption_maps(ebpf: &mut Ebpf) -> Result<EncryptionMaps> {
+    let decisions = AyaHashMap::<_, [u8; 12], [u8; 72]>::try_from(
+        ebpf.take_map("ENCRYPTION_DECISIONS")
+            .context("eBPF object does not contain ENCRYPTION_DECISIONS map")?,
+    )
+    .context("open ENCRYPTION_DECISIONS map")?;
+    let transports = AyaHashMap::<_, [u8; 16], [u8; 80]>::try_from(
+        ebpf.take_map("ENCRYPTION_TRANSPORTS")
+            .context("eBPF object does not contain ENCRYPTION_TRANSPORTS map")?,
+    )
+    .context("open ENCRYPTION_TRANSPORTS map")?;
+    let config = AyaArray::<_, [u8; 48]>::try_from(
+        ebpf.take_map("ENCRYPTION_CONFIG")
+            .context("eBPF object does not contain ENCRYPTION_CONFIG map")?,
+    )
+    .context("open ENCRYPTION_CONFIG map")?;
+    let connections = AyaHashMap::<_, [u8; 40], [u8; 64]>::try_from(
+        ebpf.take_map("ENCRYPTION_CONNECTIONS")
+            .context("eBPF object does not contain ENCRYPTION_CONNECTIONS map")?,
+    )
+    .context("open ENCRYPTION_CONNECTIONS map")?;
+    Ok(EncryptionMaps {
+        decisions,
+        transports,
+        config,
+        connections,
+    })
+}
+
+/// Phase 9.5c deliberately supports only a quiescent island. Publishing a
+/// generation before the durable CCV adapter and TC consumer are wired would
+/// turn unverified state into authority, so any non-empty recovered island is
+/// quarantined by refusing startup.
+fn validate_encryption_quarantine(maps: &EncryptionMaps, pins_existed: bool) -> Result<()> {
+    validate_map_capacity(
+        "ENCRYPTION_DECISIONS",
+        maps.decisions.map(),
+        ENCRYPTION_DECISION_MAP_CAPACITY,
+    )?;
+    validate_map_capacity(
+        "ENCRYPTION_TRANSPORTS",
+        maps.transports.map(),
+        ENCRYPTION_TRANSPORT_MAP_CAPACITY,
+    )?;
+    validate_map_capacity("ENCRYPTION_CONFIG", maps.config.map(), 1)?;
+    validate_map_capacity(
+        "ENCRYPTION_CONNECTIONS",
+        maps.connections.map(),
+        ENCRYPTION_CONNECTION_MAP_CAPACITY,
+    )?;
+
+    let config = maps
+        .config
+        .get(&0, 0)
+        .context("read encryption quarantine config")?;
+    let has_decisions = maps
+        .decisions
+        .iter()
+        .next()
+        .transpose()
+        .context("inspect quarantined encryption decisions")?
+        .is_some();
+    let has_transports = maps
+        .transports
+        .iter()
+        .next()
+        .transpose()
+        .context("inspect quarantined encryption transports")?
+        .is_some();
+    let has_connections = maps
+        .connections
+        .iter()
+        .next()
+        .transpose()
+        .context("inspect quarantined encryption connections")?
+        .is_some();
+    if config != [0; 48] || has_decisions || has_transports || has_connections {
+        bail!(
+            "encryption ABI island contains unverified active or residual state; refusing startup until causal commit-vector recovery is available"
+        );
+    }
+    if pins_existed {
+        info!(
+            encryption_map_abi = ENCRYPTION_MAP_ABI_VERSION,
+            "validated quiescent encryption ABI island"
+        );
+    }
+    Ok(())
+}
+
 fn take_egress_maps(ebpf: &mut Ebpf) -> Result<EgressMaps> {
     let sources = AyaHashMap::<_, [u8; 8], [u8; 128]>::try_from(
         ebpf.take_map("EGRESS_SOURCES")
@@ -15817,11 +16004,61 @@ fn init_tracing() {
 mod tests {
     use super::*;
     use aya::programs::{TestRun, TestRunOptions};
+    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
     use unf_ebpf_common::{
         SERVICE_CONNECTION_ROLE_FORWARD, ServiceConnectionKey, service_flow_hash,
     };
     use unf_route::{RemoteNodeIntent, RemoteRouteSnapshotNode};
+
+    #[test]
+    fn encryption_pin_island_is_independent_and_all_or_none() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("unf");
+        let core = root.join(format!("v{CURRENT_BPF_ABI_VERSION}"));
+        fs::create_dir_all(&core).unwrap();
+
+        let (island, existed) =
+            prepare_encryption_pin_island(&core).expect("empty island is initialized");
+        assert_eq!(island, root.join("encryption/v1"));
+        assert!(!existed);
+        assert_eq!(PERSISTENT_MAP_NAMES.len(), 40);
+        assert!(
+            ENCRYPTION_MAP_NAMES
+                .iter()
+                .all(|name| !PERSISTENT_MAP_NAMES.contains(name))
+        );
+
+        fs::write(island.join(ENCRYPTION_MAP_NAMES[0]), []).unwrap();
+        let error = prepare_encryption_pin_island(&core)
+            .expect_err("partial encryption state must be quarantined");
+        assert!(error.to_string().contains("partial encryption BPF map set"));
+
+        for name in ENCRYPTION_MAP_NAMES.iter().skip(1) {
+            fs::write(island.join(name), []).unwrap();
+        }
+        assert!(prepare_encryption_pin_island(&core).unwrap().1);
+
+        fs::write(island.join("OPERATOR_STATE"), []).unwrap();
+        let error = prepare_encryption_pin_island(&core)
+            .expect_err("foreign encryption state must be quarantined");
+        assert!(error.to_string().contains("foreign encryption ABI state"));
+    }
+
+    #[test]
+    fn encryption_pin_island_rejects_symlinked_ownership_boundaries() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("unf");
+        let core = root.join(format!("v{CURRENT_BPF_ABI_VERSION}"));
+        let foreign = temporary.path().join("foreign");
+        fs::create_dir_all(&core).unwrap();
+        fs::create_dir_all(&foreign).unwrap();
+        symlink(&foreign, root.join("encryption")).unwrap();
+
+        let error = prepare_encryption_pin_island(&core)
+            .expect_err("symlinked encryption ownership must be rejected");
+        assert!(error.to_string().contains("must be a real directory"));
+    }
 
     #[test]
     fn bgp_configuration_initializes_a_verified_empty_durable_snapshot() {

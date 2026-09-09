@@ -28,6 +28,9 @@ use unf_ebpf_common::{
     EgressGatewayValue, EgressIpv4DestinationData, EgressIpv4PolicyMapKey,
     EgressIpv6DestinationData, EgressIpv6PolicyMapData, EgressMapConfig, EgressSelectionKey,
     EgressSelectionValue, EgressSourceKey, EgressSourceValue, FLOW_ABI_VERSION, FlowEvent,
+    ENCRYPTION_CONNECTION_MAP_CAPACITY, ENCRYPTION_DECISION_MAP_CAPACITY,
+    ENCRYPTION_TRANSPORT_MAP_CAPACITY, EncryptionDecisionKey, EncryptionDecisionValue,
+    EncryptionFlowValue, EncryptionMapConfig, EncryptionTransportKey, EncryptionTransportValue,
     IDENTITY_BANK_COUNT, IDENTITY_MAP_ABI_VERSION, IPV6_EXTENSION_BYTE_LIMIT,
     IPV6_EXTENSION_HEADER_LIMIT, IPV6_NEXT_HEADER_HOP_BY_HOP, IdentityMapConfig, IdentityMapValue,
     Ipv4IdentityKey, Ipv4LoadBalancerFrontendKey, Ipv4NodePortFrontendKey, Ipv4PolicyMapKey,
@@ -199,6 +202,28 @@ static EGRESS_STEERING_SCRATCH: PerCpuArray<EgressSteeringScratch> =
 #[map]
 static CONNECTIONS: LruHashMap<ConnectionKey, ConnectionState> =
     LruHashMap::with_max_entries(CONNECTION_CAPACITY, 0);
+
+/// Encryption is a separately versioned persistent ABI island. Decisions and
+/// transports carry their bank in the key so a complete generation becomes
+/// visible through the single configuration-array update. The maps are not
+/// consumed until the policy-route selector lands; an all-zero config is the
+/// explicit quarantine state and cannot select plaintext or encrypted traffic.
+#[map]
+static ENCRYPTION_DECISIONS: HashMap<EncryptionDecisionKey, EncryptionDecisionValue> =
+    HashMap::with_max_entries(ENCRYPTION_DECISION_MAP_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static ENCRYPTION_TRANSPORTS: HashMap<EncryptionTransportKey, EncryptionTransportValue> =
+    HashMap::with_max_entries(ENCRYPTION_TRANSPORT_MAP_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static ENCRYPTION_CONFIG: Array<EncryptionMapConfig> = Array::with_max_entries(1, 0);
+
+/// CEL state is persistent across agent/program replacement so an admitted
+/// established flow cannot silently change epochs during a userspace restart.
+#[map]
+static ENCRYPTION_CONNECTIONS: LruHashMap<ConnectionKey, EncryptionFlowValue> =
+    LruHashMap::with_max_entries(ENCRYPTION_CONNECTION_MAP_CAPACITY, 0);
 
 /// Phase 8.5 egress state is independently banked. Source admission and its
 /// exact destination constraints become visible through one config flip.

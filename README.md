@@ -782,11 +782,16 @@ kernel-configuration digest. Persist-before-mutate phases and exact readback
 make every pointer-flip crash boundary deterministic, while rollback requires
 the previous bank plus positive target-bank absence. This passes
 `make encryption-fast-path-transaction-test`; ADR 0163. The Aya persistence
-adapter, TC mark/policy-route hook, verifier, and live packet gate remain, so no
-workload packet yet selects the staged route table. The
-[Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0163 define the ordered implementation and independent Kind/OpenShift
-gates.
+foundation now places four fixed-shape maps in a separately versioned
+`/sys/fs/bpf/unf/encryption/v1` ABI island, leaving the qualified 40-map core ABI
+unchanged. Quarantine-First Activation accepts only an exact all-or-none pin
+inventory and refuses foreign, symlinked, partial, or non-quiescent recovered
+state before attach. `make encryption-map-persistence-test` passes; ADR 0164.
+CCV-backed map mutation/recovery, the TC mark/policy-route hook, verifier, and
+live packet gate remain, so no workload packet yet selects the staged route
+table. The [Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md)
+and ADRs 0158–0164 define the ordered implementation and independent
+Kind/OpenShift gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
