@@ -24,6 +24,11 @@ grep -q 'PERSISTENT_BPF_STATE_ABI_VERSION' \
     "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'delete job "${job_name}"' "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'cni-status.lease' "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'cleanup_gateway_interface' "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'UNF_ROLLBACK_NODE_UID' "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'test "$actual4" -eq 0' "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q '(.applied.targets | length) == 0' \
+    "${project_root}/hack/rollback-kind-primary-cni.sh"
 for setting in rp_filter accept_local; do
     grep -q "/proc/sys/net/ipv4/conf/\*/${setting}" \
         "${project_root}/hack/configure-kind-primary-cni.sh"

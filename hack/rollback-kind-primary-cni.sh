@@ -117,7 +117,10 @@ done
 
 for node in "${nodes[@]}"; do
     echo "rolling back UNF primary-CNI state on ${node}"
-    sudo "${container_runtime}" exec "${node}" sh -ec '
+    node_uid=$("${kc[@]}" get node "${node}" -o jsonpath='{.metadata.uid}')
+    sudo "${container_runtime}" exec -e UNF_ROLLBACK_NODE_NAME="${node}" \
+        -e UNF_ROLLBACK_NODE_UID="${node_uid}" \
+        "${node}" sh -ec '
         state_dir=/var/lib/unf/cni/v1
         routes=${state_dir}/remote-routes.json
         services=${state_dir}/service-snapshot.json
@@ -153,6 +156,50 @@ for node in "${nodes[@]}"; do
                 rm -f "$temporary"
             done
             rmdir "$runtime_dir"
+        }
+
+        cleanup_gateway_interface() {
+            interface=unf-egress0
+            [ -e "/sys/class/net/${interface}" ] || return 0
+            link=$(ip -j -d link show dev "$interface")
+            addresses=$(ip -j address show dev "$interface")
+            expected_alias="unf:egress-address:v1:${UNF_ROLLBACK_NODE_UID}"
+            printf "%s" "$link" | jq -e --arg interface "$interface" \
+                --arg alias "$expected_alias" \
+                '\''length == 1
+                and .[0].ifname == $interface
+                and .[0].ifalias == $alias
+                and .[0].linkinfo.info_kind == "dummy"
+                and (.[0] | has("master") | not)'\'' >/dev/null
+            printf "%s" "$addresses" | jq -e \
+                '\''length == 1
+                and all(.[0].addr_info[];
+                    .family == "inet6"
+                    and .scope == "link"
+                    and (.local | startswith("fe80:")))'\'' >/dev/null
+            ip link delete dev "$interface"
+            test ! -e "/sys/class/net/${interface}"
+        }
+
+        validate_load_balancer_snapshot() {
+            snapshot=$1
+            test -f "$snapshot" && test ! -L "$snapshot"
+            test "$(stat -c %a "$snapshot")" = 600
+            jq -e --arg node_name "$UNF_ROLLBACK_NODE_NAME" \
+                --arg node_uid "$UNF_ROLLBACK_NODE_UID" \
+                '\''.schemaVersion == 1
+                and .applied.schemaVersion == 1
+                and .applied.sourceEpoch > 0
+                and .applied.revision > 0
+                and .applied.node.name == $node_name
+                and .applied.node.uid == $node_uid
+                and .applied.provider.mode == "directNode"
+                and (.applied.provider.name | length) > 0
+                and (.applied.provider.instance | length) > 0
+                and (if (.applied.targets | length) == 0
+                    then .applied.allocationRevision >= 0
+                    else .applied.allocationRevision > 0
+                    end)'\'' "$snapshot" >/dev/null
         }
 
         for temporary_pattern in \
@@ -222,9 +269,7 @@ for node in "${nodes[@]}"; do
             test ! -e "${state_dir}/attachments.json"
             test ! -e "${state_dir}/node-block.json"
             if [ -e "$load_balancers" ]; then
-                test -f "$load_balancers" && test ! -L "$load_balancers"
-                test "$(stat -c %a "$load_balancers")" = 600
-                jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and .applied.revision > 0 and .applied.allocationRevision > 0" "$load_balancers" >/dev/null
+                validate_load_balancer_snapshot "$load_balancers"
                 rm -f "$load_balancers"
             fi
             cleanup_pending_deletes
@@ -234,6 +279,7 @@ for node in "${nodes[@]}"; do
             fi
             [ ! -d /var/lib/unf/cni ] || rmdir /var/lib/unf/cni
             cleanup_runtime_state
+            cleanup_gateway_interface
             if [ -d /sys/fs/bpf/unf ]; then
                 test -z "$(find /sys/fs/bpf/unf -mindepth 1 -maxdepth 1 -print -quit)"
                 rmdir /sys/fs/bpf/unf
@@ -244,25 +290,29 @@ for node in "${nodes[@]}"; do
         test -f "$routes" && test ! -L "$routes"
         test "$(jq -r .schemaVersion "$routes")" = 1
         expected=$(jq ".remoteNodes | length" "$routes")
-        test "$(ip -j -4 route show proto 196 | jq length)" -eq "$expected"
-        test "$(ip -j -6 route show proto 196 | jq length)" -eq "$expected"
-
-        route_rows=$(jq -r '\''.remoteNodes[] | [.intent.blocks.ipv4Block, .ipv4Transport, .intent.blocks.ipv6Block, .ipv6Transport] | @tsv'\'' "$routes")
-        old_ifs=$IFS
-        IFS="
+        actual4=$(ip -j -4 route show proto 196 | jq length)
+        actual6=$(ip -j -6 route show proto 196 | jq length)
+        if [ "$actual4" -eq "$expected" ] && [ "$actual6" -eq "$expected" ]; then
+            route_rows=$(jq -r '\''.remoteNodes[] | [.intent.blocks.ipv4Block, .ipv4Transport, .intent.blocks.ipv6Block, .ipv6Transport] | @tsv'\'' "$routes")
+            old_ifs=$IFS
+            IFS="
 "
-        for row in $route_rows; do
-            IFS="	" read -r block4 gateway4 block6 gateway6 <<EOF
+            for row in $route_rows; do
+                IFS="	" read -r block4 gateway4 block6 gateway6 <<EOF
 $row
 EOF
-            actual4=$(ip -j -4 route show exact "$block4")
-            actual6=$(ip -j -6 route show exact "$block6")
-            echo "$actual4" | jq -e --arg dst "$block4" --arg gateway "$gateway4" '\''length == 1 and .[0].dst == $dst and .[0].gateway == $gateway and .[0].dev == "eth0" and .[0].protocol == "196"'\'' >/dev/null
-            echo "$actual6" | jq -e --arg dst "$block6" --arg gateway "$gateway6" '\''length == 1 and .[0].dst == $dst and .[0].gateway == $gateway and .[0].dev == "eth0" and .[0].protocol == "196"'\'' >/dev/null
-            ip -4 route del "$block4" via "$gateway4" dev eth0 proto 196
-            ip -6 route del "$block6" via "$gateway6" dev eth0 proto 196
-        done
-        IFS=$old_ifs
+                route4=$(ip -j -4 route show exact "$block4")
+                route6=$(ip -j -6 route show exact "$block6")
+                echo "$route4" | jq -e --arg dst "$block4" --arg gateway "$gateway4" '\''length == 1 and .[0].dst == $dst and .[0].gateway == $gateway and .[0].dev == "eth0" and .[0].protocol == "196"'\'' >/dev/null
+                echo "$route6" | jq -e --arg dst "$block6" --arg gateway "$gateway6" '\''length == 1 and .[0].dst == $dst and .[0].gateway == $gateway and .[0].dev == "eth0" and .[0].protocol == "196"'\'' >/dev/null
+                ip -4 route del "$block4" via "$gateway4" dev eth0 proto 196
+                ip -6 route del "$block6" via "$gateway6" dev eth0 proto 196
+            done
+            IFS=$old_ifs
+        else
+            test "$actual4" -eq 0
+            test "$actual6" -eq 0
+        fi
         test "$(ip -j -4 route show proto 196 | jq length)" -eq 0
         test "$(ip -j -6 route show proto 196 | jq length)" -eq 0
 
@@ -274,6 +324,7 @@ EOF
         test -f "$config" && test ! -L "$config"
         test "$(sha256sum "$binary" | cut -d " " -f 1)" = "$binary_sha"
         test "$(sha256sum "$config" | cut -d " " -f 1)" = "$config_sha"
+        cleanup_gateway_interface
         test "$(ip -j -d link | jq '\''[.[] | select(.ifname | startswith("unf"))] | length'\'')" -eq 0
 
         test -f "$services" && test ! -L "$services"
@@ -281,9 +332,7 @@ EOF
         jq -e "if has(\"service\") then .schemaVersion == 1 and .service.schemaVersion == 2 and .service.revision > 0 and (.service.services | length) > 0 and .nodePortNode.schemaVersion == 1 else .schemaVersion == 1 and .revision > 0 and (.services | length) > 0 end" "$services" >/dev/null
 
         if [ -e "$load_balancers" ]; then
-            test -f "$load_balancers" && test ! -L "$load_balancers"
-            test "$(stat -c %a "$load_balancers")" = 600
-            jq -e ".schemaVersion == 1 and .applied.schemaVersion == 1 and .applied.revision > 0 and .applied.allocationRevision > 0" "$load_balancers" >/dev/null
+            validate_load_balancer_snapshot "$load_balancers"
         fi
 
         for temporary in \
