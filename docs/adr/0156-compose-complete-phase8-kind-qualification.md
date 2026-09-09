@@ -60,8 +60,9 @@ fixture, and shell/static validation of the composed harness.
 
 ## Consequences
 
-- Milestone 8.10 is Verified; the full Phase 8 gate remains open until the
-  independent digest-pinned OpenShift 8.11 qualification passes.
+- Milestone 8.10 is Verified. The independent digest-pinned OpenShift 8.11 gate
+  subsequently passed and closes Phase 8 through ADR 0157; it does not alter or
+  retroactively broaden this Kind evidence.
 - Kubernetes readiness remains scheduling evidence, never HA fencing or
   promotion authority.
 - Equivalent prepared state is not allowed to supersede a durable checkpoint;

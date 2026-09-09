@@ -13,6 +13,20 @@
     "kubeProxyPresent": false,
     "result": "passed"
   },
+  "openshiftQualification": {
+    "schemaVersion": 1,
+    "phase": "8.11",
+    "context": "admin",
+    "infrastructure": "cl02-st7gq",
+    "sourceRevision": "2f404edcff94becd6d023bd8885c3c71ce4993b4",
+    "qualificationRevision": "baf2bb031a39894f3d5377b6fc1af5b5622f670b",
+    "openshiftVersion": "4.22.10",
+    "kubernetesVersion": "v1.35.6",
+    "durationSeconds": 411,
+    "evidenceSha256": "a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3",
+    "kubeProxyPresent": false,
+    "result": "passed"
+  },
   "contracts": {
     "compatibilitySchemaVersion": 2,
     "persistentBpfStateAbiVersion": 15,

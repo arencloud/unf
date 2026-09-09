@@ -23,8 +23,8 @@ require_text() {
 }
 
 require_text docs/project-status.md \
-    '| Phase 8 — identity-aware egress fabric | **In progress** |' \
-    "the authoritative Phase 8 state must be in progress"
+    '| Phase 8 — identity-aware egress fabric | **Verified** |' \
+    "the authoritative Phase 8 state must be verified"
 require_text docs/project-status.md \
     '| Architecture and acceptance boundary | **Verified** |' \
     "milestone 8.1 must be tracked as verified"
@@ -50,8 +50,8 @@ require_text docs/architecture/components.md \
     'The accepted Phase 8 boundary keeps egress policy, allocation, gateway' \
     "component ownership must be explicit"
 require_text README.md \
-    'Phase 8 begins an identity-aware enterprise egress fabric' \
-    "the user-facing roadmap must expose the active phase"
+    'Phase 8 implements a verified identity-aware enterprise egress fabric' \
+    "the user-facing roadmap must expose Phase 8 closure"
 require_text docs/roadmap.md \
     '## Phase 8 — identity-aware egress fabric' \
     "the roadmap must include Phase 8"
@@ -64,6 +64,9 @@ require_text hack/verify-openshift-egress-phase8.sh \
 require_text hack/verify-openshift-egress-phase8.sh \
     'containers:[(.status.containerStatuses // [])[] | {name,image,imageID}]' \
     "the OpenShift evidence collector must tolerate terminal pods without runtime status"
+require_text docs/adr/0157-qualify-phase8-on-openshift.md \
+    'Milestone 8.11 and Phase 8 are Verified.' \
+    "the independent OpenShift result must close Phase 8"
 require_text deploy/openshift-primary-cni/egress/kustomization.yaml \
     'digest: sha256:a7945ae471ca366fdc7fa0f9b7f8df971796612ee12021120764068eb7fc10ba' \
     "the Phase 8 controller image must remain immutable"
@@ -75,6 +78,12 @@ jq -e '
     .schemaVersion == 1 and .phase == "8.11"
     and .sourceRevision == "2f404edcff94becd6d023bd8885c3c71ce4993b4"
     and .kindQualification.phase == "8.10" and .kindQualification.result == "passed"
+    and .openshiftQualification.phase == "8.11"
+    and .openshiftQualification.result == "passed"
+    and .openshiftQualification.sourceRevision == .sourceRevision
+    and .openshiftQualification.qualificationRevision == "baf2bb031a39894f3d5377b6fc1af5b5622f670b"
+    and .openshiftQualification.evidenceSha256 == "a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3"
+    and .openshiftQualification.kubeProxyPresent == false
     and .contracts.persistentBpfStateAbiVersion == 15
     and .contracts.egressDistributionSchemaVersion == 2
     and .contracts.egressHostStateSchemaVersion == 2

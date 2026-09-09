@@ -586,7 +586,7 @@ matrix is maintained in the
 
 ## Phase 8 — identity-aware egress fabric
 
-**Gate: in progress; only OpenShift qualification remains.** The ordered evidence matrix is maintained in the
+**Gate: verified.** The ordered evidence matrix is maintained in the
 [Phase 8 egress-fabric plan](development/phase8-egress-fabric-plan.md).
 
 - Verified architecture boundary: source identity and security policy precede
@@ -686,7 +686,17 @@ matrix is maintained in the
   all six digest-bound lifecycle components, zero-churn warm-standby rejoin, and exact no-CNI rollback in 1,013
   seconds. The aggregate SHA-256 is
   `c364a99a05f1bd9a1b0416bf3305feabc3de58d25119bfc20b0fc66bb7efbc88`;
-  ADR 0156. Independent OpenShift qualification remains in 8.11.
+  ADR 0156.
+- Phase 8.11 independently qualifies the same runtime through immutable public
+  images on five-Node dual-stack OpenShift 4.22.10/Kubernetes 1.35.6 cl02.
+  Runtime `2f404ed` and qualifier `baf2bb0` passed the 411-second gate with
+  RHCOS/SELinux/CRI-O, kube-proxy absence, external IPv4/IPv6 source
+  observation, exclusive four-address/three-gateway HA, graceful drain,
+  zero-churn warm-standby restoration, controller and agent recovery, exact
+  cleanup, five-agent convergence, and an unchanged `network` unhealthy
+  baseline. Evidence SHA-256 is
+  `a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3`;
+  ADR 0157. The independent 8.10 and 8.11 results close Phase 8.
 - Milestone 8.2 is verified: bounded provider-neutral Namespace, workload, and
   ServiceAccount selectors; canonical destinations and non-overlapping
   dual-stack pools; pool-family/multiple-address intent; strict OpenShift

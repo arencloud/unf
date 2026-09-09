@@ -405,15 +405,15 @@ cross-worker DSR source/return tuples and source ranges, controller-offline
 worker-agent replacement, exact cleanup, five-agent convergence, and unchanged
 `insights`/`network` unhealthy baseline passed
 `hack/verify-openshift-service-selection.sh`; ADR 0112.
-Phase 8 begins an identity-aware enterprise egress fabric. Milestones 8.1
-through 8.7 are verified. Source-side security policy precedes steering and NAT, while
+Phase 8 implements a verified identity-aware enterprise egress fabric. All
+milestones 8.1 through 8.11 are verified. Source-side security policy precedes steering and NAT, while
 `unf-egress` now canonically validates bounded Namespace, workload, and
 ServiceAccount selectors, destinations, non-overlapping dual-stack pools, and
 pool or explicit multiple-address intent. The controller strictly translates
 OpenShift `k8s.ovn.org/v1` EgressIP into that same model and preserves foreign
 status ownership. Native egress remains the safe default until explicit intent
 is admitted. The [Phase 8 plan](docs/development/phase8-egress-fabric-plan.md)
-and ADRs 0113–0154 track the work. Milestone 8.2a now adds schema-v1 exact-Node
+and ADRs 0113–0157 record the architecture and evidence. Milestone 8.2a adds schema-v1 exact-Node
 Egress Behavior Contracts: independent replay binds source identity, original
 destinations, policy allow, exact allocation, lease-fenced ready/reachable
 gateways, capabilities, and six revision domains, with SHA-256 commitments,
@@ -722,8 +722,16 @@ three-Node dual-stack Kubernetes v1.35.0 Kind run covering watched
 steering/NAT, measured HA with zero-churn warm-standby rejoin, FQDN and Internet authority, DQR/native reachability,
 causal operations, restart recovery, exact cleanup, and no-CNI rollback. The
 digest-bound aggregate is `.artifacts/phase8-egress-complete-kind.json`; ADR
-0156. Phase 8 remains in progress until independent digest-pinned OpenShift
-milestone 8.11 passes.
+0156. The independent milestone 8.11 gate then passed in 411 seconds on
+five-Node dual-stack OpenShift 4.22.10/Kubernetes 1.35.6 cl02 using runtime
+`2f404ed` and qualifier `baf2bb0`. It verified immutable public images,
+RHCOS/SELinux/CRI-O, kube-proxy absence, externally observed IPv4/IPv6 egress
+sources, four-address exclusive ownership across three gateways, graceful drain
+and zero-churn standby restoration, controller/agent recovery, operations,
+exact cleanup, five-agent convergence, and an unchanged `network` unhealthy
+baseline. Evidence SHA-256 is
+`a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3`;
+ADR 0157. These independent Kind and OpenShift results close Phase 8.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
