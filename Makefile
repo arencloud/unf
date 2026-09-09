@@ -15,7 +15,7 @@
 .PHONY: egress-reachability-contract-test
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
-.PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-upgrade-recovery-test egress-phase8-kind-test egress-bgp-image
+.PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-upgrade-recovery-test egress-phase8-kind-test egress-phase8-openshift-deploy egress-phase8-openshift-test egress-bgp-image
 .NOTPARALLEL: egress-phase8-kind-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -820,6 +820,16 @@ service-selection-openshift-deploy:
 
 service-selection-openshift-test: cli
 	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/verify-openshift-service-selection.sh
+
+egress-phase8-openshift-deploy:
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) \
+	UNF_OPENSHIFT_SERVICE_RELEASE_RECORD=$(CURDIR)/deploy/openshift-primary-cni/egress/release.json \
+	UNF_OPENSHIFT_SERVICE_DEPLOY_EVIDENCE=$(CURDIR)/.artifacts/phase8-egress-openshift-deploy.json \
+	UNF_OPENSHIFT_SERVICE_RENDER_PATH=$(CURDIR)/deploy/openshift-primary-cni/egress \
+	hack/deploy-openshift-service-fabric.sh
+
+egress-phase8-openshift-test: cli
+	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) hack/verify-openshift-egress-phase8.sh
 
 kind-tool:
 	mkdir -p .tools/bin

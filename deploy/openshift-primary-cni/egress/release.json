@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "phase": "8.11",
+  "sourceRevision": "99adfd6bb4b3cc096265d12445189090db5aa942",
+  "kindQualification": {
+    "schemaVersion": 1,
+    "phase": "8.10",
+    "context": "kind-unf-service-dev",
+    "sourceRevision": "99adfd6bb4b3cc096265d12445189090db5aa942",
+    "qualificationRevision": "db263a10a561a685ecf6e8748afc530dc6bc63cc",
+    "durationSeconds": 1015,
+    "evidenceSha256": "4cb13c79632ae661cad7b8d588b1fdac757ef7740199c68800a0b2666a060c15",
+    "kubeProxyPresent": false,
+    "result": "passed"
+  },
+  "contracts": {
+    "compatibilitySchemaVersion": 2,
+    "persistentBpfStateAbiVersion": 15,
+    "identitySnapshotSchemaVersion": 2,
+    "policySnapshotSchemaVersion": 4,
+    "serviceSnapshotSchemaVersion": 4,
+    "selectionContractSchemaVersion": 1,
+    "egressDistributionSchemaVersion": 2,
+    "egressHostStateSchemaVersion": 2,
+    "egressHaPromotionSchemaVersion": 1,
+    "egressMapSchemaVersion": 4,
+    "egressEventSchemaVersion": 1,
+    "agentStatusSchemaVersion": 8,
+    "flowExportSchemaVersion": 7
+  },
+  "images": {
+    "controller": "quay.io/arencloud/unf-controller-dev@sha256:552e4002b26908c0ab39c002c0e7d7df27b471165da3373ee5cc49b537284511",
+    "agent": "quay.io/arencloud/unf-agent-dev@sha256:3e88b84b57e693e496b89143a39157848f72f2bd5b6b0061cdc01ce715044695",
+    "testTools": "quay.io/arencloud/unf-test-tools-dev@sha256:735a7a70065e3f61209d90633c58c367da44264458e64a289fb30c0ffad229a6"
+  }
+}

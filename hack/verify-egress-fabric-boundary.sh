@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
-for command in rg; do
+for command in jq rg; do
     command -v "${command}" >/dev/null 2>&1 || {
         echo "${command} is required to verify the Phase 8 egress boundary" >&2
         exit 1
@@ -55,6 +55,33 @@ require_text README.md \
 require_text docs/roadmap.md \
     '## Phase 8 — identity-aware egress fabric' \
     "the roadmap must include Phase 8"
+require_text Makefile \
+    'egress-phase8-openshift-test: cli' \
+    "the independent OpenShift gate must be invocable"
+require_text hack/verify-openshift-egress-phase8.sh \
+    'OpenShift cl02 Phase 8.11 egress qualification passed' \
+    "the OpenShift gate must emit an explicit terminal result"
+require_text deploy/openshift-primary-cni/egress/kustomization.yaml \
+    'digest: sha256:552e4002b26908c0ab39c002c0e7d7df27b471165da3373ee5cc49b537284511' \
+    "the Phase 8 controller image must remain immutable"
+require_text deploy/openshift-primary-cni/egress/kustomization.yaml \
+    'digest: sha256:3e88b84b57e693e496b89143a39157848f72f2bd5b6b0061cdc01ce715044695' \
+    "the Phase 8 agent image must remain immutable"
+
+jq -e '
+    .schemaVersion == 1 and .phase == "8.11"
+    and .sourceRevision == "99adfd6bb4b3cc096265d12445189090db5aa942"
+    and .kindQualification.phase == "8.10" and .kindQualification.result == "passed"
+    and .contracts.persistentBpfStateAbiVersion == 15
+    and .contracts.egressDistributionSchemaVersion == 2
+    and .contracts.egressHostStateSchemaVersion == 2
+    and .contracts.egressMapSchemaVersion == 4
+    and .contracts.flowExportSchemaVersion == 7
+    and all(.images[]; test("^quay\\.io/arencloud/unf-[a-z-]+-dev@sha256:[0-9a-f]{64}$"))
+' "${project_root}/deploy/openshift-primary-cni/egress/release.json" >/dev/null || {
+    echo "Phase 8 OpenShift release record is invalid" >&2
+    exit 1
+}
 
 for excluded in \
     'production-scale BGP/ECMP/BFD availability' \

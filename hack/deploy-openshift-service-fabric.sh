@@ -38,7 +38,7 @@ if [[ ! -s ${kubeconfig} || $(stat -c '%a' "${kubeconfig}") != 600 ]]; then
 fi
 if [[ ! -s ${release_record} ]] || ! jq -e '
     .schemaVersion == 1
-    and (.phase == "5.8" or .phase == "6.9" or .phase == "7.10")
+    and (.phase == "5.8" or .phase == "6.9" or .phase == "7.10" or .phase == "8.11")
     and (.sourceRevision | test("^[0-9a-f]{40}$"))
     and ((.phase == "5.8"
           and .kindQualification.schemaVersion == 2
@@ -69,7 +69,27 @@ if [[ ! -s ${release_record} ]] || ! jq -e '
           and .contracts.serviceSnapshotSchemaVersion == 4
           and .contracts.selectionContractSchemaVersion == 1
           and .contracts.agentStatusSchemaVersion == 8
-          and .contracts.flowExportSchemaVersion == 6))
+          and .contracts.flowExportSchemaVersion == 6)
+      or (.phase == "8.11"
+          and .kindQualification.schemaVersion == 1
+          and .kindQualification.phase == "8.10"
+          and .kindQualification.sourceRevision == .sourceRevision
+          and (.kindQualification.qualificationRevision | test("^[0-9a-f]{40}$"))
+          and .kindQualification.kubeProxyPresent == false
+          and (.contracts | type == "object")
+          and .contracts.compatibilitySchemaVersion == 2
+          and .contracts.persistentBpfStateAbiVersion == 15
+          and .contracts.identitySnapshotSchemaVersion == 2
+          and .contracts.policySnapshotSchemaVersion == 4
+          and .contracts.serviceSnapshotSchemaVersion == 4
+          and .contracts.selectionContractSchemaVersion == 1
+          and .contracts.egressDistributionSchemaVersion == 2
+          and .contracts.egressHostStateSchemaVersion == 2
+          and .contracts.egressHaPromotionSchemaVersion == 1
+          and .contracts.egressMapSchemaVersion == 4
+          and .contracts.egressEventSchemaVersion == 1
+          and .contracts.agentStatusSchemaVersion == 8
+          and .contracts.flowExportSchemaVersion == 7))
     and .kindQualification.result == "passed"
     and all(.images[]; test("^quay\\.io/arencloud/unf-[a-z-]+-dev@sha256:[0-9a-f]{64}$"))
 ' "${release_record}" >/dev/null; then
@@ -85,7 +105,7 @@ source_revision=$(jq -er .sourceRevision "${release_record}")
 controller_image=$(jq -er .images.controller "${release_record}")
 agent_image=$(jq -er .images.agent "${release_record}")
 release_phase=$(jq -er .phase "${release_record}")
-if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 ]]; then
+if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} == 8.11 ]]; then
     compatibility_schema=$(jq -er .contracts.compatibilitySchemaVersion "${release_record}")
     persistent_abi=$(jq -er .contracts.persistentBpfStateAbiVersion "${release_record}")
     identity_schema=$(jq -er .contracts.identitySnapshotSchemaVersion "${release_record}")
@@ -93,11 +113,29 @@ if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 ]]; then
     service_schema=$(jq -er .contracts.serviceSnapshotSchemaVersion "${release_record}")
     agent_status_schema=$(jq -er .contracts.agentStatusSchemaVersion "${release_record}")
     flow_export_schema=$(jq -er .contracts.flowExportSchemaVersion "${release_record}")
-    if [[ ${release_phase} == 7.10 ]]; then
+    if [[ ${release_phase} == 8.11 ]]; then
         selection_schema=$(jq -er .contracts.selectionContractSchemaVersion "${release_record}")
+        egress_distribution_schema=$(jq -er .contracts.egressDistributionSchemaVersion "${release_record}")
+        egress_host_schema=$(jq -er .contracts.egressHostStateSchemaVersion "${release_record}")
+        egress_ha_schema=$(jq -er .contracts.egressHaPromotionSchemaVersion "${release_record}")
+        egress_map_schema=$(jq -er .contracts.egressMapSchemaVersion "${release_record}")
+        egress_event_schema=$(jq -er .contracts.egressEventSchemaVersion "${release_record}")
+        deployment_stage=abi-v15-egress-fabric-staged-deployment
+    elif [[ ${release_phase} == 7.10 ]]; then
+        selection_schema=$(jq -er .contracts.selectionContractSchemaVersion "${release_record}")
+        egress_distribution_schema=0
+        egress_host_schema=0
+        egress_ha_schema=0
+        egress_map_schema=0
+        egress_event_schema=0
         deployment_stage=abi-v11-service-selection-staged-deployment
     else
         selection_schema=0
+        egress_distribution_schema=0
+        egress_host_schema=0
+        egress_ha_schema=0
+        egress_map_schema=0
+        egress_event_schema=0
         deployment_stage=abi-v7-loadbalancer-staged-deployment
     fi
 else
@@ -109,6 +147,11 @@ else
     agent_status_schema=5
     flow_export_schema=5
     selection_schema=0
+    egress_distribution_schema=0
+    egress_host_schema=0
+    egress_ha_schema=0
+    egress_map_schema=0
+    egress_event_schema=0
     deployment_stage=abi-v5-nodeport-staged-deployment
 fi
 version_query="serviceSnapshotSchemaVersion=${service_schema}"
@@ -174,6 +217,18 @@ assert_version() {
         and .flow_export_schema_version == $flow
         and ($selection == 0 or .selection_contract_schema_version == $selection)
     ' <<<"${json}" >/dev/null
+
+    if ((egress_distribution_schema > 0)); then
+        jq -e --argjson distribution "${egress_distribution_schema}" \
+            --argjson host "${egress_host_schema}" --argjson ha "${egress_ha_schema}" \
+            --argjson map "${egress_map_schema}" --argjson event "${egress_event_schema}" '
+            .egress_distribution_schema_version == $distribution
+            and .egress_host_state_schema_version == $host
+            and .egress_ha_promotion_schema_version == $ha
+            and .egress_map_schema_version == $map
+            and .egress_event_schema_version == $event
+        ' <<<"${json}" >/dev/null
+    fi
 }
 
 wait_for_controller() {
@@ -284,10 +339,16 @@ assert_agent() {
                 jq -e --argjson selection_schema "$3" \
                     ".schemaVersion == 1 and .contract.schemaVersion == \$selection_schema
                      and .contract.contractRevision > 0
-                     and (.contract.contractDigest | length) == 64" "$selection" >/dev/null
+                    and (.contract.contractDigest | length) == 64" "$selection" >/dev/null
+            fi
+            if test "$4" -gt 0; then
+                for pin in EGRESS_CONFIG EGRESS_GATEWAY_NAT_CONFIG EGRESS_EVENTS EGRESS_EVENT_COUNTERS; do
+                    test -e "$abi_directory/$pin"
+                done
             fi
             echo service-state-ready
-        ' sh "${persistent_abi}" "${service_schema}" "${selection_schema}" 2>&1 || true)
+        ' sh "${persistent_abi}" "${service_schema}" "${selection_schema}" \
+            "${egress_distribution_schema}" 2>&1 || true)
         if grep -q '^service-state-ready$' <<<"${host_state}"; then
             return 0
         fi
@@ -541,7 +602,7 @@ done
 stage=evidence
 mkdir -p "$(dirname "${artifact}")"
 artifact_tmp="${artifact}.tmp.$$"
-if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 ]]; then
+if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} == 8.11 ]]; then
     node_evidence=$("${kc[@]}" get nodes -o json | jq '[.items[] | {
         name:.metadata.name, osImage:.status.nodeInfo.osImage,
         kernelVersion:.status.nodeInfo.kernelVersion,
@@ -557,6 +618,10 @@ if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 ]]; then
         --arg compatibilityBoundary "${compatibility_boundary}" \
         --argjson persistentAbi "${persistent_abi}" --argjson serviceSchema "${service_schema}" \
         --argjson selectionSchema "${selection_schema}" \
+        --argjson egressDistributionSchema "${egress_distribution_schema}" \
+        --argjson egressHostSchema "${egress_host_schema}" \
+        --argjson egressHaSchema "${egress_ha_schema}" --argjson egressMapSchema "${egress_map_schema}" \
+        --argjson egressEventSchema "${egress_event_schema}" \
         --argjson statusSchema "${agent_status_schema}" --argjson nodes "${node_evidence}" \
         --argjson agents "${agents}" '
         {
@@ -567,12 +632,18 @@ if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 ]]; then
           kubeProxyPresent:false, persistentBpfAbi:$persistentAbi,
           serviceSnapshotSchemaVersion:$serviceSchema,
           selectionContractSchemaVersion:$selectionSchema,
+          egressDistributionSchemaVersion:$egressDistributionSchema,
+          egressHostStateSchemaVersion:$egressHostSchema,
+          egressHaPromotionSchemaVersion:$egressHaSchema,
+          egressMapSchemaVersion:$egressMapSchema,
+          egressEventSchemaVersion:$egressEventSchema,
           agentStatusSchemaVersion:$statusSchema,
           nodes:$nodes, agents:$agents,
           verified:["immutable public image digests",$compatibilityBoundary,
             "MachineConfig-aware five-node serial agent replacement","RHCOS SELinux enforcing",
             "legacy-netlink TC attachment","persistent host forwarding contract",
             "current-schema durable composite service checkpoint","host-origin Kubernetes API Service reachability",
+            "current-schema egress dataplane and recovery contract",
             "no functional kube-proxy rule residue","exact current-ABI map ownership",
             "full five-node convergence","kube-proxy remains absent"]
         }
