@@ -6,22 +6,27 @@
 //! map checkpoint. Identity cardinality therefore never creates per-policy or
 //! per-workload tunnels.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use unf_common::Revision;
+use unf_common::{IdentityId, Revision};
 
 use crate::{
     AttestedEncryptionPathContract, EncryptionContractError, EncryptionDisposition,
     EncryptionGenerationRecipient, FastPathCompileContext, FastPathDecisionInput,
     FastPathEpochAdmission, FastPathEpochState, FastPathError, FastPathMapCheckpoint,
     FastPathPublishedGeneration, FastPathTransactionError, KeyAuthorityError,
-    LinuxPreparedLocalGeneration, NodeKeyAuthority, NodeLocalOrchestratorError,
-    ProofCarryingKernelTransaction, UnderlayAddressFamily, UnderlayMtuObservation,
-    WIREGUARD_IPV4_OVERHEAD, WIREGUARD_IPV6_OVERHEAD, WireGuardEpochActivation,
-    WireGuardKernelError, WireGuardKernelPlan, WireGuardKernelPlanInput, WireGuardKernelSnapshot,
-    WireGuardMtuEnvelope, WireGuardPeerPlan, compile_encryption_fast_path,
+    LinuxPreparedLocalGeneration, MAX_FAST_PATH_DECISIONS, NodeKeyAuthority,
+    NodeLocalOrchestratorError, ProofCarryingKernelTransaction, UnderlayAddressFamily,
+    UnderlayMtuObservation, WIREGUARD_IPV4_OVERHEAD, WIREGUARD_IPV6_OVERHEAD,
+    WireGuardEpochActivation, WireGuardKernelError, WireGuardKernelPlan, WireGuardKernelPlanInput,
+    WireGuardKernelSnapshot, WireGuardMtuEnvelope, WireGuardPeerPlan, compile_encryption_fast_path,
 };
+
+pub const NODE_LOCAL_PLAN_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+const NODE_LOCAL_PLAN_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"unf.node-local-plan-snapshot.v1\0";
 
 #[cfg(target_os = "linux")]
 use crate::LinuxWireGuardProvider;
@@ -48,6 +53,68 @@ pub struct NodeLocalPlanCompileContext {
     pub prior: Option<FastPathPublishedGeneration>,
 }
 
+/// Serializable epoch recipe. It carries no private key, kernel readback,
+/// route permit, or map authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NodeLocalEpochPlanRecord {
+    pub contract: AttestedEncryptionPathContract,
+    pub readiness_digest: [u8; 32],
+    pub state: FastPathEpochState,
+    pub drain_until_monotonic_ns: u64,
+}
+
+/// Serializable identity decision recipe. Required records point to one exact
+/// plan in one epoch contract; native records carry no transport reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NodeLocalDecisionPlan {
+    pub source_identity: IdentityId,
+    pub destination_identity: IdentityId,
+    pub disposition: EncryptionDisposition,
+    pub contract_epoch: Option<u64>,
+    pub plan_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeLocalPlanSnapshotDigest(pub [u8; 32]);
+
+/// One complete, Node-scoped, secret-free input manifold. Its digest and exact
+/// coverage rule prevent partial controller updates from reaching the local
+/// compiler independently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NodeLocalPlanSnapshot {
+    pub schema_version: u16,
+    pub membership_revision: Revision,
+    pub generation: Revision,
+    pub recipient: EncryptionGenerationRecipient,
+    pub policy_revision: Revision,
+    pub service_revision: Revision,
+    pub egress_revision: Revision,
+    pub listen_port: u16,
+    pub persistent_keepalive_seconds: u16,
+    pub epochs: Vec<NodeLocalEpochPlanRecord>,
+    pub decisions: Vec<NodeLocalDecisionPlan>,
+    pub snapshot_digest: NodeLocalPlanSnapshotDigest,
+}
+
+/// Unsealed fields used to issue one canonical Node-local plan snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeLocalPlanSnapshotFields {
+    pub membership_revision: Revision,
+    pub generation: Revision,
+    pub recipient: EncryptionGenerationRecipient,
+    pub policy_revision: Revision,
+    pub service_revision: Revision,
+    pub egress_revision: Revision,
+    pub listen_port: u16,
+    pub persistent_keepalive_seconds: u16,
+    pub epochs: Vec<NodeLocalEpochPlanRecord>,
+    pub decisions: Vec<NodeLocalDecisionPlan>,
+}
+
 #[derive(Debug, Error)]
 pub enum NodeLocalPlanCompilerError {
     #[error("invalid Node-local encryption compiler input: {0}")]
@@ -64,6 +131,351 @@ pub enum NodeLocalPlanCompilerError {
     InvalidCheckpoint(#[from] FastPathTransactionError),
     #[error("Node-local convergence failed: {0}")]
     InvalidConvergence(#[from] NodeLocalOrchestratorError),
+}
+
+impl NodeLocalPlanSnapshot {
+    /// Canonicalizes and seals one all-or-nothing local compiler input.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed revisions, contracts, epoch state, decision coverage,
+    /// transport bounds, or cross-Node authority.
+    pub fn issue(
+        mut fields: NodeLocalPlanSnapshotFields,
+    ) -> Result<Self, NodeLocalPlanCompilerError> {
+        fields
+            .epochs
+            .sort_by_key(|epoch| contract_epoch(&epoch.contract).unwrap_or_default());
+        fields
+            .decisions
+            .sort_by_key(|decision| (decision.source_identity, decision.destination_identity));
+        let mut snapshot = Self {
+            schema_version: NODE_LOCAL_PLAN_SNAPSHOT_SCHEMA_VERSION,
+            membership_revision: fields.membership_revision,
+            generation: fields.generation,
+            recipient: fields.recipient,
+            policy_revision: fields.policy_revision,
+            service_revision: fields.service_revision,
+            egress_revision: fields.egress_revision,
+            listen_port: fields.listen_port,
+            persistent_keepalive_seconds: fields.persistent_keepalive_seconds,
+            epochs: fields.epochs,
+            decisions: fields.decisions,
+            snapshot_digest: NodeLocalPlanSnapshotDigest([0; 32]),
+        };
+        snapshot.validate_authority()?;
+        snapshot.snapshot_digest = snapshot.calculate_digest()?;
+        Ok(snapshot)
+    }
+
+    /// Replays every nested contract, exact decision-to-plan coverage, and the
+    /// domain-separated digest without trusting a controller-side verdict.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any mutation, unknown field, reordering, omission, or mixed
+    /// recipient/revision/epoch authority.
+    pub fn verify(&self) -> Result<(), NodeLocalPlanCompilerError> {
+        self.validate_authority()?;
+        if self.snapshot_digest != self.calculate_digest()? {
+            return Err(NodeLocalPlanCompilerError::InvalidInput(
+                "Node-local plan snapshot digest does not match",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Builds the non-serializable borrowed epoch inputs used only during one
+    /// local compilation attempt.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a mutated snapshot before returning any compiler input.
+    pub fn epoch_plans(&self) -> Result<Vec<NodeLocalEpochPlan<'_>>, NodeLocalPlanCompilerError> {
+        self.verify()?;
+        Ok(self
+            .epochs
+            .iter()
+            .map(|epoch| NodeLocalEpochPlan {
+                contract: &epoch.contract,
+                readiness_digest: epoch.readiness_digest,
+                state: epoch.state,
+                drain_until_monotonic_ns: epoch.drain_until_monotonic_ns,
+            })
+            .collect())
+    }
+
+    /// Reconstructs the pure fast-path decision input after snapshot replay.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a mutated snapshot before returning any decision.
+    pub fn fast_path_decisions(
+        &self,
+    ) -> Result<Vec<FastPathDecisionInput>, NodeLocalPlanCompilerError> {
+        self.verify()?;
+        Ok(self
+            .decisions
+            .iter()
+            .map(|decision| FastPathDecisionInput {
+                source_identity: decision.source_identity,
+                destination_identity: decision.destination_identity,
+                disposition: decision.disposition,
+                contract_epoch: decision.contract_epoch,
+                plan_index: decision.plan_index,
+            })
+            .collect())
+    }
+
+    /// Produces the exact local compiler context while keeping observations and
+    /// the durable predecessor Node-local.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid time or a mutated snapshot.
+    pub fn compile_context(
+        &self,
+        prior: Option<FastPathPublishedGeneration>,
+        now_unix_ms: u64,
+        now_monotonic_ns: u64,
+    ) -> Result<NodeLocalPlanCompileContext, NodeLocalPlanCompilerError> {
+        self.verify()?;
+        if now_unix_ms == 0 || now_monotonic_ns == 0 {
+            return Err(NodeLocalPlanCompilerError::InvalidInput(
+                "local compiler observation time must be nonzero",
+            ));
+        }
+        let bank = prior.map_or(0, |published| published.bank ^ 1);
+        Ok(NodeLocalPlanCompileContext {
+            membership_revision: self.membership_revision,
+            kernel_transaction_revision: self.generation,
+            map_transaction_revision: self.generation,
+            recipient: self.recipient.clone(),
+            fast_path: FastPathCompileContext {
+                generation: self.generation,
+                policy_revision: self.policy_revision,
+                service_revision: self.service_revision,
+                egress_revision: self.egress_revision,
+                bank,
+                now_unix_ms,
+                now_monotonic_ns,
+            },
+            listen_port: self.listen_port,
+            persistent_keepalive_seconds: self.persistent_keepalive_seconds,
+            prior,
+        })
+    }
+
+    /// Replays this complete snapshot and compiles exact supplied kernel
+    /// readback into a fresh non-serializable local capability.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid snapshot authority, time, predecessor, or readback.
+    pub fn prepare_exact_readback(
+        &self,
+        prior: Option<FastPathPublishedGeneration>,
+        now_unix_ms: u64,
+        now_monotonic_ns: u64,
+        snapshots: &[WireGuardKernelSnapshot],
+    ) -> Result<LinuxPreparedLocalGeneration, NodeLocalPlanCompilerError> {
+        let context = self.compile_context(prior, now_unix_ms, now_monotonic_ns)?;
+        let epochs = self.epoch_plans()?;
+        let decisions = self.fast_path_decisions()?;
+        LinuxPreparedLocalGeneration::compile_exact_readback(
+            context, &epochs, &decisions, snapshots,
+        )
+    }
+
+    /// Replays this complete snapshot and runs the real Linux snapshot-first
+    /// compilation path using only the exact Node-local key authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid snapshot authority, time, predecessor, keys, kernel
+    /// state, or exact-readback-derived map authority.
+    #[cfg(target_os = "linux")]
+    pub async fn prepare_linux(
+        &self,
+        prior: Option<FastPathPublishedGeneration>,
+        now_unix_ms: u64,
+        now_monotonic_ns: u64,
+        key_authority: &NodeKeyAuthority,
+    ) -> Result<LinuxPreparedLocalGeneration, NodeLocalPlanCompilerError> {
+        let context = self.compile_context(prior, now_unix_ms, now_monotonic_ns)?;
+        let epochs = self.epoch_plans()?;
+        let decisions = self.fast_path_decisions()?;
+        LinuxPreparedLocalGeneration::compile_and_stage_linux(
+            context,
+            &epochs,
+            &decisions,
+            key_authority,
+        )
+        .await
+    }
+
+    fn validate_authority(&self) -> Result<(), NodeLocalPlanCompilerError> {
+        if self.schema_version != NODE_LOCAL_PLAN_SNAPSHOT_SCHEMA_VERSION
+            || self.membership_revision == Revision::INITIAL
+            || self.generation == Revision::INITIAL
+            || self.policy_revision == Revision::INITIAL
+            || self.service_revision == Revision::INITIAL
+            || self.egress_revision == Revision::INITIAL
+            || self.recipient.node_name.is_empty()
+            || self.recipient.node_uid.is_empty()
+            || self.listen_port == 0
+            || self.persistent_keepalive_seconds > 600
+            || self.epochs.is_empty()
+            || self.epochs.len() > 2
+            || self.decisions.len() > MAX_FAST_PATH_DECISIONS
+            || self
+                .epochs
+                .iter()
+                .filter(|epoch| epoch.state == FastPathEpochState::Active)
+                .count()
+                != 1
+        {
+            return Err(NodeLocalPlanCompilerError::InvalidInput(
+                "Node-local plan snapshot shape is invalid",
+            ));
+        }
+        let epoch_inputs = self
+            .epochs
+            .iter()
+            .map(|epoch| NodeLocalEpochPlan {
+                contract: &epoch.contract,
+                readiness_digest: epoch.readiness_digest,
+                state: epoch.state,
+                drain_until_monotonic_ns: epoch.drain_until_monotonic_ns,
+            })
+            .collect::<Vec<_>>();
+        let structural_context = NodeLocalPlanCompileContext {
+            membership_revision: self.membership_revision,
+            kernel_transaction_revision: self.generation,
+            map_transaction_revision: self.generation,
+            recipient: self.recipient.clone(),
+            fast_path: FastPathCompileContext {
+                generation: self.generation,
+                policy_revision: self.policy_revision,
+                service_revision: self.service_revision,
+                egress_revision: self.egress_revision,
+                bank: 0,
+                now_unix_ms: 1,
+                now_monotonic_ns: 1,
+            },
+            listen_port: self.listen_port,
+            persistent_keepalive_seconds: self.persistent_keepalive_seconds,
+            prior: None,
+        };
+        validate_context(&structural_context, &epoch_inputs)?;
+        compile_inactive_kernel_plans(&structural_context, &epoch_inputs)?;
+
+        let epoch_numbers = self
+            .epochs
+            .iter()
+            .map(|epoch| contract_epoch(&epoch.contract))
+            .collect::<Result<Vec<_>, _>>()?;
+        if epoch_numbers.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.decisions.windows(2).any(|pair| {
+                (pair[0].source_identity, pair[0].destination_identity)
+                    >= (pair[1].source_identity, pair[1].destination_identity)
+            })
+        {
+            return Err(NodeLocalPlanCompilerError::InvalidInput(
+                "Node-local plan snapshot is not canonical",
+            ));
+        }
+        validate_decision_coverage(self, &epoch_numbers)?;
+        if self.epochs.iter().any(|epoch| {
+            epoch.readiness_digest == [0; 32]
+                || epoch.contract.plans[0].revisions.policy != self.policy_revision
+        }) {
+            return Err(NodeLocalPlanCompilerError::InvalidInput(
+                "epoch readiness or policy revision is not exact",
+            ));
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<NodeLocalPlanSnapshotDigest, NodeLocalPlanCompilerError> {
+        let mut canonical = self.clone();
+        canonical.snapshot_digest = NodeLocalPlanSnapshotDigest([0; 32]);
+        let encoded = serde_json::to_vec(&canonical).map_err(|_| {
+            NodeLocalPlanCompilerError::InvalidInput("Node-local plan snapshot encoding failed")
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(NODE_LOCAL_PLAN_SNAPSHOT_DIGEST_DOMAIN);
+        hasher.update(encoded);
+        Ok(NodeLocalPlanSnapshotDigest(hasher.finalize().into()))
+    }
+}
+
+fn validate_decision_coverage(
+    snapshot: &NodeLocalPlanSnapshot,
+    epoch_numbers: &[u64],
+) -> Result<(), NodeLocalPlanCompilerError> {
+    let mut covered = BTreeSet::new();
+    for decision in &snapshot.decisions {
+        if decision.source_identity.get() == 0 || decision.destination_identity.get() == 0 {
+            return Err(NodeLocalPlanCompilerError::InvalidInput(
+                "decision identity zero is reserved",
+            ));
+        }
+        match decision.disposition {
+            EncryptionDisposition::Native
+                if decision.contract_epoch.is_none() && decision.plan_index.is_none() => {}
+            EncryptionDisposition::Required => {
+                let epoch =
+                    decision
+                        .contract_epoch
+                        .ok_or(NodeLocalPlanCompilerError::InvalidInput(
+                            "required decision has no contract epoch",
+                        ))?;
+                let plan_index =
+                    decision
+                        .plan_index
+                        .ok_or(NodeLocalPlanCompilerError::InvalidInput(
+                            "required decision has no contract plan",
+                        ))?;
+                let epoch_position = epoch_numbers.binary_search(&epoch).map_err(|_| {
+                    NodeLocalPlanCompilerError::InvalidInput(
+                        "required decision references an unknown epoch",
+                    )
+                })?;
+                let plan = snapshot.epochs[epoch_position]
+                    .contract
+                    .plans
+                    .get(plan_index)
+                    .ok_or(NodeLocalPlanCompilerError::InvalidInput(
+                        "required decision references an unknown contract plan",
+                    ))?;
+                if plan.source.identity != decision.source_identity
+                    || plan.destination.identity != decision.destination_identity
+                    || !covered.insert((epoch_position, plan_index))
+                {
+                    return Err(NodeLocalPlanCompilerError::InvalidInput(
+                        "required decision does not exactly cover its contract plan",
+                    ));
+                }
+            }
+            EncryptionDisposition::Native => {
+                return Err(NodeLocalPlanCompilerError::InvalidInput(
+                    "native decision carries transport authority",
+                ));
+            }
+        }
+    }
+    let expected: usize = snapshot
+        .epochs
+        .iter()
+        .map(|epoch| epoch.contract.plans.len())
+        .sum();
+    if covered.len() != expected {
+        return Err(NodeLocalPlanCompilerError::InvalidInput(
+            "required contract plans are not completely covered",
+        ));
+    }
+    Ok(())
 }
 
 impl LinuxPreparedLocalGeneration {
@@ -616,5 +1028,79 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn causal_input_manifold_is_canonical_complete_and_strict() {
+        let contract = contract();
+        let decisions = contract
+            .plans
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| NodeLocalDecisionPlan {
+                source_identity: plan.source.identity,
+                destination_identity: plan.destination.identity,
+                disposition: EncryptionDisposition::Required,
+                contract_epoch: Some(7),
+                plan_index: Some(index),
+            })
+            .collect::<Vec<_>>();
+        let issue = |mut decisions: Vec<NodeLocalDecisionPlan>| {
+            decisions.reverse();
+            NodeLocalPlanSnapshot::issue(NodeLocalPlanSnapshotFields {
+                membership_revision: Revision::new(6),
+                generation: Revision::new(20),
+                recipient: EncryptionGenerationRecipient {
+                    node_name: "worker-a".to_owned(),
+                    node_uid: "uid-a".to_owned(),
+                },
+                policy_revision: Revision::new(3),
+                service_revision: Revision::new(30),
+                egress_revision: Revision::new(40),
+                listen_port: 51_820,
+                persistent_keepalive_seconds: 25,
+                epochs: vec![NodeLocalEpochPlanRecord {
+                    contract: contract.clone(),
+                    readiness_digest: [7; 32],
+                    state: FastPathEpochState::Active,
+                    drain_until_monotonic_ns: 0,
+                }],
+                decisions,
+            })
+            .unwrap()
+        };
+        let manifold = issue(decisions.clone());
+        assert_eq!(manifold, issue(decisions));
+        manifold.verify().unwrap();
+
+        let epoch = manifold.epoch_plans().unwrap()[0];
+        let plans = compile_inactive_kernel_plans(
+            &manifold.compile_context(None, 1_000, 10_000).unwrap(),
+            &[epoch],
+        )
+        .unwrap();
+        let prepared = manifold
+            .prepare_exact_readback(None, 1_000, 10_000, &[snapshot(&plans[0])])
+            .unwrap();
+        assert_eq!(
+            prepared
+                .fact()
+                .checkpoint
+                .desired_state()
+                .unwrap()
+                .decision_authority
+                .len(),
+            4
+        );
+
+        let mut partial = manifold.clone();
+        partial.decisions.pop();
+        assert!(partial.verify().is_err());
+        let mut unknown = serde_json::to_value(manifold).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("serializedAuthority".to_owned(), serde_json::json!([7]));
+        assert!(serde_json::from_value::<NodeLocalPlanSnapshot>(unknown).is_err());
     }
 }

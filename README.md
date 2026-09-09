@@ -864,11 +864,16 @@ path now starts with the Snapshot-First Causal Plan Compiler: it coalesces
 identity-pair contracts into one peer per destination Node/epoch, preflights all
 local keys before mutation, stages real WireGuard state, and lets exact readback
 produce the map checkpoint instead of predicting kernel facts. This passes
-`make encryption-local-plan-compiler-test`; ADR 0177. The authenticated running
-agent input/reconciler, TC consumer/verifier, and live encrypted packet gate
-remain, so no workload packet yet selects the staged route table. The [Phase 9
+`make encryption-local-plan-compiler-test`; ADR 0177. Its inputs now travel as
+one Causally Sealed Input Manifold: a strict Node-scoped digest atomically binds
+every contract, readiness proof, identity decision, and policy/Service/egress
+revision, with exact bidirectional decision-to-plan coverage and no private or
+reusable activation authority. `make encryption-plan-manifold-test`; ADR 0178.
+The authenticated controller/agent delivery loop, TC consumer/verifier, and
+live encrypted packet gate remain, so no workload packet yet selects the staged
+route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0177 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0178 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
