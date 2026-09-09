@@ -1710,6 +1710,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::{
+        EncryptionGenerationRecipient, NodeKeyTransparencyError, NodeKeyTransparencyLedger,
+        NodeKeyTransparencyOutcome,
+    };
 
     const NOW: u64 = 1_000_000;
 
@@ -2246,6 +2250,122 @@ mod tests {
                 &mut generator,
             ),
             Err(KeyAuthorityError::EpochCapacityOrTransition)
+        ));
+    }
+
+    fn transparency_publication(
+        node_name: &str,
+        node_uid: &str,
+        key_byte: u8,
+        topology_revision: Revision,
+    ) -> (AuthenticatedNodeIdentity, NodeKeyPublication) {
+        let mut authority = NodeKeyAuthority::new(
+            "cluster-a".to_owned(),
+            node_name.to_owned(),
+            node_uid.to_owned(),
+        )
+        .unwrap();
+        authority
+            .prepare_epoch(
+                topology_revision,
+                BTreeSet::new(),
+                NOW,
+                NOW + 10_000,
+                &mut FixedGenerator { next: key_byte },
+            )
+            .unwrap();
+        (
+            AuthenticatedNodeIdentity {
+                cluster_id: "cluster-a".to_owned(),
+                node_name: node_name.to_owned(),
+                node_uid: node_uid.to_owned(),
+            },
+            authority.publication().unwrap(),
+        )
+    }
+
+    #[test]
+    fn public_key_transparency_requires_the_complete_exact_membership_cut() {
+        let revision = Revision::new(7);
+        let (identity_a, publication_a) =
+            transparency_publication("worker-a", "uid-a", 21, revision);
+        let (identity_b, publication_b) =
+            transparency_publication("worker-b", "uid-b", 22, revision);
+        let mut members = vec![
+            EncryptionGenerationRecipient {
+                node_name: "worker-b".to_owned(),
+                node_uid: "uid-b".to_owned(),
+            },
+            EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-a".to_owned(),
+            },
+        ];
+        let mut ledger = NodeKeyTransparencyLedger::default();
+        ledger
+            .replace_membership("cluster-a".to_owned(), revision, members.clone())
+            .unwrap();
+        assert_eq!(
+            ledger.observe(&identity_a, publication_a).unwrap(),
+            NodeKeyTransparencyOutcome::Accepted
+        );
+        assert!(ledger.complete_cut().unwrap().is_none());
+        assert_eq!(
+            ledger.observe(&identity_b, publication_b).unwrap(),
+            NodeKeyTransparencyOutcome::Accepted
+        );
+        let cut = ledger.complete_cut().unwrap().unwrap();
+        cut.verify().unwrap();
+        members.sort();
+        assert_eq!(cut.members, members);
+        let wire = serde_json::to_string(&cut).unwrap();
+        assert!(!wire.contains("private"));
+        assert_eq!(cut.publications.len(), 2);
+    }
+
+    #[test]
+    fn public_key_transparency_clears_on_membership_change_and_refuses_replacement() {
+        let revision = Revision::new(7);
+        let member = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-a".to_owned(),
+        };
+        let (identity, publication) = transparency_publication("worker-a", "uid-a", 31, revision);
+        let mut ledger = NodeKeyTransparencyLedger::default();
+        assert!(
+            ledger
+                .replace_membership("cluster-a".to_owned(), revision, vec![member.clone()])
+                .unwrap()
+        );
+        assert_eq!(
+            ledger.observe(&identity, publication.clone()).unwrap(),
+            NodeKeyTransparencyOutcome::Accepted
+        );
+        assert_eq!(
+            ledger.observe(&identity, publication).unwrap(),
+            NodeKeyTransparencyOutcome::Idempotent
+        );
+        assert!(ledger.complete_cut().unwrap().is_some());
+        assert!(
+            ledger
+                .replace_membership(
+                    "cluster-a".to_owned(),
+                    revision.next(),
+                    vec![member.clone()],
+                )
+                .unwrap()
+        );
+        assert!(ledger.complete_cut().unwrap().is_none());
+
+        let (replacement, replacement_publication) =
+            transparency_publication("worker-a", "replacement-uid", 32, revision.next());
+        assert!(matches!(
+            ledger.observe(&replacement, replacement_publication),
+            Err(NodeKeyTransparencyError::ForeignMembership)
+        ));
+        assert!(matches!(
+            ledger.replace_membership("cluster-a".to_owned(), revision, vec![member]),
+            Err(NodeKeyTransparencyError::MembershipRegression)
         ));
     }
 }

@@ -875,7 +875,7 @@ matrix is maintained in the
   route readback, safe MTU derivation, foreign-state refusal, injected rollback,
   replay, and positive cleanup pass `make encryption-kernel-provider-test` and
   the privileged live-kernel gate; ADR 0161. Workload selection remains 9.5.
-- Phase 9.5a–9.5t now provide the canonical coalesced compiler and Causal Epoch
+- Phase 9.5a–9.5u now provide the canonical coalesced compiler and Causal Epoch
   Lease, Causal Commit Vector, isolated fixed-shape Aya ABI, Proof-Carrying Aya
   Map Mirror with delta-minimal recovery, and Cooperative Route-Mark Lease. The
   latter gives every admitted outer `WireGuard` bypass mark a collision-free
@@ -947,8 +947,11 @@ matrix is maintained in the
   visibility now passes through a Fleet-Synchronous Plan Cut: explicit exact
   membership, common causal revisions, and one atomic catalog swap prevent
   partial fleet publication; `make encryption-plan-catalog-test` and ADR 0181.
-  Authoritative cut production, local compile, the TC consumer, verifier
-  loading, and live encrypted packets remain within milestone 9.5.
+  Node-local key ownership now feeds a public-only transparency ledger that
+  exposes facts only after every exact current member is present at one topology
+  revision; `make encryption-key-transparency-test` and ADR 0182. Runtime key
+  publication, authoritative plan production, local compile, the TC consumer,
+  verifier loading, and live encrypted packets remain within milestone 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,

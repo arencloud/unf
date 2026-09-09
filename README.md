@@ -879,11 +879,15 @@ adoption and startup validates it before BPF access;
 is protected by a Fleet-Synchronous Plan Cut: explicit membership and common
 causal revisions become visible with one atomic catalog swap, never per-Node
 partial publication; `make encryption-plan-catalog-test`; ADR 0181.
-Authoritative cut production, local compile, the TC consumer/verifier, and live
+Node-local public epochs now join through an exact-membership transparency cut;
+topology changes clear observations and incomplete fleets expose nothing, while
+private keys never cross the Node boundary;
+`make encryption-key-transparency-test`; ADR 0182. Runtime key publication,
+authoritative cut production, local compile, the TC consumer/verifier, and live
 encrypted packet gate remain, so no workload packet yet selects the staged
 route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0181 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0182 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
