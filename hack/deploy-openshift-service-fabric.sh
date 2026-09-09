@@ -456,11 +456,15 @@ assert_host_service_path() {
 }
 
 transition_agent() {
-    local node=$1 pod current_image old_uid
+    local node=$1 pod current_image old_uid pod_revision desired_revision
     pod=$(agent_pod_on_node "${node}")
     [[ -n ${pod} ]]
     current_image=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.spec.containers[0].image}')
-    if [[ ${current_image} != "${agent_image}" ]]; then
+    pod_revision=$("${kc[@]}" -n unf-system get pod "${pod}" \
+        -o jsonpath='{.metadata.labels.controller-revision-hash}')
+    desired_revision=$("${kc[@]}" -n unf-system get daemonset unf-agent \
+        -o jsonpath='{.status.updateRevision}')
+    if [[ ${current_image} != "${agent_image}" || ${pod_revision} != "${desired_revision}" ]]; then
         old_uid=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.metadata.uid}')
         echo "transitioning UNF agent on ${node} to persistent BPF ABI v${persistent_abi}"
         "${kc[@]}" -n unf-system delete pod "${pod}" --wait=false >/dev/null
