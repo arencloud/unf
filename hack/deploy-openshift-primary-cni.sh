@@ -150,6 +150,9 @@ for node in "${nodes[@]}"; do
             test "$(sysctl -n net.ipv4.ip_forward)" = 1
             test "$(sysctl -n net.ipv6.conf.all.forwarding)" = 1
             test "$(sysctl -n net.ipv6.conf.default.forwarding)" = 1
+            test "$(sysctl -n net.ipv6.conf.all.proxy_ndp)" = 1
+            test "$(sysctl -n net.ipv6.conf.default.proxy_ndp)" = 1
+            test "$(sysctl -n net.ipv6.conf.br-ex.proxy_ndp)" = 1
             test "$(sysctl -n net.ipv4.conf.all.rp_filter)" = 0
             test "$(sysctl -n net.ipv4.conf.default.rp_filter)" = 0
             test "$(sysctl -n net.ipv4.conf.all.accept_local)" = 1

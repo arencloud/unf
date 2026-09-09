@@ -591,7 +591,9 @@ for node in "${nodes[@]}"; do
         for key in all default; do
             test "$(cat /proc/sys/net/ipv4/conf/${key}/rp_filter)" -eq 0
             test "$(cat /proc/sys/net/ipv4/conf/${key}/accept_local)" -eq 1
+            test "$(cat /proc/sys/net/ipv6/conf/${key}/proxy_ndp)" -eq 1
         done
+        test "$(cat /proc/sys/net/ipv6/conf/br-ex/proxy_ndp)" -eq 1
         for path in /proc/sys/net/ipv4/conf/*/rp_filter; do test "$(cat "$path")" -eq 0; done
         for path in /proc/sys/net/ipv4/conf/*/accept_local; do test "$(cat "$path")" -eq 1; done
         ! iptables-save | grep -Eq "KUBE-(SVC|SEP)-"

@@ -57,6 +57,9 @@ grep -q 'ip: 192.0.2.1' "${temporary_dir}/runtime.yaml"
 grep -q 'https://unf-primary-controller.internal:9964' "${temporary_dir}/runtime.yaml"
 [[ $(grep -c 'path: /etc/sysctl.d/90-unf-primary-cni.conf' "${temporary_dir}/machineconfig.yaml") -eq 2 ]]
 for setting in \
+    'net.ipv6.conf.all.proxy_ndp%3D1' \
+    'net.ipv6.conf.default.proxy_ndp%3D1' \
+    'net.ipv6.conf.br-ex.proxy_ndp%3D1' \
     'net.ipv4.conf.default.rp_filter%3D0' \
     'net.ipv4.conf.%2A.rp_filter%3D0' \
     'net.ipv4.conf.default.accept_local%3D1' \
