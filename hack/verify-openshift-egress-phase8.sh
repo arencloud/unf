@@ -18,6 +18,7 @@ gateway_label=network.unf.io/egress-gateway
 drain_label=network.unf.io/egress-drain
 pool_v4=${UNF_OPENSHIFT_EGRESS_IPV4_POOL:-10.50.60.232/31}
 pool_v6=${UNF_OPENSHIFT_EGRESS_IPV6_POOL:-2a02:abcd:1234:5600::e8/127}
+external_port=${UNF_OPENSHIFT_EGRESS_FIXTURE_PORT:-28080}
 expected_address_ack="${pool_v4},${pool_v6}"
 started_unix=$(date +%s)
 stage=initialization
@@ -221,7 +222,7 @@ peer_probe() {
     local pod=$1 destination=$2 expected_kind=$3 observed= canonical=
     for _ in $(seq 1 15); do
         observed=$("${kc[@]}" -n "${namespace}" exec "${pod}" -- \
-            wget -T 5 -t 1 -qO- "http://${destination}:18080/peer" 2>/dev/null || true)
+            wget -T 5 -t 1 -qO- "http://${destination}:${external_port}/peer" 2>/dev/null || true)
         if [[ -n ${observed} ]]; then
             canonical=$(canonical_ip "${observed}" 2>/dev/null || true)
             if [[ ${expected_kind} == native ]]; then
@@ -295,6 +296,8 @@ external_v4=$(jq -er --arg node "${external_node}" '.items[] | select(.metadata.
     | [.status.addresses[] | select(.type == "InternalIP" and (.address | contains(".")))][0].address' <<<"${nodes_json}")
 external_v6=$(jq -er --arg node "${external_node}" '.items[] | select(.metadata.name == $node)
     | [.status.addresses[] | select(.type == "InternalIP" and (.address | contains(":")))][0].address' <<<"${nodes_json}")
+node_exec "${external_node}" sh -euc \
+    '! ss -lnt | grep -qE ":${1}([[:space:]]|$)"' sh "${external_port}"
 [[ $("${kc[@]}" get egresspools.network.unf.io -o json | jq '.items | length') == 0 ]]
 [[ $("${kc[@]}" get egresspolicies.network.unf.io -o json | jq '.items | length') == 0 ]]
 [[ -z $("${kc[@]}" get nodes -l "${gateway_label}" -o name) ]]
@@ -344,7 +347,7 @@ spec:
     - name: server
       image: ${test_tools_image}
       imagePullPolicy: IfNotPresent
-      command: [sh, -ec, "exec /usr/local/bin/unf-flow-receiver 18080"]
+      command: [sh, -ec, "exec /usr/local/bin/unf-flow-receiver ${external_port}"]
       securityContext: {privileged: true}
 ---
 apiVersion: v1
@@ -430,7 +433,7 @@ for _ in $(seq 1 60); do
 done
 kill -0 "${controller_forward_pid}"
 operations_request=$(jq -nc --arg from "${namespace}/managed" --arg destination "${external_v4}" \
-    '{from:$from,destination:$destination,protocol:"tcp",port:18080}')
+    --argjson port "${external_port}" '{from:$from,destination:$destination,protocol:"tcp",port:$port}')
 for operations_attempts in $(seq 1 30); do
     operations_explain=$(curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' \
         --data-binary "${operations_request}" "http://127.0.0.1:${controller_port}/v1/egress/explain")
@@ -461,7 +464,7 @@ drained_state=
 for _ in $(seq 1 180); do
     active_state=$(control_plane_state 2>/dev/null || true)
     observed=$("${kc[@]}" -n "${namespace}" exec managed -- \
-        wget -T 2 -t 1 -qO- "http://${external_v4}:18080/peer" 2>/dev/null || true)
+        wget -T 2 -t 1 -qO- "http://${external_v4}:${external_port}/peer" 2>/dev/null || true)
     if [[ -z ${observed} ]] || ! jq -e --arg address "$(canonical_ip "${observed}" 2>/dev/null || true)" \
         '.allocation.leases[0].addresses | index($address) != null' <<<"${active_state}" >/dev/null 2>&1; then
         traffic_failures=$((traffic_failures + 1))
