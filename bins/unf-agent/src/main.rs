@@ -87,7 +87,7 @@ use unf_egress::{
 };
 use unf_encryption::{
     AdmittedEncryptionGeneration, EncryptionGenerationFact, EncryptionGenerationRequest,
-    LinuxPreparedLocalGeneration, NodeSealedGenerationCapsule,
+    LinuxPreparedLocalGeneration, NodeLocalRecoveryPlan, NodeSealedGenerationCapsule,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -1020,17 +1020,125 @@ struct EncryptionGenerationSynchronizer {
     node_name: String,
     state_path: PathBuf,
     current: Option<AdmittedEncryptionGeneration>,
+    recovery_plan_path: PathBuf,
+    recovery: EncryptionRecoveryJournal,
+    active_revalidated: bool,
     pending: Option<PendingEncryptionGeneration>,
+}
+
+const ENCRYPTION_RECOVERY_JOURNAL_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct EncryptionRecoveryJournal {
+    schema_version: u16,
+    active: Option<NodeLocalRecoveryPlan>,
+    pending: Option<NodeLocalRecoveryPlan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncryptionRecoverySlot {
+    Active,
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncryptionRecoveryAdmission {
+    Pending,
+    Active,
+    None,
+}
+
+fn select_encryption_recovery_slot(
+    admission: EncryptionRecoveryAdmission,
+    active_revalidated: bool,
+    has_pending: bool,
+) -> Option<(EncryptionRecoverySlot, bool)> {
+    if admission == EncryptionRecoveryAdmission::Pending {
+        Some((EncryptionRecoverySlot::Pending, true))
+    } else if admission == EncryptionRecoveryAdmission::Active && !active_revalidated {
+        Some((EncryptionRecoverySlot::Active, true))
+    } else if has_pending {
+        Some((EncryptionRecoverySlot::Pending, false))
+    } else {
+        None
+    }
 }
 
 /// Volatile, single-owner generation state. Neither variant is serializable:
 /// restart must reconstruct local kernel proof instead of reviving authority.
 enum PendingEncryptionGeneration {
-    Prepared(Box<LinuxPreparedLocalGeneration>),
+    Prepared {
+        prepared: Box<LinuxPreparedLocalGeneration>,
+        slot: EncryptionRecoverySlot,
+    },
     ControllerAdmitted {
         prepared: Box<LinuxPreparedLocalGeneration>,
         admitted: Box<AdmittedEncryptionGeneration>,
+        slot: EncryptionRecoverySlot,
     },
+}
+
+impl EncryptionRecoveryJournal {
+    const fn empty() -> Self {
+        Self {
+            schema_version: ENCRYPTION_RECOVERY_JOURNAL_SCHEMA_VERSION,
+            active: None,
+            pending: None,
+        }
+    }
+
+    fn verify(
+        &self,
+        node_name: &str,
+        current: Option<&AdmittedEncryptionGeneration>,
+    ) -> Result<()> {
+        if self.schema_version != ENCRYPTION_RECOVERY_JOURNAL_SCHEMA_VERSION {
+            bail!("unsupported encryption recovery journal schema");
+        }
+        for plan in self.active.iter().chain(self.pending.iter()) {
+            plan.verify().context("verify encryption recovery plan")?;
+            if plan.fact.recipient.node_name != node_name {
+                bail!(
+                    "encryption recovery plan targets Node {:?}, local Node is {:?}",
+                    plan.fact.recipient.node_name,
+                    node_name
+                );
+            }
+        }
+        match (&self.active, &self.pending) {
+            (Some(active), Some(pending))
+                if active.fact.recipient == pending.fact.recipient
+                    && pending.fact.checkpoint.transaction.prior
+                        == Some(active.fact.checkpoint.transaction.desired.published) => {}
+            (Some(_), Some(_)) => bail!("pending encryption recovery plan does not extend active"),
+            (None, Some(pending)) if pending.fact.checkpoint.transaction.prior.is_none() => {}
+            (None, Some(_)) => bail!("encryption recovery journal has an orphan successor"),
+            _ => {}
+        }
+        let matches_current =
+            |plan: &NodeLocalRecoveryPlan, admitted: &AdmittedEncryptionGeneration| {
+                plan.fact.recipient == admitted.recipient
+                    && plan.fact.checkpoint == admitted.checkpoint
+            };
+        match current {
+            Some(admitted)
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|plan| matches_current(plan, admitted))
+                    || self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|plan| matches_current(plan, admitted)) =>
+            {
+                Ok(())
+            }
+            Some(_) => bail!("encryption recovery journal does not bind the durable admission"),
+            None if self.active.is_none() => Ok(()),
+            None => bail!("active encryption recovery plan has no durable admission"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -6753,11 +6861,16 @@ async fn run_dataplane(
         config.encryption_fast_path_state_path.clone(),
         encryption_pins_existed,
     )?;
+    encryption_generations.rehydrate_local_proof().await?;
+    activate_admitted_encryption_generation(&mut encryption_generations, &mut encryption).await?;
     if encryption.requires_local_revalidation() {
         bail!(
-            "recovered encryption authority requires a fresh Node-local tri-plane activation latch before TC attachment"
+            "recovered encryption authority requires a fresh Node-local tri-plane activation latch before TC attachment; exact proof rehydration was unavailable"
         );
     }
+    // Rehydrating the active slot may reveal a separately durable successor.
+    // Only after current authority is safe may that proposal resume exchange.
+    encryption_generations.rehydrate_local_proof().await?;
     let controller_management_port = controller_url.as_deref().map(controller_port).transpose()?;
     let egress_bgp = initialize_egress_bgp(
         config.egress_bgp_config_path.as_deref(),
@@ -6857,7 +6970,7 @@ async fn run_dataplane(
         flow_export_sender.as_ref(),
         cancellation,
     )
-    .await;
+    .await?;
     drop(flow_export_sender);
     await_background_task(flow_export_task, "flow exporter").await;
     state.ready.store(false, Ordering::Release);
@@ -7412,6 +7525,7 @@ impl EncryptionGenerationSynchronizer {
         if !state_path.is_absolute() {
             bail!("encryption generation state path must be absolute");
         }
+        let recovery_plan_path = encryption_recovery_plan_path(&state_path)?;
         let current = match fs::symlink_metadata(&state_path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).context("inspect encryption generation state"),
@@ -7431,6 +7545,18 @@ impl EncryptionGenerationSynchronizer {
                 Some(current)
             }
         };
+        let recovery = match fs::symlink_metadata(&recovery_plan_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                EncryptionRecoveryJournal::empty()
+            }
+            Err(error) => return Err(error).context("inspect encryption recovery plan"),
+            Ok(_) => {
+                let recovery: EncryptionRecoveryJournal =
+                    load_secure_json(&recovery_plan_path, "encryption recovery plan")?;
+                recovery.verify(&node_name, current.as_ref())?;
+                recovery
+            }
+        };
         Ok(Self {
             controller_url,
             client,
@@ -7439,6 +7565,9 @@ impl EncryptionGenerationSynchronizer {
             node_name,
             state_path,
             current,
+            recovery_plan_path,
+            recovery,
+            active_revalidated: false,
             pending: None,
         })
     }
@@ -7465,7 +7594,9 @@ impl EncryptionGenerationSynchronizer {
         }
         if let Some(pending) = &self.pending {
             let existing = match pending {
-                PendingEncryptionGeneration::Prepared(existing)
+                PendingEncryptionGeneration::Prepared {
+                    prepared: existing, ..
+                }
                 | PendingEncryptionGeneration::ControllerAdmitted {
                     prepared: existing, ..
                 } => existing,
@@ -7475,27 +7606,143 @@ impl EncryptionGenerationSynchronizer {
             }
             bail!("a different encryption generation capability is already in flight");
         }
-        self.pending = Some(PendingEncryptionGeneration::Prepared(Box::new(prepared)));
+        if let Some(existing) = &self.recovery.pending {
+            if existing != prepared.recovery_plan() {
+                bail!("a different durable encryption recovery plan is already pending");
+            }
+        } else {
+            let mut recovery = self.recovery.clone();
+            recovery.pending = Some(prepared.recovery_plan().clone());
+            recovery.verify(&self.node_name, self.current.as_ref())?;
+            persist_secure_json(
+                &self.recovery_plan_path,
+                &recovery,
+                "encryption recovery plan",
+            )?;
+            self.recovery = recovery;
+        }
+        self.pending = Some(PendingEncryptionGeneration::Prepared {
+            prepared: Box::new(prepared),
+            slot: EncryptionRecoverySlot::Pending,
+        });
+        Ok(true)
+    }
+
+    /// Rebuilds volatile proof only from exact fresh Linux readback. A durable
+    /// plan or controller admission is never treated as activation authority.
+    async fn rehydrate_local_proof(&mut self) -> Result<bool> {
+        if self.pending.is_some() {
+            return Ok(false);
+        }
+        let current = self.current.as_ref();
+        let pending_matches_admission = self.recovery.pending.as_ref().is_some_and(|plan| {
+            current.is_some_and(|admitted| {
+                admitted.recipient == plan.fact.recipient
+                    && admitted.checkpoint == plan.fact.checkpoint
+            })
+        });
+        let active_matches_admission = self.recovery.active.as_ref().is_some_and(|plan| {
+            current.is_some_and(|admitted| {
+                admitted.recipient == plan.fact.recipient
+                    && admitted.checkpoint == plan.fact.checkpoint
+            })
+        });
+        let admission = if pending_matches_admission {
+            EncryptionRecoveryAdmission::Pending
+        } else if active_matches_admission {
+            EncryptionRecoveryAdmission::Active
+        } else {
+            EncryptionRecoveryAdmission::None
+        };
+        let Some((slot, has_admission)) = select_encryption_recovery_slot(
+            admission,
+            self.active_revalidated,
+            self.recovery.pending.is_some(),
+        ) else {
+            return Ok(false);
+        };
+        let recovery = match slot {
+            EncryptionRecoverySlot::Active => self.recovery.active.as_ref(),
+            EncryptionRecoverySlot::Pending => self.recovery.pending.as_ref(),
+        };
+        let Some(recovery) = recovery else {
+            return Ok(false);
+        };
+        let prepared = recovery
+            .rehydrate_linux()
+            .await
+            .context("rehydrate encryption proof from exact Linux readback")?;
+        if has_admission {
+            let current = current.context("selected encryption recovery slot has no admission")?;
+            prepared
+                .verify_controller_admission(current)
+                .context("bind recovered local proof to durable controller admission")?;
+            self.pending = Some(PendingEncryptionGeneration::ControllerAdmitted {
+                prepared: Box::new(prepared),
+                admitted: Box::new(current.clone()),
+                slot,
+            });
+            return Ok(true);
+        }
+        let expected_prior = self
+            .current
+            .as_ref()
+            .map(AdmittedEncryptionGeneration::published);
+        if prepared.fact().checkpoint.transaction.prior != expected_prior {
+            bail!("rehydrated pending encryption plan does not extend durable admission");
+        }
+        self.pending = Some(PendingEncryptionGeneration::Prepared {
+            prepared: Box::new(prepared),
+            slot,
+        });
         Ok(true)
     }
 
     fn prepared_fact(&self) -> Option<&EncryptionGenerationFact> {
         match self.pending.as_ref()? {
-            PendingEncryptionGeneration::Prepared(prepared) => Some(prepared.fact()),
+            PendingEncryptionGeneration::Prepared { prepared, .. } => Some(prepared.fact()),
             PendingEncryptionGeneration::ControllerAdmitted { .. } => None,
         }
     }
 
-    #[allow(dead_code)]
-    fn admitted_capability(
-        &self,
-    ) -> Option<(&LinuxPreparedLocalGeneration, &AdmittedEncryptionGeneration)> {
-        match self.pending.as_ref()? {
-            PendingEncryptionGeneration::Prepared(_) => None,
-            PendingEncryptionGeneration::ControllerAdmitted { prepared, admitted } => {
-                Some((prepared.as_ref(), admitted.as_ref()))
+    fn take_admitted_capability(
+        &mut self,
+    ) -> Option<(
+        LinuxPreparedLocalGeneration,
+        AdmittedEncryptionGeneration,
+        EncryptionRecoverySlot,
+    )> {
+        let pending = self.pending.take()?;
+        match pending {
+            PendingEncryptionGeneration::Prepared { prepared, slot } => {
+                self.pending = Some(PendingEncryptionGeneration::Prepared { prepared, slot });
+                None
+            }
+            PendingEncryptionGeneration::ControllerAdmitted {
+                prepared,
+                admitted,
+                slot,
+            } => Some((*prepared, *admitted, slot)),
+        }
+    }
+
+    fn record_activation(&mut self, slot: EncryptionRecoverySlot) -> Result<()> {
+        match slot {
+            EncryptionRecoverySlot::Active => self.active_revalidated = true,
+            EncryptionRecoverySlot::Pending => {
+                let mut recovery = self.recovery.clone();
+                recovery.active = recovery.pending.take();
+                recovery.verify(&self.node_name, self.current.as_ref())?;
+                persist_secure_json(
+                    &self.recovery_plan_path,
+                    &recovery,
+                    "encryption recovery plan",
+                )?;
+                self.recovery = recovery;
+                self.active_revalidated = true;
             }
         }
+        Ok(())
     }
 
     fn admit_exact_echo(
@@ -7508,7 +7755,7 @@ impl EncryptionGenerationSynchronizer {
             .admit(request, self.current.as_ref())
             .context("admit exact encryption generation successor")?;
         let prepared = match self.pending.as_ref() {
-            Some(PendingEncryptionGeneration::Prepared(prepared)) => prepared,
+            Some(PendingEncryptionGeneration::Prepared { prepared, .. }) => prepared,
             Some(PendingEncryptionGeneration::ControllerAdmitted { .. }) => {
                 bail!("encryption generation already has controller admission")
             }
@@ -7535,15 +7782,24 @@ impl EncryptionGenerationSynchronizer {
             .pending
             .take()
             .context("prepared encryption capability disappeared after persistence")?;
-        let PendingEncryptionGeneration::Prepared(prepared) = pending else {
+        let PendingEncryptionGeneration::Prepared { prepared, slot } = pending else {
             bail!("encryption capability changed after desired-state persistence");
         };
         self.pending = Some(PendingEncryptionGeneration::ControllerAdmitted {
             prepared,
             admitted: Box::new(candidate.clone()),
+            slot,
         });
         Ok(candidate)
     }
+}
+
+fn encryption_recovery_plan_path(state_path: &Path) -> Result<PathBuf> {
+    let file_name = state_path
+        .file_name()
+        .context("encryption generation state path must name a file")?
+        .to_string_lossy();
+    Ok(state_path.with_file_name(format!("{file_name}.recovery-plan")))
 }
 
 async fn synchronize_encryption_generation(
@@ -7601,6 +7857,23 @@ async fn synchronize_encryption_generation(
     synchronizer
         .admit_exact_echo(&request, &capsule, &fact)
         .map(|_| true)
+}
+
+async fn activate_admitted_encryption_generation(
+    generations: &mut EncryptionGenerationSynchronizer,
+    encryption: &mut EncryptionMapSynchronizer,
+) -> Result<bool> {
+    let Some((prepared, admitted, slot)) = generations.take_admitted_capability() else {
+        return Ok(false);
+    };
+    encryption
+        .apply_linux_generation(prepared, admitted)
+        .await
+        .context("consume proof-rehydrated encryption activation escrow")?;
+    generations
+        .record_activation(slot)
+        .context("commit encryption recovery escrow slot")?;
+    Ok(true)
 }
 
 async fn preflight_controller_compatibility(
@@ -13025,11 +13298,11 @@ async fn consume_events(
     services: &mut ServiceSynchronizer,
     egress: &mut EgressSynchronizer,
     encryption_generations: &mut EncryptionGenerationSynchronizer,
-    _encryption: &mut EncryptionMapSynchronizer,
+    encryption: &mut EncryptionMapSynchronizer,
     state: &AgentState,
     flow_export_sender: Option<&mpsc::Sender<FlowExportRecord>>,
     cancellation: CancellationToken,
-) {
+) -> Result<()> {
     let mut observed_egress_attempts = 0_u64;
     let mut observed_egress_ring_drops = 0_u64;
     let mut event_interval = tokio::time::interval(Duration::from_millis(25));
@@ -13088,8 +13361,16 @@ async fn consume_events(
             }
             _ = encryption_interval.tick(), if encryption_generations.controller_url.is_some()
                 && encryption_generations.prepared_fact().is_some() => {
-                if let Err(error) = synchronize_encryption_generation(encryption_generations).await {
-                    warn!(%error, "encryption generation synchronization failed; retaining durable desired predecessor and active local authority");
+                match synchronize_encryption_generation(encryption_generations).await {
+                    Ok(true) => {
+                        activate_admitted_encryption_generation(encryption_generations, encryption)
+                            .await
+                            .context("activate newly admitted encryption generation")?;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(%error, "encryption generation synchronization failed; retaining durable desired predecessor and active local authority");
+                    }
                 }
             }
             _ = egress_loss_interval.tick() => {
@@ -13151,6 +13432,7 @@ async fn consume_events(
             }
         }
     }
+    Ok(())
 }
 
 fn drain_service_events(
@@ -16253,6 +16535,56 @@ mod tests {
                 state_path,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn encryption_recovery_plan_is_owner_only_and_fail_closed() {
+        let temporary = tempdir().unwrap();
+        let state_path = temporary.path().join("encryption-generation.json");
+        let recovery_path = encryption_recovery_plan_path(&state_path).unwrap();
+        assert_eq!(
+            recovery_path,
+            temporary
+                .path()
+                .join("encryption-generation.json.recovery-plan")
+        );
+        persist_secure_json(
+            &recovery_path,
+            &serde_json::json!({"schemaVersion": 1, "serializedLatch": [7]}),
+            "encryption recovery plan",
+        )
+        .unwrap();
+        assert!(
+            EncryptionGenerationSynchronizer::recover(
+                None,
+                test_controller_client(),
+                temporary.path().join("token"),
+                Duration::from_secs(2),
+                "worker-a".to_owned(),
+                state_path,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn encryption_recovery_slot_prioritizes_admitted_successor_then_current() {
+        assert_eq!(
+            select_encryption_recovery_slot(EncryptionRecoveryAdmission::Pending, false, true),
+            Some((EncryptionRecoverySlot::Pending, true))
+        );
+        assert_eq!(
+            select_encryption_recovery_slot(EncryptionRecoveryAdmission::Active, false, true),
+            Some((EncryptionRecoverySlot::Active, true))
+        );
+        assert_eq!(
+            select_encryption_recovery_slot(EncryptionRecoveryAdmission::Active, true, true),
+            Some((EncryptionRecoverySlot::Pending, false))
+        );
+        assert_eq!(
+            select_encryption_recovery_slot(EncryptionRecoveryAdmission::Active, true, false),
+            None
         );
     }
 

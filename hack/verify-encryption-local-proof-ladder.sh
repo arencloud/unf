@@ -24,10 +24,13 @@ require_text 'causal_proof_ladder_refuses_controller_substitution_and_reuse' cra
 require_text 'Capability-Typed Causal Proof Ladder' docs/adr/0173-capability-typed-causal-proof-ladder.md
 require_text 'encryption-local-proof-ladder-test' docs/project-status.md
 
-if grep -Eq 'derive\([^)]*(Serialize|Deserialize)[^)]*\)' crates/unf-encryption/src/local_orchestrator.rs; then
-  echo "Node-local proof capabilities must not be serializable" >&2
-  exit 1
-fi
+for capability in ControllerAdmittedLocalGeneration LinuxPreparedLocalGeneration; do
+  if grep -B 3 "pub struct ${capability} {" crates/unf-encryption/src/local_orchestrator.rs \
+    | grep -Eq 'derive\([^)]*(Serialize|Deserialize|Clone)[^)]*\)'; then
+    echo "Node-local proof capability ${capability} must not be cloneable or serializable" >&2
+    exit 1
+  fi
+done
 
 if grep -Eq 'permit\.clone\(\)' crates/unf-encryption/src/fast_path.rs; then
   echo "route publication permits must remain consuming capabilities" >&2

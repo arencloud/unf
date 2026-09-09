@@ -1035,12 +1035,12 @@ mod tests {
         EncryptionRouteFamily, FastPathMapCheckpoint, FastPathMapRecoveryAction,
         FastPathMapTransaction, FastPathPublishedGeneration, FastPathTransactionError, IpPrefix,
         LinuxPreparedLocalGeneration, ManagedIdentitySelector, NodeLocalGenerationProposal,
-        NodeLocalOrchestratorError, NodeSealedGenerationCapsule, PreparedNodeEncryptionGeneration,
-        UNF_ENCRYPTION_RULE_PRIORITY_BASE, UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily,
-        UnderlayMtuObservation, WireGuardEpochActivation, WireGuardKernelPlan,
-        WireGuardKernelPlanInput, WireGuardKernelSnapshotInput, WireGuardMtuEnvelope,
-        WireGuardPeerPlan, WireGuardPeerReadback, WireGuardPublicKey, WireGuardRouteReadback,
-        WireGuardRouteScope,
+        NodeLocalOrchestratorError, NodeLocalRecoveryPlan, NodeSealedGenerationCapsule,
+        PreparedNodeEncryptionGeneration, UNF_ENCRYPTION_RULE_PRIORITY_BASE,
+        UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily, UnderlayMtuObservation,
+        WireGuardEpochActivation, WireGuardKernelPlan, WireGuardKernelPlanInput,
+        WireGuardKernelSnapshotInput, WireGuardMtuEnvelope, WireGuardPeerPlan,
+        WireGuardPeerReadback, WireGuardPublicKey, WireGuardRouteReadback, WireGuardRouteScope,
     };
 
     struct Fixture {
@@ -2189,6 +2189,42 @@ mod tests {
             prepared.verify_controller_admission(&substituted),
             Err(NodeLocalOrchestratorError::ControllerSubstitution)
         ));
+    }
+
+    #[test]
+    fn recovery_plan_rehydrates_fresh_capability_and_rejects_serialized_authority() {
+        let fixture = fixture(7);
+        let state = required_state(&fixture, context_at(1, 21));
+        let checkpoint = FastPathMapCheckpoint::begin(Revision::new(21), &state, None).unwrap();
+        let prepared = LinuxPreparedLocalGeneration::bind_exact_readback(
+            Revision::new(9),
+            EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-worker-a".to_owned(),
+            },
+            checkpoint,
+            &[inactive_plan(&fixture)],
+            std::slice::from_ref(&fixture.snapshot),
+        )
+        .unwrap();
+        let recovery = prepared.recovery_plan().clone();
+        recovery.verify().unwrap();
+        let rehydrated = recovery
+            .rehydrate_exact_readback(std::slice::from_ref(&fixture.snapshot))
+            .unwrap();
+        assert_eq!(rehydrated.fact(), prepared.fact());
+        assert_eq!(rehydrated.witness(), prepared.witness());
+        assert!(recovery.rehydrate_exact_readback(&[]).is_err());
+
+        let mut mutated = recovery.clone();
+        mutated.plans[0].plan_digest.0[0] ^= 1;
+        assert!(mutated.verify().is_err());
+        let mut encoded = serde_json::to_value(recovery).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .insert("serializedLatch".to_owned(), serde_json::json!(vec![7; 32]));
+        assert!(serde_json::from_value::<NodeLocalRecoveryPlan>(encoded).is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Phase 9 attested encryption-fabric execution plan
 
-Last reviewed: **2026-09-09**
+Last reviewed: **2026-09-10**
 
 Phase 9 implements master-prompt §25 as an identity-bound encryption fabric.
 It starts with kernel WireGuard for intra-cluster L3 transport and prepares a
@@ -18,7 +18,7 @@ separately revisioned. The authoritative state remains in
 | 9.2 | Encryption intent and path-contract model | **Verified** | `unf-encryption` provides a bounded canonical cluster baseline plus monotonic identity-pair intent and schema-v1 exact-source-Node Attested Encryption Path Contracts. Policy precedes public-key/epoch and bidirectional route admission; Node identities, lifetimes, capabilities, Pod CIDR `AllowedIPs`, interface/route/fwmark/MTU facts, and five revisions bind domain-separated golden digests and witnesses. Independent replay, explicit deny-only failure envelopes, mutation/property/strict-wire tests, and Clippy pass `make encryption-contract-test`; ADR 0159. No private key or runtime mutation exists |
 | 9.3 | Node key authority and epoch rotation | **Verified** | `unf-encryption` generates X25519/WireGuard keys directly from the OS CSPRNG into zeroizing memory, exposes secret material only to the future local kernel-provider boundary, and copy-persist-commits at most two epochs to a digest-checked atomic mode-0600 Node-UID-bound checkpoint. The Causal Epoch Barrier seals the exact affected-peer frontier/topology revision and requires every authenticated acknowledgement before activation; rotation, positive zero-flow/zero-route retirement, emergency revocation, public-only monotonic publication, replay/replacement fencing, restart/tamper recovery, and strict Clippy pass `make encryption-key-authority-test`; ADR 0160. No interface or packet mutation exists |
 | 9.4 | Transactional kernel WireGuard provider | **Verified** | Typed Rust generic-netlink/rtnetlink configures bounded dual-stack interfaces, complete peer sets, isolated routes, fwmarks, and derived safe MTUs. Proof-Carrying Kernel Transactions bind secret-free before/desired/readback digests and total restart actions; exact ownership aliases, sorted overlap/route indexes, injected rollback, foreign-state preservation, readback/replay, adjacent capability negotiation, and positive cleanup pass `make encryption-kernel-provider-test` plus the independently privileged `make encryption-kernel-provider-live-test`; ADR 0161. No workload packet selects the staged table |
-| 9.5 | Intent-Coalesced Cryptographic Fast Path | **In progress** | Phase 9.5a adds the canonical compiler and Causal Epoch Lease. Phase 9.5b adds the Causal Commit Vector and total recovery contract. Phase 9.5c–9.5f add the isolated proof-carrying Aya ABI, Cooperative Route-Mark Lease, and Route-Before-Authority. Phase 9.5g–9.5h add authenticated exact-successor delivery and the non-serializable Tri-Plane Causal Activation Latch. Phase 9.5i–9.5k add the durable complete frontier and authenticated fact reconciliation; 9.5l makes local proof ordering a consuming capability ladder. Phase 9.5m adds the Proof-Carrying Linux Convergence Capsule. Phase 9.5n adds the Echo-Sealed Agent Anti-Entropy Loop: no blind pull, fact-first retry, fresh nonce, and byte-exact echo persistence pass `make encryption-agent-anti-entropy-test`; ADRs 0168–0175. The running local plan producer, admitted-capability activation/restart reconstruction, TC consumption/verifier, and encrypted traffic remain before Verified |
+| 9.5 | Intent-Coalesced Cryptographic Fast Path | **In progress** | Phase 9.5a adds the canonical compiler and Causal Epoch Lease. Phase 9.5b adds the Causal Commit Vector and total recovery contract. Phase 9.5c–9.5f add the isolated proof-carrying Aya ABI, Cooperative Route-Mark Lease, and Route-Before-Authority. Phase 9.5g–9.5h add authenticated exact-successor delivery and the non-serializable Tri-Plane Causal Activation Latch. Phase 9.5i–9.5k add the durable complete frontier and authenticated fact reconciliation; 9.5l makes local proof ordering a consuming capability ladder. Phase 9.5m–9.5o add real Linux convergence, fact-first exact-echo exchange, immediate admitted-capability consumption, and fresh proof reconstruction before restart quarantine/TC attachment under `make encryption-activation-rehydration-test`; ADRs 0168–0176. The running local plan producer, TC consumption/verifier, and encrypted traffic remain before Verified |
 | 9.6 | Bidirectional live path proof | **Planned** | Authenticated nonce-bound readback from both endpoint Nodes proves exact peer/key epoch, route/interface/MTU, kernel counters, and encrypted challenge delivery before activation. Expiry, disagreement, endpoint roaming, one-sided readiness, replay, and underlay mutation deny closed without treating a handshake timestamp alone as path proof |
 | 9.7 | Operations, upgrade, recovery, and performance | **Planned** | Fixed-cardinality status/metrics, loss-explicit history, explanation and non-authoritative simulation expose requirement, contract, epoch, peer, path, rotation, and denial provenance without secrets. Adjacent upgrade/rollback, controller/agent outage, Node replacement, exact cleanup, and committed plaintext/encrypted throughput/latency/CPU/memory/rotation measurements pass |
 | 9.8 | Kube-proxy-free Kind qualification | **Planned** | One exact committed runtime passes a multi-Node dual-stack gate for required/default and selective encryption, externally verified ciphertext-only underlay transport, Service and egress composition, rotation, failure/recovery, observability, performance capture, exact cleanup, and no-CNI rollback |
@@ -176,9 +176,7 @@ require independent architecture and gates.
 ## Immediate next slice
 
 Complete milestone 9.5 by making the running agent produce the 9.5m Node-local
-convergence capability, consume the exact admission retained by the 9.5n
-anti-entropy loop, and remove restart quarantine only after fresh capability
-reconstruction;
+convergence capability and feed the exact exchange/activation/restart path;
 invoke bounded lookup after policy plus Service/egress selection in TC; and pass
 verifier, restart, rotation, revocation, IPv4/IPv6, Service, egress, and
 live-kernel traffic gates. The compiler/ABI, transaction contract, isolated
@@ -186,6 +184,7 @@ persistence foundation, and proof-carrying map
 mirror, cooperative mark, policy-route activation, authenticated causal
 delivery, tri-plane activation, cluster-complete publication, controller restart
 recovery, authenticated complete-cut fact reconciliation, capability-typed
-local proof ordering, concrete Linux convergence, and Echo-Sealed exchange now
-pass their focused gates, but no workload packet-path activation is claimed yet.
+local proof ordering, concrete Linux convergence, Echo-Sealed exchange, and
+proof-rehydrating restart activation now pass their focused gates, but no
+workload packet-path activation is claimed yet.
 Live two-ended encrypted challenge proof remains milestone 9.6.

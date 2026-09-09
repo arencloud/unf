@@ -853,12 +853,17 @@ capability the mandatory prerequisite for controller exchange: every retry
 publishes the exact fact first, uses a fresh predecessor-bound nonce, retains
 the single-owner capability on `204`, and persists only a byte-exact controller
 echo. With no local proof the default loop performs no blind pull. This passes
-`make encryption-agent-anti-entropy-test`; ADR 0175. The running local plan
-producer, admitted-capability activation/restart reconstruction, TC
-consumer/verifier, and live encrypted packet gate remain, so no workload packet
-yet selects the staged route table. The [Phase 9
+`make encryption-agent-anti-entropy-test`; ADR 0175. Proof-Rehydrating
+Activation Escrow then persists only the secret-free fact plus canonical public
+WireGuard plans. On restart it rereads the entire real kernel cut, recreates a
+fresh non-serializable capability, binds it to the exact durable admission, and
+completes current or pending Aya recovery before TC attachment. Newly admitted
+capabilities use the same fail-stop consuming boundary; `make
+encryption-activation-rehydration-test`; ADR 0176. The running local plan
+producer, TC consumer/verifier, and live encrypted packet gate remain, so no
+workload packet yet selects the staged route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0175 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0176 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

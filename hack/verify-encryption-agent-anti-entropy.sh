@@ -17,7 +17,7 @@ agent=bins/unf-agent/src/main.rs
 local_orchestrator=crates/unf-encryption/src/local_orchestrator.rs
 
 require_text 'enum PendingEncryptionGeneration' "${agent}"
-require_text 'Prepared\(Box<LinuxPreparedLocalGeneration>\)' "${agent}"
+require_text 'prepared: Box<LinuxPreparedLocalGeneration>' "${agent}"
 require_text 'fn offer_prepared' "${agent}"
 require_text 'a different encryption generation capability is already in flight' "${agent}"
 require_text '/v1/state/encryption-generation-facts' "${agent}"

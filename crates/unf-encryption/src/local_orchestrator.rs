@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unf_common::Revision;
@@ -25,6 +26,8 @@ use crate::{
 use crate::{LinuxEncryptionRouteProvider, LinuxWireGuardProvider};
 
 const CONVERGENCE_WITNESS_DOMAIN: &[u8] = b"unf.node-local-linux-convergence.v1\0";
+const RECOVERY_PLAN_DIGEST_DOMAIN: &[u8] = b"unf.node-local-recovery-plan.v1\0";
+pub const NODE_LOCAL_RECOVERY_PLAN_SCHEMA_VERSION: u16 = 1;
 
 /// Retryable, secret-free Node proposal. This value is intentionally not the
 /// authority to mutate maps; it only produces the authenticated controller fact.
@@ -45,6 +48,21 @@ pub struct ControllerAdmittedLocalGeneration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeLocalConvergenceWitness(pub [u8; 32]);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeLocalRecoveryPlanDigest(pub [u8; 32]);
+
+/// Secret-free durable recipe for reconstructing fresh Node-local proof after
+/// restart. It contains no private key, route permit, latch, or map authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NodeLocalRecoveryPlan {
+    pub schema_version: u16,
+    pub fact: EncryptionGenerationFact,
+    pub plans: Vec<WireGuardKernelPlan>,
+    pub recovery_digest: NodeLocalRecoveryPlanDigest,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KernelConvergenceCommitment {
     epoch: u64,
@@ -57,9 +75,137 @@ struct KernelConvergenceCommitment {
 /// policy rules and Aya publication still require controller admission.
 pub struct LinuxPreparedLocalGeneration {
     proposal: NodeLocalGenerationProposal,
+    recovery_plan: NodeLocalRecoveryPlan,
     route_authority: EncryptionRouteAuthority,
     commitments: Vec<KernelConvergenceCommitment>,
     witness: NodeLocalConvergenceWitness,
+}
+
+impl NodeLocalRecoveryPlan {
+    /// Seals the exact public plan set needed to reconstruct a local
+    /// convergence capability after process or Node-service restart.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed facts, plans, ordering conflicts, or a plan set that
+    /// differs from the checkpoint's complete transport commitments.
+    pub fn issue(
+        membership_revision: Revision,
+        recipient: EncryptionGenerationRecipient,
+        checkpoint: FastPathMapCheckpoint,
+        mut plans: Vec<WireGuardKernelPlan>,
+    ) -> Result<Self, NodeLocalOrchestratorError> {
+        plans.sort_by(|left, right| {
+            (left.epoch, left.interface_name.as_str(), left.plan_digest.0).cmp(&(
+                right.epoch,
+                right.interface_name.as_str(),
+                right.plan_digest.0,
+            ))
+        });
+        let fact = EncryptionGenerationFact::issue(membership_revision, recipient, checkpoint)
+            .map_err(NodeLocalOrchestratorError::InvalidFact)?;
+        let mut recovery = Self {
+            schema_version: NODE_LOCAL_RECOVERY_PLAN_SCHEMA_VERSION,
+            fact,
+            plans,
+            recovery_digest: NodeLocalRecoveryPlanDigest([0; 32]),
+        };
+        recovery.validate_authority()?;
+        recovery.recovery_digest = recovery.calculate_digest()?;
+        Ok(recovery)
+    }
+
+    /// Independently replays the nested fact, canonical plan set, transport
+    /// commitments, and domain-separated recovery digest.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any mutation or incomplete/cross-Node plan set.
+    pub fn verify(&self) -> Result<(), NodeLocalOrchestratorError> {
+        self.validate_authority()?;
+        if self.recovery_digest != self.calculate_digest()? {
+            return Err(NodeLocalOrchestratorError::RecoveryPlanDigestMismatch);
+        }
+        Ok(())
+    }
+
+    /// Reconstructs a fresh non-serializable capability from independently
+    /// obtained exact kernel snapshots. Snapshot order is irrelevant.
+    ///
+    /// # Errors
+    ///
+    /// Rejects partial, stale, foreign, duplicate, or substituted readback.
+    pub fn rehydrate_exact_readback(
+        &self,
+        snapshots: &[WireGuardKernelSnapshot],
+    ) -> Result<LinuxPreparedLocalGeneration, NodeLocalOrchestratorError> {
+        self.verify()?;
+        LinuxPreparedLocalGeneration::bind_recovery_plan(self.clone(), snapshots)
+    }
+
+    /// Reads every real Linux `WireGuard` interface and route afresh before
+    /// reconstructing the single-use local capability.
+    ///
+    /// # Errors
+    ///
+    /// Rejects absent, foreign, partial, or mutated kernel state.
+    #[cfg(target_os = "linux")]
+    pub async fn rehydrate_linux(
+        &self,
+    ) -> Result<LinuxPreparedLocalGeneration, NodeLocalOrchestratorError> {
+        self.verify()?;
+        let provider = LinuxWireGuardProvider;
+        let mut snapshots = Vec::with_capacity(self.plans.len());
+        for plan in &self.plans {
+            snapshots.push(
+                provider
+                    .readback(plan)
+                    .await
+                    .map_err(NodeLocalOrchestratorError::InvalidKernel)?,
+            );
+        }
+        self.rehydrate_exact_readback(&snapshots)
+    }
+
+    fn validate_authority(&self) -> Result<(), NodeLocalOrchestratorError> {
+        if self.schema_version != NODE_LOCAL_RECOVERY_PLAN_SCHEMA_VERSION || self.plans.is_empty() {
+            return Err(NodeLocalOrchestratorError::InvalidRecoveryPlan);
+        }
+        self.fact
+            .verify()
+            .map_err(NodeLocalOrchestratorError::InvalidFact)?;
+        if self.plans.windows(2).any(|pair| {
+            (
+                pair[0].epoch,
+                pair[0].interface_name.as_str(),
+                pair[0].plan_digest.0,
+            ) >= (
+                pair[1].epoch,
+                pair[1].interface_name.as_str(),
+                pair[1].plan_digest.0,
+            )
+        }) {
+            return Err(NodeLocalOrchestratorError::InvalidRecoveryPlan);
+        }
+        let desired = self
+            .fact
+            .checkpoint
+            .desired_state()
+            .map_err(NodeLocalOrchestratorError::InvalidCheckpoint)?;
+        preflight_plan_cut(&self.fact.recipient, &desired, &self.plans)?;
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<NodeLocalRecoveryPlanDigest, NodeLocalOrchestratorError> {
+        let mut canonical = self.clone();
+        canonical.recovery_digest = NodeLocalRecoveryPlanDigest([0; 32]);
+        let encoded = serde_json::to_vec(&canonical)
+            .map_err(|error| NodeLocalOrchestratorError::Encoding(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(RECOVERY_PLAN_DIGEST_DOMAIN);
+        hasher.update(encoded);
+        Ok(NodeLocalRecoveryPlanDigest(hasher.finalize().into()))
+    }
 }
 
 impl NodeLocalGenerationProposal {
@@ -201,17 +347,47 @@ impl LinuxPreparedLocalGeneration {
         plans: &[WireGuardKernelPlan],
         snapshots: &[WireGuardKernelSnapshot],
     ) -> Result<Self, NodeLocalOrchestratorError> {
+        // Preserve the established local-kernel error boundary before sealing
+        // the durable recovery recipe. Cross-Node or partial readback is a
+        // kernel commitment mismatch, never remotely supplied fact authority.
         let desired = checkpoint
             .desired_state()
             .map_err(NodeLocalOrchestratorError::InvalidCheckpoint)?;
-        let commitments = validate_exact_kernel_cut(&recipient, &desired, plans, snapshots)?;
+        validate_exact_kernel_cut(&recipient, &desired, plans, snapshots)?;
+        let recovery_plan = NodeLocalRecoveryPlan::issue(
+            membership_revision,
+            recipient,
+            checkpoint,
+            plans.to_vec(),
+        )?;
+        Self::bind_recovery_plan(recovery_plan, snapshots)
+    }
+
+    fn bind_recovery_plan(
+        recovery_plan: NodeLocalRecoveryPlan,
+        snapshots: &[WireGuardKernelSnapshot],
+    ) -> Result<Self, NodeLocalOrchestratorError> {
+        recovery_plan.verify()?;
+        let desired = recovery_plan
+            .fact
+            .checkpoint
+            .desired_state()
+            .map_err(NodeLocalOrchestratorError::InvalidCheckpoint)?;
+        let commitments = validate_exact_kernel_cut(
+            &recovery_plan.fact.recipient,
+            &desired,
+            &recovery_plan.plans,
+            snapshots,
+        )?;
         let route_authority = EncryptionRouteAuthority::issue(&desired, snapshots)
             .map_err(NodeLocalOrchestratorError::InvalidRouteAuthority)?;
-        let proposal =
-            NodeLocalGenerationProposal::issue(membership_revision, recipient, checkpoint)?;
+        let proposal = NodeLocalGenerationProposal {
+            fact: recovery_plan.fact.clone(),
+        };
         let witness = convergence_witness(proposal.fact(), &route_authority, &commitments)?;
         Ok(Self {
             proposal,
+            recovery_plan,
             route_authority,
             commitments,
             witness,
@@ -223,6 +399,12 @@ impl LinuxPreparedLocalGeneration {
     #[must_use]
     pub fn fact(&self) -> &EncryptionGenerationFact {
         self.proposal.fact()
+    }
+
+    /// Returns the secret-free durable recipe used to reconstruct this proof.
+    #[must_use]
+    pub const fn recovery_plan(&self) -> &NodeLocalRecoveryPlan {
+        &self.recovery_plan
     }
 
     #[must_use]
@@ -487,6 +669,10 @@ pub enum NodeLocalOrchestratorError {
     KernelCommitmentMismatch,
     #[error("Node-local convergence witness does not match")]
     ConvergenceWitnessMismatch,
+    #[error("invalid Node-local recovery plan")]
+    InvalidRecoveryPlan,
+    #[error("Node-local recovery plan digest does not match")]
+    RecoveryPlanDigestMismatch,
     #[error("Node-local convergence canonical encoding failed: {0}")]
     Encoding(String),
     #[error("invalid controller generation admission: {0}")]

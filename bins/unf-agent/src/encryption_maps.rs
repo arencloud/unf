@@ -140,7 +140,6 @@ impl EncryptionMapSynchronizer {
     /// Completes the real Linux route-before-Aya transition from one exact
     /// kernel-converged Node capability. Controller substitution and route
     /// drift fail before this adapter can mutate the inactive map bank.
-    #[allow(dead_code)]
     pub(super) async fn apply_linux_generation(
         &mut self,
         prepared: LinuxPreparedLocalGeneration,
@@ -165,7 +164,6 @@ impl EncryptionMapSynchronizer {
 
     /// Consumes the single-use controller/kernel/map activation latch, then
     /// stages and publishes its exact durable CCV checkpoint.
-    #[allow(dead_code)]
     pub(super) fn apply(&mut self, latch: EncryptionActivationLatch) -> Result<()> {
         let prior = self
             .active
