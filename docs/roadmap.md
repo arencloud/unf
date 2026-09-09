@@ -840,7 +840,7 @@ matrix is maintained in the
 
 ## Phase 9 — attested encryption fabric
 
-**Gate: in progress; architecture boundary verified.** The ordered evidence
+**Gate: in progress; milestones 9.1–9.3 verified.** The ordered evidence
 matrix is maintained in the
 [Phase 9 encryption-fabric plan](development/phase9-attested-encryption-fabric-plan.md).
 
@@ -858,6 +858,15 @@ matrix is maintained in the
   envelopes, adversarial mutation, property, and strict-wire tests pass
   `make encryption-contract-test`; ADR 0159. No private key or runtime state is
   introduced.
+- Phase 9.3 adds non-serializable Node-local key authority. Fresh X25519/
+  WireGuard keys come directly from the OS CSPRNG into zeroizing buffers; only
+  an atomic, digest-checked, mode-0600 checkpoint can retain them. The Causal
+  Epoch Barrier seals the exact affected peer frontier and topology revision,
+  requiring every authenticated peer acknowledgement without coupling rotation
+  to unrelated Nodes. Public-only monotonic publication, two-epoch prepare/
+  attest/activate/drain/retire, positive drain proof, emergency revocation,
+  restart recovery, and replay/replacement fencing pass
+  `make encryption-key-authority-test`; ADR 0160. No kernel state changes yet.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,

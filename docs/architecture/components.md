@@ -149,9 +149,12 @@ transport state, path evidence, and activation as separate revisioned domains.
 Attested Encryption Path Contract/reference validator. It binds policy-approved
 Required pairs to exact workload/Node/cluster identity, public-key epochs,
 bidirectional desired routes, capabilities, revisions, golden digests, and
-deny-only failure outcomes without private-key or runtime state. The controller
-will orchestrate only authenticated public-key/epoch state and matching endpoint
-evidence. Each agent will generate and retain its private WireGuard key locally,
+deny-only failure outcomes. It also owns a deliberately non-serializable Node-
+local key authority: OS-CSPRNG X25519/WireGuard secrets live in zeroizing memory
+and an atomic owner-only checkpoint, while a Causal Epoch Barrier admits an
+epoch only after every exact affected peer acknowledges the sealed topology
+revision. The controller will orchestrate only authenticated public-key/epoch
+state and matching endpoint evidence. Each agent retains private keys locally,
 independently replay contracts, transactionally own exact interfaces/peers/
 AllowedIPs/routes/fwmarks/MTUs, and publish nonce-bound kernel/path readback
 without secret material.

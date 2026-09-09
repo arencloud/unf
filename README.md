@@ -732,7 +732,7 @@ exact cleanup, five-agent convergence, and an unchanged `network` unhealthy
 baseline. Evidence SHA-256 is
 `a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3`;
 ADR 0157. These independent Kind and OpenShift results close Phase 8.
-Phase 9 begins the attested encryption fabric. Milestones 9.1–9.2 are verified.
+Phase 9 begins the attested encryption fabric. Milestones 9.1–9.3 are verified.
 The architecture requires that source policy and Service/egress ownership precede
 encryption; kernel WireGuard owns all cryptography; private keys remain on their
 Node; and an independently replayed Attested Encryption Path Contract requires
@@ -750,11 +750,18 @@ policy-allowed Required pairs and bind exact workload/Node/cluster identity,
 public-key digests and epoch/lifetime, bidirectional endpoints and Pod CIDR
 `AllowedIPs`, interface/route/fwmark/MTU facts, capabilities, and revisions.
 Independent replay, frozen witnesses, deny-only failure envelopes, and strict
-unknown-field rejection pass `make encryption-contract-test`; ADR 0159. This
-slice creates no private key, interface, route, BPF state, or packet behavior;
-the
+unknown-field rejection pass `make encryption-contract-test`; ADR 0159. Node-
+local key authority now generates fresh X25519/WireGuard keys directly from the
+OS CSPRNG into zeroizing buffers and persists at most two epochs through an
+atomic, digest-checked, mode-0600 checkpoint. A Causal Epoch Barrier seals only
+the exact affected peer frontier and topology revision, so unrelated Nodes do
+not stall rotation while every affected authenticated peer must acknowledge
+before activation. Public-only monotonic publication, bounded drain/retirement,
+emergency revocation, restart recovery, and replay/replacement fencing pass
+`make encryption-key-authority-test`; ADR 0160. This slice creates no interface,
+route, BPF state, or packet behavior; the
 [Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0159 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0160 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

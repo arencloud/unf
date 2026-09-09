@@ -16,7 +16,7 @@ separately revisioned. The authoritative state remains in
 |---|---|---|---|
 | 9.1 | Architecture and acceptance boundary | **Verified** | ADR 0158 fixes policy-before-encryption precedence, the Attested Encryption Path Contract, Node-local private-key ownership, Flow-Stable Epoch Rotation, the Intent-Coalesced Cryptographic Fast Path, fail-closed required mode, transactional recovery, performance evidence, independent Kind/OpenShift gates, and explicit exclusions; `make encryption-fabric-boundary-test` prevents drift |
 | 9.2 | Encryption intent and path-contract model | **Verified** | `unf-encryption` provides a bounded canonical cluster baseline plus monotonic identity-pair intent and schema-v1 exact-source-Node Attested Encryption Path Contracts. Policy precedes public-key/epoch and bidirectional route admission; Node identities, lifetimes, capabilities, Pod CIDR `AllowedIPs`, interface/route/fwmark/MTU facts, and five revisions bind domain-separated golden digests and witnesses. Independent replay, explicit deny-only failure envelopes, mutation/property/strict-wire tests, and Clippy pass `make encryption-contract-test`; ADR 0159. No private key or runtime mutation exists |
-| 9.3 | Node key authority and epoch rotation | **Planned** | Node-local agent-generated private keys, authenticated Node-UID/public-key publication, strict key epochs and expiry, two-epoch prepare/activate/drain/retire rotation, replacement/replay/revocation handling, owner-only durable metadata, and no secret bytes in Kubernetes objects, APIs, logs, metrics, or controller checkpoints |
+| 9.3 | Node key authority and epoch rotation | **Verified** | `unf-encryption` generates X25519/WireGuard keys directly from the OS CSPRNG into zeroizing memory, exposes secret material only to the future local kernel-provider boundary, and copy-persist-commits at most two epochs to a digest-checked atomic mode-0600 Node-UID-bound checkpoint. The Causal Epoch Barrier seals the exact affected-peer frontier/topology revision and requires every authenticated acknowledgement before activation; rotation, positive zero-flow/zero-route retirement, emergency revocation, public-only monotonic publication, replay/replacement fencing, restart/tamper recovery, and strict Clippy pass `make encryption-key-authority-test`; ADR 0160. No interface or packet mutation exists |
 | 9.4 | Transactional kernel WireGuard provider | **Planned** | Rust-owned generic-netlink configuration and exact readback; bounded interfaces/peers/AllowedIPs/endpoints; disjoint route ownership; inactive staging, rollback, restart reconstruction, foreign-state refusal, MTU derivation, exact cleanup, and adjacent-schema capability negotiation |
 | 9.5 | Intent-Coalesced Cryptographic Fast Path | **Planned** | Many identity-level contracts coalesce onto bounded Node/epoch transports without losing per-flow authority. Policy and Service/egress selection precede a fixed-width eBPF transport decision; existing connection state pins an admitted epoch, new flows move atomically, kernel WireGuard performs all cryptography, and required traffic has no plaintext fallback |
 | 9.6 | Bidirectional live path proof | **Planned** | Authenticated nonce-bound readback from both endpoint Nodes proves exact peer/key epoch, route/interface/MTU, kernel counters, and encrypted challenge delivery before activation. Expiry, disagreement, endpoint roaming, one-sided readiness, replay, and underlay mutation deny closed without treating a handshake timestamp alone as path proof |
@@ -175,11 +175,11 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 9.3 introduces Node-local key authority and Flow-Stable Epoch
-Rotation. It must generate key material through an established WireGuard
-interface and OS CSPRNG, keep private bytes Node-local and owner-only, publish
-only authenticated Node-UID-bound public epochs, and implement the bounded
-`Prepared -> MutuallyAttested -> Active -> Draining -> Retired` transaction.
-Replay, Node replacement, emergency revocation, restart recovery, secret
-redaction, capacity admission, and exact metadata cleanup must pass without yet
-steering packets through WireGuard.
+Milestone 9.4 implements the transactional kernel WireGuard provider. It must
+consume Node-local key bytes without copying them into a public model, configure
+bounded interfaces/peers/AllowedIPs/endpoints through maintained generic
+netlink APIs, derive safe dual-stack MTU, and read back exact kernel identity.
+Every stage/activate/rollback/restart/cleanup operation must be version-owned,
+preserve foreign state, retain the last-known-good epoch on partial failure, and
+publish no path-readiness claim before exact readback. Packet steering and live
+two-ended encrypted path proof remain milestones 9.5 and 9.6.

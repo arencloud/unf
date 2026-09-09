@@ -1,9 +1,13 @@
-//! Kubernetes-independent encryption intent and attested path contracts.
+//! Kubernetes-independent encryption intent, key authority, and attested path contracts.
 //!
 //! This crate is a pure userspace authority boundary. It contains public
-//! key/epoch and desired path facts only: private keys, kernel mutation, BPF
-//! state, packet processing, and Kubernetes adapters deliberately live outside
-//! milestone 9.2.
+//! Public intent and path contracts remain separate from Node-local private-key
+//! authority. Kernel mutation, BPF state, packet processing, and Kubernetes
+//! adapters deliberately live outside this crate.
+
+mod key_authority;
+
+pub use key_authority::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
