@@ -57,7 +57,7 @@ require_text docs/roadmap.md \
     "the roadmap must include Phase 8"
 
 for excluded in \
-    'production BGP/EVPN/ECMP/BFD' \
+    'production-scale BGP/ECMP/BFD availability' \
     'cross-cluster egress' \
     'WireGuard' \
     'SCTP egress NAT' \
