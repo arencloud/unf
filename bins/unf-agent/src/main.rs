@@ -86,8 +86,9 @@ use unf_egress::{
     seal_egress_bgp_snapshot, verify_egress_bgp_config, verify_egress_reachability_plan,
 };
 use unf_encryption::{
-    AdmittedEncryptionGeneration, EncryptionGenerationFact, EncryptionGenerationRequest,
-    LinuxPreparedLocalGeneration, NodeLocalRecoveryPlan, NodeSealedGenerationCapsule,
+    AdmittedEncryptionGeneration, AdmittedNodeLocalPlan, EncryptionGenerationFact,
+    EncryptionGenerationRequest, LinuxPreparedLocalGeneration, NodeLocalPlanRequest,
+    NodeLocalRecoveryPlan, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -156,6 +157,7 @@ const DEFAULT_ENCRYPTION_FAST_PATH_STATE_PATH: &str =
     "/var/lib/unf/cni/v1/encryption-fast-path.json";
 const DEFAULT_ENCRYPTION_GENERATION_STATE_PATH: &str =
     "/var/lib/unf/cni/v1/encryption-generation.json";
+const DEFAULT_ENCRYPTION_PLAN_STATE_PATH: &str = "/var/lib/unf/cni/v1/encryption-plan.json";
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -521,6 +523,14 @@ struct Args {
         default_value = DEFAULT_ENCRYPTION_GENERATION_STATE_PATH
     )]
     encryption_generation_state_path: PathBuf,
+    /// Durable desired compiler input accepted from the authenticated
+    /// controller. It carries no local activation authority.
+    #[arg(
+        long,
+        env = "UNF_ENCRYPTION_PLAN_STATE_PATH",
+        default_value = DEFAULT_ENCRYPTION_PLAN_STATE_PATH
+    )]
+    encryption_plan_state_path: PathBuf,
     #[arg(long, env = "UNF_NODE_NAME", default_value = "unknown")]
     node_name: String,
     #[arg(long, env = "UNF_POD_NAME", default_value = "unknown")]
@@ -1024,6 +1034,16 @@ struct EncryptionGenerationSynchronizer {
     recovery: EncryptionRecoveryJournal,
     active_revalidated: bool,
     pending: Option<PendingEncryptionGeneration>,
+}
+
+struct EncryptionPlanSynchronizer {
+    controller_url: Option<String>,
+    client: ReloadingControllerClient,
+    agent_token_path: PathBuf,
+    interval: Duration,
+    node_name: String,
+    state_path: PathBuf,
+    current: Option<AdmittedNodeLocalPlan>,
 }
 
 const ENCRYPTION_RECOVERY_JOURNAL_SCHEMA_VERSION: u16 = 1;
@@ -1581,6 +1601,7 @@ struct DataplaneConfig {
     encryption_fast_path_state_path: PathBuf,
     encryption_sync_interval: Duration,
     encryption_generation_state_path: PathBuf,
+    encryption_plan_state_path: PathBuf,
     node_name: String,
     agent_token_path: PathBuf,
     flow_export_interval: Duration,
@@ -1838,6 +1859,7 @@ async fn main() -> Result<()> {
             let encryption_fast_path_state_path = args.encryption_fast_path_state_path.clone();
             let encryption_sync_interval = Duration::from_secs(args.encryption_sync_seconds.max(1));
             let encryption_generation_state_path = args.encryption_generation_state_path.clone();
+            let encryption_plan_state_path = args.encryption_plan_state_path.clone();
             let node_name = args.node_name.clone();
             let agent_token_path = args.agent_token_path.clone();
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
@@ -1863,6 +1885,7 @@ async fn main() -> Result<()> {
                     encryption_fast_path_state_path,
                     encryption_sync_interval,
                     encryption_generation_state_path,
+                    encryption_plan_state_path,
                     node_name,
                     agent_token_path,
                     flow_export_interval,
@@ -6816,6 +6839,17 @@ async fn run_dataplane(
     }
     let (controller_url, controller_client) =
         preflight_dataplane_controller(&config, &state).await?;
+    // Desired plan input is validated before persistent BPF access. Receiving
+    // it grants no local authority, but corrupt or cross-Node durable state
+    // must still fail closed before any later compiler attempt.
+    let mut encryption_plans = EncryptionPlanSynchronizer::recover(
+        controller_url.clone(),
+        controller_client.clone(),
+        config.agent_token_path.clone(),
+        config.encryption_sync_interval,
+        config.node_name.clone(),
+        config.encryption_plan_state_path.clone(),
+    )?;
     // Validate the durable controller-delivery cursor before persistent BPF
     // access. A corrupt, cross-Node, or replayed cursor must not coexist with
     // later local kernel activation.
@@ -6964,6 +6998,7 @@ async fn run_dataplane(
         &mut policies,
         &mut services,
         &mut egress,
+        &mut encryption_plans,
         &mut encryption_generations,
         &mut encryption,
         &state,
@@ -7511,6 +7546,93 @@ fn authenticated_get(
         .current()
         .get(url)
         .bearer_auth(read_agent_token(token_path)?))
+}
+
+impl EncryptionPlanSynchronizer {
+    fn recover(
+        controller_url: Option<String>,
+        client: ReloadingControllerClient,
+        agent_token_path: PathBuf,
+        interval: Duration,
+        node_name: String,
+        state_path: PathBuf,
+    ) -> Result<Self> {
+        if !state_path.is_absolute() {
+            bail!("encryption plan state path must be absolute");
+        }
+        let current = match fs::symlink_metadata(&state_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("inspect encryption plan state"),
+            Ok(_) => {
+                let current: AdmittedNodeLocalPlan =
+                    load_secure_json(&state_path, "encryption plan")?;
+                current.verify().context("verify durable encryption plan")?;
+                if current.snapshot.recipient.node_name != node_name {
+                    bail!(
+                        "durable encryption plan targets Node {:?}, local Node is {:?}",
+                        current.snapshot.recipient.node_name,
+                        node_name
+                    );
+                }
+                Some(current)
+            }
+        };
+        Ok(Self {
+            controller_url,
+            client,
+            agent_token_path,
+            interval,
+            node_name,
+            state_path,
+            current,
+        })
+    }
+
+    fn admit(
+        &mut self,
+        request: &NodeLocalPlanRequest,
+        capsule: &NodeSealedPlanCapsule,
+    ) -> Result<bool> {
+        let candidate = capsule
+            .admit(request, self.current.as_ref())
+            .context("admit exact Node-local encryption plan successor")?;
+        persist_secure_json(&self.state_path, &candidate, "encryption plan")?;
+        self.current = Some(candidate);
+        Ok(true)
+    }
+}
+
+async fn synchronize_encryption_plan(
+    synchronizer: &mut EncryptionPlanSynchronizer,
+) -> Result<bool> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("encryption plan synchronization has no controller URL")?;
+    let request = NodeLocalPlanRequest::fresh(
+        synchronizer.node_name.clone(),
+        synchronizer.current.as_ref(),
+    )
+    .context("issue Node-local encryption plan request")?;
+    let response = synchronizer
+        .client
+        .current()
+        .post(format!("{controller_url}/v1/state/encryption-plan"))
+        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+        .json(&request)
+        .send()
+        .await
+        .context("request Node-sealed encryption plan")?;
+    if response.status() == StatusCode::NO_CONTENT {
+        return Ok(false);
+    }
+    let capsule: NodeSealedPlanCapsule = response
+        .error_for_status()
+        .context("controller rejected encryption plan request")?
+        .json()
+        .await
+        .context("decode Node-sealed encryption plan capsule")?;
+    synchronizer.admit(&request, &capsule)
 }
 
 impl EncryptionGenerationSynchronizer {
@@ -13297,6 +13419,7 @@ async fn consume_events(
     policies: &mut PolicySynchronizer,
     services: &mut ServiceSynchronizer,
     egress: &mut EgressSynchronizer,
+    encryption_plans: &mut EncryptionPlanSynchronizer,
     encryption_generations: &mut EncryptionGenerationSynchronizer,
     encryption: &mut EncryptionMapSynchronizer,
     state: &AgentState,
@@ -13312,6 +13435,7 @@ async fn consume_events(
     let mut policy_interval = tokio::time::interval(policies.interval);
     let mut service_interval = tokio::time::interval(services.interval);
     let mut egress_interval = tokio::time::interval(egress.interval);
+    let mut encryption_plan_interval = tokio::time::interval(encryption_plans.interval);
     let mut encryption_interval = tokio::time::interval(encryption_generations.interval);
     loop {
         tokio::select! {
@@ -13357,6 +13481,24 @@ async fn consume_events(
             _ = egress_interval.tick(), if egress.controller_url.is_some() => {
                 if let Err(error) = synchronize_egress(egress, state).await {
                     warn!(%error, "egress synchronization failed; active source state was fenced when possible");
+                }
+            }
+            _ = encryption_plan_interval.tick(), if encryption_plans.controller_url.is_some() => {
+                match synchronize_encryption_plan(encryption_plans).await {
+                    Ok(true) => {
+                        let current = encryption_plans.current.as_ref()
+                            .context("adopted encryption plan disappeared")?;
+                        info!(
+                            generation = current.snapshot.generation.get(),
+                            membership_revision = current.snapshot.membership_revision.get(),
+                            node_uid = %current.snapshot.recipient.node_uid,
+                            "durably adopted authenticated Node-local encryption plan; local compiler proof remains required"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(%error, "encryption plan synchronization failed; retaining exact durable predecessor");
+                    }
                 }
             }
             _ = encryption_interval.tick(), if encryption_generations.controller_url.is_some()
@@ -16527,6 +16669,52 @@ mod tests {
         .unwrap();
         assert!(
             EncryptionGenerationSynchronizer::recover(
+                None,
+                test_controller_client(),
+                temporary.path().join("token"),
+                Duration::from_secs(2),
+                "worker-a".to_owned(),
+                state_path,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn encryption_plan_recovery_is_private_node_scoped_and_fail_closed() {
+        let temporary = tempdir().unwrap();
+        let state_path = temporary.path().join("encryption-plan.json");
+        let synchronizer = EncryptionPlanSynchronizer::recover(
+            None,
+            test_controller_client(),
+            temporary.path().join("token"),
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            state_path.clone(),
+        )
+        .unwrap();
+        assert!(synchronizer.current.is_none());
+
+        assert!(
+            EncryptionPlanSynchronizer::recover(
+                None,
+                test_controller_client(),
+                PathBuf::from("token"),
+                Duration::from_secs(2),
+                "worker-a".to_owned(),
+                PathBuf::from("encryption-plan.json"),
+            )
+            .is_err()
+        );
+
+        persist_secure_json(
+            &state_path,
+            &serde_json::json!({"schemaVersion": 1, "serializedAuthority": [7]}),
+            "encryption plan",
+        )
+        .unwrap();
+        assert!(
+            EncryptionPlanSynchronizer::recover(
                 None,
                 test_controller_client(),
                 temporary.path().join("token"),

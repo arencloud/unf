@@ -872,11 +872,15 @@ reusable activation authority. `make encryption-plan-manifold-test`; ADR 0178.
 Its Nonce-Bound Plan Relay adds a fresh challenge, exact durable predecessor,
 Node UID, controller incarnation, and monotonic revision fences without turning
 desired state into local authority; `make encryption-plan-distribution-test`;
-ADR 0179. The runtime controller/agent adoption loop, TC consumer/verifier, and
-live encrypted packet gate remain, so no workload packet yet selects the staged
+ADR 0179. The running Pod-bound controller endpoint and agent now use a
+Persist-Before-Compile Plan Inbox: owner-only atomic durability precedes cursor
+adoption and startup validates it before BPF access;
+`make encryption-plan-runtime-test`; ADR 0180. Complete-cut catalog production,
+local compile, the TC consumer/verifier, and live encrypted packet gate remain,
+so no workload packet yet selects the staged
 route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0179 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0180 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

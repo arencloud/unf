@@ -72,7 +72,8 @@ use unf_encryption::{
     EncryptionGenerationFact, EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
     EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
-    EncryptionGenerationRequest, NodeSealedGenerationCapsule,
+    EncryptionGenerationRequest, NodeLocalPlanDistributionError, NodeLocalPlanRequest,
+    NodeLocalPlanSnapshot, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -395,6 +396,9 @@ struct ControllerState {
     encryption_generation_facts: Mutex<EncryptionGenerationFactReconciler>,
     encryption_generations_dirty: AtomicBool,
     encryption_generation_store: Option<Api<ConfigMap>>,
+    /// Complete secret-free compiler inputs awaiting authenticated Node pulls.
+    /// The next compiler slice populates this catalog from one causal cut.
+    encryption_local_plans: RwLock<BTreeMap<String, NodeLocalPlanSnapshot>>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1352,6 +1356,7 @@ async fn spawn_internal_api(
             "/v1/state/encryption-generation-facts",
             post(ingest_encryption_generation_fact),
         )
+        .route("/v1/state/encryption-plan", post(encryption_plan))
         .route(
             "/v1/state/service-selection",
             get(service_selection_contract),
@@ -1766,6 +1771,7 @@ fn new_state_with_client_and_selector(
         encryption_generation_facts: Mutex::new(EncryptionGenerationFactReconciler::default()),
         encryption_generations_dirty: AtomicBool::new(false),
         encryption_generation_store: config_map_store.clone(),
+        encryption_local_plans: RwLock::new(BTreeMap::new()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -8094,6 +8100,18 @@ async fn encryption_generation(
     }
 }
 
+async fn encryption_plan(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(request): Json<NodeLocalPlanRequest>,
+) -> Result<Response, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    match encryption_plan_for(&state, &agent, &request)? {
+        Some(capsule) => Ok(Json(capsule).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
 async fn ingest_encryption_generation_fact(
     State(state): State<Arc<ControllerState>>,
     headers: HeaderMap,
@@ -8297,6 +8315,80 @@ fn encryption_generation_for(
             }
             _ => ApiError::service_unavailable(format!(
                 "prepared encryption generation is not a valid exact successor: {error}"
+            )),
+        })
+}
+
+fn encryption_plan_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    request: &NodeLocalPlanRequest,
+) -> Result<Option<NodeSealedPlanCapsule>, ApiError> {
+    if !agent_application_is_current(state, agent) {
+        return Err(ApiError::forbidden(
+            "encryption plan request does not match the current authenticated agent Pod",
+        ));
+    }
+    request
+        .verify()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if request.node_name != agent.node_name {
+        return Err(ApiError::forbidden(
+            "encryption plan request targets a different Node",
+        ));
+    }
+    let node_uid = read_lock(&state.node_port_nodes)
+        .get(&agent.node_name)
+        .map(|record| record.node_uid.clone())
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "authoritative Node UID is unavailable for encryption plan delivery",
+            )
+        })?;
+    if request.current.as_ref().is_some_and(|current| {
+        current.recipient.node_name != agent.node_name || current.recipient.node_uid != node_uid
+    }) {
+        return Err(ApiError::forbidden(
+            "encryption plan cursor belongs to a replaced or different Node",
+        ));
+    }
+    if request
+        .current
+        .as_ref()
+        .is_some_and(|current| current.controller_epoch > state.identity_epoch)
+    {
+        return Err(ApiError::service_unavailable(
+            "encryption plan controller incarnation regressed",
+        ));
+    }
+    let plans = read_lock(&state.encryption_local_plans);
+    let Some(snapshot) = plans.get(&agent.node_name) else {
+        return Ok(None);
+    };
+    if snapshot.recipient.node_uid != node_uid {
+        return Err(ApiError::service_unavailable(
+            "prepared encryption plan targets a replaced Node UID",
+        ));
+    }
+    if request
+        .current
+        .as_ref()
+        .is_some_and(|current| current.matches(snapshot))
+    {
+        return Ok(None);
+    }
+    NodeSealedPlanCapsule::issue(state.identity_epoch, request, snapshot.clone())
+        .map(Some)
+        .map_err(|error| match error {
+            NodeLocalPlanDistributionError::RecipientMismatch
+            | NodeLocalPlanDistributionError::RequestMismatch => {
+                ApiError::forbidden(error.to_string())
+            }
+            NodeLocalPlanDistributionError::InvalidRequest => {
+                ApiError::bad_request(error.to_string())
+            }
+            _ => ApiError::service_unavailable(format!(
+                "prepared encryption plan is not a valid exact successor: {error}"
             )),
         })
 }
@@ -13743,6 +13835,49 @@ mod tests {
         };
         assert_eq!(
             encryption_generation_for(&state, &agent, &replaced_cursor)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn encryption_plan_delivery_is_authenticated_node_uid_scoped() {
+        let state = new_state(true);
+        let agent = authenticated_egress_agent("worker-a");
+        install_authenticated_agent(&state, &agent);
+        let request = NodeLocalPlanRequest::issue("worker-a".to_owned(), None, [11; 32]).unwrap();
+        assert!(
+            encryption_plan_for(&state, &agent, &request)
+                .unwrap()
+                .is_none()
+        );
+
+        let foreign = NodeLocalPlanRequest::issue("worker-b".to_owned(), None, [12; 32]).unwrap();
+        assert_eq!(
+            encryption_plan_for(&state, &agent, &foreign)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let replaced_cursor = NodeLocalPlanRequest {
+            schema_version: unf_encryption::NODE_LOCAL_PLAN_REQUEST_SCHEMA_VERSION,
+            node_name: "worker-a".to_owned(),
+            current: Some(unf_encryption::NodeLocalPlanCursor {
+                controller_epoch: 1,
+                recipient: EncryptionGenerationRecipient {
+                    node_name: "worker-a".to_owned(),
+                    node_uid: "replaced-node-uid".to_owned(),
+                },
+                membership_revision: Revision::new(1),
+                generation: Revision::new(1),
+                snapshot_digest: unf_encryption::NodeLocalPlanSnapshotDigest([1; 32]),
+            }),
+            nonce: [13; 32],
+        };
+        assert_eq!(
+            encryption_plan_for(&state, &agent, &replaced_cursor)
                 .unwrap_err()
                 .status,
             StatusCode::FORBIDDEN
