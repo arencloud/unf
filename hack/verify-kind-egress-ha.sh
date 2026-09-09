@@ -156,24 +156,45 @@ probe() {
     [[ ${v4_ok} == true && ${v6_ok} == true ]]
 }
 
-seed_continuity_flow() {
-    local response= peer=
-    "${kc[@]}" -n "${namespace}" exec managed -- sh -ec \
-        "rm -f /tmp/unf-ha-continuity.out /tmp/unf-ha-continuity.pid; \
-        nohup sh -ec 'while :; do printf tcp-continuity-seed; sleep 1; done | \
-        socat -T 310 - TCP4:${external_v4}:18082' \
-        >/tmp/unf-ha-continuity.out 2>&1 </dev/null & \
-        echo \$! >/tmp/unf-ha-continuity.pid"
-    for _ in $(seq 1 20); do
-        response=$("${kc[@]}" -n "${namespace}" exec managed -- sh -ec \
-            'cat /tmp/unf-ha-continuity.out 2>/dev/null || true' 2>/dev/null || true)
-        peer=$(sed -n 's/^SOCAT_PEERADDR=//p' <<<"${response}" | head -n1)
-        peer=$(normalize_observed_ipv4 "${peer}" || true)
-        if [[ ${response} == *"tcp-continuity-seed" && -n ${peer} ]]; then
-            last_egress_v4=${peer}
+seed_continuity_flows() {
+    local attempt response= peer= token= output= pid_file= pid= address=
+    local -a expected_addresses=()
+    local -A observed_addresses=()
+    mapfile -t expected_addresses < <(jq -r \
+        '.allocation.leases[0].addresses[] | select(contains("."))' <<<"${initial_state}")
+    (( ${#expected_addresses[@]} == 3 ))
+    for attempt in $(seq 1 60); do
+        token="tcp-continuity-seed-${attempt}"
+        output="/tmp/unf-ha-continuity-${attempt}.out"
+        pid_file="/tmp/unf-ha-continuity-${attempt}.pid"
+        "${kc[@]}" -n "${namespace}" exec managed -- sh -ec \
+            "rm -f ${output} ${pid_file}; \
+            nohup sh -ec 'while :; do printf ${token}; sleep 1; done | \
+            socat -T 310 - TCP4:${external_v4}:18082' \
+            >${output} 2>&1 </dev/null & echo \$! >${pid_file}"
+        for _ in $(seq 1 20); do
+            response=$("${kc[@]}" -n "${namespace}" exec managed -- sh -ec \
+                "cat ${output} 2>/dev/null || true" 2>/dev/null || true)
+            peer=$(sed -n 's/^SOCAT_PEERADDR=//p' <<<"${response}" | head -n1)
+            peer=$(normalize_observed_ipv4 "${peer}" || true)
+            pid=$("${kc[@]}" -n "${namespace}" exec managed -- sh -ec \
+                "cat ${pid_file} 2>/dev/null || true" 2>/dev/null || true)
+            if [[ ${response} == *"${token}" && -n ${peer} && ${pid} =~ ^[0-9]+$ ]] \
+                && "${kc[@]}" -n "${namespace}" exec managed -- sh -ec "kill -0 ${pid}" \
+                    >/dev/null 2>&1; then
+                for address in "${expected_addresses[@]}"; do
+                    if [[ ${peer} == "${address}" ]]; then
+                        observed_addresses["${peer}"]=true
+                        last_egress_v4=${peer}
+                    fi
+                done
+                break
+            fi
+            sleep 1
+        done
+        if (( ${#observed_addresses[@]} == ${#expected_addresses[@]} )); then
             return 0
         fi
-        sleep 1
     done
     return 1
 }
@@ -348,7 +369,7 @@ assert_exclusive_ownership "${initial_state}"
 for attempt in $(seq 1 80); do
     probe "warm-${attempt}"
 done
-seed_continuity_flow
+seed_continuity_flows
 
 qualification_stage=measured-graceful-drain
 mkdir -p "${diagnostics_dir}"
