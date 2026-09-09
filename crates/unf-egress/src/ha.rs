@@ -412,12 +412,17 @@ fn validate_previous(
         return Err(EgressHaError::InvalidPreviousPlan);
     }
     for failed in &previous.candidates {
-        let survivors = previous
+        let mut survivors = previous
             .candidates
             .iter()
             .filter(|candidate| candidate.node.uid != failed.node.uid)
             .cloned()
             .collect::<Vec<_>>();
+        if !failed.standby {
+            for survivor in &mut survivors {
+                survivor.standby = false;
+            }
+        }
         let (assignments, targets, certificate) = compile_assignments(
             &previous.owner,
             previous.lease_epoch,
@@ -1012,6 +1017,7 @@ mod tests {
         assert_eq!(second.certificate.unavoidable_moves, 2);
         assert!(second.certificate.minimum_disruption);
         second.verify(&lease, Some(&first)).unwrap();
+        second.verify_integrity().unwrap();
     }
 
     #[test]
