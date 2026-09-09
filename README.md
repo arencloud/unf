@@ -804,10 +804,18 @@ transaction boundary a generation-bound publication permit only after exact
 normalized rule readback. Its model and isolated rtnetlink gate pass
 `make encryption-route-authority-test` and
 `make encryption-route-authority-live-test`; ADR 0167. The controller
-distribution loop, TC consumer, verifier, and live packet gate remain, so no
-workload packet yet selects the staged route table. The
+and agent now exchange Node-Sealed Generation Capsules over the existing
+TokenReview-authenticated TLS channel. Every prepared generation is bound to a
+fresh nonce, the authoritative Node UID, controller incarnation, and the exact
+durable predecessor; the agent atomically persists it as desired state before
+advancing its cursor. Route permits remain non-serializable and Node-local, so
+remote delivery cannot manufacture kernel authority. Replay, replacement,
+mutation, recovery, and no-change behavior pass
+`make encryption-generation-distribution-test`; ADR 0168. The prepared-state
+producer, local activation orchestrator, TC consumer, verifier, and live packet
+gate remain, so no workload packet yet selects the staged route table. The
 [Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0167 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0168 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

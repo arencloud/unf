@@ -85,6 +85,9 @@ use unf_egress::{
     issue_native_egress_reachability_probe, prepare_egress_bgp_transaction, seal_egress_bgp_route,
     seal_egress_bgp_snapshot, verify_egress_bgp_config, verify_egress_reachability_plan,
 };
+use unf_encryption::{
+    AdmittedEncryptionGeneration, EncryptionGenerationRequest, NodeSealedGenerationCapsule,
+};
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -150,6 +153,8 @@ const DEFAULT_LOAD_BALANCER_REACHABILITY_STATE_PATH: &str =
 const DEFAULT_EGRESS_BGP_STATE_PATH: &str = "/var/lib/unf/cni/v1/egress-bgp.json";
 const DEFAULT_ENCRYPTION_FAST_PATH_STATE_PATH: &str =
     "/var/lib/unf/cni/v1/encryption-fast-path.json";
+const DEFAULT_ENCRYPTION_GENERATION_STATE_PATH: &str =
+    "/var/lib/unf/cni/v1/encryption-generation.json";
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -504,6 +509,17 @@ struct Args {
         default_value = DEFAULT_ENCRYPTION_FAST_PATH_STATE_PATH
     )]
     encryption_fast_path_state_path: PathBuf,
+    /// Poll interval for authenticated prepared encryption generations.
+    #[arg(long, env = "UNF_ENCRYPTION_SYNC_SECONDS", default_value_t = 2)]
+    encryption_sync_seconds: u64,
+    /// Durable desired generation accepted from the controller. This is not
+    /// evidence that routes or eBPF maps are active.
+    #[arg(
+        long,
+        env = "UNF_ENCRYPTION_GENERATION_STATE_PATH",
+        default_value = DEFAULT_ENCRYPTION_GENERATION_STATE_PATH
+    )]
+    encryption_generation_state_path: PathBuf,
     #[arg(long, env = "UNF_NODE_NAME", default_value = "unknown")]
     node_name: String,
     #[arg(long, env = "UNF_POD_NAME", default_value = "unknown")]
@@ -995,6 +1011,16 @@ struct EgressSynchronizer {
     interval: Duration,
 }
 
+struct EncryptionGenerationSynchronizer {
+    controller_url: Option<String>,
+    client: ReloadingControllerClient,
+    agent_token_path: PathBuf,
+    interval: Duration,
+    node_name: String,
+    state_path: PathBuf,
+    current: Option<AdmittedEncryptionGeneration>,
+}
+
 #[derive(Debug)]
 struct EgressBgpSynchronizer {
     config: EgressBgpConfig,
@@ -1433,6 +1459,8 @@ struct DataplaneConfig {
     egress_bgp_endpoint: String,
     egress_bgp_state_path: PathBuf,
     encryption_fast_path_state_path: PathBuf,
+    encryption_sync_interval: Duration,
+    encryption_generation_state_path: PathBuf,
     node_name: String,
     agent_token_path: PathBuf,
     flow_export_interval: Duration,
@@ -1688,6 +1716,8 @@ async fn main() -> Result<()> {
             let egress_bgp_endpoint = args.egress_bgp_endpoint.clone();
             let egress_bgp_state_path = args.egress_bgp_state_path.clone();
             let encryption_fast_path_state_path = args.encryption_fast_path_state_path.clone();
+            let encryption_sync_interval = Duration::from_secs(args.encryption_sync_seconds.max(1));
+            let encryption_generation_state_path = args.encryption_generation_state_path.clone();
             let node_name = args.node_name.clone();
             let agent_token_path = args.agent_token_path.clone();
             let flow_export_interval = Duration::from_secs(args.flow_export_seconds.max(1));
@@ -1711,6 +1741,8 @@ async fn main() -> Result<()> {
                     egress_bgp_endpoint,
                     egress_bgp_state_path,
                     encryption_fast_path_state_path,
+                    encryption_sync_interval,
+                    encryption_generation_state_path,
                     node_name,
                     agent_token_path,
                     flow_export_interval,
@@ -6664,6 +6696,17 @@ async fn run_dataplane(
     }
     let (controller_url, controller_client) =
         preflight_dataplane_controller(&config, &state).await?;
+    // Validate the durable controller-delivery cursor before persistent BPF
+    // access. A corrupt, cross-Node, or replayed cursor must not coexist with
+    // later local kernel activation.
+    let mut encryption_generations = EncryptionGenerationSynchronizer::recover(
+        controller_url.clone(),
+        controller_client.clone(),
+        config.agent_token_path.clone(),
+        config.encryption_sync_interval,
+        config.node_name.clone(),
+        config.encryption_generation_state_path.clone(),
+    )?;
 
     // Compatibility is checked before this call because opening the persistent
     // map set may create pins or adopt existing kernel state.
@@ -6791,6 +6834,7 @@ async fn run_dataplane(
         &mut policies,
         &mut services,
         &mut egress,
+        &mut encryption_generations,
         &state,
         flow_export_sender.as_ref(),
         cancellation,
@@ -7336,6 +7380,104 @@ fn authenticated_get(
         .current()
         .get(url)
         .bearer_auth(read_agent_token(token_path)?))
+}
+
+impl EncryptionGenerationSynchronizer {
+    fn recover(
+        controller_url: Option<String>,
+        client: ReloadingControllerClient,
+        agent_token_path: PathBuf,
+        interval: Duration,
+        node_name: String,
+        state_path: PathBuf,
+    ) -> Result<Self> {
+        if !state_path.is_absolute() {
+            bail!("encryption generation state path must be absolute");
+        }
+        let current = match fs::symlink_metadata(&state_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("inspect encryption generation state"),
+            Ok(_) => {
+                let current: AdmittedEncryptionGeneration =
+                    load_secure_json(&state_path, "encryption generation")?;
+                current
+                    .verify()
+                    .context("verify durable encryption generation")?;
+                if current.recipient.node_name != node_name {
+                    bail!(
+                        "durable encryption generation targets Node {:?}, local Node is {:?}",
+                        current.recipient.node_name,
+                        node_name
+                    );
+                }
+                Some(current)
+            }
+        };
+        Ok(Self {
+            controller_url,
+            client,
+            agent_token_path,
+            interval,
+            node_name,
+            state_path,
+            current,
+        })
+    }
+
+    fn admit(
+        &mut self,
+        request: &EncryptionGenerationRequest,
+        capsule: &NodeSealedGenerationCapsule,
+    ) -> Result<bool> {
+        let candidate = capsule
+            .admit(request, self.current.as_ref())
+            .context("admit exact encryption generation successor")?;
+        persist_secure_json(&self.state_path, &candidate, "encryption generation")?;
+        info!(
+            controller_epoch = candidate.controller_epoch,
+            generation = candidate.published().generation.get(),
+            policy_revision = candidate.published().policy_revision.get(),
+            service_revision = candidate.published().service_revision.get(),
+            egress_revision = candidate.published().egress_revision.get(),
+            node_uid = %candidate.recipient.node_uid,
+            "accepted Node-sealed desired encryption generation; local route proof and map activation remain pending"
+        );
+        self.current = Some(candidate);
+        Ok(true)
+    }
+}
+
+async fn synchronize_encryption_generation(
+    synchronizer: &mut EncryptionGenerationSynchronizer,
+) -> Result<bool> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("encryption generation synchronization has no controller URL")?;
+    let request = EncryptionGenerationRequest::fresh(
+        synchronizer.node_name.clone(),
+        synchronizer.current.as_ref(),
+    )
+    .context("issue encryption generation request")?;
+    let response = synchronizer
+        .client
+        .current()
+        .post(format!("{controller_url}/v1/state/encryption-generation"))
+        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+        .json(&request)
+        .send()
+        .await
+        .context("request Node-sealed encryption generation")?;
+    if response.status() == StatusCode::NO_CONTENT {
+        return Ok(false);
+    }
+    let capsule: NodeSealedGenerationCapsule = response
+        .error_for_status()
+        .context("controller rejected encryption generation request")?
+        .json()
+        .await
+        .context("decode Node-sealed encryption generation capsule")?;
+    synchronizer.admit(&request, &capsule)
 }
 
 async fn preflight_controller_compatibility(
@@ -12759,6 +12901,7 @@ async fn consume_events(
     policies: &mut PolicySynchronizer,
     services: &mut ServiceSynchronizer,
     egress: &mut EgressSynchronizer,
+    encryption_generations: &mut EncryptionGenerationSynchronizer,
     state: &AgentState,
     flow_export_sender: Option<&mpsc::Sender<FlowExportRecord>>,
     cancellation: CancellationToken,
@@ -12772,6 +12915,7 @@ async fn consume_events(
     let mut policy_interval = tokio::time::interval(policies.interval);
     let mut service_interval = tokio::time::interval(services.interval);
     let mut egress_interval = tokio::time::interval(egress.interval);
+    let mut encryption_interval = tokio::time::interval(encryption_generations.interval);
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
@@ -12816,6 +12960,11 @@ async fn consume_events(
             _ = egress_interval.tick(), if egress.controller_url.is_some() => {
                 if let Err(error) = synchronize_egress(egress, state).await {
                     warn!(%error, "egress synchronization failed; active source state was fenced when possible");
+                }
+            }
+            _ = encryption_interval.tick(), if encryption_generations.controller_url.is_some() => {
+                if let Err(error) = synchronize_encryption_generation(encryption_generations).await {
+                    warn!(%error, "encryption generation synchronization failed; retaining durable desired predecessor and active local authority");
                 }
             }
             _ = egress_loss_interval.tick() => {
@@ -15931,6 +16080,92 @@ mod tests {
         SERVICE_CONNECTION_ROLE_FORWARD, ServiceConnectionKey, service_flow_hash,
     };
     use unf_route::{RemoteNodeIntent, RemoteRouteSnapshotNode};
+
+    fn test_controller_client() -> ReloadingControllerClient {
+        ReloadingControllerClient::without_custom_trust(Counter::default(), Counter::default())
+    }
+
+    #[test]
+    fn encryption_generation_recovery_is_node_scoped_and_fail_closed() {
+        let temporary = tempdir().unwrap();
+        let state_path = temporary.path().join("encryption-generation.json");
+        let synchronizer = EncryptionGenerationSynchronizer::recover(
+            None,
+            test_controller_client(),
+            temporary.path().join("token"),
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            state_path.clone(),
+        )
+        .unwrap();
+        assert!(synchronizer.current.is_none());
+
+        assert!(
+            EncryptionGenerationSynchronizer::recover(
+                None,
+                test_controller_client(),
+                PathBuf::from("token"),
+                Duration::from_secs(2),
+                "worker-a".to_owned(),
+                PathBuf::from("encryption-generation.json"),
+            )
+            .is_err()
+        );
+
+        persist_secure_json(
+            &state_path,
+            &serde_json::json!({"schemaVersion": 1, "unexpected": true}),
+            "encryption generation",
+        )
+        .unwrap();
+        assert!(
+            EncryptionGenerationSynchronizer::recover(
+                None,
+                test_controller_client(),
+                temporary.path().join("token"),
+                Duration::from_secs(2),
+                "worker-a".to_owned(),
+                state_path,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn encryption_generation_no_change_preserves_the_durable_cursor() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/state/encryption-generation",
+                    axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let temporary = tempdir().unwrap();
+        let token_path = temporary.path().join("token");
+        fs::write(&token_path, "test-token\n").unwrap();
+        let mut synchronizer = EncryptionGenerationSynchronizer::recover(
+            Some(format!("http://{address}")),
+            test_controller_client(),
+            token_path,
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            temporary.path().join("encryption-generation.json"),
+        )
+        .unwrap();
+        assert!(
+            !synchronize_encryption_generation(&mut synchronizer)
+                .await
+                .unwrap()
+        );
+        assert!(synchronizer.current.is_none());
+        server.abort();
+    }
 
     #[test]
     fn encryption_pin_island_is_independent_and_all_or_none() {

@@ -67,6 +67,10 @@ use unf_egress::{
     EgressSourceRetirementChallenges, compile_egress_reachability_acknowledgement,
     verify_egress_bfd_evidence_report, verify_egress_internet_snapshot,
 };
+use unf_encryption::{
+    EncryptionGenerationDistributionError, EncryptionGenerationRecipient,
+    EncryptionGenerationRequest, FastPathMapCheckpoint, NodeSealedGenerationCapsule,
+};
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
     NodeBlockSnapshot,
@@ -373,6 +377,9 @@ struct ControllerState {
     egress_gateway_applications: RwLock<BTreeMap<String, AppliedEgressGatewayApplication>>,
     egress_gateway_drains: RwLock<BTreeMap<(EgressIntentOwner, String), AppliedEgressGatewayDrain>>,
     egress_release_authorities: RwLock<BTreeMap<EgressIntentOwner, EgressSafeReleaseAuthority>>,
+    /// Secret-free prepared generations awaiting exact Node-scoped delivery.
+    /// Kernel route proof and map activation deliberately remain agent-local.
+    encryption_generations: RwLock<BTreeMap<String, FastPathMapCheckpoint>>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1315,6 +1322,10 @@ async fn spawn_internal_api(
         .route("/v1/state/policies", get(policy_snapshot))
         .route("/v1/state/services", get(service_snapshot))
         .route(
+            "/v1/state/encryption-generation",
+            post(encryption_generation),
+        )
+        .route(
             "/v1/state/service-selection",
             get(service_selection_contract),
         )
@@ -1695,6 +1706,7 @@ fn new_state_with_client_and_selector(
         egress_gateway_applications: RwLock::new(BTreeMap::new()),
         egress_gateway_drains: RwLock::new(BTreeMap::new()),
         egress_release_authorities: RwLock::new(BTreeMap::new()),
+        encryption_generations: RwLock::new(BTreeMap::new()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -7892,6 +7904,86 @@ async fn service_snapshot(
     service_snapshot_for_schema(&state, requested_service_schema(&query)?).map(Json)
 }
 
+async fn encryption_generation(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(request): Json<EncryptionGenerationRequest>,
+) -> Result<Response, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    match encryption_generation_for(&state, &agent, &request)? {
+        Some(capsule) => Ok(Json(capsule).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+fn encryption_generation_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    request: &EncryptionGenerationRequest,
+) -> Result<Option<NodeSealedGenerationCapsule>, ApiError> {
+    if !agent_application_is_current(state, agent) {
+        return Err(ApiError::forbidden(
+            "encryption generation request does not match the current authenticated agent Pod",
+        ));
+    }
+    request
+        .verify()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if request.node_name != agent.node_name {
+        return Err(ApiError::forbidden(
+            "encryption generation request targets a different Node",
+        ));
+    }
+    let node_uid = read_lock(&state.node_port_nodes)
+        .get(&agent.node_name)
+        .map(|record| record.node_uid.clone())
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "authoritative Node UID is unavailable for encryption generation delivery",
+            )
+        })?;
+    let recipient = EncryptionGenerationRecipient {
+        node_name: agent.node_name.clone(),
+        node_uid,
+    };
+    if request
+        .current
+        .as_ref()
+        .is_some_and(|current| current.recipient != recipient)
+    {
+        return Err(ApiError::forbidden(
+            "encryption generation cursor belongs to a replaced or different Node",
+        ));
+    }
+    let desired = read_lock(&state.encryption_generations)
+        .get(&agent.node_name)
+        .cloned();
+    let Some(desired) = desired else {
+        return Ok(None);
+    };
+    if request
+        .current
+        .as_ref()
+        .is_some_and(|current| current.published == desired.transaction.desired.published)
+    {
+        return Ok(None);
+    }
+    NodeSealedGenerationCapsule::issue(state.identity_epoch, recipient, request, desired)
+        .map(Some)
+        .map_err(|error| match error {
+            EncryptionGenerationDistributionError::RecipientMismatch
+            | EncryptionGenerationDistributionError::RequestMismatch => {
+                ApiError::forbidden(error.to_string())
+            }
+            EncryptionGenerationDistributionError::InvalidRequest => {
+                ApiError::bad_request(error.to_string())
+            }
+            _ => ApiError::service_unavailable(format!(
+                "prepared encryption generation is not a valid exact successor: {error}"
+            )),
+        })
+}
+
 async fn service_selection_contract(
     State(state): State<Arc<ControllerState>>,
     Query(query): Query<SelectionContractQuery>,
@@ -13253,6 +13345,91 @@ mod tests {
             pod_uid: format!("unf-agent-{node}-uid"),
             audience: EGRESS_AGENT_TOKEN_AUDIENCE.to_owned(),
         }
+    }
+
+    fn install_authenticated_agent(state: &ControllerState, agent: &AuthenticatedAgent) {
+        write_lock(&state.pods).insert(
+            format!("unf-system/{}", agent.pod_name),
+            PodRecord {
+                namespace: "unf-system".to_owned(),
+                name: agent.pod_name.clone(),
+                uid: agent.pod_uid.clone(),
+                node_name: Some(agent.node_name.clone()),
+                host_network: true,
+                endpoint: Endpoint {
+                    identity: IdentityId::new(1),
+                    namespace: "unf-system".to_owned(),
+                    namespace_labels: BTreeMap::new(),
+                    service_account: EGRESS_AGENT_SERVICE_ACCOUNT.to_owned(),
+                    application: Some("unf-agent".to_owned()),
+                    labels: BTreeMap::new(),
+                    named_ports: BTreeMap::new(),
+                },
+                ipv4_addresses: BTreeSet::new(),
+                ipv6_addresses: BTreeSet::new(),
+            },
+        );
+        write_lock(&state.node_port_nodes).insert(
+            agent.node_name.clone(),
+            NodePortNodeRecord {
+                node_uid: format!("{}-uid", agent.node_name),
+                revision: Revision::new(1),
+                addresses: Vec::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn encryption_generation_delivery_is_authenticated_node_uid_scoped() {
+        let state = new_state(true);
+        let agent = authenticated_egress_agent("worker-a");
+        install_authenticated_agent(&state, &agent);
+        let request =
+            EncryptionGenerationRequest::issue("worker-a".to_owned(), None, [7; 32]).unwrap();
+        assert!(
+            encryption_generation_for(&state, &agent, &request)
+                .unwrap()
+                .is_none()
+        );
+
+        let foreign =
+            EncryptionGenerationRequest::issue("worker-b".to_owned(), None, [8; 32]).unwrap();
+        assert_eq!(
+            encryption_generation_for(&state, &agent, &foreign)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let replaced_cursor = unf_encryption::EncryptionGenerationRequest {
+            schema_version: unf_encryption::ENCRYPTION_GENERATION_REQUEST_SCHEMA_VERSION,
+            node_name: "worker-a".to_owned(),
+            current: Some(unf_encryption::EncryptionGenerationCursor {
+                controller_epoch: 1,
+                recipient: EncryptionGenerationRecipient {
+                    node_name: "worker-a".to_owned(),
+                    node_uid: "replaced-node-uid".to_owned(),
+                },
+                published: unf_encryption::FastPathPublishedGeneration {
+                    generation: Revision::new(1),
+                    policy_revision: Revision::new(1),
+                    service_revision: Revision::new(1),
+                    egress_revision: Revision::new(1),
+                    bank: 0,
+                    epoch_count: 1,
+                    decision_count: 0,
+                    transport_count: 1,
+                    state_digest: unf_encryption::EncryptionFastPathDigest([1; 32]),
+                },
+            }),
+            nonce: [9; 32],
+        };
+        assert_eq!(
+            encryption_generation_for(&state, &agent, &replaced_cursor)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
     }
 
     fn bfd_evidence_report(

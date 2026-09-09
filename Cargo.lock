@@ -3413,6 +3413,7 @@ dependencies = [
  "unf-api",
  "unf-common",
  "unf-egress",
+ "unf-encryption",
  "unf-ipam",
  "unf-loadbalancer",
  "unf-policy",

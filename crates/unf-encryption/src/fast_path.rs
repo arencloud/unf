@@ -1023,16 +1023,17 @@ mod tests {
     use super::*;
     use crate::{
         CausalCommitVector, EncryptionBaseline, EncryptionCapability, EncryptionContractFacts,
-        EncryptionContractRevisions, EncryptionEndpointFact, EncryptionIntent, EncryptionKeyFact,
-        EncryptionKeyPhase, EncryptionModel, EncryptionNode, EncryptionPathFact,
+        EncryptionContractRevisions, EncryptionEndpointFact, EncryptionGenerationDistributionError,
+        EncryptionGenerationRecipient, EncryptionGenerationRequest, EncryptionIntent,
+        EncryptionKeyFact, EncryptionKeyPhase, EncryptionModel, EncryptionNode, EncryptionPathFact,
         EncryptionPolicyFact, EncryptionRouteAuthority, EncryptionRouteAuthorityError,
         EncryptionRouteFamily, FastPathMapCheckpoint, FastPathMapRecoveryAction,
         FastPathMapTransaction, FastPathTransactionError, IpPrefix, ManagedIdentitySelector,
-        UNF_ENCRYPTION_RULE_PRIORITY_BASE, UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily,
-        UnderlayMtuObservation, WireGuardEpochActivation, WireGuardKernelPlan,
-        WireGuardKernelPlanInput, WireGuardKernelSnapshotInput, WireGuardMtuEnvelope,
-        WireGuardPeerPlan, WireGuardPeerReadback, WireGuardPublicKey, WireGuardRouteReadback,
-        WireGuardRouteScope,
+        NodeSealedGenerationCapsule, UNF_ENCRYPTION_RULE_PRIORITY_BASE,
+        UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily, UnderlayMtuObservation,
+        WireGuardEpochActivation, WireGuardKernelPlan, WireGuardKernelPlanInput,
+        WireGuardKernelSnapshotInput, WireGuardMtuEnvelope, WireGuardPeerPlan,
+        WireGuardPeerReadback, WireGuardPublicKey, WireGuardRouteReadback, WireGuardRouteScope,
     };
 
     struct Fixture {
@@ -1573,6 +1574,111 @@ mod tests {
             Err(EncryptionRouteAuthorityError::InvalidAuthority
                 | EncryptionRouteAuthorityError::InvalidRule)
         ));
+    }
+
+    #[test]
+    fn node_sealed_generation_capsule_admits_only_the_exact_causal_successor() {
+        let fixture = fixture(7);
+        let first_state = required_state(&fixture, context_at(1, 21));
+        let first_checkpoint =
+            FastPathMapCheckpoint::begin(Revision::new(22), &first_state, None).unwrap();
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-worker-a".to_owned(),
+        };
+        let first_request =
+            EncryptionGenerationRequest::issue("worker-a".to_owned(), None, [1; 32]).unwrap();
+        let first_capsule = NodeSealedGenerationCapsule::issue(
+            100,
+            recipient.clone(),
+            &first_request,
+            first_checkpoint,
+        )
+        .unwrap();
+        let first = first_capsule.admit(&first_request, None).unwrap();
+        first.verify().unwrap();
+
+        let second_state = required_state(&fixture, context_at(0, 23));
+        let second_checkpoint =
+            FastPathMapCheckpoint::begin(Revision::new(24), &second_state, Some(first.published()))
+                .unwrap();
+        let second_request =
+            EncryptionGenerationRequest::issue("worker-a".to_owned(), Some(&first), [2; 32])
+                .unwrap();
+        let mut out_of_bounds = second_request.clone();
+        out_of_bounds.current.as_mut().unwrap().published.bank =
+            unf_ebpf_common::ENCRYPTION_BANK_COUNT;
+        assert!(out_of_bounds.verify().is_err());
+        let mut out_of_capacity = second_request.clone();
+        out_of_capacity
+            .current
+            .as_mut()
+            .unwrap()
+            .published
+            .decision_count = unf_ebpf_common::ENCRYPTION_DECISION_MAP_CAPACITY + 1;
+        assert!(out_of_capacity.verify().is_err());
+        // Controller epochs identify incarnations; generation/predecessor
+        // authority is monotonic, but the opaque epoch number need not be.
+        let second_capsule =
+            NodeSealedGenerationCapsule::issue(99, recipient, &second_request, second_checkpoint)
+                .unwrap();
+        let second = second_capsule.admit(&second_request, Some(&first)).unwrap();
+        assert_eq!(second.controller_epoch, 99);
+        assert_eq!(second.published().generation, Revision::new(23));
+        assert_eq!(second.published().bank, 0);
+        assert!(!serde_json::to_string(&second).unwrap().contains("private"));
+    }
+
+    #[test]
+    fn node_sealed_generation_capsule_rejects_replay_uid_swap_and_mutation() {
+        let fixture = fixture(7);
+        let state = required_state(&fixture, context_at(1, 21));
+        let checkpoint = FastPathMapCheckpoint::begin(Revision::new(22), &state, None).unwrap();
+        let request =
+            EncryptionGenerationRequest::issue("worker-a".to_owned(), None, [3; 32]).unwrap();
+        let capsule = NodeSealedGenerationCapsule::issue(
+            100,
+            EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-worker-a".to_owned(),
+            },
+            &request,
+            checkpoint,
+        )
+        .unwrap();
+
+        let replay_request =
+            EncryptionGenerationRequest::issue("worker-a".to_owned(), None, [4; 32]).unwrap();
+        assert!(matches!(
+            capsule.admit(&replay_request, None),
+            Err(EncryptionGenerationDistributionError::RequestMismatch)
+        ));
+        let mut swapped = capsule.clone();
+        swapped.recipient.node_uid = "replacement-uid".to_owned();
+        assert!(matches!(
+            swapped.admit(&request, None),
+            Err(EncryptionGenerationDistributionError::InvalidCapsule)
+        ));
+        let mut mutated = capsule.clone();
+        mutated
+            .checkpoint
+            .transport_authority
+            .first_mut()
+            .unwrap()
+            .route_table += 1;
+        assert!(matches!(
+            mutated.admit(&request, None),
+            Err(EncryptionGenerationDistributionError::InvalidCheckpoint(_))
+        ));
+        let encoded = serde_json::to_string(&capsule).unwrap();
+        assert!(
+            serde_json::from_str::<NodeSealedGenerationCapsule>(&encoded.replacen(
+                '{',
+                "{\"unknown\":true,",
+                1
+            ))
+            .is_err()
+        );
     }
 
     #[test]
