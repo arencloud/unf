@@ -16,8 +16,8 @@ pool=unf-egress-openshift
 policy=unf-egress-openshift
 gateway_label=network.unf.io/egress-gateway
 drain_label=network.unf.io/egress-drain
-pool_v4=${UNF_OPENSHIFT_EGRESS_IPV4_POOL:-10.50.60.232/31}
-pool_v6=${UNF_OPENSHIFT_EGRESS_IPV6_POOL:-2a02:abcd:1234:5600::e8/127}
+pool_v4=${UNF_OPENSHIFT_EGRESS_IPV4_POOL:-10.50.60.232/29}
+pool_v6=${UNF_OPENSHIFT_EGRESS_IPV6_POOL:-2a02:abcd:1234:5600::e8/125}
 external_port=${UNF_OPENSHIFT_EGRESS_FIXTURE_PORT:-28080}
 expected_address_ack="${pool_v4},${pool_v6}"
 started_unix=$(date +%s)
@@ -305,7 +305,15 @@ if "${kc[@]}" get namespace "${namespace}" >/dev/null 2>&1; then
     echo "qualification namespace already exists; refusing to adopt it" >&2
     exit 1
 fi
-for address in 10.50.60.232 10.50.60.233 2a02:abcd:1234:5600::e8 2a02:abcd:1234:5600::e9; do
+mapfile -t candidate_addresses < <(python3 -c '
+import ipaddress, sys
+for value in sys.argv[1:]:
+    network = ipaddress.ip_network(value, strict=True)
+    for address in list(network.hosts())[:2]:
+        print(address)
+' "${pool_v4}" "${pool_v6}")
+(( ${#candidate_addresses[@]} == 4 ))
+for address in "${candidate_addresses[@]}"; do
     if jq -e --arg address "$(canonical_ip "${address}")" '[.items[].status.addresses[].address] | index($address) != null' \
         <<<"${nodes_json}" >/dev/null; then
         echo "refusing to use egress address already assigned to a Node: ${address}" >&2
