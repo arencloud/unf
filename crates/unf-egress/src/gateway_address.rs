@@ -563,7 +563,7 @@ impl EgressGatewayAddressAcknowledgement {
             || self.projection_digest != projection.projection_digest
             || self.interface_name.is_empty()
             || self.interface_name.len() > 15
-            || self.interface_index == 0
+            || (self.interface_index == 0 && (!owned.is_empty() || expected_released.is_empty()))
             || !(1_280..=65_535).contains(&self.mtu)
             || self
                 .owned_addresses
@@ -806,6 +806,43 @@ mod tests {
             vec![withdrawing_revision]
         );
         assert!(released_ack.quarantined_desired_revisions.is_empty());
+
+        let mut false_absence = released_ack.clone();
+        false_absence.interface_index = 0;
+        assert_eq!(
+            false_absence.verify(&released).unwrap_err(),
+            EgressGatewayAddressError::AcknowledgementMismatch,
+            "partial release still owns ensured addresses and cannot claim link absence"
+        );
+
+        let mut final_registry = EgressGatewayRegistry::default();
+        let final_lease = lease("final", &["192.0.2.40", "2001:db8::40"], 3);
+        final_registry
+            .ensure(&final_lease, vec![node("a")])
+            .unwrap();
+        let final_withdrawal = final_registry.withdraw(&final_lease.intent.owner).unwrap();
+        let final_release = EgressGatewayAddressProjection::issue_with_releases(
+            &principal("a"),
+            7,
+            final_registry.checkpoint(),
+            vec![final_withdrawal.revision],
+        )
+        .unwrap()
+        .admit(&principal("a"))
+        .unwrap();
+        let absence = EgressGatewayAddressAcknowledgement::issue(
+            &final_release,
+            "unf-egress0".to_string(),
+            0,
+            1_500,
+            Vec::new(),
+        )
+        .expect("a proof-authorized full release certifies interface absence");
+        assert!(absence.owned_addresses.is_empty());
+        assert_eq!(
+            absence.released_desired_revisions,
+            vec![final_withdrawal.revision]
+        );
 
         let mut incomplete = ack;
         incomplete.owned_addresses.remove(0);

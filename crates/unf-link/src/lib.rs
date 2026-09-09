@@ -1070,6 +1070,16 @@ impl GatewayAddressPlan {
             })?;
         tokio::spawn(connection);
         let Some(link) = find_link(&handle, &self.interface_name).await? else {
+            // A replayed full release may observe that the owned link is
+            // already gone.  The link and proxy-neighbour lifecycles are
+            // independent, so still withdraw any authorized stale proxies
+            // before certifying absence.
+            remove_gateway_proxies(
+                &handle,
+                &self.ipv6_proxy_addresses(),
+                self.ipv6_proxy_uplink.as_ref(),
+            )
+            .await?;
             return Ok(DeleteOutcome::AlreadyAbsent);
         };
         self.readback_with_handle(&handle).await?;
@@ -2092,6 +2102,12 @@ mod tests {
         assert_eq!(
             empty.release().await.expect("release exact empty plan"),
             DeleteOutcome::Deleted
+        );
+        assert_eq!(
+            plan.release()
+                .await
+                .expect("replayed full release certifies link and proxy absence"),
+            DeleteOutcome::AlreadyAbsent
         );
         assert_eq!(
             empty.release().await.expect("idempotent release"),

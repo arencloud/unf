@@ -89,7 +89,7 @@ use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
     NodeBlockSnapshot,
 };
-use unf_link::GatewayAddressPlan;
+use unf_link::{EGRESS_GATEWAY_INTERFACE, GatewayAddressPlan, GatewayAddressReadback};
 use unf_loadbalancer::{
     LOAD_BALANCER_FRONTEND_BANK_CAPACITY, LoadBalancerDataplaneState,
     NODE_REACHABILITY_CHECKPOINT_SCHEMA_VERSION, NodeReachabilityCheckpoint,
@@ -9140,7 +9140,7 @@ async fn apply_egress_gateway_address_projection(
     )
     .context("compile complete Node-UID-bound gateway-address plan")?;
     let mut plan = GatewayAddressPlan::new(
-        node_uid,
+        node_uid.clone(),
         1_500,
         retained_addresses.iter().copied().collect(),
     )
@@ -9153,7 +9153,28 @@ async fn apply_egress_gateway_address_projection(
             .with_ipv6_proxy_uplink(interface_name, interface_index)
             .context("bind retained gateway-address plan to IPv6 proxy uplink")?;
     }
-    let readback = if previous_addresses.is_empty() || previous_addresses == retained_addresses {
+    let readback = if retained_addresses.is_empty() && !previous_addresses.is_empty() {
+        // A proof-authorized full release owns absence, not an empty dummy
+        // interface.  Certify that state with interface index zero; the wire
+        // verifier permits this sentinel only when every address is released.
+        if let Err(previous_error) = previous_plan.release().await {
+            // Rolling forward from an older agent may leave an exact owned,
+            // already-empty link. It is safe to delete only if the empty plan
+            // independently validates that ownership.
+            plan.release().await.map_err(|empty_error| {
+                anyhow!(
+                    "release complete gateway ownership failed ({previous_error}); exact empty-link recovery also failed ({empty_error})"
+                )
+            })?;
+        }
+        GatewayAddressReadback {
+            node_uid: node_uid.clone(),
+            interface_name: EGRESS_GATEWAY_INTERFACE.to_string(),
+            interface_index: 0,
+            mtu: 1_500,
+            addresses: BTreeSet::new(),
+        }
+    } else if previous_addresses.is_empty() || previous_addresses == retained_addresses {
         plan.apply()
             .await
             .context("apply and read back gateway-address ownership")?
