@@ -14,6 +14,7 @@ mod generation_reconciler;
 mod kernel_provider;
 mod key_authority;
 mod local_orchestrator;
+mod local_plan_compiler;
 mod route_authority;
 
 pub use activation_latch::*;
@@ -25,6 +26,7 @@ pub use generation_reconciler::*;
 pub use kernel_provider::*;
 pub use key_authority::*;
 pub use local_orchestrator::*;
+pub use local_plan_compiler::*;
 pub use route_authority::*;
 
 use std::collections::{BTreeMap, BTreeSet};
