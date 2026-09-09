@@ -869,11 +869,14 @@ one Causally Sealed Input Manifold: a strict Node-scoped digest atomically binds
 every contract, readiness proof, identity decision, and policy/Service/egress
 revision, with exact bidirectional decision-to-plan coverage and no private or
 reusable activation authority. `make encryption-plan-manifold-test`; ADR 0178.
-The authenticated controller/agent delivery loop, TC consumer/verifier, and
+Its Nonce-Bound Plan Relay adds a fresh challenge, exact durable predecessor,
+Node UID, controller incarnation, and monotonic revision fences without turning
+desired state into local authority; `make encryption-plan-distribution-test`;
+ADR 0179. The runtime controller/agent adoption loop, TC consumer/verifier, and
 live encrypted packet gate remain, so no workload packet yet selects the staged
 route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0178 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0179 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

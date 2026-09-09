@@ -772,10 +772,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        EncryptionBaseline, EncryptionCapability, EncryptionContractFacts,
+        AdmittedNodeLocalPlan, EncryptionBaseline, EncryptionCapability, EncryptionContractFacts,
         EncryptionContractRevisions, EncryptionEndpointFact, EncryptionKeyFact, EncryptionKeyPhase,
         EncryptionModel, EncryptionNode, EncryptionPathClass, EncryptionPathFact,
-        EncryptionPolicyFact, IpPrefix, UNF_WIREGUARD_ROUTE_PROTOCOL, WireGuardKernelSnapshotInput,
+        EncryptionPolicyFact, IpPrefix, NodeLocalPlanDistributionError, NodeLocalPlanRequest,
+        NodeSealedPlanCapsule, UNF_WIREGUARD_ROUTE_PROTOCOL, WireGuardKernelSnapshotInput,
         WireGuardPeerReadback, WireGuardPublicKey, WireGuardRouteReadback, WireGuardRouteScope,
     };
 
@@ -949,6 +950,46 @@ mod tests {
         .unwrap()
     }
 
+    fn manifold(generation: u64, reverse_decisions: bool) -> NodeLocalPlanSnapshot {
+        let contract = contract();
+        let mut decisions = contract
+            .plans
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| NodeLocalDecisionPlan {
+                source_identity: plan.source.identity,
+                destination_identity: plan.destination.identity,
+                disposition: EncryptionDisposition::Required,
+                contract_epoch: Some(7),
+                plan_index: Some(index),
+            })
+            .collect::<Vec<_>>();
+        if reverse_decisions {
+            decisions.reverse();
+        }
+        NodeLocalPlanSnapshot::issue(NodeLocalPlanSnapshotFields {
+            membership_revision: Revision::new(6),
+            generation: Revision::new(generation),
+            recipient: EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-a".to_owned(),
+            },
+            policy_revision: Revision::new(3),
+            service_revision: Revision::new(30),
+            egress_revision: Revision::new(40),
+            listen_port: 51_820,
+            persistent_keepalive_seconds: 25,
+            epochs: vec![NodeLocalEpochPlanRecord {
+                contract,
+                readiness_digest: [7; 32],
+                state: FastPathEpochState::Active,
+                drain_until_monotonic_ns: 0,
+            }],
+            decisions,
+        })
+        .unwrap()
+    }
+
     #[test]
     fn snapshot_first_compiler_coalesces_identity_cartesian_product_to_one_peer() {
         let contract = contract();
@@ -1032,54 +1073,17 @@ mod tests {
 
     #[test]
     fn causal_input_manifold_is_canonical_complete_and_strict() {
-        let contract = contract();
-        let decisions = contract
-            .plans
-            .iter()
-            .enumerate()
-            .map(|(index, plan)| NodeLocalDecisionPlan {
-                source_identity: plan.source.identity,
-                destination_identity: plan.destination.identity,
-                disposition: EncryptionDisposition::Required,
-                contract_epoch: Some(7),
-                plan_index: Some(index),
-            })
-            .collect::<Vec<_>>();
-        let issue = |mut decisions: Vec<NodeLocalDecisionPlan>| {
-            decisions.reverse();
-            NodeLocalPlanSnapshot::issue(NodeLocalPlanSnapshotFields {
-                membership_revision: Revision::new(6),
-                generation: Revision::new(20),
-                recipient: EncryptionGenerationRecipient {
-                    node_name: "worker-a".to_owned(),
-                    node_uid: "uid-a".to_owned(),
-                },
-                policy_revision: Revision::new(3),
-                service_revision: Revision::new(30),
-                egress_revision: Revision::new(40),
-                listen_port: 51_820,
-                persistent_keepalive_seconds: 25,
-                epochs: vec![NodeLocalEpochPlanRecord {
-                    contract: contract.clone(),
-                    readiness_digest: [7; 32],
-                    state: FastPathEpochState::Active,
-                    drain_until_monotonic_ns: 0,
-                }],
-                decisions,
-            })
-            .unwrap()
-        };
-        let manifold = issue(decisions.clone());
-        assert_eq!(manifold, issue(decisions));
-        manifold.verify().unwrap();
+        let plan = manifold(20, false);
+        assert_eq!(plan, manifold(20, true));
+        plan.verify().unwrap();
 
-        let epoch = manifold.epoch_plans().unwrap()[0];
+        let epoch = plan.epoch_plans().unwrap()[0];
         let plans = compile_inactive_kernel_plans(
-            &manifold.compile_context(None, 1_000, 10_000).unwrap(),
+            &plan.compile_context(None, 1_000, 10_000).unwrap(),
             &[epoch],
         )
         .unwrap();
-        let prepared = manifold
+        let prepared = plan
             .prepare_exact_readback(None, 1_000, 10_000, &[snapshot(&plans[0])])
             .unwrap();
         assert_eq!(
@@ -1093,14 +1097,57 @@ mod tests {
             4
         );
 
-        let mut partial = manifold.clone();
+        let mut partial = plan.clone();
         partial.decisions.pop();
         assert!(partial.verify().is_err());
-        let mut unknown = serde_json::to_value(manifold).unwrap();
+        let mut unknown = serde_json::to_value(plan).unwrap();
         unknown
             .as_object_mut()
             .unwrap()
             .insert("serializedAuthority".to_owned(), serde_json::json!([7]));
         assert!(serde_json::from_value::<NodeLocalPlanSnapshot>(unknown).is_err());
+    }
+
+    #[test]
+    fn node_sealed_plan_delivery_is_nonce_bound_monotonic_and_non_authoritative() {
+        let first_snapshot = manifold(20, false);
+        let first_request = NodeLocalPlanRequest::issue("worker-a".to_owned(), None, [8; 32])
+            .expect("issue fresh predecessor-free request");
+        let first_capsule =
+            NodeSealedPlanCapsule::issue(41, &first_request, first_snapshot.clone())
+                .expect("seal first plan");
+        let first = first_capsule
+            .admit(&first_request, None)
+            .expect("admit first plan");
+        first.verify().unwrap();
+        assert!(first.cursor().matches(&first_snapshot));
+
+        let next_request =
+            NodeLocalPlanRequest::issue("worker-a".to_owned(), Some(&first), [9; 32]).unwrap();
+        let next = NodeSealedPlanCapsule::issue(42, &next_request, manifold(21, false)).unwrap();
+        let admitted = next.admit(&next_request, Some(&first)).unwrap();
+        assert_eq!(admitted.snapshot.generation, Revision::new(21));
+
+        let replay_request =
+            NodeLocalPlanRequest::issue("worker-a".to_owned(), Some(&first), [10; 32]).unwrap();
+        assert!(matches!(
+            next.admit(&replay_request, Some(&first)),
+            Err(NodeLocalPlanDistributionError::RequestMismatch)
+        ));
+        assert!(matches!(
+            NodeSealedPlanCapsule::issue(42, &next_request, first_snapshot),
+            Err(NodeLocalPlanDistributionError::InvalidTransition)
+        ));
+
+        let mut replaced = manifold(21, false);
+        replaced.recipient.node_uid = "uid-replaced".to_owned();
+        assert!(NodeSealedPlanCapsule::issue(42, &next_request, replaced).is_err());
+
+        let mut serialized = serde_json::to_value(admitted).unwrap();
+        serialized.as_object_mut().unwrap().insert(
+            "routePermit".to_owned(),
+            serde_json::json!("must-never-cross-wire"),
+        );
+        assert!(serde_json::from_value::<AdmittedNodeLocalPlan>(serialized).is_err());
     }
 }
