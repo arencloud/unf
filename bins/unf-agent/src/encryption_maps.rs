@@ -19,8 +19,8 @@ use unf_ebpf_common::{
     EncryptionTransportValue, encryption_route_mark,
 };
 use unf_encryption::{
-    EncryptionFastPathState, FastPathMapCheckpoint, FastPathMapRecoveryAction,
-    FastPathMapTransactionPhase, FastPathPublishedGeneration,
+    EncryptionFastPathState, EncryptionRoutePublicationPermit, FastPathMapCheckpoint,
+    FastPathMapRecoveryAction, FastPathMapTransactionPhase, FastPathPublishedGeneration,
 };
 
 use super::{load_secure_json, persist_secure_json, reject_node_block_symlinks};
@@ -135,7 +135,11 @@ impl EncryptionMapSynchronizer {
         &mut self,
         transaction_revision: Revision,
         desired: &EncryptionFastPathState,
+        route_permit: &EncryptionRoutePublicationPermit,
     ) -> Result<()> {
+        route_permit
+            .verify_for(desired)
+            .context("verify route-before-authority publication permit")?;
         let prior = self
             .active
             .as_ref()

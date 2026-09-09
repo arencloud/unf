@@ -481,7 +481,7 @@ pub struct WireGuardRouteReadback {
     pub scope: WireGuardRouteScope,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WireGuardRouteScope {
     Link,
@@ -558,6 +558,70 @@ impl WireGuardKernelSnapshot {
         Ok(snapshot)
     }
 
+    /// Verifies the canonical self-contained readback envelope without
+    /// trusting its stored digests. Exact desired-state comparison remains in
+    /// [`Self::verify_against`].
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, reordered, duplicate, or digest-mutated readback.
+    pub fn verify_integrity(&self) -> Result<(), WireGuardKernelError> {
+        if self.schema_version != WIREGUARD_KERNEL_SNAPSHOT_SCHEMA_VERSION
+            || !valid_interface_name(&self.interface_name)
+            || self.interface_index == 0
+            || self.owner_alias.is_empty()
+            || self.owner_alias.len() > MAX_WIREGUARD_OWNER_ALIAS_BYTES
+            || !self.owner_alias.starts_with("unf:encryption:v1:")
+            || !self.is_up
+            || !(MIN_WIREGUARD_MTU..=MAX_WIREGUARD_MTU).contains(&self.mtu)
+            || self.public_key.0 == [0; 32]
+            || self.listen_port == 0
+            || self.fwmark == 0
+            || self.peers.is_empty()
+            || self.peers.len() > MAX_WIREGUARD_PEERS
+            || self.routes.is_empty()
+            || self.routes.len() > MAX_WIREGUARD_ALLOWED_IPS
+            || self
+                .peers
+                .windows(2)
+                .any(|pair| pair[0].public_key >= pair[1].public_key)
+            || self
+                .routes
+                .windows(2)
+                .any(|pair| pair[0].prefix >= pair[1].prefix)
+            || self.configuration_digest != self.calculate_configuration_digest()?
+            || self.observation_digest != self.calculate_observation_digest()?
+        {
+            return Err(WireGuardKernelError::ReadbackMismatch);
+        }
+        let mut allowed_ips = BTreeSet::new();
+        for peer in &self.peers {
+            if peer.public_key.0 == [0; 32]
+                || !valid_endpoint(peer.endpoint)
+                || peer.persistent_keepalive_seconds > 600
+                || peer.allowed_ips.is_empty()
+                || peer.allowed_ips.windows(2).any(|pair| pair[0] >= pair[1])
+                || peer
+                    .allowed_ips
+                    .iter()
+                    .any(|prefix| !prefix.is_canonical() || !allowed_ips.insert(*prefix))
+            {
+                return Err(WireGuardKernelError::ReadbackMismatch);
+            }
+        }
+        if self.routes.iter().any(|route| {
+            !route.prefix.is_canonical()
+                || route.interface_index != self.interface_index
+                || route.table == 0
+                || route.protocol != UNF_WIREGUARD_ROUTE_PROTOCOL
+                || route.scope != WireGuardRouteScope::for_prefix(route.prefix)
+                || !allowed_ips.contains(&route.prefix)
+        }) {
+            return Err(WireGuardKernelError::ReadbackMismatch);
+        }
+        Ok(())
+    }
+
     /// Verifies exact desired configuration while deliberately excluding
     /// counters and handshake time from the stable configuration digest.
     ///
@@ -567,6 +631,7 @@ impl WireGuardKernelSnapshot {
     /// activation, or digest drift.
     pub fn verify_against(&self, plan: &WireGuardKernelPlan) -> Result<(), WireGuardKernelError> {
         plan.verify()?;
+        self.verify_integrity()?;
         if self.schema_version != WIREGUARD_KERNEL_SNAPSHOT_SCHEMA_VERSION
             || self.interface_name != plan.interface_name
             || self.interface_index == 0

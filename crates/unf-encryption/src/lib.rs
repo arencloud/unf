@@ -9,11 +9,13 @@ mod fast_path;
 mod fast_path_transaction;
 mod kernel_provider;
 mod key_authority;
+mod route_authority;
 
 pub use fast_path::*;
 pub use fast_path_transaction::*;
 pub use kernel_provider::*;
 pub use key_authority::*;
+pub use route_authority::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};

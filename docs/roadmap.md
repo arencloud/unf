@@ -875,14 +875,17 @@ matrix is maintained in the
   route readback, safe MTU derivation, foreign-state refusal, injected rollback,
   replay, and positive cleanup pass `make encryption-kernel-provider-test` and
   the privileged live-kernel gate; ADR 0161. Workload selection remains 9.5.
-- Phase 9.5a–9.5e now provide the canonical coalesced compiler and Causal Epoch
+- Phase 9.5a–9.5f now provide the canonical coalesced compiler and Causal Epoch
   Lease, Causal Commit Vector, isolated fixed-shape Aya ABI, Proof-Carrying Aya
   Map Mirror with delta-minimal recovery, and Cooperative Route-Mark Lease. The
   latter gives every admitted outer `WireGuard` bypass mark a collision-free
   complementary plaintext selector inside an isolated 16-bit field while
   preserving all neighboring `skb->mark` ownership. Focused gates and ADRs
-  0162–0166 pass. Controller distribution, masked policy rules, TC consumption,
-  verifier loading, and live encrypted packets remain within milestone 9.5.
+  0162–0166 pass. Route-Before-Authority then binds self-verified kernel
+  snapshots to deterministic masked IPv4/IPv6 rules and permits Aya publication
+  only after exact route/rule readback; its model and isolated live-kernel gate
+  pass under ADR 0167. Controller distribution, TC consumption, verifier loading,
+  and live encrypted packets remain within milestone 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,

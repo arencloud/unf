@@ -1025,12 +1025,14 @@ mod tests {
         CausalCommitVector, EncryptionBaseline, EncryptionCapability, EncryptionContractFacts,
         EncryptionContractRevisions, EncryptionEndpointFact, EncryptionIntent, EncryptionKeyFact,
         EncryptionKeyPhase, EncryptionModel, EncryptionNode, EncryptionPathFact,
-        EncryptionPolicyFact, FastPathMapCheckpoint, FastPathMapRecoveryAction,
+        EncryptionPolicyFact, EncryptionRouteAuthority, EncryptionRouteAuthorityError,
+        EncryptionRouteFamily, FastPathMapCheckpoint, FastPathMapRecoveryAction,
         FastPathMapTransaction, FastPathTransactionError, IpPrefix, ManagedIdentitySelector,
-        UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily, UnderlayMtuObservation,
-        WireGuardEpochActivation, WireGuardKernelPlan, WireGuardKernelPlanInput,
-        WireGuardKernelSnapshotInput, WireGuardMtuEnvelope, WireGuardPeerPlan,
-        WireGuardPeerReadback, WireGuardPublicKey, WireGuardRouteReadback, WireGuardRouteScope,
+        UNF_ENCRYPTION_RULE_PRIORITY_BASE, UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily,
+        UnderlayMtuObservation, WireGuardEpochActivation, WireGuardKernelPlan,
+        WireGuardKernelPlanInput, WireGuardKernelSnapshotInput, WireGuardMtuEnvelope,
+        WireGuardPeerPlan, WireGuardPeerReadback, WireGuardPublicKey, WireGuardRouteReadback,
+        WireGuardRouteScope,
     };
 
     struct Fixture {
@@ -1505,6 +1507,72 @@ mod tests {
 
         authority[1].route_table = authority[0].route_table;
         assert!(route_marks_are_unambiguous(&authority));
+    }
+
+    #[test]
+    fn route_before_authority_binds_dual_stack_rules_to_exact_kernel_evidence() {
+        let fixture = fixture(7);
+        let state = required_state(&fixture, context_at(1, 21));
+        let authority =
+            EncryptionRouteAuthority::issue(&state, std::slice::from_ref(&fixture.snapshot))
+                .unwrap();
+        authority.verify().unwrap();
+
+        assert_eq!(authority.generation, Revision::new(21));
+        assert_eq!(authority.fast_path_digest, state.state_digest);
+        assert_eq!(authority.rules.len(), 2);
+        assert_eq!(authority.routes.len(), 2);
+        assert_eq!(authority.rules[0].family, EncryptionRouteFamily::Ipv4);
+        assert_eq!(authority.rules[1].family, EncryptionRouteFamily::Ipv6);
+        assert_eq!(authority.rules[0].route_mark, 0x00aa_f800);
+        assert_eq!(authority.rules[0].outer_fwmark, 0x0055_0700);
+        assert_eq!(authority.rules[0].route_table, 20_007);
+        assert_eq!(
+            authority.rules[0].priority,
+            UNF_ENCRYPTION_RULE_PRIORITY_BASE + 0xaaf8
+        );
+        let permit = authority.authorize_publication(&authority.rules).unwrap();
+        permit.verify_for(&state).unwrap();
+
+        let mut wrong_generation = required_state(&fixture, context_at(0, 22));
+        assert!(matches!(
+            permit.verify_for(&wrong_generation),
+            Err(EncryptionRouteAuthorityError::InvalidPublicationPermit)
+        ));
+        wrong_generation.state_digest = state.state_digest;
+        assert!(permit.verify_for(&wrong_generation).is_err());
+    }
+
+    #[test]
+    fn route_before_authority_refuses_missing_mutated_or_partial_readback() {
+        let fixture = fixture(7);
+        let state = required_state(&fixture, context_at(1, 21));
+        assert!(matches!(
+            EncryptionRouteAuthority::issue(&state, &[]),
+            Err(EncryptionRouteAuthorityError::KernelEvidenceMismatch)
+        ));
+
+        let mut mutated_snapshot = fixture.snapshot.clone();
+        mutated_snapshot.routes[0].interface_index += 1;
+        assert!(matches!(
+            EncryptionRouteAuthority::issue(&state, &[mutated_snapshot]),
+            Err(EncryptionRouteAuthorityError::InvalidKernelSnapshot(_))
+        ));
+
+        let mut authority =
+            EncryptionRouteAuthority::issue(&state, std::slice::from_ref(&fixture.snapshot))
+                .unwrap();
+        let partial = &authority.rules[..1];
+        assert!(matches!(
+            authority.authorize_publication(partial),
+            Err(EncryptionRouteAuthorityError::RuleReadbackMismatch)
+        ));
+        authority.rules[0].route_table += 1;
+        assert!(matches!(
+            authority.verify(),
+            Err(EncryptionRouteAuthorityError::InvalidAuthority
+                | EncryptionRouteAuthorityError::InvalidRule)
+        ));
     }
 
     #[test]

@@ -798,10 +798,16 @@ Lease then derives an O(1), collision-free plaintext selector from each
 neighboring `skb->mark` bits, rejects ambiguous mark-to-table authority, and
 releases only its own field for Native traffic. Exhaustive proof over all
 65,534 admitted values passes `make encryption-route-mark-contract-test`; ADR
-0166. The controller distribution loop, TC mark/policy-route hook, verifier, and live packet gate remain, so no
+0166. Route-Before-Authority now reconstructs exact kernel witnesses, installs
+deterministic masked IPv4/IPv6 rules only after route readback, and gives the Aya
+transaction boundary a generation-bound publication permit only after exact
+normalized rule readback. Its model and isolated rtnetlink gate pass
+`make encryption-route-authority-test` and
+`make encryption-route-authority-live-test`; ADR 0167. The controller
+distribution loop, TC consumer, verifier, and live packet gate remain, so no
 workload packet yet selects the staged route table. The
 [Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0166 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0167 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
