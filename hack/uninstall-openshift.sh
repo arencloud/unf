@@ -344,7 +344,8 @@ else
     "${kc[@]}" -n unf-system delete service unf-controller \
         --ignore-not-found >/dev/null
     "${kc[@]}" -n unf-system delete configmap \
-        unf-agent-acknowledgements unf-flow-history unf-topology-history unf-internal-ca \
+        unf-agent-acknowledgements unf-flow-history unf-topology-history \
+        unf-encryption-generation-frontier unf-internal-ca \
         --ignore-not-found >/dev/null
     # Retain cleanup compatibility with deployments created before public-image
     # pulls stopped installing a namespaced Quay credential.

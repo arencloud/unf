@@ -1872,6 +1872,25 @@ mod tests {
         assert!(producer.acknowledge(&recipient, first_published).unwrap());
         assert!(!producer.acknowledge(&recipient, first_published).unwrap());
         assert!(producer.is_fully_acknowledged());
+        let durable = producer.checkpoint().unwrap();
+        durable.verify().unwrap();
+        let mut cross_frontier_receipt = durable.clone();
+        cross_frontier_receipt.acknowledgements[0].frontier_digest.0[0] ^= 1;
+        assert!(matches!(
+            EncryptionGenerationProducer::restore(cross_frontier_receipt),
+            Err(EncryptionGenerationFrontierError::InvalidProducerCheckpoint)
+        ));
+        let mut encoded = serde_json::to_value(&durable).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<crate::EncryptionGenerationProducerCheckpoint>(encoded)
+                .is_err()
+        );
+        producer = EncryptionGenerationProducer::restore(durable).unwrap();
+        assert!(producer.is_fully_acknowledged());
         assert_eq!(
             producer.publish(second).unwrap(),
             EncryptionFrontierPublishOutcome::Published
@@ -1880,6 +1899,13 @@ mod tests {
             producer.desired_for(&recipient).unwrap().transaction.prior,
             Some(first_published)
         );
+
+        let empty = EncryptionGenerationProducer::default()
+            .checkpoint()
+            .unwrap();
+        let restored_empty = EncryptionGenerationProducer::restore(empty).unwrap();
+        assert!(restored_empty.active().is_none());
+        assert!(restored_empty.is_fully_acknowledged());
     }
 
     #[test]

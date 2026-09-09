@@ -820,15 +820,20 @@ plane mutation and staged-crash recovery pass
 `make encryption-activation-latch-test`; ADR 0169. The live fact reconciler,
 durable producer store, local WireGuard/route orchestrator, TC consumer,
 verifier, and packet gate remain, so no workload packet yet selects the staged
-route table. The
-Causal Generation Frontier additionally makes one digest-bound, complete Node
+route table. The Causal Generation Frontier additionally makes one
+digest-bound, complete Node
 cut the controller's unit of publication. Exact durable cursor receipts apply
 slowest-member backpressure before the next cut, preventing mixed revisions,
 skipped predecessors, and unbounded per-Node history; Node-UID and trust-domain
 drift fail closed under `make encryption-generation-frontier-test`; ADR 0170.
-The
-[Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0170 define the ordered implementation and independent Kind/OpenShift
+The Proof-Carrying Frontier Recovery checkpoint now persists the exact active
+cut plus Node-UID, published-generation, and frontier-digest-bound receipts.
+Strict replay happens before controller readiness; retrying dirty writes and
+shutdown flushes preserve safe progress without treating a cursor as kernel
+proof. Deployment/RBAC and corruption gates pass
+`make encryption-generation-recovery-test`; ADR 0171. The [Phase 9
+plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
+ADRs 0158–0171 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

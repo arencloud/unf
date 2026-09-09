@@ -19,8 +19,11 @@ use crate::{
 };
 
 pub const ENCRYPTION_GENERATION_FRONTIER_SCHEMA_VERSION: u16 = 1;
+pub const ENCRYPTION_GENERATION_PRODUCER_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_ENCRYPTION_GENERATION_FRONTIER_NODES: usize = 4_096;
 const FRONTIER_DIGEST_DOMAIN: &[u8] = b"unf.encryption-generation-frontier.v1\0";
+const PRODUCER_CHECKPOINT_DIGEST_DOMAIN: &[u8] =
+    b"unf.encryption-generation-producer-checkpoint.v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -44,6 +47,28 @@ pub struct EncryptionGenerationFrontier {
     pub frontier_digest: EncryptionGenerationFrontierDigest,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionGenerationAcknowledgement {
+    pub recipient: EncryptionGenerationRecipient,
+    pub published: FastPathPublishedGeneration,
+    pub frontier_digest: EncryptionGenerationFrontierDigest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EncryptionGenerationProducerCheckpointDigest(pub [u8; 32]);
+
+/// Durable anti-entropy image of the exact published cut and its receipts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionGenerationProducerCheckpoint {
+    pub schema_version: u16,
+    pub active: Option<EncryptionGenerationFrontier>,
+    pub acknowledgements: Vec<EncryptionGenerationAcknowledgement>,
+    pub checkpoint_digest: EncryptionGenerationProducerCheckpointDigest,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionFrontierPublishOutcome {
     Published,
@@ -55,7 +80,7 @@ pub enum EncryptionFrontierPublishOutcome {
 #[derive(Debug, Default)]
 pub struct EncryptionGenerationProducer {
     active: Option<EncryptionGenerationFrontier>,
-    acknowledged: BTreeSet<EncryptionGenerationRecipient>,
+    acknowledged: BTreeMap<EncryptionGenerationRecipient, EncryptionGenerationAcknowledgement>,
 }
 
 impl EncryptionGenerationFrontier {
@@ -204,6 +229,47 @@ impl EncryptionGenerationFrontier {
 }
 
 impl EncryptionGenerationProducer {
+    /// Reconstructs publication authority only from an independently replayed
+    /// checkpoint. Serialized receipts never imply local kernel authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects schema/digest mutation, noncanonical or foreign receipts, and
+    /// any receipt that does not exactly name the active frontier generation.
+    pub fn restore(
+        checkpoint: EncryptionGenerationProducerCheckpoint,
+    ) -> Result<Self, EncryptionGenerationFrontierError> {
+        checkpoint.verify()?;
+        let acknowledged = checkpoint
+            .acknowledgements
+            .into_iter()
+            .map(|acknowledgement| (acknowledgement.recipient.clone(), acknowledgement))
+            .collect();
+        Ok(Self {
+            active: checkpoint.active,
+            acknowledged,
+        })
+    }
+
+    /// Creates a canonical proof-carrying anti-entropy checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error only if canonical JSON serialization fails.
+    pub fn checkpoint(
+        &self,
+    ) -> Result<EncryptionGenerationProducerCheckpoint, EncryptionGenerationFrontierError> {
+        let mut checkpoint = EncryptionGenerationProducerCheckpoint {
+            schema_version: ENCRYPTION_GENERATION_PRODUCER_CHECKPOINT_SCHEMA_VERSION,
+            active: self.active.clone(),
+            acknowledgements: self.acknowledged.values().cloned().collect(),
+            checkpoint_digest: EncryptionGenerationProducerCheckpointDigest([0; 32]),
+        };
+        checkpoint.checkpoint_digest = checkpoint.calculate_digest()?;
+        checkpoint.verify()?;
+        Ok(checkpoint)
+    }
+
     #[must_use]
     pub const fn active(&self) -> Option<&EncryptionGenerationFrontier> {
         self.active.as_ref()
@@ -270,7 +336,15 @@ impl EncryptionGenerationProducer {
         if expected != published {
             return Err(EncryptionGenerationFrontierError::AcknowledgementMismatch);
         }
-        Ok(self.acknowledged.insert(recipient.clone()))
+        let acknowledgement = EncryptionGenerationAcknowledgement {
+            recipient: recipient.clone(),
+            published,
+            frontier_digest: active.frontier_digest,
+        };
+        Ok(self
+            .acknowledged
+            .insert(recipient.clone(), acknowledgement)
+            .is_none())
     }
 
     #[must_use]
@@ -278,6 +352,74 @@ impl EncryptionGenerationProducer {
         self.active
             .as_ref()
             .is_none_or(|active| self.acknowledged.len() == active.members.len())
+    }
+}
+
+impl EncryptionGenerationProducerCheckpoint {
+    /// Replays the complete active cut and every exact receipt.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported schema, noncanonical ordering, unknown Nodes,
+    /// cross-frontier receipts, generation drift, and digest mutation.
+    pub fn verify(&self) -> Result<(), EncryptionGenerationFrontierError> {
+        if self.schema_version != ENCRYPTION_GENERATION_PRODUCER_CHECKPOINT_SCHEMA_VERSION
+            || self
+                .acknowledgements
+                .windows(2)
+                .any(|pair| pair[0].recipient >= pair[1].recipient)
+        {
+            return Err(EncryptionGenerationFrontierError::InvalidProducerCheckpoint);
+        }
+        match &self.active {
+            None if !self.acknowledgements.is_empty() => {
+                return Err(EncryptionGenerationFrontierError::InvalidProducerCheckpoint);
+            }
+            None => {}
+            Some(active) => {
+                active.verify()?;
+                if self.acknowledgements.len() > active.members.len() {
+                    return Err(EncryptionGenerationFrontierError::InvalidProducerCheckpoint);
+                }
+                for acknowledgement in &self.acknowledgements {
+                    super::generation_distribution::validate_recipient(&acknowledgement.recipient)
+                        .map_err(|_| {
+                            EncryptionGenerationFrontierError::InvalidProducerCheckpoint
+                        })?;
+                    let expected = active
+                        .checkpoint_for(&acknowledgement.recipient)
+                        .ok_or(EncryptionGenerationFrontierError::InvalidProducerCheckpoint)?
+                        .transaction
+                        .desired
+                        .published;
+                    if acknowledgement.published != expected
+                        || acknowledgement.frontier_digest != active.frontier_digest
+                    {
+                        return Err(EncryptionGenerationFrontierError::InvalidProducerCheckpoint);
+                    }
+                }
+            }
+        }
+        if self.checkpoint_digest != self.calculate_digest()? {
+            return Err(EncryptionGenerationFrontierError::ProducerCheckpointDigestMismatch);
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(
+        &self,
+    ) -> Result<EncryptionGenerationProducerCheckpointDigest, EncryptionGenerationFrontierError>
+    {
+        let mut canonical = self.clone();
+        canonical.checkpoint_digest = EncryptionGenerationProducerCheckpointDigest([0; 32]);
+        let encoded = serde_json::to_vec(&canonical)
+            .map_err(|error| EncryptionGenerationFrontierError::Encoding(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(PRODUCER_CHECKPOINT_DIGEST_DOMAIN);
+        hasher.update(encoded);
+        Ok(EncryptionGenerationProducerCheckpointDigest(
+            hasher.finalize().into(),
+        ))
     }
 }
 
@@ -349,6 +491,10 @@ pub enum EncryptionGenerationFrontierError {
     UnknownRecipient,
     #[error("encryption generation acknowledgement differs from current desired state")]
     AcknowledgementMismatch,
+    #[error("invalid encryption generation producer checkpoint")]
+    InvalidProducerCheckpoint,
+    #[error("encryption generation producer checkpoint digest mismatch")]
+    ProducerCheckpointDigestMismatch,
     #[error("encode encryption generation frontier: {0}")]
     Encoding(String),
 }

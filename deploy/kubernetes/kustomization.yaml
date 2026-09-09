@@ -13,6 +13,7 @@ resources:
   - load-balancer-status-store.yaml
   - egress-desired-store.yaml
   - egress-control-plane-store.yaml
+  - encryption-generation-store.yaml
   - controller.yaml
   - service.yaml
   - agent.yaml

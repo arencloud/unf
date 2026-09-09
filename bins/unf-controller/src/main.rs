@@ -69,7 +69,8 @@ use unf_egress::{
 };
 use unf_encryption::{
     EncryptionGenerationDistributionError, EncryptionGenerationProducer,
-    EncryptionGenerationRecipient, EncryptionGenerationRequest, NodeSealedGenerationCapsule,
+    EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
+    EncryptionGenerationRequest, NodeSealedGenerationCapsule,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -153,6 +154,10 @@ const AGENT_REPORT_STORE_SCHEMA_VERSION: u16 = 1;
 const AGENT_REPORT_STORE_CAPACITY: usize = 1_024;
 const AGENT_REPORT_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_REPORT_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
+const ENCRYPTION_GENERATION_STORE_NAME: &str = "unf-encryption-generation-frontier";
+const ENCRYPTION_GENERATION_STORE_KEY: &str = "frontier.json";
+const ENCRYPTION_GENERATION_STORE_DATA_LIMIT: usize = 900_000;
+const ENCRYPTION_GENERATION_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const EGRESS_DESIRED_STORE_NAME: &str = "unf-egress-desired-state";
 const EGRESS_DESIRED_STORE_KEY: &str = "desired.json";
 const EGRESS_FQDN_OBSERVATION_STORE_KEY: &str = "fqdn-observations.json";
@@ -315,6 +320,9 @@ struct ControllerMetrics {
     topology_history_persistence_writes: Counter,
     topology_history_persistence_errors: Counter,
     topology_history_entries_restored: Counter,
+    encryption_generation_persistence_writes: Counter,
+    encryption_generation_persistence_errors: Counter,
+    encryption_generation_receipts_restored: Counter,
     external_flow_export: ExternalFlowExportMetrics,
 }
 
@@ -380,6 +388,8 @@ struct ControllerState {
     /// Secret-free prepared generations awaiting exact Node-scoped delivery.
     /// Kernel route proof and map activation deliberately remain agent-local.
     encryption_generations: Mutex<EncryptionGenerationProducer>,
+    encryption_generations_dirty: AtomicBool,
+    encryption_generation_store: Option<Api<ConfigMap>>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1216,10 +1226,18 @@ async fn main() -> Result<()> {
         restore_egress_control_plane(&state)
             .await
             .context("restore durable egress control plane")?;
+        restore_encryption_generation_producer(&state)
+            .await
+            .context("restore durable encryption generation frontier")?;
         spawn_agent_report_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_flow_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_topology_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_egress_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
+        spawn_encryption_generation_persistence(
+            Arc::clone(&state),
+            cancellation.clone(),
+            &mut tasks,
+        );
         let client = client.context("Kubernetes client is required in connected mode")?;
         spawn_load_balancer_reconciler(
             &mut tasks,
@@ -1592,6 +1610,24 @@ fn register_topology_history_metrics(registry: &mut Registry, metrics: &Controll
     );
 }
 
+fn register_encryption_generation_metrics(registry: &mut Registry, metrics: &ControllerMetrics) {
+    registry.register(
+        "unf_encryption_generation_persistence_writes",
+        "Durable encryption generation-frontier checkpoints written by the controller",
+        metrics.encryption_generation_persistence_writes.clone(),
+    );
+    registry.register(
+        "unf_encryption_generation_persistence_errors",
+        "Durable encryption generation-frontier checkpoint operations that failed",
+        metrics.encryption_generation_persistence_errors.clone(),
+    );
+    registry.register(
+        "unf_encryption_generation_receipts_restored",
+        "Exact Node generation-frontier receipts restored at controller startup",
+        metrics.encryption_generation_receipts_restored.clone(),
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 fn new_state_with_client_and_selector(
     offline: bool,
@@ -1658,6 +1694,7 @@ fn new_state_with_client_and_selector(
     register_flow_history_metrics(&mut registry, &metrics);
     register_external_flow_export_metrics(&mut registry, &metrics);
     register_topology_history_metrics(&mut registry, &metrics);
+    register_encryption_generation_metrics(&mut registry, &metrics);
     let config_map_store = token_review_client
         .clone()
         .map(|client| Api::<ConfigMap>::namespaced(client, "unf-system"));
@@ -1707,6 +1744,8 @@ fn new_state_with_client_and_selector(
         egress_gateway_drains: RwLock::new(BTreeMap::new()),
         egress_release_authorities: RwLock::new(BTreeMap::new()),
         encryption_generations: Mutex::new(EncryptionGenerationProducer::default()),
+        encryption_generations_dirty: AtomicBool::new(false),
+        encryption_generation_store: config_map_store.clone(),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -3147,6 +3186,125 @@ async fn persist_agent_reports(state: &ControllerState) -> Result<()> {
     .await
     .with_context(|| format!("patch ConfigMap unf-system/{AGENT_REPORT_STORE_NAME}"))?;
     state.metrics.agent_report_persistence_writes.inc();
+    Ok(())
+}
+
+async fn restore_encryption_generation_producer(state: &ControllerState) -> Result<()> {
+    let api = state
+        .encryption_generation_store
+        .as_ref()
+        .context("durable encryption generation-frontier API is unavailable")?;
+    let config_map = api
+        .get(ENCRYPTION_GENERATION_STORE_NAME)
+        .await
+        .with_context(|| format!("read ConfigMap unf-system/{ENCRYPTION_GENERATION_STORE_NAME}"))?;
+    let Some(encoded) = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(ENCRYPTION_GENERATION_STORE_KEY))
+    else {
+        info!("durable encryption generation-frontier store is empty");
+        return Ok(());
+    };
+    let producer = decode_encryption_generation_producer(encoded)?;
+    let checkpoint = producer
+        .checkpoint()
+        .context("replay restored encryption generation producer")?;
+    let receipts = checkpoint.acknowledgements.len() as u64;
+    let revision = checkpoint
+        .active
+        .as_ref()
+        .map(|frontier| frontier.revision.get());
+    *mutex_lock(&state.encryption_generations) = producer;
+    state
+        .metrics
+        .encryption_generation_receipts_restored
+        .inc_by(receipts);
+    info!(
+        ?revision,
+        receipts, "restored durable encryption generation frontier"
+    );
+    Ok(())
+}
+
+fn decode_encryption_generation_producer(encoded: &str) -> Result<EncryptionGenerationProducer> {
+    let checkpoint: EncryptionGenerationProducerCheckpoint = serde_json::from_str(encoded)
+        .context("decode durable encryption generation-frontier checkpoint")?;
+    EncryptionGenerationProducer::restore(checkpoint)
+        .context("validate durable encryption generation-frontier checkpoint")
+}
+
+fn spawn_encryption_generation_persistence(
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+    tasks: &mut JoinSet<()>,
+) {
+    tasks.spawn(async move {
+        let mut interval = tokio::time::interval(ENCRYPTION_GENERATION_PERSISTENCE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    persist_encryption_generation_if_dirty(&state).await;
+                    break;
+                }
+                _ = interval.tick() => persist_encryption_generation_if_dirty(&state).await,
+            }
+        }
+    });
+}
+
+async fn persist_encryption_generation_if_dirty(state: &ControllerState) {
+    if !state
+        .encryption_generations_dirty
+        .swap(false, Ordering::AcqRel)
+    {
+        return;
+    }
+    if let Err(error) = persist_encryption_generation(state).await {
+        state
+            .encryption_generations_dirty
+            .store(true, Ordering::Release);
+        state.metrics.encryption_generation_persistence_errors.inc();
+        warn!(%error, "could not persist encryption generation frontier; retrying");
+    }
+}
+
+async fn persist_encryption_generation(state: &ControllerState) -> Result<()> {
+    let api = state
+        .encryption_generation_store
+        .as_ref()
+        .context("durable encryption generation-frontier API is unavailable")?;
+    let checkpoint = mutex_lock(&state.encryption_generations)
+        .checkpoint()
+        .context("build durable encryption generation-frontier checkpoint")?;
+    let encoded = serde_json::to_string(&checkpoint)
+        .context("encode durable encryption generation-frontier checkpoint")?;
+    if encoded.len() > ENCRYPTION_GENERATION_STORE_DATA_LIMIT {
+        return Err(anyhow!(
+            "durable encryption generation frontier requires {} bytes; ConfigMap limit is {}",
+            encoded.len(),
+            ENCRYPTION_GENERATION_STORE_DATA_LIMIT
+        ));
+    }
+    let data = BTreeMap::from([(ENCRYPTION_GENERATION_STORE_KEY.to_owned(), encoded)]);
+    let patch = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": ENCRYPTION_GENERATION_STORE_NAME,
+            "namespace": "unf-system",
+        },
+        "data": data,
+    });
+    api.patch(
+        ENCRYPTION_GENERATION_STORE_NAME,
+        &PatchParams::apply("unf-controller-encryption-generation").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch ConfigMap unf-system/{ENCRYPTION_GENERATION_STORE_NAME}"))?;
+    state.metrics.encryption_generation_persistence_writes.inc();
     Ok(())
 }
 
@@ -7965,13 +8123,18 @@ fn encryption_generation_for(
         .as_ref()
         .is_some_and(|current| current.published == desired.transaction.desired.published)
     {
-        producer
+        let receipt_changed = producer
             .acknowledge(&recipient, desired.transaction.desired.published)
             .map_err(|error| {
                 ApiError::service_unavailable(format!(
                     "current encryption generation could not acknowledge its causal frontier: {error}"
                 ))
             })?;
+        if receipt_changed {
+            state
+                .encryption_generations_dirty
+                .store(true, Ordering::Release);
+        }
         return Ok(None);
     }
     NodeSealedGenerationCapsule::issue(state.identity_epoch, recipient, request, desired)
@@ -13436,6 +13599,30 @@ mod tests {
                 .status,
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[test]
+    fn encryption_generation_frontier_checkpoint_is_durable_and_fail_closed() {
+        let producer = EncryptionGenerationProducer::default();
+        let checkpoint = producer.checkpoint().unwrap();
+        let encoded = serde_json::to_string(&checkpoint).unwrap();
+        let restored = decode_encryption_generation_producer(&encoded).unwrap();
+        assert!(restored.active().is_none());
+        assert!(restored.is_fully_acknowledged());
+
+        let mut corrupted = checkpoint.clone();
+        corrupted.checkpoint_digest.0[0] ^= 1;
+        assert!(
+            decode_encryption_generation_producer(&serde_json::to_string(&corrupted).unwrap())
+                .is_err()
+        );
+
+        let mut unknown = serde_json::to_value(checkpoint).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), serde_json::json!(true));
+        assert!(decode_encryption_generation_producer(&unknown.to_string()).is_err());
     }
 
     fn bfd_evidence_report(
