@@ -29,6 +29,13 @@ pub struct EgressHaCandidate {
     pub node: EgressNode,
     pub capacity_units: u16,
     pub failure_domains: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub standby: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,11 +159,16 @@ pub fn compile_egress_ha_plan(
     )?;
     let mut contingencies = Vec::with_capacity(candidates.len());
     for failed in &candidates {
-        let survivors = candidates
+        let mut survivors = candidates
             .iter()
             .filter(|candidate| candidate.node.uid != failed.node.uid)
             .cloned()
             .collect::<Vec<_>>();
+        if !failed.standby {
+            for survivor in &mut survivors {
+                survivor.standby = false;
+            }
+        }
         let (next, targets, certificate) = compile_assignments(
             &lease.intent.owner,
             lease.lease_epoch,
@@ -735,7 +747,13 @@ fn capacity_targets(
 ) -> Result<Vec<EgressHaCapacityTarget>, EgressHaError> {
     let total_capacity = candidates
         .iter()
-        .map(|candidate| u64::from(candidate.capacity_units))
+        .map(|candidate| {
+            if candidate.standby {
+                0
+            } else {
+                u64::from(candidate.capacity_units)
+            }
+        })
         .sum::<u64>();
     if total_capacity == 0 {
         return Err(EgressHaError::CapacityInvariant);
@@ -745,7 +763,12 @@ fn capacity_targets(
     let mut targets = candidates
         .iter()
         .map(|candidate| {
-            let numerator = shard_count_u64 * u64::from(candidate.capacity_units);
+            let effective_capacity = if candidate.standby {
+                0
+            } else {
+                u64::from(candidate.capacity_units)
+            };
+            let numerator = shard_count_u64 * effective_capacity;
             (
                 candidate,
                 numerator / total_capacity,
@@ -916,6 +939,7 @@ mod tests {
                 ("topology.kubernetes.io/zone".to_owned(), zone.to_owned()),
                 ("network.unf.io/rack".to_owned(), rack.to_owned()),
             ]),
+            standby: false,
         }
     }
 
@@ -988,6 +1012,60 @@ mod tests {
         assert_eq!(second.certificate.unavoidable_moves, 2);
         assert!(second.certificate.minimum_disruption);
         second.verify(&lease, Some(&first)).unwrap();
+    }
+
+    #[test]
+    fn warm_standby_expansion_restores_contingency_without_active_movement() {
+        let lease = lease(3);
+        let active = vec![
+            candidate("gateway-a", 1, "zone-a", "rack-a"),
+            candidate("gateway-b", 1, "zone-b", "rack-b"),
+        ];
+        let first = compile_egress_ha_plan(&lease, active, None, Revision::new(20)).unwrap();
+        let mut standby = candidate("gateway-c", 1, "zone-c", "rack-c");
+        standby.standby = true;
+        let mut expanded = first.candidates.clone();
+        expanded.push(standby.clone());
+        let second =
+            compile_egress_ha_plan(&lease, expanded, Some(&first), Revision::new(21)).unwrap();
+
+        assert_eq!(second.assignments, first.assignments);
+        assert_eq!(second.certificate.moved_shards, 0);
+        assert_eq!(
+            second
+                .capacity_targets
+                .iter()
+                .find(|target| target.gateway == standby.node)
+                .unwrap()
+                .target_shards,
+            0
+        );
+        for failed in first.candidates.iter().map(|candidate| &candidate.node) {
+            assert!(
+                second
+                    .contingencies
+                    .iter()
+                    .find(|contingency| &contingency.failed_gateway == failed)
+                    .unwrap()
+                    .assignments
+                    .iter()
+                    .any(|assignment| assignment.gateway == standby.node)
+            );
+        }
+        let standby_failure = second
+            .contingencies
+            .iter()
+            .find(|contingency| contingency.failed_gateway == standby.node)
+            .unwrap();
+        assert_eq!(standby_failure.assignments, first.assignments);
+        second.verify(&lease, Some(&first)).unwrap();
+        assert!(
+            serde_json::to_value(&first).unwrap()["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|candidate| candidate.get("standby").is_none())
+        );
     }
 
     #[test]

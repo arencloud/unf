@@ -1516,6 +1516,7 @@ mod tests {
                 node: gateway.node.clone(),
                 capacity_units: 1,
                 failure_domains: BTreeMap::new(),
+                standby: false,
             })
             .collect();
         compile_egress_ha_plan(&lease, candidates, None, facts.revisions.gateway).expect("HA plan")

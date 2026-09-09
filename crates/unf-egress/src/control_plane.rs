@@ -376,6 +376,7 @@ impl EgressControlPlane {
                     node,
                     capacity_units: 1,
                     failure_domains: BTreeMap::new(),
+                    standby: false,
                 })
                 .collect(),
         )
@@ -822,13 +823,24 @@ impl EgressControlPlane {
             .lease(owner)
             .cloned()
             .ok_or(EgressControlPlaneError::InvalidHaCheckpoint)?;
-        let survivors = promotion
+        let mut survivors = promotion
             .previous_plan
             .candidates
             .iter()
             .filter(|candidate| candidate.node != promotion.coordinator.manifest.failed_gateway)
             .cloned()
             .collect::<Vec<_>>();
+        if promotion
+            .previous_plan
+            .candidates
+            .iter()
+            .find(|candidate| candidate.node == promotion.coordinator.manifest.failed_gateway)
+            .is_some_and(|candidate| !candidate.standby)
+        {
+            for survivor in &mut survivors {
+                survivor.standby = false;
+            }
+        }
         if survivors.is_empty() {
             return Err(EgressControlPlaneError::InvalidGatewayCandidates);
         }

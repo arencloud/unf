@@ -1,6 +1,7 @@
 # ADR 0141: Close live measured egress HA
 
-**Status:** Accepted and implemented for Phase 8 milestone 8.6f
+**Status:** Accepted and implemented for Phase 8 milestone 8.6f; amended during
+8.11 qualification
 
 ## Context
 
@@ -51,6 +52,15 @@ fencing but never proves old-owner isolation. Graceful drain uses exact kernel
 address absence. Abrupt loss cannot advance until the old owner returns and
 completes the proof chain or a separately admitted infrastructure fence exists.
 
+Candidate expansion after a completed drain is also proof-bounded. A recovered
+eligible Node rejoins as a digest-bound warm standby with a zero active-shard
+target. The controller accepts the expanded plan only after replay proves that
+every active assignment is byte-for-byte unchanged. Its precomputed failure
+contingencies may promote the standby only through the same source-fence,
+revocation, acquisition, reachability, and activation transaction. The optional
+`standby` encoding is omitted when false, preserving existing plan bytes and
+checkpoint digests.
+
 ## Consequences
 
 - Phase 8.6 has repeatable bounded availability evidence rather than only a
@@ -58,9 +68,9 @@ completes the proof chain or a separately admitted infrastructure fence exists.
 - Existing flows can survive a graceful handoff when their complete pair is in
   the acknowledged snapshot; the unacknowledged asynchronous tail remains
   measurable and may be disrupted.
-- Minimum-disruption membership is sticky. A recovered Node is not
-  automatically given ownership back, and an abrupt recovery may leave reduced
-  redundancy until a later explicit rebalance feature is designed.
+- Minimum-disruption ownership remains sticky while recovered capacity can
+  automatically rejoin as a warm standby. Rejoin restores a certified failure
+  path without moving an active address or opening an unfenced rebalance path.
 - Empty AFT streams are valid for shards with no live state. Qualification seeds
   a TCP mapping and selects its externally observed owner so nonzero replication
   is deterministic rather than probabilistic.
@@ -92,3 +102,9 @@ The schema-v1 evidence file was
 `5b3a6fc6775b7c164dd80651ce7ddc237b37fbffec14a9db63187e0473d4692c`.
 The gate also verifies the sealed structured-recipient checkpoint can be
 encoded, restored, and independently revalidated.
+
+The 8.11 amendment adds focused planner and controller tests for digest-stable
+legacy encoding, zero-move warm-standby admission, deterministic contingency
+promotion, plus a controller guard that rejects any expansion changing an
+active assignment.
+The independent live OpenShift claim remains gated by milestone 8.11.

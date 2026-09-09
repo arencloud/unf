@@ -705,6 +705,7 @@ mod tests {
                 node: node(name),
                 capacity_units: 1,
                 failure_domains: std::collections::BTreeMap::new(),
+                standby: false,
             })
             .collect();
         let plan = compile_egress_ha_plan(&payments, candidates, None, Revision::new(10)).unwrap();
@@ -869,6 +870,7 @@ mod tests {
                 node: node(name),
                 capacity_units: 1,
                 failure_domains: std::collections::BTreeMap::new(),
+                standby: false,
             })
             .collect();
         let plan = compile_egress_ha_plan(&payments, candidates, None, desired.revision).unwrap();

@@ -32,7 +32,7 @@ use prometheus_client::registry::Registry;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use unf_api::{
     EgressInternetClassification, EgressPolicy, EgressPool, EgressProvider as ApiEgressProvider,
     EgressReachabilityAction as ApiEgressReachabilityAction,
@@ -4557,7 +4557,8 @@ fn reconcile_egress_control_plane_locked(state: &ControllerState) -> Result<()> 
         (desired.revision(), model, explicit_providers)
     };
     let current_control_checkpoint = mutex_lock(&state.egress_control_plane).checkpoint();
-    let candidates = live_egress_ha_candidates(state, &current_control_checkpoint)?;
+    let (candidates, expanded_candidates) =
+        egress_ha_candidate_sets(state, &current_control_checkpoint, revision, &model)?;
     let (dqr_revision, dqr_plans, dqr_assessments) = {
         let reachability = mutex_lock(&state.egress_reachability);
         (
@@ -4570,10 +4571,14 @@ fn reconcile_egress_control_plane_locked(state: &ControllerState) -> Result<()> 
     };
     let mut control_plane = mutex_lock(&state.egress_control_plane);
     let before = control_plane.checkpoint();
-    let mut next = control_plane.clone();
-    let result = next
-        .reconcile_with_ha_candidates(revision, model, &explicit_providers, candidates)
-        .context("derive allocation and gateway desired state")?;
+    let mut next = reconcile_egress_ha_candidates(
+        &control_plane,
+        revision,
+        &model,
+        &explicit_providers,
+        candidates,
+        expanded_candidates,
+    )?;
     let checkpoint = next.checkpoint();
     let registered = checkpoint
         .retirements
@@ -4598,7 +4603,8 @@ fn reconcile_egress_control_plane_locked(state: &ControllerState) -> Result<()> 
         acknowledge_dqr_egress_reachability(&mut next, dqr_revision, &dqr_plans, &dqr_assessments)
             .context("bridge verified DQR reachability")?;
     }
-    let changed = next.checkpoint() != before;
+    let final_checkpoint = next.checkpoint();
+    let changed = final_checkpoint != before;
     *control_plane = next;
     drop(control_plane);
     if changed {
@@ -4608,13 +4614,56 @@ fn reconcile_egress_control_plane_locked(state: &ControllerState) -> Result<()> 
         invalidate_egress_distributions_locked(state);
         info!(
             desired_revision = revision.get(),
-            allocated = result.allocated,
-            ensuring = result.ensuring,
-            withdrawing = result.withdrawing,
+            allocated = final_checkpoint.allocation.leases.len(),
+            ensuring = final_checkpoint
+                .gateways
+                .records
+                .iter()
+                .filter(|record| record.desired.action == unf_egress::EgressGatewayAction::Ensure)
+                .count(),
+            withdrawing = final_checkpoint
+                .gateways
+                .records
+                .iter()
+                .filter(|record| record.desired.action == unf_egress::EgressGatewayAction::Withdraw)
+                .count(),
             "reconciled durable egress control plane"
         );
     }
     Ok(())
+}
+
+fn reconcile_egress_ha_candidates(
+    current: &EgressControlPlane,
+    revision: Revision,
+    model: &EgressModel,
+    explicit_providers: &BTreeMap<EgressIntentOwner, EgressProviderRef>,
+    frozen: Vec<EgressHaCandidate>,
+    expansion: Option<Vec<EgressHaCandidate>>,
+) -> Result<EgressControlPlane> {
+    let before = current.checkpoint();
+    let attempted_expansion = expansion.is_some();
+    let mut next = current.clone();
+    next.reconcile_with_ha_candidates(
+        revision,
+        model.clone(),
+        explicit_providers,
+        expansion.unwrap_or_else(|| frozen.clone()),
+    )
+    .context("derive allocation and gateway desired state")?;
+    if attempted_expansion && !egress_ha_assignments_unchanged(&before, &next.checkpoint()) {
+        let mut retained = current.clone();
+        retained
+            .reconcile_with_ha_candidates(revision, model.clone(), explicit_providers, frozen)
+            .context("retain frozen egress HA ownership after disruptive candidate expansion")?;
+        debug!("deferred egress HA candidate expansion because it would move active shards");
+        Ok(retained)
+    } else {
+        if attempted_expansion {
+            info!("admitted zero-disruption egress HA candidate expansion");
+        }
+        Ok(next)
+    }
 }
 
 fn acknowledge_dqr_egress_reachability(
@@ -8871,6 +8920,25 @@ fn advance_egress_ha_transactions(
     Ok(changed)
 }
 
+fn egress_ha_candidate_sets(
+    state: &ControllerState,
+    checkpoint: &EgressControlPlaneCheckpoint,
+    desired_revision: Revision,
+    desired_model: &EgressModel,
+) -> Result<(Vec<EgressHaCandidate>, Option<Vec<EgressHaCandidate>>)> {
+    let frozen = live_egress_ha_candidates(state, checkpoint)?;
+    let expansion = if desired_revision == checkpoint.desired_revision
+        && desired_model == &checkpoint.desired_model
+        && checkpoint.ha_promotions.is_empty()
+        && !checkpoint.ha_plans.is_empty()
+    {
+        zero_disruption_egress_ha_expansion_candidates(state, checkpoint, &frozen)?
+    } else {
+        None
+    };
+    Ok((frozen, expansion))
+}
+
 fn live_egress_ha_candidates(
     state: &ControllerState,
     checkpoint: &EgressControlPlaneCheckpoint,
@@ -8908,10 +8976,19 @@ fn live_egress_ha_candidates(
                     capacity_units: labels
                         .map_or(Ok(1), |labels| egress_ha_capacity("frozen gateway", labels))?,
                     failure_domains: labels.map_or_else(BTreeMap::new, egress_ha_failure_domains),
+                    standby: false,
                 })
             })
             .collect();
     }
+    eligible_egress_ha_candidates(&nodes, &node_uids, &capabilities)
+}
+
+fn eligible_egress_ha_candidates(
+    nodes: &BTreeMap<String, TopologyNode>,
+    node_uids: &BTreeMap<String, NodePortNodeRecord>,
+    capabilities: &BTreeSet<EgressCapability>,
+) -> Result<Vec<EgressHaCandidate>> {
     nodes
         .values()
         .filter(|node| {
@@ -8923,6 +9000,10 @@ fn live_egress_ha_candidates(
                     .get(EGRESS_GATEWAY_NODE_LABEL)
                     .map(String::as_str)
                     == Some(EGRESS_GATEWAY_NODE_LABEL_VALUE)
+                && !node
+                    .labels
+                    .get(EGRESS_HA_DRAIN_LABEL)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("true"))
         })
         .filter_map(|node| {
             node_uids.get(&node.name).map(|record| {
@@ -8934,11 +9015,62 @@ fn live_egress_ha_candidates(
                     },
                     capacity_units: egress_ha_capacity(&node.name, &node.labels)?,
                     failure_domains: egress_ha_failure_domains(&node.labels),
+                    standby: false,
                 })
             })
         })
         .take(unf_egress::MAX_EGRESS_GATEWAY_NODES)
         .collect()
+}
+
+fn zero_disruption_egress_ha_expansion_candidates(
+    state: &ControllerState,
+    checkpoint: &EgressControlPlaneCheckpoint,
+    frozen: &[EgressHaCandidate],
+) -> Result<Option<Vec<EgressHaCandidate>>> {
+    if frozen.len() < 2
+        || checkpoint
+            .ha_plans
+            .iter()
+            .any(|plan| plan.candidates != frozen)
+    {
+        return Ok(None);
+    }
+    let nodes = read_lock(&state.nodes);
+    let node_uids = read_lock(&state.node_port_nodes);
+    let capabilities = frozen[0].node.capabilities.clone();
+    let mut eligible = eligible_egress_ha_candidates(&nodes, &node_uids, &capabilities)?;
+    if eligible.len() <= frozen.len()
+        || !frozen.iter().all(|current| {
+            eligible.iter().any(|candidate| {
+                candidate.node == current.node
+                    && candidate.capacity_units == current.capacity_units
+                    && candidate.failure_domains == current.failure_domains
+            })
+        })
+    {
+        return Ok(None);
+    }
+    for candidate in &mut eligible {
+        candidate.standby = frozen
+            .iter()
+            .find(|current| current.node == candidate.node)
+            .is_none_or(|current| current.standby);
+    }
+    Ok(Some(eligible))
+}
+
+fn egress_ha_assignments_unchanged(
+    before: &EgressControlPlaneCheckpoint,
+    after: &EgressControlPlaneCheckpoint,
+) -> bool {
+    before.ha_plans.iter().all(|previous| {
+        after
+            .ha_plans
+            .iter()
+            .find(|candidate| candidate.owner == previous.owner)
+            .is_some_and(|candidate| candidate.assignments == previous.assignments)
+    })
 }
 
 const EGRESS_HA_CAPACITY_LABEL: &str = "network.unf.io/egress-capacity";
@@ -13982,6 +14114,7 @@ mod tests {
             },
             capacity_units: 1,
             failure_domains: BTreeMap::new(),
+            standby: false,
         }
     }
 
@@ -14119,6 +14252,10 @@ mod tests {
     }
 
     fn native_egress_policy() -> EgressPolicy {
+        native_egress_policy_with_addresses(2)
+    }
+
+    fn native_egress_policy_with_addresses(addresses_per_family: u16) -> EgressPolicy {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "network.unf.io/v1alpha1",
             "kind": "EgressPolicy",
@@ -14133,7 +14270,7 @@ mod tests {
                 "egress": {
                     "pool": "finance",
                     "families": ["IPv4"],
-                    "addressesPerFamily": 2
+                    "addressesPerFamily": addresses_per_family
                 }
             }
         }))
@@ -14491,6 +14628,49 @@ mod tests {
                 .checkpoint(),
             withdrawing
         );
+    }
+
+    #[test]
+    fn recovered_egress_gateway_rejoins_only_without_active_shard_movement() {
+        let build_state = |addresses_per_family: u16| {
+            let state = new_state(true);
+            for (name, suffix) in [("gateway-a", 10), ("gateway-b", 11)] {
+                apply_node_event(&state, Event::Apply(egress_gateway_node(name, suffix)));
+            }
+            apply_egress_pool_event(&state, Event::Apply(native_egress_pool("192.0.2.0/24")));
+            apply_egress_policy_event(
+                &state,
+                Event::Apply(native_egress_policy_with_addresses(addresses_per_family)),
+            );
+            state
+        };
+
+        let state = build_state(2);
+        let before = mutex_lock(&state.egress_control_plane).checkpoint();
+        assert_eq!(before.ha_plans[0].candidates.len(), 2);
+        let assignments = before.ha_plans[0].assignments.clone();
+        apply_node_event(&state, Event::Apply(egress_gateway_node("gateway-c", 12)));
+        let expanded = mutex_lock(&state.egress_control_plane).checkpoint();
+        assert_eq!(expanded.ha_plans[0].candidates.len(), 3);
+        assert_eq!(
+            expanded.ha_plans[0]
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.standby)
+                .count(),
+            1
+        );
+        assert_eq!(expanded.ha_plans[0].assignments, assignments);
+        assert_eq!(expanded.gateways.records[0].desired.nodes.len(), 3);
+
+        let state = build_state(3);
+        let before = mutex_lock(&state.egress_control_plane).checkpoint();
+        let assignments = before.ha_plans[0].assignments.clone();
+        apply_node_event(&state, Event::Apply(egress_gateway_node("gateway-c", 12)));
+        let expanded = mutex_lock(&state.egress_control_plane).checkpoint();
+        assert_eq!(expanded.ha_plans[0].candidates.len(), 3);
+        assert_eq!(expanded.ha_plans[0].assignments, assignments);
+        assert_eq!(expanded.gateways.records[0].desired.nodes.len(), 3);
     }
 
     #[test]
@@ -15330,6 +15510,35 @@ mod tests {
             }
         }))
         .expect("test Node is valid Kubernetes JSON")
+    }
+
+    fn egress_gateway_node(name: &str, suffix: u8) -> Node {
+        let mut node = node(true);
+        node.metadata.name = Some(name.to_owned());
+        node.metadata.uid = Some(format!("{name}-uid"));
+        let labels = node.metadata.labels.get_or_insert_default();
+        labels.insert("kubernetes.io/hostname".to_owned(), name.to_owned());
+        labels.insert(
+            PRIMARY_CNI_NODE_LABEL.to_owned(),
+            PRIMARY_CNI_NODE_LABEL_VALUE.to_owned(),
+        );
+        labels.insert(
+            EGRESS_GATEWAY_NODE_LABEL.to_owned(),
+            EGRESS_GATEWAY_NODE_LABEL_VALUE.to_owned(),
+        );
+        if let Some(status) = node.status.as_mut() {
+            status.addresses = Some(vec![
+                k8s_openapi::api::core::v1::NodeAddress {
+                    address: format!("192.0.2.{suffix}"),
+                    type_: "InternalIP".to_owned(),
+                },
+                k8s_openapi::api::core::v1::NodeAddress {
+                    address: format!("fdff::{suffix:x}"),
+                    type_: "InternalIP".to_owned(),
+                },
+            ]);
+        }
+        node
     }
 
     fn primary_node(name: &str, ipv4: &str, ipv6: &str) -> Node {

@@ -810,6 +810,7 @@ mod tests {
                 },
                 capacity_units: 1,
                 failure_domains: BTreeMap::from([("zone".to_owned(), name.to_owned())]),
+                standby: false,
             })
             .collect();
         let plan = compile_egress_ha_plan(&lease, candidates, None, Revision::new(9)).unwrap();

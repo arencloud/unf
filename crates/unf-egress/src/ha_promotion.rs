@@ -1181,6 +1181,7 @@ mod tests {
                     "topology.kubernetes.io/zone".to_owned(),
                     format!("zone-{name}"),
                 )]),
+                standby: false,
             })
             .collect();
         compile_egress_ha_plan(&lease, candidates, None, Revision::new(9)).unwrap()
