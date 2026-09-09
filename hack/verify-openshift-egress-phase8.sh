@@ -394,7 +394,20 @@ metadata: {name: ${pool}}
 spec:
   provider: {name: static, instance: openshift-cl02}
   prefixes: [${pool_v4}, ${pool_v6}]
----
+EOF
+"${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/external pod/managed pod/native --timeout=10m >/dev/null
+pool_uid=$("${kc[@]}" get egresspool.network.unf.io "${pool}" -o jsonpath='{.metadata.uid}')
+for _ in $(seq 1 120); do
+    desired=$("${kc[@]}" -n unf-system get configmap unf-egress-desired-state -o json 2>/dev/null \
+        | jq -r '.data["desired.json"]' | jq -c . 2>/dev/null || true)
+    if jq -e --arg uid "${pool_uid}" 'any(.pools[]; .pool.uid == $uid)' \
+        <<<"${desired}" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+jq -e --arg uid "${pool_uid}" 'any(.pools[]; .pool.uid == $uid)' <<<"${desired}" >/dev/null
+"${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: network.unf.io/v1alpha1
 kind: EgressPolicy
 metadata: {name: ${policy}}
@@ -413,7 +426,6 @@ spec:
     families: [IPv4, IPv6]
     addressesPerFamily: 2
 EOF
-"${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/external pod/managed pod/native --timeout=10m >/dev/null
 managed_v4=$("${kc[@]}" -n "${namespace}" get pod managed -o json | jq -er '[.status.podIPs[].ip | select(contains("."))][0]')
 managed_v6=$("${kc[@]}" -n "${namespace}" get pod managed -o json | jq -er '[.status.podIPs[].ip | select(contains(":"))][0]')
 native_v4=$("${kc[@]}" -n "${namespace}" get pod native -o json | jq -er '[.status.podIPs[].ip | select(contains("."))][0]')
