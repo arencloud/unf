@@ -397,7 +397,7 @@ spec:
 EOF
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pod/external pod/managed pod/native --timeout=10m >/dev/null
 pool_uid=$("${kc[@]}" get egresspool.network.unf.io "${pool}" -o jsonpath='{.metadata.uid}')
-for _ in $(seq 1 120); do
+for _ in $(seq 1 300); do
     desired=$("${kc[@]}" -n unf-system get configmap unf-egress-desired-state -o json 2>/dev/null \
         | jq -r '.data["desired.json"]' | jq -c . 2>/dev/null || true)
     if jq -e --arg uid "${pool_uid}" 'any(.pools[]; .pool.uid == $uid)' \
