@@ -20,7 +20,7 @@ require_text '"/v1/state/encryption-plan", post\(encryption_plan\)' "${controlle
 require_text 'authenticate_internal_agent' "${controller}"
 require_text 'current\.recipient\.node_uid != node_uid' "${controller}"
 require_text 'current\.controller_epoch > state\.identity_epoch' "${controller}"
-require_text 'current\.matches\(snapshot\)' "${controller}"
+require_text 'current\.matches\(&snapshot\)' "${controller}"
 require_text 'encryption_plan_delivery_is_authenticated_node_uid_scoped' "${controller}"
 
 require_text 'struct EncryptionPlanSynchronizer' "${agent}"

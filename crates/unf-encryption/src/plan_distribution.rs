@@ -20,6 +20,9 @@ pub const ADMITTED_NODE_LOCAL_PLAN_SCHEMA_VERSION: u16 = 1;
 const MAX_NODE_IDENTITY_BYTES: usize = 253;
 const NODE_SEALED_PLAN_CAPSULE_DIGEST_DOMAIN: &[u8] = b"unf.node-sealed-plan-capsule.v1\0";
 const ADMITTED_NODE_LOCAL_PLAN_DIGEST_DOMAIN: &[u8] = b"unf.admitted-node-local-plan.v1\0";
+pub const NODE_LOCAL_PLAN_FLEET_CUT_SCHEMA_VERSION: u16 = 1;
+pub const MAX_ENCRYPTION_PLAN_MEMBERS: usize = 4_096;
+const NODE_LOCAL_PLAN_FLEET_CUT_DIGEST_DOMAIN: &[u8] = b"unf.node-local-plan-fleet-cut.v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -70,6 +73,36 @@ pub struct AdmittedNodeLocalPlan {
     pub controller_epoch: u64,
     pub snapshot: NodeLocalPlanSnapshot,
     pub admitted_digest: AdmittedNodeLocalPlanDigest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeLocalPlanFleetCutDigest(pub [u8; 32]);
+
+/// One atomic fleet-wide set of Node-local plan manifolds. Explicit membership
+/// makes omission distinguishable from an intentionally smaller cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NodeLocalPlanFleetCut {
+    pub schema_version: u16,
+    pub membership_revision: Revision,
+    pub generation: Revision,
+    pub members: Vec<EncryptionGenerationRecipient>,
+    pub plans: Vec<NodeLocalPlanSnapshot>,
+    pub cut_digest: NodeLocalPlanFleetCutDigest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeLocalPlanCatalogOutcome {
+    Published,
+    Unchanged,
+}
+
+/// In-memory publication boundary. Readers can observe one verified complete
+/// cut or no cut, never incremental per-Node updates.
+#[derive(Debug, Default)]
+pub struct NodeLocalPlanCatalog {
+    active: Option<NodeLocalPlanFleetCut>,
 }
 
 impl NodeLocalPlanRequest {
@@ -303,6 +336,150 @@ impl AdmittedNodeLocalPlan {
     }
 }
 
+impl NodeLocalPlanFleetCut {
+    /// Canonicalizes and seals a complete membership-aligned fleet cut.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty/oversized membership, duplicates, omissions, foreign
+    /// recipients, mixed revisions/generations, or invalid nested plans.
+    pub fn issue(
+        membership_revision: Revision,
+        generation: Revision,
+        mut members: Vec<EncryptionGenerationRecipient>,
+        mut plans: Vec<NodeLocalPlanSnapshot>,
+    ) -> Result<Self, NodeLocalPlanCatalogError> {
+        members.sort();
+        plans.sort_by(|left, right| left.recipient.cmp(&right.recipient));
+        let mut cut = Self {
+            schema_version: NODE_LOCAL_PLAN_FLEET_CUT_SCHEMA_VERSION,
+            membership_revision,
+            generation,
+            members,
+            plans,
+            cut_digest: NodeLocalPlanFleetCutDigest([0; 32]),
+        };
+        cut.validate()?;
+        cut.cut_digest = cut.calculate_digest()?;
+        Ok(cut)
+    }
+
+    /// # Errors
+    ///
+    /// Replays nested plans, exact membership coverage, common causal
+    /// revisions, canonical order, and the fleet digest.
+    pub fn verify(&self) -> Result<(), NodeLocalPlanCatalogError> {
+        self.validate()?;
+        if self.cut_digest != self.calculate_digest()? {
+            return Err(NodeLocalPlanCatalogError::InvalidCut(
+                "fleet plan cut digest does not match",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), NodeLocalPlanCatalogError> {
+        if self.schema_version != NODE_LOCAL_PLAN_FLEET_CUT_SCHEMA_VERSION
+            || self.membership_revision == Revision::INITIAL
+            || self.generation == Revision::INITIAL
+            || self.members.is_empty()
+            || self.members.len() > MAX_ENCRYPTION_PLAN_MEMBERS
+            || self.members.len() != self.plans.len()
+            || self.members.windows(2).any(|pair| pair[0] >= pair[1])
+            || self
+                .plans
+                .windows(2)
+                .any(|pair| pair[0].recipient >= pair[1].recipient)
+        {
+            return Err(NodeLocalPlanCatalogError::InvalidCut(
+                "fleet plan cut shape is invalid or noncanonical",
+            ));
+        }
+        for (member, plan) in self.members.iter().zip(&self.plans) {
+            plan.verify()
+                .map_err(NodeLocalPlanCatalogError::InvalidPlan)?;
+            if member != &plan.recipient
+                || plan.membership_revision != self.membership_revision
+                || plan.generation != self.generation
+            {
+                return Err(NodeLocalPlanCatalogError::InvalidCut(
+                    "fleet plan membership or generation is incomplete",
+                ));
+            }
+        }
+        let first = &self.plans[0];
+        if self.plans.iter().any(|plan| {
+            plan.policy_revision != first.policy_revision
+                || plan.service_revision != first.service_revision
+                || plan.egress_revision != first.egress_revision
+        }) {
+            return Err(NodeLocalPlanCatalogError::InvalidCut(
+                "fleet plan causal revisions are mixed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<NodeLocalPlanFleetCutDigest, NodeLocalPlanCatalogError> {
+        let mut canonical = self.clone();
+        canonical.cut_digest = NodeLocalPlanFleetCutDigest([0; 32]);
+        let encoded = serde_json::to_vec(&canonical)
+            .map_err(|error| NodeLocalPlanCatalogError::Encoding(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(NODE_LOCAL_PLAN_FLEET_CUT_DIGEST_DOMAIN);
+        hasher.update(encoded);
+        Ok(NodeLocalPlanFleetCutDigest(hasher.finalize().into()))
+    }
+}
+
+impl NodeLocalPlanCatalog {
+    /// Atomically publishes one complete successor cut.
+    ///
+    /// # Errors
+    ///
+    /// Rejects rollback and same-generation equivocation without changing the
+    /// active catalog.
+    pub fn publish(
+        &mut self,
+        candidate: NodeLocalPlanFleetCut,
+    ) -> Result<NodeLocalPlanCatalogOutcome, NodeLocalPlanCatalogError> {
+        candidate.verify()?;
+        if let Some(active) = &self.active {
+            if candidate.generation < active.generation
+                || candidate.membership_revision < active.membership_revision
+            {
+                return Err(NodeLocalPlanCatalogError::Regression);
+            }
+            if candidate.generation == active.generation {
+                if &candidate == active {
+                    return Ok(NodeLocalPlanCatalogOutcome::Unchanged);
+                }
+                return Err(NodeLocalPlanCatalogError::Equivocation);
+            }
+        }
+        self.active = Some(candidate);
+        Ok(NodeLocalPlanCatalogOutcome::Published)
+    }
+
+    #[must_use]
+    pub fn active(&self) -> Option<&NodeLocalPlanFleetCut> {
+        self.active.as_ref()
+    }
+
+    #[must_use]
+    pub fn desired_for(
+        &self,
+        recipient: &EncryptionGenerationRecipient,
+    ) -> Option<&NodeLocalPlanSnapshot> {
+        let active = self.active.as_ref()?;
+        active
+            .plans
+            .binary_search_by(|plan| plan.recipient.cmp(recipient))
+            .ok()
+            .and_then(|position| active.plans.get(position))
+    }
+}
+
 fn validate_cursor(cursor: &NodeLocalPlanCursor) -> Result<(), NodeLocalPlanDistributionError> {
     if cursor.controller_epoch == 0
         || !valid_identity(&cursor.recipient.node_name)
@@ -355,5 +532,19 @@ pub enum NodeLocalPlanDistributionError {
     #[error("operating-system randomness failed: {0}")]
     Randomness(String),
     #[error("canonical Node-local plan distribution encoding failed: {0}")]
+    Encoding(String),
+}
+
+#[derive(Debug, Error)]
+pub enum NodeLocalPlanCatalogError {
+    #[error("invalid fleet-local encryption plan cut: {0}")]
+    InvalidCut(&'static str),
+    #[error("invalid Node-local plan in fleet cut: {0}")]
+    InvalidPlan(NodeLocalPlanCompilerError),
+    #[error("fleet-local encryption plan catalog regressed")]
+    Regression,
+    #[error("fleet-local encryption plan catalog equivocated at one generation")]
+    Equivocation,
+    #[error("canonical fleet-local encryption plan encoding failed: {0}")]
     Encoding(String),
 }

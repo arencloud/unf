@@ -72,8 +72,8 @@ use unf_encryption::{
     EncryptionGenerationFact, EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
     EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
-    EncryptionGenerationRequest, NodeLocalPlanDistributionError, NodeLocalPlanRequest,
-    NodeLocalPlanSnapshot, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
+    EncryptionGenerationRequest, NodeLocalPlanCatalog, NodeLocalPlanDistributionError,
+    NodeLocalPlanRequest, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -398,7 +398,7 @@ struct ControllerState {
     encryption_generation_store: Option<Api<ConfigMap>>,
     /// Complete secret-free compiler inputs awaiting authenticated Node pulls.
     /// The next compiler slice populates this catalog from one causal cut.
-    encryption_local_plans: RwLock<BTreeMap<String, NodeLocalPlanSnapshot>>,
+    encryption_local_plans: Mutex<NodeLocalPlanCatalog>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1771,7 +1771,7 @@ fn new_state_with_client_and_selector(
         encryption_generation_facts: Mutex::new(EncryptionGenerationFactReconciler::default()),
         encryption_generations_dirty: AtomicBool::new(false),
         encryption_generation_store: config_map_store.clone(),
-        encryption_local_plans: RwLock::new(BTreeMap::new()),
+        encryption_local_plans: Mutex::new(NodeLocalPlanCatalog::default()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -8361,8 +8361,14 @@ fn encryption_plan_for(
             "encryption plan controller incarnation regressed",
         ));
     }
-    let plans = read_lock(&state.encryption_local_plans);
-    let Some(snapshot) = plans.get(&agent.node_name) else {
+    let recipient = EncryptionGenerationRecipient {
+        node_name: agent.node_name.clone(),
+        node_uid: node_uid.clone(),
+    };
+    let snapshot = mutex_lock(&state.encryption_local_plans)
+        .desired_for(&recipient)
+        .cloned();
+    let Some(snapshot) = snapshot else {
         return Ok(None);
     };
     if snapshot.recipient.node_uid != node_uid {
@@ -8373,11 +8379,11 @@ fn encryption_plan_for(
     if request
         .current
         .as_ref()
-        .is_some_and(|current| current.matches(snapshot))
+        .is_some_and(|current| current.matches(&snapshot))
     {
         return Ok(None);
     }
-    NodeSealedPlanCapsule::issue(state.identity_epoch, request, snapshot.clone())
+    NodeSealedPlanCapsule::issue(state.identity_epoch, request, snapshot)
         .map(Some)
         .map_err(|error| match error {
             NodeLocalPlanDistributionError::RecipientMismatch

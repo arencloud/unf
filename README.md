@@ -875,12 +875,15 @@ desired state into local authority; `make encryption-plan-distribution-test`;
 ADR 0179. The running Pod-bound controller endpoint and agent now use a
 Persist-Before-Compile Plan Inbox: owner-only atomic durability precedes cursor
 adoption and startup validates it before BPF access;
-`make encryption-plan-runtime-test`; ADR 0180. Complete-cut catalog production,
-local compile, the TC consumer/verifier, and live encrypted packet gate remain,
-so no workload packet yet selects the staged
+`make encryption-plan-runtime-test`; ADR 0180. Complete-cut catalog visibility
+is protected by a Fleet-Synchronous Plan Cut: explicit membership and common
+causal revisions become visible with one atomic catalog swap, never per-Node
+partial publication; `make encryption-plan-catalog-test`; ADR 0181.
+Authoritative cut production, local compile, the TC consumer/verifier, and live
+encrypted packet gate remain, so no workload packet yet selects the staged
 route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0180 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0181 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

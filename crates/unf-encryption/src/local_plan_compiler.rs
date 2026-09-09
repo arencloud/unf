@@ -775,9 +775,11 @@ mod tests {
         AdmittedNodeLocalPlan, EncryptionBaseline, EncryptionCapability, EncryptionContractFacts,
         EncryptionContractRevisions, EncryptionEndpointFact, EncryptionKeyFact, EncryptionKeyPhase,
         EncryptionModel, EncryptionNode, EncryptionPathClass, EncryptionPathFact,
-        EncryptionPolicyFact, IpPrefix, NodeLocalPlanDistributionError, NodeLocalPlanRequest,
-        NodeSealedPlanCapsule, UNF_WIREGUARD_ROUTE_PROTOCOL, WireGuardKernelSnapshotInput,
-        WireGuardPeerReadback, WireGuardPublicKey, WireGuardRouteReadback, WireGuardRouteScope,
+        EncryptionPolicyFact, IpPrefix, NodeLocalPlanCatalog, NodeLocalPlanCatalogError,
+        NodeLocalPlanCatalogOutcome, NodeLocalPlanDistributionError, NodeLocalPlanFleetCut,
+        NodeLocalPlanRequest, NodeSealedPlanCapsule, UNF_WIREGUARD_ROUTE_PROTOCOL,
+        WireGuardKernelSnapshotInput, WireGuardPeerReadback, WireGuardPublicKey,
+        WireGuardRouteReadback, WireGuardRouteScope,
     };
 
     fn node(name: &str, uid: &str, pod_octet: u8, underlay_octet: u8) -> EncryptionNode {
@@ -950,7 +952,11 @@ mod tests {
         .unwrap()
     }
 
-    fn manifold(generation: u64, reverse_decisions: bool) -> NodeLocalPlanSnapshot {
+    fn manifold_with_port(
+        generation: u64,
+        reverse_decisions: bool,
+        listen_port: u16,
+    ) -> NodeLocalPlanSnapshot {
         let contract = contract();
         let mut decisions = contract
             .plans
@@ -977,7 +983,7 @@ mod tests {
             policy_revision: Revision::new(3),
             service_revision: Revision::new(30),
             egress_revision: Revision::new(40),
-            listen_port: 51_820,
+            listen_port,
             persistent_keepalive_seconds: 25,
             epochs: vec![NodeLocalEpochPlanRecord {
                 contract,
@@ -988,6 +994,10 @@ mod tests {
             decisions,
         })
         .unwrap()
+    }
+
+    fn manifold(generation: u64, reverse_decisions: bool) -> NodeLocalPlanSnapshot {
+        manifold_with_port(generation, reverse_decisions, 51_820)
     }
 
     #[test]
@@ -1149,5 +1159,81 @@ mod tests {
             serde_json::json!("must-never-cross-wire"),
         );
         assert!(serde_json::from_value::<AdmittedNodeLocalPlan>(serialized).is_err());
+    }
+
+    #[test]
+    fn fleet_synchronous_plan_cut_refuses_omission_and_is_canonical() {
+        let plan = manifold(20, false);
+        let member = plan.recipient.clone();
+        let cut = NodeLocalPlanFleetCut::issue(
+            Revision::new(6),
+            Revision::new(20),
+            vec![member.clone()],
+            vec![plan],
+        )
+        .unwrap();
+        cut.verify().unwrap();
+
+        let mut incomplete_members = vec![
+            member,
+            EncryptionGenerationRecipient {
+                node_name: "worker-b".to_owned(),
+                node_uid: "uid-b".to_owned(),
+            },
+        ];
+        incomplete_members.reverse();
+        assert!(
+            NodeLocalPlanFleetCut::issue(
+                Revision::new(6),
+                Revision::new(20),
+                incomplete_members,
+                vec![manifold(20, false)],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fleet_synchronous_catalog_is_atomic_monotonic_and_equivocation_safe() {
+        let issue_cut = |plan: NodeLocalPlanSnapshot| {
+            NodeLocalPlanFleetCut::issue(
+                plan.membership_revision,
+                plan.generation,
+                vec![plan.recipient.clone()],
+                vec![plan],
+            )
+            .unwrap()
+        };
+        let first = issue_cut(manifold(20, false));
+        let recipient = first.members[0].clone();
+        let mut catalog = NodeLocalPlanCatalog::default();
+        assert_eq!(
+            catalog.publish(first.clone()).unwrap(),
+            NodeLocalPlanCatalogOutcome::Published
+        );
+        assert_eq!(
+            catalog.publish(first.clone()).unwrap(),
+            NodeLocalPlanCatalogOutcome::Unchanged
+        );
+        assert_eq!(
+            catalog.desired_for(&recipient).unwrap().snapshot_digest,
+            first.plans[0].snapshot_digest
+        );
+
+        let equivocation = issue_cut(manifold_with_port(20, false, 51_821));
+        assert!(matches!(
+            catalog.publish(equivocation),
+            Err(NodeLocalPlanCatalogError::Equivocation)
+        ));
+        let successor = issue_cut(manifold(21, false));
+        assert_eq!(
+            catalog.publish(successor).unwrap(),
+            NodeLocalPlanCatalogOutcome::Published
+        );
+        assert!(matches!(
+            catalog.publish(first),
+            Err(NodeLocalPlanCatalogError::Regression)
+        ));
+        assert_eq!(catalog.active().unwrap().generation, Revision::new(21));
     }
 }

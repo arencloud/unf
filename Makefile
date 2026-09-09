@@ -16,7 +16,7 @@
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
 .PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-upgrade-recovery-test egress-phase8-kind-test egress-phase8-openshift-deploy egress-phase8-openshift-test egress-bgp-image
-.PHONY: encryption-fabric-boundary-test encryption-contract-test encryption-key-authority-test encryption-kernel-provider-test encryption-kernel-provider-live-test encryption-fast-path-contract-test encryption-fast-path-transaction-test encryption-map-persistence-test encryption-map-transaction-test encryption-map-backend-live-test encryption-route-mark-contract-test encryption-route-authority-test encryption-route-authority-live-test encryption-generation-distribution-test encryption-activation-latch-test encryption-generation-frontier-test encryption-generation-recovery-test encryption-generation-reconciler-test encryption-local-proof-ladder-test encryption-linux-convergence-test encryption-agent-anti-entropy-test encryption-activation-rehydration-test encryption-local-plan-compiler-test encryption-plan-manifold-test encryption-plan-distribution-test encryption-plan-runtime-test
+.PHONY: encryption-fabric-boundary-test encryption-contract-test encryption-key-authority-test encryption-kernel-provider-test encryption-kernel-provider-live-test encryption-fast-path-contract-test encryption-fast-path-transaction-test encryption-map-persistence-test encryption-map-transaction-test encryption-map-backend-live-test encryption-route-mark-contract-test encryption-route-authority-test encryption-route-authority-live-test encryption-generation-distribution-test encryption-activation-latch-test encryption-generation-frontier-test encryption-generation-recovery-test encryption-generation-reconciler-test encryption-local-proof-ladder-test encryption-linux-convergence-test encryption-agent-anti-entropy-test encryption-activation-rehydration-test encryption-local-plan-compiler-test encryption-plan-manifold-test encryption-plan-distribution-test encryption-plan-runtime-test encryption-plan-catalog-test
 .NOTPARALLEL: egress-phase8-kind-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -201,6 +201,12 @@ encryption-plan-runtime-test: encryption-plan-distribution-test
 	cargo test -p unf-controller encryption_plan_delivery
 	cargo test -p unf-agent encryption_plan_recovery
 	cargo clippy -p unf-encryption -p unf-controller -p unf-agent --all-targets --all-features -- -D warnings
+
+encryption-plan-catalog-test: encryption-plan-runtime-test
+	hack/verify-encryption-plan-catalog.sh
+	cargo test -p unf-encryption fleet_synchronous
+	cargo test -p unf-controller encryption_plan_delivery
+	cargo clippy -p unf-encryption -p unf-controller --all-targets --all-features -- -D warnings
 
 egress-intent-test: egress-fabric-boundary-test
 	hack/verify-egress-intent.sh

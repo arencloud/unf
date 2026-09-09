@@ -875,7 +875,7 @@ matrix is maintained in the
   route readback, safe MTU derivation, foreign-state refusal, injected rollback,
   replay, and positive cleanup pass `make encryption-kernel-provider-test` and
   the privileged live-kernel gate; ADR 0161. Workload selection remains 9.5.
-- Phase 9.5a–9.5s now provide the canonical coalesced compiler and Causal Epoch
+- Phase 9.5a–9.5t now provide the canonical coalesced compiler and Causal Epoch
   Lease, Causal Commit Vector, isolated fixed-shape Aya ABI, Proof-Carrying Aya
   Map Mirror with delta-minimal recovery, and Cooperative Route-Mark Lease. The
   latter gives every admitted outer `WireGuard` bypass mark a collision-free
@@ -937,15 +937,18 @@ matrix is maintained in the
   Manifold: contracts, readiness, decisions, and cross-domain revisions cannot
   tear independently, and every required plan has exact coverage;
   `make encryption-plan-manifold-test` and ADR 0178. Authenticated controller/
-  delivery is protected by a Nonce-Bound Plan Relay whose exact durable cursor,
+  agent delivery is protected by a Nonce-Bound Plan Relay whose exact durable cursor,
   Node name/UID, controller incarnation, and monotonic revisions prevent replay
   or replacement without conveying local activation authority;
   `make encryption-plan-distribution-test` and ADR 0179. Runtime controller/agent
   adoption is now wired through the internal Pod-bound endpoint into an atomic
   owner-only Persist-Before-Compile Plan Inbox that validates before BPF access;
   `make encryption-plan-runtime-test` and ADR 0180. Complete-cut catalog
-  production, local compile, the TC consumer, verifier loading, and live encrypted packets
-  remain within milestone 9.5.
+  visibility now passes through a Fleet-Synchronous Plan Cut: explicit exact
+  membership, common causal revisions, and one atomic catalog swap prevent
+  partial fleet publication; `make encryption-plan-catalog-test` and ADR 0181.
+  Authoritative cut production, local compile, the TC consumer, verifier
+  loading, and live encrypted packets remain within milestone 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,
