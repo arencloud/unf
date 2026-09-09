@@ -24,6 +24,12 @@ spec:
       containers:
         - name: agent
           imagePullPolicy: IfNotPresent
+          env:
+            # Host-wide TC coverage can observe control-plane packet rates.
+            # Counters and authenticated exports remain active independently;
+            # avoid turning per-packet INFO events into a node log amplifier.
+            - name: RUST_LOG
+              value: unf_agent=warn
           args:
             - --listen
             - 0.0.0.0:9963
