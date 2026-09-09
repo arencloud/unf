@@ -10,6 +10,7 @@
 | `unf-ebpf-common` | Versioned fixed-layout flow and BPF map ABIs, including independently banked dual-stack NodePort and LoadBalancer frontend contracts | Variable strings or allocation |
 | `unf-api` | CRD schema and serialization | Policy evaluation |
 | `unf-policy` | Native and NetworkPolicy conversion, shared IR, deterministic evaluation, identity-tuple lowering | Kubernetes watches or BPF map mutation |
+| `unf-encryption` | Bounded schema-v1 Native/Required cluster baseline, monotonic identity-pair intent, canonical exact-Node Attested Encryption Path Contracts, independent replay, public-key/epoch and bidirectional desired-route binding, deny-only failure envelopes, and compact witnesses | Private-key material, Kubernetes conversion, key generation or persistence, kernel WireGuard/interface/route mutation, BPF state, or packet processing |
 | `unf-service` | Bounded revisioned schema-v4 service IR, typed ClusterIP/NodePort/LoadBalancer plus internal policy, affinity, topology preference, algorithm, and forwarding intent; provider-neutral Service/EndpointSlice and authenticated local-Node inputs; stable collision-checked IDs; deterministic normalization/validation; fixed dual-stack lowering with explicit advanced-intent fencing | Kubernetes watches, Node-address discovery, runtime connection tracking, or BPF map mutation |
 | `unf-state` | Revision snapshots, bounded flow-history contract, Service/backend topology schema, and identity metadata | Transport or controller loops |
 | `unf-controller` | Watches, EndpointSlice-aware desired-state/topology reconciliation, retained-last-valid service compilation, durable explicit-class LoadBalancer allocation/finalizer orchestration, TokenReview-scoped Node intent, authenticated snapshot distribution, explicit Node block and complete remote-route distribution, bounded durable agent-report and flow-history checkpointing, non-blocking external HTTP flow handoff, time-window flow queries, explanation, and read-only simulation orchestration | Packet parsing |
@@ -144,12 +145,16 @@ deliberately separate from planning; ADR 0136.
 
 The accepted Phase 9 boundary keeps encryption intent, key authority, kernel
 transport state, path evidence, and activation as separate revisioned domains.
-A planned Kubernetes-independent encryption domain will own canonical intent
-and the Attested Encryption Path Contract; the controller will orchestrate only
-authenticated public-key/epoch state and matching endpoint evidence. Each agent
-will generate and retain its private WireGuard key locally, independently replay
-contracts, transactionally own exact interfaces/peers/AllowedIPs/routes/fwmarks/
-MTUs, and publish nonce-bound kernel/path readback without secret material.
+`unf-encryption` now owns canonical monotonic identity intent and the schema-v1
+Attested Encryption Path Contract/reference validator. It binds policy-approved
+Required pairs to exact workload/Node/cluster identity, public-key epochs,
+bidirectional desired routes, capabilities, revisions, golden digests, and
+deny-only failure outcomes without private-key or runtime state. The controller
+will orchestrate only authenticated public-key/epoch state and matching endpoint
+evidence. Each agent will generate and retain its private WireGuard key locally,
+independently replay contracts, transactionally own exact interfaces/peers/
+AllowedIPs/routes/fwmarks/MTUs, and publish nonce-bound kernel/path readback
+without secret material.
 `unf-ebpf-tc` may eventually consume only fixed-width policy-approved
 transport/epoch decisions; it will not implement cryptography, parse keys, or
 configure WireGuard. The Intent-Coalesced Cryptographic Fast Path may share a

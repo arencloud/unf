@@ -848,6 +848,16 @@ matrix is maintained in the
   the initial L3 provider. UNF manages configuration and proof in Rust but does
   not implement cryptographic primitives or expose private keys through the
   controller, Kubernetes APIs, telemetry, or diagnostics.
+- Phase 9.2 adds the Kubernetes-independent `unf-encryption` domain. A canonical
+  Native/Required baseline plus monotonic identity-pair intent feeds schema-v1
+  exact-source-Node contracts. Policy-allowed Required pairs bind exact
+  workload/Node/cluster identities, public-key digests and epoch/lifetime,
+  bidirectional peer endpoints and Pod CIDR `AllowedIPs`, interface/route/
+  fwmark/MTU facts, capabilities, and five revisions. Independent replay,
+  frozen domain-separated digest/witness bytes, bounded deny-only failure
+  envelopes, adversarial mutation, property, and strict-wire tests pass
+  `make encryption-contract-test`; ADR 0159. No private key or runtime state is
+  introduced.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,

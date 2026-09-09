@@ -15,7 +15,7 @@ separately revisioned. The authoritative state remains in
 | ID | Milestone | State | Exit evidence |
 |---|---|---|---|
 | 9.1 | Architecture and acceptance boundary | **Verified** | ADR 0158 fixes policy-before-encryption precedence, the Attested Encryption Path Contract, Node-local private-key ownership, Flow-Stable Epoch Rotation, the Intent-Coalesced Cryptographic Fast Path, fail-closed required mode, transactional recovery, performance evidence, independent Kind/OpenShift gates, and explicit exclusions; `make encryption-fabric-boundary-test` prevents drift |
-| 9.2 | Encryption intent and path-contract model | **Planned** | Kubernetes-independent bounded identity/destination intent; exact defaulting and overlap rules; canonical per-source/per-destination-Node Attested Encryption Path Contracts; independent reference validation, domain-separated digests, compact witnesses, mutation/property tests, and no packet-path claim |
+| 9.2 | Encryption intent and path-contract model | **Verified** | `unf-encryption` provides a bounded canonical cluster baseline plus monotonic identity-pair intent and schema-v1 exact-source-Node Attested Encryption Path Contracts. Policy precedes public-key/epoch and bidirectional route admission; Node identities, lifetimes, capabilities, Pod CIDR `AllowedIPs`, interface/route/fwmark/MTU facts, and five revisions bind domain-separated golden digests and witnesses. Independent replay, explicit deny-only failure envelopes, mutation/property/strict-wire tests, and Clippy pass `make encryption-contract-test`; ADR 0159. No private key or runtime mutation exists |
 | 9.3 | Node key authority and epoch rotation | **Planned** | Node-local agent-generated private keys, authenticated Node-UID/public-key publication, strict key epochs and expiry, two-epoch prepare/activate/drain/retire rotation, replacement/replay/revocation handling, owner-only durable metadata, and no secret bytes in Kubernetes objects, APIs, logs, metrics, or controller checkpoints |
 | 9.4 | Transactional kernel WireGuard provider | **Planned** | Rust-owned generic-netlink configuration and exact readback; bounded interfaces/peers/AllowedIPs/endpoints; disjoint route ownership; inactive staging, rollback, restart reconstruction, foreign-state refusal, MTU derivation, exact cleanup, and adjacent-schema capability negotiation |
 | 9.5 | Intent-Coalesced Cryptographic Fast Path | **Planned** | Many identity-level contracts coalesce onto bounded Node/epoch transports without losing per-flow authority. Policy and Service/egress selection precede a fixed-width eBPF transport decision; existing connection state pins an admitted epoch, new flows move atomically, kernel WireGuard performs all cryptography, and required traffic has no plaintext fallback |
@@ -175,9 +175,11 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Milestone 9.2 introduces a Kubernetes-independent encryption-intent model and
-the canonical Attested Encryption Path Contract plus reference validator. It
-must establish strict normalization/defaulting, overlap precedence, revision
-and lifetime bounds, two-ended facts, domain-separated golden digests, mutation
-and property tests, and explicit failure outcomes without changing keys,
-interfaces, routes, BPF state, packets, or platform support.
+Milestone 9.3 introduces Node-local key authority and Flow-Stable Epoch
+Rotation. It must generate key material through an established WireGuard
+interface and OS CSPRNG, keep private bytes Node-local and owner-only, publish
+only authenticated Node-UID-bound public epochs, and implement the bounded
+`Prepared -> MutuallyAttested -> Active -> Draining -> Retired` transaction.
+Replay, Node replacement, emergency revocation, restart recovery, secret
+redaction, capacity admission, and exact metadata cleanup must pass without yet
+steering packets through WireGuard.

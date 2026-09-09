@@ -3350,6 +3350,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "unf-encryption"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "unf-common",
+]
+
+[[package]]
 name = "unf-gobgp"
 version = "0.1.0"
 dependencies = [
