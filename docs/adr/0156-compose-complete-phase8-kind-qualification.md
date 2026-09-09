@@ -45,13 +45,14 @@ requires the isolated no-CNI baseline.
 
 ## Evidence
 
-Runtime and qualifier `7c576643626a1ec68f309c881743093a1551a50e` passed the
-uninterrupted gate in 1,008 seconds on `kind-unf-service-dev`. The aggregate is
+Runtime and qualifier `2f404edcff94becd6d023bd8885c3c71ce4993b4` passed the
+uninterrupted gate in 1,013 seconds on `kind-unf-service-dev`. The aggregate is
 `.artifacts/phase8-egress-complete-kind.json`, with SHA-256
-`feccddf02115da33e673f108ade153e17e530e24bad9233659efe8cd598c8209`.
+`c364a99a05f1bd9a1b0416bf3305feabc3de58d25119bfc20b0fc66bb7efbc88`.
 It records six component paths, hashes, and durations and confirms exact ABI-v15
 plus primary-CNI rollback. This rerun includes proof-authorized full-release
-acknowledgement through verified `unf-egress0` absence.
+acknowledgement through verified `unf-egress0` absence and zero-churn
+warm-standby rejoin with independently replayed contingency state.
 
 Focused regression additionally includes the real-kernel selection recovery
 case, agent unit and strict-Clippy gates, the primary-CNI installer/rollback

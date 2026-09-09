@@ -717,9 +717,9 @@ reconcile forward. Checkpoint-v5 migration, evidence-preserving rollback
 refusal, provider/agent last-known-good replay, and exact current-v15 cleanup
 pass `make egress-upgrade-recovery-test`; ADR 0155.
 Phase 8.10 composes the complete egress runtime rather than inferring success
-from focused gates. Runtime and qualifier `7c57664` passed a 1,008-second,
+from focused gates. Runtime and qualifier `2f404ed` passed a 1,013-second,
 three-Node dual-stack Kubernetes v1.35.0 Kind run covering watched
-steering/NAT, measured HA, FQDN and Internet authority, DQR/native reachability,
+steering/NAT, measured HA with zero-churn warm-standby rejoin, FQDN and Internet authority, DQR/native reachability,
 causal operations, restart recovery, exact cleanup, and no-CNI rollback. The
 digest-bound aggregate is `.artifacts/phase8-egress-complete-kind.json`; ADR
 0156. Phase 8 remains in progress until independent digest-pinned OpenShift

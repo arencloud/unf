@@ -62,15 +62,15 @@ require_text hack/verify-openshift-egress-phase8.sh \
     'OpenShift cl02 Phase 8.11 egress qualification passed' \
     "the OpenShift gate must emit an explicit terminal result"
 require_text deploy/openshift-primary-cni/egress/kustomization.yaml \
-    'digest: sha256:c5d552a42d818c706fc04146546101fb7aef9a04ebe157e10b76721721e51df0' \
+    'digest: sha256:a7945ae471ca366fdc7fa0f9b7f8df971796612ee12021120764068eb7fc10ba' \
     "the Phase 8 controller image must remain immutable"
 require_text deploy/openshift-primary-cni/egress/kustomization.yaml \
-    'digest: sha256:502ec481e74a3b292b00cd0085f8d3fb444c66a151f0cd67e91d944c920c09e6' \
+    'digest: sha256:75dc091af8d886b414ba136bfc3cae95012e477505f7c066a03a3fb05bf37814' \
     "the Phase 8 agent image must remain immutable"
 
 jq -e '
     .schemaVersion == 1 and .phase == "8.11"
-    and .sourceRevision == "7c576643626a1ec68f309c881743093a1551a50e"
+    and .sourceRevision == "2f404edcff94becd6d023bd8885c3c71ce4993b4"
     and .kindQualification.phase == "8.10" and .kindQualification.result == "passed"
     and .contracts.persistentBpfStateAbiVersion == 15
     and .contracts.egressDistributionSchemaVersion == 2
