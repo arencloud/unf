@@ -14,11 +14,12 @@ use unf_ebpf_common::{
     ENCRYPTION_BANK_COUNT, ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED,
     ENCRYPTION_DECISION_FLAG_SELECTION_BOUND, ENCRYPTION_DECISION_MAP_CAPACITY,
     ENCRYPTION_DISPOSITION_NATIVE, ENCRYPTION_DISPOSITION_REQUIRED,
-    ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE, ENCRYPTION_MAP_ABI_VERSION,
+    ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE, ENCRYPTION_MAP_ABI_VERSION, ENCRYPTION_ROUTE_MARK_MASK,
     ENCRYPTION_TRANSPORT_ACTIVE, ENCRYPTION_TRANSPORT_DRAINING,
     ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK, ENCRYPTION_TRANSPORT_MAP_CAPACITY,
     EncryptionDecisionKey, EncryptionDecisionValue, EncryptionFlowValue, EncryptionMapConfig,
-    EncryptionTransportKey, EncryptionTransportValue, encryption_transport_is_usable,
+    EncryptionTransportKey, EncryptionTransportValue, apply_encryption_route_mark,
+    clear_encryption_route_mark, encryption_route_mark, encryption_transport_is_usable,
 };
 
 use crate::{
@@ -168,6 +169,7 @@ impl EncryptionFastPathState {
                     &self.transport_authority,
                 )?
             || !transport_ids_are_valid(&self.transport_authority)
+            || !route_marks_are_unambiguous(&self.transport_authority)
         {
             return Err(FastPathError::IntegrityMismatch);
         }
@@ -281,13 +283,31 @@ pub enum FastPathDropReason {
 pub enum FastPathPacketDecision {
     Native,
     Encrypt {
-        fwmark: u32,
+        /// Kernel `WireGuard` applies this mark to its outer UDP packet. It is
+        /// evidence only and must never be copied directly onto plaintext.
+        outer_fwmark: u32,
+        /// Complementary selector placed only in UNF's leased skb-mark field.
+        route_mark: u32,
+        route_mark_mask: u32,
         route_table: u32,
         interface_index: u32,
         mtu: u32,
         lease: CausalEpochLease,
     },
     Drop(FastPathDropReason),
+}
+
+impl FastPathPacketDecision {
+    /// Applies a selected route lease without disturbing marks owned by a
+    /// Service, another dataplane, or the application. Drops have no mark.
+    #[must_use]
+    pub const fn apply_to_mark(self, existing: u32) -> Option<u32> {
+        match self {
+            Self::Native => Some(clear_encryption_route_mark(existing)),
+            Self::Encrypt { route_mark, .. } => apply_encryption_route_mark(existing, route_mark),
+            Self::Drop(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -312,6 +332,8 @@ pub enum FastPathError {
     },
     #[error("content-derived encryption transport ID collision")]
     TransportIdCollision,
+    #[error("encryption route mark resolves to conflicting policy-route tables")]
+    RouteMarkCollision,
     #[error("encryption fast-path state differs from canonical replay")]
     IntegrityMismatch,
     #[error("encryption fast-path canonical encoding failed: {0}")]
@@ -339,6 +361,9 @@ pub fn compile_encryption_fast_path(
     add_draining_transports(epochs, &mut transport_by_key)?;
     decision_authority.sort_by_key(|entry| (entry.source_identity, entry.destination_identity));
     let transport_authority = materialize_transports(transport_by_key)?;
+    if !route_marks_are_unambiguous(&transport_authority) {
+        return Err(FastPathError::RouteMarkCollision);
+    }
     let config = map_config(
         context,
         epochs.len(),
@@ -714,6 +739,7 @@ fn validate_epoch(
         || epoch.transaction.plan.cluster_id != epoch.contract.local_node.cluster_id
         || epoch.transaction.plan.local_node_uid != epoch.contract.local_node.uid
         || epoch.transaction.plan.epoch != epoch.contract.plans[0].source_key.epoch
+        || encryption_route_mark(epoch.transaction.plan.fwmark).is_none()
         || (epoch.state == FastPathEpochState::Draining
             && epoch.drain_until_monotonic_ns <= context.now_monotonic_ns)
         || (epoch.state == FastPathEpochState::Active && epoch.drain_until_monotonic_ns != 0)
@@ -846,6 +872,18 @@ fn transport_ids_are_valid(transports: &[EncryptionTransportAuthority]) -> bool 
     })
 }
 
+fn route_marks_are_unambiguous(transports: &[EncryptionTransportAuthority]) -> bool {
+    let mut tables = BTreeMap::new();
+    transports.iter().all(|transport| {
+        let Some(mark) = encryption_route_mark(transport.fwmark) else {
+            return false;
+        };
+        tables
+            .insert(mark, transport.route_table)
+            .is_none_or(|existing| existing == transport.route_table)
+    })
+}
+
 fn native_witness(context: FastPathCompileContext, input: FastPathDecisionInput) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(b"unf.encryption-native-decision.v1\0");
@@ -958,12 +996,17 @@ fn state_digest(
     Ok(EncryptionFastPathDigest(hasher.finalize().into()))
 }
 
-const fn encrypted(
+fn encrypted(
     transport: &EncryptionTransportValue,
     lease: CausalEpochLease,
 ) -> FastPathPacketDecision {
+    let Some(route_mark) = encryption_route_mark(transport.fwmark) else {
+        return FastPathPacketDecision::Drop(FastPathDropReason::TransportUnavailable);
+    };
     FastPathPacketDecision::Encrypt {
-        fwmark: transport.fwmark,
+        outer_fwmark: transport.fwmark,
+        route_mark,
+        route_mark_mask: ENCRYPTION_ROUTE_MARK_MASK,
         route_table: transport.route_table,
         interface_index: transport.interface_index,
         mtu: transport.mtu,
@@ -1089,7 +1132,7 @@ mod tests {
             allowed_ips: destination.pod_cidrs.clone(),
             interface_name: format!("unfwg{epoch:09}"),
             route_table: 20_000 + u32::try_from(epoch).unwrap(),
-            fwmark: 0x554e_0000 + u32::try_from(epoch).unwrap(),
+            fwmark: 0x0055_0000 + (u32::try_from(epoch).unwrap() << 8),
             mtu: 1_420,
         };
         let facts = EncryptionContractFacts {
@@ -1149,7 +1192,7 @@ mod tests {
             interface_name: format!("unfwg{epoch:09}"),
             local_public_key: WireGuardPublicKey([1; 32]),
             listen_port: 51_820,
-            fwmark: 0x554e_0000 + u32::try_from(epoch).unwrap(),
+            fwmark: 0x0055_0000 + (u32::try_from(epoch).unwrap() << 8),
             route_table: 20_000 + u32::try_from(epoch).unwrap(),
             mtu_envelope,
             activation: WireGuardEpochActivation::Active,
@@ -1369,6 +1412,99 @@ mod tests {
             select_encryption_transport(&state, stale_packet, None),
             FastPathPacketDecision::Drop(FastPathDropReason::RevisionMismatch)
         );
+    }
+
+    #[test]
+    fn cooperative_mark_lease_separates_inner_outer_and_preserves_foreign_bits() {
+        let fixture = fixture(7);
+        let state = compile_encryption_fast_path(
+            context(0),
+            &[FastPathEpochAdmission {
+                contract: &fixture.contract,
+                transaction: &fixture.transaction,
+                readback: &fixture.snapshot,
+                readiness_digest: [7; 32],
+                state: FastPathEpochState::Active,
+                drain_until_monotonic_ns: 0,
+            }],
+            &[FastPathDecisionInput {
+                source_identity: IdentityId::new(11),
+                destination_identity: IdentityId::new(21),
+                disposition: EncryptionDisposition::Required,
+                contract_epoch: Some(7),
+                plan_index: Some(0),
+            }],
+        )
+        .unwrap();
+        let selection = select_encryption_transport(&state, packet(), None);
+        let FastPathPacketDecision::Encrypt {
+            outer_fwmark,
+            route_mark,
+            route_mark_mask,
+            ..
+        } = selection
+        else {
+            panic!("required flow must receive a cooperative mark lease");
+        };
+        assert_eq!(outer_fwmark, 0x0055_0700);
+        assert_eq!(route_mark, 0x00aa_f800);
+        assert_eq!(route_mark_mask, ENCRYPTION_ROUTE_MARK_MASK);
+        assert_ne!(outer_fwmark & route_mark_mask, route_mark);
+
+        let preexisting = 0x8100_005a;
+        let marked = selection
+            .apply_to_mark(preexisting)
+            .expect("encrypt decision owns a valid mark lease");
+        assert_eq!(marked, 0x81aa_f85a);
+        assert_eq!(
+            marked & !route_mark_mask,
+            preexisting & !route_mark_mask,
+            "neighboring skb mark fields must survive"
+        );
+        assert_eq!(
+            FastPathPacketDecision::Native.apply_to_mark(marked),
+            Some(preexisting),
+            "native selection must release only UNF's mark lease"
+        );
+        assert_eq!(
+            FastPathPacketDecision::Drop(FastPathDropReason::PolicyDenied)
+                .apply_to_mark(preexisting),
+            None,
+            "a drop must never publish route metadata"
+        );
+    }
+
+    #[test]
+    fn cooperative_mark_lease_rejects_conflicting_route_table_authority() {
+        let fixture = fixture(7);
+        let state = compile_encryption_fast_path(
+            context(0),
+            &[FastPathEpochAdmission {
+                contract: &fixture.contract,
+                transaction: &fixture.transaction,
+                readback: &fixture.snapshot,
+                readiness_digest: [7; 32],
+                state: FastPathEpochState::Active,
+                drain_until_monotonic_ns: 0,
+            }],
+            &[FastPathDecisionInput {
+                source_identity: IdentityId::new(11),
+                destination_identity: IdentityId::new(21),
+                disposition: EncryptionDisposition::Required,
+                contract_epoch: Some(7),
+                plan_index: Some(0),
+            }],
+        )
+        .unwrap();
+        let mut authority = state.transport_authority;
+        let mut conflict = authority[0].clone();
+        conflict.transport_id ^= 1;
+        conflict.route_table += 1;
+        authority.push(conflict);
+        assert!(!route_marks_are_unambiguous(&authority));
+
+        authority[1].route_table = authority[0].route_table;
+        assert!(route_marks_are_unambiguous(&authority));
     }
 
     #[test]

@@ -52,9 +52,9 @@ proportional to the delta while retaining atomic generation publication.
 
 The adapter is wired into startup recovery and exposes the mutation boundary
 for the upcoming encryption distribution loop. No TC program consumes these
-maps yet, so this milestone does not claim encrypted workload traffic. The next
-slice must implement the post-policy/post-Service/post-egress packet selector,
-skb-mark preservation, and policy-route enforcement.
+maps yet, so this milestone does not claim encrypted workload traffic. Phase
+9.5e defines the separate outer-bypass and inner-route mark contract before
+distribution, packet mutation, and policy-route enforcement use it.
 
 ## Verification
 

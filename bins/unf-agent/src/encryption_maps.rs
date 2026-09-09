@@ -16,7 +16,7 @@ use unf_ebpf_common::{
     ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE, ENCRYPTION_MAP_ABI_VERSION,
     ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK, ENCRYPTION_TRANSPORT_MAP_CAPACITY,
     EncryptionDecisionKey, EncryptionDecisionValue, EncryptionMapConfig, EncryptionTransportKey,
-    EncryptionTransportValue,
+    EncryptionTransportValue, encryption_route_mark,
 };
 use unf_encryption::{
     EncryptionFastPathState, FastPathMapCheckpoint, FastPathMapRecoveryAction,
@@ -604,12 +604,14 @@ fn validate_decision_entry(key: &[u8; 12], value: &[u8; 72]) -> Result<()> {
 
 fn validate_transport_entry(key: &[u8; 16], value: &[u8; 80]) -> Result<()> {
     let drain_until = u64::from_ne_bytes(value[16..24].try_into().expect("fixed drain deadline"));
+    let fwmark = u32::from_ne_bytes(value[24..28].try_into().expect("fixed outer fwmark"));
     let state = value[74];
     if key[0..8] == [0; 8]
         || key[8] >= ENCRYPTION_BANK_COUNT
         || key[9..16] != [0; 7]
         || value[0..16].chunks_exact(8).any(|field| field == [0; 8])
-        || value[24..40].chunks_exact(4).any(|field| field == [0; 4])
+        || encryption_route_mark(fwmark).is_none()
+        || value[28..40].chunks_exact(4).any(|field| field == [0; 4])
         || value[40..56] == [0; 16]
         || value[56..72] == [0; 16]
         || u16::from_ne_bytes(value[72..74].try_into().expect("fixed transport schema"))
@@ -768,7 +770,7 @@ mod tests {
             key_epoch: 46,
             contract_revision: 42,
             drain_until_monotonic_ns: 0,
-            fwmark: 0x554e_0001,
+            fwmark: 0x0055_0100,
             route_table: 20_001,
             interface_index: 7,
             mtu: 1_420,
@@ -783,7 +785,7 @@ mod tests {
         let value = encode_transport_value(&transport_value);
         assert_eq!(
             u32::from_ne_bytes(value[24..28].try_into().unwrap()),
-            0x554e_0001
+            0x0055_0100
         );
         assert_eq!(u32::from_ne_bytes(value[36..40].try_into().unwrap()), 1_420);
         validate_transport_entry(&key, &value).unwrap();

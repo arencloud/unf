@@ -74,6 +74,10 @@ pub const ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED: u8 = 1;
 pub const ENCRYPTION_DECISION_FLAG_SELECTION_BOUND: u8 = 1 << 1;
 pub const ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK: u8 = 1;
 pub const ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE: u8 = 1;
+/// UNF owns only bits 8..23 of `skb->mark`. The high byte (including the
+/// Service DSR handoff bit) and low byte remain available to Kubernetes,
+/// applications, and cooperating dataplanes.
+pub const ENCRYPTION_ROUTE_MARK_MASK: u32 = 0x00ff_ff00;
 pub const SERVICE_MAP_ABI_VERSION: u16 = 5;
 pub const SERVICE_BANK_COUNT: u8 = 2;
 pub const NODE_PORT_MAP_ABI_VERSION: u16 = 4;
@@ -1008,7 +1012,7 @@ pub const fn encryption_transport_is_usable(
     if transport.schema_version != ENCRYPTION_MAP_ABI_VERSION
         || transport.key_epoch == 0
         || transport.contract_revision == 0
-        || transport.fwmark == 0
+        || encryption_route_mark(transport.fwmark).is_none()
         || transport.route_table == 0
         || transport.interface_index == 0
         || transport.mtu == 0
@@ -1027,6 +1031,39 @@ pub const fn encryption_transport_is_usable(
         }
         _ => false,
     }
+}
+
+/// Derives the plaintext policy-routing selector from the `WireGuard` outer
+/// packet bypass mark. Complementing within UNF's owned field guarantees that
+/// the two packet classes cannot match the same masked `ip rule`.
+#[must_use]
+pub const fn encryption_route_mark(outer_fwmark: u32) -> Option<u32> {
+    if outer_fwmark == 0 || outer_fwmark & !ENCRYPTION_ROUTE_MARK_MASK != 0 {
+        return None;
+    }
+    let route_mark = (!outer_fwmark) & ENCRYPTION_ROUTE_MARK_MASK;
+    if route_mark == 0 {
+        None
+    } else {
+        Some(route_mark)
+    }
+}
+
+/// Replaces only UNF's leased route-selection field. Callers must first obtain
+/// `route_mark` through [`encryption_route_mark`].
+#[must_use]
+pub const fn apply_encryption_route_mark(existing: u32, route_mark: u32) -> Option<u32> {
+    if route_mark == 0 || route_mark & !ENCRYPTION_ROUTE_MARK_MASK != 0 {
+        return None;
+    }
+    Some((existing & !ENCRYPTION_ROUTE_MARK_MASK) | route_mark)
+}
+
+/// Removes only UNF's route-selection lease when a canonical Native decision
+/// is selected or a packet leaves the owned routing boundary.
+#[must_use]
+pub const fn clear_encryption_route_mark(existing: u32) -> u32 {
+    existing & !ENCRYPTION_ROUTE_MARK_MASK
 }
 
 const fn encryption_digest_is_nonzero(digest: &[u8; 16]) -> bool {
@@ -1725,7 +1762,7 @@ mod tests {
             key_epoch: 7,
             contract_revision: 9,
             drain_until_monotonic_ns: 0,
-            fwmark: 0x554e_0007,
+            fwmark: 0x0055_0700,
             route_table: 20_007,
             interface_index: 17,
             mtu: 1_420,
@@ -1751,6 +1788,55 @@ mod tests {
             ENCRYPTION_DISPOSITION_REQUIRED
         ));
         assert!(!encryption_disposition_is_valid(0));
+    }
+
+    #[test]
+    fn encryption_route_mark_separates_outer_packets_and_preserves_neighbors() {
+        let outer = 0x0055_4e00;
+        let selector = encryption_route_mark(outer).expect("valid owned outer mark");
+        assert_eq!(selector, 0x00aa_b100);
+        assert_ne!(selector & ENCRYPTION_ROUTE_MARK_MASK, outer);
+
+        let neighboring_bits = 0xa500_007b;
+        let marked =
+            apply_encryption_route_mark(neighboring_bits, selector).expect("valid route selector");
+        assert_eq!(marked, 0xa5aa_b17b);
+        assert_eq!(
+            marked & !ENCRYPTION_ROUTE_MARK_MASK,
+            neighboring_bits & !ENCRYPTION_ROUTE_MARK_MASK
+        );
+        assert_eq!(clear_encryption_route_mark(marked), neighboring_bits);
+
+        assert_eq!(encryption_route_mark(0), None);
+        assert_eq!(encryption_route_mark(ENCRYPTION_ROUTE_MARK_MASK), None);
+        assert_eq!(encryption_route_mark(0x8000_0100), None);
+        assert_eq!(apply_encryption_route_mark(0, 0), None);
+        assert_eq!(apply_encryption_route_mark(0, 0x0100_0001), None);
+    }
+
+    #[test]
+    fn encryption_route_mark_is_a_collision_free_owned_field_permutation() {
+        let mut selectors = std::collections::BTreeSet::new();
+        for code in 1_u32..u32::from(u16::MAX) {
+            let outer = code << 8;
+            let selector = encryption_route_mark(outer).expect("admitted outer mark");
+            assert!(
+                selectors.insert(selector),
+                "selector collision for {outer:#x}"
+            );
+            assert_ne!(selector, outer);
+            assert_eq!(selector & !ENCRYPTION_ROUTE_MARK_MASK, 0);
+
+            let neighboring_bits = 0xa500_005a;
+            let marked = apply_encryption_route_mark(neighboring_bits, selector)
+                .expect("derived selector must be applicable");
+            assert_eq!(
+                marked & !ENCRYPTION_ROUTE_MARK_MASK,
+                neighboring_bits,
+                "foreign mark bits changed for {outer:#x}"
+            );
+        }
+        assert_eq!(selectors.len(), usize::from(u16::MAX) - 1);
     }
 
     #[test]
