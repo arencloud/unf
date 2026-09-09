@@ -68,7 +68,9 @@ use unf_egress::{
     verify_egress_bfd_evidence_report, verify_egress_internet_snapshot,
 };
 use unf_encryption::{
-    EncryptionGenerationDistributionError, EncryptionGenerationProducer,
+    EncryptionFrontierPublishOutcome, EncryptionGenerationDistributionError,
+    EncryptionGenerationFact, EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
+    EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
     EncryptionGenerationRequest, NodeSealedGenerationCapsule,
 };
@@ -323,6 +325,8 @@ struct ControllerMetrics {
     encryption_generation_persistence_writes: Counter,
     encryption_generation_persistence_errors: Counter,
     encryption_generation_receipts_restored: Counter,
+    encryption_generation_facts_accepted: Counter,
+    encryption_generation_frontiers_published: Counter,
     external_flow_export: ExternalFlowExportMetrics,
 }
 
@@ -388,6 +392,7 @@ struct ControllerState {
     /// Secret-free prepared generations awaiting exact Node-scoped delivery.
     /// Kernel route proof and map activation deliberately remain agent-local.
     encryption_generations: Mutex<EncryptionGenerationProducer>,
+    encryption_generation_facts: Mutex<EncryptionGenerationFactReconciler>,
     encryption_generations_dirty: AtomicBool,
     encryption_generation_store: Option<Api<ConfigMap>>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
@@ -1344,6 +1349,10 @@ async fn spawn_internal_api(
             post(encryption_generation),
         )
         .route(
+            "/v1/state/encryption-generation-facts",
+            post(ingest_encryption_generation_fact),
+        )
+        .route(
             "/v1/state/service-selection",
             get(service_selection_contract),
         )
@@ -1626,6 +1635,16 @@ fn register_encryption_generation_metrics(registry: &mut Registry, metrics: &Con
         "Exact Node generation-frontier receipts restored at controller startup",
         metrics.encryption_generation_receipts_restored.clone(),
     );
+    registry.register(
+        "unf_encryption_generation_facts_accepted",
+        "Authenticated exact-membership Node encryption facts accepted by the controller",
+        metrics.encryption_generation_facts_accepted.clone(),
+    );
+    registry.register(
+        "unf_encryption_generation_frontiers_published",
+        "Complete encryption generation frontiers published by the controller",
+        metrics.encryption_generation_frontiers_published.clone(),
+    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1744,6 +1763,7 @@ fn new_state_with_client_and_selector(
         egress_gateway_drains: RwLock::new(BTreeMap::new()),
         egress_release_authorities: RwLock::new(BTreeMap::new()),
         encryption_generations: Mutex::new(EncryptionGenerationProducer::default()),
+        encryption_generation_facts: Mutex::new(EncryptionGenerationFactReconciler::default()),
         encryption_generations_dirty: AtomicBool::new(false),
         encryption_generation_store: config_map_store.clone(),
         node_port_nodes: RwLock::new(BTreeMap::new()),
@@ -8074,6 +8094,130 @@ async fn encryption_generation(
     }
 }
 
+async fn ingest_encryption_generation_fact(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(fact): Json<EncryptionGenerationFact>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    reconcile_encryption_generation_fact(&state, &agent, fact)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+fn reconcile_encryption_generation_fact(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+    fact: EncryptionGenerationFact,
+) -> Result<(), ApiError> {
+    if !agent_application_is_current(state, agent) {
+        return Err(ApiError::forbidden(
+            "encryption generation fact does not match the current authenticated agent Pod",
+        ));
+    }
+    fact.verify()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let _policy_state_guard = read_lock(&state.policy_state_guard);
+    let (membership_revision, members) = encryption_generation_membership(state)?;
+    let expected = members
+        .binary_search_by(|member| member.node_name.cmp(&agent.node_name))
+        .ok()
+        .and_then(|index| members.get(index))
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "authenticated agent Node is absent from the authoritative encryption membership",
+            )
+        })?;
+    if &fact.recipient != expected {
+        return Err(ApiError::forbidden(
+            "encryption generation fact targets a different or replaced Node",
+        ));
+    }
+    let outcome = {
+        let mut reconciler = mutex_lock(&state.encryption_generation_facts);
+        reconciler
+            .replace_membership(membership_revision, members)
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        reconciler
+            .observe(fact)
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?
+    };
+    if outcome == EncryptionGenerationFactOutcome::Accepted {
+        state.metrics.encryption_generation_facts_accepted.inc();
+    }
+    let published = publish_reconciled_encryption_generation(state)?;
+    if published {
+        info!(
+            membership_revision = membership_revision.get(),
+            "published complete encryption generation from authenticated Node facts"
+        );
+    }
+    Ok(())
+}
+
+fn encryption_generation_membership(
+    state: &ControllerState,
+) -> Result<(Revision, Vec<EncryptionGenerationRecipient>), ApiError> {
+    let membership_revision = mutex_lock(&state.revisions).topology;
+    let nodes = read_lock(&state.nodes);
+    let node_records = read_lock(&state.node_port_nodes);
+    let mut members = nodes
+        .values()
+        .filter(|node| agent_node_matches(node, state.agent_node_selector.as_deref()))
+        .map(|node| {
+            let record = node_records.get(&node.name).ok_or_else(|| {
+                ApiError::service_unavailable(format!(
+                    "authoritative UID is unavailable for encryption member {}",
+                    node.name
+                ))
+            })?;
+            Ok(EncryptionGenerationRecipient {
+                node_name: node.name.clone(),
+                node_uid: record.node_uid.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    members.sort();
+    if membership_revision == Revision::INITIAL || members.is_empty() {
+        return Err(ApiError::service_unavailable(
+            "authoritative encryption membership is not initialized",
+        ));
+    }
+    Ok((membership_revision, members))
+}
+
+fn publish_reconciled_encryption_generation(state: &ControllerState) -> Result<bool, ApiError> {
+    let candidate = mutex_lock(&state.encryption_generation_facts)
+        .candidate()
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    let Some(candidate) = candidate else {
+        return Ok(false);
+    };
+    let outcome = mutex_lock(&state.encryption_generations)
+        .publish(candidate)
+        .or_else(|error| {
+            if matches!(
+                error,
+                EncryptionGenerationFrontierError::PredecessorNotAcknowledged
+            ) {
+                Ok(EncryptionFrontierPublishOutcome::Unchanged)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    if outcome == EncryptionFrontierPublishOutcome::Published {
+        state
+            .encryption_generations_dirty
+            .store(true, Ordering::Release);
+        state
+            .metrics
+            .encryption_generation_frontiers_published
+            .inc();
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn encryption_generation_for(
     state: &ControllerState,
     agent: &AuthenticatedAgent,
@@ -8134,6 +8278,10 @@ fn encryption_generation_for(
             state
                 .encryption_generations_dirty
                 .store(true, Ordering::Release);
+        }
+        drop(producer);
+        if receipt_changed {
+            publish_reconciled_encryption_generation(state)?;
         }
         return Ok(None);
     }

@@ -817,10 +817,8 @@ route permit, and the exact Aya predecessor/quarantined transaction agree at
 one consuming boundary. Serialized active or pending state cannot resume or
 reach TC attachment after restart until local kernel proof is renewed. Cross-
 plane mutation and staged-crash recovery pass
-`make encryption-activation-latch-test`; ADR 0169. The live fact reconciler,
-durable producer store, local WireGuard/route orchestrator, TC consumer,
-verifier, and packet gate remain, so no workload packet yet selects the staged
-route table. The Causal Generation Frontier additionally makes one
+`make encryption-activation-latch-test`; ADR 0169. The Causal Generation
+Frontier additionally makes one
 digest-bound, complete Node
 cut the controller's unit of publication. Exact durable cursor receipts apply
 slowest-member backpressure before the next cut, preventing mixed revisions,
@@ -831,9 +829,19 @@ cut plus Node-UID, published-generation, and frontier-digest-bound receipts.
 Strict replay happens before controller readiness; retrying dirty writes and
 shutdown flushes preserve safe progress without treating a cursor as kernel
 proof. Deployment/RBAC and corruption gates pass
-`make encryption-generation-recovery-test`; ADR 0171. The [Phase 9
+`make encryption-generation-recovery-test`; ADR 0171. The Complete-Cut Fact
+Reconciler now accepts each Node-local prepared checkpoint
+only from the current Pod-bound agent and authoritative Node UID. A topology or
+UID change atomically invalidates every staged fact; regression, equivocation,
+missing members, and mixed generations cannot publish. Only unanimous exact
+membership feeds the durable frontier, and the final predecessor receipt
+retries an already prepared successor. This all-or-nothing safety property
+passes `make encryption-generation-reconciler-test`; ADR 0172. Agent-side fact
+production, the local WireGuard/route/Aya orchestrator, TC consumer/verifier,
+and live encrypted packet gate remain, so no workload packet yet selects the
+staged route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0171 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0172 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

@@ -875,7 +875,7 @@ matrix is maintained in the
   route readback, safe MTU derivation, foreign-state refusal, injected rollback,
   replay, and positive cleanup pass `make encryption-kernel-provider-test` and
   the privileged live-kernel gate; ADR 0161. Workload selection remains 9.5.
-- Phase 9.5a–9.5j now provide the canonical coalesced compiler and Causal Epoch
+- Phase 9.5a–9.5k now provide the canonical coalesced compiler and Causal Epoch
   Lease, Causal Commit Vector, isolated fixed-shape Aya ABI, Proof-Carrying Aya
   Map Mirror with delta-minimal recovery, and Cooperative Route-Mark Lease. The
   latter gives every admitted outer `WireGuard` bypass mark a collision-free
@@ -902,10 +902,15 @@ matrix is maintained in the
   now exact across restart: a domain-separated
   checkpoint binds the active cut plus every Node UID, published generation,
   and frontier receipt; restore occurs before readiness and corrupt state fails
-  closed under `make encryption-generation-recovery-test` and ADR 0171. Live
-  fact reconciliation, local WireGuard/route orchestration, TC
-  consumption, verifier loading, and live encrypted packets remain within
-  milestone 9.5.
+  closed under `make encryption-generation-recovery-test` and ADR 0171. The
+  Complete-Cut Fact Reconciler now ingests strict Node-local prepared facts over
+  the Pod-bound authenticated endpoint, atomically discards all staged facts on
+  topology/UID drift, rejects regression and same-generation equivocation, and
+  publishes only when every exact Kubernetes member agrees on one generation.
+  The final predecessor receipt retries a ready successor; `make
+  encryption-generation-reconciler-test` and ADR 0172. Agent fact production,
+  local WireGuard/route orchestration, TC consumption, verifier loading, and
+  live encrypted packets remain within milestone 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,

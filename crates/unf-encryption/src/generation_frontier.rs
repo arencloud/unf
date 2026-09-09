@@ -137,10 +137,22 @@ impl EncryptionGenerationFrontier {
     }
 
     fn validate_shape(&self) -> Result<(), EncryptionGenerationFrontierError> {
+        let unique_node_names = self
+            .members
+            .iter()
+            .map(|member| member.node_name.as_str())
+            .collect::<BTreeSet<_>>();
+        let unique_node_uids = self
+            .members
+            .iter()
+            .map(|member| member.node_uid.as_str())
+            .collect::<BTreeSet<_>>();
         if self.schema_version != ENCRYPTION_GENERATION_FRONTIER_SCHEMA_VERSION
             || self.revision == Revision::INITIAL
             || self.members.is_empty()
             || self.members.len() > MAX_ENCRYPTION_GENERATION_FRONTIER_NODES
+            || unique_node_names.len() != self.members.len()
+            || unique_node_uids.len() != self.members.len()
             || self.members.windows(2).any(|pair| pair[0] >= pair[1])
             || self
                 .generations

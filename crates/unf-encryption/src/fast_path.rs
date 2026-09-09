@@ -1026,13 +1026,15 @@ mod tests {
         EncryptionActivationMode, EncryptionBaseline, EncryptionCapability,
         EncryptionContractFacts, EncryptionContractRevisions, EncryptionEndpointFact,
         EncryptionFrontierPublishOutcome, EncryptionGenerationDistributionError,
-        EncryptionGenerationFrontier, EncryptionGenerationFrontierError,
-        EncryptionGenerationProducer, EncryptionGenerationRecipient, EncryptionGenerationRequest,
-        EncryptionIntent, EncryptionKeyFact, EncryptionKeyPhase, EncryptionModel, EncryptionNode,
-        EncryptionPathFact, EncryptionPolicyFact, EncryptionRouteAuthority,
-        EncryptionRouteAuthorityError, EncryptionRouteFamily, FastPathMapCheckpoint,
-        FastPathMapRecoveryAction, FastPathMapTransaction, FastPathTransactionError, IpPrefix,
-        ManagedIdentitySelector, NodeSealedGenerationCapsule, PreparedNodeEncryptionGeneration,
+        EncryptionGenerationFact, EncryptionGenerationFactError, EncryptionGenerationFactOutcome,
+        EncryptionGenerationFactReconciler, EncryptionGenerationFrontier,
+        EncryptionGenerationFrontierError, EncryptionGenerationProducer,
+        EncryptionGenerationRecipient, EncryptionGenerationRequest, EncryptionIntent,
+        EncryptionKeyFact, EncryptionKeyPhase, EncryptionModel, EncryptionNode, EncryptionPathFact,
+        EncryptionPolicyFact, EncryptionRouteAuthority, EncryptionRouteAuthorityError,
+        EncryptionRouteFamily, FastPathMapCheckpoint, FastPathMapRecoveryAction,
+        FastPathMapTransaction, FastPathTransactionError, IpPrefix, ManagedIdentitySelector,
+        NodeSealedGenerationCapsule, PreparedNodeEncryptionGeneration,
         UNF_ENCRYPTION_RULE_PRIORITY_BASE, UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily,
         UnderlayMtuObservation, WireGuardEpochActivation, WireGuardKernelPlan,
         WireGuardKernelPlanInput, WireGuardKernelSnapshotInput, WireGuardMtuEnvelope,
@@ -1906,6 +1908,73 @@ mod tests {
         let restored_empty = EncryptionGenerationProducer::restore(empty).unwrap();
         assert!(restored_empty.active().is_none());
         assert!(restored_empty.is_fully_acknowledged());
+    }
+
+    #[test]
+    fn complete_cut_fact_reconciler_never_mixes_membership_truth() {
+        let fixture = fixture(7);
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-worker-a".to_owned(),
+        };
+        let state = required_state(&fixture, context_at(1, 21));
+        let checkpoint = FastPathMapCheckpoint::begin(Revision::new(21), &state, None).unwrap();
+        let fact = EncryptionGenerationFact::issue(Revision::new(9), recipient.clone(), checkpoint)
+            .unwrap();
+        fact.verify().unwrap();
+
+        let mut reconciler = EncryptionGenerationFactReconciler::default();
+        let alias = EncryptionGenerationRecipient {
+            node_name: "worker-alias".to_owned(),
+            node_uid: recipient.node_uid.clone(),
+        };
+        assert!(matches!(
+            reconciler.replace_membership(Revision::new(9), vec![recipient.clone(), alias]),
+            Err(EncryptionGenerationFactError::InvalidMembership)
+        ));
+        assert!(
+            reconciler
+                .replace_membership(Revision::new(9), vec![recipient.clone()])
+                .unwrap()
+        );
+        assert_eq!(reconciler.expected(), 1);
+        assert_eq!(reconciler.observed(), 0);
+        assert_eq!(
+            reconciler.observe(fact.clone()).unwrap(),
+            EncryptionGenerationFactOutcome::Accepted
+        );
+        assert_eq!(
+            reconciler.observe(fact.clone()).unwrap(),
+            EncryptionGenerationFactOutcome::Unchanged
+        );
+        let frontier = reconciler.candidate().unwrap().unwrap();
+        assert_eq!(frontier.members, vec![recipient.clone()]);
+        assert_eq!(frontier.revision, Revision::new(21));
+
+        let mut mutated = fact.clone();
+        mutated.fact_digest.0[0] ^= 1;
+        assert!(matches!(
+            mutated.verify(),
+            Err(EncryptionGenerationFactError::DigestMismatch)
+        ));
+        let mut unknown = serde_json::to_value(&fact).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), serde_json::json!(true));
+        assert!(serde_json::from_value::<EncryptionGenerationFact>(unknown).is_err());
+
+        assert!(
+            reconciler
+                .replace_membership(Revision::new(10), vec![recipient])
+                .unwrap()
+        );
+        assert_eq!(reconciler.observed(), 0);
+        assert!(reconciler.candidate().unwrap().is_none());
+        assert!(matches!(
+            reconciler.observe(fact),
+            Err(EncryptionGenerationFactError::ForeignMembership)
+        ));
     }
 
     #[test]
