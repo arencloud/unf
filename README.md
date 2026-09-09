@@ -817,11 +817,18 @@ route permit, and the exact Aya predecessor/quarantined transaction agree at
 one consuming boundary. Serialized active or pending state cannot resume or
 reach TC attachment after restart until local kernel proof is renewed. Cross-
 plane mutation and staged-crash recovery pass
-`make encryption-activation-latch-test`; ADR 0169. The prepared-state producer,
-live local WireGuard/route orchestrator, TC consumer, verifier, and packet
-gate remain, so no workload packet yet selects the staged route table. The
+`make encryption-activation-latch-test`; ADR 0169. The live fact reconciler,
+durable producer store, local WireGuard/route orchestrator, TC consumer,
+verifier, and packet gate remain, so no workload packet yet selects the staged
+route table. The
+Causal Generation Frontier additionally makes one digest-bound, complete Node
+cut the controller's unit of publication. Exact durable cursor receipts apply
+slowest-member backpressure before the next cut, preventing mixed revisions,
+skipped predecessors, and unbounded per-Node history; Node-UID and trust-domain
+drift fail closed under `make encryption-generation-frontier-test`; ADR 0170.
+The
 [Phase 9 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0169 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0170 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

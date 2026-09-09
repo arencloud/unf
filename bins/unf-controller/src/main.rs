@@ -68,8 +68,8 @@ use unf_egress::{
     verify_egress_bfd_evidence_report, verify_egress_internet_snapshot,
 };
 use unf_encryption::{
-    EncryptionGenerationDistributionError, EncryptionGenerationRecipient,
-    EncryptionGenerationRequest, FastPathMapCheckpoint, NodeSealedGenerationCapsule,
+    EncryptionGenerationDistributionError, EncryptionGenerationProducer,
+    EncryptionGenerationRecipient, EncryptionGenerationRequest, NodeSealedGenerationCapsule,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -379,7 +379,7 @@ struct ControllerState {
     egress_release_authorities: RwLock<BTreeMap<EgressIntentOwner, EgressSafeReleaseAuthority>>,
     /// Secret-free prepared generations awaiting exact Node-scoped delivery.
     /// Kernel route proof and map activation deliberately remain agent-local.
-    encryption_generations: RwLock<BTreeMap<String, FastPathMapCheckpoint>>,
+    encryption_generations: Mutex<EncryptionGenerationProducer>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1706,7 +1706,7 @@ fn new_state_with_client_and_selector(
         egress_gateway_applications: RwLock::new(BTreeMap::new()),
         egress_gateway_drains: RwLock::new(BTreeMap::new()),
         egress_release_authorities: RwLock::new(BTreeMap::new()),
-        encryption_generations: RwLock::new(BTreeMap::new()),
+        encryption_generations: Mutex::new(EncryptionGenerationProducer::default()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -7955,9 +7955,8 @@ fn encryption_generation_for(
             "encryption generation cursor belongs to a replaced or different Node",
         ));
     }
-    let desired = read_lock(&state.encryption_generations)
-        .get(&agent.node_name)
-        .cloned();
+    let mut producer = mutex_lock(&state.encryption_generations);
+    let desired = producer.desired_for(&recipient).cloned();
     let Some(desired) = desired else {
         return Ok(None);
     };
@@ -7966,6 +7965,13 @@ fn encryption_generation_for(
         .as_ref()
         .is_some_and(|current| current.published == desired.transaction.desired.published)
     {
+        producer
+            .acknowledge(&recipient, desired.transaction.desired.published)
+            .map_err(|error| {
+                ApiError::service_unavailable(format!(
+                    "current encryption generation could not acknowledge its causal frontier: {error}"
+                ))
+            })?;
         return Ok(None);
     }
     NodeSealedGenerationCapsule::issue(state.identity_epoch, recipient, request, desired)

@@ -318,7 +318,7 @@ impl AdmittedEncryptionGeneration {
     }
 }
 
-fn validate_recipient(
+pub(crate) fn validate_recipient(
     recipient: &EncryptionGenerationRecipient,
 ) -> Result<(), EncryptionGenerationDistributionError> {
     if !valid_identity(&recipient.node_name) || !valid_identity(&recipient.node_uid) {

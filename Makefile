@@ -16,7 +16,7 @@
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
 .PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-upgrade-recovery-test egress-phase8-kind-test egress-phase8-openshift-deploy egress-phase8-openshift-test egress-bgp-image
-.PHONY: encryption-fabric-boundary-test encryption-contract-test encryption-key-authority-test encryption-kernel-provider-test encryption-kernel-provider-live-test encryption-fast-path-contract-test encryption-fast-path-transaction-test encryption-map-persistence-test encryption-map-transaction-test encryption-map-backend-live-test encryption-route-mark-contract-test encryption-route-authority-test encryption-route-authority-live-test encryption-generation-distribution-test encryption-activation-latch-test
+.PHONY: encryption-fabric-boundary-test encryption-contract-test encryption-key-authority-test encryption-kernel-provider-test encryption-kernel-provider-live-test encryption-fast-path-contract-test encryption-fast-path-transaction-test encryption-map-persistence-test encryption-map-transaction-test encryption-map-backend-live-test encryption-route-mark-contract-test encryption-route-authority-test encryption-route-authority-live-test encryption-generation-distribution-test encryption-activation-latch-test encryption-generation-frontier-test
 .NOTPARALLEL: egress-phase8-kind-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -139,6 +139,12 @@ encryption-activation-latch-test: encryption-generation-distribution-test
 	cargo test -p unf-encryption tri_plane_activation_latch
 	cargo test -p unf-agent encryption_
 	cargo clippy -p unf-encryption -p unf-agent --all-targets --all-features -- -D warnings
+
+encryption-generation-frontier-test: encryption-activation-latch-test
+	hack/verify-encryption-generation-frontier.sh
+	cargo test -p unf-encryption causal_generation_frontier
+	cargo test -p unf-controller encryption_generation_delivery
+	cargo clippy -p unf-encryption -p unf-controller --all-targets --all-features -- -D warnings
 
 egress-intent-test: egress-fabric-boundary-test
 	hack/verify-egress-intent.sh

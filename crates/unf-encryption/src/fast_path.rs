@@ -1025,12 +1025,14 @@ mod tests {
         CausalCommitVector, EncryptionActivationLatch, EncryptionActivationLatchError,
         EncryptionActivationMode, EncryptionBaseline, EncryptionCapability,
         EncryptionContractFacts, EncryptionContractRevisions, EncryptionEndpointFact,
-        EncryptionGenerationDistributionError, EncryptionGenerationRecipient,
-        EncryptionGenerationRequest, EncryptionIntent, EncryptionKeyFact, EncryptionKeyPhase,
-        EncryptionModel, EncryptionNode, EncryptionPathFact, EncryptionPolicyFact,
-        EncryptionRouteAuthority, EncryptionRouteAuthorityError, EncryptionRouteFamily,
-        FastPathMapCheckpoint, FastPathMapRecoveryAction, FastPathMapTransaction,
-        FastPathTransactionError, IpPrefix, ManagedIdentitySelector, NodeSealedGenerationCapsule,
+        EncryptionFrontierPublishOutcome, EncryptionGenerationDistributionError,
+        EncryptionGenerationFrontier, EncryptionGenerationFrontierError,
+        EncryptionGenerationProducer, EncryptionGenerationRecipient, EncryptionGenerationRequest,
+        EncryptionIntent, EncryptionKeyFact, EncryptionKeyPhase, EncryptionModel, EncryptionNode,
+        EncryptionPathFact, EncryptionPolicyFact, EncryptionRouteAuthority,
+        EncryptionRouteAuthorityError, EncryptionRouteFamily, FastPathMapCheckpoint,
+        FastPathMapRecoveryAction, FastPathMapTransaction, FastPathTransactionError, IpPrefix,
+        ManagedIdentitySelector, NodeSealedGenerationCapsule, PreparedNodeEncryptionGeneration,
         UNF_ENCRYPTION_RULE_PRIORITY_BASE, UNF_WIREGUARD_ROUTE_PROTOCOL, UnderlayAddressFamily,
         UnderlayMtuObservation, WireGuardEpochActivation, WireGuardKernelPlan,
         WireGuardKernelPlanInput, WireGuardKernelSnapshotInput, WireGuardMtuEnvelope,
@@ -1801,6 +1803,124 @@ mod tests {
         assert!(matches!(
             renewed.open(None, Some(&other_checkpoint)),
             Err(EncryptionActivationLatchError::PendingTransactionMismatch)
+        ));
+    }
+
+    #[test]
+    fn causal_generation_frontier_backpressures_every_exact_predecessor() {
+        let fixture = fixture(7);
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-worker-a".to_owned(),
+        };
+        let first_state = required_state(&fixture, context_at(1, 21));
+        let first_checkpoint =
+            FastPathMapCheckpoint::begin(Revision::new(21), &first_state, None).unwrap();
+        let first_published = first_checkpoint.transaction.desired.published;
+        let first = EncryptionGenerationFrontier::issue(
+            Revision::new(21),
+            vec![recipient.clone()],
+            vec![PreparedNodeEncryptionGeneration {
+                recipient: recipient.clone(),
+                checkpoint: first_checkpoint,
+            }],
+        )
+        .unwrap();
+        first.verify().unwrap();
+        let mut tampered = first.clone();
+        tampered.frontier_digest.0[0] ^= 1;
+        assert!(matches!(
+            tampered.verify(),
+            Err(EncryptionGenerationFrontierError::DigestMismatch)
+        ));
+
+        let second_state = required_state(&fixture, context_at(0, 22));
+        let second_checkpoint =
+            FastPathMapCheckpoint::begin(Revision::new(22), &second_state, Some(first_published))
+                .unwrap();
+        let second = EncryptionGenerationFrontier::issue(
+            Revision::new(22),
+            vec![recipient.clone()],
+            vec![PreparedNodeEncryptionGeneration {
+                recipient: recipient.clone(),
+                checkpoint: second_checkpoint,
+            }],
+        )
+        .unwrap();
+
+        let mut producer = EncryptionGenerationProducer::default();
+        assert_eq!(
+            producer.publish(first.clone()).unwrap(),
+            EncryptionFrontierPublishOutcome::Published
+        );
+        assert_eq!(
+            producer.publish(first).unwrap(),
+            EncryptionFrontierPublishOutcome::Unchanged
+        );
+        assert!(!producer.is_fully_acknowledged());
+        assert!(matches!(
+            producer.publish(second.clone()),
+            Err(EncryptionGenerationFrontierError::PredecessorNotAcknowledged)
+        ));
+
+        let mut wrong = first_published;
+        wrong.state_digest.0[0] ^= 1;
+        assert!(matches!(
+            producer.acknowledge(&recipient, wrong),
+            Err(EncryptionGenerationFrontierError::AcknowledgementMismatch)
+        ));
+        assert!(producer.acknowledge(&recipient, first_published).unwrap());
+        assert!(!producer.acknowledge(&recipient, first_published).unwrap());
+        assert!(producer.is_fully_acknowledged());
+        assert_eq!(
+            producer.publish(second).unwrap(),
+            EncryptionFrontierPublishOutcome::Published
+        );
+        assert_eq!(
+            producer.desired_for(&recipient).unwrap().transaction.prior,
+            Some(first_published)
+        );
+    }
+
+    #[test]
+    fn causal_generation_frontier_refuses_partial_or_cross_node_cuts() {
+        let fixture = fixture(7);
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-worker-a".to_owned(),
+        };
+        let state = required_state(&fixture, context_at(1, 21));
+        let checkpoint = FastPathMapCheckpoint::begin(Revision::new(21), &state, None).unwrap();
+        let replacement = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "replacement-uid".to_owned(),
+        };
+        assert!(matches!(
+            EncryptionGenerationFrontier::issue(
+                Revision::new(21),
+                vec![replacement.clone()],
+                vec![PreparedNodeEncryptionGeneration {
+                    recipient: replacement,
+                    checkpoint: checkpoint.clone(),
+                }],
+            ),
+            Err(EncryptionGenerationFrontierError::CrossDomainAuthority)
+        ));
+
+        let second_member = EncryptionGenerationRecipient {
+            node_name: "worker-b".to_owned(),
+            node_uid: "uid-worker-b".to_owned(),
+        };
+        assert!(matches!(
+            EncryptionGenerationFrontier::issue(
+                Revision::new(21),
+                vec![recipient.clone(), second_member],
+                vec![PreparedNodeEncryptionGeneration {
+                    recipient,
+                    checkpoint,
+                }],
+            ),
+            Err(EncryptionGenerationFrontierError::IncompleteMembership)
         ));
     }
 
