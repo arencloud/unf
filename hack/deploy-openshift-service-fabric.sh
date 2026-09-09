@@ -185,12 +185,20 @@ controller_raw() {
 }
 
 agent_pod_on_node() {
-    local node=$1
-    "${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent -o json \
-        | jq -r --arg node "${node}" '
-            .items[] | select(.spec.nodeName == $node and .metadata.deletionTimestamp == null)
-            | .metadata.name
-        ' | head -n 1
+    local node=$1 pod=
+    for _ in $(seq 1 10); do
+        pod=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent \
+            -o json 2>/dev/null | jq -r --arg node "${node}" '
+                .items[] | select(.spec.nodeName == $node and .metadata.deletionTimestamp == null)
+                | .metadata.name
+            ' | head -n 1 || true)
+        if [[ -n ${pod} ]]; then
+            printf '%s\n' "${pod}"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 agent_raw() {
