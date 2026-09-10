@@ -283,6 +283,21 @@ mod tests {
         }
     }
 
+    fn path(source: &EncryptionNode, destination: &EncryptionNode) -> EncryptionPathFact {
+        EncryptionPathFact {
+            source_node_uid: source.uid.clone(),
+            destination_node_uid: destination.uid.clone(),
+            epoch: 1,
+            path_class: EncryptionPathClass::ManagedPod,
+            peer_endpoint: SocketAddr::new(destination.underlay_addresses[0], 51_820),
+            allowed_ips: destination.pod_cidrs.clone(),
+            interface_name: "unfwg000000001".to_owned(),
+            route_table: 20_001,
+            fwmark: 0x0055_0100,
+            mtu: 1_420,
+        }
+    }
+
     fn ready_key_cut(nodes: &[EncryptionNode], attest_all: bool) -> NodeKeyTransparencyCut {
         let members = nodes
             .iter()
@@ -363,18 +378,6 @@ mod tests {
                 node: nodes[1].clone(),
             },
         ];
-        let path = |source: &EncryptionNode, destination: &EncryptionNode| EncryptionPathFact {
-            source_node_uid: source.uid.clone(),
-            destination_node_uid: destination.uid.clone(),
-            epoch: 1,
-            path_class: EncryptionPathClass::ManagedPod,
-            peer_endpoint: SocketAddr::new(destination.underlay_addresses[0], 51_820),
-            allowed_ips: destination.pod_cidrs.clone(),
-            interface_name: "unfwg000000001".to_owned(),
-            route_table: 20_001,
-            fwmark: 0x0055_0100,
-            mtu: 1_420,
-        };
         let key_cut = ready_key_cut(&nodes, attest_all);
         FleetPlanProductionInput {
             membership_revision: Revision::new(7),
@@ -438,5 +441,44 @@ mod tests {
             produce_fleet_plan_cut(input(false)),
             Err(FleetPlanProductionError::UnreadyOrAmbiguousKey)
         ));
+    }
+
+    #[test]
+    fn fleet_plan_preserves_all_replicas_for_address_exact_late_binding() {
+        let mut input = input(true);
+        let source = input.nodes[0].clone();
+        let replica = input.nodes[2].clone();
+        input.endpoints.push(EncryptionEndpointFact {
+            identity: IdentityId::new(21),
+            workload_uid: "pod-c-replica".to_owned(),
+            node: replica.clone(),
+        });
+        input.paths.push(path(&source, &replica));
+        input.paths.push(path(&replica, &source));
+        input.paths.push(path(&input.nodes[1].clone(), &replica));
+        input.paths.push(path(&replica, &input.nodes[1].clone()));
+        input.policies.push(EncryptionPolicyFact {
+            source: IdentityId::new(21),
+            destination: IdentityId::new(21),
+            allowed: true,
+            reason: PolicyReason::ExplicitRule,
+            policy_ids: vec![PolicyId::new(11)],
+        });
+        let cut = produce_fleet_plan_cut(input).unwrap();
+        let source_plan = cut
+            .plans
+            .iter()
+            .find(|plan| plan.recipient.node_uid == "uid-a")
+            .unwrap();
+        let replicas = source_plan
+            .decisions
+            .iter()
+            .filter(|decision| {
+                decision.source_identity == IdentityId::new(11)
+                    && decision.destination_identity == IdentityId::new(21)
+            })
+            .count();
+        assert_eq!(replicas, 2);
+        source_plan.verify().unwrap();
     }
 }

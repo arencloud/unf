@@ -14088,6 +14088,7 @@ mod tests {
                     epoch_count: 1,
                     decision_count: 0,
                     transport_count: 1,
+                    path_count: 0,
                     state_digest: unf_encryption::EncryptionFastPathDigest([1; 32]),
                 },
             }),

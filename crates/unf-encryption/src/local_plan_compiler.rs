@@ -156,9 +156,15 @@ impl NodeLocalPlanSnapshot {
         fields
             .epochs
             .sort_by_key(|epoch| contract_epoch(&epoch.contract).unwrap_or_default());
-        fields
-            .decisions
-            .sort_by_key(|decision| (decision.source_identity, decision.destination_identity));
+        fields.decisions.sort_by_key(|decision| {
+            (
+                decision.source_identity,
+                decision.destination_identity,
+                decision.disposition,
+                decision.contract_epoch,
+                decision.plan_index,
+            )
+        });
         let mut snapshot = Self {
             schema_version: NODE_LOCAL_PLAN_SNAPSHOT_SCHEMA_VERSION,
             membership_revision: fields.membership_revision,
@@ -384,8 +390,19 @@ impl NodeLocalPlanSnapshot {
             .collect::<Result<Vec<_>, _>>()?;
         if epoch_numbers.windows(2).any(|pair| pair[0] >= pair[1])
             || self.decisions.windows(2).any(|pair| {
-                (pair[0].source_identity, pair[0].destination_identity)
-                    >= (pair[1].source_identity, pair[1].destination_identity)
+                (
+                    pair[0].source_identity,
+                    pair[0].destination_identity,
+                    pair[0].disposition,
+                    pair[0].contract_epoch,
+                    pair[0].plan_index,
+                ) >= (
+                    pair[1].source_identity,
+                    pair[1].destination_identity,
+                    pair[1].disposition,
+                    pair[1].contract_epoch,
+                    pair[1].plan_index,
+                )
             })
         {
             return Err(NodeLocalPlanCompilerError::InvalidInput(

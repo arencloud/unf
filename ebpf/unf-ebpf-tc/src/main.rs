@@ -29,8 +29,10 @@ use unf_ebpf_common::{
     EgressIpv6DestinationData, EgressIpv6PolicyMapData, EgressMapConfig, EgressSelectionKey,
     EgressSelectionValue, EgressSourceKey, EgressSourceValue, FLOW_ABI_VERSION, FlowEvent,
     ENCRYPTION_CONNECTION_MAP_CAPACITY, ENCRYPTION_DECISION_MAP_CAPACITY,
-    ENCRYPTION_TRANSPORT_MAP_CAPACITY, EncryptionDecisionKey, EncryptionDecisionValue,
-    EncryptionFlowValue, EncryptionMapConfig, EncryptionTransportKey, EncryptionTransportValue,
+    ENCRYPTION_PATH_MAP_CAPACITY, ENCRYPTION_TRANSPORT_MAP_CAPACITY, EncryptionDecisionKey,
+    EncryptionDecisionValue, EncryptionFlowValue, EncryptionIpv4PathData,
+    EncryptionIpv6PathData, EncryptionMapConfig, EncryptionPathValue, EncryptionTransportKey,
+    EncryptionTransportValue,
     IDENTITY_BANK_COUNT, IDENTITY_MAP_ABI_VERSION, IPV6_EXTENSION_BYTE_LIMIT,
     IPV6_EXTENSION_HEADER_LIMIT, IPV6_NEXT_HEADER_HOP_BY_HOP, IdentityMapConfig, IdentityMapValue,
     Ipv4IdentityKey, Ipv4LoadBalancerFrontendKey, Ipv4NodePortFrontendKey, Ipv4PolicyMapKey,
@@ -215,6 +217,14 @@ static ENCRYPTION_DECISIONS: HashMap<EncryptionDecisionKey, EncryptionDecisionVa
 #[map]
 static ENCRYPTION_TRANSPORTS: HashMap<EncryptionTransportKey, EncryptionTransportValue> =
     HashMap::with_max_entries(ENCRYPTION_TRANSPORT_MAP_CAPACITY, BPF_F_NO_PREALLOC);
+
+#[map]
+static ENCRYPTION_PATHS_V4: LpmTrie<EncryptionIpv4PathData, EncryptionPathValue> =
+    LpmTrie::with_max_entries(ENCRYPTION_PATH_MAP_CAPACITY, 0);
+
+#[map]
+static ENCRYPTION_PATHS_V6: LpmTrie<EncryptionIpv6PathData, EncryptionPathValue> =
+    LpmTrie::with_max_entries(ENCRYPTION_PATH_MAP_CAPACITY, 0);
 
 #[map]
 static ENCRYPTION_CONFIG: Array<EncryptionMapConfig> = Array::with_max_entries(1, 0);

@@ -424,9 +424,11 @@ const PERSISTENT_MAP_NAMES: [&str; 40] = [
     "EGRESS_GATEWAY_NAT_SELECTIONS",
     "EGRESS_GATEWAY_NAT_CONFIG",
 ];
-const ENCRYPTION_MAP_NAMES: [&str; 4] = [
+const ENCRYPTION_MAP_NAMES: [&str; 6] = [
     "ENCRYPTION_DECISIONS",
     "ENCRYPTION_TRANSPORTS",
+    "ENCRYPTION_PATHS_V4",
+    "ENCRYPTION_PATHS_V6",
     "ENCRYPTION_CONFIG",
     "ENCRYPTION_CONNECTIONS",
 ];
@@ -17356,7 +17358,10 @@ mod tests {
 
         let (island, existed) =
             prepare_encryption_pin_island(&core).expect("empty island is initialized");
-        assert_eq!(island, root.join("encryption/v1"));
+        assert_eq!(
+            island,
+            root.join(format!("encryption/v{ENCRYPTION_MAP_ABI_VERSION}"))
+        );
         assert!(!existed);
         assert_eq!(PERSISTENT_MAP_NAMES.len(), 40);
         assert!(

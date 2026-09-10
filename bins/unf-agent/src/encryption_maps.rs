@@ -7,15 +7,21 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use aya::Ebpf;
-use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, IterableMap, MapData};
+use aya::maps::lpm_trie::Key as AyaLpmKey;
+use aya::maps::{
+    Array as AyaArray, HashMap as AyaHashMap, IterableMap, LpmTrie as AyaLpmTrie, MapData,
+};
 use tracing::info;
 use unf_ebpf_common::{
-    ENCRYPTION_BANK_COUNT, ENCRYPTION_CONNECTION_MAP_CAPACITY, ENCRYPTION_DECISION_MAP_CAPACITY,
+    ENCRYPTION_BANK_COUNT, ENCRYPTION_CONNECTION_MAP_CAPACITY,
+    ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND, ENCRYPTION_DECISION_MAP_CAPACITY,
     ENCRYPTION_DISPOSITION_NATIVE, ENCRYPTION_DISPOSITION_REQUIRED,
     ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE, ENCRYPTION_MAP_ABI_VERSION,
+    ENCRYPTION_PATH_MAP_CAPACITY, ENCRYPTION_PATH_PREFIX_BASE_BITS,
     ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK, ENCRYPTION_TRANSPORT_MAP_CAPACITY,
-    EncryptionDecisionKey, EncryptionDecisionValue, EncryptionMapConfig, EncryptionTransportKey,
-    EncryptionTransportValue, encryption_route_mark,
+    EncryptionDecisionKey, EncryptionDecisionValue, EncryptionIpv4PathData, EncryptionIpv6PathData,
+    EncryptionMapConfig, EncryptionPathValue, EncryptionTransportKey, EncryptionTransportValue,
+    encryption_route_mark,
 };
 use unf_encryption::{
     AdmittedEncryptionGeneration, EncryptionActivationLatch, EncryptionActivationMode,
@@ -29,6 +35,8 @@ use super::{load_secure_json, persist_secure_json, reject_node_block_symlinks};
 struct EncodedEncryptionBank {
     decisions: BTreeMap<[u8; 12], [u8; 72]>,
     transports: BTreeMap<[u8; 16], [u8; 80]>,
+    ipv4_paths: BTreeMap<(u32, [u8; 8]), [u8; 48]>,
+    ipv6_paths: BTreeMap<(u32, [u8; 20]), [u8; 48]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +56,8 @@ struct EncryptionMapMutationStats {
 pub(super) struct EncryptionMaps {
     decisions: AyaHashMap<MapData, [u8; 12], [u8; 72]>,
     transports: AyaHashMap<MapData, [u8; 16], [u8; 80]>,
+    ipv4_paths: AyaLpmTrie<MapData, [u8; 8], [u8; 48]>,
+    ipv6_paths: AyaLpmTrie<MapData, [u8; 20], [u8; 48]>,
     config: AyaArray<MapData, [u8; 48]>,
     connections: AyaHashMap<MapData, [u8; 40], [u8; 64]>,
 }
@@ -390,6 +400,16 @@ impl EncryptionMapSynchronizer {
             self.maps.transports.map(),
             ENCRYPTION_TRANSPORT_MAP_CAPACITY,
         )?;
+        validate_capacity(
+            "ENCRYPTION_PATHS_V4",
+            self.maps.ipv4_paths.map(),
+            ENCRYPTION_PATH_MAP_CAPACITY,
+        )?;
+        validate_capacity(
+            "ENCRYPTION_PATHS_V6",
+            self.maps.ipv6_paths.map(),
+            ENCRYPTION_PATH_MAP_CAPACITY,
+        )?;
         validate_capacity("ENCRYPTION_CONFIG", self.maps.config.map(), 1)?;
         validate_capacity(
             "ENCRYPTION_CONNECTIONS",
@@ -406,6 +426,14 @@ impl EncryptionMapSynchronizer {
         for entry in &self.maps.transports {
             let (key, value) = entry.context("iterate persistent encryption transports")?;
             validate_transport_entry(&key, &value)?;
+        }
+        for entry in &self.maps.ipv4_paths {
+            let (key, value) = entry.context("iterate persistent IPv4 encryption paths")?;
+            validate_path_entry(key.prefix_len(), &key.data(), &value, 32)?;
+        }
+        for entry in &self.maps.ipv6_paths {
+            let (key, value) = entry.context("iterate persistent IPv6 encryption paths")?;
+            validate_path_entry(key.prefix_len(), &key.data(), &value, 128)?;
         }
         for entry in &self.maps.connections {
             let (key, value) = entry.context("iterate persistent encryption connections")?;
@@ -429,6 +457,20 @@ impl EncryptionMapSynchronizer {
             let (key, value) = entry.context("read encryption transport bank")?;
             if key[8] == bank {
                 observed.transports.insert(key, value);
+            }
+        }
+        for entry in &self.maps.ipv4_paths {
+            let (key, value) = entry.context("read IPv4 encryption path bank")?;
+            let data = key.data();
+            if data[0] == bank {
+                observed.ipv4_paths.insert((key.prefix_len(), data), value);
+            }
+        }
+        for entry in &self.maps.ipv6_paths {
+            let (key, value) = entry.context("read IPv6 encryption path bank")?;
+            let data = key.data();
+            if data[0] == bank {
+                observed.ipv6_paths.insert((key.prefix_len(), data), value);
             }
         }
         Ok(observed)
@@ -460,6 +502,22 @@ impl EncryptionMapSynchronizer {
                 stats.removed += 1;
             }
         }
+        for (prefix, key) in current.ipv4_paths.keys() {
+            if !desired.ipv4_paths.contains_key(&(*prefix, *key)) {
+                self.maps
+                    .ipv4_paths
+                    .remove(&AyaLpmKey::new(*prefix, *key))?;
+                stats.removed += 1;
+            }
+        }
+        for (prefix, key) in current.ipv6_paths.keys() {
+            if !desired.ipv6_paths.contains_key(&(*prefix, *key)) {
+                self.maps
+                    .ipv6_paths
+                    .remove(&AyaLpmKey::new(*prefix, *key))?;
+                stats.removed += 1;
+            }
+        }
         for (key, value) in &desired.decisions {
             match current.decisions.get(key) {
                 Some(current) if current == value => stats.retained += 1,
@@ -486,6 +544,40 @@ impl EncryptionMapSynchronizer {
                 }
             }
         }
+        for ((prefix, key), value) in &desired.ipv4_paths {
+            match current.ipv4_paths.get(&(*prefix, *key)) {
+                Some(current) if current == value => stats.retained += 1,
+                Some(_) => {
+                    self.maps
+                        .ipv4_paths
+                        .insert(&AyaLpmKey::new(*prefix, *key), value, 0)?;
+                    stats.updated += 1;
+                }
+                None => {
+                    self.maps
+                        .ipv4_paths
+                        .insert(&AyaLpmKey::new(*prefix, *key), value, 0)?;
+                    stats.inserted += 1;
+                }
+            }
+        }
+        for ((prefix, key), value) in &desired.ipv6_paths {
+            match current.ipv6_paths.get(&(*prefix, *key)) {
+                Some(current) if current == value => stats.retained += 1,
+                Some(_) => {
+                    self.maps
+                        .ipv6_paths
+                        .insert(&AyaLpmKey::new(*prefix, *key), value, 0)?;
+                    stats.updated += 1;
+                }
+                None => {
+                    self.maps
+                        .ipv6_paths
+                        .insert(&AyaLpmKey::new(*prefix, *key), value, 0)?;
+                    stats.inserted += 1;
+                }
+            }
+        }
         Ok(stats)
     }
 }
@@ -501,6 +593,16 @@ pub(super) fn take_encryption_maps(ebpf: &mut Ebpf) -> Result<EncryptionMaps> {
             .context("eBPF object does not contain ENCRYPTION_TRANSPORTS map")?,
     )
     .context("open ENCRYPTION_TRANSPORTS map")?;
+    let ipv4_paths = AyaLpmTrie::<_, [u8; 8], [u8; 48]>::try_from(
+        ebpf.take_map("ENCRYPTION_PATHS_V4")
+            .context("eBPF object does not contain ENCRYPTION_PATHS_V4 map")?,
+    )
+    .context("open ENCRYPTION_PATHS_V4 map")?;
+    let ipv6_paths = AyaLpmTrie::<_, [u8; 20], [u8; 48]>::try_from(
+        ebpf.take_map("ENCRYPTION_PATHS_V6")
+            .context("eBPF object does not contain ENCRYPTION_PATHS_V6 map")?,
+    )
+    .context("open ENCRYPTION_PATHS_V6 map")?;
     let config = AyaArray::<_, [u8; 48]>::try_from(
         ebpf.take_map("ENCRYPTION_CONFIG")
             .context("eBPF object does not contain ENCRYPTION_CONFIG map")?,
@@ -514,6 +616,8 @@ pub(super) fn take_encryption_maps(ebpf: &mut Ebpf) -> Result<EncryptionMaps> {
     Ok(EncryptionMaps {
         decisions,
         transports,
+        ipv4_paths,
+        ipv6_paths,
         config,
         connections,
     })
@@ -544,6 +648,30 @@ fn encode_generation(state: &EncryptionFastPathState) -> Result<EncodedEncryptio
                 .is_some()
         {
             bail!("desired encryption transports contain duplicate or foreign state");
+        }
+    }
+    for (prefix, data, value) in &state.ipv4_paths {
+        let key = encode_ipv4_path_data(*data);
+        let prefix = ENCRYPTION_PATH_PREFIX_BASE_BITS + prefix;
+        if key[0] != state.config.active_bank
+            || bank
+                .ipv4_paths
+                .insert((prefix, key), encode_path_value(value))
+                .is_some()
+        {
+            bail!("desired encryption paths contain duplicate or foreign IPv4 state");
+        }
+    }
+    for (prefix, data, value) in &state.ipv6_paths {
+        let key = encode_ipv6_path_data(data);
+        let prefix = ENCRYPTION_PATH_PREFIX_BASE_BITS + prefix;
+        if key[0] != state.config.active_bank
+            || bank
+                .ipv6_paths
+                .insert((prefix, key), encode_path_value(value))
+                .is_some()
+        {
+            bail!("desired encryption paths contain duplicate or foreign IPv6 state");
         }
     }
     Ok(EncodedEncryptionGeneration {
@@ -623,6 +751,37 @@ fn encode_transport_value(value: &EncryptionTransportValue) -> [u8; 80] {
     encoded
 }
 
+fn encode_ipv4_path_data(value: EncryptionIpv4PathData) -> [u8; 8] {
+    let mut encoded = [0; 8];
+    encoded[0] = value.bank;
+    encoded[1..4].copy_from_slice(&value.reserved);
+    encoded[4..8].copy_from_slice(&value.destination_address);
+    encoded
+}
+
+fn encode_ipv6_path_data(value: &EncryptionIpv6PathData) -> [u8; 20] {
+    let mut encoded = [0; 20];
+    encoded[0] = value.bank;
+    encoded[1..4].copy_from_slice(&value.reserved);
+    encoded[4..20].copy_from_slice(&value.destination_address);
+    encoded
+}
+
+fn encode_path_value(value: &EncryptionPathValue) -> [u8; 48] {
+    let mut encoded = [0; 48];
+    for (index, field) in [value.transport_id, value.contract_revision, value.key_epoch]
+        .into_iter()
+        .enumerate()
+    {
+        encoded[index * 8..index * 8 + 8].copy_from_slice(&field.to_ne_bytes());
+    }
+    encoded[24..40].copy_from_slice(&value.binding_witness);
+    encoded[40..42].copy_from_slice(&value.schema_version.to_ne_bytes());
+    encoded[42] = value.flags;
+    encoded[43..48].copy_from_slice(&value.reserved);
+    encoded
+}
+
 fn encode_map_config(value: &EncryptionMapConfig) -> [u8; 48] {
     let mut encoded = [0; 48];
     for (index, field) in [
@@ -641,6 +800,7 @@ fn encode_map_config(value: &EncryptionMapConfig) -> [u8; 48] {
     encoded[40..42].copy_from_slice(&value.schema_version.to_ne_bytes());
     encoded[42] = value.active_bank;
     encoded[43] = value.epoch_count;
+    encoded[44..48].copy_from_slice(&value.path_count.to_ne_bytes());
     encoded
 }
 
@@ -661,18 +821,61 @@ fn validate_decision_entry(key: &[u8; 12], value: &[u8; 72]) -> Result<()> {
             disposition,
             ENCRYPTION_DISPOSITION_NATIVE | ENCRYPTION_DISPOSITION_REQUIRED
         )
-        || value[67]
-            != unf_ebpf_common::ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED
-                | unf_ebpf_common::ENCRYPTION_DECISION_FLAG_SELECTION_BOUND
+        || !matches!(
+            value[67],
+            flags if flags
+                == unf_ebpf_common::ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED
+                    | unf_ebpf_common::ENCRYPTION_DECISION_FLAG_SELECTION_BOUND
+                || flags
+                    == unf_ebpf_common::ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED
+                        | unf_ebpf_common::ENCRYPTION_DECISION_FLAG_SELECTION_BOUND
+                        | ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND
+        )
         || value[68..72] != [0; 4]
         || (disposition == ENCRYPTION_DISPOSITION_NATIVE
             && (transport != 0 || contract != 0 || epoch != 0))
         || (disposition == ENCRYPTION_DISPOSITION_REQUIRED
-            && (transport == 0 || contract == 0 || epoch == 0))
+            && (contract == 0
+                || epoch == 0
+                || (value[67] & ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND == 0) == (transport == 0)))
     {
         bail!("persistent encryption decision entry is incompatible");
     }
     Ok(())
+}
+
+fn validate_path_entry(prefix: u32, key: &[u8], value: &[u8; 48], family_bits: u32) -> Result<()> {
+    let address_prefix = prefix.saturating_sub(ENCRYPTION_PATH_PREFIX_BASE_BITS);
+    if key.len() != usize::try_from(4 + family_bits / 8).expect("bounded address family")
+        || prefix < ENCRYPTION_PATH_PREFIX_BASE_BITS
+        || prefix > ENCRYPTION_PATH_PREFIX_BASE_BITS + family_bits
+        || key[0] >= ENCRYPTION_BANK_COUNT
+        || key[1..4] != [0; 3]
+        || value[0..24].chunks_exact(8).any(|field| field == [0; 8])
+        || value[24..40] == [0; 16]
+        || u16::from_ne_bytes(value[40..42].try_into().expect("fixed path schema"))
+            != ENCRYPTION_MAP_ABI_VERSION
+        || value[42..48] != [0; 6]
+        || !prefix_bytes_are_canonical(&key[4..], address_prefix)
+    {
+        bail!("persistent encryption path entry is incompatible");
+    }
+    Ok(())
+}
+
+fn prefix_bytes_are_canonical(address: &[u8], prefix_len: u32) -> bool {
+    address.iter().enumerate().all(|(index, byte)| {
+        let first_bit = u32::try_from(index).unwrap_or(u32::MAX) * 8;
+        if first_bit + 8 <= prefix_len {
+            true
+        } else if first_bit >= prefix_len {
+            *byte == 0
+        } else {
+            let retained = prefix_len - first_bit;
+            let mask = u8::MAX << (8 - retained);
+            *byte & !mask == 0
+        }
+    })
 }
 
 fn validate_transport_entry(key: &[u8; 16], value: &[u8; 80]) -> Result<()> {
@@ -863,6 +1066,26 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(value[36..40].try_into().unwrap()), 1_420);
         validate_transport_entry(&key, &value).unwrap();
 
+        let path_data = EncryptionIpv4PathData {
+            bank: 1,
+            reserved: [0; 3],
+            destination_address: [10, 42, 2, 0],
+        };
+        let path_value = EncryptionPathValue {
+            transport_id: 41,
+            contract_revision: 42,
+            key_epoch: 46,
+            binding_witness: [10; 16],
+            schema_version: ENCRYPTION_MAP_ABI_VERSION,
+            flags: 0,
+            reserved: [0; 5],
+        };
+        let key = encode_ipv4_path_data(path_data);
+        let value = encode_path_value(&path_value);
+        assert_eq!(key, [1, 0, 0, 0, 10, 42, 2, 0]);
+        assert_eq!(u64::from_ne_bytes(value[0..8].try_into().unwrap()), 41);
+        validate_path_entry(ENCRYPTION_PATH_PREFIX_BASE_BITS + 24, &key, &value, 32).unwrap();
+
         let config = encode_map_config(&EncryptionMapConfig {
             generation: 50,
             policy_revision: 43,
@@ -873,10 +1096,11 @@ mod tests {
             schema_version: ENCRYPTION_MAP_ABI_VERSION,
             active_bank: 1,
             epoch_count: 1,
+            path_count: 1,
         });
         assert_eq!(u64::from_ne_bytes(config[0..8].try_into().unwrap()), 50);
         assert_eq!(config[42..44], [1, 1]);
-        assert_eq!(config[44..48], [0; 4]);
+        assert_eq!(u32::from_ne_bytes(config[44..48].try_into().unwrap()), 1);
     }
 
     #[test]

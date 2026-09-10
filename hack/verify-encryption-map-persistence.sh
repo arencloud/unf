@@ -20,7 +20,7 @@ require_text() {
     }
 }
 
-for map_name in ENCRYPTION_DECISIONS ENCRYPTION_TRANSPORTS ENCRYPTION_CONFIG ENCRYPTION_CONNECTIONS; do
+for map_name in ENCRYPTION_DECISIONS ENCRYPTION_TRANSPORTS ENCRYPTION_PATHS_V4 ENCRYPTION_PATHS_V6 ENCRYPTION_CONFIG ENCRYPTION_CONNECTIONS; do
     require_text ebpf/unf-ebpf-tc/src/main.rs \
         "static ${map_name}:" \
         "the BPF object must declare ${map_name}"

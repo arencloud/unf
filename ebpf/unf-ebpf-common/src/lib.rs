@@ -61,17 +61,23 @@ pub const EGRESS_EVENT_REASON_PAIR_STORE_FAILED: u8 = 4;
 pub const EGRESS_EVENT_REASON_PORT_EXHAUSTED: u8 = 5;
 pub const EGRESS_EVENT_COUNTER_ATTEMPTED: u32 = 0;
 pub const EGRESS_EVENT_COUNTER_DROPPED: u32 = 1;
-pub const ENCRYPTION_MAP_ABI_VERSION: u16 = 1;
+pub const ENCRYPTION_MAP_ABI_VERSION: u16 = 2;
 pub const ENCRYPTION_BANK_COUNT: u8 = 2;
 pub const ENCRYPTION_DECISION_MAP_CAPACITY: u32 = 65_536;
 pub const ENCRYPTION_TRANSPORT_MAP_CAPACITY: u32 = 4_096;
+pub const ENCRYPTION_PATH_MAP_CAPACITY: u32 = 65_536;
 pub const ENCRYPTION_CONNECTION_MAP_CAPACITY: u32 = 65_536;
+/// LPM keys contain a bank discriminator before destination address bits.
+pub const ENCRYPTION_PATH_PREFIX_BASE_BITS: u32 = 32;
 pub const ENCRYPTION_DISPOSITION_NATIVE: u8 = 1;
 pub const ENCRYPTION_DISPOSITION_REQUIRED: u8 = 2;
 pub const ENCRYPTION_TRANSPORT_ACTIVE: u8 = 1;
 pub const ENCRYPTION_TRANSPORT_DRAINING: u8 = 2;
 pub const ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED: u8 = 1;
 pub const ENCRYPTION_DECISION_FLAG_SELECTION_BOUND: u8 = 1 << 1;
+/// The identity decision deliberately defers transport selection to the
+/// destination-address LPM map because the identity has remote replicas.
+pub const ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND: u8 = 1 << 2;
 pub const ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK: u8 = 1;
 pub const ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE: u8 = 1;
 /// UNF owns only bits 8..23 of `skb->mark`. The high byte (including the
@@ -964,6 +970,40 @@ pub struct EncryptionTransportValue {
     pub reserved: [u8; 4],
 }
 
+/// Banked IPv4 destination selector used only when an identity pair can land
+/// on more than one remote Node. Userspace supplies `32 + prefix_len` to the
+/// LPM key, preserving bank isolation without per-Pod transport records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EncryptionIpv4PathData {
+    pub bank: u8,
+    pub reserved: [u8; 3],
+    pub destination_address: [u8; 4],
+}
+
+/// Banked IPv6 counterpart of [`EncryptionIpv4PathData`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EncryptionIpv6PathData {
+    pub bank: u8,
+    pub reserved: [u8; 3],
+    pub destination_address: [u8; 16],
+}
+
+/// Late-bound transport authority. Revisions and a content witness prevent a
+/// prefix from being combined with a decision or transport from another cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EncryptionPathValue {
+    pub transport_id: u64,
+    pub contract_revision: u64,
+    pub key_epoch: u64,
+    pub binding_witness: [u8; 16],
+    pub schema_version: u16,
+    pub flags: u8,
+    pub reserved: [u8; 5],
+}
+
 /// One atomic selector publishes a complete inactive bank to new flows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -977,6 +1017,7 @@ pub struct EncryptionMapConfig {
     pub schema_version: u16,
     pub active_bank: u8,
     pub epoch_count: u8,
+    pub path_count: u32,
 }
 
 /// Causal Epoch Lease retained for an established five-tuple. It carries the
@@ -1618,6 +1659,9 @@ const _: () = assert!(core::mem::size_of::<EncryptionDecisionKey>() == 12);
 const _: () = assert!(core::mem::size_of::<EncryptionDecisionValue>() == 72);
 const _: () = assert!(core::mem::size_of::<EncryptionTransportKey>() == 16);
 const _: () = assert!(core::mem::size_of::<EncryptionTransportValue>() == 80);
+const _: () = assert!(core::mem::size_of::<EncryptionIpv4PathData>() == 8);
+const _: () = assert!(core::mem::size_of::<EncryptionIpv6PathData>() == 20);
+const _: () = assert!(core::mem::size_of::<EncryptionPathValue>() == 48);
 const _: () = assert!(core::mem::size_of::<EncryptionMapConfig>() == 48);
 const _: () = assert!(core::mem::size_of::<EncryptionFlowValue>() == 64);
 const _: () = assert!(core::mem::size_of::<EgressConnectionKey>() == 44);
@@ -1713,6 +1757,9 @@ mod tests {
         assert_eq!(core::mem::size_of::<EncryptionDecisionValue>(), 72);
         assert_eq!(core::mem::size_of::<EncryptionTransportKey>(), 16);
         assert_eq!(core::mem::size_of::<EncryptionTransportValue>(), 80);
+        assert_eq!(core::mem::size_of::<EncryptionIpv4PathData>(), 8);
+        assert_eq!(core::mem::size_of::<EncryptionIpv6PathData>(), 20);
+        assert_eq!(core::mem::size_of::<EncryptionPathValue>(), 48);
         assert_eq!(core::mem::size_of::<EncryptionMapConfig>(), 48);
         assert_eq!(core::mem::size_of::<EncryptionFlowValue>(), 64);
         assert_eq!(core::mem::align_of::<EgressConnectionKey>(), 4);

@@ -8,18 +8,18 @@ use thiserror::Error;
 use unf_common::Revision;
 
 use crate::{
-    EncryptionFastPathDigest, EncryptionFastPathState, EncryptionTransportAuthority,
-    FastPathDecisionAuthority, FastPathEpochState, FastPathError, FastPathRestoreAuthority,
-    restore_encryption_fast_path_state,
+    EncryptionFastPathDigest, EncryptionFastPathState, EncryptionPathAuthority,
+    EncryptionTransportAuthority, FastPathDecisionAuthority, FastPathEpochState, FastPathError,
+    FastPathRestoreAuthority, restore_encryption_fast_path_state,
 };
 
-pub const CAUSAL_COMMIT_VECTOR_SCHEMA_VERSION: u16 = 1;
-pub const FAST_PATH_MAP_TRANSACTION_SCHEMA_VERSION: u16 = 1;
-pub const FAST_PATH_MAP_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
+pub const CAUSAL_COMMIT_VECTOR_SCHEMA_VERSION: u16 = 2;
+pub const FAST_PATH_MAP_TRANSACTION_SCHEMA_VERSION: u16 = 2;
+pub const FAST_PATH_MAP_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 
-const COMMIT_VECTOR_DIGEST_DOMAIN: &[u8] = b"unf.encryption-causal-commit-vector.v1\0";
-const MAP_TRANSACTION_DIGEST_DOMAIN: &[u8] = b"unf.encryption-map-transaction.v1\0";
-const MAP_CHECKPOINT_DIGEST_DOMAIN: &[u8] = b"unf.encryption-map-checkpoint.v1\0";
+const COMMIT_VECTOR_DIGEST_DOMAIN: &[u8] = b"unf.encryption-causal-commit-vector.v2\0";
+const MAP_TRANSACTION_DIGEST_DOMAIN: &[u8] = b"unf.encryption-map-transaction.v2\0";
+const MAP_CHECKPOINT_DIGEST_DOMAIN: &[u8] = b"unf.encryption-map-checkpoint.v2\0";
 
 /// Serializable commitment to one complete bank. This is deliberately not a
 /// substitute for map readback; recovery must supply the observed digest.
@@ -34,6 +34,7 @@ pub struct FastPathPublishedGeneration {
     pub epoch_count: u8,
     pub decision_count: u32,
     pub transport_count: u32,
+    pub path_count: u32,
     pub state_digest: EncryptionFastPathDigest,
 }
 
@@ -56,6 +57,7 @@ impl FastPathPublishedGeneration {
             epoch_count: state.config.epoch_count,
             decision_count: state.config.decision_count,
             transport_count: state.config.transport_count,
+            path_count: state.config.path_count,
             state_digest: state.state_digest,
         })
     }
@@ -199,6 +201,7 @@ pub struct FastPathMapCheckpoint {
     pub transaction: FastPathMapTransaction,
     pub decision_authority: Vec<FastPathDecisionAuthority>,
     pub transport_authority: Vec<EncryptionTransportAuthority>,
+    pub path_authority: Vec<EncryptionPathAuthority>,
     pub checkpoint_digest: FastPathMapCheckpointDigest,
 }
 
@@ -227,6 +230,7 @@ impl FastPathMapCheckpoint {
             transaction,
             decision_authority: desired.decision_authority.clone(),
             transport_authority: desired.transport_authority.clone(),
+            path_authority: desired.path_authority.clone(),
             checkpoint_digest: FastPathMapCheckpointDigest([0; 32]),
         };
         checkpoint.checkpoint_digest = checkpoint.calculate_digest()?;
@@ -250,6 +254,7 @@ impl FastPathMapCheckpoint {
             epoch_count: published.epoch_count,
             decisions: self.decision_authority.clone(),
             transports: self.transport_authority.clone(),
+            paths: self.path_authority.clone(),
             expected_digest: published.state_digest,
         })
         .map_err(FastPathTransactionError::InvalidFastPath)

@@ -782,8 +782,8 @@ kernel-configuration digest. Persist-before-mutate phases and exact readback
 make every pointer-flip crash boundary deterministic, while rollback requires
 the previous bank plus positive target-bank absence. This passes
 `make encryption-fast-path-transaction-test`; ADR 0163. The Aya persistence
-foundation now places four fixed-shape maps in a separately versioned
-`/sys/fs/bpf/unf/encryption/v1` ABI island, leaving the qualified 40-map core ABI
+foundation now places six fixed-shape maps in a separately versioned
+`/sys/fs/bpf/unf/encryption/v2` ABI island, leaving the qualified 40-map core ABI
 unchanged. Quarantine-First Activation accepts only an exact all-or-none pin
 inventory and refuses foreign, symlinked, partial, or non-quiescent recovered
 state before attach. `make encryption-map-persistence-test` passes; ADR 0164.
@@ -897,12 +897,16 @@ explicit authority-free dormant plan instead of a fabricated tunnel;
 Quotient preserves mixed L4 allow/deny semantics while provisioning shared L3
 transport and represents default allow without inventing a policy ID; policy
 remains the first packet authority; `make encryption-policy-quotient-test`; ADR
-0186. Address-exact replica binding, Kubernetes fact projection, controller
-invocation, local compile, the TC consumer/verifier, and live
+0186. Adaptive Address-Exact Replica Binding keeps the one-lookup direct path
+for a single remote Node and adds a banked, witnessed IPv4/IPv6 LPM lookup only
+when one identity spans several Nodes; the final translated backend address
+then selects the exact coalesced transport without per-Pod tunnels;
+`make encryption-address-binding-test`; ADR 0187. Kubernetes fact projection,
+controller invocation, local compile, the TC consumer/verifier, and live
 encrypted packet gate remain, so no workload packet yet selects the staged
 route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0186 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0187 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

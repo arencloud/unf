@@ -5,21 +5,24 @@
 //! inactive BPF bank and publish only [`EncryptionMapConfig`] atomically.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unf_common::{IdentityId, Revision};
 use unf_ebpf_common::{
-    ENCRYPTION_BANK_COUNT, ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED,
-    ENCRYPTION_DECISION_FLAG_SELECTION_BOUND, ENCRYPTION_DECISION_MAP_CAPACITY,
-    ENCRYPTION_DISPOSITION_NATIVE, ENCRYPTION_DISPOSITION_REQUIRED,
-    ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE, ENCRYPTION_MAP_ABI_VERSION, ENCRYPTION_ROUTE_MARK_MASK,
+    ENCRYPTION_BANK_COUNT, ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND,
+    ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED, ENCRYPTION_DECISION_FLAG_SELECTION_BOUND,
+    ENCRYPTION_DECISION_MAP_CAPACITY, ENCRYPTION_DISPOSITION_NATIVE,
+    ENCRYPTION_DISPOSITION_REQUIRED, ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE,
+    ENCRYPTION_MAP_ABI_VERSION, ENCRYPTION_PATH_MAP_CAPACITY, ENCRYPTION_ROUTE_MARK_MASK,
     ENCRYPTION_TRANSPORT_ACTIVE, ENCRYPTION_TRANSPORT_DRAINING,
     ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK, ENCRYPTION_TRANSPORT_MAP_CAPACITY,
-    EncryptionDecisionKey, EncryptionDecisionValue, EncryptionFlowValue, EncryptionMapConfig,
-    EncryptionTransportKey, EncryptionTransportValue, apply_encryption_route_mark,
-    clear_encryption_route_mark, encryption_route_mark, encryption_transport_is_usable,
+    EncryptionDecisionKey, EncryptionDecisionValue, EncryptionFlowValue, EncryptionIpv4PathData,
+    EncryptionIpv6PathData, EncryptionMapConfig, EncryptionPathValue, EncryptionTransportKey,
+    EncryptionTransportValue, apply_encryption_route_mark, clear_encryption_route_mark,
+    encryption_route_mark, encryption_transport_is_usable,
 };
 
 use crate::{
@@ -29,9 +32,10 @@ use crate::{
 
 pub const MAX_FAST_PATH_DECISIONS: usize = ENCRYPTION_DECISION_MAP_CAPACITY as usize;
 pub const MAX_FAST_PATH_TRANSPORTS: usize = ENCRYPTION_TRANSPORT_MAP_CAPACITY as usize;
+pub const MAX_FAST_PATH_PATHS: usize = ENCRYPTION_PATH_MAP_CAPACITY as usize;
 pub const MAX_FAST_PATH_EPOCHS: usize = 2;
 
-const FAST_PATH_DIGEST_DOMAIN: &[u8] = b"unf.encryption-fast-path.v1\0";
+const FAST_PATH_DIGEST_DOMAIN: &[u8] = b"unf.encryption-fast-path.v2\0";
 const TRANSPORT_ID_DOMAIN: &[u8] = b"unf.encryption-transport-id.v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -108,6 +112,18 @@ pub struct FastPathDecisionAuthority {
     pub decision_witness: [u8; 16],
 }
 
+/// One destination-prefix-to-transport binding used only when an identity
+/// pair can land on multiple remote Nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionPathAuthority {
+    pub prefix: crate::IpPrefix,
+    pub transport_id: u64,
+    pub contract_revision: Revision,
+    pub key_epoch: u64,
+    pub binding_witness: [u8; 16],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EncryptionFastPathDigest(pub [u8; 32]);
@@ -117,8 +133,11 @@ pub struct EncryptionFastPathState {
     pub config: EncryptionMapConfig,
     pub decisions: Vec<(EncryptionDecisionKey, EncryptionDecisionValue)>,
     pub transports: Vec<(EncryptionTransportKey, EncryptionTransportValue)>,
+    pub ipv4_paths: Vec<(u32, EncryptionIpv4PathData, EncryptionPathValue)>,
+    pub ipv6_paths: Vec<(u32, EncryptionIpv6PathData, EncryptionPathValue)>,
     pub decision_authority: Vec<FastPathDecisionAuthority>,
     pub transport_authority: Vec<EncryptionTransportAuthority>,
+    pub path_authority: Vec<EncryptionPathAuthority>,
     pub state_digest: EncryptionFastPathDigest,
 }
 
@@ -156,20 +175,25 @@ impl EncryptionFastPathState {
             usize::from(self.config.epoch_count),
             &self.decision_authority,
             &self.transport_authority,
+            &self.path_authority,
         )?;
         if self.config != expected_config
             || self.decisions != lower_decisions(context, &self.decision_authority)
             || self.transports
                 != lower_transports(self.config.active_bank, &self.transport_authority)
+            || self.ipv4_paths != lower_ipv4_paths(self.config.active_bank, &self.path_authority)
+            || self.ipv6_paths != lower_ipv6_paths(self.config.active_bank, &self.path_authority)
             || self.state_digest
                 != state_digest(
                     context,
                     usize::from(self.config.epoch_count),
                     &self.decision_authority,
                     &self.transport_authority,
+                    &self.path_authority,
                 )?
             || !transport_ids_are_valid(&self.transport_authority)
             || !route_marks_are_unambiguous(&self.transport_authority)
+            || !paths_are_valid(&self.path_authority, &self.transport_authority)
         {
             return Err(FastPathError::IntegrityMismatch);
         }
@@ -186,6 +210,7 @@ pub(crate) struct FastPathRestoreAuthority {
     pub epoch_count: u8,
     pub decisions: Vec<FastPathDecisionAuthority>,
     pub transports: Vec<EncryptionTransportAuthority>,
+    pub paths: Vec<EncryptionPathAuthority>,
     pub expected_digest: EncryptionFastPathDigest,
 }
 
@@ -206,14 +231,18 @@ pub(crate) fn restore_encryption_fast_path_state(
         usize::from(authority.epoch_count),
         &authority.decisions,
         &authority.transports,
+        &authority.paths,
     )?;
     let decisions = lower_decisions(context, &authority.decisions);
     let transports = lower_transports(authority.bank, &authority.transports);
+    let ipv4_paths = lower_ipv4_paths(authority.bank, &authority.paths);
+    let ipv6_paths = lower_ipv6_paths(authority.bank, &authority.paths);
     let state_digest = state_digest(
         context,
         usize::from(authority.epoch_count),
         &authority.decisions,
         &authority.transports,
+        &authority.paths,
     )?;
     if state_digest != authority.expected_digest {
         return Err(FastPathError::IntegrityMismatch);
@@ -222,8 +251,11 @@ pub(crate) fn restore_encryption_fast_path_state(
         config,
         decisions,
         transports,
+        ipv4_paths,
+        ipv6_paths,
         decision_authority: authority.decisions,
         transport_authority: authority.transports,
+        path_authority: authority.paths,
         state_digest,
     };
     state.verify_integrity()?;
@@ -263,6 +295,8 @@ impl CausalEpochLease {
 pub struct FastPathPacketContext {
     pub source_identity: IdentityId,
     pub destination_identity: IdentityId,
+    /// Final backend or egress address after Service and egress resolution.
+    pub destination_address: IpAddr,
     pub policy_authorized: bool,
     pub policy_revision: Revision,
     pub service_revision: Revision,
@@ -356,7 +390,7 @@ pub fn compile_encryption_fast_path(
     validate_context(context, epochs, inputs)?;
     let admitted = admit_epochs(context, epochs)?;
     let mut transport_by_key = BTreeMap::new();
-    let mut decision_authority =
+    let (mut decision_authority, path_authority) =
         compile_decisions(context, inputs, &admitted, &mut transport_by_key)?;
     add_draining_transports(epochs, &mut transport_by_key)?;
     decision_authority.sort_by_key(|entry| (entry.source_identity, entry.destination_identity));
@@ -369,21 +403,28 @@ pub fn compile_encryption_fast_path(
         epochs.len(),
         &decision_authority,
         &transport_authority,
+        &path_authority,
     )?;
     let decisions = lower_decisions(context, &decision_authority);
     let transports = lower_transports(context.bank, &transport_authority);
+    let ipv4_paths = lower_ipv4_paths(context.bank, &path_authority);
+    let ipv6_paths = lower_ipv6_paths(context.bank, &path_authority);
     let state_digest = state_digest(
         context,
         epochs.len(),
         &decision_authority,
         &transport_authority,
+        &path_authority,
     )?;
     let state = EncryptionFastPathState {
         config,
         decisions,
         transports,
+        ipv4_paths,
+        ipv6_paths,
         decision_authority,
         transport_authority,
+        path_authority,
         state_digest,
     };
     state.verify_integrity()?;
@@ -414,25 +455,135 @@ fn compile_decisions<'a>(
     inputs: &[FastPathDecisionInput],
     admitted: &BTreeMap<u64, &'a FastPathEpochAdmission<'a>>,
     transports: &mut TransportIndex<'a>,
-) -> Result<Vec<FastPathDecisionAuthority>, FastPathError> {
-    let mut decisions = Vec::with_capacity(inputs.len());
-    let mut seen = BTreeSet::new();
+) -> Result<(Vec<FastPathDecisionAuthority>, Vec<EncryptionPathAuthority>), FastPathError> {
+    let mut grouped = BTreeMap::<(IdentityId, IdentityId), Vec<FastPathDecisionInput>>::new();
     for input in inputs {
-        if input.source_identity.get() == 0
-            || input.destination_identity.get() == 0
-            || !seen.insert((input.source_identity, input.destination_identity))
-        {
+        if input.source_identity.get() == 0 || input.destination_identity.get() == 0 {
             return Err(FastPathError::InvalidDecision);
         }
-        let decision = match input.disposition {
-            EncryptionDisposition::Native => native_decision(context, *input)?,
-            EncryptionDisposition::Required => {
-                required_decision(context, *input, admitted, transports)?
-            }
-        };
-        decisions.push(decision);
+        grouped
+            .entry((input.source_identity, input.destination_identity))
+            .or_default()
+            .push(*input);
     }
-    Ok(decisions)
+    let mut decisions = Vec::with_capacity(grouped.len());
+    let mut paths = BTreeMap::<crate::IpPrefix, EncryptionPathAuthority>::new();
+    for ((source, destination), group) in grouped {
+        if group.len() == 1 {
+            let input = group[0];
+            decisions.push(match input.disposition {
+                EncryptionDisposition::Native => native_decision(context, input)?,
+                EncryptionDisposition::Required => {
+                    required_decision(context, input, admitted, transports)?.0
+                }
+            });
+            continue;
+        }
+        decisions.push(compile_replicated_decision(
+            context,
+            source,
+            destination,
+            group,
+            admitted,
+            transports,
+            &mut paths,
+        )?);
+    }
+    let paths = paths.into_values().collect::<Vec<_>>();
+    if paths.len() > MAX_FAST_PATH_PATHS {
+        return Err(FastPathError::Capacity {
+            kind: "path",
+            actual: paths.len(),
+            limit: MAX_FAST_PATH_PATHS,
+        });
+    }
+    Ok((decisions, paths))
+}
+
+fn compile_replicated_decision<'a>(
+    context: FastPathCompileContext,
+    source: IdentityId,
+    destination: IdentityId,
+    group: Vec<FastPathDecisionInput>,
+    admitted: &BTreeMap<u64, &'a FastPathEpochAdmission<'a>>,
+    transports: &mut TransportIndex<'a>,
+    paths: &mut BTreeMap<crate::IpPrefix, EncryptionPathAuthority>,
+) -> Result<FastPathDecisionAuthority, FastPathError> {
+    if group
+        .iter()
+        .any(|input| input.disposition != EncryptionDisposition::Required)
+    {
+        return Err(FastPathError::InvalidDecision);
+    }
+    let mut references = BTreeSet::new();
+    let mut bindings = Vec::with_capacity(group.len());
+    for input in group {
+        if !references.insert((input.contract_epoch, input.plan_index)) {
+            return Err(FastPathError::InvalidDecision);
+        }
+        bindings.push(required_decision(context, input, admitted, transports)?);
+    }
+    let contract_revision = bindings[0]
+        .0
+        .contract_revision
+        .ok_or(FastPathError::RequiredAuthorityUnavailable)?;
+    let key_epoch = bindings[0]
+        .0
+        .key_epoch
+        .ok_or(FastPathError::RequiredAuthorityUnavailable)?;
+    if bindings.iter().any(|(decision, _)| {
+        decision.contract_revision != Some(contract_revision)
+            || decision.key_epoch != Some(key_epoch)
+    }) {
+        return Err(FastPathError::RequiredAuthorityUnavailable);
+    }
+    let mut plan_witnesses = Vec::with_capacity(bindings.len());
+    for (decision, prefixes) in bindings {
+        let transport_id = decision
+            .transport_id
+            .ok_or(FastPathError::RequiredAuthorityUnavailable)?;
+        plan_witnesses.push(decision.decision_witness);
+        insert_path_bindings(paths, prefixes, transport_id, contract_revision, key_epoch)?;
+    }
+    plan_witnesses.sort_unstable();
+    Ok(FastPathDecisionAuthority {
+        source_identity: source,
+        destination_identity: destination,
+        disposition: EncryptionDisposition::Required,
+        transport_id: None,
+        contract_revision: Some(contract_revision),
+        key_epoch: Some(key_epoch),
+        decision_witness: aggregate_decision_witness(context, source, destination, &plan_witnesses),
+    })
+}
+
+fn insert_path_bindings(
+    paths: &mut BTreeMap<crate::IpPrefix, EncryptionPathAuthority>,
+    prefixes: Vec<crate::IpPrefix>,
+    transport_id: u64,
+    contract_revision: Revision,
+    key_epoch: u64,
+) -> Result<(), FastPathError> {
+    for prefix in prefixes {
+        let candidate = EncryptionPathAuthority {
+            prefix,
+            transport_id,
+            contract_revision,
+            key_epoch,
+            binding_witness: path_binding_witness(
+                prefix,
+                transport_id,
+                contract_revision,
+                key_epoch,
+            )?,
+        };
+        if let Some(existing) = paths.insert(prefix, candidate)
+            && existing != candidate
+        {
+            return Err(FastPathError::RequiredAuthorityUnavailable);
+        }
+    }
+    Ok(())
 }
 
 fn native_decision(
@@ -458,7 +609,7 @@ fn required_decision<'a>(
     input: FastPathDecisionInput,
     admitted: &BTreeMap<u64, &'a FastPathEpochAdmission<'a>>,
     transports: &mut TransportIndex<'a>,
-) -> Result<FastPathDecisionAuthority, FastPathError> {
+) -> Result<(FastPathDecisionAuthority, Vec<crate::IpPrefix>), FastPathError> {
     let epoch_number = input
         .contract_epoch
         .ok_or(FastPathError::RequiredAuthorityUnavailable)?;
@@ -488,19 +639,22 @@ fn required_decision<'a>(
     {
         return Err(FastPathError::TransportIdCollision);
     }
-    Ok(FastPathDecisionAuthority {
-        source_identity: input.source_identity,
-        destination_identity: input.destination_identity,
-        disposition: input.disposition,
-        transport_id: Some(id),
-        contract_revision: Some(epoch.contract.contract_revision),
-        key_epoch: Some(epoch_number),
-        decision_witness: epoch
-            .contract
-            .decision_witness(plan_index)
-            .map_err(|_| FastPathError::InvalidContract)?
-            .0,
-    })
+    Ok((
+        FastPathDecisionAuthority {
+            source_identity: input.source_identity,
+            destination_identity: input.destination_identity,
+            disposition: input.disposition,
+            transport_id: Some(id),
+            contract_revision: Some(epoch.contract.contract_revision),
+            key_epoch: Some(epoch_number),
+            decision_witness: epoch
+                .contract
+                .decision_witness(plan_index)
+                .map_err(|_| FastPathError::InvalidContract)?
+                .0,
+        },
+        plan.transport.forward.allowed_ips.clone(),
+    ))
 }
 
 fn add_draining_transports<'a>(
@@ -552,6 +706,7 @@ fn map_config(
     epoch_count: usize,
     decisions: &[FastPathDecisionAuthority],
     transports: &[EncryptionTransportAuthority],
+    paths: &[EncryptionPathAuthority],
 ) -> Result<EncryptionMapConfig, FastPathError> {
     Ok(EncryptionMapConfig {
         generation: context.generation.get(),
@@ -571,6 +726,11 @@ fn map_config(
         schema_version: ENCRYPTION_MAP_ABI_VERSION,
         active_bank: context.bank,
         epoch_count: u8::try_from(epoch_count).map_err(|_| FastPathError::InvalidEpochSet)?,
+        path_count: u32::try_from(paths.len()).map_err(|_| FastPathError::Capacity {
+            kind: "path",
+            actual: paths.len(),
+            limit: MAX_FAST_PATH_PATHS,
+        })?,
     })
 }
 
@@ -595,28 +755,8 @@ pub fn select_encryption_transport(
     {
         return FastPathPacketDecision::Drop(FastPathDropReason::RevisionMismatch);
     }
-    if let Some(mut lease) = established {
-        if lease.source_identity != packet.source_identity
-            || lease.destination_identity != packet.destination_identity
-        {
-            return FastPathPacketDecision::Drop(FastPathDropReason::LeaseExpiredOrRevoked);
-        }
-        let Some((_, transport)) = state
-            .transports
-            .iter()
-            .find(|(key, _)| key.transport_id == lease.transport_id)
-        else {
-            return FastPathPacketDecision::Drop(FastPathDropReason::LeaseExpiredOrRevoked);
-        };
-        if lease.key_epoch != transport.key_epoch
-            || lease.contract_revision != transport.contract_revision
-            || !encryption_transport_is_usable(transport, true, packet.now_monotonic_ns)
-        {
-            return FastPathPacketDecision::Drop(FastPathDropReason::LeaseExpiredOrRevoked);
-        }
-        lease.last_seen_monotonic_ns = packet.now_monotonic_ns;
-        lease.drain_until_monotonic_ns = transport.drain_until_monotonic_ns;
-        return encrypted(transport, lease);
+    if let Some(lease) = established {
+        return select_established_transport(state, packet, lease);
     }
     let Some((_, decision)) = state.decisions.iter().find(|(key, _)| {
         key.bank == state.config.active_bank
@@ -625,10 +765,12 @@ pub fn select_encryption_transport(
     }) else {
         return FastPathPacketDecision::Drop(FastPathDropReason::AuthorityMissing);
     };
+    let base_flags =
+        ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED | ENCRYPTION_DECISION_FLAG_SELECTION_BOUND;
+    let address_bound = decision.flags == base_flags | ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND;
     if decision.schema_version != ENCRYPTION_MAP_ABI_VERSION
         || decision.decision_witness == [0; 16]
-        || decision.flags
-            != ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED | ENCRYPTION_DECISION_FLAG_SELECTION_BOUND
+        || decision.flags != base_flags && !address_bound
         || decision.policy_revision != packet.policy_revision.get()
         || decision.service_revision != packet.service_revision.get()
         || decision.egress_revision != packet.egress_revision.get()
@@ -636,7 +778,8 @@ pub fn select_encryption_transport(
         return FastPathPacketDecision::Drop(FastPathDropReason::RevisionMismatch);
     }
     if decision.disposition == ENCRYPTION_DISPOSITION_NATIVE {
-        return if decision.transport_id == 0
+        return if !address_bound
+            && decision.transport_id == 0
             && decision.contract_revision == 0
             && decision.key_epoch == 0
         {
@@ -646,15 +789,20 @@ pub fn select_encryption_transport(
         };
     }
     if decision.disposition != ENCRYPTION_DISPOSITION_REQUIRED
-        || decision.transport_id == 0
         || decision.contract_revision == 0
         || decision.key_epoch == 0
     {
         return FastPathPacketDecision::Drop(FastPathDropReason::RevisionMismatch);
     }
-    let Some((_, transport)) = state.transports.iter().find(|(key, _)| {
-        key.bank == state.config.active_bank && key.transport_id == decision.transport_id
-    }) else {
+    let transport_id = match resolve_new_transport_id(state, packet, decision, address_bound) {
+        Ok(transport_id) => transport_id,
+        Err(reason) => return FastPathPacketDecision::Drop(reason),
+    };
+    let Some((_, transport)) = state
+        .transports
+        .iter()
+        .find(|(key, _)| key.bank == state.config.active_bank && key.transport_id == transport_id)
+    else {
         return FastPathPacketDecision::Drop(FastPathDropReason::TransportUnavailable);
     };
     if decision.key_epoch != transport.key_epoch
@@ -668,7 +816,7 @@ pub fn select_encryption_transport(
         CausalEpochLease {
             source_identity: packet.source_identity,
             destination_identity: packet.destination_identity,
-            transport_id: decision.transport_id,
+            transport_id,
             key_epoch: decision.key_epoch,
             contract_revision: decision.contract_revision,
             decision_witness: decision.decision_witness,
@@ -676,6 +824,63 @@ pub fn select_encryption_transport(
             drain_until_monotonic_ns: transport.drain_until_monotonic_ns,
         },
     )
+}
+
+fn resolve_new_transport_id(
+    state: &EncryptionFastPathState,
+    packet: FastPathPacketContext,
+    decision: &EncryptionDecisionValue,
+    address_bound: bool,
+) -> Result<u64, FastPathDropReason> {
+    if !address_bound {
+        return (decision.transport_id != 0)
+            .then_some(decision.transport_id)
+            .ok_or(FastPathDropReason::RevisionMismatch);
+    }
+    if decision.transport_id != 0 {
+        return Err(FastPathDropReason::RevisionMismatch);
+    }
+    let path = state
+        .path_authority
+        .iter()
+        .filter(|path| path.prefix.contains(packet.destination_address))
+        .max_by_key(|path| path.prefix.prefix_len)
+        .ok_or(FastPathDropReason::TransportUnavailable)?;
+    if path.contract_revision.get() != decision.contract_revision
+        || path.key_epoch != decision.key_epoch
+        || path.binding_witness == [0; 16]
+    {
+        return Err(FastPathDropReason::RevisionMismatch);
+    }
+    Ok(path.transport_id)
+}
+
+fn select_established_transport(
+    state: &EncryptionFastPathState,
+    packet: FastPathPacketContext,
+    mut lease: CausalEpochLease,
+) -> FastPathPacketDecision {
+    if lease.source_identity != packet.source_identity
+        || lease.destination_identity != packet.destination_identity
+    {
+        return FastPathPacketDecision::Drop(FastPathDropReason::LeaseExpiredOrRevoked);
+    }
+    let Some((_, transport)) = state
+        .transports
+        .iter()
+        .find(|(key, _)| key.transport_id == lease.transport_id)
+    else {
+        return FastPathPacketDecision::Drop(FastPathDropReason::LeaseExpiredOrRevoked);
+    };
+    if lease.key_epoch != transport.key_epoch
+        || lease.contract_revision != transport.contract_revision
+        || !encryption_transport_is_usable(transport, true, packet.now_monotonic_ns)
+    {
+        return FastPathPacketDecision::Drop(FastPathDropReason::LeaseExpiredOrRevoked);
+    }
+    lease.last_seen_monotonic_ns = packet.now_monotonic_ns;
+    lease.drain_until_monotonic_ns = transport.drain_until_monotonic_ns;
+    encrypted(transport, lease)
 }
 
 fn validate_context(
@@ -884,6 +1089,72 @@ fn route_marks_are_unambiguous(transports: &[EncryptionTransportAuthority]) -> b
     })
 }
 
+fn paths_are_valid(
+    paths: &[EncryptionPathAuthority],
+    transports: &[EncryptionTransportAuthority],
+) -> bool {
+    let mut seen = BTreeSet::new();
+    paths.iter().enumerate().all(|(index, path)| {
+        path.prefix.is_canonical()
+            && seen.insert(path.prefix)
+            && !paths
+                .iter()
+                .skip(index + 1)
+                .any(|other| path.prefix.overlaps(other.prefix))
+            && path.binding_witness
+                == path_binding_witness(
+                    path.prefix,
+                    path.transport_id,
+                    path.contract_revision,
+                    path.key_epoch,
+                )
+                .unwrap_or_default()
+            && transports.iter().any(|transport| {
+                transport.transport_id == path.transport_id
+                    && transport.contract_revision == path.contract_revision
+                    && transport.key_epoch == path.key_epoch
+                    && transport.state == FastPathEpochState::Active
+            })
+    })
+}
+
+fn path_binding_witness(
+    prefix: crate::IpPrefix,
+    transport_id: u64,
+    contract_revision: Revision,
+    key_epoch: u64,
+) -> Result<[u8; 16], FastPathError> {
+    let material = serde_json::to_vec(&(prefix, transport_id, contract_revision, key_epoch))
+        .map_err(|error| FastPathError::CanonicalEncoding(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"unf.encryption-address-path.v1\0");
+    hasher.update(material);
+    let digest = hasher.finalize();
+    let mut witness = [0; 16];
+    witness.copy_from_slice(&digest[..16]);
+    Ok(witness)
+}
+
+fn aggregate_decision_witness(
+    context: FastPathCompileContext,
+    source: IdentityId,
+    destination: IdentityId,
+    plan_witnesses: &[[u8; 16]],
+) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"unf.encryption-replica-decision.v1\0");
+    hasher.update(context.generation.get().to_be_bytes());
+    hasher.update(source.get().to_be_bytes());
+    hasher.update(destination.get().to_be_bytes());
+    for witness in plan_witnesses {
+        hasher.update(witness);
+    }
+    let digest = hasher.finalize();
+    let mut witness = [0; 16];
+    witness.copy_from_slice(&digest[..16]);
+    witness
+}
+
 fn native_witness(context: FastPathCompileContext, input: FastPathDecisionInput) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(b"unf.encryption-native-decision.v1\0");
@@ -926,7 +1197,12 @@ fn lower_decisions(
                         ENCRYPTION_DISPOSITION_NATIVE
                     },
                     flags: ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED
-                        | ENCRYPTION_DECISION_FLAG_SELECTION_BOUND,
+                        | ENCRYPTION_DECISION_FLAG_SELECTION_BOUND
+                        | if required && entry.transport_id.is_none() {
+                            ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND
+                        } else {
+                            0
+                        },
                 },
             )
         })
@@ -973,11 +1249,66 @@ fn lower_transports(
         .collect()
 }
 
+fn lower_ipv4_paths(
+    bank: u8,
+    authority: &[EncryptionPathAuthority],
+) -> Vec<(u32, EncryptionIpv4PathData, EncryptionPathValue)> {
+    authority
+        .iter()
+        .filter_map(|entry| match entry.prefix.address {
+            IpAddr::V4(address) => Some((
+                u32::from(entry.prefix.prefix_len),
+                EncryptionIpv4PathData {
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: address.octets(),
+                },
+                lower_path_value(entry),
+            )),
+            IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+fn lower_ipv6_paths(
+    bank: u8,
+    authority: &[EncryptionPathAuthority],
+) -> Vec<(u32, EncryptionIpv6PathData, EncryptionPathValue)> {
+    authority
+        .iter()
+        .filter_map(|entry| match entry.prefix.address {
+            IpAddr::V4(_) => None,
+            IpAddr::V6(address) => Some((
+                u32::from(entry.prefix.prefix_len),
+                EncryptionIpv6PathData {
+                    bank,
+                    reserved: [0; 3],
+                    destination_address: address.octets(),
+                },
+                lower_path_value(entry),
+            )),
+        })
+        .collect()
+}
+
+fn lower_path_value(entry: &EncryptionPathAuthority) -> EncryptionPathValue {
+    EncryptionPathValue {
+        transport_id: entry.transport_id,
+        contract_revision: entry.contract_revision.get(),
+        key_epoch: entry.key_epoch,
+        binding_witness: entry.binding_witness,
+        schema_version: ENCRYPTION_MAP_ABI_VERSION,
+        flags: 0,
+        reserved: [0; 5],
+    }
+}
+
 fn state_digest(
     context: FastPathCompileContext,
     epoch_count: usize,
     decisions: &[FastPathDecisionAuthority],
     transports: &[EncryptionTransportAuthority],
+    paths: &[EncryptionPathAuthority],
 ) -> Result<EncryptionFastPathDigest, FastPathError> {
     let material = serde_json::to_vec(&(
         context.generation,
@@ -988,6 +1319,7 @@ fn state_digest(
         epoch_count,
         decisions,
         transports,
+        paths,
     ))
     .map_err(|error| FastPathError::CanonicalEncoding(error.to_string()))?;
     let mut hasher = Sha256::new();
@@ -1083,8 +1415,14 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     fn fixture(epoch: u64) -> Fixture {
+        fixture_with_replica(epoch, false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fixture_with_replica(epoch: u64, replicated: bool) -> Fixture {
         let source_node = node("worker-a", 1);
         let destination_node = node("worker-b", 2);
+        let replica_node = node("worker-c", 3);
         let source_identities = [IdentityId::new(11), IdentityId::new(12)];
         let destination_identities = [IdentityId::new(21), IdentityId::new(22)];
         let model = EncryptionModel::normalize(
@@ -1103,7 +1441,7 @@ mod tests {
             }],
         )
         .unwrap();
-        let endpoints = source_identities
+        let mut endpoints = source_identities
             .into_iter()
             .map(|identity| EncryptionEndpointFact {
                 identity,
@@ -1120,6 +1458,15 @@ mod tests {
                     }),
             )
             .collect::<Vec<_>>();
+        if replicated {
+            endpoints.extend(destination_identities.into_iter().map(|identity| {
+                EncryptionEndpointFact {
+                    identity,
+                    workload_uid: format!("replica-{}", identity.get()),
+                    node: replica_node.clone(),
+                }
+            }));
+        }
         let policies = source_identities
             .into_iter()
             .flat_map(|source| {
@@ -1146,6 +1493,40 @@ mod tests {
             fwmark: 0x0055_0000 + (u32::try_from(epoch).unwrap() << 8),
             mtu: 1_420,
         };
+        let mut keys = vec![
+            EncryptionKeyFact {
+                node_uid: source_node.uid.clone(),
+                epoch,
+                public_key: WireGuardPublicKey([1; 32]),
+                phase: EncryptionKeyPhase::Active,
+                valid_from_unix_ms: 900,
+                valid_until_unix_ms: 3_000,
+            },
+            EncryptionKeyFact {
+                node_uid: destination_node.uid.clone(),
+                epoch,
+                public_key: WireGuardPublicKey([2; 32]),
+                phase: EncryptionKeyPhase::Active,
+                valid_from_unix_ms: 900,
+                valid_until_unix_ms: 3_000,
+            },
+        ];
+        let mut paths = vec![
+            path(&source_node, &destination_node),
+            path(&destination_node, &source_node),
+        ];
+        if replicated {
+            keys.push(EncryptionKeyFact {
+                node_uid: replica_node.uid.clone(),
+                epoch,
+                public_key: WireGuardPublicKey([3; 32]),
+                phase: EncryptionKeyPhase::Active,
+                valid_from_unix_ms: 900,
+                valid_until_unix_ms: 3_000,
+            });
+            paths.push(path(&source_node, &replica_node));
+            paths.push(path(&replica_node, &source_node));
+        }
         let facts = EncryptionContractFacts {
             revisions: EncryptionContractRevisions {
                 intent: Revision::new(1),
@@ -1157,28 +1538,8 @@ mod tests {
             active_epoch: epoch,
             endpoints,
             policies,
-            keys: vec![
-                EncryptionKeyFact {
-                    node_uid: source_node.uid.clone(),
-                    epoch,
-                    public_key: WireGuardPublicKey([1; 32]),
-                    phase: EncryptionKeyPhase::Active,
-                    valid_from_unix_ms: 900,
-                    valid_until_unix_ms: 3_000,
-                },
-                EncryptionKeyFact {
-                    node_uid: destination_node.uid.clone(),
-                    epoch,
-                    public_key: WireGuardPublicKey([2; 32]),
-                    phase: EncryptionKeyPhase::Active,
-                    valid_from_unix_ms: 900,
-                    valid_until_unix_ms: 3_000,
-                },
-            ],
-            paths: vec![
-                path(&source_node, &destination_node),
-                path(&destination_node, &source_node),
-            ],
+            keys,
+            paths,
         };
         let contract = AttestedEncryptionPathContract::issue(
             &model,
@@ -1189,12 +1550,35 @@ mod tests {
             2_500,
         )
         .unwrap();
-        let mtu_envelope = WireGuardMtuEnvelope::derive(&[UnderlayMtuObservation {
+        let mut mtu_observations = vec![UnderlayMtuObservation {
             peer_node_uid: destination_node.uid.clone(),
             family: UnderlayAddressFamily::Ipv4,
             underlay_mtu: 1_480,
-        }])
-        .unwrap();
+        }];
+        if replicated {
+            mtu_observations.push(UnderlayMtuObservation {
+                peer_node_uid: replica_node.uid.clone(),
+                family: UnderlayAddressFamily::Ipv4,
+                underlay_mtu: 1_480,
+            });
+        }
+        let mtu_envelope = WireGuardMtuEnvelope::derive(&mtu_observations).unwrap();
+        let mut peers = vec![WireGuardPeerPlan {
+            node_uid: destination_node.uid.clone(),
+            public_key: WireGuardPublicKey([2; 32]),
+            endpoint: SocketAddr::new(destination_node.underlay_addresses[0], 51_820),
+            persistent_keepalive_seconds: 25,
+            allowed_ips: destination_node.pod_cidrs.clone(),
+        }];
+        if replicated {
+            peers.push(WireGuardPeerPlan {
+                node_uid: replica_node.uid.clone(),
+                public_key: WireGuardPublicKey([3; 32]),
+                endpoint: SocketAddr::new(replica_node.underlay_addresses[0], 51_820),
+                persistent_keepalive_seconds: 25,
+                allowed_ips: replica_node.pod_cidrs.clone(),
+            });
+        }
         let plan = WireGuardKernelPlan::new(WireGuardKernelPlanInput {
             cluster_id: "cluster-a".to_owned(),
             local_node_uid: source_node.uid,
@@ -1207,13 +1591,7 @@ mod tests {
             route_table: 20_000 + u32::try_from(epoch).unwrap(),
             mtu_envelope,
             activation: WireGuardEpochActivation::Active,
-            peers: vec![WireGuardPeerPlan {
-                node_uid: destination_node.uid,
-                public_key: WireGuardPublicKey([2; 32]),
-                endpoint: SocketAddr::new(destination_node.underlay_addresses[0], 51_820),
-                persistent_keepalive_seconds: 25,
-                allowed_ips: destination_node.pod_cidrs.clone(),
-            }],
+            peers,
         })
         .unwrap();
         let interface_index = 17;
@@ -1282,6 +1660,7 @@ mod tests {
         FastPathPacketContext {
             source_identity: IdentityId::new(11),
             destination_identity: IdentityId::new(21),
+            destination_address: "10.2.0.8".parse().unwrap(),
             policy_authorized: true,
             policy_revision: Revision::new(3),
             service_revision: Revision::new(30),
@@ -1403,6 +1782,78 @@ mod tests {
         mutated.transports[0].1.mtu -= 1;
         assert_eq!(
             mutated.verify_integrity(),
+            Err(FastPathError::IntegrityMismatch)
+        );
+    }
+
+    #[test]
+    fn replicated_identity_late_binds_the_final_dual_stack_destination() {
+        let fixture = fixture_with_replica(7, true);
+        let epoch = FastPathEpochAdmission {
+            contract: &fixture.contract,
+            transaction: &fixture.transaction,
+            readback: &fixture.snapshot,
+            readiness_digest: [7; 32],
+            state: FastPathEpochState::Active,
+            drain_until_monotonic_ns: 0,
+        };
+        let inputs = fixture
+            .contract
+            .plans
+            .iter()
+            .enumerate()
+            .filter(|(_, plan)| {
+                plan.source.identity == IdentityId::new(11)
+                    && plan.destination.identity == IdentityId::new(21)
+            })
+            .map(|(plan_index, _)| FastPathDecisionInput {
+                source_identity: IdentityId::new(11),
+                destination_identity: IdentityId::new(21),
+                disposition: EncryptionDisposition::Required,
+                contract_epoch: Some(7),
+                plan_index: Some(plan_index),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 2);
+        let state = compile_encryption_fast_path(context(1), &[epoch], &inputs).unwrap();
+        assert_eq!(state.decisions.len(), 1);
+        assert_eq!(state.transports.len(), 2);
+        assert_eq!(state.path_authority.len(), 4);
+        assert_eq!(state.config.path_count, 4);
+        assert_eq!(state.decisions[0].1.transport_id, 0);
+        assert_ne!(
+            state.decisions[0].1.flags & ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND,
+            0
+        );
+
+        let mut first = packet();
+        first.destination_address = "10.42.2.8".parse().unwrap();
+        let FastPathPacketDecision::Encrypt {
+            lease: first_lease, ..
+        } = select_encryption_transport(&state, first, None)
+        else {
+            panic!("first replica must resolve");
+        };
+        let mut second = packet();
+        second.destination_address = "fd42:3::8".parse().unwrap();
+        let FastPathPacketDecision::Encrypt {
+            lease: second_lease,
+            ..
+        } = select_encryption_transport(&state, second, None)
+        else {
+            panic!("second replica must resolve");
+        };
+        assert_ne!(first_lease.transport_id, second_lease.transport_id);
+
+        second.destination_address = "10.42.99.8".parse().unwrap();
+        assert_eq!(
+            select_encryption_transport(&state, second, None),
+            FastPathPacketDecision::Drop(FastPathDropReason::TransportUnavailable)
+        );
+        let mut corrupt = state.clone();
+        corrupt.path_authority[0].binding_witness[0] ^= 1;
+        assert_eq!(
+            corrupt.verify_integrity(),
             Err(FastPathError::IntegrityMismatch)
         );
     }
