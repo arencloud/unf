@@ -875,7 +875,7 @@ matrix is maintained in the
   route readback, safe MTU derivation, foreign-state refusal, injected rollback,
   replay, and positive cleanup pass `make encryption-kernel-provider-test` and
   the privileged live-kernel gate; ADR 0161. Workload selection remains 9.5.
-- Phase 9.5a–9.5w now provide the canonical coalesced compiler and Causal Epoch
+- Phase 9.5a–9.5x now provide the canonical coalesced compiler and Causal Epoch
   Lease, Causal Commit Vector, isolated fixed-shape Aya ABI, Proof-Carrying Aya
   Map Mirror with delta-minimal recovery, and Cooperative Route-Mark Lease. The
   latter gives every admitted outer `WireGuard` bypass mark a collision-free
@@ -957,8 +957,11 @@ matrix is maintained in the
   through an immutable Reciprocal Witness Matrix: deterministic authenticated
   rows release no Node column until every exact member participates, and agents
   durably apply the independently replayed result; `make
-  encryption-key-attestation-test` and ADR 0184. Authoritative plan production,
-  local compile, the TC consumer, verifier
+  encryption-key-attestation-test` and ADR 0184. The Demand-Sparse Fleet Plan
+  Forge derives readiness from that cut and atomically emits active plans plus
+  explicit authority-free dormant members instead of fake idle tunnels;
+  `make encryption-fleet-plan-producer-test` and ADR 0185. Kubernetes fact
+  projection, controller invocation, local compile, the TC consumer, verifier
   loading, and live encrypted packets remain within milestone 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,

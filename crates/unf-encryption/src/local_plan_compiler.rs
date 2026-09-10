@@ -25,8 +25,8 @@ use crate::{
     WireGuardKernelSnapshot, WireGuardMtuEnvelope, WireGuardPeerPlan, compile_encryption_fast_path,
 };
 
-pub const NODE_LOCAL_PLAN_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
-const NODE_LOCAL_PLAN_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"unf.node-local-plan-snapshot.v1\0";
+pub const NODE_LOCAL_PLAN_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+const NODE_LOCAL_PLAN_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"unf.node-local-plan-snapshot.v2\0";
 
 #[cfg(target_os = "linux")]
 use crate::LinuxWireGuardProvider;
@@ -80,6 +80,14 @@ pub struct NodeLocalDecisionPlan {
 #[serde(transparent)]
 pub struct NodeLocalPlanSnapshotDigest(pub [u8; 32]);
 
+/// Whether this Node owns an encrypted transport in the current demand cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NodeLocalPlanMode {
+    Active,
+    Dormant,
+}
+
 /// One complete, Node-scoped, secret-free input manifold. Its digest and exact
 /// coverage rule prevent partial controller updates from reaching the local
 /// compiler independently.
@@ -90,6 +98,7 @@ pub struct NodeLocalPlanSnapshot {
     pub membership_revision: Revision,
     pub generation: Revision,
     pub recipient: EncryptionGenerationRecipient,
+    pub mode: NodeLocalPlanMode,
     pub policy_revision: Revision,
     pub service_revision: Revision,
     pub egress_revision: Revision,
@@ -106,6 +115,7 @@ pub struct NodeLocalPlanSnapshotFields {
     pub membership_revision: Revision,
     pub generation: Revision,
     pub recipient: EncryptionGenerationRecipient,
+    pub mode: NodeLocalPlanMode,
     pub policy_revision: Revision,
     pub service_revision: Revision,
     pub egress_revision: Revision,
@@ -154,6 +164,7 @@ impl NodeLocalPlanSnapshot {
             membership_revision: fields.membership_revision,
             generation: fields.generation,
             recipient: fields.recipient,
+            mode: fields.mode,
             policy_revision: fields.policy_revision,
             service_revision: fields.service_revision,
             egress_revision: fields.egress_revision,
@@ -325,20 +336,14 @@ impl NodeLocalPlanSnapshot {
             || self.recipient.node_uid.is_empty()
             || self.listen_port == 0
             || self.persistent_keepalive_seconds > 600
-            || self.epochs.is_empty()
             || self.epochs.len() > 2
             || self.decisions.len() > MAX_FAST_PATH_DECISIONS
-            || self
-                .epochs
-                .iter()
-                .filter(|epoch| epoch.state == FastPathEpochState::Active)
-                .count()
-                != 1
         {
             return Err(NodeLocalPlanCompilerError::InvalidInput(
                 "Node-local plan snapshot shape is invalid",
             ));
         }
+        self.validate_mode()?;
         let epoch_inputs = self
             .epochs
             .iter()
@@ -367,8 +372,10 @@ impl NodeLocalPlanSnapshot {
             persistent_keepalive_seconds: self.persistent_keepalive_seconds,
             prior: None,
         };
-        validate_context(&structural_context, &epoch_inputs)?;
-        compile_inactive_kernel_plans(&structural_context, &epoch_inputs)?;
+        if self.mode == NodeLocalPlanMode::Active {
+            validate_context(&structural_context, &epoch_inputs)?;
+            compile_inactive_kernel_plans(&structural_context, &epoch_inputs)?;
+        }
 
         let epoch_numbers = self
             .epochs
@@ -393,6 +400,31 @@ impl NodeLocalPlanSnapshot {
             return Err(NodeLocalPlanCompilerError::InvalidInput(
                 "epoch readiness or policy revision is not exact",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_mode(&self) -> Result<(), NodeLocalPlanCompilerError> {
+        match self.mode {
+            NodeLocalPlanMode::Active
+                if self.epochs.is_empty()
+                    || self
+                        .epochs
+                        .iter()
+                        .filter(|epoch| epoch.state == FastPathEpochState::Active)
+                        .count()
+                        != 1 =>
+            {
+                return Err(NodeLocalPlanCompilerError::InvalidInput(
+                    "active Node-local plan has no unique active epoch",
+                ));
+            }
+            NodeLocalPlanMode::Dormant if !self.epochs.is_empty() || !self.decisions.is_empty() => {
+                return Err(NodeLocalPlanCompilerError::InvalidInput(
+                    "dormant Node-local plan carries transport authority",
+                ));
+            }
+            NodeLocalPlanMode::Active | NodeLocalPlanMode::Dormant => {}
         }
         Ok(())
     }
@@ -980,6 +1012,7 @@ mod tests {
                 node_name: "worker-a".to_owned(),
                 node_uid: "uid-a".to_owned(),
             },
+            mode: NodeLocalPlanMode::Active,
             policy_revision: Revision::new(3),
             service_revision: Revision::new(30),
             egress_revision: Revision::new(40),

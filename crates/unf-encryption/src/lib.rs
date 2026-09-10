@@ -8,6 +8,7 @@
 mod activation_latch;
 mod fast_path;
 mod fast_path_transaction;
+mod fleet_plan_producer;
 mod generation_distribution;
 mod generation_frontier;
 mod generation_reconciler;
@@ -23,6 +24,7 @@ mod route_authority;
 pub use activation_latch::*;
 pub use fast_path::*;
 pub use fast_path_transaction::*;
+pub use fleet_plan_producer::*;
 pub use generation_distribution::*;
 pub use generation_frontier::*;
 pub use generation_reconciler::*;
@@ -370,6 +372,7 @@ pub struct WireGuardPublicKey(pub [u8; 32]);
 #[serde(rename_all = "camelCase")]
 pub enum EncryptionKeyPhase {
     Prepared,
+    MutuallyAttested,
     Active,
 }
 

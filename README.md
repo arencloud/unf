@@ -890,12 +890,15 @@ authority, durably prepares before publishing, and sends only public state;
 Reciprocal Witness Matrix: one immutable transparency round, exact authenticated
 N×(N-1) rows, complete-column release, and durable Node-local adoption prevent
 partial-fleet key advancement; `make encryption-key-attestation-test`; ADR
-0184. Authoritative plan production, local compile, the TC consumer/verifier,
-and live
+0184. The Demand-Sparse Fleet Plan Forge now derives key facts and readiness
+from that one cut, emits a single atomic catalog, and gives idle members an
+explicit authority-free dormant plan instead of a fabricated tunnel;
+`make encryption-fleet-plan-producer-test`; ADR 0185. Kubernetes fact projection,
+controller invocation, local compile, the TC consumer/verifier, and live
 encrypted packet gate remain, so no workload packet yet selects the staged
 route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0184 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0185 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
