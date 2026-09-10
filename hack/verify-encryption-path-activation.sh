@@ -26,7 +26,7 @@ require_text 'MissingPathProof' \
 require_text '/v1/state/encryption-path-receipts' \
     bins/unf-agent/src/main.rs \
     'the agent must retrieve live receipts before consuming local authority'
-require_text 'apply_linux_generation(prepared, admitted, path_permit, now_unix_ms)' \
+require_text 'apply_linux_generation(prepared, admitted, route_permit, path_permit, now_unix_ms)' \
     bins/unf-agent/src/main.rs \
     'the path permit must be consumed by the map activation path'
 require_text 'current duplex path quorum consumed at map boundary' \

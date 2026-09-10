@@ -490,6 +490,36 @@ impl LinuxPreparedLocalGeneration {
         Ok(())
     }
 
+    /// Installs and independently reads the exact policy-route rules while the
+    /// packet-map generation is still unpublished. The returned authority is
+    /// consuming; the prepared generation itself remains available for a
+    /// bounded live-path exchange or retry.
+    ///
+    /// # Errors
+    ///
+    /// Rejects convergence drift, controller substitution, route mutation, or
+    /// a conflicting foreign rule.
+    #[cfg(target_os = "linux")]
+    pub async fn activate_linux_routes_for_probe(
+        &self,
+        admitted: &AdmittedEncryptionGeneration,
+    ) -> Result<EncryptionRoutePublicationPermit, NodeLocalOrchestratorError> {
+        if self.witness
+            != convergence_witness(
+                self.proposal.fact(),
+                &self.route_authority,
+                &self.commitments,
+            )?
+        {
+            return Err(NodeLocalOrchestratorError::ConvergenceWitnessMismatch);
+        }
+        self.verify_controller_admission(admitted)?;
+        LinuxEncryptionRouteProvider
+            .activate(&self.route_authority)
+            .await
+            .map_err(NodeLocalOrchestratorError::InvalidRouteAuthority)
+    }
+
     /// Consumes exact kernel convergence, verifies the controller returned the
     /// same proposal, installs/read-backs the real Linux policy rules, and
     /// returns the only latch accepted by the Aya transaction adapter.
@@ -531,10 +561,11 @@ impl LinuxPreparedLocalGeneration {
     /// Rejects convergence/controller/route drift or incomplete, expired, or
     /// substituted path evidence.
     #[cfg(target_os = "linux")]
-    pub async fn admit_and_activate_linux_path_proven(
+    pub fn admit_and_activate_linux_path_proven(
         self,
         admitted: AdmittedEncryptionGeneration,
         applied: Option<FastPathPublishedGeneration>,
+        route_permit: EncryptionRoutePublicationPermit,
         path_permit: EncryptionGenerationPathProofPermit,
         now_unix_ms: u64,
     ) -> Result<PathProvenEncryptionActivationLatch, NodeLocalOrchestratorError> {
@@ -549,13 +580,9 @@ impl LinuxPreparedLocalGeneration {
         }
         self.verify_controller_admission(&admitted)?;
         let controller_bound = self.proposal.bind_controller_admission(admitted)?;
-        let permit = LinuxEncryptionRouteProvider
-            .activate(&self.route_authority)
-            .await
-            .map_err(NodeLocalOrchestratorError::InvalidRouteAuthority)?;
         controller_bound.authorize_path_proven_map_activation(
             applied,
-            permit,
+            route_permit,
             path_permit,
             now_unix_ms,
         )

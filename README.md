@@ -947,8 +947,18 @@ challenge assignments from the active fleet plan, scopes every read and write
 to the current Pod-bound Node identity, rejects generation equivocation, clears
 old evidence on successor publication, renews expired rounds, and exposes only
 current completed receipts to involved endpoints. `make
-encryption-path-runtime-test`; ADR 0195. Agent live execution and consuming
-activation remain 9.6c.
+encryption-path-runtime-test`; ADR 0195. Evidence-Carrying Activation then
+requires exact current receipt coverage to survive as a consuming capability
+through the final map boundary; `make encryption-path-activation-test`; ADR
+0196. Workload-Independent In-Fabric Proof Beacons reserve deterministic
+IPAM-excluded IPv4/IPv6 identities inside each full Pod CIDR and bind their
+installation/readback to provider schema v2; `make encryption-proof-beacon-test`;
+ADR 0197. The Mark-Multiplexed Duplex Rendezvous now runs strict fixed-width
+nonce exchanges from those beacons, selects the isolated epoch route per send,
+captures before/after kernel evidence, preserves exact retry identity, and
+consumes the joined proof without adding `NET_RAW`; `make
+encryption-path-executor-test`; ADR 0198. A live two-agent executor and failure
+gate remains before milestone 9.6 is Verified.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

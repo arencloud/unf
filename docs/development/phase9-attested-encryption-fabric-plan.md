@@ -19,7 +19,7 @@ separately revisioned. The authoritative state remains in
 | 9.3 | Node key authority and epoch rotation | **Verified** | `unf-encryption` generates X25519/WireGuard keys directly from the OS CSPRNG into zeroizing memory, exposes secret material only to the future local kernel-provider boundary, and copy-persist-commits at most two epochs to a digest-checked atomic mode-0600 Node-UID-bound checkpoint. The Causal Epoch Barrier seals the exact affected-peer frontier/topology revision and requires every authenticated acknowledgement before activation; rotation, positive zero-flow/zero-route retirement, emergency revocation, public-only monotonic publication, replay/replacement fencing, restart/tamper recovery, and strict Clippy pass `make encryption-key-authority-test`; ADR 0160. No interface or packet mutation exists |
 | 9.4 | Transactional kernel WireGuard provider | **Verified** | Typed Rust generic-netlink/rtnetlink configures bounded dual-stack interfaces, complete peer sets, isolated routes, fwmarks, and derived safe MTUs. Proof-Carrying Kernel Transactions bind secret-free before/desired/readback digests and total restart actions; exact ownership aliases, sorted overlap/route indexes, injected rollback, foreign-state preservation, readback/replay, adjacent capability negotiation, and positive cleanup pass `make encryption-kernel-provider-test` plus the independently privileged `make encryption-kernel-provider-live-test`; ADR 0161. No workload packet selects the staged table |
 | 9.5 | Intent-Coalesced Cryptographic Fast Path | **Verified** | Phase 9.5a adds the canonical compiler and Causal Epoch Lease; Phase 9.5b adds the Causal Commit Vector. Later slices connect proof-carrying maps/routes, authenticated complete-cut distribution, local Linux/key proof, quiescent generations, the policy-first dual-stack TC consumer, and Flow-Adaptive Secure DSR. Phase 9.5af closes the chain with independently captured real-kernel IPv4/IPv6 WireGuard ciphertext, positive transfer counters, peer-removal denial, exact recovery, and scoped cleanup under `make encryption-ciphertext-live-test`; ADRs 0162–0193 |
-| 9.6 | Bidirectional live path proof | **In progress** | Phases 9.6a–c provide the Causal Duplex Path Quorum, generation-fenced authenticated exchange, and Evidence-Carrying Activation Choke Point. Phase 9.6d adds Workload-Independent In-Fabric Proof Beacons: deterministic UNF-IPAM-excluded IPv4/IPv6 host identities are derived from each exact local Pod CIDR, bound into WireGuard provider schema v2 and stable kernel readback, and proven over full-CIDR real ciphertext without probe Pods or new routes. `make encryption-proof-beacon-test`; ADRs 0194–0197. Agent nonce execution remains next |
+| 9.6 | Bidirectional live path proof | **In progress** | Phases 9.6a–e provide the Causal Duplex Path Quorum, generation-fenced authenticated exchange, consuming activation, Workload-Independent In-Fabric Proof Beacons, and the Mark-Multiplexed Duplex Rendezvous. The agent stages isolated routes while maps remain unpublished, runs bounded concurrent exact-beacon nonce exchanges with per-send route marks, reads kernel counters, preserves first-proof identity across retries, and consumes current duplex receipts without adding `NET_RAW`. `make encryption-path-executor-test`; ADRs 0194–0198. A live two-agent executor gate remains before closure |
 | 9.7 | Operations, upgrade, recovery, and performance | **Planned** | Fixed-cardinality status/metrics, loss-explicit history, explanation and non-authoritative simulation expose requirement, contract, epoch, peer, path, rotation, and denial provenance without secrets. Adjacent upgrade/rollback, controller/agent outage, Node replacement, exact cleanup, and committed plaintext/encrypted throughput/latency/CPU/memory/rotation measurements pass |
 | 9.8 | Kube-proxy-free Kind qualification | **Planned** | One exact committed runtime passes a multi-Node dual-stack gate for required/default and selective encryption, externally verified ciphertext-only underlay transport, Service and egress composition, rotation, failure/recovery, observability, performance capture, exact cleanup, and no-CNI rollback |
 | 9.9 | OpenShift qualification | **Planned** | The exact Kind-qualified images independently pass a five-Node dual-stack cl02 RHCOS/SELinux/CRI-O gate with immutable provenance, cross-worker encrypted traffic, rotation/recovery, exact cleanup, convergence, kube-proxy absence, and ClusterOperator comparison |
@@ -175,16 +175,8 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Complete milestone 9.5 with a live dual-stack WireGuard ciphertext gate over
-the new policy/Service/egress/DSR composition. The compiler/ABI, transaction contract, isolated
-persistence foundation, and proof-carrying map
-mirror, cooperative mark, policy-route activation, authenticated causal
-delivery, tri-plane activation, cluster-complete publication, controller restart
-recovery, authenticated complete-cut fact reconciliation, capability-typed
-local proof ordering, concrete Linux convergence, Echo-Sealed exchange,
-proof-rehydrating restart activation, snapshot-first local plan compilation,
-the causally sealed input manifold, nonce-bound plan relay, persist-before-
-compile runtime inbox, fleet-synchronous catalog, public-key transparency cut,
-durable edge-key bootstrap, reciprocal key witness matrix, demand-sparse fleet plan forge, policy-truth quotient, adaptive address-exact replica binding, and placement-truth demand projection now pass their focused gates, but no workload
-packet-path activation is claimed yet.
-Live two-ended encrypted challenge proof remains milestone 9.6.
+Close milestone 9.6 with a repeatable two-agent dual-stack live executor gate.
+It must exercise the running controller assignments and both agent responders,
+observe exact nonce/counter-backed receipts, prove Required map publication only
+after the duplex join, inject peer loss/expiry/restart, recover with a fresh
+round, and clean every version-owned route, interface, map, and checkpoint.

@@ -33,7 +33,7 @@ use prometheus_client::registry::Registry;
 use rustix::time::{ClockId, clock_gettime};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
+use socket2::{Domain, Protocol as SocketProtocol, SockRef, Socket, Type};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -56,9 +56,9 @@ use unf_ebpf_common::{
     SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL, SERVICE_EVENT_FRONTEND_NODE_PORT_CLUSTER,
     SERVICE_EVENT_FRONTEND_NODE_PORT_LOCAL, SERVICE_EVENT_REASON_NO_BACKEND,
     SERVICE_EVENT_REASON_SOURCE_RANGE_DENIED, SERVICE_MAP_ABI_VERSION, ServiceEvent,
-    egress_event_action_reason_is_valid, service_event_action_reason_is_valid,
-    service_event_frontend_kind_is_valid, service_selection_algorithm_is_valid,
-    service_selection_tier_is_valid,
+    egress_event_action_reason_is_valid, encryption_route_mark,
+    service_event_action_reason_is_valid, service_event_frontend_kind_is_valid,
+    service_selection_algorithm_is_valid, service_selection_tier_is_valid,
 };
 #[cfg(test)]
 use unf_egress::compile_egress_dataplane;
@@ -86,12 +86,17 @@ use unf_egress::{
     seal_egress_bgp_snapshot, verify_egress_bgp_config, verify_egress_reachability_plan,
 };
 use unf_encryption::{
-    AdmittedEncryptionGeneration, AdmittedNodeLocalPlan, DurableNodeKeyAuthority,
-    EncryptionGenerationFact, EncryptionGenerationPathProofPermit, EncryptionGenerationRequest,
-    EncryptionKeyBootstrap, EncryptionPathActivationReceipt, FileNodeKeyStateStore,
-    LinuxPreparedLocalGeneration, NodeKeyAttestationCut, NodeKeyAttestationRound, NodeKeyAuthority,
+    AdmittedEncryptionGeneration, AdmittedNodeLocalPlan, AuthenticatedNodeIdentity,
+    DurableNodeKeyAuthority, ENCRYPTION_PATH_PROBE_FRAME_BYTES, ENCRYPTION_PATH_PROBE_PORT,
+    EncryptionEndpointPathProof, EncryptionGenerationFact, EncryptionGenerationPathProofPermit,
+    EncryptionGenerationRequest, EncryptionKeyBootstrap, EncryptionPathActivationReceipt,
+    EncryptionPathChallengeDelivery, EncryptionPathEndpointRole, EncryptionPathProbeExchange,
+    EncryptionPathProbeFrame, EncryptionPathProbeKind, EncryptionPathProbeTarget,
+    EncryptionPathProofAssignment, EncryptionPathProofRoundDigest,
+    EncryptionRoutePublicationPermit, FileNodeKeyStateStore, LinuxPreparedLocalGeneration,
+    LinuxWireGuardProvider, NodeKeyAttestationCut, NodeKeyAttestationRound, NodeKeyAuthority,
     NodeLocalPlanRequest, NodeLocalRecoveryPlan, NodeSealedGenerationCapsule,
-    NodeSealedPlanCapsule, OsWireGuardKeyGenerator,
+    NodeSealedPlanCapsule, OsWireGuardKeyGenerator, WireGuardKernelPlan,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -1054,6 +1059,7 @@ struct EncryptionGenerationSynchronizer {
     recovery: EncryptionRecoveryJournal,
     active_revalidated: bool,
     pending: Option<PendingEncryptionGeneration>,
+    path_proofs: BTreeMap<EncryptionPathProofRoundDigest, EncryptionEndpointPathProof>,
 }
 
 struct EncryptionPlanSynchronizer {
@@ -1128,6 +1134,7 @@ enum PendingEncryptionGeneration {
     ControllerAdmitted {
         prepared: Box<LinuxPreparedLocalGeneration>,
         admitted: Box<AdmittedEncryptionGeneration>,
+        route_permit: Option<EncryptionRoutePublicationPermit>,
         slot: EncryptionRecoverySlot,
     },
 }
@@ -8027,6 +8034,7 @@ impl EncryptionGenerationSynchronizer {
             recovery,
             active_revalidated: false,
             pending: None,
+            path_proofs: BTreeMap::new(),
         })
     }
 
@@ -8082,6 +8090,7 @@ impl EncryptionGenerationSynchronizer {
             prepared: Box::new(prepared),
             slot: EncryptionRecoverySlot::Pending,
         });
+        self.path_proofs.clear();
         Ok(true)
     }
 
@@ -8137,8 +8146,10 @@ impl EncryptionGenerationSynchronizer {
             self.pending = Some(PendingEncryptionGeneration::ControllerAdmitted {
                 prepared: Box::new(prepared),
                 admitted: Box::new(current.clone()),
+                route_permit: None,
                 slot,
             });
+            self.path_proofs.clear();
             return Ok(true);
         }
         let expected_prior = self
@@ -8178,11 +8189,19 @@ impl EncryptionGenerationSynchronizer {
         )
     }
 
+    fn has_controller_admission(&self) -> bool {
+        matches!(
+            &self.pending,
+            Some(PendingEncryptionGeneration::ControllerAdmitted { .. })
+        )
+    }
+
     fn take_admitted_capability(
         &mut self,
     ) -> Option<(
         LinuxPreparedLocalGeneration,
         AdmittedEncryptionGeneration,
+        EncryptionRoutePublicationPermit,
         EncryptionRecoverySlot,
     )> {
         let pending = self.pending.take()?;
@@ -8194,8 +8213,21 @@ impl EncryptionGenerationSynchronizer {
             PendingEncryptionGeneration::ControllerAdmitted {
                 prepared,
                 admitted,
+                route_permit,
                 slot,
-            } => Some((*prepared, *admitted, slot)),
+            } => {
+                if let Some(route_permit) = route_permit {
+                    Some((*prepared, *admitted, route_permit, slot))
+                } else {
+                    self.pending = Some(PendingEncryptionGeneration::ControllerAdmitted {
+                        prepared,
+                        admitted,
+                        route_permit: None,
+                        slot,
+                    });
+                    None
+                }
+            }
         }
     }
 
@@ -8205,6 +8237,7 @@ impl EncryptionGenerationSynchronizer {
         Option<(
             unf_encryption::EncryptionGenerationRecipient,
             unf_encryption::EncryptionFastPathState,
+            Vec<unf_encryption::WireGuardKernelPlan>,
         )>,
     > {
         let Some(PendingEncryptionGeneration::ControllerAdmitted { admitted, .. }) =
@@ -8216,7 +8249,62 @@ impl EncryptionGenerationSynchronizer {
             .checkpoint
             .desired_state()
             .context("rebuild pending desired generation for path proof")?;
-        Ok(Some((admitted.recipient.clone(), desired)))
+        let plans = match self.pending.as_ref() {
+            Some(PendingEncryptionGeneration::ControllerAdmitted { prepared, .. }) => {
+                prepared.recovery_plan().plans.clone()
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some((admitted.recipient.clone(), desired, plans)))
+    }
+
+    async fn ensure_probe_routes(&mut self) -> Result<bool> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(false);
+        };
+        let PendingEncryptionGeneration::ControllerAdmitted {
+            prepared,
+            admitted,
+            route_permit,
+            slot,
+        } = pending
+        else {
+            self.pending = Some(pending);
+            return Ok(false);
+        };
+        if route_permit.is_some() {
+            self.pending = Some(PendingEncryptionGeneration::ControllerAdmitted {
+                prepared,
+                admitted,
+                route_permit,
+                slot,
+            });
+            return Ok(false);
+        }
+        let result = prepared
+            .activate_linux_routes_for_probe(&admitted)
+            .await
+            .context("activate exact encryption routes for live path proof");
+        match result {
+            Ok(route_permit) => {
+                self.pending = Some(PendingEncryptionGeneration::ControllerAdmitted {
+                    prepared,
+                    admitted,
+                    route_permit: Some(route_permit),
+                    slot,
+                });
+                Ok(true)
+            }
+            Err(error) => {
+                self.pending = Some(PendingEncryptionGeneration::ControllerAdmitted {
+                    prepared,
+                    admitted,
+                    route_permit: None,
+                    slot,
+                });
+                Err(error)
+            }
+        }
     }
 
     fn record_activation(&mut self, slot: EncryptionRecoverySlot) -> Result<()> {
@@ -8235,6 +8323,7 @@ impl EncryptionGenerationSynchronizer {
                 self.active_revalidated = true;
             }
         }
+        self.path_proofs.clear();
         Ok(())
     }
 
@@ -8281,6 +8370,7 @@ impl EncryptionGenerationSynchronizer {
         self.pending = Some(PendingEncryptionGeneration::ControllerAdmitted {
             prepared,
             admitted: Box::new(candidate.clone()),
+            route_permit: None,
             slot,
         });
         Ok(candidate)
@@ -8412,17 +8502,408 @@ async fn synchronize_encryption_generation(
         .map(|_| true)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PathProbeSocketKey {
+    local_address: IpAddr,
+}
+
+#[derive(Clone)]
+struct PathProbeWork {
+    assignment: EncryptionPathProofAssignment,
+    target: EncryptionPathProbeTarget,
+    route_mark: u32,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn execute_live_encryption_path_proofs(
+    recipient: &unf_encryption::EncryptionGenerationRecipient,
+    desired: &unf_encryption::EncryptionFastPathState,
+    plans: &[WireGuardKernelPlan],
+    assignments: &[EncryptionPathProofAssignment],
+) -> Result<Vec<EncryptionEndpointPathProof>> {
+    if assignments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let desired_generation = Revision::new(desired.config.generation);
+    let provider = LinuxWireGuardProvider;
+    let mut plan_by_round = BTreeMap::new();
+    let mut before_by_plan = BTreeMap::new();
+    let mut groups = BTreeMap::<PathProbeSocketKey, Vec<PathProbeWork>>::new();
+    for assignment in assignments {
+        assignment
+            .verify()
+            .context("verify live encryption path assignment")?;
+        if assignment.generation != desired_generation || !assignment.includes(recipient) {
+            bail!("path assignment does not belong to the pending local generation");
+        }
+        let path = assignment
+            .local_path(recipient)
+            .context("resolve local path proof contract")?;
+        let plan = plans
+            .iter()
+            .find(|plan| {
+                plan.epoch == assignment.round.epoch
+                    && plan.interface_name == path.interface_name
+                    && plan.fwmark == path.fwmark
+            })
+            .context("path assignment has no exact local WireGuard plan")?;
+        let key = (plan.epoch, plan.interface_name.clone());
+        if let Some(previous) = plan_by_round.insert(assignment.round.round_digest, key.clone())
+            && previous != key
+        {
+            bail!("one path round resolves conflicting local WireGuard plans");
+        }
+        if !before_by_plan.contains_key(&key) {
+            let snapshot = provider
+                .readback(plan)
+                .await
+                .context("read WireGuard state before encrypted path challenge")?;
+            before_by_plan.insert(key.clone(), snapshot);
+        }
+        let route_mark = encryption_route_mark(plan.fwmark)
+            .context("derive proof socket policy-route mark from WireGuard fwmark")?;
+        for target in assignment
+            .probe_targets(recipient)
+            .context("derive exact contract proof beacons")?
+        {
+            groups
+                .entry(PathProbeSocketKey {
+                    local_address: target.local_address,
+                })
+                .or_default()
+                .push(PathProbeWork {
+                    assignment: assignment.clone(),
+                    target,
+                    route_mark,
+                });
+        }
+    }
+
+    let mut tasks = JoinSet::new();
+    for (key, work) in groups {
+        tasks.spawn(exchange_encryption_path_probe_group(key, work));
+    }
+    let mut exchanges =
+        BTreeMap::<EncryptionPathProofRoundDigest, Vec<EncryptionPathProbeExchange>>::new();
+    while let Some(result) = tasks.join_next().await {
+        for (round, exchange) in result
+            .context("join encrypted path probe task")?
+            .context("exchange encrypted path probe group")?
+        {
+            exchanges.entry(round).or_default().push(exchange);
+        }
+    }
+
+    let mut after_by_plan = BTreeMap::new();
+    for key in before_by_plan.keys() {
+        let plan = plans
+            .iter()
+            .find(|plan| plan.epoch == key.0 && plan.interface_name == key.1)
+            .context("path proof WireGuard plan disappeared before readback")?;
+        after_by_plan.insert(
+            key.clone(),
+            provider
+                .readback(plan)
+                .await
+                .context("read WireGuard state after encrypted path challenge")?,
+        );
+    }
+
+    let now_unix_ms = current_unix_time_milliseconds();
+    assignments
+        .iter()
+        .map(|assignment| {
+            let role = assignment
+                .endpoint_role(recipient)
+                .context("resolve local endpoint path role")?;
+            let contract_plan = assignment
+                .contract
+                .plans
+                .get(assignment.plan_index)
+                .context("path proof contract plan disappeared")?;
+            let local_node = match role {
+                EncryptionPathEndpointRole::Source => &contract_plan.source.node,
+                EncryptionPathEndpointRole::Destination => &contract_plan.destination.node,
+            };
+            let authenticated = AuthenticatedNodeIdentity {
+                cluster_id: local_node.cluster_id.clone(),
+                node_name: recipient.node_name.clone(),
+                node_uid: recipient.node_uid.clone(),
+            };
+            let delivery = EncryptionPathChallengeDelivery::issue(
+                assignment,
+                recipient,
+                exchanges
+                    .remove(&assignment.round.round_digest)
+                    .context("path probe did not return every required family")?,
+            )
+            .context("seal exact encrypted path challenge delivery")?;
+            let plan_key = plan_by_round
+                .get(&assignment.round.round_digest)
+                .context("path proof lost its local kernel-plan binding")?;
+            EncryptionEndpointPathProof::issue(
+                &assignment.round,
+                &assignment.contract,
+                assignment.plan_index,
+                role,
+                &authenticated,
+                before_by_plan
+                    .get(plan_key)
+                    .context("path proof lost its before-kernel snapshot")?,
+                after_by_plan
+                    .get(plan_key)
+                    .context("path proof lost its after-kernel snapshot")?,
+                &delivery,
+                now_unix_ms,
+            )
+            .context("issue counter-backed encrypted endpoint path proof")
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
+async fn exchange_encryption_path_probe_group(
+    key: PathProbeSocketKey,
+    work: Vec<PathProbeWork>,
+) -> Result<Vec<(EncryptionPathProofRoundDigest, EncryptionPathProbeExchange)>> {
+    let socket = path_probe_socket(&key)?;
+    let mut pending = BTreeMap::<
+        EncryptionPathProofRoundDigest,
+        (
+            [u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES],
+            Option<[u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES]>,
+        ),
+    >::new();
+    let now_unix_ms = current_unix_time_milliseconds();
+    let valid_for_ms = work
+        .iter()
+        .map(|item| item.assignment.round.expires_at_unix_ms)
+        .min()
+        .context("path probe group is empty")?
+        .saturating_sub(now_unix_ms)
+        .min(4_000);
+    if valid_for_ms < 250 {
+        bail!("path proof round expires before a bounded exchange can run");
+    }
+    for item in &work {
+        let request =
+            EncryptionPathProbeFrame::request(&item.assignment.round, item.target.family)?.encode();
+        if pending
+            .insert(item.assignment.round.round_digest, (request, None))
+            .is_some()
+        {
+            bail!("path probe group contains a duplicate round");
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(valid_for_ms);
+    let mut retry = tokio::time::interval(Duration::from_millis(100));
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut buffer = [0_u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES];
+    loop {
+        if pending.values().all(|(_, response)| response.is_some()) {
+            // Keep the responder alive for two peer retry periods so both
+            // independently scheduled agents can close the same rendezvous.
+            let grace = tokio::time::sleep(Duration::from_millis(225));
+            tokio::pin!(grace);
+            loop {
+                tokio::select! {
+                    () = &mut grace => break,
+                    received = socket.recv_from(&mut buffer) => {
+                        respond_to_encryption_path_probe(&socket, &work, &buffer, received?).await?;
+                    }
+                }
+            }
+            break;
+        }
+        tokio::select! {
+            _ = retry.tick() => {
+                for item in &work {
+                    let (request, response) = pending
+                        .get(&item.assignment.round.round_digest)
+                        .context("path probe request disappeared")?;
+                    if response.is_none() {
+                        set_path_probe_mark(&socket, item.route_mark)?;
+                        socket.send_to(
+                            request,
+                            SocketAddr::new(item.target.peer_address, ENCRYPTION_PATH_PROBE_PORT),
+                        ).await.context("send encrypted path probe request")?;
+                    }
+                }
+            }
+            received = socket.recv_from(&mut buffer) => {
+                let (length, peer) = received.context("receive encrypted path probe frame")?;
+                let frame = EncryptionPathProbeFrame::decode(&buffer[..length])?;
+                let Some(item) = work.iter().find(|item| {
+                    item.assignment.round.round_digest == frame.round_digest()
+                        && item.target.family == frame.family()
+                        && peer == SocketAddr::new(item.target.peer_address, ENCRYPTION_PATH_PROBE_PORT)
+                }) else {
+                    continue;
+                };
+                match frame.kind() {
+                    EncryptionPathProbeKind::Request => {
+                        let response = EncryptionPathProbeFrame::response(
+                            &item.assignment.round,
+                            frame,
+                        )?.encode();
+                        set_path_probe_mark(&socket, item.route_mark)?;
+                        socket.send_to(&response, peer).await
+                            .context("send encrypted path probe response")?;
+                    }
+                    EncryptionPathProbeKind::Response => {
+                        frame.verify_for(
+                            &item.assignment.round,
+                            EncryptionPathProbeKind::Response,
+                        )?;
+                        pending.get_mut(&frame.round_digest())
+                            .context("path probe response has no pending request")?.1 =
+                            Some(buffer[..length].try_into().expect("validated fixed probe frame"));
+                    }
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                bail!("encrypted path probe rendezvous timed out");
+            }
+        }
+    }
+    work.into_iter()
+        .map(|item| {
+            let (request, response) = pending
+                .remove(&item.assignment.round.round_digest)
+                .context("completed path probe transcript disappeared")?;
+            Ok((
+                item.assignment.round.round_digest,
+                EncryptionPathProbeExchange::from_wire(
+                    &item.assignment.round,
+                    item.target.local_address,
+                    item.target.peer_address,
+                    &request,
+                    &response.context("path probe completed without a response")?,
+                )?,
+            ))
+        })
+        .collect()
+}
+
+async fn respond_to_encryption_path_probe(
+    socket: &tokio::net::UdpSocket,
+    work: &[PathProbeWork],
+    buffer: &[u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES],
+    received: (usize, SocketAddr),
+) -> Result<()> {
+    let (length, peer) = received;
+    let frame = EncryptionPathProbeFrame::decode(&buffer[..length])?;
+    if frame.kind() != EncryptionPathProbeKind::Request {
+        return Ok(());
+    }
+    let Some(item) = work.iter().find(|item| {
+        item.assignment.round.round_digest == frame.round_digest()
+            && item.target.family == frame.family()
+            && peer == SocketAddr::new(item.target.peer_address, ENCRYPTION_PATH_PROBE_PORT)
+    }) else {
+        return Ok(());
+    };
+    let response = EncryptionPathProbeFrame::response(&item.assignment.round, frame)?.encode();
+    set_path_probe_mark(socket, item.route_mark)?;
+    socket
+        .send_to(&response, peer)
+        .await
+        .context("send encrypted path probe grace response")?;
+    Ok(())
+}
+
+fn path_probe_socket(key: &PathProbeSocketKey) -> Result<tokio::net::UdpSocket> {
+    let domain = if key.local_address.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(SocketProtocol::UDP))
+        .context("create encrypted path probe socket")?;
+    socket
+        .set_reuse_address(true)
+        .context("enable path probe address reuse")?;
+    socket
+        .bind(&SocketAddr::new(key.local_address, ENCRYPTION_PATH_PROBE_PORT).into())
+        .context("bind path probe socket to local in-fabric beacon")?;
+    socket
+        .set_nonblocking(true)
+        .context("make path probe socket nonblocking")?;
+    let socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(socket).context("adopt path probe socket into async runtime")
+}
+
+fn set_path_probe_mark(socket: &tokio::net::UdpSocket, route_mark: u32) -> Result<()> {
+    SockRef::from(socket)
+        .set_mark(route_mark)
+        .context("select exact encryption policy route for path probe")
+}
+
 async fn activate_admitted_encryption_generation(
     generations: &mut EncryptionGenerationSynchronizer,
     encryption: &mut EncryptionMapSynchronizer,
 ) -> Result<bool> {
-    let Some((recipient, desired)) = generations.pending_path_proof_state()? else {
+    generations.ensure_probe_routes().await?;
+    let Some((recipient, desired, plans)) = generations.pending_path_proof_state()? else {
         return Ok(false);
     };
     let controller_url = generations
         .controller_url
         .as_deref()
         .context("encryption path receipt synchronization has no controller URL")?;
+    let assignments: Vec<EncryptionPathProofAssignment> = authenticated_get(
+        &generations.client,
+        format!("{controller_url}/v1/state/encryption-path-proof-assignments"),
+        &generations.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request current encrypted path proof assignments")?
+    .error_for_status()
+    .context("controller rejected encrypted path proof assignments")?
+    .json()
+    .await
+    .context("decode encrypted path proof assignments")?;
+    let assignment_rounds = assignments
+        .iter()
+        .map(|assignment| assignment.round.round_digest)
+        .collect::<BTreeSet<_>>();
+    generations
+        .path_proofs
+        .retain(|round, proof| assignment_rounds.contains(round) && proof.round_digest == *round);
+    for proof in execute_live_encryption_path_proofs(&recipient, &desired, &plans, &assignments)
+        .await
+        .context("execute workload-independent encrypted path challenges")?
+    {
+        generations
+            .path_proofs
+            .entry(proof.round_digest)
+            .or_insert(proof);
+    }
+    for assignment in &assignments {
+        let proof = generations
+            .path_proofs
+            .get(&assignment.round.round_digest)
+            .context("live path executor did not produce every assigned proof")?;
+        proof
+            .verify(&assignment.round, current_unix_time_milliseconds())
+            .context("revalidate cached endpoint path proof before publication")?;
+        let response = generations
+            .client
+            .current()
+            .post(format!("{controller_url}/v1/state/encryption-path-proofs"))
+            .bearer_auth(read_agent_token(&generations.agent_token_path)?)
+            .json(proof)
+            .send()
+            .await
+            .context("publish encrypted endpoint path proof")?;
+        if response.status() != StatusCode::ACCEPTED {
+            response
+                .error_for_status()
+                .context("controller rejected encrypted endpoint path proof")?;
+            bail!("controller returned a non-202 response for endpoint path proof");
+        }
+    }
     let response = authenticated_get(
         &generations.client,
         format!("{controller_url}/v1/state/encryption-path-receipts"),
@@ -8441,12 +8922,12 @@ async fn activate_admitted_encryption_generation(
     let path_permit =
         EncryptionGenerationPathProofPermit::issue(&desired, recipient, receipts, now_unix_ms)
             .context("join complete live path receipts to the desired generation")?;
-    let Some((prepared, admitted, slot)) = generations.take_admitted_capability() else {
+    let Some((prepared, admitted, route_permit, slot)) = generations.take_admitted_capability()
+    else {
         bail!("admitted encryption capability changed during path-proof exchange");
     };
     encryption
-        .apply_linux_generation(prepared, admitted, path_permit, now_unix_ms)
-        .await
+        .apply_linux_generation(prepared, admitted, route_permit, path_permit, now_unix_ms)
         .context("consume proof-rehydrated encryption activation escrow")?;
     generations
         .record_activation(slot)
@@ -13991,17 +14472,19 @@ async fn consume_events(
                 }
             }
             _ = encryption_interval.tick(), if encryption_generations.controller_url.is_some()
-                && encryption_generations.prepared_fact().is_some() => {
-                match synchronize_encryption_generation(encryption_generations).await {
-                    Ok(true) => {
-                        activate_admitted_encryption_generation(encryption_generations, encryption)
-                            .await
-                            .context("activate newly admitted encryption generation")?;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        warn!(%error, "encryption generation synchronization failed; retaining durable desired predecessor and active local authority");
-                    }
+                && encryption_generations.pending_generation().is_some() => {
+                if encryption_generations.prepared_fact().is_some()
+                    && let Err(error) = synchronize_encryption_generation(encryption_generations).await
+                {
+                    warn!(%error, "encryption generation synchronization failed; retaining durable desired predecessor and active local authority");
+                }
+                if encryption_generations.has_controller_admission()
+                    && let Err(error) = activate_admitted_encryption_generation(
+                        encryption_generations,
+                        encryption,
+                    ).await
+                {
+                    warn!(%error, "encrypted path activation is not complete; retaining the pending proof capability and active predecessor");
                 }
             }
             _ = egress_loss_interval.tick() => {

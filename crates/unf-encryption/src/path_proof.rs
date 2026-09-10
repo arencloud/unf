@@ -15,20 +15,20 @@ use unf_common::Revision;
 use crate::{
     AttestedEncryptionContractDigest, AttestedEncryptionPathContract, AuthenticatedNodeIdentity,
     EncryptionDecisionWitness, EncryptionDisposition, EncryptionFastPathDigest,
-    EncryptionFastPathState, EncryptionGenerationRecipient, FastPathError, IpPrefix,
-    WireGuardKernelConfigurationDigest, WireGuardKernelObservationDigest, WireGuardKernelSnapshot,
-    WireGuardPublicKey, derive_wireguard_proof_addresses,
+    EncryptionFastPathState, EncryptionGenerationRecipient, EncryptionPathChallengeDelivery,
+    FastPathError, IpPrefix, WireGuardKernelConfigurationDigest, WireGuardKernelObservationDigest,
+    WireGuardKernelSnapshot, WireGuardPublicKey, derive_wireguard_proof_addresses,
 };
 
-pub const ENCRYPTION_PATH_PROOF_SCHEMA_VERSION: u16 = 1;
+pub const ENCRYPTION_PATH_PROOF_SCHEMA_VERSION: u16 = 2;
 pub const MAX_ENCRYPTION_PATH_PROOF_LIFETIME_MS: u64 = 60_000;
 pub const PATH_FAMILY_IPV4: u8 = 1;
 pub const PATH_FAMILY_IPV6: u8 = 2;
-const ROUND_DOMAIN: &[u8] = b"unf.encryption-path-proof-round.v1\0";
-const CHALLENGE_REQUEST_DOMAIN: &[u8] = b"unf.encryption-path-challenge-request.v1\0";
-const CHALLENGE_RESPONSE_DOMAIN: &[u8] = b"unf.encryption-path-challenge-response.v1\0";
-const ENDPOINT_PROOF_DOMAIN: &[u8] = b"unf.encryption-path-endpoint-proof.v1\0";
-const ACTIVATION_DOMAIN: &[u8] = b"unf.encryption-path-activation.v1\0";
+const ROUND_DOMAIN: &[u8] = b"unf.encryption-path-proof-round.v2\0";
+const CHALLENGE_REQUEST_DOMAIN: &[u8] = b"unf.encryption-path-challenge-request.v2\0";
+const CHALLENGE_RESPONSE_DOMAIN: &[u8] = b"unf.encryption-path-challenge-response.v2\0";
+const ENDPOINT_PROOF_DOMAIN: &[u8] = b"unf.encryption-path-endpoint-proof.v2\0";
+const ACTIVATION_DOMAIN: &[u8] = b"unf.encryption-path-activation.v2\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,6 +106,7 @@ pub struct EncryptionEndpointPathProof {
     pub kernel_after_observation_digest: WireGuardKernelObservationDigest,
     pub counters: EncryptionPeerCounterDelta,
     pub family_mask: u8,
+    pub challenge_delivery_digest: [u8; 32],
     pub challenge_request_digest: EncryptionPathChallengeDigest,
     pub challenge_response_digest: EncryptionPathChallengeDigest,
     pub observed_at_unix_ms: u64,
@@ -363,7 +364,7 @@ impl EncryptionEndpointPathProof {
         authenticated: &AuthenticatedNodeIdentity,
         before: &WireGuardKernelSnapshot,
         after: &WireGuardKernelSnapshot,
-        delivered_family_mask: u8,
+        delivery: &EncryptionPathChallengeDelivery,
         observed_at_unix_ms: u64,
     ) -> Result<Self, EncryptionPathProofError> {
         round.verify()?;
@@ -374,6 +375,8 @@ impl EncryptionEndpointPathProof {
             .plans
             .get(plan_index)
             .ok_or(EncryptionPathProofError::InvalidContractPlan)?;
+        delivery.verify_for(round)?;
+        let delivered_family_mask = delivery.family_mask();
         if round.contract_digest != contract.contract_digest
             || round.decision_witness
                 != contract
@@ -483,6 +486,7 @@ impl EncryptionEndpointPathProof {
             kernel_after_observation_digest: after.observation_digest,
             counters,
             family_mask: delivered_family_mask,
+            challenge_delivery_digest: delivery.transcript_digest(),
             challenge_request_digest: round.request_digest()?,
             challenge_response_digest: round.response_digest()?,
             observed_at_unix_ms,
@@ -516,6 +520,7 @@ impl EncryptionEndpointPathProof {
             || self.decision_witness != round.decision_witness
             || self.epoch != round.epoch
             || self.family_mask != round.family_mask
+            || self.challenge_delivery_digest == [0; 32]
             || self.challenge_request_digest != round.request_digest()?
             || self.challenge_response_digest != round.response_digest()?
             || self.observed_at_unix_ms < round.issued_at_unix_ms
@@ -639,8 +644,16 @@ impl EncryptionPathProofAssignment {
             .verify_integrity()
             .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
         self.round.verify()?;
+        let expected_round = EncryptionPathProofRound::issue(
+            &self.contract,
+            self.plan_index,
+            self.round.nonce,
+            self.round.issued_at_unix_ms,
+            self.round.expires_at_unix_ms,
+        )?;
         if self.schema_version != ENCRYPTION_PATH_PROOF_SCHEMA_VERSION
             || self.generation == unf_common::Revision::INITIAL
+            || self.round != expected_round
             || self.round.contract_digest != self.contract.contract_digest
             || self.round.decision_witness
                 != self
@@ -1039,7 +1052,7 @@ fn hash<T: Serialize>(domain: &[u8], value: &T) -> Result<[u8; 32], EncryptionPa
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -1051,7 +1064,8 @@ mod tests {
         ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION, AttestedEncryptionPathPlan,
         EncryptionCapability, EncryptionContractRevisions, EncryptionEndpointFact,
         EncryptionFailureEnvelope, EncryptionKeyBinding, EncryptionKeyPhase, EncryptionNode,
-        EncryptionPathClass, EncryptionPathFact, EncryptionPolicyBinding,
+        EncryptionPathChallengeDelivery, EncryptionPathClass, EncryptionPathFact,
+        EncryptionPathProbeExchange, EncryptionPathProbeFrame, EncryptionPolicyBinding,
         EncryptionPublicKeyDigest, EncryptionTransportBinding, UNF_WIREGUARD_ROUTE_PROTOCOL,
         WireGuardPeerReadback, WireGuardRouteReadback, WireGuardRouteScope,
     };
@@ -1064,11 +1078,19 @@ mod tests {
     }
 
     fn node(name: &str, uid: &str, pod: IpAddr, underlay: IpAddr) -> EncryptionNode {
+        let ipv6 = if uid == "uid-a" {
+            "fd00:1::".parse().unwrap()
+        } else {
+            "fd00:2::".parse().unwrap()
+        };
         EncryptionNode {
             cluster_id: "cluster-a".into(),
             name: name.into(),
             uid: uid.into(),
-            pod_cidrs: vec![prefix(pod, if pod.is_ipv4() { 24 } else { 64 })],
+            pod_cidrs: vec![
+                prefix(pod, if pod.is_ipv4() { 24 } else { 64 }),
+                prefix(IpAddr::V6(ipv6), 64),
+            ],
             underlay_addresses: vec![underlay],
             capabilities: BTreeSet::from([
                 EncryptionCapability::KernelWireGuard,
@@ -1195,6 +1217,18 @@ mod tests {
         contract
     }
 
+    pub(crate) fn assignment_fixture() -> EncryptionPathProofAssignment {
+        let contract = fixture_contract();
+        let round = EncryptionPathProofRound::issue(&contract, 0, [9; 32], 1_500, 10_000).unwrap();
+        EncryptionPathProofAssignment {
+            schema_version: ENCRYPTION_PATH_PROOF_SCHEMA_VERSION,
+            generation: Revision::new(10),
+            round,
+            contract,
+            plan_index: 0,
+        }
+    }
+
     fn snapshot(
         contract: &AttestedEncryptionPathContract,
         role: EncryptionPathEndpointRole,
@@ -1267,11 +1301,61 @@ mod tests {
         }
     }
 
+    fn delivery(
+        round: &EncryptionPathProofRound,
+        contract: &AttestedEncryptionPathContract,
+        role: EncryptionPathEndpointRole,
+    ) -> EncryptionPathChallengeDelivery {
+        let assignment = EncryptionPathProofAssignment {
+            schema_version: ENCRYPTION_PATH_PROOF_SCHEMA_VERSION,
+            generation: Revision::new(10),
+            round: round.clone(),
+            contract: contract.clone(),
+            plan_index: 0,
+        };
+        let recipient = match role {
+            EncryptionPathEndpointRole::Source => round.source.clone(),
+            EncryptionPathEndpointRole::Destination => round.destination.clone(),
+        };
+        let plan = &contract.plans[0];
+        let (local_node, peer_node) = match role {
+            EncryptionPathEndpointRole::Source => (&plan.source.node, &plan.destination.node),
+            EncryptionPathEndpointRole::Destination => (&plan.destination.node, &plan.source.node),
+        };
+        let local = crate::derive_wireguard_proof_addresses(&local_node.pod_cidrs).unwrap();
+        let peer = crate::derive_wireguard_proof_addresses(&peer_node.pod_cidrs).unwrap();
+        let exchanges = [PATH_FAMILY_IPV4, PATH_FAMILY_IPV6]
+            .into_iter()
+            .filter(|family| round.family_mask & family != 0)
+            .map(|family| {
+                let request = EncryptionPathProbeFrame::request(round, family).unwrap();
+                let response = EncryptionPathProbeFrame::response(round, request).unwrap();
+                EncryptionPathProbeExchange::from_wire(
+                    round,
+                    local
+                        .iter()
+                        .find(|prefix| prefix.address.is_ipv4() == (family == PATH_FAMILY_IPV4))
+                        .unwrap()
+                        .address,
+                    peer.iter()
+                        .find(|prefix| prefix.address.is_ipv4() == (family == PATH_FAMILY_IPV4))
+                        .unwrap()
+                        .address,
+                    &request.encode(),
+                    &response.encode(),
+                )
+                .unwrap()
+            })
+            .collect();
+        EncryptionPathChallengeDelivery::issue(&assignment, &recipient, exchanges).unwrap()
+    }
+
     fn proof(
         round: &EncryptionPathProofRound,
         contract: &AttestedEncryptionPathContract,
         role: EncryptionPathEndpointRole,
     ) -> EncryptionEndpointPathProof {
+        let delivery = delivery(round, contract, role);
         EncryptionEndpointPathProof::issue(
             round,
             contract,
@@ -1280,7 +1364,7 @@ mod tests {
             &auth(role),
             &snapshot(contract, role, 10, 20),
             &snapshot(contract, role, 110, 120),
-            PATH_FAMILY_IPV4 | PATH_FAMILY_IPV6,
+            &delivery,
             2_000,
         )
         .unwrap()
@@ -1329,7 +1413,7 @@ mod tests {
             &auth(role),
             &before,
             &before,
-            round.family_mask,
+            &delivery(&round, &contract, role),
             2_000,
         );
         assert_eq!(stalled, Err(EncryptionPathProofError::CounterProofMissing));
@@ -1345,7 +1429,7 @@ mod tests {
                 &auth(role),
                 &before,
                 &roamed,
-                round.family_mask,
+                &delivery(&round, &contract, role),
                 2_000,
             )
             .is_err()

@@ -25,9 +25,9 @@ use unf_ebpf_common::{
 };
 use unf_encryption::{
     AdmittedEncryptionGeneration, EncryptionActivationMode, EncryptionActivationWitness,
-    EncryptionFastPathState, EncryptionGenerationPathProofPermit, FastPathMapCheckpoint,
-    FastPathMapRecoveryAction, FastPathMapTransactionPhase, FastPathPublishedGeneration,
-    LinuxPreparedLocalGeneration, PathProvenEncryptionActivationLatch,
+    EncryptionFastPathState, EncryptionGenerationPathProofPermit, EncryptionRoutePublicationPermit,
+    FastPathMapCheckpoint, FastPathMapRecoveryAction, FastPathMapTransactionPhase,
+    FastPathPublishedGeneration, LinuxPreparedLocalGeneration, PathProvenEncryptionActivationLatch,
 };
 
 use super::{load_secure_json, persist_secure_json, reject_node_block_symlinks};
@@ -151,10 +151,11 @@ impl EncryptionMapSynchronizer {
     /// Completes the real Linux route-before-Aya transition from one exact
     /// kernel-converged Node capability. Controller substitution and route
     /// drift fail before this adapter can mutate the inactive map bank.
-    pub(super) async fn apply_linux_generation(
+    pub(super) fn apply_linux_generation(
         &mut self,
         prepared: LinuxPreparedLocalGeneration,
         admitted: AdmittedEncryptionGeneration,
+        route_permit: EncryptionRoutePublicationPermit,
         path_permit: EncryptionGenerationPathProofPermit,
         now_unix_ms: u64,
     ) -> Result<()> {
@@ -164,8 +165,13 @@ impl EncryptionMapSynchronizer {
             .map(|checkpoint| checkpoint.transaction.desired.published);
         let convergence_witness = prepared.witness();
         let latch = prepared
-            .admit_and_activate_linux_path_proven(admitted, prior, path_permit, now_unix_ms)
-            .await
+            .admit_and_activate_linux_path_proven(
+                admitted,
+                prior,
+                route_permit,
+                path_permit,
+                now_unix_ms,
+            )
             .context("activate exact Node-local Linux encryption generation")?;
         self.apply_path_proven(latch, now_unix_ms)?;
         info!(

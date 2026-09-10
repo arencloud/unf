@@ -1368,11 +1368,13 @@ mod tests {
         EncryptionGenerationFrontierError, EncryptionGenerationPathProofPermit,
         EncryptionGenerationProducer, EncryptionGenerationRecipient, EncryptionGenerationRequest,
         EncryptionIntent, EncryptionKeyFact, EncryptionKeyPhase, EncryptionModel, EncryptionNode,
-        EncryptionPathActivationReceipt, EncryptionPathEndpointRole, EncryptionPathFact,
-        EncryptionPathProofError, EncryptionPathProofLedger, EncryptionPathProofRound,
-        EncryptionPolicyFact, EncryptionRouteAuthority, EncryptionRouteAuthorityError,
-        EncryptionRouteFamily, FastPathMapCheckpoint, FastPathMapRecoveryAction,
-        FastPathMapTransaction, FastPathPublishedGeneration, FastPathTransactionError, IpPrefix,
+        EncryptionPathActivationReceipt, EncryptionPathChallengeDelivery,
+        EncryptionPathEndpointRole, EncryptionPathFact, EncryptionPathProbeExchange,
+        EncryptionPathProbeFrame, EncryptionPathProofAssignment, EncryptionPathProofError,
+        EncryptionPathProofLedger, EncryptionPathProofRound, EncryptionPolicyFact,
+        EncryptionRouteAuthority, EncryptionRouteAuthorityError, EncryptionRouteFamily,
+        FastPathMapCheckpoint, FastPathMapRecoveryAction, FastPathMapTransaction,
+        FastPathPublishedGeneration, FastPathTransactionError, IpPrefix,
         LinuxPreparedLocalGeneration, ManagedIdentitySelector, NodeLocalGenerationProposal,
         NodeLocalOrchestratorError, NodeLocalRecoveryPlan, NodeSealedGenerationCapsule,
         PreparedNodeEncryptionGeneration, UNF_ENCRYPTION_RULE_PRIORITY_BASE,
@@ -1789,6 +1791,61 @@ mod tests {
                 node_name: node.name.clone(),
                 node_uid: node.uid.clone(),
             };
+            let assignment = EncryptionPathProofAssignment {
+                schema_version: crate::ENCRYPTION_PATH_PROOF_SCHEMA_VERSION,
+                generation: Revision::new(21),
+                round: round.clone(),
+                contract: fixture.contract.clone(),
+                plan_index: 0,
+            };
+            let (local_node, peer_node) = match role {
+                EncryptionPathEndpointRole::Source => (
+                    &fixture.contract.plans[0].source.node,
+                    &fixture.contract.plans[0].destination.node,
+                ),
+                EncryptionPathEndpointRole::Destination => (
+                    &fixture.contract.plans[0].destination.node,
+                    &fixture.contract.plans[0].source.node,
+                ),
+            };
+            let local = crate::derive_wireguard_proof_addresses(&local_node.pod_cidrs).unwrap();
+            let peer = crate::derive_wireguard_proof_addresses(&peer_node.pod_cidrs).unwrap();
+            let exchanges = [crate::PATH_FAMILY_IPV4, crate::PATH_FAMILY_IPV6]
+                .into_iter()
+                .filter(|family| round.family_mask & family != 0)
+                .map(|family| {
+                    let request = EncryptionPathProbeFrame::request(&round, family).unwrap();
+                    let response = EncryptionPathProbeFrame::response(&round, request).unwrap();
+                    EncryptionPathProbeExchange::from_wire(
+                        &round,
+                        local
+                            .iter()
+                            .find(|prefix| {
+                                prefix.address.is_ipv4() == (family == crate::PATH_FAMILY_IPV4)
+                            })
+                            .unwrap()
+                            .address,
+                        peer.iter()
+                            .find(|prefix| {
+                                prefix.address.is_ipv4() == (family == crate::PATH_FAMILY_IPV4)
+                            })
+                            .unwrap()
+                            .address,
+                        &request.encode(),
+                        &response.encode(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let delivery = EncryptionPathChallengeDelivery::issue(
+                &assignment,
+                match role {
+                    EncryptionPathEndpointRole::Source => &round.source,
+                    EncryptionPathEndpointRole::Destination => &round.destination,
+                },
+                exchanges,
+            )
+            .unwrap();
             let proof = EncryptionEndpointPathProof::issue(
                 &round,
                 &fixture.contract,
@@ -1797,7 +1854,7 @@ mod tests {
                 &authenticated,
                 &path_snapshot(fixture, role, 1, 1),
                 &path_snapshot(fixture, role, 2, 2),
-                round.family_mask,
+                &delivery,
                 1_200,
             )
             .unwrap();
