@@ -425,16 +425,16 @@ impl EncryptionEndpointPathProof {
         })
         .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
         let routes_exact = |snapshot: &WireGuardKernelSnapshot| {
-            snapshot.routes.len() == path.allowed_ips.len()
-                && snapshot
+            path.allowed_ips.iter().all(|prefix| {
+                let mut matching = snapshot
                     .routes
                     .iter()
-                    .zip(&path.allowed_ips)
-                    .all(|(route, prefix)| {
-                        route.prefix == *prefix
-                            && route.table == path.route_table
-                            && route.interface_index == snapshot.interface_index
-                    })
+                    .filter(|route| route.prefix == *prefix);
+                matching.next().is_some_and(|route| {
+                    route.table == path.route_table
+                        && route.interface_index == snapshot.interface_index
+                }) && matching.next().is_none()
+            })
         };
         if before.configuration_digest != after.configuration_digest
             || before.public_key != local_key
@@ -1271,24 +1271,37 @@ pub(crate) mod tests {
             fwmark: path.fwmark,
             proof_addresses: crate::derive_wireguard_proof_addresses(&local_node.pod_cidrs)
                 .unwrap(),
-            peers: vec![WireGuardPeerReadback {
-                public_key: peer_key,
-                endpoint: path.peer_endpoint,
-                persistent_keepalive_seconds: 5,
-                allowed_ips: path.allowed_ips.clone(),
-                last_handshake_unix_seconds: 2,
-                received_bytes: rx,
-                transmitted_bytes: tx,
-            }],
+            peers: vec![
+                WireGuardPeerReadback {
+                    public_key: peer_key,
+                    endpoint: path.peer_endpoint,
+                    persistent_keepalive_seconds: 5,
+                    allowed_ips: path.allowed_ips.clone(),
+                    last_handshake_unix_seconds: 2,
+                    received_bytes: rx,
+                    transmitted_bytes: tx,
+                },
+                WireGuardPeerReadback {
+                    public_key: WireGuardPublicKey([9; 32]),
+                    endpoint: SocketAddr::from(([192, 0, 2, 99], 51_899)),
+                    persistent_keepalive_seconds: 5,
+                    allowed_ips: vec![prefix(IpAddr::V4(Ipv4Addr::new(10, 250, 0, 0)), 24)],
+                    last_handshake_unix_seconds: 2,
+                    received_bytes: rx,
+                    transmitted_bytes: tx,
+                },
+            ],
             routes: path
                 .allowed_ips
                 .iter()
+                .copied()
+                .chain([prefix(IpAddr::V4(Ipv4Addr::new(10, 250, 0, 0)), 24)])
                 .map(|prefix| WireGuardRouteReadback {
-                    prefix: *prefix,
+                    prefix,
                     interface_index: index,
                     table: path.route_table,
                     protocol: UNF_WIREGUARD_ROUTE_PROTOCOL,
-                    scope: WireGuardRouteScope::for_prefix(*prefix),
+                    scope: WireGuardRouteScope::for_prefix(prefix),
                 })
                 .collect(),
         })
