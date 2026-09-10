@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-09-10T06:55:39Z",
+  "revision": "f2a39673f34b645abdb58132183523a41d17ddac",
+  "environment": {
+    "kernel": "7.1.4-204.fc44.x86_64",
+    "iperf3": "iperf 3.20 (cJSON 1.7.15)",
+    "durationSeconds": 3,
+    "topology": "two isolated namespaces over one veth pair"
+  },
+  "native": {
+    "ipv4": {
+      "latency": {
+        "sent": 200,
+        "received": 200,
+        "lossPercent": 0,
+        "p50Ms": 0.026000,
+        "p95Ms": 0.046000,
+        "p99Ms": 0.061000
+      },
+      "throughput": {
+        "throughputBitsPerSecond": 134343295416.3667,
+        "retransmits": 1,
+        "senderCpuPercent": 334.77355720880257,
+        "receiverCpuPercent": 251.78686894211549,
+        "maxResidentSetKiB": 5088
+      },
+      "mtu": {
+        "acceptedPayloadBytes": 1472,
+        "rejectedPayloadBytes": 1473,
+        "accepted": true,
+        "rejected": true
+      }
+    },
+    "ipv6": {
+      "latency": {
+        "sent": 200,
+        "received": 200,
+        "lossPercent": 0,
+        "p50Ms": 0.028000,
+        "p95Ms": 0.044000,
+        "p99Ms": 0.057000
+      },
+      "throughput": {
+        "throughputBitsPerSecond": 120746254693.24471,
+        "retransmits": 5,
+        "senderCpuPercent": 319.61228230522971,
+        "receiverCpuPercent": 245.12537631388091,
+        "maxResidentSetKiB": 4932
+      },
+      "mtu": {
+        "acceptedPayloadBytes": 1452,
+        "rejectedPayloadBytes": 1453,
+        "accepted": true,
+        "rejected": true
+      }
+    }
+  },
+  "encrypted": {
+    "provider": "Linux kernel WireGuard",
+    "mtu": 1420,
+    "handshakeConvergenceMs": 84,
+    "capture": {
+      "ciphertextPackets": 2684452,
+      "plaintextInnerPackets": 0
+    },
+    "ipv4": {
+      "latency": {
+        "sent": 200,
+        "received": 200,
+        "lossPercent": 0,
+        "p50Ms": 0.103000,
+        "p95Ms": 0.897000,
+        "p99Ms": 4.000000
+      },
+      "throughput": {
+        "throughputBitsPerSecond": 2808883380.6989417,
+        "retransmits": 0,
+        "senderCpuPercent": 7.9735048382523583,
+        "receiverCpuPercent": 48.872432103270619,
+        "maxResidentSetKiB": 4932
+      },
+      "mtu": {
+        "acceptedPayloadBytes": 1392,
+        "rejectedPayloadBytes": 1393,
+        "accepted": true,
+        "rejected": true
+      }
+    },
+    "ipv6": {
+      "latency": {
+        "sent": 200,
+        "received": 200,
+        "lossPercent": 0,
+        "p50Ms": 0.102000,
+        "p95Ms": 0.259000,
+        "p99Ms": 1.560000
+      },
+      "throughput": {
+        "throughputBitsPerSecond": 2641706762.2224035,
+        "retransmits": 0,
+        "senderCpuPercent": 7.7645757047442547,
+        "receiverCpuPercent": 49.769423065586658,
+        "maxResidentSetKiB": 4928
+      },
+      "mtu": {
+        "acceptedPayloadBytes": 1372,
+        "rejectedPayloadBytes": 1373,
+        "accepted": true,
+        "rejected": true
+      }
+    }
+  },
+  "rotation": {
+    "strategy": "prewarmed parallel epoch then route replacement",
+    "samples": 400,
+    "intervalMs": 10,
+    "lostSamples": 5,
+    "maxConsecutiveMissingSamples": 5,
+    "routeSwitchMicros": 131954
+  },
+  "peerScale": [
+    {
+      "peers": 1,
+      "configureAndReadbackMicros": 37858
+    },
+    {
+      "peers": 16,
+      "configureAndReadbackMicros": 553278
+    },
+    {
+      "peers": 64,
+      "configureAndReadbackMicros": 2520655
+    },
+    {
+      "peers": 128,
+      "configureAndReadbackMicros": 5007730
+    }
+  ],
+  "mapActivity": {
+    "source": "verifier-qualified TC program plus live Aya quiescent-recovery gate",
+    "newDirectFlow": {
+      "lookups": 4,
+      "writes": 1
+    },
+    "newAddressBoundFlow": {
+      "lookups": 5,
+      "writes": 1
+    },
+    "establishedFlow": {
+      "lookups": 3,
+      "writes": 1
+    },
+    "quiescentRecoveryMutations": 0,
+    "note": "counts include config, connection, decision, optional path, and transport maps; per-CPU scratch is excluded"
+  },
+  "limitations": [
+    "single-host namespace microbenchmark; not a production capacity claim",
+    "CPU percentages and RSS are iperf3 process observations; kernel WireGuard memory is not isolated",
+    "Kind and OpenShift qualification independently repeat end-to-end workload measurements"
+  ]
+}

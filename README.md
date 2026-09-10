@@ -1002,6 +1002,14 @@ generation, recovery, and private-key owner before persistent BPF access.
 Current cleanup preflights both shared and encryption map islands, removes
 encryption authority first, and preserves foreign and adjacent versions.
 `make encryption-recovery-cleanup-test`; ADR 0206. Performance evidence remains.
+Phase 9.7h completes the milestone with a Regression-First Performance Ledger.
+Committed native/kernel-WireGuard IPv4/IPv6 evidence includes throughput,
+p50/p95/p99, loss/retransmits, CPU/RSS, fixed map activity, 1–128-peer cost,
+exact MTU, handshake convergence, ciphertext-only capture, and prewarmed
+rotation disruption. The much slower encrypted same-host throughput remains
+visible rather than becoming a selective claim. `make encryption-performance-test`
+validates the digest; `make encryption-performance-live` reproduces it; ADR
+0207. Phase 9.8 Kind qualification is next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
