@@ -15262,7 +15262,7 @@ async fn consume_events(
                         encryption,
                     ).await
                 {
-                    warn!(%error, "encrypted path activation is not complete; retaining the pending proof capability and active predecessor");
+                    warn!(error = ?error, "encrypted path activation is not complete; retaining the pending proof capability and active predecessor");
                 }
                 if encryption_generations.pending_activation_report.is_some()
                     && let Err(error) = publish_pending_encryption_activation(
