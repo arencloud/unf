@@ -20,7 +20,7 @@ separately revisioned. The authoritative state remains in
 | 9.4 | Transactional kernel WireGuard provider | **Verified** | Typed Rust generic-netlink/rtnetlink configures bounded dual-stack interfaces, complete peer sets, isolated routes, fwmarks, and derived safe MTUs. Proof-Carrying Kernel Transactions bind secret-free before/desired/readback digests and total restart actions; exact ownership aliases, sorted overlap/route indexes, injected rollback, foreign-state preservation, readback/replay, adjacent capability negotiation, and positive cleanup pass `make encryption-kernel-provider-test` plus the independently privileged `make encryption-kernel-provider-live-test`; ADR 0161. No workload packet selects the staged table |
 | 9.5 | Intent-Coalesced Cryptographic Fast Path | **Verified** | Phase 9.5a adds the canonical compiler and Causal Epoch Lease; Phase 9.5b adds the Causal Commit Vector. Later slices connect proof-carrying maps/routes, authenticated complete-cut distribution, local Linux/key proof, quiescent generations, the policy-first dual-stack TC consumer, and Flow-Adaptive Secure DSR. Phase 9.5af closes the chain with independently captured real-kernel IPv4/IPv6 WireGuard ciphertext, positive transfer counters, peer-removal denial, exact recovery, and scoped cleanup under `make encryption-ciphertext-live-test`; ADRs 0162–0193 |
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
-| 9.7 | Operations, upgrade, recovery, and performance | **Planned** | Fixed-cardinality status/metrics, loss-explicit history, explanation and non-authoritative simulation expose requirement, contract, epoch, peer, path, rotation, and denial provenance without secrets. Adjacent upgrade/rollback, controller/agent outage, Node replacement, exact cleanup, and committed plaintext/encrypted throughput/latency/CPU/memory/rotation measurements pass |
+| 9.7 | Operations, upgrade, recovery, and performance | **In progress** | Phase 9.7a adds the Causal Evidence Watermark: a fixed 54-cell stage/outcome counter domain plus bounded generation-fenced, hash-chained history makes upstream loss and retention eviction explicit without serializing secret/reusable authority. `make encryption-operations-evidence-test`; ADR 0200. Runtime status/metrics, explanation/simulation, adjacent upgrade/rollback, outage/replacement/cleanup, and committed performance evidence remain |
 | 9.8 | Kube-proxy-free Kind qualification | **Planned** | One exact committed runtime passes a multi-Node dual-stack gate for required/default and selective encryption, externally verified ciphertext-only underlay transport, Service and egress composition, rotation, failure/recovery, observability, performance capture, exact cleanup, and no-CNI rollback |
 | 9.9 | OpenShift qualification | **Planned** | The exact Kind-qualified images independently pass a five-Node dual-stack cl02 RHCOS/SELinux/CRI-O gate with immutable provenance, cross-worker encrypted traffic, rotation/recovery, exact cleanup, convergence, kube-proxy absence, and ClusterOperator comparison |
 
@@ -175,9 +175,8 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Begin milestone 9.7 with fixed-cardinality, secret-free operational evidence.
-Status and metrics must distinguish requirement, assignment, local exchange,
-remote quorum, activation, expiry, collision, and loss without serializing a
-private key or reusable capability. Explanation, simulation, bounded history,
-upgrade/recovery, and committed performance comparison follow in independent
-slices.
+Continue milestone 9.7 by wiring the Causal Evidence Watermark into authenticated
+agent/controller status and fixed-cardinality Prometheus metrics. Then add exact
+explanation and non-authoritative simulation, durable adjacent upgrade/rollback,
+outage/replacement/cleanup, and committed native-versus-encrypted performance
+evidence as independent verified slices.

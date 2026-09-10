@@ -964,7 +964,14 @@ but cannot alias proof, and the owned WireGuard interface carries exact
 reverse-path acceptance. Two production socket engines complete both families,
 deny on peer loss, recover only with a fresh round, advance counters, and expose
 only ciphertext on the underlay under `make encryption-path-live-test`; ADR
-0199. Milestone 9.6 is Verified.
+0199. Milestone 9.6 is Verified. Phase 9.7a then adds the Causal Evidence
+Watermark: a fixed 54-cell stage/outcome matrix prevents metrics cardinality
+from scaling with Nodes, peers, contracts, or epochs, while a separate bounded
+hash-chained history records exact secret-free provenance. Both upstream loss
+and retention eviction remain explicit across checkpoint restore, so missing
+evidence cannot look like healthy silence. `make
+encryption-operations-evidence-test`; ADR 0200. Runtime export,
+explanation/simulation, recovery, upgrade, and performance gates remain next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
