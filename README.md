@@ -934,6 +934,15 @@ both families. `make encryption-ciphertext-live-test`; ADR 0193. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
 ADRs 0158–0193 define the ordered implementation and independent Kind/OpenShift
 gates.
+Phase 9.6a adds the Causal Duplex Path Quorum. A short-lived nonce binds the
+exact contract, decision witness, Node UIDs, key epoch, address families,
+before/after kernel readback, positive per-peer counter movement, and the
+encrypted request/response transcript independently observed by both
+authenticated endpoints. A handshake timestamp or one healthy endpoint can
+never activate the path. Replay, roaming, counter stall, mutation, expiry, and
+unknown wire authority deny closed under `make encryption-path-proof-test`;
+ADR 0194. Runtime evidence collection and consuming activation are tracked as
+9.6b.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
