@@ -3461,6 +3461,7 @@ dependencies = [
  "tokio",
  "unf-common",
  "unf-ebpf-common",
+ "unf-ipam",
  "x25519-dalek",
  "zeroize",
 ]

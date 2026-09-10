@@ -774,6 +774,7 @@ fn compile_epoch_plan(
         fwmark: path.fwmark,
         route_table: path.route_table,
         mtu_envelope,
+        local_pod_cidrs: contract.local_node.pod_cidrs.clone(),
         activation: WireGuardEpochActivation::InactiveStaged,
         peers: peers.into_values().collect(),
     })
@@ -795,6 +796,7 @@ fn with_activation(
         fwmark: plan.fwmark,
         route_table: plan.route_table,
         mtu_envelope: plan.mtu_envelope.clone(),
+        local_pod_cidrs: plan.local_pod_cidrs.clone(),
         activation,
         peers: plan.peers.clone(),
     })
@@ -974,6 +976,7 @@ mod tests {
             public_key: plan.local_public_key,
             listen_port: plan.listen_port,
             fwmark: plan.fwmark,
+            proof_addresses: plan.proof_addresses.clone(),
             peers: plan
                 .peers
                 .iter()

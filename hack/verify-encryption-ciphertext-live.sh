@@ -52,26 +52,32 @@ for ns in "${ns_a}" "${ns_b}"; do
 done
 sudo -n ip -n "${ns_a}" address add 192.0.2.1/30 dev underlay0
 sudo -n ip -n "${ns_b}" address add 192.0.2.2/30 dev underlay0
-sudo -n ip -n "${ns_a}" address add 10.250.0.1/32 dev unfwg0
-sudo -n ip -n "${ns_a}" address add fd00:250::1/128 dev unfwg0
-sudo -n ip -n "${ns_b}" address add 10.250.0.2/32 dev unfwg0
-sudo -n ip -n "${ns_b}" address add fd00:250::2/128 dev unfwg0
+sudo -n ip -n "${ns_a}" address add 10.250.1.2/32 dev unfwg0
+sudo -n ip -n "${ns_a}" address add fd00:250:1::2/128 dev unfwg0
+sudo -n ip -n "${ns_b}" address add 10.250.2.2/32 dev unfwg0
+sudo -n ip -n "${ns_b}" address add fd00:250:2::2/128 dev unfwg0
+# UNF IPAM permanently excludes the IPv4 block end and IPv6 network address.
+# Installed as host addresses, they are dependency-free path-proof beacons.
+sudo -n ip -n "${ns_a}" address add 10.250.1.255/32 dev unfwg0
+sudo -n ip -n "${ns_a}" address add fd00:250:1::/128 dev unfwg0
+sudo -n ip -n "${ns_b}" address add 10.250.2.255/32 dev unfwg0
+sudo -n ip -n "${ns_b}" address add fd00:250:2::/128 dev unfwg0
 
 sudo -n ip netns exec "${ns_a}" wg set unfwg0 \
     private-key "${work_dir}/a.key" listen-port 51820 \
     peer "${pub_b}" endpoint 192.0.2.2:51821 \
-    allowed-ips 10.250.0.2/32,fd00:250::2/128 persistent-keepalive 1
+    allowed-ips 10.250.2.0/24,fd00:250:2::/64 persistent-keepalive 1
 sudo -n ip netns exec "${ns_b}" wg set unfwg0 \
     private-key "${work_dir}/b.key" listen-port 51821 \
     peer "${pub_a}" endpoint 192.0.2.1:51820 \
-    allowed-ips 10.250.0.1/32,fd00:250::1/128 persistent-keepalive 1
+    allowed-ips 10.250.1.0/24,fd00:250:1::/64 persistent-keepalive 1
 for ns in "${ns_a}" "${ns_b}"; do
     sudo -n ip -n "${ns}" link set unfwg0 up
 done
-sudo -n ip -n "${ns_a}" route add 10.250.0.2/32 dev unfwg0
-sudo -n ip -n "${ns_a}" -6 route add fd00:250::2/128 dev unfwg0
-sudo -n ip -n "${ns_b}" route add 10.250.0.1/32 dev unfwg0
-sudo -n ip -n "${ns_b}" -6 route add fd00:250::1/128 dev unfwg0
+sudo -n ip -n "${ns_a}" route add 10.250.2.0/24 dev unfwg0
+sudo -n ip -n "${ns_a}" -6 route add fd00:250:2::/64 dev unfwg0
+sudo -n ip -n "${ns_b}" route add 10.250.1.0/24 dev unfwg0
+sudo -n ip -n "${ns_b}" -6 route add fd00:250:1::/64 dev unfwg0
 
 # Observe only the underlay device. The pcap is independently inspected for
 # WireGuard UDP and for accidental exposure of any inner source/destination.
@@ -79,15 +85,17 @@ sudo -n ip netns exec "${ns_a}" timeout --signal=INT 5 \
     tcpdump -U -ni underlay0 -w "${pcap_file}" >/dev/null 2>&1 &
 capture_pid=$!
 sleep 0.5
-sudo -n ip netns exec "${ns_a}" ping -q -c 3 -W 2 -I 10.250.0.1 10.250.0.2
-sudo -n ip netns exec "${ns_a}" ping -6 -q -c 3 -W 2 -I fd00:250::1 fd00:250::2
+sudo -n ip netns exec "${ns_a}" ping -q -c 3 -W 2 -I 10.250.1.2 10.250.2.2
+sudo -n ip netns exec "${ns_a}" ping -6 -q -c 3 -W 2 -I fd00:250:1::2 fd00:250:2::2
+sudo -n ip netns exec "${ns_a}" ping -q -c 1 -W 2 -I 10.250.1.255 10.250.2.255
+sudo -n ip netns exec "${ns_a}" ping -6 -q -c 1 -W 2 -I fd00:250:1:: fd00:250:2::
 wait "${capture_pid}" || [[ $? -eq 124 ]]
 capture_pid=
 
 encrypted_packets=$(sudo -n tcpdump -nn -r "${pcap_file}" \
     'udp and (port 51820 or port 51821)' 2>/dev/null | wc -l)
 plaintext_packets=$(sudo -n tcpdump -nn -r "${pcap_file}" \
-    'host 10.250.0.1 or host 10.250.0.2 or host fd00:250::1 or host fd00:250::2' \
+    'host 10.250.1.2 or host 10.250.2.2 or host fd00:250:1::2 or host fd00:250:2::2 or host 10.250.1.255 or host 10.250.2.255 or host fd00:250:1:: or host fd00:250:2::' \
     2>/dev/null | wc -l)
 [[ ${encrypted_packets} -gt 0 ]] || {
     echo "no WireGuard ciphertext was observed on the underlay" >&2
@@ -110,7 +118,7 @@ read -r received sent < <(
 # Removing authenticated peer authority leaves the inner route pointing only
 # at WireGuard. Delivery must stop; plaintext fallback is structurally absent.
 sudo -n ip netns exec "${ns_a}" wg set unfwg0 peer "${pub_b}" remove
-if sudo -n ip netns exec "${ns_a}" ping -q -c 1 -W 1 -I 10.250.0.1 10.250.0.2; then
+if sudo -n ip netns exec "${ns_a}" ping -q -c 1 -W 1 -I 10.250.1.2 10.250.2.2; then
     echo "traffic survived removal of WireGuard peer authority" >&2
     exit 1
 fi
@@ -118,8 +126,10 @@ fi
 # Restore the exact peer and prove retry-safe recovery for both inner families.
 sudo -n ip netns exec "${ns_a}" wg set unfwg0 \
     peer "${pub_b}" endpoint 192.0.2.2:51821 \
-    allowed-ips 10.250.0.2/32,fd00:250::2/128 persistent-keepalive 1
-sudo -n ip netns exec "${ns_a}" ping -q -c 1 -W 2 -I 10.250.0.1 10.250.0.2
-sudo -n ip netns exec "${ns_a}" ping -6 -q -c 1 -W 2 -I fd00:250::1 fd00:250::2
+    allowed-ips 10.250.2.0/24,fd00:250:2::/64 persistent-keepalive 1
+sudo -n ip netns exec "${ns_a}" ping -q -c 1 -W 2 -I 10.250.1.2 10.250.2.2
+sudo -n ip netns exec "${ns_a}" ping -6 -q -c 1 -W 2 -I fd00:250:1::2 fd00:250:2::2
+sudo -n ip netns exec "${ns_a}" ping -q -c 1 -W 2 -I 10.250.1.255 10.250.2.255
+sudo -n ip netns exec "${ns_a}" ping -6 -q -c 1 -W 2 -I fd00:250:1:: fd00:250:2::
 
 echo "Phase 9.5 live ciphertext passed: dual-stack inner traffic crossed WireGuard as UDP-only underlay ciphertext, peer removal denied closed, and exact recovery succeeded"

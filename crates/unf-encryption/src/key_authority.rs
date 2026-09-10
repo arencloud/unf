@@ -1835,6 +1835,16 @@ mod tests {
                     },
                 ])
                 .unwrap(),
+                local_pod_cidrs: vec![
+                    crate::IpPrefix {
+                        address: "10.244.1.0".parse().unwrap(),
+                        prefix_len: 24,
+                    },
+                    crate::IpPrefix {
+                        address: "fd00:244:1::".parse().unwrap(),
+                        prefix_len: 64,
+                    },
+                ],
                 activation: crate::WireGuardEpochActivation::InactiveStaged,
                 peers: vec![
                     crate::WireGuardPeerPlan {

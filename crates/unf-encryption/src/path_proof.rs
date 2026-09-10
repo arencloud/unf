@@ -17,7 +17,7 @@ use crate::{
     EncryptionDecisionWitness, EncryptionDisposition, EncryptionFastPathDigest,
     EncryptionFastPathState, EncryptionGenerationRecipient, FastPathError, IpPrefix,
     WireGuardKernelConfigurationDigest, WireGuardKernelObservationDigest, WireGuardKernelSnapshot,
-    WireGuardPublicKey,
+    WireGuardPublicKey, derive_wireguard_proof_addresses,
 };
 
 pub const ENCRYPTION_PATH_PROOF_SCHEMA_VERSION: u16 = 1;
@@ -416,6 +416,11 @@ impl EncryptionEndpointPathProof {
         }
         let before_peer = exact_peer(before, peer_key)?;
         let after_peer = exact_peer(after, peer_key)?;
+        let expected_proof_addresses = derive_wireguard_proof_addresses(match role {
+            EncryptionPathEndpointRole::Source => &plan.source.node.pod_cidrs,
+            EncryptionPathEndpointRole::Destination => &plan.destination.node.pod_cidrs,
+        })
+        .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
         let routes_exact = |snapshot: &WireGuardKernelSnapshot| {
             snapshot.routes.len() == path.allowed_ips.len()
                 && snapshot
@@ -437,6 +442,8 @@ impl EncryptionEndpointPathProof {
             || after.mtu != path.mtu
             || before.fwmark != path.fwmark
             || after.fwmark != path.fwmark
+            || before.proof_addresses != expected_proof_addresses
+            || after.proof_addresses != expected_proof_addresses
             || before_peer.endpoint != path.peer_endpoint
             || after_peer.endpoint != path.peer_endpoint
             || before_peer.allowed_ips != path.allowed_ips
@@ -1195,11 +1202,12 @@ mod tests {
         tx: u64,
     ) -> WireGuardKernelSnapshot {
         let plan = &contract.plans[0];
-        let (path, local_key, peer_key, index, port) = match role {
+        let (path, local_key, peer_key, local_node, index, port) = match role {
             EncryptionPathEndpointRole::Source => (
                 &plan.transport.forward,
                 plan.source_key.public_key,
                 plan.destination_key.public_key,
+                &plan.source.node,
                 71,
                 51820,
             ),
@@ -1207,6 +1215,7 @@ mod tests {
                 &plan.transport.reverse,
                 plan.destination_key.public_key,
                 plan.source_key.public_key,
+                &plan.destination.node,
                 72,
                 51821,
             ),
@@ -1214,12 +1223,14 @@ mod tests {
         WireGuardKernelSnapshot::issue(WireGuardKernelSnapshotInput {
             interface_name: path.interface_name.clone(),
             interface_index: index,
-            owner_alias: format!("unf:encryption:v1:{}:7", plan.source.node.cluster_id),
+            owner_alias: format!("unf:encryption:v2:{}:7", plan.source.node.cluster_id),
             is_up: true,
             mtu: path.mtu,
             public_key: local_key,
             listen_port: port,
             fwmark: path.fwmark,
+            proof_addresses: crate::derive_wireguard_proof_addresses(&local_node.pod_cidrs)
+                .unwrap(),
             peers: vec![WireGuardPeerReadback {
                 public_key: peer_key,
                 endpoint: path.peer_endpoint,

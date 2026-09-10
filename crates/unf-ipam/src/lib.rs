@@ -119,6 +119,16 @@ impl Ipv4NodeBlock {
         Ipv4Addr::from(u32::from(self.network) + 1)
     }
 
+    /// Returns the block's permanently non-leasable address for Node-local
+    /// encrypted path challenges. It is installed as a /32, so Linux treats
+    /// the traditional subnet broadcast value as a host address on the proof
+    /// interface while workload allocation can never select it.
+    #[must_use]
+    pub fn proof_beacon(self) -> Ipv4Addr {
+        let host_mask = !prefix_mask_v4(self.prefix_len);
+        Ipv4Addr::from(u32::from(self.network) | host_mask)
+    }
+
     #[must_use]
     pub fn bounded_capacity(self) -> usize {
         let addresses = 1_u64 << (32 - self.prefix_len);
@@ -241,6 +251,14 @@ impl Ipv6NodeBlock {
     #[must_use]
     pub fn gateway(self) -> Ipv6Addr {
         Ipv6Addr::from(u128::from(self.network) + 1)
+    }
+
+    /// Returns the block's permanently non-leasable network address for a
+    /// Node-local encrypted path challenge. UNF workload leases begin at +2;
+    /// the beacon is installed as a /128 and creates no connected route.
+    #[must_use]
+    pub const fn proof_beacon(self) -> Ipv6Addr {
+        self.network
     }
 
     #[must_use]
@@ -617,6 +635,35 @@ mod tests {
             "fd00:42::3".parse::<Ipv6Addr>().unwrap()
         );
         provider.validate(&second).expect("lease belongs to blocks");
+    }
+
+    #[test]
+    fn proof_beacons_are_deterministic_in_block_and_never_leasable() {
+        let ipv4: Ipv4NodeBlock = "10.42.0.0/30".parse().unwrap();
+        let ipv6: Ipv6NodeBlock = "fd00:42::/126".parse().unwrap();
+        assert_eq!(ipv4.proof_beacon(), Ipv4Addr::new(10, 42, 0, 3));
+        assert_eq!(
+            ipv6.proof_beacon(),
+            "fd00:42::".parse::<Ipv6Addr>().unwrap()
+        );
+        assert!(ipv4.contains(ipv4.proof_beacon()));
+        assert!(ipv6.contains(ipv6.proof_beacon()));
+        assert!(!ipv4.contains_workload(ipv4.proof_beacon()));
+        assert!(!ipv6.contains_workload(ipv6.proof_beacon()));
+
+        let provider = NodeBlockProvider::new(ipv4, ipv6);
+        let mut used = UsedAddresses::default();
+        loop {
+            match provider.allocate(&used) {
+                Ok(lease) => {
+                    assert_ne!(lease.ipv4.address, ipv4.proof_beacon());
+                    assert_ne!(lease.ipv6.address, ipv6.proof_beacon());
+                    used.insert(lease).unwrap();
+                }
+                Err(IpamError::Exhausted { .. }) => break,
+                Err(error) => panic!("unexpected allocation failure: {error}"),
+            }
+        }
     }
 
     #[test]

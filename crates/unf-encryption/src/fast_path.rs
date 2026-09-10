@@ -1597,6 +1597,7 @@ mod tests {
             fwmark: 0x0055_0000 + (u32::try_from(epoch).unwrap() << 8),
             route_table: 20_000 + u32::try_from(epoch).unwrap(),
             mtu_envelope,
+            local_pod_cidrs: source_node.pod_cidrs.clone(),
             activation: WireGuardEpochActivation::Active,
             peers,
         })
@@ -1611,6 +1612,7 @@ mod tests {
             public_key: plan.local_public_key,
             listen_port: plan.listen_port,
             fwmark: plan.fwmark,
+            proof_addresses: plan.proof_addresses.clone(),
             peers: plan
                 .peers
                 .iter()
@@ -1708,17 +1710,19 @@ mod tests {
         transmitted_bytes: u64,
     ) -> WireGuardKernelSnapshot {
         let plan = &fixture.contract.plans[0];
-        let (path, local_key, peer_key, interface_index) = match role {
+        let (path, local_key, peer_key, local_node, interface_index) = match role {
             EncryptionPathEndpointRole::Source => (
                 &plan.transport.forward,
                 plan.source_key.public_key,
                 plan.destination_key.public_key,
+                &plan.source.node,
                 fixture.snapshot.interface_index,
             ),
             EncryptionPathEndpointRole::Destination => (
                 &plan.transport.reverse,
                 plan.destination_key.public_key,
                 plan.source_key.public_key,
+                &plan.destination.node,
                 fixture.snapshot.interface_index + 1,
             ),
         };
@@ -1726,7 +1730,7 @@ mod tests {
             EncryptionPathEndpointRole::Source => fixture.snapshot.owner_alias.clone(),
             EncryptionPathEndpointRole::Destination => {
                 format!(
-                    "unf:encryption:v1:fixture:destination:{}",
+                    "unf:encryption:v2:fixture:destination:{}",
                     plan.source_key.epoch
                 )
             }
@@ -1740,6 +1744,8 @@ mod tests {
             public_key: local_key,
             listen_port: 51_820,
             fwmark: path.fwmark,
+            proof_addresses: crate::derive_wireguard_proof_addresses(&local_node.pod_cidrs)
+                .unwrap(),
             peers: vec![WireGuardPeerReadback {
                 public_key: peer_key,
                 endpoint: path.peer_endpoint,
@@ -1813,6 +1819,7 @@ mod tests {
             fwmark: plan.fwmark,
             route_table: plan.route_table,
             mtu_envelope: plan.mtu_envelope.clone(),
+            local_pod_cidrs: plan.local_pod_cidrs.clone(),
             activation: WireGuardEpochActivation::InactiveStaged,
             peers: plan.peers.clone(),
         })

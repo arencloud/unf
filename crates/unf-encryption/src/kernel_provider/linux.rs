@@ -9,9 +9,10 @@ use netlink_packet_wireguard::{
     WireguardCmd, WireguardDeviceFlags, WireguardMessage, WireguardPeer, WireguardPeerAttribute,
     WireguardPeerFlags,
 };
+use rtnetlink::packet_route::address::AddressAttribute;
 use rtnetlink::packet_route::link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage};
 use rtnetlink::packet_route::route::{
-    RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope,
+    RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType,
 };
 use rtnetlink::{Handle, LinkUnspec, LinkWireguard, RouteMessageBuilder};
 use zeroize::Zeroize as _;
@@ -84,6 +85,7 @@ impl LinuxWireGuardProvider {
         let result = async {
             configure_device(plan, private_key).await?;
             after_device()?;
+            add_proof_addresses(&handle, plan, link.header.index).await?;
             add_routes(&handle, plan, link.header.index).await?;
             let snapshot = read_snapshot(&handle, plan, &link).await?;
             snapshot.verify_against(plan)?;
@@ -322,6 +324,7 @@ async fn read_snapshot(
         return Err(WireGuardKernelError::ReadbackMismatch);
     }
     let routes = read_routes(handle, plan, link.header.index, true).await?;
+    let proof_addresses = read_proof_addresses(handle, plan, link.header.index).await?;
     WireGuardKernelSnapshot::issue(WireGuardKernelSnapshotInput {
         interface_name: device.interface_name,
         interface_index: device.interface_index,
@@ -331,9 +334,72 @@ async fn read_snapshot(
         public_key: device.public_key,
         listen_port: device.listen_port,
         fwmark: device.fwmark,
+        proof_addresses,
         peers: device.peers,
         routes,
     })
+}
+
+async fn add_proof_addresses(
+    handle: &Handle,
+    plan: &WireGuardKernelPlan,
+    interface_index: u32,
+) -> Result<(), WireGuardKernelError> {
+    for prefix in &plan.proof_addresses {
+        handle
+            .address()
+            .add(interface_index, prefix.address, prefix.prefix_len)
+            .replace()
+            .execute()
+            .await
+            .map_err(|error| kernel("assign WireGuard proof address", &error))?;
+    }
+    Ok(())
+}
+
+async fn read_proof_addresses(
+    handle: &Handle,
+    plan: &WireGuardKernelPlan,
+    interface_index: u32,
+) -> Result<Vec<IpPrefix>, WireGuardKernelError> {
+    let mut stream = handle
+        .address()
+        .get()
+        .set_link_index_filter(interface_index)
+        .execute();
+    let mut observed = Vec::new();
+    while let Some(message) = stream
+        .try_next()
+        .await
+        .map_err(|error| kernel("read WireGuard proof addresses", &error))?
+    {
+        let address = message
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                AddressAttribute::Local(address) | AddressAttribute::Address(address) => {
+                    Some(*address)
+                }
+                _ => None,
+            });
+        if let Some(address) = address {
+            observed.push(IpPrefix {
+                address,
+                prefix_len: message.header.prefix_len,
+            });
+        }
+        if observed.len() > crate::MAX_ENCRYPTION_PREFIXES_PER_NODE {
+            return Err(WireGuardKernelError::CapacityExceeded);
+        }
+    }
+    observed.sort_unstable();
+    observed.dedup();
+    if observed != plan.proof_addresses {
+        return Err(WireGuardKernelError::ForeignState(
+            "owned WireGuard interface has unexpected proof addresses".to_owned(),
+        ));
+    }
+    Ok(observed)
 }
 
 struct ParsedDevice {
@@ -684,9 +750,10 @@ async fn read_routes(
             }
         }
     }
-    if messages.iter().any(|message| {
+    if let Some(message) = messages.iter().find(|message| {
         route_oif(message) == Some(interface_index)
             && !is_kernel_generated_wireguard_multicast(message)
+            && !is_kernel_generated_proof_address_route(message, plan, interface_index)
             && match route_key(message) {
                 Some((prefix, table)) => {
                     table != plan.route_table
@@ -696,9 +763,13 @@ async fn read_routes(
                 None => true,
             }
     }) {
-        return Err(WireGuardKernelError::ForeignState(
-            "unexpected route points at the owned WireGuard interface".to_owned(),
-        ));
+        return Err(WireGuardKernelError::ForeignState(format!(
+            "unexpected route points at the owned WireGuard interface: key={:?}, protocol={:?}, scope={:?}, kind={:?}",
+            route_key(message),
+            message.header.protocol,
+            message.header.scope,
+            message.header.kind
+        )));
     }
     Ok(routes)
 }
@@ -795,6 +866,32 @@ fn is_kernel_generated_wireguard_multicast(message: &RouteMessage) -> bool {
         && message.header.scope == RouteScope::Universe
 }
 
+fn is_kernel_generated_proof_address_route(
+    message: &RouteMessage,
+    plan: &WireGuardKernelPlan,
+    interface_index: u32,
+) -> bool {
+    route_key(message).is_some_and(|(prefix, table)| {
+        plan.proof_addresses.contains(&prefix)
+            && route_oif(message) == Some(interface_index)
+            && message.header.protocol == RouteProtocol::Kernel
+            && ((table == 255
+                && message.header.scope
+                    == match prefix.address {
+                        IpAddr::V4(_) => RouteScope::Host,
+                        IpAddr::V6(_) => RouteScope::Universe,
+                    }
+                && message.header.kind == RouteType::Local)
+                || (table == 254
+                    && message.header.scope
+                        == match prefix.address {
+                            IpAddr::V4(_) => RouteScope::Link,
+                            IpAddr::V6(_) => RouteScope::Universe,
+                        }
+                    && message.header.kind == RouteType::Unicast))
+    })
+}
+
 async fn rollback_fresh_stage(
     handle: &Handle,
     plan: &WireGuardKernelPlan,
@@ -860,6 +957,16 @@ mod tests {
                 },
             ])
             .unwrap(),
+            local_pod_cidrs: vec![
+                IpPrefix {
+                    address: "10.245.1.0".parse().unwrap(),
+                    prefix_len: 24,
+                },
+                IpPrefix {
+                    address: "fd00:245:1::".parse().unwrap(),
+                    prefix_len: 64,
+                },
+            ],
             activation: WireGuardEpochActivation::InactiveStaged,
             peers: vec![WireGuardPeerPlan {
                 node_uid: "kernel-node-b".to_owned(),

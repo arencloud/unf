@@ -1,12 +1,13 @@
 //! Transactional kernel `WireGuard` desired state and proof-carrying recovery.
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unf_common::Revision;
+use unf_ipam::{Ipv4NodeBlock, Ipv6NodeBlock};
 
 use crate::{IpPrefix, WireGuardPrivateKey, WireGuardPublicKey};
 
@@ -16,8 +17,8 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxWireGuardProvider;
 
-pub const WIREGUARD_KERNEL_PROVIDER_SCHEMA_VERSION: u16 = 1;
-pub const WIREGUARD_KERNEL_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const WIREGUARD_KERNEL_PROVIDER_SCHEMA_VERSION: u16 = 2;
+pub const WIREGUARD_KERNEL_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 pub const PROOF_CARRYING_KERNEL_TRANSACTION_SCHEMA_VERSION: u16 = 1;
 pub const MAX_WIREGUARD_PEERS: usize = 4_096;
 pub const MAX_WIREGUARD_ALLOWED_IPS: usize = 65_536;
@@ -30,9 +31,9 @@ pub const UNF_WIREGUARD_ROUTE_PROTOCOL: u8 = 0x55;
 pub const MAX_WIREGUARD_INTERFACE_NAME_BYTES: usize = 15;
 pub const MAX_WIREGUARD_OWNER_ALIAS_BYTES: usize = 255;
 
-const PLAN_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-plan.v1\0";
-const CONFIGURATION_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-configuration.v1\0";
-const OBSERVATION_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-observation.v1\0";
+const PLAN_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-plan.v2\0";
+const CONFIGURATION_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-configuration.v2\0";
+const OBSERVATION_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-observation.v2\0";
 const TRANSACTION_DIGEST_DOMAIN: &[u8] = b"unf.proof-carrying-kernel-transaction.v1\0";
 const MAX_TEXT_BYTES: usize = 253;
 
@@ -45,6 +46,7 @@ pub enum WireGuardKernelCapability {
     DualStackRoutes,
     LinkOwnershipAlias,
     InactiveEpochStaging,
+    ExactProofBeaconAddresses,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +264,8 @@ pub struct WireGuardKernelPlan {
     pub fwmark: u32,
     pub route_table: u32,
     pub mtu_envelope: WireGuardMtuEnvelope,
+    pub local_pod_cidrs: Vec<IpPrefix>,
+    pub proof_addresses: Vec<IpPrefix>,
     pub activation: WireGuardEpochActivation,
     pub peers: Vec<WireGuardPeerPlan>,
     pub plan_digest: WireGuardKernelPlanDigest,
@@ -279,6 +283,7 @@ pub struct WireGuardKernelPlanInput {
     pub fwmark: u32,
     pub route_table: u32,
     pub mtu_envelope: WireGuardMtuEnvelope,
+    pub local_pod_cidrs: Vec<IpPrefix>,
     pub activation: WireGuardEpochActivation,
     pub peers: Vec<WireGuardPeerPlan>,
 }
@@ -295,6 +300,50 @@ pub struct WireGuardKernelConfigurationDigest(pub [u8; 32]);
 #[serde(transparent)]
 pub struct WireGuardKernelObservationDigest(pub [u8; 32]);
 
+/// Derives one workload-IPAM-excluded host address per local Pod CIDR. These
+/// addresses let a Node prove the encrypted route itself without depending on
+/// the lifecycle, policy, or availability of any workload Pod.
+///
+/// # Errors
+///
+/// Rejects noncanonical, overlapping, or too-small Node blocks.
+pub fn derive_wireguard_proof_addresses(
+    pod_cidrs: &[IpPrefix],
+) -> Result<Vec<IpPrefix>, WireGuardKernelError> {
+    if pod_cidrs.is_empty() || pod_cidrs.len() > crate::MAX_ENCRYPTION_PREFIXES_PER_NODE {
+        return Err(WireGuardKernelError::InvalidPlan);
+    }
+    let mut blocks = pod_cidrs.to_vec();
+    blocks.sort_unstable();
+    if blocks.iter().any(|prefix| !prefix.is_canonical())
+        || blocks.windows(2).any(|pair| pair[0].overlaps(pair[1]))
+    {
+        return Err(WireGuardKernelError::InvalidPlan);
+    }
+    let mut addresses = blocks
+        .into_iter()
+        .map(|prefix| match prefix.address {
+            IpAddr::V4(network) => Ipv4NodeBlock::new(network, prefix.prefix_len)
+                .map(|block| IpPrefix {
+                    address: IpAddr::V4(block.proof_beacon()),
+                    prefix_len: 32,
+                })
+                .map_err(|_| WireGuardKernelError::InvalidPlan),
+            IpAddr::V6(network) => Ipv6NodeBlock::new(network, prefix.prefix_len)
+                .map(|block| IpPrefix {
+                    address: IpAddr::V6(block.proof_beacon()),
+                    prefix_len: 128,
+                })
+                .map_err(|_| WireGuardKernelError::InvalidPlan),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    addresses.sort_unstable();
+    if addresses.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(WireGuardKernelError::InvalidPlan);
+    }
+    Ok(addresses)
+}
+
 impl WireGuardKernelPlan {
     /// Creates a canonical, bounded, exact kernel plan.
     ///
@@ -303,6 +352,7 @@ impl WireGuardKernelPlan {
     /// Rejects malformed ownership, unsupported schema/capacity, duplicate or
     /// overlapping peers/prefixes, unsafe MTU, and noncanonical inputs.
     pub fn new(mut input: WireGuardKernelPlanInput) -> Result<Self, WireGuardKernelError> {
+        input.local_pod_cidrs.sort_unstable();
         input.peers.sort_by(|left, right| {
             (&left.node_uid, left.public_key).cmp(&(&right.node_uid, right.public_key))
         });
@@ -310,9 +360,10 @@ impl WireGuardKernelPlan {
             peer.allowed_ips.sort();
         }
         let owner_alias = format!(
-            "unf:encryption:v1:{}:{}:{}",
+            "unf:encryption:v2:{}:{}:{}",
             input.cluster_id, input.local_node_uid, input.epoch
         );
+        let proof_addresses = derive_wireguard_proof_addresses(&input.local_pod_cidrs)?;
         let mut plan = Self {
             schema_version: WIREGUARD_KERNEL_PROVIDER_SCHEMA_VERSION,
             cluster_id: input.cluster_id,
@@ -326,6 +377,8 @@ impl WireGuardKernelPlan {
             fwmark: input.fwmark,
             route_table: input.route_table,
             mtu_envelope: input.mtu_envelope,
+            local_pod_cidrs: input.local_pod_cidrs,
+            proof_addresses,
             activation: input.activation,
             peers: input.peers,
             plan_digest: WireGuardKernelPlanDigest([0; 32]),
@@ -374,6 +427,8 @@ impl WireGuardKernelPlan {
 
     fn validate_shape(&self) -> Result<(), WireGuardKernelError> {
         self.mtu_envelope.verify()?;
+        let proof_addresses_match = derive_wireguard_proof_addresses(&self.local_pod_cidrs)
+            .is_ok_and(|derived| derived == self.proof_addresses);
         if self.schema_version != WIREGUARD_KERNEL_PROVIDER_SCHEMA_VERSION {
             return Err(WireGuardKernelError::UnsupportedProviderSchema(
                 self.schema_version,
@@ -386,7 +441,7 @@ impl WireGuardKernelPlan {
             || !valid_interface_name(&self.interface_name)
             || self.owner_alias
                 != format!(
-                    "unf:encryption:v1:{}:{}:{}",
+                    "unf:encryption:v2:{}:{}:{}",
                     self.cluster_id, self.local_node_uid, self.epoch
                 )
             || self.owner_alias.len() > MAX_WIREGUARD_OWNER_ALIAS_BYTES
@@ -394,6 +449,20 @@ impl WireGuardKernelPlan {
             || self.listen_port == 0
             || self.fwmark == 0
             || self.route_table == 0
+            || !proof_addresses_match
+            || self.proof_addresses.is_empty()
+            || self.proof_addresses.len() > crate::MAX_ENCRYPTION_PREFIXES_PER_NODE
+            || self
+                .proof_addresses
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self.proof_addresses.iter().any(|prefix| {
+                !prefix.is_canonical()
+                    || match prefix.address {
+                        IpAddr::V4(_) => prefix.prefix_len != 32,
+                        IpAddr::V6(_) => prefix.prefix_len != 128,
+                    }
+            })
             || self.peers.is_empty()
             || self.peers.len() > MAX_WIREGUARD_PEERS
         {
@@ -510,6 +579,7 @@ pub struct WireGuardKernelSnapshot {
     pub public_key: WireGuardPublicKey,
     pub listen_port: u16,
     pub fwmark: u32,
+    pub proof_addresses: Vec<IpPrefix>,
     pub peers: Vec<WireGuardPeerReadback>,
     pub routes: Vec<WireGuardRouteReadback>,
     pub configuration_digest: WireGuardKernelConfigurationDigest,
@@ -525,6 +595,7 @@ pub(crate) struct WireGuardKernelSnapshotInput {
     pub public_key: WireGuardPublicKey,
     pub listen_port: u16,
     pub fwmark: u32,
+    pub proof_addresses: Vec<IpPrefix>,
     pub peers: Vec<WireGuardPeerReadback>,
     pub routes: Vec<WireGuardRouteReadback>,
 }
@@ -533,6 +604,7 @@ impl WireGuardKernelSnapshot {
     pub(crate) fn issue(
         mut input: WireGuardKernelSnapshotInput,
     ) -> Result<Self, WireGuardKernelError> {
+        input.proof_addresses.sort_unstable();
         input.peers.sort_by_key(|peer| peer.public_key);
         for peer in &mut input.peers {
             peer.allowed_ips.sort();
@@ -548,6 +620,7 @@ impl WireGuardKernelSnapshot {
             public_key: input.public_key,
             listen_port: input.listen_port,
             fwmark: input.fwmark,
+            proof_addresses: input.proof_addresses,
             peers: input.peers,
             routes: input.routes,
             configuration_digest: WireGuardKernelConfigurationDigest([0; 32]),
@@ -571,7 +644,20 @@ impl WireGuardKernelSnapshot {
             || self.interface_index == 0
             || self.owner_alias.is_empty()
             || self.owner_alias.len() > MAX_WIREGUARD_OWNER_ALIAS_BYTES
-            || !self.owner_alias.starts_with("unf:encryption:v1:")
+            || !self.owner_alias.starts_with("unf:encryption:v2:")
+            || self.proof_addresses.is_empty()
+            || self.proof_addresses.len() > crate::MAX_ENCRYPTION_PREFIXES_PER_NODE
+            || self
+                .proof_addresses
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self.proof_addresses.iter().any(|prefix| {
+                !prefix.is_canonical()
+                    || match prefix.address {
+                        IpAddr::V4(_) => prefix.prefix_len != 32,
+                        IpAddr::V6(_) => prefix.prefix_len != 128,
+                    }
+            })
             || !self.is_up
             || !(MIN_WIREGUARD_MTU..=MAX_WIREGUARD_MTU).contains(&self.mtu)
             || self.public_key.0 == [0; 32]
@@ -641,6 +727,7 @@ impl WireGuardKernelSnapshot {
             || self.public_key != plan.local_public_key
             || self.listen_port != plan.listen_port
             || self.fwmark != plan.fwmark
+            || self.proof_addresses != plan.proof_addresses
             || self.configuration_digest != self.calculate_configuration_digest()?
             || self.observation_digest != self.calculate_observation_digest()?
         {
@@ -713,6 +800,7 @@ impl WireGuardKernelSnapshot {
             self.public_key,
             self.listen_port,
             self.fwmark,
+            &self.proof_addresses,
             peers,
             &self.routes,
         );
@@ -963,6 +1051,7 @@ fn required_capabilities() -> BTreeSet<WireGuardKernelCapability> {
         WireGuardKernelCapability::DualStackRoutes,
         WireGuardKernelCapability::LinkOwnershipAlias,
         WireGuardKernelCapability::InactiveEpochStaging,
+        WireGuardKernelCapability::ExactProofBeaconAddresses,
     ])
 }
 
@@ -1037,6 +1126,16 @@ mod tests {
             fwmark: 0x554e_0007,
             route_table: 20_007,
             mtu_envelope: mtu(),
+            local_pod_cidrs: vec![
+                IpPrefix {
+                    address: "10.244.1.0".parse().unwrap(),
+                    prefix_len: 24,
+                },
+                IpPrefix {
+                    address: "fd00:244:1::".parse().unwrap(),
+                    prefix_len: 64,
+                },
+            ],
             activation: WireGuardEpochActivation::InactiveStaged,
             peers: vec![WireGuardPeerPlan {
                 node_uid: "node-b".to_owned(),
@@ -1069,6 +1168,7 @@ mod tests {
             public_key: plan.local_public_key,
             listen_port: plan.listen_port,
             fwmark: plan.fwmark,
+            proof_addresses: plan.proof_addresses.clone(),
             peers: plan
                 .peers
                 .iter()
@@ -1161,6 +1261,19 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         assert!(!json.contains("private"));
         assert_eq!(plan.route_prefixes().len(), 2);
+        assert_eq!(
+            plan.proof_addresses,
+            vec![
+                IpPrefix {
+                    address: "10.244.1.255".parse().unwrap(),
+                    prefix_len: 32,
+                },
+                IpPrefix {
+                    address: "fd00:244:1::".parse().unwrap(),
+                    prefix_len: 128,
+                },
+            ]
+        );
         let mut wrong_generator = OsWireGuardKeyGenerator;
         let wrong = wrong_generator.generate().unwrap();
         assert!(matches!(
@@ -1183,6 +1296,7 @@ mod tests {
             fwmark: plan.fwmark,
             route_table: plan.route_table,
             mtu_envelope: plan.mtu_envelope.clone(),
+            local_pod_cidrs: plan.local_pod_cidrs.clone(),
             activation: plan.activation,
             peers: plan.peers.clone(),
         };
@@ -1240,6 +1354,49 @@ mod tests {
             observed.verify_against(&plan),
             Err(WireGuardKernelError::ReadbackMismatch)
         ));
+
+        let mut observed = snapshot(&plan);
+        observed.proof_addresses[0].address = "10.244.1.254".parse().unwrap();
+        observed.configuration_digest = observed.calculate_configuration_digest().unwrap();
+        observed.observation_digest = observed.calculate_observation_digest().unwrap();
+        assert!(matches!(
+            observed.verify_against(&plan),
+            Err(WireGuardKernelError::ReadbackMismatch)
+        ));
+    }
+
+    #[test]
+    fn proof_beacons_are_derived_only_from_ipam_excluded_node_boundaries() {
+        assert_eq!(
+            derive_wireguard_proof_addresses(&[
+                IpPrefix {
+                    address: "10.42.7.0".parse().unwrap(),
+                    prefix_len: 24,
+                },
+                IpPrefix {
+                    address: "fd42:7::".parse().unwrap(),
+                    prefix_len: 64,
+                },
+            ])
+            .unwrap(),
+            vec![
+                IpPrefix {
+                    address: "10.42.7.255".parse().unwrap(),
+                    prefix_len: 32,
+                },
+                IpPrefix {
+                    address: "fd42:7::".parse().unwrap(),
+                    prefix_len: 128,
+                },
+            ]
+        );
+        assert!(
+            derive_wireguard_proof_addresses(&[IpPrefix {
+                address: "10.42.7.0".parse().unwrap(),
+                prefix_len: 31,
+            }])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1303,7 +1460,10 @@ mod tests {
         adjacent.maximum_schema = 2;
         adjacent.maximum_peers = 2_048;
         let negotiated = local.negotiate(&adjacent).unwrap();
-        assert_eq!(negotiated.schema_version, 1);
+        assert_eq!(
+            negotiated.schema_version,
+            WIREGUARD_KERNEL_PROVIDER_SCHEMA_VERSION
+        );
         assert_eq!(negotiated.maximum_peers, 2_048);
         adjacent
             .capabilities

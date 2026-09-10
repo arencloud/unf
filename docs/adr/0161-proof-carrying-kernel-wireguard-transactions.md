@@ -35,8 +35,8 @@ link/route absence. Same-name or same-route-key foreign state is never adopted.
 
 Configuration and observation have separate digests. The stable configuration
 digest covers interface identity/index, owner alias, MTU, link state, public key,
-listen port, fwmark, complete peer endpoints/keepalives/`AllowedIPs`, and exact
-routes. The observation digest additionally covers handshake time and byte
+listen port, fwmark, complete peer endpoints/keepalives/`AllowedIPs`, exact
+proof-beacon addresses, and exact routes. The observation digest additionally covers handshake time and byte
 counters, so traffic cannot create false configuration drift while operational
 evidence remains lossless.
 
