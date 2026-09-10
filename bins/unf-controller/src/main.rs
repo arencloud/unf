@@ -68,12 +68,13 @@ use unf_egress::{
     verify_egress_bfd_evidence_report, verify_egress_internet_snapshot,
 };
 use unf_encryption::{
-    AuthenticatedNodeIdentity, EncryptionBaseline, EncryptionFrontierPublishOutcome,
-    EncryptionGenerationDistributionError, EncryptionGenerationFact,
-    EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
+    AuthenticatedNodeIdentity, EncryptionBaseline, EncryptionEndpointPathProof,
+    EncryptionFrontierPublishOutcome, EncryptionGenerationDistributionError,
+    EncryptionGenerationFact, EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
     EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
     EncryptionGenerationRequest, EncryptionIdentityPair, EncryptionKeyBootstrap, EncryptionModel,
+    EncryptionPathActivationReceipt, EncryptionPathProofAssignment, EncryptionPathProofCoordinator,
     EncryptionPolicyObservation, FleetPlanProductionInput, IpPrefix,
     KubernetesEncryptionNodeSnapshot, KubernetesEncryptionProjectionInput,
     KubernetesEncryptionWorkloadSnapshot, NodeKeyAttestationCut, NodeKeyAttestationLedger,
@@ -430,6 +431,7 @@ struct ControllerState {
     encryption_plan_reconciler: Mutex<EncryptionPlanReconciler>,
     encryption_key_transparency: Mutex<NodeKeyTransparencyLedger>,
     encryption_key_attestations: Mutex<NodeKeyAttestationLedger>,
+    encryption_path_proofs: Mutex<EncryptionPathProofCoordinator>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1407,6 +1409,18 @@ async fn spawn_internal_api(
             get(encryption_key_attestation_cut),
         )
         .route(
+            "/v1/state/encryption-path-proof-assignments",
+            get(encryption_path_proof_assignments),
+        )
+        .route(
+            "/v1/state/encryption-path-proofs",
+            post(ingest_encryption_path_proof),
+        )
+        .route(
+            "/v1/state/encryption-path-receipts",
+            get(encryption_path_receipts),
+        )
+        .route(
             "/v1/state/service-selection",
             get(service_selection_contract),
         )
@@ -1839,6 +1853,7 @@ fn new_state_with_client_and_selector(
         encryption_plan_reconciler: Mutex::new(EncryptionPlanReconciler::default()),
         encryption_key_transparency: Mutex::new(NodeKeyTransparencyLedger::default()),
         encryption_key_attestations: Mutex::new(NodeKeyAttestationLedger::default()),
+        encryption_path_proofs: Mutex::new(EncryptionPathProofCoordinator::default()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -8221,6 +8236,119 @@ async fn encryption_key_attestation_cut(
 ) -> Result<Json<NodeKeyAttestationCut>, ApiError> {
     let agent = authenticate_internal_agent(&state, &headers).await?;
     encryption_key_attestation_cut_for(&state, &agent).map(Json)
+}
+
+async fn encryption_path_proof_assignments(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<EncryptionPathProofAssignment>>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    require_current_encryption_agent(&state, &agent)?;
+    let now = unix_time_millis();
+    synchronize_encryption_path_proofs(&state, now)?;
+    let recipient = encryption_recipient(&state, &agent)?;
+    Ok(Json(
+        mutex_lock(&state.encryption_path_proofs).assignments_for(&recipient),
+    ))
+}
+
+async fn ingest_encryption_path_proof(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(proof): Json<EncryptionEndpointPathProof>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    require_current_encryption_agent(&state, &agent)?;
+    let now = unix_time_millis();
+    synchronize_encryption_path_proofs(&state, now)?;
+    mutex_lock(&state.encryption_path_proofs)
+        .observe(&encryption_authenticated_node(&state, &agent)?, proof, now)
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn encryption_path_receipts(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<EncryptionPathActivationReceipt>>, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    require_current_encryption_agent(&state, &agent)?;
+    let now = unix_time_millis();
+    synchronize_encryption_path_proofs(&state, now)?;
+    Ok(Json(
+        mutex_lock(&state.encryption_path_proofs)
+            .receipts_for(&encryption_recipient(&state, &agent)?, now),
+    ))
+}
+
+fn synchronize_encryption_path_proofs(
+    state: &ControllerState,
+    now_unix_ms: u64,
+) -> Result<(), ApiError> {
+    let cut = mutex_lock(&state.encryption_local_plans)
+        .active()
+        .cloned()
+        .ok_or_else(|| ApiError::service_unavailable("encryption plan cut is unavailable"))?;
+    cut.verify()
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    let mut contracts = Vec::new();
+    let mut lifetime_ms = 30_000_u64;
+    for local_plan in &cut.plans {
+        for epoch in &local_plan.epochs {
+            if epoch.contract.local_node.name != local_plan.recipient.node_name
+                || epoch.contract.local_node.uid != local_plan.recipient.node_uid
+                || now_unix_ms < epoch.contract.valid_from_unix_ms
+                || now_unix_ms >= epoch.contract.valid_until_unix_ms
+            {
+                return Err(ApiError::service_unavailable(
+                    "encryption path contract is not current for its fleet-plan owner",
+                ));
+            }
+            lifetime_ms = lifetime_ms.min(epoch.contract.valid_until_unix_ms - now_unix_ms);
+            contracts.extend(
+                (0..epoch.contract.plans.len()).map(|index| (epoch.contract.clone(), index)),
+            );
+        }
+    }
+    mutex_lock(&state.encryption_path_proofs)
+        .replace_contracts(cut.generation, contracts, now_unix_ms, lifetime_ms)
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    Ok(())
+}
+
+fn require_current_encryption_agent(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+) -> Result<(), ApiError> {
+    if !agent_application_is_current(state, agent) {
+        return Err(ApiError::forbidden(
+            "encryption path proof does not match the current authenticated agent Pod",
+        ));
+    }
+    Ok(())
+}
+
+fn encryption_recipient(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+) -> Result<EncryptionGenerationRecipient, ApiError> {
+    encryption_generation_membership(state)?
+        .1
+        .into_iter()
+        .find(|recipient| recipient.node_name == agent.node_name)
+        .ok_or_else(|| ApiError::forbidden("agent is outside encryption path membership"))
+}
+
+fn encryption_authenticated_node(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+) -> Result<AuthenticatedNodeIdentity, ApiError> {
+    let recipient = encryption_recipient(state, agent)?;
+    Ok(AuthenticatedNodeIdentity {
+        cluster_id: state.encryption_cluster_id.clone(),
+        node_name: recipient.node_name,
+        node_uid: recipient.node_uid,
+    })
 }
 
 async fn ingest_encryption_generation_fact(
@@ -14704,6 +14832,67 @@ mod tests {
             .unwrap();
         assert!(successor.snapshot.generation > first.snapshot.generation);
         assert_eq!(successor.snapshot.service_revision, Revision::new(6));
+    }
+
+    #[test]
+    fn encryption_path_exchange_is_current_agent_and_plan_cut_scoped() {
+        let state = new_state(true);
+        let agent = authenticated_egress_agent("worker-a");
+        install_authenticated_agent(&state, &agent);
+        mutex_lock(&state.revisions).topology = Revision::new(7);
+        write_lock(&state.nodes).insert(
+            "worker-a".into(),
+            TopologyNode {
+                name: "worker-a".into(),
+                ready: true,
+                labels: BTreeMap::new(),
+            },
+        );
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".into(),
+            node_uid: "worker-a-uid".into(),
+        };
+        let snapshot = unf_encryption::NodeLocalPlanSnapshot::issue(
+            unf_encryption::NodeLocalPlanSnapshotFields {
+                membership_revision: Revision::new(7),
+                generation: Revision::new(10),
+                recipient: recipient.clone(),
+                mode: unf_encryption::NodeLocalPlanMode::Dormant,
+                policy_revision: Revision::new(2),
+                service_revision: Revision::new(3),
+                egress_revision: Revision::new(4),
+                listen_port: 51_820,
+                persistent_keepalive_seconds: 5,
+                epochs: vec![],
+                decisions: vec![],
+            },
+        )
+        .unwrap();
+        let cut = unf_encryption::NodeLocalPlanFleetCut::issue(
+            Revision::new(7),
+            Revision::new(10),
+            vec![recipient.clone()],
+            vec![snapshot],
+        )
+        .unwrap();
+        mutex_lock(&state.encryption_local_plans)
+            .publish(cut)
+            .unwrap();
+
+        synchronize_encryption_path_proofs(&state, 10_000).unwrap();
+        assert_eq!(
+            mutex_lock(&state.encryption_path_proofs).generation(),
+            Revision::new(10)
+        );
+        assert!(
+            mutex_lock(&state.encryption_path_proofs)
+                .assignments_for(&recipient)
+                .is_empty()
+        );
+        assert_eq!(encryption_recipient(&state, &agent).unwrap(), recipient);
+
+        let replaced = authenticated_egress_agent("worker-b");
+        assert!(require_current_encryption_agent(&state, &replaced).is_err());
     }
 
     #[test]

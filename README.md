@@ -942,7 +942,13 @@ authenticated endpoints. A handshake timestamp or one healthy endpoint can
 never activate the path. Replay, roaming, counter stall, mutation, expiry, and
 unknown wire authority deny closed under `make encryption-path-proof-test`;
 ADR 0194. Runtime evidence collection and consuming activation are tracked as
-9.6b.
+9.6b. The Pull-Synchronized Duplex Proof Exchange now atomically derives
+challenge assignments from the active fleet plan, scopes every read and write
+to the current Pod-bound Node identity, rejects generation equivocation, clears
+old evidence on successor publication, renews expired rounds, and exposes only
+current completed receipts to involved endpoints. `make
+encryption-path-runtime-test`; ADR 0195. Agent live execution and consuming
+activation remain 9.6c.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

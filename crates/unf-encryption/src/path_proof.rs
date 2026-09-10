@@ -35,7 +35,7 @@ pub enum EncryptionPathEndpointRole {
     Destination,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EncryptionPathProofRoundDigest(pub [u8; 32]);
 
@@ -119,6 +119,17 @@ pub struct EncryptionPathActivationReceipt {
     pub activation_digest: EncryptionPathActivationDigest,
 }
 
+/// Self-contained work item delivered only to one of the two path endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionPathProofAssignment {
+    pub schema_version: u16,
+    pub generation: unf_common::Revision,
+    pub round: EncryptionPathProofRound,
+    pub contract: AttestedEncryptionPathContract,
+    pub plan_index: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionPathProofAdmission {
     AcceptedPendingPeer,
@@ -130,6 +141,21 @@ pub enum EncryptionPathProofAdmission {
 pub struct EncryptionPathProofLedger {
     round: EncryptionPathProofRound,
     proofs: BTreeMap<EncryptionPathEndpointRole, EncryptionEndpointPathProof>,
+}
+
+#[derive(Debug)]
+struct CoordinatedPathProof {
+    assignment: EncryptionPathProofAssignment,
+    ledger: EncryptionPathProofLedger,
+}
+
+/// Generation-fenced controller exchange. A plan cut publishes every challenge
+/// atomically; later endpoint evidence cannot leak into its successor.
+#[derive(Debug, Default)]
+pub struct EncryptionPathProofCoordinator {
+    generation: unf_common::Revision,
+    source_digest: [u8; 32],
+    paths: BTreeMap<EncryptionPathProofRoundDigest, CoordinatedPathProof>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -152,6 +178,8 @@ pub enum EncryptionPathProofError {
     IncompleteQuorum,
     #[error("canonical path-proof encoding failed: {0}")]
     CanonicalEncoding(String),
+    #[error("path-proof generation regressed or equivocated")]
+    GenerationConflict,
     #[error("invalid kernel snapshot: {0}")]
     InvalidKernelSnapshot(String),
     #[error("invalid contract: {0}")]
@@ -567,6 +595,188 @@ impl EncryptionPathProofLedger {
     }
 }
 
+impl EncryptionPathProofAssignment {
+    /// Replays the contract, selection, round, and generation binding.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, cross-contract, or digest-mutated assignments.
+    pub fn verify(&self) -> Result<(), EncryptionPathProofError> {
+        self.contract
+            .verify_integrity()
+            .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+        self.round.verify()?;
+        if self.schema_version != ENCRYPTION_PATH_PROOF_SCHEMA_VERSION
+            || self.generation == unf_common::Revision::INITIAL
+            || self.round.contract_digest != self.contract.contract_digest
+            || self.round.decision_witness
+                != self
+                    .contract
+                    .decision_witness(self.plan_index)
+                    .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?
+        {
+            return Err(EncryptionPathProofError::InvalidContractPlan);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn includes(&self, recipient: &EncryptionGenerationRecipient) -> bool {
+        &self.round.source == recipient || &self.round.destination == recipient
+    }
+}
+
+impl EncryptionPathProofCoordinator {
+    /// Atomically replaces the full challenge set for one fleet generation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects regression, same-generation equivocation, malformed contracts,
+    /// duplicate paths, invalid lifetime, or randomness failure. Existing
+    /// rounds remain unchanged on every error.
+    pub fn replace_contracts(
+        &mut self,
+        generation: unf_common::Revision,
+        mut contracts: Vec<(AttestedEncryptionPathContract, usize)>,
+        issued_at_unix_ms: u64,
+        lifetime_ms: u64,
+    ) -> Result<bool, EncryptionPathProofError> {
+        if generation == unf_common::Revision::INITIAL
+            || lifetime_ms == 0
+            || lifetime_ms > MAX_ENCRYPTION_PATH_PROOF_LIFETIME_MS
+        {
+            return Err(EncryptionPathProofError::InvalidRound);
+        }
+        contracts.sort_by_key(|(contract, plan_index)| (contract.contract_digest.0, *plan_index));
+        if contracts.windows(2).any(|pair| {
+            (pair[0].0.contract_digest, pair[0].1) == (pair[1].0.contract_digest, pair[1].1)
+        }) {
+            return Err(EncryptionPathProofError::InvalidContractPlan);
+        }
+        for (contract, plan_index) in &contracts {
+            contract
+                .verify_integrity()
+                .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+            contract
+                .plans
+                .get(*plan_index)
+                .ok_or(EncryptionPathProofError::InvalidContractPlan)?;
+        }
+        let source_digest = hash(
+            b"unf.encryption-path-proof-source.v1\0",
+            &(
+                generation,
+                contracts
+                    .iter()
+                    .map(|(contract, index)| (contract.contract_digest, *index))
+                    .collect::<Vec<_>>(),
+            ),
+        )?;
+        if generation < self.generation
+            || generation == self.generation
+                && self.source_digest != [0; 32]
+                && self.source_digest != source_digest
+        {
+            return Err(EncryptionPathProofError::GenerationConflict);
+        }
+        if generation == self.generation
+            && self.source_digest == source_digest
+            && (self.paths.is_empty()
+                || self
+                    .paths
+                    .values()
+                    .all(|path| path.assignment.round.expires_at_unix_ms > issued_at_unix_ms))
+        {
+            return Ok(false);
+        }
+        let expires_at_unix_ms = issued_at_unix_ms
+            .checked_add(lifetime_ms)
+            .ok_or(EncryptionPathProofError::InvalidRound)?;
+        let mut paths = BTreeMap::new();
+        for (contract, plan_index) in contracts {
+            let round = EncryptionPathProofRound::fresh(
+                &contract,
+                plan_index,
+                issued_at_unix_ms,
+                expires_at_unix_ms,
+            )?;
+            let assignment = EncryptionPathProofAssignment {
+                schema_version: ENCRYPTION_PATH_PROOF_SCHEMA_VERSION,
+                generation,
+                round: round.clone(),
+                contract,
+                plan_index,
+            };
+            assignment.verify()?;
+            let ledger = EncryptionPathProofLedger::new(round.clone())?;
+            if paths
+                .insert(
+                    round.round_digest,
+                    CoordinatedPathProof { assignment, ledger },
+                )
+                .is_some()
+            {
+                return Err(EncryptionPathProofError::ReplayOrEquivocation);
+            }
+        }
+        self.generation = generation;
+        self.source_digest = source_digest;
+        self.paths = paths;
+        Ok(true)
+    }
+
+    /// Returns only immutable work assigned to the authenticated endpoint.
+    #[must_use]
+    pub fn assignments_for(
+        &self,
+        recipient: &EncryptionGenerationRecipient,
+    ) -> Vec<EncryptionPathProofAssignment> {
+        self.paths
+            .values()
+            .filter(|path| path.assignment.includes(recipient))
+            .map(|path| path.assignment.clone())
+            .collect()
+    }
+
+    /// Admits one proof into its exact generation/round ledger.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown round, foreign Node, expired evidence, replay, or
+    /// equivocation.
+    pub fn observe(
+        &mut self,
+        authenticated: &AuthenticatedNodeIdentity,
+        proof: EncryptionEndpointPathProof,
+        now_unix_ms: u64,
+    ) -> Result<EncryptionPathProofAdmission, EncryptionPathProofError> {
+        self.paths
+            .get_mut(&proof.round_digest)
+            .ok_or(EncryptionPathProofError::ReplayOrEquivocation)?
+            .ledger
+            .observe(authenticated, proof, now_unix_ms)
+    }
+
+    /// Returns current completed receipts involving one endpoint.
+    #[must_use]
+    pub fn receipts_for(
+        &self,
+        recipient: &EncryptionGenerationRecipient,
+        now_unix_ms: u64,
+    ) -> Vec<EncryptionPathActivationReceipt> {
+        self.paths
+            .values()
+            .filter(|path| path.assignment.includes(recipient))
+            .filter_map(|path| path.ledger.activation_receipt(now_unix_ms).ok())
+            .collect()
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> unf_common::Revision {
+        self.generation
+    }
+}
+
 impl EncryptionPathActivationReceipt {
     /// Replays receipt integrity and current lifetime.
     ///
@@ -969,5 +1179,80 @@ mod tests {
             .unwrap()
             .insert("handshakeIsEnough".into(), serde_json::json!(true));
         assert!(serde_json::from_value::<EncryptionPathProofRound>(value).is_err());
+    }
+
+    #[test]
+    fn generation_fenced_coordinator_scopes_assignments_and_clears_old_evidence() {
+        let contract = fixture_contract();
+        let mut coordinator = EncryptionPathProofCoordinator::default();
+        assert_eq!(
+            coordinator.replace_contracts(
+                Revision::new(12),
+                vec![(contract.clone(), 0)],
+                1_500,
+                8_000,
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            coordinator.replace_contracts(
+                Revision::new(12),
+                vec![(contract.clone(), 0)],
+                1_500,
+                8_000,
+            ),
+            Ok(false)
+        );
+        let source_recipient = recipient("node-a", "uid-a");
+        let destination_recipient = recipient("node-b", "uid-b");
+        let foreign_recipient = recipient("node-c", "uid-c");
+        assert_eq!(coordinator.assignments_for(&source_recipient).len(), 1);
+        assert_eq!(coordinator.assignments_for(&destination_recipient).len(), 1);
+        assert!(coordinator.assignments_for(&foreign_recipient).is_empty());
+
+        let assignment = coordinator.assignments_for(&source_recipient).remove(0);
+        coordinator
+            .observe(
+                &auth(EncryptionPathEndpointRole::Source),
+                proof(
+                    &assignment.round,
+                    &assignment.contract,
+                    EncryptionPathEndpointRole::Source,
+                ),
+                2_100,
+            )
+            .unwrap();
+        assert!(
+            coordinator
+                .receipts_for(&source_recipient, 2_100)
+                .is_empty()
+        );
+        coordinator
+            .observe(
+                &auth(EncryptionPathEndpointRole::Destination),
+                proof(
+                    &assignment.round,
+                    &assignment.contract,
+                    EncryptionPathEndpointRole::Destination,
+                ),
+                2_100,
+            )
+            .unwrap();
+        assert_eq!(coordinator.receipts_for(&source_recipient, 2_100).len(), 1);
+
+        assert_eq!(
+            coordinator.replace_contracts(Revision::new(13), vec![], 3_000, 8_000),
+            Ok(true)
+        );
+        assert!(coordinator.assignments_for(&source_recipient).is_empty());
+        assert!(
+            coordinator
+                .receipts_for(&source_recipient, 3_100)
+                .is_empty()
+        );
+        assert!(matches!(
+            coordinator.replace_contracts(Revision::new(12), vec![(contract, 0)], 3_000, 8_000,),
+            Err(EncryptionPathProofError::GenerationConflict)
+        ));
     }
 }
