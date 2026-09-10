@@ -9075,6 +9075,11 @@ async fn preflight_controller_compatibility(
         egress_ha_promotion_schema_version = compatibility.egress_ha_promotion_schema_version,
         egress_map_schema_version = compatibility.egress_map_schema_version,
         egress_event_schema_version = compatibility.egress_event_schema_version,
+        encryption_model_schema_version = compatibility.encryption_model_schema_version,
+        encryption_plan_schema_version = compatibility.encryption_plan_schema_version,
+        encryption_path_proof_schema_version = compatibility.encryption_path_proof_schema_version,
+        encryption_operations_schema_version = compatibility.encryption_operations_schema_version,
+        encryption_map_abi_version = compatibility.encryption_map_abi_version,
         "controller compatibility preflight passed before persistent BPF state access"
     );
     Ok(())
@@ -9157,6 +9162,7 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
         ));
     }
     collect_egress_compatibility_mismatches(controller, &local, &mut mismatches);
+    collect_encryption_compatibility_mismatches(controller, &local, &mut mismatches);
     if controller.component != "unf-controller" {
         bail!(
             "incompatible controller compatibility response: component={}; expected unf-controller",
@@ -9170,6 +9176,61 @@ fn ensure_controller_compatibility(controller: &ComponentCompatibility) -> Resul
         );
     }
     Ok(())
+}
+
+fn collect_encryption_compatibility_mismatches(
+    controller: &ComponentCompatibility,
+    local: &ComponentCompatibility,
+    mismatches: &mut Vec<String>,
+) {
+    let remote = [
+        controller.encryption_model_schema_version,
+        controller.encryption_plan_schema_version,
+        controller.encryption_path_proof_schema_version,
+        controller.encryption_operations_schema_version,
+        controller.encryption_map_abi_version,
+    ];
+    if remote.iter().all(|version| *version == 0) {
+        // An adjacent pre-encryption controller cannot issue encryption
+        // authority. The agent may recover its last-known-good local state,
+        // but every encryption endpoint remains payload-fenced by absence.
+        return;
+    }
+    if remote.contains(&0) {
+        mismatches.push("encryption compatibility tuple is partial".to_owned());
+        return;
+    }
+    for (name, remote, expected) in [
+        (
+            "encryption model schema",
+            controller.encryption_model_schema_version,
+            local.encryption_model_schema_version,
+        ),
+        (
+            "encryption plan schema",
+            controller.encryption_plan_schema_version,
+            local.encryption_plan_schema_version,
+        ),
+        (
+            "encryption path-proof schema",
+            controller.encryption_path_proof_schema_version,
+            local.encryption_path_proof_schema_version,
+        ),
+        (
+            "encryption operations schema",
+            controller.encryption_operations_schema_version,
+            local.encryption_operations_schema_version,
+        ),
+        (
+            "encryption map ABI",
+            controller.encryption_map_abi_version,
+            local.encryption_map_abi_version,
+        ),
+    ] {
+        if remote != expected {
+            mismatches.push(format!("{name} controller={remote} agent={expected}"));
+        }
+    }
 }
 
 fn collect_egress_compatibility_mismatches(
@@ -17670,6 +17731,14 @@ fn component_compatibility() -> ComponentCompatibility {
     compatibility.egress_distribution_schema_version = EGRESS_DISTRIBUTION_SCHEMA_VERSION;
     compatibility.egress_host_state_schema_version = EGRESS_HOST_STATE_SCHEMA_VERSION;
     compatibility.egress_ha_promotion_schema_version = EGRESS_HA_PROMOTION_SCHEMA_VERSION;
+    compatibility.encryption_model_schema_version = unf_encryption::ENCRYPTION_MODEL_SCHEMA_VERSION;
+    compatibility.encryption_plan_schema_version =
+        unf_encryption::NODE_LOCAL_PLAN_SNAPSHOT_SCHEMA_VERSION;
+    compatibility.encryption_path_proof_schema_version =
+        unf_encryption::ENCRYPTION_PATH_PROOF_SCHEMA_VERSION;
+    compatibility.encryption_operations_schema_version =
+        unf_encryption::ENCRYPTION_OPERATIONS_SCHEMA_VERSION;
+    compatibility.encryption_map_abi_version = ENCRYPTION_MAP_ABI_VERSION;
     compatibility
 }
 
@@ -25545,6 +25614,26 @@ mod tests {
             version.egress_event_schema_version,
             EGRESS_EVENT_ABI_VERSION
         );
+        assert_eq!(
+            version.encryption_model_schema_version,
+            unf_encryption::ENCRYPTION_MODEL_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.encryption_plan_schema_version,
+            unf_encryption::NODE_LOCAL_PLAN_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.encryption_path_proof_schema_version,
+            unf_encryption::ENCRYPTION_PATH_PROOF_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.encryption_operations_schema_version,
+            unf_encryption::ENCRYPTION_OPERATIONS_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.encryption_map_abi_version,
+            ENCRYPTION_MAP_ABI_VERSION
+        );
     }
 
     #[test]
@@ -25656,6 +25745,42 @@ mod tests {
             error
                 .to_string()
                 .contains("LoadBalancer reachability schema controller=2 agent=1")
+        );
+    }
+
+    #[test]
+    fn encryption_compatibility_is_bidirectional_complete_and_pre_bpf() {
+        let mut current = component_compatibility();
+        current.component = "unf-controller".to_owned();
+        assert!(ensure_controller_compatibility(&current).is_ok());
+
+        let mut old_shape = serde_json::to_value(&current).unwrap();
+        let old_shape = old_shape.as_object_mut().unwrap();
+        for field in [
+            "encryption_model_schema_version",
+            "encryption_plan_schema_version",
+            "encryption_path_proof_schema_version",
+            "encryption_operations_schema_version",
+            "encryption_map_abi_version",
+        ] {
+            old_shape.remove(field);
+        }
+        let old_shape: ComponentCompatibility =
+            serde_json::from_value(serde_json::Value::Object(old_shape.clone())).unwrap();
+        assert!(ensure_controller_compatibility(&old_shape).is_ok());
+
+        current.encryption_path_proof_schema_version += 1;
+        let error = ensure_controller_compatibility(&current)
+            .expect_err("a foreign path-proof schema is rejected before BPF access");
+        assert!(error.to_string().contains("encryption path-proof schema"));
+        current.encryption_path_proof_schema_version -= 1;
+        current.encryption_operations_schema_version = 0;
+        let error = ensure_controller_compatibility(&current)
+            .expect_err("a partially advertised encryption tuple is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("encryption compatibility tuple is partial")
         );
     }
 

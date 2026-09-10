@@ -7690,6 +7690,14 @@ fn component_compatibility() -> ComponentCompatibility {
     compatibility.egress_host_state_schema_version = unf_egress::EGRESS_HOST_STATE_SCHEMA_VERSION;
     compatibility.egress_ha_promotion_schema_version =
         unf_egress::EGRESS_HA_PROMOTION_SCHEMA_VERSION;
+    compatibility.encryption_model_schema_version = unf_encryption::ENCRYPTION_MODEL_SCHEMA_VERSION;
+    compatibility.encryption_plan_schema_version =
+        unf_encryption::NODE_LOCAL_PLAN_SNAPSHOT_SCHEMA_VERSION;
+    compatibility.encryption_path_proof_schema_version =
+        unf_encryption::ENCRYPTION_PATH_PROOF_SCHEMA_VERSION;
+    compatibility.encryption_operations_schema_version =
+        unf_encryption::ENCRYPTION_OPERATIONS_SCHEMA_VERSION;
+    compatibility.encryption_map_abi_version = unf_encryption::ENCRYPTION_FAST_PATH_MAP_ABI_VERSION;
     compatibility
 }
 
@@ -17630,6 +17638,26 @@ mod tests {
         );
         assert_ne!(version.egress_map_schema_version, 0);
         assert_ne!(version.egress_event_schema_version, 0);
+        assert_eq!(
+            version.encryption_model_schema_version,
+            unf_encryption::ENCRYPTION_MODEL_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.encryption_plan_schema_version,
+            unf_encryption::NODE_LOCAL_PLAN_SNAPSHOT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.encryption_path_proof_schema_version,
+            unf_encryption::ENCRYPTION_PATH_PROOF_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.encryption_operations_schema_version,
+            unf_encryption::ENCRYPTION_OPERATIONS_SCHEMA_VERSION
+        );
+        assert_eq!(
+            version.encryption_map_abi_version,
+            unf_encryption::ENCRYPTION_FAST_PATH_MAP_ABI_VERSION
+        );
     }
 
     #[test]

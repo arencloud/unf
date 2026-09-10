@@ -57,6 +57,7 @@ use unf_common::{IdentityId, PolicyId, PolicyReason, Revision};
 
 pub const ENCRYPTION_MODEL_SCHEMA_VERSION: u16 = 1;
 pub const ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION: u16 = 1;
+pub const ENCRYPTION_FAST_PATH_MAP_ABI_VERSION: u16 = unf_ebpf_common::ENCRYPTION_MAP_ABI_VERSION;
 pub const MAX_ENCRYPTION_INTENTS: usize = 4_096;
 pub const MAX_ENCRYPTION_IDENTITIES_PER_SELECTOR: usize = 4_096;
 pub const MAX_ENCRYPTION_ENDPOINTS: usize = 4_096;

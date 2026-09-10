@@ -62,6 +62,18 @@ pub struct ComponentCompatibility {
     pub egress_map_schema_version: u16,
     #[serde(default)]
     pub egress_event_schema_version: u16,
+    /// All-zero is the adjacent pre-encryption tuple. A nonzero tuple must be
+    /// complete and exact before an agent accesses persistent encryption state.
+    #[serde(default)]
+    pub encryption_model_schema_version: u16,
+    #[serde(default)]
+    pub encryption_plan_schema_version: u16,
+    #[serde(default)]
+    pub encryption_path_proof_schema_version: u16,
+    #[serde(default)]
+    pub encryption_operations_schema_version: u16,
+    #[serde(default)]
+    pub encryption_map_abi_version: u16,
     pub agent_status_schema_version: u16,
     pub flow_export_schema_version: u16,
 }
@@ -85,6 +97,11 @@ impl ComponentCompatibility {
             egress_ha_promotion_schema_version: 0,
             egress_map_schema_version: EGRESS_MAP_ABI_VERSION,
             egress_event_schema_version: EGRESS_EVENT_ABI_VERSION,
+            encryption_model_schema_version: 0,
+            encryption_plan_schema_version: 0,
+            encryption_path_proof_schema_version: 0,
+            encryption_operations_schema_version: 0,
+            encryption_map_abi_version: 0,
             agent_status_schema_version: AGENT_STATUS_SCHEMA_VERSION,
             flow_export_schema_version: FLOW_EXPORT_SCHEMA_VERSION,
         }
@@ -1946,6 +1963,12 @@ mod tests {
 
     #[test]
     fn component_compatibility_fixes_the_upgrade_contract() {
+        #[derive(Deserialize)]
+        struct AdjacentReader {
+            schema_version: u16,
+            component: String,
+        }
+
         let compatibility = ComponentCompatibility::current("unf-agent", "0.1.0", "revision-a");
         assert_eq!(
             compatibility.schema_version,
@@ -1993,10 +2016,44 @@ mod tests {
             compatibility.egress_event_schema_version,
             EGRESS_EVENT_ABI_VERSION
         );
+        assert_eq!(compatibility.encryption_model_schema_version, 0);
+        assert_eq!(compatibility.encryption_plan_schema_version, 0);
+        assert_eq!(compatibility.encryption_path_proof_schema_version, 0);
+        assert_eq!(compatibility.encryption_operations_schema_version, 0);
+        assert_eq!(compatibility.encryption_map_abi_version, 0);
         assert_eq!(
             compatibility.flow_export_schema_version,
             FLOW_EXPORT_SCHEMA_VERSION
         );
+
+        let mut adjacent = serde_json::to_value(&compatibility).unwrap();
+        let object = adjacent.as_object_mut().unwrap();
+        for field in [
+            "encryption_model_schema_version",
+            "encryption_plan_schema_version",
+            "encryption_path_proof_schema_version",
+            "encryption_operations_schema_version",
+            "encryption_map_abi_version",
+        ] {
+            object.remove(field);
+        }
+        let adjacent: ComponentCompatibility = serde_json::from_value(adjacent).unwrap();
+        assert_eq!(adjacent.encryption_model_schema_version, 0);
+        assert_eq!(adjacent.encryption_map_abi_version, 0);
+
+        let mut current = compatibility;
+        current.encryption_model_schema_version = 1;
+        current.encryption_plan_schema_version = 2;
+        current.encryption_path_proof_schema_version = 2;
+        current.encryption_operations_schema_version = 1;
+        current.encryption_map_abi_version = 2;
+        let old_reader: AdjacentReader =
+            serde_json::from_value(serde_json::to_value(current).unwrap()).unwrap();
+        assert_eq!(
+            old_reader.schema_version,
+            COMPONENT_COMPATIBILITY_SCHEMA_VERSION
+        );
+        assert_eq!(old_reader.component, "unf-agent");
     }
 
     #[test]

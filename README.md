@@ -988,7 +988,13 @@ Counterfactual queries may withhold one stage or advance expiry time but are
 explicitly non-authoritative and side-effect free. Dedicated `unfctl`
 encryption status/history/explain/simulate commands pass
 `make encryption-operations-query-test`; ADR 0204. Adjacent compatibility,
-outage/replacement/cleanup, and performance evidence remain.
+outage/replacement/cleanup, and performance evidence remain. Phase 9.7f adds a
+Bidirectional Compatibility Sextant: five additive encryption coordinates let
+old/new readers interoperate in either rollout order, while partial or foreign
+tuples fail before persistent BPF access and strict endpoint schemas prevent
+the compatibility document from becoming authority. The exact N baseline and
+N+1 transition pass `make encryption-adjacent-compatibility-test`; ADR 0205.
+Outage/replacement/cleanup and performance evidence remain.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
