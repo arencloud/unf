@@ -9797,7 +9797,12 @@ fn reconcile_encryption_plan_catalog_at(
         egress_revision: initialized_revision(egress_revision),
         key_cut_digest: key_cut.cut_digest,
     };
-    if reconciler.source.as_ref() == Some(&source) && reconciler.generation >= minimum_generation {
+    // A current agent cursor is an acknowledgement of the published cut, not
+    // a request to manufacture a successor.  The minimum only fences a
+    // controller that must reconstruct a catalog after losing its in-memory
+    // source; once the causal source matches, every poll must converge on the
+    // same generation until an input actually changes.
+    if reconciler.source.as_ref() == Some(&source) {
         return Ok(true);
     }
     let _policy_cut = read_lock(&state.policy_state_guard);
@@ -15621,6 +15626,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn encryption_plan_poll_projects_one_causal_catalog_and_coalesces_retries() {
         let state = new_state(true);
         let now = unix_time_millis().max(1);
@@ -15714,6 +15720,25 @@ mod tests {
         assert_eq!(
             retry.snapshot.snapshot_digest,
             first.snapshot.snapshot_digest
+        );
+
+        let settled_request = NodeLocalPlanRequest {
+            schema_version: unf_encryption::NODE_LOCAL_PLAN_REQUEST_SCHEMA_VERSION,
+            node_name: "worker-a".to_owned(),
+            current: Some(unf_encryption::NodeLocalPlanCursor {
+                controller_epoch: first.controller_epoch,
+                recipient: first.snapshot.recipient.clone(),
+                membership_revision: first.snapshot.membership_revision,
+                generation: first.snapshot.generation,
+                snapshot_digest: first.snapshot.snapshot_digest,
+            }),
+            nonce: [24; 32],
+        };
+        assert!(
+            encryption_plan_for(&state, &agent, &settled_request)
+                .unwrap()
+                .is_none(),
+            "an exact durable cursor must settle instead of forcing plan churn"
         );
 
         mutex_lock(&state.revisions).service = Revision::new(6);
