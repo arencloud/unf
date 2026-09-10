@@ -18,6 +18,17 @@ use crate::{IpPrefix, UNF_WIREGUARD_ROUTE_PROTOCOL, WireGuardKernelPlan, WireGua
 
 const MAX_KERNEL_RULE_READBACK: usize = 262_144;
 const MAX_KERNEL_ROUTE_READBACK: usize = 262_144;
+// Linux's built-in `main` rule normally starts at 32_766. UNF's two
+// alternating table-lookup slots are 30_000 and 30_001, so this common tier
+// is evaluated after either successful lookup but before `main`. Rules at this
+// tier have disjoint masked marks; sharing a priority is therefore unambiguous.
+const UNF_ENCRYPTION_TERMINAL_RULE_PRIORITY: u32 = 30_002;
+
+#[derive(Debug, Clone, Copy)]
+enum CreatedRuleKind {
+    Lookup,
+    Terminal,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LinuxEncryptionRouteProvider;
@@ -43,13 +54,19 @@ impl LinuxEncryptionRouteProvider {
 
         let mut created = Vec::new();
         for rule in &authority.rules {
+            if find_exact_terminal_rule(&before, rule).is_none() {
+                if let Err(cause) = add_terminal_rule(&handle, rule).await {
+                    return rollback_or_error(&handle, &created, cause).await;
+                }
+                created.push((rule.clone(), CreatedRuleKind::Terminal));
+            }
             if find_exact_rule(&before, rule).is_some() {
                 continue;
             }
             if let Err(cause) = add_rule(&handle, rule).await {
                 return rollback_or_error(&handle, &created, cause).await;
             }
-            created.push(rule.clone());
+            created.push((rule.clone(), CreatedRuleKind::Lookup));
         }
         let observed = match exact_desired_rules(&handle, &authority.rules).await {
             Ok(observed) => observed,
@@ -81,13 +98,20 @@ impl LinuxEncryptionRouteProvider {
                     .await
                     .map_err(|error| kernel("delete encryption policy rule", &error))?;
             }
+            if let Some(message) = find_exact_terminal_rule(&observed, rule) {
+                handle
+                    .rule()
+                    .del(message.clone())
+                    .execute()
+                    .await
+                    .map_err(|error| kernel("delete encryption terminal rule", &error))?;
+            }
         }
         let remaining = list_rules(&handle).await?;
-        if authority
-            .rules
-            .iter()
-            .any(|rule| find_exact_rule(&remaining, rule).is_some())
-        {
+        if authority.rules.iter().any(|rule| {
+            find_exact_rule(&remaining, rule).is_some()
+                || find_exact_terminal_rule(&remaining, rule).is_some()
+        }) {
             return Err(EncryptionRouteAuthorityError::RuleReadbackMismatch);
         }
         Ok(())
@@ -135,12 +159,20 @@ impl LinuxEncryptionRouteProvider {
                     .await
                     .map_err(|error| kernel("delete retiring encryption policy rule", &error))?;
             }
+            if let Some(message) = find_exact_terminal_rule(&observed, rule) {
+                handle
+                    .rule()
+                    .del(message.clone())
+                    .execute()
+                    .await
+                    .map_err(|error| kernel("delete retiring encryption terminal rule", &error))?;
+            }
         }
         let remaining = list_rules(&handle).await?;
-        if rules
-            .iter()
-            .any(|rule| find_exact_rule(&remaining, rule).is_some())
-        {
+        if rules.iter().any(|rule| {
+            find_exact_rule(&remaining, rule).is_some()
+                || find_exact_terminal_rule(&remaining, rule).is_some()
+        }) {
             return Err(EncryptionRouteAuthorityError::RuleReadbackMismatch);
         }
         Ok(())
@@ -206,9 +238,58 @@ async fn add_rule(
     }
 }
 
+async fn add_terminal_rule(
+    handle: &Handle,
+    rule: &EncryptionPolicyRouteRule,
+) -> Result<(), EncryptionRouteAuthorityError> {
+    let request = handle
+        .rule()
+        .add()
+        .table_id(0)
+        .priority(UNF_ENCRYPTION_TERMINAL_RULE_PRIORITY)
+        .fw_mark(rule.route_mark)
+        .action(RuleAction::Unreachable);
+    match rule.family {
+        EncryptionRouteFamily::Ipv4 => {
+            let mut request = request.v4();
+            request
+                .message_mut()
+                .attributes
+                .push(RuleAttribute::FwMask(rule.route_mark_mask));
+            request
+                .message_mut()
+                .attributes
+                .push(RuleAttribute::Protocol(RouteProtocol::from(
+                    UNF_WIREGUARD_ROUTE_PROTOCOL,
+                )));
+            request
+                .execute()
+                .await
+                .map_err(|error| kernel("add IPv4 encryption terminal rule", &error))
+        }
+        EncryptionRouteFamily::Ipv6 => {
+            let mut request = request.v6();
+            request
+                .message_mut()
+                .attributes
+                .push(RuleAttribute::FwMask(rule.route_mark_mask));
+            request
+                .message_mut()
+                .attributes
+                .push(RuleAttribute::Protocol(RouteProtocol::from(
+                    UNF_WIREGUARD_ROUTE_PROTOCOL,
+                )));
+            request
+                .execute()
+                .await
+                .map_err(|error| kernel("add IPv6 encryption terminal rule", &error))
+        }
+    }
+}
+
 async fn rollback_or_error<T>(
     handle: &Handle,
-    created: &[EncryptionPolicyRouteRule],
+    created: &[(EncryptionPolicyRouteRule, CreatedRuleKind)],
     cause: EncryptionRouteAuthorityError,
 ) -> Result<T, EncryptionRouteAuthorityError> {
     match rollback_created(handle, created).await {
@@ -222,11 +303,15 @@ async fn rollback_or_error<T>(
 
 async fn rollback_created(
     handle: &Handle,
-    created: &[EncryptionPolicyRouteRule],
+    created: &[(EncryptionPolicyRouteRule, CreatedRuleKind)],
 ) -> Result<(), EncryptionRouteAuthorityError> {
     let observed = list_rules(handle).await?;
-    for rule in created.iter().rev() {
-        let message = find_exact_rule(&observed, rule).ok_or_else(|| {
+    for (rule, kind) in created.iter().rev() {
+        let message = match kind {
+            CreatedRuleKind::Lookup => find_exact_rule(&observed, rule),
+            CreatedRuleKind::Terminal => find_exact_terminal_rule(&observed, rule),
+        }
+        .ok_or_else(|| {
             EncryptionRouteAuthorityError::ForeignState(
                 "new policy rule changed before rollback".to_owned(),
             )
@@ -239,10 +324,10 @@ async fn rollback_created(
             .map_err(|error| kernel("rollback encryption policy rule", &error))?;
     }
     let remaining = list_rules(handle).await?;
-    if created
-        .iter()
-        .any(|rule| find_exact_rule(&remaining, rule).is_some())
-    {
+    if created.iter().any(|(rule, kind)| match kind {
+        CreatedRuleKind::Lookup => find_exact_rule(&remaining, rule).is_some(),
+        CreatedRuleKind::Terminal => find_exact_terminal_rule(&remaining, rule).is_some(),
+    }) {
         return Err(EncryptionRouteAuthorityError::RuleReadbackMismatch);
     }
     Ok(())
@@ -254,10 +339,10 @@ async fn exact_desired_rules(
 ) -> Result<Vec<EncryptionPolicyRouteRule>, EncryptionRouteAuthorityError> {
     let observed = list_rules(handle).await?;
     preflight_rules(&observed, desired)?;
-    if desired
-        .iter()
-        .any(|rule| find_exact_rule(&observed, rule).is_none())
-    {
+    if desired.iter().any(|rule| {
+        find_exact_rule(&observed, rule).is_none()
+            || find_exact_terminal_rule(&observed, rule).is_none()
+    }) {
         return Err(EncryptionRouteAuthorityError::RuleReadbackMismatch);
     }
     Ok(desired.to_vec())
@@ -272,17 +357,34 @@ fn preflight_rules(
             .get(&rule.family)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let collisions = family
+        let lookup_collisions = family
             .iter()
-            .filter(|message| rule_key_collides(message, rule))
+            .filter(|message| lookup_rule_key_collides(message, rule))
             .collect::<Vec<_>>();
-        match collisions.as_slice() {
+        match lookup_collisions.as_slice() {
             [] => {}
             [message] if rule_is_exact(message, rule) => {}
             _ => {
                 return Err(EncryptionRouteAuthorityError::ForeignState(format!(
-                    "{:?} rule priority {} or selector {:#010x}/{:#010x} is not exactly UNF-owned: {collisions:?}",
+                    "{:?} lookup rule priority {} or selector {:#010x}/{:#010x} is not exactly UNF-owned: {lookup_collisions:?}",
                     rule.family, rule.priority, rule.route_mark, rule.route_mark_mask,
+                )));
+            }
+        }
+        let terminal_collisions = family
+            .iter()
+            .filter(|message| terminal_rule_key_collides(message, rule))
+            .collect::<Vec<_>>();
+        match terminal_collisions.as_slice() {
+            [] => {}
+            [message] if terminal_rule_is_exact(message, rule) => {}
+            _ => {
+                return Err(EncryptionRouteAuthorityError::ForeignState(format!(
+                    "{:?} terminal rule priority {} or selector {:#010x}/{:#010x} is not exactly UNF-owned: {terminal_collisions:?}",
+                    rule.family,
+                    UNF_ENCRYPTION_TERMINAL_RULE_PRIORITY,
+                    rule.route_mark,
+                    rule.route_mark_mask,
                 )));
             }
         }
@@ -300,10 +402,29 @@ fn find_exact_rule<'a>(
         .find(|message| rule_is_exact(message, desired))
 }
 
-fn rule_key_collides(message: &RuleMessage, desired: &EncryptionPolicyRouteRule) -> bool {
+fn find_exact_terminal_rule<'a>(
+    observed: &'a BTreeMap<EncryptionRouteFamily, Vec<RuleMessage>>,
+    desired: &EncryptionPolicyRouteRule,
+) -> Option<&'a RuleMessage> {
+    observed
+        .get(&desired.family)?
+        .iter()
+        .find(|message| terminal_rule_is_exact(message, desired))
+}
+
+fn lookup_rule_key_collides(message: &RuleMessage, desired: &EncryptionPolicyRouteRule) -> bool {
     rule_priority_value(message) == Some(desired.priority)
         || (rule_fwmark(message) == Some(desired.route_mark)
-            && rule_fwmask(message).unwrap_or(u32::MAX) == desired.route_mark_mask)
+            && rule_fwmask(message).unwrap_or(u32::MAX) == desired.route_mark_mask
+            && !terminal_rule_is_exact(message, desired))
+}
+
+fn terminal_rule_key_collides(message: &RuleMessage, desired: &EncryptionPolicyRouteRule) -> bool {
+    let same_selector = rule_fwmark(message) == Some(desired.route_mark)
+        && rule_fwmask(message).unwrap_or(u32::MAX) == desired.route_mark_mask;
+    same_selector
+        && (rule_priority_value(message) == Some(UNF_ENCRYPTION_TERMINAL_RULE_PRIORITY)
+            || !rule_is_exact(message, desired))
 }
 
 fn rule_is_exact(message: &RuleMessage, desired: &EncryptionPolicyRouteRule) -> bool {
@@ -319,6 +440,36 @@ fn rule_is_exact(message: &RuleMessage, desired: &EncryptionPolicyRouteRule) -> 
         && message.header.flags.is_empty()
         && rule_table(message) == desired.route_table
         && rule_priority_value(message) == Some(desired.priority)
+        && rule_fwmark(message) == Some(desired.route_mark)
+        && rule_fwmask(message) == Some(desired.route_mark_mask)
+        && rule_protocol(message) == Some(UNF_WIREGUARD_ROUTE_PROTOCOL)
+        && rule_suppress_prefix_len(message).is_none_or(|value| value == u32::MAX)
+        && message.attributes.iter().all(|attribute| {
+            matches!(
+                attribute,
+                RuleAttribute::Table(_)
+                    | RuleAttribute::Priority(_)
+                    | RuleAttribute::FwMark(_)
+                    | RuleAttribute::FwMask(_)
+                    | RuleAttribute::Protocol(_)
+                    | RuleAttribute::SuppressPrefixLen(_)
+            )
+        })
+}
+
+fn terminal_rule_is_exact(message: &RuleMessage, desired: &EncryptionPolicyRouteRule) -> bool {
+    message.header.family
+        == match desired.family {
+            EncryptionRouteFamily::Ipv4 => AddressFamily::Inet,
+            EncryptionRouteFamily::Ipv6 => AddressFamily::Inet6,
+        }
+        && message.header.dst_len == 0
+        && message.header.src_len == 0
+        && message.header.tos == 0
+        && message.header.action == RuleAction::Unreachable
+        && message.header.flags.is_empty()
+        && rule_table(message) == 0
+        && rule_priority_value(message) == Some(UNF_ENCRYPTION_TERMINAL_RULE_PRIORITY)
         && rule_fwmark(message) == Some(desired.route_mark)
         && rule_fwmask(message) == Some(desired.route_mark_mask)
         && rule_protocol(message) == Some(UNF_WIREGUARD_ROUTE_PROTOCOL)
@@ -637,6 +788,62 @@ mod tests {
         }
     }
 
+    fn build_rule_message(
+        rule: &EncryptionPolicyRouteRule,
+        action: RuleAction,
+        priority: u32,
+    ) -> RuleMessage {
+        let mut message = RuleMessage::default();
+        message.header.family = match rule.family {
+            EncryptionRouteFamily::Ipv4 => AddressFamily::Inet,
+            EncryptionRouteFamily::Ipv6 => AddressFamily::Inet6,
+        };
+        message.header.action = action;
+        if action == RuleAction::ToTable {
+            message
+                .attributes
+                .push(RuleAttribute::Table(rule.route_table));
+        }
+        message.attributes.push(RuleAttribute::Priority(priority));
+        message
+            .attributes
+            .push(RuleAttribute::FwMark(rule.route_mark));
+        message
+            .attributes
+            .push(RuleAttribute::FwMask(rule.route_mark_mask));
+        message
+            .attributes
+            .push(RuleAttribute::Protocol(RouteProtocol::from(
+                UNF_WIREGUARD_ROUTE_PROTOCOL,
+            )));
+        message
+    }
+
+    #[test]
+    fn lookup_and_terminal_rules_are_exact_and_foreign_safe() {
+        let authority = live_authority(51);
+        let rule = &authority.rules[0];
+        let lookup = build_rule_message(rule, RuleAction::ToTable, rule.priority);
+        let terminal = build_rule_message(
+            rule,
+            RuleAction::Unreachable,
+            UNF_ENCRYPTION_TERMINAL_RULE_PRIORITY,
+        );
+        let observed = BTreeMap::from([(rule.family, vec![lookup, terminal.clone()])]);
+
+        preflight_rules(&observed, std::slice::from_ref(rule)).unwrap();
+        assert!(find_exact_rule(&observed, rule).is_some());
+        assert!(find_exact_terminal_rule(&observed, rule).is_some());
+
+        let mut unsafe_fallback = terminal;
+        unsafe_fallback.header.action = RuleAction::ToTable;
+        let observed = BTreeMap::from([(rule.family, vec![unsafe_fallback])]);
+        assert!(matches!(
+            preflight_rules(&observed, std::slice::from_ref(rule)),
+            Err(EncryptionRouteAuthorityError::ForeignState(_))
+        ));
+    }
+
     #[tokio::test]
     #[ignore = "requires an isolated network namespace with CAP_NET_ADMIN"]
     async fn privileged_route_before_authority_is_exact_replayable_and_foreign_safe() {
@@ -682,12 +889,22 @@ mod tests {
             .unwrap();
         let permit = provider.activate(&authority).await.unwrap();
         assert_eq!(permit.authority_digest(), authority.authority_digest);
+        let active_rules = list_rules(&handle).await.unwrap();
+        assert!(authority.rules.iter().all(|rule| {
+            find_exact_rule(&active_rules, rule).is_some()
+                && find_exact_terminal_rule(&active_rules, rule).is_some()
+        }));
         assert_eq!(
             provider.activate(&authority).await.unwrap(),
             permit,
             "exact activation must be replayable"
         );
         provider.deactivate(&authority).await.unwrap();
+        let deactivated_rules = list_rules(&handle).await.unwrap();
+        assert!(authority.rules.iter().all(|rule| {
+            find_exact_rule(&deactivated_rules, rule).is_none()
+                && find_exact_terminal_rule(&deactivated_rules, rule).is_none()
+        }));
 
         let mut foreign = authority.rules[0].clone();
         foreign.route_table += 1;
