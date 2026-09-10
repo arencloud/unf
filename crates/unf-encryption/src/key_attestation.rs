@@ -360,8 +360,9 @@ impl NodeKeyAttestationCut {
 }
 
 impl NodeKeyAttestationLedger {
-    /// Starts a round once per exact topology membership. Later public phase
-    /// updates cannot rewrite the frozen proposal round.
+    /// Starts a round once per exact public proposal cut. Later phase updates
+    /// cannot rewrite a frozen round, while a complete fleet-wide successor
+    /// epoch may open a new round without manufacturing topology churn.
     ///
     /// # Errors
     ///
@@ -380,12 +381,31 @@ impl NodeKeyAttestationLedger {
                 return Err(NodeKeyAttestationError::MembershipRegression);
             }
             if transparency.membership_revision == current.membership_revision {
-                if transparency.cluster_id == current.cluster_id
-                    && transparency.members == current.members
+                if transparency.cluster_id != current.cluster_id
+                    || transparency.members != current.members
                 {
+                    return Err(NodeKeyAttestationError::MembershipEquivocation);
+                }
+                let successor =
+                    match NodeKeyAttestationRound::issue(transparency, issued_at_unix_ms) {
+                        Ok(successor) => successor,
+                        Err(NodeKeyAttestationError::AmbiguousProposal) => return Ok(false),
+                        Err(error) => return Err(error),
+                    };
+                if successor.proposals == current.proposals {
                     return Ok(false);
                 }
-                return Err(NodeKeyAttestationError::MembershipEquivocation);
+                if successor
+                    .proposals
+                    .iter()
+                    .zip(&current.proposals)
+                    .any(|(next, previous)| next.epoch <= previous.epoch)
+                {
+                    return Err(NodeKeyAttestationError::ProposalRegression);
+                }
+                self.round = Some(successor);
+                self.rows.clear();
+                return Ok(true);
             }
         }
         self.round = Some(NodeKeyAttestationRound::issue(
@@ -499,6 +519,8 @@ pub enum NodeKeyAttestationError {
     MembershipRegression,
     #[error("key attestation membership equivocated")]
     MembershipEquivocation,
+    #[error("key attestation proposal epoch regressed")]
+    ProposalRegression,
     #[error("key attestation round is uninitialized")]
     Uninitialized,
     #[error("key attestation peer is outside the exact membership")]
@@ -645,5 +667,74 @@ mod tests {
             NodeKeyAttestationOutcome::Idempotent
         );
         assert!(!ledger.begin_if_needed(&transparency, NOW + 3).unwrap());
+    }
+
+    #[test]
+    fn complete_successor_epoch_opens_a_new_round_without_membership_churn() {
+        let (members, mut authorities, first_transparency) = prepared_fleet();
+        let mut attestations = NodeKeyAttestationLedger::default();
+        attestations
+            .begin_if_needed(&first_transparency, NOW + 1)
+            .unwrap();
+        let first_round = attestations.round().unwrap().clone();
+        for member in &members {
+            attestations
+                .observe_row(
+                    &identity(member),
+                    first_round.row_for(member).unwrap(),
+                    NOW + 2,
+                )
+                .unwrap();
+        }
+        let peer_uids = members
+            .iter()
+            .map(|member| member.node_uid.clone())
+            .collect::<BTreeSet<_>>();
+        for (member, authority) in members.iter().zip(&mut authorities) {
+            let cut = attestations.complete_cut_for(member).unwrap().unwrap();
+            for acknowledgement in cut.acknowledgements {
+                authority
+                    .acknowledge_epoch(
+                        &acknowledgement.peer_node_uid.clone(),
+                        acknowledgement,
+                        NOW + 2,
+                    )
+                    .unwrap();
+            }
+            authority
+                .activate_epoch(1, Revision::new(7), NOW + 3, 1_000)
+                .unwrap();
+            let mut required = peer_uids.clone();
+            required.remove(&member.node_uid);
+            authority
+                .prepare_epoch(
+                    Revision::new(7),
+                    required,
+                    NOW + 4,
+                    NOW + 200_000,
+                    &mut OsWireGuardKeyGenerator,
+                )
+                .unwrap();
+        }
+
+        let mut transparency = NodeKeyTransparencyLedger::default();
+        transparency
+            .replace_membership("cluster-a".to_owned(), Revision::new(7), members.clone())
+            .unwrap();
+        for (member, authority) in members.iter().zip(&authorities) {
+            transparency
+                .observe(&identity(member), authority.publication().unwrap())
+                .unwrap();
+        }
+        let successor = transparency.complete_cut().unwrap().unwrap();
+        assert!(attestations.begin_if_needed(&successor, NOW + 5).unwrap());
+        assert!(
+            attestations
+                .round()
+                .unwrap()
+                .proposals
+                .iter()
+                .all(|proposal| proposal.epoch == 2)
+        );
     }
 }

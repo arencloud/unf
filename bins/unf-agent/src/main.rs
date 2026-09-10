@@ -169,6 +169,9 @@ const DEFAULT_ENCRYPTION_PLAN_STATE_PATH: &str = "/var/lib/unf/cni/v1/encryption
 const DEFAULT_ENCRYPTION_KEY_STATE_PATH: &str =
     "/var/lib/unf/cni/v1/encryption-keys/authority.json";
 const INITIAL_ENCRYPTION_KEY_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const DEFAULT_ENCRYPTION_ROTATE_BEFORE: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_ENCRYPTION_ROTATION_JITTER: Duration = Duration::from_secs(60 * 60);
+const DEFAULT_ENCRYPTION_DRAIN_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -532,6 +535,34 @@ struct Args {
     /// Poll interval for authenticated prepared encryption generations.
     #[arg(long, env = "UNF_ENCRYPTION_SYNC_SECONDS", default_value_t = 2)]
     encryption_sync_seconds: u64,
+    /// Lifetime of each Node-local encryption key epoch.
+    #[arg(
+        long,
+        env = "UNF_ENCRYPTION_KEY_LIFETIME_SECONDS",
+        default_value_t = 7 * 24 * 60 * 60
+    )]
+    encryption_key_lifetime_seconds: u64,
+    /// Begin preparing a successor this far before the active epoch expires.
+    #[arg(
+        long,
+        env = "UNF_ENCRYPTION_ROTATE_BEFORE_SECONDS",
+        default_value_t = 24 * 60 * 60
+    )]
+    encryption_rotate_before_seconds: u64,
+    /// Deterministic per-Node staggering window for rotation preparation.
+    #[arg(
+        long,
+        env = "UNF_ENCRYPTION_ROTATION_JITTER_SECONDS",
+        default_value_t = 60 * 60
+    )]
+    encryption_rotation_jitter_seconds: u64,
+    /// Bounded overlap window retained for an established-flow predecessor.
+    #[arg(
+        long,
+        env = "UNF_ENCRYPTION_DRAIN_SECONDS",
+        default_value_t = 5 * 60
+    )]
+    encryption_drain_seconds: u64,
     /// Durable desired generation accepted from the controller. This is not
     /// evidence that routes or eBPF maps are active.
     #[arg(
@@ -1084,6 +1115,10 @@ struct EncryptionKeySynchronizer {
     node_name: String,
     state_path: PathBuf,
     authority: Option<RuntimeNodeKeyAuthority>,
+    key_lifetime: Duration,
+    rotate_before: Duration,
+    rotation_jitter: Duration,
+    drain_window: Duration,
 }
 
 const ENCRYPTION_RECOVERY_JOURNAL_SCHEMA_VERSION: u16 = 1;
@@ -1641,6 +1676,10 @@ struct DataplaneConfig {
     egress_bgp_state_path: PathBuf,
     encryption_fast_path_state_path: PathBuf,
     encryption_sync_interval: Duration,
+    encryption_key_lifetime: Duration,
+    encryption_rotate_before: Duration,
+    encryption_rotation_jitter: Duration,
+    encryption_drain_window: Duration,
     encryption_generation_state_path: PathBuf,
     encryption_plan_state_path: PathBuf,
     encryption_key_state_path: PathBuf,
@@ -1909,6 +1948,13 @@ async fn main() -> Result<()> {
             let egress_bgp_state_path = args.egress_bgp_state_path.clone();
             let encryption_fast_path_state_path = args.encryption_fast_path_state_path.clone();
             let encryption_sync_interval = Duration::from_secs(args.encryption_sync_seconds.max(1));
+            let encryption_key_lifetime =
+                Duration::from_secs(args.encryption_key_lifetime_seconds.max(1));
+            let encryption_rotate_before =
+                Duration::from_secs(args.encryption_rotate_before_seconds.max(1));
+            let encryption_rotation_jitter =
+                Duration::from_secs(args.encryption_rotation_jitter_seconds);
+            let encryption_drain_window = Duration::from_secs(args.encryption_drain_seconds.max(1));
             let encryption_generation_state_path = args.encryption_generation_state_path.clone();
             let encryption_plan_state_path = args.encryption_plan_state_path.clone();
             let encryption_key_state_path = args.encryption_key_state_path.clone();
@@ -1936,6 +1982,10 @@ async fn main() -> Result<()> {
                     egress_bgp_state_path,
                     encryption_fast_path_state_path,
                     encryption_sync_interval,
+                    encryption_key_lifetime,
+                    encryption_rotate_before,
+                    encryption_rotation_jitter,
+                    encryption_drain_window,
                     encryption_generation_state_path,
                     encryption_plan_state_path,
                     encryption_key_state_path,
@@ -7055,6 +7105,12 @@ async fn run_dataplane(
         config.encryption_sync_interval,
         config.node_name.clone(),
         config.encryption_key_state_path.clone(),
+    )?
+    .with_rotation_timing(
+        config.encryption_key_lifetime,
+        config.encryption_rotate_before,
+        config.encryption_rotation_jitter,
+        config.encryption_drain_window,
     )?;
     // Validate the durable controller-delivery cursor before persistent BPF
     // access. A corrupt, cross-Node, or replayed cursor must not coexist with
@@ -7791,7 +7847,35 @@ impl EncryptionKeySynchronizer {
             node_name,
             state_path,
             authority: None,
+            key_lifetime: INITIAL_ENCRYPTION_KEY_LIFETIME,
+            rotate_before: DEFAULT_ENCRYPTION_ROTATE_BEFORE,
+            rotation_jitter: DEFAULT_ENCRYPTION_ROTATION_JITTER,
+            drain_window: DEFAULT_ENCRYPTION_DRAIN_WINDOW,
         })
+    }
+
+    fn with_rotation_timing(
+        mut self,
+        key_lifetime: Duration,
+        rotate_before: Duration,
+        rotation_jitter: Duration,
+        drain_window: Duration,
+    ) -> Result<Self> {
+        if key_lifetime.is_zero()
+            || rotate_before.is_zero()
+            || drain_window.is_zero()
+            || rotate_before
+                .checked_add(rotation_jitter)
+                .is_none_or(|window| window >= key_lifetime)
+            || drain_window >= key_lifetime
+        {
+            bail!("encryption rotation timing must fit strictly inside the key lifetime");
+        }
+        self.key_lifetime = key_lifetime;
+        self.rotate_before = rotate_before;
+        self.rotation_jitter = rotation_jitter;
+        self.drain_window = drain_window;
+        Ok(self)
     }
 
     fn bind_bootstrap(&mut self, bootstrap: &EncryptionKeyBootstrap) -> Result<()> {
@@ -7839,9 +7923,7 @@ impl EncryptionKeySynchronizer {
         if durable.authority().epochs().is_empty() {
             let now = current_unix_time_milliseconds();
             let valid_until = now
-                .checked_add(
-                    u64::try_from(INITIAL_ENCRYPTION_KEY_LIFETIME.as_millis()).unwrap_or(u64::MAX),
-                )
+                .checked_add(u64::try_from(self.key_lifetime.as_millis()).unwrap_or(u64::MAX))
                 .context("initial encryption key lifetime overflowed")?;
             durable
                 .prepare_epoch(
@@ -7890,21 +7972,114 @@ impl EncryptionKeySynchronizer {
             .find(|epoch| epoch.epoch() == target.epoch)
             .map(unf_encryption::LocalKeyEpoch::phase)
             .context("key attestation cut targets an unknown local epoch")?;
-        if phase != unf_encryption::KeyEpochPhase::Prepared {
-            return Ok(false);
-        }
         let mut changed = false;
-        for acknowledgement in &cut.acknowledgements {
-            changed |= authority
-                .acknowledge_epoch(
-                    &acknowledgement.peer_node_uid,
-                    acknowledgement.clone(),
+        if phase == unf_encryption::KeyEpochPhase::Prepared {
+            for acknowledgement in &cut.acknowledgements {
+                changed |= authority
+                    .acknowledge_epoch(
+                        &acknowledgement.peer_node_uid,
+                        acknowledgement.clone(),
+                        now_unix_ms,
+                    )
+                    .context("durably record reciprocal peer key acknowledgement")?;
+            }
+        }
+        let phase = authority
+            .authority()
+            .epochs()
+            .iter()
+            .find(|epoch| epoch.epoch() == target.epoch)
+            .map(unf_encryption::LocalKeyEpoch::phase)
+            .context("attested local key epoch disappeared")?;
+        if phase == unf_encryption::KeyEpochPhase::MutuallyAttested {
+            authority
+                .activate_epoch(
+                    target.epoch,
+                    cut.round.membership_revision,
                     now_unix_ms,
+                    u64::try_from(self.drain_window.as_millis()).unwrap_or(u64::MAX),
                 )
-                .context("durably record reciprocal peer key acknowledgement")?;
+                .context("durably activate mutually attested key epoch")?;
+            info!(
+                epoch = target.epoch,
+                drain_seconds = self.drain_window.as_secs(),
+                "activated fleet-attested Node-local encryption key epoch"
+            );
+            changed = true;
         }
         Ok(changed)
     }
+}
+
+fn deterministic_rotation_jitter_ms(node_uid: &str, ceiling: Duration) -> u64 {
+    let ceiling_ms = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
+    if ceiling_ms == 0 {
+        return 0;
+    }
+    let hash = node_uid
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    hash % ceiling_ms
+}
+
+fn prepare_due_encryption_rotation(
+    synchronizer: &mut EncryptionKeySynchronizer,
+    bootstrap: &EncryptionKeyBootstrap,
+    now_unix_ms: u64,
+) -> Result<bool> {
+    let authority = synchronizer
+        .authority
+        .as_mut()
+        .context("Node-local key authority is unavailable for rotation")?;
+    let epochs = authority.authority().epochs();
+    if epochs.iter().any(|epoch| {
+        matches!(
+            epoch.phase(),
+            unf_encryption::KeyEpochPhase::Prepared
+                | unf_encryption::KeyEpochPhase::MutuallyAttested
+                | unf_encryption::KeyEpochPhase::Draining
+        )
+    }) {
+        return Ok(false);
+    }
+    let Some(active) = epochs
+        .iter()
+        .find(|epoch| epoch.phase() == unf_encryption::KeyEpochPhase::Active)
+    else {
+        return Ok(false);
+    };
+    let threshold = u64::try_from(synchronizer.rotate_before.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(deterministic_rotation_jitter_ms(
+            &bootstrap.recipient.node_uid,
+            synchronizer.rotation_jitter,
+        ));
+    if active.valid_until_unix_ms().saturating_sub(now_unix_ms) > threshold {
+        return Ok(false);
+    }
+    let valid_until = now_unix_ms
+        .checked_add(u64::try_from(synchronizer.key_lifetime.as_millis()).unwrap_or(u64::MAX))
+        .context("rotated encryption key lifetime overflowed")?;
+    let epoch = authority
+        .prepare_epoch(
+            bootstrap.membership_revision,
+            bootstrap.required_peer_uids(),
+            now_unix_ms,
+            valid_until,
+        )
+        .context("durably prepare staggered Node-local key rotation")?;
+    info!(
+        epoch,
+        jitter_ms = deterministic_rotation_jitter_ms(
+            &bootstrap.recipient.node_uid,
+            synchronizer.rotation_jitter,
+        ),
+        "prepared proactive fleet-attested encryption key rotation"
+    );
+    Ok(true)
 }
 
 fn ensure_encryption_key_directory(state_path: &Path) -> Result<()> {
@@ -7993,6 +8168,7 @@ async fn synchronize_encryption_keys(synchronizer: &mut EncryptionKeySynchronize
     )
     .await?;
     synchronizer.bind_bootstrap(&bootstrap)?;
+    prepare_due_encryption_rotation(synchronizer, &bootstrap, current_unix_time_milliseconds())?;
     publish_node_key_state(synchronizer, &controller_url).await?;
 
     let response = authenticated_get(
@@ -18397,6 +18573,13 @@ mod tests {
             "worker-a".to_owned(),
             state_path.clone(),
         )
+        .unwrap()
+        .with_rotation_timing(
+            Duration::from_secs(10),
+            Duration::from_secs(8),
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
         .unwrap();
         synchronizer.bind_bootstrap(&bootstrap).unwrap();
 
@@ -18439,16 +18622,30 @@ mod tests {
                 .authority()
                 .epochs()[0]
                 .phase(),
-            unf_encryption::KeyEpochPhase::MutuallyAttested
+            unf_encryption::KeyEpochPhase::Active
         );
         assert!(!synchronizer.bind_attestation_cut(&cut, issued_at).unwrap());
+        assert!(
+            prepare_due_encryption_rotation(&mut synchronizer, &bootstrap, issued_at + 3_000)
+                .unwrap()
+        );
+        assert_eq!(
+            synchronizer
+                .authority
+                .as_ref()
+                .unwrap()
+                .authority()
+                .epochs()[1]
+                .phase(),
+            unf_encryption::KeyEpochPhase::Prepared
+        );
 
         let recovered = FileNodeKeyStateStore::new(state_path)
             .restore("cluster-a", "worker-a", "uid-a")
             .unwrap();
         assert_eq!(
             recovered.epochs()[0].phase(),
-            unf_encryption::KeyEpochPhase::MutuallyAttested
+            unf_encryption::KeyEpochPhase::Active
         );
     }
 
