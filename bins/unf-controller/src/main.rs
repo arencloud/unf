@@ -927,7 +927,7 @@ struct EgressOperationsResponse {
 const ENCRYPTION_EXPLANATION_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EncryptionExplanationRequest {
     from: String,
     to: String,
@@ -16504,6 +16504,30 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn encryption_explanation_accepts_the_public_camel_case_contract() {
+        let public_request =
+            serde_json::from_value::<EncryptionExplanationRequest>(serde_json::json!({
+                "from": "frontend/client",
+                "to": "backend/server",
+                "protocol": "tcp",
+                "port": 443,
+                "ipFamily": "ipv4",
+                "withhold": "activation",
+                "atUnixMs": 2_000_000
+            }))
+            .expect("public camelCase encryption request decodes");
+        assert!(matches!(
+            public_request.ip_family,
+            Some(RequestIpFamily::Ipv4)
+        ));
+        assert_eq!(
+            public_request.withhold,
+            Some(EncryptionOperationalStage::Activation)
+        );
+        assert_eq!(public_request.at_unix_ms, Some(2_000_000));
     }
 
     #[test]
