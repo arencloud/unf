@@ -79,6 +79,7 @@ use unf_ebpf_common::{
     ServiceEvent, ServiceFrontendValue, ServiceMapConfig, connection_is_active,
     connection_timeout_ns, egress_connection_is_active, egress_flow_hash, egress_selection_bucket,
     egress_snat_candidate, ipv6_extension_step, node_port_snat_candidate, packet_starts_connection,
+    packet_starts_encryption_lease,
     service_backend_is_eligible, service_connection_is_active, service_flow_hash,
     service_selection_tier_is_valid,
 };
@@ -947,7 +948,7 @@ fn apply_encryption_selection<const IPV6: bool>(
         return TC_ACT_PIPE;
     }
 
-    if !packet_starts_connection(observation.protocol, observation.tcp_flags) {
+    if !packet_starts_encryption_lease(observation.protocol, observation.tcp_flags) {
         return TC_ACT_SHOT;
     }
     let decision_key = EncryptionDecisionKey {

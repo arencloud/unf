@@ -167,6 +167,7 @@ pub const CONNECTION_TCP_TIMEOUT_NS: u64 = 300_000_000_000;
 pub const CONNECTION_UDP_TIMEOUT_NS: u64 = 30_000_000_000;
 pub const CONNECTION_SCTP_TIMEOUT_NS: u64 = 60_000_000_000;
 pub const TCP_FLAG_SYN: u8 = 0x02;
+pub const TCP_FLAG_RST: u8 = 0x04;
 pub const TCP_FLAG_ACK: u8 = 0x10;
 
 /// Returns whether a fixed-width frontend carries a known locality tier.
@@ -580,6 +581,22 @@ pub const fn packet_starts_connection(protocol: u8, tcp_flags: u8) -> bool {
         17 | 132 => true,
         _ => false,
     }
+}
+
+/// Returns whether an already policy-authorized packet may establish one
+/// direction of an encryption route lease.
+///
+/// Encryption leases are Node-local. The destination Node cannot observe the
+/// source Node's forward lease, so the first TCP reply must be able to select
+/// its own exact reverse transport. Restricting that bootstrap to SYN-ACK or
+/// RST-ACK retains fail-closed behavior for arbitrary midstream TCP packets;
+/// UDP and SCTP retain their connectionless first-packet semantics.
+#[must_use]
+pub const fn packet_starts_encryption_lease(protocol: u8, tcp_flags: u8) -> bool {
+    if packet_starts_connection(protocol, tcp_flags) {
+        return true;
+    }
+    protocol == 6 && tcp_flags & TCP_FLAG_ACK != 0 && tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_RST) != 0
 }
 
 #[must_use]
@@ -2142,6 +2159,24 @@ mod tests {
         assert!(packet_starts_connection(17, 0));
         assert!(packet_starts_connection(132, 0));
         assert!(!packet_starts_connection(1, 0));
+    }
+
+    #[test]
+    fn encryption_lease_bootstrap_admits_only_handshake_or_rejection_boundaries() {
+        assert!(packet_starts_encryption_lease(6, TCP_FLAG_SYN));
+        assert!(packet_starts_encryption_lease(
+            6,
+            TCP_FLAG_SYN | TCP_FLAG_ACK
+        ));
+        assert!(packet_starts_encryption_lease(
+            6,
+            TCP_FLAG_RST | TCP_FLAG_ACK
+        ));
+        assert!(!packet_starts_encryption_lease(6, TCP_FLAG_ACK));
+        assert!(!packet_starts_encryption_lease(6, TCP_FLAG_RST));
+        assert!(packet_starts_encryption_lease(17, 0));
+        assert!(packet_starts_encryption_lease(132, 0));
+        assert!(!packet_starts_encryption_lease(1, 0));
     }
 
     fn service_connection(protocol: u8) -> ServiceConnectionValue {
