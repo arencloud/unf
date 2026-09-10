@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -65,13 +65,45 @@ impl LinuxWireGuardProvider {
         if let Some(link) = existing {
             validate_owned_link(&link, plan)?;
             ensure_ipv4_reverse_path_acceptance(plan)?;
-            let snapshot = read_snapshot(&handle, plan, &link).await?;
-            snapshot.verify_against(plan).map_err(|_| {
-                WireGuardKernelError::ForeignState(
-                    "owned interface exists but does not exactly match desired state".to_owned(),
+            let before = read_owned_snapshot(&handle, plan, &link).await?;
+            validate_reconfiguration_boundary(&before, plan)?;
+            if before.verify_against(plan).is_ok() {
+                return Ok((KernelApplyOutcome::AlreadyExact, before));
+            }
+            preflight_route_reconciliation(
+                &handle,
+                plan,
+                link.header.index,
+                &plan.route_prefixes(),
+            )
+            .await?;
+            let result = async {
+                configure_device(plan, private_key).await?;
+                after_device()?;
+                reconcile_routes(&handle, plan, link.header.index, &plan.route_prefixes()).await?;
+                let snapshot = read_snapshot(&handle, plan, &link).await?;
+                snapshot.verify_against(plan)?;
+                Ok(snapshot)
+            }
+            .await;
+            return match result {
+                Ok(snapshot) => Ok((KernelApplyOutcome::Reconfigured, snapshot)),
+                Err(cause) => match restore_owned_snapshot(
+                    &handle,
+                    plan,
+                    private_key,
+                    &before,
+                    link.header.index,
                 )
-            })?;
-            return Ok((KernelApplyOutcome::AlreadyExact, snapshot));
+                .await
+                {
+                    Ok(()) => Err(cause),
+                    Err(rollback) => Err(WireGuardKernelError::Rollback {
+                        cause: cause.to_string(),
+                        rollback: rollback.to_string(),
+                    }),
+                },
+            };
         }
         require_route_keys_absent(&handle, plan).await?;
 
@@ -288,6 +320,23 @@ async fn configure_device(
     plan: &WireGuardKernelPlan,
     private_key: &WireGuardPrivateKey,
 ) -> Result<(), WireGuardKernelError> {
+    configure_device_fields(
+        &plan.interface_name,
+        private_key,
+        plan.listen_port,
+        plan.fwmark,
+        plan.peers.iter().map(encode_peer).collect(),
+    )
+    .await
+}
+
+async fn configure_device_fields(
+    interface_name: &str,
+    private_key: &WireGuardPrivateKey,
+    listen_port: u16,
+    fwmark: u32,
+    peers: Vec<WireguardPeer>,
+) -> Result<(), WireGuardKernelError> {
     let (connection, mut handle, _) =
         genetlink::new_connection().map_err(|error| WireGuardKernelError::Kernel {
             operation: "open WireGuard generic-netlink connection",
@@ -295,12 +344,11 @@ async fn configure_device(
         })?;
     tokio::spawn(connection);
     let mut private_bytes = *private_key.expose_for_kernel();
-    let peers = plan.peers.iter().map(encode_peer).collect::<Vec<_>>();
     let attributes = vec![
-        WireguardAttribute::IfName(plan.interface_name.clone()),
+        WireguardAttribute::IfName(interface_name.to_owned()),
         WireguardAttribute::PrivateKey(private_bytes),
-        WireguardAttribute::ListenPort(plan.listen_port),
-        WireguardAttribute::Fwmark(plan.fwmark),
+        WireguardAttribute::ListenPort(listen_port),
+        WireguardAttribute::Fwmark(fwmark),
         WireguardAttribute::Flags(WireguardDeviceFlags::ReplacePeers),
         WireguardAttribute::Peers(peers),
     ];
@@ -331,6 +379,30 @@ async fn configure_device(
         }
     }
     Ok(())
+}
+
+fn encode_readback_peer(peer: &WireGuardPeerReadback) -> WireguardPeer {
+    let allowed_ips = peer
+        .allowed_ips
+        .iter()
+        .map(|prefix| {
+            WireguardAllowedIp(vec![
+                WireguardAllowedIpAttr::Family(match prefix.address {
+                    IpAddr::V4(_) => WireguardAddressFamily::Ipv4,
+                    IpAddr::V6(_) => WireguardAddressFamily::Ipv6,
+                }),
+                WireguardAllowedIpAttr::IpAddr(prefix.address),
+                WireguardAllowedIpAttr::Cidr(prefix.prefix_len),
+            ])
+        })
+        .collect();
+    WireguardPeer(vec![
+        WireguardPeerAttribute::PublicKey(peer.public_key.0),
+        WireguardPeerAttribute::Endpoint(peer.endpoint),
+        WireguardPeerAttribute::PersistentKeepalive(peer.persistent_keepalive_seconds),
+        WireguardPeerAttribute::AllowedIps(allowed_ips),
+        WireguardPeerAttribute::Flags(WireguardPeerFlags::ReplaceAllowedIps),
+    ])
 }
 
 fn encode_peer(peer: &super::WireGuardPeerPlan) -> WireguardPeer {
@@ -382,6 +454,102 @@ async fn read_snapshot(
         peers: device.peers,
         routes,
     })
+}
+
+async fn read_owned_snapshot(
+    handle: &Handle,
+    plan: &WireGuardKernelPlan,
+    link: &LinkMessage,
+) -> Result<WireGuardKernelSnapshot, WireGuardKernelError> {
+    let link_state = parse_link(link)?;
+    let device = read_device(&plan.interface_name).await?;
+    if device.interface_index != link.header.index || device.interface_name != plan.interface_name {
+        return Err(WireGuardKernelError::ReadbackMismatch);
+    }
+    let routes = read_all_owned_routes(handle, plan, link.header.index).await?;
+    let proof_addresses = read_proof_addresses(handle, plan, link.header.index).await?;
+    let snapshot = WireGuardKernelSnapshot::issue(WireGuardKernelSnapshotInput {
+        interface_name: device.interface_name,
+        interface_index: device.interface_index,
+        owner_alias: link_state.owner_alias,
+        is_up: link_state.is_up,
+        mtu: link_state.mtu,
+        public_key: device.public_key,
+        listen_port: device.listen_port,
+        fwmark: device.fwmark,
+        proof_addresses,
+        peers: device.peers,
+        routes,
+    })?;
+    snapshot.verify_integrity()?;
+    let allowed = snapshot
+        .peers
+        .iter()
+        .flat_map(|peer| peer.allowed_ips.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let routed_prefixes = snapshot
+        .routes
+        .iter()
+        .map(|route| route.prefix)
+        .collect::<BTreeSet<_>>();
+    if allowed != routed_prefixes {
+        return Err(WireGuardKernelError::ForeignState(
+            "owned WireGuard interface has an incomplete peer-to-route cut".to_owned(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn validate_reconfiguration_boundary(
+    before: &WireGuardKernelSnapshot,
+    plan: &WireGuardKernelPlan,
+) -> Result<(), WireGuardKernelError> {
+    if before.interface_name != plan.interface_name
+        || before.owner_alias != plan.owner_alias
+        || before.public_key != plan.local_public_key
+        || before.listen_port != plan.listen_port
+        || before.fwmark != plan.fwmark
+        || before.mtu != plan.mtu_envelope.interface_mtu
+        || before.proof_addresses != plan.proof_addresses
+        || before
+            .routes
+            .iter()
+            .any(|route| route.table != plan.route_table)
+    {
+        return Err(WireGuardKernelError::ForeignState(
+            "owned WireGuard epoch changed immutable local authority".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn restore_owned_snapshot(
+    handle: &Handle,
+    plan: &WireGuardKernelPlan,
+    private_key: &WireGuardPrivateKey,
+    before: &WireGuardKernelSnapshot,
+    interface_index: u32,
+) -> Result<(), WireGuardKernelError> {
+    configure_device_fields(
+        &before.interface_name,
+        private_key,
+        before.listen_port,
+        before.fwmark,
+        before.peers.iter().map(encode_readback_peer).collect(),
+    )
+    .await?;
+    let prefixes = before
+        .routes
+        .iter()
+        .map(|route| route.prefix)
+        .collect::<BTreeSet<_>>();
+    reconcile_routes(handle, plan, interface_index, &prefixes).await?;
+    let link = require_link(handle, &plan.interface_name).await?;
+    let restored = read_owned_snapshot(handle, plan, &link).await?;
+    if restored.configuration_digest != before.configuration_digest {
+        return Err(WireGuardKernelError::ReadbackMismatch);
+    }
+    Ok(())
 }
 
 async fn add_proof_addresses(
@@ -739,6 +907,122 @@ async fn add_routes(
     Ok(())
 }
 
+async fn preflight_route_reconciliation(
+    handle: &Handle,
+    plan: &WireGuardKernelPlan,
+    interface_index: u32,
+    desired: &BTreeSet<IpPrefix>,
+) -> Result<(), WireGuardKernelError> {
+    let messages = list_routes(handle).await?;
+    for prefix in desired {
+        let matching = messages
+            .iter()
+            .filter(|message| route_key(message) == Some((*prefix, plan.route_table)))
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [] => {}
+            [message] if route_is_exact(message, *prefix, interface_index) => {}
+            _ => {
+                return Err(WireGuardKernelError::ForeignState(format!(
+                    "desired route key {}/{} table {} is not exclusively owned by this epoch",
+                    prefix.address, prefix.prefix_len, plan.route_table
+                )));
+            }
+        }
+    }
+    read_all_owned_routes(handle, plan, interface_index).await?;
+    Ok(())
+}
+
+async fn reconcile_routes(
+    handle: &Handle,
+    plan: &WireGuardKernelPlan,
+    interface_index: u32,
+    desired: &BTreeSet<IpPrefix>,
+) -> Result<(), WireGuardKernelError> {
+    preflight_route_reconciliation(handle, plan, interface_index, desired).await?;
+    let messages = list_routes(handle).await?;
+    let current = messages
+        .iter()
+        .filter_map(|message| {
+            let (prefix, table) = route_key(message)?;
+            (table == plan.route_table
+                && route_oif(message) == Some(interface_index)
+                && route_is_exact(message, prefix, interface_index))
+            .then_some((prefix, message.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for prefix in desired {
+        if !current.contains_key(prefix) {
+            handle
+                .route()
+                .add(build_route(*prefix, plan.route_table, interface_index))
+                .execute()
+                .await
+                .map_err(|error| kernel("add reconfigured WireGuard route", &error))?;
+        }
+    }
+    for (prefix, message) in current {
+        if !desired.contains(&prefix) {
+            handle
+                .route()
+                .del(message)
+                .execute()
+                .await
+                .map_err(|error| kernel("remove stale WireGuard route", &error))?;
+        }
+    }
+    Ok(())
+}
+
+async fn read_all_owned_routes(
+    handle: &Handle,
+    plan: &WireGuardKernelPlan,
+    interface_index: u32,
+) -> Result<Vec<WireGuardRouteReadback>, WireGuardKernelError> {
+    let messages = list_routes(handle).await?;
+    let mut routes = Vec::new();
+    for message in &messages {
+        if route_oif(message) != Some(interface_index)
+            || is_kernel_generated_wireguard_multicast(message)
+            || is_kernel_generated_proof_address_route(message, plan, interface_index)
+        {
+            continue;
+        }
+        let Some((prefix, table)) = route_key(message) else {
+            return Err(WireGuardKernelError::ForeignState(
+                "unkeyed route points at the owned WireGuard interface".to_owned(),
+            ));
+        };
+        if table != plan.route_table || !route_is_exact(message, prefix, interface_index) {
+            return Err(WireGuardKernelError::ForeignState(format!(
+                "unexpected route points at the owned WireGuard interface: key={:?}, protocol={:?}, scope={:?}, kind={:?}",
+                route_key(message),
+                message.header.protocol,
+                message.header.scope,
+                message.header.kind
+            )));
+        }
+        routes.push(WireGuardRouteReadback {
+            prefix,
+            interface_index,
+            table,
+            protocol: UNF_WIREGUARD_ROUTE_PROTOCOL,
+            scope: WireGuardRouteScope::for_prefix(prefix),
+        });
+    }
+    routes.sort_by_key(|route| route.prefix);
+    if routes
+        .windows(2)
+        .any(|pair| pair[0].prefix == pair[1].prefix)
+    {
+        return Err(WireGuardKernelError::ForeignState(
+            "duplicate route key points at the owned WireGuard interface".to_owned(),
+        ));
+    }
+    Ok(routes)
+}
+
 fn build_route(prefix: IpPrefix, table: u32, interface_index: u32) -> RouteMessage {
     match prefix.address {
         IpAddr::V4(address) => RouteMessageBuilder::<Ipv4Addr>::new()
@@ -1033,6 +1317,56 @@ mod tests {
         (plan, private_key)
     }
 
+    fn expanded_plan(plan: &WireGuardKernelPlan) -> WireGuardKernelPlan {
+        let observations = ["kernel-node-b", "kernel-node-c"]
+            .into_iter()
+            .flat_map(|node| {
+                [UnderlayAddressFamily::Ipv4, UnderlayAddressFamily::Ipv6].map(|family| {
+                    UnderlayMtuObservation {
+                        peer_node_uid: node.to_owned(),
+                        family,
+                        underlay_mtu: 1_500,
+                    }
+                })
+            });
+        WireGuardKernelPlan::new(WireGuardKernelPlanInput {
+            cluster_id: plan.cluster_id.clone(),
+            local_node_uid: plan.local_node_uid.clone(),
+            epoch: plan.epoch,
+            revision: Revision::new(2),
+            interface_name: plan.interface_name.clone(),
+            local_public_key: plan.local_public_key,
+            listen_port: plan.listen_port,
+            fwmark: plan.fwmark,
+            route_table: plan.route_table,
+            mtu_envelope: WireGuardMtuEnvelope::derive(&observations.collect::<Vec<_>>()).unwrap(),
+            local_pod_cidrs: plan.local_pod_cidrs.clone(),
+            activation: WireGuardEpochActivation::InactiveStaged,
+            peers: plan
+                .peers
+                .iter()
+                .cloned()
+                .chain([WireGuardPeerPlan {
+                    node_uid: "kernel-node-c".to_owned(),
+                    public_key: WireGuardPublicKey([43; 32]),
+                    endpoint: "192.0.2.43:51820".parse().unwrap(),
+                    persistent_keepalive_seconds: 0,
+                    allowed_ips: vec![
+                        IpPrefix {
+                            address: "198.51.101.0".parse().unwrap(),
+                            prefix_len: 24,
+                        },
+                        IpPrefix {
+                            address: "2001:db8:43::".parse().unwrap(),
+                            prefix_len: 64,
+                        },
+                    ],
+                }])
+                .collect(),
+        })
+        .unwrap()
+    }
+
     async fn prove_same_name_foreign_state_is_preserved(
         provider: &LinuxWireGuardProvider,
         plan: &WireGuardKernelPlan,
@@ -1181,6 +1515,24 @@ mod tests {
         assert_eq!(outcome, KernelApplyOutcome::AlreadyExact);
         assert_eq!(fs::read_to_string(reverse_path_filter).unwrap().trim(), "0");
         assert_eq!(first.configuration_digest, replay.configuration_digest);
+
+        let expanded = expanded_plan(&plan);
+        let injected_update = provider
+            .apply_with_checkpoint(&expanded, &private_key, || {
+                Err(WireGuardKernelError::Kernel {
+                    operation: "injected after same-epoch peer replacement",
+                    message: "fault".to_owned(),
+                })
+            })
+            .await;
+        assert!(injected_update.is_err());
+        provider.readback(&plan).await.unwrap();
+        let (outcome, expanded_snapshot) = provider.apply(&expanded, &private_key).await.unwrap();
+        assert_eq!(outcome, KernelApplyOutcome::Reconfigured);
+        expanded_snapshot.verify_against(&expanded).unwrap();
+        let (outcome, restored_snapshot) = provider.apply(&plan, &private_key).await.unwrap();
+        assert_eq!(outcome, KernelApplyOutcome::Reconfigured);
+        restored_snapshot.verify_against(&plan).unwrap();
 
         let mut transaction = super::super::ProofCarryingKernelTransaction::begin(
             Revision::new(2),

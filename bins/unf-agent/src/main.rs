@@ -127,6 +127,7 @@ use unf_service::{
     compile_node_port_selection_fabric_dataplane, compile_service_load_balancer_fabric_dataplane,
     compile_service_selection_dataplane, has_advanced_selection_intent,
 };
+
 use unf_state::{
     AGENT_STATUS_SCHEMA_VERSION, AgentStateReport, ComponentCompatibility, EgressFlowKey,
     EgressFlowOutcome, EgressIpv4PolicyMapEntry, EgressIpv6PolicyMapEntry, FLOW_EXPORT_BATCH_LIMIT,
@@ -173,6 +174,7 @@ const INITIAL_ENCRYPTION_KEY_LIFETIME: Duration = Duration::from_secs(7 * 24 * 6
 const DEFAULT_ENCRYPTION_ROTATE_BEFORE: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_ENCRYPTION_ROTATION_JITTER: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_ENCRYPTION_DRAIN_WINDOW: Duration = Duration::from_secs(5 * 60);
+const ENCRYPTION_STARTUP_REVALIDATION_ATTEMPTS: u8 = 30;
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -7212,8 +7214,35 @@ async fn run_dataplane(
         encryption_pins_existed,
     )?;
     encryption_generations.rehydrate_local_proof().await?;
-    activate_admitted_encryption_generation(&mut encryption_generations, &mut encryption).await?;
+    let mut startup_activation_error = None;
+    for attempt in 1..=ENCRYPTION_STARTUP_REVALIDATION_ATTEMPTS {
+        match activate_admitted_encryption_generation(&mut encryption_generations, &mut encryption)
+            .await
+        {
+            Ok(_) => {
+                startup_activation_error = None;
+                if !encryption.requires_local_revalidation() {
+                    break;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    attempt,
+                    max_attempts = ENCRYPTION_STARTUP_REVALIDATION_ATTEMPTS,
+                    "startup encryption proof revalidation is incomplete; TC attachment remains fenced"
+                );
+                startup_activation_error = Some(error);
+            }
+        }
+        tokio::time::sleep(config.encryption_sync_interval).await;
+    }
     if encryption.requires_local_revalidation() {
+        if let Some(error) = startup_activation_error {
+            return Err(error).context(
+                "startup encryption authority could not renew its tri-plane activation proof",
+            );
+        }
         bail!(
             "recovered encryption authority requires a fresh Node-local tri-plane activation latch before TC attachment; exact proof rehydration was unavailable"
         );
@@ -15167,7 +15196,7 @@ async fn consume_events(
                             encryption_keys,
                             encryption_generations,
                         ).await {
-                            warn!(%error, "encryption plan could not consume exact Node-local key and kernel truth");
+                            warn!(?error, "encryption plan could not consume exact Node-local key and kernel truth");
                         }
                     }
                     Err(error) => {
@@ -15198,7 +15227,7 @@ async fn consume_events(
                             ),
                             Ok(false) => {}
                             Err(error) => warn!(
-                                %error,
+                                ?error,
                                 "encryption plan could not consume exact Node-local key and kernel truth"
                             ),
                         }

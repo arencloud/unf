@@ -994,6 +994,7 @@ impl ProofCarryingKernelTransaction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelApplyOutcome {
     Created,
+    Reconfigured,
     AlreadyExact,
 }
 
