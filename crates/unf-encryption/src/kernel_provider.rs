@@ -633,8 +633,9 @@ impl WireGuardKernelSnapshot {
     }
 
     /// Verifies the canonical self-contained readback envelope without
-    /// trusting its stored digests. Exact desired-state comparison remains in
-    /// [`Self::verify_against`].
+    /// trusting its stored digests. A readback may contain no proof addresses
+    /// or routes when owned kernel state was stripped by an external event;
+    /// exact desired-state comparison remains in [`Self::verify_against`].
     ///
     /// # Errors
     ///
@@ -646,7 +647,6 @@ impl WireGuardKernelSnapshot {
             || self.owner_alias.is_empty()
             || self.owner_alias.len() > MAX_WIREGUARD_OWNER_ALIAS_BYTES
             || !self.owner_alias.starts_with("unf:encryption:v2:")
-            || self.proof_addresses.is_empty()
             || self.proof_addresses.len() > crate::MAX_ENCRYPTION_PREFIXES_PER_NODE
             || self
                 .proof_addresses
@@ -666,7 +666,6 @@ impl WireGuardKernelSnapshot {
             || self.fwmark == 0
             || self.peers.is_empty()
             || self.peers.len() > MAX_WIREGUARD_PEERS
-            || self.routes.is_empty()
             || self.routes.len() > MAX_WIREGUARD_ALLOWED_IPS
             || self
                 .peers
@@ -1345,6 +1344,22 @@ mod tests {
         assert_eq!(first.configuration_digest, config);
         assert_ne!(first.observation_digest, observation);
         first.verify_against(&plan).unwrap();
+    }
+
+    #[test]
+    fn partial_owned_readback_is_integral_but_not_exact() {
+        let (plan, _) = plan();
+        let mut observed = snapshot(&plan);
+        observed.proof_addresses.clear();
+        observed.routes.clear();
+        observed.configuration_digest = observed.calculate_configuration_digest().unwrap();
+        observed.observation_digest = observed.calculate_observation_digest().unwrap();
+
+        observed.verify_integrity().unwrap();
+        assert!(matches!(
+            observed.verify_against(&plan),
+            Err(WireGuardKernelError::ReadbackMismatch)
+        ));
     }
 
     #[test]

@@ -82,7 +82,9 @@ impl LinuxWireGuardProvider {
                 after_device()?;
                 reconcile_proof_addresses(&handle, plan, link.header.index, &plan.proof_addresses)
                     .await?;
+                read_proof_addresses(&handle, plan, link.header.index, true).await?;
                 reconcile_routes(&handle, plan, link.header.index, &plan.route_prefixes()).await?;
+                read_routes(&handle, plan, link.header.index, true).await?;
                 let snapshot = read_snapshot(&handle, plan, &link).await?;
                 snapshot.verify_against(plan)?;
                 Ok(snapshot)
@@ -1592,6 +1594,37 @@ mod tests {
             .execute()
             .await
             .unwrap();
+        assert!(provider.readback(plan).await.is_err());
+        let (outcome, repaired) = provider.apply(plan, private_key).await.unwrap();
+        assert_eq!(outcome, KernelApplyOutcome::Reconfigured);
+        repaired.verify_against(plan).unwrap();
+
+        let link = require_link(handle, &plan.interface_name).await.unwrap();
+        let missing_address = list_proof_addresses(handle, link.header.index)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(prefix, _)| *prefix == missing_proof)
+            .unwrap()
+            .1;
+        handle
+            .address()
+            .del(missing_address)
+            .execute()
+            .await
+            .unwrap();
+        for route in list_routes(handle)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|route| {
+                route_key(route).is_some_and(|(prefix, table)| {
+                    table == plan.route_table && plan.route_prefixes().contains(&prefix)
+                })
+            })
+        {
+            handle.route().del(route).execute().await.unwrap();
+        }
         assert!(provider.readback(plan).await.is_err());
         let (outcome, repaired) = provider.apply(plan, private_key).await.unwrap();
         assert_eq!(outcome, KernelApplyOutcome::Reconfigured);
