@@ -803,7 +803,13 @@ impl EncryptionPathProofCoordinator {
             .observe(authenticated, proof, now_unix_ms)
     }
 
-    /// Returns current completed receipts involving one endpoint.
+    /// Returns current completed receipts owned by one source endpoint.
+    ///
+    /// Destination participation proves duplex reachability, but only the
+    /// source-side receipt can authorize that Node's outbound fast-path
+    /// decision. Keeping destination receipts out of this projection avoids
+    /// weakening exact generation coverage when several workload decisions
+    /// share one pair of Nodes.
     #[must_use]
     pub fn receipts_for(
         &self,
@@ -812,7 +818,7 @@ impl EncryptionPathProofCoordinator {
     ) -> Vec<EncryptionPathActivationReceipt> {
         self.paths
             .values()
-            .filter(|path| path.assignment.includes(recipient))
+            .filter(|path| path.assignment.round.source == *recipient)
             .filter_map(|path| path.ledger.activation_receipt(now_unix_ms).ok())
             .collect()
     }
@@ -1517,6 +1523,11 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(coordinator.receipts_for(&source_recipient, 2_100).len(), 1);
+        assert!(
+            coordinator
+                .receipts_for(&destination_recipient, 2_100)
+                .is_empty()
+        );
 
         assert_eq!(
             coordinator.replace_contracts(Revision::new(13), vec![], 3_000, 8_000),
