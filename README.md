@@ -913,10 +913,16 @@ The agent now consumes that durable input through exact local key and Linux
 readback proof. Authority-Free Quiescent Generations let idle fleet members
 contribute a digest-bound zero-tunnel/zero-route fact without fabricated
 authority or fleet deadlock; `make encryption-agent-plan-compile-test`; ADR
-0190. The TC consumer/verifier and live encrypted packet gate remain, so no
-workload packet yet selects the staged route table. The [Phase 9
+0190. Proof-Carrying Deferred Encryption now runs as a family-specific verifier
+island after policy, final Service translation, and explicit egress ownership.
+It consumes exact active-bank decision/path/transport proof, applies only UNF's
+leased mark field, retains bounded active/draining flow epochs, and drops any
+missing Required authority. Real kernel verifier loading plus IPv4 direct,
+IPv6 address-bound, and transport-removal packet execution pass
+`make encryption-tc-consumer-test`; ADR 0191. Required DSR remains fail-closed
+until a tunnel-aware handoff and live ciphertext gate land. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0190 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0191 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

@@ -1074,6 +1074,101 @@ pub const fn encryption_transport_is_usable(
     }
 }
 
+/// Validates the single bank pointer before any packet can consume encryption
+/// authority. A zero-epoch generation is a proven quiescent cut, not packet
+/// authority; it therefore never reaches identity-pair lookup.
+#[must_use]
+pub const fn encryption_config_is_active(config: &EncryptionMapConfig) -> bool {
+    config.schema_version == ENCRYPTION_MAP_ABI_VERSION
+        && config.active_bank < ENCRYPTION_BANK_COUNT
+        && config.generation != 0
+        && config.policy_revision != 0
+        && config.service_revision != 0
+        && config.egress_revision != 0
+        && config.epoch_count > 0
+        && config.epoch_count <= 2
+        && config.decision_count > 0
+        && config.decision_count <= ENCRYPTION_DECISION_MAP_CAPACITY
+        && config.transport_count > 0
+        && config.transport_count <= ENCRYPTION_TRANSPORT_MAP_CAPACITY
+        && config.path_count <= ENCRYPTION_PATH_MAP_CAPACITY
+}
+
+/// Replays the fixed-width identity decision invariants in the TC consumer.
+#[must_use]
+#[inline]
+pub fn encryption_decision_is_usable(
+    decision: &EncryptionDecisionValue,
+    config: &EncryptionMapConfig,
+) -> bool {
+    let base_flags =
+        ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED | ENCRYPTION_DECISION_FLAG_SELECTION_BOUND;
+    let address_bound = decision.flags == base_flags | ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND;
+    if decision.schema_version != ENCRYPTION_MAP_ABI_VERSION
+        || decision.decision_witness == [0; 16]
+        || decision.flags != base_flags && !address_bound
+        || decision.policy_revision != config.policy_revision
+        || decision.service_revision != config.service_revision
+        || decision.egress_revision != config.egress_revision
+    {
+        return false;
+    }
+    match decision.disposition {
+        ENCRYPTION_DISPOSITION_NATIVE => {
+            !address_bound
+                && decision.transport_id == 0
+                && decision.contract_revision == 0
+                && decision.key_epoch == 0
+        }
+        ENCRYPTION_DISPOSITION_REQUIRED => {
+            decision.contract_revision != 0
+                && decision.key_epoch != 0
+                && (address_bound == (decision.transport_id == 0))
+        }
+        _ => false,
+    }
+}
+
+/// Validates a late-bound destination path against its owning decision.
+#[must_use]
+#[inline]
+pub fn encryption_path_is_usable(
+    path: &EncryptionPathValue,
+    decision: &EncryptionDecisionValue,
+) -> bool {
+    path.schema_version == ENCRYPTION_MAP_ABI_VERSION
+        && path.transport_id != 0
+        && path.contract_revision == decision.contract_revision
+        && path.key_epoch == decision.key_epoch
+        && path.binding_witness != [0; 16]
+        && path.flags == 0
+        && path.reserved == [0; 5]
+}
+
+/// A Causal Epoch Lease is useful only while its exact five-tuple remains
+/// active. Invalid state is removed by the TC consumer and never retried as a
+/// new flow in the same packet invocation.
+#[must_use]
+#[inline]
+pub fn encryption_flow_is_usable(
+    flow: &EncryptionFlowValue,
+    protocol: u8,
+    now_monotonic_ns: u64,
+) -> bool {
+    let Some(timeout_ns) = connection_timeout_ns(protocol) else {
+        return false;
+    };
+    flow.schema_version == ENCRYPTION_MAP_ABI_VERSION
+        && flow.last_seen_monotonic_ns != 0
+        && flow.transport_id != 0
+        && flow.key_epoch != 0
+        && flow.contract_revision != 0
+        && flow.decision_witness != [0; 16]
+        && flow.flags == ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE
+        && flow.reserved == [0; 5]
+        && now_monotonic_ns.saturating_sub(flow.last_seen_monotonic_ns) <= timeout_ns
+}
+
 /// Derives the plaintext policy-routing selector from the `WireGuard` outer
 /// packet bypass mark. Complementing within UNF's owned field guarantees that
 /// the two packet classes cannot match the same masked `ip rule`.
@@ -1835,6 +1930,64 @@ mod tests {
             ENCRYPTION_DISPOSITION_REQUIRED
         ));
         assert!(!encryption_disposition_is_valid(0));
+    }
+
+    #[test]
+    fn encryption_packet_authority_is_exact_revision_bound_and_temporal() {
+        let config = EncryptionMapConfig {
+            generation: 11,
+            policy_revision: 12,
+            service_revision: 13,
+            egress_revision: 14,
+            decision_count: 1,
+            transport_count: 1,
+            schema_version: ENCRYPTION_MAP_ABI_VERSION,
+            active_bank: 1,
+            epoch_count: 1,
+            path_count: 1,
+        };
+        assert!(encryption_config_is_active(&config));
+        let mut decision = EncryptionDecisionValue {
+            transport_id: 17,
+            contract_revision: 18,
+            policy_revision: 12,
+            service_revision: 13,
+            egress_revision: 14,
+            key_epoch: 19,
+            decision_witness: [0xA5; 16],
+            schema_version: ENCRYPTION_MAP_ABI_VERSION,
+            disposition: ENCRYPTION_DISPOSITION_REQUIRED,
+            flags: ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED
+                | ENCRYPTION_DECISION_FLAG_SELECTION_BOUND,
+        };
+        assert!(encryption_decision_is_usable(&decision, &config));
+        decision.flags |= ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND;
+        decision.transport_id = 0;
+        assert!(encryption_decision_is_usable(&decision, &config));
+        let path = EncryptionPathValue {
+            transport_id: 17,
+            contract_revision: 18,
+            key_epoch: 19,
+            binding_witness: [0x5A; 16],
+            schema_version: ENCRYPTION_MAP_ABI_VERSION,
+            flags: 0,
+            reserved: [0; 5],
+        };
+        assert!(encryption_path_is_usable(&path, &decision));
+        let mut flow = EncryptionFlowValue {
+            last_seen_monotonic_ns: 100,
+            transport_id: 17,
+            key_epoch: 19,
+            contract_revision: 18,
+            drain_until_monotonic_ns: 0,
+            decision_witness: [0xA5; 16],
+            schema_version: ENCRYPTION_MAP_ABI_VERSION,
+            flags: ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE,
+            reserved: [0; 5],
+        };
+        assert!(encryption_flow_is_usable(&flow, 6, 101));
+        flow.decision_witness = [0; 16];
+        assert!(!encryption_flow_is_usable(&flow, 6, 101));
     }
 
     #[test]

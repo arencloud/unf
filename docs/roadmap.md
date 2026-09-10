@@ -977,8 +977,14 @@ matrix is maintained in the
   `make encryption-controller-plan-test` and ADR 0189. Agents consume active
   plans only through local key/Linux proof, while Authority-Free Quiescent
   Generations let idle members contribute exact zero-authority facts without
-  fake tunnels; `make encryption-agent-plan-compile-test` and ADR 0190. The TC consumer, verifier
-  loading, and live encrypted packets remain within milestone 9.5.
+  fake tunnels; `make encryption-agent-plan-compile-test` and ADR 0190.
+  Proof-Carrying Deferred Encryption then places a family-specific verifier
+  island after policy, Service translation, and explicit egress ownership. It
+  consumes exact decision/path/transport proof, changes only UNF's cooperative
+  mark field, retains bounded Causal Epoch Leases, and drops missing Required
+  authority; real verifier loading plus IPv4 direct and IPv6 late-bound packet
+  execution pass `make encryption-tc-consumer-test` and ADR 0191. Complete
+  Service/egress/DSR composition and live ciphertext remain within 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,

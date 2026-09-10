@@ -170,7 +170,7 @@ const SELECTION_CONTRACT_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 const SELECTION_BANK_COUNT: u8 = 2;
 const CURRENT_BPF_ABI_VERSION: u16 = PERSISTENT_BPF_STATE_ABI_VERSION;
 const BLOCKED_TRANSITION_REPORTING_WINDOW: Duration = Duration::from_secs(30);
-const DATAPLANE_TAIL_PROGRAM_NAMES: [&str; 8] = [
+const DATAPLANE_TAIL_PROGRAM_NAMES: [&str; 10] = [
     "unf_policy_v4",
     "unf_policy_v6",
     "unf_dsr_v4",
@@ -179,6 +179,8 @@ const DATAPLANE_TAIL_PROGRAM_NAMES: [&str; 8] = [
     "unf_egress_gateway_v6",
     "unf_egress_source_v4",
     "unf_egress_source_v6",
+    "unf_encryption_v4",
+    "unf_encryption_v6",
 ];
 const DATAPLANE_TAIL_CALL_MAP_NAME: &str = "SERVICE_DATAPLANE_TAIL_CALLS_V2";
 const LEGACY_DATAPLANE_TAIL_CALL_MAP_NAME: &str = "SERVICE_DATAPLANE_TAIL_CALLS";
@@ -19651,11 +19653,250 @@ mod tests {
             .indices()
             .collect::<std::result::Result<Vec<_>, _>>()
             .expect("read retained tail-call indices");
-        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(indices, (0..10).collect::<Vec<_>>());
         drop(tail_calls);
 
         fs::remove_file(&pin).expect("remove isolated tail-call map pin");
         fs::remove_dir(&root).expect("remove isolated bpffs test directory");
+    }
+
+    #[test]
+    #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
+    fn privileged_encryption_finalizer_is_dual_stack_late_bound_and_fail_closed() {
+        const POLICY_REVISION: u64 = 12;
+        const SERVICE_REVISION: u64 = 13;
+        const EGRESS_REVISION: u64 = 14;
+        const CONTRACT_REVISION: u64 = 18;
+        const KEY_EPOCH: u64 = 19;
+        const BANK: u8 = 1;
+        const TC_ACT_PIPE: u32 = 3;
+        const TC_ACT_SHOT: u32 = 2;
+
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new()
+            .load_file(object)
+            .expect("load verifier-approved eBPF object");
+        load_dataplane_tail_programs(&mut ebpf)
+            .expect("kernel verifier accepts encryption finalizers");
+        for program_name in ["unf_observe_ingress", "unf_observe_egress"] {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut(program_name)
+                .expect("UNF TC program exists")
+                .try_into()
+                .expect("UNF program is a TC classifier");
+            program
+                .load()
+                .expect("kernel verifier accepts main TC program");
+        }
+
+        let source_v4 = Ipv4Addr::new(10, 244, 0, 20);
+        let destination_v4 = Ipv4Addr::new(10, 244, 1, 21);
+        let source_v6: Ipv6Addr = "fd00::20".parse().unwrap();
+        let destination_v6: Ipv6Addr = "fd00:1::21".parse().unwrap();
+        let source_identity = IdentityId::new(42);
+        let destination_identity = IdentityId::new(43);
+
+        let (mut identity_v4, mut identity_v6, mut identity_config) =
+            take_identity_maps(&mut ebpf).expect("take identity maps");
+        for (address, identity) in [
+            (source_v4.octets(), source_identity),
+            (destination_v4.octets(), destination_identity),
+        ] {
+            identity_v4[0]
+                .insert(
+                    address,
+                    encode_identity_value(IdentityMapValue::new(identity, 3)),
+                    0,
+                )
+                .unwrap();
+        }
+        for (address, identity) in [
+            (source_v6.octets(), IdentityId::new(44)),
+            (destination_v6.octets(), destination_identity),
+        ] {
+            identity_v6[0]
+                .insert(
+                    address,
+                    encode_identity_value(IdentityMapValue::new(identity, 3)),
+                    0,
+                )
+                .unwrap();
+        }
+        identity_config
+            .set(0, encode_identity_config(7, 3, 4, 0).unwrap(), 0)
+            .unwrap();
+
+        let (_, _, _, _, _, mut policy_config) =
+            take_policy_maps(&mut ebpf).expect("take policy maps");
+        policy_config
+            .set(
+                0,
+                encode_policy_config(7, POLICY_REVISION, 0, 0).unwrap(),
+                0,
+            )
+            .unwrap();
+        let mut service_config = AyaArray::<_, [u8; 32]>::try_from(
+            ebpf.take_map("SERVICE_CONFIG")
+                .expect("service config map exists"),
+        )
+        .expect("open service config map");
+        service_config
+            .set(
+                0,
+                compile_service_dataplane(&service_test_snapshot(7, SERVICE_REVISION), 0)
+                    .unwrap()
+                    .config,
+                0,
+            )
+            .unwrap();
+
+        let mut encryption = take_encryption_maps(&mut ebpf).expect("take encryption maps");
+        let config = unf_ebpf_common::EncryptionMapConfig {
+            generation: 11,
+            policy_revision: POLICY_REVISION,
+            service_revision: SERVICE_REVISION,
+            egress_revision: EGRESS_REVISION,
+            decision_count: 2,
+            transport_count: 2,
+            schema_version: ENCRYPTION_MAP_ABI_VERSION,
+            active_bank: BANK,
+            epoch_count: 1,
+            path_count: 1,
+        };
+        let decision = |transport_id, flags| unf_ebpf_common::EncryptionDecisionValue {
+            transport_id,
+            contract_revision: CONTRACT_REVISION,
+            policy_revision: POLICY_REVISION,
+            service_revision: SERVICE_REVISION,
+            egress_revision: EGRESS_REVISION,
+            key_epoch: KEY_EPOCH,
+            decision_witness: [0xA5; 16],
+            schema_version: ENCRYPTION_MAP_ABI_VERSION,
+            disposition: unf_ebpf_common::ENCRYPTION_DISPOSITION_REQUIRED,
+            flags,
+        };
+        let base_flags = unf_ebpf_common::ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED
+            | unf_ebpf_common::ENCRYPTION_DECISION_FLAG_SELECTION_BOUND;
+        let direct_key = unf_ebpf_common::EncryptionDecisionKey {
+            source_identity,
+            destination_identity,
+            bank: BANK,
+            reserved: [0; 3],
+        };
+        encryption
+            .decisions
+            .insert(
+                encryption_maps::encode_decision_key(&direct_key),
+                encryption_maps::encode_decision_value(&decision(101, base_flags)),
+                0,
+            )
+            .unwrap();
+        let v6_key = unf_ebpf_common::EncryptionDecisionKey {
+            source_identity: IdentityId::new(44),
+            destination_identity,
+            bank: BANK,
+            reserved: [0; 3],
+        };
+        let v6_decision = decision(
+            0,
+            base_flags | unf_ebpf_common::ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND,
+        );
+        encryption
+            .decisions
+            .insert(
+                encryption_maps::encode_decision_key(&v6_key),
+                encryption_maps::encode_decision_value(&v6_decision),
+                0,
+            )
+            .unwrap();
+        let transport = |transport_id| {
+            (
+                unf_ebpf_common::EncryptionTransportKey {
+                    transport_id,
+                    bank: BANK,
+                    reserved: [0; 7],
+                },
+                unf_ebpf_common::EncryptionTransportValue {
+                    key_epoch: KEY_EPOCH,
+                    contract_revision: CONTRACT_REVISION,
+                    drain_until_monotonic_ns: 0,
+                    fwmark: if transport_id == 101 {
+                        0x0055_0700
+                    } else {
+                        0x0055_0800
+                    },
+                    route_table: 20_007,
+                    interface_index: 17,
+                    mtu: 1_420,
+                    kernel_configuration_digest: [0x11; 16],
+                    readiness_digest: [0x22; 16],
+                    schema_version: ENCRYPTION_MAP_ABI_VERSION,
+                    state: unf_ebpf_common::ENCRYPTION_TRANSPORT_ACTIVE,
+                    flags: unf_ebpf_common::ENCRYPTION_TRANSPORT_FLAG_KERNEL_READBACK,
+                    reserved: [0; 4],
+                },
+            )
+        };
+        for (key, value) in [transport(101), transport(102)] {
+            encryption
+                .transports
+                .insert(
+                    encryption_maps::encode_transport_key(&key),
+                    encryption_maps::encode_transport_value(&value),
+                    0,
+                )
+                .unwrap();
+        }
+        encryption
+            .ipv6_paths
+            .insert(
+                &LpmKey::new(
+                    unf_ebpf_common::ENCRYPTION_PATH_PREFIX_BASE_BITS + 128,
+                    encryption_maps::encode_ipv6_path_data(
+                        &unf_ebpf_common::EncryptionIpv6PathData {
+                            bank: BANK,
+                            reserved: [0; 3],
+                            destination_address: destination_v6.octets(),
+                        },
+                    ),
+                ),
+                encryption_maps::encode_path_value(&unf_ebpf_common::EncryptionPathValue {
+                    transport_id: 102,
+                    contract_revision: CONTRACT_REVISION,
+                    key_epoch: KEY_EPOCH,
+                    binding_witness: [0x33; 16],
+                    schema_version: ENCRYPTION_MAP_ABI_VERSION,
+                    flags: 0,
+                    reserved: [0; 5],
+                }),
+                0,
+            )
+            .unwrap();
+        encryption
+            .config
+            .set(0, encryption_maps::encode_map_config(&config), 0)
+            .unwrap();
+
+        let packet_v4 = ipv4_packet(6, source_v4, destination_v4, 40_000, 443);
+        let packet_v6 = ipv6_packet(6, source_v6, destination_v6, 40_001, 443);
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &packet_v4).0,
+            TC_ACT_PIPE
+        );
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &packet_v6).0,
+            TC_ACT_PIPE
+        );
+
+        let missing = encryption_maps::encode_transport_key(&transport(101).0);
+        encryption.transports.remove(&missing).unwrap();
+        let new_flow = ipv4_packet(6, source_v4, destination_v4, 40_002, 443);
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &new_flow).0,
+            TC_ACT_SHOT,
+            "Required traffic cannot downgrade when transport proof disappears"
+        );
     }
 
     #[test]

@@ -32,7 +32,12 @@ use unf_ebpf_common::{
     ENCRYPTION_PATH_MAP_CAPACITY, ENCRYPTION_TRANSPORT_MAP_CAPACITY, EncryptionDecisionKey,
     EncryptionDecisionValue, EncryptionFlowValue, EncryptionIpv4PathData,
     EncryptionIpv6PathData, EncryptionMapConfig, EncryptionPathValue, EncryptionTransportKey,
-    EncryptionTransportValue,
+    EncryptionTransportValue, ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND,
+    ENCRYPTION_DISPOSITION_NATIVE, ENCRYPTION_DISPOSITION_REQUIRED, ENCRYPTION_MAP_ABI_VERSION,
+    ENCRYPTION_PATH_PREFIX_BASE_BITS, ENCRYPTION_ROUTE_MARK_MASK, apply_encryption_route_mark,
+    clear_encryption_route_mark,
+    encryption_config_is_active, encryption_decision_is_usable, encryption_flow_is_usable,
+    encryption_path_is_usable, encryption_route_mark, encryption_transport_is_usable,
     IDENTITY_BANK_COUNT, IDENTITY_MAP_ABI_VERSION, IPV6_EXTENSION_BYTE_LIMIT,
     IPV6_EXTENSION_HEADER_LIMIT, IPV6_NEXT_HEADER_HOP_BY_HOP, IdentityMapConfig, IdentityMapValue,
     Ipv4IdentityKey, Ipv4LoadBalancerFrontendKey, Ipv4NodePortFrontendKey, Ipv4PolicyMapKey,
@@ -110,9 +115,12 @@ const EGRESS_GATEWAY_TAIL_V4: u32 = 4;
 const EGRESS_GATEWAY_TAIL_V6: u32 = 5;
 const EGRESS_SOURCE_TAIL_V4: u32 = 6;
 const EGRESS_SOURCE_TAIL_V6: u32 = 7;
+const ENCRYPTION_TAIL_V4: u32 = 8;
+const ENCRYPTION_TAIL_V6: u32 = 9;
 const SERVICE_POLICY_DISPATCH_V4: i32 = -1_001;
 const SERVICE_POLICY_DISPATCH_V6: i32 = -1_002;
 const EGRESS_GATEWAY_NOT_OWNED: i32 = -1_003;
+const ENCRYPTION_DSR_DISPATCH: i32 = -1_004;
 const SERVICE_POST_LOOKUP_TRANSLATED: u8 = 1 << 0;
 const SERVICE_POST_LOOKUP_REROUTE_HOST: u8 = 1 << 1;
 // A DSR redirect preserves the frontend tuple. Reserve one skb mark bit so a
@@ -234,6 +242,23 @@ static ENCRYPTION_CONFIG: Array<EncryptionMapConfig> = Array::with_max_entries(1
 #[map]
 static ENCRYPTION_CONNECTIONS: LruHashMap<ConnectionKey, EncryptionFlowValue> =
     LruHashMap::with_max_entries(ENCRYPTION_CONNECTION_MAP_CAPACITY, 0);
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct EncryptionSelectionScratch {
+    config: EncryptionMapConfig,
+    decision: EncryptionDecisionValue,
+    transport: EncryptionTransportValue,
+    path: EncryptionPathValue,
+    flow: EncryptionFlowValue,
+}
+
+/// One per-CPU proof workspace keeps the family-specific finalizers below the
+/// verifier stack limit. It is runtime-only; all authority remains in the
+/// persistent, atomically banked maps above.
+#[map]
+static ENCRYPTION_SELECTION_SCRATCH: PerCpuArray<EncryptionSelectionScratch> =
+    PerCpuArray::with_max_entries(1, 0);
 
 /// Phase 8.5 egress state is independently banked. Source admission and its
 /// exact destination constraints become visible through one config flip.
@@ -467,11 +492,11 @@ static FLOW_OBSERVATION_SCRATCH: PerCpuArray<FlowObservation> = PerCpuArray::wit
 #[map]
 static SERVICE_POST_LOOKUP_SCRATCH: PerCpuArray<u8> = PerCpuArray::with_max_entries(1, 0);
 
-/// Runtime-only jump table isolates policy evaluation and DSR FIB resolution
-/// from the bounded main classifiers. The agent loads all four targets before
-/// attaching either hook.
+/// Runtime-only jump table isolates policy, DSR, egress, and encryption
+/// finalization from the bounded main classifiers. The agent loads every
+/// target before attaching either hook.
 #[map]
-static SERVICE_DATAPLANE_TAIL_CALLS_V2: ProgramArray = ProgramArray::with_max_entries(8, 0);
+static SERVICE_DATAPLANE_TAIL_CALLS_V2: ProgramArray = ProgramArray::with_max_entries(10, 0);
 
 #[classifier]
 pub fn unf_observe_ingress(ctx: TcContext) -> i32 {
@@ -673,27 +698,14 @@ pub fn unf_policy_v4(ctx: TcContext) -> i32 {
         };
         return TC_ACT_SHOT;
     }
-    let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
-        return TC_ACT_SHOT;
+    // Encryption is deliberately the last selection stage: the observation
+    // already contains the policy-authorized, post-Service destination and
+    // the finalizer first gives explicit egress ownership precedence.
+    #[allow(unsafe_code)]
+    unsafe {
+        SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, ENCRYPTION_TAIL_V4)
     };
-    if post_lookup & SERVICE_POST_LOOKUP_TRANSLATED != 0 {
-        seed_service_frontend_policy_connection(observation.tcp_flags);
-        if service_connection_is_dsr() {
-            // SAFETY: index 2 is a TC classifier over this exact context and
-            // the agent installs it before attaching the main hook.
-            #[allow(unsafe_code)]
-            unsafe {
-                SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V4)
-            };
-            return dsr_route_failed();
-        }
-        if !observation.enforce && post_lookup & SERVICE_POST_LOOKUP_REROUTE_HOST != 0 {
-            return reroute_host_service_v4(&ctx, observation, false);
-        }
-    } else if observation.enforce {
-        return source_egress_action(&ctx, observation).unwrap_or(action);
-    }
-    action
+    TC_ACT_SHOT
 }
 
 #[classifier]
@@ -717,27 +729,317 @@ pub fn unf_policy_v6(ctx: TcContext) -> i32 {
         };
         return TC_ACT_SHOT;
     }
+    #[allow(unsafe_code)]
+    unsafe {
+        SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, ENCRYPTION_TAIL_V6)
+    };
+    TC_ACT_SHOT
+}
+
+#[classifier]
+pub fn unf_encryption_v4(ctx: TcContext) -> i32 {
+    let action = encryption_finalizer::<false>(&ctx);
+    if action == ENCRYPTION_DSR_DISPATCH {
+        #[allow(unsafe_code)]
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V4)
+        };
+        return dsr_route_failed();
+    }
+    action
+}
+
+#[classifier]
+pub fn unf_encryption_v6(ctx: TcContext) -> i32 {
+    let action = encryption_finalizer::<true>(&ctx);
+    if action == ENCRYPTION_DSR_DISPATCH {
+        #[allow(unsafe_code)]
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V6)
+        };
+        return dsr_route_failed();
+    }
+    action
+}
+
+/// Proof-Carrying Deferred Encryption: policy and address translation run
+/// once, then this bounded verifier island consumes only the final tuple. The
+/// absence of a tail target or any malformed proof drops instead of silently
+/// returning to native routing.
+#[inline(never)]
+fn encryption_finalizer<const IPV6: bool>(ctx: &TcContext) -> i32 {
+    let Some(observation_ptr) = FLOW_OBSERVATION_SCRATCH.get_ptr(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: the policy tail initialized this CPU-local slot immediately
+    // before its non-returning tail call.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &*observation_ptr };
     let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
         return TC_ACT_SHOT;
     };
     if post_lookup & SERVICE_POST_LOOKUP_TRANSLATED != 0 {
         seed_service_frontend_policy_connection(observation.tcp_flags);
-        if service_connection_is_dsr() {
-            // SAFETY: index 3 is a TC classifier over this exact context and
-            // the agent installs it before attaching the main hook.
-            #[allow(unsafe_code)]
-            unsafe {
-                SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V6)
-            };
-            return dsr_route_failed();
-        }
         if !observation.enforce && post_lookup & SERVICE_POST_LOOKUP_REROUTE_HOST != 0 {
-            return reroute_host_service_v6(&ctx, observation, false);
+            return if IPV6 {
+                reroute_host_service_v6(ctx, observation, false)
+            } else {
+                reroute_host_service_v4(ctx, observation, false)
+            };
         }
     } else if observation.enforce {
-        return source_egress_action(&ctx, observation).unwrap_or(action);
+        if let Some(action) = source_egress_action(ctx, observation) {
+            return action;
+        }
     }
-    action
+    if !observation.enforce {
+        return TC_ACT_PIPE;
+    }
+    let selection = apply_encryption_selection::<IPV6>(ctx, observation);
+    if selection != TC_ACT_PIPE {
+        return selection;
+    }
+    if post_lookup & SERVICE_POST_LOOKUP_TRANSLATED != 0 && service_connection_is_dsr() {
+        // DSR retains the VIP in packet bytes and bypasses policy routing with
+        // an explicit neighbor redirect. Until 9.6 supplies a tunnel-aware DSR
+        // handoff, a Required mark must not be mistaken for ciphertext.
+        if encryption_mark_is_set(ctx) {
+            return TC_ACT_SHOT;
+        }
+        return ENCRYPTION_DSR_DISPATCH;
+    }
+    TC_ACT_PIPE
+}
+
+#[inline(always)]
+fn encryption_mark_is_set(ctx: &TcContext) -> bool {
+    // SAFETY: TC owns this skb for the invocation; this is a read-only check.
+    #[allow(unsafe_code)]
+    unsafe {
+        (*ctx.skb.skb).mark & ENCRYPTION_ROUTE_MARK_MASK != 0
+    }
+}
+
+/// Resolves a policy-authorized final tuple to either explicit Native or one
+/// proven WireGuard route lease. Any managed identity pair without complete
+/// authority drops. Unmanaged/external traffic remains outside Phase 9 and has
+/// only UNF's stale mark field cleared.
+#[inline(never)]
+fn apply_encryption_selection<const IPV6: bool>(
+    ctx: &TcContext,
+    observation: &FlowObservation,
+) -> i32 {
+    if observation.source_identity.get() == 0 || observation.destination_identity.get() == 0 {
+        clear_packet_encryption_mark(ctx);
+        return TC_ACT_PIPE;
+    }
+    let Some(scratch_ptr) = ENCRYPTION_SELECTION_SCRATCH.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: this CPU exclusively owns the workspace for the invocation.
+    #[allow(unsafe_code)]
+    let scratch = unsafe { &mut *scratch_ptr };
+    let Some(config) = ENCRYPTION_CONFIG.get(0).copied() else {
+        return TC_ACT_SHOT;
+    };
+    scratch.config = config;
+    if !encryption_config_is_active(&scratch.config)
+        || active_policy_revision() != scratch.config.policy_revision
+        || active_service_config().map(|service| service.revision)
+            != Some(scratch.config.service_revision)
+    {
+        return TC_ACT_SHOT;
+    }
+    let Some(flow_key_ptr) = POLICY_CONNECTION_SCRATCH.get_ptr(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: policy evaluation populated the forward tuple in this CPU slot.
+    #[allow(unsafe_code)]
+    let flow_key = unsafe { &*flow_key_ptr };
+    // SAFETY: monotonic clock has no caller preconditions.
+    #[allow(unsafe_code)]
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+
+    // A prior flow lease is authority for its exact transport, not for policy.
+    // Policy has already allowed this packet above; rotation may therefore
+    // keep the old epoch only while the current bank explicitly carries it.
+    #[allow(unsafe_code)]
+    if let Some(existing) = unsafe { ENCRYPTION_CONNECTIONS.get(flow_key) } {
+        scratch.flow = *existing;
+        if !encryption_flow_is_usable(&scratch.flow, observation.protocol, now_ns) {
+            let _ = ENCRYPTION_CONNECTIONS.remove(flow_key);
+            return TC_ACT_SHOT;
+        }
+        let transport_key = EncryptionTransportKey {
+            transport_id: scratch.flow.transport_id,
+            bank: scratch.config.active_bank,
+            reserved: [0; 7],
+        };
+        // SAFETY: read-only fixed-layout lookup; copied before map mutation.
+        #[allow(unsafe_code)]
+        let Some(transport) = (unsafe { ENCRYPTION_TRANSPORTS.get(&transport_key) }) else {
+            let _ = ENCRYPTION_CONNECTIONS.remove(flow_key);
+            return TC_ACT_SHOT;
+        };
+        scratch.transport = *transport;
+        if scratch.flow.key_epoch != scratch.transport.key_epoch
+            || scratch.flow.contract_revision != scratch.transport.contract_revision
+            || !encryption_transport_is_usable(&scratch.transport, true, now_ns)
+            || packet_exceeds_encryption_mtu(ctx, scratch.transport.mtu)
+        {
+            let _ = ENCRYPTION_CONNECTIONS.remove(flow_key);
+            return TC_ACT_SHOT;
+        }
+        scratch.flow.last_seen_monotonic_ns = now_ns;
+        scratch.flow.drain_until_monotonic_ns = scratch.transport.drain_until_monotonic_ns;
+        if ENCRYPTION_CONNECTIONS
+            .insert(flow_key, &scratch.flow, 0)
+            .is_err()
+            || !apply_packet_encryption_mark(ctx, scratch.transport.fwmark)
+        {
+            return TC_ACT_SHOT;
+        }
+        return TC_ACT_PIPE;
+    }
+
+    if !packet_starts_connection(observation.protocol, observation.tcp_flags) {
+        return TC_ACT_SHOT;
+    }
+    let decision_key = EncryptionDecisionKey {
+        source_identity: observation.source_identity,
+        destination_identity: observation.destination_identity,
+        bank: scratch.config.active_bank,
+        reserved: [0; 3],
+    };
+    // SAFETY: fixed-layout lookup is copied into CPU-local scratch.
+    #[allow(unsafe_code)]
+    let Some(decision) = (unsafe { ENCRYPTION_DECISIONS.get(&decision_key) }) else {
+        return TC_ACT_SHOT;
+    };
+    scratch.decision = *decision;
+    if !encryption_decision_is_usable(&scratch.decision, &scratch.config) {
+        return TC_ACT_SHOT;
+    }
+    if scratch.decision.disposition == ENCRYPTION_DISPOSITION_NATIVE {
+        clear_packet_encryption_mark(ctx);
+        return TC_ACT_PIPE;
+    }
+    if scratch.decision.disposition != ENCRYPTION_DISPOSITION_REQUIRED {
+        return TC_ACT_SHOT;
+    }
+    let transport_id = if scratch.decision.flags & ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND == 0 {
+        scratch.decision.transport_id
+    } else if IPV6 {
+        let key = LpmKey::new(
+            ENCRYPTION_PATH_PREFIX_BASE_BITS + 128,
+            EncryptionIpv6PathData {
+                bank: scratch.config.active_bank,
+                reserved: [0; 3],
+                destination_address: observation.destination_address,
+            },
+        );
+        let Some(path) = ENCRYPTION_PATHS_V6.get(&key) else {
+            return TC_ACT_SHOT;
+        };
+        scratch.path = *path;
+        if !encryption_path_is_usable(&scratch.path, &scratch.decision) {
+            return TC_ACT_SHOT;
+        }
+        scratch.path.transport_id
+    } else {
+        let key = LpmKey::new(
+            ENCRYPTION_PATH_PREFIX_BASE_BITS + 32,
+            EncryptionIpv4PathData {
+                bank: scratch.config.active_bank,
+                reserved: [0; 3],
+                destination_address: [
+                    observation.destination_address[0],
+                    observation.destination_address[1],
+                    observation.destination_address[2],
+                    observation.destination_address[3],
+                ],
+            },
+        );
+        let Some(path) = ENCRYPTION_PATHS_V4.get(&key) else {
+            return TC_ACT_SHOT;
+        };
+        scratch.path = *path;
+        if !encryption_path_is_usable(&scratch.path, &scratch.decision) {
+            return TC_ACT_SHOT;
+        }
+        scratch.path.transport_id
+    };
+    let transport_key = EncryptionTransportKey {
+        transport_id,
+        bank: scratch.config.active_bank,
+        reserved: [0; 7],
+    };
+    // SAFETY: copied before connection-map insertion.
+    #[allow(unsafe_code)]
+    let Some(transport) = (unsafe { ENCRYPTION_TRANSPORTS.get(&transport_key) }) else {
+        return TC_ACT_SHOT;
+    };
+    scratch.transport = *transport;
+    if scratch.decision.key_epoch != scratch.transport.key_epoch
+        || scratch.decision.contract_revision != scratch.transport.contract_revision
+        || !encryption_transport_is_usable(&scratch.transport, false, now_ns)
+        || packet_exceeds_encryption_mtu(ctx, scratch.transport.mtu)
+    {
+        return TC_ACT_SHOT;
+    }
+    scratch.flow = EncryptionFlowValue {
+        last_seen_monotonic_ns: now_ns,
+        transport_id,
+        key_epoch: scratch.decision.key_epoch,
+        contract_revision: scratch.decision.contract_revision,
+        drain_until_monotonic_ns: scratch.transport.drain_until_monotonic_ns,
+        decision_witness: scratch.decision.decision_witness,
+        schema_version: ENCRYPTION_MAP_ABI_VERSION,
+        flags: unf_ebpf_common::ENCRYPTION_FLOW_FLAG_ESTABLISHED_LEASE,
+        reserved: [0; 5],
+    };
+    if ENCRYPTION_CONNECTIONS
+        .insert(flow_key, &scratch.flow, 0)
+        .is_err()
+        || !apply_packet_encryption_mark(ctx, scratch.transport.fwmark)
+    {
+        let _ = ENCRYPTION_CONNECTIONS.remove(flow_key);
+        return TC_ACT_SHOT;
+    }
+    TC_ACT_PIPE
+}
+
+#[inline(always)]
+fn packet_exceeds_encryption_mtu(ctx: &TcContext, mtu: u32) -> bool {
+    ctx.len().saturating_sub(ETHERNET_HEADER_LEN as u32) > mtu
+}
+
+#[inline(always)]
+fn apply_packet_encryption_mark(ctx: &TcContext, outer_fwmark: u32) -> bool {
+    let Some(route_mark) = encryption_route_mark(outer_fwmark) else {
+        return false;
+    };
+    // SAFETY: this TC invocation exclusively owns skb metadata. Only UNF's
+    // leased field changes; DSR and neighboring mark ownership are preserved.
+    #[allow(unsafe_code)]
+    unsafe {
+        let skb = &mut *ctx.skb.skb;
+        let Some(mark) = apply_encryption_route_mark(skb.mark, route_mark) else {
+            return false;
+        };
+        skb.mark = mark;
+    }
+    true
+}
+
+#[inline(always)]
+fn clear_packet_encryption_mark(ctx: &TcContext) {
+    // SAFETY: same exclusive metadata ownership as mark application.
+    #[allow(unsafe_code)]
+    unsafe {
+        let skb = &mut *ctx.skb.skb;
+        skb.mark = clear_encryption_route_mark(skb.mark);
+    }
 }
 
 #[classifier]

@@ -54,12 +54,12 @@ struct EncryptionMapMutationStats {
 }
 
 pub(super) struct EncryptionMaps {
-    decisions: AyaHashMap<MapData, [u8; 12], [u8; 72]>,
-    transports: AyaHashMap<MapData, [u8; 16], [u8; 80]>,
-    ipv4_paths: AyaLpmTrie<MapData, [u8; 8], [u8; 48]>,
-    ipv6_paths: AyaLpmTrie<MapData, [u8; 20], [u8; 48]>,
-    config: AyaArray<MapData, [u8; 48]>,
-    connections: AyaHashMap<MapData, [u8; 40], [u8; 64]>,
+    pub(super) decisions: AyaHashMap<MapData, [u8; 12], [u8; 72]>,
+    pub(super) transports: AyaHashMap<MapData, [u8; 16], [u8; 80]>,
+    pub(super) ipv4_paths: AyaLpmTrie<MapData, [u8; 8], [u8; 48]>,
+    pub(super) ipv6_paths: AyaLpmTrie<MapData, [u8; 20], [u8; 48]>,
+    pub(super) config: AyaArray<MapData, [u8; 48]>,
+    pub(super) connections: AyaHashMap<MapData, [u8; 40], [u8; 64]>,
 }
 
 pub(super) struct EncryptionMapSynchronizer {
@@ -680,7 +680,7 @@ fn encode_generation(state: &EncryptionFastPathState) -> Result<EncodedEncryptio
     })
 }
 
-fn encode_decision_key(key: &EncryptionDecisionKey) -> [u8; 12] {
+pub(super) fn encode_decision_key(key: &EncryptionDecisionKey) -> [u8; 12] {
     let mut encoded = [0; 12];
     encoded[0..4].copy_from_slice(&key.source_identity.get().to_ne_bytes());
     encoded[4..8].copy_from_slice(&key.destination_identity.get().to_ne_bytes());
@@ -689,7 +689,7 @@ fn encode_decision_key(key: &EncryptionDecisionKey) -> [u8; 12] {
     encoded
 }
 
-fn encode_decision_value(value: &EncryptionDecisionValue) -> [u8; 72] {
+pub(super) fn encode_decision_value(value: &EncryptionDecisionValue) -> [u8; 72] {
     let mut encoded = [0; 72];
     for (index, field) in [
         value.transport_id,
@@ -711,7 +711,7 @@ fn encode_decision_value(value: &EncryptionDecisionValue) -> [u8; 72] {
     encoded
 }
 
-fn encode_transport_key(key: &EncryptionTransportKey) -> [u8; 16] {
+pub(super) fn encode_transport_key(key: &EncryptionTransportKey) -> [u8; 16] {
     let mut encoded = [0; 16];
     encoded[0..8].copy_from_slice(&key.transport_id.to_ne_bytes());
     encoded[8] = key.bank;
@@ -719,7 +719,7 @@ fn encode_transport_key(key: &EncryptionTransportKey) -> [u8; 16] {
     encoded
 }
 
-fn encode_transport_value(value: &EncryptionTransportValue) -> [u8; 80] {
+pub(super) fn encode_transport_value(value: &EncryptionTransportValue) -> [u8; 80] {
     let mut encoded = [0; 80];
     for (index, field) in [
         value.key_epoch,
@@ -751,7 +751,7 @@ fn encode_transport_value(value: &EncryptionTransportValue) -> [u8; 80] {
     encoded
 }
 
-fn encode_ipv4_path_data(value: EncryptionIpv4PathData) -> [u8; 8] {
+pub(super) fn encode_ipv4_path_data(value: EncryptionIpv4PathData) -> [u8; 8] {
     let mut encoded = [0; 8];
     encoded[0] = value.bank;
     encoded[1..4].copy_from_slice(&value.reserved);
@@ -759,7 +759,7 @@ fn encode_ipv4_path_data(value: EncryptionIpv4PathData) -> [u8; 8] {
     encoded
 }
 
-fn encode_ipv6_path_data(value: &EncryptionIpv6PathData) -> [u8; 20] {
+pub(super) fn encode_ipv6_path_data(value: &EncryptionIpv6PathData) -> [u8; 20] {
     let mut encoded = [0; 20];
     encoded[0] = value.bank;
     encoded[1..4].copy_from_slice(&value.reserved);
@@ -767,7 +767,7 @@ fn encode_ipv6_path_data(value: &EncryptionIpv6PathData) -> [u8; 20] {
     encoded
 }
 
-fn encode_path_value(value: &EncryptionPathValue) -> [u8; 48] {
+pub(super) fn encode_path_value(value: &EncryptionPathValue) -> [u8; 48] {
     let mut encoded = [0; 48];
     for (index, field) in [value.transport_id, value.contract_revision, value.key_epoch]
         .into_iter()
@@ -782,7 +782,7 @@ fn encode_path_value(value: &EncryptionPathValue) -> [u8; 48] {
     encoded
 }
 
-fn encode_map_config(value: &EncryptionMapConfig) -> [u8; 48] {
+pub(super) fn encode_map_config(value: &EncryptionMapConfig) -> [u8; 48] {
     let mut encoded = [0; 48];
     for (index, field) in [
         value.generation,
