@@ -893,12 +893,16 @@ partial-fleet key advancement; `make encryption-key-attestation-test`; ADR
 0184. The Demand-Sparse Fleet Plan Forge now derives key facts and readiness
 from that one cut, emits a single atomic catalog, and gives idle members an
 explicit authority-free dormant plan instead of a fabricated tunnel;
-`make encryption-fleet-plan-producer-test`; ADR 0185. Kubernetes fact projection,
-controller invocation, local compile, the TC consumer/verifier, and live
+`make encryption-fleet-plan-producer-test`; ADR 0185. Its Policy-Truth Transport
+Quotient preserves mixed L4 allow/deny semantics while provisioning shared L3
+transport and represents default allow without inventing a policy ID; policy
+remains the first packet authority; `make encryption-policy-quotient-test`; ADR
+0186. Address-exact replica binding, Kubernetes fact projection, controller
+invocation, local compile, the TC consumer/verifier, and live
 encrypted packet gate remain, so no workload packet yet selects the staged
 route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0185 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0186 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

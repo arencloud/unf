@@ -1018,7 +1018,7 @@ fn encrypted(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-    use unf_common::PolicyId;
+    use unf_common::{PolicyId, PolicyReason};
 
     use super::*;
     use crate::{
@@ -1129,6 +1129,7 @@ mod tests {
                         source,
                         destination,
                         allowed: true,
+                        reason: PolicyReason::ExplicitRule,
                         policy_ids: vec![PolicyId::new(9)],
                     })
             })

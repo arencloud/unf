@@ -19,6 +19,7 @@ mod key_transparency;
 mod local_orchestrator;
 mod local_plan_compiler;
 mod plan_distribution;
+mod policy_projection;
 mod route_authority;
 
 pub use activation_latch::*;
@@ -35,6 +36,7 @@ pub use key_transparency::*;
 pub use local_orchestrator::*;
 pub use local_plan_compiler::*;
 pub use plan_distribution::*;
+pub use policy_projection::*;
 pub use route_authority::*;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,7 +45,7 @@ use std::net::{IpAddr, SocketAddr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use unf_common::{IdentityId, PolicyId, Revision};
+use unf_common::{IdentityId, PolicyId, PolicyReason, Revision};
 
 pub const ENCRYPTION_MODEL_SCHEMA_VERSION: u16 = 1;
 pub const ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION: u16 = 1;
@@ -361,6 +363,7 @@ pub struct EncryptionPolicyFact {
     pub source: IdentityId,
     pub destination: IdentityId,
     pub allowed: bool,
+    pub reason: PolicyReason,
     pub policy_ids: Vec<PolicyId>,
 }
 
@@ -447,6 +450,7 @@ pub struct EncryptionKeyBinding {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EncryptionPolicyBinding {
     pub policy_ids: Vec<PolicyId>,
+    pub reason: PolicyReason,
     pub revision: Revision,
 }
 
@@ -861,7 +865,7 @@ fn compile_plan(
     if !policy.allowed {
         return Ok(None);
     }
-    if policy.policy_ids.is_empty() {
+    if matches!(policy.reason, PolicyReason::NoApplicablePolicy) != policy.policy_ids.is_empty() {
         return Err(EncryptionContractError::InvalidPolicy);
     }
     let source_key = key_binding(
@@ -899,6 +903,7 @@ fn compile_plan(
         intent_uids: requirement.intent_uids,
         policy: EncryptionPolicyBinding {
             policy_ids: policy.policy_ids.clone(),
+            reason: policy.reason,
             revision: context.facts.revisions.policy,
         },
         source_key,
@@ -1060,6 +1065,9 @@ fn canonical_policies(
         policy.policy_ids.sort_unstable();
         if policy.policy_ids.iter().any(|id| id.get() == 0)
             || policy.policy_ids.windows(2).any(|pair| pair[0] == pair[1])
+            || policy.allowed
+                && matches!(policy.reason, PolicyReason::NoApplicablePolicy)
+                    != policy.policy_ids.is_empty()
         {
             return Err(EncryptionContractError::InvalidPolicy);
         }
@@ -1435,6 +1443,7 @@ mod tests {
                 source: IdentityId::new(11),
                 destination: IdentityId::new(22),
                 allowed: true,
+                reason: PolicyReason::ExplicitRule,
                 policy_ids: vec![PolicyId::new(9), PolicyId::new(3)],
             }],
             keys: vec![
@@ -1544,14 +1553,14 @@ mod tests {
         assert_eq!(
             first.contract_digest,
             AttestedEncryptionContractDigest([
-                144, 234, 201, 131, 134, 50, 71, 213, 141, 90, 159, 218, 133, 223, 8, 100, 107, 27,
-                16, 117, 76, 129, 88, 142, 86, 31, 119, 200, 155, 216, 162, 193,
+                7, 169, 135, 128, 228, 86, 54, 31, 179, 212, 193, 215, 220, 100, 102, 91, 40, 231,
+                217, 113, 123, 195, 252, 134, 203, 53, 58, 156, 218, 82, 62, 19,
             ])
         );
         assert_eq!(
             first.decision_witness(0).expect("witness"),
             EncryptionDecisionWitness([
-                139, 184, 20, 51, 222, 46, 0, 32, 250, 78, 33, 208, 63, 74, 222, 250,
+                60, 42, 112, 101, 162, 221, 31, 214, 35, 249, 170, 5, 67, 222, 8, 247,
             ])
         );
         assert!(first.decision_witness(1).is_err());
@@ -1564,6 +1573,25 @@ mod tests {
         let contract = issue(&model, &facts, &source_node).expect("denial is valid policy state");
         assert!(contract.plans.is_empty());
         assert!(contract.failure_envelope.observations.is_empty());
+    }
+
+    #[test]
+    fn no_applicable_policy_is_truthful_authority_without_a_fabricated_id() {
+        let (model, mut facts, source_node) = fixture();
+        facts.policies[0].reason = PolicyReason::NoApplicablePolicy;
+        facts.policies[0].policy_ids.clear();
+        let contract = issue(&model, &facts, &source_node).expect("default allow is explicit");
+        assert_eq!(
+            contract.plans[0].policy.reason,
+            PolicyReason::NoApplicablePolicy
+        );
+        assert!(contract.plans[0].policy.policy_ids.is_empty());
+
+        facts.policies[0].reason = PolicyReason::ExplicitRule;
+        assert!(matches!(
+            issue(&model, &facts, &source_node),
+            Err(EncryptionContractError::InvalidPolicy)
+        ));
     }
 
     #[test]

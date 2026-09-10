@@ -252,7 +252,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use unf_common::{IdentityId, PolicyId};
+    use unf_common::{IdentityId, PolicyId, PolicyReason};
 
     use super::*;
     use crate::{
@@ -403,12 +403,14 @@ mod tests {
                     source: IdentityId::new(11),
                     destination: IdentityId::new(21),
                     allowed: true,
+                    reason: PolicyReason::ExplicitRule,
                     policy_ids: vec![PolicyId::new(9)],
                 },
                 EncryptionPolicyFact {
                     source: IdentityId::new(21),
                     destination: IdentityId::new(11),
                     allowed: true,
+                    reason: PolicyReason::ExplicitRule,
                     policy_ids: vec![PolicyId::new(10)],
                 },
             ],
