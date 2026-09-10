@@ -7393,7 +7393,14 @@ async fn advance_startup_encryption_authority(
         {
             Ok(_) => {
                 if let Some(plan) = plans.current.as_ref() {
-                    generations.supersede_stale_active_revalidation(plan.snapshot.generation);
+                    let desired = plan.snapshot.generation;
+                    generations.supersede_stale_active_revalidation(desired);
+                    if let Some(authority) = keys.authority.as_ref() {
+                        generations
+                            .abandon_superseded_prepared(desired, authority.authority())
+                            .await
+                            .context("retire superseded startup encryption stage")?;
+                    }
                 }
                 if let Err(error) = prepare_admitted_encryption_plan(plans, keys, generations)
                     .await
@@ -8807,6 +8814,97 @@ impl EncryptionGenerationSynchronizer {
             self.path_proofs.clear();
         }
         stale
+    }
+
+    /// Abandons a locally prepared generation that the authenticated plan
+    /// stream has superseded before controller admission.
+    ///
+    /// A controller can restart after agents stage a generation but before it
+    /// durably admits the complete fleet fact cut. The replacement controller
+    /// then publishes a newer plan, while the orphaned prepared capability
+    /// would otherwise block every Node from compiling that successor. Only a
+    /// non-admitted capability may take this path. Pending-only interfaces are
+    /// removed with exact positive absence and any shared interface is restored
+    /// from the durable active recovery plan before the pending journal is
+    /// cleared.
+    async fn abandon_superseded_prepared(
+        &mut self,
+        desired: Revision,
+        key_authority: &NodeKeyAuthority,
+    ) -> Result<bool> {
+        let Some(pending) = self.recovery.pending.clone() else {
+            return Ok(false);
+        };
+        let pending_generation = pending
+            .fact
+            .checkpoint
+            .transaction
+            .desired
+            .published
+            .generation;
+        if pending_generation >= desired {
+            return Ok(false);
+        }
+        if self.current.as_ref().is_some_and(|current| {
+            current.recipient == pending.fact.recipient
+                && current.checkpoint == pending.fact.checkpoint
+        }) {
+            bail!("controller-admitted pending encryption generation cannot be superseded");
+        }
+        if self.has_controller_admission() {
+            bail!("volatile controller admission must be settled before superseding a stage");
+        }
+        if let Some(PendingEncryptionGeneration::Prepared { prepared, .. }) = self.pending.as_ref()
+            && prepared.fact() != &pending.fact
+        {
+            bail!("volatile prepared capability differs from the superseded recovery plan");
+        }
+        let active_interfaces = self
+            .recovery
+            .active
+            .iter()
+            .flat_map(|recovery| recovery.plans.iter())
+            .map(|plan| plan.interface_name.as_str())
+            .collect::<BTreeSet<_>>();
+        let route_provider = LinuxEncryptionRouteProvider;
+        let kernel_provider = LinuxWireGuardProvider;
+        for plan in pending.plans.iter().rev() {
+            if active_interfaces.contains(plan.interface_name.as_str()) {
+                continue;
+            }
+            route_provider
+                .deactivate_plan(plan)
+                .await
+                .context("remove superseded prepared policy-route authority")?;
+            kernel_provider
+                .delete(plan)
+                .await
+                .context("remove superseded prepared WireGuard stage")?;
+        }
+        if let Some(active) = &self.recovery.active {
+            active
+                .repair_and_rehydrate_linux(key_authority)
+                .await
+                .context("restore durable active Linux state after superseding a stage")?;
+        }
+
+        let mut recovery = self.recovery.clone();
+        recovery.pending = None;
+        recovery.verify(&self.node_name, self.current.as_ref())?;
+        persist_secure_json(
+            &self.recovery_plan_path,
+            &recovery,
+            "superseded encryption recovery plan",
+        )?;
+        self.recovery = recovery;
+        self.pending = None;
+        self.path_proofs.clear();
+        info!(
+            superseded_generation = pending_generation.get(),
+            desired_generation = desired.get(),
+            "removed non-admitted encryption stage superseded across controller recovery"
+        );
+        Ok(true)
     }
 
     fn has_controller_admission(&self) -> bool {
@@ -15446,6 +15544,21 @@ async fn consume_events(
                                 "durably adopted authenticated Node-local encryption plan"
                             );
                         }
+                        if let Some(current) = encryption_plans.current.as_ref()
+                            && let Some(authority) = encryption_keys.authority.as_ref()
+                            && let Err(error) = encryption_generations
+                                .abandon_superseded_prepared(
+                                    current.snapshot.generation,
+                                    authority.authority(),
+                                )
+                                .await
+                        {
+                            warn!(
+                                ?error,
+                                "superseded encryption stage could not be removed exactly"
+                            );
+                            continue;
+                        }
                         match prepare_admitted_encryption_plan(
                             encryption_plans,
                             encryption_keys,
@@ -18742,6 +18855,26 @@ mod tests {
         );
     }
 
+    async fn prove_dormant_prepared_generation_can_be_superseded(
+        generations: &mut EncryptionGenerationSynchronizer,
+        keys: &EncryptionKeySynchronizer,
+    ) {
+        // A restart deliberately drops the volatile capability while the
+        // durable, non-admitted stage remains in the recovery journal.
+        generations.pending = None;
+        assert!(
+            generations
+                .abandon_superseded_prepared(
+                    Revision::new(20),
+                    keys.authority.as_ref().unwrap().authority(),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(generations.pending.is_none());
+        assert!(generations.recovery.pending.is_none());
+    }
+
     #[tokio::test]
     async fn dormant_plan_compiles_once_into_an_empty_retryable_generation_fact() {
         let temporary = tempdir().unwrap();
@@ -18840,6 +18973,7 @@ mod tests {
                 .await
                 .unwrap()
         );
+        prove_dormant_prepared_generation_can_be_superseded(&mut generations, &keys).await;
     }
 
     #[test]
