@@ -369,15 +369,15 @@ fn native_decisions(
     facts
         .endpoints
         .iter()
-        .filter(|source| source.node == *node)
         .flat_map(|source| {
             facts
                 .endpoints
                 .iter()
-                .filter(|destination| destination.node.uid != node.uid)
+                .filter(|destination| destination.node.uid != source.node.uid)
                 .filter_map(|destination| {
                     let pair = (source.identity, destination.identity);
-                    (allowed.contains(&pair)
+                    ((source.node.uid == node.uid || destination.node.uid == node.uid)
+                        && allowed.contains(&pair)
                         && input.model.requirement(pair.0, pair.1).disposition
                             == crate::EncryptionDisposition::Native)
                         .then_some(pair)
@@ -757,6 +757,34 @@ mod tests {
         assert!(unf_ebpf_common::encryption_config_is_active(
             &desired.config
         ));
+    }
+
+    #[test]
+    fn native_delivery_authority_reaches_both_ends_of_the_exact_path() {
+        let mut input = input(true);
+        input.model = EncryptionModel::normalize(
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Native,
+            Vec::new(),
+        )
+        .unwrap();
+        let cut = produce_fleet_plan_cut(input).unwrap();
+        for plan in cut
+            .plans
+            .iter()
+            .filter(|plan| matches!(plan.recipient.node_uid.as_str(), "uid-a" | "uid-b"))
+        {
+            assert_eq!(plan.mode, NodeLocalPlanMode::Active);
+            assert!(plan.epochs.is_empty());
+            assert_eq!(plan.decisions.len(), 2);
+            assert!(plan.decisions.iter().all(|decision| {
+                decision.disposition == crate::EncryptionDisposition::Native
+                    && decision.contract_epoch.is_none()
+                    && decision.plan_index.is_none()
+            }));
+            plan.verify().unwrap();
+        }
+        assert_eq!(cut.plans[2].mode, NodeLocalPlanMode::Dormant);
     }
 
     #[test]
