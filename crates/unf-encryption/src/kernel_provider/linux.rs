@@ -492,9 +492,13 @@ async fn read_owned_snapshot(
         .iter()
         .map(|route| route.prefix)
         .collect::<BTreeSet<_>>();
-    if allowed != routed_prefixes {
+    // Missing routes are safe, observable drift: marked traffic is caught by
+    // the terminal unreachable rule and the exact plan can recreate them.
+    // A route not justified by the WireGuard peer set is foreign authority
+    // and must never be adopted or deleted by reconciliation.
+    if !routed_prefixes.is_subset(&allowed) {
         return Err(WireGuardKernelError::ForeignState(
-            "owned WireGuard interface has an incomplete peer-to-route cut".to_owned(),
+            "owned WireGuard interface has a route outside its peer authority".to_owned(),
         ));
     }
     Ok(snapshot)
@@ -1517,6 +1521,19 @@ mod tests {
         assert_eq!(outcome, KernelApplyOutcome::AlreadyExact);
         assert_eq!(fs::read_to_string(reverse_path_filter).unwrap().trim(), "0");
         assert_eq!(first.configuration_digest, replay.configuration_digest);
+
+        let missing_prefix = *plan.route_prefixes().iter().next().unwrap();
+        let missing_route = list_routes(&handle)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|route| route_key(route) == Some((missing_prefix, plan.route_table)))
+            .unwrap();
+        handle.route().del(missing_route).execute().await.unwrap();
+        assert!(provider.readback(&plan).await.is_err());
+        let (outcome, repaired) = provider.apply(&plan, &private_key).await.unwrap();
+        assert_eq!(outcome, KernelApplyOutcome::Reconfigured);
+        repaired.verify_against(&plan).unwrap();
 
         let expanded = expanded_plan(&plan);
         let injected_update = provider

@@ -17,8 +17,8 @@ use crate::{
     EncryptionGenerationDistributionError, EncryptionGenerationFact, EncryptionGenerationFactError,
     EncryptionGenerationPathProofPermit, EncryptionGenerationRecipient, EncryptionRouteAuthority,
     EncryptionRouteAuthorityError, EncryptionRoutePublicationPermit, FastPathMapCheckpoint,
-    FastPathPublishedGeneration, FastPathTransactionError, KeyAuthorityError, NodeKeyAuthority,
-    PathProvenEncryptionActivationLatch, WireGuardEpochActivation,
+    FastPathPublishedGeneration, FastPathTransactionError, KernelApplyOutcome, KeyAuthorityError,
+    NodeKeyAuthority, PathProvenEncryptionActivationLatch, WireGuardEpochActivation,
     WireGuardKernelConfigurationDigest, WireGuardKernelError, WireGuardKernelPlan,
     WireGuardKernelPlanDigest, WireGuardKernelSnapshot,
 };
@@ -168,6 +168,60 @@ impl NodeLocalRecoveryPlan {
         self.rehydrate_exact_readback(&snapshots)
     }
 
+    /// Repairs only digest-bound UNF-owned kernel state before reconstructing
+    /// fresh volatile proof for an already admitted generation.
+    ///
+    /// This is the restart counterpart to initial staging: a down link can
+    /// make Linux withdraw its connected policy-table routes even after the
+    /// link is raised again. Read-only rehydration must reject that drift, but
+    /// a restart must also be able to restore the exact durable plan without
+    /// inventing a successor generation. The provider refuses foreign links,
+    /// aliases, route keys, public keys, and private-key mismatches.
+    ///
+    /// # Errors
+    ///
+    /// Rejects mutated recovery authority, foreign kernel state, unavailable
+    /// key authority, partial convergence, or incomplete rollback.
+    #[cfg(target_os = "linux")]
+    pub async fn repair_and_rehydrate_linux(
+        &self,
+        key_authority: &NodeKeyAuthority,
+    ) -> Result<LinuxPreparedLocalGeneration, NodeLocalOrchestratorError> {
+        self.verify()?;
+        preflight_linux_plans(&self.fact.recipient, key_authority, &self.plans)?;
+        let provider = LinuxWireGuardProvider;
+        let mut snapshots = Vec::with_capacity(self.plans.len());
+        let mut created = Vec::new();
+        for plan in &self.plans {
+            let private_key = key_authority
+                .private_key_for_kernel_plan(plan)
+                .map_err(NodeLocalOrchestratorError::InvalidKeyAuthority)?;
+            match provider.apply(plan, private_key).await {
+                Ok((outcome, snapshot)) => {
+                    if outcome == KernelApplyOutcome::Created {
+                        created.push(plan.clone());
+                    }
+                    snapshots.push(snapshot);
+                }
+                Err(cause) => {
+                    return rollback_recovery_created(&provider, &created, cause).await;
+                }
+            }
+        }
+        match self.rehydrate_exact_readback(&snapshots) {
+            Ok(prepared) => Ok(prepared),
+            Err(cause) => {
+                for plan in created.iter().rev() {
+                    provider
+                        .delete(plan)
+                        .await
+                        .map_err(NodeLocalOrchestratorError::InvalidKernel)?;
+                }
+                Err(cause)
+            }
+        }
+    }
+
     fn validate_authority(&self) -> Result<(), NodeLocalOrchestratorError> {
         if self.schema_version != NODE_LOCAL_RECOVERY_PLAN_SCHEMA_VERSION {
             return Err(NodeLocalOrchestratorError::InvalidRecoveryPlan);
@@ -207,6 +261,25 @@ impl NodeLocalRecoveryPlan {
         hasher.update(encoded);
         Ok(NodeLocalRecoveryPlanDigest(hasher.finalize().into()))
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn rollback_recovery_created<T>(
+    provider: &LinuxWireGuardProvider,
+    created: &[WireGuardKernelPlan],
+    cause: WireGuardKernelError,
+) -> Result<T, NodeLocalOrchestratorError> {
+    for plan in created.iter().rev() {
+        if let Err(rollback) = provider.delete(plan).await {
+            return Err(NodeLocalOrchestratorError::InvalidKernel(
+                WireGuardKernelError::Rollback {
+                    cause: cause.to_string(),
+                    rollback: rollback.to_string(),
+                },
+            ));
+        }
+    }
+    Err(NodeLocalOrchestratorError::InvalidKernel(cause))
 }
 
 impl NodeLocalGenerationProposal {

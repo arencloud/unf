@@ -7253,7 +7253,7 @@ async fn run_dataplane(
     }
     // Rehydrating the active slot may reveal a separately durable successor.
     // Only after current authority is safe may that proposal resume exchange.
-    encryption_generations.rehydrate_local_proof().await?;
+    encryption_generations.rehydrate_local_proof(None).await?;
     let controller_management_port = controller_url.as_deref().map(controller_port).transpose()?;
     let egress_bgp = initialize_egress_bgp(
         config.egress_bgp_config_path.as_deref(),
@@ -7412,8 +7412,12 @@ async fn advance_startup_encryption_authority(
         }
     }
     if generations.pending.is_none() {
+        let key_authority = keys
+            .authority
+            .as_ref()
+            .map(RuntimeNodeKeyAuthority::authority);
         generations
-            .rehydrate_local_proof()
+            .rehydrate_local_proof(key_authority)
             .await
             .context("rehydrate durable startup encryption predecessor")?;
     }
@@ -8659,7 +8663,10 @@ impl EncryptionGenerationSynchronizer {
 
     /// Rebuilds volatile proof only from exact fresh Linux readback. A durable
     /// plan or controller admission is never treated as activation authority.
-    async fn rehydrate_local_proof(&mut self) -> Result<bool> {
+    async fn rehydrate_local_proof(
+        &mut self,
+        repair_authority: Option<&NodeKeyAuthority>,
+    ) -> Result<bool> {
         if self.pending.is_some() {
             return Ok(false);
         }
@@ -8697,10 +8704,19 @@ impl EncryptionGenerationSynchronizer {
         let Some(recovery) = recovery else {
             return Ok(false);
         };
-        let prepared = recovery
-            .rehydrate_linux()
-            .await
-            .context("rehydrate encryption proof from exact Linux readback")?;
+        let prepared = match recovery.rehydrate_linux().await {
+            Ok(prepared) => prepared,
+            Err(readback) => {
+                let Some(repair_authority) = repair_authority else {
+                    return Err(readback)
+                        .context("rehydrate encryption proof from exact Linux readback");
+                };
+                recovery
+                    .repair_and_rehydrate_linux(repair_authority)
+                    .await
+                    .context("repair digest-bound encryption state and rehydrate exact readback")?
+            }
+        };
         if has_admission {
             let current = current.context("selected encryption recovery slot has no admission")?;
             prepared
