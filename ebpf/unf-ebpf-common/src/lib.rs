@@ -116,6 +116,11 @@ pub const SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER: u16 = 1 << 0;
 pub const SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL: u16 = 1 << 1;
 pub const SERVICE_CONNECTION_FLAG_MAGLEV: u16 = 1 << 2;
 pub const SERVICE_CONNECTION_FLAG_DSR: u16 = 1 << 3;
+/// A DSR-selected `LoadBalancer` flow was deterministically converted to
+/// reversible NAT because Required `WireGuard` routing needs the selected
+/// backend in the inner destination. This bit is runtime flow provenance and
+/// is never a frontend capability.
+pub const SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT: u16 = 1 << 4;
 pub const SERVICE_FRONTEND_FLAG_CLIENT_IP_AFFINITY: u16 = 1;
 pub const SERVICE_FRONTEND_FLAG_MAGLEV: u16 = 1 << 1;
 pub const SERVICE_FRONTEND_FLAG_DSR: u16 = 1 << 2;
@@ -325,13 +330,21 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
             & !(SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
                 | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL
                 | SERVICE_CONNECTION_FLAG_MAGLEV
-                | SERVICE_CONNECTION_FLAG_DSR)
+                | SERVICE_CONNECTION_FLAG_DSR
+                | SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT)
             == 0
         && state.flags
             & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
             != (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
         && state.reserved[3] >> SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT
             <= SERVICE_AFFINITY_OUTCOME_RESELECTED
+        && (state.flags & SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT == 0
+            || state.flags
+                & (SERVICE_CONNECTION_FLAG_DSR
+                    | SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
+                    | SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL)
+                == 0
+                && state.reserved[2] == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER)
         && if state.flags & SERVICE_CONNECTION_FLAG_DSR != 0 {
             state.flags
                 & (SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER
@@ -364,10 +377,11 @@ pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns
             address_is_zero(state.translated_source_address)
                 && state.reserved[0] == 0
                 && state.reserved[1] == 0
-                && matches!(
+                && (matches!(
                     state.reserved[2],
                     0 | SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL
-                )
+                ) || state.flags & SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT != 0
+                    && state.reserved[2] == SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER)
                 && service_selection_tier_is_valid(
                     state.reserved[3] & SERVICE_CONNECTION_SELECTION_TIER_MASK,
                 )
@@ -2251,6 +2265,15 @@ mod tests {
         invalid.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER;
         assert!(service_connection_is_active(&invalid, 11));
         invalid.flags |= SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER;
+        assert!(!service_connection_is_active(&invalid, 11));
+        invalid = tcp;
+        invalid.flags = SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT;
+        invalid.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_CLUSTER;
+        assert!(service_connection_is_active(&invalid, 11));
+        invalid.flags |= SERVICE_CONNECTION_FLAG_DSR;
+        assert!(!service_connection_is_active(&invalid, 11));
+        invalid.flags = SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT;
+        invalid.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL;
         assert!(!service_connection_is_active(&invalid, 11));
     }
 

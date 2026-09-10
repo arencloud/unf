@@ -919,10 +919,15 @@ It consumes exact active-bank decision/path/transport proof, applies only UNF's
 leased mark field, retains bounded active/draining flow epochs, and drops any
 missing Required authority. Real kernel verifier loading plus IPv4 direct,
 IPv6 address-bound, and transport-removal packet execution pass
-`make encryption-tc-consumer-test`; ADR 0191. Required DSR remains fail-closed
-until a tunnel-aware handoff and live ciphertext gate land. The [Phase 9
+`make encryption-tc-consumer-test`; ADR 0191. Flow-Adaptive Secure DSR now
+preserves Native VIP/direct-return behavior while morphing only a Required flow
+to an atomic reversible NAT pair using its already selected backend. WireGuard
+therefore sees a peer-owned inner destination, return traffic restores the VIP,
+and explicit external egress cannot borrow a Pod epoch lease. Real packet tests
+also prove bounded old-epoch drain and immediate no-downgrade revocation under
+`make encryption-composition-test`; ADR 0192. Live ciphertext remains. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0191 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0192 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

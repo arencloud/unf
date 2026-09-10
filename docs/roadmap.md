@@ -983,8 +983,14 @@ matrix is maintained in the
   consumes exact decision/path/transport proof, changes only UNF's cooperative
   mark field, retains bounded Causal Epoch Leases, and drops missing Required
   authority; real verifier loading plus IPv4 direct and IPv6 late-bound packet
-  execution pass `make encryption-tc-consumer-test` and ADR 0191. Complete
-  Service/egress/DSR composition and live ciphertext remain within 9.5.
+  execution pass `make encryption-tc-consumer-test` and ADR 0191.
+  Flow-Adaptive Secure DSR then preserves Native VIP/direct-return behavior but
+  morphs only a Required flow into an atomic reversible NAT pair using its
+  already selected backend, so WireGuard sees a peer-owned inner destination.
+  Explicit external egress remains prior and cannot acquire a Pod lease, while
+  active-to-draining flow continuity and immediate revocation pass real packet
+  execution under `make encryption-composition-test` and ADR 0192. Live
+  WireGuard ciphertext remains within 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,

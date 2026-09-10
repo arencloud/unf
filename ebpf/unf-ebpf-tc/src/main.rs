@@ -56,7 +56,8 @@ use unf_ebpf_common::{
     SERVICE_AFFINITY_MIN_TIMEOUT_SECONDS, SERVICE_AFFINITY_OUTCOME_CREATED,
     SERVICE_AFFINITY_OUTCOME_NONE, SERVICE_AFFINITY_OUTCOME_RESELECTED,
     SERVICE_AFFINITY_OUTCOME_REUSED, SERVICE_BANK_COUNT, SERVICE_CONNECTION_AFFINITY_OUTCOME_SHIFT,
-    SERVICE_CONNECTION_FLAG_DSR, SERVICE_CONNECTION_FLAG_MAGLEV,
+    SERVICE_CONNECTION_FLAG_DSR, SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT,
+    SERVICE_CONNECTION_FLAG_MAGLEV,
     SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER, SERVICE_CONNECTION_FLAG_NODE_PORT_LOCAL,
     SERVICE_CONNECTION_ROLE_AFFINITY, SERVICE_CONNECTION_ROLE_FORWARD,
     SERVICE_CONNECTION_ROLE_REVERSE, SERVICE_CONNECTION_SELECTION_TIER_MASK,
@@ -117,10 +118,13 @@ const EGRESS_SOURCE_TAIL_V4: u32 = 6;
 const EGRESS_SOURCE_TAIL_V6: u32 = 7;
 const ENCRYPTION_TAIL_V4: u32 = 8;
 const ENCRYPTION_TAIL_V6: u32 = 9;
+const ENCRYPTION_SECURE_NAT_TAIL_V4: u32 = 10;
+const ENCRYPTION_SECURE_NAT_TAIL_V6: u32 = 11;
 const SERVICE_POLICY_DISPATCH_V4: i32 = -1_001;
 const SERVICE_POLICY_DISPATCH_V6: i32 = -1_002;
 const EGRESS_GATEWAY_NOT_OWNED: i32 = -1_003;
 const ENCRYPTION_DSR_DISPATCH: i32 = -1_004;
+const ENCRYPTION_SECURE_NAT_DISPATCH: i32 = -1_005;
 const SERVICE_POST_LOOKUP_TRANSLATED: u8 = 1 << 0;
 const SERVICE_POST_LOOKUP_REROUTE_HOST: u8 = 1 << 1;
 // A DSR redirect preserves the frontend tuple. Reserve one skb mark bit so a
@@ -496,7 +500,7 @@ static SERVICE_POST_LOOKUP_SCRATCH: PerCpuArray<u8> = PerCpuArray::with_max_entr
 /// finalization from the bounded main classifiers. The agent loads every
 /// target before attaching either hook.
 #[map]
-static SERVICE_DATAPLANE_TAIL_CALLS_V2: ProgramArray = ProgramArray::with_max_entries(10, 0);
+static SERVICE_DATAPLANE_TAIL_CALLS_V2: ProgramArray = ProgramArray::with_max_entries(12, 0);
 
 #[classifier]
 pub fn unf_observe_ingress(ctx: TcContext) -> i32 {
@@ -739,6 +743,13 @@ pub fn unf_policy_v6(ctx: TcContext) -> i32 {
 #[classifier]
 pub fn unf_encryption_v4(ctx: TcContext) -> i32 {
     let action = encryption_finalizer::<false>(&ctx);
+    if action == ENCRYPTION_SECURE_NAT_DISPATCH {
+        #[allow(unsafe_code)]
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, ENCRYPTION_SECURE_NAT_TAIL_V4)
+        };
+        return TC_ACT_SHOT;
+    }
     if action == ENCRYPTION_DSR_DISPATCH {
         #[allow(unsafe_code)]
         unsafe {
@@ -752,6 +763,13 @@ pub fn unf_encryption_v4(ctx: TcContext) -> i32 {
 #[classifier]
 pub fn unf_encryption_v6(ctx: TcContext) -> i32 {
     let action = encryption_finalizer::<true>(&ctx);
+    if action == ENCRYPTION_SECURE_NAT_DISPATCH {
+        #[allow(unsafe_code)]
+        unsafe {
+            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, ENCRYPTION_SECURE_NAT_TAIL_V6)
+        };
+        return TC_ACT_SHOT;
+    }
     if action == ENCRYPTION_DSR_DISPATCH {
         #[allow(unsafe_code)]
         unsafe {
@@ -760,6 +778,32 @@ pub fn unf_encryption_v6(ctx: TcContext) -> i32 {
         return dsr_route_failed();
     }
     action
+}
+
+#[classifier]
+pub fn unf_encryption_secure_nat_v4(ctx: TcContext) -> i32 {
+    encryption_secure_nat_tail::<false>(&ctx)
+}
+
+#[classifier]
+pub fn unf_encryption_secure_nat_v6(ctx: TcContext) -> i32 {
+    encryption_secure_nat_tail::<true>(&ctx)
+}
+
+#[inline(never)]
+fn encryption_secure_nat_tail<const IPV6: bool>(ctx: &TcContext) -> i32 {
+    let Some(observation_ptr) = FLOW_OBSERVATION_SCRATCH.get_ptr(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: the encryption finalizer populated and retained this CPU-local
+    // observation immediately before its non-returning tail call.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &*observation_ptr };
+    if secure_dsr_service_translation::<IPV6>(ctx, observation) {
+        TC_ACT_PIPE
+    } else {
+        TC_ACT_SHOT
+    }
 }
 
 /// Proof-Carrying Deferred Encryption: policy and address translation run
@@ -800,11 +844,12 @@ fn encryption_finalizer<const IPV6: bool>(ctx: &TcContext) -> i32 {
         return selection;
     }
     if post_lookup & SERVICE_POST_LOOKUP_TRANSLATED != 0 && service_connection_is_dsr() {
-        // DSR retains the VIP in packet bytes and bypasses policy routing with
-        // an explicit neighbor redirect. Until 9.6 supplies a tunnel-aware DSR
-        // handoff, a Required mark must not be mistaken for ciphertext.
+        // DSR retains the VIP in packet bytes, while WireGuard selects a peer
+        // from the inner destination. Required flows therefore convert the
+        // already selected backend to reversible NAT before returning to the
+        // marked policy route. Native DSR keeps its direct-return path.
         if encryption_mark_is_set(ctx) {
-            return TC_ACT_SHOT;
+            return ENCRYPTION_SECURE_NAT_DISPATCH;
         }
         return ENCRYPTION_DSR_DISPATCH;
     }
@@ -1040,6 +1085,69 @@ fn clear_packet_encryption_mark(ctx: &TcContext) {
         let skb = &mut *ctx.skb.skb;
         skb.mark = clear_encryption_route_mark(skb.mark);
     }
+}
+
+/// Converts only the current DSR-selected flow into a reversible NAT pair.
+/// The selected backend, identity, and policy decision are unchanged. This is
+/// the minimal secure composition: the WireGuard inner packet names the real
+/// peer-owned Pod address, while the return hook restores the Service VIP.
+#[inline(never)]
+fn secure_dsr_service_translation<const IPV6: bool>(
+    ctx: &TcContext,
+    observation: &FlowObservation,
+) -> bool {
+    let Some(value_ptr) = SERVICE_CONNECTION_SCRATCH.get_ptr_mut(0) else {
+        return false;
+    };
+    // SAFETY: the Service lookup initialized this CPU-local value and no map
+    // reference aliases it.
+    #[allow(unsafe_code)]
+    let value = unsafe { &mut *value_ptr };
+    if value.flags & SERVICE_CONNECTION_FLAG_DSR == 0
+        || value.backend_address != observation.destination_address
+        || value.backend_port != observation.destination_port
+        || value.protocol != observation.protocol
+        || value.address_family != observation.address_family as u8
+    {
+        return false;
+    }
+    let forward = service_forward_key(value);
+    value.flags = (value.flags & !SERVICE_CONNECTION_FLAG_DSR)
+        | SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT;
+    if !service_connection_is_active(value, value.last_seen_ns) || !store_service_pair(value, &forward)
+    {
+        remove_service_pair(value, &forward);
+        return false;
+    }
+    let translation = ServiceTranslation {
+        address: value.backend_address,
+        port: value.backend_port,
+    };
+    let rewritten = if IPV6 {
+        let Some((protocol, offset, translatable)) = ipv6_transport(ctx) else {
+            return false;
+        };
+        translatable
+            && protocol == observation.protocol
+            && rewrite_ipv6(ctx, offset, protocol, &translation, false)
+    } else {
+        let Ok(ihl) = ctx.load::<u8>(ETHERNET_HEADER_LEN) else {
+            return false;
+        };
+        let words = ihl & 0x0f;
+        (5..=15).contains(&words)
+            && rewrite_ipv4(
+                ctx,
+                ETHERNET_HEADER_LEN + usize::from(words) * 4,
+                observation.protocol,
+                &translation,
+                false,
+            )
+    };
+    if !rewritten {
+        remove_service_pair(value, &forward);
+    }
+    rewritten
 }
 
 #[classifier]
