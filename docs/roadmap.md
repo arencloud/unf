@@ -840,7 +840,7 @@ matrix is maintained in the
 
 ## Phase 9 — attested encryption fabric
 
-**Gate: in progress; milestones 9.1–9.4 verified.** The ordered evidence
+**Gate: in progress; milestones 9.1–9.5 verified.** The ordered evidence
 matrix is maintained in the
 [Phase 9 encryption-fabric plan](development/phase9-attested-encryption-fabric-plan.md).
 
@@ -989,8 +989,12 @@ matrix is maintained in the
   already selected backend, so WireGuard sees a peer-owned inner destination.
   Explicit external egress remains prior and cannot acquire a Pod lease, while
   active-to-draining flow continuity and immediate revocation pass real packet
-  execution under `make encryption-composition-test` and ADR 0192. Live
-  WireGuard ciphertext remains within 9.5.
+  execution under `make encryption-composition-test` and ADR 0192. A separate
+  disposable two-namespace live-kernel gate completes 9.5 by carrying both
+  inner families through real WireGuard, requiring positive transfer counters
+  and UDP ciphertext with no inner address on the underlay, denying after peer
+  removal, and recovering after exact restoration; `make
+  encryption-ciphertext-live-test` and ADR 0193.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,

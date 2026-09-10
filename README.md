@@ -732,8 +732,8 @@ exact cleanup, five-agent convergence, and an unchanged `network` unhealthy
 baseline. Evidence SHA-256 is
 `a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3`;
 ADR 0157. These independent Kind and OpenShift results close Phase 8.
-Phase 9 begins the attested encryption fabric. Milestones 9.1–9.4 are verified;
-9.5 is in progress.
+Phase 9 begins the attested encryption fabric. Milestones 9.1–9.5 are verified;
+9.6 is in progress.
 The architecture requires that source policy and Service/egress ownership precede
 encryption; kernel WireGuard owns all cryptography; private keys remain on their
 Node; and an independently replayed Attested Encryption Path Contract requires
@@ -925,9 +925,14 @@ to an atomic reversible NAT pair using its already selected backend. WireGuard
 therefore sees a peer-owned inner destination, return traffic restores the VIP,
 and explicit external egress cannot borrow a Pod epoch lease. Real packet tests
 also prove bounded old-epoch drain and immediate no-downgrade revocation under
-`make encryption-composition-test`; ADR 0192. Live ciphertext remains. The [Phase 9
+`make encryption-composition-test`; ADR 0192. The independent Phase 9.5 closure
+gate then carries IPv4 and IPv6 inner traffic between two real kernel
+WireGuard peers while capturing only the underlay. It requires WireGuard UDP,
+positive bidirectional counters, and positive absence of every inner address;
+peer removal denies without plaintext fallback and exact restoration recovers
+both families. `make encryption-ciphertext-live-test`; ADR 0193. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0192 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0193 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

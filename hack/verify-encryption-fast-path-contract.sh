@@ -21,11 +21,11 @@ require_text() {
 }
 
 require_text docs/project-status.md \
-    '| Intent-Coalesced Cryptographic Fast Path | **In progress** |' \
-    "the tracker must keep the live packet hook gap visible"
+    '| Intent-Coalesced Cryptographic Fast Path | **Verified** |' \
+    "the tracker must record the completed fast-path proof chain"
 require_text docs/development/phase9-attested-encryption-fabric-plan.md \
-    '| 9.5 | Intent-Coalesced Cryptographic Fast Path | **In progress** |' \
-    "the execution plan must track the bounded compiler slice"
+    '| 9.5 | Intent-Coalesced Cryptographic Fast Path | **Verified** |' \
+    "the execution plan must record the bounded compiler and live closure"
 require_text docs/adr/0162-causal-epoch-lease-fast-path.md \
     '**Status:** Accepted and implemented for Phase 9.5a' \
     "ADR 0162 must record the implemented boundary"
