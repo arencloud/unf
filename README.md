@@ -973,9 +973,11 @@ evidence cannot look like healthy silence. Phase 9.7b publishes that watermark
 and bounded history through controller APIs and preallocates exactly 54
 Prometheus series with only closed stage/outcome labels. Causal cut changes and
 accepted proof transitions advance counters; polling and idempotent retries do
-not. `make encryption-operations-runtime-test`; ADRs 0200–0201. Authenticated
-activation, durable recovery, explanation/simulation, upgrade, and performance
-gates remain next.
+not. Phase 9.7c persists the bounded chain in an exact-name ConfigMap, rejects
+damaged replay, retries coalesced writes, flushes on shutdown, and resumes all
+54 metric cells at the durable watermark after controller replacement. `make
+encryption-operations-recovery-test`; ADRs 0200–0202. Authenticated activation,
+explanation/simulation, upgrade, and performance gates remain next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

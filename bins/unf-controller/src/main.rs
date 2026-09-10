@@ -172,6 +172,10 @@ const ENCRYPTION_GENERATION_STORE_NAME: &str = "unf-encryption-generation-fronti
 const ENCRYPTION_GENERATION_STORE_KEY: &str = "frontier.json";
 const ENCRYPTION_GENERATION_STORE_DATA_LIMIT: usize = 900_000;
 const ENCRYPTION_GENERATION_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
+const ENCRYPTION_OPERATIONS_STORE_NAME: &str = "unf-encryption-operations";
+const ENCRYPTION_OPERATIONS_STORE_KEY: &str = "operations.json";
+const ENCRYPTION_OPERATIONS_STORE_DATA_LIMIT: usize = 900_000;
+const ENCRYPTION_OPERATIONS_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const EGRESS_DESIRED_STORE_NAME: &str = "unf-egress-desired-state";
 const EGRESS_DESIRED_STORE_KEY: &str = "desired.json";
 const EGRESS_FQDN_OBSERVATION_STORE_KEY: &str = "fqdn-observations.json";
@@ -340,6 +344,9 @@ struct ControllerMetrics {
     encryption_generation_facts_accepted: Counter,
     encryption_generation_frontiers_published: Counter,
     encryption_operations: Family<EncryptionOperationLabels, Counter>,
+    encryption_operations_persistence_writes: Counter,
+    encryption_operations_persistence_errors: Counter,
+    encryption_operations_records_restored: Counter,
     external_flow_export: ExternalFlowExportMetrics,
 }
 
@@ -443,6 +450,8 @@ struct ControllerState {
     encryption_key_attestations: Mutex<NodeKeyAttestationLedger>,
     encryption_path_proofs: Mutex<EncryptionPathProofCoordinator>,
     encryption_operations: Mutex<EncryptionOperationsLedger>,
+    encryption_operations_dirty: AtomicBool,
+    encryption_operations_store: Option<Api<ConfigMap>>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1283,11 +1292,19 @@ async fn main() -> Result<()> {
         restore_encryption_generation_producer(&state)
             .await
             .context("restore durable encryption generation frontier")?;
+        restore_encryption_operations(&state)
+            .await
+            .context("restore durable encryption operations")?;
         spawn_agent_report_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_flow_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_topology_history_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_egress_persistence(Arc::clone(&state), cancellation.clone(), &mut tasks);
         spawn_encryption_generation_persistence(
+            Arc::clone(&state),
+            cancellation.clone(),
+            &mut tasks,
+        );
+        spawn_encryption_operations_persistence(
             Arc::clone(&state),
             cancellation.clone(),
             &mut tasks,
@@ -1791,6 +1808,21 @@ fn register_encryption_operations_metrics(registry: &mut Registry, metrics: &Con
         "Secret-free encryption lifecycle observations in one closed stage/outcome domain",
         metrics.encryption_operations.clone(),
     );
+    registry.register(
+        "unf_encryption_operations_persistence_writes",
+        "Durable encryption operations checkpoints written by the controller",
+        metrics.encryption_operations_persistence_writes.clone(),
+    );
+    registry.register(
+        "unf_encryption_operations_persistence_errors",
+        "Durable encryption operations checkpoint reads or writes that failed",
+        metrics.encryption_operations_persistence_errors.clone(),
+    );
+    registry.register(
+        "unf_encryption_operations_records_restored",
+        "Encryption operations history records restored at controller startup",
+        metrics.encryption_operations_records_restored.clone(),
+    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1921,6 +1953,8 @@ fn new_state_with_client_and_selector(
         encryption_key_attestations: Mutex::new(NodeKeyAttestationLedger::default()),
         encryption_path_proofs: Mutex::new(EncryptionPathProofCoordinator::default()),
         encryption_operations: Mutex::new(EncryptionOperationsLedger::default()),
+        encryption_operations_dirty: AtomicBool::new(false),
+        encryption_operations_store: config_map_store.clone(),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -3480,6 +3514,133 @@ async fn persist_encryption_generation(state: &ControllerState) -> Result<()> {
     .await
     .with_context(|| format!("patch ConfigMap unf-system/{ENCRYPTION_GENERATION_STORE_NAME}"))?;
     state.metrics.encryption_generation_persistence_writes.inc();
+    Ok(())
+}
+
+async fn restore_encryption_operations(state: &ControllerState) -> Result<()> {
+    let api = state
+        .encryption_operations_store
+        .as_ref()
+        .context("durable encryption operations API is unavailable")?;
+    let config_map = api
+        .get(ENCRYPTION_OPERATIONS_STORE_NAME)
+        .await
+        .with_context(|| format!("read ConfigMap unf-system/{ENCRYPTION_OPERATIONS_STORE_NAME}"))?;
+    let Some(encoded) = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(ENCRYPTION_OPERATIONS_STORE_KEY))
+    else {
+        info!("durable encryption operations store is empty");
+        return Ok(());
+    };
+    let (checkpoint, ledger) = decode_encryption_operations(encoded)?;
+    for stage in EncryptionOperationalStage::ALL {
+        for outcome in EncryptionOperationalOutcome::ALL {
+            state
+                .metrics
+                .encryption_operations
+                .get_or_create(&encryption_operation_labels(stage, outcome))
+                .inc_by(checkpoint.counters.get(stage, outcome));
+        }
+    }
+    let restored = checkpoint.records.len() as u64;
+    *mutex_lock(&state.encryption_operations) = ledger;
+    state
+        .metrics
+        .encryption_operations_records_restored
+        .inc_by(restored);
+    info!(
+        restored,
+        evicted = checkpoint.evicted_records,
+        lost = checkpoint.reported_lost_observations,
+        "restored durable encryption operations"
+    );
+    Ok(())
+}
+
+fn decode_encryption_operations(
+    encoded: &str,
+) -> Result<(
+    EncryptionOperationsHistoryCheckpoint,
+    EncryptionOperationsLedger,
+)> {
+    let checkpoint: EncryptionOperationsHistoryCheckpoint =
+        serde_json::from_str(encoded).context("decode durable encryption operations checkpoint")?;
+    let ledger = EncryptionOperationsLedger::restore(checkpoint.clone())
+        .context("validate durable encryption operations checkpoint")?;
+    Ok((checkpoint, ledger))
+}
+
+fn spawn_encryption_operations_persistence(
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+    tasks: &mut JoinSet<()>,
+) {
+    tasks.spawn(async move {
+        let mut interval = tokio::time::interval(ENCRYPTION_OPERATIONS_PERSISTENCE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    persist_encryption_operations_if_dirty(&state).await;
+                    break;
+                }
+                _ = interval.tick() => persist_encryption_operations_if_dirty(&state).await,
+            }
+        }
+    });
+}
+
+async fn persist_encryption_operations_if_dirty(state: &ControllerState) {
+    if !state
+        .encryption_operations_dirty
+        .swap(false, Ordering::AcqRel)
+    {
+        return;
+    }
+    if let Err(error) = persist_encryption_operations(state).await {
+        state
+            .encryption_operations_dirty
+            .store(true, Ordering::Release);
+        state.metrics.encryption_operations_persistence_errors.inc();
+        warn!(%error, "could not persist encryption operations; retrying");
+    }
+}
+
+async fn persist_encryption_operations(state: &ControllerState) -> Result<()> {
+    let api = state
+        .encryption_operations_store
+        .as_ref()
+        .context("durable encryption operations API is unavailable")?;
+    let checkpoint = mutex_lock(&state.encryption_operations).checkpoint();
+    let encoded = serde_json::to_string(&checkpoint)
+        .context("encode durable encryption operations checkpoint")?;
+    if encoded.len() > ENCRYPTION_OPERATIONS_STORE_DATA_LIMIT {
+        return Err(anyhow!(
+            "durable encryption operations require {} bytes; ConfigMap limit is {}",
+            encoded.len(),
+            ENCRYPTION_OPERATIONS_STORE_DATA_LIMIT
+        ));
+    }
+    let data = BTreeMap::from([(ENCRYPTION_OPERATIONS_STORE_KEY.to_owned(), encoded)]);
+    let patch = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": ENCRYPTION_OPERATIONS_STORE_NAME,
+            "namespace": "unf-system",
+        },
+        "data": data,
+    });
+    api.patch(
+        ENCRYPTION_OPERATIONS_STORE_NAME,
+        &PatchParams::apply("unf-controller-encryption-operations").force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .with_context(|| format!("patch ConfigMap unf-system/{ENCRYPTION_OPERATIONS_STORE_NAME}"))?;
+    state.metrics.encryption_operations_persistence_writes.inc();
     Ok(())
 }
 
@@ -7120,6 +7281,9 @@ fn record_encryption_operation(
         .encryption_operations
         .get_or_create(&encryption_operation_labels(lifecycle_stage, outcome))
         .inc();
+    state
+        .encryption_operations_dirty
+        .store(true, Ordering::Release);
     Ok(())
 }
 
@@ -15027,6 +15191,20 @@ mod tests {
         );
         let Json(history) = encryption_operations_history(State(Arc::clone(&state))).await;
         assert_eq!(history.records.len(), 1);
+        assert!(state.encryption_operations_dirty.load(Ordering::Acquire));
+        let durable = serde_json::to_string(&history).unwrap();
+        let (restored_checkpoint, restored) = decode_encryption_operations(&durable).unwrap();
+        assert_eq!(restored.checkpoint(), restored_checkpoint);
+        assert_eq!(
+            restored_checkpoint.counters.get(
+                EncryptionOperationalStage::Assignment,
+                EncryptionOperationalOutcome::Pending,
+            ),
+            1
+        );
+        let mut corrupted = serde_json::to_value(&history).unwrap();
+        corrupted["records"][0]["sequence"] = serde_json::json!(9);
+        assert!(decode_encryption_operations(&corrupted.to_string()).is_err());
 
         let mut encoded = String::new();
         encode(&mut encoded, &mutex_lock(&state.registry)).unwrap();
