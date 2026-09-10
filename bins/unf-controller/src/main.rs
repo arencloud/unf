@@ -9131,9 +9131,14 @@ fn synchronize_encryption_path_proofs(
     let mut lifetime_ms = 30_000_u64;
     for local_plan in &cut.plans {
         for epoch in &local_plan.epochs {
-            if epoch.state == unf_encryption::FastPathEpochState::Draining
-                && now_unix_ms >= epoch.contract.valid_until_unix_ms
-            {
+            // A draining epoch is prior, already-proven authority retained
+            // only for established flow leases. It cannot back any new
+            // decision in this cut. Including it here would make the proof
+            // source set shrink at its drain deadline without advancing the
+            // fleet generation, which is indistinguishable from
+            // same-generation equivocation. Challenging only Active epochs
+            // keeps the source set immutable and avoids redundant wire work.
+            if !epoch_requires_fresh_path_proof(epoch.state) {
                 continue;
             }
             if epoch.contract.local_node.name != local_plan.recipient.node_name
@@ -9157,6 +9162,9 @@ fn synchronize_encryption_path_proofs(
     if changed {
         for local_plan in &cut.plans {
             for epoch in &local_plan.epochs {
+                if !epoch_requires_fresh_path_proof(epoch.state) {
+                    continue;
+                }
                 for plan in &epoch.contract.plans {
                     record_encryption_operation(
                         state,
@@ -9187,6 +9195,10 @@ fn synchronize_encryption_path_proofs(
         }
     }
     Ok(())
+}
+
+const fn epoch_requires_fresh_path_proof(state: unf_encryption::FastPathEpochState) -> bool {
+    matches!(state, unf_encryption::FastPathEpochState::Active)
 }
 
 fn require_current_encryption_agent(
@@ -16140,6 +16152,16 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn only_active_epochs_request_fresh_path_proof() {
+        assert!(epoch_requires_fresh_path_proof(
+            unf_encryption::FastPathEpochState::Active
+        ));
+        assert!(!epoch_requires_fresh_path_proof(
+            unf_encryption::FastPathEpochState::Draining
+        ));
     }
 
     #[test]
