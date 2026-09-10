@@ -47,6 +47,11 @@ pub struct FleetPlanProductionInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetDrainingEpochInput {
     pub epoch: u64,
+    /// Retains the exact contract coordinate that admitted established flows
+    /// while this epoch was active. Reissuing a draining contract at the
+    /// successor revision would change its content-addressed transport ID and
+    /// strand every still-valid Causal Epoch Lease at the bank cut.
+    pub contract_revision: Revision,
     pub valid_until_unix_ms: u64,
     pub paths: Vec<EncryptionPathFact>,
 }
@@ -312,7 +317,11 @@ fn produce_node_plan(
                 &input.model,
                 draining_facts,
                 node,
-                input.contract_revision,
+                input
+                    .draining
+                    .as_ref()
+                    .expect("draining facts require draining input")
+                    .contract_revision,
                 input.valid_from_unix_ms,
                 *valid_until_unix_ms,
             )?;
@@ -709,6 +718,7 @@ mod tests {
         ];
         input.draining = Some(FleetDrainingEpochInput {
             epoch: 1,
+            contract_revision: Revision::new(7),
             valid_until_unix_ms: NOW + 25_000,
             paths: vec![
                 path_at(&input.nodes[0], &input.nodes[1], 1),
@@ -746,6 +756,8 @@ mod tests {
                     .iter()
                     .all(|contract| contract.source_key.epoch == 1)
             );
+            assert_eq!(draining.contract.contract_revision, Revision::new(7));
+            assert_eq!(active.contract.contract_revision, Revision::new(8));
             assert_eq!(draining.drain_until_monotonic_ns, 0);
             assert!(
                 plan.decisions

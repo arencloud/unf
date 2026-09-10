@@ -80,8 +80,8 @@ use unf_encryption::{
     EncryptionOperationalObservation, EncryptionOperationalOutcome, EncryptionOperationalStage,
     EncryptionOperationsHistoryCheckpoint, EncryptionOperationsLedger, EncryptionOperationsStatus,
     EncryptionPathActivationReceipt, EncryptionPathProofAdmission, EncryptionPathProofAssignment,
-    EncryptionPathProofCoordinator, EncryptionPolicyObservation, FleetDrainingEpochInput,
-    FleetPlanProductionInput, IpPrefix, KubernetesEncryptionNodeSnapshot,
+    EncryptionPathProofCoordinator, EncryptionPolicyObservation, FastPathEpochState,
+    FleetDrainingEpochInput, FleetPlanProductionInput, IpPrefix, KubernetesEncryptionNodeSnapshot,
     KubernetesEncryptionProjection, KubernetesEncryptionProjectionInput,
     KubernetesEncryptionWorkloadSnapshot, NodeKeyAttestationCut, NodeKeyAttestationLedger,
     NodeKeyAttestationRound, NodeKeyAttestationRow, NodeKeyPublication,
@@ -9615,21 +9615,82 @@ fn project_encryption_epoch(
 fn project_draining_encryption_epoch(
     cluster_id: &str,
     draining: Option<(u64, u64)>,
+    contract_revision: Option<Revision>,
     nodes: Vec<KubernetesEncryptionNodeSnapshot>,
     workloads: Vec<KubernetesEncryptionWorkloadSnapshot>,
     policy_observations: Vec<EncryptionPolicyObservation>,
 ) -> Result<Option<FleetDrainingEpochInput>, ApiError> {
     draining
         .map(|(epoch, valid_until_unix_ms)| {
+            let contract_revision = contract_revision.ok_or_else(|| {
+                ApiError::service_unavailable(
+                    "draining encryption epoch has no exact predecessor contract revision",
+                )
+            })?;
             project_encryption_epoch(cluster_id, epoch, nodes, workloads, policy_observations).map(
                 |projection| FleetDrainingEpochInput {
                     epoch,
+                    contract_revision,
                     valid_until_unix_ms,
                     paths: projection.paths,
                 },
             )
         })
         .transpose()
+}
+
+/// Resolves the one contract coordinate that admitted the epoch while it was
+/// active. The in-memory plan is preferred; the independently prepared fleet
+/// frontier is a restart-safe fallback. A successor must never manufacture a
+/// new coordinate for draining transport authority because established flow
+/// leases name the content-addressed transport derived from this revision.
+fn draining_encryption_contract_revision(
+    state: &ControllerState,
+    draining_epoch: Option<(u64, u64)>,
+) -> Result<Option<Revision>, ApiError> {
+    let Some((epoch_number, _)) = draining_epoch else {
+        return Ok(None);
+    };
+    let mut revisions = BTreeSet::new();
+    if let Some(cut) = mutex_lock(&state.encryption_local_plans).active() {
+        for plan in &cut.plans {
+            for epoch in &plan.epochs {
+                if epoch.state == FastPathEpochState::Active
+                    && epoch
+                        .contract
+                        .plans
+                        .first()
+                        .is_some_and(|path| path.source_key.epoch == epoch_number)
+                {
+                    revisions.insert(epoch.contract.contract_revision);
+                }
+            }
+        }
+    }
+    if revisions.is_empty()
+        && let Some(frontier) = mutex_lock(&state.encryption_generation_facts)
+            .candidate()
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?
+    {
+        for generation in frontier.generations {
+            for transport in generation.checkpoint.transport_authority {
+                if transport.state == FastPathEpochState::Active
+                    && transport.key_epoch == epoch_number
+                {
+                    revisions.insert(transport.contract_revision);
+                }
+            }
+        }
+    }
+    match revisions.len() {
+        1 => Ok(revisions.into_iter().next()),
+        0 => Err(ApiError::service_unavailable(
+            "draining encryption epoch is absent from predecessor authority",
+        )),
+        _ => Err(ApiError::service_unavailable(
+            "draining encryption epoch has equivocal predecessor contract revisions",
+        )),
+    }
 }
 
 fn current_encryption_plan_source(
@@ -9994,6 +10055,7 @@ fn reconcile_encryption_plan_catalog_at(
     let draining = project_draining_encryption_epoch(
         &state.encryption_cluster_id,
         draining_epoch,
+        draining_encryption_contract_revision(state, draining_epoch)?,
         nodes,
         workloads,
         policy_observations,
