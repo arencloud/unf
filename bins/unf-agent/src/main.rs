@@ -8717,31 +8717,34 @@ fn encryption_recovery_plan_path(state_path: &Path) -> Result<PathBuf> {
 async fn synchronize_encryption_generation(
     synchronizer: &mut EncryptionGenerationSynchronizer,
 ) -> Result<bool> {
-    let Some(fact) = synchronizer.prepared_fact().cloned() else {
+    let fact = synchronizer.prepared_fact().cloned();
+    if fact.is_none() && synchronizer.current.is_none() {
         return Ok(false);
-    };
-    fact.verify()
-        .context("verify Node-local generation fact before publication")?;
+    }
     let controller_url = synchronizer
         .controller_url
         .as_deref()
         .context("encryption generation synchronization has no controller URL")?;
-    let fact_response = synchronizer
-        .client
-        .current()
-        .post(format!(
-            "{controller_url}/v1/state/encryption-generation-facts"
-        ))
-        .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
-        .json(&fact)
-        .send()
-        .await
-        .context("publish Node-local encryption generation fact")?;
-    if fact_response.status() != StatusCode::ACCEPTED {
-        fact_response
-            .error_for_status()
-            .context("controller rejected Node-local encryption generation fact")?;
-        bail!("controller returned a non-202 response for encryption generation fact");
+    if let Some(fact) = &fact {
+        fact.verify()
+            .context("verify Node-local generation fact before publication")?;
+        let fact_response = synchronizer
+            .client
+            .current()
+            .post(format!(
+                "{controller_url}/v1/state/encryption-generation-facts"
+            ))
+            .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+            .json(fact)
+            .send()
+            .await
+            .context("publish Node-local encryption generation fact")?;
+        if fact_response.status() != StatusCode::ACCEPTED {
+            fact_response
+                .error_for_status()
+                .context("controller rejected Node-local encryption generation fact")?;
+            bail!("controller returned a non-202 response for encryption generation fact");
+        }
     }
     let request = EncryptionGenerationRequest::fresh(
         synchronizer.node_name.clone(),
@@ -8760,6 +8763,9 @@ async fn synchronize_encryption_generation(
     if response.status() == StatusCode::NO_CONTENT {
         return Ok(false);
     }
+    let fact = fact.as_ref().context(
+        "controller offered an encryption successor without a Node-local prepared capability",
+    )?;
     let capsule: NodeSealedGenerationCapsule = response
         .error_for_status()
         .context("controller rejected encryption generation request")?
@@ -8767,7 +8773,7 @@ async fn synchronize_encryption_generation(
         .await
         .context("decode Node-sealed encryption generation capsule")?;
     synchronizer
-        .admit_exact_echo(&request, &capsule, &fact)
+        .admit_exact_echo(&request, &capsule, fact)
         .map(|_| true)
 }
 
@@ -14879,7 +14885,8 @@ async fn consume_events(
                 }
             }
             _ = encryption_interval.tick(), if encryption_generations.controller_url.is_some()
-                && (encryption_generations.pending_generation().is_some()
+                && (encryption_generations.current.is_some()
+                    || encryption_generations.pending_generation().is_some()
                     || encryption_generations.pending_activation_report.is_some()) => {
                 if encryption_generations.pending_activation_report.is_some()
                     && let Err(error) = publish_pending_encryption_activation(
@@ -14889,7 +14896,8 @@ async fn consume_events(
                     warn!(%error, "encryption activation evidence remains queued for retry");
                 }
                 if encryption_generations.pending_activation_report.is_none()
-                    && encryption_generations.prepared_fact().is_some()
+                    && (encryption_generations.prepared_fact().is_some()
+                        || encryption_generations.current.is_some())
                     && let Err(error) = synchronize_encryption_generation(encryption_generations).await
                 {
                     warn!(%error, "encryption generation synchronization failed; retaining durable desired predecessor and active local authority");
