@@ -734,7 +734,7 @@ impl WireGuardKernelSnapshot {
         {
             return Err(WireGuardKernelError::ReadbackMismatch);
         }
-        let expected_peers = plan
+        let mut expected_peers = plan
             .peers
             .iter()
             .map(|peer| {
@@ -746,6 +746,7 @@ impl WireGuardKernelSnapshot {
                 )
             })
             .collect::<Vec<_>>();
+        expected_peers.sort_by_key(|peer| peer.0);
         let observed_peers = self
             .peers
             .iter()

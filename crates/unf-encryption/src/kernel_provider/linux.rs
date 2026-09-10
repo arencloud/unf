@@ -1348,7 +1348,9 @@ mod tests {
                 .cloned()
                 .chain([WireGuardPeerPlan {
                     node_uid: "kernel-node-c".to_owned(),
-                    public_key: WireGuardPublicKey([43; 32]),
+                    // Intentionally sorts before kernel-node-b's key while the
+                    // authenticated plan remains Node-UID ordered.
+                    public_key: WireGuardPublicKey([41; 32]),
                     endpoint: "192.0.2.43:51820".parse().unwrap(),
                     persistent_keepalive_seconds: 0,
                     allowed_ips: vec![
