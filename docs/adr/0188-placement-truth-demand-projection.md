@@ -32,7 +32,7 @@ state. Its output is the bounded public input to the existing fleet plan forge.
 
 This prevents placement races from becoming encryption authority and avoids an
 eager full mesh when policy denies or workloads are local. Controller snapshot
-capture and catalog publication remain the next runtime slice.
+capture and catalog publication are implemented by ADR 0189.
 
 ## Verification
 

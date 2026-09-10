@@ -905,11 +905,14 @@ then selects the exact coalesced transport without per-Pod tunnels;
 then validates UID-bound Ready Nodes, Pod-to-block placement, effective policy,
 and emits only demanded bidirectional Node paths through Placement-Truth Demand
 Projection; `make encryption-kubernetes-projection-test`; ADR 0188. Controller
-invocation, local compile, the TC consumer/verifier, and live
-encrypted packet gate remain, so no workload packet yet selects the staged
-route table. The [Phase 9
+invocation now uses a Pull-Synchronized Causal Catalog: authenticated polls
+capture one revision/key cut, evaluate both policy directions at every semantic
+port boundary and concrete dual-stack address, coalesce retries, and atomically
+publish one fleet successor; `make encryption-controller-plan-test`; ADR 0189.
+The TC consumer/verifier and live encrypted packet gate remain, so no workload
+packet yet selects the staged route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0188 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0189 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

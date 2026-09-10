@@ -970,8 +970,11 @@ matrix is maintained in the
   Placement-Truth Demand Projection then rejects stale UID/readiness/IPAM cuts,
   excludes host-network workloads, preserves effective policy truth, and emits
   only required bidirectional Node paths; `make
-  encryption-kubernetes-projection-test` and ADR 0188. Controller invocation,
-  local compile, the TC consumer, verifier
+  encryption-kubernetes-projection-test` and ADR 0188. The Pull-Synchronized
+  Causal Catalog captures one revision/key cut on authenticated agent demand,
+  evaluates both policy directions at semantic port boundaries and concrete
+  addresses, coalesces unchanged polls, and atomically publishes the fleet;
+  `make encryption-controller-plan-test` and ADR 0189. The TC consumer, verifier
   loading, and live encrypted packets remain within milestone 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,

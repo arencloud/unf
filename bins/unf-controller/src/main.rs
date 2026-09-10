@@ -68,15 +68,19 @@ use unf_egress::{
     verify_egress_bfd_evidence_report, verify_egress_internet_snapshot,
 };
 use unf_encryption::{
-    AuthenticatedNodeIdentity, EncryptionFrontierPublishOutcome,
+    AuthenticatedNodeIdentity, EncryptionBaseline, EncryptionFrontierPublishOutcome,
     EncryptionGenerationDistributionError, EncryptionGenerationFact,
     EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
     EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
-    EncryptionGenerationRequest, EncryptionKeyBootstrap, NodeKeyAttestationCut,
-    NodeKeyAttestationLedger, NodeKeyAttestationRound, NodeKeyAttestationRow, NodeKeyPublication,
-    NodeKeyTransparencyLedger, NodeLocalPlanCatalog, NodeLocalPlanDistributionError,
-    NodeLocalPlanRequest, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
+    EncryptionGenerationRequest, EncryptionIdentityPair, EncryptionKeyBootstrap, EncryptionModel,
+    EncryptionPolicyObservation, FleetPlanProductionInput, IpPrefix,
+    KubernetesEncryptionNodeSnapshot, KubernetesEncryptionProjectionInput,
+    KubernetesEncryptionWorkloadSnapshot, NodeKeyAttestationCut, NodeKeyAttestationLedger,
+    NodeKeyAttestationRound, NodeKeyAttestationRow, NodeKeyPublication,
+    NodeKeyTransparencyCutDigest, NodeKeyTransparencyLedger, NodeLocalPlanCatalog,
+    NodeLocalPlanDistributionError, NodeLocalPlanRequest, NodeSealedGenerationCapsule,
+    NodeSealedPlanCapsule, produce_fleet_plan_cut, project_kubernetes_encryption,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -349,6 +353,26 @@ struct EgressFqdnMaterialization {
     model: unf_egress::EgressModel,
 }
 
+/// Immutable inputs that define one controller-produced encryption plan cut.
+/// Keeping this separate from the output generation lets concurrent agent
+/// polls coalesce onto one publication instead of manufacturing plan churn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EncryptionPlanSource {
+    membership_revision: Revision,
+    identity_revision: Revision,
+    policy_revision: Revision,
+    routing_revision: Revision,
+    service_revision: Revision,
+    egress_revision: Revision,
+    key_cut_digest: NodeKeyTransparencyCutDigest,
+}
+
+#[derive(Debug, Default)]
+struct EncryptionPlanReconciler {
+    source: Option<EncryptionPlanSource>,
+    generation: Revision,
+}
+
 struct ControllerState {
     ready: AtomicBool,
     identity_epoch: u64,
@@ -401,8 +425,9 @@ struct ControllerState {
     encryption_generations_dirty: AtomicBool,
     encryption_generation_store: Option<Api<ConfigMap>>,
     /// Complete secret-free compiler inputs awaiting authenticated Node pulls.
-    /// The next compiler slice populates this catalog from one causal cut.
+    /// The pull-synchronized reconciler populates this from one causal cut.
     encryption_local_plans: Mutex<NodeLocalPlanCatalog>,
+    encryption_plan_reconciler: Mutex<EncryptionPlanReconciler>,
     encryption_key_transparency: Mutex<NodeKeyTransparencyLedger>,
     encryption_key_attestations: Mutex<NodeKeyAttestationLedger>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
@@ -1811,6 +1836,7 @@ fn new_state_with_client_and_selector(
         encryption_generations_dirty: AtomicBool::new(false),
         encryption_generation_store: config_map_store.clone(),
         encryption_local_plans: Mutex::new(NodeLocalPlanCatalog::default()),
+        encryption_plan_reconciler: Mutex::new(EncryptionPlanReconciler::default()),
         encryption_key_transparency: Mutex::new(NodeKeyTransparencyLedger::default()),
         encryption_key_attestations: Mutex::new(NodeKeyAttestationLedger::default()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
@@ -8404,6 +8430,427 @@ fn encryption_generation_for(
         })
 }
 
+fn initialized_revision(revision: Revision) -> Revision {
+    Revision::new(revision.get().max(1))
+}
+
+fn encryption_epoch_window(
+    cut: &unf_encryption::NodeKeyTransparencyCut,
+    now_unix_ms: u64,
+) -> Result<Option<(u64, u64)>, ApiError> {
+    let mut common_epoch = None;
+    let mut valid_until = u64::MAX;
+    for publication in &cut.publications {
+        let ready = publication
+            .epochs
+            .iter()
+            .filter(|epoch| {
+                matches!(
+                    epoch.phase,
+                    unf_encryption::KeyEpochPhase::MutuallyAttested
+                        | unf_encryption::KeyEpochPhase::Active
+                ) && epoch.readiness_digest.is_some()
+                    && epoch.valid_from_unix_ms <= now_unix_ms
+                    && epoch.valid_until_unix_ms > now_unix_ms
+            })
+            .collect::<Vec<_>>();
+        let [epoch] = ready.as_slice() else {
+            return Ok(None);
+        };
+        if common_epoch
+            .replace(epoch.epoch)
+            .is_some_and(|current| current != epoch.epoch)
+        {
+            return Err(ApiError::service_unavailable(
+                "encryption key cut has no common ready epoch",
+            ));
+        }
+        valid_until = valid_until.min(epoch.valid_until_unix_ms);
+    }
+    Ok(common_epoch.map(|epoch| (epoch, valid_until)))
+}
+
+fn base36_fixed(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    const WIDTH: usize = 10;
+    const MODULUS: u64 = 3_656_158_440_062_976;
+    value %= MODULUS;
+    let mut encoded = [b'0'; WIDTH];
+    for byte in encoded.iter_mut().rev() {
+        *byte = DIGITS[(value % 36) as usize];
+        value /= 36;
+    }
+    String::from_utf8(encoded.to_vec()).expect("base36 alphabet is UTF-8")
+}
+
+fn encryption_transport_coordinates(epoch: u64) -> (String, u32, u32) {
+    let interface_name = format!("unfwg{}", base36_fixed(epoch));
+    let route_table = 20_000 + u32::try_from(epoch % 10_000).expect("bounded route slot");
+    let mark_slot = u32::try_from((epoch % 254) + 1).expect("bounded mark slot");
+    let fwmark = 0x0055_0000 | (mark_slot << 8);
+    (interface_name, route_table, fwmark)
+}
+
+fn encryption_nodes(
+    state: &ControllerState,
+    members: &[EncryptionGenerationRecipient],
+) -> Result<Vec<KubernetesEncryptionNodeSnapshot>, ApiError> {
+    let topology = read_lock(&state.nodes);
+    let records = read_lock(&state.node_port_nodes);
+    let blocks = read_lock(&state.node_blocks);
+    members
+        .iter()
+        .map(|member| {
+            let node = topology.get(&member.node_name).ok_or_else(|| {
+                ApiError::service_unavailable("encryption topology Node disappeared")
+            })?;
+            let record = records.get(&member.node_name).ok_or_else(|| {
+                ApiError::service_unavailable("encryption Node address truth disappeared")
+            })?;
+            let block = blocks.get(&member.node_name).ok_or_else(|| {
+                ApiError::service_unavailable("encryption Node IPAM truth is unavailable")
+            })?;
+            if record.node_uid != member.node_uid || block.node_uid != member.node_uid {
+                return Err(ApiError::service_unavailable(
+                    "encryption Node UID differs across topology, address, and IPAM truth",
+                ));
+            }
+            Ok(KubernetesEncryptionNodeSnapshot {
+                name: member.node_name.clone(),
+                uid: member.node_uid.clone(),
+                ready: node.ready,
+                managed: node.labels.get(PRIMARY_CNI_NODE_LABEL).map(String::as_str)
+                    == Some(PRIMARY_CNI_NODE_LABEL_VALUE),
+                pod_cidrs: vec![
+                    IpPrefix {
+                        address: IpAddr::V4(block.provider.ipv4_block.network()),
+                        prefix_len: block.provider.ipv4_block.prefix_len(),
+                    },
+                    IpPrefix {
+                        address: IpAddr::V6(block.provider.ipv6_block.network()),
+                        prefix_len: block.provider.ipv6_block.prefix_len(),
+                    },
+                ],
+                underlay_addresses: record.addresses.iter().map(|item| item.address).collect(),
+            })
+        })
+        .collect()
+}
+
+fn encryption_workloads(
+    state: &ControllerState,
+    members: &[EncryptionGenerationRecipient],
+) -> Vec<KubernetesEncryptionWorkloadSnapshot> {
+    let member_names = members
+        .iter()
+        .map(|member| member.node_name.as_str())
+        .collect::<BTreeSet<_>>();
+    read_lock(&state.pods)
+        .values()
+        .filter_map(|pod| {
+            let node_name = pod.node_name.as_ref()?;
+            member_names.contains(node_name.as_str()).then(|| {
+                KubernetesEncryptionWorkloadSnapshot {
+                    workload_uid: pod.uid.clone(),
+                    identity: pod.endpoint.identity,
+                    node_name: node_name.clone(),
+                    host_network: pod.host_network,
+                    addresses: pod
+                        .ipv4_addresses
+                        .iter()
+                        .copied()
+                        .map(IpAddr::V4)
+                        .chain(pod.ipv6_addresses.iter().copied().map(IpAddr::V6))
+                        .collect(),
+                }
+            })
+        })
+        .collect()
+}
+
+fn policy_sample_ports(policies: &[PolicyIr], destination: &Endpoint) -> BTreeSet<u16> {
+    let mut ports = BTreeSet::from([0, 1, u16::MAX]);
+    ports.extend(destination.named_ports.values().copied());
+    for port in policies
+        .iter()
+        .flat_map(|policy| policy.rules.iter().map(|rule| &rule.destination_port))
+    {
+        match port {
+            DestinationPort::Number(port) => {
+                ports.insert(*port);
+            }
+            DestinationPort::Range { start, end } => {
+                ports.extend([*start, *end]);
+                if *start > 0 {
+                    ports.insert(start - 1);
+                }
+                if *end < u16::MAX {
+                    ports.insert(end + 1);
+                }
+            }
+            DestinationPort::Any | DestinationPort::Named(_) => {}
+        }
+    }
+    ports
+}
+
+fn policy_address_samples(
+    source: &PodRecord,
+    destination: &PodRecord,
+) -> Vec<(Option<Ipv4Addr>, Option<Ipv6Addr>, DestinationAddresses)> {
+    let mut samples = Vec::new();
+    for destination_address in &destination.ipv4_addresses {
+        for source_address in source.ipv4_addresses.iter().copied().map(Some) {
+            samples.push((
+                source_address,
+                None,
+                DestinationAddresses {
+                    ipv4: Some(*destination_address),
+                    ipv6: None,
+                },
+            ));
+        }
+    }
+    for destination_address in &destination.ipv6_addresses {
+        for source_address in source.ipv6_addresses.iter().copied().map(Some) {
+            samples.push((
+                None,
+                source_address,
+                DestinationAddresses {
+                    ipv4: None,
+                    ipv6: Some(*destination_address),
+                },
+            ));
+        }
+    }
+    samples
+}
+
+fn record_effective_policy_observation(
+    observations: &mut BTreeMap<
+        (EncryptionIdentityPair, bool, u8, u32),
+        EncryptionPolicyObservation,
+    >,
+    pair: EncryptionIdentityPair,
+    ingress: &unf_policy::PolicyDecision,
+    egress: &unf_policy::PolicyDecision,
+) {
+    let allowed = ingress.verdict == Verdict::Allow && egress.verdict == Verdict::Allow;
+    let candidates = if allowed {
+        vec![ingress, egress]
+    } else {
+        [ingress, egress]
+            .into_iter()
+            .filter(|decision| decision.verdict == Verdict::Deny)
+            .collect()
+    };
+    let mut recorded = false;
+    for decision in candidates {
+        let Some(policy_id) = decision.policy_id else {
+            continue;
+        };
+        observations.insert(
+            (pair, allowed, decision.reason as u8, policy_id.get()),
+            EncryptionPolicyObservation {
+                pair,
+                allowed,
+                reason: decision.reason,
+                policy_id: Some(policy_id),
+            },
+        );
+        recorded = true;
+    }
+    if !recorded {
+        observations.insert(
+            (pair, allowed, PolicyReason::NoApplicablePolicy as u8, 0),
+            EncryptionPolicyObservation {
+                pair,
+                allowed,
+                reason: PolicyReason::NoApplicablePolicy,
+                policy_id: None,
+            },
+        );
+    }
+}
+
+fn encryption_policy_observations(
+    state: &ControllerState,
+    members: &[EncryptionGenerationRecipient],
+) -> Vec<EncryptionPolicyObservation> {
+    let member_names = members
+        .iter()
+        .map(|member| member.node_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let namespaces = read_lock(&state.namespaces);
+    let pods = read_lock(&state.pods);
+    let pods = pods
+        .values()
+        .filter(|pod| {
+            !pod.host_network
+                && pod
+                    .node_name
+                    .as_deref()
+                    .is_some_and(|node| member_names.contains(node))
+        })
+        .collect::<Vec<_>>();
+    let policies = compiled_policies(state);
+    let mut observations = BTreeMap::new();
+    for source in &pods {
+        for destination in &pods {
+            if source.node_name == destination.node_name {
+                continue;
+            }
+            let pair = EncryptionIdentityPair {
+                source: source.endpoint.identity,
+                destination: destination.endpoint.identity,
+            };
+            let source_endpoint = endpoint_with_namespace_labels(&source.endpoint, &namespaces);
+            let destination_endpoint =
+                endpoint_with_namespace_labels(&destination.endpoint, &namespaces);
+            let ports = policy_sample_ports(&policies, &destination_endpoint);
+            for (source_ipv4, source_ipv6, destination_addresses) in
+                policy_address_samples(source, destination)
+            {
+                for protocol in [Protocol::Icmp, Protocol::Tcp, Protocol::Udp, Protocol::Sctp] {
+                    for destination_port in &ports {
+                        let flow = Flow {
+                            source: &source_endpoint,
+                            destination: &destination_endpoint,
+                            protocol,
+                            destination_port: *destination_port,
+                            source_ipv4,
+                            source_ipv6,
+                        };
+                        let ingress = evaluate_for_direction_with_addresses(
+                            &policies,
+                            PolicyDirection::Ingress,
+                            flow,
+                            destination_addresses,
+                        );
+                        let egress = evaluate_for_direction_with_addresses(
+                            &policies,
+                            PolicyDirection::Egress,
+                            flow,
+                            destination_addresses,
+                        );
+                        record_effective_policy_observation(
+                            &mut observations,
+                            pair,
+                            &ingress,
+                            &egress,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    observations.into_values().collect()
+}
+
+fn reconcile_encryption_plan_catalog_at(
+    state: &ControllerState,
+    now_unix_ms: u64,
+    minimum_generation: Revision,
+) -> Result<bool, ApiError> {
+    let mut reconciler = mutex_lock(&state.encryption_plan_reconciler);
+    if mutex_lock(&state.revisions).topology == Revision::INITIAL
+        || !read_lock(&state.nodes)
+            .values()
+            .any(|node| agent_node_matches(node, state.agent_node_selector.as_deref()))
+    {
+        return Ok(false);
+    }
+    let (membership_revision, members) = encryption_generation_membership(state)?;
+    let Some(key_cut) = mutex_lock(&state.encryption_key_transparency)
+        .complete_cut()
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    let Some((active_epoch, valid_until_unix_ms)) = encryption_epoch_window(&key_cut, now_unix_ms)?
+    else {
+        return Ok(false);
+    };
+    let revisions = mutex_lock(&state.revisions).clone();
+    let egress_revision = mutex_lock(&state.egress_control_plane)
+        .checkpoint()
+        .desired_revision;
+    let source = EncryptionPlanSource {
+        membership_revision,
+        identity_revision: initialized_revision(mutex_lock(&state.identities).revision()),
+        policy_revision: initialized_revision(revisions.policy),
+        routing_revision: initialized_revision(revisions.routing),
+        service_revision: initialized_revision(revisions.service),
+        egress_revision: initialized_revision(egress_revision),
+        key_cut_digest: key_cut.cut_digest,
+    };
+    if reconciler.source.as_ref() == Some(&source) && reconciler.generation >= minimum_generation {
+        return Ok(true);
+    }
+    let _policy_cut = read_lock(&state.policy_state_guard);
+    let nodes = encryption_nodes(state, &members)?;
+    let workloads = encryption_workloads(state, &members);
+    let policy_observations = encryption_policy_observations(state, &members);
+    let (interface_name, route_table, fwmark) = encryption_transport_coordinates(active_epoch);
+    let projection = project_kubernetes_encryption(KubernetesEncryptionProjectionInput {
+        cluster_id: state.encryption_cluster_id.clone(),
+        active_epoch,
+        interface_name,
+        listen_port: 51_820,
+        route_table,
+        fwmark,
+        mtu: 1_420,
+        nodes,
+        workloads,
+        policy_observations,
+    })
+    .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    let generation = reconciler
+        .generation
+        .next()
+        .max(Revision::new(now_unix_ms))
+        .max(minimum_generation);
+    let model = EncryptionModel::normalize(
+        state.encryption_cluster_id.clone(),
+        EncryptionBaseline::Required,
+        Vec::new(),
+    )
+    .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    let cut = produce_fleet_plan_cut(FleetPlanProductionInput {
+        membership_revision,
+        generation,
+        intent_revision: Revision::new(1),
+        identity_revision: source.identity_revision,
+        policy_revision: source.policy_revision,
+        routing_revision: source.routing_revision,
+        service_revision: source.service_revision,
+        egress_revision: source.egress_revision,
+        contract_revision: generation,
+        valid_from_unix_ms: now_unix_ms,
+        valid_until_unix_ms,
+        listen_port: 51_820,
+        persistent_keepalive_seconds: 25,
+        model,
+        nodes: projection.nodes,
+        endpoints: projection.endpoints,
+        policies: projection.policies,
+        paths: projection.paths,
+        key_cut,
+    })
+    .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    mutex_lock(&state.encryption_local_plans)
+        .publish(cut)
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    reconciler.source = Some(source);
+    reconciler.generation = generation;
+    info!(
+        generation = generation.get(),
+        membership_revision = membership_revision.get(),
+        "published pull-synchronized causal encryption plan catalog"
+    );
+    Ok(true)
+}
+
 fn encryption_plan_for(
     state: &ControllerState,
     agent: &AuthenticatedAgent,
@@ -8450,6 +8897,14 @@ fn encryption_plan_for(
         node_name: agent.node_name.clone(),
         node_uid: node_uid.clone(),
     };
+    let minimum_generation = request
+        .current
+        .as_ref()
+        .map_or(Revision::INITIAL, |current| current.generation.next());
+    if !reconcile_encryption_plan_catalog_at(state, unix_time_millis().max(1), minimum_generation)?
+    {
+        return Ok(None);
+    }
     let snapshot = mutex_lock(&state.encryption_local_plans)
         .desired_for(&recipient)
         .cloned();
@@ -14143,6 +14598,112 @@ mod tests {
                 .status,
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[test]
+    fn encryption_plan_poll_projects_one_causal_catalog_and_coalesces_retries() {
+        let state = new_state(true);
+        let now = unix_time_millis().max(1);
+        let agent = authenticated_egress_agent("worker-a");
+        install_authenticated_agent(&state, &agent);
+        write_lock(&state.nodes).insert(
+            "worker-a".to_owned(),
+            TopologyNode {
+                name: "worker-a".to_owned(),
+                ready: true,
+                labels: BTreeMap::from([(
+                    PRIMARY_CNI_NODE_LABEL.to_owned(),
+                    PRIMARY_CNI_NODE_LABEL_VALUE.to_owned(),
+                )]),
+            },
+        );
+        write_lock(&state.node_port_nodes)
+            .get_mut("worker-a")
+            .unwrap()
+            .addresses = vec![
+            ServiceNodeAddress {
+                address: "192.0.2.10".parse().unwrap(),
+                kind: NodeAddressKind::Internal,
+            },
+            ServiceNodeAddress {
+                address: "2001:db8::10".parse().unwrap(),
+                kind: NodeAddressKind::Internal,
+            },
+        ];
+        write_lock(&state.node_blocks).insert(
+            "worker-a".to_owned(),
+            AssignedNodeBlock {
+                node_uid: "worker-a-uid".to_owned(),
+                provider: NodeBlockProvider::new(
+                    Ipv4NodeBlock::new("10.42.0.0".parse().unwrap(), 24).unwrap(),
+                    Ipv6NodeBlock::new("fd42::".parse().unwrap(), 64).unwrap(),
+                ),
+                revision: Revision::new(4),
+                transport: Ok(NodeTransport {
+                    ipv4: "10.42.0.1".parse().unwrap(),
+                    ipv6: "fd42::1".parse().unwrap(),
+                }),
+            },
+        );
+        *mutex_lock(&state.revisions) = RevisionSet {
+            identity: Revision::new(2),
+            policy: Revision::new(3),
+            service: Revision::new(5),
+            routing: Revision::new(4),
+            topology: Revision::new(7),
+            telemetry: Revision::INITIAL,
+        };
+
+        let bootstrap = encryption_key_bootstrap_for(&state, &agent).unwrap();
+        let mut authority = unf_encryption::NodeKeyAuthority::new(
+            bootstrap.cluster_id,
+            bootstrap.recipient.node_name,
+            bootstrap.recipient.node_uid,
+        )
+        .unwrap();
+        authority
+            .prepare_epoch(
+                bootstrap.membership_revision,
+                BTreeSet::new(),
+                now,
+                now + 10_000,
+                &mut unf_encryption::OsWireGuardKeyGenerator,
+            )
+            .unwrap();
+        ingest_encryption_keys_for_at(&state, &agent, authority.publication().unwrap(), now + 1)
+            .unwrap();
+
+        let first_request =
+            NodeLocalPlanRequest::issue("worker-a".to_owned(), None, [21; 32]).unwrap();
+        let first = encryption_plan_for(&state, &agent, &first_request)
+            .unwrap()
+            .unwrap();
+        first.verify().unwrap();
+        assert!(first.snapshot.generation.get() >= now);
+        assert_eq!(
+            first.snapshot.mode,
+            unf_encryption::NodeLocalPlanMode::Dormant
+        );
+
+        let retry_request =
+            NodeLocalPlanRequest::issue("worker-a".to_owned(), None, [22; 32]).unwrap();
+        let retry = encryption_plan_for(&state, &agent, &retry_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.snapshot.generation, first.snapshot.generation);
+        assert_eq!(
+            retry.snapshot.snapshot_digest,
+            first.snapshot.snapshot_digest
+        );
+
+        mutex_lock(&state.revisions).service = Revision::new(6);
+        let successor_request =
+            NodeLocalPlanRequest::issue("worker-a".to_owned(), None, [23; 32]).unwrap();
+        let successor = encryption_plan_for(&state, &agent, &successor_request)
+            .unwrap()
+            .unwrap();
+        assert!(successor.snapshot.generation > first.snapshot.generation);
+        assert_eq!(successor.snapshot.service_revision, Revision::new(6));
     }
 
     #[test]
