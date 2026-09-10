@@ -17,7 +17,7 @@ use crate::{
     AttestedEncryptionPathContract, EncryptionContractError, EncryptionDisposition,
     EncryptionGenerationRecipient, FastPathCompileContext, FastPathDecisionInput,
     FastPathEpochAdmission, FastPathEpochState, FastPathError, FastPathMapCheckpoint,
-    FastPathPublishedGeneration, FastPathTransactionError, KeyAuthorityError,
+    FastPathPublishedGeneration, FastPathTransactionError, KernelApplyOutcome, KeyAuthorityError,
     LinuxPreparedLocalGeneration, MAX_FAST_PATH_DECISIONS, NodeKeyAuthority,
     NodeLocalOrchestratorError, ProofCarryingKernelTransaction, UnderlayAddressFamily,
     UnderlayMtuObservation, WIREGUARD_IPV4_OVERHEAD, WIREGUARD_IPV6_OVERHEAD,
@@ -685,12 +685,52 @@ impl LinuxPreparedLocalGeneration {
             .collect::<Result<Vec<_>, _>>()?;
         let provider = LinuxWireGuardProvider;
         let mut snapshots = Vec::with_capacity(plans.len());
+        let mut created = Vec::with_capacity(plans.len());
         for (plan, private_key) in plans.iter().zip(keys) {
-            let (_, snapshot) = provider.apply(plan, private_key).await?;
-            snapshots.push(snapshot);
+            match provider.apply(plan, private_key).await {
+                Ok((outcome, snapshot)) => {
+                    if outcome == KernelApplyOutcome::Created {
+                        created.push(plan.clone());
+                    }
+                    snapshots.push(snapshot);
+                }
+                Err(cause) => {
+                    return match rollback_created_epoch_cut(&provider, &created).await {
+                        Ok(()) => Err(NodeLocalPlanCompilerError::InvalidKernel(cause)),
+                        Err(rollback) => Err(NodeLocalPlanCompilerError::InvalidKernel(
+                            WireGuardKernelError::Rollback {
+                                cause: cause.to_string(),
+                                rollback: rollback.to_string(),
+                            },
+                        )),
+                    };
+                }
+            }
         }
-        Self::compile_exact_readback(context, epochs, decisions, &snapshots)
+        match Self::compile_exact_readback(context, epochs, decisions, &snapshots) {
+            Ok(prepared) => Ok(prepared),
+            Err(cause) => match rollback_created_epoch_cut(&provider, &created).await {
+                Ok(()) => Err(cause),
+                Err(rollback) => Err(NodeLocalPlanCompilerError::InvalidKernel(
+                    WireGuardKernelError::Rollback {
+                        cause: cause.to_string(),
+                        rollback: rollback.to_string(),
+                    },
+                )),
+            },
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn rollback_created_epoch_cut(
+    provider: &LinuxWireGuardProvider,
+    created: &[WireGuardKernelPlan],
+) -> Result<(), WireGuardKernelError> {
+    for plan in created.iter().rev() {
+        provider.delete(plan).await?;
+    }
+    Ok(())
 }
 
 fn validate_context(
