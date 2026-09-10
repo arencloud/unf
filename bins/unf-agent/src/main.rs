@@ -8729,11 +8729,32 @@ impl EncryptionGenerationSynchronizer {
         Ok(true)
     }
 
-    fn prepared_fact(&self) -> Option<&EncryptionGenerationFact> {
-        match self.pending.as_ref()? {
-            PendingEncryptionGeneration::Prepared { prepared, .. } => Some(prepared.fact()),
-            PendingEncryptionGeneration::ControllerAdmitted { .. } => None,
+    /// Returns the exact fact that can reconstruct controller-side consensus.
+    ///
+    /// Controller state is deliberately replaceable while the Node-local
+    /// recovery journal is durable.  Consequently an already-admitted or
+    /// already-active generation must remain publishable: otherwise an
+    /// unacknowledged activation outbox can prevent the controller from ever
+    /// rebuilding the complete fleet candidate needed to acknowledge that
+    /// same report.
+    fn fact_for_publication(&self) -> Option<&EncryptionGenerationFact> {
+        if let Some(pending) = &self.pending {
+            return Some(match pending {
+                PendingEncryptionGeneration::Prepared { prepared, .. }
+                | PendingEncryptionGeneration::ControllerAdmitted { prepared, .. } => {
+                    prepared.fact()
+                }
+            });
         }
+        let current = self.current.as_ref()?;
+        self.recovery
+            .active
+            .as_ref()
+            .filter(|recovery| {
+                recovery.fact.recipient == current.recipient
+                    && recovery.fact.checkpoint == current.checkpoint
+            })
+            .map(|recovery| &recovery.fact)
     }
 
     fn pending_generation(&self) -> Option<Revision> {
@@ -9229,7 +9250,11 @@ fn encryption_recovery_plan_path(state_path: &Path) -> Result<PathBuf> {
 async fn synchronize_encryption_generation(
     synchronizer: &mut EncryptionGenerationSynchronizer,
 ) -> Result<bool> {
-    let fact = synchronizer.prepared_fact().cloned();
+    // Replay durable active facts as well as new prepared facts. The
+    // controller may have restarted after local activation but before it
+    // acknowledged the activation outbox; reconstructing the complete fact
+    // cut must precede retrying that outbox.
+    let fact = synchronizer.fact_for_publication().cloned();
     if fact.is_none() && synchronizer.current.is_none() {
         return Ok(false);
     }
@@ -15426,9 +15451,16 @@ async fn consume_events(
                 }
             }
             _ = encryption_interval.tick(), if encryption_generations.controller_url.is_some()
-                && (encryption_generations.current.is_some()
-                    || encryption_generations.pending_generation().is_some()
-                    || encryption_generations.pending_activation_report.is_some()) => {
+                && should_exchange_encryption_generation(encryption_generations) => {
+                // Rebuild replaceable controller consensus from durable local
+                // facts before retrying activation evidence. An activation
+                // outbox is not a reason to suppress fact publication: the
+                // report itself depends on the complete reconstructed cut.
+                if encryption_generations.fact_for_publication().is_some()
+                    && let Err(error) = synchronize_encryption_generation(encryption_generations).await
+                {
+                    warn!(%error, "encryption generation fact replay failed; retaining durable local authority and activation outbox");
+                }
                 if encryption_generations.pending_activation_report.is_some()
                     && let Err(error) = publish_pending_encryption_activation(
                         encryption_generations,
@@ -15437,8 +15469,8 @@ async fn consume_events(
                     warn!(error = ?error, "encryption activation evidence remains queued for retry");
                 }
                 if encryption_generations.pending_activation_report.is_none()
-                    && (encryption_generations.prepared_fact().is_some()
-                        || encryption_generations.current.is_some())
+                    && encryption_generations.fact_for_publication().is_none()
+                    && encryption_generations.current.is_some()
                     && let Err(error) = synchronize_encryption_generation(encryption_generations).await
                 {
                     warn!(%error, "encryption generation synchronization failed; retaining durable desired predecessor and active local authority");
@@ -15529,6 +15561,12 @@ async fn consume_events(
         }
     }
     Ok(())
+}
+
+fn should_exchange_encryption_generation(generations: &EncryptionGenerationSynchronizer) -> bool {
+    generations.current.is_some()
+        || generations.pending_generation().is_some()
+        || generations.pending_activation_report.is_some()
 }
 
 fn drain_service_events(
@@ -18761,7 +18799,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let fact = generations.prepared_fact().unwrap();
+        let fact = generations.fact_for_publication().unwrap();
         assert_eq!(
             fact.checkpoint.transaction.desired.published.generation,
             Revision::new(19)
@@ -19110,6 +19148,10 @@ mod tests {
         equivocation.activated_at_unix_ms += 1;
         assert!(synchronizer.queue_activation_report(equivocation).is_err());
         assert!(synchronizer.pending_activation_report.is_some());
+        assert!(
+            should_exchange_encryption_generation(&synchronizer),
+            "an activation outbox must keep controller reconstruction scheduled"
+        );
     }
 
     #[tokio::test]
@@ -19131,6 +19173,7 @@ mod tests {
         );
         assert!(synchronizer.current.is_none());
         assert!(synchronizer.pending.is_none());
+        assert!(!should_exchange_encryption_generation(&synchronizer));
     }
 
     fn live_path_probe_frame(kind: u8, family: u8, seed: u8) -> [u8; 72] {
