@@ -9342,13 +9342,13 @@ async fn exchange_encryption_path_probe_group(
         ),
     >::new();
     let now_unix_ms = current_unix_time_milliseconds();
-    let valid_for_ms = work
+    let round_valid_for_ms = work
         .iter()
         .map(|item| item.expires_at_unix_ms)
         .min()
         .context("path probe group is empty")?
-        .saturating_sub(now_unix_ms)
-        .min(4_000);
+        .saturating_sub(now_unix_ms);
+    let valid_for_ms = round_valid_for_ms.min(4_000);
     if valid_for_ms < 250 {
         bail!("path proof round expires before a bounded exchange can run");
     }
@@ -9360,24 +9360,21 @@ async fn exchange_encryption_path_probe_group(
             bail!("path probe group contains a duplicate round");
         }
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(valid_for_ms);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(valid_for_ms);
+    let round_deadline = started + Duration::from_millis(round_valid_for_ms);
     let mut retry = tokio::time::interval(Duration::from_millis(100));
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut buffer = [0_u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES];
     loop {
         if pending.values().all(|(_, response)| response.is_some()) {
-            // Keep the responder alive for two peer retry periods so both
-            // independently scheduled agents can close the same rendezvous.
-            let grace = tokio::time::sleep(Duration::from_millis(225));
-            tokio::pin!(grace);
-            loop {
-                tokio::select! {
-                    () = &mut grace => break,
-                    received = socket.recv_from(&mut buffer) => {
-                        respond_to_encryption_path_probe(&socket, &work, &buffer, received?).await?;
-                    }
-                }
-            }
+            // Proof completion is asymmetric: one independently scheduled
+            // endpoint can finish before its peer has received every family.
+            // Return the local transcript immediately, but retain this exact
+            // nonce-bound responder until the authenticated round expires.
+            // This decouples activation latency from scheduler skew without
+            // creating reusable reachability authority.
+            spawn_encryption_path_probe_responder_lease(socket, work.clone(), round_deadline);
             break;
         }
         tokio::select! {
@@ -9443,6 +9440,38 @@ async fn exchange_encryption_path_probe_group(
             })
         })
         .collect()
+}
+
+fn spawn_encryption_path_probe_responder_lease(
+    socket: tokio::net::UdpSocket,
+    work: Vec<PathProbeWork>,
+    deadline: tokio::time::Instant,
+) {
+    tokio::spawn(async move {
+        let mut buffer = [0_u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES];
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => break,
+                received = socket.recv_from(&mut buffer) => {
+                    let received = match received {
+                        Ok(received) => received,
+                        Err(error) => {
+                            warn!(%error, "encrypted path proof responder lease stopped early");
+                            break;
+                        }
+                    };
+                    if let Err(error) = respond_to_encryption_path_probe(
+                        &socket,
+                        &work,
+                        &buffer,
+                        received,
+                    ).await {
+                        warn!(%error, "ignored invalid encrypted path proof lease frame");
+                    }
+                }
+            }
+        }
+    });
 }
 
 async fn respond_to_encryption_path_probe(
@@ -19039,6 +19068,11 @@ mod tests {
             assert!(ipv4.is_err() && ipv6.is_err());
             return;
         }
+        // The production agent runtime outlives every proof round. This
+        // isolated test process would otherwise tear its runtime down as soon
+        // as its own two families finish, aborting the responder leases before
+        // the independently scheduled peer process consumes its last reply.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let ipv4 = ipv4.expect("IPv4 live nonce rendezvous failed");
         let ipv6 = ipv6.expect("IPv6 live nonce rendezvous failed");
         assert_eq!(ipv4.len(), 1);
