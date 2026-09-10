@@ -7213,11 +7213,15 @@ async fn run_dataplane(
         config.encryption_fast_path_state_path.clone(),
         encryption_pins_existed,
     )?;
-    encryption_generations.rehydrate_local_proof().await?;
     let mut startup_activation_error = None;
     for attempt in 1..=ENCRYPTION_STARTUP_REVALIDATION_ATTEMPTS {
-        match activate_admitted_encryption_generation(&mut encryption_generations, &mut encryption)
-            .await
+        match advance_startup_encryption_authority(
+            &mut encryption_keys,
+            &mut encryption_plans,
+            &mut encryption_generations,
+            &mut encryption,
+        )
+        .await
         {
             Ok(_) => {
                 startup_activation_error = None;
@@ -7358,6 +7362,72 @@ async fn run_dataplane(
     state.bpf_loaded.store(false, Ordering::Release);
     state.metrics.bpf_loaded.set(0);
     Ok(())
+}
+
+/// Advances a fenced startup directly to the controller's current exact cut.
+///
+/// A restarted agent can hold a valid durable predecessor while the remaining
+/// fleet has already advanced the global generation. Revalidating that
+/// predecessor against successor path assignments can never succeed. Before
+/// attaching TC, recover public key state, adopt and compile the authenticated
+/// current plan, exchange its Node-local generation fact, and activate only
+/// the exact controller-admitted successor. If no successor exists, rebuild
+/// proof for the durable current generation as before.
+async fn advance_startup_encryption_authority(
+    keys: &mut EncryptionKeySynchronizer,
+    plans: &mut EncryptionPlanSynchronizer,
+    generations: &mut EncryptionGenerationSynchronizer,
+    encryption: &mut EncryptionMapSynchronizer,
+) -> Result<bool> {
+    let mut synchronization_error = None;
+    if keys.controller_url.is_some() {
+        if let Err(error) = synchronize_encryption_keys(keys)
+            .await
+            .context("synchronize startup encryption keys")
+        {
+            synchronization_error = Some(error);
+        }
+        match synchronize_encryption_plan(plans)
+            .await
+            .context("adopt current startup encryption plan")
+        {
+            Ok(_) => {
+                if let Some(plan) = plans.current.as_ref() {
+                    generations.supersede_stale_active_revalidation(plan.snapshot.generation);
+                }
+                if let Err(error) = prepare_admitted_encryption_plan(plans, keys, generations)
+                    .await
+                    .context("compile current startup encryption plan")
+                {
+                    synchronization_error = Some(error);
+                }
+            }
+            Err(error) => synchronization_error = Some(error),
+        }
+        if let Err(error) = synchronize_encryption_generation(generations)
+            .await
+            .context("exchange current startup encryption generation")
+        {
+            synchronization_error = Some(error);
+        }
+    }
+    if generations.pending.is_none() {
+        generations
+            .rehydrate_local_proof()
+            .await
+            .context("rehydrate durable startup encryption predecessor")?;
+    }
+    match activate_admitted_encryption_generation(generations, encryption).await {
+        Ok(changed) if !encryption.requires_local_revalidation() => Ok(changed),
+        Ok(_) => {
+            if let Some(error) = synchronization_error {
+                Err(error)
+            } else {
+                bail!("current startup encryption generation is not yet admitted")
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn attach_dataplane_programs<'ebpf>(
@@ -8680,6 +8750,26 @@ impl EncryptionGenerationSynchronizer {
                 .published
                 .generation,
         )
+    }
+
+    /// Drops only a volatile proof reconstruction for the durable active slot
+    /// when an authenticated newer plan is available. Durable admission,
+    /// recovery journals, kernel state, and maps remain untouched and fenced;
+    /// the successor must independently rebuild every capability.
+    fn supersede_stale_active_revalidation(&mut self, desired: Revision) -> bool {
+        let stale = matches!(
+            self.pending.as_ref(),
+            Some(PendingEncryptionGeneration::ControllerAdmitted {
+                prepared,
+                slot: EncryptionRecoverySlot::Active,
+                ..
+            }) if prepared.fact().checkpoint.transaction.desired.published.generation < desired
+        );
+        if stale {
+            self.pending = None;
+            self.path_proofs.clear();
+        }
+        stale
     }
 
     fn has_controller_admission(&self) -> bool {
