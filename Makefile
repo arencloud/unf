@@ -16,7 +16,7 @@
 .PHONY: egress-reachability-lifecycle-test
 .PHONY: egress-native-reachability-test
 .PHONY: egress-bgp-test egress-bfd-test egress-operations-history-test egress-operations-causal-test egress-upgrade-recovery-test egress-phase8-kind-test egress-phase8-openshift-deploy egress-phase8-openshift-test egress-bgp-image
-.PHONY: encryption-fabric-boundary-test encryption-contract-test encryption-key-authority-test encryption-kernel-provider-test encryption-kernel-provider-live-test encryption-fast-path-contract-test encryption-fast-path-transaction-test encryption-map-persistence-test encryption-map-transaction-test encryption-map-backend-live-test encryption-route-mark-contract-test encryption-route-authority-test encryption-route-authority-live-test encryption-generation-distribution-test encryption-activation-latch-test encryption-generation-frontier-test encryption-generation-recovery-test encryption-generation-reconciler-test encryption-local-proof-ladder-test encryption-linux-convergence-test encryption-agent-anti-entropy-test encryption-activation-rehydration-test encryption-local-plan-compiler-test encryption-plan-manifold-test encryption-plan-distribution-test encryption-plan-runtime-test encryption-plan-catalog-test encryption-key-transparency-test encryption-key-runtime-test encryption-key-attestation-test encryption-fleet-plan-producer-test encryption-policy-quotient-test encryption-address-binding-test encryption-kubernetes-projection-test encryption-controller-plan-test encryption-agent-plan-compile-test encryption-tc-consumer-test encryption-composition-test encryption-ciphertext-live-test encryption-path-proof-test encryption-path-runtime-test encryption-path-activation-test encryption-proof-beacon-test encryption-path-executor-test encryption-path-live-test encryption-operations-evidence-test encryption-operations-runtime-test encryption-operations-recovery-test encryption-activation-report-test encryption-operations-query-test encryption-adjacent-compatibility-test encryption-recovery-cleanup-test encryption-performance-test encryption-performance-live
+.PHONY: encryption-fabric-boundary-test encryption-contract-test encryption-key-authority-test encryption-kernel-provider-test encryption-kernel-provider-live-test encryption-fast-path-contract-test encryption-fast-path-transaction-test encryption-map-persistence-test encryption-map-transaction-test encryption-map-backend-live-test encryption-route-mark-contract-test encryption-route-authority-test encryption-route-authority-live-test encryption-generation-distribution-test encryption-activation-latch-test encryption-generation-frontier-test encryption-generation-recovery-test encryption-generation-reconciler-test encryption-local-proof-ladder-test encryption-linux-convergence-test encryption-agent-anti-entropy-test encryption-activation-rehydration-test encryption-local-plan-compiler-test encryption-plan-manifold-test encryption-plan-distribution-test encryption-plan-runtime-test encryption-plan-catalog-test encryption-key-transparency-test encryption-key-runtime-test encryption-key-attestation-test encryption-fleet-plan-producer-test encryption-policy-quotient-test encryption-address-binding-test encryption-kubernetes-projection-test encryption-controller-plan-test encryption-agent-plan-compile-test encryption-tc-consumer-test encryption-composition-test encryption-ciphertext-live-test encryption-path-proof-test encryption-path-runtime-test encryption-path-activation-test encryption-proof-beacon-test encryption-path-executor-test encryption-path-live-test encryption-operations-evidence-test encryption-operations-runtime-test encryption-operations-recovery-test encryption-activation-report-test encryption-operations-query-test encryption-adjacent-compatibility-test encryption-recovery-cleanup-test encryption-performance-test encryption-performance-live encryption-selective-policy-test
 .NOTPARALLEL: egress-phase8-kind-test kind-upgrade-test kind-skipped-upgrade-test kind-incompatible-version-test kind-clean-rebuild-test kind-unsupported-downgrade-test kind-rollback-reporting-test
 
 KIND := .tools/bin/kind
@@ -365,6 +365,14 @@ encryption-performance-live: encryption-recovery-cleanup-test ebpf
 
 encryption-performance-test: encryption-recovery-cleanup-test
 	hack/verify-encryption-performance.sh
+
+encryption-selective-policy-test: encryption-performance-test
+	hack/verify-encryption-selective-policy.sh
+	cargo test -p unf-encryption native_only_generation_is_explicit_packet_authority_without_transport
+	cargo test -p unf-encryption selective_cut_proves_native_authority_without_a_fake_kernel_epoch
+	cargo test -p unf-controller encryption_policy_relist_is_atomic_and_materializes_bidirectional_identities
+	cargo test -p unf-api checked_in_crd_matches_rust_schema
+	cargo clippy -p unf-api -p unf-encryption -p unf-controller --all-targets --all-features -- -D warnings
 
 egress-intent-test: egress-fabric-boundary-test
 	hack/verify-egress-intent.sh
@@ -948,6 +956,7 @@ ebpf:
 
 generate-crds:
 	cargo run -p unf-api --example crdgen -- security-policy > deploy/crds/network.unf.io_securitypolicies.yaml
+	cargo run -p unf-api --example crdgen -- encryption-policy > deploy/crds/network.unf.io_encryptionpolicies.yaml
 	cargo run -p unf-api --example crdgen -- egress-pool > deploy/crds/network.unf.io_egresspools.yaml
 	cargo run -p unf-api --example crdgen -- egress-policy > deploy/crds/network.unf.io_egresspolicies.yaml
 	cargo run -p unf-api --example crdgen -- egress-internet-classification > deploy/crds/network.unf.io_egressinternetclassifications.yaml

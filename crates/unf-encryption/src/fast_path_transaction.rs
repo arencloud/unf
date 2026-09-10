@@ -130,15 +130,14 @@ impl CausalCommitVector {
     /// Rejects schema, revision, count, epoch, ordering, zero-digest, or digest
     /// mutation.
     pub fn verify(&self) -> Result<(), FastPathTransactionError> {
-        let dormant = self.published.epoch_count == 0;
-        let invalid_dormant = dormant
-            && (self.published.decision_count != 0
-                || self.published.transport_count != 0
+        let transport_free = self.published.epoch_count == 0;
+        let invalid_transport_free = transport_free
+            && (self.published.transport_count != 0
                 || self.published.path_count != 0
                 || self.active_epoch != 0
                 || self.draining_epoch.is_some()
                 || !self.kernel_configuration_digests.is_empty());
-        let invalid_active = !dormant
+        let invalid_active = !transport_free
             && (self.published.transport_count == 0
                 || self.active_epoch == 0
                 || self.draining_epoch == Some(0)
@@ -152,7 +151,7 @@ impl CausalCommitVector {
             || self.published.service_revision == Revision::INITIAL
             || self.published.egress_revision == Revision::INITIAL
             || self.published.epoch_count > 2
-            || invalid_dormant
+            || invalid_transport_free
             || invalid_active
             || self
                 .kernel_configuration_digests

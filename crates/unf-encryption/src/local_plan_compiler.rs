@@ -472,16 +472,21 @@ impl NodeLocalPlanSnapshot {
     fn validate_mode(&self) -> Result<(), NodeLocalPlanCompilerError> {
         match self.mode {
             NodeLocalPlanMode::Active
-                if self.epochs.is_empty()
-                    || self
-                        .epochs
-                        .iter()
-                        .filter(|epoch| epoch.state == FastPathEpochState::Active)
-                        .count()
-                        != 1 =>
+                if self.decisions.is_empty()
+                    || !self.epochs.is_empty()
+                        && self
+                            .epochs
+                            .iter()
+                            .filter(|epoch| epoch.state == FastPathEpochState::Active)
+                            .count()
+                            != 1
+                    || self.epochs.is_empty()
+                        && self.decisions.iter().any(|decision| {
+                            decision.disposition != EncryptionDisposition::Native
+                        }) =>
             {
                 return Err(NodeLocalPlanCompilerError::InvalidInput(
-                    "active Node-local plan has no unique active epoch",
+                    "active Node-local plan lacks exact native or epoch authority",
                 ));
             }
             NodeLocalPlanMode::Dormant if !self.epochs.is_empty() || !self.decisions.is_empty() => {

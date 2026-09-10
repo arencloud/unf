@@ -4,7 +4,7 @@
 //! causal model/fact snapshot. Nodes without a required cross-Node path receive
 //! an explicit dormant plan instead of an unnecessary tunnel or fake workload.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use unf_common::Revision;
@@ -284,12 +284,7 @@ fn produce_node_plan(
         input.valid_from_unix_ms,
         input.valid_until_unix_ms,
     )?;
-    let mode = if contract.plans.is_empty() {
-        NodeLocalPlanMode::Dormant
-    } else {
-        NodeLocalPlanMode::Active
-    };
-    let decisions = contract
+    let mut decisions = contract
         .plans
         .iter()
         .enumerate()
@@ -301,7 +296,13 @@ fn produce_node_plan(
             plan_index: Some(plan_index),
         })
         .collect::<Vec<_>>();
-    let epochs = if mode == NodeLocalPlanMode::Dormant {
+    decisions.extend(native_decisions(input, facts, &node));
+    let mode = if decisions.is_empty() {
+        NodeLocalPlanMode::Dormant
+    } else {
+        NodeLocalPlanMode::Active
+    };
+    let epochs = if contract.plans.is_empty() {
         Vec::new()
     } else {
         let mut epochs = vec![NodeLocalEpochPlanRecord {
@@ -352,6 +353,48 @@ fn produce_node_plan(
         decisions,
     })
     .map_err(FleetPlanProductionError::from)
+}
+
+fn native_decisions(
+    input: &FleetPlanProductionInput,
+    facts: &EncryptionContractFacts,
+    node: &crate::EncryptionNode,
+) -> Vec<NodeLocalDecisionPlan> {
+    let allowed = facts
+        .policies
+        .iter()
+        .filter(|policy| policy.allowed)
+        .map(|policy| (policy.source, policy.destination))
+        .collect::<BTreeSet<_>>();
+    facts
+        .endpoints
+        .iter()
+        .filter(|source| source.node == *node)
+        .flat_map(|source| {
+            facts
+                .endpoints
+                .iter()
+                .filter(|destination| destination.node.uid != node.uid)
+                .filter_map(|destination| {
+                    let pair = (source.identity, destination.identity);
+                    (allowed.contains(&pair)
+                        && input.model.requirement(pair.0, pair.1).disposition
+                            == crate::EncryptionDisposition::Native)
+                        .then_some(pair)
+                })
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(
+            |(source_identity, destination_identity)| NodeLocalDecisionPlan {
+                source_identity,
+                destination_identity,
+                disposition: crate::EncryptionDisposition::Native,
+                contract_epoch: None,
+                plan_index: None,
+            },
+        )
+        .collect()
 }
 
 #[derive(Debug, Error)]
@@ -658,6 +701,62 @@ mod tests {
         assert_eq!(cut.plans[0].epochs.len(), 1);
         assert_eq!(cut.plans[1].epochs.len(), 1);
         assert!(cut.plans[2].decisions.is_empty());
+    }
+
+    #[test]
+    fn selective_cut_proves_native_authority_without_a_fake_kernel_epoch() {
+        let mut input = input(true);
+        input.model = EncryptionModel::normalize(
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Native,
+            vec![crate::EncryptionIntent {
+                name: "encrypt-client-to-server".to_owned(),
+                uid: "uid-selective-forward".to_owned(),
+                priority: 100,
+                sources: crate::ManagedIdentitySelector::Identities(BTreeSet::from([
+                    IdentityId::new(11),
+                ])),
+                destinations: crate::ManagedIdentitySelector::Identities(BTreeSet::from([
+                    IdentityId::new(21),
+                ])),
+            }],
+        )
+        .unwrap();
+        let cut = produce_fleet_plan_cut(input).unwrap();
+        let source = cut
+            .plans
+            .iter()
+            .find(|plan| plan.recipient.node_uid == "uid-a")
+            .unwrap();
+        assert_eq!(source.epochs.len(), 1);
+        assert_eq!(
+            source.decisions[0].disposition,
+            crate::EncryptionDisposition::Required
+        );
+
+        let reverse = cut
+            .plans
+            .iter()
+            .find(|plan| plan.recipient.node_uid == "uid-b")
+            .unwrap();
+        assert_eq!(reverse.mode, NodeLocalPlanMode::Active);
+        assert!(reverse.epochs.is_empty());
+        assert_eq!(reverse.decisions.len(), 1);
+        assert_eq!(
+            reverse.decisions[0].disposition,
+            crate::EncryptionDisposition::Native
+        );
+        reverse.verify().unwrap();
+        let prepared = reverse
+            .prepare_exact_readback(None, NOW + 3, 1, &[])
+            .unwrap();
+        let desired = prepared.fact().checkpoint.desired_state().unwrap();
+        assert_eq!(desired.config.epoch_count, 0);
+        assert_eq!(desired.config.decision_count, 1);
+        assert_eq!(desired.config.transport_count, 0);
+        assert!(unf_ebpf_common::encryption_config_is_active(
+            &desired.config
+        ));
     }
 
     #[test]

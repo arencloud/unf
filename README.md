@@ -1009,7 +1009,14 @@ exact MTU, handshake convergence, ciphertext-only capture, and prewarmed
 rotation disruption. The much slower encrypted same-host throughput remains
 visible rather than becoming a selective claim. `make encryption-performance-test`
 validates the digest; `make encryption-performance-live` reproduces it; ADR
-0207. Phase 9.8 Kind qualification is next.
+0207. Phase 9.8a–d then close restart-safe membership, positive secret rollback,
+continuous attested rotation, and the Kubernetes selective-encryption gap. A
+namespaced `EncryptionPolicy` materializes exact bidirectional identity intent;
+its Proof-Carrying Native Exception makes every allowed plaintext pair an
+explicit revision-bound decision, while absent authority still drops and
+native-only Nodes create no fake tunnel. Required remains the installation
+default. `make encryption-selective-policy-test`; ADRs 0208–0211. One immutable
+dual-stack Kind gate is next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -21,7 +21,7 @@ separately revisioned. The authoritative state remains in
 | 9.5 | Intent-Coalesced Cryptographic Fast Path | **Verified** | Phase 9.5a adds the canonical compiler and Causal Epoch Lease; Phase 9.5b adds the Causal Commit Vector. Later slices connect proof-carrying maps/routes, authenticated complete-cut distribution, local Linux/key proof, quiescent generations, the policy-first dual-stack TC consumer, and Flow-Adaptive Secure DSR. Phase 9.5af closes the chain with independently captured real-kernel IPv4/IPv6 WireGuard ciphertext, positive transfer counters, peer-removal denial, exact recovery, and scoped cleanup under `make encryption-ciphertext-live-test`; ADRs 0162–0193 |
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
-| 9.8 | Kube-proxy-free Kind qualification | **In progress** | Phase 9.8a adds Content-Addressed Membership Resume; 9.8b adds Secret-Aware Positive Rollback; and 9.8c adds the Convergent Attested Rotation Wave: continuous settled-frontier anti-entropy, bounded Node-UID jitter, same-membership successor rounds, and durable `Active`/`Draining` promotion. Node replacement, proposal regression, partial waves, and foreign state remain fenced; focused tests and strict Clippy pass; ADRs 0208–0210. One exact committed runtime must now pass the complete live gate |
+| 9.8 | Kube-proxy-free Kind qualification | **In progress** | Phases 9.8a–c add Content-Addressed Membership Resume, Secret-Aware Positive Rollback, and the Convergent Attested Rotation Wave. Phase 9.8d adds the namespaced `EncryptionPolicy` runtime and Proof-Carrying Native Exception: atomic relists, selector-to-identity materialization, monotonic intent cuts, and explicit native-only map authority without fake tunnels. Missing authority remains closed and Required remains the fresh-install default. Focused tests and strict Clippy pass; ADRs 0208–0211. One exact committed runtime must now pass the complete live gate |
 | 9.9 | OpenShift qualification | **Planned** | The exact Kind-qualified images independently pass a five-Node dual-stack cl02 RHCOS/SELinux/CRI-O gate with immutable provenance, cross-worker encrypted traffic, rotation/recovery, exact cleanup, convergence, kube-proxy absence, and ClusterOperator comparison |
 
 ## Accepted Phase 9 gate
@@ -175,7 +175,7 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Begin milestone 9.8 on one exact kube-proxy-free dual-stack Kind runtime. It
-must compose default-required and selective encryption with Service and egress,
-then prove rotation, failure/recovery, operations, performance capture, exact
-cleanup, and no-CNI rollback.
+Finish milestone 9.8 on one exact kube-proxy-free dual-stack Kind runtime. It
+must qualify the implemented default-required and explicit-selective modes with
+Service and egress, then prove rotation, failure/recovery, operations,
+performance capture, exact cleanup, and no-CNI rollback.

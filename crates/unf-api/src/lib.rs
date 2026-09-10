@@ -30,6 +30,31 @@ pub struct SecurityPolicySpec {
     pub enforcement_mode: EnforcementMode,
 }
 
+/// Selects identity pairs that must use the attested encryption fabric when
+/// the cluster baseline is `Native`. A `Required` baseline remains monotonic:
+/// policies add provenance but can never weaken cluster-wide encryption.
+#[derive(CustomResource, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "network.unf.io",
+    version = "v1alpha1",
+    kind = "EncryptionPolicy",
+    plural = "encryptionpolicies",
+    namespaced,
+    shortname = "unfenc"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptionPolicySpec {
+    pub sources: WorkloadSelector,
+    pub destinations: WorkloadSelector,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    /// Emit the exact reverse identity-pair intent as part of the same atomic
+    /// policy. This is default-on because most request/reply transports need
+    /// symmetric underlay confidentiality.
+    #[serde(default = "default_true")]
+    pub bidirectional: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SecurityPolicyStatus {
@@ -107,6 +132,10 @@ pub enum EnforcementMode {
 
 const fn default_priority() -> u32 {
     1_000
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(CustomResource, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -446,6 +475,13 @@ mod tests {
         let value = serde_json::to_value(SecurityPolicy::crd()).expect("CRD serializes");
         assert_eq!(value["spec"]["group"], "network.unf.io");
         assert!(value["spec"]["versions"][0]["schema"]["openAPIV3Schema"].is_object());
+        let encryption = serde_json::to_value(EncryptionPolicy::crd()).expect("CRD serializes");
+        assert_eq!(encryption["spec"]["scope"], "Namespaced");
+        assert_eq!(
+            encryption["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+                ["bidirectional"]["default"],
+            true
+        );
     }
 
     #[test]
@@ -472,6 +508,16 @@ mod tests {
         .expect("checked-in CRD is valid YAML");
         let generated = serde_json::to_value(SecurityPolicy::crd()).expect("CRD serializes");
         assert_eq!(checked_in, generated, "run `make generate-crds`");
+        let checked_in_encryption: serde_json::Value = serde_yaml::from_str(include_str!(
+            "../../../deploy/crds/network.unf.io_encryptionpolicies.yaml"
+        ))
+        .expect("checked-in encryption CRD is valid YAML");
+        let generated_encryption =
+            serde_json::to_value(EncryptionPolicy::crd()).expect("CRD serializes");
+        assert_eq!(
+            checked_in_encryption, generated_encryption,
+            "run `make generate-crds`"
+        );
     }
 
     #[test]

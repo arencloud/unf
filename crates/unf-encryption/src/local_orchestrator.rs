@@ -742,12 +742,12 @@ fn preflight_plan_cut(
     Ok(expected)
 }
 
+/// A zero-kernel-authority generation is dormant from the kernel provider's
+/// perspective even when its map carries explicit Native decisions.
 fn dormant_fast_path(desired: &crate::EncryptionFastPathState) -> bool {
     desired.config.epoch_count == 0
-        && desired.config.decision_count == 0
         && desired.config.transport_count == 0
         && desired.config.path_count == 0
-        && desired.decision_authority.is_empty()
         && desired.transport_authority.is_empty()
         && desired.path_authority.is_empty()
 }

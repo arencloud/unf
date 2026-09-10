@@ -1106,8 +1106,8 @@ pub const fn encryption_transport_is_usable(
 }
 
 /// Validates the single bank pointer before any packet can consume encryption
-/// authority. A zero-epoch generation is a proven quiescent cut, not packet
-/// authority; it therefore never reaches identity-pair lookup.
+/// authority. A zero-epoch generation may contain only explicit Native
+/// identity-pair decisions; missing authority remains fail closed.
 #[must_use]
 pub const fn encryption_config_is_active(config: &EncryptionMapConfig) -> bool {
     config.schema_version == ENCRYPTION_MAP_ABI_VERSION
@@ -1116,12 +1116,11 @@ pub const fn encryption_config_is_active(config: &EncryptionMapConfig) -> bool {
         && config.policy_revision != 0
         && config.service_revision != 0
         && config.egress_revision != 0
-        && config.epoch_count > 0
         && config.epoch_count <= 2
         && config.decision_count > 0
         && config.decision_count <= ENCRYPTION_DECISION_MAP_CAPACITY
-        && config.transport_count > 0
         && config.transport_count <= ENCRYPTION_TRANSPORT_MAP_CAPACITY
+        && (config.epoch_count > 0) == (config.transport_count > 0)
         && config.path_count <= ENCRYPTION_PATH_MAP_CAPACITY
 }
 

@@ -158,7 +158,10 @@ impl EncryptionFastPathState {
             || self.config.egress_revision == 0
             || usize::from(self.config.epoch_count) > MAX_FAST_PATH_EPOCHS
             || self.config.epoch_count == 0
-                && (!self.decision_authority.is_empty()
+                && (self
+                    .decision_authority
+                    .iter()
+                    .any(|decision| decision.disposition != EncryptionDisposition::Native)
                     || !self.transport_authority.is_empty()
                     || !self.path_authority.is_empty())
         {
@@ -750,7 +753,6 @@ pub fn select_encryption_transport(
     }
     if state.config.schema_version != ENCRYPTION_MAP_ABI_VERSION
         || state.config.active_bank >= ENCRYPTION_BANK_COUNT
-        || state.config.epoch_count == 0
         || usize::from(state.config.epoch_count) > MAX_FAST_PATH_EPOCHS
         || packet.policy_revision.get() != state.config.policy_revision
         || packet.service_revision.get() != state.config.service_revision
@@ -902,7 +904,10 @@ fn validate_context(
         return Err(FastPathError::InvalidContext);
     }
     if epochs.len() > MAX_FAST_PATH_EPOCHS
-        || epochs.is_empty() && !inputs.is_empty()
+        || epochs.is_empty()
+            && inputs
+                .iter()
+                .any(|input| input.disposition != EncryptionDisposition::Native)
         || !epochs.is_empty()
             && epochs
                 .iter()
@@ -3116,6 +3121,37 @@ mod tests {
             select_encryption_transport(&corrupt, packet(), None),
             FastPathPacketDecision::Drop(FastPathDropReason::RevisionMismatch)
         );
+        let mut unknown = packet();
+        unknown.destination_identity = IdentityId::new(99);
+        assert_eq!(
+            select_encryption_transport(&state, unknown, None),
+            FastPathPacketDecision::Drop(FastPathDropReason::AuthorityMissing)
+        );
+    }
+
+    #[test]
+    fn native_only_generation_is_explicit_packet_authority_without_transport() {
+        let state = compile_encryption_fast_path(
+            context(0),
+            &[],
+            &[FastPathDecisionInput {
+                source_identity: IdentityId::new(11),
+                destination_identity: IdentityId::new(21),
+                disposition: EncryptionDisposition::Native,
+                contract_epoch: None,
+                plan_index: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(state.config.epoch_count, 0);
+        assert_eq!(state.config.transport_count, 0);
+        assert!(unf_ebpf_common::encryption_config_is_active(&state.config));
+        assert_eq!(
+            select_encryption_transport(&state, packet(), None),
+            FastPathPacketDecision::Native
+        );
+        let vector = crate::CausalCommitVector::issue(&state).unwrap();
+        vector.verify().unwrap();
         let mut unknown = packet();
         unknown.destination_identity = IdentityId::new(99);
         assert_eq!(

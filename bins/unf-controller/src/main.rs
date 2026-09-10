@@ -42,7 +42,8 @@ use unf_api::{
     EgressReachabilityPath as ApiEgressReachabilityPath,
     EgressReachabilityPlan as ApiEgressReachabilityPlan,
     EgressReachabilityPlanSpec as ApiEgressReachabilityPlanSpec,
-    EgressReachabilityVantage as ApiEgressReachabilityVantage, SecurityPolicy,
+    EgressReachabilityVantage as ApiEgressReachabilityVantage, EncryptionPolicy, SecurityPolicy,
+    WorkloadSelector as ApiWorkloadSelector,
 };
 use unf_common::{
     BackendId, IdentityId, PolicyAction, PolicyDirection, PolicyId, PolicyReason, Protocol,
@@ -76,14 +77,15 @@ use unf_encryption::{
     EncryptionGenerationFact, EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
     EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
-    EncryptionGenerationRequest, EncryptionIdentityPair, EncryptionKeyBootstrap, EncryptionModel,
-    EncryptionOperationalObservation, EncryptionOperationalOutcome, EncryptionOperationalStage,
-    EncryptionOperationsHistoryCheckpoint, EncryptionOperationsLedger, EncryptionOperationsStatus,
-    EncryptionPathActivationReceipt, EncryptionPathProofAdmission, EncryptionPathProofAssignment,
-    EncryptionPathProofCoordinator, EncryptionPolicyObservation, FastPathEpochState,
-    FleetDrainingEpochInput, FleetPlanProductionInput, IpPrefix, KubernetesEncryptionNodeSnapshot,
-    KubernetesEncryptionProjection, KubernetesEncryptionProjectionInput,
-    KubernetesEncryptionWorkloadSnapshot, NodeKeyAttestationCut, NodeKeyAttestationLedger,
+    EncryptionGenerationRequest, EncryptionIdentityPair, EncryptionIntent, EncryptionKeyBootstrap,
+    EncryptionModel, EncryptionOperationalObservation, EncryptionOperationalOutcome,
+    EncryptionOperationalStage, EncryptionOperationsHistoryCheckpoint, EncryptionOperationsLedger,
+    EncryptionOperationsStatus, EncryptionPathActivationReceipt, EncryptionPathProofAdmission,
+    EncryptionPathProofAssignment, EncryptionPathProofCoordinator, EncryptionPolicyObservation,
+    FastPathEpochState, FleetDrainingEpochInput, FleetPlanProductionInput, IpPrefix,
+    KubernetesEncryptionNodeSnapshot, KubernetesEncryptionProjection,
+    KubernetesEncryptionProjectionInput, KubernetesEncryptionWorkloadSnapshot,
+    ManagedIdentitySelector, NodeKeyAttestationCut, NodeKeyAttestationLedger,
     NodeKeyAttestationRound, NodeKeyAttestationRow, NodeKeyPublication,
     NodeKeyTransparencyCutDigest, NodeKeyTransparencyLedger, NodeLocalPlanCatalog,
     NodeLocalPlanDistributionError, NodeLocalPlanRequest, NodeSealedGenerationCapsule,
@@ -261,6 +263,16 @@ struct Args {
         value_parser = validate_agent_node_selector
     )]
     agent_node_selector: Option<String>,
+    /// Cross-Node managed-workload encryption baseline. Fresh installations
+    /// default to Required; Native exists only for explicit selective-policy
+    /// deployments and never turns a Required policy decision into plaintext.
+    #[arg(
+        long,
+        env = "UNF_ENCRYPTION_BASELINE",
+        value_enum,
+        default_value_t = ControllerEncryptionBaseline::Required
+    )]
+    encryption_baseline: ControllerEncryptionBaseline,
     /// Optional HTTP endpoint that receives validated, schema-versioned flow batches.
     #[arg(long, env = "UNF_CONTROLLER_FLOW_EXPORT_HTTP_URL")]
     flow_export_http_url: Option<String>,
@@ -322,6 +334,22 @@ struct Args {
     offline: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum ControllerEncryptionBaseline {
+    Native,
+    #[default]
+    Required,
+}
+
+impl From<ControllerEncryptionBaseline> for EncryptionBaseline {
+    fn from(value: ControllerEncryptionBaseline) -> Self {
+        match value {
+            ControllerEncryptionBaseline::Native => Self::Native,
+            ControllerEncryptionBaseline::Required => Self::Required,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ControllerMetrics {
     reconciles: Counter,
@@ -380,6 +408,7 @@ struct EgressFqdnMaterialization {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EncryptionPlanSource {
     membership_revision: Revision,
+    intent_revision: Revision,
     identity_revision: Revision,
     policy_revision: Revision,
     routing_revision: Revision,
@@ -419,6 +448,7 @@ struct ControllerState {
     offline: bool,
     agent_node_selector: Option<String>,
     encryption_cluster_id: String,
+    encryption_baseline: EncryptionBaseline,
     pods: RwLock<BTreeMap<String, PodRecord>>,
     nodes: RwLock<BTreeMap<String, TopologyNode>>,
     egress_desired: Mutex<EgressDesiredStore>,
@@ -475,6 +505,9 @@ struct ControllerState {
     encryption_activation_cursors: Mutex<BTreeMap<String, EncryptionActivationCursor>>,
     encryption_operations_dirty: AtomicBool,
     encryption_operations_store: Option<Api<ConfigMap>>,
+    encryption_policies: RwLock<BTreeMap<String, EncryptionPolicy>>,
+    encryption_policy_initialization: Mutex<Option<BTreeMap<String, EncryptionPolicy>>>,
+    encryption_intent_revision: Mutex<Revision>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1333,6 +1366,7 @@ async fn main() -> Result<()> {
         client.clone(),
         args.agent_node_selector.clone(),
         discover_encryption_cluster_id(client.as_ref()).await?,
+        args.encryption_baseline.into(),
     ));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
@@ -1719,7 +1753,13 @@ fn install_crypto_provider() -> Result<()> {
 
 #[cfg(test)]
 fn new_state(offline: bool) -> ControllerState {
-    new_state_with_client_and_selector(offline, None, None, "test-cluster-uid".to_owned())
+    new_state_with_client_and_selector(
+        offline,
+        None,
+        None,
+        "test-cluster-uid".to_owned(),
+        EncryptionBaseline::Required,
+    )
 }
 
 async fn discover_encryption_cluster_id(client: Option<&Client>) -> Result<String> {
@@ -1926,6 +1966,7 @@ fn new_state_with_client_and_selector(
     token_review_client: Option<Client>,
     agent_node_selector: Option<String>,
     encryption_cluster_id: String,
+    encryption_baseline: EncryptionBaseline,
 ) -> ControllerState {
     let metrics = ControllerMetrics::default();
     let mut registry = Registry::default();
@@ -2001,6 +2042,7 @@ fn new_state_with_client_and_selector(
         offline,
         agent_node_selector,
         encryption_cluster_id,
+        encryption_baseline,
         pods: RwLock::new(BTreeMap::new()),
         nodes: RwLock::new(BTreeMap::new()),
         egress_desired: Mutex::new(EgressDesiredStore::default()),
@@ -2051,6 +2093,13 @@ fn new_state_with_client_and_selector(
         encryption_activation_cursors: Mutex::new(BTreeMap::new()),
         encryption_operations_dirty: AtomicBool::new(false),
         encryption_operations_store: config_map_store.clone(),
+        encryption_policies: RwLock::new(BTreeMap::new()),
+        // Refuse the first plan until the watcher publishes one complete
+        // initial cut. This is essential for an explicitly Native baseline.
+        encryption_policy_initialization: Mutex::new(
+            (encryption_baseline == EncryptionBaseline::Native).then(BTreeMap::new),
+        ),
+        encryption_intent_revision: Mutex::new(Revision::new(1)),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -4120,6 +4169,12 @@ fn spawn_watchers(
     });
 
     let policy_api = Api::<SecurityPolicy>::all(client.clone());
+    spawn_encryption_policy_watcher(
+        tasks,
+        client.clone(),
+        Arc::clone(&state),
+        cancellation.clone(),
+    );
     let egress_pool_state = Arc::clone(&state);
     let egress_pool_cancel = cancellation.clone();
     let egress_pool_api = Api::<EgressPool>::all(client.clone());
@@ -4183,6 +4238,17 @@ fn spawn_watchers(
             network_policy_cancel,
         )
         .await;
+    });
+}
+
+fn spawn_encryption_policy_watcher(
+    tasks: &mut JoinSet<()>,
+    client: Client,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    tasks.spawn(async move {
+        watch_encryption_policies(Api::<EncryptionPolicy>::all(client), state, cancellation).await;
     });
 }
 
@@ -7225,6 +7291,102 @@ async fn watch_policies(
     }
 }
 
+async fn watch_encryption_policies(
+    api: Api<EncryptionPolicy>,
+    state: Arc<ControllerState>,
+    cancellation: CancellationToken,
+) {
+    let stream = watcher::watcher(api, watcher::Config::default()).boxed();
+    tokio::pin!(stream);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            item = stream.try_next() => match item {
+                Ok(Some(event)) => apply_encryption_policy_event(&state, event),
+                Ok(None) => break,
+                Err(error) => {
+                    state.metrics.errors.inc();
+                    warn!(%error, "EncryptionPolicy watch error; retaining last-known-good intent cut");
+                }
+            }
+        }
+    }
+}
+
+fn bump_encryption_intent_revision(state: &ControllerState) {
+    let mut revision = mutex_lock(&state.encryption_intent_revision);
+    *revision = revision.next();
+}
+
+fn encryption_policy_semantically_equal(left: &EncryptionPolicy, right: &EncryptionPolicy) -> bool {
+    left.namespace() == right.namespace()
+        && left.name_any() == right.name_any()
+        && left.uid() == right.uid()
+        && left.spec == right.spec
+}
+
+fn encryption_policy_maps_equal(
+    left: &BTreeMap<String, EncryptionPolicy>,
+    right: &BTreeMap<String, EncryptionPolicy>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(key, policy)| {
+            right
+                .get(key)
+                .is_some_and(|candidate| encryption_policy_semantically_equal(policy, candidate))
+        })
+}
+
+/// Applies relists through a staging map so a watch restart cannot briefly
+/// publish the Native baseline without its selective Required authority.
+fn apply_encryption_policy_event(state: &ControllerState, event: Event<EncryptionPolicy>) {
+    match event {
+        Event::Apply(policy) => {
+            let key = object_key(&policy);
+            let changed = write_lock(&state.encryption_policies)
+                .insert(key, policy.clone())
+                .as_ref()
+                .is_none_or(|previous| !encryption_policy_semantically_equal(previous, &policy));
+            if changed {
+                bump_encryption_intent_revision(state);
+            }
+            state.metrics.reconciles.inc();
+        }
+        Event::Delete(policy) => {
+            if write_lock(&state.encryption_policies)
+                .remove(&object_key(&policy))
+                .is_some()
+            {
+                bump_encryption_intent_revision(state);
+            }
+        }
+        Event::Init => {
+            *mutex_lock(&state.encryption_policy_initialization) = Some(BTreeMap::new());
+        }
+        Event::InitApply(policy) => {
+            let key = object_key(&policy);
+            let mut initialization = mutex_lock(&state.encryption_policy_initialization);
+            if let Some(staged) = initialization.as_mut() {
+                staged.insert(key, policy);
+            } else {
+                drop(initialization);
+                apply_encryption_policy_event(state, Event::Apply(policy));
+            }
+        }
+        Event::InitDone => {
+            let Some(staged) = mutex_lock(&state.encryption_policy_initialization).take() else {
+                return;
+            };
+            let mut current = write_lock(&state.encryption_policies);
+            if !encryption_policy_maps_equal(&current, &staged) {
+                *current = staged;
+                drop(current);
+                bump_encryption_intent_revision(state);
+            }
+        }
+    }
+}
+
 fn apply_policy_event(state: &ControllerState, event: Event<SecurityPolicy>) {
     let _policy_state_guard = write_lock(&state.policy_state_guard);
     match event {
@@ -7422,6 +7584,7 @@ fn encryption_explanation(
             "port and optional simulation timestamp must be nonzero",
         ));
     }
+    let model = current_encryption_model(state)?;
     let pods = read_lock(&state.pods);
     let source = pods
         .get(&request.from)
@@ -7443,7 +7606,9 @@ fn encryption_explanation(
     let policy_allowed =
         ingress.decision.verdict == Verdict::Allow && egress.decision.verdict == Verdict::Allow;
     let policy_revision = ingress.policy_revision.max(egress.policy_revision);
-    let requirement = EncryptionDisposition::Required;
+    let requirement = model
+        .requirement(source.endpoint.identity, destination.endpoint.identity)
+        .disposition;
     let source_node = source.node_name.clone();
     let destination_node = destination.node_name.clone();
     let history = mutex_lock(&state.encryption_operations).checkpoint();
@@ -9704,6 +9869,7 @@ fn current_encryption_plan_source(
         .desired_revision;
     EncryptionPlanSource {
         membership_revision,
+        intent_revision: *mutex_lock(&state.encryption_intent_revision),
         identity_revision: initialized_revision(mutex_lock(&state.identities).revision()),
         policy_revision: initialized_revision(revisions.policy),
         routing_revision: initialized_revision(revisions.routing),
@@ -9711,6 +9877,101 @@ fn current_encryption_plan_source(
         egress_revision: initialized_revision(egress_revision),
         key_cut_digest,
     }
+}
+
+fn encryption_selector_identities(
+    selector: &ApiWorkloadSelector,
+    policy_namespace: &str,
+    pods: &BTreeMap<String, PodRecord>,
+) -> Result<BTreeSet<IdentityId>, ApiError> {
+    let namespace = selector.namespace.as_deref().unwrap_or(policy_namespace);
+    if namespace.is_empty()
+        || selector.service_account.as_deref() == Some("")
+        || selector.application.as_deref() == Some("")
+        || selector
+            .match_labels
+            .iter()
+            .any(|(key, value)| key.is_empty() || value.is_empty())
+    {
+        return Err(ApiError::service_unavailable(
+            "EncryptionPolicy contains an empty selector coordinate",
+        ));
+    }
+    Ok(pods
+        .values()
+        .filter(|pod| {
+            !pod.host_network
+                && pod.endpoint.identity.get() != 0
+                && pod.namespace == namespace
+                && selector
+                    .service_account
+                    .as_ref()
+                    .is_none_or(|value| &pod.endpoint.service_account == value)
+                && selector
+                    .application
+                    .as_ref()
+                    .is_none_or(|value| pod.endpoint.application.as_ref() == Some(value))
+                && selector
+                    .match_labels
+                    .iter()
+                    .all(|(key, value)| pod.endpoint.labels.get(key) == Some(value))
+        })
+        .map(|pod| pod.endpoint.identity)
+        .collect())
+}
+
+/// Materializes API selectors against one identity snapshot. Empty selector
+/// results are valid pending demand and create no wildcard authority.
+fn current_encryption_model(state: &ControllerState) -> Result<EncryptionModel, ApiError> {
+    if mutex_lock(&state.encryption_policy_initialization).is_some() {
+        return Err(ApiError::service_unavailable(
+            "EncryptionPolicy initial list is incomplete",
+        ));
+    }
+    let pods = read_lock(&state.pods);
+    let policies = read_lock(&state.encryption_policies);
+    let mut intents = Vec::new();
+    for policy in policies.values() {
+        let namespace = policy
+            .namespace()
+            .ok_or_else(|| ApiError::service_unavailable("EncryptionPolicy has no namespace"))?;
+        let uid = policy.uid().ok_or_else(|| {
+            ApiError::service_unavailable("EncryptionPolicy has no immutable UID")
+        })?;
+        if policy.name_any().is_empty() || uid.is_empty() {
+            return Err(ApiError::service_unavailable(
+                "EncryptionPolicy has an empty identity coordinate",
+            ));
+        }
+        let sources = encryption_selector_identities(&policy.spec.sources, &namespace, &pods)?;
+        let destinations =
+            encryption_selector_identities(&policy.spec.destinations, &namespace, &pods)?;
+        if sources.is_empty() || destinations.is_empty() {
+            continue;
+        }
+        intents.push(EncryptionIntent {
+            name: format!("{uid}:forward"),
+            uid: format!("{uid}:forward"),
+            priority: policy.spec.priority,
+            sources: ManagedIdentitySelector::Identities(sources.clone()),
+            destinations: ManagedIdentitySelector::Identities(destinations.clone()),
+        });
+        if policy.spec.bidirectional && sources != destinations {
+            intents.push(EncryptionIntent {
+                name: format!("{uid}:reverse"),
+                uid: format!("{uid}:reverse"),
+                priority: policy.spec.priority,
+                sources: ManagedIdentitySelector::Identities(destinations),
+                destinations: ManagedIdentitySelector::Identities(sources),
+            });
+        }
+    }
+    EncryptionModel::normalize(
+        state.encryption_cluster_id.clone(),
+        state.encryption_baseline,
+        intents,
+    )
+    .map_err(|error| ApiError::service_unavailable(error.to_string()))
 }
 
 fn encryption_plan_cut_is_activated(
@@ -10065,16 +10326,11 @@ fn reconcile_encryption_plan_catalog_at(
         .next()
         .max(Revision::new(now_unix_ms))
         .max(minimum_generation);
-    let model = EncryptionModel::normalize(
-        state.encryption_cluster_id.clone(),
-        EncryptionBaseline::Required,
-        Vec::new(),
-    )
-    .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    let model = current_encryption_model(state)?;
     let cut = produce_fleet_plan_cut(FleetPlanProductionInput {
         membership_revision,
         generation,
-        intent_revision: Revision::new(1),
+        intent_revision: source.intent_revision,
         identity_revision: source.identity_revision,
         policy_revision: source.policy_revision,
         routing_revision: source.routing_revision,
@@ -18420,6 +18676,89 @@ mod tests {
         }
     }
 
+    fn encryption_policy(name: &str, uid: &str) -> EncryptionPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "network.unf.io/v1alpha1",
+            "kind": "EncryptionPolicy",
+            "metadata": {"name": name, "namespace": "backend", "uid": uid},
+            "spec": {
+                "sources": {"namespace": "frontend", "matchLabels": {"app": "client"}},
+                "destinations": {"matchLabels": {"app": "server"}},
+                "priority": 50,
+                "bidirectional": true
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn encryption_policy_relist_is_atomic_and_materializes_bidirectional_identities() {
+        let state = new_state_with_client_and_selector(
+            true,
+            None,
+            None,
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Native,
+        );
+        write_lock(&state.pods).insert(
+            "frontend/client".to_owned(),
+            pod_record(11, "frontend", "client", "client"),
+        );
+        write_lock(&state.pods).insert(
+            "backend/server".to_owned(),
+            pod_record(21, "backend", "server", "server"),
+        );
+        let policy = encryption_policy("protect-api", "uid-protect-api");
+        let initial_revision = *mutex_lock(&state.encryption_intent_revision);
+        apply_encryption_policy_event(&state, Event::Init);
+        apply_encryption_policy_event(&state, Event::InitApply(policy.clone()));
+        assert!(current_encryption_model(&state).is_err());
+        apply_encryption_policy_event(&state, Event::InitDone);
+        assert_eq!(
+            *mutex_lock(&state.encryption_intent_revision),
+            initial_revision.next()
+        );
+        let model = current_encryption_model(&state).unwrap();
+        assert_eq!(model.intents.len(), 2);
+        assert_eq!(
+            model
+                .requirement(IdentityId::new(11), IdentityId::new(21))
+                .disposition,
+            EncryptionDisposition::Required
+        );
+        assert_eq!(
+            model
+                .requirement(IdentityId::new(21), IdentityId::new(11))
+                .disposition,
+            EncryptionDisposition::Required
+        );
+        assert_eq!(
+            model
+                .requirement(IdentityId::new(11), IdentityId::new(99))
+                .disposition,
+            EncryptionDisposition::Native
+        );
+
+        apply_encryption_policy_event(&state, Event::Init);
+        assert_eq!(read_lock(&state.encryption_policies).len(), 1);
+        apply_encryption_policy_event(&state, Event::InitApply(policy));
+        apply_encryption_policy_event(&state, Event::InitDone);
+        assert_eq!(
+            *mutex_lock(&state.encryption_intent_revision),
+            initial_revision.next(),
+            "an identical relist must not manufacture plan churn"
+        );
+
+        apply_encryption_policy_event(&state, Event::Init);
+        assert_eq!(read_lock(&state.encryption_policies).len(), 1);
+        apply_encryption_policy_event(&state, Event::InitDone);
+        assert!(read_lock(&state.encryption_policies).is_empty());
+        assert_eq!(
+            *mutex_lock(&state.encryption_intent_revision),
+            initial_revision.next().next()
+        );
+    }
+
     fn network_policy(port: &serde_json::Value, protocol: &str) -> NetworkPolicy {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "networking.k8s.io/v1",
@@ -20133,6 +20472,7 @@ mod tests {
             None,
             Some("node-role.kubernetes.io/worker".to_owned()),
             "test-cluster-uid".to_owned(),
+            EncryptionBaseline::Required,
         );
         let mut worker = node(true);
         worker
