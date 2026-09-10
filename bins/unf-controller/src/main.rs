@@ -9181,6 +9181,16 @@ async fn ingest_encryption_activation(
         ));
     }
 
+    // An accepted report is durable history, not a claim about the newest
+    // desired cut. The agent can lose the HTTP acknowledgement after the
+    // controller commits its cursor and advances the fleet plan. Recognize
+    // that byte-exact retry before comparing it with current desired state;
+    // otherwise an already-authorized report becomes permanently
+    // unacknowledgeable and fences every later local generation.
+    if encryption_activation_report_is_replay(&state, &recipient.node_uid, report.report_digest) {
+        return Ok(StatusCode::ACCEPTED);
+    }
+
     let frontier = mutex_lock(&state.encryption_generation_facts)
         .candidate()
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?
@@ -9246,9 +9256,6 @@ async fn ingest_encryption_activation(
         .get(&recipient.node_uid)
         .cloned()
     {
-        if cursor.report_digest == report.report_digest {
-            return Ok(StatusCode::ACCEPTED);
-        }
         if report.generation == cursor.generation && report.state_digest == cursor.state_digest {
             mutex_lock(&state.encryption_activation_cursors).insert(
                 recipient.node_uid,
@@ -9311,6 +9318,16 @@ async fn ingest_encryption_activation(
         .encryption_operations_dirty
         .store(true, Ordering::Release);
     Ok(StatusCode::ACCEPTED)
+}
+
+fn encryption_activation_report_is_replay(
+    state: &ControllerState,
+    node_uid: &str,
+    report_digest: EncryptionActivationReportDigest,
+) -> bool {
+    mutex_lock(&state.encryption_activation_cursors)
+        .get(node_uid)
+        .is_some_and(|cursor| cursor.report_digest == report_digest)
 }
 
 fn synchronize_encryption_path_proofs(
@@ -16394,6 +16411,25 @@ mod tests {
         let legacy = serde_json::to_string(&history).unwrap();
         let (migrated, _) = decode_encryption_operations(&legacy).unwrap();
         assert!(migrated.activation_cursors.is_empty());
+
+        mutex_lock(&state.encryption_activation_cursors).insert(
+            "worker-a-uid".to_owned(),
+            EncryptionActivationCursor {
+                generation: Revision::new(3),
+                state_digest: unf_encryption::EncryptionFastPathDigest([8; 32]),
+                report_digest: EncryptionActivationReportDigest([9; 32]),
+            },
+        );
+        assert!(encryption_activation_report_is_replay(
+            &state,
+            "worker-a-uid",
+            EncryptionActivationReportDigest([9; 32]),
+        ));
+        assert!(!encryption_activation_report_is_replay(
+            &state,
+            "worker-a-uid",
+            EncryptionActivationReportDigest([10; 32]),
+        ));
 
         let mut encoded = String::new();
         encode(&mut encoded, &mutex_lock(&state.registry)).unwrap();
