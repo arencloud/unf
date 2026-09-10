@@ -901,12 +901,15 @@ remains the first packet authority; `make encryption-policy-quotient-test`; ADR
 for a single remote Node and adds a banked, witnessed IPv4/IPv6 LPM lookup only
 when one identity spans several Nodes; the final translated backend address
 then selects the exact coalesced transport without per-Pod tunnels;
-`make encryption-address-binding-test`; ADR 0187. Kubernetes fact projection,
-controller invocation, local compile, the TC consumer/verifier, and live
+`make encryption-address-binding-test`; ADR 0187. Kubernetes fact projection
+then validates UID-bound Ready Nodes, Pod-to-block placement, effective policy,
+and emits only demanded bidirectional Node paths through Placement-Truth Demand
+Projection; `make encryption-kubernetes-projection-test`; ADR 0188. Controller
+invocation, local compile, the TC consumer/verifier, and live
 encrypted packet gate remain, so no workload packet yet selects the staged
 route table. The [Phase 9
 plan](docs/development/phase9-attested-encryption-fabric-plan.md) and
-ADRs 0158–0187 define the ordered implementation and independent Kind/OpenShift
+ADRs 0158–0188 define the ordered implementation and independent Kind/OpenShift
 gates.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup

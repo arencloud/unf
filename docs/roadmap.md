@@ -967,7 +967,11 @@ matrix is maintained in the
   Replica Binding retains direct lookup for single-Node identities and invokes
   a witnessed dual-stack LPM lookup only for multi-Node replicas after final
   destination translation; `make encryption-address-binding-test` and ADR 0187.
-  Kubernetes fact projection, controller invocation, local compile, the TC consumer, verifier
+  Placement-Truth Demand Projection then rejects stale UID/readiness/IPAM cuts,
+  excludes host-network workloads, preserves effective policy truth, and emits
+  only required bidirectional Node paths; `make
+  encryption-kubernetes-projection-test` and ADR 0188. Controller invocation,
+  local compile, the TC consumer, verifier
   loading, and live encrypted packets remain within milestone 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
