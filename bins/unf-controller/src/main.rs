@@ -393,7 +393,6 @@ struct EncryptionPlanReconciler {
     source: Option<EncryptionPlanSource>,
     generation: Revision,
     refresh_at_unix_ms: Option<u64>,
-    acknowledged_members: BTreeSet<String>,
 }
 
 const ENCRYPTION_OPERATIONS_DURABLE_SCHEMA_VERSION: u16 = 1;
@@ -9627,6 +9626,18 @@ fn current_encryption_plan_source(
     }
 }
 
+fn encryption_plan_cut_is_activated(
+    state: &ControllerState,
+    cut: &unf_encryption::NodeLocalPlanFleetCut,
+) -> bool {
+    let cursors = mutex_lock(&state.encryption_activation_cursors);
+    cut.members.iter().all(|member| {
+        cursors
+            .get(&member.node_uid)
+            .is_some_and(|cursor| cursor.generation == cut.generation)
+    })
+}
+
 fn encryption_nodes(
     state: &ControllerState,
     members: &[EncryptionGenerationRecipient],
@@ -9923,7 +9934,7 @@ fn reconcile_encryption_plan_catalog_at(
     }
     if let Some(active) = mutex_lock(&state.encryption_local_plans).active()
         && active.membership_revision == membership_revision
-        && reconciler.acknowledged_members.len() < active.members.len()
+        && !encryption_plan_cut_is_activated(state, active)
     {
         return Ok(true);
     }
@@ -9985,30 +9996,12 @@ fn reconcile_encryption_plan_catalog_at(
     reconciler.source = Some(source);
     reconciler.generation = generation;
     reconciler.refresh_at_unix_ms = draining_epoch.map(|(_, deadline)| deadline);
-    reconciler.acknowledged_members.clear();
     info!(
         generation = generation.get(),
         membership_revision = membership_revision.get(),
         "published pull-synchronized causal encryption plan catalog"
     );
     Ok(true)
-}
-
-fn acknowledge_encryption_plan_cursor(
-    state: &ControllerState,
-    recipient: &EncryptionGenerationRecipient,
-    request: &NodeLocalPlanRequest,
-    snapshot: &unf_encryption::NodeLocalPlanSnapshot,
-) {
-    if request
-        .current
-        .as_ref()
-        .is_some_and(|cursor| cursor.matches(snapshot))
-    {
-        mutex_lock(&state.encryption_plan_reconciler)
-            .acknowledged_members
-            .insert(recipient.node_uid.clone());
-    }
 }
 
 fn encryption_plan_for(
@@ -10076,7 +10069,6 @@ fn encryption_plan_for(
             "prepared encryption plan targets a replaced Node UID",
         ));
     }
-    acknowledge_encryption_plan_cursor(state, &recipient, request, &snapshot);
     if request
         .current
         .as_ref()
@@ -15909,11 +15901,27 @@ mod tests {
             encryption_plan_for(&state, &agent, &settled_request)
                 .unwrap()
                 .is_none(),
-            "an exact durable cursor must settle instead of forcing plan churn"
+            "an exact durable cursor must settle without claiming activation"
         );
 
-        let successor_request =
+        let receipt_only_request =
             NodeLocalPlanRequest::issue("worker-a".to_owned(), None, [23; 32]).unwrap();
+        let receipt_only = encryption_plan_for(&state, &agent, &receipt_only_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt_only.snapshot.generation, first.snapshot.generation);
+        assert_eq!(receipt_only.snapshot.service_revision, Revision::new(5));
+
+        mutex_lock(&state.encryption_activation_cursors).insert(
+            "worker-a-uid".to_owned(),
+            EncryptionActivationCursor {
+                generation: first.snapshot.generation,
+                state_digest: unf_encryption::EncryptionFastPathDigest([31; 32]),
+                report_digest: EncryptionActivationReportDigest([32; 32]),
+            },
+        );
+        let successor_request =
+            NodeLocalPlanRequest::issue("worker-a".to_owned(), None, [26; 32]).unwrap();
         let successor = encryption_plan_for(&state, &agent, &successor_request)
             .unwrap()
             .unwrap();

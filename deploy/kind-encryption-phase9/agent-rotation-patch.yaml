@@ -10,10 +10,10 @@ spec:
         - name: agent
           env:
             - name: UNF_ENCRYPTION_KEY_LIFETIME_SECONDS
-              value: "180"
+              value: "240"
             - name: UNF_ENCRYPTION_ROTATE_BEFORE_SECONDS
-              value: "150"
+              value: "120"
             - name: UNF_ENCRYPTION_ROTATION_JITTER_SECONDS
               value: "5"
             - name: UNF_ENCRYPTION_DRAIN_SECONDS
-              value: "15"
+              value: "30"
