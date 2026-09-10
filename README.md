@@ -1015,8 +1015,14 @@ namespaced `EncryptionPolicy` materializes exact bidirectional identity intent;
 its Proof-Carrying Native Exception makes every allowed plaintext pair an
 explicit revision-bound decision, while absent authority still drops and
 native-only Nodes create no fake tunnel. Required remains the installation
-default. `make encryption-selective-policy-test`; ADRs 0208–0211. One immutable
-dual-stack Kind gate is next.
+default. `make encryption-selective-policy-test`; ADRs 0208–0211. Phase 9.8e
+turns the remaining Kind closure into one dedicated-cluster transaction:
+immutable provenance, both encryption modes, IPv4/IPv6 PodIP and Service paths,
+ciphertext-only Required capture, simultaneous Native exception, link-failure
+denial, natural rotation, controller/agent recovery, causal operations,
+performance, egress coexistence, exact cleanup, and optional primary-CNI
+rollback. `make encryption-phase9-kind-gate-test`; ADR 0212. The fresh live run
+must pass before 9.8 is promoted.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

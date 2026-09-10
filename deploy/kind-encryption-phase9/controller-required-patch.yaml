@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unf-controller
+  namespace: unf-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          env:
+            - name: UNF_ENCRYPTION_BASELINE
+              value: required

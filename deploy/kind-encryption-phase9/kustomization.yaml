@@ -4,4 +4,4 @@ resources:
   - ../kind-loadbalancer
 patches:
   - path: agent-rotation-patch.yaml
-
+  - path: controller-required-patch.yaml
