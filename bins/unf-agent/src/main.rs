@@ -15275,7 +15275,7 @@ async fn consume_events(
                         encryption_generations,
                     ).await
                 {
-                    warn!(%error, "encryption activation evidence remains queued for retry");
+                    warn!(error = ?error, "encryption activation evidence remains queued for retry");
                 }
                 if encryption_generations.pending_activation_report.is_none()
                     && (encryption_generations.prepared_fact().is_some()
@@ -15298,7 +15298,7 @@ async fn consume_events(
                         encryption_generations,
                     ).await
                 {
-                    warn!(%error, "encryption activation evidence remains queued for retry");
+                    warn!(error = ?error, "encryption activation evidence remains queued for retry");
                 }
                 if encryption_generations.pending_activation_report.is_none()
                     && let Err(error) = retire_drained_encryption_epoch(

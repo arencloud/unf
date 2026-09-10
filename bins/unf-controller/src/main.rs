@@ -9025,6 +9025,7 @@ async fn ingest_encryption_activation(
     let mut expected_paths = local_plan
         .epochs
         .iter()
+        .filter(|epoch| epoch_requires_fresh_path_proof(epoch.state))
         .flat_map(|epoch| {
             epoch
                 .contract
