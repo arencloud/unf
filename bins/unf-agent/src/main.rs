@@ -87,10 +87,11 @@ use unf_egress::{
 };
 use unf_encryption::{
     AdmittedEncryptionGeneration, AdmittedNodeLocalPlan, DurableNodeKeyAuthority,
-    EncryptionGenerationFact, EncryptionGenerationRequest, EncryptionKeyBootstrap,
-    FileNodeKeyStateStore, LinuxPreparedLocalGeneration, NodeKeyAttestationCut,
-    NodeKeyAttestationRound, NodeKeyAuthority, NodeLocalPlanRequest, NodeLocalRecoveryPlan,
-    NodeSealedGenerationCapsule, NodeSealedPlanCapsule, OsWireGuardKeyGenerator,
+    EncryptionGenerationFact, EncryptionGenerationPathProofPermit, EncryptionGenerationRequest,
+    EncryptionKeyBootstrap, EncryptionPathActivationReceipt, FileNodeKeyStateStore,
+    LinuxPreparedLocalGeneration, NodeKeyAttestationCut, NodeKeyAttestationRound, NodeKeyAuthority,
+    NodeLocalPlanRequest, NodeLocalRecoveryPlan, NodeSealedGenerationCapsule,
+    NodeSealedPlanCapsule, OsWireGuardKeyGenerator,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -8198,6 +8199,26 @@ impl EncryptionGenerationSynchronizer {
         }
     }
 
+    fn pending_path_proof_state(
+        &self,
+    ) -> Result<
+        Option<(
+            unf_encryption::EncryptionGenerationRecipient,
+            unf_encryption::EncryptionFastPathState,
+        )>,
+    > {
+        let Some(PendingEncryptionGeneration::ControllerAdmitted { admitted, .. }) =
+            self.pending.as_ref()
+        else {
+            return Ok(None);
+        };
+        let desired = admitted
+            .checkpoint
+            .desired_state()
+            .context("rebuild pending desired generation for path proof")?;
+        Ok(Some((admitted.recipient.clone(), desired)))
+    }
+
     fn record_activation(&mut self, slot: EncryptionRecoverySlot) -> Result<()> {
         match slot {
             EncryptionRecoverySlot::Active => self.active_revalidated = true,
@@ -8395,11 +8416,36 @@ async fn activate_admitted_encryption_generation(
     generations: &mut EncryptionGenerationSynchronizer,
     encryption: &mut EncryptionMapSynchronizer,
 ) -> Result<bool> {
-    let Some((prepared, admitted, slot)) = generations.take_admitted_capability() else {
+    let Some((recipient, desired)) = generations.pending_path_proof_state()? else {
         return Ok(false);
     };
+    let controller_url = generations
+        .controller_url
+        .as_deref()
+        .context("encryption path receipt synchronization has no controller URL")?;
+    let response = authenticated_get(
+        &generations.client,
+        format!("{controller_url}/v1/state/encryption-path-receipts"),
+        &generations.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request current duplex encryption path receipts")?;
+    let receipts: Vec<EncryptionPathActivationReceipt> = response
+        .error_for_status()
+        .context("controller rejected encryption path receipt request")?
+        .json()
+        .await
+        .context("decode encryption path receipts")?;
+    let now_unix_ms = current_unix_time_milliseconds();
+    let path_permit =
+        EncryptionGenerationPathProofPermit::issue(&desired, recipient, receipts, now_unix_ms)
+            .context("join complete live path receipts to the desired generation")?;
+    let Some((prepared, admitted, slot)) = generations.take_admitted_capability() else {
+        bail!("admitted encryption capability changed during path-proof exchange");
+    };
     encryption
-        .apply_linux_generation(prepared, admitted)
+        .apply_linux_generation(prepared, admitted, path_permit, now_unix_ms)
         .await
         .context("consume proof-rehydrated encryption activation escrow")?;
     generations

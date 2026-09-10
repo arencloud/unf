@@ -10,10 +10,12 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+use unf_common::Revision;
 
 use crate::{
     AttestedEncryptionContractDigest, AttestedEncryptionPathContract, AuthenticatedNodeIdentity,
-    EncryptionDecisionWitness, EncryptionDisposition, EncryptionGenerationRecipient, IpPrefix,
+    EncryptionDecisionWitness, EncryptionDisposition, EncryptionFastPathDigest,
+    EncryptionFastPathState, EncryptionGenerationRecipient, FastPathError, IpPrefix,
     WireGuardKernelConfigurationDigest, WireGuardKernelObservationDigest, WireGuardKernelSnapshot,
     WireGuardPublicKey,
 };
@@ -51,12 +53,16 @@ pub struct EncryptionEndpointPathProofDigest(pub [u8; 32]);
 #[serde(transparent)]
 pub struct EncryptionPathActivationDigest(pub [u8; 32]);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptionGenerationPathProofWitness(pub [u8; 32]);
+
 /// Controller-issued immutable challenge for one canonical Required plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EncryptionPathProofRound {
     pub schema_version: u16,
     pub contract_digest: AttestedEncryptionContractDigest,
+    pub contract_revision: Revision,
     pub decision_witness: EncryptionDecisionWitness,
     pub source: EncryptionGenerationRecipient,
     pub destination: EncryptionGenerationRecipient,
@@ -114,6 +120,8 @@ pub struct EncryptionPathActivationReceipt {
     pub round: EncryptionPathProofRound,
     pub source_proof_digest: EncryptionEndpointPathProofDigest,
     pub destination_proof_digest: EncryptionEndpointPathProofDigest,
+    pub source_kernel_configuration_digest: WireGuardKernelConfigurationDigest,
+    pub destination_kernel_configuration_digest: WireGuardKernelConfigurationDigest,
     pub admitted_at_unix_ms: u64,
     pub valid_until_unix_ms: u64,
     pub activation_digest: EncryptionPathActivationDigest,
@@ -158,6 +166,16 @@ pub struct EncryptionPathProofCoordinator {
     paths: BTreeMap<EncryptionPathProofRoundDigest, CoordinatedPathProof>,
 }
 
+/// Consuming, non-serializable authority proving that every Required decision
+/// in one exact local generation has a current two-ended receipt.
+pub struct EncryptionGenerationPathProofPermit {
+    recipient: EncryptionGenerationRecipient,
+    state_digest: EncryptionFastPathDigest,
+    receipts: Vec<EncryptionPathActivationReceipt>,
+    valid_until_unix_ms: u64,
+    witness: EncryptionGenerationPathProofWitness,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EncryptionPathProofError {
     #[error("invalid or expired path-proof round")]
@@ -184,6 +202,10 @@ pub enum EncryptionPathProofError {
     InvalidKernelSnapshot(String),
     #[error("invalid contract: {0}")]
     InvalidContract(String),
+    #[error("path receipts do not cover the exact Required generation")]
+    InvalidGenerationProof,
+    #[error("invalid encryption fast-path generation: {0}")]
+    InvalidFastPath(FastPathError),
 }
 
 impl EncryptionPathProofRound {
@@ -252,6 +274,7 @@ impl EncryptionPathProofRound {
         let mut round = Self {
             schema_version: ENCRYPTION_PATH_PROOF_SCHEMA_VERSION,
             contract_digest: contract.contract_digest,
+            contract_revision: contract.contract_revision,
             decision_witness: contract
                 .decision_witness(plan_index)
                 .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?,
@@ -277,6 +300,7 @@ impl EncryptionPathProofRound {
     pub fn verify(&self) -> Result<(), EncryptionPathProofError> {
         if self.schema_version != ENCRYPTION_PATH_PROOF_SCHEMA_VERSION
             || self.source == self.destination
+            || self.contract_revision == Revision::INITIAL
             || self.source.node_name.is_empty()
             || self.source.node_uid.is_empty()
             || self.destination.node_name.is_empty()
@@ -585,6 +609,8 @@ impl EncryptionPathProofLedger {
             round: self.round.clone(),
             source_proof_digest: source.proof_digest,
             destination_proof_digest: destination.proof_digest,
+            source_kernel_configuration_digest: source.kernel_configuration_digest,
+            destination_kernel_configuration_digest: destination.kernel_configuration_digest,
             admitted_at_unix_ms: now_unix_ms,
             valid_until_unix_ms: self.round.expires_at_unix_ms,
             activation_digest: EncryptionPathActivationDigest([0; 32]),
@@ -789,6 +815,8 @@ impl EncryptionPathActivationReceipt {
             || self.source_proof_digest.0 == [0; 32]
             || self.destination_proof_digest.0 == [0; 32]
             || self.source_proof_digest == self.destination_proof_digest
+            || self.source_kernel_configuration_digest.0 == [0; 32]
+            || self.destination_kernel_configuration_digest.0 == [0; 32]
             || self.admitted_at_unix_ms < self.round.issued_at_unix_ms
             || self.valid_until_unix_ms != self.round.expires_at_unix_ms
             || now_unix_ms >= self.valid_until_unix_ms
@@ -804,6 +832,161 @@ impl EncryptionPathActivationReceipt {
         canonical.activation_digest = EncryptionPathActivationDigest([0; 32]);
         hash(ACTIVATION_DOMAIN, &canonical).map(EncryptionPathActivationDigest)
     }
+}
+
+impl EncryptionGenerationPathProofPermit {
+    /// Joins all current receipts to one exact local fast-path generation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incomplete, extra, expired, foreign, duplicate, or kernel-
+    /// divergent receipt coverage.
+    pub fn issue(
+        state: &EncryptionFastPathState,
+        recipient: EncryptionGenerationRecipient,
+        mut receipts: Vec<EncryptionPathActivationReceipt>,
+        now_unix_ms: u64,
+    ) -> Result<Self, EncryptionPathProofError> {
+        state
+            .verify_integrity()
+            .map_err(EncryptionPathProofError::InvalidFastPath)?;
+        receipts.sort_by_key(|receipt| receipt.activation_digest.0);
+        if receipts
+            .windows(2)
+            .any(|pair| pair[0].activation_digest == pair[1].activation_digest)
+        {
+            return Err(EncryptionPathProofError::InvalidGenerationProof);
+        }
+        let valid_until_unix_ms =
+            validate_generation_coverage(state, &recipient, &receipts, now_unix_ms)?;
+        let witness = generation_path_witness(
+            state.state_digest,
+            &recipient,
+            &receipts,
+            valid_until_unix_ms,
+        )?;
+        Ok(Self {
+            recipient,
+            state_digest: state.state_digest,
+            receipts,
+            valid_until_unix_ms,
+            witness,
+        })
+    }
+
+    /// Revalidates the consuming permit immediately before map staging.
+    ///
+    /// # Errors
+    ///
+    /// Rejects generation/Node substitution, expiry, or receipt drift.
+    pub fn verify_for(
+        &self,
+        state: &EncryptionFastPathState,
+        recipient: &EncryptionGenerationRecipient,
+        now_unix_ms: u64,
+    ) -> Result<(), EncryptionPathProofError> {
+        state
+            .verify_integrity()
+            .map_err(EncryptionPathProofError::InvalidFastPath)?;
+        let valid_until =
+            validate_generation_coverage(state, recipient, &self.receipts, now_unix_ms)?;
+        if &self.recipient != recipient
+            || self.state_digest != state.state_digest
+            || self.valid_until_unix_ms != valid_until
+            || self.witness
+                != generation_path_witness(
+                    state.state_digest,
+                    recipient,
+                    &self.receipts,
+                    valid_until,
+                )?
+        {
+            return Err(EncryptionPathProofError::InvalidGenerationProof);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn witness(&self) -> EncryptionGenerationPathProofWitness {
+        self.witness
+    }
+}
+
+fn validate_generation_coverage(
+    state: &EncryptionFastPathState,
+    recipient: &EncryptionGenerationRecipient,
+    receipts: &[EncryptionPathActivationReceipt],
+    now_unix_ms: u64,
+) -> Result<u64, EncryptionPathProofError> {
+    let required = state
+        .decision_authority
+        .iter()
+        .filter(|decision| decision.disposition == EncryptionDisposition::Required)
+        .collect::<Vec<_>>();
+    if required.is_empty() {
+        return receipts
+            .is_empty()
+            .then_some(u64::MAX)
+            .ok_or(EncryptionPathProofError::InvalidGenerationProof);
+    }
+    if receipts.len() != required.len() {
+        return Err(EncryptionPathProofError::InvalidGenerationProof);
+    }
+    let mut used = vec![false; receipts.len()];
+    let mut valid_until = u64::MAX;
+    for decision in required {
+        let transport_id = decision
+            .transport_id
+            .ok_or(EncryptionPathProofError::InvalidGenerationProof)?;
+        let transport = state
+            .transport_authority
+            .iter()
+            .find(|transport| transport.transport_id == transport_id)
+            .ok_or(EncryptionPathProofError::InvalidGenerationProof)?;
+        let position = receipts
+            .iter()
+            .enumerate()
+            .find(|(position, receipt)| {
+                !used[*position]
+                    && receipt.round.source == *recipient
+                    && receipt.round.destination.node_uid == transport.destination_node_uid
+                    && receipt.round.epoch == transport.key_epoch
+                    && Some(receipt.round.contract_revision) == decision.contract_revision
+                    && receipt.round.decision_witness.0 == decision.decision_witness
+                    && receipt.source_kernel_configuration_digest.0
+                        == transport.kernel_configuration_digest
+                    && receipt.verify(now_unix_ms).is_ok()
+            })
+            .map(|(position, _)| position)
+            .ok_or(EncryptionPathProofError::InvalidGenerationProof)?;
+        used[position] = true;
+        valid_until = valid_until.min(receipts[position].valid_until_unix_ms);
+    }
+    if used.iter().any(|used| !used) || now_unix_ms >= valid_until {
+        return Err(EncryptionPathProofError::InvalidGenerationProof);
+    }
+    Ok(valid_until)
+}
+
+fn generation_path_witness(
+    state_digest: EncryptionFastPathDigest,
+    recipient: &EncryptionGenerationRecipient,
+    receipts: &[EncryptionPathActivationReceipt],
+    valid_until_unix_ms: u64,
+) -> Result<EncryptionGenerationPathProofWitness, EncryptionPathProofError> {
+    hash(
+        b"unf.encryption-generation-path-proof.v1\0",
+        &(
+            state_digest.0,
+            recipient,
+            receipts
+                .iter()
+                .map(|receipt| receipt.activation_digest)
+                .collect::<Vec<_>>(),
+            valid_until_unix_ms,
+        ),
+    )
+    .map(EncryptionGenerationPathProofWitness)
 }
 
 fn exact_peer(

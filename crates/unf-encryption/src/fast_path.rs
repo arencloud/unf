@@ -1358,15 +1358,18 @@ mod tests {
 
     use super::*;
     use crate::{
-        CausalCommitVector, EncryptionActivationLatch, EncryptionActivationLatchError,
-        EncryptionActivationMode, EncryptionBaseline, EncryptionCapability,
-        EncryptionContractFacts, EncryptionContractRevisions, EncryptionEndpointFact,
-        EncryptionFrontierPublishOutcome, EncryptionGenerationDistributionError,
-        EncryptionGenerationFact, EncryptionGenerationFactError, EncryptionGenerationFactOutcome,
+        AuthenticatedNodeIdentity, CausalCommitVector, EncryptionActivationLatch,
+        EncryptionActivationLatchError, EncryptionActivationMode, EncryptionBaseline,
+        EncryptionCapability, EncryptionContractFacts, EncryptionContractRevisions,
+        EncryptionEndpointFact, EncryptionEndpointPathProof, EncryptionFrontierPublishOutcome,
+        EncryptionGenerationDistributionError, EncryptionGenerationFact,
+        EncryptionGenerationFactError, EncryptionGenerationFactOutcome,
         EncryptionGenerationFactReconciler, EncryptionGenerationFrontier,
-        EncryptionGenerationFrontierError, EncryptionGenerationProducer,
-        EncryptionGenerationRecipient, EncryptionGenerationRequest, EncryptionIntent,
-        EncryptionKeyFact, EncryptionKeyPhase, EncryptionModel, EncryptionNode, EncryptionPathFact,
+        EncryptionGenerationFrontierError, EncryptionGenerationPathProofPermit,
+        EncryptionGenerationProducer, EncryptionGenerationRecipient, EncryptionGenerationRequest,
+        EncryptionIntent, EncryptionKeyFact, EncryptionKeyPhase, EncryptionModel, EncryptionNode,
+        EncryptionPathActivationReceipt, EncryptionPathEndpointRole, EncryptionPathFact,
+        EncryptionPathProofError, EncryptionPathProofLedger, EncryptionPathProofRound,
         EncryptionPolicyFact, EncryptionRouteAuthority, EncryptionRouteAuthorityError,
         EncryptionRouteFamily, FastPathMapCheckpoint, FastPathMapRecoveryAction,
         FastPathMapTransaction, FastPathPublishedGeneration, FastPathTransactionError, IpPrefix,
@@ -1696,6 +1699,105 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    fn path_snapshot(
+        fixture: &Fixture,
+        role: EncryptionPathEndpointRole,
+        received_bytes: u64,
+        transmitted_bytes: u64,
+    ) -> WireGuardKernelSnapshot {
+        let plan = &fixture.contract.plans[0];
+        let (path, local_key, peer_key, interface_index) = match role {
+            EncryptionPathEndpointRole::Source => (
+                &plan.transport.forward,
+                plan.source_key.public_key,
+                plan.destination_key.public_key,
+                fixture.snapshot.interface_index,
+            ),
+            EncryptionPathEndpointRole::Destination => (
+                &plan.transport.reverse,
+                plan.destination_key.public_key,
+                plan.source_key.public_key,
+                fixture.snapshot.interface_index + 1,
+            ),
+        };
+        let owner_alias = match role {
+            EncryptionPathEndpointRole::Source => fixture.snapshot.owner_alias.clone(),
+            EncryptionPathEndpointRole::Destination => {
+                format!(
+                    "unf:encryption:v1:fixture:destination:{}",
+                    plan.source_key.epoch
+                )
+            }
+        };
+        WireGuardKernelSnapshot::issue(WireGuardKernelSnapshotInput {
+            interface_name: path.interface_name.clone(),
+            interface_index,
+            owner_alias,
+            is_up: true,
+            mtu: path.mtu,
+            public_key: local_key,
+            listen_port: 51_820,
+            fwmark: path.fwmark,
+            peers: vec![WireGuardPeerReadback {
+                public_key: peer_key,
+                endpoint: path.peer_endpoint,
+                persistent_keepalive_seconds: 25,
+                allowed_ips: path.allowed_ips.clone(),
+                last_handshake_unix_seconds: 1,
+                received_bytes,
+                transmitted_bytes,
+            }],
+            routes: path
+                .allowed_ips
+                .iter()
+                .map(|prefix| WireGuardRouteReadback {
+                    prefix: *prefix,
+                    interface_index,
+                    table: path.route_table,
+                    protocol: UNF_WIREGUARD_ROUTE_PROTOCOL,
+                    scope: WireGuardRouteScope::for_prefix(*prefix),
+                })
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    fn path_receipt(fixture: &Fixture) -> EncryptionPathActivationReceipt {
+        let round =
+            EncryptionPathProofRound::issue(&fixture.contract, 0, [19; 32], 1_100, 2_000).unwrap();
+        let mut ledger = EncryptionPathProofLedger::new(round.clone()).unwrap();
+        for role in [
+            EncryptionPathEndpointRole::Source,
+            EncryptionPathEndpointRole::Destination,
+        ] {
+            let node = match role {
+                EncryptionPathEndpointRole::Source => &fixture.contract.plans[0].source.node,
+                EncryptionPathEndpointRole::Destination => {
+                    &fixture.contract.plans[0].destination.node
+                }
+            };
+            let authenticated = AuthenticatedNodeIdentity {
+                cluster_id: node.cluster_id.clone(),
+                node_name: node.name.clone(),
+                node_uid: node.uid.clone(),
+            };
+            let proof = EncryptionEndpointPathProof::issue(
+                &round,
+                &fixture.contract,
+                0,
+                role,
+                &authenticated,
+                &path_snapshot(fixture, role, 1, 1),
+                &path_snapshot(fixture, role, 2, 2),
+                round.family_mask,
+                1_200,
+            )
+            .unwrap();
+            ledger.observe(&authenticated, proof, 1_200).unwrap();
+        }
+        ledger.activation_receipt(1_300).unwrap()
     }
 
     fn inactive_plan(fixture: &Fixture) -> WireGuardKernelPlan {
@@ -2506,15 +2608,43 @@ mod tests {
             Err(NodeLocalOrchestratorError::ControllerSubstitution)
         ));
 
+        let proven_bound = proposal
+            .clone()
+            .bind_controller_admission(admitted.clone())
+            .unwrap();
         let controller_bound = proposal.bind_controller_admission(admitted).unwrap();
+        assert!(matches!(
+            EncryptionGenerationPathProofPermit::issue(
+                &state,
+                recipient.clone(),
+                Vec::new(),
+                1_000,
+            ),
+            Err(EncryptionPathProofError::InvalidGenerationProof)
+        ));
         let authority =
             EncryptionRouteAuthority::issue(&state, std::slice::from_ref(&fixture.snapshot))
                 .unwrap();
         let permit = authority.authorize_publication(&authority.rules).unwrap();
-        let latch = controller_bound
-            .authorize_map_activation(None, permit)
+        assert!(matches!(
+            controller_bound.authorize_map_activation(None, permit),
+            Err(NodeLocalOrchestratorError::InvalidActivation(
+                EncryptionActivationLatchError::MissingPathProof
+            ))
+        ));
+
+        let path_permit = EncryptionGenerationPathProofPermit::issue(
+            &state,
+            recipient,
+            vec![path_receipt(&fixture)],
+            1_300,
+        )
+        .unwrap();
+        let route_permit = authority.authorize_publication(&authority.rules).unwrap();
+        let latch = proven_bound
+            .authorize_path_proven_map_activation(None, route_permit, path_permit, 1_300)
             .unwrap();
-        let material = latch.open(None, None).unwrap();
+        let material = latch.open(None, None, 1_300).unwrap();
         assert_eq!(
             material.into_parts().0.transaction.desired.published,
             FastPathPublishedGeneration::issue(&state).unwrap()

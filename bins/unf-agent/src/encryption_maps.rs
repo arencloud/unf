@@ -24,9 +24,10 @@ use unf_ebpf_common::{
     encryption_route_mark,
 };
 use unf_encryption::{
-    AdmittedEncryptionGeneration, EncryptionActivationLatch, EncryptionActivationMode,
-    EncryptionFastPathState, FastPathMapCheckpoint, FastPathMapRecoveryAction,
-    FastPathMapTransactionPhase, FastPathPublishedGeneration, LinuxPreparedLocalGeneration,
+    AdmittedEncryptionGeneration, EncryptionActivationMode, EncryptionActivationWitness,
+    EncryptionFastPathState, EncryptionGenerationPathProofPermit, FastPathMapCheckpoint,
+    FastPathMapRecoveryAction, FastPathMapTransactionPhase, FastPathPublishedGeneration,
+    LinuxPreparedLocalGeneration, PathProvenEncryptionActivationLatch,
 };
 
 use super::{load_secure_json, persist_secure_json, reject_node_block_symlinks};
@@ -154,6 +155,8 @@ impl EncryptionMapSynchronizer {
         &mut self,
         prepared: LinuxPreparedLocalGeneration,
         admitted: AdmittedEncryptionGeneration,
+        path_permit: EncryptionGenerationPathProofPermit,
+        now_unix_ms: u64,
     ) -> Result<()> {
         let prior = self
             .active
@@ -161,10 +164,10 @@ impl EncryptionMapSynchronizer {
             .map(|checkpoint| checkpoint.transaction.desired.published);
         let convergence_witness = prepared.witness();
         let latch = prepared
-            .admit_and_activate_linux(admitted, prior)
+            .admit_and_activate_linux_path_proven(admitted, prior, path_permit, now_unix_ms)
             .await
             .context("activate exact Node-local Linux encryption generation")?;
-        self.apply(latch)?;
+        self.apply_path_proven(latch, now_unix_ms)?;
         info!(
             convergence_witness = ?convergence_witness.0,
             "Node-local WireGuard, policy routes, and Aya generation converged"
@@ -172,17 +175,29 @@ impl EncryptionMapSynchronizer {
         Ok(())
     }
 
-    /// Consumes the single-use controller/kernel/map activation latch, then
-    /// stages and publishes its exact durable CCV checkpoint.
-    pub(super) fn apply(&mut self, latch: EncryptionActivationLatch) -> Result<()> {
+    fn apply_path_proven(
+        &mut self,
+        latch: PathProvenEncryptionActivationLatch,
+        now_unix_ms: u64,
+    ) -> Result<()> {
         let prior = self
             .active
             .as_ref()
             .map(|checkpoint| checkpoint.transaction.desired.published);
-        let witness = latch.witness();
+        let witness = latch.activation_witness();
+        let path_witness = latch.path_witness();
         let material = latch
-            .open(prior, self.pending.as_ref())
-            .context("open tri-plane encryption activation latch")?;
+            .open(prior, self.pending.as_ref(), now_unix_ms)
+            .context("open path-proven encryption activation latch")?;
+        info!(path_witness = ?path_witness.0, "current duplex path quorum consumed at map boundary");
+        self.apply_material(material, witness)
+    }
+
+    fn apply_material(
+        &mut self,
+        material: unf_encryption::EncryptionActivationMaterial,
+        witness: EncryptionActivationWitness,
+    ) -> Result<()> {
         let (distributed_checkpoint, desired, route_permit, mode) = material.into_parts();
         route_permit
             .verify_for(&desired)

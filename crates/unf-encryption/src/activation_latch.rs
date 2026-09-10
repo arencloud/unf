@@ -10,7 +10,8 @@ use thiserror::Error;
 
 use crate::{
     AdmittedEncryptionGeneration, AdmittedEncryptionGenerationDigest, EncryptionFastPathState,
-    EncryptionGenerationDistributionError, EncryptionGenerationRecipient,
+    EncryptionGenerationDistributionError, EncryptionGenerationPathProofPermit,
+    EncryptionGenerationPathProofWitness, EncryptionGenerationRecipient, EncryptionPathProofError,
     EncryptionRouteAuthorityDigest, EncryptionRouteAuthorityError,
     EncryptionRoutePublicationPermit, FastPathMapCheckpoint, FastPathPublishedGeneration,
     FastPathTransactionError,
@@ -47,6 +48,15 @@ pub struct EncryptionActivationMaterial {
     route_permit: EncryptionRoutePublicationPermit,
     mode: EncryptionActivationMode,
     witness: EncryptionActivationWitness,
+}
+
+/// Single-use activation that retains the complete live-path capability until
+/// immediately before inactive-bank staging.
+pub struct PathProvenEncryptionActivationLatch {
+    latch: EncryptionActivationLatch,
+    path_permit: EncryptionGenerationPathProofPermit,
+    recipient: EncryptionGenerationRecipient,
+    path_witness: EncryptionGenerationPathProofWitness,
 }
 
 #[derive(Serialize)]
@@ -154,6 +164,55 @@ impl EncryptionActivationLatch {
     }
 }
 
+impl PathProvenEncryptionActivationLatch {
+    pub(crate) fn issue(
+        latch: EncryptionActivationLatch,
+        path_permit: EncryptionGenerationPathProofPermit,
+        recipient: EncryptionGenerationRecipient,
+    ) -> Self {
+        let path_witness = path_permit.witness();
+        Self {
+            latch,
+            path_permit,
+            recipient,
+            path_witness,
+        }
+    }
+
+    #[must_use]
+    pub const fn path_witness(&self) -> EncryptionGenerationPathProofWitness {
+        self.path_witness
+    }
+
+    #[must_use]
+    pub const fn activation_witness(&self) -> EncryptionActivationWitness {
+        self.latch.witness()
+    }
+
+    /// Consumes and revalidates route, map, and live duplex-path authority at
+    /// the final pre-mutation boundary.
+    ///
+    /// # Errors
+    ///
+    /// Rejects predecessor movement, route/checkpoint drift, path expiry, or
+    /// generation/Node substitution.
+    pub fn open(
+        self,
+        applied: Option<FastPathPublishedGeneration>,
+        quarantined: Option<&FastPathMapCheckpoint>,
+        now_unix_ms: u64,
+    ) -> Result<EncryptionActivationMaterial, EncryptionActivationLatchError> {
+        let material = self.latch.open(applied, quarantined)?;
+        self.path_permit
+            .verify_for(&material.desired, &self.recipient, now_unix_ms)
+            .map_err(EncryptionActivationLatchError::InvalidPathProof)?;
+        if self.path_witness != self.path_permit.witness() {
+            return Err(EncryptionActivationLatchError::WitnessMismatch);
+        }
+        Ok(material)
+    }
+}
+
 fn same_activation_transaction(
     distributed: &FastPathMapCheckpoint,
     pending: &FastPathMapCheckpoint,
@@ -237,6 +296,10 @@ pub enum EncryptionActivationLatchError {
     InvalidCheckpoint(FastPathTransactionError),
     #[error("local route permit does not authorize the admitted generation: {0}")]
     InvalidRoutePermit(EncryptionRouteAuthorityError),
+    #[error("live duplex path proof does not authorize the generation: {0}")]
+    InvalidPathProof(EncryptionPathProofError),
+    #[error("Required encryption activation has no live duplex path proof")]
+    MissingPathProof,
     #[error("encryption activation witness changed before map staging")]
     WitnessMismatch,
     #[error("quarantined encryption transaction differs from the renewed activation latch")]

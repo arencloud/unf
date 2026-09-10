@@ -37,8 +37,8 @@ require_text crates/unf-encryption/src/activation_latch.rs \
     'same_activation_transaction(&self.admitted.checkpoint, pending)' \
     "crash recovery must renew proof for the identical quarantined transaction"
 require_text bins/unf-agent/src/encryption_maps.rs \
-    '.open(prior, self.pending.as_ref())' \
-    "the Aya adapter must consume the exact tri-plane latch"
+    '.open(prior, self.pending.as_ref(), now_unix_ms)' \
+    "the Aya adapter must consume the exact path-proven tri-plane latch"
 require_text bins/unf-agent/src/encryption_maps.rs \
     'synchronizer.requires_local_revalidation = true;' \
     "restart must quarantine serialized authority until local proof is renewed"

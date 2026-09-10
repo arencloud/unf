@@ -15,9 +15,10 @@ use unf_common::Revision;
 use crate::{
     AdmittedEncryptionGeneration, EncryptionActivationLatch, EncryptionActivationLatchError,
     EncryptionGenerationDistributionError, EncryptionGenerationFact, EncryptionGenerationFactError,
-    EncryptionGenerationRecipient, EncryptionRouteAuthority, EncryptionRouteAuthorityError,
-    EncryptionRoutePublicationPermit, FastPathMapCheckpoint, FastPathPublishedGeneration,
-    FastPathTransactionError, KeyAuthorityError, NodeKeyAuthority, WireGuardEpochActivation,
+    EncryptionGenerationPathProofPermit, EncryptionGenerationRecipient, EncryptionRouteAuthority,
+    EncryptionRouteAuthorityError, EncryptionRoutePublicationPermit, FastPathMapCheckpoint,
+    FastPathPublishedGeneration, FastPathTransactionError, KeyAuthorityError, NodeKeyAuthority,
+    PathProvenEncryptionActivationLatch, WireGuardEpochActivation,
     WireGuardKernelConfigurationDigest, WireGuardKernelError, WireGuardKernelPlan,
     WireGuardKernelPlanDigest, WireGuardKernelSnapshot,
 };
@@ -268,8 +269,58 @@ impl ControllerAdmittedLocalGeneration {
         route_permit: EncryptionRoutePublicationPermit,
     ) -> Result<EncryptionActivationLatch, NodeLocalOrchestratorError> {
         let recipient = self.admitted.recipient.clone();
+        let desired = self
+            .admitted
+            .checkpoint
+            .desired_state()
+            .map_err(NodeLocalOrchestratorError::InvalidCheckpoint)?;
+        if desired
+            .decision_authority
+            .iter()
+            .any(|decision| decision.disposition == crate::EncryptionDisposition::Required)
+        {
+            return Err(NodeLocalOrchestratorError::InvalidActivation(
+                EncryptionActivationLatchError::MissingPathProof,
+            ));
+        }
         EncryptionActivationLatch::issue(&self.admitted, &recipient, applied, route_permit)
             .map_err(NodeLocalOrchestratorError::InvalidActivation)
+    }
+
+    /// Consumes controller admission, route proof, and complete current duplex
+    /// path evidence into one final pre-map capability.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any Node, generation, predecessor, route, or path-proof drift.
+    pub fn authorize_path_proven_map_activation(
+        self,
+        applied: Option<FastPathPublishedGeneration>,
+        route_permit: EncryptionRoutePublicationPermit,
+        path_permit: EncryptionGenerationPathProofPermit,
+        now_unix_ms: u64,
+    ) -> Result<PathProvenEncryptionActivationLatch, NodeLocalOrchestratorError> {
+        let recipient = self.admitted.recipient.clone();
+        let desired = self
+            .admitted
+            .checkpoint
+            .desired_state()
+            .map_err(NodeLocalOrchestratorError::InvalidCheckpoint)?;
+        path_permit
+            .verify_for(&desired, &recipient, now_unix_ms)
+            .map_err(|error| {
+                NodeLocalOrchestratorError::InvalidActivation(
+                    EncryptionActivationLatchError::InvalidPathProof(error),
+                )
+            })?;
+        let latch =
+            EncryptionActivationLatch::issue(&self.admitted, &recipient, applied, route_permit)
+                .map_err(NodeLocalOrchestratorError::InvalidActivation)?;
+        Ok(PathProvenEncryptionActivationLatch::issue(
+            latch,
+            path_permit,
+            recipient,
+        ))
     }
 
     #[must_use]
@@ -470,6 +521,44 @@ impl LinuxPreparedLocalGeneration {
             .await
             .map_err(NodeLocalOrchestratorError::InvalidRouteAuthority)?;
         controller_bound.authorize_map_activation(applied, permit)
+    }
+
+    /// Performs the Linux route join and retains current two-ended path proof
+    /// until the final map boundary for a Required generation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects convergence/controller/route drift or incomplete, expired, or
+    /// substituted path evidence.
+    #[cfg(target_os = "linux")]
+    pub async fn admit_and_activate_linux_path_proven(
+        self,
+        admitted: AdmittedEncryptionGeneration,
+        applied: Option<FastPathPublishedGeneration>,
+        path_permit: EncryptionGenerationPathProofPermit,
+        now_unix_ms: u64,
+    ) -> Result<PathProvenEncryptionActivationLatch, NodeLocalOrchestratorError> {
+        if self.witness
+            != convergence_witness(
+                self.proposal.fact(),
+                &self.route_authority,
+                &self.commitments,
+            )?
+        {
+            return Err(NodeLocalOrchestratorError::ConvergenceWitnessMismatch);
+        }
+        self.verify_controller_admission(&admitted)?;
+        let controller_bound = self.proposal.bind_controller_admission(admitted)?;
+        let permit = LinuxEncryptionRouteProvider
+            .activate(&self.route_authority)
+            .await
+            .map_err(NodeLocalOrchestratorError::InvalidRouteAuthority)?;
+        controller_bound.authorize_path_proven_map_activation(
+            applied,
+            permit,
+            path_permit,
+            now_unix_ms,
+        )
     }
 }
 
