@@ -981,8 +981,14 @@ post-map activation through an authenticated one-item agent outbox. Current
 Node/generation/state/path truth is revalidated, outage retries cannot block or
 broaden dataplane authority, and durable per-Node cursors deduplicate both
 delivery retry and same-generation restart revalidation. `make
-encryption-activation-report-test`; ADR 0203. Explanation/simulation, upgrade,
-and performance gates remain next.
+encryption-activation-report-test`; ADR 0203. Phase 9.7e adds policy-first Minimum Causal
+Cut Explanation: current queries identify the earliest absent assignment,
+two-ended proof, quorum, or durable activation, while loss remains visible.
+Counterfactual queries may withhold one stage or advance expiry time but are
+explicitly non-authoritative and side-effect free. Dedicated `unfctl`
+encryption status/history/explain/simulate commands pass
+`make encryption-operations-query-test`; ADR 0204. Adjacent compatibility,
+outage/replacement/cleanup, and performance evidence remain.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

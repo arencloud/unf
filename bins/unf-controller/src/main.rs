@@ -70,9 +70,9 @@ use unf_egress::{
 };
 use unf_encryption::{
     AuthenticatedNodeIdentity, EncryptionActivationReport, EncryptionActivationReportDigest,
-    EncryptionBaseline, EncryptionEndpointPathProof, EncryptionFrontierPublishOutcome,
-    EncryptionGenerationDistributionError, EncryptionGenerationFact,
-    EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
+    EncryptionBaseline, EncryptionDisposition, EncryptionEndpointPathProof,
+    EncryptionFrontierPublishOutcome, EncryptionGenerationDistributionError,
+    EncryptionGenerationFact, EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
     EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
     EncryptionGenerationRequest, EncryptionIdentityPair, EncryptionKeyBootstrap, EncryptionModel,
@@ -887,6 +887,72 @@ struct EgressOperationsResponse {
     note: &'static str,
 }
 
+const ENCRYPTION_EXPLANATION_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EncryptionExplanationRequest {
+    from: String,
+    to: String,
+    protocol: RequestProtocol,
+    port: u16,
+    #[serde(default)]
+    ip_family: Option<RequestIpFamily>,
+    #[serde(default)]
+    withhold: Option<EncryptionOperationalStage>,
+    #[serde(default)]
+    at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum EncryptionExplanationMode {
+    Explain,
+    Counterfactual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum EncryptionExplanationOutcome {
+    PolicyDenied,
+    SameNodeNoUnderlay,
+    Native,
+    AwaitingAssignment,
+    AwaitingLocalExchange,
+    AwaitingRemoteQuorum,
+    AwaitingActivation,
+    Active,
+    Expired,
+    Unavailable,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EncryptionExplanationResponse {
+    schema_version: u16,
+    mode: EncryptionExplanationMode,
+    authoritative: bool,
+    source: ResolvedEndpoint,
+    destination: ResolvedEndpoint,
+    source_node: Option<String>,
+    destination_node: Option<String>,
+    ip_family: RequestIpFamily,
+    protocol: &'static str,
+    port: u16,
+    policy_allowed: bool,
+    policy_revision: Revision,
+    requirement: EncryptionDisposition,
+    generation: Option<Revision>,
+    contract_digest: Option<unf_encryption::AttestedEncryptionContractDigest>,
+    epoch: Option<u64>,
+    outcome: EncryptionExplanationOutcome,
+    minimum_missing_stage: Option<EncryptionOperationalStage>,
+    loss_affected: bool,
+    retained_evidence_records: u32,
+    next_action: &'static str,
+    note: &'static str,
+}
+
 const POLICY_SIMULATION_SCHEMA_VERSION: u16 = 4;
 const POLICY_SIMULATION_FLOW_LIMIT: usize = 10_000;
 
@@ -1354,6 +1420,8 @@ async fn main() -> Result<()> {
         .route("/v1/egress/failovers", get(egress_failover_history))
         .route("/v1/encryption/status", get(encryption_operations_status))
         .route("/v1/encryption/history", get(encryption_operations_history))
+        .route("/v1/encryption/explain", post(explain_encryption))
+        .route("/v1/encryption/simulate", post(simulate_encryption))
         .route("/v1/egress/explain", post(explain_egress))
         .route("/v1/egress/simulate", post(simulate_egress))
         .route("/v1/services/explain", get(explain_service))
@@ -7319,6 +7387,266 @@ async fn encryption_operations_history(
     State(state): State<Arc<ControllerState>>,
 ) -> Json<EncryptionOperationsHistoryCheckpoint> {
     Json(mutex_lock(&state.encryption_operations).checkpoint())
+}
+
+async fn explain_encryption(
+    State(state): State<Arc<ControllerState>>,
+    Json(request): Json<EncryptionExplanationRequest>,
+) -> Result<Json<EncryptionExplanationResponse>, ApiError> {
+    if request.withhold.is_some() || request.at_unix_ms.is_some() {
+        return Err(ApiError::bad_request(
+            "counterfactual fields are accepted only by encryption simulation",
+        ));
+    }
+    encryption_explanation(&state, &request, EncryptionExplanationMode::Explain).map(Json)
+}
+
+async fn simulate_encryption(
+    State(state): State<Arc<ControllerState>>,
+    Json(request): Json<EncryptionExplanationRequest>,
+) -> Result<Json<EncryptionExplanationResponse>, ApiError> {
+    encryption_explanation(&state, &request, EncryptionExplanationMode::Counterfactual).map(Json)
+}
+
+#[allow(clippy::too_many_lines)]
+fn encryption_explanation(
+    state: &ControllerState,
+    request: &EncryptionExplanationRequest,
+    mode: EncryptionExplanationMode,
+) -> Result<EncryptionExplanationResponse, ApiError> {
+    if request.port == 0 || request.at_unix_ms == Some(0) {
+        return Err(ApiError::bad_request(
+            "port and optional simulation timestamp must be nonzero",
+        ));
+    }
+    let pods = read_lock(&state.pods);
+    let source = pods
+        .get(&request.from)
+        .ok_or_else(|| ApiError::not_found(format!("source pod {} not found", request.from)))?;
+    let destination = pods
+        .get(&request.to)
+        .ok_or_else(|| ApiError::not_found(format!("destination pod {} not found", request.to)))?;
+    let (ip_family, _, _) = explain_addresses(source, destination, request.ip_family)?;
+    let policy_request = |direction| ExplainRequest {
+        from: request.from.clone(),
+        to: request.to.clone(),
+        direction,
+        ip_family: request.ip_family,
+        protocol: request.protocol,
+        port: request.port,
+    };
+    let ingress = explain_response(state, &policy_request(RequestPolicyDirection::Ingress))?;
+    let egress = explain_response(state, &policy_request(RequestPolicyDirection::Egress))?;
+    let policy_allowed =
+        ingress.decision.verdict == Verdict::Allow && egress.decision.verdict == Verdict::Allow;
+    let policy_revision = ingress.policy_revision.max(egress.policy_revision);
+    let requirement = EncryptionDisposition::Required;
+    let source_node = source.node_name.clone();
+    let destination_node = destination.node_name.clone();
+    let history = mutex_lock(&state.encryption_operations).checkpoint();
+    let status = mutex_lock(&state.encryption_operations)
+        .status(unix_time_millis().max(request.at_unix_ms.unwrap_or(0)))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+
+    let base = |outcome, minimum_missing_stage, next_action| EncryptionExplanationResponse {
+        schema_version: ENCRYPTION_EXPLANATION_SCHEMA_VERSION,
+        mode,
+        authoritative: matches!(mode, EncryptionExplanationMode::Explain),
+        source: resolved(source),
+        destination: resolved(destination),
+        source_node: source_node.clone(),
+        destination_node: destination_node.clone(),
+        ip_family,
+        protocol: match request.protocol {
+            RequestProtocol::Tcp => "tcp",
+            RequestProtocol::Udp => "udp",
+            RequestProtocol::Sctp => "sctp",
+        },
+        port: request.port,
+        policy_allowed,
+        policy_revision,
+        requirement,
+        generation: None,
+        contract_digest: None,
+        epoch: None,
+        outcome,
+        minimum_missing_stage,
+        loss_affected: status.loss_affected,
+        retained_evidence_records: status.retained_records,
+        next_action,
+        note: "policy is evaluated before encryption; simulation reads one snapshot and never mutates or grants authority",
+    };
+    if !policy_allowed {
+        return Ok(base(
+            EncryptionExplanationOutcome::PolicyDenied,
+            Some(EncryptionOperationalStage::Requirement),
+            "inspect the ingress and egress policy decisions; encryption cannot override denial",
+        ));
+    }
+    if source_node.is_some() && source_node == destination_node {
+        return Ok(base(
+            EncryptionExplanationOutcome::SameNodeNoUnderlay,
+            None,
+            "no encrypted underlay hop is required for this same-Node flow",
+        ));
+    }
+    if request.withhold == Some(EncryptionOperationalStage::Requirement) {
+        return Ok(base(
+            EncryptionExplanationOutcome::Unavailable,
+            Some(EncryptionOperationalStage::Requirement),
+            "restore authoritative encryption intent evaluation",
+        ));
+    }
+    let Some(source_node_name) = source_node.as_deref() else {
+        return Ok(base(
+            EncryptionExplanationOutcome::Unavailable,
+            Some(EncryptionOperationalStage::Assignment),
+            "wait for authoritative source Pod placement",
+        ));
+    };
+    let Some(destination_node_name) = destination_node.as_deref() else {
+        return Ok(base(
+            EncryptionExplanationOutcome::Unavailable,
+            Some(EncryptionOperationalStage::Assignment),
+            "wait for authoritative destination Pod placement",
+        ));
+    };
+    let cut = mutex_lock(&state.encryption_local_plans).active().cloned();
+    let Some(cut) = cut else {
+        return Ok(base(
+            EncryptionExplanationOutcome::AwaitingAssignment,
+            Some(EncryptionOperationalStage::Assignment),
+            "wait for a complete fleet-synchronous encryption plan",
+        ));
+    };
+    let Some(local_plan) = cut
+        .plans
+        .iter()
+        .find(|plan| plan.recipient.node_name == source_node_name)
+    else {
+        return Ok(base(
+            EncryptionExplanationOutcome::AwaitingAssignment,
+            Some(EncryptionOperationalStage::Assignment),
+            "restore the source Node in the current fleet plan",
+        ));
+    };
+    let Some(decision) = local_plan.decisions.iter().find(|decision| {
+        decision.source_identity == source.endpoint.identity
+            && decision.destination_identity == destination.endpoint.identity
+    }) else {
+        return Ok(base(
+            EncryptionExplanationOutcome::Unavailable,
+            Some(EncryptionOperationalStage::Requirement),
+            "reconcile identity-pair encryption demand from current policy truth",
+        ));
+    };
+    if decision.disposition == EncryptionDisposition::Native {
+        return Ok(base(
+            EncryptionExplanationOutcome::Native,
+            None,
+            "the authoritative decision does not require an encrypted underlay path",
+        ));
+    }
+    let contract_epoch = decision
+        .contract_epoch
+        .ok_or_else(|| ApiError::internal("required encryption decision has no contract epoch"))?;
+    let plan_index = decision
+        .plan_index
+        .ok_or_else(|| ApiError::internal("required encryption decision has no plan index"))?;
+    let epoch = local_plan
+        .epochs
+        .iter()
+        .find(|epoch| {
+            epoch
+                .contract
+                .plans
+                .get(plan_index)
+                .is_some_and(|plan| plan.source_key.epoch == contract_epoch)
+        })
+        .ok_or_else(|| ApiError::internal("required encryption contract is unavailable"))?;
+    let now = request.at_unix_ms.unwrap_or_else(unix_time_millis);
+    let contract_digest = epoch.contract.contract_digest;
+    let mut response = base(
+        EncryptionExplanationOutcome::AwaitingAssignment,
+        Some(EncryptionOperationalStage::Assignment),
+        "wait for the exact contract assignment round",
+    );
+    response.generation = Some(cut.generation);
+    response.contract_digest = Some(contract_digest);
+    response.epoch = Some(contract_epoch);
+    if now < epoch.contract.valid_from_unix_ms || now >= epoch.contract.valid_until_unix_ms {
+        response.outcome = EncryptionExplanationOutcome::Expired;
+        response.minimum_missing_stage = Some(EncryptionOperationalStage::Lifecycle);
+        response.next_action =
+            "reconcile a fresh contract generation; Required traffic remains closed";
+        return Ok(response);
+    }
+    let matching =
+        |stage, outcome| {
+            history.records.iter().filter(|record| {
+            matches!(
+                &record.entry,
+                unf_encryption::EncryptionOperationsHistoryEntry::Observation { observation }
+                    if observation.stage == stage
+                        && observation.outcome == outcome
+                        && observation.contract_digest == Some(contract_digest)
+                        && observation.epoch == Some(contract_epoch)
+            )
+        }).count()
+        };
+    if request.withhold == Some(EncryptionOperationalStage::Assignment)
+        || matching(
+            EncryptionOperationalStage::Assignment,
+            EncryptionOperationalOutcome::Pending,
+        ) == 0
+    {
+        return Ok(response);
+    }
+    response.outcome = EncryptionExplanationOutcome::AwaitingLocalExchange;
+    response.minimum_missing_stage = Some(EncryptionOperationalStage::LocalExchange);
+    response.next_action = "wait for both endpoints to execute the exact marked nonce exchange";
+    if request.withhold == Some(EncryptionOperationalStage::LocalExchange)
+        || matching(
+            EncryptionOperationalStage::LocalExchange,
+            EncryptionOperationalOutcome::Proven,
+        ) < 2
+    {
+        return Ok(response);
+    }
+    response.outcome = EncryptionExplanationOutcome::AwaitingRemoteQuorum;
+    response.minimum_missing_stage = Some(EncryptionOperationalStage::RemoteQuorum);
+    response.next_action = "wait for the controller to join both authenticated endpoint proofs";
+    if request.withhold == Some(EncryptionOperationalStage::RemoteQuorum)
+        || matching(
+            EncryptionOperationalStage::RemoteQuorum,
+            EncryptionOperationalOutcome::Proven,
+        ) == 0
+    {
+        return Ok(response);
+    }
+    response.outcome = EncryptionExplanationOutcome::AwaitingActivation;
+    response.minimum_missing_stage = Some(EncryptionOperationalStage::Activation);
+    response.next_action = "wait for both Nodes to acknowledge exact post-map activation";
+    if request.withhold == Some(EncryptionOperationalStage::Activation)
+        || request.withhold == Some(EncryptionOperationalStage::Lifecycle)
+    {
+        return Ok(response);
+    }
+    let cursors = mutex_lock(&state.encryption_activation_cursors);
+    let node_active = |node_name: &str| {
+        cut.members
+            .iter()
+            .find(|member| member.node_name == node_name)
+            .and_then(|member| cursors.get(&member.node_uid))
+            .is_some_and(|cursor| cursor.generation == cut.generation)
+    };
+    if node_active(source_node_name) && node_active(destination_node_name) {
+        response.outcome = EncryptionExplanationOutcome::Active;
+        response.minimum_missing_stage = None;
+        response.next_action =
+            "no action; current policy, contract, quorum, and both activations agree";
+    }
+    Ok(response)
 }
 
 fn record_encryption_operation(
@@ -15443,6 +15771,98 @@ mod tests {
         assert!(!encoded.contains("node="));
         assert!(!encoded.contains("peer="));
         assert!(!encoded.contains("epoch="));
+    }
+
+    #[test]
+    fn encryption_explanation_finds_minimum_cut_and_simulation_is_read_only() {
+        let state = new_state(true);
+        let mut source = pod_record(41, "frontend", "client", "client");
+        source.node_name = Some("worker-a".to_owned());
+        source.ipv4_addresses.insert("10.1.0.10".parse().unwrap());
+        let mut destination = pod_record(42, "backend", "server", "server");
+        destination.node_name = Some("worker-b".to_owned());
+        destination
+            .ipv4_addresses
+            .insert("10.2.0.10".parse().unwrap());
+        write_lock(&state.pods).insert("frontend/client".to_owned(), source);
+        write_lock(&state.pods).insert("backend/server".to_owned(), destination);
+        let request = EncryptionExplanationRequest {
+            from: "frontend/client".to_owned(),
+            to: "backend/server".to_owned(),
+            protocol: RequestProtocol::Tcp,
+            port: 443,
+            ip_family: Some(RequestIpFamily::Ipv4),
+            withhold: None,
+            at_unix_ms: None,
+        };
+        let before = mutex_lock(&state.encryption_operations).checkpoint();
+        let explanation =
+            encryption_explanation(&state, &request, EncryptionExplanationMode::Explain).unwrap();
+        assert_eq!(
+            explanation.outcome,
+            EncryptionExplanationOutcome::AwaitingAssignment
+        );
+        assert_eq!(
+            explanation.minimum_missing_stage,
+            Some(EncryptionOperationalStage::Assignment)
+        );
+        assert!(explanation.authoritative);
+
+        let simulation = encryption_explanation(
+            &state,
+            &EncryptionExplanationRequest {
+                withhold: Some(EncryptionOperationalStage::Requirement),
+                at_unix_ms: Some(unix_time_millis()),
+                ..request
+            },
+            EncryptionExplanationMode::Counterfactual,
+        )
+        .unwrap();
+        assert_eq!(
+            simulation.outcome,
+            EncryptionExplanationOutcome::Unavailable
+        );
+        assert!(!simulation.authoritative);
+        assert_eq!(
+            mutex_lock(&state.encryption_operations).checkpoint(),
+            before
+        );
+        assert!(mutex_lock(&state.encryption_activation_cursors).is_empty());
+
+        write_lock(&state.pods)
+            .get_mut("backend/server")
+            .unwrap()
+            .node_name = Some("worker-a".to_owned());
+        let same_node = encryption_explanation(
+            &state,
+            &EncryptionExplanationRequest {
+                from: "frontend/client".to_owned(),
+                to: "backend/server".to_owned(),
+                protocol: RequestProtocol::Tcp,
+                port: 443,
+                ip_family: Some(RequestIpFamily::Ipv4),
+                withhold: None,
+                at_unix_ms: None,
+            },
+            EncryptionExplanationMode::Explain,
+        )
+        .unwrap();
+        assert_eq!(
+            same_node.outcome,
+            EncryptionExplanationOutcome::SameNodeNoUnderlay
+        );
+        assert!(same_node.minimum_missing_stage.is_none());
+
+        assert!(
+            serde_json::from_value::<EncryptionExplanationRequest>(serde_json::json!({
+                "from": "frontend/client",
+                "to": "backend/server",
+                "protocol": "tcp",
+                "port": 443,
+                "unexpectedAuthority": true
+            }))
+            .is_err()
+        );
     }
 
     #[test]

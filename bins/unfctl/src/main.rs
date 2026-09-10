@@ -106,6 +106,48 @@ enum Command {
         #[arg(long)]
         port: u16,
     },
+    /// Show the loss-explicit encryption operations watermark.
+    EncryptionStatus,
+    /// Show bounded, hash-chained encryption lifecycle evidence.
+    EncryptionHistory,
+    /// Explain the minimum missing cause on one inter-Pod encryption path.
+    EncryptionExplain {
+        /// Source pod as namespace/name.
+        #[arg(long)]
+        from: String,
+        /// Destination pod as namespace/name.
+        #[arg(long)]
+        to: String,
+        #[arg(long, value_enum, default_value = "tcp")]
+        protocol: Protocol,
+        #[arg(long)]
+        port: u16,
+        /// Concrete Pod address family; defaults to IPv4 when both Pods have it.
+        #[arg(long, value_enum)]
+        ip_family: Option<IpFamily>,
+    },
+    /// Evaluate a read-only encryption-stage counterfactual.
+    EncryptionSimulate {
+        /// Source pod as namespace/name.
+        #[arg(long)]
+        from: String,
+        /// Destination pod as namespace/name.
+        #[arg(long)]
+        to: String,
+        #[arg(long, value_enum, default_value = "tcp")]
+        protocol: Protocol,
+        #[arg(long)]
+        port: u16,
+        /// Concrete Pod address family; defaults to IPv4 when both Pods have it.
+        #[arg(long, value_enum)]
+        ip_family: Option<IpFamily>,
+        /// Pretend this lifecycle proof is absent without mutating live state.
+        #[arg(long, value_enum)]
+        withhold: Option<EncryptionStage>,
+        /// Evaluate lifecycle expiry at this Unix-millisecond timestamp.
+        #[arg(long)]
+        at_unix_ms: Option<u64>,
+    },
     /// Correlate a Service/backend with current intent and observed dataplane outcomes.
     ServiceExplain {
         /// Stable service ID reported by agent status, flow history, or metrics.
@@ -302,6 +344,17 @@ enum IpFamily {
     Ipv6,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "camelCase")]
+enum EncryptionStage {
+    Requirement,
+    Assignment,
+    LocalExchange,
+    RemoteQuorum,
+    Activation,
+    Lifecycle,
+}
+
 #[derive(Debug, Serialize)]
 struct ExplainRequest<'a> {
     from: &'a str,
@@ -319,6 +372,21 @@ struct EgressOperationsRequest<'a> {
     destination: IpAddr,
     protocol: Protocol,
     port: u16,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EncryptionExplanationRequest<'a> {
+    from: &'a str,
+    to: &'a str,
+    protocol: Protocol,
+    port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip_family: Option<IpFamily>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    withhold: Option<EncryptionStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -449,6 +517,64 @@ async fn run() -> Result<()> {
                 *destination,
                 *protocol,
                 *port,
+            )
+            .await?
+        }
+        Command::EncryptionStatus => {
+            get_json(
+                &client,
+                &format!("{}/v1/encryption/status", cli.controller_url),
+            )
+            .await?
+        }
+        Command::EncryptionHistory => {
+            get_json(
+                &client,
+                &format!("{}/v1/encryption/history", cli.controller_url),
+            )
+            .await?
+        }
+        Command::EncryptionExplain {
+            from,
+            to,
+            protocol,
+            port,
+            ip_family,
+        } => {
+            encryption_explanation_value(
+                &client,
+                &cli.controller_url,
+                "/v1/encryption/explain",
+                from,
+                to,
+                *protocol,
+                *port,
+                *ip_family,
+                None,
+                None,
+            )
+            .await?
+        }
+        Command::EncryptionSimulate {
+            from,
+            to,
+            protocol,
+            port,
+            ip_family,
+            withhold,
+            at_unix_ms,
+        } => {
+            encryption_explanation_value(
+                &client,
+                &cli.controller_url,
+                "/v1/encryption/simulate",
+                from,
+                to,
+                *protocol,
+                *port,
+                *ip_family,
+                *withhold,
+                *at_unix_ms,
             )
             .await?
         }
@@ -668,6 +794,38 @@ async fn egress_operations_value(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn encryption_explanation_value(
+    client: &reqwest::Client,
+    controller_url: &str,
+    path: &str,
+    from: &str,
+    to: &str,
+    protocol: Protocol,
+    port: u16,
+    ip_family: Option<IpFamily>,
+    withhold: Option<EncryptionStage>,
+    at_unix_ms: Option<u64>,
+) -> Result<Value> {
+    if port == 0 {
+        bail!("port must be between 1 and 65535");
+    }
+    post_json(
+        client,
+        &format!("{controller_url}{path}"),
+        &EncryptionExplanationRequest {
+            from,
+            to,
+            protocol,
+            port,
+            ip_family,
+            withhold,
+            at_unix_ms,
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn topology_history_value(
     client: &reqwest::Client,
     controller_url: &str,
@@ -805,6 +963,13 @@ fn print_value(value: &Value, output: Output) -> Result<()> {
 }
 
 fn print_table(value: &Value) {
+    if value.get("minimumMissingStage").is_some()
+        && value.get("policyAllowed").is_some()
+        && value.get("nextAction").is_some()
+    {
+        print_encryption_explanation_table(value);
+        return;
+    }
     if value.get("mode").is_some()
         && value.get("evidence").is_some()
         && value.get("private_nat_state_inferred").is_some()
@@ -884,6 +1049,39 @@ fn print_table(value: &Value) {
         }
     } else {
         println!("{value}");
+    }
+}
+
+fn print_encryption_explanation_table(value: &Value) {
+    for key in [
+        "mode",
+        "authoritative",
+        "sourceNode",
+        "destinationNode",
+        "ipFamily",
+        "protocol",
+        "port",
+        "policyAllowed",
+        "policyRevision",
+        "requirement",
+        "generation",
+        "epoch",
+        "outcome",
+        "minimumMissingStage",
+        "lossAffected",
+        "retainedEvidenceRecords",
+        "nextAction",
+        "note",
+    ] {
+        let rendered = value.get(key).map_or_else(
+            || "-".to_owned(),
+            |item| match item {
+                Value::String(text) => text.clone(),
+                Value::Null => "-".to_owned(),
+                _ => item.to_string(),
+            },
+        );
+        println!("{key:24} {rendered}");
     }
 }
 
@@ -2205,6 +2403,90 @@ mod tests {
             ),
             "http://controller/v1/egress/history?since_unix_ms=10&until_unix_ms=20&limit=5"
         );
+    }
+
+    #[test]
+    fn encryption_operations_commands_are_strict_and_counterfactual() {
+        let explain = Cli::try_parse_from([
+            "unfctl",
+            "encryption-explain",
+            "--from",
+            "payments/ledger-0",
+            "--to",
+            "payments/database-0",
+            "--ip-family",
+            "ipv6",
+            "--port",
+            "5432",
+        ])
+        .expect("encryption explanation command parses");
+        assert!(matches!(
+            explain.command,
+            Command::EncryptionExplain {
+                from,
+                to,
+                protocol: Protocol::Tcp,
+                port: 5432,
+                ip_family: Some(IpFamily::Ipv6),
+            } if from == "payments/ledger-0" && to == "payments/database-0"
+        ));
+
+        let simulate = Cli::try_parse_from([
+            "unfctl",
+            "encryption-simulate",
+            "--from",
+            "payments/ledger-0",
+            "--to",
+            "payments/database-0",
+            "--protocol",
+            "udp",
+            "--port",
+            "53",
+            "--withhold",
+            "remote-quorum",
+            "--at-unix-ms",
+            "2000000",
+        ])
+        .expect("encryption counterfactual command parses");
+        assert!(matches!(
+            simulate.command,
+            Command::EncryptionSimulate {
+                protocol: Protocol::Udp,
+                withhold: Some(EncryptionStage::RemoteQuorum),
+                at_unix_ms: Some(2_000_000),
+                ..
+            }
+        ));
+
+        let body = serde_json::to_value(EncryptionExplanationRequest {
+            from: "payments/ledger-0",
+            to: "payments/database-0",
+            protocol: Protocol::Tcp,
+            port: 5432,
+            ip_family: Some(IpFamily::Ipv6),
+            withhold: Some(EncryptionStage::Activation),
+            at_unix_ms: None,
+        })
+        .expect("encryption request serializes");
+        assert_eq!(body["ipFamily"], "ipv6");
+        assert_eq!(body["withhold"], "activation");
+        assert!(body.get("atUnixMs").is_none());
+
+        assert!(
+            Cli::try_parse_from([
+                "unfctl",
+                "encryption-explain",
+                "--from",
+                "payments/ledger-0",
+                "--to",
+                "payments/database-0",
+                "--port",
+                "0",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["unfctl", "encryption-status"]).is_ok());
+        assert!(Cli::try_parse_from(["unfctl", "encryption-history"]).is_ok());
     }
 
     #[test]

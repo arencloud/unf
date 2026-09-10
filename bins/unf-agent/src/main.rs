@@ -18283,7 +18283,11 @@ mod tests {
             ),
             _ => panic!("unknown live role"),
         };
-        let expires_at = current_unix_time_milliseconds() + 3_000;
+        // Independent test processes may reach the rendezvous at different
+        // times under CI load. Give each one enough source lifetime to use the
+        // production four-second exchange cap instead of shortening it to a
+        // scheduler-sensitive three-second window.
+        let expires_at = current_unix_time_milliseconds() + 8_000;
         let ipv4 = exchange_encryption_path_probe_group(
             PathProbeSocketKey {
                 local_address: local_v4.parse().unwrap(),
