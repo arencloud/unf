@@ -88,8 +88,10 @@ admission boundaries, and socket-fenced fingerprinted CNI publication.
 
 IPAM stays below a provider interface and above routing. The first provider
 accepts one canonical IPv4 and IPv6 node block, reserves network/gateway and IPv4
-broadcast boundaries, and deterministically selects the lowest free address in
-each family as one atomic lease. Search and node usage are capped at 65,536
+broadcast boundaries, plus the penultimate IPv4 unicast address for encrypted
+path proof, and deterministically selects the lowest free address in each family
+as one atomic lease. Pre-reservation journals stay valid but block encryption
+while colliding; search and node usage are capped at 65,536
 leases. The provider validates reconstructed leases but owns no persistence.
 ADR 0060 integrates each lease into the same atomic attachment record, migrates
 schema-v1 journals, stores exact block provenance, retains leases through cleanup

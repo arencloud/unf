@@ -56,11 +56,11 @@ sudo -n ip -n "${ns_a}" address add 10.250.1.2/32 dev unfwg0
 sudo -n ip -n "${ns_a}" address add fd00:250:1::2/128 dev unfwg0
 sudo -n ip -n "${ns_b}" address add 10.250.2.2/32 dev unfwg0
 sudo -n ip -n "${ns_b}" address add fd00:250:2::2/128 dev unfwg0
-# UNF IPAM permanently excludes the IPv4 block end and IPv6 network address.
+# UNF IPAM reserves an IPv4 unicast host and the IPv6 network address.
 # Installed as host addresses, they are dependency-free path-proof beacons.
-sudo -n ip -n "${ns_a}" address add 10.250.1.255/32 dev unfwg0
+sudo -n ip -n "${ns_a}" address add 10.250.1.254/32 dev unfwg0
 sudo -n ip -n "${ns_a}" address add fd00:250:1::/128 dev unfwg0
-sudo -n ip -n "${ns_b}" address add 10.250.2.255/32 dev unfwg0
+sudo -n ip -n "${ns_b}" address add 10.250.2.254/32 dev unfwg0
 sudo -n ip -n "${ns_b}" address add fd00:250:2::/128 dev unfwg0
 
 sudo -n ip netns exec "${ns_a}" wg set unfwg0 \
@@ -87,7 +87,7 @@ capture_pid=$!
 sleep 0.5
 sudo -n ip netns exec "${ns_a}" ping -q -c 3 -W 2 -I 10.250.1.2 10.250.2.2
 sudo -n ip netns exec "${ns_a}" ping -6 -q -c 3 -W 2 -I fd00:250:1::2 fd00:250:2::2
-sudo -n ip netns exec "${ns_a}" ping -q -c 1 -W 2 -I 10.250.1.255 10.250.2.255
+sudo -n ip netns exec "${ns_a}" ping -q -c 1 -W 2 -I 10.250.1.254 10.250.2.254
 sudo -n ip netns exec "${ns_a}" ping -6 -q -c 1 -W 2 -I fd00:250:1:: fd00:250:2::
 wait "${capture_pid}" || [[ $? -eq 124 ]]
 capture_pid=
@@ -95,7 +95,7 @@ capture_pid=
 encrypted_packets=$(sudo -n tcpdump -nn -r "${pcap_file}" \
     'udp and (port 51820 or port 51821)' 2>/dev/null | wc -l)
 plaintext_packets=$(sudo -n tcpdump -nn -r "${pcap_file}" \
-    'host 10.250.1.2 or host 10.250.2.2 or host fd00:250:1::2 or host fd00:250:2::2 or host 10.250.1.255 or host 10.250.2.255 or host fd00:250:1:: or host fd00:250:2::' \
+    'host 10.250.1.2 or host 10.250.2.2 or host fd00:250:1::2 or host fd00:250:2::2 or host 10.250.1.254 or host 10.250.2.254 or host fd00:250:1:: or host fd00:250:2::' \
     2>/dev/null | wc -l)
 [[ ${encrypted_packets} -gt 0 ]] || {
     echo "no WireGuard ciphertext was observed on the underlay" >&2
@@ -129,7 +129,7 @@ sudo -n ip netns exec "${ns_a}" wg set unfwg0 \
     allowed-ips 10.250.2.0/24,fd00:250:2::/64 persistent-keepalive 1
 sudo -n ip netns exec "${ns_a}" ping -q -c 1 -W 2 -I 10.250.1.2 10.250.2.2
 sudo -n ip netns exec "${ns_a}" ping -6 -q -c 1 -W 2 -I fd00:250:1::2 fd00:250:2::2
-sudo -n ip netns exec "${ns_a}" ping -q -c 1 -W 2 -I 10.250.1.255 10.250.2.255
+sudo -n ip netns exec "${ns_a}" ping -q -c 1 -W 2 -I 10.250.1.254 10.250.2.254
 sudo -n ip netns exec "${ns_a}" ping -6 -q -c 1 -W 2 -I fd00:250:1:: fd00:250:2::
 
 echo "Phase 9.5 live ciphertext passed: dual-stack inner traffic crossed WireGuard as UDP-only underlay ciphertext, peer removal denied closed, and exact recovery succeeded"

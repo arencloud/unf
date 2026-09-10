@@ -11,7 +11,8 @@ use crate::{
     EncryptionPathClass, EncryptionPathFact, EncryptionPolicyFact, EncryptionPolicyObservation,
     IpPrefix, MAX_ENCRYPTION_ENDPOINTS, MAX_ENCRYPTION_MTU, MAX_ENCRYPTION_PATHS,
     MAX_ENCRYPTION_PREFIXES_PER_NODE, MAX_ENCRYPTION_UNDERLAY_ADDRESSES_PER_NODE,
-    MIN_DUAL_STACK_ENCRYPTION_MTU, project_encryption_policy_facts,
+    MIN_DUAL_STACK_ENCRYPTION_MTU, derive_wireguard_proof_addresses,
+    project_encryption_policy_facts,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +110,8 @@ pub fn project_kubernetes_encryption(
         let node = nodes_by_name
             .get(workload.node_name.as_str())
             .ok_or(KubernetesEncryptionProjectionError::InvalidWorkload)?;
+        let proof_beacons = derive_wireguard_proof_addresses(&node.pod_cidrs)
+            .map_err(|_| KubernetesEncryptionProjectionError::InvalidNode)?;
         if workload.identity.get() == 0
             || workload.workload_uid.is_empty()
             || workload.addresses.is_empty()
@@ -117,6 +120,11 @@ pub fn project_kubernetes_encryption(
                     .pod_cidrs
                     .iter()
                     .any(|prefix| prefix.contains(*address))
+            })
+            || workload.addresses.iter().any(|address| {
+                proof_beacons
+                    .iter()
+                    .any(|beacon| beacon.address == *address)
             })
         {
             return Err(KubernetesEncryptionProjectionError::InvalidWorkload);
@@ -389,6 +397,12 @@ mod tests {
         drift.workloads[0].addresses[0] = "10.99.0.8".parse().unwrap();
         assert_eq!(
             project_kubernetes_encryption(drift),
+            Err(KubernetesEncryptionProjectionError::InvalidWorkload)
+        );
+        let mut legacy_beacon_collision = input();
+        legacy_beacon_collision.workloads[0].addresses[0] = "10.42.1.254".parse().unwrap();
+        assert_eq!(
+            project_kubernetes_encryption(legacy_beacon_collision),
             Err(KubernetesEncryptionProjectionError::InvalidWorkload)
         );
     }

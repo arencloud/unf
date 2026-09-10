@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 
 use futures::{StreamExt as _, TryStreamExt as _};
 use netlink_packet_core::{NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload};
@@ -62,6 +64,7 @@ impl LinuxWireGuardProvider {
         let existing = find_link(&handle, &plan.interface_name).await?;
         if let Some(link) = existing {
             validate_owned_link(&link, plan)?;
+            ensure_ipv4_reverse_path_acceptance(plan)?;
             let snapshot = read_snapshot(&handle, plan, &link).await?;
             snapshot.verify_against(plan).map_err(|_| {
                 WireGuardKernelError::ForeignState(
@@ -87,6 +90,7 @@ impl LinuxWireGuardProvider {
             after_device()?;
             add_proof_addresses(&handle, plan, link.header.index).await?;
             add_routes(&handle, plan, link.header.index).await?;
+            ensure_ipv4_reverse_path_acceptance(plan)?;
             let snapshot = read_snapshot(&handle, plan, &link).await?;
             snapshot.verify_against(plan)?;
             Ok(snapshot)
@@ -120,6 +124,7 @@ impl LinuxWireGuardProvider {
         let handle = connect_route("open rtnetlink readback connection")?;
         let link = require_link(&handle, &plan.interface_name).await?;
         validate_owned_link(&link, plan)?;
+        verify_ipv4_reverse_path_acceptance(plan)?;
         let snapshot = read_snapshot(&handle, plan, &link).await?;
         snapshot.verify_against(plan)?;
         Ok(snapshot)
@@ -175,6 +180,45 @@ impl LinuxWireGuardProvider {
         let handle = connect_route("open rtnetlink recovery connection")?;
         rollback_fresh_stage(&handle, &transaction.plan).await
     }
+}
+
+fn ipv4_reverse_path_filter_path(interface_name: &str) -> std::path::PathBuf {
+    Path::new("/proc/sys/net/ipv4/conf")
+        .join(interface_name)
+        .join("rp_filter")
+}
+
+fn ensure_ipv4_reverse_path_acceptance(
+    plan: &WireGuardKernelPlan,
+) -> Result<(), WireGuardKernelError> {
+    let path = ipv4_reverse_path_filter_path(&plan.interface_name);
+    let current = fs::read_to_string(&path).map_err(|error| WireGuardKernelError::Kernel {
+        operation: "read WireGuard reverse-path filter",
+        message: error.to_string(),
+    })?;
+    if current.trim() != "0" {
+        fs::write(&path, b"0\n").map_err(|error| WireGuardKernelError::Kernel {
+            operation: "configure WireGuard reverse-path filter",
+            message: error.to_string(),
+        })?;
+    }
+    verify_ipv4_reverse_path_acceptance(plan)
+}
+
+fn verify_ipv4_reverse_path_acceptance(
+    plan: &WireGuardKernelPlan,
+) -> Result<(), WireGuardKernelError> {
+    let path = ipv4_reverse_path_filter_path(&plan.interface_name);
+    let current = fs::read_to_string(path).map_err(|error| WireGuardKernelError::Kernel {
+        operation: "verify WireGuard reverse-path filter",
+        message: error.to_string(),
+    })?;
+    if current.trim() != "0" {
+        return Err(WireGuardKernelError::ForeignState(
+            "owned WireGuard interface does not admit isolated IPv4 return paths".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn connect_route(operation: &'static str) -> Result<Handle, WireGuardKernelError> {
@@ -1123,8 +1167,19 @@ mod tests {
         let (outcome, first) = provider.apply(&plan, &private_key).await.unwrap();
         assert_eq!(outcome, KernelApplyOutcome::Created);
         first.verify_against(&plan).unwrap();
+        let reverse_path_filter = ipv4_reverse_path_filter_path(&plan.interface_name);
+        assert_eq!(
+            fs::read_to_string(&reverse_path_filter).unwrap().trim(),
+            "0"
+        );
+        fs::write(&reverse_path_filter, b"2\n").unwrap();
+        assert!(matches!(
+            provider.readback(&plan).await,
+            Err(WireGuardKernelError::ForeignState(_))
+        ));
         let (outcome, replay) = provider.apply(&plan, &private_key).await.unwrap();
         assert_eq!(outcome, KernelApplyOutcome::AlreadyExact);
+        assert_eq!(fs::read_to_string(reverse_path_filter).unwrap().trim(), "0");
         assert_eq!(first.configuration_digest, replay.configuration_digest);
 
         let mut transaction = super::super::ProofCarryingKernelTransaction::begin(

@@ -1167,30 +1167,32 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("attachments.json");
         let limited = NodeBlockProvider::new(
-            "10.42.0.0/30".parse().unwrap(),
+            "10.42.0.0/29".parse().unwrap(),
             "fd00:42::/120".parse().unwrap(),
         );
         let mut journal = AttachmentJournal::open(&path, limited).expect("open journal");
-        journal
-            .apply(request(TransactionOperation::Prepare {
-                attachment: spec("container-1"),
-            }))
-            .expect("first lease");
+        for index in 1..=4 {
+            journal
+                .apply(request(TransactionOperation::Prepare {
+                    attachment: spec(&format!("container-{index}")),
+                }))
+                .expect("available lease");
+        }
         assert!(matches!(
             journal.apply(request(TransactionOperation::Prepare {
-                attachment: spec("container-2")
+                attachment: spec("container-5")
             })),
             Err(JournalError::Ipam(IpamError::Exhausted {
                 family: unf_ipam::AddressFamily::Ipv4,
                 ..
             }))
         ));
-        assert_eq!(journal.len(), 1);
+        assert_eq!(journal.len(), 4);
         assert_eq!(
             AttachmentJournal::open(path, limited)
                 .expect("restart after exhaustion")
                 .len(),
-            1
+            4
         );
     }
 

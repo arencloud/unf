@@ -952,13 +952,19 @@ requires exact current receipt coverage to survive as a consuming capability
 through the final map boundary; `make encryption-path-activation-test`; ADR
 0196. Workload-Independent In-Fabric Proof Beacons reserve deterministic
 IPAM-excluded IPv4/IPv6 identities inside each full Pod CIDR and bind their
-installation/readback to provider schema v2; `make encryption-proof-beacon-test`;
+installation/readback to provider schema v3; `make encryption-proof-beacon-test`;
 ADR 0197. The Mark-Multiplexed Duplex Rendezvous now runs strict fixed-width
 nonce exchanges from those beacons, selects the isolated epoch route per send,
 captures before/after kernel evidence, preserves exact retry identity, and
 consumes the joined proof without adding `NET_RAW`; `make
 encryption-path-executor-test`; ADR 0198. A live two-agent executor and failure
-gate remains before milestone 9.6 is Verified.
+gate then found and eliminated IPv4 broadcast and reverse-path-filter ambiguity:
+the beacon is now a collision-fenced unicast reserve, legacy leases are retained
+but cannot alias proof, and the owned WireGuard interface carries exact
+reverse-path acceptance. Two production socket engines complete both families,
+deny on peer loss, recover only with a fresh round, advance counters, and expose
+only ciphertext on the underlay under `make encryption-path-live-test`; ADR
+0199. Milestone 9.6 is Verified.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

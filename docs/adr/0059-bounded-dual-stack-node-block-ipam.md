@@ -24,7 +24,11 @@ canonical IPv6 block. Blocks must have at least one workload address: IPv4
 accepts `/0` through `/30`, and IPv6 accepts `/0` through `/126`.
 
 For IPv4, the network address, first host gateway, and broadcast address are not
-allocatable. For IPv6, the subnet-router anycast/network address and first host
+allocatable. Phase 9 additionally reserves the penultimate unicast address for
+path proof: old journals may retain it, but new allocation never selects it and
+encryption projection refuses a collision. A `/30` consequently has zero new
+capacity while remaining readable for compatibility. For IPv6, the
+subnet-router anycast/network address and first host
 gateway are not allocatable. Allocation chooses the lowest unused workload
 address independently in each block and returns both as one `DualStackLease`.
 The provider does not mutate the usage snapshot, so exhaustion in either family

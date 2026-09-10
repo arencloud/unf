@@ -15,13 +15,13 @@ can collide with CNI link ownership.
 
 Phase 9.6d adds the **Workload-Independent In-Fabric Proof Beacon**:
 
-- each UNF IPv4 Node block already excludes network, gateway, and block-end
-  addresses; its block-end becomes the beacon and is installed as a `/32`;
+- each UNF IPv4 Node block reserves its penultimate address as an ordinary
+  unicast beacon, installs it as a `/32`, and stops new allocation before it;
 - each UNF IPv6 Node block already begins workload allocation at `network + 2`;
   its network address becomes the beacon and is installed as a `/128`;
-- the host prefixes create no connected pool route, remain unique because Node
-  Pod CIDRs cannot overlap, and can never be returned by UNF IPAM;
-- WireGuard provider schema v2 derives the addresses from the exact local Pod
+- the host prefixes create no connected pool route and remain unique because
+  Node Pod CIDRs cannot overlap;
+- WireGuard provider schema v3 derives the addresses from the exact local Pod
   CIDRs, includes both inputs and results in its plan digest, installs them on
   the epoch interface, and includes exact address readback in its stable kernel
   configuration digest;
@@ -35,6 +35,13 @@ The destination beacon is inside the same full Pod CIDR `AllowedIPs` and route
 that real managed traffic uses. It therefore proves the intended encrypted
 route without a per-workload tunnel, a userspace forwarding data path, a probe
 Pod, or additional routable address space.
+
+Pre-Phase-9 attachment journals remain readable: a formerly valid lease at the
+new IPv4 beacon is retained rather than revoked. Placement projection detects
+that collision and keeps encryption unpublished until normal workload
+replacement frees the address. This preserves upgrade availability without
+ever aliasing a workload and proof identity. `/30` remains parseable for
+journal compatibility but has zero new IPv4 lease capacity.
 
 ## Consequences
 
@@ -52,3 +59,7 @@ rejection, runs strict Clippy, exercises exact create/readback/replay/rollback/
 cleanup against the real Linux provider, and sends both workload-like and beacon
 IPv4/IPv6 traffic through full Pod CIDR `AllowedIPs` while underlay capture sees
 only WireGuard UDP ciphertext.
+
+ADR 0199 records the live-executor correction from IPv4 block-end to
+collision-fenced penultimate unicast identity and exact per-interface
+reverse-path acceptance.

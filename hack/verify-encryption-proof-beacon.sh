@@ -32,7 +32,7 @@ require_text 'read_proof_addresses(handle, plan, link.header.index).await?;' \
 require_text 'is_kernel_generated_proof_address_route' \
     crates/unf-encryption/src/kernel_provider/linux.rs \
     'exact readback must recognize only the beacon-generated kernel routes'
-require_text '10.250.1.255/32' \
+require_text '10.250.1.254/32' \
     hack/verify-encryption-ciphertext-live.sh \
     'the live ciphertext gate must exercise the IPv4 proof beacon'
 require_text 'fd00:250:1::/128' \

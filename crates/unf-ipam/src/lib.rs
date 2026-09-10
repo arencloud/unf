@@ -119,20 +119,21 @@ impl Ipv4NodeBlock {
         Ipv4Addr::from(u32::from(self.network) + 1)
     }
 
-    /// Returns the block's permanently non-leasable address for Node-local
-    /// encrypted path challenges. It is installed as a /32, so Linux treats
-    /// the traditional subnet broadcast value as a host address on the proof
-    /// interface while workload allocation can never select it.
+    /// Returns the block's reserved unicast address for Node-local encrypted
+    /// path challenges. New allocation never selects the penultimate address;
+    /// retained pre-encryption leases remain valid for upgrade safety and are
+    /// detected before encryption planning.
     #[must_use]
     pub fn proof_beacon(self) -> Ipv4Addr {
         let host_mask = !prefix_mask_v4(self.prefix_len);
-        Ipv4Addr::from(u32::from(self.network) | host_mask)
+        Ipv4Addr::from((u32::from(self.network) | host_mask) - 1)
     }
 
     #[must_use]
     pub fn bounded_capacity(self) -> usize {
         let addresses = 1_u64 << (32 - self.prefix_len);
-        usize::try_from((addresses - 3).min(MAX_NODE_LEASES as u64)).unwrap_or(MAX_NODE_LEASES)
+        usize::try_from(addresses.saturating_sub(4).min(MAX_NODE_LEASES as u64))
+            .unwrap_or(MAX_NODE_LEASES)
     }
 
     #[must_use]
@@ -639,16 +640,18 @@ mod tests {
 
     #[test]
     fn proof_beacons_are_deterministic_in_block_and_never_leasable() {
-        let ipv4: Ipv4NodeBlock = "10.42.0.0/30".parse().unwrap();
+        let ipv4: Ipv4NodeBlock = "10.42.0.0/29".parse().unwrap();
         let ipv6: Ipv6NodeBlock = "fd00:42::/126".parse().unwrap();
-        assert_eq!(ipv4.proof_beacon(), Ipv4Addr::new(10, 42, 0, 3));
+        assert_eq!(ipv4.proof_beacon(), Ipv4Addr::new(10, 42, 0, 6));
         assert_eq!(
             ipv6.proof_beacon(),
             "fd00:42::".parse::<Ipv6Addr>().unwrap()
         );
         assert!(ipv4.contains(ipv4.proof_beacon()));
         assert!(ipv6.contains(ipv6.proof_beacon()));
-        assert!(!ipv4.contains_workload(ipv4.proof_beacon()));
+        // Pre-Phase-9 journals may retain this once-valid address. Validation
+        // preserves it, while the allocation frontier below never emits it.
+        assert!(ipv4.contains_workload(ipv4.proof_beacon()));
         assert!(!ipv6.contains_workload(ipv6.proof_beacon()));
 
         let provider = NodeBlockProvider::new(ipv4, ipv6);
@@ -668,16 +671,18 @@ mod tests {
 
     #[test]
     fn either_family_exhaustion_fails_without_partial_usage_mutation() {
-        let ipv4_limited = provider("10.42.0.0/30", "fd00:42::/125");
+        let ipv4_limited = provider("10.42.0.0/29", "fd00:42::/122");
         let mut used = UsedAddresses::default();
-        let first = ipv4_limited.allocate(&used).expect("only IPv4 lease");
-        used.insert(first).expect("record lease");
+        for _ in 0..4 {
+            let lease = ipv4_limited.allocate(&used).expect("available IPv4 lease");
+            used.insert(lease).expect("record lease");
+        }
         let before = used.clone();
         assert_eq!(
             ipv4_limited.allocate(&used),
             Err(IpamError::Exhausted {
                 family: AddressFamily::Ipv4,
-                limit: 1
+                limit: 4
             })
         );
         assert_eq!(used, before);
@@ -755,7 +760,7 @@ mod tests {
                 .parse::<Ipv4NodeBlock>()
                 .unwrap()
                 .bounded_capacity(),
-            1
+            0
         );
         assert_eq!(
             "fd00::/126"

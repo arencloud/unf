@@ -91,12 +91,12 @@ use unf_encryption::{
     EncryptionEndpointPathProof, EncryptionGenerationFact, EncryptionGenerationPathProofPermit,
     EncryptionGenerationRequest, EncryptionKeyBootstrap, EncryptionPathActivationReceipt,
     EncryptionPathChallengeDelivery, EncryptionPathEndpointRole, EncryptionPathProbeExchange,
-    EncryptionPathProbeFrame, EncryptionPathProbeKind, EncryptionPathProbeTarget,
-    EncryptionPathProofAssignment, EncryptionPathProofRoundDigest,
-    EncryptionRoutePublicationPermit, FileNodeKeyStateStore, LinuxPreparedLocalGeneration,
-    LinuxWireGuardProvider, NodeKeyAttestationCut, NodeKeyAttestationRound, NodeKeyAuthority,
-    NodeLocalPlanRequest, NodeLocalRecoveryPlan, NodeSealedGenerationCapsule,
-    NodeSealedPlanCapsule, OsWireGuardKeyGenerator, WireGuardKernelPlan,
+    EncryptionPathProbeFrame, EncryptionPathProbeKind, EncryptionPathProofAssignment,
+    EncryptionPathProofRoundDigest, EncryptionRoutePublicationPermit, FileNodeKeyStateStore,
+    LinuxPreparedLocalGeneration, LinuxWireGuardProvider, NodeKeyAttestationCut,
+    NodeKeyAttestationRound, NodeKeyAuthority, NodeLocalPlanRequest, NodeLocalRecoveryPlan,
+    NodeSealedGenerationCapsule, NodeSealedPlanCapsule, OsWireGuardKeyGenerator,
+    WireGuardKernelPlan,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -8509,9 +8509,21 @@ struct PathProbeSocketKey {
 
 #[derive(Clone)]
 struct PathProbeWork {
-    assignment: EncryptionPathProofAssignment,
-    target: EncryptionPathProbeTarget,
+    round_digest: EncryptionPathProofRoundDigest,
+    family: u8,
+    peer_address: IpAddr,
     route_mark: u32,
+    expires_at_unix_ms: u64,
+    request: [u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES],
+    response: [u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES],
+}
+
+struct PathProbeWireExchange {
+    round_digest: EncryptionPathProofRoundDigest,
+    family: u8,
+    peer_address: IpAddr,
+    request: [u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES],
+    response: [u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES],
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8566,15 +8578,21 @@ async fn execute_live_encryption_path_proofs(
             .probe_targets(recipient)
             .context("derive exact contract proof beacons")?
         {
+            let request = EncryptionPathProbeFrame::request(&assignment.round, target.family)?;
+            let response = EncryptionPathProbeFrame::response(&assignment.round, request)?;
             groups
                 .entry(PathProbeSocketKey {
                     local_address: target.local_address,
                 })
                 .or_default()
                 .push(PathProbeWork {
-                    assignment: assignment.clone(),
-                    target,
+                    round_digest: assignment.round.round_digest,
+                    family: target.family,
+                    peer_address: target.peer_address,
                     route_mark,
+                    expires_at_unix_ms: assignment.round.expires_at_unix_ms,
+                    request: request.encode(),
+                    response: response.encode(),
                 });
         }
     }
@@ -8586,11 +8604,32 @@ async fn execute_live_encryption_path_proofs(
     let mut exchanges =
         BTreeMap::<EncryptionPathProofRoundDigest, Vec<EncryptionPathProbeExchange>>::new();
     while let Some(result) = tasks.join_next().await {
-        for (round, exchange) in result
+        for exchange in result
             .context("join encrypted path probe task")?
             .context("exchange encrypted path probe group")?
         {
-            exchanges.entry(round).or_default().push(exchange);
+            let assignment = assignments
+                .iter()
+                .find(|assignment| assignment.round.round_digest == exchange.round_digest)
+                .context("wire exchange has no authenticated assignment")?;
+            let target = assignment
+                .probe_targets(recipient)?
+                .into_iter()
+                .find(|target| {
+                    target.family == exchange.family && target.peer_address == exchange.peer_address
+                })
+                .context("wire exchange has no exact contract beacon")?;
+            let sealed = EncryptionPathProbeExchange::from_wire(
+                &assignment.round,
+                target.local_address,
+                target.peer_address,
+                &exchange.request,
+                &exchange.response,
+            )?;
+            exchanges
+                .entry(exchange.round_digest)
+                .or_default()
+                .push(sealed);
         }
     }
 
@@ -8665,7 +8704,7 @@ async fn execute_live_encryption_path_proofs(
 async fn exchange_encryption_path_probe_group(
     key: PathProbeSocketKey,
     work: Vec<PathProbeWork>,
-) -> Result<Vec<(EncryptionPathProofRoundDigest, EncryptionPathProbeExchange)>> {
+) -> Result<Vec<PathProbeWireExchange>> {
     let socket = path_probe_socket(&key)?;
     let mut pending = BTreeMap::<
         EncryptionPathProofRoundDigest,
@@ -8677,7 +8716,7 @@ async fn exchange_encryption_path_probe_group(
     let now_unix_ms = current_unix_time_milliseconds();
     let valid_for_ms = work
         .iter()
-        .map(|item| item.assignment.round.expires_at_unix_ms)
+        .map(|item| item.expires_at_unix_ms)
         .min()
         .context("path probe group is empty")?
         .saturating_sub(now_unix_ms)
@@ -8686,10 +8725,8 @@ async fn exchange_encryption_path_probe_group(
         bail!("path proof round expires before a bounded exchange can run");
     }
     for item in &work {
-        let request =
-            EncryptionPathProbeFrame::request(&item.assignment.round, item.target.family)?.encode();
         if pending
-            .insert(item.assignment.round.round_digest, (request, None))
+            .insert(item.round_digest, (item.request, None))
             .is_some()
         {
             bail!("path probe group contains a duplicate round");
@@ -8719,13 +8756,13 @@ async fn exchange_encryption_path_probe_group(
             _ = retry.tick() => {
                 for item in &work {
                     let (request, response) = pending
-                        .get(&item.assignment.round.round_digest)
+                        .get(&item.round_digest)
                         .context("path probe request disappeared")?;
                     if response.is_none() {
                         set_path_probe_mark(&socket, item.route_mark)?;
                         socket.send_to(
                             request,
-                            SocketAddr::new(item.target.peer_address, ENCRYPTION_PATH_PROBE_PORT),
+                            SocketAddr::new(item.peer_address, ENCRYPTION_PATH_PROBE_PORT),
                         ).await.context("send encrypted path probe request")?;
                     }
                 }
@@ -8734,27 +8771,25 @@ async fn exchange_encryption_path_probe_group(
                 let (length, peer) = received.context("receive encrypted path probe frame")?;
                 let frame = EncryptionPathProbeFrame::decode(&buffer[..length])?;
                 let Some(item) = work.iter().find(|item| {
-                    item.assignment.round.round_digest == frame.round_digest()
-                        && item.target.family == frame.family()
-                        && peer == SocketAddr::new(item.target.peer_address, ENCRYPTION_PATH_PROBE_PORT)
+                    item.round_digest == frame.round_digest()
+                        && item.family == frame.family()
+                        && peer == SocketAddr::new(item.peer_address, ENCRYPTION_PATH_PROBE_PORT)
                 }) else {
                     continue;
                 };
                 match frame.kind() {
                     EncryptionPathProbeKind::Request => {
-                        let response = EncryptionPathProbeFrame::response(
-                            &item.assignment.round,
-                            frame,
-                        )?.encode();
+                        if buffer[..length] != item.request {
+                            continue;
+                        }
                         set_path_probe_mark(&socket, item.route_mark)?;
-                        socket.send_to(&response, peer).await
+                        socket.send_to(&item.response, peer).await
                             .context("send encrypted path probe response")?;
                     }
                     EncryptionPathProbeKind::Response => {
-                        frame.verify_for(
-                            &item.assignment.round,
-                            EncryptionPathProbeKind::Response,
-                        )?;
+                        if buffer[..length] != item.response {
+                            continue;
+                        }
                         pending.get_mut(&frame.round_digest())
                             .context("path probe response has no pending request")?.1 =
                             Some(buffer[..length].try_into().expect("validated fixed probe frame"));
@@ -8769,18 +8804,15 @@ async fn exchange_encryption_path_probe_group(
     work.into_iter()
         .map(|item| {
             let (request, response) = pending
-                .remove(&item.assignment.round.round_digest)
+                .remove(&item.round_digest)
                 .context("completed path probe transcript disappeared")?;
-            Ok((
-                item.assignment.round.round_digest,
-                EncryptionPathProbeExchange::from_wire(
-                    &item.assignment.round,
-                    item.target.local_address,
-                    item.target.peer_address,
-                    &request,
-                    &response.context("path probe completed without a response")?,
-                )?,
-            ))
+            Ok(PathProbeWireExchange {
+                round_digest: item.round_digest,
+                family: item.family,
+                peer_address: item.peer_address,
+                request,
+                response: response.context("path probe completed without a response")?,
+            })
         })
         .collect()
 }
@@ -8797,16 +8829,18 @@ async fn respond_to_encryption_path_probe(
         return Ok(());
     }
     let Some(item) = work.iter().find(|item| {
-        item.assignment.round.round_digest == frame.round_digest()
-            && item.target.family == frame.family()
-            && peer == SocketAddr::new(item.target.peer_address, ENCRYPTION_PATH_PROBE_PORT)
+        item.round_digest == frame.round_digest()
+            && item.family == frame.family()
+            && peer == SocketAddr::new(item.peer_address, ENCRYPTION_PATH_PROBE_PORT)
     }) else {
         return Ok(());
     };
-    let response = EncryptionPathProbeFrame::response(&item.assignment.round, frame)?.encode();
+    if buffer[..length] != item.request {
+        return Ok(());
+    }
     set_path_probe_mark(socket, item.route_mark)?;
     socket
-        .send_to(&response, peer)
+        .send_to(&item.response, peer)
         .await
         .context("send encrypted path probe grace response")?;
     Ok(())
@@ -18067,6 +18101,106 @@ mod tests {
         );
         assert!(synchronizer.current.is_none());
         assert!(synchronizer.pending.is_none());
+    }
+
+    fn live_path_probe_frame(kind: u8, family: u8, seed: u8) -> [u8; 72] {
+        let mut frame = [0_u8; 72];
+        frame[0..4].copy_from_slice(b"UNFP");
+        frame[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        frame[6] = kind;
+        frame[7] = family;
+        frame[8..40].fill(seed);
+        frame[40..72].fill(seed.wrapping_add(1));
+        EncryptionPathProbeFrame::decode(&frame).expect("live fixture frame must be strict");
+        frame
+    }
+
+    fn live_path_probe_work(
+        family: u8,
+        peer_address: IpAddr,
+        route_mark: u32,
+        seed: u8,
+        expires_at_unix_ms: u64,
+    ) -> PathProbeWork {
+        PathProbeWork {
+            round_digest: EncryptionPathProofRoundDigest([seed; 32]),
+            family,
+            peer_address,
+            route_mark,
+            expires_at_unix_ms,
+            request: live_path_probe_frame(1, family, seed),
+            response: live_path_probe_frame(2, family, seed),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires two isolated network namespaces with CAP_NET_ADMIN and WireGuard"]
+    async fn privileged_dual_stack_path_probe_wire_engine_is_duplex_and_mark_routed() {
+        let role = std::env::var("UNF_PATH_PROBE_LIVE_ROLE").expect("missing live role");
+        let route_mark = u32::from_str_radix(
+            std::env::var("UNF_PATH_PROBE_LIVE_MARK")
+                .expect("missing live route mark")
+                .trim_start_matches("0x"),
+            16,
+        )
+        .expect("invalid live route mark");
+        let seed = std::env::var("UNF_PATH_PROBE_LIVE_ROUND")
+            .expect("missing live round")
+            .parse::<u8>()
+            .expect("invalid live round");
+        let (local_v4, peer_v4, local_v6, peer_v6) = match role.as_str() {
+            "a" => (
+                "10.250.1.254",
+                "10.250.2.254",
+                "fd00:250:1::",
+                "fd00:250:2::",
+            ),
+            "b" => (
+                "10.250.2.254",
+                "10.250.1.254",
+                "fd00:250:2::",
+                "fd00:250:1::",
+            ),
+            _ => panic!("unknown live role"),
+        };
+        let expires_at = current_unix_time_milliseconds() + 3_000;
+        let ipv4 = exchange_encryption_path_probe_group(
+            PathProbeSocketKey {
+                local_address: local_v4.parse().unwrap(),
+            },
+            vec![live_path_probe_work(
+                unf_encryption::PATH_FAMILY_IPV4,
+                peer_v4.parse().unwrap(),
+                route_mark,
+                seed,
+                expires_at,
+            )],
+        );
+        let ipv6 = exchange_encryption_path_probe_group(
+            PathProbeSocketKey {
+                local_address: local_v6.parse().unwrap(),
+            },
+            vec![live_path_probe_work(
+                unf_encryption::PATH_FAMILY_IPV6,
+                peer_v6.parse().unwrap(),
+                route_mark,
+                seed,
+                expires_at,
+            )],
+        );
+        let (ipv4, ipv6) = tokio::join!(ipv4, ipv6);
+        if std::env::var_os("UNF_PATH_PROBE_EXPECT_TIMEOUT").is_some() {
+            assert!(ipv4.is_err() && ipv6.is_err());
+            return;
+        }
+        let ipv4 = ipv4.expect("IPv4 live nonce rendezvous failed");
+        let ipv6 = ipv6.expect("IPv6 live nonce rendezvous failed");
+        assert_eq!(ipv4.len(), 1);
+        assert_eq!(ipv6.len(), 1);
+        assert_eq!(ipv4[0].response[6], 2);
+        assert_eq!(ipv6[0].response[6], 2);
+        assert_eq!(ipv4[0].round_digest.0, [seed; 32]);
+        assert_eq!(ipv6[0].round_digest.0, [seed; 32]);
     }
 
     #[test]

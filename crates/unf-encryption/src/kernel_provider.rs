@@ -17,8 +17,8 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxWireGuardProvider;
 
-pub const WIREGUARD_KERNEL_PROVIDER_SCHEMA_VERSION: u16 = 2;
-pub const WIREGUARD_KERNEL_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+pub const WIREGUARD_KERNEL_PROVIDER_SCHEMA_VERSION: u16 = 3;
+pub const WIREGUARD_KERNEL_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 pub const PROOF_CARRYING_KERNEL_TRANSACTION_SCHEMA_VERSION: u16 = 1;
 pub const MAX_WIREGUARD_PEERS: usize = 4_096;
 pub const MAX_WIREGUARD_ALLOWED_IPS: usize = 65_536;
@@ -31,9 +31,9 @@ pub const UNF_WIREGUARD_ROUTE_PROTOCOL: u8 = 0x55;
 pub const MAX_WIREGUARD_INTERFACE_NAME_BYTES: usize = 15;
 pub const MAX_WIREGUARD_OWNER_ALIAS_BYTES: usize = 255;
 
-const PLAN_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-plan.v2\0";
-const CONFIGURATION_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-configuration.v2\0";
-const OBSERVATION_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-observation.v2\0";
+const PLAN_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-plan.v3\0";
+const CONFIGURATION_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-configuration.v3\0";
+const OBSERVATION_DIGEST_DOMAIN: &[u8] = b"unf.wireguard-kernel-observation.v3\0";
 const TRANSACTION_DIGEST_DOMAIN: &[u8] = b"unf.proof-carrying-kernel-transaction.v1\0";
 const MAX_TEXT_BYTES: usize = 253;
 
@@ -47,6 +47,7 @@ pub enum WireGuardKernelCapability {
     LinkOwnershipAlias,
     InactiveEpochStaging,
     ExactProofBeaconAddresses,
+    ExactIpv4ReversePathAcceptance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1052,6 +1053,7 @@ fn required_capabilities() -> BTreeSet<WireGuardKernelCapability> {
         WireGuardKernelCapability::LinkOwnershipAlias,
         WireGuardKernelCapability::InactiveEpochStaging,
         WireGuardKernelCapability::ExactProofBeaconAddresses,
+        WireGuardKernelCapability::ExactIpv4ReversePathAcceptance,
     ])
 }
 
@@ -1265,7 +1267,7 @@ mod tests {
             plan.proof_addresses,
             vec![
                 IpPrefix {
-                    address: "10.244.1.255".parse().unwrap(),
+                    address: "10.244.1.254".parse().unwrap(),
                     prefix_len: 32,
                 },
                 IpPrefix {
@@ -1356,7 +1358,7 @@ mod tests {
         ));
 
         let mut observed = snapshot(&plan);
-        observed.proof_addresses[0].address = "10.244.1.254".parse().unwrap();
+        observed.proof_addresses[0].address = "10.244.1.253".parse().unwrap();
         observed.configuration_digest = observed.calculate_configuration_digest().unwrap();
         observed.observation_digest = observed.calculate_observation_digest().unwrap();
         assert!(matches!(
@@ -1381,7 +1383,7 @@ mod tests {
             .unwrap(),
             vec![
                 IpPrefix {
-                    address: "10.42.7.255".parse().unwrap(),
+                    address: "10.42.7.254".parse().unwrap(),
                     prefix_len: 32,
                 },
                 IpPrefix {
@@ -1457,7 +1459,7 @@ mod tests {
     fn capability_negotiation_selects_overlap_and_never_drops_requirements() {
         let local = WireGuardProviderCapabilities::current();
         let mut adjacent = local.clone();
-        adjacent.maximum_schema = 2;
+        adjacent.minimum_schema = 2;
         adjacent.maximum_peers = 2_048;
         let negotiated = local.negotiate(&adjacent).unwrap();
         assert_eq!(

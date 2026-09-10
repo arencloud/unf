@@ -840,7 +840,7 @@ matrix is maintained in the
 
 ## Phase 9 — attested encryption fabric
 
-**Gate: in progress; milestones 9.1–9.5 verified.** The ordered evidence
+**Gate: in progress; milestones 9.1–9.6 verified.** The ordered evidence
 matrix is maintained in the
 [Phase 9 encryption-fabric plan](development/phase9-attested-encryption-fabric-plan.md).
 
@@ -995,6 +995,16 @@ matrix is maintained in the
   and UDP ciphertext with no inner address on the underlay, denying after peer
   removal, and recovering after exact restoration; `make
   encryption-ciphertext-live-test` and ADR 0193.
+- Milestone 9.6 is verified. Causal Duplex Path Quorum binds an exact short-lived
+  controller nonce, both authenticated Node UIDs, contract/decision/epoch,
+  required families, kernel readback and positive peer-counter movement into a
+  two-ended receipt consumed only at map activation. Workload-independent
+  beacons need no Pod or new CIDR; the live gate corrected IPv4 to a
+  collision-fenced unicast reserve and provider schema v3 now owns exact
+  per-interface reverse-path acceptance. Two production socket engines complete
+  marked dual-stack WireGuard rounds, deny after peer removal, recover with a
+  distinct round, and expose ciphertext only under `make
+  encryption-path-live-test`; ADRs 0194–0199.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,
   peer endpoint, disjoint AllowedIPs, interface/route/fwmark/MTU facts,
