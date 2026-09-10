@@ -386,6 +386,7 @@ pub enum EncryptionKeyPhase {
     Prepared,
     MutuallyAttested,
     Active,
+    Draining,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

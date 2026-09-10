@@ -222,6 +222,47 @@ impl NodeLocalPlanSnapshot {
             .collect())
     }
 
+    fn epoch_plans_at(
+        &self,
+        now_unix_ms: u64,
+        now_monotonic_ns: u64,
+    ) -> Result<Vec<NodeLocalEpochPlan<'_>>, NodeLocalPlanCompilerError> {
+        self.verify()?;
+        self.epochs
+            .iter()
+            .map(|epoch| {
+                let drain_until_monotonic_ns = match epoch.state {
+                    FastPathEpochState::Active => 0,
+                    FastPathEpochState::Draining => {
+                        let remaining_ms = epoch
+                            .contract
+                            .valid_until_unix_ms
+                            .checked_sub(now_unix_ms)
+                            .filter(|remaining| *remaining > 0)
+                            .ok_or(NodeLocalPlanCompilerError::InvalidInput(
+                                "draining epoch deadline already expired",
+                            ))?;
+                        now_monotonic_ns
+                            .checked_add(remaining_ms.checked_mul(1_000_000).ok_or(
+                                NodeLocalPlanCompilerError::InvalidInput(
+                                    "draining epoch deadline overflows",
+                                ),
+                            )?)
+                            .ok_or(NodeLocalPlanCompilerError::InvalidInput(
+                                "draining epoch deadline overflows",
+                            ))?
+                    }
+                };
+                Ok(NodeLocalEpochPlan {
+                    contract: &epoch.contract,
+                    readiness_digest: epoch.readiness_digest,
+                    state: epoch.state,
+                    drain_until_monotonic_ns,
+                })
+            })
+            .collect()
+    }
+
     /// Reconstructs the pure fast-path decision input after snapshot replay.
     ///
     /// # Errors
@@ -297,7 +338,7 @@ impl NodeLocalPlanSnapshot {
         snapshots: &[WireGuardKernelSnapshot],
     ) -> Result<LinuxPreparedLocalGeneration, NodeLocalPlanCompilerError> {
         let context = self.compile_context(prior, now_unix_ms, now_monotonic_ns)?;
-        let epochs = self.epoch_plans()?;
+        let epochs = self.epoch_plans_at(now_unix_ms, now_monotonic_ns)?;
         let decisions = self.fast_path_decisions()?;
         LinuxPreparedLocalGeneration::compile_exact_readback(
             context, &epochs, &decisions, snapshots,
@@ -320,7 +361,7 @@ impl NodeLocalPlanSnapshot {
         key_authority: &NodeKeyAuthority,
     ) -> Result<LinuxPreparedLocalGeneration, NodeLocalPlanCompilerError> {
         let context = self.compile_context(prior, now_unix_ms, now_monotonic_ns)?;
-        let epochs = self.epoch_plans()?;
+        let epochs = self.epoch_plans_at(now_unix_ms, now_monotonic_ns)?;
         let decisions = self.fast_path_decisions()?;
         LinuxPreparedLocalGeneration::compile_and_stage_linux(
             context,
@@ -343,6 +384,10 @@ impl NodeLocalPlanSnapshot {
             || self.listen_port == 0
             || self.persistent_keepalive_seconds > 600
             || self.epochs.len() > 2
+            || self
+                .epochs
+                .iter()
+                .any(|epoch| epoch.drain_until_monotonic_ns != 0)
             || self.decisions.len() > MAX_FAST_PATH_DECISIONS
         {
             return Err(NodeLocalPlanCompilerError::InvalidInput(
@@ -498,7 +543,8 @@ fn validate_decision_coverage(
                     .ok_or(NodeLocalPlanCompilerError::InvalidInput(
                         "required decision references an unknown contract plan",
                     ))?;
-                if plan.source.identity != decision.source_identity
+                if snapshot.epochs[epoch_position].state != FastPathEpochState::Active
+                    || plan.source.identity != decision.source_identity
                     || plan.destination.identity != decision.destination_identity
                     || !covered.insert((epoch_position, plan_index))
                 {
@@ -517,6 +563,7 @@ fn validate_decision_coverage(
     let expected: usize = snapshot
         .epochs
         .iter()
+        .filter(|epoch| epoch.state == FastPathEpochState::Active)
         .map(|epoch| epoch.contract.plans.len())
         .sum();
     if covered.len() != expected {
@@ -853,7 +900,10 @@ mod tests {
         }
     }
 
-    fn contract() -> AttestedEncryptionPathContract {
+    fn contract_at(
+        epoch: u64,
+        contract_valid_until_unix_ms: u64,
+    ) -> AttestedEncryptionPathContract {
         let local = node("worker-a", "uid-a", 42, 1);
         let remote = node("worker-b", "uid-b", 43, 2);
         let sources = [IdentityId::new(11), IdentityId::new(12)];
@@ -898,13 +948,13 @@ mod tests {
         let path = |source: &EncryptionNode, destination: &EncryptionNode| EncryptionPathFact {
             source_node_uid: source.uid.clone(),
             destination_node_uid: destination.uid.clone(),
-            epoch: 7,
+            epoch,
             path_class: EncryptionPathClass::ManagedPod,
             peer_endpoint: SocketAddr::new(destination.underlay_addresses[0], 51_820),
             allowed_ips: destination.pod_cidrs.clone(),
-            interface_name: "unfwg000000007".to_owned(),
-            route_table: 20_007,
-            fwmark: 0x0055_0700,
+            interface_name: format!("unfwg{epoch:010}"),
+            route_table: 20_000 + u32::try_from(epoch).unwrap(),
+            fwmark: 0x0055_0000 | (u32::try_from(epoch).unwrap() << 8),
             mtu: 1_420,
         };
         let facts = EncryptionContractFacts {
@@ -915,13 +965,13 @@ mod tests {
                 routing: Revision::new(4),
                 key: Revision::new(5),
             },
-            active_epoch: 7,
+            active_epoch: epoch,
             endpoints,
             policies,
             keys: vec![
                 EncryptionKeyFact {
                     node_uid: local.uid.clone(),
-                    epoch: 7,
+                    epoch,
                     public_key: WireGuardPublicKey([1; 32]),
                     phase: EncryptionKeyPhase::Active,
                     valid_from_unix_ms: 900,
@@ -929,7 +979,7 @@ mod tests {
                 },
                 EncryptionKeyFact {
                     node_uid: remote.uid.clone(),
-                    epoch: 7,
+                    epoch,
                     public_key: WireGuardPublicKey([2; 32]),
                     phase: EncryptionKeyPhase::Active,
                     valid_from_unix_ms: 900,
@@ -938,8 +988,19 @@ mod tests {
             ],
             paths: vec![path(&local, &remote), path(&remote, &local)],
         };
-        AttestedEncryptionPathContract::issue(&model, &facts, local, Revision::new(8), 950, 2_500)
-            .unwrap()
+        AttestedEncryptionPathContract::issue(
+            &model,
+            &facts,
+            local,
+            Revision::new(8),
+            950,
+            contract_valid_until_unix_ms,
+        )
+        .unwrap()
+    }
+
+    fn contract() -> AttestedEncryptionPathContract {
+        contract_at(7, 2_500)
     }
 
     fn context() -> NodeLocalPlanCompileContext {
@@ -1100,6 +1161,69 @@ mod tests {
             plan_index: Some(0),
         });
         assert!(fabricated.verify().is_err());
+    }
+
+    #[test]
+    fn draining_deadline_is_translated_once_from_wall_to_node_monotonic_time() {
+        let active = contract_at(8, 2_500);
+        let draining = contract_at(7, 1_500);
+        let decisions = active
+            .plans
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| NodeLocalDecisionPlan {
+                source_identity: plan.source.identity,
+                destination_identity: plan.destination.identity,
+                disposition: EncryptionDisposition::Required,
+                contract_epoch: Some(8),
+                plan_index: Some(index),
+            })
+            .collect();
+        let snapshot = NodeLocalPlanSnapshot::issue(NodeLocalPlanSnapshotFields {
+            membership_revision: Revision::new(6),
+            generation: Revision::new(21),
+            recipient: EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-a".to_owned(),
+            },
+            mode: NodeLocalPlanMode::Active,
+            policy_revision: Revision::new(3),
+            service_revision: Revision::new(30),
+            egress_revision: Revision::new(40),
+            listen_port: 51_820,
+            persistent_keepalive_seconds: 25,
+            epochs: vec![
+                NodeLocalEpochPlanRecord {
+                    contract: active,
+                    readiness_digest: [8; 32],
+                    state: FastPathEpochState::Active,
+                    drain_until_monotonic_ns: 0,
+                },
+                NodeLocalEpochPlanRecord {
+                    contract: draining,
+                    readiness_digest: [7; 32],
+                    state: FastPathEpochState::Draining,
+                    drain_until_monotonic_ns: 0,
+                },
+            ],
+            decisions,
+        })
+        .unwrap();
+        let epochs = snapshot.epoch_plans_at(1_000, 10_000).unwrap();
+        let active = epochs
+            .iter()
+            .find(|epoch| epoch.state == FastPathEpochState::Active)
+            .unwrap();
+        let draining = epochs
+            .iter()
+            .find(|epoch| epoch.state == FastPathEpochState::Draining)
+            .unwrap();
+        assert_eq!(active.drain_until_monotonic_ns, 0);
+        assert_eq!(draining.drain_until_monotonic_ns, 500_010_000);
+
+        let mut forged = snapshot;
+        forged.epochs[0].drain_until_monotonic_ns = 1;
+        assert!(forged.verify().is_err());
     }
 
     #[test]

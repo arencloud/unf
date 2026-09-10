@@ -8,12 +8,13 @@ use rtnetlink::packet_route::route::{
 };
 use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute, RuleMessage};
 use rtnetlink::{Handle, IpVersion, RouteMessageBuilder};
+use unf_ebpf_common::{ENCRYPTION_ROUTE_MARK_MASK, encryption_route_mark};
 
 use super::{
     EncryptionPolicyRouteRule, EncryptionRouteAuthority, EncryptionRouteAuthorityError,
-    EncryptionRouteFamily, EncryptionRoutePublicationPermit, EncryptionRouteWitness,
+    EncryptionRouteFamily, EncryptionRoutePublicationPermit, EncryptionRouteWitness, rule_priority,
 };
-use crate::{IpPrefix, UNF_WIREGUARD_ROUTE_PROTOCOL, WireGuardRouteScope};
+use crate::{IpPrefix, UNF_WIREGUARD_ROUTE_PROTOCOL, WireGuardKernelPlan, WireGuardRouteScope};
 
 const MAX_KERNEL_RULE_READBACK: usize = 262_144;
 const MAX_KERNEL_ROUTE_READBACK: usize = 262_144;
@@ -84,6 +85,59 @@ impl LinuxEncryptionRouteProvider {
         let remaining = list_rules(&handle).await?;
         if authority
             .rules
+            .iter()
+            .any(|rule| find_exact_rule(&remaining, rule).is_some())
+        {
+            return Err(EncryptionRouteAuthorityError::RuleReadbackMismatch);
+        }
+        Ok(())
+    }
+
+    /// Removes the exact policy rules owned by one retiring `WireGuard` plan.
+    /// This deliberately derives the ownership key from the digest-verified
+    /// plan, so restart recovery never needs a broad priority/table sweep.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a malformed plan or any priority/selector collision that is
+    /// not byte-exact UNF state. Success includes positive rule absence.
+    pub async fn deactivate_plan(
+        &self,
+        plan: &WireGuardKernelPlan,
+    ) -> Result<(), EncryptionRouteAuthorityError> {
+        plan.verify()
+            .map_err(EncryptionRouteAuthorityError::InvalidKernelSnapshot)?;
+        let route_mark =
+            encryption_route_mark(plan.fwmark).ok_or(EncryptionRouteAuthorityError::InvalidRule)?;
+        let priority = rule_priority(route_mark)?;
+        let rules = plan
+            .route_prefixes()
+            .into_iter()
+            .map(|prefix| EncryptionPolicyRouteRule {
+                family: EncryptionRouteFamily::for_address(prefix.address),
+                priority,
+                route_mark,
+                route_mark_mask: ENCRYPTION_ROUTE_MARK_MASK,
+                route_table: plan.route_table,
+                outer_fwmark: plan.fwmark,
+            })
+            .collect::<BTreeSet<_>>();
+        let handle = connect_route("open retiring encryption policy-route connection")?;
+        let observed = list_rules(&handle).await?;
+        let rules = rules.into_iter().collect::<Vec<_>>();
+        preflight_rules(&observed, &rules)?;
+        for rule in rules.iter().rev() {
+            if let Some(message) = find_exact_rule(&observed, rule) {
+                handle
+                    .rule()
+                    .del(message.clone())
+                    .execute()
+                    .await
+                    .map_err(|error| kernel("delete retiring encryption policy rule", &error))?;
+            }
+        }
+        let remaining = list_rules(&handle).await?;
+        if rules
             .iter()
             .any(|rule| find_exact_rule(&remaining, rule).is_some())
         {

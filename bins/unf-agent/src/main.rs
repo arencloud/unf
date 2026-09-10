@@ -93,10 +93,11 @@ use unf_encryption::{
     EncryptionPathActivationReceipt, EncryptionPathChallengeDelivery, EncryptionPathEndpointRole,
     EncryptionPathProbeExchange, EncryptionPathProbeFrame, EncryptionPathProbeKind,
     EncryptionPathProofAssignment, EncryptionPathProofRoundDigest,
-    EncryptionRoutePublicationPermit, FileNodeKeyStateStore, LinuxPreparedLocalGeneration,
-    LinuxWireGuardProvider, NodeKeyAttestationCut, NodeKeyAttestationRound, NodeKeyAuthority,
-    NodeLocalPlanRequest, NodeLocalRecoveryPlan, NodeSealedGenerationCapsule,
-    NodeSealedPlanCapsule, OsWireGuardKeyGenerator, WireGuardKernelPlan,
+    EncryptionRoutePublicationPermit, EpochDrainProof, FileNodeKeyStateStore,
+    LinuxEncryptionRouteProvider, LinuxPreparedLocalGeneration, LinuxWireGuardProvider,
+    NodeKeyAttestationCut, NodeKeyAttestationRound, NodeKeyAuthority, NodeLocalPlanRequest,
+    NodeLocalRecoveryPlan, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
+    OsWireGuardKeyGenerator, WireGuardKernelPlan,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -1129,6 +1130,8 @@ struct EncryptionRecoveryJournal {
     schema_version: u16,
     active: Option<NodeLocalRecoveryPlan>,
     pending: Option<NodeLocalRecoveryPlan>,
+    #[serde(default)]
+    retiring: Vec<WireGuardKernelPlan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1181,6 +1184,7 @@ impl EncryptionRecoveryJournal {
             schema_version: ENCRYPTION_RECOVERY_JOURNAL_SCHEMA_VERSION,
             active: None,
             pending: None,
+            retiring: Vec::new(),
         }
     }
 
@@ -1200,6 +1204,40 @@ impl EncryptionRecoveryJournal {
                     plan.fact.recipient.node_name,
                     node_name
                 );
+            }
+        }
+        if self.retiring.len() > 1 {
+            bail!("encryption recovery journal has an unbounded retirement set");
+        }
+        let mut live_plan_keys = self
+            .active
+            .iter()
+            .chain(self.pending.iter())
+            .flat_map(|recovery| recovery.plans.iter())
+            .map(|plan| {
+                (
+                    plan.epoch,
+                    plan.interface_name.clone(),
+                    plan.owner_alias.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        for plan in &self.retiring {
+            plan.verify().context("verify retiring encryption plan")?;
+            if plan.local_node_uid
+                != self
+                    .active
+                    .as_ref()
+                    .or(self.pending.as_ref())
+                    .map(|recovery| recovery.fact.recipient.node_uid.as_str())
+                    .unwrap_or_default()
+                || !live_plan_keys.insert((
+                    plan.epoch,
+                    plan.interface_name.clone(),
+                    plan.owner_alias.clone(),
+                ))
+            {
+                bail!("retiring encryption plan is foreign or overlaps live authority");
             }
         }
         match (&self.active, &self.pending) {
@@ -8742,7 +8780,39 @@ impl EncryptionGenerationSynchronizer {
             EncryptionRecoverySlot::Active => self.active_revalidated = true,
             EncryptionRecoverySlot::Pending => {
                 let mut recovery = self.recovery.clone();
-                recovery.active = recovery.pending.take();
+                let successor = recovery
+                    .pending
+                    .take()
+                    .context("pending recovery plan disappeared during activation")?;
+                let successor_keys = successor
+                    .plans
+                    .iter()
+                    .map(|plan| {
+                        (
+                            plan.epoch,
+                            plan.interface_name.as_str(),
+                            plan.owner_alias.as_str(),
+                        )
+                    })
+                    .collect::<BTreeSet<_>>();
+                let removed = recovery
+                    .active
+                    .iter()
+                    .flat_map(|active| active.plans.iter())
+                    .filter(|plan| {
+                        !successor_keys.contains(&(
+                            plan.epoch,
+                            plan.interface_name.as_str(),
+                            plan.owner_alias.as_str(),
+                        ))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !recovery.retiring.is_empty() && recovery.retiring != removed {
+                    bail!("unretired encryption authority cannot be replaced");
+                }
+                recovery.retiring = removed;
+                recovery.active = Some(successor);
                 recovery.verify(&self.node_name, self.current.as_ref())?;
                 persist_secure_json(
                     &self.recovery_plan_path,
@@ -8880,6 +8950,84 @@ async fn prepare_admitted_encryption_plan(
         .await
         .context("compile authenticated plan against exact Node-local keys and Linux readback")?;
     generations.offer_prepared(prepared)
+}
+
+async fn retire_drained_encryption_epoch(
+    generations: &mut EncryptionGenerationSynchronizer,
+    keys: &mut EncryptionKeySynchronizer,
+    encryption: &mut EncryptionMapSynchronizer,
+) -> Result<bool> {
+    if generations.recovery.retiring.is_empty() {
+        return Ok(false);
+    }
+    if generations.pending.is_some()
+        || generations.pending_activation_report.is_some()
+        || !generations.active_revalidated
+    {
+        return Ok(false);
+    }
+    let [plan] = generations.recovery.retiring.as_slice() else {
+        bail!("encryption retirement journal is not singleton-bounded");
+    };
+    let plan = plan.clone();
+    let observation_revision = generations
+        .current
+        .as_ref()
+        .map(|current| current.published().generation)
+        .context("retiring encryption epoch has no active admitted generation")?;
+
+    let removed_flows = encryption
+        .purge_epoch_connections(plan.epoch)
+        .context("purge expired established-flow leases for retiring epoch")?;
+    LinuxEncryptionRouteProvider
+        .deactivate_plan(&plan)
+        .await
+        .context("remove exact retiring encryption policy rules")?;
+    LinuxWireGuardProvider
+        .delete(&plan)
+        .await
+        .context("remove exact retiring WireGuard transport")?;
+
+    let authority = keys
+        .authority
+        .as_mut()
+        .context("retiring encryption epoch has no Node-local key authority")?;
+    let publication = authority
+        .authority()
+        .publication()
+        .context("verify key authority before drained-epoch retirement")?;
+    if publication.retired_through_epoch < plan.epoch {
+        let now_unix_ms = current_unix_time_milliseconds();
+        let proof = EpochDrainProof::issue(
+            publication.node_uid,
+            plan.epoch,
+            observation_revision,
+            now_unix_ms,
+            0,
+            0,
+        )
+        .context("issue exact zero-state encryption drain proof")?;
+        authority
+            .retire_drained_epoch(&proof, now_unix_ms)
+            .context("durably retire drained Node-local key epoch")?;
+    }
+
+    let mut recovery = generations.recovery.clone();
+    recovery.retiring.clear();
+    recovery.verify(&generations.node_name, generations.current.as_ref())?;
+    persist_secure_json(
+        &generations.recovery_plan_path,
+        &recovery,
+        "encryption recovery plan",
+    )?;
+    generations.recovery = recovery;
+    info!(
+        epoch = plan.epoch,
+        removed_expired_flow_leases = removed_flows,
+        interface = %plan.interface_name,
+        "retired drained encryption epoch after exact map, rule, route, link, and key absence"
+    );
+    Ok(true)
 }
 
 fn encryption_recovery_plan_path(state_path: &Path) -> Result<PathBuf> {
@@ -15093,6 +15241,15 @@ async fn consume_events(
                     ).await
                 {
                     warn!(%error, "encryption activation evidence remains queued for retry");
+                }
+                if encryption_generations.pending_activation_report.is_none()
+                    && let Err(error) = retire_drained_encryption_epoch(
+                        encryption_generations,
+                        encryption_keys,
+                        encryption,
+                    ).await
+                {
+                    warn!(%error, "drained encryption epoch retirement remains journaled for exact retry");
                 }
             }
             _ = egress_loss_interval.tick() => {

@@ -148,6 +148,57 @@ impl EncryptionMapSynchronizer {
         self.requires_local_revalidation
     }
 
+    /// Physically removes expired established-flow leases for one retired key
+    /// epoch and proves no matching connection entry remains. The active map
+    /// generation must already have removed the epoch's transport authority.
+    pub(super) fn purge_epoch_connections(&mut self, epoch: u64) -> Result<u64> {
+        if epoch == 0 {
+            bail!("cannot purge the zero encryption epoch");
+        }
+        if self.pending.is_some() || self.requires_local_revalidation {
+            bail!("cannot retire encryption connections across an unsettled map boundary");
+        }
+        let active = self
+            .active
+            .as_ref()
+            .context("cannot retire encryption connections without an active checkpoint")?;
+        let state = active.desired_state()?;
+        if state
+            .transports
+            .iter()
+            .any(|(_, transport)| transport.key_epoch == epoch)
+        {
+            bail!("active encryption transport still references the retiring epoch");
+        }
+        let keys = self
+            .maps
+            .connections
+            .iter()
+            .map(|entry| {
+                let (key, value) = entry.context("scan retiring encryption connections")?;
+                validate_connection_entry(&key, &value)?;
+                Ok((
+                    key,
+                    u64::from_ne_bytes(value[16..24].try_into().expect("fixed key epoch")),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut removed = 0_u64;
+        for (key, key_epoch) in keys {
+            if key_epoch == epoch {
+                self.maps.connections.remove(&key)?;
+                removed = removed.saturating_add(1);
+            }
+        }
+        for entry in &self.maps.connections {
+            let (_, value) = entry.context("prove retired encryption connection absence")?;
+            if u64::from_ne_bytes(value[16..24].try_into().expect("fixed key epoch")) == epoch {
+                bail!("retired encryption connection survived exact purge");
+            }
+        }
+        Ok(removed)
+    }
+
     /// Completes the real Linux route-before-Aya transition from one exact
     /// kernel-converged Node capability. Controller substitution and route
     /// drift fail before this adapter can mutate the inactive map bank.

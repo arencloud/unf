@@ -306,6 +306,97 @@ for node in "${nodes[@]}"; do
             rmdir "$key_dir"
         }
 
+        cleanup_encryption_kernel_state() {
+            recovery=${state_dir}/encryption-generation.json.recovery-plan
+            [ -e "$recovery" ] || return 0
+            test -f "$recovery" && test ! -L "$recovery"
+            test "$(stat -c %a "$recovery")" = 600
+            test "$(stat -c %s "$recovery")" -le 67108864
+            jq -e --arg node_uid "$UNF_ROLLBACK_NODE_UID" \
+                '\''.schemaVersion == 1
+	                and ([.active, .pending] | map(select(. != null)) | length) <= 2
+	                and ((.retiring // []) | length) <= 1
+                and all([.active, .pending][] | select(. != null);
+                    .schemaVersion == 1
+                    and .fact.recipient.nodeUid == $node_uid
+                    and all(.plans[];
+                        .schemaVersion == 3
+                        and .localNodeUid == $node_uid
+                        and .epoch > 0 and .routeTable > 0 and .fwmark > 0
+                        and (.interfaceName | test("^unfwg[0-9a-z]{10}$"))
+	                        and .ownerAlias == ("unf:encryption:v2:" + .clusterId + ":" + $node_uid + ":" + (.epoch | tostring))))
+	                and all((.retiring // [])[];
+	                    .schemaVersion == 3
+	                    and .localNodeUid == $node_uid
+	                    and .epoch > 0 and .routeTable > 0 and .fwmark > 0
+	                    and (.interfaceName | test("^unfwg[0-9a-z]{10}$"))
+	                    and .ownerAlias == ("unf:encryption:v2:" + .clusterId + ":" + $node_uid + ":" + (.epoch | tostring)))'\'' \
+                "$recovery" >/dev/null
+
+	            plans=$(jq -r '\''(([.active, .pending][] | select(. != null) | .plans[]) // empty),
+	                ((.retiring // [])[])
+                | [.interfaceName, .ownerAlias, (.routeTable | tostring), (.fwmark | tostring),
+                   ([.peers[].allowedIps[] | (.address + "/" + (.prefixLen | tostring))] | join(","))]
+                | @tsv'\'' "$recovery" | sort -u)
+            old_ifs=$IFS
+            IFS="
+"
+            for plan in $plans; do
+                IFS="	" read -r interface owner_alias route_table fwmark allowed <<EOF
+$plan
+EOF
+                link=$(ip -j -d link show dev "$interface" 2>/dev/null || printf "[]")
+                if [ "$(printf "%s" "$link" | jq length)" -eq 0 ]; then
+                    test "$(ip -j -4 route show table "$route_table" | jq length)" -eq 0
+                    test "$(ip -j -6 route show table "$route_table" | jq length)" -eq 0
+                    continue
+                fi
+                printf "%s" "$link" | jq -e --arg interface "$interface" --arg alias "$owner_alias" \
+                    '\''length == 1 and .[0].ifname == $interface and .[0].ifalias == $alias
+                    and .[0].linkinfo.info_kind == "wireguard" and (.[0] | has("master") | not)'\'' \
+                    >/dev/null
+                routes4=$(ip -j -4 route show table "$route_table")
+                routes6=$(ip -j -6 route show table "$route_table")
+                printf "%s\n%s" "$routes4" "$routes6" | jq -s -e \
+                    --arg interface "$interface" --arg allowed ",$allowed," \
+                    '\''flatten | all(.[];
+                        .dev == $interface and (.protocol | tostring) == "85"
+                        and (.dst as $dst | $allowed | contains("," + $dst + ",")))'\'' >/dev/null
+
+                route_mark=$(( (~fwmark) & 0x00ffff00 ))
+                priority=$(( 0x554e0000 + ((route_mark & 0x00ffff00) >> 8) ))
+                route_mark_hex=$(printf '0x%x' "$route_mark")
+                route_mask=$(( 0x00ffff00 ))
+                route_mask_hex=$(printf '0x%x' "$route_mask")
+                for family in -4 -6; do
+                    rules=$(ip -j "$family" rule show | jq --argjson table "$route_table" \
+                        --argjson priority "$priority" \
+                        '\''[.[] | select((.table | tostring) == ($table | tostring)
+                            or .priority == $priority)]'\'')
+                    if [ "$(printf "%s" "$rules" | jq length)" -gt 0 ]; then
+                        printf "%s" "$rules" | jq -e \
+                            --argjson table "$route_table" --argjson priority "$priority" \
+                            --arg route_mark "$route_mark" --arg route_mark_hex "$route_mark_hex" \
+                            --arg route_mask "$route_mask" --arg route_mask_hex "$route_mask_hex" \
+                            '\''length == 1
+                            and .[0].priority == $priority
+                            and (.[0].table | tostring) == ($table | tostring)
+                            and ((.[0].fwmark | tostring) as $mark
+                                | $mark == $route_mark or $mark == $route_mark_hex)
+                            and ((.[0].fwmask | tostring) as $mask
+                                | $mask == $route_mask or $mask == $route_mask_hex)
+                            and (.[0].protocol | tostring) == "85"'\'' >/dev/null
+                        ip "$family" rule del priority "$priority" table "$route_table"
+                    fi
+                done
+                ip link delete dev "$interface"
+                test ! -e "/sys/class/net/${interface}"
+                test "$(ip -j -4 route show table "$route_table" | jq length)" -eq 0
+                test "$(ip -j -6 route show table "$route_table" | jq length)" -eq 0
+            done
+            IFS=$old_ifs
+        }
+
         # A previous rollback attempt may already have removed the complete
         # owned transaction on this Node before another Node failed. Resume only
         # from an exact empty owned boundary; any partial combination remains
@@ -319,6 +410,7 @@ for node in "${nodes[@]}"; do
                 rm -f "$load_balancers"
             fi
             cleanup_pending_deletes
+            cleanup_encryption_kernel_state
             cleanup_encryption_state
             if [ -d "$state_dir" ]; then
                 test -z "$(find "$state_dir" -mindepth 1 -print -quit)"
@@ -372,6 +464,7 @@ EOF
         test "$(sha256sum "$binary" | cut -d " " -f 1)" = "$binary_sha"
         test "$(sha256sum "$config" | cut -d " " -f 1)" = "$config_sha"
         cleanup_gateway_interface
+        cleanup_encryption_kernel_state
         test "$(ip -j -d link | jq '\''[.[] | select(.ifname | startswith("unf"))] | length'\'')" -eq 0
 
         test -f "$services" && test ! -L "$services"

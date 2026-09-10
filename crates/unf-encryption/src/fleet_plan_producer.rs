@@ -40,7 +40,15 @@ pub struct FleetPlanProductionInput {
     pub endpoints: Vec<EncryptionEndpointFact>,
     pub policies: Vec<EncryptionPolicyFact>,
     pub paths: Vec<EncryptionPathFact>,
+    pub draining: Option<FleetDrainingEpochInput>,
     pub key_cut: NodeKeyTransparencyCut,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetDrainingEpochInput {
+    pub epoch: u64,
+    pub valid_until_unix_ms: u64,
+    pub paths: Vec<EncryptionPathFact>,
 }
 
 /// Produces one atomic all-member plan cut from a single causal input.
@@ -93,6 +101,38 @@ pub fn produce_fleet_plan_cut(
         keys,
         paths: input.paths.clone(),
     };
+    let draining = input
+        .draining
+        .as_ref()
+        .map(|draining| {
+            if draining.epoch >= active_epoch
+                || draining.valid_until_unix_ms <= input.valid_from_unix_ms
+                || draining.valid_until_unix_ms > input.valid_until_unix_ms
+            {
+                return Err(FleetPlanProductionError::UnreadyOrAmbiguousKey);
+            }
+            let (draining_keys, draining_readiness) = derive_epoch_key_facts(
+                &input,
+                draining.epoch,
+                input.valid_from_unix_ms,
+                draining.valid_until_unix_ms,
+                KeyEpochPhase::Draining,
+                EncryptionKeyPhase::Draining,
+            )?;
+            Ok((
+                EncryptionContractFacts {
+                    revisions: facts.revisions,
+                    active_epoch: draining.epoch,
+                    endpoints: input.endpoints.clone(),
+                    policies: input.policies.clone(),
+                    keys: draining_keys,
+                    paths: draining.paths.clone(),
+                },
+                draining_readiness,
+                draining.valid_until_unix_ms,
+            ))
+        })
+        .transpose()?;
 
     let plans = input
         .nodes
@@ -100,11 +140,63 @@ pub fn produce_fleet_plan_cut(
         .cloned()
         .zip(&members)
         .map(|(node, recipient)| {
-            produce_node_plan(&input, &facts, node, recipient, active_epoch, &readiness)
+            produce_node_plan(
+                &input,
+                &facts,
+                draining.as_ref(),
+                node,
+                recipient,
+                active_epoch,
+                &readiness,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     NodeLocalPlanFleetCut::issue(input.membership_revision, input.generation, members, plans)
         .map_err(FleetPlanProductionError::InvalidFleetCut)
+}
+
+fn derive_epoch_key_facts(
+    input: &FleetPlanProductionInput,
+    epoch_number: u64,
+    valid_from_unix_ms: u64,
+    valid_until_unix_ms: u64,
+    required_phase: KeyEpochPhase,
+    contract_phase: EncryptionKeyPhase,
+) -> Result<(Vec<EncryptionKeyFact>, ReadinessByNode), FleetPlanProductionError> {
+    let mut keys = Vec::with_capacity(input.key_cut.publications.len());
+    let mut readiness = BTreeMap::new();
+    for publication in &input.key_cut.publications {
+        let candidates = publication
+            .epochs
+            .iter()
+            .filter(|epoch| {
+                epoch.epoch == epoch_number
+                    && epoch.phase == required_phase
+                    && epoch.readiness_digest.is_some()
+                    && epoch.valid_from_unix_ms <= valid_from_unix_ms
+                    && epoch.valid_until_unix_ms >= valid_until_unix_ms
+            })
+            .collect::<Vec<_>>();
+        let [epoch] = candidates.as_slice() else {
+            return Err(FleetPlanProductionError::UnreadyOrAmbiguousKey);
+        };
+        keys.push(EncryptionKeyFact {
+            node_uid: publication.node_uid.clone(),
+            epoch: epoch.epoch,
+            public_key: epoch.public_key,
+            phase: contract_phase,
+            valid_from_unix_ms: epoch.valid_from_unix_ms,
+            valid_until_unix_ms: epoch.valid_until_unix_ms,
+        });
+        readiness.insert(
+            publication.node_uid.clone(),
+            epoch
+                .readiness_digest
+                .ok_or(FleetPlanProductionError::UnreadyOrAmbiguousKey)?
+                .0,
+        );
+    }
+    Ok((keys, readiness))
 }
 
 type ReadinessByNode = BTreeMap<String, [u8; 32]>;
@@ -173,6 +265,7 @@ fn derive_ready_key_facts(
 fn produce_node_plan(
     input: &FleetPlanProductionInput,
     facts: &EncryptionContractFacts,
+    draining: Option<&(EncryptionContractFacts, ReadinessByNode, u64)>,
     node: crate::EncryptionNode,
     recipient: &EncryptionGenerationRecipient,
     active_epoch: u64,
@@ -181,7 +274,7 @@ fn produce_node_plan(
     let contract = AttestedEncryptionPathContract::issue(
         &input.model,
         facts,
-        node,
+        node.clone(),
         input.contract_revision,
         input.valid_from_unix_ms,
         input.valid_until_unix_ms,
@@ -206,14 +299,35 @@ fn produce_node_plan(
     let epochs = if mode == NodeLocalPlanMode::Dormant {
         Vec::new()
     } else {
-        vec![NodeLocalEpochPlanRecord {
+        let mut epochs = vec![NodeLocalEpochPlanRecord {
             contract,
             readiness_digest: *readiness
                 .get(&recipient.node_uid)
                 .ok_or(FleetPlanProductionError::InvalidMembership)?,
             state: FastPathEpochState::Active,
             drain_until_monotonic_ns: 0,
-        }]
+        }];
+        if let Some((draining_facts, draining_readiness, valid_until_unix_ms)) = draining {
+            let draining_contract = AttestedEncryptionPathContract::issue(
+                &input.model,
+                draining_facts,
+                node,
+                input.contract_revision,
+                input.valid_from_unix_ms,
+                *valid_until_unix_ms,
+            )?;
+            if !draining_contract.plans.is_empty() {
+                epochs.push(NodeLocalEpochPlanRecord {
+                    contract: draining_contract,
+                    readiness_digest: *draining_readiness
+                        .get(&recipient.node_uid)
+                        .ok_or(FleetPlanProductionError::InvalidMembership)?,
+                    state: FastPathEpochState::Draining,
+                    drain_until_monotonic_ns: 0,
+                });
+            }
+        }
+        epochs
     };
     NodeLocalPlanSnapshot::issue(NodeLocalPlanSnapshotFields {
         membership_revision: input.membership_revision,
@@ -283,19 +397,27 @@ mod tests {
         }
     }
 
-    fn path(source: &EncryptionNode, destination: &EncryptionNode) -> EncryptionPathFact {
+    fn path_at(
+        source: &EncryptionNode,
+        destination: &EncryptionNode,
+        epoch: u64,
+    ) -> EncryptionPathFact {
         EncryptionPathFact {
             source_node_uid: source.uid.clone(),
             destination_node_uid: destination.uid.clone(),
-            epoch: 1,
+            epoch,
             path_class: EncryptionPathClass::ManagedPod,
             peer_endpoint: SocketAddr::new(destination.underlay_addresses[0], 51_820),
             allowed_ips: destination.pod_cidrs.clone(),
-            interface_name: "unfwg000000001".to_owned(),
-            route_table: 20_001,
-            fwmark: 0x0055_0100,
+            interface_name: format!("unfwg{epoch:010}"),
+            route_table: 20_000 + u32::try_from(epoch).unwrap(),
+            fwmark: 0x0055_0000 | (u32::try_from(epoch).unwrap() << 8),
             mtu: 1_420,
         }
+    }
+
+    fn path(source: &EncryptionNode, destination: &EncryptionNode) -> EncryptionPathFact {
+        path_at(source, destination, 1)
     }
 
     fn ready_key_cut(nodes: &[EncryptionNode], attest_all: bool) -> NodeKeyTransparencyCut {
@@ -346,6 +468,99 @@ mod tests {
                         .unwrap();
                 }
             }
+            ledger
+                .observe(
+                    &AuthenticatedNodeIdentity {
+                        cluster_id: "cluster-a".to_owned(),
+                        node_name: node.name.clone(),
+                        node_uid: node.uid.clone(),
+                    },
+                    authority.publication().unwrap(),
+                )
+                .unwrap();
+        }
+        ledger.complete_cut().unwrap().unwrap()
+    }
+
+    fn rotating_key_cut(nodes: &[EncryptionNode]) -> NodeKeyTransparencyCut {
+        let members = nodes
+            .iter()
+            .map(|node| EncryptionGenerationRecipient {
+                node_name: node.name.clone(),
+                node_uid: node.uid.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut ledger = NodeKeyTransparencyLedger::default();
+        ledger
+            .replace_membership("cluster-a".to_owned(), Revision::new(7), members)
+            .unwrap();
+        for node in nodes {
+            let peers = nodes
+                .iter()
+                .filter(|peer| peer.uid != node.uid)
+                .map(|peer| peer.uid.clone())
+                .collect::<BTreeSet<_>>();
+            let mut authority =
+                NodeKeyAuthority::new("cluster-a".to_owned(), node.name.clone(), node.uid.clone())
+                    .unwrap();
+            authority
+                .prepare_epoch(
+                    Revision::new(7),
+                    peers.clone(),
+                    NOW,
+                    NOW + 100_000,
+                    &mut OsWireGuardKeyGenerator,
+                )
+                .unwrap();
+            for peer in nodes.iter().filter(|peer| peer.uid != node.uid) {
+                let barrier = authority.epochs()[0].barrier().clone();
+                authority
+                    .acknowledge_epoch(
+                        &peer.uid,
+                        PeerEpochAcknowledgement {
+                            peer_node_uid: peer.uid.clone(),
+                            target_node_uid: node.uid.clone(),
+                            epoch: 1,
+                            barrier_digest: barrier.barrier_digest,
+                            peer_public_epoch: 1,
+                            observed_at_unix_ms: NOW + 1,
+                        },
+                        NOW + 1,
+                    )
+                    .unwrap();
+            }
+            authority
+                .activate_epoch(1, Revision::new(7), NOW + 2, 20_000)
+                .unwrap();
+            authority
+                .prepare_epoch(
+                    Revision::new(7),
+                    peers,
+                    NOW + 3,
+                    NOW + 100_000,
+                    &mut OsWireGuardKeyGenerator,
+                )
+                .unwrap();
+            for peer in nodes.iter().filter(|peer| peer.uid != node.uid) {
+                let barrier = authority.epochs()[1].barrier().clone();
+                authority
+                    .acknowledge_epoch(
+                        &peer.uid,
+                        PeerEpochAcknowledgement {
+                            peer_node_uid: peer.uid.clone(),
+                            target_node_uid: node.uid.clone(),
+                            epoch: 2,
+                            barrier_digest: barrier.barrier_digest,
+                            peer_public_epoch: 2,
+                            observed_at_unix_ms: NOW + 4,
+                        },
+                        NOW + 4,
+                    )
+                    .unwrap();
+            }
+            authority
+                .activate_epoch(2, Revision::new(7), NOW + 5, 20_000)
+                .unwrap();
             ledger
                 .observe(
                     &AuthenticatedNodeIdentity {
@@ -418,6 +633,7 @@ mod tests {
                 },
             ],
             paths: vec![path(&nodes[0], &nodes[1]), path(&nodes[1], &nodes[0])],
+            draining: None,
             key_cut,
         }
     }
@@ -480,5 +696,63 @@ mod tests {
             .count();
         assert_eq!(replicas, 2);
         source_plan.verify().unwrap();
+    }
+
+    #[test]
+    fn two_epoch_cut_sends_new_flows_only_to_active_and_keeps_drain_portable() {
+        let mut input = input(true);
+        input.key_cut = rotating_key_cut(&input.nodes);
+        input.valid_from_unix_ms = NOW + 6;
+        input.paths = vec![
+            path_at(&input.nodes[0], &input.nodes[1], 2),
+            path_at(&input.nodes[1], &input.nodes[0], 2),
+        ];
+        input.draining = Some(FleetDrainingEpochInput {
+            epoch: 1,
+            valid_until_unix_ms: NOW + 25_000,
+            paths: vec![
+                path_at(&input.nodes[0], &input.nodes[1], 1),
+                path_at(&input.nodes[1], &input.nodes[0], 1),
+            ],
+        });
+        let cut = produce_fleet_plan_cut(input).unwrap();
+        for plan in cut
+            .plans
+            .iter()
+            .filter(|plan| plan.mode == NodeLocalPlanMode::Active)
+        {
+            assert_eq!(plan.epochs.len(), 2);
+            let active = plan
+                .epochs
+                .iter()
+                .find(|epoch| epoch.state == FastPathEpochState::Active)
+                .unwrap();
+            let draining = plan
+                .epochs
+                .iter()
+                .find(|epoch| epoch.state == FastPathEpochState::Draining)
+                .unwrap();
+            assert!(
+                active
+                    .contract
+                    .plans
+                    .iter()
+                    .all(|contract| contract.source_key.epoch == 2)
+            );
+            assert!(
+                draining
+                    .contract
+                    .plans
+                    .iter()
+                    .all(|contract| contract.source_key.epoch == 1)
+            );
+            assert_eq!(draining.drain_until_monotonic_ns, 0);
+            assert!(
+                plan.decisions
+                    .iter()
+                    .all(|decision| decision.contract_epoch == Some(2))
+            );
+            plan.verify().unwrap();
+        }
     }
 }

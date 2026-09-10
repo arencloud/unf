@@ -80,8 +80,9 @@ use unf_encryption::{
     EncryptionOperationalObservation, EncryptionOperationalOutcome, EncryptionOperationalStage,
     EncryptionOperationsHistoryCheckpoint, EncryptionOperationsLedger, EncryptionOperationsStatus,
     EncryptionPathActivationReceipt, EncryptionPathProofAdmission, EncryptionPathProofAssignment,
-    EncryptionPathProofCoordinator, EncryptionPolicyObservation, FleetPlanProductionInput,
-    IpPrefix, KubernetesEncryptionNodeSnapshot, KubernetesEncryptionProjectionInput,
+    EncryptionPathProofCoordinator, EncryptionPolicyObservation, FleetDrainingEpochInput,
+    FleetPlanProductionInput, IpPrefix, KubernetesEncryptionNodeSnapshot,
+    KubernetesEncryptionProjection, KubernetesEncryptionProjectionInput,
     KubernetesEncryptionWorkloadSnapshot, NodeKeyAttestationCut, NodeKeyAttestationLedger,
     NodeKeyAttestationRound, NodeKeyAttestationRow, NodeKeyPublication,
     NodeKeyTransparencyCutDigest, NodeKeyTransparencyLedger, NodeLocalPlanCatalog,
@@ -391,6 +392,7 @@ struct EncryptionPlanSource {
 struct EncryptionPlanReconciler {
     source: Option<EncryptionPlanSource>,
     generation: Revision,
+    refresh_at_unix_ms: Option<u64>,
 }
 
 const ENCRYPTION_OPERATIONS_DURABLE_SCHEMA_VERSION: u16 = 1;
@@ -9483,6 +9485,63 @@ fn encryption_epoch_window(
     Ok(common_epoch.map(|epoch| (epoch, valid_until)))
 }
 
+fn encryption_draining_epoch_window(
+    cut: &unf_encryption::NodeKeyTransparencyCut,
+    active_epoch: u64,
+    now_unix_ms: u64,
+) -> Result<Option<(u64, u64)>, ApiError> {
+    let mut common_epoch = None;
+    let mut drain_until = u64::MAX;
+    let mut absent = 0usize;
+    for publication in &cut.publications {
+        let draining = publication
+            .epochs
+            .iter()
+            .filter(|epoch| {
+                epoch.phase == unf_encryption::KeyEpochPhase::Draining
+                    && epoch.epoch < active_epoch
+                    && epoch.readiness_digest.is_some()
+                    && epoch.valid_from_unix_ms <= now_unix_ms
+                    && epoch.valid_until_unix_ms > now_unix_ms
+                    && epoch
+                        .drain_deadline_unix_ms
+                        .is_some_and(|deadline| deadline > now_unix_ms)
+            })
+            .collect::<Vec<_>>();
+        if draining.is_empty() {
+            absent += 1;
+            continue;
+        }
+        let [epoch] = draining.as_slice() else {
+            return Err(ApiError::service_unavailable(
+                "encryption key cut has ambiguous draining epochs",
+            ));
+        };
+        if common_epoch
+            .replace(epoch.epoch)
+            .is_some_and(|current| current != epoch.epoch)
+        {
+            return Err(ApiError::service_unavailable(
+                "encryption key cut has no common draining epoch",
+            ));
+        }
+        drain_until = drain_until.min(
+            epoch
+                .drain_deadline_unix_ms
+                .expect("filtered draining epoch has a deadline"),
+        );
+    }
+    if absent == cut.publications.len() {
+        return Ok(None);
+    }
+    if absent != 0 {
+        return Err(ApiError::service_unavailable(
+            "encryption key cut has an incomplete draining epoch",
+        ));
+    }
+    Ok(common_epoch.map(|epoch| (epoch, drain_until)))
+}
+
 fn base36_fixed(mut value: u64) -> String {
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     const WIDTH: usize = 10;
@@ -9502,6 +9561,69 @@ fn encryption_transport_coordinates(epoch: u64) -> (String, u32, u32) {
     let mark_slot = u32::try_from((epoch % 254) + 1).expect("bounded mark slot");
     let fwmark = 0x0055_0000 | (mark_slot << 8);
     (interface_name, route_table, fwmark)
+}
+
+fn project_encryption_epoch(
+    cluster_id: &str,
+    epoch: u64,
+    nodes: Vec<KubernetesEncryptionNodeSnapshot>,
+    workloads: Vec<KubernetesEncryptionWorkloadSnapshot>,
+    policy_observations: Vec<EncryptionPolicyObservation>,
+) -> Result<KubernetesEncryptionProjection, ApiError> {
+    let (interface_name, route_table, fwmark) = encryption_transport_coordinates(epoch);
+    project_kubernetes_encryption(KubernetesEncryptionProjectionInput {
+        cluster_id: cluster_id.to_owned(),
+        active_epoch: epoch,
+        interface_name,
+        listen_port: 51_820,
+        route_table,
+        fwmark,
+        mtu: 1_420,
+        nodes,
+        workloads,
+        policy_observations,
+    })
+    .map_err(|error| ApiError::service_unavailable(error.to_string()))
+}
+
+fn project_draining_encryption_epoch(
+    cluster_id: &str,
+    draining: Option<(u64, u64)>,
+    nodes: Vec<KubernetesEncryptionNodeSnapshot>,
+    workloads: Vec<KubernetesEncryptionWorkloadSnapshot>,
+    policy_observations: Vec<EncryptionPolicyObservation>,
+) -> Result<Option<FleetDrainingEpochInput>, ApiError> {
+    draining
+        .map(|(epoch, valid_until_unix_ms)| {
+            project_encryption_epoch(cluster_id, epoch, nodes, workloads, policy_observations).map(
+                |projection| FleetDrainingEpochInput {
+                    epoch,
+                    valid_until_unix_ms,
+                    paths: projection.paths,
+                },
+            )
+        })
+        .transpose()
+}
+
+fn current_encryption_plan_source(
+    state: &ControllerState,
+    membership_revision: Revision,
+    key_cut_digest: NodeKeyTransparencyCutDigest,
+) -> EncryptionPlanSource {
+    let revisions = mutex_lock(&state.revisions).clone();
+    let egress_revision = mutex_lock(&state.egress_control_plane)
+        .checkpoint()
+        .desired_revision;
+    EncryptionPlanSource {
+        membership_revision,
+        identity_revision: initialized_revision(mutex_lock(&state.identities).revision()),
+        policy_revision: initialized_revision(revisions.policy),
+        routing_revision: initialized_revision(revisions.routing),
+        service_revision: initialized_revision(revisions.service),
+        egress_revision: initialized_revision(egress_revision),
+        key_cut_digest,
+    }
 }
 
 fn encryption_nodes(
@@ -9784,45 +9906,38 @@ fn reconcile_encryption_plan_catalog_at(
     else {
         return Ok(false);
     };
-    let revisions = mutex_lock(&state.revisions).clone();
-    let egress_revision = mutex_lock(&state.egress_control_plane)
-        .checkpoint()
-        .desired_revision;
-    let source = EncryptionPlanSource {
-        membership_revision,
-        identity_revision: initialized_revision(mutex_lock(&state.identities).revision()),
-        policy_revision: initialized_revision(revisions.policy),
-        routing_revision: initialized_revision(revisions.routing),
-        service_revision: initialized_revision(revisions.service),
-        egress_revision: initialized_revision(egress_revision),
-        key_cut_digest: key_cut.cut_digest,
-    };
+    let draining_epoch = encryption_draining_epoch_window(&key_cut, active_epoch, now_unix_ms)?;
+    let source = current_encryption_plan_source(state, membership_revision, key_cut.cut_digest);
     // A current agent cursor is an acknowledgement of the published cut, not
     // a request to manufacture a successor.  The minimum only fences a
     // controller that must reconstruct a catalog after losing its in-memory
     // source; once the causal source matches, every poll must converge on the
     // same generation until an input actually changes.
-    if reconciler.source.as_ref() == Some(&source) {
+    if reconciler.source.as_ref() == Some(&source)
+        && reconciler
+            .refresh_at_unix_ms
+            .is_none_or(|deadline| now_unix_ms < deadline)
+    {
         return Ok(true);
     }
     let _policy_cut = read_lock(&state.policy_state_guard);
     let nodes = encryption_nodes(state, &members)?;
     let workloads = encryption_workloads(state, &members);
     let policy_observations = encryption_policy_observations(state, &members);
-    let (interface_name, route_table, fwmark) = encryption_transport_coordinates(active_epoch);
-    let projection = project_kubernetes_encryption(KubernetesEncryptionProjectionInput {
-        cluster_id: state.encryption_cluster_id.clone(),
+    let projection = project_encryption_epoch(
+        &state.encryption_cluster_id,
         active_epoch,
-        interface_name,
-        listen_port: 51_820,
-        route_table,
-        fwmark,
-        mtu: 1_420,
+        nodes.clone(),
+        workloads.clone(),
+        policy_observations.clone(),
+    )?;
+    let draining = project_draining_encryption_epoch(
+        &state.encryption_cluster_id,
+        draining_epoch,
         nodes,
         workloads,
         policy_observations,
-    })
-    .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    )?;
     let generation = reconciler
         .generation
         .next()
@@ -9853,6 +9968,7 @@ fn reconcile_encryption_plan_catalog_at(
         endpoints: projection.endpoints,
         policies: projection.policies,
         paths: projection.paths,
+        draining,
         key_cut,
     })
     .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
@@ -9861,6 +9977,7 @@ fn reconcile_encryption_plan_catalog_at(
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
     reconciler.source = Some(source);
     reconciler.generation = generation;
+    reconciler.refresh_at_unix_ms = draining_epoch.map(|(_, deadline)| deadline);
     info!(
         generation = generation.get(),
         membership_revision = membership_revision.get(),
