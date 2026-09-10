@@ -69,9 +69,10 @@ use unf_egress::{
     verify_egress_bfd_evidence_report, verify_egress_internet_snapshot,
 };
 use unf_encryption::{
-    AuthenticatedNodeIdentity, EncryptionBaseline, EncryptionEndpointPathProof,
-    EncryptionFrontierPublishOutcome, EncryptionGenerationDistributionError,
-    EncryptionGenerationFact, EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
+    AuthenticatedNodeIdentity, EncryptionActivationReport, EncryptionActivationReportDigest,
+    EncryptionBaseline, EncryptionEndpointPathProof, EncryptionFrontierPublishOutcome,
+    EncryptionGenerationDistributionError, EncryptionGenerationFact,
+    EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
     EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
     EncryptionGenerationRequest, EncryptionIdentityPair, EncryptionKeyBootstrap, EncryptionModel,
@@ -391,6 +392,24 @@ struct EncryptionPlanReconciler {
     generation: Revision,
 }
 
+const ENCRYPTION_OPERATIONS_DURABLE_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct EncryptionActivationCursor {
+    generation: Revision,
+    state_digest: unf_encryption::EncryptionFastPathDigest,
+    report_digest: EncryptionActivationReportDigest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DurableEncryptionOperations {
+    schema_version: u16,
+    history: EncryptionOperationsHistoryCheckpoint,
+    activation_cursors: BTreeMap<String, EncryptionActivationCursor>,
+}
+
 struct ControllerState {
     ready: AtomicBool,
     identity_epoch: u64,
@@ -450,6 +469,7 @@ struct ControllerState {
     encryption_key_attestations: Mutex<NodeKeyAttestationLedger>,
     encryption_path_proofs: Mutex<EncryptionPathProofCoordinator>,
     encryption_operations: Mutex<EncryptionOperationsLedger>,
+    encryption_activation_cursors: Mutex<BTreeMap<String, EncryptionActivationCursor>>,
     encryption_operations_dirty: AtomicBool,
     encryption_operations_store: Option<Api<ConfigMap>>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
@@ -1451,6 +1471,10 @@ async fn spawn_internal_api(
             get(encryption_path_receipts),
         )
         .route(
+            "/v1/state/encryption-activations",
+            post(ingest_encryption_activation),
+        )
+        .route(
             "/v1/state/service-selection",
             get(service_selection_contract),
         )
@@ -1953,6 +1977,7 @@ fn new_state_with_client_and_selector(
         encryption_key_attestations: Mutex::new(NodeKeyAttestationLedger::default()),
         encryption_path_proofs: Mutex::new(EncryptionPathProofCoordinator::default()),
         encryption_operations: Mutex::new(EncryptionOperationsLedger::default()),
+        encryption_activation_cursors: Mutex::new(BTreeMap::new()),
         encryption_operations_dirty: AtomicBool::new(false),
         encryption_operations_store: config_map_store.clone(),
         node_port_nodes: RwLock::new(BTreeMap::new()),
@@ -3534,7 +3559,8 @@ async fn restore_encryption_operations(state: &ControllerState) -> Result<()> {
         info!("durable encryption operations store is empty");
         return Ok(());
     };
-    let (checkpoint, ledger) = decode_encryption_operations(encoded)?;
+    let (durable, ledger) = decode_encryption_operations(encoded)?;
+    let checkpoint = &durable.history;
     for stage in EncryptionOperationalStage::ALL {
         for outcome in EncryptionOperationalOutcome::ALL {
             state
@@ -3546,6 +3572,7 @@ async fn restore_encryption_operations(state: &ControllerState) -> Result<()> {
     }
     let restored = checkpoint.records.len() as u64;
     *mutex_lock(&state.encryption_operations) = ledger;
+    *mutex_lock(&state.encryption_activation_cursors) = durable.activation_cursors;
     state
         .metrics
         .encryption_operations_records_restored
@@ -3561,15 +3588,38 @@ async fn restore_encryption_operations(state: &ControllerState) -> Result<()> {
 
 fn decode_encryption_operations(
     encoded: &str,
-) -> Result<(
-    EncryptionOperationsHistoryCheckpoint,
-    EncryptionOperationsLedger,
-)> {
-    let checkpoint: EncryptionOperationsHistoryCheckpoint =
-        serde_json::from_str(encoded).context("decode durable encryption operations checkpoint")?;
-    let ledger = EncryptionOperationsLedger::restore(checkpoint.clone())
+) -> Result<(DurableEncryptionOperations, EncryptionOperationsLedger)> {
+    let durable: DurableEncryptionOperations = match serde_json::from_str(encoded) {
+        Ok(durable) => durable,
+        Err(wrapper_error) => {
+            let history: EncryptionOperationsHistoryCheckpoint = serde_json::from_str(encoded)
+                .with_context(|| {
+                    format!(
+                        "decode durable encryption operations wrapper or adjacent legacy checkpoint: {wrapper_error}"
+                    )
+                })?;
+            DurableEncryptionOperations {
+                schema_version: ENCRYPTION_OPERATIONS_DURABLE_SCHEMA_VERSION,
+                history,
+                activation_cursors: BTreeMap::new(),
+            }
+        }
+    };
+    if durable.schema_version != ENCRYPTION_OPERATIONS_DURABLE_SCHEMA_VERSION
+        || durable.activation_cursors.len() > MAX_REMOTE_NODES
+        || durable.activation_cursors.iter().any(|(node_uid, cursor)| {
+            node_uid.is_empty()
+                || cursor.generation == Revision::INITIAL
+                || cursor.generation > durable.history.generation
+                || cursor.state_digest.0 == [0; 32]
+                || cursor.report_digest == EncryptionActivationReportDigest::default()
+        })
+    {
+        return Err(anyhow!("invalid durable encryption activation cursors"));
+    }
+    let ledger = EncryptionOperationsLedger::restore(durable.history.clone())
         .context("validate durable encryption operations checkpoint")?;
-    Ok((checkpoint, ledger))
+    Ok((durable, ledger))
 }
 
 fn spawn_encryption_operations_persistence(
@@ -3613,8 +3663,12 @@ async fn persist_encryption_operations(state: &ControllerState) -> Result<()> {
         .encryption_operations_store
         .as_ref()
         .context("durable encryption operations API is unavailable")?;
-    let checkpoint = mutex_lock(&state.encryption_operations).checkpoint();
-    let encoded = serde_json::to_string(&checkpoint)
+    let durable = DurableEncryptionOperations {
+        schema_version: ENCRYPTION_OPERATIONS_DURABLE_SCHEMA_VERSION,
+        history: mutex_lock(&state.encryption_operations).checkpoint(),
+        activation_cursors: mutex_lock(&state.encryption_activation_cursors).clone(),
+    };
+    let encoded = serde_json::to_string(&durable)
         .context("encode durable encryption operations checkpoint")?;
     if encoded.len() > ENCRYPTION_OPERATIONS_STORE_DATA_LIMIT {
         return Err(anyhow!(
@@ -8573,6 +8627,155 @@ async fn encryption_path_receipts(
         mutex_lock(&state.encryption_path_proofs)
             .receipts_for(&encryption_recipient(&state, &agent)?, now),
     ))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn ingest_encryption_activation(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(report): Json<EncryptionActivationReport>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    require_current_encryption_agent(&state, &agent)?;
+    report
+        .verify()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let recipient = encryption_recipient(&state, &agent)?;
+    if report.recipient != recipient {
+        return Err(ApiError::forbidden(
+            "encryption activation report belongs to another Node identity",
+        ));
+    }
+
+    let frontier = mutex_lock(&state.encryption_generation_facts)
+        .candidate()
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?
+        .ok_or_else(|| {
+            ApiError::service_unavailable("complete encryption generation is unavailable")
+        })?;
+    let prepared = frontier
+        .generations
+        .iter()
+        .find(|generation| generation.recipient == recipient)
+        .ok_or_else(|| {
+            ApiError::forbidden("activation Node is absent from the current generation")
+        })?;
+    let published = prepared.checkpoint.transaction.desired.published;
+    if report.generation != published.generation || report.state_digest != published.state_digest {
+        return Err(ApiError::bad_request(
+            "activation report does not bind the current prepared fast-path generation",
+        ));
+    }
+
+    let cut = mutex_lock(&state.encryption_local_plans)
+        .active()
+        .cloned()
+        .ok_or_else(|| ApiError::service_unavailable("encryption plan cut is unavailable"))?;
+    let local_plan = cut
+        .plans
+        .iter()
+        .find(|plan| plan.recipient == recipient)
+        .ok_or_else(|| {
+            ApiError::forbidden("activation Node is absent from the current plan cut")
+        })?;
+    if cut.generation != report.generation {
+        return Err(ApiError::bad_request(
+            "activation report generation differs from the current plan cut",
+        ));
+    }
+    let mut expected_paths = local_plan
+        .epochs
+        .iter()
+        .flat_map(|epoch| {
+            epoch
+                .contract
+                .plans
+                .iter()
+                .map(|plan| (epoch.contract.contract_digest, plan.source_key.epoch))
+        })
+        .collect::<Vec<_>>();
+    let mut reported_paths = report
+        .paths
+        .iter()
+        .map(|path| (path.contract_digest, path.epoch))
+        .collect::<Vec<_>>();
+    expected_paths.sort_unstable_by_key(|(digest, epoch)| (digest.0, *epoch));
+    reported_paths.sort_unstable_by_key(|(digest, epoch)| (digest.0, *epoch));
+    if expected_paths != reported_paths {
+        return Err(ApiError::bad_request(
+            "activation report does not cover the exact current duplex path set",
+        ));
+    }
+
+    if let Some(cursor) = mutex_lock(&state.encryption_activation_cursors)
+        .get(&recipient.node_uid)
+        .cloned()
+    {
+        if cursor.report_digest == report.report_digest {
+            return Ok(StatusCode::ACCEPTED);
+        }
+        if report.generation == cursor.generation && report.state_digest == cursor.state_digest {
+            mutex_lock(&state.encryption_activation_cursors).insert(
+                recipient.node_uid,
+                EncryptionActivationCursor {
+                    generation: report.generation,
+                    state_digest: report.state_digest,
+                    report_digest: report.report_digest,
+                },
+            );
+            state
+                .encryption_operations_dirty
+                .store(true, Ordering::Release);
+            return Ok(StatusCode::ACCEPTED);
+        }
+        if report.generation < cursor.generation {
+            return Err(ApiError::bad_request(
+                "activation report regressed or equivocated at one generation",
+            ));
+        }
+    }
+    let observed_at = unix_time_millis().max(report.activated_at_unix_ms);
+    if report.paths.is_empty() {
+        record_encryption_operation(
+            &state,
+            EncryptionOperationalObservation::issue(
+                observed_at,
+                report.generation,
+                EncryptionOperationalStage::Lifecycle,
+                EncryptionOperationalOutcome::Activated,
+                None,
+                None,
+            )
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+        )?;
+    } else {
+        for path in &report.paths {
+            record_encryption_operation(
+                &state,
+                EncryptionOperationalObservation::issue(
+                    observed_at,
+                    report.generation,
+                    EncryptionOperationalStage::Activation,
+                    EncryptionOperationalOutcome::Activated,
+                    Some(path.contract_digest),
+                    Some(path.epoch),
+                )
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+            )?;
+        }
+    }
+    mutex_lock(&state.encryption_activation_cursors).insert(
+        recipient.node_uid,
+        EncryptionActivationCursor {
+            generation: report.generation,
+            state_digest: report.state_digest,
+            report_digest: report.report_digest,
+        },
+    );
+    state
+        .encryption_operations_dirty
+        .store(true, Ordering::Release);
+    Ok(StatusCode::ACCEPTED)
 }
 
 fn synchronize_encryption_path_proofs(
@@ -15192,19 +15395,36 @@ mod tests {
         let Json(history) = encryption_operations_history(State(Arc::clone(&state))).await;
         assert_eq!(history.records.len(), 1);
         assert!(state.encryption_operations_dirty.load(Ordering::Acquire));
-        let durable = serde_json::to_string(&history).unwrap();
-        let (restored_checkpoint, restored) = decode_encryption_operations(&durable).unwrap();
-        assert_eq!(restored.checkpoint(), restored_checkpoint);
+        let durable = DurableEncryptionOperations {
+            schema_version: ENCRYPTION_OPERATIONS_DURABLE_SCHEMA_VERSION,
+            history: history.clone(),
+            activation_cursors: BTreeMap::from([(
+                "worker-a-uid".to_owned(),
+                EncryptionActivationCursor {
+                    generation: Revision::new(3),
+                    state_digest: unf_encryption::EncryptionFastPathDigest([8; 32]),
+                    report_digest: EncryptionActivationReportDigest([9; 32]),
+                },
+            )]),
+        };
+        let encoded_checkpoint = serde_json::to_string(&durable).unwrap();
+        let (restored_durable, restored) =
+            decode_encryption_operations(&encoded_checkpoint).unwrap();
+        assert_eq!(restored.checkpoint(), restored_durable.history);
+        assert_eq!(restored_durable.activation_cursors.len(), 1);
         assert_eq!(
-            restored_checkpoint.counters.get(
+            restored_durable.history.counters.get(
                 EncryptionOperationalStage::Assignment,
                 EncryptionOperationalOutcome::Pending,
             ),
             1
         );
-        let mut corrupted = serde_json::to_value(&history).unwrap();
-        corrupted["records"][0]["sequence"] = serde_json::json!(9);
+        let mut corrupted = serde_json::to_value(&durable).unwrap();
+        corrupted["history"]["records"][0]["sequence"] = serde_json::json!(9);
         assert!(decode_encryption_operations(&corrupted.to_string()).is_err());
+        let legacy = serde_json::to_string(&history).unwrap();
+        let (migrated, _) = decode_encryption_operations(&legacy).unwrap();
+        assert!(migrated.activation_cursors.is_empty());
 
         let mut encoded = String::new();
         encode(&mut encoded, &mutex_lock(&state.registry)).unwrap();

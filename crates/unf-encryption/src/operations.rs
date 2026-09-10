@@ -10,15 +10,20 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unf_common::Revision;
 
-use crate::AttestedEncryptionContractDigest;
+use crate::{
+    AttestedEncryptionContractDigest, EncryptionFastPathDigest, EncryptionGenerationRecipient,
+    EncryptionPathActivationDigest, EncryptionPathActivationReceipt,
+};
 
 pub const ENCRYPTION_OPERATIONS_SCHEMA_VERSION: u16 = 1;
 pub const ENCRYPTION_OPERATIONS_HISTORY_CAPACITY: usize = 512;
 pub const ENCRYPTION_OPERATIONAL_STAGE_COUNT: usize = 6;
 pub const ENCRYPTION_OPERATIONAL_OUTCOME_COUNT: usize = 9;
 const HISTORY_DOMAIN: &[u8] = b"unf.encryption.operations.history.v1\0";
+const ACTIVATION_REPORT_DOMAIN: &[u8] = b"unf.encryption.operations.activation-report.v1\0";
+pub const MAX_ENCRYPTION_ACTIVATION_REPORT_PATHS: usize = 4_096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EncryptionOperationalStage {
     Requirement,
@@ -188,7 +193,12 @@ impl EncryptionOperationalObservation {
             || requirement && self.epoch.is_some()
             || requirement && self.contract_digest.is_some()
             || !requirement
-                && (!lifecycle || self.outcome != EncryptionOperationalOutcome::Collision)
+                && (!lifecycle
+                    || !matches!(
+                        self.outcome,
+                        EncryptionOperationalOutcome::Activated
+                            | EncryptionOperationalOutcome::Collision
+                    ))
                 && (self.contract_digest.is_none() || self.epoch.is_none_or(|epoch| epoch == 0))
         {
             return Err(EncryptionOperationsError::InvalidObservation);
@@ -307,6 +317,146 @@ pub struct EncryptionOperationsStatus {
     pub reported_lost_observations: u64,
     pub loss_affected: bool,
     pub history_head_digest: EncryptionOperationsHistoryDigest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionActivationPathEvidence {
+    pub contract_digest: AttestedEncryptionContractDigest,
+    pub epoch: u64,
+    pub activation_digest: EncryptionPathActivationDigest,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EncryptionActivationReportDigest(pub [u8; 32]);
+
+/// Retry-stable, non-authoritative acknowledgement emitted only after the
+/// agent has published and read back one exact fast-path generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionActivationReport {
+    pub schema_version: u16,
+    pub recipient: EncryptionGenerationRecipient,
+    pub generation: Revision,
+    pub state_digest: EncryptionFastPathDigest,
+    pub activated_at_unix_ms: u64,
+    pub paths: Vec<EncryptionActivationPathEvidence>,
+    pub report_digest: EncryptionActivationReportDigest,
+}
+
+impl EncryptionActivationReport {
+    /// Seals the exact set of duplex receipts consumed by a published map cut.
+    /// Empty paths are valid only for an authority-free dormant generation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed identity/generation/state, duplicate or oversized
+    /// paths, receipt generation mismatch, or canonical encoding failure.
+    pub fn issue(
+        recipient: EncryptionGenerationRecipient,
+        generation: Revision,
+        state_digest: EncryptionFastPathDigest,
+        activated_at_unix_ms: u64,
+        receipts: &[EncryptionPathActivationReceipt],
+    ) -> Result<Self, EncryptionOperationsError> {
+        let mut paths = receipts
+            .iter()
+            .map(|receipt| EncryptionActivationPathEvidence {
+                contract_digest: receipt.round.contract_digest,
+                epoch: receipt.round.epoch,
+                activation_digest: receipt.activation_digest,
+            })
+            .collect::<Vec<_>>();
+        paths.sort_unstable_by_key(|path| {
+            (path.contract_digest.0, path.epoch, path.activation_digest.0)
+        });
+        let mut report = Self {
+            schema_version: ENCRYPTION_OPERATIONS_SCHEMA_VERSION,
+            recipient,
+            generation,
+            state_digest,
+            activated_at_unix_ms,
+            paths,
+            report_digest: EncryptionActivationReportDigest::default(),
+        };
+        report.validate_fields()?;
+        report.report_digest = report.calculate_digest()?;
+        Ok(report)
+    }
+
+    /// Replays the strict wire shape and digest.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, noncanonical, or mutated reports.
+    pub fn verify(&self) -> Result<(), EncryptionOperationsError> {
+        self.validate_fields()?;
+        if self.report_digest == EncryptionActivationReportDigest::default()
+            || self.report_digest != self.calculate_digest()?
+        {
+            return Err(EncryptionOperationsError::InvalidActivationReport);
+        }
+        Ok(())
+    }
+
+    fn validate_fields(&self) -> Result<(), EncryptionOperationsError> {
+        if self.schema_version != ENCRYPTION_OPERATIONS_SCHEMA_VERSION
+            || self.recipient.node_name.is_empty()
+            || self.recipient.node_uid.is_empty()
+            || self.generation == Revision::INITIAL
+            || self.state_digest.0 == [0; 32]
+            || self.activated_at_unix_ms == 0
+            || self.paths.len() > MAX_ENCRYPTION_ACTIVATION_REPORT_PATHS
+            || self.paths.windows(2).any(|pair| {
+                (
+                    pair[0].contract_digest.0,
+                    pair[0].epoch,
+                    pair[0].activation_digest.0,
+                ) >= (
+                    pair[1].contract_digest.0,
+                    pair[1].epoch,
+                    pair[1].activation_digest.0,
+                )
+            })
+            || self.paths.iter().any(|path| {
+                path.contract_digest.0 == [0; 32]
+                    || path.epoch == 0
+                    || path.activation_digest.0 == [0; 32]
+            })
+        {
+            return Err(EncryptionOperationsError::InvalidActivationReport);
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(
+        &self,
+    ) -> Result<EncryptionActivationReportDigest, EncryptionOperationsError> {
+        #[derive(Serialize)]
+        struct Seal<'a> {
+            domain: &'a [u8],
+            schema_version: u16,
+            recipient: &'a EncryptionGenerationRecipient,
+            generation: Revision,
+            state_digest: EncryptionFastPathDigest,
+            activated_at_unix_ms: u64,
+            paths: &'a [EncryptionActivationPathEvidence],
+        }
+        let encoded = serde_json::to_vec(&Seal {
+            domain: ACTIVATION_REPORT_DOMAIN,
+            schema_version: self.schema_version,
+            recipient: &self.recipient,
+            generation: self.generation,
+            state_digest: self.state_digest,
+            activated_at_unix_ms: self.activated_at_unix_ms,
+            paths: &self.paths,
+        })
+        .map_err(|error| EncryptionOperationsError::Encoding(error.to_string()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(encoded);
+        Ok(EncryptionActivationReportDigest(hasher.finalize().into()))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -515,6 +665,8 @@ pub enum EncryptionOperationsError {
     CounterExhausted,
     #[error("invalid encryption operations status timestamp")]
     InvalidStatusTime,
+    #[error("invalid encryption activation report")]
+    InvalidActivationReport,
     #[error("encryption operations encoding failed: {0}")]
     Encoding(String),
 }
@@ -837,5 +989,44 @@ mod tests {
         let mut value = serde_json::to_value(observation).unwrap();
         value["privateKey"] = serde_json::json!("must-not-be-accepted");
         assert!(serde_json::from_value::<EncryptionOperationalObservation>(value).is_err());
+    }
+
+    #[test]
+    fn activation_report_is_retry_stable_strict_and_non_authoritative() {
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "worker-a-uid".to_owned(),
+        };
+        let report = EncryptionActivationReport::issue(
+            recipient,
+            Revision::new(7),
+            EncryptionFastPathDigest([9; 32]),
+            12_000,
+            &[],
+        )
+        .unwrap();
+        report.verify().unwrap();
+        let replay = EncryptionActivationReport::issue(
+            report.recipient.clone(),
+            report.generation,
+            report.state_digest,
+            report.activated_at_unix_ms,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(replay.report_digest, report.report_digest);
+        let mut mutation = report.clone();
+        mutation.activated_at_unix_ms += 1;
+        assert_eq!(
+            mutation.verify(),
+            Err(EncryptionOperationsError::InvalidActivationReport)
+        );
+        let encoded = serde_json::to_string(&report).unwrap();
+        for forbidden in ["privateKey", "publicKey", "nonce", "challenge", "permit"] {
+            assert!(!encoded.contains(forbidden));
+        }
+        let mut unknown = serde_json::to_value(report).unwrap();
+        unknown["activationPermit"] = serde_json::json!("forbidden");
+        assert!(serde_json::from_value::<EncryptionActivationReport>(unknown).is_err());
     }
 }

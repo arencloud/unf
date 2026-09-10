@@ -88,15 +88,15 @@ use unf_egress::{
 use unf_encryption::{
     AdmittedEncryptionGeneration, AdmittedNodeLocalPlan, AuthenticatedNodeIdentity,
     DurableNodeKeyAuthority, ENCRYPTION_PATH_PROBE_FRAME_BYTES, ENCRYPTION_PATH_PROBE_PORT,
-    EncryptionEndpointPathProof, EncryptionGenerationFact, EncryptionGenerationPathProofPermit,
-    EncryptionGenerationRequest, EncryptionKeyBootstrap, EncryptionPathActivationReceipt,
-    EncryptionPathChallengeDelivery, EncryptionPathEndpointRole, EncryptionPathProbeExchange,
-    EncryptionPathProbeFrame, EncryptionPathProbeKind, EncryptionPathProofAssignment,
-    EncryptionPathProofRoundDigest, EncryptionRoutePublicationPermit, FileNodeKeyStateStore,
-    LinuxPreparedLocalGeneration, LinuxWireGuardProvider, NodeKeyAttestationCut,
-    NodeKeyAttestationRound, NodeKeyAuthority, NodeLocalPlanRequest, NodeLocalRecoveryPlan,
-    NodeSealedGenerationCapsule, NodeSealedPlanCapsule, OsWireGuardKeyGenerator,
-    WireGuardKernelPlan,
+    EncryptionActivationReport, EncryptionEndpointPathProof, EncryptionGenerationFact,
+    EncryptionGenerationPathProofPermit, EncryptionGenerationRequest, EncryptionKeyBootstrap,
+    EncryptionPathActivationReceipt, EncryptionPathChallengeDelivery, EncryptionPathEndpointRole,
+    EncryptionPathProbeExchange, EncryptionPathProbeFrame, EncryptionPathProbeKind,
+    EncryptionPathProofAssignment, EncryptionPathProofRoundDigest,
+    EncryptionRoutePublicationPermit, FileNodeKeyStateStore, LinuxPreparedLocalGeneration,
+    LinuxWireGuardProvider, NodeKeyAttestationCut, NodeKeyAttestationRound, NodeKeyAuthority,
+    NodeLocalPlanRequest, NodeLocalRecoveryPlan, NodeSealedGenerationCapsule,
+    NodeSealedPlanCapsule, OsWireGuardKeyGenerator, WireGuardKernelPlan,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -1060,6 +1060,7 @@ struct EncryptionGenerationSynchronizer {
     active_revalidated: bool,
     pending: Option<PendingEncryptionGeneration>,
     path_proofs: BTreeMap<EncryptionPathProofRoundDigest, EncryptionEndpointPathProof>,
+    pending_activation_report: Option<EncryptionActivationReport>,
 }
 
 struct EncryptionPlanSynchronizer {
@@ -8035,6 +8036,7 @@ impl EncryptionGenerationSynchronizer {
             active_revalidated: false,
             pending: None,
             path_proofs: BTreeMap::new(),
+            pending_activation_report: None,
         })
     }
 
@@ -8307,7 +8309,11 @@ impl EncryptionGenerationSynchronizer {
         }
     }
 
-    fn record_activation(&mut self, slot: EncryptionRecoverySlot) -> Result<()> {
+    fn record_activation(
+        &mut self,
+        slot: EncryptionRecoverySlot,
+        report: EncryptionActivationReport,
+    ) -> Result<()> {
         match slot {
             EncryptionRecoverySlot::Active => self.active_revalidated = true,
             EncryptionRecoverySlot::Pending => {
@@ -8323,8 +8329,23 @@ impl EncryptionGenerationSynchronizer {
                 self.active_revalidated = true;
             }
         }
+        self.queue_activation_report(report)?;
         self.path_proofs.clear();
         Ok(())
+    }
+
+    fn queue_activation_report(&mut self, report: EncryptionActivationReport) -> Result<bool> {
+        report
+            .verify()
+            .context("verify queued encryption activation report")?;
+        if let Some(pending) = &self.pending_activation_report {
+            if pending == &report {
+                return Ok(false);
+            }
+            bail!("a different encryption activation report remains unacknowledged");
+        }
+        self.pending_activation_report = Some(report);
+        Ok(true)
     }
 
     fn admit_exact_echo(
@@ -8953,6 +8974,14 @@ async fn activate_admitted_encryption_generation(
         .await
         .context("decode encryption path receipts")?;
     let now_unix_ms = current_unix_time_milliseconds();
+    let activation_report = EncryptionActivationReport::issue(
+        recipient.clone(),
+        Revision::new(desired.config.generation),
+        desired.state_digest,
+        now_unix_ms,
+        &receipts,
+    )
+    .context("seal retry-stable encryption activation observation")?;
     let path_permit =
         EncryptionGenerationPathProofPermit::issue(&desired, recipient, receipts, now_unix_ms)
             .context("join complete live path receipts to the desired generation")?;
@@ -8964,8 +8993,43 @@ async fn activate_admitted_encryption_generation(
         .apply_linux_generation(prepared, admitted, route_permit, path_permit, now_unix_ms)
         .context("consume proof-rehydrated encryption activation escrow")?;
     generations
-        .record_activation(slot)
+        .record_activation(slot, activation_report)
         .context("commit encryption recovery escrow slot")?;
+    Ok(true)
+}
+
+async fn publish_pending_encryption_activation(
+    generations: &mut EncryptionGenerationSynchronizer,
+) -> Result<bool> {
+    let Some(report) = generations.pending_activation_report.clone() else {
+        return Ok(false);
+    };
+    let controller_url = generations
+        .controller_url
+        .as_deref()
+        .context("encryption activation reporting has no controller URL")?;
+    let response = generations
+        .client
+        .current()
+        .post(format!("{controller_url}/v1/state/encryption-activations"))
+        .bearer_auth(read_agent_token(&generations.agent_token_path)?)
+        .json(&report)
+        .send()
+        .await
+        .context("publish retry-stable encryption activation report")?;
+    if response.status() != StatusCode::ACCEPTED {
+        response
+            .error_for_status()
+            .context("controller rejected encryption activation report")?;
+        bail!("controller returned a non-202 response for encryption activation report");
+    }
+    if generations
+        .pending_activation_report
+        .as_ref()
+        .is_some_and(|pending| pending.report_digest == report.report_digest)
+    {
+        generations.pending_activation_report = None;
+    }
     Ok(true)
 }
 
@@ -14506,19 +14570,36 @@ async fn consume_events(
                 }
             }
             _ = encryption_interval.tick(), if encryption_generations.controller_url.is_some()
-                && encryption_generations.pending_generation().is_some() => {
-                if encryption_generations.prepared_fact().is_some()
+                && (encryption_generations.pending_generation().is_some()
+                    || encryption_generations.pending_activation_report.is_some()) => {
+                if encryption_generations.pending_activation_report.is_some()
+                    && let Err(error) = publish_pending_encryption_activation(
+                        encryption_generations,
+                    ).await
+                {
+                    warn!(%error, "encryption activation evidence remains queued for retry");
+                }
+                if encryption_generations.pending_activation_report.is_none()
+                    && encryption_generations.prepared_fact().is_some()
                     && let Err(error) = synchronize_encryption_generation(encryption_generations).await
                 {
                     warn!(%error, "encryption generation synchronization failed; retaining durable desired predecessor and active local authority");
                 }
-                if encryption_generations.has_controller_admission()
+                if encryption_generations.pending_activation_report.is_none()
+                    && encryption_generations.has_controller_admission()
                     && let Err(error) = activate_admitted_encryption_generation(
                         encryption_generations,
                         encryption,
                     ).await
                 {
                     warn!(%error, "encrypted path activation is not complete; retaining the pending proof capability and active predecessor");
+                }
+                if encryption_generations.pending_activation_report.is_some()
+                    && let Err(error) = publish_pending_encryption_activation(
+                        encryption_generations,
+                    ).await
+                {
+                    warn!(%error, "encryption activation evidence remains queued for retry");
                 }
             }
             _ = egress_loss_interval.tick() => {
@@ -18080,6 +18161,45 @@ mod tests {
             select_encryption_recovery_slot(EncryptionRecoveryAdmission::Active, true, false),
             None
         );
+    }
+
+    #[test]
+    fn encryption_activation_outbox_is_retry_stable_and_equivocation_safe() {
+        let temporary = tempdir().unwrap();
+        let mut synchronizer = EncryptionGenerationSynchronizer::recover(
+            None,
+            test_controller_client(),
+            temporary.path().join("token"),
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            temporary.path().join("encryption-generation.json"),
+        )
+        .unwrap();
+        let report = EncryptionActivationReport::issue(
+            unf_encryption::EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "worker-a-uid".to_owned(),
+            },
+            Revision::new(9),
+            unf_encryption::EncryptionFastPathDigest([8; 32]),
+            12_000,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            synchronizer
+                .queue_activation_report(report.clone())
+                .unwrap()
+        );
+        assert!(
+            !synchronizer
+                .queue_activation_report(report.clone())
+                .unwrap()
+        );
+        let mut equivocation = report;
+        equivocation.activated_at_unix_ms += 1;
+        assert!(synchronizer.queue_activation_report(equivocation).is_err());
+        assert!(synchronizer.pending_activation_report.is_some());
     }
 
     #[tokio::test]

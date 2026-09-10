@@ -840,7 +840,7 @@ matrix is maintained in the
 
 ## Phase 9 — attested encryption fabric
 
-**Gate: in progress; milestones 9.1–9.6 verified and 9.7a–c implemented.** The ordered evidence
+**Gate: in progress; milestones 9.1–9.6 verified and 9.7a–d implemented.** The ordered evidence
 matrix is maintained in the
 [Phase 9 encryption-fabric plan](development/phase9-attested-encryption-fabric-plan.md).
 

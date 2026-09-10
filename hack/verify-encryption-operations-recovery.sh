@@ -15,7 +15,7 @@ require_text 'restore_encryption_operations(&state)' bins/unf-controller/src/mai
     'controller startup must validate the operations checkpoint before serving'
 require_text 'spawn_encryption_operations_persistence(' bins/unf-controller/src/main.rs \
     'dirty operations state must be retried and flushed on shutdown'
-require_text 'EncryptionOperationsLedger::restore(checkpoint.clone())' \
+require_text 'EncryptionOperationsLedger::restore(durable.history.clone())' \
     bins/unf-controller/src/main.rs \
     'restore must use the same hash-chain/counter validator as the runtime'
 require_text '.inc_by(checkpoint.counters.get(stage, outcome));' \
