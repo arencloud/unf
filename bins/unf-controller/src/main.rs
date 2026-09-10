@@ -175,6 +175,7 @@ const AGENT_REPORT_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_REPORT_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
 const ENCRYPTION_GENERATION_STORE_NAME: &str = "unf-encryption-generation-frontier";
 const ENCRYPTION_GENERATION_STORE_KEY: &str = "frontier.json";
+const ENCRYPTION_PLAN_STORE_KEY: &str = "plans.json";
 const ENCRYPTION_GENERATION_STORE_DATA_LIMIT: usize = 900_000;
 const ENCRYPTION_GENERATION_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const ENCRYPTION_OPERATIONS_STORE_NAME: &str = "unf-encryption-operations";
@@ -3570,6 +3571,27 @@ async fn restore_encryption_generation_producer(state: &ControllerState) -> Resu
         .as_ref()
         .map(|frontier| frontier.revision.get());
     *mutex_lock(&state.encryption_generations) = producer;
+    if let Some(encoded) = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(ENCRYPTION_PLAN_STORE_KEY))
+    {
+        let cut: unf_encryption::NodeLocalPlanFleetCut =
+            serde_json::from_str(encoded).context("decode durable encryption fleet-plan cut")?;
+        cut.verify()
+            .context("validate durable encryption fleet-plan cut")?;
+        mutex_lock(&state.encryption_local_plans)
+            .publish(cut.clone())
+            .context("restore durable encryption fleet-plan cut")?;
+        mutex_lock(&state.encryption_plan_reconciler).generation = cut.generation;
+        info!(
+            generation = cut.generation.get(),
+            members = cut.members.len(),
+            "restored durable encryption fleet-plan cut"
+        );
+    } else {
+        info!("durable encryption fleet-plan store is empty");
+    }
     state
         .metrics
         .encryption_generation_receipts_restored
@@ -3634,14 +3656,22 @@ async fn persist_encryption_generation(state: &ControllerState) -> Result<()> {
         .context("build durable encryption generation-frontier checkpoint")?;
     let encoded = serde_json::to_string(&checkpoint)
         .context("encode durable encryption generation-frontier checkpoint")?;
-    if encoded.len() > ENCRYPTION_GENERATION_STORE_DATA_LIMIT {
+    let plan = mutex_lock(&state.encryption_local_plans).active().cloned();
+    let encoded_plan = plan
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("encode durable encryption fleet-plan cut")?;
+    let encoded_size = encoded.len() + encoded_plan.as_ref().map_or(0, String::len);
+    if encoded_size > ENCRYPTION_GENERATION_STORE_DATA_LIMIT {
         return Err(anyhow!(
-            "durable encryption generation frontier requires {} bytes; ConfigMap limit is {}",
-            encoded.len(),
-            ENCRYPTION_GENERATION_STORE_DATA_LIMIT
+            "durable encryption generation frontier and plan require {encoded_size} bytes; ConfigMap limit is {ENCRYPTION_GENERATION_STORE_DATA_LIMIT}"
         ));
     }
-    let data = BTreeMap::from([(ENCRYPTION_GENERATION_STORE_KEY.to_owned(), encoded)]);
+    let mut data = BTreeMap::from([(ENCRYPTION_GENERATION_STORE_KEY.to_owned(), encoded)]);
+    if let Some(encoded_plan) = encoded_plan {
+        data.insert(ENCRYPTION_PLAN_STORE_KEY.to_owned(), encoded_plan);
+    }
     let patch = serde_json::json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -10353,6 +10383,9 @@ fn reconcile_encryption_plan_catalog_at(
     mutex_lock(&state.encryption_local_plans)
         .publish(cut)
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    state
+        .encryption_generations_dirty
+        .store(true, Ordering::Release);
     reconciler.source = Some(source);
     reconciler.generation = generation;
     reconciler.refresh_at_unix_ms = draining_epoch.map(|(_, deadline)| deadline);
