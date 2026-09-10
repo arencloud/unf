@@ -969,9 +969,13 @@ Watermark: a fixed 54-cell stage/outcome matrix prevents metrics cardinality
 from scaling with Nodes, peers, contracts, or epochs, while a separate bounded
 hash-chained history records exact secret-free provenance. Both upstream loss
 and retention eviction remain explicit across checkpoint restore, so missing
-evidence cannot look like healthy silence. `make
-encryption-operations-evidence-test`; ADR 0200. Runtime export,
-explanation/simulation, recovery, upgrade, and performance gates remain next.
+evidence cannot look like healthy silence. Phase 9.7b publishes that watermark
+and bounded history through controller APIs and preallocates exactly 54
+Prometheus series with only closed stage/outcome labels. Causal cut changes and
+accepted proof transitions advance counters; polling and idempotent retries do
+not. `make encryption-operations-runtime-test`; ADRs 0200–0201. Authenticated
+activation, durable recovery, explanation/simulation, upgrade, and performance
+gates remain next.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

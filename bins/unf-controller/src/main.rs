@@ -26,8 +26,9 @@ use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::watcher::{self, Event};
 use kube::{Api, Client, ResourceExt};
-use prometheus_client::encoding::text::encode;
+use prometheus_client::encoding::{EncodeLabelSet, text::encode};
 use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -74,9 +75,11 @@ use unf_encryption::{
     EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
     EncryptionGenerationRequest, EncryptionIdentityPair, EncryptionKeyBootstrap, EncryptionModel,
-    EncryptionPathActivationReceipt, EncryptionPathProofAssignment, EncryptionPathProofCoordinator,
-    EncryptionPolicyObservation, FleetPlanProductionInput, IpPrefix,
-    KubernetesEncryptionNodeSnapshot, KubernetesEncryptionProjectionInput,
+    EncryptionOperationalObservation, EncryptionOperationalOutcome, EncryptionOperationalStage,
+    EncryptionOperationsHistoryCheckpoint, EncryptionOperationsLedger, EncryptionOperationsStatus,
+    EncryptionPathActivationReceipt, EncryptionPathProofAdmission, EncryptionPathProofAssignment,
+    EncryptionPathProofCoordinator, EncryptionPolicyObservation, FleetPlanProductionInput,
+    IpPrefix, KubernetesEncryptionNodeSnapshot, KubernetesEncryptionProjectionInput,
     KubernetesEncryptionWorkloadSnapshot, NodeKeyAttestationCut, NodeKeyAttestationLedger,
     NodeKeyAttestationRound, NodeKeyAttestationRow, NodeKeyPublication,
     NodeKeyTransparencyCutDigest, NodeKeyTransparencyLedger, NodeLocalPlanCatalog,
@@ -336,7 +339,14 @@ struct ControllerMetrics {
     encryption_generation_receipts_restored: Counter,
     encryption_generation_facts_accepted: Counter,
     encryption_generation_frontiers_published: Counter,
+    encryption_operations: Family<EncryptionOperationLabels, Counter>,
     external_flow_export: ExternalFlowExportMetrics,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct EncryptionOperationLabels {
+    stage: &'static str,
+    outcome: &'static str,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -432,6 +442,7 @@ struct ControllerState {
     encryption_key_transparency: Mutex<NodeKeyTransparencyLedger>,
     encryption_key_attestations: Mutex<NodeKeyAttestationLedger>,
     encryption_path_proofs: Mutex<EncryptionPathProofCoordinator>,
+    encryption_operations: Mutex<EncryptionOperationsLedger>,
     node_port_nodes: RwLock<BTreeMap<String, NodePortNodeRecord>>,
     rejected_node_port_nodes: RwLock<BTreeMap<String, String>>,
     node_port_node_initialization: Mutex<Option<BTreeSet<String>>>,
@@ -1304,6 +1315,8 @@ async fn main() -> Result<()> {
         .route("/v1/flows", get(flow_history))
         .route("/v1/egress/history", get(egress_history))
         .route("/v1/egress/failovers", get(egress_failover_history))
+        .route("/v1/encryption/status", get(encryption_operations_status))
+        .route("/v1/encryption/history", get(encryption_operations_history))
         .route("/v1/egress/explain", post(explain_egress))
         .route("/v1/egress/simulate", post(simulate_egress))
         .route("/v1/services/explain", get(explain_service))
@@ -1728,6 +1741,58 @@ fn register_encryption_generation_metrics(registry: &mut Registry, metrics: &Con
     );
 }
 
+fn encryption_stage_label(stage: EncryptionOperationalStage) -> &'static str {
+    match stage {
+        EncryptionOperationalStage::Requirement => "requirement",
+        EncryptionOperationalStage::Assignment => "assignment",
+        EncryptionOperationalStage::LocalExchange => "local_exchange",
+        EncryptionOperationalStage::RemoteQuorum => "remote_quorum",
+        EncryptionOperationalStage::Activation => "activation",
+        EncryptionOperationalStage::Lifecycle => "lifecycle",
+    }
+}
+
+fn encryption_outcome_label(outcome: EncryptionOperationalOutcome) -> &'static str {
+    match outcome {
+        EncryptionOperationalOutcome::Native => "native",
+        EncryptionOperationalOutcome::Required => "required",
+        EncryptionOperationalOutcome::Pending => "pending",
+        EncryptionOperationalOutcome::Proven => "proven",
+        EncryptionOperationalOutcome::Activated => "activated",
+        EncryptionOperationalOutcome::Denied => "denied",
+        EncryptionOperationalOutcome::Expired => "expired",
+        EncryptionOperationalOutcome::Collision => "collision",
+        EncryptionOperationalOutcome::Loss => "loss",
+    }
+}
+
+fn encryption_operation_labels(
+    stage: EncryptionOperationalStage,
+    outcome: EncryptionOperationalOutcome,
+) -> EncryptionOperationLabels {
+    EncryptionOperationLabels {
+        stage: encryption_stage_label(stage),
+        outcome: encryption_outcome_label(outcome),
+    }
+}
+
+fn register_encryption_operations_metrics(registry: &mut Registry, metrics: &ControllerMetrics) {
+    // Materialize the closed matrix up front. Scrapes therefore always expose
+    // exactly 54 series, including zeros, independently of fleet size.
+    for stage in EncryptionOperationalStage::ALL {
+        for outcome in EncryptionOperationalOutcome::ALL {
+            let _ = metrics
+                .encryption_operations
+                .get_or_create(&encryption_operation_labels(stage, outcome));
+        }
+    }
+    registry.register(
+        "unf_encryption_operations",
+        "Secret-free encryption lifecycle observations in one closed stage/outcome domain",
+        metrics.encryption_operations.clone(),
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 fn new_state_with_client_and_selector(
     offline: bool,
@@ -1796,6 +1861,7 @@ fn new_state_with_client_and_selector(
     register_external_flow_export_metrics(&mut registry, &metrics);
     register_topology_history_metrics(&mut registry, &metrics);
     register_encryption_generation_metrics(&mut registry, &metrics);
+    register_encryption_operations_metrics(&mut registry, &metrics);
     let config_map_store = token_review_client
         .clone()
         .map(|client| Api::<ConfigMap>::namespaced(client, "unf-system"));
@@ -1854,6 +1920,7 @@ fn new_state_with_client_and_selector(
         encryption_key_transparency: Mutex::new(NodeKeyTransparencyLedger::default()),
         encryption_key_attestations: Mutex::new(NodeKeyAttestationLedger::default()),
         encryption_path_proofs: Mutex::new(EncryptionPathProofCoordinator::default()),
+        encryption_operations: Mutex::new(EncryptionOperationsLedger::default()),
         node_port_nodes: RwLock::new(BTreeMap::new()),
         rejected_node_port_nodes: RwLock::new(BTreeMap::new()),
         node_port_node_initialization: Mutex::new(None),
@@ -7024,6 +7091,38 @@ async fn metrics(State(state): State<Arc<ControllerState>>) -> Response {
     }
 }
 
+async fn encryption_operations_status(
+    State(state): State<Arc<ControllerState>>,
+) -> Result<Json<EncryptionOperationsStatus>, ApiError> {
+    mutex_lock(&state.encryption_operations)
+        .status(unix_time_millis())
+        .map(Json)
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+async fn encryption_operations_history(
+    State(state): State<Arc<ControllerState>>,
+) -> Json<EncryptionOperationsHistoryCheckpoint> {
+    Json(mutex_lock(&state.encryption_operations).checkpoint())
+}
+
+fn record_encryption_operation(
+    state: &ControllerState,
+    observation: EncryptionOperationalObservation,
+) -> Result<(), ApiError> {
+    let lifecycle_stage = observation.stage;
+    let outcome = observation.outcome;
+    mutex_lock(&state.encryption_operations)
+        .observe(observation)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    state
+        .metrics
+        .encryption_operations
+        .get_or_create(&encryption_operation_labels(lifecycle_stage, outcome))
+        .inc();
+    Ok(())
+}
+
 async fn version(
     Query(query): Query<ServiceSchemaQuery>,
 ) -> Result<Json<ComponentCompatibility>, ApiError> {
@@ -8261,9 +8360,40 @@ async fn ingest_encryption_path_proof(
     require_current_encryption_agent(&state, &agent)?;
     let now = unix_time_millis();
     synchronize_encryption_path_proofs(&state, now)?;
-    mutex_lock(&state.encryption_path_proofs)
+    let contract_digest = proof.contract_digest;
+    let epoch = proof.epoch;
+    let generation = mutex_lock(&state.encryption_path_proofs).generation();
+    let admission = mutex_lock(&state.encryption_path_proofs)
         .observe(&encryption_authenticated_node(&state, &agent)?, proof, now)
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    if admission != EncryptionPathProofAdmission::Idempotent {
+        record_encryption_operation(
+            &state,
+            EncryptionOperationalObservation::issue(
+                now,
+                generation,
+                EncryptionOperationalStage::LocalExchange,
+                EncryptionOperationalOutcome::Proven,
+                Some(contract_digest),
+                Some(epoch),
+            )
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+        )?;
+    }
+    if admission == EncryptionPathProofAdmission::AcceptedComplete {
+        record_encryption_operation(
+            &state,
+            EncryptionOperationalObservation::issue(
+                now,
+                generation,
+                EncryptionOperationalStage::RemoteQuorum,
+                EncryptionOperationalOutcome::Proven,
+                Some(contract_digest),
+                Some(epoch),
+            )
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+        )?;
+    }
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -8310,9 +8440,41 @@ fn synchronize_encryption_path_proofs(
             );
         }
     }
-    mutex_lock(&state.encryption_path_proofs)
+    let changed = mutex_lock(&state.encryption_path_proofs)
         .replace_contracts(cut.generation, contracts, now_unix_ms, lifetime_ms)
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    if changed {
+        for local_plan in &cut.plans {
+            for epoch in &local_plan.epochs {
+                for plan in &epoch.contract.plans {
+                    record_encryption_operation(
+                        state,
+                        EncryptionOperationalObservation::issue(
+                            now_unix_ms,
+                            cut.generation,
+                            EncryptionOperationalStage::Requirement,
+                            EncryptionOperationalOutcome::Required,
+                            None,
+                            None,
+                        )
+                        .map_err(|error| ApiError::internal(error.to_string()))?,
+                    )?;
+                    record_encryption_operation(
+                        state,
+                        EncryptionOperationalObservation::issue(
+                            now_unix_ms,
+                            cut.generation,
+                            EncryptionOperationalStage::Assignment,
+                            EncryptionOperationalOutcome::Pending,
+                            Some(epoch.contract.contract_digest),
+                            Some(plan.source_key.epoch),
+                        )
+                        .map_err(|error| ApiError::internal(error.to_string()))?,
+                    )?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -14832,6 +14994,57 @@ mod tests {
             .unwrap();
         assert!(successor.snapshot.generation > first.snapshot.generation);
         assert_eq!(successor.snapshot.service_revision, Revision::new(6));
+    }
+
+    #[tokio::test]
+    async fn encryption_operations_export_is_fixed_cardinality_and_watermarked() {
+        let state = Arc::new(new_state(true));
+        record_encryption_operation(
+            &state,
+            EncryptionOperationalObservation::issue(
+                10_000,
+                Revision::new(3),
+                EncryptionOperationalStage::Assignment,
+                EncryptionOperationalOutcome::Pending,
+                Some(unf_encryption::AttestedEncryptionContractDigest([7; 32])),
+                Some(4),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let Json(status) = encryption_operations_status(State(Arc::clone(&state)))
+            .await
+            .unwrap();
+        assert_eq!(status.complete_through_sequence, 1);
+        assert_eq!(status.retained_records, 1);
+        assert_eq!(
+            status.counters.get(
+                EncryptionOperationalStage::Assignment,
+                EncryptionOperationalOutcome::Pending,
+            ),
+            1
+        );
+        let Json(history) = encryption_operations_history(State(Arc::clone(&state))).await;
+        assert_eq!(history.records.len(), 1);
+
+        let mut encoded = String::new();
+        encode(&mut encoded, &mutex_lock(&state.registry)).unwrap();
+        assert_eq!(
+            encoded
+                .lines()
+                .filter(|line| line.starts_with("unf_encryption_operations_total{"))
+                .count(),
+            unf_encryption::ENCRYPTION_OPERATIONAL_STAGE_COUNT
+                * unf_encryption::ENCRYPTION_OPERATIONAL_OUTCOME_COUNT
+        );
+        assert!(encoded.contains(
+            "unf_encryption_operations_total{stage=\"assignment\",outcome=\"pending\"} 1"
+        ));
+        assert!(!encoded.contains("contract="));
+        assert!(!encoded.contains("node="));
+        assert!(!encoded.contains("peer="));
+        assert!(!encoded.contains("epoch="));
     }
 
     #[test]
