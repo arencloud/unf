@@ -2178,8 +2178,9 @@ mod tests {
         assert_eq!(authority.rules[0].route_table, 20_007);
         assert_eq!(
             authority.rules[0].priority,
-            UNF_ENCRYPTION_RULE_PRIORITY_BASE + 0xaaf8
+            UNF_ENCRYPTION_RULE_PRIORITY_BASE
         );
+        assert!(authority.rules[0].priority < 32_766);
         let permit = authority.authorize_publication(&authority.rules).unwrap();
         permit.verify_for(&state).unwrap();
 

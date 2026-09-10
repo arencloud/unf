@@ -9131,6 +9131,11 @@ fn synchronize_encryption_path_proofs(
     let mut lifetime_ms = 30_000_u64;
     for local_plan in &cut.plans {
         for epoch in &local_plan.epochs {
+            if epoch.state == unf_encryption::FastPathEpochState::Draining
+                && now_unix_ms >= epoch.contract.valid_until_unix_ms
+            {
+                continue;
+            }
             if epoch.contract.local_node.name != local_plan.recipient.node_name
                 || epoch.contract.local_node.uid != local_plan.recipient.node_uid
                 || now_unix_ms < epoch.contract.valid_from_unix_ms
@@ -9646,6 +9651,21 @@ fn encryption_plan_cut_is_activated(
     })
 }
 
+fn encryption_plan_cut_is_current(
+    cut: &unf_encryption::NodeLocalPlanFleetCut,
+    now_unix_ms: u64,
+) -> bool {
+    cut.plans.iter().all(|plan| {
+        plan.epochs
+            .iter()
+            .filter(|epoch| epoch.state == unf_encryption::FastPathEpochState::Active)
+            .all(|epoch| {
+                now_unix_ms >= epoch.contract.valid_from_unix_ms
+                    && now_unix_ms < epoch.contract.valid_until_unix_ms
+            })
+    })
+}
+
 fn encryption_nodes(
     state: &ControllerState,
     members: &[EncryptionGenerationRecipient],
@@ -9943,6 +9963,7 @@ fn reconcile_encryption_plan_catalog_at(
     if let Some(active) = mutex_lock(&state.encryption_local_plans).active()
         && active.membership_revision == membership_revision
         && !encryption_plan_cut_is_activated(state, active)
+        && encryption_plan_cut_is_current(active, now_unix_ms)
     {
         return Ok(true);
     }

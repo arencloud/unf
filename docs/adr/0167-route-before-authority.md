@@ -31,10 +31,11 @@ The agent's Aya transaction boundary now requires that local, non-deserializable
 capability before it can stage or flip the generation. Only the Linux readback
 provider can mint it; controller or checkpoint bytes cannot manufacture one. A
 permit cannot authorize another generation or another fast-path digest.
-Identical coalesced transports share the minimal rule
-per family. Priorities are a deterministic injection of the 16-bit route-mark
-lease into the reserved `0x554e0000` priority domain, avoiding an allocator and
-making collision diagnosis reproducible.
+Identical coalesced transports share the minimal rule per family. The two
+admitted epoch selectors alternate between reserved priorities `30000` and
+`30001`. Both precede Linux's `main` rule at `32766`, so a competing native Pod
+route cannot capture a Required marked packet; the two-slot mapping stays
+allocator-free and collision diagnosis remains reproducible.
 
 Pre-existing exact rules are replayed. A same-family priority or masked-selector
 collision is foreign state and is preserved. Rules staged successfully before

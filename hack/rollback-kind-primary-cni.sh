@@ -364,7 +364,7 @@ EOF
                         and (.dst as $dst | $allowed | contains("," + $dst + ",")))'\'' >/dev/null
 
                 route_mark=$(( (~fwmark) & 0x00ffff00 ))
-                priority=$(( 0x554e0000 + ((route_mark & 0x00ffff00) >> 8) ))
+                priority=$(( 30000 + (((route_mark & 0x00ffff00) >> 8) % 2) ))
                 route_mark_hex=$(printf '0x%x' "$route_mark")
                 route_mask=$(( 0x00ffff00 ))
                 route_mask_hex=$(printf '0x%x' "$route_mask")

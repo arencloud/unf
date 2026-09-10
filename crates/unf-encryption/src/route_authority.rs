@@ -28,7 +28,12 @@ pub use linux::LinuxEncryptionRouteProvider;
 
 pub const ENCRYPTION_ROUTE_AUTHORITY_SCHEMA_VERSION: u16 = 1;
 pub const ENCRYPTION_ROUTE_PUBLICATION_PERMIT_SCHEMA_VERSION: u16 = 1;
-pub const UNF_ENCRYPTION_RULE_PRIORITY_BASE: u32 = 0x554e_0000;
+/// Two alternating pre-main slots are sufficient because one Node admits at
+/// most an active and a draining epoch. Linux evaluates lower priorities
+/// first, so Required selectors reach their `WireGuard` table before the native
+/// Pod route in table `main` can capture them.
+pub const UNF_ENCRYPTION_RULE_PRIORITY_BASE: u32 = 30_000;
+const UNF_ENCRYPTION_RULE_PRIORITY_SLOTS: u32 = 2;
 pub const MAX_ENCRYPTION_POLICY_RULES: usize = 8_192;
 pub const MAX_ENCRYPTION_ROUTE_WITNESSES: usize = 65_536;
 
@@ -359,8 +364,9 @@ fn rule_priority(route_mark: u32) -> Result<u32, EncryptionRouteAuthorityError> 
     if route_mark == 0 || route_mark & !ENCRYPTION_ROUTE_MARK_MASK != 0 {
         return Err(EncryptionRouteAuthorityError::InvalidRule);
     }
+    let selector = (route_mark & ENCRYPTION_ROUTE_MARK_MASK) >> 8;
     UNF_ENCRYPTION_RULE_PRIORITY_BASE
-        .checked_add((route_mark & ENCRYPTION_ROUTE_MARK_MASK) >> 8)
+        .checked_add(selector % UNF_ENCRYPTION_RULE_PRIORITY_SLOTS)
         .ok_or(EncryptionRouteAuthorityError::InvalidRule)
 }
 
@@ -411,4 +417,19 @@ pub enum EncryptionRouteAuthorityError {
     Rollback { cause: String, rollback: String },
     #[error("canonical encryption route encoding failed: {0}")]
     CanonicalEncoding(String),
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+
+    #[test]
+    fn adjacent_epoch_selectors_use_distinct_pre_main_priorities() {
+        let first = rule_priority(0x00aa_fd00).unwrap();
+        let second = rule_priority(0x00aa_fc00).unwrap();
+        assert_eq!(first, 30_001);
+        assert_eq!(second, 30_000);
+        assert_ne!(first, second);
+        assert!(first < 32_766 && second < 32_766);
+    }
 }
