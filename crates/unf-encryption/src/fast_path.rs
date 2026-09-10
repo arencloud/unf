@@ -156,8 +156,11 @@ impl EncryptionFastPathState {
             || self.config.policy_revision == 0
             || self.config.service_revision == 0
             || self.config.egress_revision == 0
-            || self.config.epoch_count == 0
             || usize::from(self.config.epoch_count) > MAX_FAST_PATH_EPOCHS
+            || self.config.epoch_count == 0
+                && (!self.decision_authority.is_empty()
+                    || !self.transport_authority.is_empty()
+                    || !self.path_authority.is_empty())
         {
             return Err(FastPathError::IntegrityMismatch);
         }
@@ -898,13 +901,14 @@ fn validate_context(
     {
         return Err(FastPathError::InvalidContext);
     }
-    if epochs.is_empty()
-        || epochs.len() > MAX_FAST_PATH_EPOCHS
-        || epochs
-            .iter()
-            .filter(|epoch| epoch.state == FastPathEpochState::Active)
-            .count()
-            != 1
+    if epochs.len() > MAX_FAST_PATH_EPOCHS
+        || epochs.is_empty() && !inputs.is_empty()
+        || !epochs.is_empty()
+            && epochs
+                .iter()
+                .filter(|epoch| epoch.state == FastPathEpochState::Active)
+                .count()
+                != 1
     {
         return Err(FastPathError::InvalidEpochSet);
     }

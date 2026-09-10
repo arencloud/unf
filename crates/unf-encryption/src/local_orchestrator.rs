@@ -168,7 +168,7 @@ impl NodeLocalRecoveryPlan {
     }
 
     fn validate_authority(&self) -> Result<(), NodeLocalOrchestratorError> {
-        if self.schema_version != NODE_LOCAL_RECOVERY_PLAN_SCHEMA_VERSION || self.plans.is_empty() {
+        if self.schema_version != NODE_LOCAL_RECOVERY_PLAN_SCHEMA_VERSION {
             return Err(NodeLocalOrchestratorError::InvalidRecoveryPlan);
         }
         self.fact
@@ -480,7 +480,6 @@ fn preflight_linux_plans(
 ) -> Result<(), NodeLocalOrchestratorError> {
     if key_authority.node_name() != recipient.node_name
         || key_authority.node_uid() != recipient.node_uid
-        || plans.is_empty()
     {
         return Err(NodeLocalOrchestratorError::KernelCommitmentMismatch);
     }
@@ -508,7 +507,7 @@ fn validate_exact_kernel_cut(
     plans: &[WireGuardKernelPlan],
     snapshots: &[WireGuardKernelSnapshot],
 ) -> Result<Vec<KernelConvergenceCommitment>, NodeLocalOrchestratorError> {
-    if plans.is_empty() || plans.len() != snapshots.len() {
+    if plans.len() != snapshots.len() || plans.is_empty() && !dormant_fast_path(desired) {
         return Err(NodeLocalOrchestratorError::KernelCommitmentMismatch);
     }
     let expected = preflight_plan_cut(recipient, desired, plans)?;
@@ -578,7 +577,7 @@ fn preflight_plan_cut(
         .iter()
         .map(|transport| transport.kernel_configuration_digest)
         .collect::<BTreeSet<_>>();
-    if plans.is_empty() || expected.len() != plans.len() {
+    if expected.len() != plans.len() || plans.is_empty() && !dormant_fast_path(desired) {
         return Err(NodeLocalOrchestratorError::KernelCommitmentMismatch);
     }
     let mut epochs = BTreeSet::new();
@@ -625,6 +624,16 @@ fn preflight_plan_cut(
         return Err(NodeLocalOrchestratorError::KernelCommitmentMismatch);
     }
     Ok(expected)
+}
+
+fn dormant_fast_path(desired: &crate::EncryptionFastPathState) -> bool {
+    desired.config.epoch_count == 0
+        && desired.config.decision_count == 0
+        && desired.config.transport_count == 0
+        && desired.config.path_count == 0
+        && desired.decision_authority.is_empty()
+        && desired.transport_authority.is_empty()
+        && desired.path_authority.is_empty()
 }
 
 fn convergence_witness(

@@ -974,7 +974,10 @@ matrix is maintained in the
   Causal Catalog captures one revision/key cut on authenticated agent demand,
   evaluates both policy directions at semantic port boundaries and concrete
   addresses, coalesces unchanged polls, and atomically publishes the fleet;
-  `make encryption-controller-plan-test` and ADR 0189. The TC consumer, verifier
+  `make encryption-controller-plan-test` and ADR 0189. Agents consume active
+  plans only through local key/Linux proof, while Authority-Free Quiescent
+  Generations let idle members contribute exact zero-authority facts without
+  fake tunnels; `make encryption-agent-plan-compile-test` and ADR 0190. The TC consumer, verifier
   loading, and live encrypted packets remain within milestone 9.5.
 - The Attested Encryption Path Contract binds exact source/destination cluster,
   workload, and Node identities to policy/routing revisions, public-key epochs,

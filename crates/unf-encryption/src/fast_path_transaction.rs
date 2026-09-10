@@ -64,7 +64,8 @@ impl FastPathPublishedGeneration {
 }
 
 /// Cross-domain activation proof. One digest binds the BPF generation to all
-/// distinct committed kernel configurations and its exact two-epoch state.
+/// distinct committed kernel configurations and its exact zero-to-two-epoch
+/// state. Zero is the explicit authority-free quiescent state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CausalCommitVector {
@@ -82,7 +83,8 @@ pub struct CausalCommitVectorDigest(pub [u8; 32]);
 
 impl CausalCommitVector {
     /// Seals a canonical active/draining epoch set and every exact kernel
-    /// configuration referenced by the desired map bank.
+    /// configuration referenced by the desired map bank, or an exact empty
+    /// set for a quiescent member.
     ///
     /// # Errors
     ///
@@ -91,12 +93,9 @@ impl CausalCommitVector {
     pub fn issue(state: &EncryptionFastPathState) -> Result<Self, FastPathTransactionError> {
         let published = FastPathPublishedGeneration::issue(state)?;
         let epochs = canonical_epochs(state)?;
-        let active_epoch = epochs
-            .iter()
-            .find_map(|(epoch, lifecycle)| {
-                (*lifecycle == FastPathEpochState::Active).then_some(*epoch)
-            })
-            .ok_or(FastPathTransactionError::InvalidEpochFrontier)?;
+        let active_epoch = epochs.iter().find_map(|(epoch, lifecycle)| {
+            (*lifecycle == FastPathEpochState::Active).then_some(*epoch)
+        });
         let draining_epoch = epochs.iter().find_map(|(epoch, lifecycle)| {
             (*lifecycle == FastPathEpochState::Draining).then_some(*epoch)
         });
@@ -107,7 +106,7 @@ impl CausalCommitVector {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        if kernel_configuration_digests.is_empty()
+        if kernel_configuration_digests.is_empty() != epochs.is_empty()
             || kernel_configuration_digests.contains(&[0; 32])
         {
             return Err(FastPathTransactionError::InvalidKernelCommitment);
@@ -115,7 +114,7 @@ impl CausalCommitVector {
         let mut vector = Self {
             schema_version: CAUSAL_COMMIT_VECTOR_SCHEMA_VERSION,
             published,
-            active_epoch,
+            active_epoch: active_epoch.unwrap_or(0),
             draining_epoch,
             kernel_configuration_digests,
             vector_digest: CausalCommitVectorDigest([0; 32]),
@@ -131,20 +130,30 @@ impl CausalCommitVector {
     /// Rejects schema, revision, count, epoch, ordering, zero-digest, or digest
     /// mutation.
     pub fn verify(&self) -> Result<(), FastPathTransactionError> {
+        let dormant = self.published.epoch_count == 0;
+        let invalid_dormant = dormant
+            && (self.published.decision_count != 0
+                || self.published.transport_count != 0
+                || self.published.path_count != 0
+                || self.active_epoch != 0
+                || self.draining_epoch.is_some()
+                || !self.kernel_configuration_digests.is_empty());
+        let invalid_active = !dormant
+            && (self.published.transport_count == 0
+                || self.active_epoch == 0
+                || self.draining_epoch == Some(0)
+                || self.draining_epoch == Some(self.active_epoch)
+                || usize::from(self.published.epoch_count)
+                    != 1 + usize::from(self.draining_epoch.is_some())
+                || self.kernel_configuration_digests.is_empty());
         if self.schema_version != CAUSAL_COMMIT_VECTOR_SCHEMA_VERSION
             || self.published.generation == Revision::INITIAL
             || self.published.policy_revision == Revision::INITIAL
             || self.published.service_revision == Revision::INITIAL
             || self.published.egress_revision == Revision::INITIAL
-            || self.published.epoch_count == 0
             || self.published.epoch_count > 2
-            || self.published.transport_count == 0
-            || self.active_epoch == 0
-            || self.draining_epoch == Some(0)
-            || self.draining_epoch == Some(self.active_epoch)
-            || usize::from(self.published.epoch_count)
-                != 1 + usize::from(self.draining_epoch.is_some())
-            || self.kernel_configuration_digests.is_empty()
+            || invalid_dormant
+            || invalid_active
             || self
                 .kernel_configuration_digests
                 .windows(2)
@@ -546,13 +555,14 @@ fn canonical_epochs(
             return Err(FastPathTransactionError::InvalidEpochFrontier);
         }
     }
-    if epochs.is_empty()
-        || epochs.len() > 2
-        || epochs
-            .values()
-            .filter(|state| **state == FastPathEpochState::Active)
-            .count()
-            != 1
+    if epochs.len() > 2
+        || epochs.is_empty() && state.config.epoch_count != 0
+        || !epochs.is_empty()
+            && epochs
+                .values()
+                .filter(|state| **state == FastPathEpochState::Active)
+                .count()
+                != 1
         || epochs
             .values()
             .filter(|state| **state == FastPathEpochState::Draining)

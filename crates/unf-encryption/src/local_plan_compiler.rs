@@ -655,13 +655,13 @@ fn validate_context(
         || context.recipient.node_uid.is_empty()
         || context.listen_port == 0
         || context.persistent_keepalive_seconds > 600
-        || epochs.is_empty()
         || epochs.len() > 2
-        || epochs
-            .iter()
-            .filter(|epoch| epoch.state == FastPathEpochState::Active)
-            .count()
-            != 1
+        || !epochs.is_empty()
+            && epochs
+                .iter()
+                .filter(|epoch| epoch.state == FastPathEpochState::Active)
+                .count()
+                != 1
     {
         return Err(NodeLocalPlanCompilerError::InvalidInput(
             "revisions, recipient, transport bounds, or epoch frontier are invalid",
@@ -1049,6 +1049,54 @@ mod tests {
 
     fn manifold(generation: u64, reverse_decisions: bool) -> NodeLocalPlanSnapshot {
         manifold_with_port(generation, reverse_decisions, 51_820)
+    }
+
+    fn dormant_manifold(generation: u64) -> NodeLocalPlanSnapshot {
+        NodeLocalPlanSnapshot::issue(NodeLocalPlanSnapshotFields {
+            membership_revision: Revision::new(6),
+            generation: Revision::new(generation),
+            recipient: EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-a".to_owned(),
+            },
+            mode: NodeLocalPlanMode::Dormant,
+            policy_revision: Revision::new(3),
+            service_revision: Revision::new(30),
+            egress_revision: Revision::new(40),
+            listen_port: 51_820,
+            persistent_keepalive_seconds: 25,
+            epochs: Vec::new(),
+            decisions: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn authority_free_dormant_member_produces_a_provable_empty_generation() {
+        let plan = dormant_manifold(19);
+        let prepared = plan
+            .prepare_exact_readback(None, 1_000, 10_000, &[])
+            .unwrap();
+        let desired = prepared.fact().checkpoint.desired_state().unwrap();
+        assert_eq!(desired.config.epoch_count, 0);
+        assert_eq!(desired.config.decision_count, 0);
+        assert_eq!(desired.config.transport_count, 0);
+        assert_eq!(desired.config.path_count, 0);
+        assert!(prepared.recovery_plan().plans.is_empty());
+        prepared
+            .recovery_plan()
+            .rehydrate_exact_readback(&[])
+            .unwrap();
+
+        let mut fabricated = plan;
+        fabricated.decisions.push(NodeLocalDecisionPlan {
+            source_identity: IdentityId::new(11),
+            destination_identity: IdentityId::new(21),
+            disposition: EncryptionDisposition::Required,
+            contract_epoch: Some(7),
+            plan_index: Some(0),
+        });
+        assert!(fabricated.verify().is_err());
     }
 
     #[test]

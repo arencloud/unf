@@ -189,10 +189,17 @@ impl EncryptionGenerationFrontier {
                 .iter()
                 .map(|transport| transport.trust_domain.as_str())
                 .collect::<BTreeSet<_>>();
+            let dormant = published.epoch_count == 0
+                && published.transport_count == 0
+                && generation.checkpoint.transport_authority.is_empty();
             if transaction.phase != FastPathMapTransactionPhase::Prepared
                 || transaction.transaction_revision != self.revision
                 || published.generation != self.revision
-                || trust_domains.len() != 1
+                || if dormant {
+                    !trust_domains.is_empty()
+                } else {
+                    trust_domains.len() != 1
+                }
                 || generation
                     .checkpoint
                     .transport_authority
@@ -201,15 +208,14 @@ impl EncryptionGenerationFrontier {
             {
                 return Err(EncryptionGenerationFrontierError::CrossDomainAuthority);
             }
-            let trust_domain = (*trust_domains
-                .first()
-                .ok_or(EncryptionGenerationFrontierError::CrossDomainAuthority)?)
-            .to_owned();
-            if common_trust_domain
-                .replace(trust_domain.clone())
-                .is_some_and(|seen| seen != trust_domain)
-            {
-                return Err(EncryptionGenerationFrontierError::CrossDomainAuthority);
+            if let Some(trust_domain) = trust_domains.first() {
+                let trust_domain = (*trust_domain).to_owned();
+                if common_trust_domain
+                    .replace(trust_domain.clone())
+                    .is_some_and(|seen| seen != trust_domain)
+                {
+                    return Err(EncryptionGenerationFrontierError::CrossDomainAuthority);
+                }
             }
             let revisions = (
                 published.policy_revision,

@@ -8027,7 +8027,6 @@ impl EncryptionGenerationSynchronizer {
 
     /// Installs one newly kernel-converged capability for retry-safe exchange.
     /// A second proposal cannot replace an in-flight capability.
-    #[allow(dead_code)]
     fn offer_prepared(&mut self, prepared: LinuxPreparedLocalGeneration) -> Result<bool> {
         let fact = prepared.fact();
         fact.verify().context("verify prepared encryption fact")?;
@@ -8158,6 +8157,22 @@ impl EncryptionGenerationSynchronizer {
         }
     }
 
+    fn pending_generation(&self) -> Option<Revision> {
+        let prepared = match self.pending.as_ref()? {
+            PendingEncryptionGeneration::Prepared { prepared, .. }
+            | PendingEncryptionGeneration::ControllerAdmitted { prepared, .. } => prepared,
+        };
+        Some(
+            prepared
+                .fact()
+                .checkpoint
+                .transaction
+                .desired
+                .published
+                .generation,
+        )
+    }
+
     fn take_admitted_capability(
         &mut self,
     ) -> Option<(
@@ -8245,6 +8260,66 @@ impl EncryptionGenerationSynchronizer {
         });
         Ok(candidate)
     }
+}
+
+fn monotonic_time_ns() -> Result<u64> {
+    let now = clock_gettime(ClockId::Monotonic);
+    let seconds = u64::try_from(now.tv_sec).context("CLOCK_MONOTONIC returned negative seconds")?;
+    let nanoseconds =
+        u64::try_from(now.tv_nsec).context("CLOCK_MONOTONIC returned negative nanoseconds")?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .context("CLOCK_MONOTONIC nanoseconds overflowed")
+}
+
+async fn prepare_admitted_encryption_plan(
+    plans: &EncryptionPlanSynchronizer,
+    keys: &EncryptionKeySynchronizer,
+    generations: &mut EncryptionGenerationSynchronizer,
+) -> Result<bool> {
+    let Some(admitted) = plans.current.as_ref() else {
+        return Ok(false);
+    };
+    let snapshot = &admitted.snapshot;
+    let prior = generations
+        .current
+        .as_ref()
+        .map(AdmittedEncryptionGeneration::published);
+    if let Some(prior) = prior {
+        if prior.generation > snapshot.generation {
+            bail!("durable encryption plan regressed behind the active local generation");
+        }
+        if prior.generation == snapshot.generation {
+            if prior.policy_revision != snapshot.policy_revision
+                || prior.service_revision != snapshot.service_revision
+                || prior.egress_revision != snapshot.egress_revision
+            {
+                bail!("same-generation encryption plan changed causal revisions");
+            }
+            return Ok(false);
+        }
+    }
+    if let Some(pending) = generations.pending_generation() {
+        if pending > snapshot.generation {
+            bail!("durable encryption plan regressed behind an in-flight local generation");
+        }
+        return Ok(false);
+    }
+    let authority = keys
+        .authority
+        .as_ref()
+        .context("Node-local key authority is not ready for encryption plan compilation")?;
+    let prepared = snapshot
+        .prepare_linux(
+            prior,
+            current_unix_time_milliseconds(),
+            monotonic_time_ns()?,
+            authority.authority(),
+        )
+        .await
+        .context("compile authenticated plan against exact Node-local keys and Linux readback")?;
+    generations.offer_prepared(prepared)
 }
 
 fn encryption_recovery_plan_path(state_path: &Path) -> Result<PathBuf> {
@@ -13817,23 +13892,49 @@ async fn consume_events(
                 }
             }
             _ = encryption_key_interval.tick(), if encryption_keys.controller_url.is_some() => {
-                if let Err(error) = synchronize_encryption_keys(encryption_keys).await {
-                    warn!(%error, "encryption key publication failed; retaining Node-local key authority");
+                match synchronize_encryption_keys(encryption_keys).await {
+                    Ok(_) => {
+                        if let Err(error) = prepare_admitted_encryption_plan(
+                            encryption_plans,
+                            encryption_keys,
+                            encryption_generations,
+                        ).await {
+                            warn!(%error, "encryption plan could not consume exact Node-local key and kernel truth");
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "encryption key publication failed; retaining Node-local key authority");
+                    }
                 }
             }
             _ = encryption_plan_interval.tick(), if encryption_plans.controller_url.is_some() => {
                 match synchronize_encryption_plan(encryption_plans).await {
-                    Ok(true) => {
-                        let current = encryption_plans.current.as_ref()
-                            .context("adopted encryption plan disappeared")?;
-                        info!(
-                            generation = current.snapshot.generation.get(),
-                            membership_revision = current.snapshot.membership_revision.get(),
-                            node_uid = %current.snapshot.recipient.node_uid,
-                            "durably adopted authenticated Node-local encryption plan; local compiler proof remains required"
-                        );
+                    Ok(changed) => {
+                        if changed {
+                            let current = encryption_plans.current.as_ref()
+                                .context("adopted encryption plan disappeared")?;
+                            info!(
+                                generation = current.snapshot.generation.get(),
+                                membership_revision = current.snapshot.membership_revision.get(),
+                                node_uid = %current.snapshot.recipient.node_uid,
+                                "durably adopted authenticated Node-local encryption plan"
+                            );
+                        }
+                        match prepare_admitted_encryption_plan(
+                            encryption_plans,
+                            encryption_keys,
+                            encryption_generations,
+                        ).await {
+                            Ok(true) => info!(
+                                "compiled plan against exact Node-local key and Linux readback; generation fact is ready"
+                            ),
+                            Ok(false) => {}
+                            Err(error) => warn!(
+                                %error,
+                                "encryption plan could not consume exact Node-local key and kernel truth"
+                            ),
+                        }
                     }
-                    Ok(false) => {}
                     Err(error) => {
                         warn!(%error, "encryption plan synchronization failed; retaining exact durable predecessor");
                     }
@@ -17061,6 +17162,92 @@ mod tests {
                 state_path,
             )
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dormant_plan_compiles_once_into_an_empty_retryable_generation_fact() {
+        let temporary = tempdir().unwrap();
+        let recipient = unf_encryption::EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-a".to_owned(),
+        };
+        let snapshot = unf_encryption::NodeLocalPlanSnapshot::issue(
+            unf_encryption::NodeLocalPlanSnapshotFields {
+                membership_revision: Revision::new(7),
+                generation: Revision::new(19),
+                recipient: recipient.clone(),
+                mode: unf_encryption::NodeLocalPlanMode::Dormant,
+                policy_revision: Revision::new(3),
+                service_revision: Revision::new(4),
+                egress_revision: Revision::new(5),
+                listen_port: 51_820,
+                persistent_keepalive_seconds: 25,
+                epochs: Vec::new(),
+                decisions: Vec::new(),
+            },
+        )
+        .unwrap();
+        let request = NodeLocalPlanRequest::issue("worker-a".to_owned(), None, [7; 32]).unwrap();
+        let capsule = NodeSealedPlanCapsule::issue(11, &request, snapshot).unwrap();
+        let admitted = capsule.admit(&request, None).unwrap();
+        let mut plans = EncryptionPlanSynchronizer::recover(
+            None,
+            test_controller_client(),
+            temporary.path().join("token"),
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            temporary.path().join("plan.json"),
+        )
+        .unwrap();
+        plans.current = Some(admitted);
+
+        let mut keys = EncryptionKeySynchronizer::new(
+            None,
+            test_controller_client(),
+            temporary.path().join("token"),
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            temporary.path().join("keys").join("authority.json"),
+        )
+        .unwrap();
+        let bootstrap = EncryptionKeyBootstrap::issue(
+            11,
+            "cluster-a".to_owned(),
+            Revision::new(7),
+            recipient,
+            vec![unf_encryption::EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-a".to_owned(),
+            }],
+        )
+        .unwrap();
+        keys.bind_bootstrap(&bootstrap).unwrap();
+        let mut generations = EncryptionGenerationSynchronizer::recover(
+            None,
+            test_controller_client(),
+            temporary.path().join("token"),
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            temporary.path().join("generation.json"),
+        )
+        .unwrap();
+
+        assert!(
+            prepare_admitted_encryption_plan(&plans, &keys, &mut generations)
+                .await
+                .unwrap()
+        );
+        let fact = generations.prepared_fact().unwrap();
+        assert_eq!(
+            fact.checkpoint.transaction.desired.published.generation,
+            Revision::new(19)
+        );
+        assert_eq!(fact.checkpoint.transaction.desired.published.epoch_count, 0);
+        assert!(
+            !prepare_admitted_encryption_plan(&plans, &keys, &mut generations)
+                .await
+                .unwrap()
         );
     }
 
