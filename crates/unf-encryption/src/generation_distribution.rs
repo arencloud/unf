@@ -335,7 +335,6 @@ fn validate_published(
         || published.service_revision.get() == 0
         || published.egress_revision.get() == 0
         || published.bank >= ENCRYPTION_BANK_COUNT
-        || published.epoch_count == 0
         || published.epoch_count > 2
         || published.decision_count > ENCRYPTION_DECISION_MAP_CAPACITY
         || published.transport_count > ENCRYPTION_TRANSPORT_MAP_CAPACITY

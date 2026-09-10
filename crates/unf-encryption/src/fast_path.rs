@@ -2278,6 +2278,33 @@ mod tests {
     }
 
     #[test]
+    fn quiescent_generation_is_a_valid_anti_entropy_cursor() {
+        let state = compile_encryption_fast_path(context_at(0, 21), &[], &[]).unwrap();
+        assert_eq!(state.config.epoch_count, 0);
+        let checkpoint = FastPathMapCheckpoint::begin(Revision::new(22), &state, None).unwrap();
+        let recipient = EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-worker-a".to_owned(),
+        };
+        let first_request =
+            EncryptionGenerationRequest::issue("worker-a".to_owned(), None, [1; 32]).unwrap();
+        let first = NodeSealedGenerationCapsule::issue(100, recipient, &first_request, checkpoint)
+            .unwrap()
+            .admit(&first_request, None)
+            .unwrap();
+
+        let acknowledgement =
+            EncryptionGenerationRequest::issue("worker-a".to_owned(), Some(&first), [2; 32])
+                .unwrap();
+        acknowledgement.verify().unwrap();
+        assert_eq!(
+            acknowledgement.current.unwrap().published.epoch_count,
+            0,
+            "an exact empty generation remains valid causal backpressure"
+        );
+    }
+
+    #[test]
     fn node_sealed_generation_capsule_rejects_replay_uid_swap_and_mutation() {
         let fixture = fixture(7);
         let state = required_state(&fixture, context_at(1, 21));
