@@ -995,6 +995,13 @@ tuples fail before persistent BPF access and strict endpoint schemas prevent
 the compatibility document from becoming authority. The exact N baseline and
 N+1 transition pass `make encryption-adjacent-compatibility-test`; ADR 0205.
 Outage/replacement/cleanup and performance evidence remain.
+Phase 9.7g adds the Survivable Authority Envelope. A controller outage retains
+only independently replayable last-known-good state; when the controller is
+reachable, its Pod-authenticated Node UID must match every durable plan,
+generation, recovery, and private-key owner before persistent BPF access.
+Current cleanup preflights both shared and encryption map islands, removes
+encryption authority first, and preserves foreign and adjacent versions.
+`make encryption-recovery-cleanup-test`; ADR 0206. Performance evidence remains.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

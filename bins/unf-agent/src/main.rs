@@ -1731,6 +1731,15 @@ struct AbiCleanupPlan {
 }
 
 #[derive(Debug)]
+struct EncryptionAbiCleanupPlan {
+    root_directory: PathBuf,
+    abi_directory: PathBuf,
+    map_pins: Vec<PathBuf>,
+    remove_root_directory: bool,
+    directory_exists: bool,
+}
+
+#[derive(Debug)]
 struct LegacyCleanupTarget {
     interface: String,
     attach_type: TcAttachType,
@@ -5881,6 +5890,11 @@ fn run_cleanup(args: &CleanupArgs) -> Result<()> {
         .abi_version
         .map(|version| plan_abi_cleanup(&args.bpf_root, version, args.allow_current_abi))
         .transpose()?;
+    let encryption_plan = args
+        .abi_version
+        .filter(|version| *version == CURRENT_BPF_ABI_VERSION)
+        .map(|_| plan_encryption_abi_cleanup(&args.bpf_root))
+        .transpose()?;
     let legacy_targets = plan_legacy_cleanup(args)?;
     let mode = if args.execute { "execute" } else { "dry-run" };
     println!("UNF cleanup plan ({mode})");
@@ -5910,6 +5924,9 @@ fn run_cleanup(args: &CleanupArgs) -> Result<()> {
                 plan.abi_directory.display()
             );
         }
+    }
+    if let Some(plan) = &encryption_plan {
+        print_encryption_cleanup_plan(plan);
     }
     for target in &legacy_targets {
         println!(
@@ -5942,11 +5959,123 @@ fn run_cleanup(args: &CleanupArgs) -> Result<()> {
             }
         }
     }
+    // Remove encryption packet authority before the shared policy/Service map
+    // island. Both complete plans were validated before either mutation.
+    if let Some(plan) = &encryption_plan {
+        execute_encryption_abi_cleanup(plan)?;
+    }
     if let Some(plan) = &abi_plan {
         execute_abi_cleanup(plan)?;
     }
     println!("UNF cleanup completed");
     Ok(())
+}
+
+fn print_encryption_cleanup_plan(plan: &EncryptionAbiCleanupPlan) {
+    println!("Encryption ABI directory: {}", plan.abi_directory.display());
+    if !plan.directory_exists {
+        println!("  no matching encryption ABI directory exists");
+    }
+    for path in &plan.map_pins {
+        println!("  remove encryption map pin: {}", path.display());
+    }
+    if plan.directory_exists {
+        println!(
+            "  remove empty encryption ABI directory: {}",
+            plan.abi_directory.display()
+        );
+    }
+    if plan.remove_root_directory {
+        println!(
+            "  remove empty encryption root: {}",
+            plan.root_directory.display()
+        );
+    }
+}
+
+fn plan_encryption_abi_cleanup(bpf_root: &Path) -> Result<EncryptionAbiCleanupPlan> {
+    validate_cleanup_root(bpf_root)?;
+    let root_directory = bpf_root.join("encryption");
+    let abi_directory = root_directory.join(format!("v{ENCRYPTION_MAP_ABI_VERSION}"));
+    let mut plan = EncryptionAbiCleanupPlan {
+        root_directory: root_directory.clone(),
+        abi_directory: abi_directory.clone(),
+        map_pins: Vec::new(),
+        remove_root_directory: false,
+        directory_exists: false,
+    };
+    let root_metadata = match fs::symlink_metadata(&root_directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(plan),
+        Err(error) => return Err(error).context("inspect encryption cleanup root"),
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        bail!(
+            "encryption cleanup root must be a real directory: {}",
+            root_directory.display()
+        );
+    }
+    let root_entries = fs::read_dir(&root_directory)
+        .with_context(|| {
+            format!(
+                "inspect encryption cleanup root {}",
+                root_directory.display()
+            )
+        })?
+        .collect::<io::Result<Vec<_>>>()?;
+    plan.remove_root_directory = root_entries.len() == 1
+        && root_entries[0].path() == abi_directory
+        && root_entries[0].file_type()?.is_dir()
+        && !root_entries[0].file_type()?.is_symlink();
+
+    let metadata = match fs::symlink_metadata(&abi_directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(plan),
+        Err(error) => return Err(error).context("inspect encryption ABI cleanup directory"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "encryption ABI cleanup target must be a real directory: {}",
+            abi_directory.display()
+        );
+    }
+    plan.directory_exists = true;
+    let mut unknown = Vec::new();
+    for entry in fs::read_dir(&abi_directory).with_context(|| {
+        format!(
+            "inspect encryption ABI directory {}",
+            abi_directory.display()
+        )
+    })? {
+        let entry = entry.context("read encryption ABI cleanup entry")?;
+        let file_type = entry
+            .file_type()
+            .context("inspect encryption ABI cleanup entry type")?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| ENCRYPTION_MAP_NAMES.contains(&name))
+            && !file_type.is_dir()
+            && !file_type.is_symlink()
+        {
+            plan.map_pins.push(entry.path());
+        } else {
+            unknown.push(entry.path());
+        }
+    }
+    plan.map_pins.sort();
+    if !unknown.is_empty() {
+        unknown.sort();
+        bail!(
+            "unrecognized encryption ABI state; refusing cleanup: {}",
+            unknown
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(plan)
 }
 
 fn plan_abi_cleanup(
@@ -6214,6 +6343,31 @@ fn execute_abi_cleanup(plan: &AbiCleanupPlan) -> Result<()> {
             format!(
                 "remove empty ABI directory {}",
                 plan.abi_directory.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn execute_encryption_abi_cleanup(plan: &EncryptionAbiCleanupPlan) -> Result<()> {
+    for path in &plan.map_pins {
+        fs::remove_file(path)
+            .with_context(|| format!("remove owned encryption BPF pin {}", path.display()))?;
+        println!("removed encryption BPF pin: {}", path.display());
+    }
+    if plan.directory_exists {
+        fs::remove_dir(&plan.abi_directory).with_context(|| {
+            format!(
+                "remove empty encryption ABI directory {}",
+                plan.abi_directory.display()
+            )
+        })?;
+    }
+    if plan.remove_root_directory {
+        fs::remove_dir(&plan.root_directory).with_context(|| {
+            format!(
+                "remove empty encryption root {}",
+                plan.root_directory.display()
             )
         })?;
     }
@@ -6913,6 +7067,22 @@ async fn run_dataplane(
         config.node_name.clone(),
         config.encryption_generation_state_path.clone(),
     )?;
+    if let Some(bootstrap) = preflight_encryption_node_identity(
+        &controller_client,
+        controller_url.as_deref(),
+        &config.agent_token_path,
+    )
+    .await?
+    {
+        if bootstrap.recipient.node_name != config.node_name {
+            bail!("authenticated encryption bootstrap targets a different local Node");
+        }
+        encryption_plans.verify_durable_recipient(&bootstrap.recipient)?;
+        encryption_generations.verify_durable_recipient(&bootstrap.recipient)?;
+        encryption_keys
+            .bind_bootstrap(&bootstrap)
+            .context("fence replaced Node encryption state before persistent BPF access")?;
+    }
 
     // Compatibility is checked before this call because opening the persistent
     // map set may create pins or adopt existing kernel state.
@@ -7763,16 +7933,15 @@ fn ensure_encryption_key_directory(state_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn synchronize_encryption_keys(synchronizer: &mut EncryptionKeySynchronizer) -> Result<bool> {
-    let controller_url = synchronizer
-        .controller_url
-        .as_deref()
-        .context("encryption key synchronization has no controller URL")?
-        .to_owned();
-    let bootstrap: EncryptionKeyBootstrap = authenticated_get(
-        &synchronizer.client,
+async fn fetch_encryption_key_bootstrap(
+    client: &ReloadingControllerClient,
+    controller_url: &str,
+    token_path: &Path,
+) -> Result<EncryptionKeyBootstrap> {
+    authenticated_get(
+        client,
         format!("{controller_url}/v1/state/encryption-key-bootstrap"),
-        &synchronizer.agent_token_path,
+        token_path,
     )?
     .send()
     .await
@@ -7781,7 +7950,48 @@ async fn synchronize_encryption_keys(synchronizer: &mut EncryptionKeySynchronize
     .context("controller rejected encryption key bootstrap")?
     .json()
     .await
-    .context("decode encryption key bootstrap")?;
+    .context("decode encryption key bootstrap")
+}
+
+async fn preflight_encryption_node_identity(
+    client: &ReloadingControllerClient,
+    controller_url: Option<&str>,
+    token_path: &Path,
+) -> Result<Option<EncryptionKeyBootstrap>> {
+    let Some(controller_url) = controller_url else {
+        return Ok(None);
+    };
+    match fetch_encryption_key_bootstrap(client, controller_url, token_path).await {
+        Ok(bootstrap) => {
+            bootstrap
+                .verify()
+                .context("verify pre-BPF encryption Node identity")?;
+            Ok(Some(bootstrap))
+        }
+        Err(error)
+            if error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|error| error.is_connect() || error.is_timeout()) =>
+        {
+            warn!(%error, "encryption Node-identity preflight unavailable; retaining offline-start recovery");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn synchronize_encryption_keys(synchronizer: &mut EncryptionKeySynchronizer) -> Result<bool> {
+    let controller_url = synchronizer
+        .controller_url
+        .as_deref()
+        .context("encryption key synchronization has no controller URL")?
+        .to_owned();
+    let bootstrap = fetch_encryption_key_bootstrap(
+        &synchronizer.client,
+        &controller_url,
+        &synchronizer.agent_token_path,
+    )
+    .await?;
     synchronizer.bind_bootstrap(&bootstrap)?;
     publish_node_key_state(synchronizer, &controller_url).await?;
 
@@ -7932,6 +8142,22 @@ impl EncryptionPlanSynchronizer {
         })
     }
 
+    fn verify_durable_recipient(
+        &self,
+        expected: &unf_encryption::EncryptionGenerationRecipient,
+    ) -> Result<()> {
+        if let Some(current) = &self.current
+            && current.snapshot.recipient != *expected
+        {
+            bail!(
+                "durable encryption plan belongs to replaced Node UID {:?}; authoritative UID is {:?}",
+                current.snapshot.recipient.node_uid,
+                expected.node_uid
+            );
+        }
+        Ok(())
+    }
+
     fn admit(
         &mut self,
         request: &NodeLocalPlanRequest,
@@ -8038,6 +8264,28 @@ impl EncryptionGenerationSynchronizer {
             path_proofs: BTreeMap::new(),
             pending_activation_report: None,
         })
+    }
+
+    fn verify_durable_recipient(
+        &self,
+        expected: &unf_encryption::EncryptionGenerationRecipient,
+    ) -> Result<()> {
+        for recipient in self.current.iter().map(|current| &current.recipient).chain(
+            self.recovery
+                .active
+                .iter()
+                .chain(self.recovery.pending.iter())
+                .map(|plan| &plan.fact.recipient),
+        ) {
+            if recipient != expected {
+                bail!(
+                    "durable encryption generation belongs to replaced Node UID {:?}; authoritative UID is {:?}",
+                    recipient.node_uid,
+                    expected.node_uid
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Installs one newly kernel-converged capability for retry-safe exchange.
@@ -17961,6 +18209,20 @@ mod tests {
             Revision::new(19)
         );
         assert_eq!(fact.checkpoint.transaction.desired.published.epoch_count, 0);
+        let current_recipient = unf_encryption::EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-a".to_owned(),
+        };
+        plans.verify_durable_recipient(&current_recipient).unwrap();
+        generations
+            .verify_durable_recipient(&current_recipient)
+            .unwrap();
+        let replacement = unf_encryption::EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "replacement-uid".to_owned(),
+        };
+        assert!(plans.verify_durable_recipient(&replacement).is_err());
+        assert!(generations.verify_durable_recipient(&replacement).is_err());
         assert!(
             !prepare_admitted_encryption_plan(&plans, &keys, &mut generations)
                 .await
@@ -24955,6 +25217,43 @@ mod tests {
         assert!(!current.exists());
         assert!(historical.join("EGRESS_CONFIG").exists());
         assert!(root.join("operator-owned").exists());
+    }
+
+    #[test]
+    fn encryption_cleanup_is_version_scoped_foreign_safe_and_positive() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("unf");
+        let encryption_root = root.join("encryption");
+        let current = encryption_root.join(format!("v{ENCRYPTION_MAP_ABI_VERSION}"));
+        let adjacent = encryption_root.join("v1");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&adjacent).unwrap();
+        for name in ENCRYPTION_MAP_NAMES {
+            fs::write(current.join(name), []).unwrap();
+        }
+        fs::write(adjacent.join("operator-retained"), []).unwrap();
+
+        let foreign = current.join("foreign-pin");
+        fs::write(&foreign, []).unwrap();
+        assert!(plan_encryption_abi_cleanup(&root).is_err());
+        assert!(current.join(ENCRYPTION_MAP_NAMES[0]).exists());
+        assert!(foreign.exists());
+        fs::remove_file(foreign).unwrap();
+
+        let plan = plan_encryption_abi_cleanup(&root).unwrap();
+        assert_eq!(plan.map_pins.len(), ENCRYPTION_MAP_NAMES.len());
+        assert!(!plan.remove_root_directory);
+        execute_encryption_abi_cleanup(&plan).unwrap();
+        assert!(!current.exists());
+        assert!(adjacent.join("operator-retained").exists());
+
+        fs::remove_file(adjacent.join("operator-retained")).unwrap();
+        fs::remove_dir(&adjacent).unwrap();
+        fs::create_dir(&current).unwrap();
+        let plan = plan_encryption_abi_cleanup(&root).unwrap();
+        assert!(plan.remove_root_directory);
+        execute_encryption_abi_cleanup(&plan).unwrap();
+        assert!(!encryption_root.exists());
     }
 
     #[test]
