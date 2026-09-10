@@ -260,6 +260,52 @@ for node in "${nodes[@]}"; do
             rmdir "$pending"
         }
 
+        cleanup_encryption_state() {
+            for owned in \
+                "${state_dir}/encryption-fast-path.json" \
+                "${state_dir}/encryption-generation.json" \
+                "${state_dir}/encryption-generation.json.recovery-plan" \
+                "${state_dir}/encryption-plan.json"; do
+                temporary="${state_dir}/.${owned##*/}.tmp"
+                if [ -e "$temporary" ] || [ -L "$temporary" ]; then
+                    test -f "$temporary" && test ! -L "$temporary"
+                    test "$(stat -c %a "$temporary")" = 600
+                    rm -f "$temporary"
+                fi
+                [ -e "$owned" ] || continue
+                test -f "$owned" && test ! -L "$owned"
+                test "$(stat -c %a "$owned")" = 600
+                test "$(stat -c %s "$owned")" -le 67108864
+                jq -e '\''.schemaVersion | type == "number" and . > 0'\'' "$owned" >/dev/null
+                rm -f "$owned"
+            done
+
+            key_dir=${state_dir}/encryption-keys
+            [ -e "$key_dir" ] || return 0
+            test -d "$key_dir" && test ! -L "$key_dir"
+            test "$(stat -c %a "$key_dir")" = 700
+            test -z "$(find "$key_dir" -mindepth 1 -maxdepth 1 ! -name authority.json -print -quit)"
+            authority=${key_dir}/authority.json
+            if [ -e "$authority" ] || [ -L "$authority" ]; then
+                test -f "$authority" && test ! -L "$authority"
+                test "$(stat -c %a "$authority")" = 600
+                test "$(stat -c %s "$authority")" -le 67108864
+                jq -e --arg node_name "$UNF_ROLLBACK_NODE_NAME" \
+                    --arg node_uid "$UNF_ROLLBACK_NODE_UID" \
+                    '\''.schemaVersion == 1
+                    and .nodeName == $node_name and .nodeUid == $node_uid
+                    and (.clusterId | type == "string" and length > 0)
+                    and (.epochs | type == "array" and length <= 2)
+                    and all(.epochs[];
+                        (.privateKey | type == "array" and length == 32)
+                        and (.publicKey | type == "array" and length == 32))
+                    and (.checkpointDigest | type == "array" and length == 32)'\'' \
+                    "$authority" >/dev/null
+                rm -f "$authority"
+            fi
+            rmdir "$key_dir"
+        }
+
         # A previous rollback attempt may already have removed the complete
         # owned transaction on this Node before another Node failed. Resume only
         # from an exact empty owned boundary; any partial combination remains
@@ -273,6 +319,7 @@ for node in "${nodes[@]}"; do
                 rm -f "$load_balancers"
             fi
             cleanup_pending_deletes
+            cleanup_encryption_state
             if [ -d "$state_dir" ]; then
                 test -z "$(find "$state_dir" -mindepth 1 -print -quit)"
                 rmdir "$state_dir"
@@ -355,6 +402,7 @@ EOF
             "$routes" "$services" "${services}.pending" "$selection" \
             "${selection}.pending" "$load_balancers" "$marker"
         cleanup_pending_deletes
+        cleanup_encryption_state
         rmdir "$state_dir"
         rmdir /var/lib/unf/cni
         cleanup_runtime_state

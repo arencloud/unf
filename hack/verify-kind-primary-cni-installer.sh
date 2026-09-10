@@ -25,6 +25,11 @@ grep -q 'PERSISTENT_BPF_STATE_ABI_VERSION' \
 grep -q 'delete job "${job_name}"' "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'cni-status.lease' "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'cleanup_gateway_interface' "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'cleanup_encryption_state' "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'encryption-generation.json.recovery-plan' \
+    "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'checkpointDigest | type == "array" and length == 32' \
+    "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'UNF_ROLLBACK_NODE_UID' "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'test "$actual4" -eq 0' "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q '(.applied.targets | length) == 0' \
