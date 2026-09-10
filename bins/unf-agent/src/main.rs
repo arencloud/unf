@@ -8981,29 +8981,98 @@ async fn prepare_admitted_encryption_plan(
     generations.offer_prepared(prepared)
 }
 
+fn retire_transport_free_drained_encryption_epoch(
+    generations: &EncryptionGenerationSynchronizer,
+    keys: &mut EncryptionKeySynchronizer,
+    encryption: &mut EncryptionMapSynchronizer,
+    observation_revision: Revision,
+) -> Result<bool> {
+    let now_unix_ms = current_unix_time_milliseconds();
+    let authority = keys
+        .authority
+        .as_mut()
+        .context("retiring encryption epoch has no Node-local key authority")?;
+    let Some(epoch) = authority
+        .authority()
+        .drained_epoch_ready_for_retirement(now_unix_ms)
+        .context("select transport-free drained Node-local key epoch")?
+    else {
+        return Ok(false);
+    };
+    let journal_references_epoch = generations
+        .recovery
+        .active
+        .iter()
+        .chain(generations.recovery.pending.iter())
+        .flat_map(|recovery| recovery.plans.iter())
+        .any(|plan| plan.epoch == epoch);
+    if journal_references_epoch {
+        // The controller has not yet published the generation that removes
+        // this transport. That successor will move the exact plan into the
+        // normal retirement journal; do not preempt it here.
+        return Ok(false);
+    }
+    let removed_flows = encryption
+        .purge_epoch_connections(epoch)
+        .context("purge transport-free expired encryption leases")?;
+    let publication = authority
+        .authority()
+        .publication()
+        .context("verify key authority before transport-free retirement")?;
+    let proof = EpochDrainProof::issue(
+        publication.node_uid,
+        epoch,
+        observation_revision,
+        now_unix_ms,
+        0,
+        0,
+    )
+    .context("issue transport-free zero-state encryption drain proof")?;
+    authority
+        .retire_drained_epoch(&proof, now_unix_ms)
+        .context("durably retire transport-free Node-local key epoch")?;
+    info!(
+        epoch,
+        removed_expired_flow_leases = removed_flows,
+        "retired transport-free drained encryption epoch after exact map and journal absence"
+    );
+    Ok(true)
+}
+
 async fn retire_drained_encryption_epoch(
     generations: &mut EncryptionGenerationSynchronizer,
     keys: &mut EncryptionKeySynchronizer,
     encryption: &mut EncryptionMapSynchronizer,
 ) -> Result<bool> {
-    if generations.recovery.retiring.is_empty() {
-        return Ok(false);
-    }
     if generations.pending.is_some()
         || generations.pending_activation_report.is_some()
         || !generations.active_revalidated
     {
         return Ok(false);
     }
-    let [plan] = generations.recovery.retiring.as_slice() else {
-        bail!("encryption retirement journal is not singleton-bounded");
-    };
-    let plan = plan.clone();
     let observation_revision = generations
         .current
         .as_ref()
         .map(|current| current.published().generation)
         .context("retiring encryption epoch has no active admitted generation")?;
+
+    // Rotation can occur while this Node has no cross-Node workload
+    // transport. Such an epoch has no synthetic WireGuard plan to place in
+    // the retirement journal. The current map checkpoint still proves no
+    // transport references it, while the empty active/pending plan sets prove
+    // no owned Linux route or link was staged for it.
+    if generations.recovery.retiring.is_empty() {
+        return retire_transport_free_drained_encryption_epoch(
+            generations,
+            keys,
+            encryption,
+            observation_revision,
+        );
+    }
+    let [plan] = generations.recovery.retiring.as_slice() else {
+        bail!("encryption retirement journal is not singleton-bounded");
+    };
+    let plan = plan.clone();
 
     let removed_flows = encryption
         .purge_epoch_connections(plan.epoch)

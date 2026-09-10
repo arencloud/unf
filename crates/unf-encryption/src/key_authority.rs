@@ -376,6 +376,34 @@ impl NodeKeyAuthority {
         &self.epochs
     }
 
+    /// Returns the draining epoch whose bounded drain window has elapsed.
+    ///
+    /// This is deliberately only a lifecycle query. The caller must still
+    /// prove that packet, route, and kernel ownership are empty before issuing
+    /// an [`EpochDrainProof`]. An idle Node can have a draining key with no
+    /// transport plan, so retirement cannot depend solely on a WireGuard-plan
+    /// journal entry.
+    ///
+    /// # Errors
+    ///
+    /// Rejects corrupt authority state or the zero wall-clock instant.
+    pub fn drained_epoch_ready_for_retirement(
+        &self,
+        now_unix_ms: u64,
+    ) -> Result<Option<u64>, KeyAuthorityError> {
+        self.validate()?;
+        if now_unix_ms == 0 {
+            return Err(KeyAuthorityError::InvalidDrainProof);
+        }
+        Ok(self.epochs.iter().find_map(|epoch| {
+            (epoch.phase == KeyEpochPhase::Draining
+                && epoch
+                    .drain_deadline_unix_ms
+                    .is_some_and(|deadline| now_unix_ms >= deadline))
+            .then_some(epoch.epoch)
+        }))
+    }
+
     /// Returns secret authority only to the in-crate Linux convergence
     /// orchestrator after the complete plan identity and public key match a
     /// locally ready epoch.
@@ -1995,6 +2023,18 @@ mod tests {
             .unwrap();
         assert_eq!(authority.epochs[0].phase, KeyEpochPhase::Draining);
         assert_eq!(authority.epochs[1].phase, KeyEpochPhase::Active);
+        assert_eq!(
+            authority
+                .drained_epoch_ready_for_retirement(NOW + 1_011)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            authority
+                .drained_epoch_ready_for_retirement(NOW + 1_012)
+                .unwrap(),
+            Some(first)
+        );
         let nonempty = EpochDrainProof::issue(
             "node-uid-a".to_owned(),
             first,
