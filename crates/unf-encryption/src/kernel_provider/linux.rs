@@ -11,7 +11,7 @@ use netlink_packet_wireguard::{
     WireguardCmd, WireguardDeviceFlags, WireguardMessage, WireguardPeer, WireguardPeerAttribute,
     WireguardPeerFlags,
 };
-use rtnetlink::packet_route::address::AddressAttribute;
+use rtnetlink::packet_route::address::{AddressAttribute, AddressMessage};
 use rtnetlink::packet_route::link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage};
 use rtnetlink::packet_route::route::{
     RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType,
@@ -80,6 +80,8 @@ impl LinuxWireGuardProvider {
             let result = async {
                 configure_device(plan, private_key).await?;
                 after_device()?;
+                reconcile_proof_addresses(&handle, plan, link.header.index, &plan.proof_addresses)
+                    .await?;
                 reconcile_routes(&handle, plan, link.header.index, &plan.route_prefixes()).await?;
                 let snapshot = read_snapshot(&handle, plan, &link).await?;
                 snapshot.verify_against(plan)?;
@@ -440,7 +442,7 @@ async fn read_snapshot(
         return Err(WireGuardKernelError::ReadbackMismatch);
     }
     let routes = read_routes(handle, plan, link.header.index, true).await?;
-    let proof_addresses = read_proof_addresses(handle, plan, link.header.index).await?;
+    let proof_addresses = read_proof_addresses(handle, plan, link.header.index, true).await?;
     WireGuardKernelSnapshot::issue(WireGuardKernelSnapshotInput {
         interface_name: device.interface_name,
         interface_index: device.interface_index,
@@ -467,7 +469,7 @@ async fn read_owned_snapshot(
         return Err(WireGuardKernelError::ReadbackMismatch);
     }
     let routes = read_all_owned_routes(handle, plan, link.header.index).await?;
-    let proof_addresses = read_proof_addresses(handle, plan, link.header.index).await?;
+    let proof_addresses = read_proof_addresses(handle, plan, link.header.index, false).await?;
     let snapshot = WireGuardKernelSnapshot::issue(WireGuardKernelSnapshotInput {
         interface_name: device.interface_name,
         interface_index: device.interface_index,
@@ -514,7 +516,10 @@ fn validate_reconfiguration_boundary(
         || before.listen_port != plan.listen_port
         || before.fwmark != plan.fwmark
         || before.mtu != plan.mtu_envelope.interface_mtu
-        || before.proof_addresses != plan.proof_addresses
+        || before
+            .proof_addresses
+            .iter()
+            .any(|prefix| !plan.proof_addresses.contains(prefix))
         || before
             .routes
             .iter()
@@ -542,6 +547,7 @@ async fn restore_owned_snapshot(
         before.peers.iter().map(encode_readback_peer).collect(),
     )
     .await?;
+    reconcile_proof_addresses(handle, plan, interface_index, &before.proof_addresses).await?;
     let prefixes = before
         .routes
         .iter()
@@ -577,7 +583,33 @@ async fn read_proof_addresses(
     handle: &Handle,
     plan: &WireGuardKernelPlan,
     interface_index: u32,
+    require_complete: bool,
 ) -> Result<Vec<IpPrefix>, WireGuardKernelError> {
+    let messages = list_proof_addresses(handle, interface_index).await?;
+    let mut observed = messages
+        .iter()
+        .map(|(prefix, _)| *prefix)
+        .collect::<Vec<_>>();
+    observed.sort_unstable();
+    if observed.windows(2).any(|pair| pair[0] == pair[1])
+        || observed
+            .iter()
+            .any(|prefix| !plan.proof_addresses.contains(prefix))
+    {
+        return Err(WireGuardKernelError::ForeignState(
+            "owned WireGuard interface has unexpected proof addresses".to_owned(),
+        ));
+    }
+    if require_complete && observed != plan.proof_addresses {
+        return Err(WireGuardKernelError::ReadbackMismatch);
+    }
+    Ok(observed)
+}
+
+async fn list_proof_addresses(
+    handle: &Handle,
+    interface_index: u32,
+) -> Result<Vec<(IpPrefix, AddressMessage)>, WireGuardKernelError> {
     let mut stream = handle
         .address()
         .get()
@@ -599,23 +631,71 @@ async fn read_proof_addresses(
                 _ => None,
             });
         if let Some(address) = address {
-            observed.push(IpPrefix {
-                address,
-                prefix_len: message.header.prefix_len,
-            });
+            observed.push((
+                IpPrefix {
+                    address,
+                    prefix_len: message.header.prefix_len,
+                },
+                message,
+            ));
         }
         if observed.len() > crate::MAX_ENCRYPTION_PREFIXES_PER_NODE {
             return Err(WireGuardKernelError::CapacityExceeded);
         }
     }
-    observed.sort_unstable();
-    observed.dedup();
-    if observed != plan.proof_addresses {
+    Ok(observed)
+}
+
+async fn reconcile_proof_addresses(
+    handle: &Handle,
+    plan: &WireGuardKernelPlan,
+    interface_index: u32,
+    desired: &[IpPrefix],
+) -> Result<(), WireGuardKernelError> {
+    let current = list_proof_addresses(handle, interface_index).await?;
+    if current
+        .iter()
+        .any(|(prefix, _)| !plan.proof_addresses.contains(prefix) || !prefix.is_canonical())
+    {
         return Err(WireGuardKernelError::ForeignState(
-            "owned WireGuard interface has unexpected proof addresses".to_owned(),
+            "refusing to reconcile an unexpected WireGuard proof address".to_owned(),
         ));
     }
-    Ok(observed)
+    for prefix in desired {
+        if !current.iter().any(|(existing, _)| existing == prefix) {
+            handle
+                .address()
+                .add(interface_index, prefix.address, prefix.prefix_len)
+                .replace()
+                .execute()
+                .await
+                .map_err(|error| kernel("restore WireGuard proof address", &error))?;
+        }
+    }
+    for (_, message) in current {
+        let prefix = message
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                AddressAttribute::Local(address) | AddressAttribute::Address(address) => {
+                    Some(IpPrefix {
+                        address: *address,
+                        prefix_len: message.header.prefix_len,
+                    })
+                }
+                _ => None,
+            })
+            .ok_or(WireGuardKernelError::ReadbackMismatch)?;
+        if !desired.contains(&prefix) {
+            handle
+                .address()
+                .del(message)
+                .execute()
+                .await
+                .map_err(|error| kernel("remove stale WireGuard proof address", &error))?;
+        }
+    }
+    Ok(())
 }
 
 struct ParsedDevice {
@@ -1478,6 +1558,46 @@ mod tests {
             .unwrap();
     }
 
+    async fn prove_missing_owned_state_is_repaired(
+        provider: &LinuxWireGuardProvider,
+        plan: &WireGuardKernelPlan,
+        private_key: &WireGuardPrivateKey,
+        handle: &Handle,
+    ) {
+        let missing_prefix = *plan.route_prefixes().iter().next().unwrap();
+        let missing_route = list_routes(handle)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|route| route_key(route) == Some((missing_prefix, plan.route_table)))
+            .unwrap();
+        handle.route().del(missing_route).execute().await.unwrap();
+        assert!(provider.readback(plan).await.is_err());
+        let (outcome, repaired) = provider.apply(plan, private_key).await.unwrap();
+        assert_eq!(outcome, KernelApplyOutcome::Reconfigured);
+        repaired.verify_against(plan).unwrap();
+
+        let link = require_link(handle, &plan.interface_name).await.unwrap();
+        let missing_proof = plan.proof_addresses[1];
+        let missing_address = list_proof_addresses(handle, link.header.index)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(prefix, _)| *prefix == missing_proof)
+            .unwrap()
+            .1;
+        handle
+            .address()
+            .del(missing_address)
+            .execute()
+            .await
+            .unwrap();
+        assert!(provider.readback(plan).await.is_err());
+        let (outcome, repaired) = provider.apply(plan, private_key).await.unwrap();
+        assert_eq!(outcome, KernelApplyOutcome::Reconfigured);
+        repaired.verify_against(plan).unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires CAP_NET_ADMIN and kernel WireGuard"]
     async fn privileged_kernel_stage_readback_rollback_and_cleanup_are_exact() {
@@ -1522,18 +1642,7 @@ mod tests {
         assert_eq!(fs::read_to_string(reverse_path_filter).unwrap().trim(), "0");
         assert_eq!(first.configuration_digest, replay.configuration_digest);
 
-        let missing_prefix = *plan.route_prefixes().iter().next().unwrap();
-        let missing_route = list_routes(&handle)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|route| route_key(route) == Some((missing_prefix, plan.route_table)))
-            .unwrap();
-        handle.route().del(missing_route).execute().await.unwrap();
-        assert!(provider.readback(&plan).await.is_err());
-        let (outcome, repaired) = provider.apply(&plan, &private_key).await.unwrap();
-        assert_eq!(outcome, KernelApplyOutcome::Reconfigured);
-        repaired.verify_against(&plan).unwrap();
+        prove_missing_owned_state_is_repaired(&provider, &plan, &private_key, &handle).await;
 
         let expanded = expanded_plan(&plan);
         let injected_update = provider
