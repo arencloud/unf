@@ -21396,16 +21396,22 @@ mod tests {
 
         let source_v4 = Ipv4Addr::new(10, 244, 0, 20);
         let destination_v4 = Ipv4Addr::new(10, 244, 1, 21);
+        let native_source_v4 = Ipv4Addr::new(10, 244, 0, 30);
+        let native_destination_v4 = Ipv4Addr::new(10, 244, 1, 31);
         let source_v6: Ipv6Addr = "fd00::20".parse().unwrap();
         let destination_v6: Ipv6Addr = "fd00:1::21".parse().unwrap();
         let source_identity = IdentityId::new(42);
         let destination_identity = IdentityId::new(43);
+        let native_source_identity = IdentityId::new(45);
+        let native_destination_identity = IdentityId::new(46);
 
         let (mut identity_v4, mut identity_v6, mut identity_config) =
             take_identity_maps(&mut ebpf).expect("take identity maps");
         for (address, identity) in [
             (source_v4.octets(), source_identity),
             (destination_v4.octets(), destination_identity),
+            (native_source_v4.octets(), native_source_identity),
+            (native_destination_v4.octets(), native_destination_identity),
         ] {
             identity_v4[0]
                 .insert(
@@ -21461,7 +21467,7 @@ mod tests {
             policy_revision: POLICY_REVISION,
             service_revision: SERVICE_REVISION,
             egress_revision: EGRESS_REVISION,
-            decision_count: 2,
+            decision_count: 3,
             transport_count: 2,
             schema_version: ENCRYPTION_MAP_ABI_VERSION,
             active_bank: BANK,
@@ -21493,6 +21499,32 @@ mod tests {
             .insert(
                 encryption_maps::encode_decision_key(&direct_key),
                 encryption_maps::encode_decision_value(&decision(101, base_flags)),
+                0,
+            )
+            .unwrap();
+        let native_key = unf_ebpf_common::EncryptionDecisionKey {
+            source_identity: native_source_identity,
+            destination_identity: native_destination_identity,
+            bank: BANK,
+            reserved: [0; 3],
+        };
+        let native_decision = unf_ebpf_common::EncryptionDecisionValue {
+            transport_id: 0,
+            contract_revision: 0,
+            policy_revision: POLICY_REVISION,
+            service_revision: SERVICE_REVISION,
+            egress_revision: EGRESS_REVISION,
+            key_epoch: 0,
+            decision_witness: [0x5A; 16],
+            schema_version: ENCRYPTION_MAP_ABI_VERSION,
+            disposition: unf_ebpf_common::ENCRYPTION_DISPOSITION_NATIVE,
+            flags: base_flags,
+        };
+        encryption
+            .decisions
+            .insert(
+                encryption_maps::encode_decision_key(&native_key),
+                encryption_maps::encode_decision_value(&native_decision),
                 0,
             )
             .unwrap();
@@ -21591,6 +21623,19 @@ mod tests {
         assert_eq!(
             run_tc(&mut ebpf, "unf_observe_ingress", &packet_v6).0,
             TC_ACT_PIPE
+        );
+        let native_syn = ipv4_packet(6, native_source_v4, native_destination_v4, 40_003, 8081);
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &native_syn).0,
+            TC_ACT_PIPE,
+            "an explicit Native decision admits the opening SYN"
+        );
+        let mut native_ack = native_syn.clone();
+        native_ack[14 + 20 + 13] = 0x10;
+        assert_eq!(
+            run_tc(&mut ebpf, "unf_observe_ingress", &native_ack).0,
+            TC_ACT_PIPE,
+            "explicit Native authority applies to established packets without a tunnel lease"
         );
 
         let (draining_key, mut draining) = transport(101);

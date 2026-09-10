@@ -948,9 +948,6 @@ fn apply_encryption_selection<const IPV6: bool>(
         return TC_ACT_PIPE;
     }
 
-    if !packet_starts_encryption_lease(observation.protocol, observation.tcp_flags) {
-        return TC_ACT_SHOT;
-    }
     let decision_key = EncryptionDecisionKey {
         source_identity: observation.source_identity,
         destination_identity: observation.destination_identity,
@@ -971,6 +968,9 @@ fn apply_encryption_selection<const IPV6: bool>(
         return TC_ACT_PIPE;
     }
     if scratch.decision.disposition != ENCRYPTION_DISPOSITION_REQUIRED {
+        return TC_ACT_SHOT;
+    }
+    if !packet_starts_encryption_lease(observation.protocol, observation.tcp_flags) {
         return TC_ACT_SHOT;
     }
     let transport_id = if scratch.decision.flags & ENCRYPTION_DECISION_FLAG_ADDRESS_BOUND == 0 {
