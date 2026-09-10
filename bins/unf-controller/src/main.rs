@@ -9563,6 +9563,14 @@ fn encryption_transport_coordinates(epoch: u64) -> (String, u32, u32) {
     (interface_name, route_table, fwmark)
 }
 
+/// Alternates a bounded pair of Node-local UDP sockets with the two admitted
+/// key epochs. Consecutive active/draining epochs therefore cannot contend for
+/// one kernel socket, while the port remains a deterministic contract fact at
+/// both endpoints.
+fn encryption_epoch_listen_port(epoch: u64) -> u16 {
+    51_820 + u16::try_from(epoch & 1).expect("epoch parity is bounded")
+}
+
 fn project_encryption_epoch(
     cluster_id: &str,
     epoch: u64,
@@ -9575,7 +9583,7 @@ fn project_encryption_epoch(
         cluster_id: cluster_id.to_owned(),
         active_epoch: epoch,
         interface_name,
-        listen_port: 51_820,
+        listen_port: encryption_epoch_listen_port(epoch),
         route_table,
         fwmark,
         mtu: 1_420,
@@ -15423,6 +15431,16 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consecutive_encryption_epochs_lease_distinct_bounded_udp_sockets() {
+        assert_eq!(encryption_epoch_listen_port(1), 51_821);
+        assert_eq!(encryption_epoch_listen_port(2), 51_820);
+        assert_ne!(
+            encryption_epoch_listen_port(u64::MAX),
+            encryption_epoch_listen_port(u64::MAX - 1)
+        );
+    }
 
     #[test]
     fn native_reachability_plan_requires_provider_receipt_and_two_fabric_domains() {

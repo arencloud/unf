@@ -228,39 +228,42 @@ impl NodeLocalPlanSnapshot {
         now_monotonic_ns: u64,
     ) -> Result<Vec<NodeLocalEpochPlan<'_>>, NodeLocalPlanCompilerError> {
         self.verify()?;
-        self.epochs
-            .iter()
-            .map(|epoch| {
-                let drain_until_monotonic_ns = match epoch.state {
-                    FastPathEpochState::Active => 0,
-                    FastPathEpochState::Draining => {
-                        let remaining_ms = epoch
-                            .contract
-                            .valid_until_unix_ms
-                            .checked_sub(now_unix_ms)
-                            .filter(|remaining| *remaining > 0)
-                            .ok_or(NodeLocalPlanCompilerError::InvalidInput(
-                                "draining epoch deadline already expired",
-                            ))?;
-                        now_monotonic_ns
-                            .checked_add(remaining_ms.checked_mul(1_000_000).ok_or(
-                                NodeLocalPlanCompilerError::InvalidInput(
-                                    "draining epoch deadline overflows",
-                                ),
-                            )?)
-                            .ok_or(NodeLocalPlanCompilerError::InvalidInput(
+        let mut plans = Vec::with_capacity(self.epochs.len());
+        for epoch in &self.epochs {
+            let drain_until_monotonic_ns = match epoch.state {
+                FastPathEpochState::Active => 0,
+                FastPathEpochState::Draining => {
+                    let Some(remaining_ms) = epoch
+                        .contract
+                        .valid_until_unix_ms
+                        .checked_sub(now_unix_ms)
+                        .filter(|remaining| *remaining > 0)
+                    else {
+                        // A delayed retry must never revive an expired
+                        // draining transport. Omitting it lets the normal
+                        // successor transaction positively retire any
+                        // previously active kernel/map authority.
+                        continue;
+                    };
+                    now_monotonic_ns
+                        .checked_add(remaining_ms.checked_mul(1_000_000).ok_or(
+                            NodeLocalPlanCompilerError::InvalidInput(
                                 "draining epoch deadline overflows",
-                            ))?
-                    }
-                };
-                Ok(NodeLocalEpochPlan {
-                    contract: &epoch.contract,
-                    readiness_digest: epoch.readiness_digest,
-                    state: epoch.state,
-                    drain_until_monotonic_ns,
-                })
-            })
-            .collect()
+                            ),
+                        )?)
+                        .ok_or(NodeLocalPlanCompilerError::InvalidInput(
+                            "draining epoch deadline overflows",
+                        ))?
+                }
+            };
+            plans.push(NodeLocalEpochPlan {
+                contract: &epoch.contract,
+                readiness_digest: epoch.readiness_digest,
+                state: epoch.state,
+                drain_until_monotonic_ns,
+            });
+        }
+        Ok(plans)
     }
 
     /// Reconstructs the pure fast-path decision input after snapshot replay.
@@ -749,6 +752,7 @@ fn compile_epoch_plan(
     }
     let first = &contract.plans[0];
     let path = &first.transport.forward;
+    let local_listen_port = first.transport.reverse.peer_endpoint.port();
     let epoch = first.source_key.epoch;
     let local_public_key = first.source_key.public_key;
     let mut peers = BTreeMap::<String, WireGuardPeerPlan>::new();
@@ -765,6 +769,7 @@ fn compile_epoch_plan(
             || forward.route_table != path.route_table
             || forward.fwmark != path.fwmark
             || forward.mtu != path.mtu
+            || plan.transport.reverse.peer_endpoint.port() != local_listen_port
             || plan.destination.node.uid != forward.destination_node_uid
             || plan.destination_key.node_uid != forward.destination_node_uid
             || plan.destination_key.epoch != epoch
@@ -817,7 +822,7 @@ fn compile_epoch_plan(
         revision: context.kernel_transaction_revision,
         interface_name: path.interface_name.clone(),
         local_public_key,
-        listen_port: context.listen_port,
+        listen_port: local_listen_port,
         fwmark: path.fwmark,
         route_table: path.route_table,
         mtu_envelope,
@@ -1220,6 +1225,9 @@ mod tests {
             .unwrap();
         assert_eq!(active.drain_until_monotonic_ns, 0);
         assert_eq!(draining.drain_until_monotonic_ns, 500_010_000);
+        let after_deadline = snapshot.epoch_plans_at(1_500, 20_000).unwrap();
+        assert_eq!(after_deadline.len(), 1);
+        assert_eq!(after_deadline[0].state, FastPathEpochState::Active);
 
         let mut forged = snapshot;
         forged.epochs[0].drain_until_monotonic_ns = 1;
@@ -1266,6 +1274,21 @@ mod tests {
         assert_eq!(desired.decision_authority.len(), 4);
         assert_eq!(desired.transport_authority.len(), 1);
         assert_eq!(prepared.recovery_plan().plans, plans);
+    }
+
+    #[test]
+    fn epoch_kernel_socket_is_derived_from_attested_reverse_path() {
+        let contract = contract();
+        let epoch = NodeLocalEpochPlan {
+            contract: &contract,
+            readiness_digest: [7; 32],
+            state: FastPathEpochState::Active,
+            drain_until_monotonic_ns: 0,
+        };
+        let mut compile_context = context();
+        compile_context.listen_port = 60_000;
+        let plans = compile_inactive_kernel_plans(&compile_context, &[epoch]).unwrap();
+        assert_eq!(plans[0].listen_port, 51_820);
     }
 
     #[test]
