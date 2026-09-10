@@ -10043,10 +10043,29 @@ fn ingest_encryption_keys_for_at(
     if let Some(complete_cut) = complete_cut {
         // A controller restart can reconstruct an already mutually-attested
         // public cut directly from agents. Reopening a witness round would be
-        // both impossible (there is no Prepared epoch) and unnecessary; the
-        // readiness digests remain independently verifiable. A genuinely new
-        // Prepared epoch still enters the complete reciprocal matrix.
-        if encryption_epoch_window(&complete_cut, now_unix_ms)?.is_none() {
+        // both impossible (there is no Prepared epoch) and unnecessary. A
+        // complete higher Prepared epoch must, however, open its reciprocal
+        // round while the predecessor is still Active; waiting for the old
+        // window to expire makes a positive drain mathematically impossible.
+        let prepared_epochs = complete_cut
+            .publications
+            .iter()
+            .filter_map(|publication| {
+                let candidates = publication
+                    .epochs
+                    .iter()
+                    .filter(|epoch| epoch.phase == unf_encryption::KeyEpochPhase::Prepared)
+                    .map(|epoch| epoch.epoch)
+                    .collect::<Vec<_>>();
+                let [epoch] = candidates.as_slice() else {
+                    return None;
+                };
+                Some(*epoch)
+            })
+            .collect::<Vec<_>>();
+        let complete_prepared_epoch = prepared_epochs.len() == complete_cut.publications.len()
+            && prepared_epochs.windows(2).all(|pair| pair[0] == pair[1]);
+        if complete_prepared_epoch {
             mutex_lock(&state.encryption_key_attestations)
                 .begin_if_needed(&complete_cut, now_unix_ms)
                 .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
@@ -16173,6 +16192,43 @@ mod tests {
                 .round()
                 .is_none(),
             "already-ready authority must not reopen an impossible attestation round"
+        );
+
+        let peer_uids = members
+            .iter()
+            .map(|member| member.node_uid.clone())
+            .collect::<BTreeSet<_>>();
+        for (agent, member, authority) in agents
+            .iter()
+            .zip(&members)
+            .zip(&mut authorities)
+            .map(|((agent, member), authority)| (agent, member, authority))
+        {
+            authority
+                .activate_epoch(1, membership_revision, now + 3, 1_000)
+                .unwrap();
+            let mut required = peer_uids.clone();
+            required.remove(&member.node_uid);
+            authority
+                .prepare_epoch(
+                    membership_revision,
+                    required,
+                    now + 4,
+                    now + 20_000,
+                    &mut unf_encryption::OsWireGuardKeyGenerator,
+                )
+                .unwrap();
+            ingest_encryption_keys_for_at(&state, agent, authority.publication().unwrap(), now + 5)
+                .unwrap();
+        }
+        assert!(
+            mutex_lock(&state.encryption_key_attestations)
+                .round()
+                .unwrap()
+                .proposals
+                .iter()
+                .all(|proposal| proposal.epoch == 2),
+            "a complete prepared successor must attest before the active key expires"
         );
     }
 
