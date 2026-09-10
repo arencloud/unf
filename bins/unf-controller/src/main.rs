@@ -31,6 +31,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -9279,7 +9280,6 @@ fn reconcile_encryption_generation_fact(
 fn encryption_generation_membership(
     state: &ControllerState,
 ) -> Result<(Revision, Vec<EncryptionGenerationRecipient>), ApiError> {
-    let membership_revision = mutex_lock(&state.revisions).topology;
     let nodes = read_lock(&state.nodes);
     let node_records = read_lock(&state.node_port_nodes);
     let mut members = nodes
@@ -9299,12 +9299,32 @@ fn encryption_generation_membership(
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     members.sort();
-    if membership_revision == Revision::INITIAL || members.is_empty() {
+    if members.is_empty() {
         return Err(ApiError::service_unavailable(
             "authoritative encryption membership is not initialized",
         ));
     }
+    let membership_revision = encryption_membership_revision(&members);
     Ok((membership_revision, members))
+}
+
+/// Produces a restart-stable causal coordinate from the exact Node name/UID
+/// membership rather than the noisy general topology event counter. Pod,
+/// Service, readiness, or controller churn therefore cannot strand a valid
+/// Node-local key epoch, while any Node replacement changes the coordinate.
+fn encryption_membership_revision(members: &[EncryptionGenerationRecipient]) -> Revision {
+    let mut hasher = Sha256::new();
+    hasher.update(b"unf.encryption-membership.v1\0");
+    for member in members {
+        hasher.update((member.node_name.len() as u64).to_be_bytes());
+        hasher.update(member.node_name.as_bytes());
+        hasher.update((member.node_uid.len() as u64).to_be_bytes());
+        hasher.update(member.node_uid.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut coordinate = [0_u8; 8];
+    coordinate.copy_from_slice(&digest[..8]);
+    Revision::new(u64::from_be_bytes(coordinate).max(1))
 }
 
 fn publish_reconciled_encryption_generation(state: &ControllerState) -> Result<bool, ApiError> {
@@ -10016,9 +10036,16 @@ fn ingest_encryption_keys_for_at(
             .map_err(|error| ApiError::service_unavailable(error.to_string()))?
     };
     if let Some(complete_cut) = complete_cut {
-        mutex_lock(&state.encryption_key_attestations)
-            .begin_if_needed(&complete_cut, now_unix_ms)
-            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        // A controller restart can reconstruct an already mutually-attested
+        // public cut directly from agents. Reopening a witness round would be
+        // both impossible (there is no Prepared epoch) and unnecessary; the
+        // readiness digests remain independently verifiable. A genuinely new
+        // Prepared epoch still enters the complete reciprocal matrix.
+        if encryption_epoch_window(&complete_cut, now_unix_ms)?.is_none() {
+            mutex_lock(&state.encryption_key_attestations)
+                .begin_if_needed(&complete_cut, now_unix_ms)
+                .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        }
     }
     Ok(())
 }
@@ -15995,6 +16022,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn encryption_key_attestation_releases_only_an_authenticated_complete_matrix() {
         let state = new_state(true);
         let now = unix_time_millis().max(1);
@@ -16014,7 +16042,8 @@ mod tests {
             );
         }
         mutex_lock(&state.revisions).topology = Revision::new(9);
-        let members = encryption_generation_membership(&state).unwrap().1;
+        let (membership_revision, members) = encryption_generation_membership(&state).unwrap();
+        let mut authorities = Vec::new();
         for (agent, member) in agents.iter().zip(&members) {
             let mut authority = unf_encryption::NodeKeyAuthority::new(
                 "test-cluster-uid".to_owned(),
@@ -16024,7 +16053,7 @@ mod tests {
             .unwrap();
             authority
                 .prepare_epoch(
-                    Revision::new(9),
+                    membership_revision,
                     members
                         .iter()
                         .filter(|peer| *peer != member)
@@ -16037,6 +16066,7 @@ mod tests {
                 .unwrap();
             ingest_encryption_keys_for_at(&state, agent, authority.publication().unwrap(), now + 1)
                 .unwrap();
+            authorities.push(authority);
         }
 
         let round = encryption_key_attestation_round_for(&state, &agents[0]).unwrap();
@@ -16066,11 +16096,98 @@ mod tests {
             now + 2,
         )
         .unwrap();
-        for agent in &agents {
+        for (index, agent) in agents.iter().enumerate() {
             let cut = encryption_key_attestation_cut_for(&state, agent).unwrap();
             cut.verify().unwrap();
             assert_eq!(cut.acknowledgements.len(), 1);
+            for acknowledgement in cut.acknowledgements {
+                authorities[index]
+                    .acknowledge_epoch(
+                        &acknowledgement.peer_node_uid.clone(),
+                        acknowledgement,
+                        now + 2,
+                    )
+                    .unwrap();
+            }
         }
+
+        let restarted = new_state(true);
+        for agent in &agents {
+            install_authenticated_agent(&restarted, agent);
+            write_lock(&restarted.nodes).insert(
+                agent.node_name.clone(),
+                TopologyNode {
+                    name: agent.node_name.clone(),
+                    ready: true,
+                    labels: BTreeMap::new(),
+                },
+            );
+        }
+        mutex_lock(&restarted.revisions).topology = Revision::new(50_000);
+        assert_eq!(
+            encryption_generation_membership(&restarted).unwrap().0,
+            membership_revision
+        );
+        for (agent, authority) in agents.iter().zip(&authorities) {
+            ingest_encryption_keys_for_at(
+                &restarted,
+                agent,
+                authority.publication().unwrap(),
+                now + 3,
+            )
+            .expect("restart must reconstruct a mutually-attested public cut");
+        }
+        assert!(
+            mutex_lock(&restarted.encryption_key_transparency)
+                .complete_cut()
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            mutex_lock(&restarted.encryption_key_attestations)
+                .round()
+                .is_none(),
+            "already-ready authority must not reopen an impossible attestation round"
+        );
+    }
+
+    #[test]
+    fn encryption_membership_coordinate_ignores_topology_churn_but_fences_replacement() {
+        let state = new_state(true);
+        for node in ["worker-a", "worker-b"] {
+            let agent = authenticated_egress_agent(node);
+            install_authenticated_agent(&state, &agent);
+            write_lock(&state.nodes).insert(
+                node.to_owned(),
+                TopologyNode {
+                    name: node.to_owned(),
+                    ready: true,
+                    labels: BTreeMap::new(),
+                },
+            );
+        }
+        mutex_lock(&state.revisions).topology = Revision::new(9);
+        let (before, members) = encryption_generation_membership(&state).unwrap();
+        assert_ne!(before, Revision::INITIAL);
+        assert_eq!(before, encryption_membership_revision(&members));
+
+        mutex_lock(&state.revisions).topology = Revision::new(10_000);
+        write_lock(&state.nodes).get_mut("worker-a").unwrap().ready = false;
+        assert_eq!(
+            encryption_generation_membership(&state).unwrap().0,
+            before,
+            "readiness and unrelated topology events cannot invalidate key authority"
+        );
+
+        write_lock(&state.node_port_nodes)
+            .get_mut("worker-a")
+            .unwrap()
+            .node_uid = "worker-a-replacement-uid".to_owned();
+        assert_ne!(
+            encryption_generation_membership(&state).unwrap().0,
+            before,
+            "Node replacement must change the causal membership coordinate"
+        );
     }
 
     #[test]
