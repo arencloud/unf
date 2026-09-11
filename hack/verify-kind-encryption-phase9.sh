@@ -209,14 +209,26 @@ set_baseline() {
     "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=180s >/dev/null
 }
 
-http_probe() {
+http_probe_once() {
     local pod=$1 address=$2 port=$3 target
     if [[ ${address} == *:* ]]; then target="http://[${address}]:${port}/health"; else target="http://${address}:${port}/health"; fi
     "${kc[@]}" -n "${namespace}" exec "${pod}" -- wget -T 3 -t 1 -qO- "${target}" | rg -qx ok
 }
 
+http_probe() {
+    local pod=$1 address=$2 port=$3
+    for _ in $(seq 1 30); do
+        if http_probe_once "${pod}" "${address}" "${port}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "HTTP readiness probe failed from ${pod} to ${address}:${port}" >&2
+    return 1
+}
+
 http_probe_fails() {
-    ! http_probe "$@" >/dev/null 2>&1
+    ! http_probe_once "$@" >/dev/null 2>&1
 }
 
 traffic_matrix() {
