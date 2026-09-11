@@ -1055,6 +1055,11 @@ matrix is maintained in the
   when controller replacement restores the preceding fleet cut. The controller
   advances one complete cut beyond that durable cursor, while equal/older polls
   remain acknowledgements and cannot generate churn; ADR 0217.
+- Proof-Time Exact Kernel Self-Healing replays only a digest-bound UNF-owned
+  durable plan when Linux down/up handling removes an address or policy route.
+  Fresh readback reconstructs a non-serializable capability against the same
+  admission, avoiding both partial-state trust and needless fleet churn; ADR
+  0218.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

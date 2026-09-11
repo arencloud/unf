@@ -7447,7 +7447,11 @@ async fn advance_startup_encryption_authority(
             .await
             .context("rehydrate durable startup encryption predecessor")?;
     }
-    match activate_admitted_encryption_generation(generations, encryption).await {
+    let key_authority = keys
+        .authority
+        .as_ref()
+        .map(RuntimeNodeKeyAuthority::authority);
+    match activate_admitted_encryption_generation(generations, encryption, key_authority).await {
         Ok(changed) if !encryption.requires_local_revalidation() => Ok(changed),
         Ok(_) => {
             if let Some(error) = synchronization_error {
@@ -9024,6 +9028,76 @@ impl EncryptionGenerationSynchronizer {
         )
     }
 
+    /// Repairs only the exact durable kernel plan behind an already admitted
+    /// activation capability. External link faults can remove IPv6 addresses
+    /// and connected policy routes while leaving the interface itself alive.
+    /// The original admission and route permit remain fenced until fresh
+    /// readback reconstructs the single-use convergence capability.
+    async fn repair_controller_admitted_kernel(
+        &mut self,
+        key_authority: Option<&NodeKeyAuthority>,
+    ) -> Result<bool> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(false);
+        };
+        let PendingEncryptionGeneration::ControllerAdmitted {
+            prepared,
+            admitted,
+            route_permit,
+            slot,
+        } = pending
+        else {
+            self.pending = Some(pending);
+            return Ok(false);
+        };
+        let recovery = match slot {
+            EncryptionRecoverySlot::Active => self.recovery.active.as_ref(),
+            EncryptionRecoverySlot::Pending => self.recovery.pending.as_ref(),
+        }
+        .cloned();
+        let repaired = async {
+            let recovery =
+                recovery.context("admitted encryption slot has no durable recovery plan")?;
+            if prepared.recovery_plan() != &recovery {
+                bail!("admitted encryption capability differs from its durable recovery plan");
+            }
+            if recovery.plans.is_empty() {
+                return Ok(None);
+            }
+            let key_authority = key_authority
+                .context("encryption kernel repair has no Node-local key authority")?;
+            let repaired = recovery
+                .repair_and_rehydrate_linux(key_authority)
+                .await
+                .context("repair admitted digest-bound encryption kernel state")?;
+            repaired
+                .verify_controller_admission(&admitted)
+                .context("rebind repaired kernel proof to controller admission")?;
+            Ok::<_, anyhow::Error>(Some(Box::new(repaired)))
+        }
+        .await;
+        match repaired {
+            Ok(repaired) => {
+                self.pending = Some(PendingEncryptionGeneration::ControllerAdmitted {
+                    prepared: repaired.unwrap_or(prepared),
+                    admitted,
+                    route_permit,
+                    slot,
+                });
+                Ok(true)
+            }
+            Err(error) => {
+                self.pending = Some(PendingEncryptionGeneration::ControllerAdmitted {
+                    prepared,
+                    admitted,
+                    route_permit,
+                    slot,
+                });
+                Err(error)
+            }
+        }
+    }
+
     fn take_admitted_capability(
         &mut self,
     ) -> Option<(
@@ -10134,10 +10208,23 @@ async fn collect_live_encryption_path_receipts(
 
 async fn assist_active_encryption_path_proofs(
     generations: &mut EncryptionGenerationSynchronizer,
+    key_authority: Option<&NodeKeyAuthority>,
 ) -> Result<bool> {
     let Some((recipient, desired, plans)) = generations.active_path_proof_state()? else {
         return Ok(false);
     };
+    if !plans.is_empty() {
+        let key_authority = key_authority
+            .context("active encryption path repair has no Node-local key authority")?;
+        generations
+            .recovery
+            .active
+            .as_ref()
+            .context("active encryption path service has no durable recovery plan")?
+            .repair_and_rehydrate_linux(key_authority)
+            .await
+            .context("repair active digest-bound encryption kernel state")?;
+    }
     // Receipts authorize only a pending activation latch. An already-active
     // Node contributes fresh endpoint evidence but never consumes the
     // resulting receipt as new local authority.
@@ -10150,11 +10237,15 @@ async fn assist_active_encryption_path_proofs(
 async fn activate_admitted_encryption_generation(
     generations: &mut EncryptionGenerationSynchronizer,
     encryption: &mut EncryptionMapSynchronizer,
+    key_authority: Option<&NodeKeyAuthority>,
 ) -> Result<bool> {
     if encryption_activation_is_retirement_fenced(generations.recovery.retiring.len()) {
         return Ok(false);
     }
     generations.ensure_probe_routes().await?;
+    generations
+        .repair_controller_admitted_kernel(key_authority)
+        .await?;
     let Some((recipient, desired, plans)) = generations.pending_path_proof_state()? else {
         return Ok(false);
     };
@@ -15862,6 +15953,7 @@ async fn consume_events(
                     && let Err(error) = activate_admitted_encryption_generation(
                         encryption_generations,
                         encryption,
+                        encryption_keys.authority.as_ref().map(RuntimeNodeKeyAuthority::authority),
                     ).await
                 {
                     warn!(error = ?error, "encrypted path activation is not complete; retaining the pending proof capability and active predecessor");
@@ -15870,6 +15962,7 @@ async fn consume_events(
                     && !encryption_generations.has_controller_admission()
                     && let Err(error) = assist_active_encryption_path_proofs(
                         encryption_generations,
+                        encryption_keys.authority.as_ref().map(RuntimeNodeKeyAuthority::authority),
                     ).await
                 {
                     warn!(error = ?error, "active encryption generation could not assist a fresh peer path-proof round");
