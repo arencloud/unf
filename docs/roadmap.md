@@ -1162,7 +1162,9 @@ matrix is maintained in the
   immutable images, evidence, and capture. The complete cl02 gate remains
   mandatory for the revised runtime. ADR 0238 additionally makes every
   streaming witness wall-clock bounded and moves causal controller observation
-  onto Node-local loopback, outside the dataplane being qualified.
+  onto Node-local loopback, outside the dataplane being qualified. ADR 0239
+  applies a finite deadline to every remaining OpenShift API request so an
+  outer retry count cannot hide an indefinitely blocked attempt.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

@@ -4,6 +4,7 @@ set -Eeuo pipefail
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 kubeconfig=${KUBECONFIG:-"${project_root}/.tools/cl02-audit.kubeconfig"}
 context=${KUBE_CONTEXT:-}
+request_timeout=${UNF_OPENSHIFT_ENCRYPTION_REQUEST_TIMEOUT:-20s}
 expected_infrastructure=${UNF_OPENSHIFT_ENCRYPTION_EXPECTED_INFRASTRUCTURE:-}
 disposable_ack=${UNF_OPENSHIFT_ENCRYPTION_ACKNOWLEDGE_DISPOSABLE:-}
 migration_ack=${UNF_OPENSHIFT_ENCRYPTION_ACKNOWLEDGE_MIGRATION:-}
@@ -118,9 +119,11 @@ agent_image=$(jq -er .images.agent "${release_record}")
 test_tools_image=$(jq -er .images.testTools "${release_record}")
 qualification_revision=$(git -C "${project_root}" rev-parse HEAD)
 git -C "${project_root}" merge-base --is-ancestor "${source_revision}" "${qualification_revision}"
-if [[ -z ${context} ]]; then context=$(oc --kubeconfig "${kubeconfig}" config current-context); fi
-[[ $(oc --kubeconfig "${kubeconfig}" config current-context) == "${context}" ]]
-kc=(oc --kubeconfig "${kubeconfig}" --context "${context}")
+if [[ -z ${context} ]]; then
+    context=$(timeout 20 oc --kubeconfig "${kubeconfig}" config current-context)
+fi
+[[ $(timeout 20 oc --kubeconfig "${kubeconfig}" config current-context) == "${context}" ]]
+kc=(oc --kubeconfig "${kubeconfig}" --context "${context}" --request-timeout="${request_timeout}")
 
 oc_read() {
     local attempt output

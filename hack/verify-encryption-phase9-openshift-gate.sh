@@ -44,6 +44,7 @@ require 'new_unhealthy=' "${gate}"
 require 'newlyUnhealthyOperators' "${gate}"
 require 'timeout 20.*exec' "${gate}"
 require 'http://127.0.0.1:9962' "${gate}"
+require 'request-timeout=' "${gate}"
 require 'simultaneous replacement of every encrypted endpoint' "${gate}"
 require 'kind: DaemonSet' "${gate}"
 require 'unf-encryption-host-probe' "${gate}"
@@ -86,6 +87,8 @@ require 'Immutable Activation-Supersession Kind Requalification' \
     "${root}/docs/adr/0237-immutable-activation-supersession-kind-requalification.md"
 require 'Bounded Node-Local Control Witness' \
     "${root}/docs/adr/0238-bounded-node-local-control-witness.md"
+require 'Whole-Gate API Deadline' \
+    "${root}/docs/adr/0239-whole-gate-api-deadline.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"

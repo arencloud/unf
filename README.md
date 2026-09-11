@@ -1179,6 +1179,10 @@ wall-clock bounded and observes the host-network controller over Node-local
 loopback. Required dataplane state therefore cannot obstruct its own readiness
 proof, and a timed-out sample remains unavailable rather than stale evidence;
 ADR 0238.
+The Whole-Gate API Deadline extends that property to ordinary reads and
+mutations: every OpenShift client request has a finite deadline, retries always
+obtain a fresh sample, and uncertain writes are closed by idempotent cleanup;
+ADR 0239.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
