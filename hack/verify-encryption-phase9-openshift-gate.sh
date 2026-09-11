@@ -70,6 +70,8 @@ require 'Expired Authority Recovery' \
     "${root}/docs/adr/0231-expired-authority-recovery.md"
 require 'Crash-Residue Cleanup Closure' \
     "${root}/docs/adr/0232-crash-residue-cleanup-closure.md"
+require 'Immutable Expiry-Recovery Kind Requalification' \
+    "${root}/docs/adr/0233-immutable-expiry-recovery-kind-requalification.md"
 require 'UNF_ENCRYPTION_BASELINE' "${overlay}/controller-native-patch.yaml"
 require 'value: native' "${overlay}/controller-native-patch.yaml"
 require 'UNF_ENCRYPTION_KEY_LIFETIME_SECONDS' "${overlay}/agent-rotation-patch.yaml"

@@ -1152,6 +1152,10 @@ an atomic service-checkpoint temporary left by agent termination. Crash-Residue
 Cleanup Closure validates and removes only the finite owner-only temporary
 vocabulary, including an unread private-key temporary, while unknown names,
 types, modes, and sizes remain fail-closed; ADR 0232.
+Exact revision `7296f06` then passed the complete fresh Phase 9 Kind gate,
+including crash-residue cleanup and no-CNI rollback. ADR 0233 binds the public
+Linux/amd64 controller, agent, and test-tool manifests plus the evidence and
+capture hashes as the only tuple eligible for the next cl02 rollout.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

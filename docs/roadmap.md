@@ -1146,8 +1146,9 @@ matrix is maintained in the
   coexistence but correctly refused final rollback on an interrupted atomic
   service-checkpoint temporary. Crash-Residue Cleanup Closure admits only the
   finite owner-only temporary vocabulary and keeps foreign state closed; ADR
-  0232. A fresh immutable Kind result and the complete cl02 gate remain
-  mandatory.
+  0232. Exact runtime `7296f06` passed the fresh full Kind lifecycle and is
+  bound to public immutable images plus evidence hashes by ADR 0233. The
+  complete cl02 gate remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
