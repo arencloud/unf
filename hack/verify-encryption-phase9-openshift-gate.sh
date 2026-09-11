@@ -101,6 +101,8 @@ require 'Durable Admission-First Reconstruction' \
     "${root}/docs/adr/0244-durable-admission-first-reconstruction.md"
 require 'Immutable Durable-Admission-First Kind Requalification' \
     "${root}/docs/adr/0245-immutable-durable-admission-first-kind-requalification.md"
+require 'Fail-Closed Tombstoned Predecessor Bridge' \
+    "${root}/docs/adr/0246-fail-closed-tombstoned-predecessor-bridge.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"
@@ -108,6 +110,10 @@ require 'discard_tombstoned_active_revalidation' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'must_settle_admitted_pending_before' \
     "${root}/bins/unf-agent/src/main.rs"
+require 'abandon_tombstoned_admitted_pending' \
+    "${root}/bins/unf-agent/src/main.rs"
+require 'begin_verified_tombstoned_predecessor_bridge' \
+    "${root}/bins/unf-agent/src/encryption_maps.rs"
 require 'unknown untombstoned key epoch' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'policyRevision:.active.fact.checkpoint.transaction.desired.published.policyRevision' \

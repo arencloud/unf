@@ -1183,7 +1183,11 @@ matrix is maintained in the
   equality before rebuilding volatile proof and rejects every conflicting
   state; ADR 0244. Exact runtime `b3aee0a` passed the fresh full Kind lifecycle;
   ADR 0245 binds its immutable public images and evidence for the resumed cl02
-  gate.
+  gate. That rollout found the admitted pending epoch already durably revoked.
+  The Fail-Closed Tombstoned Predecessor Bridge preserves logical ancestry,
+  zeros attached map authority before cleanup, and admits only a fully proved
+  fresh-key successor across the physical map gap; ADR 0246. Fresh Kind and
+  cl02 qualification remain mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

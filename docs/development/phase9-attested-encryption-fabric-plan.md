@@ -175,9 +175,11 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-ADR 0245 records the successful fresh full Kind qualification and immutable
-publication of ADR 0244 runtime `b3aee0a`. Deploy that exact tuple to the
-simultaneously rebooted five-Node cl02 fleet, then rerun the complete
+Qualify ADR 0246 Fail-Closed Tombstoned Predecessor Bridge on a fresh full Kind
+lifecycle and publish its immutable tuple. Then resume the five-Node cl02
+reboot residue: the bridge must cross from physical generation
+`1789160626300`, through revoked admitted cursor `1789160696724`, to the fresh
+authenticated successor without plaintext or key reuse. Rerun the complete
 qualification with the
 non-perturbing and bounded Node-local witness,
 causal readiness join, monotonic platform-health delta, and whole-gate API

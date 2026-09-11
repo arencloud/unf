@@ -1136,6 +1136,8 @@ struct EncryptionRecoveryJournal {
     active: Option<NodeLocalRecoveryPlan>,
     pending: Option<NodeLocalRecoveryPlan>,
     #[serde(default)]
+    tombstoned_predecessor: Option<NodeLocalRecoveryPlan>,
+    #[serde(default)]
     retiring: Vec<WireGuardKernelPlan>,
 }
 
@@ -1189,10 +1191,12 @@ impl EncryptionRecoveryJournal {
             schema_version: ENCRYPTION_RECOVERY_JOURNAL_SCHEMA_VERSION,
             active: None,
             pending: None,
+            tombstoned_predecessor: None,
             retiring: Vec::new(),
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn verify(
         &self,
         node_name: &str,
@@ -1201,7 +1205,12 @@ impl EncryptionRecoveryJournal {
         if self.schema_version != ENCRYPTION_RECOVERY_JOURNAL_SCHEMA_VERSION {
             bail!("unsupported encryption recovery journal schema");
         }
-        for plan in self.active.iter().chain(self.pending.iter()) {
+        for plan in self
+            .active
+            .iter()
+            .chain(self.pending.iter())
+            .chain(self.tombstoned_predecessor.iter())
+        {
             plan.verify().context("verify encryption recovery plan")?;
             if plan.fact.recipient.node_name != node_name {
                 bail!(
@@ -1249,11 +1258,30 @@ impl EncryptionRecoveryJournal {
                 bail!("retiring encryption plan is foreign or overlaps live authority");
             }
         }
+        if let Some(tombstoned) = &self.tombstoned_predecessor
+            && (tombstoned.plans.is_empty()
+                || tombstoned.fact.checkpoint.transaction.prior
+                    != self
+                        .active
+                        .as_ref()
+                        .map(|active| active.fact.checkpoint.transaction.desired.published))
+        {
+            bail!("tombstoned encryption predecessor lost its physical ancestry");
+        }
         match (&self.active, &self.pending) {
             (Some(active), Some(pending))
                 if active.fact.recipient == pending.fact.recipient
                     && pending.fact.checkpoint.transaction.prior
                         == Some(active.fact.checkpoint.transaction.desired.published) => {}
+            (Some(_), Some(pending))
+                if self
+                    .tombstoned_predecessor
+                    .as_ref()
+                    .is_some_and(|tombstoned| {
+                        tombstoned.fact.recipient == pending.fact.recipient
+                            && pending.fact.checkpoint.transaction.prior
+                                == Some(tombstoned.fact.checkpoint.transaction.desired.published)
+                    }) => {}
             (Some(_), Some(_)) => bail!("pending encryption recovery plan does not extend active"),
             (None, Some(pending)) if pending.fact.checkpoint.transaction.prior.is_none() => {}
             (None, Some(_)) => bail!("encryption recovery journal has an orphan successor"),
@@ -1272,6 +1300,10 @@ impl EncryptionRecoveryJournal {
                     .is_some_and(|plan| matches_current(plan, admitted))
                     || self
                         .pending
+                        .as_ref()
+                        .is_some_and(|plan| matches_current(plan, admitted))
+                    || self
+                        .tombstoned_predecessor
                         .as_ref()
                         .is_some_and(|plan| matches_current(plan, admitted)) =>
             {
@@ -7450,6 +7482,22 @@ async fn advance_startup_encryption_authority(
                 if let Some(plan) = plans.current.as_ref() {
                     let desired = plan.snapshot.generation;
                     generations.supersede_stale_active_revalidation(desired);
+                    if let Some(authority) = keys.authority.as_ref()
+                        && let Some(admitted) = generations
+                            .tombstoned_admitted_pending(desired, authority.authority())
+                            .context("classify admitted startup predecessor key authority")?
+                    {
+                        encryption
+                            .begin_verified_tombstoned_predecessor_bridge(&admitted)
+                            .context("quarantine tombstoned startup predecessor")?;
+                        if !generations
+                            .abandon_tombstoned_admitted_pending(desired, authority.authority())
+                            .await
+                            .context("retire tombstoned admitted startup predecessor")?
+                        {
+                            bail!("tombstoned startup predecessor changed after map quarantine");
+                        }
+                    }
                     settle_admitted_predecessor = generations
                         .must_settle_admitted_pending_before(desired)
                         .context("join admitted startup predecessor to successor plan")?;
@@ -8426,6 +8474,36 @@ fn encryption_recovery_uses_tombstoned_authority(
     Ok(tombstoned)
 }
 
+fn encryption_recovery_is_fully_tombstoned(
+    recovery: &NodeLocalRecoveryPlan,
+    authority: &NodeKeyAuthority,
+) -> Result<bool> {
+    recovery
+        .verify()
+        .context("verify generation recovery plan before tombstone bridge")?;
+    if recovery.plans.is_empty() {
+        return Ok(false);
+    }
+    let publication = authority
+        .publication()
+        .context("verify Node-local key authority before tombstone bridge")?;
+    let references = recovery
+        .plans
+        .iter()
+        .map(|plan| {
+            encryption_recovery_key_reference(&publication, plan.epoch, plan.local_public_key)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let tombstoned = references
+        .iter()
+        .filter(|reference| **reference == EncryptionRecoveryKeyReference::Tombstoned)
+        .count();
+    if tombstoned != 0 && tombstoned != references.len() {
+        bail!("generation recovery mixes available and tombstoned key authority");
+    }
+    Ok(tombstoned == references.len())
+}
+
 fn active_encryption_epoch(authority: &NodeKeyAuthority) -> Option<u64> {
     authority
         .epochs()
@@ -9235,6 +9313,114 @@ impl EncryptionGenerationSynchronizer {
         Ok(true)
     }
 
+    fn tombstoned_admitted_pending(
+        &self,
+        desired: Revision,
+        key_authority: &NodeKeyAuthority,
+    ) -> Result<Option<AdmittedEncryptionGeneration>> {
+        let Some(pending) = self.recovery.pending.as_ref() else {
+            return Ok(None);
+        };
+        let pending_generation = pending
+            .fact
+            .checkpoint
+            .transaction
+            .desired
+            .published
+            .generation;
+        if pending_generation >= desired
+            || !encryption_recovery_is_fully_tombstoned(pending, key_authority)?
+        {
+            return Ok(None);
+        }
+        let admitted = self
+            .current
+            .as_ref()
+            .filter(|current| {
+                current.recipient == pending.fact.recipient
+                    && current.checkpoint == pending.fact.checkpoint
+            })
+            .cloned()
+            .context("tombstoned pending generation has no exact durable admission")?;
+        match self.pending.as_ref() {
+            None => {}
+            Some(PendingEncryptionGeneration::ControllerAdmitted {
+                prepared,
+                admitted: volatile,
+                slot: EncryptionRecoverySlot::Pending,
+                ..
+            }) if prepared.recovery_plan() == pending && volatile.as_ref() == &admitted => {}
+            Some(_) => bail!("tombstoned pending admission has conflicting volatile authority"),
+        }
+        Ok(Some(admitted))
+    }
+
+    /// Removes only a fully tombstoned, controller-admitted pending Linux
+    /// stage after the map adapter has durably entered its fail-closed bridge.
+    /// The admitted cursor remains the logical controller predecessor; the
+    /// physical active recovery plan remains until the successor commits and
+    /// moves it through ordinary bounded retirement.
+    async fn abandon_tombstoned_admitted_pending(
+        &mut self,
+        desired: Revision,
+        key_authority: &NodeKeyAuthority,
+    ) -> Result<bool> {
+        let Some(_admitted) = self.tombstoned_admitted_pending(desired, key_authority)? else {
+            return Ok(false);
+        };
+        let pending = self
+            .recovery
+            .pending
+            .clone()
+            .context("tombstoned pending recovery plan disappeared")?;
+        let pending_generation = pending
+            .fact
+            .checkpoint
+            .transaction
+            .desired
+            .published
+            .generation;
+        let active_interfaces = self
+            .recovery
+            .active
+            .iter()
+            .flat_map(|recovery| recovery.plans.iter())
+            .map(|plan| plan.interface_name.as_str())
+            .collect::<BTreeSet<_>>();
+        let route_provider = LinuxEncryptionRouteProvider;
+        let kernel_provider = LinuxWireGuardProvider;
+        for plan in pending.plans.iter().rev() {
+            if active_interfaces.contains(plan.interface_name.as_str()) {
+                continue;
+            }
+            route_provider
+                .deactivate_plan(plan)
+                .await
+                .context("remove tombstoned admitted policy-route authority")?;
+            kernel_provider
+                .delete(plan)
+                .await
+                .context("remove tombstoned admitted WireGuard stage")?;
+        }
+        let mut recovery = self.recovery.clone();
+        recovery.tombstoned_predecessor = recovery.pending.take();
+        recovery.verify(&self.node_name, self.current.as_ref())?;
+        persist_secure_json(
+            &self.recovery_plan_path,
+            &recovery,
+            "tombstoned admitted encryption recovery plan",
+        )?;
+        self.recovery = recovery;
+        self.pending = None;
+        self.path_proofs.clear();
+        warn!(
+            skipped_generation = pending_generation.get(),
+            desired_generation = desired.get(),
+            "removed fully tombstoned admitted predecessor behind fail-closed map bridge"
+        );
+        Ok(true)
+    }
+
     fn has_controller_admission(&self) -> bool {
         matches!(
             &self.pending,
@@ -9555,6 +9741,7 @@ impl EncryptionGenerationSynchronizer {
                 }
                 recovery.retiring = removed;
                 recovery.active = Some(successor);
+                recovery.tombstoned_predecessor = None;
                 recovery.verify(&self.node_name, self.current.as_ref())?;
                 persist_secure_json(
                     &self.recovery_plan_path,

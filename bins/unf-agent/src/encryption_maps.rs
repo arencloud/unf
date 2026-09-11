@@ -66,12 +66,15 @@ pub(super) struct EncryptionMaps {
 pub(super) struct EncryptionMapSynchronizer {
     maps: EncryptionMaps,
     state_path: PathBuf,
+    tombstoned_predecessor_path: PathBuf,
     active: Option<FastPathMapCheckpoint>,
     pending: Option<FastPathMapCheckpoint>,
+    tombstoned_predecessor: Option<AdmittedEncryptionGeneration>,
     requires_local_revalidation: bool,
 }
 
 impl EncryptionMapSynchronizer {
+    #[allow(clippy::too_many_lines)]
     pub(super) fn recover(
         maps: EncryptionMaps,
         state_path: PathBuf,
@@ -82,9 +85,11 @@ impl EncryptionMapSynchronizer {
         }
         let mut synchronizer = Self {
             maps,
+            tombstoned_predecessor_path: tombstoned_predecessor_path(&state_path)?,
             state_path,
             active: None,
             pending: None,
+            tombstoned_predecessor: None,
             requires_local_revalidation: false,
         };
         synchronizer.validate_shapes()?;
@@ -92,6 +97,10 @@ impl EncryptionMapSynchronizer {
         let current = load_optional_checkpoint(&synchronizer.state_path, "encryption fast path")?;
         let pending_path = pending_checkpoint_path(&synchronizer.state_path)?;
         let pending = load_optional_checkpoint(&pending_path, "pending encryption fast path")?;
+        let mut tombstoned_predecessor = load_optional_admitted_generation(
+            &synchronizer.tombstoned_predecessor_path,
+            "tombstoned encryption predecessor bridge",
+        )?;
 
         if let Some(checkpoint) = &current {
             if checkpoint.transaction.phase != FastPathMapTransactionPhase::Committed {
@@ -105,11 +114,13 @@ impl EncryptionMapSynchronizer {
             checkpoint
                 .verify()
                 .context("verify pending encryption checkpoint")?;
-            if checkpoint.transaction.prior
-                != current
-                    .as_ref()
-                    .map(|checkpoint| checkpoint.transaction.desired.published)
-            {
+            let physical = current
+                .as_ref()
+                .map(|checkpoint| checkpoint.transaction.desired.published);
+            let bridged = tombstoned_predecessor
+                .as_ref()
+                .map(|admitted| admitted.checkpoint.transaction.desired.published);
+            if checkpoint.transaction.prior != physical && checkpoint.transaction.prior != bridged {
                 bail!("pending encryption checkpoint does not bind the current generation");
             }
             // A serialized checkpoint cannot replace the Node-local route
@@ -119,12 +130,43 @@ impl EncryptionMapSynchronizer {
             synchronizer.pending = Some(checkpoint.clone());
             synchronizer.requires_local_revalidation = true;
         } else if let Some(checkpoint) = current {
-            synchronizer.require_exact_published(&checkpoint)?;
+            if let Some(bridge) = tombstoned_predecessor.as_ref() {
+                let physical = checkpoint.transaction.desired.published;
+                let skipped = bridge.checkpoint.transaction.desired.published;
+                if bridge.checkpoint.transaction.prior == Some(physical) {
+                    let observed = synchronizer
+                        .maps
+                        .config
+                        .get(&0, 0)
+                        .context("read encryption config behind tombstone bridge")?;
+                    if observed != [0; 48] {
+                        synchronizer.require_exact_published(&checkpoint)?;
+                    }
+                } else if checkpoint.transaction.prior == Some(skipped) {
+                    synchronizer.require_exact_published(&checkpoint)?;
+                    remove_checkpoint(&synchronizer.tombstoned_predecessor_path)?;
+                    tombstoned_predecessor = None;
+                } else {
+                    bail!("tombstoned encryption predecessor bridge lost causal ancestry");
+                }
+            } else {
+                synchronizer.require_exact_published(&checkpoint)?;
+            }
             synchronizer.active = Some(checkpoint);
             synchronizer.requires_local_revalidation = true;
         } else {
             synchronizer.require_quiescent()?;
         }
+        if let Some(bridge) = tombstoned_predecessor.as_ref() {
+            let physical = synchronizer
+                .active
+                .as_ref()
+                .context("tombstoned predecessor bridge has no physical map checkpoint")?;
+            if bridge.checkpoint.transaction.prior != Some(physical.transaction.desired.published) {
+                bail!("tombstoned encryption predecessor bridge does not extend the physical map");
+            }
+        }
+        synchronizer.tombstoned_predecessor = tombstoned_predecessor;
 
         if pins_existed {
             info!(
@@ -155,6 +197,70 @@ impl EncryptionMapSynchronizer {
     /// proof-carrying generation has committed locally.
     pub(super) const fn has_active_generation(&self) -> bool {
         self.active.is_some() && !self.requires_local_revalidation
+    }
+
+    /// Quarantines an admitted generation whose complete key authority is
+    /// durably tombstoned. The companion admission is persisted before the
+    /// shared config is zeroed, so an already attached TC program fails closed
+    /// across every crash boundary. A later exact successor may use the
+    /// skipped admission as its logical controller predecessor while the map
+    /// adapter independently retains the last physically published checkpoint.
+    pub(super) fn begin_verified_tombstoned_predecessor_bridge(
+        &mut self,
+        admitted: &AdmittedEncryptionGeneration,
+    ) -> Result<bool> {
+        admitted
+            .verify()
+            .context("verify tombstoned predecessor admission")?;
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending != &admitted.checkpoint)
+        {
+            bail!("cannot bridge a tombstoned predecessor across a different map transaction");
+        }
+        let physical = self
+            .active
+            .as_ref()
+            .context("tombstoned predecessor bridge has no physical map checkpoint")?;
+        if admitted.checkpoint.transaction.prior != Some(physical.transaction.desired.published) {
+            bail!("tombstoned predecessor does not immediately extend the physical map");
+        }
+        if let Some(existing) = &self.tombstoned_predecessor {
+            if existing != admitted {
+                bail!("a different tombstoned predecessor bridge is already durable");
+            }
+        } else {
+            persist_secure_json(
+                &self.tombstoned_predecessor_path,
+                admitted,
+                "tombstoned encryption predecessor bridge",
+            )?;
+            self.tombstoned_predecessor = Some(admitted.clone());
+        }
+        self.maps
+            .config
+            .set(0, [0; 48], 0)
+            .context("quarantine tombstoned encryption predecessor")?;
+        let connection_keys = self
+            .maps
+            .connections
+            .iter()
+            .map(|entry| entry.map(|(key, _)| key))
+            .collect::<Result<Vec<_>, _>>()?;
+        for key in connection_keys {
+            self.maps.connections.remove(&key)?;
+        }
+        if self.maps.config.get(&0, 0)? != [0; 48]
+            || self.maps.connections.iter().next().transpose()?.is_some()
+        {
+            bail!("tombstoned predecessor quarantine did not become fail closed");
+        }
+        if self.pending.take().is_some() {
+            remove_checkpoint(&pending_checkpoint_path(&self.state_path)?)?;
+        }
+        self.requires_local_revalidation = true;
+        Ok(true)
     }
 
     /// Physically removes expired established-flow leases for one retired key
@@ -219,10 +325,7 @@ impl EncryptionMapSynchronizer {
         path_permit: EncryptionGenerationPathProofPermit,
         now_unix_ms: u64,
     ) -> Result<()> {
-        let prior = self
-            .active
-            .as_ref()
-            .map(|checkpoint| checkpoint.transaction.desired.published);
+        let prior = self.logical_predecessor();
         let convergence_witness = prepared.witness();
         let latch = prepared
             .admit_and_activate_linux_path_proven(
@@ -246,10 +349,7 @@ impl EncryptionMapSynchronizer {
         latch: PathProvenEncryptionActivationLatch,
         now_unix_ms: u64,
     ) -> Result<()> {
-        let prior = self
-            .active
-            .as_ref()
-            .map(|checkpoint| checkpoint.transaction.desired.published);
+        let prior = self.logical_predecessor();
         let witness = latch.activation_witness();
         let path_witness = latch.path_witness();
         let material = latch
@@ -301,7 +401,11 @@ impl EncryptionMapSynchronizer {
             )?;
             distributed_checkpoint
         };
-        let current = self.active.clone();
+        let current = self
+            .tombstoned_predecessor
+            .as_ref()
+            .map(|bridge| bridge.checkpoint.clone())
+            .or_else(|| self.active.clone());
         if let Err(error) = self.recover_pending(current.as_ref(), checkpoint, &pending_path) {
             self.pending =
                 load_optional_checkpoint(&pending_path, "failed pending encryption fast path")?;
@@ -311,12 +415,26 @@ impl EncryptionMapSynchronizer {
         self.active = load_optional_checkpoint(&self.state_path, "applied encryption fast path")?;
         self.pending = None;
         self.requires_local_revalidation = false;
+        if self.tombstoned_predecessor.take().is_some() {
+            remove_checkpoint(&self.tombstoned_predecessor_path)?;
+        }
         info!(
             activation_witness = ?witness.0,
             generation = desired.config.generation,
             "tri-plane encryption activation committed"
         );
         Ok(())
+    }
+
+    fn logical_predecessor(&self) -> Option<FastPathPublishedGeneration> {
+        self.tombstoned_predecessor
+            .as_ref()
+            .map(|bridge| bridge.checkpoint.transaction.desired.published)
+            .or_else(|| {
+                self.active
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.transaction.desired.published)
+            })
     }
 
     fn recover_pending(
@@ -422,6 +540,19 @@ impl EncryptionMapSynchronizer {
             && self.read_bank(pending.transaction.desired.published.bank)? == desired.bank
         {
             return Ok(Some(pending.transaction.desired.published));
+        }
+        if observed_config == [0; 48]
+            && self.tombstoned_predecessor.as_ref().is_some_and(|bridge| {
+                current.is_some_and(|checkpoint| checkpoint == &bridge.checkpoint)
+                    && pending.transaction.prior
+                        == Some(bridge.checkpoint.transaction.desired.published)
+                    && self.active.as_ref().is_some_and(|physical| {
+                        bridge.checkpoint.transaction.prior
+                            == Some(physical.transaction.desired.published)
+                    })
+            })
+        {
+            return Ok(current.map(|checkpoint| checkpoint.transaction.desired.published));
         }
         if let Some(current) = current {
             let current_state = current.desired_state()?;
@@ -1022,6 +1153,30 @@ fn pending_checkpoint_path(path: &Path) -> Result<PathBuf> {
         .context("encryption fast-path state path must name a file")?
         .to_string_lossy();
     Ok(path.with_file_name(format!("{file_name}.pending")))
+}
+
+fn tombstoned_predecessor_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .context("encryption fast-path state path must name a file")?
+        .to_string_lossy();
+    Ok(path.with_file_name(format!("{file_name}.tombstoned-predecessor")))
+}
+
+fn load_optional_admitted_generation(
+    path: &Path,
+    description: &str,
+) -> Result<Option<AdmittedEncryptionGeneration>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("inspect {description}")),
+        Ok(_) => {
+            let admitted = load_secure_json(path, description)?;
+            AdmittedEncryptionGeneration::verify(&admitted)
+                .with_context(|| format!("verify {description}"))?;
+            Ok(Some(admitted))
+        }
+    }
 }
 
 fn load_optional_checkpoint(

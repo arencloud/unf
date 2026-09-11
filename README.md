@@ -1215,6 +1215,13 @@ Exact runtime `b3aee0a` then passed the complete fresh three-Node dual-stack,
 kube-proxy-free Kind lifecycle. ADR 0245 binds its anonymously pullable
 Linux/amd64 images, evidence, and packet capture as the only tuple eligible for
 the resumed cl02 rollout and complete Phase 9.9 platform gate.
+That rollout proved the admitted generation's epoch 12 was already durably
+revoked through epoch 31. The Fail-Closed Tombstoned Predecessor Bridge first
+persists the exact admission, zeros live encryption config and leases, retires
+only the revoked pending Linux stage, and then permits an exact epoch-32/33
+successor to join the logical controller cursor to the physical map predecessor.
+Every crash boundary remains denied and restartable; no revoked key is reused;
+ADR 0246. Its revised runtime requires fresh Kind and cl02 qualification.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
