@@ -33,9 +33,9 @@ collect_diagnostics() {
     mkdir -p "${diagnostics}"
     "${kc[@]}" get nodes -o wide >"${diagnostics}/nodes.txt" 2>&1 || true
     "${kc[@]}" -n unf-system get pods -o wide >"${diagnostics}/unf-pods.txt" 2>&1 || true
-    "${kc[@]}" -n unf-system logs deployment/unf-controller --all-pods=true \
+    timeout 60 "${kc[@]}" -n unf-system logs deployment/unf-controller --all-pods=true \
         >"${diagnostics}/controller.log" 2>&1 || true
-    "${kc[@]}" -n unf-system logs daemonset/unf-agent --all-pods=true --prefix \
+    timeout 60 "${kc[@]}" -n unf-system logs daemonset/unf-agent --all-pods=true --prefix \
         >"${diagnostics}/agents.log" 2>&1 || true
     "${kc[@]}" -n "${namespace}" get all,encryptionpolicy.network.unf.io -o yaml \
         >"${diagnostics}/fixture.yaml" 2>&1 || true
@@ -134,30 +134,49 @@ oc_read() {
     "${kc[@]}" "$@"
 }
 
-node_exec() {
-    local node=$1 pod
-    shift
-    pod=$("${kc[@]}" -n "${host_probe_namespace}" get pods \
+host_probe_pod_on_node() {
+    local node=$1
+    oc_read -n "${host_probe_namespace}" get pods \
         -l app.kubernetes.io/name=unf-encryption-host-probe \
         --field-selector "spec.nodeName=${node}" -o json | jq -er '
           .items[] | select(.metadata.deletionTimestamp == null
             and .status.phase == "Running"
             and any(.status.containerStatuses[]; .name == "host-probe" and .ready))
-          | .metadata.name' | head -n 1)
-    [[ -n ${pod} ]]
-    "${kc[@]}" -n "${host_probe_namespace}" exec "${pod}" -c host-probe -- chroot /host "$@"
+          | .metadata.name' | head -n 1
 }
 
-controller_pod() {
-    "${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller -o json \
-        | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name' \
+node_exec() {
+    local node=$1 pod
+    shift
+    pod=$(host_probe_pod_on_node "${node}")
+    [[ -n ${pod} ]]
+    timeout 20 "${kc[@]}" -n "${host_probe_namespace}" exec "${pod}" -c host-probe \
+        -- chroot /host "$@"
+}
+
+controller_pod_and_node() {
+    oc_read -n unf-system get pods -l app.kubernetes.io/name=unf-controller -o json \
+        | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running")
+            | [.metadata.name,.spec.nodeName] | @tsv' \
         | head -1
 }
 
 controller_raw() {
-    local path=$1 pod
-    pod=$(controller_pod); [[ -n ${pod} ]]
-    timeout 20 "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${pod}:9962/proxy${path}"
+    local path=$1 controller pod node probe
+    controller=$(controller_pod_and_node)
+    IFS=$'\t' read -r pod node <<<"${controller}"
+    [[ -n ${pod} && -n ${node} ]]
+    probe=$(host_probe_pod_on_node "${node}" 2>/dev/null || true)
+    if [[ -n ${probe} ]]; then
+        timeout 20 "${kc[@]}" -n "${host_probe_namespace}" exec "${probe}" -c host-probe \
+            -- wget -T 10 -t 1 -qO- "http://127.0.0.1:9962${path}"
+    else
+        # The witness is deliberately removed before final Native-only agent
+        # convergence. This bounded fallback is never reachable by a causal
+        # generation join or a Required/selective traffic stage.
+        timeout 20 "${kc[@]}" get --raw \
+            "/api/v1/namespaces/unf-system/pods/${pod}:9962/proxy${path}"
+    fi
 }
 
 unhealthy_operators() {
@@ -293,7 +312,8 @@ set_baseline() {
 http_probe_once() {
     local pod=$1 address=$2 port=$3 target
     if [[ ${address} == *:* ]]; then target="http://[${address}]:${port}/health"; else target="http://${address}:${port}/health"; fi
-    "${kc[@]}" -n "${namespace}" exec "${pod}" -- wget -T 3 -t 1 -qO- "${target}" | rg -qx ok
+    timeout 15 "${kc[@]}" -n "${namespace}" exec "${pod}" \
+        -- wget -T 3 -t 1 -qO- "${target}" | rg -qx ok
 }
 
 http_probe() {
@@ -440,7 +460,8 @@ jq -e --arg revision "${source_revision}" '
 ' <<<"${controller_version}" >/dev/null
 agent_versions='[]'
 while read -r agent_pod; do
-    agent_version=$("${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${agent_pod}:9963/proxy/v1/version")
+    agent_version=$(timeout 20 "${kc[@]}" get --raw \
+        "/api/v1/namespaces/unf-system/pods/${agent_pod}:9963/proxy/v1/version")
     jq -e --arg revision "${source_revision}" '
         .component == "unf-agent" and .build_revision == $revision
         and .encryption_model_schema_version == 1 and .encryption_plan_schema_version == 2

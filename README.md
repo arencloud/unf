@@ -1174,6 +1174,11 @@ Exact revised runtime `e1dbb94` then passed the complete fresh three-Node
 dual-stack, kube-proxy-free Kind lifecycle. ADR 0237 binds its anonymous-public
 Linux/amd64 image digests to the evidence and packet-capture hashes as the only
 tuple eligible for the cl02 recovery rollout.
+The Bounded Node-Local Control Witness makes every Kubernetes streaming sample
+wall-clock bounded and observes the host-network controller over Node-local
+loopback. Required dataplane state therefore cannot obstruct its own readiness
+proof, and a timed-out sample remains unavailable rather than stale evidence;
+ADR 0238.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

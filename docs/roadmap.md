@@ -1160,7 +1160,9 @@ matrix is maintained in the
   unauthenticated reports remain fail closed; ADR 0236. Exact runtime
   `e1dbb94` passed the fresh full Kind lifecycle and ADR 0237 binds its public
   immutable images, evidence, and capture. The complete cl02 gate remains
-  mandatory for the revised runtime.
+  mandatory for the revised runtime. ADR 0238 additionally makes every
+  streaming witness wall-clock bounded and moves causal controller observation
+  onto Node-local loopback, outside the dataplane being qualified.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
