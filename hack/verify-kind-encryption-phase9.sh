@@ -13,7 +13,7 @@ run_egress=${UNF_PHASE9_RUN_EGRESS:-true}
 run_rollback=${UNF_PHASE9_RUN_ROLLBACK:-true}
 namespace=unf-encryption-phase9-qualification
 policy=required-pair
-capture_container_path=/tmp/unf-phase9-encryption.pcap
+capture_container_path=/capture/unf-phase9-encryption.pcap
 started_unix_seconds=$(date +%s)
 diagnostics_dir=${UNF_PHASE9_KIND_DIAGNOSTICS:-"${project_root}/.artifacts/phase9-kind-${started_unix_seconds}"}
 temporary_dir=$(mktemp -d)
@@ -21,7 +21,6 @@ capture_host_path=${temporary_dir}/underlay.pcap
 qualification_stage=preflight
 resources_created=false
 link_lowered=false
-capture_pid=
 capture_node=
 capture_pod=
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
@@ -64,10 +63,6 @@ report_failure() {
 }
 
 cleanup() {
-    if [[ -n ${capture_pid} && -n ${capture_pod} ]]; then
-        "${kc[@]}" -n "${namespace}" exec "${capture_pod}" -- kill -INT "${capture_pid}" \
-            >/dev/null 2>&1 || true
-    fi
     if [[ ${link_lowered} == true && -n ${source_node:-} && -n ${source_interface:-} ]]; then
         "${runtime[@]}" exec "${source_node}" ip link set dev "${source_interface}" up \
             >/dev/null 2>&1 || true
@@ -443,20 +438,29 @@ spec:
   nodeName: ${capture_node}
   hostNetwork: true
   restartPolicy: Never
-  containers:
+  volumes:
   - name: capture
+    emptyDir: {}
+  containers:
+  - name: tcpdump
+    image: ${test_tools_image}
+    imagePullPolicy: Never
+    command: [/usr/bin/timeout]
+    args: ["--signal=INT", "45", "/usr/bin/tcpdump", "-U", "-ni", "eth0", "-w", "${capture_container_path}"]
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: capture
+      mountPath: /capture
+  - name: keeper
     image: ${test_tools_image}
     imagePullPolicy: Never
     command: [/bin/sh, -ec, "trap : TERM INT; sleep infinity & wait"]
-    securityContext:
-      privileged: true
+    volumeMounts:
+    - name: capture
+      mountPath: /capture
 EOF
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready "pod/${capture_pod}" --timeout=60s >/dev/null
-"${kc[@]}" -n "${namespace}" exec "${capture_pod}" -- rm -f "${capture_container_path}"
-"${kc[@]}" -n "${namespace}" exec "${capture_pod}" -- sh -ec \
-    "nohup tcpdump -U -ni eth0 -w '${capture_container_path}' </dev/null >/tmp/unf-phase9-tcpdump.log 2>&1 & echo \$!" \
-    >"${temporary_dir}/capture.pid"
-capture_pid=$(<"${temporary_dir}/capture.pid")
 sleep 1
 for _ in $(seq 1 4); do
     traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
@@ -474,29 +478,16 @@ done
 [[ ${required_blocked} == 8 && ${native_succeeded} == 8 ]]
 "${runtime[@]}" exec "${source_node}" ip link set dev "${source_interface}" up
 link_lowered=false
-"${kc[@]}" -n "${namespace}" exec "${capture_pod}" -- kill -INT "${capture_pid}" \
-    >/dev/null 2>&1 || true
-for _ in $(seq 1 20); do
-    "${kc[@]}" -n "${namespace}" exec "${capture_pod}" -- test ! -d "/proc/${capture_pid}" && break
-    sleep 0.2
+capture_exit=
+for _ in $(seq 1 60); do
+    capture_exit=$("${kc[@]}" -n "${namespace}" get pod "${capture_pod}" -o json | jq -r '
+        [.status.containerStatuses[] | select(.name == "tcpdump")
+          | .state.terminated.exitCode][0] // empty')
+    [[ -n ${capture_exit} ]] && break
+    sleep 1
 done
-capture_pid=
-capture_size=-1
-capture_stable=0
-for _ in $(seq 1 20); do
-    observed_size=$("${kc[@]}" -n "${namespace}" exec "${capture_pod}" -- \
-        stat -c %s "${capture_container_path}")
-    if [[ ${observed_size} == "${capture_size}" ]]; then
-        capture_stable=$((capture_stable + 1))
-        (( capture_stable >= 2 )) && break
-    else
-        capture_size=${observed_size}
-        capture_stable=0
-    fi
-    sleep 0.5
-done
-(( capture_stable >= 2 ))
-"${kc[@]}" -n "${namespace}" cp \
+[[ ${capture_exit} == 0 || ${capture_exit} == 124 ]]
+"${kc[@]}" -n "${namespace}" cp -c keeper \
     "${capture_pod}:${capture_container_path}" "${capture_host_path}"
 capture_sha256=$(sha256sum "${capture_host_path}" | awk '{print $1}')
 wireguard_frames=$(tcpdump -nn -r "${capture_host_path}" 'udp and (port 51820 or port 51821)' 2>/dev/null | wc -l)
