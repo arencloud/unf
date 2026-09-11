@@ -58,6 +58,8 @@ require 'Proof-Carrying Zero-Transport Closure' \
     "${root}/docs/adr/0227-proof-carrying-zero-transport-closure.md"
 require 'Activation-Before-Recovery-Successor' \
     "${root}/docs/adr/0228-activation-before-recovery-successor.md"
+require 'Immutable Activation-Ordered Kind Requalification' \
+    "${root}/docs/adr/0229-immutable-activation-ordered-kind-requalification.md"
 require 'UNF_ENCRYPTION_BASELINE' "${overlay}/controller-native-patch.yaml"
 require 'value: native' "${overlay}/controller-native-patch.yaml"
 require 'UNF_ENCRYPTION_KEY_LIFETIME_SECONDS' "${overlay}/agent-rotation-patch.yaml"

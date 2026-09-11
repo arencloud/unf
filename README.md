@@ -1124,7 +1124,12 @@ Node finished path proof. Activation-Before-Recovery-Successor now retains an
 exact reconstructible cut until its durable fleet activation cursor closes,
 then lets normal current-source reconciliation publish one successor. This is
 evidence-ordered rather than timing-ordered and adds no packet authority; ADR
-0228.
+0228. Exact revision `32b5501` then passed the complete fresh Kind transaction:
+297 WireGuard frames, zero Required plaintext frames, 311 Native plaintext
+frames, eight-of-eight fail-closed Required denials, eight-of-eight Native
+successes, loss-free operations, egress coexistence, exact cleanup, and no-CNI
+rollback. Its anonymous Linux/amd64 manifests and evidence hashes are bound by
+ADR 0229 and are the only tuple admitted to the resumed cl02 gate.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

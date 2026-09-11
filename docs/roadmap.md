@@ -1130,8 +1130,10 @@ matrix is maintained in the
   held admitted path-proof escrow for that exact cut.
   Activation-Before-Recovery-Successor now retains a reconstructible restored
   cut until its durable fleet activation cursor closes, then permits one
-  normal current-source successor; ADR 0228. Full Kind requalification remains
-  mandatory.
+  normal current-source successor; ADR 0228. Exact revision `32b5501` passed
+  the complete fresh Kind transaction and its public Linux/amd64 manifest
+  digests plus evidence hashes are release-bound by ADR 0229. The resumed cl02
+  gate remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
