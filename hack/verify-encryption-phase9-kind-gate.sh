@@ -28,6 +28,10 @@ require 'verify-encryption-performance.sh' "${gate}"
 require 'rollback-kind-primary-cni.sh' "${gate}"
 require 'requiredPlaintextFrames' "${gate}"
 require 'imageID' "${gate}"
+require 'encryption_key_epoch_floor_defers_until_draining_predecessor_retires' \
+    "${root}/bins/unf-agent/src/main.rs"
+require 'replacement_pod_authority_retry_is_bounded_and_fail_closed' \
+    "${root}/bins/unf-agent/src/main.rs"
 
 for bounded_wait in wait_generation_after wait_epoch_change; do
     wait_body=$(sed -n "/^${bounded_wait}()/,/^}/p" "${gate}")

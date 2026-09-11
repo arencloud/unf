@@ -1109,6 +1109,15 @@ matrix is maintained in the
   from every exact member, publishes nothing while the cut is incomplete, and
   emits exactly one successor above the restored catalog and fleet maximum;
   ADR 0224. Full Kind requalification remains mandatory.
+- The next fresh run reached controlled agent replacement after natural
+  rotation and safely stopped when a higher fleet floor requested a third key
+  while the bounded local window still contained `Draining` and `Active`.
+  Retirement-Before-Catch-Up preserves both exact authorities, lets the active
+  generation revalidate, retires the predecessor only after positive
+  zero-flow/zero-route proof, and then prepares the fleet-aligned successor.
+  Replacement-Pod `403`/`503` observation gaps receive a bounded fenced retry,
+  never last-known-good authority; ADR 0225. Full Kind requalification remains
+  mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

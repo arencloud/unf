@@ -1099,7 +1099,15 @@ ADR 0223. Its first fresh Kind run subsequently found that sequential agent
 cursors could make a replacement controller publish two different recovery
 successors. The Complete Fleet Cursor Recovery Barrier now waits for every
 exact Node UID and publishes one cut above the fleet maximum. Focused tests
-pass; complete fresh Kind and cl02 evidence remain required; ADR 0224.
+pass; ADR 0224. The next fresh run reached controlled agent replacement after
+natural rotation and exposed safe but deadlocked ordering: the fleet floor
+requested a third epoch while the two local slots still held `Draining` and
+`Active`. Retirement-Before-Catch-Up now revalidates the exact active authority,
+retires the predecessor only through positive zero-state proof, and prepares
+the successor on the next synchronization. A bounded fenced retry also absorbs
+replacement-Pod watch latency without accepting an authorization failure as
+last-known-good state. Complete fresh Kind and cl02 evidence remain required;
+ADR 0225.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

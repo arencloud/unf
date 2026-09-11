@@ -176,6 +176,7 @@ const DEFAULT_ENCRYPTION_ROTATE_BEFORE: Duration = Duration::from_secs(24 * 60 *
 const DEFAULT_ENCRYPTION_ROTATION_JITTER: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_ENCRYPTION_DRAIN_WINDOW: Duration = Duration::from_secs(5 * 60);
 const ENCRYPTION_STARTUP_REVALIDATION_ATTEMPTS: u16 = 900;
+const NODE_BLOCK_STARTUP_AUTHORITY_ATTEMPTS: u16 = 120;
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -2211,35 +2212,55 @@ async fn resolve_cni_provider(
                 .trim_end_matches('/');
             let client =
                 dataplane_controller_client(Some(controller_url), &args.controller_ca_path, state)?;
-            let request = authenticated_get(
-                &client,
-                format!("{controller_url}/v1/state/node-block"),
-                &args.agent_token_path,
-            )?;
-            let snapshot = match request.send().await {
-                Ok(response) => response
-                    .error_for_status()
-                    .context("controller rejected node-block snapshot request")?
-                    .json::<NodeBlockSnapshot>()
-                    .await
-                    .context("decode controller node-block snapshot")?,
-                Err(transport_error) => {
-                    let snapshot: NodeBlockSnapshot =
-                        load_secure_json(&args.cni_node_block_state_path, "node-block")
-                            .with_context(|| {
-                                format!(
-                                    "controller node-block transport failed ({transport_error}); no usable last-known-good snapshot"
-                                )
-                            })?;
-                    warn!(
-                        %transport_error,
-                        path = %args.cni_node_block_state_path.display(),
-                        "restored last-known-good node-block snapshot during controller outage"
-                    );
-                    state
-                        .applied_node_block_revision
-                        .store(snapshot.revision, Ordering::Release);
-                    snapshot
+            let mut authority_attempt = 1;
+            let snapshot = loop {
+                let request = authenticated_get(
+                    &client,
+                    format!("{controller_url}/v1/state/node-block"),
+                    &args.agent_token_path,
+                )?;
+                match request.send().await {
+                    Ok(response)
+                        if node_block_startup_authority_retry(
+                            response.status(),
+                            authority_attempt,
+                        ) =>
+                    {
+                        warn!(
+                            status = %response.status(),
+                            attempt = authority_attempt,
+                            max_attempts = NODE_BLOCK_STARTUP_AUTHORITY_ATTEMPTS,
+                            "controller has not observed replacement Pod authority; startup remains fenced"
+                        );
+                        authority_attempt += 1;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    Ok(response) => {
+                        break response
+                            .error_for_status()
+                            .context("controller rejected node-block snapshot request")?
+                            .json::<NodeBlockSnapshot>()
+                            .await
+                            .context("decode controller node-block snapshot")?;
+                    }
+                    Err(transport_error) => {
+                        let snapshot: NodeBlockSnapshot =
+                            load_secure_json(&args.cni_node_block_state_path, "node-block")
+                                .with_context(|| {
+                                    format!(
+                                        "controller node-block transport failed ({transport_error}); no usable last-known-good snapshot"
+                                    )
+                                })?;
+                        warn!(
+                            %transport_error,
+                            path = %args.cni_node_block_state_path.display(),
+                            "restored last-known-good node-block snapshot during controller outage"
+                        );
+                        state
+                            .applied_node_block_revision
+                            .store(snapshot.revision, Ordering::Release);
+                        break snapshot;
+                    }
                 }
             };
             validate_node_block_snapshot(&snapshot, &args.node_name)?;
@@ -2258,6 +2279,14 @@ async fn resolve_cni_provider(
             }))
         }
     }
+}
+
+fn node_block_startup_authority_retry(status: StatusCode, attempt: u16) -> bool {
+    attempt < NODE_BLOCK_STARTUP_AUTHORITY_ATTEMPTS
+        && matches!(
+            status,
+            StatusCode::FORBIDDEN | StatusCode::SERVICE_UNAVAILABLE
+        )
 }
 
 async fn fetch_node_block_snapshot(
@@ -8171,6 +8200,14 @@ impl EncryptionKeySynchronizer {
                         bootstrap.epoch_floor
                     );
                 }
+                if encryption_epoch_retirement_pending(authority.authority()) {
+                    warn!(
+                        active_epoch,
+                        fleet_epoch_floor = bootstrap.epoch_floor,
+                        "deferred encryption key epoch catch-up until the draining predecessor retires"
+                    );
+                    return Ok(changed);
+                }
             }
 
             let valid_until = now_unix_ms
@@ -8271,6 +8308,13 @@ impl EncryptionKeySynchronizer {
         }
         Ok(changed)
     }
+}
+
+fn encryption_epoch_retirement_pending(authority: &NodeKeyAuthority) -> bool {
+    authority
+        .epochs()
+        .iter()
+        .any(|epoch| epoch.phase() == KeyEpochPhase::Draining)
 }
 
 fn deterministic_rotation_jitter_ms(node_uid: &str, ceiling: Duration) -> u64 {
@@ -19571,6 +19615,168 @@ mod tests {
         assert_eq!(converged.epochs[0].epoch, 3);
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn encryption_key_epoch_floor_defers_until_draining_predecessor_retires() {
+        let temporary = tempdir().unwrap();
+        let members = vec![
+            unf_encryption::EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-a".to_owned(),
+            },
+            unf_encryption::EncryptionGenerationRecipient {
+                node_name: "worker-b".to_owned(),
+                node_uid: "uid-b".to_owned(),
+            },
+        ];
+        let bootstrap = EncryptionKeyBootstrap::issue(
+            11,
+            "cluster-a".to_owned(),
+            Revision::new(7),
+            1,
+            members[0].clone(),
+            members.clone(),
+        )
+        .unwrap();
+        let mut synchronizer = EncryptionKeySynchronizer::new(
+            None,
+            test_controller_client(),
+            temporary.path().join("token"),
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            temporary.path().join("keys").join("authority.json"),
+        )
+        .unwrap()
+        .with_rotation_timing(
+            Duration::from_secs(10),
+            Duration::from_secs(8),
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        synchronizer.bind_bootstrap(&bootstrap).unwrap();
+
+        let now = current_unix_time_milliseconds().max(1);
+        let mut peer = NodeKeyAuthority::new(
+            "cluster-a".to_owned(),
+            "worker-b".to_owned(),
+            "uid-b".to_owned(),
+        )
+        .unwrap();
+        peer.prepare_epoch(
+            Revision::new(7),
+            BTreeSet::from(["uid-a".to_owned()]),
+            now,
+            now + 10_000,
+            &mut OsWireGuardKeyGenerator,
+        )
+        .unwrap();
+        let first_cut = complete_reciprocal_attestation_cut(
+            &members,
+            [
+                synchronizer
+                    .authority
+                    .as_ref()
+                    .unwrap()
+                    .authority()
+                    .publication()
+                    .unwrap(),
+                peer.publication().unwrap(),
+            ],
+            now + 1,
+        );
+        assert!(
+            synchronizer
+                .bind_attestation_cut(&first_cut, now + 1)
+                .unwrap()
+        );
+        assert!(
+            prepare_due_encryption_rotation(&mut synchronizer, &bootstrap, now + 3_000).unwrap()
+        );
+
+        peer.revoke_through(1, EpochRevocationReason::FleetEpochSuperseded, now + 2)
+            .unwrap();
+        peer.prepare_epoch(
+            Revision::new(7),
+            BTreeSet::from(["uid-a".to_owned()]),
+            now + 3_000,
+            now + 13_000,
+            &mut OsWireGuardKeyGenerator,
+        )
+        .unwrap();
+        let second_cut = complete_reciprocal_attestation_cut(
+            &members,
+            [
+                synchronizer
+                    .authority
+                    .as_ref()
+                    .unwrap()
+                    .authority()
+                    .publication()
+                    .unwrap(),
+                peer.publication().unwrap(),
+            ],
+            now + 3_001,
+        );
+        assert!(
+            synchronizer
+                .bind_attestation_cut(&second_cut, now + 3_001)
+                .unwrap()
+        );
+
+        let advanced = EncryptionKeyBootstrap::issue(
+            11,
+            "cluster-a".to_owned(),
+            Revision::new(7),
+            3,
+            members[0].clone(),
+            members,
+        )
+        .unwrap();
+        assert!(
+            !synchronizer
+                .reconcile_bootstrap_epoch_floor(&advanced, now + 3_002)
+                .unwrap()
+        );
+        let deferred = synchronizer
+            .authority
+            .as_ref()
+            .unwrap()
+            .authority()
+            .publication()
+            .unwrap();
+        assert_eq!(deferred.next_epoch, 3);
+        assert_eq!(deferred.epochs[0].phase, KeyEpochPhase::Draining);
+        assert_eq!(deferred.epochs[1].phase, KeyEpochPhase::Active);
+
+        let proof =
+            EpochDrainProof::issue("uid-a".to_owned(), 1, Revision::new(7), now + 4_002, 0, 0)
+                .unwrap();
+        synchronizer
+            .authority
+            .as_mut()
+            .unwrap()
+            .retire_drained_epoch(&proof, now + 4_002)
+            .unwrap();
+        assert!(
+            synchronizer
+                .reconcile_bootstrap_epoch_floor(&advanced, now + 4_003)
+                .unwrap()
+        );
+        let converged = synchronizer
+            .authority
+            .as_ref()
+            .unwrap()
+            .authority()
+            .publication()
+            .unwrap();
+        assert_eq!(converged.retired_through_epoch, 1);
+        assert_eq!(converged.epochs[0].epoch, 2);
+        assert_eq!(converged.epochs[0].phase, KeyEpochPhase::Active);
+        assert_eq!(converged.epochs[1].epoch, 3);
+        assert_eq!(converged.epochs[1].phase, KeyEpochPhase::Prepared);
+    }
+
     fn complete_reciprocal_attestation_cut(
         members: &[unf_encryption::EncryptionGenerationRecipient],
         publications: [unf_encryption::NodeKeyPublication; 2],
@@ -20170,6 +20376,24 @@ mod tests {
         assert_eq!(native.cni_native_ipv6_uplink.as_deref(), Some("eth1"));
         assert!(native.cni_native_ipv4_onlink);
         assert!(!native.cni_native_ipv6_onlink);
+    }
+
+    #[test]
+    fn replacement_pod_authority_retry_is_bounded_and_fail_closed() {
+        assert!(node_block_startup_authority_retry(StatusCode::FORBIDDEN, 1));
+        assert!(node_block_startup_authority_retry(
+            StatusCode::SERVICE_UNAVAILABLE,
+            NODE_BLOCK_STARTUP_AUTHORITY_ATTEMPTS - 1
+        ));
+        assert!(!node_block_startup_authority_retry(
+            StatusCode::FORBIDDEN,
+            NODE_BLOCK_STARTUP_AUTHORITY_ATTEMPTS
+        ));
+        assert!(!node_block_startup_authority_retry(
+            StatusCode::UNAUTHORIZED,
+            1
+        ));
+        assert!(!node_block_startup_authority_retry(StatusCode::OK, 1));
     }
 
     #[test]
