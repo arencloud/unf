@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,7 +15,11 @@ use axum::{Json, Router};
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, ValueEnum};
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use futures::{StreamExt, TryStreamExt};
+use k8s_openapi::ByteString;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
 use k8s_openapi::api::core::v1::{
     ConfigMap, LoadBalancerIngress, Namespace, Node, Pod, Service, ServiceSpec,
@@ -89,8 +94,9 @@ use unf_encryption::{
     ManagedIdentitySelector, NodeKeyAttestationCut, NodeKeyAttestationLedger,
     NodeKeyAttestationRound, NodeKeyAttestationRow, NodeKeyPublication,
     NodeKeyTransparencyCutDigest, NodeKeyTransparencyLedger, NodeLocalPlanCatalog,
-    NodeLocalPlanDistributionError, NodeLocalPlanRequest, NodeSealedGenerationCapsule,
-    NodeSealedPlanCapsule, produce_fleet_plan_cut, project_kubernetes_encryption,
+    NodeLocalPlanDistributionError, NodeLocalPlanFleetCut, NodeLocalPlanRequest,
+    NodeSealedGenerationCapsule, NodeSealedPlanCapsule, produce_fleet_plan_cut,
+    project_kubernetes_encryption,
 };
 use unf_ipam::{
     Ipv4NodeBlock, Ipv6NodeBlock, NODE_BLOCK_SNAPSHOT_SCHEMA_VERSION, NodeBlockProvider,
@@ -177,7 +183,11 @@ const AGENT_REPORT_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
 const ENCRYPTION_GENERATION_STORE_NAME: &str = "unf-encryption-generation-frontier";
 const ENCRYPTION_GENERATION_STORE_KEY: &str = "frontier.json";
 const ENCRYPTION_PLAN_STORE_KEY: &str = "plans.json";
+const ENCRYPTION_GENERATION_STORE_DESCRIPTOR_KEY: &str = "checkpoint.json";
+const ENCRYPTION_GENERATION_STORE_PAYLOAD_KEY: &str = "checkpoint.gz";
+const ENCRYPTION_GENERATION_STORE_SCHEMA_VERSION: u16 = 1;
 const ENCRYPTION_GENERATION_STORE_DATA_LIMIT: usize = 900_000;
+const ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT: usize = 64_000_000;
 const ENCRYPTION_GENERATION_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const ENCRYPTION_OPERATIONS_STORE_NAME: &str = "unf-encryption-operations";
 const ENCRYPTION_OPERATIONS_STORE_KEY: &str = "operations.json";
@@ -442,6 +452,28 @@ struct DurableEncryptionOperations {
     schema_version: u16,
     history: EncryptionOperationsHistoryCheckpoint,
     activation_cursors: BTreeMap<String, EncryptionActivationCursor>,
+}
+
+/// One atomic, content-verified envelope for the frontier and its exact plan.
+/// Compression removes structural repetition without weakening either
+/// component's independent cryptographic replay checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DurableEncryptionGenerationEnvelope {
+    schema_version: u16,
+    frontier: EncryptionGenerationProducerCheckpoint,
+    plan: Option<NodeLocalPlanFleetCut>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DurableEncryptionGenerationDescriptor {
+    schema_version: u16,
+    codec: String,
+    compressed_bytes: u64,
+    uncompressed_bytes: u64,
+    compressed_sha256: [u8; 32],
+    payload_sha256: [u8; 32],
 }
 
 struct ControllerState {
@@ -3558,15 +3590,49 @@ async fn restore_encryption_generation_producer(state: &ControllerState) -> Resu
         .get(ENCRYPTION_GENERATION_STORE_NAME)
         .await
         .with_context(|| format!("read ConfigMap unf-system/{ENCRYPTION_GENERATION_STORE_NAME}"))?;
-    let Some(encoded) = config_map
+    let descriptor = config_map
         .data
         .as_ref()
-        .and_then(|data| data.get(ENCRYPTION_GENERATION_STORE_KEY))
-    else {
-        info!("durable encryption generation-frontier store is empty");
-        return Ok(());
+        .and_then(|data| data.get(ENCRYPTION_GENERATION_STORE_DESCRIPTOR_KEY));
+    let payload = config_map
+        .binary_data
+        .as_ref()
+        .and_then(|data| data.get(ENCRYPTION_GENERATION_STORE_PAYLOAD_KEY));
+    let legacy_frontier = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(ENCRYPTION_GENERATION_STORE_KEY));
+    let legacy_plan = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(ENCRYPTION_PLAN_STORE_KEY));
+    let (producer, plan) = match (descriptor, payload) {
+        (Some(descriptor), Some(payload)) => {
+            decode_compact_encryption_generation_store(descriptor, &payload.0)?
+        }
+        (None, None) => {
+            let Some(encoded) = legacy_frontier else {
+                info!("durable encryption generation-frontier store is empty");
+                return Ok(());
+            };
+            let producer = decode_encryption_generation_producer(encoded)?;
+            let plan = legacy_plan
+                .map(|encoded| {
+                    let cut: NodeLocalPlanFleetCut = serde_json::from_str(encoded)
+                        .context("decode durable encryption fleet-plan cut")?;
+                    cut.verify()
+                        .context("validate durable encryption fleet-plan cut")?;
+                    Ok::<_, anyhow::Error>(cut)
+                })
+                .transpose()?;
+            (producer, plan)
+        }
+        _ => {
+            return Err(anyhow!(
+                "durable compact encryption generation store is incomplete"
+            ));
+        }
     };
-    let producer = decode_encryption_generation_producer(encoded)?;
     let checkpoint = producer
         .checkpoint()
         .context("replay restored encryption generation producer")?;
@@ -3576,15 +3642,7 @@ async fn restore_encryption_generation_producer(state: &ControllerState) -> Resu
         .as_ref()
         .map(|frontier| frontier.revision.get());
     *mutex_lock(&state.encryption_generations) = producer;
-    if let Some(encoded) = config_map
-        .data
-        .as_ref()
-        .and_then(|data| data.get(ENCRYPTION_PLAN_STORE_KEY))
-    {
-        let cut: unf_encryption::NodeLocalPlanFleetCut =
-            serde_json::from_str(encoded).context("decode durable encryption fleet-plan cut")?;
-        cut.verify()
-            .context("validate durable encryption fleet-plan cut")?;
+    if let Some(cut) = plan {
         mutex_lock(&state.encryption_local_plans)
             .publish(cut.clone())
             .context("restore durable encryption fleet-plan cut")?;
@@ -3613,6 +3671,98 @@ fn decode_encryption_generation_producer(encoded: &str) -> Result<EncryptionGene
         .context("decode durable encryption generation-frontier checkpoint")?;
     EncryptionGenerationProducer::restore(checkpoint)
         .context("validate durable encryption generation-frontier checkpoint")
+}
+
+fn encode_compact_encryption_generation_store(
+    frontier: EncryptionGenerationProducerCheckpoint,
+    plan: Option<NodeLocalPlanFleetCut>,
+) -> Result<(String, Vec<u8>, usize)> {
+    let envelope = DurableEncryptionGenerationEnvelope {
+        schema_version: ENCRYPTION_GENERATION_STORE_SCHEMA_VERSION,
+        frontier,
+        plan,
+    };
+    let payload = serde_json::to_vec(&envelope)
+        .context("encode compact encryption generation-store payload")?;
+    if payload.len() > ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT {
+        return Err(anyhow!(
+            "durable encryption generation payload requires {} bytes; decoded limit is {}",
+            payload.len(),
+            ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT
+        ));
+    }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&payload)
+        .context("compress encryption generation-store payload")?;
+    let compressed = encoder
+        .finish()
+        .context("finish encryption generation-store compression")?;
+    let descriptor = DurableEncryptionGenerationDescriptor {
+        schema_version: ENCRYPTION_GENERATION_STORE_SCHEMA_VERSION,
+        codec: "gzip".to_owned(),
+        compressed_bytes: u64::try_from(compressed.len())
+            .context("compressed encryption generation-store size exceeds u64")?,
+        uncompressed_bytes: u64::try_from(payload.len())
+            .context("encryption generation-store size exceeds u64")?,
+        compressed_sha256: Sha256::digest(&compressed).into(),
+        payload_sha256: Sha256::digest(&payload).into(),
+    };
+    let descriptor = serde_json::to_string(&descriptor)
+        .context("encode compact encryption generation-store descriptor")?;
+    Ok((descriptor, compressed, payload.len()))
+}
+
+fn decode_compact_encryption_generation_store(
+    encoded_descriptor: &str,
+    compressed: &[u8],
+) -> Result<(EncryptionGenerationProducer, Option<NodeLocalPlanFleetCut>)> {
+    let descriptor: DurableEncryptionGenerationDescriptor =
+        serde_json::from_str(encoded_descriptor)
+            .context("decode compact encryption generation-store descriptor")?;
+    if descriptor.schema_version != ENCRYPTION_GENERATION_STORE_SCHEMA_VERSION
+        || descriptor.codec != "gzip"
+        || descriptor.compressed_bytes != u64::try_from(compressed.len()).unwrap_or(u64::MAX)
+        || descriptor.uncompressed_bytes
+            > u64::try_from(ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT).unwrap_or(u64::MAX)
+        || descriptor.compressed_sha256 != <[u8; 32]>::from(Sha256::digest(compressed))
+    {
+        return Err(anyhow!(
+            "compact encryption generation-store descriptor is invalid"
+        ));
+    }
+    let mut payload = Vec::new();
+    GzDecoder::new(compressed)
+        .take(
+            u64::try_from(ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut payload)
+        .context("decompress encryption generation-store payload")?;
+    if descriptor.uncompressed_bytes != u64::try_from(payload.len()).unwrap_or(u64::MAX)
+        || payload.len() > ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT
+        || descriptor.payload_sha256 != <[u8; 32]>::from(Sha256::digest(&payload))
+    {
+        return Err(anyhow!(
+            "compact encryption generation-store payload failed integrity verification"
+        ));
+    }
+    let envelope: DurableEncryptionGenerationEnvelope = serde_json::from_slice(&payload)
+        .context("decode compact encryption generation-store payload")?;
+    if envelope.schema_version != ENCRYPTION_GENERATION_STORE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "unsupported compact encryption generation-store schema {}",
+            envelope.schema_version
+        ));
+    }
+    let producer = EncryptionGenerationProducer::restore(envelope.frontier)
+        .context("validate compact encryption generation-frontier checkpoint")?;
+    if let Some(plan) = &envelope.plan {
+        plan.verify()
+            .context("validate compact encryption fleet-plan cut")?;
+    }
+    Ok((producer, envelope.plan))
 }
 
 fn spawn_encryption_generation_persistence(
@@ -3659,24 +3809,23 @@ async fn persist_encryption_generation(state: &ControllerState) -> Result<()> {
     let checkpoint = mutex_lock(&state.encryption_generations)
         .checkpoint()
         .context("build durable encryption generation-frontier checkpoint")?;
-    let encoded = serde_json::to_string(&checkpoint)
-        .context("encode durable encryption generation-frontier checkpoint")?;
     let plan = mutex_lock(&state.encryption_local_plans).active().cloned();
-    let encoded_plan = plan
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
-        .context("encode durable encryption fleet-plan cut")?;
-    let encoded_size = encoded.len() + encoded_plan.as_ref().map_or(0, String::len);
-    if encoded_size > ENCRYPTION_GENERATION_STORE_DATA_LIMIT {
+    let (descriptor, payload, uncompressed_size) =
+        encode_compact_encryption_generation_store(checkpoint, plan)?;
+    let stored_size = descriptor.len().saturating_add(payload.len());
+    if stored_size > ENCRYPTION_GENERATION_STORE_DATA_LIMIT {
         return Err(anyhow!(
-            "durable encryption generation frontier and plan require {encoded_size} bytes; ConfigMap limit is {ENCRYPTION_GENERATION_STORE_DATA_LIMIT}"
+            "compact durable encryption generation frontier and plan require {stored_size} bytes ({uncompressed_size} decoded); ConfigMap limit is {ENCRYPTION_GENERATION_STORE_DATA_LIMIT}"
         ));
     }
-    let mut data = BTreeMap::from([(ENCRYPTION_GENERATION_STORE_KEY.to_owned(), encoded)]);
-    if let Some(encoded_plan) = encoded_plan {
-        data.insert(ENCRYPTION_PLAN_STORE_KEY.to_owned(), encoded_plan);
-    }
+    let data = BTreeMap::from([(
+        ENCRYPTION_GENERATION_STORE_DESCRIPTOR_KEY.to_owned(),
+        descriptor,
+    )]);
+    let binary_data = BTreeMap::from([(
+        ENCRYPTION_GENERATION_STORE_PAYLOAD_KEY.to_owned(),
+        ByteString(payload),
+    )]);
     let patch = serde_json::json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -3685,6 +3834,7 @@ async fn persist_encryption_generation(state: &ControllerState) -> Result<()> {
             "namespace": "unf-system",
         },
         "data": data,
+        "binaryData": binary_data,
     });
     api.patch(
         ENCRYPTION_GENERATION_STORE_NAME,
@@ -17068,6 +17218,68 @@ mod tests {
             .unwrap()
             .insert("unexpected".to_owned(), serde_json::json!(true));
         assert!(decode_encryption_generation_producer(&unknown.to_string()).is_err());
+    }
+
+    #[test]
+    fn compact_encryption_generation_store_is_bounded_and_content_verified() {
+        let checkpoint = EncryptionGenerationProducer::default()
+            .checkpoint()
+            .unwrap();
+        let recipients = (0..128)
+            .map(|index| EncryptionGenerationRecipient {
+                node_name: format!("node-{index:03}"),
+                node_uid: format!("node-{index:03}-uid"),
+            })
+            .collect::<Vec<_>>();
+        let plans = recipients
+            .iter()
+            .cloned()
+            .map(|recipient| {
+                unf_encryption::NodeLocalPlanSnapshot::issue(
+                    unf_encryption::NodeLocalPlanSnapshotFields {
+                        membership_revision: Revision::new(7),
+                        generation: Revision::new(10),
+                        recipient,
+                        mode: unf_encryption::NodeLocalPlanMode::Dormant,
+                        policy_revision: Revision::new(2),
+                        service_revision: Revision::new(3),
+                        egress_revision: Revision::new(4),
+                        listen_port: 51_820,
+                        persistent_keepalive_seconds: 5,
+                        epochs: vec![],
+                        decisions: vec![],
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        let cut =
+            NodeLocalPlanFleetCut::issue(Revision::new(7), Revision::new(10), recipients, plans)
+                .unwrap();
+        let (descriptor, payload, uncompressed) =
+            encode_compact_encryption_generation_store(checkpoint.clone(), Some(cut.clone()))
+                .unwrap();
+        assert!(payload.len() < uncompressed / 2);
+        assert!(descriptor.len() + payload.len() < ENCRYPTION_GENERATION_STORE_DATA_LIMIT);
+
+        let (restored, restored_plan) =
+            decode_compact_encryption_generation_store(&descriptor, &payload).unwrap();
+        assert_eq!(restored.checkpoint().unwrap(), checkpoint);
+        assert_eq!(restored_plan, Some(cut));
+
+        let mut corrupted = payload.clone();
+        corrupted[0] ^= u8::MAX;
+        assert!(decode_compact_encryption_generation_store(&descriptor, &corrupted).is_err());
+
+        let mut descriptor_value: serde_json::Value = serde_json::from_str(&descriptor).unwrap();
+        descriptor_value["uncompressedBytes"] = serde_json::json!(1);
+        assert!(
+            decode_compact_encryption_generation_store(
+                &serde_json::to_string(&descriptor_value).unwrap(),
+                &payload
+            )
+            .is_err()
+        );
     }
 
     fn bfd_evidence_report(

@@ -22,7 +22,7 @@ separately revisioned. The authoritative state remains in
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
 | 9.8 | Kube-proxy-free Kind qualification | **Verified** | Runtime and qualifier `a08d9a8` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADRs 0220–0222. Default-required and explicit-selective PodIP/Service traffic, 368 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, exact link repair before permit, monotonic epoch retirement, agent replacement, natural rotation, controller replacement, loss-free operations, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `53c4f871…0ed`; packet-capture SHA-256 is `09fb4e00…f96` |
-| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0222 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and recovery boundaries. Runtime `a08d9a8` passes fresh Kind and is published as immutable public Quay manifests: controller `374c7108…6d9`, agent `f65582e4…560`, and tools `24425d52…e1e`. The release record binds those digests to evidence `53c4f871…0ed`. cl02 must be recovered to its known baseline, then the full five-Node RHCOS/SELinux/CRI-O, ciphertext, selective fail-closed, rotation/recovery, loss-free operations, exact cleanup, convergence, kube-proxy-absence, and ClusterOperator gate must pass |
+| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0223 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and recovery boundaries. Reboot recovery proved the corrected mark behavior, then safely exposed a 1,955,398-byte five-Node frontier/plan versus the 900,000-byte ConfigMap bound. Content-Verified Compact Frontier now keeps both objects atomic in one bounded, dual-digest-verified compressed envelope; registry preflight also distinguishes OCI manifests from configuration IDs. Focused tests pass. A fresh full Kind qualification, immutable publication, and the complete cl02 gate remain |
 
 ## Accepted Phase 9 gate
 
@@ -175,8 +175,9 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Publish the exact Kind-qualified runtime images by immutable digest and qualify
-that tuple independently on five-Node dual-stack cl02 for milestone 9.9. The
-OpenShift gate must preserve RHCOS/SELinux/CRI-O facts, cross-worker encrypted
-IPv4/IPv6 direct and Service traffic, rotation/recovery, exact cleanup, agent
-convergence, kube-proxy absence, and the before/after ClusterOperator state.
+Run the complete fresh dual-stack Kind gate against ADR 0223, publish that exact
+runtime by registry manifest digest, and resume the five-Node cl02 qualification.
+The OpenShift gate must preserve RHCOS/SELinux/CRI-O facts, cross-worker
+encrypted IPv4/IPv6 direct and Service traffic, rotation/recovery, exact
+cleanup, agent convergence, kube-proxy absence, and the before/after
+ClusterOperator state.

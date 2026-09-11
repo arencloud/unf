@@ -42,6 +42,8 @@ require 'baseline_unhealthy' "${gate}"
 require 'final_unhealthy' "${gate}"
 require 'simultaneous replacement of every encrypted endpoint' "${gate}"
 require 'must_establish_initial_generation' "${root}/bins/unf-agent/src/main.rs"
+require 'oc image info .*--filter-by-os=linux/amd64 -o json' \
+    "${root}/hack/deploy-openshift-service-fabric.sh"
 require 'reconcile_bootstrap_epoch_floor' "${root}/bins/unf-agent/src/main.rs"
 require '/v1/state/encryption-activation-testimony' "${root}/bins/unf-agent/src/main.rs"
 require 'encryption_activation_testimony' "${root}/bins/unf-controller/src/main.rs"

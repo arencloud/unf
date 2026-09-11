@@ -141,6 +141,17 @@ if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} ==
     agent_status_schema=$(jq -er .contracts.agentStatusSchemaVersion "${release_record}")
     flow_export_schema=$(jq -er .contracts.flowExportSchemaVersion "${release_record}")
     if [[ ${release_phase} == 9.9 ]]; then
+        test_tools_image=$(jq -er .images.testTools "${release_record}")
+        for image in "${controller_image}" "${agent_image}" "${test_tools_image}"; do
+            image_info=$(oc image info "${image}" --filter-by-os=linux/amd64 -o json)
+            jq -e --arg image "${image}" '
+                .name == $image and .digest == ($image | split("@") | .[1])
+                and .config.os == "linux" and .config.architecture == "amd64"
+            ' <<<"${image_info}" >/dev/null || {
+                echo "Phase 9 release reference is not an amd64 registry manifest: ${image}" >&2
+                exit 1
+            }
+        done
         selection_schema=$(jq -er .contracts.selectionContractSchemaVersion "${release_record}")
         egress_distribution_schema=$(jq -er .contracts.egressDistributionSchemaVersion "${release_record}")
         egress_host_schema=$(jq -er .contracts.egressHostStateSchemaVersion "${release_record}")

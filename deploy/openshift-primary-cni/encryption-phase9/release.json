@@ -34,8 +34,8 @@
     "flowExportSchemaVersion": 7
   },
   "images": {
-    "controller": "quay.io/arencloud/unf-controller-dev@sha256:374c710849a7647e82db886c3f52b55783ad543acd7059a82cc87b86d75576d9",
-    "agent": "quay.io/arencloud/unf-agent-dev@sha256:f65582e426c2f038fa3bb6e1756002f8c937f97194c8ff688bcc0818a0d4b560",
-    "testTools": "quay.io/arencloud/unf-test-tools-dev@sha256:24425d528741dbaa9b395cba45ab0a9e104bf7c394b16505ba5e512859552e1e"
+    "controller": "quay.io/arencloud/unf-controller-dev@sha256:493d54ff0c0af91fdb18f3f0d0412cafb4a5b2eb3241c91a8e426e4637f51f10",
+    "agent": "quay.io/arencloud/unf-agent-dev@sha256:89103c4a70d0b025db890cf19d539d506b8aa788f8e7cd013b473960bdfc5241",
+    "testTools": "quay.io/arencloud/unf-test-tools-dev@sha256:e9cce439d92d0f7d3d6751f234e397a7efc29f9983bc0ae8fc318432c4ff2352"
   }
 }

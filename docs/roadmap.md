@@ -1094,6 +1094,14 @@ matrix is maintained in the
   permit, then starts duplex proof. Partial or foreign repair still fails
   closed; the privileged provider gate proves route restoration and the full
   Kind fault sequence passes at `a08d9a8`; the OpenShift gate remains; ADR 0222.
+- Reboot recovery on cl02 proved the corrected unmanaged-host path, then the
+  five-Node fleet safely stopped because its exact frontier and plan occupied
+  1,955,398 bytes against a 900,000-byte single-ConfigMap bound. The
+  Content-Verified Compact Frontier stores both in one atomic gzip envelope,
+  binds compressed and decoded bytes with SHA-256 and explicit lengths, caps
+  decoding at 64 MB, preserves legacy restart compatibility, and rejects
+  corruption before replay. Registry preflight now also proves each digest is
+  a real Linux/amd64 manifest rather than an OCI configuration ID; ADR 0223.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

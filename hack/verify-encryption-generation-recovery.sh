@@ -51,6 +51,9 @@ require_text deploy/kubernetes/rbac.yaml \
 require_text bins/unf-controller/src/main.rs \
     'encryption_generation_frontier_checkpoint_is_durable_and_fail_closed' \
     "controller decoding must fail closed under corruption"
+require_text bins/unf-controller/src/main.rs \
+    'compact_encryption_generation_store_is_bounded_and_content_verified' \
+    "large frontier/plan cuts must use bounded content-verified compression"
 require_text docs/adr/0171-proof-carrying-frontier-recovery.md \
     '**Status:** Accepted and implemented for Phase 9.5j' \
     "the restart decision must be recorded"
