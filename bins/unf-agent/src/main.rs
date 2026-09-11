@@ -9303,10 +9303,14 @@ async fn retire_drained_encryption_epoch(
     keys: &mut EncryptionKeySynchronizer,
     encryption: &mut EncryptionMapSynchronizer,
 ) -> Result<bool> {
-    if generations.pending.is_some()
-        || generations.pending_activation_report.is_some()
-        || !generations.active_revalidated
-    {
+    if generations.pending_activation_report.is_some() || !generations.active_revalidated {
+        return Ok(false);
+    }
+    // A prepared successor may wait behind an already committed bounded
+    // retirement. The active bank no longer references that authority, so
+    // retiring it is both safe and necessary before the successor can commit.
+    // Transport-free key retirement remains serialized behind pending work.
+    if generations.pending.is_some() && generations.recovery.retiring.is_empty() {
         return Ok(false);
     }
     let observation_revision = generations
@@ -9872,17 +9876,22 @@ fn set_path_probe_mark(socket: &tokio::net::UdpSocket, route_mark: u32) -> Resul
         .context("select exact encryption policy route for path probe")
 }
 
-async fn activate_admitted_encryption_generation(
+/// Keeps map publication and recovery-journal promotion one logical commit.
+/// The event loop drains an older committed retirement before it may consume
+/// the successor map latch, making journal promotion infallible after mutation.
+const fn encryption_activation_is_retirement_fenced(retirement_count: usize) -> bool {
+    retirement_count != 0
+}
+
+async fn collect_live_encryption_path_receipts(
     generations: &mut EncryptionGenerationSynchronizer,
-    encryption: &mut EncryptionMapSynchronizer,
-) -> Result<bool> {
-    generations.ensure_probe_routes().await?;
-    let Some((recipient, desired, plans)) = generations.pending_path_proof_state()? else {
-        return Ok(false);
-    };
+    recipient: &unf_encryption::EncryptionGenerationRecipient,
+    desired: &unf_encryption::EncryptionFastPathState,
+    plans: &[unf_encryption::WireGuardKernelPlan],
+) -> Result<Vec<EncryptionPathActivationReceipt>> {
     let controller_url = generations
         .controller_url
-        .as_deref()
+        .clone()
         .context("encryption path receipt synchronization has no controller URL")?;
     let assignments: Vec<EncryptionPathProofAssignment> = authenticated_get(
         &generations.client,
@@ -9904,7 +9913,7 @@ async fn activate_admitted_encryption_generation(
     generations
         .path_proofs
         .retain(|round, proof| assignment_rounds.contains(round) && proof.round_digest == *round);
-    for proof in execute_live_encryption_path_proofs(&recipient, &desired, &plans, &assignments)
+    for proof in execute_live_encryption_path_proofs(recipient, desired, plans, &assignments)
         .await
         .context("execute workload-independent encrypted path challenges")?
     {
@@ -9945,12 +9954,27 @@ async fn activate_admitted_encryption_generation(
     .send()
     .await
     .context("request current duplex encryption path receipts")?;
-    let receipts: Vec<EncryptionPathActivationReceipt> = response
+    response
         .error_for_status()
         .context("controller rejected encryption path receipt request")?
         .json()
         .await
-        .context("decode encryption path receipts")?;
+        .context("decode encryption path receipts")
+}
+
+async fn activate_admitted_encryption_generation(
+    generations: &mut EncryptionGenerationSynchronizer,
+    encryption: &mut EncryptionMapSynchronizer,
+) -> Result<bool> {
+    if encryption_activation_is_retirement_fenced(generations.recovery.retiring.len()) {
+        return Ok(false);
+    }
+    generations.ensure_probe_routes().await?;
+    let Some((recipient, desired, plans)) = generations.pending_path_proof_state()? else {
+        return Ok(false);
+    };
+    let receipts =
+        collect_live_encryption_path_receipts(generations, &recipient, &desired, &plans).await?;
     let now_unix_ms = current_unix_time_milliseconds();
     let activation_report = EncryptionActivationReport::issue(
         recipient.clone(),
@@ -19320,6 +19344,13 @@ mod tests {
             select_encryption_recovery_slot(EncryptionRecoveryAdmission::Active, true, false),
             None
         );
+    }
+
+    #[test]
+    fn encryption_activation_waits_for_all_committed_retirements() {
+        assert!(!encryption_activation_is_retirement_fenced(0));
+        assert!(encryption_activation_is_retirement_fenced(1));
+        assert!(encryption_activation_is_retirement_fenced(2));
     }
 
     #[test]
