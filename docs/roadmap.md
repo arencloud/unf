@@ -1151,6 +1151,8 @@ matrix is maintained in the
   Causal Readiness Join now requires every Node generation's policy, Service,
   and egress revisions to equal the current converged control cut, eliminating
   the independently-green stale view exposed by the reboot; ADR 0234. The
+  Monotonic Platform Health Delta admits recovery of an initially unhealthy
+  ClusterOperator while rejecting every newly unhealthy name; ADR 0235. The
   complete cl02 gate remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,

@@ -1160,6 +1160,10 @@ The Causal Readiness Join additionally makes the platform gate compare every
 host-local encryption generation's policy/Service/egress vector with the
 current converged agent and controller cut. Individually green but mutually
 stale control, durable, and packet-authority views can no longer pass; ADR 0234.
+The Monotonic Platform Health Delta records the initial and final unhealthy
+ClusterOperator sets and rejects the exact `final - baseline` difference. This
+admits operator recovery during qualification without allowing a regression to
+hide behind equal unhealthy counts; ADR 0235.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -717,7 +717,9 @@ host_probe_created=false
 final_agents=$(wait_for_convergence)
 "${kc[@]}" wait --for=condition=Ready nodes --all --timeout=10m >/dev/null
 final_unhealthy=$(unhealthy_operators)
-[[ ${final_unhealthy} == "${baseline_unhealthy}" ]]
+new_unhealthy=$(jq -cn --argjson baseline "${baseline_unhealthy}" \
+    --argjson final "${final_unhealthy}" '$final - $baseline')
+jq -e 'length == 0' <<<"${new_unhealthy}" >/dev/null
 
 stage=evidence
 mkdir -p "$(dirname "${artifact}")" "$(dirname "${capture_artifact}")"
@@ -753,7 +755,8 @@ jq -n \
     --argjson recoveredGeneration "${recovered_generation}" --argjson rotatedGeneration "${rotated_generation}" \
     --argjson restartGeneration "${restart_generation}" --argjson operations "${operations_status}" \
     --argjson initialAgents "${initial_agents}" --argjson finalAgents "${final_agents}" \
-    --argjson baselineUnhealthy "${baseline_unhealthy}" --argjson finalUnhealthy "${final_unhealthy}" '
+    --argjson baselineUnhealthy "${baseline_unhealthy}" --argjson finalUnhealthy "${final_unhealthy}" \
+    --argjson newUnhealthy "${new_unhealthy}" '
     {schemaVersion:1,milestone:"9.9",result:"passed",generatedAt:$generatedAt,
       context:$context,infrastructure:$infrastructure,runtimeRevision:$runtimeRevision,
       qualificationRevision:$qualificationRevision,openshiftVersion:$openshiftVersion,
@@ -776,6 +779,7 @@ jq -n \
         retainedRecords:$operations.retainedRecords,lossAffected:$operations.lossAffected},
       cleanup:"passed",initialAgents:$initialAgents,finalAgents:$finalAgents,
       baselineUnhealthyOperators:$baselineUnhealthy,finalUnhealthyOperators:$finalUnhealthy,
+      newlyUnhealthyOperators:$newUnhealthy,
       verified:["exact Kind-qualified public image digests","five-node dual-stack UNF primary CNI",
         "OpenShift RHCOS, enforcing SELinux, and CRI-O","kube-proxy absence",
         "explicitly acknowledged Native-to-Required migration","cross-worker IPv4 and IPv6 PodIP and ClusterIP",

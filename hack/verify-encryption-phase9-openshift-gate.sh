@@ -40,6 +40,8 @@ require 'lossAffected == false' "${gate}"
 require 'exact-cleanup' "${gate}"
 require 'baseline_unhealthy' "${gate}"
 require 'final_unhealthy' "${gate}"
+require 'new_unhealthy=' "${gate}"
+require 'newlyUnhealthyOperators' "${gate}"
 require 'simultaneous replacement of every encrypted endpoint' "${gate}"
 require 'kind: DaemonSet' "${gate}"
 require 'unf-encryption-host-probe' "${gate}"
@@ -74,6 +76,8 @@ require 'Immutable Expiry-Recovery Kind Requalification' \
     "${root}/docs/adr/0233-immutable-expiry-recovery-kind-requalification.md"
 require 'Causal Readiness Join' \
     "${root}/docs/adr/0234-causal-readiness-join.md"
+require 'Monotonic Platform Health Delta' \
+    "${root}/docs/adr/0235-monotonic-platform-health-delta.md"
 require 'policyRevision:.active.fact.checkpoint.transaction.desired.published.policyRevision' \
     "${gate}"
 require 'UNF_ENCRYPTION_BASELINE' "${overlay}/controller-native-patch.yaml"
