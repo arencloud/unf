@@ -1196,6 +1196,12 @@ Exact runtime `1fd2d77` then passed the complete fresh three-Node dual-stack,
 kube-proxy-free Kind lifecycle. ADR 0241 binds its anonymously pullable
 Linux/amd64 images to the evidence and capture hashes as the only tuple eligible
 for the cl02 tombstone-handoff recovery and final Phase 9.9 gate.
+That rollout then found a later causal state shared by all five Nodes: a
+durable pending generation was already controller-admitted while the restored
+plan had advanced. Admitted Predecessor Settlement verifies its volatile,
+cursor, and journal views are identical, completes the predecessor through the
+ordinary live proof and map commit, and only then compiles the successor. It
+never treats the newer plan as authority to erase or skip admission; ADR 0242.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

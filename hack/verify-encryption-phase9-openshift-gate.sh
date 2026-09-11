@@ -93,10 +93,14 @@ require 'Tombstone-Aware Generation Handoff' \
     "${root}/docs/adr/0240-tombstone-aware-generation-handoff.md"
 require 'Immutable Tombstone-Handoff Kind Requalification' \
     "${root}/docs/adr/0241-immutable-tombstone-handoff-kind-requalification.md"
+require 'Admitted Predecessor Settlement' \
+    "${root}/docs/adr/0242-admitted-predecessor-settlement.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"
 require 'discard_tombstoned_active_revalidation' \
+    "${root}/bins/unf-agent/src/main.rs"
+require 'must_settle_admitted_pending_before' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'unknown untombstoned key epoch' \
     "${root}/bins/unf-agent/src/main.rs"

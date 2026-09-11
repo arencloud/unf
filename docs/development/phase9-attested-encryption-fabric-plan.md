@@ -22,7 +22,7 @@ separately revisioned. The authoritative state remains in
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
 | 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `1fd2d77` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADR 0241. Default-Required and explicit-selective PodIP/Service traffic, 352 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent/controller replacement, 341 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `18e8d9e…66a9`; packet-capture SHA-256 is `875978e…02b` |
-| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0241 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration, recovery, non-perturbing evidence, causal-readiness, monotonic-platform-health, activation-supersession, immutable requalification, and fully bounded witness boundaries. Tombstone-Aware Generation Handoff preserves durable/kernel ownership while allowing only a completely proved successor. Exact runtime `1fd2d77` passed fresh full Kind and is bound to immutable public images; the complete cl02 gate remains |
+| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0242 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and fully bounded recovery/evidence boundaries. Runtime `1fd2d77` recovered tombstoned active proof but exposed an admitted pending predecessor older than the restored plan on all five Nodes. Admitted Predecessor Settlement completes that consuming capability through normal activation before compiling its successor. The revised runtime must repeat fresh full Kind before cl02 resumes |
 
 ## Accepted Phase 9 gate
 
@@ -175,8 +175,9 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Deploy the ADR 0241 immutable tombstone-handoff tuple to the simultaneously
-rebooted five-Node cl02 fleet. Then rerun the complete qualification with the
+Qualify ADR 0242 Admitted Predecessor Settlement on a fresh full Kind lifecycle,
+publish its exact immutable tuple, and deploy it to the simultaneously rebooted
+five-Node cl02 fleet. Then rerun the complete qualification with the
 non-perturbing and bounded Node-local witness,
 causal readiness join, monotonic platform-health delta, and whole-gate API
 deadline. The OpenShift gate must preserve RHCOS/SELinux/CRI-O facts,

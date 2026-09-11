@@ -7446,19 +7446,25 @@ async fn advance_startup_encryption_authority(
             .context("adopt current startup encryption plan")
         {
             Ok(_) => {
+                let mut settle_admitted_predecessor = false;
                 if let Some(plan) = plans.current.as_ref() {
                     let desired = plan.snapshot.generation;
                     generations.supersede_stale_active_revalidation(desired);
-                    if let Some(authority) = keys.authority.as_ref() {
+                    settle_admitted_predecessor = generations
+                        .must_settle_admitted_pending_before(desired)
+                        .context("join admitted startup predecessor to successor plan")?;
+                    if !settle_admitted_predecessor && let Some(authority) = keys.authority.as_ref()
+                    {
                         generations
                             .abandon_superseded_prepared(desired, authority.authority())
                             .await
                             .context("retire superseded startup encryption stage")?;
                     }
                 }
-                if let Err(error) = prepare_admitted_encryption_plan(plans, keys, generations)
-                    .await
-                    .context("compile current startup encryption plan")
+                if !settle_admitted_predecessor
+                    && let Err(error) = prepare_admitted_encryption_plan(plans, keys, generations)
+                        .await
+                        .context("compile current startup encryption plan")
                 {
                     synchronization_error = Some(error);
                 }
@@ -9234,6 +9240,39 @@ impl EncryptionGenerationSynchronizer {
             &self.pending,
             Some(PendingEncryptionGeneration::ControllerAdmitted { .. })
         )
+    }
+
+    /// An admitted pending generation is a consuming capability, not an
+    /// orphaned stage. If the controller has already published a newer plan,
+    /// finish this exact predecessor first; only its normal activation commit
+    /// can make it safe to compile the causal successor.
+    fn must_settle_admitted_pending_before(&self, desired: Revision) -> Result<bool> {
+        let Some(PendingEncryptionGeneration::ControllerAdmitted {
+            prepared,
+            admitted,
+            slot: EncryptionRecoverySlot::Pending,
+            ..
+        }) = self.pending.as_ref()
+        else {
+            return Ok(false);
+        };
+        let pending_generation = prepared
+            .fact()
+            .checkpoint
+            .transaction
+            .desired
+            .published
+            .generation;
+        if pending_generation >= desired {
+            return Ok(false);
+        }
+        if self.current.as_ref() != Some(admitted.as_ref()) {
+            bail!("volatile pending admission differs from its durable generation cursor");
+        }
+        if self.recovery.pending.as_ref() != Some(prepared.recovery_plan()) {
+            bail!("volatile pending admission differs from its durable recovery journal");
+        }
+        Ok(true)
     }
 
     /// Repairs only the exact durable kernel plan behind an already admitted
@@ -16179,11 +16218,13 @@ async fn consume_events(
             _ = encryption_key_interval.tick(), if encryption_keys.controller_url.is_some() => {
                 match synchronize_encryption_keys(encryption_keys).await {
                     Ok(_) => {
-                        if let Err(error) = prepare_admitted_encryption_plan(
-                            encryption_plans,
-                            encryption_keys,
-                            encryption_generations,
-                        ).await {
+                        if !encryption_generations.has_controller_admission()
+                            && let Err(error) = prepare_admitted_encryption_plan(
+                                encryption_plans,
+                                encryption_keys,
+                                encryption_generations,
+                            ).await
+                        {
                             warn!(?error, "encryption plan could not consume exact Node-local key and kernel truth");
                         }
                     }
@@ -16207,18 +16248,34 @@ async fn consume_events(
                         }
                         if let Some(current) = encryption_plans.current.as_ref()
                             && let Some(authority) = encryption_keys.authority.as_ref()
-                            && let Err(error) = encryption_generations
-                                .abandon_superseded_prepared(
-                                    current.snapshot.generation,
-                                    authority.authority(),
-                                )
-                                .await
                         {
-                            warn!(
-                                ?error,
-                                "superseded encryption stage could not be removed exactly"
-                            );
-                            continue;
+                            match encryption_generations.must_settle_admitted_pending_before(
+                                current.snapshot.generation,
+                            ) {
+                                Ok(true) => continue,
+                                Ok(false) => {
+                                    if let Err(error) = encryption_generations
+                                        .abandon_superseded_prepared(
+                                            current.snapshot.generation,
+                                            authority.authority(),
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            ?error,
+                                            "superseded encryption stage could not be removed exactly"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        ?error,
+                                        "admitted encryption predecessor could not be joined to its successor plan"
+                                    );
+                                    continue;
+                                }
+                            }
                         }
                         match prepare_admitted_encryption_plan(
                             encryption_plans,
@@ -19547,6 +19604,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn dormant_plan_compiles_once_into_an_empty_retryable_generation_fact() {
         let temporary = tempdir().unwrap();
         let recipient = unf_encryption::EncryptionGenerationRecipient {
@@ -19646,6 +19704,46 @@ mod tests {
                 .unwrap()
         );
         prove_dormant_prepared_generation_can_be_superseded(&mut generations, &keys).await;
+
+        assert!(
+            prepare_admitted_encryption_plan(&plans, &keys, &mut generations)
+                .await
+                .unwrap()
+        );
+        let fact = generations.fact_for_publication().unwrap().clone();
+        let request = EncryptionGenerationRequest::fresh("worker-a".to_owned(), None).unwrap();
+        let capsule = NodeSealedGenerationCapsule::issue(
+            12,
+            unf_encryption::EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-a".to_owned(),
+            },
+            &request,
+            fact.checkpoint.clone(),
+        )
+        .unwrap();
+        generations
+            .admit_exact_echo(&request, &capsule, &fact)
+            .unwrap();
+        assert!(
+            generations
+                .must_settle_admitted_pending_before(Revision::new(20))
+                .unwrap()
+        );
+        assert!(
+            !generations
+                .must_settle_admitted_pending_before(Revision::new(19))
+                .unwrap()
+        );
+        assert!(
+            generations
+                .abandon_superseded_prepared(
+                    Revision::new(20),
+                    keys.authority.as_ref().unwrap().authority(),
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

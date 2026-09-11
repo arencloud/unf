@@ -1172,7 +1172,11 @@ matrix is maintained in the
   equivocal key references, and admits recovery only through a fully proved
   successor; ADR 0240. Exact runtime `1fd2d77` passed the fresh full Kind
   lifecycle; ADR 0241 binds its immutable public images and evidence as the
-  only tuple eligible for the complete cl02 qualification.
+  first tuple eligible for cl02. That rollout exposed a controller-admitted
+  pending generation preceding the restored newer plan on all five Nodes.
+  Admitted Predecessor Settlement completes that consuming capability before
+  compiling its successor and rejects every cursor/journal mismatch; ADR 0242.
+  Its runtime must repeat fresh Kind before cl02 resumes.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
