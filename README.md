@@ -1081,6 +1081,13 @@ authenticated plan before deleting the interface; missing planned state is
 safe progress, while any mutation or addition is preserved and refused. The
 privileged kernel regression passes; complete fresh Kind and cl02 evidence is
 still required. See ADR 0221.
+That same clean run also proved the self-healer was ordered behind route-permit
+issuance: missing prepared routes caused permit failure before exact repair
+could execute. Repair-Before-Permit Activation now replays and independently
+reads back the admitted digest-bound plan first, then mints the route permit,
+then begins duplex proof. It cannot turn a partial snapshot into authority and
+adds no packet-path work; ADR 0222. Fresh complete Kind and cl02 evidence remain
+required.
 This avoids both mixed-version management-path loss and the tempting but unsafe
 alternative of treating absent Required authority as Native; ADR 0214.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test

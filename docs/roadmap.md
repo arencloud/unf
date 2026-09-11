@@ -1083,6 +1083,14 @@ matrix is maintained in the
   mutations remain foreign and are never deleted. A privileged kernel test
   reproduces partial route/address teardown and proves exact positive cleanup;
   fresh full Kind and OpenShift qualification remain required; ADR 0221.
+- The same fault stage also showed that exact-plan self-healing was sequenced
+  after Route-Before-Authority permit issuance. Once link down/up withdrew the
+  prepared routes, permit creation failed and made its own repair step
+  unreachable. Repair-Before-Permit Activation now reconstructs and exactly
+  reads back the admitted durable Linux plan first, then issues a fresh route
+  permit, then starts duplex proof. Partial or foreign repair still fails
+  closed; the privileged provider gate proves route restoration and the full
+  Kind fault sequence remains the acceptance regression; ADR 0222.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

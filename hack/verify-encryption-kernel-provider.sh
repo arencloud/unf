@@ -59,6 +59,18 @@ require_text crates/unf-encryption/src/kernel_provider/linux.rs \
 require_text crates/unf-encryption/src/kernel_provider/linux.rs \
     'retiring WireGuard epoch has an unplanned peer' \
     "retirement must refuse peer authority outside the signed plan"
+require_text bins/unf-agent/src/main.rs \
+    'before asking Route-Before-Authority to mint a permit' \
+    "proof-time repair must precede route-permit issuance"
+
+repair_line=$(rg -n 'repair_controller_admitted_kernel\(key_authority\)' \
+    "${project_root}/bins/unf-agent/src/main.rs" | tail -1 | cut -d: -f1)
+permit_line=$(rg -n 'generations\.ensure_probe_routes\(\)\.await' \
+    "${project_root}/bins/unf-agent/src/main.rs" | tail -1 | cut -d: -f1)
+if [[ -z ${repair_line} || -z ${permit_line} || ${repair_line} -ge ${permit_line} ]]; then
+    echo "Phase 9.4 check failed: admitted kernel repair must precede route-permit issuance" >&2
+    exit 1
+fi
 
 if rg --quiet '#\[allow' \
     "${project_root}/crates/unf-encryption/src/kernel_provider.rs" \

@@ -10298,10 +10298,14 @@ async fn activate_admitted_encryption_generation(
     if encryption_activation_is_retirement_fenced(generations.recovery.retiring.len()) {
         return Ok(false);
     }
-    generations.ensure_probe_routes().await?;
+    // A down/up fault can withdraw connected routes from both the admitted
+    // active and staged epoch. Reconstruct exact digest-bound Linux truth
+    // before asking Route-Before-Authority to mint a permit; otherwise the
+    // failed permit prevents the self-healer from ever becoming reachable.
     generations
         .repair_controller_admitted_kernel(key_authority)
         .await?;
+    generations.ensure_probe_routes().await?;
     let Some((recipient, desired, plans)) = generations.pending_path_proof_state()? else {
         return Ok(false);
     };
