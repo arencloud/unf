@@ -38,6 +38,11 @@ require 'an unactivated restored cut must remain available' \
     "${root}/bins/unf-controller/src/main.rs"
 require 'Activation-Before-Recovery-Successor' \
     "${root}/docs/adr/0228-activation-before-recovery-successor.md"
+require 'Crash-Residue Cleanup Closure' \
+    "${root}/docs/adr/0232-crash-residue-cleanup-closure.md"
+require '.service-snapshot.json.pending.tmp' \
+    "${root}/hack/rollback-kind-primary-cni.sh"
+require '.authority.json.tmp' "${root}/hack/rollback-kind-primary-cni.sh"
 
 for bounded_wait in wait_generation_after wait_epoch_change; do
     wait_body=$(sed -n "/^${bounded_wait}()/,/^}/p" "${gate}")

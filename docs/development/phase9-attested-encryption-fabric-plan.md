@@ -22,7 +22,7 @@ separately revisioned. The authoritative state remains in
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
 | 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `32b5501` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADRs 0227–0229. Default-Required and explicit-selective PodIP/Service traffic, 297 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent replacement, activation-ordered controller replacement, 340 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `9a99fb9…eb31`; packet-capture SHA-256 is `74b22d1…b0b` |
-| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0231 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration, recovery, and non-perturbing evidence boundaries. Exact runtime `32b5501` passed fresh full Kind. Live cl02 work exposed and corrected observer churn and, after a simultaneous five-Node reboot, a real expired Active-plus-Prepared key deadlock that left the restored Native selector on an obsolete policy cut. Expired Authority Recovery durably revokes the unusable two-slot authority and prepares a fresh fleet-aligned epoch without plaintext fallback or BPF ABI change. A rebuilt immutable tuple, reboot recovery proof, and the complete cl02 gate remain |
+| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0232 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration, recovery, and non-perturbing evidence boundaries. Exact runtime `32b5501` passed fresh full Kind. Live cl02 work exposed observer churn and, after a simultaneous five-Node reboot, a real expired Active-plus-Prepared key deadlock. Expired Authority Recovery renews the unusable authority without plaintext fallback. Its first exact Kind requalification completed runtime and egress checks, then found a service-checkpoint atomic temporary at final rollback; Crash-Residue Cleanup Closure safely makes that interruption boundary retryable. Fresh immutable Kind evidence, reboot recovery proof, and the complete cl02 gate remain |
 
 ## Accepted Phase 9 gate
 
@@ -175,10 +175,10 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Build and deploy one immutable tuple containing ADR 0231 Expired Authority
-Recovery, prove that the simultaneously rebooted five-Node cl02 fleet replaces
-its stale Native generation, then rerun the complete qualification with the
-ADR 0230 non-perturbing witness. The OpenShift gate must preserve
+Complete one fresh immutable Kind transaction containing ADRs 0231–0232, then
+deploy that tuple and prove that the simultaneously rebooted five-Node cl02
+fleet replaces its stale Native generation. Rerun the complete qualification
+with the ADR 0230 non-perturbing witness. The OpenShift gate must preserve
 RHCOS/SELinux/CRI-O facts, cross-worker
 encrypted IPv4/IPv6 direct and Service traffic, rotation/recovery, exact
 cleanup, agent convergence, kube-proxy absence, and the before/after

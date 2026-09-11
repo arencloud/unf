@@ -1142,7 +1142,12 @@ matrix is maintained in the
   fresh fleet-plan reconstruction returned retryable `503`. Expired Authority
   Recovery atomically revokes the unusable two-slot authority and prepares a
   fresh fleet-aligned epoch without plaintext fallback or BPF ABI change; ADR
-  0231. A rebuilt immutable tuple and the complete cl02 gate remain mandatory.
+  0231. Its first exact Kind requalification completed runtime and egress
+  coexistence but correctly refused final rollback on an interrupted atomic
+  service-checkpoint temporary. Crash-Residue Cleanup Closure admits only the
+  finite owner-only temporary vocabulary and keeps foreign state closed; ADR
+  0232. A fresh immutable Kind result and the complete cl02 gate remain
+  mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

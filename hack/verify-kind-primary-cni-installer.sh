@@ -26,6 +26,12 @@ grep -q 'delete job "${job_name}"' "${project_root}/hack/rollback-kind-primary-c
 grep -q 'cni-status.lease' "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'cleanup_gateway_interface' "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'cleanup_encryption_state' "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'cleanup_durable_temporaries' "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q '.service-snapshot.json.pending.tmp' \
+    "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q '.load-balancer-reachability.json.pending.tmp' \
+    "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q '.authority.json.tmp' "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'encryption-generation.json.recovery-plan' \
     "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'checkpointDigest | type == "array" and length == 32' \

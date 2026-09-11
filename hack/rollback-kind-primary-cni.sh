@@ -260,6 +260,30 @@ for node in "${nodes[@]}"; do
             rmdir "$pending"
         }
 
+        # SIGTERM can land after an owner-only temporary file is synced but
+        # before its atomic rename. These exact names are product-owned crash
+        # residue, not live checkpoints. Validate every boundary before
+        # deleting it; any unknown state still makes the final rmdir fail.
+        cleanup_durable_temporaries() {
+            for temporary in \
+                "${state_dir}/attachments.json.tmp" \
+                "${state_dir}/.node-block.json.tmp" \
+                "${state_dir}/.remote-routes.json.tmp" \
+                "${state_dir}/.service-snapshot.json.tmp" \
+                "${state_dir}/.service-snapshot.json.pending.tmp" \
+                "${state_dir}/.service-snapshot.json.selection.tmp" \
+                "${state_dir}/.service-snapshot.json.selection.pending.tmp" \
+                "${state_dir}/.load-balancer-reachability.json.tmp" \
+                "${state_dir}/.load-balancer-reachability.json.pending.tmp" \
+                "${state_dir}/.egress-bgp.json.tmp"; do
+                [ -e "$temporary" ] || [ -L "$temporary" ] || continue
+                test -f "$temporary" && test ! -L "$temporary"
+                test "$(stat -c %a "$temporary")" = 600
+                test "$(stat -c %s "$temporary")" -le 67108864
+                rm -f "$temporary"
+            done
+        }
+
         cleanup_encryption_state() {
             for owned in \
                 "${state_dir}/encryption-fast-path.json" \
@@ -285,7 +309,15 @@ for node in "${nodes[@]}"; do
             [ -e "$key_dir" ] || return 0
             test -d "$key_dir" && test ! -L "$key_dir"
             test "$(stat -c %a "$key_dir")" = 700
-            test -z "$(find "$key_dir" -mindepth 1 -maxdepth 1 ! -name authority.json -print -quit)"
+            test -z "$(find "$key_dir" -mindepth 1 -maxdepth 1 \
+                ! -name authority.json ! -name .authority.json.tmp -print -quit)"
+            key_temporary=${key_dir}/.authority.json.tmp
+            if [ -e "$key_temporary" ] || [ -L "$key_temporary" ]; then
+                test -f "$key_temporary" && test ! -L "$key_temporary"
+                test "$(stat -c %a "$key_temporary")" = 600
+                test "$(stat -c %s "$key_temporary")" -le 67108864
+                rm -f "$key_temporary"
+            fi
             authority=${key_dir}/authority.json
             if [ -e "$authority" ] || [ -L "$authority" ]; then
                 test -f "$authority" && test ! -L "$authority"
@@ -411,6 +443,7 @@ EOF
                 rm -f "$load_balancers"
             fi
             cleanup_pending_deletes
+            cleanup_durable_temporaries
             cleanup_encryption_kernel_state
             cleanup_encryption_state
             if [ -d "$state_dir" ]; then
@@ -476,20 +509,7 @@ EOF
             validate_load_balancer_snapshot "$load_balancers"
         fi
 
-        for temporary in \
-            "${state_dir}/attachments.json.tmp" \
-            "${state_dir}/.node-block.json.tmp" \
-            "${state_dir}/.remote-routes.json.tmp" \
-            "${state_dir}/.service-snapshot.json.tmp" \
-            "${state_dir}/.service-snapshot.json.selection.tmp" \
-            "${state_dir}/.service-snapshot.json.selection.pending.tmp" \
-            "${state_dir}/.load-balancer-reachability.json.tmp"; do
-            if [ -e "$temporary" ]; then
-                test -f "$temporary" && test ! -L "$temporary"
-                test "$(stat -c %a "$temporary")" = 600
-                rm -f "$temporary"
-            fi
-        done
+        cleanup_durable_temporaries
 
         rm -f "$binary" "$config"
         rm -f "${state_dir}/attachments.json" "${state_dir}/node-block.json" \

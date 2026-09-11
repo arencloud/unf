@@ -1147,6 +1147,11 @@ Recovery now durably revokes and zeroizes the complete unusable key frontier,
 then prepares a fresh controller-floor-aligned epoch. It never revokes a
 still-current Active key, never exports private material, and never converts a
 missing Required path to Native; ADR 0231.
+The first exact requalification then reached final no-CNI rollback and exposed
+an atomic service-checkpoint temporary left by agent termination. Crash-Residue
+Cleanup Closure validates and removes only the finite owner-only temporary
+vocabulary, including an unread private-key temporary, while unknown names,
+types, modes, and sizes remain fail-closed; ADR 0232.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
