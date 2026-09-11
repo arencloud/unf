@@ -1067,6 +1067,12 @@ matrix is maintained in the
   incomplete. Every active peer remains available for fresh duplex proof, only
   a missing member reports, exact retries do not dirty checkpoints, and the
   testimony path cannot create local packet authority; ADR 0219.
+- The first cl02 9.9 transition exposed and safely stopped on protocol-specific
+  host management loss before qualification. Identity-Scoped Packet-Mark
+  Ownership now leaves every mark bit untouched unless both endpoints have
+  managed identities and exact Phase 9 authority selects the packet. A real
+  kernel TC test preserves a nonzero foreign mark on unmanaged TCP/6443;
+  corrected Kind and OpenShift reruns remain required; ADR 0220.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

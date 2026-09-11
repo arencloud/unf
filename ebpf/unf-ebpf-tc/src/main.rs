@@ -868,15 +868,20 @@ fn encryption_mark_is_set(ctx: &TcContext) -> bool {
 
 /// Resolves a policy-authorized final tuple to either explicit Native or one
 /// proven WireGuard route lease. Any managed identity pair without complete
-/// authority drops. Unmanaged/external traffic remains outside Phase 9 and has
-/// only UNF's stale mark field cleared.
+/// authority drops. Unmanaged/external traffic remains outside Phase 9 and its
+/// complete packet mark is preserved: without a managed identity pair there is
+/// no proof that any mark field was written by UNF rather than by the host
+/// network, firewall, or another cooperating dataplane.
 #[inline(never)]
 fn apply_encryption_selection<const IPV6: bool>(
     ctx: &TcContext,
     observation: &FlowObservation,
 ) -> i32 {
+    // Identity-Scoped Packet-Mark Ownership: an identity-incomplete tuple is
+    // positive evidence that Phase 9 did not select this packet. In particular,
+    // never interpret a coincidental value in the shared skb mark as a stale
+    // UNF lease and erase platform metadata on physical-uplink traffic.
     if observation.source_identity.get() == 0 || observation.destination_identity.get() == 0 {
-        clear_packet_encryption_mark(ctx);
         return TC_ACT_PIPE;
     }
     let Some(scratch_ptr) = ENCRYPTION_SELECTION_SCRATCH.get_ptr_mut(0) else {

@@ -21495,6 +21495,47 @@ mod tests {
         (result.return_value, output)
     }
 
+    fn run_tc_with_mark(
+        ebpf: &mut Ebpf,
+        program_name: &str,
+        packet: &[u8],
+        mark: u32,
+    ) -> (u32, Vec<u8>, u32) {
+        // `BPF_PROG_TEST_RUN` accepts the UAPI `__sk_buff` byte layout. The
+        // first fields are `len`, `pkt_type`, then `mark`, so offset eight is
+        // stable across supported kernels. A full current context buffer lets
+        // the kernel return every classifier mutation without importing the
+        // target-architecture eBPF bindings into userspace tests.
+        const SK_BUFF_CONTEXT_SIZE: usize = 192;
+        const SK_BUFF_MARK_OFFSET: usize = 8;
+        let mut context_in = vec![0_u8; SK_BUFF_CONTEXT_SIZE];
+        context_in[SK_BUFF_MARK_OFFSET..SK_BUFF_MARK_OFFSET + 4]
+            .copy_from_slice(&mark.to_ne_bytes());
+        let mut context_out = vec![0_u8; SK_BUFF_CONTEXT_SIZE];
+        let mut output = vec![0_u8; packet.len() + 64];
+        let program: &mut SchedClassifier = ebpf
+            .program_mut(program_name)
+            .expect("service TC program exists")
+            .try_into()
+            .expect("service program is a TC classifier");
+        let result = program
+            .test_run(TestRunOptions {
+                data_in: Some(packet),
+                data_out: Some(&mut output),
+                ctx_in: Some(&context_in),
+                ctx_out: Some(&mut context_out),
+                ..Default::default()
+            })
+            .expect("TC packet test run with skb context succeeds");
+        output.truncate(result.data_size_out as usize);
+        let returned_mark = u32::from_ne_bytes(
+            context_out[SK_BUFF_MARK_OFFSET..SK_BUFF_MARK_OFFSET + 4]
+                .try_into()
+                .expect("mark is four bytes"),
+        );
+        (result.return_value, output, returned_mark)
+    }
+
     fn assert_ipv4_packet(
         packet: &[u8],
         protocol: u8,
@@ -22351,6 +22392,26 @@ mod tests {
 
         let packet_v4 = ipv4_packet(6, source_v4, destination_v4, 40_000, 443);
         let packet_v6 = ipv6_packet(6, source_v6, destination_v6, 40_001, 443);
+        let host_mark = 0x00aa_b100;
+        let unmanaged_host_tcp = ipv4_packet(
+            6,
+            Ipv4Addr::new(10, 50, 60, 10),
+            Ipv4Addr::new(10, 50, 60, 200),
+            40_022,
+            6_443,
+        );
+        let (action, output, returned_mark) = run_tc_with_mark(
+            &mut ebpf,
+            "unf_observe_ingress",
+            &unmanaged_host_tcp,
+            host_mark,
+        );
+        assert_eq!(action, TC_ACT_PIPE);
+        assert_eq!(output, unmanaged_host_tcp);
+        assert_eq!(
+            returned_mark, host_mark,
+            "an unmanaged physical-uplink flow must preserve foreign host mark ownership byte-for-byte"
+        );
         assert_eq!(
             run_tc(&mut ebpf, "unf_observe_ingress", &packet_v4).0,
             TC_ACT_PIPE

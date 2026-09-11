@@ -1062,6 +1062,16 @@ active peers answer fresh duplex rounds and only the missing member reconstructs
 its controller acknowledgement. Exact generation/state/path validation remains
 mandatory, duplicate acknowledgement causes no checkpoint churn, and testimony
 cannot mutate Node-local packet authority; ADR 0219.
+The first cl02 Phase 9 transition then exposed a host-boundary ownership bug
+before qualification: unmanaged TCP crossed the encryption finalizer and lost
+foreign bits 8–23 from its existing packet mark, while unparsed ICMP remained
+reachable. Identity-Scoped Packet-Mark Ownership now requires a complete
+managed identity pair before Phase 9 may mutate that field. A privileged kernel
+test sends unmanaged TCP/6443 through the release tail graph with a nonzero
+foreign mark and proves byte-exact preservation; managed Native/Required,
+dual-stack, rotation, revocation, Service, and egress behavior remain covered.
+ADR 0220 records the failed gate and remediation; fresh Kind and cl02 runs are
+still required before milestone 9.9 or Phase 9 can be marked Verified.
 This avoids both mixed-version management-path loss and the tempting but unsafe
 alternative of treating absent Required authority as Native; ADR 0214.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
