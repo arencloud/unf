@@ -263,6 +263,7 @@ for node in "${nodes[@]}"; do
         cleanup_encryption_state() {
             for owned in \
                 "${state_dir}/encryption-fast-path.json" \
+                "${state_dir}/encryption-fast-path.json.pending" \
                 "${state_dir}/encryption-generation.json" \
                 "${state_dir}/encryption-generation.json.recovery-plan" \
                 "${state_dir}/encryption-plan.json"; do
