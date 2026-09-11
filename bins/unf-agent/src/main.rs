@@ -93,7 +93,7 @@ use unf_encryption::{
     EncryptionPathActivationReceipt, EncryptionPathChallengeDelivery, EncryptionPathEndpointRole,
     EncryptionPathProbeExchange, EncryptionPathProbeFrame, EncryptionPathProbeKind,
     EncryptionPathProofAssignment, EncryptionPathProofRoundDigest,
-    EncryptionRoutePublicationPermit, EpochDrainProof, FileNodeKeyStateStore,
+    EncryptionRoutePublicationPermit, EpochDrainProof, FileNodeKeyStateStore, KeyEpochPhase,
     LinuxEncryptionRouteProvider, LinuxPreparedLocalGeneration, LinuxWireGuardProvider,
     NodeKeyAttestationCut, NodeKeyAttestationRound, NodeKeyAuthority, NodeLocalPlanRequest,
     NodeLocalRecoveryPlan, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
@@ -1208,7 +1208,11 @@ impl EncryptionRecoveryJournal {
                 );
             }
         }
-        if self.retiring.len() > 1 {
+        // A generation may remove both the draining and active transport when
+        // the final cross-Node demand disappears during an epoch overlap.
+        // The key authority itself admits at most two epochs, so two exact
+        // plans remain a hard, independently verified bound.
+        if self.retiring.len() > 2 {
             bail!("encryption recovery journal has an unbounded retirement set");
         }
         let mut live_plan_keys = self
@@ -9264,6 +9268,36 @@ fn retire_transport_free_drained_encryption_epoch(
     Ok(true)
 }
 
+fn retiring_transport_requires_key_retirement(
+    authority: &NodeKeyAuthority,
+    epoch: u64,
+    now_unix_ms: u64,
+) -> Result<Option<bool>> {
+    let publication = authority
+        .publication()
+        .context("verify key authority before transport retirement")?;
+    let published_epoch = publication.epochs.iter().find(|item| item.epoch == epoch);
+    match published_epoch {
+        Some(item) if item.phase == KeyEpochPhase::Draining => {
+            if item
+                .drain_deadline_unix_ms
+                .is_some_and(|deadline| deadline > now_unix_ms)
+            {
+                return Ok(None);
+            }
+            Ok(Some(true))
+        }
+        Some(item) if item.phase == KeyEpochPhase::Active => Ok(Some(false)),
+        Some(_) => bail!("unready encryption key epoch cannot retire kernel transport"),
+        None if publication.retired_through_epoch >= epoch
+            || publication.revoked_through_epoch >= epoch =>
+        {
+            Ok(Some(false))
+        }
+        None => bail!("retiring encryption transport has no matching key epoch"),
+    }
+}
+
 async fn retire_drained_encryption_epoch(
     generations: &mut EncryptionGenerationSynchronizer,
     keys: &mut EncryptionKeySynchronizer,
@@ -9294,10 +9328,25 @@ async fn retire_drained_encryption_epoch(
             observation_revision,
         );
     }
-    let [plan] = generations.recovery.retiring.as_slice() else {
-        bail!("encryption retirement journal is not singleton-bounded");
+    let plan = generations
+        .recovery
+        .retiring
+        .first()
+        .cloned()
+        .context("encryption retirement journal lost its first bounded plan")?;
+
+    let authority = keys
+        .authority
+        .as_mut()
+        .context("retiring encryption epoch has no Node-local key authority")?;
+    let Some(retire_key) = retiring_transport_requires_key_retirement(
+        authority.authority(),
+        plan.epoch,
+        current_unix_time_milliseconds(),
+    )?
+    else {
+        return Ok(false);
     };
-    let plan = plan.clone();
 
     let removed_flows = encryption
         .purge_epoch_connections(plan.epoch)
@@ -9311,18 +9360,10 @@ async fn retire_drained_encryption_epoch(
         .await
         .context("remove exact retiring WireGuard transport")?;
 
-    let authority = keys
-        .authority
-        .as_mut()
-        .context("retiring encryption epoch has no Node-local key authority")?;
-    let publication = authority
-        .authority()
-        .publication()
-        .context("verify key authority before drained-epoch retirement")?;
-    if publication.retired_through_epoch < plan.epoch {
+    if retire_key {
         let now_unix_ms = current_unix_time_milliseconds();
         let proof = EpochDrainProof::issue(
-            publication.node_uid,
+            plan.local_node_uid.clone(),
             plan.epoch,
             observation_revision,
             now_unix_ms,
@@ -9336,19 +9377,22 @@ async fn retire_drained_encryption_epoch(
     }
 
     let mut recovery = generations.recovery.clone();
-    recovery.retiring.clear();
+    recovery.retiring.remove(0);
     recovery.verify(&generations.node_name, generations.current.as_ref())?;
     persist_secure_json(
         &generations.recovery_plan_path,
         &recovery,
         "encryption recovery plan",
     )?;
+    let remaining_retirements = recovery.retiring.len();
     generations.recovery = recovery;
     info!(
         epoch = plan.epoch,
+        key_retired = retire_key,
+        remaining_retirements,
         removed_expired_flow_leases = removed_flows,
         interface = %plan.interface_name,
-        "retired drained encryption epoch after exact map, rule, route, link, and key absence"
+        "retired bounded encryption transport after exact map, rule, route, and link absence"
     );
     Ok(true)
 }
@@ -19105,6 +19149,29 @@ mod tests {
         attestations.complete_cut_for(&members[0]).unwrap().unwrap()
     }
 
+    fn assert_unready_transport_retirement_is_refused(authority: &NodeKeyAuthority, now: u64) {
+        assert!(retiring_transport_requires_key_retirement(authority, 1, now).is_err());
+    }
+
+    fn assert_active_transport_retirement_preserves_key(authority: &NodeKeyAuthority, now: u64) {
+        assert_eq!(
+            retiring_transport_requires_key_retirement(authority, 1, now).unwrap(),
+            Some(false)
+        );
+    }
+
+    fn bind_attestation_and_assert_active(
+        synchronizer: &mut EncryptionKeySynchronizer,
+        cut: &NodeKeyAttestationCut,
+        issued_at: u64,
+    ) {
+        assert!(synchronizer.bind_attestation_cut(cut, issued_at).unwrap());
+        let authority = synchronizer.authority.as_ref().unwrap().authority();
+        assert_eq!(authority.epochs()[0].phase(), KeyEpochPhase::Active);
+        assert_active_transport_retirement_preserves_key(authority, issued_at);
+        assert!(!synchronizer.bind_attestation_cut(cut, issued_at).unwrap());
+    }
+
     #[test]
     fn reciprocal_key_attestation_is_durable_and_complete_cut_only() {
         let temporary = tempdir().unwrap();
@@ -19144,6 +19211,11 @@ mod tests {
         )
         .unwrap();
         synchronizer.bind_bootstrap(&bootstrap).unwrap();
+        let prepared_now = current_unix_time_milliseconds().max(1);
+        assert_unready_transport_retirement_is_refused(
+            synchronizer.authority.as_ref().unwrap().authority(),
+            prepared_now,
+        );
 
         let mut peer = NodeKeyAuthority::new(
             "cluster-a".to_owned(),
@@ -19175,18 +19247,7 @@ mod tests {
             ],
             issued_at,
         );
-        assert!(synchronizer.bind_attestation_cut(&cut, issued_at).unwrap());
-        assert_eq!(
-            synchronizer
-                .authority
-                .as_ref()
-                .unwrap()
-                .authority()
-                .epochs()[0]
-                .phase(),
-            unf_encryption::KeyEpochPhase::Active
-        );
-        assert!(!synchronizer.bind_attestation_cut(&cut, issued_at).unwrap());
+        bind_attestation_and_assert_active(&mut synchronizer, &cut, issued_at);
         assert!(
             prepare_due_encryption_rotation(&mut synchronizer, &bootstrap, issued_at + 3_000)
                 .unwrap()
