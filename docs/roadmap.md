@@ -1031,10 +1031,11 @@ matrix is maintained in the
 - Milestones 9.2–9.7 implement the intent/contract model, Node-local key and
   rotation authority, transactional WireGuard provider, coalesced fast path,
   bidirectional live proof, secret-free operations, recovery, and benchmarks.
-  Milestone 9.8 passed its independent kube-proxy-free three-Node dual-stack
-  Kind gate at safety-fixed runtime and qualifier `6d29ac3`, with evidence
-  SHA-256 `c432111d…fde`, including successful controller-replacement
-  activation-history reconstruction. Milestone 9.9 now requires the same immutable runtime on the
+  Milestone 9.8 most recently passed its independent kube-proxy-free three-Node
+  dual-stack Kind gate at runtime and qualifier `a08d9a8`, with evidence
+  SHA-256 `53c4f871…0ed`, including link-fault repair-before-permit, monotonic
+  epoch retirement, and successful controller-replacement activation-history
+  reconstruction. Milestone 9.9 now requires the same immutable runtime on the
   independent five-Node OpenShift gate; ADRs 0158 and 0212.
 - Phase 9.9 adds a Causal Pre-Attachment Fleet Barrier for adjacent upgrades:
   new agents can exchange authenticated facts while the prior TC program stays
@@ -1072,7 +1073,8 @@ matrix is maintained in the
   Ownership now leaves every mark bit untouched unless both endpoints have
   managed identities and exact Phase 9 authority selects the packet. A real
   kernel TC test preserves a nonzero foreign mark on unmanaged TCP/6443;
-  corrected Kind and OpenShift reruns remain required; ADR 0220.
+  corrected Kind qualification now passes at `a08d9a8`; OpenShift remains;
+  ADR 0220.
 - The required fresh Kind rerun then exposed a separate bounded-rotation
   liveness defect: an already journaled retiring interface could retain its
   exact ownership, device, and peers after some plan-owned routes disappeared,
@@ -1082,7 +1084,8 @@ matrix is maintained in the
   and route is proven to be a subset of the authenticated plan; additions or
   mutations remain foreign and are never deleted. A privileged kernel test
   reproduces partial route/address teardown and proves exact positive cleanup;
-  fresh full Kind and OpenShift qualification remain required; ADR 0221.
+  fresh full Kind qualification now passes at `a08d9a8`; OpenShift remains;
+  ADR 0221.
 - The same fault stage also showed that exact-plan self-healing was sequenced
   after Route-Before-Authority permit issuance. Once link down/up withdrew the
   prepared routes, permit creation failed and made its own repair step
@@ -1090,7 +1093,7 @@ matrix is maintained in the
   reads back the admitted durable Linux plan first, then issues a fresh route
   permit, then starts duplex proof. Partial or foreign repair still fails
   closed; the privileged provider gate proves route restoration and the full
-  Kind fault sequence remains the acceptance regression; ADR 0222.
+  Kind fault sequence passes at `a08d9a8`; the OpenShift gate remains; ADR 0222.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

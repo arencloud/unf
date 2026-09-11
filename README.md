@@ -1021,10 +1021,10 @@ immutable provenance, both encryption modes, IPv4/IPv6 PodIP and Service paths,
 ciphertext-only Required capture, simultaneous Native exception, link-failure
 denial, natural rotation, controller/agent recovery, causal operations,
 performance, egress coexistence, exact cleanup, and optional primary-CNI
-rollback. `make encryption-phase9-kind-gate-test`; ADR 0212. Runtime `6d29ac3`,
+rollback. `make encryption-phase9-kind-gate-test`; ADR 0212. Runtime `a08d9a8`,
 qualified by the same committed revision, passed that fresh three-Node
 dual-stack Kubernetes v1.35.0 transaction. Evidence JSON SHA-256 is
-`c432111d…fde`; the independently hashed packet capture recorded 409 WireGuard
+`53c4f871…0ed`; the independently hashed packet capture recorded 368 WireGuard
 frames and zero Required-path plaintext frames. Controller replacement also
 reconstructed its missing activation history without generation churn or
 plaintext fallback. Milestone 9.8 is Verified; 9.9 independently qualifies the
@@ -1070,8 +1070,7 @@ managed identity pair before Phase 9 may mutate that field. A privileged kernel
 test sends unmanaged TCP/6443 through the release tail graph with a nonzero
 foreign mark and proves byte-exact preservation; managed Native/Required,
 dual-stack, rotation, revocation, Service, and egress behavior remain covered.
-ADR 0220 records the failed gate and remediation; fresh Kind and cl02 runs are
-still required before milestone 9.9 or Phase 9 can be marked Verified.
+ADR 0220 records the failed gate and remediation.
 The first fresh Kind rerun then found a separate recovery/rotation liveness
 boundary: an exact journaled interface with some already-missing owned routes
 could not pass pristine readback, so its retired key occupied the bounded
@@ -1079,15 +1078,14 @@ two-epoch window indefinitely. Proof-Carrying Monotonic Retirement now proves
 that every remaining local field, peer, proof address, and route is within the
 authenticated plan before deleting the interface; missing planned state is
 safe progress, while any mutation or addition is preserved and refused. The
-privileged kernel regression passes; complete fresh Kind and cl02 evidence is
-still required. See ADR 0221.
+privileged kernel regression passes. See ADR 0221.
 That same clean run also proved the self-healer was ordered behind route-permit
 issuance: missing prepared routes caused permit failure before exact repair
 could execute. Repair-Before-Permit Activation now replays and independently
 reads back the admitted digest-bound plan first, then mints the route permit,
 then begins duplex proof. It cannot turn a partial snapshot into authority and
-adds no packet-path work; ADR 0222. Fresh complete Kind and cl02 evidence remain
-required.
+adds no packet-path work; ADR 0222. Runtime `a08d9a8` passed the complete fresh
+Kind gate with both corrections; digest-pinned cl02 evidence remains required.
 This avoids both mixed-version management-path loss and the tempting but unsafe
 alternative of treating absent Required authority as Native; ADR 0214.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
