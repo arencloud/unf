@@ -38,7 +38,7 @@ if [[ ! -s ${kubeconfig} || $(stat -c '%a' "${kubeconfig}") != 600 ]]; then
 fi
 if [[ ! -s ${release_record} ]] || ! jq -e '
     .schemaVersion == 1
-    and (.phase == "5.8" or .phase == "6.9" or .phase == "7.10" or .phase == "8.11")
+    and (.phase == "5.8" or .phase == "6.9" or .phase == "7.10" or .phase == "8.11" or .phase == "9.9")
     and (.sourceRevision | test("^[0-9a-f]{40}$"))
     and ((.phase == "5.8"
           and .kindQualification.schemaVersion == 2
@@ -89,6 +89,33 @@ if [[ ! -s ${release_record} ]] || ! jq -e '
           and .contracts.egressMapSchemaVersion == 4
           and .contracts.egressEventSchemaVersion == 1
           and .contracts.agentStatusSchemaVersion == 8
+          and .contracts.flowExportSchemaVersion == 7)
+      or (.phase == "9.9"
+          and .kindQualification.schemaVersion == 1
+          and .kindQualification.milestone == "9.8"
+          and .kindQualification.runtimeRevision == .sourceRevision
+          and (.kindQualification.qualificationRevision | test("^[0-9a-f]{40}$"))
+          and (.kindQualification.evidenceSha256 | test("^[0-9a-f]{64}$"))
+          and (.kindQualification.captureSha256 | test("^[0-9a-f]{64}$"))
+          and .kindQualification.kubeProxyPresent == false
+          and (.contracts | type == "object")
+          and .contracts.compatibilitySchemaVersion == 2
+          and .contracts.persistentBpfStateAbiVersion == 15
+          and .contracts.identitySnapshotSchemaVersion == 2
+          and .contracts.policySnapshotSchemaVersion == 4
+          and .contracts.serviceSnapshotSchemaVersion == 4
+          and .contracts.selectionContractSchemaVersion == 1
+          and .contracts.egressDistributionSchemaVersion == 2
+          and .contracts.egressHostStateSchemaVersion == 2
+          and .contracts.egressHaPromotionSchemaVersion == 1
+          and .contracts.egressMapSchemaVersion == 4
+          and .contracts.egressEventSchemaVersion == 1
+          and .contracts.encryptionModelSchemaVersion == 1
+          and .contracts.encryptionPlanSchemaVersion == 2
+          and .contracts.encryptionPathProofSchemaVersion == 2
+          and .contracts.encryptionOperationsSchemaVersion == 1
+          and .contracts.encryptionMapAbiVersion == 2
+          and .contracts.agentStatusSchemaVersion == 8
           and .contracts.flowExportSchemaVersion == 7))
     and .kindQualification.result == "passed"
     and all(.images[]; test("^quay\\.io/arencloud/unf-[a-z-]+-dev@sha256:[0-9a-f]{64}$"))
@@ -105,7 +132,7 @@ source_revision=$(jq -er .sourceRevision "${release_record}")
 controller_image=$(jq -er .images.controller "${release_record}")
 agent_image=$(jq -er .images.agent "${release_record}")
 release_phase=$(jq -er .phase "${release_record}")
-if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} == 8.11 ]]; then
+if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} == 8.11 || ${release_phase} == 9.9 ]]; then
     compatibility_schema=$(jq -er .contracts.compatibilitySchemaVersion "${release_record}")
     persistent_abi=$(jq -er .contracts.persistentBpfStateAbiVersion "${release_record}")
     identity_schema=$(jq -er .contracts.identitySnapshotSchemaVersion "${release_record}")
@@ -113,7 +140,20 @@ if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} ==
     service_schema=$(jq -er .contracts.serviceSnapshotSchemaVersion "${release_record}")
     agent_status_schema=$(jq -er .contracts.agentStatusSchemaVersion "${release_record}")
     flow_export_schema=$(jq -er .contracts.flowExportSchemaVersion "${release_record}")
-    if [[ ${release_phase} == 8.11 ]]; then
+    if [[ ${release_phase} == 9.9 ]]; then
+        selection_schema=$(jq -er .contracts.selectionContractSchemaVersion "${release_record}")
+        egress_distribution_schema=$(jq -er .contracts.egressDistributionSchemaVersion "${release_record}")
+        egress_host_schema=$(jq -er .contracts.egressHostStateSchemaVersion "${release_record}")
+        egress_ha_schema=$(jq -er .contracts.egressHaPromotionSchemaVersion "${release_record}")
+        egress_map_schema=$(jq -er .contracts.egressMapSchemaVersion "${release_record}")
+        egress_event_schema=$(jq -er .contracts.egressEventSchemaVersion "${release_record}")
+        encryption_model_schema=$(jq -er .contracts.encryptionModelSchemaVersion "${release_record}")
+        encryption_plan_schema=$(jq -er .contracts.encryptionPlanSchemaVersion "${release_record}")
+        encryption_path_schema=$(jq -er .contracts.encryptionPathProofSchemaVersion "${release_record}")
+        encryption_operations_schema=$(jq -er .contracts.encryptionOperationsSchemaVersion "${release_record}")
+        encryption_map_abi=$(jq -er .contracts.encryptionMapAbiVersion "${release_record}")
+        deployment_stage=abi-v15-encryption-v2-staged-deployment
+    elif [[ ${release_phase} == 8.11 ]]; then
         selection_schema=$(jq -er .contracts.selectionContractSchemaVersion "${release_record}")
         egress_distribution_schema=$(jq -er .contracts.egressDistributionSchemaVersion "${release_record}")
         egress_host_schema=$(jq -er .contracts.egressHostStateSchemaVersion "${release_record}")
@@ -153,6 +193,13 @@ else
     egress_map_schema=0
     egress_event_schema=0
     deployment_stage=abi-v5-nodeport-staged-deployment
+fi
+if [[ ${release_phase} != 9.9 ]]; then
+    encryption_model_schema=0
+    encryption_plan_schema=0
+    encryption_path_schema=0
+    encryption_operations_schema=0
+    encryption_map_abi=0
 fi
 version_query="serviceSnapshotSchemaVersion=${service_schema}"
 if ((selection_schema > 0)); then
@@ -235,6 +282,17 @@ assert_version() {
             and .egress_ha_promotion_schema_version == $ha
             and .egress_map_schema_version == $map
             and .egress_event_schema_version == $event
+        ' <<<"${json}" >/dev/null
+    fi
+    if ((encryption_model_schema > 0)); then
+        jq -e --argjson model "${encryption_model_schema}" \
+            --argjson plan "${encryption_plan_schema}" --argjson path "${encryption_path_schema}" \
+            --argjson operations "${encryption_operations_schema}" --argjson map "${encryption_map_abi}" '
+            .encryption_model_schema_version == $model
+            and .encryption_plan_schema_version == $plan
+            and .encryption_path_proof_schema_version == $path
+            and .encryption_operations_schema_version == $operations
+            and .encryption_map_abi_version == $map
         ' <<<"${json}" >/dev/null
     fi
 }
@@ -622,7 +680,7 @@ done
 stage=evidence
 mkdir -p "$(dirname "${artifact}")"
 artifact_tmp="${artifact}.tmp.$$"
-if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} == 8.11 ]]; then
+if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} == 8.11 || ${release_phase} == 9.9 ]]; then
     node_evidence=$("${kc[@]}" get nodes -o json | jq '[.items[] | {
         name:.metadata.name, osImage:.status.nodeInfo.osImage,
         kernelVersion:.status.nodeInfo.kernelVersion,
@@ -642,6 +700,11 @@ if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} ==
         --argjson egressHostSchema "${egress_host_schema}" \
         --argjson egressHaSchema "${egress_ha_schema}" --argjson egressMapSchema "${egress_map_schema}" \
         --argjson egressEventSchema "${egress_event_schema}" \
+        --argjson encryptionModelSchema "${encryption_model_schema}" \
+        --argjson encryptionPlanSchema "${encryption_plan_schema}" \
+        --argjson encryptionPathSchema "${encryption_path_schema}" \
+        --argjson encryptionOperationsSchema "${encryption_operations_schema}" \
+        --argjson encryptionMapAbi "${encryption_map_abi}" \
         --argjson statusSchema "${agent_status_schema}" --argjson nodes "${node_evidence}" \
         --argjson agents "${agents}" '
         {
@@ -657,6 +720,11 @@ if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} ==
           egressHaPromotionSchemaVersion:$egressHaSchema,
           egressMapSchemaVersion:$egressMapSchema,
           egressEventSchemaVersion:$egressEventSchema,
+          encryptionModelSchemaVersion:$encryptionModelSchema,
+          encryptionPlanSchemaVersion:$encryptionPlanSchema,
+          encryptionPathProofSchemaVersion:$encryptionPathSchema,
+          encryptionOperationsSchemaVersion:$encryptionOperationsSchema,
+          encryptionMapAbiVersion:$encryptionMapAbi,
           agentStatusSchemaVersion:$statusSchema,
           nodes:$nodes, agents:$agents,
           verified:["immutable public image digests",$compatibilityBoundary,
@@ -664,6 +732,7 @@ if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} ==
             "legacy-netlink TC attachment","persistent host forwarding contract",
             "current-schema durable composite service checkpoint","host-origin Kubernetes API Service reachability",
             "current-schema egress dataplane and recovery contract",
+            "Phase 9 encryption schema and isolated map-ABI compatibility",
             "no functional kube-proxy rule residue","exact current-ABI map ownership",
             "full five-node convergence","kube-proxy remains absent"]
         }

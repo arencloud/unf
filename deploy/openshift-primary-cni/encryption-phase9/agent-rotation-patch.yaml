@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: unf-agent
+  namespace: unf-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: agent
+          env:
+            - name: UNF_ENCRYPTION_KEY_LIFETIME_SECONDS
+              value: "600"
+            - name: UNF_ENCRYPTION_ROTATE_BEFORE_SECONDS
+              value: "480"
+            - name: UNF_ENCRYPTION_ROTATION_JITTER_SECONDS
+              value: "5"
+            - name: UNF_ENCRYPTION_DRAIN_SECONDS
+              value: "30"
