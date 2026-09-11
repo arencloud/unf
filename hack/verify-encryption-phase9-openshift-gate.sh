@@ -80,6 +80,8 @@ require 'Monotonic Platform Health Delta' \
     "${root}/docs/adr/0235-monotonic-platform-health-delta.md"
 require 'Conflict-Acknowledged Activation Supersession' \
     "${root}/docs/adr/0236-conflict-acknowledged-activation-supersession.md"
+require 'Immutable Activation-Supersession Kind Requalification' \
+    "${root}/docs/adr/0237-immutable-activation-supersession-kind-requalification.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"

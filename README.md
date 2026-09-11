@@ -1170,6 +1170,10 @@ controller has already superseded. Only that volatile report is retired; every
 malformed, equivocal, unauthorized, unavailable, or transport-failed report
 remains fail closed, and the successor still needs the complete proof chain;
 ADR 0236.
+Exact revised runtime `e1dbb94` then passed the complete fresh three-Node
+dual-stack, kube-proxy-free Kind lifecycle. ADR 0237 binds its anonymous-public
+Linux/amd64 image digests to the evidence and packet-capture hashes as the only
+tuple eligible for the cl02 recovery rollout.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

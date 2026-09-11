@@ -1157,8 +1157,10 @@ matrix is maintained in the
   permanently occupying the outbox after a newer controller generation had
   superseded it. Conflict-Acknowledged Activation Supersession retires only an
   explicit HTTP 409 predecessor, while all invalid, equivocal, unavailable, or
-  unauthenticated reports remain fail closed; ADR 0236. Fresh full Kind and the
-  complete cl02 gate remain mandatory for the revised runtime.
+  unauthenticated reports remain fail closed; ADR 0236. Exact runtime
+  `e1dbb94` passed the fresh full Kind lifecycle and ADR 0237 binds its public
+  immutable images, evidence, and capture. The complete cl02 gate remains
+  mandatory for the revised runtime.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
