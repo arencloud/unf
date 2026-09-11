@@ -33,9 +33,11 @@ UNF adds one destructive, dedicated-cluster qualification gate that:
   deletion; and
 - optionally ends by running the existing exact primary-CNI rollback gate.
 
-The Phase 9 overlay uses a 180-second test-key lifetime, a 120-second
+The Phase 9 overlay uses a 600-second test-key lifetime, a 480-second
 rotate-before window, five seconds of deterministic jitter allowance, and a
-30-second drain. These are qualification timings, not production defaults.
+30-second drain. The 120-second rotation cadence remains observable while a
+restarted agent has a generous validity window for controller reconstruction.
+These are qualification timings, not production defaults.
 Evidence is atomically written as schema-v1 JSON; it contains public runtime
 and causal facts but no private key material.
 
