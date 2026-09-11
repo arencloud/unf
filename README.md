@@ -1206,6 +1206,11 @@ Exact runtime `180ae2f` passed the complete fresh three-Node dual-stack,
 kube-proxy-free Kind lifecycle after that change. ADR 0243 binds its anonymous
 Linux/amd64 public images, evidence, and packet capture as the only tuple
 eligible for the resumed cl02 rollout.
+That image proved the first settlement check was still ordered after volatile
+reconstruction. Durable Admission-First Reconstruction instead recognizes the
+byte-identical durable generation cursor and pending journal before volatile
+state exists, admits either no volatile proof or its exact reconstruction, and
+rejects every under-classified or conflicting state; ADR 0244.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

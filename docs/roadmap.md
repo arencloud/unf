@@ -1178,6 +1178,10 @@ matrix is maintained in the
   compiling its successor and rejects every cursor/journal mismatch; ADR 0242.
   Exact runtime `180ae2f` passed the fresh full Kind lifecycle and ADR 0243
   binds its immutable public images and evidence for the resumed cl02 gate.
+  That rollout proved the first join still depended on volatile reconstruction.
+  Durable Admission-First Reconstruction recognizes only exact cursor/journal
+  equality before rebuilding volatile proof and rejects every conflicting
+  state; ADR 0244. Its runtime must repeat fresh Kind before cl02 resumes.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

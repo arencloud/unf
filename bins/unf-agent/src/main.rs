@@ -9247,30 +9247,48 @@ impl EncryptionGenerationSynchronizer {
     /// finish this exact predecessor first; only its normal activation commit
     /// can make it safe to compile the causal successor.
     fn must_settle_admitted_pending_before(&self, desired: Revision) -> Result<bool> {
-        let Some(PendingEncryptionGeneration::ControllerAdmitted {
-            prepared,
-            admitted,
-            slot: EncryptionRecoverySlot::Pending,
-            ..
-        }) = self.pending.as_ref()
-        else {
+        let Some(recovery) = self.recovery.pending.as_ref() else {
             return Ok(false);
         };
-        let pending_generation = prepared
-            .fact()
+        let Some(admitted) = self.current.as_ref().filter(|admitted| {
+            admitted.recipient == recovery.fact.recipient
+                && admitted.checkpoint == recovery.fact.checkpoint
+        }) else {
+            if matches!(
+                self.pending,
+                Some(PendingEncryptionGeneration::ControllerAdmitted {
+                    slot: EncryptionRecoverySlot::Pending,
+                    ..
+                })
+            ) {
+                bail!("volatile pending admission has no matching durable generation cursor");
+            }
+            return Ok(false);
+        };
+        let pending_generation = recovery
+            .fact
             .checkpoint
             .transaction
             .desired
             .published
             .generation;
-        if pending_generation >= desired {
-            return Ok(false);
+        if pending_generation > desired {
+            bail!("current encryption plan regressed behind an admitted pending generation");
         }
-        if self.current.as_ref() != Some(admitted.as_ref()) {
-            bail!("volatile pending admission differs from its durable generation cursor");
-        }
-        if self.recovery.pending.as_ref() != Some(prepared.recovery_plan()) {
-            bail!("volatile pending admission differs from its durable recovery journal");
+        match self.pending.as_ref() {
+            None => {}
+            Some(PendingEncryptionGeneration::ControllerAdmitted {
+                prepared,
+                admitted: volatile_admission,
+                slot: EncryptionRecoverySlot::Pending,
+                ..
+            }) if prepared.recovery_plan() == recovery
+                && volatile_admission.as_ref() == admitted => {}
+            Some(PendingEncryptionGeneration::Prepared {
+                slot: EncryptionRecoverySlot::Pending,
+                ..
+            }) => bail!("durably admitted pending generation lost volatile admission identity"),
+            Some(_) => bail!("durably admitted pending generation has conflicting volatile state"),
         }
         Ok(true)
     }
@@ -19731,10 +19749,17 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            !generations
+            generations
                 .must_settle_admitted_pending_before(Revision::new(19))
                 .unwrap()
         );
+        generations.pending = None;
+        assert!(
+            generations
+                .must_settle_admitted_pending_before(Revision::new(20))
+                .unwrap()
+        );
+        generations.rehydrate_local_proof(None).await.unwrap();
         assert!(
             generations
                 .abandon_superseded_prepared(
