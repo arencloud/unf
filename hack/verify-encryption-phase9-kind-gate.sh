@@ -34,6 +34,10 @@ require 'replacement_pod_authority_retry_is_bounded_and_fail_closed' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'native_only_generation_closes_without_encrypted_path_exchange' \
     "${root}/bins/unf-agent/src/main.rs"
+require 'an unactivated restored cut must remain available' \
+    "${root}/bins/unf-controller/src/main.rs"
+require 'Activation-Before-Recovery-Successor' \
+    "${root}/docs/adr/0228-activation-before-recovery-successor.md"
 
 for bounded_wait in wait_generation_after wait_epoch_change; do
     wait_body=$(sed -n "/^${bounded_wait}()/,/^}/p" "${gate}")

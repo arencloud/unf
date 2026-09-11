@@ -1117,7 +1117,14 @@ but the agent still requested a path-proof round and correctly received `503`.
 Proof-Carrying Zero-Transport Closure now verifies the complete decision state
 and empty kernel-plan set, then consumes the existing generation permit with
 its already-defined empty receipt cut. Required decisions cannot use this path,
-and missing authority remains a drop; ADR 0227.
+and missing authority remains a drop; ADR 0227. Its first fresh Kind rerun then
+proved a separate restart race: a replacement controller could advance its
+restored fleet cut after the complete plan-cursor join but before one admitted
+Node finished path proof. Activation-Before-Recovery-Successor now retains an
+exact reconstructible cut until its durable fleet activation cursor closes,
+then lets normal current-source reconciliation publish one successor. This is
+evidence-ordered rather than timing-ordered and adds no packet authority; ADR
+0228.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

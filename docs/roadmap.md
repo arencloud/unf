@@ -1124,7 +1124,14 @@ matrix is maintained in the
   Zero-Transport Closure now verifies the exact Native decision state and
   empty kernel plans before consuming the existing empty-receipt permit;
   Required decisions remain on duplex proof. New immutable Kind and cl02
-  qualification remain mandatory; ADR 0227.
+  qualification remain mandatory; ADR 0227. The first new Kind run reached
+  controller replacement and exposed a distinct ordering race: the restored
+  plan cut advanced after the complete plan-cursor join while one Node still
+  held admitted path-proof escrow for that exact cut.
+  Activation-Before-Recovery-Successor now retains a reconstructible restored
+  cut until its durable fleet activation cursor closes, then permits one
+  normal current-source successor; ADR 0228. Full Kind requalification remains
+  mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

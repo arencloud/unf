@@ -10363,7 +10363,29 @@ fn encryption_plan_minimum_generation(
     };
     match recovery_join {
         EncryptionPlanRecoveryJoin::Waiting => None,
-        EncryptionPlanRecoveryJoin::Complete(floor) => Some(floor),
+        EncryptionPlanRecoveryJoin::Complete(floor) => {
+            // If every authenticated agent cursor is at or behind the exact
+            // restored catalog, that cut is still reconstructible.  Keep it
+            // published until its durable activation cursor cut closes so
+            // path-proof work admitted immediately before the controller
+            // restart cannot be orphaned by a needless recovery successor.
+            // Once activation closes, normal reconciliation observes the
+            // intentionally empty restored source and emits one fresh cut.
+            let restored_cut_requires_activation = catalog_generation.is_some_and(|catalog| {
+                floor == catalog.next()
+                    && mutex_lock(&state.encryption_local_plans)
+                        .active()
+                        .is_some_and(|cut| {
+                            cut.generation == catalog
+                                && !encryption_plan_cut_is_activated(state, cut)
+                        })
+            });
+            Some(if restored_cut_requires_activation {
+                Revision::INITIAL
+            } else {
+                floor
+            })
+        }
         EncryptionPlanRecoveryJoin::Inactive => Some(match (catalog_generation, current) {
             (Some(catalog), Some(cursor)) if cursor.generation > catalog => {
                 cursor.generation.next()
@@ -16736,6 +16758,36 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "an exact durable cursor must settle without claiming activation"
+        );
+
+        // A replacement controller must first let an unactivated restored cut
+        // finish its path-proof exchange. Advancing merely because the fleet
+        // cursor join completed would strand a Node that durably admitted the
+        // restored generation immediately before the restart.
+        *mutex_lock(&state.encryption_plan_reconciler) = EncryptionPlanReconciler {
+            source: None,
+            generation: first.snapshot.generation,
+            refresh_at_unix_ms: None,
+            recovery_cursors: Some(BTreeMap::new()),
+        };
+        let restart_request = NodeLocalPlanRequest {
+            schema_version: unf_encryption::NODE_LOCAL_PLAN_REQUEST_SCHEMA_VERSION,
+            node_name: "worker-a".to_owned(),
+            current: settled_request.current.clone(),
+            nonce: [28; 32],
+        };
+        assert!(
+            encryption_plan_for(&state, &agent, &restart_request)
+                .unwrap()
+                .is_none(),
+            "an unactivated restored cut must remain available after the fleet cursor join"
+        );
+        assert_eq!(
+            mutex_lock(&state.encryption_local_plans)
+                .active()
+                .unwrap()
+                .generation,
+            first.snapshot.generation
         );
 
         let receipt_only_request =
