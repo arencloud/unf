@@ -510,6 +510,7 @@ required_http_markers=$(tcpdump -A -nn -r "${capture_host_path}" \
 (( wireguard_frames > 0 && required_plaintext_frames == 0 && required_http_markers == 0 && native_plaintext_frames > 0 ))
 
 qualification_stage=recovery-and-rotation
+pre_agent_recovery_generation=$(wait_generation true)
 old_agent=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent \
     --field-selector "spec.nodeName=${source_node}" -o jsonpath='{.items[0].metadata.name}')
 "${kc[@]}" -n unf-system delete pod "${old_agent}" --wait=true --timeout=60s >/dev/null
@@ -528,6 +529,11 @@ done
 [[ -n ${replacement_agent} ]]
 "${kc[@]}" -n unf-system rollout status daemonset/unf-agent --timeout=180s >/dev/null
 recovered_generation=$(wait_generation true)
+jq -e --argjson recovered "${recovered_generation}" '
+    length == ($recovered | length)
+    and all(.[] as $before; any($recovered[];
+        .node == $before.node and .generation == $before.generation))' \
+    <<<"${pre_agent_recovery_generation}" >/dev/null
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
 initial_epoch=$(jq -r --arg node "${source_node}" '.[] | select(.node == $node) | .epochs | max' <<<"${recovered_generation}")
 rotated_generation=$(wait_epoch_change "${initial_epoch}")
