@@ -7,6 +7,7 @@ context=${KUBE_CONTEXT:-kind-unf-service-dev}
 container_runtime=${KIND_PROVIDER:-podman}
 test_tools_image=${UNF_TEST_TOOLS_IMAGE:-localhost/unf-test-tools:ipv6-ext-v1}
 artifact=${UNF_EGRESS_KIND_EVIDENCE:-"${project_root}/.artifacts/phase8-egress-kind.json"}
+run_restart_recovery=${UNF_EGRESS_RUN_RESTART_RECOVERY:-true}
 namespace=unf-egress-lifecycle-qualification
 pool=unf-egress-lifecycle
 policy=unf-egress-lifecycle
@@ -32,6 +33,11 @@ controller_forward_pid=
 controller_port=$((21000 + started_unix_seconds % 10000))
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
 runtime=(sudo "${container_runtime}")
+
+[[ ${run_restart_recovery} == true || ${run_restart_recovery} == false ]] || {
+    echo "UNF_EGRESS_RUN_RESTART_RECOVERY must be true or false" >&2
+    exit 1
+}
 
 collect_diagnostics() {
     [[ ${diagnostics_collected} == false ]] || return 0
@@ -706,12 +712,15 @@ if [[ ${native_reachability} == true ]]; then
     publish_native_observation "${fabric_a_observer_namespace}" present "${native_refresh_until}"
     publish_native_observation "${fabric_b_observer_namespace}" present "${native_refresh_until}"
 fi
-"${kc[@]}" -n unf-system rollout restart deployment/unf-controller >/dev/null
-"${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=180s
-restart_status=$(wait_for_activation)
-assert_gateway_ownership
-native_peer_matrix
-managed_udp_matrix controller-restart
+restart_status=${initial_status}
+if [[ ${run_restart_recovery} == true ]]; then
+    "${kc[@]}" -n unf-system rollout restart deployment/unf-controller >/dev/null
+    "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=180s
+    restart_status=$(wait_for_activation)
+    assert_gateway_ownership
+    native_peer_matrix
+    managed_udp_matrix controller-restart
+fi
 if [[ ${native_reachability} == true ]]; then
     qualification_stage=autonomous-reachability-expiry
     native_expiry=$(( $(date +%s) + 7 ))
@@ -742,12 +751,15 @@ if [[ ${native_reachability} == true ]]; then
     publish_native_observation "${fabric_b_observer_namespace}" present "${native_recovery_until}"
     wait_for_activation >/dev/null
 fi
-"${kc[@]}" -n unf-system rollout restart daemonset/unf-agent >/dev/null
-"${kc[@]}" -n unf-system rollout status daemonset/unf-agent --timeout=180s
 agent_restart_status=$(wait_for_activation)
-assert_gateway_ownership
-native_peer_matrix
-managed_udp_matrix agent-restart
+if [[ ${run_restart_recovery} == true ]]; then
+    "${kc[@]}" -n unf-system rollout restart daemonset/unf-agent >/dev/null
+    "${kc[@]}" -n unf-system rollout status daemonset/unf-agent --timeout=180s
+    agent_restart_status=$(wait_for_activation)
+    assert_gateway_ownership
+    native_peer_matrix
+    managed_udp_matrix agent-restart
+fi
 
 qualification_stage=withdrawal-and-safe-release
 "${kc[@]}" delete egresspolicy.network.unf.io "${policy}" --wait=true >/dev/null
@@ -847,6 +859,7 @@ jq -n \
     --arg milestone "${qualification_milestone}" \
     --arg providerName "${provider_name}" \
     --argjson nativeReachability "${native_reachability}" \
+    --argjson restartRecovery "${run_restart_recovery}" \
     --argjson initialEpoch "${initial_epoch}" \
     --argjson reusedEpoch "${reused_epoch}" \
     --argjson images "${images}" \
@@ -868,6 +881,7 @@ jq -n \
         independentFabricFailureDomains:(if $nativeReachability then 2 else 0 end),
         conflictDenied:$nativeReachability,autonomousExpiryDenied:$nativeReachability,
         positiveWithdrawal:$nativeReachability},
+      restartRecovery:$restartRecovery,
       fixture:{externalIPv4:$externalIPv4,externalIPv6:$externalIPv6,
         egressIPv4:$egressIPv4,egressIPv6:$egressIPv6},
       lifecycle:{initialLeaseEpoch:$initialEpoch,reusedLeaseEpoch:$reusedEpoch,
@@ -886,10 +900,11 @@ jq -n \
         "exact sparse NAT witnesses","unrelated native egress source preservation",
         "dual-stack evidence-complete explanation and non-authoritative simulation",
         "loss-explicit Causal Egress Chronicle without private NAT inference",
-        "controller restart recovery","agent restart and address readback recovery",
         "source fencing","lease-specific NAT drain","reachability withdrawal",
         "host address and proxy removal","Proof of Safe Forgetting release",
         "same-address reuse under a monotonic lease epoch","final clean release"]
+        + (if $restartRecovery then ["controller restart recovery",
+          "agent restart and address readback recovery"] else [] end)
         + (if $nativeReachability then ["controller-owned native DQR plan",
           "explicit provider route receipt","two independently authorized fabric failure domains",
           "nonce-bound IPv4 and IPv6 kernel ownership probes","conflicting observation denial",

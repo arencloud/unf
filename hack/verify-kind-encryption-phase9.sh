@@ -556,6 +556,7 @@ egress_result=skipped
 if [[ ${run_egress} == true ]]; then
     KUBECONFIG="${kubeconfig}" KUBE_CONTEXT="${context}" KIND_PROVIDER="${container_runtime}" \
         UNF_TEST_TOOLS_IMAGE="${test_tools_image}" \
+        UNF_EGRESS_RUN_RESTART_RECOVERY=false \
         "${project_root}/hack/verify-kind-egress-lifecycle.sh"
     egress_result=passed
 fi
