@@ -7,6 +7,7 @@ context=${KUBE_CONTEXT:-kind-unf-service-dev}
 container_runtime=${KIND_PROVIDER:-podman}
 test_tools_image=${UNF_TEST_TOOLS_IMAGE:-localhost/unf-test-tools:ipv6-ext-v1}
 artifact=${UNF_PHASE9_KIND_EVIDENCE:-"${project_root}/.artifacts/phase9-encryption-kind.json"}
+capture_artifact=${UNF_PHASE9_KIND_CAPTURE:-"${project_root}/.artifacts/phase9-encryption-kind.pcap"}
 expected_runtime_revision=${UNF_PHASE9_RUNTIME_REVISION:-}
 run_egress=${UNF_PHASE9_RUN_EGRESS:-true}
 run_rollback=${UNF_PHASE9_RUN_ROLLBACK:-true}
@@ -526,7 +527,8 @@ done
     exit 1
 }
 
-mkdir -p "$(dirname "${artifact}")"
+mkdir -p "$(dirname "${artifact}")" "$(dirname "${capture_artifact}")"
+install -m 0600 "${capture_host_path}" "${capture_artifact}"
 artifact_tmp=${artifact}.tmp.$$
 jq -n \
     --arg revision "${runtime_revision}" \
@@ -542,6 +544,7 @@ jq -n \
     --argjson rotatedGeneration "${rotated_generation}" \
     --argjson restartGeneration "${restart_generation}" \
     --arg captureSha256 "${capture_sha256}" \
+    --arg capturePath "${capture_artifact}" \
     --argjson wireguardFrames "${wireguard_frames}" \
     --argjson requiredPlaintextFrames "${required_plaintext_frames}" \
     --argjson nativePlaintextFrames "${native_plaintext_frames}" \
@@ -564,7 +567,7 @@ jq -n \
       defaultRequired: {result:"passed", generations:$defaultGeneration},
       explicitSelective: {result:"passed", generations:$selectiveGeneration},
       traffic: {directDualStack:"passed", serviceDualStack:"passed"},
-      capture: {sha256:$captureSha256, wireguardFrames:$wireguardFrames,
+      capture: {path:$capturePath, sha256:$captureSha256, wireguardFrames:$wireguardFrames,
         requiredPlaintextFrames:$requiredPlaintextFrames,
         nativePlaintextFrames:$nativePlaintextFrames},
       failClosed: {requiredBlocked:$requiredBlocked, nativeSucceeded:$nativeSucceeded},
