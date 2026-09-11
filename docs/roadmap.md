@@ -1133,7 +1133,11 @@ matrix is maintained in the
   normal current-source successor; ADR 0228. Exact revision `32b5501` passed
   the complete fresh Kind transaction and its public Linux/amd64 manifest
   digests plus evidence hashes are release-bound by ADR 0229. The resumed cl02
-  gate remains mandatory.
+  gate then exposed observer-induced livelock from per-sample `oc debug` Pods.
+  The Non-Perturbing Fleet Witness uses one stable host-networked probe per
+  Node, fixes selective-before-evidence execution order, and bounds every retry
+  to one snapshot without changing runtime `32b5501`; ADR 0230. The complete
+  cl02 gate remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

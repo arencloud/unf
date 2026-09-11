@@ -1130,6 +1130,12 @@ frames, eight-of-eight fail-closed Required denials, eight-of-eight Native
 successes, loss-free operations, egress coexistence, exact cleanup, and no-CNI
 rollback. Its anonymous Linux/amd64 manifests and evidence hashes are bound by
 ADR 0229 and are the only tuple admitted to the resumed cl02 gate.
+The first cl02 gate attempt then identified observer-induced churn rather than
+a runtime failure: repeated `oc debug node` snapshots created Pods that changed
+the generation being observed. The Non-Perturbing Fleet Witness uses one stable
+host-networked executor per Node, runs selective qualification before evidence,
+and bounds each retry to one fleet snapshot. It needs no SSH and changes no
+qualified runtime byte; ADR 0230.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

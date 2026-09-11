@@ -41,6 +41,9 @@ require 'exact-cleanup' "${gate}"
 require 'baseline_unhealthy' "${gate}"
 require 'final_unhealthy' "${gate}"
 require 'simultaneous replacement of every encrypted endpoint' "${gate}"
+require 'kind: DaemonSet' "${gate}"
+require 'unf-encryption-host-probe' "${gate}"
+require 'chroot /host' "${gate}"
 require 'must_establish_initial_generation' "${root}/bins/unf-agent/src/main.rs"
 require 'oc image info .*--filter-by-os=linux/amd64 -o json' \
     "${root}/hack/deploy-openshift-service-fabric.sh"
@@ -60,6 +63,8 @@ require 'Activation-Before-Recovery-Successor' \
     "${root}/docs/adr/0228-activation-before-recovery-successor.md"
 require 'Immutable Activation-Ordered Kind Requalification' \
     "${root}/docs/adr/0229-immutable-activation-ordered-kind-requalification.md"
+require 'Non-Perturbing Fleet Witness' \
+    "${root}/docs/adr/0230-non-perturbing-fleet-witness.md"
 require 'UNF_ENCRYPTION_BASELINE' "${overlay}/controller-native-patch.yaml"
 require 'value: native' "${overlay}/controller-native-patch.yaml"
 require 'UNF_ENCRYPTION_KEY_LIFETIME_SECONDS' "${overlay}/agent-rotation-patch.yaml"
@@ -69,5 +74,29 @@ agent_image=$(jq -er .images.agent "${release}")
 grep -Fq "image: ${controller_image}" "${rendered}"
 [[ $(grep -Fc "image: ${agent_image}" "${rendered}") == 2 ]]
 grep -Fq 'value: native' "${rendered}"
+
+if rg -q 'debug "node/' "${gate}"; then
+    echo "Phase 9.9 host evidence must not create observer Pods per sample" >&2
+    exit 1
+fi
+for bounded_wait in wait_generation_after wait_epoch_change; do
+    wait_body=$(sed -n "/^${bounded_wait}()/,/^}/p" "${gate}")
+    rg -q 'generation_snapshot' <<<"${wait_body}" || {
+        echo "${bounded_wait} must inspect one direct generation snapshot per retry" >&2
+        exit 1
+    }
+    if rg -q 'snapshot=\$\(wait_generation' <<<"${wait_body}"; then
+        echo "${bounded_wait} must not nest the independent convergence timeout" >&2
+        exit 1
+    fi
+done
+
+selective_line=$(rg -n '^stage=selective-native-exception$' "${gate}" | cut -d: -f1)
+ciphertext_line=$(rg -n '^stage=ciphertext-and-fail-closed$' "${gate}" | cut -d: -f1)
+evidence_line=$(rg -n '^stage=evidence$' "${gate}" | cut -d: -f1)
+(( selective_line < ciphertext_line && ciphertext_line < evidence_line )) || {
+    echo "selective qualification must execute before ciphertext and evidence emission" >&2
+    exit 1
+}
 
 echo "Phase 9.9 OpenShift encryption qualification gate contract verified"

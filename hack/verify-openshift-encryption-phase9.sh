@@ -13,12 +13,14 @@ artifact=${UNF_OPENSHIFT_ENCRYPTION_EVIDENCE:-"${project_root}/.artifacts/phase9
 capture_artifact=${UNF_OPENSHIFT_ENCRYPTION_CAPTURE:-"${project_root}/.artifacts/phase9-encryption-openshift.pcap"}
 diagnostics=${UNF_OPENSHIFT_ENCRYPTION_DIAGNOSTICS:-"${project_root}/.artifacts/phase9-encryption-openshift-diagnostics"}
 namespace=unf-encryption-openshift-qualification
+host_probe_namespace=unf-encryption-openshift-host-probe
 policy=required-pair
 capture_pod=underlay-capture
 capture_container_path=/capture/unf-phase9-encryption.pcap
 stage=initialization
 started_unix=$(date +%s)
 resources_created=false
+host_probe_created=false
 link_lowered=false
 source_interface=
 artifact_tmp=
@@ -50,6 +52,10 @@ cleanup() {
         "${kc[@]}" -n unf-system set env deployment/unf-controller \
             UNF_ENCRYPTION_BASELINE=native >/dev/null 2>&1 || true
         "${kc[@]}" delete namespace "${namespace}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    fi
+    if [[ ${host_probe_created} == true ]]; then
+        "${kc[@]}" delete namespace "${host_probe_namespace}" --ignore-not-found --wait=false \
+            >/dev/null 2>&1 || true
     fi
     [[ -z ${artifact_tmp} ]] || unlink "${artifact_tmp}" >/dev/null 2>&1 || true
     exit "${status}"
@@ -126,9 +132,17 @@ oc_read() {
 }
 
 node_exec() {
-    local node=$1
+    local node=$1 pod
     shift
-    "${kc[@]}" debug "node/${node}" --quiet -- chroot /host "$@"
+    pod=$("${kc[@]}" -n "${host_probe_namespace}" get pods \
+        -l app.kubernetes.io/name=unf-encryption-host-probe \
+        --field-selector "spec.nodeName=${node}" -o json | jq -er '
+          .items[] | select(.metadata.deletionTimestamp == null
+            and .status.phase == "Running"
+            and any(.status.containerStatuses[]; .name == "host-probe" and .ready))
+          | .metadata.name' | head -n 1)
+    [[ -n ${pod} ]]
+    "${kc[@]}" -n "${host_probe_namespace}" exec "${pod}" -c host-probe -- chroot /host "$@"
 }
 
 controller_pod() {
@@ -185,9 +199,14 @@ wait_generation() {
 wait_generation_after() {
     local predecessor=$1 snapshot= generation=
     for _ in $(seq 1 360); do
-        snapshot=$(wait_generation)
-        generation=$(jq -r '.[0].generation' <<<"${snapshot}")
-        if [[ ${generation} =~ ^[0-9]+$ ]] && (( generation > predecessor )); then
+        snapshot=$(generation_snapshot 2>/dev/null || true)
+        generation=$(jq -r '.[0].generation // empty' <<<"${snapshot}" 2>/dev/null || true)
+        if jq -e --argjson expected "${#nodes[@]}" '
+            length == $expected
+            and all(.[]; .pending == null and .generation != null)
+            and ([.[].generation] | unique | length) == 1
+        ' <<<"${snapshot}" >/dev/null 2>&1 \
+            && [[ ${generation} =~ ^[0-9]+$ ]] && (( generation > predecessor )); then
             printf '%s\n' "${snapshot}"
             return 0
         fi
@@ -252,9 +271,16 @@ traffic_matrix() {
 wait_epoch_change() {
     local initial_epoch=$1 snapshot= epoch=
     for _ in $(seq 1 360); do
-        snapshot=$(wait_generation)
-        epoch=$(jq -r --arg node "${source_node}" '.[] | select(.node == $node) | .epochs | max' <<<"${snapshot}")
-        if [[ ${epoch} =~ ^[0-9]+$ ]] && (( epoch > initial_epoch )); then
+        snapshot=$(generation_snapshot 2>/dev/null || true)
+        epoch=$(jq -r --arg node "${source_node}" '
+            .[] | select(.node == $node) | .epochs | max // empty
+        ' <<<"${snapshot}" 2>/dev/null || true)
+        if jq -e --argjson expected "${#nodes[@]}" '
+            length == $expected
+            and all(.[]; .pending == null and .generation != null)
+            and ([.[].generation] | unique | length) == 1
+        ' <<<"${snapshot}" >/dev/null 2>&1 \
+            && [[ ${epoch} =~ ^[0-9]+$ ]] && (( epoch > initial_epoch )); then
             printf '%s\n' "${snapshot}"
             return 0
         fi
@@ -305,10 +331,49 @@ mapfile -t workers < <(jq -r '.items[] | select(.metadata.labels | has("node-rol
 source_node=${workers[0]}
 destination_node=${workers[1]}
 [[ $("${kc[@]}" get encryptionpolicies.network.unf.io -A -o json | jq '.items | length') == 0 ]]
-if "${kc[@]}" get namespace "${namespace}" >/dev/null 2>&1; then
-    echo "qualification namespace already exists; refusing to adopt it" >&2
-    exit 1
-fi
+for reserved_namespace in "${namespace}" "${host_probe_namespace}"; do
+    if "${kc[@]}" get namespace "${reserved_namespace}" >/dev/null 2>&1; then
+        echo "qualification namespace ${reserved_namespace} already exists; refusing to adopt it" >&2
+        exit 1
+    fi
+done
+
+# One stable, host-networked executor per Node makes host evidence
+# non-perturbing. Repeated `oc debug node` calls create and delete Pods, which
+# are themselves encryption inputs and can prevent the generation being
+# observed from ever becoming quiescent.
+"${kc[@]}" create namespace "${host_probe_namespace}" >/dev/null
+host_probe_created=true
+"${kc[@]}" -n "${host_probe_namespace}" create serviceaccount host-probe >/dev/null
+"${kc[@]}" -n "${host_probe_namespace}" adm policy add-scc-to-user privileged \
+    --serviceaccount=host-probe >/dev/null
+"${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: host-probe, namespace: ${host_probe_namespace}}
+spec:
+  selector: {matchLabels: {app.kubernetes.io/name: unf-encryption-host-probe}}
+  template:
+    metadata: {labels: {app.kubernetes.io/name: unf-encryption-host-probe}}
+    spec:
+      serviceAccountName: host-probe
+      hostNetwork: true
+      hostPID: true
+      nodeSelector: {network.unf.io/primary-cni: enabled}
+      tolerations: [{operator: Exists}]
+      containers:
+      - name: host-probe
+        image: ${test_tools_image}
+        imagePullPolicy: IfNotPresent
+        command: [/bin/sh, -ec, "trap : TERM INT; sleep infinity & wait"]
+        securityContext: {privileged: true}
+        volumeMounts: [{name: host-root, mountPath: /host}]
+      volumes:
+      - name: host-root
+        hostPath: {path: /, type: Directory}
+EOF
+"${kc[@]}" -n "${host_probe_namespace}" rollout status daemonset/host-probe \
+    --timeout=10m >/dev/null
 for node in "${nodes[@]}"; do
     host_facts=$(node_exec "${node}" sh -euc '
         test "$(getenforce)" = Enforcing
@@ -440,6 +505,23 @@ required_service4=$("${kc[@]}" -n "${namespace}" get service required-server -o 
 required_service6=$("${kc[@]}" -n "${namespace}" get service required-server -o json | jq -er '.spec.clusterIPs[] | select(contains(":"))')
 native_service4=$("${kc[@]}" -n "${namespace}" get service native-server -o json | jq -er '.spec.clusterIPs[] | select(contains("."))')
 native_service6=$("${kc[@]}" -n "${namespace}" get service native-server -o json | jq -er '.spec.clusterIPs[] | select(contains(":"))')
+traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
+traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
+
+stage=selective-native-exception
+set_baseline native
+pre_selective_generation=$(jq -r '.[0].generation' <<<"${default_generation}")
+"${kc[@]}" apply -f - >/dev/null <<EOF
+apiVersion: network.unf.io/v1alpha1
+kind: EncryptionPolicy
+metadata: {name: ${policy}, namespace: ${namespace}}
+spec:
+  priority: 1000
+  bidirectional: true
+  sources: {matchLabels: {app: required-client}}
+  destinations: {matchLabels: {app: required-server}}
+EOF
+selective_generation=$(wait_generation_after "${pre_selective_generation}")
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
 traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
 
@@ -588,6 +670,8 @@ for _ in $(seq 1 360); do
 done
 [[ ${owned_state_absent} == true ]]
 [[ $("${kc[@]}" get encryptionpolicies.network.unf.io -A -o json | jq '.items | length') == 0 ]]
+"${kc[@]}" delete namespace "${host_probe_namespace}" --wait=true --timeout=10m >/dev/null
+host_probe_created=false
 final_agents=$(wait_for_convergence)
 "${kc[@]}" wait --for=condition=Ready nodes --all --timeout=10m >/dev/null
 final_unhealthy=$(unhealthy_operators)
@@ -669,20 +753,3 @@ artifact_tmp=
 trap - ERR EXIT
 echo "OpenShift cl02 Phase 9.9 encryption qualification passed"
 echo "evidence: ${artifact}"
-
-stage=selective-native-exception
-set_baseline native
-pre_selective_generation=$(jq -r '.[0].generation' <<<"${default_generation}")
-"${kc[@]}" apply -f - >/dev/null <<EOF
-apiVersion: network.unf.io/v1alpha1
-kind: EncryptionPolicy
-metadata: {name: ${policy}, namespace: ${namespace}}
-spec:
-  priority: 1000
-  bidirectional: true
-  sources: {matchLabels: {app: required-client}}
-  destinations: {matchLabels: {app: required-server}}
-EOF
-selective_generation=$(wait_generation_after "${pre_selective_generation}")
-traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
-traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
