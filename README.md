@@ -1021,10 +1021,10 @@ immutable provenance, both encryption modes, IPv4/IPv6 PodIP and Service paths,
 ciphertext-only Required capture, simultaneous Native exception, link-failure
 denial, natural rotation, controller/agent recovery, causal operations,
 performance, egress coexistence, exact cleanup, and optional primary-CNI
-rollback. `make encryption-phase9-kind-gate-test`; ADR 0212. Runtime `a08d9a8`,
+rollback. `make encryption-phase9-kind-gate-test`; ADR 0212. Runtime `ec76916`,
 qualified by the same committed revision, passed that fresh three-Node
 dual-stack Kubernetes v1.35.0 transaction. Evidence JSON SHA-256 is
-`53c4f871…0ed`; the independently hashed packet capture recorded 368 WireGuard
+`a975dcc…cd3`; the independently hashed packet capture recorded 381 WireGuard
 frames and zero Required-path plaintext frames. Controller replacement also
 reconstructed its missing activation history without generation churn or
 plaintext fallback. Milestone 9.8 is Verified; 9.9 independently qualifies the
@@ -1086,8 +1086,9 @@ reads back the admitted digest-bound plan first, then mints the route permit,
 then begins duplex proof. It cannot turn a partial snapshot into authority and
 adds no packet-path work; ADR 0222. Runtime `a08d9a8` passed the complete fresh
 Kind gate with both corrections; digest-pinned cl02 evidence remains required.
-The public development tuple is pinned by registry manifest digest: controller
-`493d54ff…1f10`, agent `89103c4a…5241`, and test tools `e9cce439…2352`; the
+The current public development tuple is pinned by registry manifest digest:
+controller `3c52ed0f…1939`, agent `6275ffef…e800`, and test tools
+`e9cce439…2352`; the
 Phase 9.9 release record binds them to the exact Kind evidence before rollout.
 This avoids both mixed-version management-path loss and the tempting but unsafe
 alternative of treating absent Required authority as Native; ADR 0214.
@@ -1106,8 +1107,10 @@ requested a third epoch while the two local slots still held `Draining` and
 retires the predecessor only through positive zero-state proof, and prepares
 the successor on the next synchronization. A bounded fenced retry also absorbs
 replacement-Pod watch latency without accepting an authorization failure as
-last-known-good state. Complete fresh Kind and cl02 evidence remain required;
-ADR 0225.
+last-known-good state; ADR 0225. Runtime `ec76916` passed the complete fresh
+transaction, including that replacement lifecycle, with 381 WireGuard frames
+and zero Required plaintext frames. The immutable Linux/amd64 manifests and
+evidence hashes are release-bound by ADR 0226; cl02 evidence remains required.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -1032,11 +1032,11 @@ matrix is maintained in the
   rotation authority, transactional WireGuard provider, coalesced fast path,
   bidirectional live proof, secret-free operations, recovery, and benchmarks.
   Milestone 9.8 most recently passed its independent kube-proxy-free three-Node
-  dual-stack Kind gate at runtime and qualifier `a08d9a8`, with evidence
-  SHA-256 `53c4f871…0ed`, including link-fault repair-before-permit, monotonic
+  dual-stack Kind gate at runtime and qualifier `ec76916`, with evidence
+  SHA-256 `a975dcc…cd3`, including link-fault repair-before-permit, monotonic
   epoch retirement, and successful controller-replacement activation-history
   reconstruction. Milestone 9.9 now requires the same immutable runtime on the
-  independent five-Node OpenShift gate; ADRs 0158 and 0212.
+  independent five-Node OpenShift gate; ADRs 0158, 0212, and 0226.
 - Phase 9.9 adds a Causal Pre-Attachment Fleet Barrier for adjacent upgrades:
   new agents can exchange authenticated facts while the prior TC program stays
   authoritative, but no new tail-call graph or attachment is published until
@@ -1116,8 +1116,10 @@ matrix is maintained in the
   generation revalidate, retires the predecessor only after positive
   zero-flow/zero-route proof, and then prepares the fleet-aligned successor.
   Replacement-Pod `403`/`503` observation gaps receive a bounded fenced retry,
-  never last-known-good authority; ADR 0225. Full Kind requalification remains
-  mandatory.
+  never last-known-good authority; ADR 0225. Exact revision `ec76916` then
+  passed the entire fresh Kind transaction and was published as anonymous
+  Linux/amd64 manifests with evidence and capture hashes bound in ADR 0226.
+  Independent cl02 qualification remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
