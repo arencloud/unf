@@ -1086,6 +1086,9 @@ reads back the admitted digest-bound plan first, then mints the route permit,
 then begins duplex proof. It cannot turn a partial snapshot into authority and
 adds no packet-path work; ADR 0222. Runtime `a08d9a8` passed the complete fresh
 Kind gate with both corrections; digest-pinned cl02 evidence remains required.
+The public development tuple is pinned by manifest digest: controller
+`374c7108…6d9`, agent `f65582e4…560`, and test tools `24425d52…e1e`; the
+Phase 9.9 release record binds them to the exact Kind evidence before rollout.
 This avoids both mixed-version management-path loss and the tempting but unsafe
 alternative of treating absent Required authority as Native; ADR 0214.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
