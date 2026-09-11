@@ -481,6 +481,21 @@ for _ in $(seq 1 20); do
     sleep 0.2
 done
 capture_pid=
+capture_size=-1
+capture_stable=0
+for _ in $(seq 1 20); do
+    observed_size=$("${kc[@]}" -n "${namespace}" exec "${capture_pod}" -- \
+        stat -c %s "${capture_container_path}")
+    if [[ ${observed_size} == "${capture_size}" ]]; then
+        capture_stable=$((capture_stable + 1))
+        (( capture_stable >= 2 )) && break
+    else
+        capture_size=${observed_size}
+        capture_stable=0
+    fi
+    sleep 0.5
+done
+(( capture_stable >= 2 ))
 "${kc[@]}" -n "${namespace}" cp \
     "${capture_pod}:${capture_container_path}" "${capture_host_path}"
 capture_sha256=$(sha256sum "${capture_host_path}" | awk '{print $1}')
@@ -497,7 +512,20 @@ required_http_markers=$(tcpdump -A -nn -r "${capture_host_path}" \
 qualification_stage=recovery-and-rotation
 old_agent=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent \
     --field-selector "spec.nodeName=${source_node}" -o jsonpath='{.items[0].metadata.name}')
-"${kc[@]}" -n unf-system delete pod "${old_agent}" --wait=false >/dev/null
+"${kc[@]}" -n unf-system delete pod "${old_agent}" --wait=true --timeout=60s >/dev/null
+replacement_agent=
+for _ in $(seq 1 180); do
+    replacement_agent=$("${kc[@]}" -n unf-system get pods \
+        -l app.kubernetes.io/name=unf-agent \
+        --field-selector "spec.nodeName=${source_node}" -o json | jq -r --arg old "${old_agent}" '
+          .items[] | select(.metadata.name != $old and .metadata.deletionTimestamp == null
+            and .status.phase == "Running"
+            and any(.status.containerStatuses[]; .name == "agent" and .ready
+              and .restartCount == 0)) | .metadata.name' | head -n 1)
+    [[ -n ${replacement_agent} ]] && break
+    sleep 1
+done
+[[ -n ${replacement_agent} ]]
 "${kc[@]}" -n unf-system rollout status daemonset/unf-agent --timeout=180s >/dev/null
 recovered_generation=$(wait_generation true)
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
