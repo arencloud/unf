@@ -1051,6 +1051,10 @@ matrix is maintained in the
   answers and attests current nonce-bound rounds but discards receipts and gains
   no activation authority, allowing a still-pending peer to complete the exact
   two-ended quorum without replay or forced generation churn; ADR 0216.
+- A strictly ahead authenticated agent cursor is also a recovery high-watermark
+  when controller replacement restores the preceding fleet cut. The controller
+  advances one complete cut beyond that durable cursor, while equal/older polls
+  remain acknowledgements and cannot generate churn; ADR 0217.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

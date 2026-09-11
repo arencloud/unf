@@ -10048,6 +10048,25 @@ fn encryption_plan_cut_is_current(
     })
 }
 
+fn encryption_plan_catalog_requires_recovery(
+    state: &ControllerState,
+    minimum_generation: Revision,
+) -> bool {
+    mutex_lock(&state.encryption_local_plans)
+        .active()
+        .map_or(minimum_generation > Revision::INITIAL, |active| {
+            minimum_generation > active.generation
+        })
+}
+
+fn next_encryption_plan_generation(
+    previous: Revision,
+    now_unix_ms: u64,
+    minimum: Revision,
+) -> Revision {
+    previous.next().max(Revision::new(now_unix_ms)).max(minimum)
+}
+
 fn encryption_nodes(
     state: &ControllerState,
     members: &[EncryptionGenerationRecipient],
@@ -10330,19 +10349,23 @@ fn reconcile_encryption_plan_catalog_at(
     };
     let draining_epoch = encryption_draining_epoch_window(&key_cut, active_epoch, now_unix_ms)?;
     let source = current_encryption_plan_source(state, membership_revision, key_cut.cut_digest);
+    let recovery_successor_required =
+        encryption_plan_catalog_requires_recovery(state, minimum_generation);
     // A current agent cursor is an acknowledgement of the published cut, not
     // a request to manufacture a successor.  The minimum only fences a
     // controller that must reconstruct a catalog after losing its in-memory
     // source; once the causal source matches, every poll must converge on the
     // same generation until an input actually changes.
-    if reconciler.source.as_ref() == Some(&source)
+    if !recovery_successor_required
+        && reconciler.source.as_ref() == Some(&source)
         && reconciler
             .refresh_at_unix_ms
             .is_none_or(|deadline| now_unix_ms < deadline)
     {
         return Ok(true);
     }
-    if let Some(active) = mutex_lock(&state.encryption_local_plans).active()
+    if !recovery_successor_required
+        && let Some(active) = mutex_lock(&state.encryption_local_plans).active()
         && active.membership_revision == membership_revision
         && !encryption_plan_cut_is_activated(state, active)
         && encryption_plan_cut_is_current(active, now_unix_ms)
@@ -10368,11 +10391,8 @@ fn reconcile_encryption_plan_catalog_at(
         workloads,
         policy_observations,
     )?;
-    let generation = reconciler
-        .generation
-        .next()
-        .max(Revision::new(now_unix_ms))
-        .max(minimum_generation);
+    let generation =
+        next_encryption_plan_generation(reconciler.generation, now_unix_ms, minimum_generation);
     let model = current_encryption_model(state)?;
     let cut = produce_fleet_plan_cut(FleetPlanProductionInput {
         membership_revision,
@@ -10460,10 +10480,19 @@ fn encryption_plan_for(
         node_name: agent.node_name.clone(),
         node_uid: node_uid.clone(),
     };
-    let minimum_generation = request
-        .current
-        .as_ref()
-        .map_or(Revision::INITIAL, |current| current.generation.next());
+    // A controller replacement can restore a durable fleet cut just before a
+    // successor that one agent already admitted was checkpointed. Treat an
+    // authenticated cursor ahead of the restored cut as recovery evidence and
+    // mint one fleet-wide successor beyond it. Cursors at or behind the
+    // catalog are acknowledgements only: they must not manufacture churn.
+    let catalog_generation = mutex_lock(&state.encryption_local_plans)
+        .active()
+        .map(|cut| cut.generation);
+    let minimum_generation = match (catalog_generation, request.current.as_ref()) {
+        (Some(catalog), Some(current)) if current.generation > catalog => current.generation.next(),
+        (None, Some(current)) => current.generation.next(),
+        _ => Revision::INITIAL,
+    };
     if !reconcile_encryption_plan_catalog_at(state, unix_time_millis().max(1), minimum_generation)?
     {
         return Ok(None);
@@ -16333,6 +16362,10 @@ mod tests {
             .unwrap();
         assert_eq!(receipt_only.snapshot.generation, first.snapshot.generation);
         assert_eq!(receipt_only.snapshot.service_revision, Revision::new(5));
+        let durable_predecessor_cut = mutex_lock(&state.encryption_local_plans)
+            .active()
+            .unwrap()
+            .clone();
 
         mutex_lock(&state.encryption_activation_cursors).insert(
             "worker-a-uid".to_owned(),
@@ -16349,6 +16382,34 @@ mod tests {
             .unwrap();
         assert!(successor.snapshot.generation > first.snapshot.generation);
         assert_eq!(successor.snapshot.service_revision, Revision::new(6));
+
+        // Model a replacement controller that restores the predecessor cut
+        // after this agent has already durably admitted the successor.
+        let mut restored_catalog = NodeLocalPlanCatalog::default();
+        restored_catalog.publish(durable_predecessor_cut).unwrap();
+        *mutex_lock(&state.encryption_local_plans) = restored_catalog;
+        *mutex_lock(&state.encryption_plan_reconciler) = EncryptionPlanReconciler {
+            source: None,
+            generation: first.snapshot.generation,
+            refresh_at_unix_ms: None,
+        };
+        let ahead_request = NodeLocalPlanRequest {
+            schema_version: unf_encryption::NODE_LOCAL_PLAN_REQUEST_SCHEMA_VERSION,
+            node_name: "worker-a".to_owned(),
+            current: Some(unf_encryption::NodeLocalPlanCursor {
+                controller_epoch: successor.controller_epoch,
+                recipient: successor.snapshot.recipient.clone(),
+                membership_revision: successor.snapshot.membership_revision,
+                generation: successor.snapshot.generation,
+                snapshot_digest: successor.snapshot.snapshot_digest,
+            }),
+            nonce: [27; 32],
+        };
+        let recovered = encryption_plan_for(&state, &agent, &ahead_request)
+            .unwrap()
+            .unwrap();
+        assert!(recovered.snapshot.generation > ahead_request.current.as_ref().unwrap().generation);
+        assert_eq!(recovered.snapshot.service_revision, Revision::new(6));
     }
 
     #[tokio::test]

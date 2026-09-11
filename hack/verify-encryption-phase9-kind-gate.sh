@@ -29,4 +29,16 @@ require 'rollback-kind-primary-cni.sh' "${gate}"
 require 'requiredPlaintextFrames' "${gate}"
 require 'imageID' "${gate}"
 
+for bounded_wait in wait_generation_after wait_epoch_change; do
+    wait_body=$(sed -n "/^${bounded_wait}()/,/^}/p" "${gate}")
+    rg -q 'generation_snapshot' <<<"${wait_body}" || {
+        echo "${bounded_wait} must inspect one direct generation snapshot per retry" >&2
+        exit 1
+    }
+    if rg -q 'wait_generation true' <<<"${wait_body}"; then
+        echo "${bounded_wait} must not nest the independent convergence timeout" >&2
+        exit 1
+    fi
+done
+
 echo "Phase 9.8 Kind qualification gate contract verified"

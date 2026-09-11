@@ -191,9 +191,14 @@ wait_generation() {
 wait_generation_after() {
     local predecessor=$1 snapshot= generation=
     for _ in $(seq 1 240); do
-        snapshot=$(wait_generation true)
-        generation=$(jq -r '.[0].generation' <<<"${snapshot}")
-        if [[ ${generation} =~ ^[0-9]+$ ]] && (( generation > predecessor )); then
+        snapshot=$(generation_snapshot 2>/dev/null || true)
+        generation=$(jq -r '.[0].generation // empty' <<<"${snapshot}" 2>/dev/null || true)
+        if jq -e '
+            length == 3
+            and all(.[]; .pending == null and .generation != null)
+            and ([.[].generation] | unique | length) == 1
+        ' <<<"${snapshot}" >/dev/null 2>&1 \
+            && [[ ${generation} =~ ^[0-9]+$ ]] && (( generation > predecessor )); then
             printf '%s\n' "${snapshot}"
             return 0
         fi
@@ -274,9 +279,15 @@ traffic_matrix() {
 wait_epoch_change() {
     local initial_epoch=$1 snapshot= epoch=
     for _ in $(seq 1 240); do
-        snapshot=$(wait_generation true)
-        epoch=$(jq -r --arg node "${source_node}" '.[] | select(.node == $node) | .epochs | max' <<<"${snapshot}")
-        if [[ ${epoch} =~ ^[0-9]+$ ]] && (( epoch > initial_epoch )); then
+        snapshot=$(generation_snapshot 2>/dev/null || true)
+        epoch=$(jq -r --arg node "${source_node}" \
+            '.[] | select(.node == $node) | .epochs | max // empty' <<<"${snapshot}" 2>/dev/null || true)
+        if jq -e '
+            length == 3
+            and all(.[]; .pending == null and .generation != null)
+            and ([.[].generation] | unique | length) == 1
+        ' <<<"${snapshot}" >/dev/null 2>&1 \
+            && [[ ${epoch} =~ ^[0-9]+$ ]] && (( epoch > initial_epoch )); then
             printf '%s\n' "${snapshot}"
             return 0
         fi

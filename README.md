@@ -1043,6 +1043,11 @@ two-ended kernel/ciphertext evidence, and discard the resulting receipts. They
 gain no new authority, while a peer still holding activation escrow can finish
 without replaying pre-restart nonces or waiting for another generation; ADR
 0216.
+If replacement instead restores a fleet cut immediately before a successor
+already admitted by one Node, that authenticated cursor becomes a monotonic
+high-watermark: the controller publishes one complete cut beyond it and all
+members converge forward. Equal or older cursors remain non-mutating
+acknowledgements; ADR 0217.
 This avoids both mixed-version management-path loss and the tempting but unsafe
 alternative of treating absent Required authority as Native; ADR 0214.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
