@@ -21,6 +21,7 @@ capture_host_path=${temporary_dir}/underlay.pcap
 qualification_stage=preflight
 resources_created=false
 link_lowered=false
+lowered_source_interfaces=()
 capture_node=
 capture_pod=
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
@@ -63,9 +64,11 @@ report_failure() {
 }
 
 cleanup() {
-    if [[ ${link_lowered} == true && -n ${source_node:-} && -n ${source_interface:-} ]]; then
-        "${runtime[@]}" exec "${source_node}" ip link set dev "${source_interface}" up \
-            >/dev/null 2>&1 || true
+    if [[ ${link_lowered} == true && -n ${source_node:-} ]]; then
+        for interface in "${lowered_source_interfaces[@]}"; do
+            "${runtime[@]}" exec "${source_node}" ip link set dev "${interface}" up \
+                >/dev/null 2>&1 || true
+        done
     fi
     if [[ ${resources_created} == true ]]; then
         "${kc[@]}" delete namespace "${namespace}" --ignore-not-found --wait=false \
@@ -223,6 +226,37 @@ http_probe() {
     done
     echo "HTTP readiness probe failed from ${pod} to ${address}:${port}" >&2
     return 1
+}
+
+lower_owned_encryption_links() {
+    local interface alias
+    local -a current_interfaces=()
+    mapfile -t current_interfaces < <(
+        "${runtime[@]}" exec "${source_node}" ip -j -details link show type wireguard |
+            jq -er '.[] | select((.ifalias // "") | startswith("unf:encryption:v2:")) | .ifname' |
+            sort -u
+    )
+    (( ${#current_interfaces[@]} > 0 && ${#current_interfaces[@]} <= 2 )) || {
+        echo "expected one or two exactly owned UNF encryption links, found ${#current_interfaces[@]}" >&2
+        return 1
+    }
+    for interface in "${current_interfaces[@]}"; do
+        [[ ${interface} =~ ^unfwg[0-9]{10}$ ]] || {
+            echo "refusing unexpected encryption interface ${interface@Q}" >&2
+            return 1
+        }
+        alias=$("${runtime[@]}" exec "${source_node}" ip -j -details link show dev "${interface}" |
+            jq -er '.[0].ifalias')
+        [[ ${alias} == unf:encryption:v2:* ]] || {
+            echo "refusing encryption link without exact v2 UNF ownership" >&2
+            return 1
+        }
+        "${runtime[@]}" exec "${source_node}" ip link set dev "${interface}" down
+        if [[ ! " ${lowered_source_interfaces[*]} " =~ " ${interface} " ]]; then
+            lowered_source_interfaces+=("${interface}")
+        fi
+    done
+    link_lowered=true
 }
 
 http_probe_fails() {
@@ -418,14 +452,6 @@ traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required
 traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
 
 qualification_stage=ciphertext-and-fail-closed
-source_interface=$("${runtime[@]}" exec "${source_node}" jq -er '.active.plans[0].interfaceName' \
-    /var/lib/unf/cni/v1/encryption-generation.json.recovery-plan)
-source_alias=$("${runtime[@]}" exec "${source_node}" ip -j -details link show dev "${source_interface}" |
-    jq -er '.[0].ifalias')
-[[ ${source_alias} == unf:encryption:* ]] || {
-    echo "refusing to operate an encryption link without the exact UNF ownership alias" >&2
-    exit 1
-}
 capture_node=${source_node}
 capture_pod=underlay-capture
 "${kc[@]}" apply -f - >/dev/null <<EOF
@@ -466,17 +492,25 @@ for _ in $(seq 1 4); do
     traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
     traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
 done
-"${runtime[@]}" exec "${source_node}" ip link set dev "${source_interface}" down
-link_lowered=true
+lower_owned_encryption_links
 required_blocked=0
 native_succeeded=0
 for family in 4 6 4 6 4 6 4 6; do
+    # Rotation is intentionally live during this fault. Reconcile any exact
+    # successor created after the first snapshot so the outage cannot
+    # accidentally test a now-draining interface while traffic uses a new one.
+    lower_owned_encryption_links
     if [[ ${family} == 4 ]]; then required_target=${required_pod4}; native_target=${native_pod4}; else required_target=${required_pod6}; native_target=${native_pod6}; fi
     http_probe_fails required-client "${required_target}" 8080 && required_blocked=$((required_blocked + 1))
     http_probe native-client "${native_target}" 8081 && native_succeeded=$((native_succeeded + 1))
 done
-[[ ${required_blocked} == 8 && ${native_succeeded} == 8 ]]
-"${runtime[@]}" exec "${source_node}" ip link set dev "${source_interface}" up
+if [[ ${required_blocked} != 8 || ${native_succeeded} != 8 ]]; then
+    echo "link-fault matrix mismatch: Required denied ${required_blocked}/8, Native succeeded ${native_succeeded}/8" >&2
+    false
+fi
+for interface in "${lowered_source_interfaces[@]}"; do
+    "${runtime[@]}" exec "${source_node}" ip link set dev "${interface}" up
+done
 link_lowered=false
 capture_exit=
 for _ in $(seq 1 60); do
