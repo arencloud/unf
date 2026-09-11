@@ -103,6 +103,8 @@ require 'Immutable Durable-Admission-First Kind Requalification' \
     "${root}/docs/adr/0245-immutable-durable-admission-first-kind-requalification.md"
 require 'Fail-Closed Tombstoned Predecessor Bridge' \
     "${root}/docs/adr/0246-fail-closed-tombstoned-predecessor-bridge.md"
+require 'Immutable Tombstoned-Predecessor-Bridge Kind Requalification' \
+    "${root}/docs/adr/0247-immutable-tombstoned-predecessor-bridge-kind-requalification.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"

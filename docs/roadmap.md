@@ -1186,8 +1186,10 @@ matrix is maintained in the
   gate. That rollout found the admitted pending epoch already durably revoked.
   The Fail-Closed Tombstoned Predecessor Bridge preserves logical ancestry,
   zeros attached map authority before cleanup, and admits only a fully proved
-  fresh-key successor across the physical map gap; ADR 0246. Fresh Kind and
-  cl02 qualification remain mandatory.
+  fresh-key successor across the physical map gap; ADR 0246. Exact runtime
+  `b64282a` passed the fresh full Kind lifecycle; ADR 0247 binds its immutable
+  public images and evidence as the sole tuple eligible for the resumed cl02
+  bridge recovery. Complete cl02 qualification remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

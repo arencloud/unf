@@ -1,6 +1,6 @@
 # Phase 9 attested encryption-fabric execution plan
 
-Last reviewed: **2026-09-11**
+Last reviewed: **2026-09-12**
 
 Phase 9 implements master-prompt §25 as an identity-bound encryption fabric.
 It starts with kernel WireGuard for intra-cluster L3 transport and prepares a
@@ -21,8 +21,8 @@ separately revisioned. The authoritative state remains in
 | 9.5 | Intent-Coalesced Cryptographic Fast Path | **Verified** | Phase 9.5a adds the canonical compiler and Causal Epoch Lease; Phase 9.5b adds the Causal Commit Vector. Later slices connect proof-carrying maps/routes, authenticated complete-cut distribution, local Linux/key proof, quiescent generations, the policy-first dual-stack TC consumer, and Flow-Adaptive Secure DSR. Phase 9.5af closes the chain with independently captured real-kernel IPv4/IPv6 WireGuard ciphertext, positive transfer counters, peer-removal denial, exact recovery, and scoped cleanup under `make encryption-ciphertext-live-test`; ADRs 0162–0193 |
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
-| 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `180ae2f` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADR 0243. Default-Required and explicit-selective PodIP/Service traffic, 284 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent/controller replacement, 308 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `9c94737…e071`; packet-capture SHA-256 is `b39d6d3…0d41` |
-| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0244 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and fully bounded recovery/evidence boundaries. Runtime `180ae2f` proved the first admitted-predecessor join still depended on volatile proof absent on initial restart. Durable Admission-First Reconstruction recognizes exact persisted cursor/journal equality first and rejects all conflicting states. The revised runtime must repeat fresh full Kind before cl02 resumes |
+| 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `b64282a` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADR 0247. Default-Required and explicit-selective PodIP/Service traffic, 400 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent/controller replacement, 312 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `714c58c…9b89`; packet-capture SHA-256 is `2331609…5da` |
+| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0247 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and bounded recovery/evidence boundaries. The Fail-Closed Tombstoned Predecessor Bridge has passed fresh Kind and is published as an immutable tuple. cl02 must prove it crosses the exact physical/admitted/desired generation chain without plaintext or revoked-key reuse, then pass the complete platform gate |
 
 ## Accepted Phase 9 gate
 
@@ -175,9 +175,8 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Qualify ADR 0246 Fail-Closed Tombstoned Predecessor Bridge on a fresh full Kind
-lifecycle and publish its immutable tuple. Then resume the five-Node cl02
-reboot residue: the bridge must cross from physical generation
+Deploy the ADR 0247 immutable tuple to the five-Node cl02 reboot residue. The
+bridge must cross from physical generation
 `1789160626300`, through revoked admitted cursor `1789160696724`, to the fresh
 authenticated successor without plaintext or key reuse. Rerun the complete
 qualification with the
