@@ -1183,6 +1183,15 @@ The Whole-Gate API Deadline extends that property to ordinary reads and
 mutations: every OpenShift client request has a finite deadline, retries always
 obtain a fresh sample, and uncertain writes are closed by idempotent cleanup;
 ADR 0239.
+The worker restart also exposed a durable/volatile recovery join: after expired
+authority was correctly tombstoned, an older active generation journal could
+no longer reconstruct its private key and repeatedly blocked the successor.
+Tombstone-Aware Generation Handoff discards only that active volatile proof,
+preserves every durable journal, map, and kernel ownership record, and requires
+the authenticated successor to traverse the complete normal proof-carrying
+commit before TC readiness. Unknown epochs, public-key mismatch, and Prepared
+authority remain hard failures; Required traffic never falls back to plaintext;
+ADR 0240.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

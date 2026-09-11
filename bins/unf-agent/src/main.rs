@@ -96,9 +96,10 @@ use unf_encryption::{
     EncryptionRoutePublicationPermit, EpochDrainProof, EpochRevocationReason,
     FileNodeKeyStateStore, KeyEpochPhase, LinuxEncryptionRouteProvider,
     LinuxPreparedLocalGeneration, LinuxWireGuardProvider, NodeKeyAttestationCut,
-    NodeKeyAttestationRound, NodeKeyAuthority, NodeLocalPlanRequest, NodeLocalRecoveryPlan,
-    NodeSealedGenerationCapsule, NodeSealedPlanCapsule, OsWireGuardKeyGenerator,
-    WireGuardKernelPlan, validate_encryption_generation_path_receipts,
+    NodeKeyAttestationRound, NodeKeyAuthority, NodeKeyPublication, NodeLocalPlanRequest,
+    NodeLocalRecoveryPlan, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
+    OsWireGuardKeyGenerator, WireGuardKernelPlan, WireGuardPublicKey,
+    validate_encryption_generation_path_receipts,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -7435,6 +7436,11 @@ async fn advance_startup_encryption_authority(
         {
             synchronization_error = Some(error);
         }
+        if let Some(authority) = keys.authority.as_ref() {
+            generations
+                .discard_tombstoned_active_revalidation(authority.authority())
+                .context("retire volatile proof for tombstoned startup key authority")?;
+        }
         match synchronize_encryption_plan(plans)
             .await
             .context("adopt current startup encryption plan")
@@ -8365,6 +8371,55 @@ fn revoke_expired_active_authority(
     Ok(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncryptionRecoveryKeyReference {
+    Available,
+    Tombstoned,
+}
+
+fn encryption_recovery_key_reference(
+    publication: &NodeKeyPublication,
+    epoch: u64,
+    public_key: WireGuardPublicKey,
+) -> Result<EncryptionRecoveryKeyReference> {
+    publication
+        .verify()
+        .context("verify key publication for generation recovery")?;
+    if let Some(current) = publication.epochs.iter().find(|item| item.epoch == epoch) {
+        if current.public_key != public_key || current.phase == KeyEpochPhase::Prepared {
+            bail!("generation recovery key differs from locally ready authority");
+        }
+        return Ok(EncryptionRecoveryKeyReference::Available);
+    }
+    if epoch
+        <= publication
+            .retired_through_epoch
+            .max(publication.revoked_through_epoch)
+    {
+        return Ok(EncryptionRecoveryKeyReference::Tombstoned);
+    }
+    bail!("generation recovery references an unknown untombstoned key epoch {epoch}")
+}
+
+fn encryption_recovery_uses_tombstoned_authority(
+    recovery: &NodeLocalRecoveryPlan,
+    authority: &NodeKeyAuthority,
+) -> Result<bool> {
+    recovery
+        .verify()
+        .context("verify generation recovery plan before key join")?;
+    let publication = authority
+        .publication()
+        .context("verify Node-local key authority before generation recovery")?;
+    let mut tombstoned = false;
+    for plan in &recovery.plans {
+        tombstoned |=
+            encryption_recovery_key_reference(&publication, plan.epoch, plan.local_public_key)?
+                == EncryptionRecoveryKeyReference::Tombstoned;
+    }
+    Ok(tombstoned)
+}
+
 fn active_encryption_epoch(authority: &NodeKeyAuthority) -> Option<u64> {
     authority
         .epochs()
@@ -8932,6 +8987,11 @@ impl EncryptionGenerationSynchronizer {
         let Some(recovery) = recovery else {
             return Ok(false);
         };
+        if let Some(authority) = repair_authority
+            && encryption_recovery_uses_tombstoned_authority(recovery, authority)?
+        {
+            return Ok(false);
+        }
         let prepared = match recovery.rehydrate_linux().await {
             Ok(prepared) => prepared,
             Err(readback) => {
@@ -9035,6 +9095,47 @@ impl EncryptionGenerationSynchronizer {
             self.path_proofs.clear();
         }
         stale
+    }
+
+    /// Drops only a volatile reconstruction of an active generation whose
+    /// key epoch has been durably revoked or retired. The durable predecessor,
+    /// map checkpoint, and Linux journal remain intact so an authenticated
+    /// successor can advance them through the ordinary proof-carrying commit.
+    fn discard_tombstoned_active_revalidation(
+        &mut self,
+        key_authority: &NodeKeyAuthority,
+    ) -> Result<bool> {
+        let generation = match self.pending.as_ref() {
+            Some(PendingEncryptionGeneration::ControllerAdmitted {
+                prepared,
+                slot: EncryptionRecoverySlot::Active,
+                ..
+            }) => {
+                prepared
+                    .fact()
+                    .checkpoint
+                    .transaction
+                    .desired
+                    .published
+                    .generation
+            }
+            _ => return Ok(false),
+        };
+        let active = self
+            .recovery
+            .active
+            .as_ref()
+            .context("active volatile revalidation has no recovery journal")?;
+        if !encryption_recovery_uses_tombstoned_authority(active, key_authority)? {
+            return Ok(false);
+        }
+        self.pending = None;
+        self.path_proofs.clear();
+        warn!(
+            generation = generation.get(),
+            "discarded volatile revalidation for tombstoned encryption key authority"
+        );
+        Ok(true)
     }
 
     /// Abandons a locally prepared generation that the authenticated plan
@@ -19876,6 +19977,55 @@ mod tests {
         assert_eq!(
             recovered.epochs[0].valid_from_unix_ms,
             successor_valid_until
+        );
+    }
+
+    #[test]
+    fn encryption_generation_recovery_distinguishes_tombstones_from_unknown_keys() {
+        let now = current_unix_time_milliseconds().max(1);
+        let mut authority = NodeKeyAuthority::new(
+            "cluster-a".to_owned(),
+            "worker-a".to_owned(),
+            "uid-a".to_owned(),
+        )
+        .unwrap();
+        let mut generator = OsWireGuardKeyGenerator;
+        let epoch = authority
+            .prepare_epoch(
+                Revision::new(7),
+                BTreeSet::new(),
+                now,
+                now + 10_000,
+                &mut generator,
+            )
+            .unwrap();
+        let publication = authority.publication().unwrap();
+        let public_key = publication.epochs[0].public_key;
+        assert_eq!(
+            encryption_recovery_key_reference(&publication, epoch, public_key).unwrap(),
+            EncryptionRecoveryKeyReference::Available
+        );
+        assert!(
+            encryption_recovery_key_reference(
+                &publication,
+                epoch,
+                WireGuardPublicKey([u8::MAX; 32])
+            )
+            .is_err()
+        );
+        assert!(encryption_recovery_key_reference(&publication, epoch + 1, public_key).is_err());
+
+        authority
+            .revoke_through(
+                epoch,
+                EpochRevocationReason::ExpiredBeforeActivation,
+                now + 1,
+            )
+            .unwrap();
+        let tombstoned = authority.publication().unwrap();
+        assert_eq!(
+            encryption_recovery_key_reference(&tombstoned, epoch, public_key).unwrap(),
+            EncryptionRecoveryKeyReference::Tombstoned
         );
     }
 

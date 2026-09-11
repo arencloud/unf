@@ -89,9 +89,15 @@ require 'Bounded Node-Local Control Witness' \
     "${root}/docs/adr/0238-bounded-node-local-control-witness.md"
 require 'Whole-Gate API Deadline' \
     "${root}/docs/adr/0239-whole-gate-api-deadline.md"
+require 'Tombstone-Aware Generation Handoff' \
+    "${root}/docs/adr/0240-tombstone-aware-generation-handoff.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"
+require 'discard_tombstoned_active_revalidation' \
+    "${root}/bins/unf-agent/src/main.rs"
+require 'unknown untombstoned key epoch' \
+    "${root}/bins/unf-agent/src/main.rs"
 require 'policyRevision:.active.fact.checkpoint.transaction.desired.published.policyRevision' \
     "${gate}"
 require 'UNF_ENCRYPTION_BASELINE' "${overlay}/controller-native-patch.yaml"

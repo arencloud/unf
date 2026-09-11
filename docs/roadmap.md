@@ -1165,6 +1165,13 @@ matrix is maintained in the
   onto Node-local loopback, outside the dataplane being qualified. ADR 0239
   applies a finite deadline to every remaining OpenShift API request so an
   outer retry count cannot hide an indefinitely blocked attempt.
+  The same reboot recovery then exposed an active generation journal referring
+  to a key epoch already durably tombstoned by expired-authority recovery.
+  Tombstone-Aware Generation Handoff drops only its volatile reconstructed
+  proof, preserves durable and kernel ownership state, rejects unknown or
+  equivocal key references, and admits recovery only through a fully proved
+  successor; ADR 0240. Fresh Kind and complete cl02 qualification remain
+  mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
