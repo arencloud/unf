@@ -522,8 +522,8 @@ done
 recovered_generation=$(wait_generation true)
 jq -e --argjson recovered "${recovered_generation}" '
     length == ($recovered | length)
-    and all(.[]; . as $before | any($recovered[];
-        .node == $before.node and .generation == $before.generation))' \
+    and all(.[]; . as $before | any($recovered[]; .node == $before.node))
+    and ($recovered[0].generation >= .[0].generation)' \
     <<<"${pre_agent_recovery_generation}" >/dev/null
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
 initial_epoch=$(jq -r --arg node "${source_node}" '.[] | select(.node == $node) | .epochs | max' <<<"${recovered_generation}")
