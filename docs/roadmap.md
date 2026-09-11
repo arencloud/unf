@@ -1181,7 +1181,9 @@ matrix is maintained in the
   That rollout proved the first join still depended on volatile reconstruction.
   Durable Admission-First Reconstruction recognizes only exact cursor/journal
   equality before rebuilding volatile proof and rejects every conflicting
-  state; ADR 0244. Its runtime must repeat fresh Kind before cl02 resumes.
+  state; ADR 0244. Exact runtime `b3aee0a` passed the fresh full Kind lifecycle;
+  ADR 0245 binds its immutable public images and evidence for the resumed cl02
+  gate.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

@@ -175,9 +175,10 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Qualify ADR 0244 Durable Admission-First Reconstruction on a fresh full Kind
-lifecycle, publish its immutable tuple, and deploy it to the simultaneously
-rebooted five-Node cl02 fleet. Then rerun the complete qualification with the
+ADR 0245 records the successful fresh full Kind qualification and immutable
+publication of ADR 0244 runtime `b3aee0a`. Deploy that exact tuple to the
+simultaneously rebooted five-Node cl02 fleet, then rerun the complete
+qualification with the
 non-perturbing and bounded Node-local witness,
 causal readiness join, monotonic platform-health delta, and whole-gate API
 deadline. The OpenShift gate must preserve RHCOS/SELinux/CRI-O facts,

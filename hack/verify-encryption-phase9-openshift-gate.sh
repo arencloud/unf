@@ -99,6 +99,8 @@ require 'Immutable Admitted-Predecessor Kind Requalification' \
     "${root}/docs/adr/0243-immutable-admitted-predecessor-kind-requalification.md"
 require 'Durable Admission-First Reconstruction' \
     "${root}/docs/adr/0244-durable-admission-first-reconstruction.md"
+require 'Immutable Durable-Admission-First Kind Requalification' \
+    "${root}/docs/adr/0245-immutable-durable-admission-first-kind-requalification.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"
