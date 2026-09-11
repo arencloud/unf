@@ -91,6 +91,8 @@ require 'Whole-Gate API Deadline' \
     "${root}/docs/adr/0239-whole-gate-api-deadline.md"
 require 'Tombstone-Aware Generation Handoff' \
     "${root}/docs/adr/0240-tombstone-aware-generation-handoff.md"
+require 'Immutable Tombstone-Handoff Kind Requalification' \
+    "${root}/docs/adr/0241-immutable-tombstone-handoff-kind-requalification.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"

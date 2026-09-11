@@ -1192,6 +1192,10 @@ the authenticated successor to traverse the complete normal proof-carrying
 commit before TC readiness. Unknown epochs, public-key mismatch, and Prepared
 authority remain hard failures; Required traffic never falls back to plaintext;
 ADR 0240.
+Exact runtime `1fd2d77` then passed the complete fresh three-Node dual-stack,
+kube-proxy-free Kind lifecycle. ADR 0241 binds its anonymously pullable
+Linux/amd64 images to the evidence and capture hashes as the only tuple eligible
+for the cl02 tombstone-handoff recovery and final Phase 9.9 gate.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

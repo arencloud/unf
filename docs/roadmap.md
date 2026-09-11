@@ -1170,8 +1170,9 @@ matrix is maintained in the
   Tombstone-Aware Generation Handoff drops only its volatile reconstructed
   proof, preserves durable and kernel ownership state, rejects unknown or
   equivocal key references, and admits recovery only through a fully proved
-  successor; ADR 0240. Fresh Kind and complete cl02 qualification remain
-  mandatory.
+  successor; ADR 0240. Exact runtime `1fd2d77` passed the fresh full Kind
+  lifecycle; ADR 0241 binds its immutable public images and evidence as the
+  only tuple eligible for the complete cl02 qualification.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
