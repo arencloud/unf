@@ -1111,6 +1111,13 @@ last-known-good state; ADR 0225. Runtime `ec76916` passed the complete fresh
 transaction, including that replacement lifecycle, with 381 WireGuard frames
 and zero Required plaintext frames. The immutable Linux/amd64 manifests and
 evidence hashes are release-bound by ADR 0226; cl02 evidence remains required.
+The first cl02 staging attempt with that tuple then exposed an all-Native
+bootstrap edge: an explicit Native generation has no encrypted paths to prove,
+but the agent still requested a path-proof round and correctly received `503`.
+Proof-Carrying Zero-Transport Closure now verifies the complete decision state
+and empty kernel-plan set, then consumes the existing generation permit with
+its already-defined empty receipt cut. Required decisions cannot use this path,
+and missing authority remains a drop; ADR 0227.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

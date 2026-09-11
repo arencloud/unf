@@ -10160,6 +10160,16 @@ async fn collect_live_encryption_path_receipts(
     desired: &unf_encryption::EncryptionFastPathState,
     plans: &[unf_encryption::WireGuardKernelPlan],
 ) -> Result<Vec<EncryptionPathActivationReceipt>> {
+    if !generation_requires_live_encryption_path_receipts(desired) {
+        desired
+            .verify_integrity()
+            .context("verify proof-carrying zero-transport generation")?;
+        if !plans.is_empty() {
+            bail!("Native-only encryption generation retained unexpected kernel plans");
+        }
+        generations.path_proofs.clear();
+        return Ok(Vec::new());
+    }
     let controller_url = generations
         .controller_url
         .clone()
@@ -10248,6 +10258,15 @@ async fn collect_live_encryption_path_receipts(
         .json()
         .await
         .context("decode encryption path receipts")
+}
+
+fn generation_requires_live_encryption_path_receipts(
+    desired: &unf_encryption::EncryptionFastPathState,
+) -> bool {
+    desired
+        .decision_authority
+        .iter()
+        .any(|decision| decision.disposition == unf_encryption::EncryptionDisposition::Required)
 }
 
 async fn assist_active_encryption_path_proofs(
@@ -19441,6 +19460,53 @@ mod tests {
                 .unwrap()
         );
         prove_dormant_prepared_generation_can_be_superseded(&mut generations, &keys).await;
+    }
+
+    #[tokio::test]
+    async fn native_only_generation_closes_without_encrypted_path_exchange() {
+        let temporary = tempdir().unwrap();
+        let state = unf_encryption::compile_encryption_fast_path(
+            unf_encryption::FastPathCompileContext {
+                generation: Revision::new(11),
+                policy_revision: Revision::new(7),
+                service_revision: Revision::new(8),
+                egress_revision: Revision::new(9),
+                bank: 0,
+                now_unix_ms: 1,
+                now_monotonic_ns: 1,
+            },
+            &[],
+            &[unf_encryption::FastPathDecisionInput {
+                source_identity: IdentityId::new(101),
+                destination_identity: IdentityId::new(202),
+                disposition: unf_encryption::EncryptionDisposition::Native,
+                contract_epoch: None,
+                plan_index: None,
+            }],
+        )
+        .unwrap();
+        let recipient = unf_encryption::EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-a".to_owned(),
+        };
+        let mut generations = EncryptionGenerationSynchronizer::recover(
+            None,
+            test_controller_client(),
+            temporary.path().join("token"),
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            temporary.path().join("generation.json"),
+        )
+        .unwrap();
+        let receipts =
+            collect_live_encryption_path_receipts(&mut generations, &recipient, &state, &[])
+                .await
+                .unwrap();
+        assert!(receipts.is_empty());
+        let permit =
+            EncryptionGenerationPathProofPermit::issue(&state, recipient.clone(), receipts, 1)
+                .unwrap();
+        permit.verify_for(&state, &recipient, 1).unwrap();
     }
 
     #[test]

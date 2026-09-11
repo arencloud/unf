@@ -46,12 +46,16 @@ require 'oc image info .*--filter-by-os=linux/amd64 -o json' \
     "${root}/hack/deploy-openshift-service-fabric.sh"
 require 'reconcile_bootstrap_epoch_floor' "${root}/bins/unf-agent/src/main.rs"
 require 'node_block_startup_authority_retry' "${root}/bins/unf-agent/src/main.rs"
+require 'native_only_generation_closes_without_encrypted_path_exchange' \
+    "${root}/bins/unf-agent/src/main.rs"
 require '/v1/state/encryption-activation-testimony' "${root}/bins/unf-agent/src/main.rs"
 require 'encryption_activation_testimony' "${root}/bins/unf-controller/src/main.rs"
 require 'assert_phase9_agent_staging' "${root}/hack/deploy-openshift-service-fabric.sh"
 require 'Monotonic Fleet Key Epoch Floor' "${root}/docs/adr/0215-monotonic-fleet-key-epoch-floor.md"
 require 'Demand-Driven Reciprocal Activation Testimony' "${root}/docs/adr/0219-demand-driven-reciprocal-activation-testimony.md"
 require 'Retirement-Before-Catch-Up' "${root}/docs/adr/0225-retirement-before-catch-up.md"
+require 'Proof-Carrying Zero-Transport Closure' \
+    "${root}/docs/adr/0227-proof-carrying-zero-transport-closure.md"
 require 'UNF_ENCRYPTION_BASELINE' "${overlay}/controller-native-patch.yaml"
 require 'value: native' "${overlay}/controller-native-patch.yaml"
 require 'UNF_ENCRYPTION_KEY_LIFETIME_SECONDS' "${overlay}/agent-rotation-patch.yaml"

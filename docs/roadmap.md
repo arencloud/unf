@@ -1119,7 +1119,12 @@ matrix is maintained in the
   never last-known-good authority; ADR 0225. Exact revision `ec76916` then
   passed the entire fresh Kind transaction and was published as anonymous
   Linux/amd64 manifests with evidence and capture hashes bound in ADR 0226.
-  Independent cl02 qualification remains mandatory.
+  cl02 staging then showed that an all-Native generation with zero transports
+  still requested a nonexistent encrypted proof round. Proof-Carrying
+  Zero-Transport Closure now verifies the exact Native decision state and
+  empty kernel plans before consuming the existing empty-receipt permit;
+  Required decisions remain on duplex proof. New immutable Kind and cl02
+  qualification remain mandatory; ADR 0227.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
