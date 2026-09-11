@@ -27,9 +27,11 @@ recovery plan byte-matches its durable controller admission. It fetches fresh
 authenticated assignments, performs the same marked dual-stack encrypted
 challenge, independently reads kernel counters, and publishes endpoint proof.
 
-This service grants no new packet authority. An active participant discards
-receipts and never opens an activation latch. A Node with pending work uses the
-existing activation path instead. Proofs are cached only in memory for their
+This service grants no new packet authority. An active participant never opens
+an activation latch. It normally discards receipts; ADR 0219 permits their
+non-authoritative validation only when a replacement controller explicitly
+requests reconstruction of a missing activation cursor. A Node with pending
+work uses the existing activation path instead. Proofs are cached only in memory for their
 exact round digest and lifetime; a changed or expired round evicts the cache and
 requires a new exchange. The existing bounded responder lease stays alive until
 that round expires, allowing scheduler-skewed peers to finish without making a
@@ -42,9 +44,10 @@ reusable responder.
 - Freshness, two-ended Node identity, exact generation/contract/epoch binding,
   kernel readback, policy-route marking, and ciphertext traversal remain
   mandatory.
-- Active Nodes continuously prove availability only for controller-authenticated
-  current rounds; they cannot manufacture receipts or mutate maps, routes, keys,
-  recovery journals, or activation cursors through this path.
+- Active Nodes prove availability only while controller-authenticated current
+  work exists; they cannot mutate maps, routes, keys, recovery journals, or
+  local activation authority through this path. ADR 0219 separately governs
+  demand-driven reconstruction of controller activation history.
 - Duplicate publication is idempotent and provides retry safety after an
   ambiguous HTTP acknowledgement.
 

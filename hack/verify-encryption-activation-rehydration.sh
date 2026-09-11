@@ -37,7 +37,9 @@ require_text 'repair_and_rehydrate_linux\(key_authority\)' "${agent}"
 require_text 'active\.fact\.checkpoint != admitted\.checkpoint' "${agent}"
 require_text 'missing_assignments' "${agent}"
 require_text 'participate in current active-generation path proof rounds' "${agent}"
-require_text 'let _ = collect_live_encryption_path_receipts' "${agent}"
+require_text '/v1/state/encryption-activation-testimony' "${agent}"
+require_text 'validate_encryption_generation_path_receipts' "${agent}"
+require_text 'publish active-generation recovery testimony' "${agent}"
 require_text 'rehydrate_local_proof\([^)]*\)\.await\?' "${agent}"
 require_text 'requires a fresh Node-local tri-plane activation latch before TC attachment' "${agent}"
 require_text 'recovery_plan_rehydrates_fresh_capability_and_rejects_serialized_authority' crates/unf-encryption/src/fast_path.rs
@@ -46,6 +48,7 @@ require_text 'encryption_recovery_slot_prioritizes_admitted_successor_then_curre
 require_text 'Proof-Rehydrating Activation Escrow' docs/adr/0176-proof-rehydrating-activation-escrow.md
 require_text 'Reciprocal Active-Generation Proof Service' docs/adr/0216-reciprocal-active-generation-proof-service.md
 require_text 'Proof-Time Exact Kernel Self-Healing' docs/adr/0218-proof-time-exact-kernel-self-healing.md
+require_text 'Demand-Driven Reciprocal Activation Testimony' docs/adr/0219-demand-driven-reciprocal-activation-testimony.md
 require_text 'encryption-activation-rehydration-test' docs/project-status.md
 
 rehydrate_line="$(grep -nE 'rehydrate_local_proof\([^)]*\)\.await\?' "${agent}" | head -1 | cut -d: -f1)"

@@ -1054,6 +1054,13 @@ link, the agent replays only its digest-bound durable plan with its local key,
 requires independent exact readback, and reconstructs a fresh single-use proof
 capability. It never accepts a partial interface or creates avoidable fleet
 churn; ADR 0218.
+Replacement-controller history also self-heals without forcing a dataplane
+generation. A Demand-Driven Reciprocal Activation Testimony request stays idle
+once the exact fleet cursor cut is complete; while any cursor is missing, all
+active peers answer fresh duplex rounds and only the missing member reconstructs
+its controller acknowledgement. Exact generation/state/path validation remains
+mandatory, duplicate acknowledgement causes no checkpoint churn, and testimony
+cannot mutate Node-local packet authority; ADR 0219.
 This avoids both mixed-version management-path loss and the tempting but unsafe
 alternative of treating absent Required authority as Native; ADR 0214.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test

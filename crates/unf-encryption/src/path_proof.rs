@@ -4,7 +4,7 @@
 //! encrypted challenge are independent evidence planes. No single plane—and
 //! especially no handshake timestamp—can activate Required traffic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
@@ -936,6 +936,36 @@ impl EncryptionGenerationPathProofPermit {
     pub const fn witness(&self) -> EncryptionGenerationPathProofWitness {
         self.witness
     }
+}
+
+/// Checks whether current duplex receipts cover one exact local generation
+/// without creating a consuming activation capability.
+///
+/// This is used by an already-active Node when a replacement controller asks
+/// it to reconstruct lost activation history. Successful validation permits a
+/// testimony report only; it cannot be supplied to map publication.
+///
+/// # Errors
+///
+/// Rejects an invalid fast-path state or incomplete, duplicate, expired,
+/// foreign, or kernel-divergent receipt coverage.
+pub fn validate_encryption_generation_path_receipts(
+    state: &EncryptionFastPathState,
+    recipient: &EncryptionGenerationRecipient,
+    receipts: &[EncryptionPathActivationReceipt],
+    now_unix_ms: u64,
+) -> Result<(), EncryptionPathProofError> {
+    state
+        .verify_integrity()
+        .map_err(EncryptionPathProofError::InvalidFastPath)?;
+    let unique = receipts
+        .iter()
+        .map(|receipt| receipt.activation_digest.0)
+        .collect::<BTreeSet<_>>();
+    if unique.len() != receipts.len() {
+        return Err(EncryptionPathProofError::InvalidGenerationProof);
+    }
+    validate_generation_coverage(state, recipient, receipts, now_unix_ms).map(|_| ())
 }
 
 fn validate_generation_coverage(

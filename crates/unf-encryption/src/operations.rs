@@ -23,6 +23,61 @@ const HISTORY_DOMAIN: &[u8] = b"unf.encryption.operations.history.v1\0";
 const ACTIVATION_REPORT_DOMAIN: &[u8] = b"unf.encryption.operations.activation-report.v1\0";
 pub const MAX_ENCRYPTION_ACTIVATION_REPORT_PATHS: usize = 4_096;
 
+/// Strict, non-authoritative controller request for active-generation
+/// testimony. A fleet-wide incomplete cut keeps every endpoint available for
+/// reciprocal proofs, while only a Node whose cursor is missing must report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionActivationTestimonyRequest {
+    pub schema_version: u16,
+    pub recipient: EncryptionGenerationRecipient,
+    pub generation: Revision,
+    pub state_digest: EncryptionFastPathDigest,
+    pub report_required: bool,
+}
+
+impl EncryptionActivationTestimonyRequest {
+    /// Creates a request bound to one exact prepared generation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty identity, initial generation, or empty state digest.
+    pub fn issue(
+        recipient: EncryptionGenerationRecipient,
+        generation: Revision,
+        state_digest: EncryptionFastPathDigest,
+        report_required: bool,
+    ) -> Result<Self, EncryptionOperationsError> {
+        let request = Self {
+            schema_version: ENCRYPTION_OPERATIONS_SCHEMA_VERSION,
+            recipient,
+            generation,
+            state_digest,
+            report_required,
+        };
+        request.verify()?;
+        Ok(request)
+    }
+
+    /// Validates the strict wire shape. This request deliberately carries no
+    /// activation capability and cannot authorize local state mutation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported or malformed coordinates.
+    pub fn verify(&self) -> Result<(), EncryptionOperationsError> {
+        if self.schema_version != ENCRYPTION_OPERATIONS_SCHEMA_VERSION
+            || self.recipient.node_name.is_empty()
+            || self.recipient.node_uid.is_empty()
+            || self.generation == Revision::INITIAL
+            || self.state_digest.0 == [0; 32]
+        {
+            return Err(EncryptionOperationsError::InvalidActivationTestimonyRequest);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EncryptionOperationalStage {
@@ -667,6 +722,8 @@ pub enum EncryptionOperationsError {
     InvalidStatusTime,
     #[error("invalid encryption activation report")]
     InvalidActivationReport,
+    #[error("invalid encryption activation testimony request")]
+    InvalidActivationTestimonyRequest,
     #[error("encryption operations encoding failed: {0}")]
     Encoding(String),
 }
@@ -1028,5 +1085,27 @@ mod tests {
         let mut unknown = serde_json::to_value(report).unwrap();
         unknown["activationPermit"] = serde_json::json!("forbidden");
         assert!(serde_json::from_value::<EncryptionActivationReport>(unknown).is_err());
+    }
+
+    #[test]
+    fn activation_testimony_request_is_strict_and_carries_no_authority() {
+        let request = EncryptionActivationTestimonyRequest::issue(
+            EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "worker-a-uid".to_owned(),
+            },
+            Revision::new(7),
+            EncryptionFastPathDigest([9; 32]),
+            true,
+        )
+        .unwrap();
+        request.verify().unwrap();
+        let encoded = serde_json::to_string(&request).unwrap();
+        for forbidden in ["privateKey", "publicKey", "permit", "witness", "receipt"] {
+            assert!(!encoded.contains(forbidden));
+        }
+        let mut unknown = serde_json::to_value(request).unwrap();
+        unknown["activationPermit"] = serde_json::json!("forbidden");
+        assert!(serde_json::from_value::<EncryptionActivationTestimonyRequest>(unknown).is_err());
     }
 }

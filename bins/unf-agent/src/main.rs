@@ -88,17 +88,17 @@ use unf_egress::{
 use unf_encryption::{
     AdmittedEncryptionGeneration, AdmittedNodeLocalPlan, AuthenticatedNodeIdentity,
     DurableNodeKeyAuthority, ENCRYPTION_PATH_PROBE_FRAME_BYTES, ENCRYPTION_PATH_PROBE_PORT,
-    EncryptionActivationReport, EncryptionEndpointPathProof, EncryptionGenerationFact,
-    EncryptionGenerationPathProofPermit, EncryptionGenerationRequest, EncryptionKeyBootstrap,
-    EncryptionPathActivationReceipt, EncryptionPathChallengeDelivery, EncryptionPathEndpointRole,
-    EncryptionPathProbeExchange, EncryptionPathProbeFrame, EncryptionPathProbeKind,
-    EncryptionPathProofAssignment, EncryptionPathProofRoundDigest,
+    EncryptionActivationReport, EncryptionActivationTestimonyRequest, EncryptionEndpointPathProof,
+    EncryptionGenerationFact, EncryptionGenerationPathProofPermit, EncryptionGenerationRequest,
+    EncryptionKeyBootstrap, EncryptionPathActivationReceipt, EncryptionPathChallengeDelivery,
+    EncryptionPathEndpointRole, EncryptionPathProbeExchange, EncryptionPathProbeFrame,
+    EncryptionPathProbeKind, EncryptionPathProofAssignment, EncryptionPathProofRoundDigest,
     EncryptionRoutePublicationPermit, EpochDrainProof, EpochRevocationReason,
     FileNodeKeyStateStore, KeyEpochPhase, LinuxEncryptionRouteProvider,
     LinuxPreparedLocalGeneration, LinuxWireGuardProvider, NodeKeyAttestationCut,
     NodeKeyAttestationRound, NodeKeyAuthority, NodeLocalPlanRequest, NodeLocalRecoveryPlan,
     NodeSealedGenerationCapsule, NodeSealedPlanCapsule, OsWireGuardKeyGenerator,
-    WireGuardKernelPlan,
+    WireGuardKernelPlan, validate_encryption_generation_path_receipts,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -10213,6 +10213,37 @@ async fn assist_active_encryption_path_proofs(
     let Some((recipient, desired, plans)) = generations.active_path_proof_state()? else {
         return Ok(false);
     };
+    let controller_url = generations
+        .controller_url
+        .clone()
+        .context("active encryption testimony has no controller URL")?;
+    let response = authenticated_get(
+        &generations.client,
+        format!("{controller_url}/v1/state/encryption-activation-testimony"),
+        &generations.agent_token_path,
+    )?
+    .send()
+    .await
+    .context("request active encryption testimony work")?;
+    if response.status() == StatusCode::NO_CONTENT {
+        generations.path_proofs.clear();
+        return Ok(false);
+    }
+    let request: EncryptionActivationTestimonyRequest = response
+        .error_for_status()
+        .context("controller rejected active encryption testimony request")?
+        .json()
+        .await
+        .context("decode active encryption testimony request")?;
+    request
+        .verify()
+        .context("verify active encryption testimony request")?;
+    if request.recipient != recipient
+        || request.generation != Revision::new(desired.config.generation)
+        || request.state_digest != desired.state_digest
+    {
+        bail!("active encryption testimony request differs from durable local authority");
+    }
     if !plans.is_empty() {
         let key_authority = key_authority
             .context("active encryption path repair has no Node-local key authority")?;
@@ -10225,12 +10256,37 @@ async fn assist_active_encryption_path_proofs(
             .await
             .context("repair active digest-bound encryption kernel state")?;
     }
-    // Receipts authorize only a pending activation latch. An already-active
-    // Node contributes fresh endpoint evidence but never consumes the
-    // resulting receipt as new local authority.
-    let _ = collect_live_encryption_path_receipts(generations, &recipient, &desired, &plans)
+    // Every active endpoint participates while the fleet cursor cut is
+    // incomplete so a pending peer can form duplex evidence. Only a Node whose
+    // own cursor is missing reconstructs controller history, and it validates
+    // full coverage without creating or consuming a map activation permit.
+    let receipts = collect_live_encryption_path_receipts(generations, &recipient, &desired, &plans)
         .await
         .context("participate in current active-generation path proof rounds")?;
+    if request.report_required {
+        let now_unix_ms = current_unix_time_milliseconds();
+        if validate_encryption_generation_path_receipts(
+            &desired,
+            &recipient,
+            &receipts,
+            now_unix_ms,
+        )
+        .is_err()
+        {
+            return Ok(true);
+        }
+        let report = EncryptionActivationReport::issue(
+            recipient,
+            request.generation,
+            request.state_digest,
+            now_unix_ms,
+            &receipts,
+        )
+        .context("seal active-generation recovery testimony")?;
+        publish_encryption_activation_report(generations, &report)
+            .await
+            .context("publish active-generation recovery testimony")?;
+    }
     Ok(true)
 }
 
@@ -10282,6 +10338,21 @@ async fn publish_pending_encryption_activation(
     let Some(report) = generations.pending_activation_report.clone() else {
         return Ok(false);
     };
+    publish_encryption_activation_report(generations, &report).await?;
+    if generations
+        .pending_activation_report
+        .as_ref()
+        .is_some_and(|pending| pending.report_digest == report.report_digest)
+    {
+        generations.pending_activation_report = None;
+    }
+    Ok(true)
+}
+
+async fn publish_encryption_activation_report(
+    generations: &EncryptionGenerationSynchronizer,
+    report: &EncryptionActivationReport,
+) -> Result<()> {
     let controller_url = generations
         .controller_url
         .as_deref()
@@ -10291,7 +10362,7 @@ async fn publish_pending_encryption_activation(
         .current()
         .post(format!("{controller_url}/v1/state/encryption-activations"))
         .bearer_auth(read_agent_token(&generations.agent_token_path)?)
-        .json(&report)
+        .json(report)
         .send()
         .await
         .context("publish retry-stable encryption activation report")?;
@@ -10301,14 +10372,7 @@ async fn publish_pending_encryption_activation(
             .context("controller rejected encryption activation report")?;
         bail!("controller returned a non-202 response for encryption activation report");
     }
-    if generations
-        .pending_activation_report
-        .as_ref()
-        .is_some_and(|pending| pending.report_digest == report.report_digest)
-    {
-        generations.pending_activation_report = None;
-    }
-    Ok(true)
+    Ok(())
 }
 
 async fn preflight_controller_compatibility(

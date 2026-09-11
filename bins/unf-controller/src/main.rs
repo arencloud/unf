@@ -72,9 +72,10 @@ use unf_egress::{
 };
 use unf_encryption::{
     AuthenticatedNodeIdentity, EncryptionActivationReport, EncryptionActivationReportDigest,
-    EncryptionBaseline, EncryptionDisposition, EncryptionEndpointPathProof,
-    EncryptionFrontierPublishOutcome, EncryptionGenerationDistributionError,
-    EncryptionGenerationFact, EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
+    EncryptionActivationTestimonyRequest, EncryptionBaseline, EncryptionDisposition,
+    EncryptionEndpointPathProof, EncryptionFrontierPublishOutcome,
+    EncryptionGenerationDistributionError, EncryptionGenerationFact,
+    EncryptionGenerationFactOutcome, EncryptionGenerationFactReconciler,
     EncryptionGenerationFrontierError, EncryptionGenerationProducer,
     EncryptionGenerationProducerCheckpoint, EncryptionGenerationRecipient,
     EncryptionGenerationRequest, EncryptionIdentityPair, EncryptionIntent, EncryptionKeyBootstrap,
@@ -1579,6 +1580,10 @@ async fn spawn_internal_api(
         .route(
             "/v1/state/encryption-activations",
             post(ingest_encryption_activation),
+        )
+        .route(
+            "/v1/state/encryption-activation-testimony",
+            get(encryption_activation_testimony),
         )
         .route(
             "/v1/state/service-selection",
@@ -9163,6 +9168,89 @@ async fn encryption_path_receipts(
     ))
 }
 
+async fn encryption_activation_testimony(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    require_current_encryption_agent(&state, &agent)?;
+    match encryption_activation_testimony_for(&state, &agent)? {
+        Some(request) => Ok(Json(request).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+fn encryption_activation_testimony_for(
+    state: &ControllerState,
+    agent: &AuthenticatedAgent,
+) -> Result<Option<EncryptionActivationTestimonyRequest>, ApiError> {
+    let cut = mutex_lock(&state.encryption_local_plans)
+        .active()
+        .cloned()
+        .ok_or_else(|| ApiError::service_unavailable("encryption plan cut is unavailable"))?;
+    let recipient = encryption_recipient(state, agent)?;
+    let local_plan = cut
+        .plans
+        .iter()
+        .find(|plan| plan.recipient == recipient)
+        .ok_or_else(|| {
+            ApiError::forbidden("activation testimony Node is absent from the current plan cut")
+        })?;
+    if local_plan.generation != cut.generation {
+        return Err(ApiError::service_unavailable(
+            "activation testimony plan generation differs from the fleet cut",
+        ));
+    }
+    let frontier = mutex_lock(&state.encryption_generation_facts)
+        .candidate()
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?
+        .ok_or_else(|| {
+            ApiError::service_unavailable("complete encryption generation is unavailable")
+        })?;
+    let prepared = frontier
+        .generations
+        .iter()
+        .find(|generation| generation.recipient == recipient)
+        .ok_or_else(|| {
+            ApiError::forbidden("activation testimony Node is absent from current generation")
+        })?;
+    let published = prepared.checkpoint.transaction.desired.published;
+    if published.generation != cut.generation {
+        return Err(ApiError::service_unavailable(
+            "activation testimony generation differs from the current plan cut",
+        ));
+    }
+    let cursors = mutex_lock(&state.encryption_activation_cursors);
+    let fleet_complete = cut.members.iter().all(|member| {
+        frontier
+            .generations
+            .iter()
+            .find(|generation| generation.recipient == *member)
+            .map(|generation| generation.checkpoint.transaction.desired.published)
+            .is_some_and(|member_published| {
+                member_published.generation == cut.generation
+                    && cursors.get(&member.node_uid).is_some_and(|cursor| {
+                        cursor.generation == member_published.generation
+                            && cursor.state_digest == member_published.state_digest
+                    })
+            })
+    });
+    if fleet_complete {
+        return Ok(None);
+    }
+    let report_required = !cursors.get(&recipient.node_uid).is_some_and(|cursor| {
+        cursor.generation == published.generation && cursor.state_digest == published.state_digest
+    });
+    EncryptionActivationTestimonyRequest::issue(
+        recipient,
+        published.generation,
+        published.state_digest,
+        report_required,
+    )
+    .map(Some)
+    .map_err(|error| ApiError::internal(error.to_string()))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn ingest_encryption_activation(
     State(state): State<Arc<ControllerState>>,
@@ -9257,20 +9345,12 @@ async fn ingest_encryption_activation(
         .cloned()
     {
         if report.generation == cursor.generation && report.state_digest == cursor.state_digest {
-            mutex_lock(&state.encryption_activation_cursors).insert(
-                recipient.node_uid,
-                EncryptionActivationCursor {
-                    generation: report.generation,
-                    state_digest: report.state_digest,
-                    report_digest: report.report_digest,
-                },
-            );
-            state
-                .encryption_operations_dirty
-                .store(true, Ordering::Release);
+            // A fresh active-generation testimony can race an accepted reply.
+            // The exact cursor is already authoritative history; acknowledging
+            // the retry without replacing its digest avoids checkpoint churn.
             return Ok(StatusCode::ACCEPTED);
         }
-        if report.generation < cursor.generation {
+        if report.generation <= cursor.generation {
             return Err(ApiError::bad_request(
                 "activation report regressed or equivocated at one generation",
             ));

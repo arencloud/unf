@@ -1048,9 +1048,10 @@ matrix is maintained in the
   cannot leap and bounded catch-up fails closed; ADR 0215.
 - Fresh path-proof rounds survive controller replacement through reciprocal
   active-generation participation. A byte-matched, already-revalidated Node
-  answers and attests current nonce-bound rounds but discards receipts and gains
-  no activation authority, allowing a still-pending peer to complete the exact
-  two-ended quorum without replay or forced generation churn; ADR 0216.
+  answers and attests current nonce-bound rounds but gains no local activation
+  authority, allowing a still-pending peer to complete the exact two-ended
+  quorum without replay or forced generation churn; ADR 0216. Receipts are
+  normally discarded; ADR 0219 narrowly governs missing controller history.
 - A strictly ahead authenticated agent cursor is also a recovery high-watermark
   when controller replacement restores the preceding fleet cut. The controller
   advances one complete cut beyond that durable cursor, while equal/older polls
@@ -1060,6 +1061,11 @@ matrix is maintained in the
   Fresh readback reconstructs a non-serializable capability against the same
   admission, avoiding both partial-state trust and needless fleet churn; ADR
   0218.
+- Demand-Driven Reciprocal Activation Testimony reconstructs a replacement
+  controller's missing cursor history only while the exact fleet cut is
+  incomplete. Every active peer remains available for fresh duplex proof, only
+  a missing member reports, exact retries do not dirty checkpoints, and the
+  testimony path cannot create local packet authority; ADR 0219.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
