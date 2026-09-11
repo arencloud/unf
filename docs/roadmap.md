@@ -1148,6 +1148,9 @@ matrix is maintained in the
   finite owner-only temporary vocabulary and keeps foreign state closed; ADR
   0232. Exact runtime `7296f06` passed the fresh full Kind lifecycle and is
   bound to public immutable images plus evidence hashes by ADR 0233. The
+  Causal Readiness Join now requires every Node generation's policy, Service,
+  and egress revisions to equal the current converged control cut, eliminating
+  the independently-green stale view exposed by the reboot; ADR 0234. The
   complete cl02 gate remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,

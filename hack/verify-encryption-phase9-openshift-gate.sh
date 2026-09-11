@@ -72,6 +72,10 @@ require 'Crash-Residue Cleanup Closure' \
     "${root}/docs/adr/0232-crash-residue-cleanup-closure.md"
 require 'Immutable Expiry-Recovery Kind Requalification' \
     "${root}/docs/adr/0233-immutable-expiry-recovery-kind-requalification.md"
+require 'Causal Readiness Join' \
+    "${root}/docs/adr/0234-causal-readiness-join.md"
+require 'policyRevision:.active.fact.checkpoint.transaction.desired.published.policyRevision' \
+    "${gate}"
 require 'UNF_ENCRYPTION_BASELINE' "${overlay}/controller-native-patch.yaml"
 require 'value: native' "${overlay}/controller-native-patch.yaml"
 require 'UNF_ENCRYPTION_KEY_LIFETIME_SECONDS' "${overlay}/agent-rotation-patch.yaml"
@@ -96,6 +100,18 @@ for bounded_wait in wait_generation_after wait_epoch_change; do
         echo "${bounded_wait} must not nest the independent convergence timeout" >&2
         exit 1
     fi
+done
+
+for bounded_wait in wait_generation wait_generation_after wait_epoch_change; do
+    wait_body=$(sed -n "/^${bounded_wait}()/,/^}/p" "${gate}")
+    rg -q 'current_revision_cut' <<<"${wait_body}" || {
+        echo "${bounded_wait} must join the current agent and egress revision cut" >&2
+        exit 1
+    }
+    rg -q 'generation_matches_current_cut' <<<"${wait_body}" || {
+        echo "${bounded_wait} must reject a stale encryption revision vector" >&2
+        exit 1
+    }
 done
 
 selective_line=$(rg -n '^stage=selective-native-exception$' "${gate}" | cut -d: -f1)

@@ -174,6 +174,9 @@ generation_snapshot() {
         node_exec "${node}" jq -cer --arg node "${node}" '
             {node:$node,
              generation:.active.fact.checkpoint.transaction.desired.published.generation,
+             policyRevision:.active.fact.checkpoint.transaction.desired.published.policyRevision,
+             serviceRevision:.active.fact.checkpoint.transaction.desired.published.serviceRevision,
+             egressRevision:.active.fact.checkpoint.transaction.desired.published.egressRevision,
              pending:(if .pending == null then null else
                 .pending.fact.checkpoint.transaction.desired.published.generation end),
              epochs:[.active.plans[].epoch] | sort}' \
@@ -181,14 +184,52 @@ generation_snapshot() {
     done | jq -sc 'sort_by(.node)'
 }
 
+current_revision_cut() {
+    local agents egress_revision
+    agents=$(controller_raw /v1/state/agents)
+    egress_revision=$(oc_read -n unf-system get configmap unf-egress-control-plane -o json \
+        | jq -er '.data["state.json"] | fromjson | .desiredRevision')
+    jq -cen --argjson agents "${agents}" --argjson expected "${#nodes[@]}" \
+        --argjson egress "${egress_revision}" '
+        $agents.schema_version == 8
+        and $agents.expected_agents == $expected
+        and $agents.reporting_agents == $expected
+        and $agents.all_converged
+        and ($agents.nodes | length) == $expected
+        and all($agents.nodes[];
+            .fresh and .converged and .report.ready and .report.bpf_loaded
+            and .report.desired_policy_revision == .report.applied_policy_revision
+            and .report.desired_service_revision == .report.applied_service_revision)
+        and ([$agents.nodes[].report.desired_policy_revision] | unique | length) == 1
+        and ([$agents.nodes[].report.desired_service_revision] | unique | length) == 1
+        | select(.)
+        | {policyRevision:$agents.nodes[0].report.desired_policy_revision,
+           serviceRevision:$agents.nodes[0].report.desired_service_revision,
+           egressRevision:$egress}'
+}
+
+generation_matches_current_cut() {
+    local snapshot=$1 cut=$2
+    jq -e --argjson expected "${#nodes[@]}" --argjson cut "${cut}" '
+        length == $expected
+        and all(.[];
+            .pending == null and .generation != null
+            and .policyRevision == $cut.policyRevision
+            and .serviceRevision == $cut.serviceRevision
+            and .egressRevision == $cut.egressRevision)
+        and ([.[].generation] | unique | length) == 1
+        and ([.[].policyRevision] | unique | length) == 1
+        and ([.[].serviceRevision] | unique | length) == 1
+        and ([.[].egressRevision] | unique | length) == 1
+    ' <<<"${snapshot}" >/dev/null 2>&1
+}
+
 wait_generation() {
-    local snapshot=
+    local snapshot= cut=
     for _ in $(seq 1 360); do
+        cut=$(current_revision_cut 2>/dev/null || true)
         snapshot=$(generation_snapshot 2>/dev/null || true)
-        if jq -e --argjson expected "${#nodes[@]}" '
-            length == $expected and all(.[]; .pending == null)
-            and .[0].generation != null and ([.[].generation] | unique | length) == 1
-        ' <<<"${snapshot}" >/dev/null 2>&1; then
+        if [[ -n ${cut} ]] && generation_matches_current_cut "${snapshot}" "${cut}"; then
             printf '%s\n' "${snapshot}"
             return 0
         fi
@@ -200,15 +241,12 @@ wait_generation() {
 }
 
 wait_generation_after() {
-    local predecessor=$1 snapshot= generation=
+    local predecessor=$1 snapshot= generation= cut=
     for _ in $(seq 1 360); do
+        cut=$(current_revision_cut 2>/dev/null || true)
         snapshot=$(generation_snapshot 2>/dev/null || true)
         generation=$(jq -r '.[0].generation // empty' <<<"${snapshot}" 2>/dev/null || true)
-        if jq -e --argjson expected "${#nodes[@]}" '
-            length == $expected
-            and all(.[]; .pending == null and .generation != null)
-            and ([.[].generation] | unique | length) == 1
-        ' <<<"${snapshot}" >/dev/null 2>&1 \
+        if [[ -n ${cut} ]] && generation_matches_current_cut "${snapshot}" "${cut}" \
             && [[ ${generation} =~ ^[0-9]+$ ]] && (( generation > predecessor )); then
             printf '%s\n' "${snapshot}"
             return 0
@@ -277,17 +315,14 @@ traffic_matrix() {
 }
 
 wait_epoch_change() {
-    local initial_epoch=$1 snapshot= epoch=
+    local initial_epoch=$1 snapshot= epoch= cut=
     for _ in $(seq 1 360); do
+        cut=$(current_revision_cut 2>/dev/null || true)
         snapshot=$(generation_snapshot 2>/dev/null || true)
         epoch=$(jq -r --arg node "${source_node}" '
             .[] | select(.node == $node) | .epochs | max // empty
         ' <<<"${snapshot}" 2>/dev/null || true)
-        if jq -e --argjson expected "${#nodes[@]}" '
-            length == $expected
-            and all(.[]; .pending == null and .generation != null)
-            and ([.[].generation] | unique | length) == 1
-        ' <<<"${snapshot}" >/dev/null 2>&1 \
+        if [[ -n ${cut} ]] && generation_matches_current_cut "${snapshot}" "${cut}" \
             && [[ ${epoch} =~ ^[0-9]+$ ]] && (( epoch > initial_epoch )); then
             printf '%s\n' "${snapshot}"
             return 0
