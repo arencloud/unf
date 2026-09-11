@@ -166,12 +166,16 @@ impl LinuxWireGuardProvider {
         Ok(snapshot)
     }
 
-    /// Deletes only an exact version-owned interface and its exact routes.
+    /// Deletes only a version-owned interface whose remaining state is a
+    /// monotonic subset of the authenticated plan.
     ///
     /// # Errors
     ///
-    /// Refuses partial, mutated, same-name foreign, or same-route-key foreign
-    /// state. Successful deletion includes positive link and route absence.
+    /// Missing planned routes and proof addresses are accepted because kernel
+    /// teardown or an external fault may already have removed them. Mutated
+    /// local authority, peers, added routes/addresses, same-name foreign state,
+    /// and same-route-key foreign state are refused. Successful deletion
+    /// includes positive link and route absence.
     pub async fn delete(
         &self,
         plan: &WireGuardKernelPlan,
@@ -183,8 +187,7 @@ impl LinuxWireGuardProvider {
             return Ok(KernelDeleteOutcome::AlreadyAbsent);
         };
         validate_owned_link(&link, plan)?;
-        let snapshot = read_snapshot(&handle, plan, &link).await?;
-        snapshot.verify_against(plan)?;
+        validate_monotonic_retirement_boundary(&handle, plan, &link).await?;
         handle
             .link()
             .del(link.header.index)
@@ -216,6 +219,67 @@ impl LinuxWireGuardProvider {
         let handle = connect_route("open rtnetlink recovery connection")?;
         rollback_fresh_stage(&handle, &transaction.plan).await
     }
+}
+
+/// Proves that every remaining object is still within the authority of the
+/// authenticated plan. Retirement needs a different boundary than repair:
+/// absence is monotonic and safe, while any mutation or addition is foreign.
+async fn validate_monotonic_retirement_boundary(
+    handle: &Handle,
+    plan: &WireGuardKernelPlan,
+    link: &LinkMessage,
+) -> Result<(), WireGuardKernelError> {
+    let link_state = parse_link(link)?;
+    let device = read_device(&plan.interface_name).await?;
+    if device.interface_index != link.header.index
+        || device.interface_name != plan.interface_name
+        || link_state.owner_alias != plan.owner_alias
+        || link_state.mtu != plan.mtu_envelope.interface_mtu
+        || device.public_key != plan.local_public_key
+        || device.listen_port != plan.listen_port
+        || device.fwmark != plan.fwmark
+    {
+        return Err(WireGuardKernelError::ForeignState(
+            "retiring WireGuard epoch changed immutable local authority".to_owned(),
+        ));
+    }
+
+    let proof_addresses = read_proof_addresses(handle, plan, link.header.index, false).await?;
+    if proof_addresses
+        .iter()
+        .any(|prefix| !plan.proof_addresses.contains(prefix))
+    {
+        return Err(WireGuardKernelError::ForeignState(
+            "retiring WireGuard epoch has an unplanned proof address".to_owned(),
+        ));
+    }
+
+    for observed in &device.peers {
+        let Some(expected) = plan
+            .peers
+            .iter()
+            .find(|expected| expected.public_key == observed.public_key)
+        else {
+            return Err(WireGuardKernelError::ForeignState(
+                "retiring WireGuard epoch has an unplanned peer".to_owned(),
+            ));
+        };
+        if observed.endpoint != expected.endpoint
+            || observed.persistent_keepalive_seconds != expected.persistent_keepalive_seconds
+            || observed.allowed_ips != expected.allowed_ips
+        {
+            return Err(WireGuardKernelError::ForeignState(
+                "retiring WireGuard epoch peer authority was mutated".to_owned(),
+            ));
+        }
+    }
+
+    // This global key preflight is deliberately stronger than inspecting only
+    // routes pointing at the retiring interface: a same-prefix/table route on
+    // another interface must be refused before deletion, not discovered by the
+    // positive-absence check after the owned link has already been removed.
+    read_routes(handle, plan, link.header.index, false).await?;
+    Ok(())
 }
 
 fn ipv4_reverse_path_filter_path(interface_name: &str) -> std::path::PathBuf {
@@ -1482,6 +1546,10 @@ mod tests {
             provider.apply(plan, private_key).await,
             Err(WireGuardKernelError::ForeignState(_))
         ));
+        assert!(matches!(
+            provider.delete(plan).await,
+            Err(WireGuardKernelError::ForeignState(_))
+        ));
         let foreign = require_link(handle, &plan.interface_name).await.unwrap();
         assert_eq!(
             parse_link(&foreign).unwrap().owner_alias,
@@ -1711,6 +1779,28 @@ mod tests {
             provider.apply(&plan, &private_key).await.unwrap().0,
             KernelApplyOutcome::Created
         );
+
+        // Retirement is restart-safe after partial, plan-owned teardown. This
+        // reproduces a real rotation boundary where route/proof state vanished
+        // before the durable retiring journal could remove the interface.
+        let retiring_link = require_link(&handle, &plan.interface_name).await.unwrap();
+        let missing_prefix = *plan.route_prefixes().iter().next().unwrap();
+        let missing_route = list_routes(&handle)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|route| route_key(route) == Some((missing_prefix, plan.route_table)))
+            .unwrap();
+        handle.route().del(missing_route).execute().await.unwrap();
+        let missing_proof = list_proof_addresses(&handle, retiring_link.header.index)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(prefix, _)| *prefix == plan.proof_addresses[0])
+            .unwrap()
+            .1;
+        handle.address().del(missing_proof).execute().await.unwrap();
+        assert!(provider.readback(&plan).await.is_err());
         assert_eq!(
             provider.delete(&plan).await.unwrap(),
             KernelDeleteOutcome::Deleted

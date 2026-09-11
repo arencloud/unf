@@ -1073,6 +1073,16 @@ matrix is maintained in the
   managed identities and exact Phase 9 authority selects the packet. A real
   kernel TC test preserves a nonzero foreign mark on unmanaged TCP/6443;
   corrected Kind and OpenShift reruns remain required; ADR 0220.
+- The required fresh Kind rerun then exposed a separate bounded-rotation
+  liveness defect: an already journaled retiring interface could retain its
+  exact ownership, device, and peers after some plan-owned routes disappeared,
+  yet pristine readback prevented deletion and permanently consumed the
+  two-epoch key window. Proof-Carrying Monotonic Retirement treats absence as
+  safe progress only after every remaining local field, peer, proof address,
+  and route is proven to be a subset of the authenticated plan; additions or
+  mutations remain foreign and are never deleted. A privileged kernel test
+  reproduces partial route/address teardown and proves exact positive cleanup;
+  fresh full Kind and OpenShift qualification remain required; ADR 0221.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

@@ -54,4 +54,4 @@ sudo -n env "UNF_WIREGUARD_TEST_INTERFACE=${test_interface}" \
     kernel_provider::linux::tests::privileged_kernel_stage_readback_rollback_and_cleanup_are_exact \
     --ignored --exact --nocapture
 
-echo "Phase 9.4 live kernel provider passed: injected rollback, foreign preservation, exact dual-stack readback, replay, restart rollback, and cleanup are verified"
+echo "Phase 9.4 live kernel provider passed: injected rollback, foreign preservation, exact dual-stack readback, replay, partial-owned retirement, restart rollback, and cleanup are verified"

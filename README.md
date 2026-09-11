@@ -1072,6 +1072,15 @@ foreign mark and proves byte-exact preservation; managed Native/Required,
 dual-stack, rotation, revocation, Service, and egress behavior remain covered.
 ADR 0220 records the failed gate and remediation; fresh Kind and cl02 runs are
 still required before milestone 9.9 or Phase 9 can be marked Verified.
+The first fresh Kind rerun then found a separate recovery/rotation liveness
+boundary: an exact journaled interface with some already-missing owned routes
+could not pass pristine readback, so its retired key occupied the bounded
+two-epoch window indefinitely. Proof-Carrying Monotonic Retirement now proves
+that every remaining local field, peer, proof address, and route is within the
+authenticated plan before deleting the interface; missing planned state is
+safe progress, while any mutation or addition is preserved and refused. The
+privileged kernel regression passes; complete fresh Kind and cl02 evidence is
+still required. See ADR 0221.
 This avoids both mixed-version management-path loss and the tempting but unsafe
 alternative of treating absent Required authority as Native; ADR 0214.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test

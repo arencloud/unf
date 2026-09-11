@@ -53,6 +53,12 @@ require_text crates/unf-encryption/src/kernel_provider/linux.rs \
 require_text crates/unf-encryption/src/kernel_provider/linux.rs \
     'privileged_kernel_stage_readback_rollback_and_cleanup_are_exact' \
     "the real-kernel lifecycle must remain available as a focused test"
+require_text crates/unf-encryption/src/kernel_provider/linux.rs \
+    'validate_monotonic_retirement_boundary' \
+    "partial owned retirement must use its dedicated subset proof"
+require_text crates/unf-encryption/src/kernel_provider/linux.rs \
+    'retiring WireGuard epoch has an unplanned peer' \
+    "retirement must refuse peer authority outside the signed plan"
 
 if rg --quiet '#\[allow' \
     "${project_root}/crates/unf-encryption/src/kernel_provider.rs" \
@@ -61,4 +67,4 @@ if rg --quiet '#\[allow' \
     exit 1
 fi
 
-echo "Phase 9.4 kernel provider passed: typed netlink, proof-carrying recovery, exact readback, bounded reconciliation, foreign-state refusal, MTU, and cleanup agree"
+echo "Phase 9.4 kernel provider passed: typed netlink, proof-carrying recovery, exact readback, bounded reconciliation, monotonic retirement, foreign-state refusal, MTU, and cleanup agree"
