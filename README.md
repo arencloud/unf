@@ -732,8 +732,8 @@ exact cleanup, five-agent convergence, and an unchanged `network` unhealthy
 baseline. Evidence SHA-256 is
 `a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3`;
 ADR 0157. These independent Kind and OpenShift results close Phase 8.
-Phase 9 begins the attested encryption fabric. Milestones 9.1–9.5 are verified;
-9.6 is in progress.
+Phase 9 begins the attested encryption fabric. Milestones 9.1–9.8 are verified;
+the independent OpenShift milestone 9.9 remains in progress.
 The architecture requires that source policy and Service/egress ownership precede
 encryption; kernel WireGuard owns all cryptography; private keys remain on their
 Node; and an independently replayed Attested Encryption Path Contract requires
@@ -1021,8 +1021,12 @@ immutable provenance, both encryption modes, IPv4/IPv6 PodIP and Service paths,
 ciphertext-only Required capture, simultaneous Native exception, link-failure
 denial, natural rotation, controller/agent recovery, causal operations,
 performance, egress coexistence, exact cleanup, and optional primary-CNI
-rollback. `make encryption-phase9-kind-gate-test`; ADR 0212. The fresh live run
-must pass before 9.8 is promoted.
+rollback. `make encryption-phase9-kind-gate-test`; ADR 0212. Runtime `6fe2a92`,
+qualified by `e1fc112`, passed that fresh three-Node dual-stack Kubernetes
+v1.35.0 transaction. Evidence JSON SHA-256 is `f35a0ede…035`; the independently
+hashed packet capture recorded 333 WireGuard frames and zero Required-path
+plaintext frames. Milestone 9.8 is Verified; 9.9 independently qualifies the
+same immutable runtime on five-Node dual-stack OpenShift.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

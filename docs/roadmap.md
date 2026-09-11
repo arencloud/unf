@@ -840,7 +840,7 @@ matrix is maintained in the
 
 ## Phase 9 — attested encryption fabric
 
-**Gate: in progress; milestones 9.1–9.7 verified.** The ordered evidence
+**Gate: in progress; milestones 9.1–9.8 verified.** The ordered evidence
 matrix is maintained in the
 [Phase 9 encryption-fabric plan](development/phase9-attested-encryption-fabric-plan.md).
 
@@ -1031,8 +1031,10 @@ matrix is maintained in the
 - Milestones 9.2–9.7 implement the intent/contract model, Node-local key and
   rotation authority, transactional WireGuard provider, coalesced fast path,
   bidirectional live proof, secret-free operations, recovery, and benchmarks.
-  Milestones 9.8 and 9.9 then require independent kube-proxy-free dual-stack
-  Kind and five-Node OpenShift qualification; ADR 0158.
+  Milestone 9.8 passed its independent kube-proxy-free three-Node dual-stack
+  Kind gate at runtime `6fe2a92`, qualified by `e1fc112`, with evidence SHA-256
+  `f35a0ede…035`. Milestone 9.9 now requires the same immutable runtime on the
+  independent five-Node OpenShift gate; ADRs 0158 and 0212.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

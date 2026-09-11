@@ -53,3 +53,24 @@ milestone 9.9 independently reuses the exact qualified image tuple on cl02.
 `make encryption-phase9-kind-gate-test` validates the rendered overlay, shell
 syntax, and required gate boundaries. `make encryption-phase9-kind-test` runs
 the live qualification and writes `.artifacts/phase9-encryption-kind.json`.
+
+The fresh three-Node dual-stack Kubernetes v1.35.0 qualification passed on
+2026-09-11. Runtime revision
+`6fe2a929aaf07a5f2a20a0d7c5ef4e3df8788fda`, qualified by revision
+`e1fc112cd53a0fa44506e6c04321752c2308e807`, produced schema-v1 evidence with
+SHA-256 `f35a0edeead41e8a94b7d84d8a8d162f99579c886700c4aaf607a23b262ed035`.
+Its 2,647,196-byte packet capture has SHA-256
+`c6e50342c0f96e092e13a3a5ac5f732fc91bde82a69bfc2441b23da771cc04f9`
+and records 333 WireGuard frames, zero Required-path plaintext frames, and 312
+explicit Native-path plaintext frames. Required traffic failed closed for all
+eight link-loss probes while all eight Native probes remained live. Natural
+rotation, one exact agent replacement, controller replacement, loss-free
+operations through sequence 311, the committed performance ledger, Phase 8
+egress coexistence, exact encryption cleanup, and complete primary-CNI rollback
+all passed.
+
+This evidence qualifies controlled single-agent replacement and separate
+controller replacement. It deliberately does not claim that simultaneously
+restarting every encrypted endpoint preserves an already established path;
+that event removes both ends of the live proof rendezvous and therefore fails
+closed until fresh mutual authority is available.
