@@ -1135,7 +1135,9 @@ a runtime failure: repeated `oc debug node` snapshots created Pods that changed
 the generation being observed. The Non-Perturbing Fleet Witness uses one stable
 host-networked executor per Node, runs selective qualification before evidence,
 and bounds each retry to one fleet snapshot. It needs no SSH and changes no
-qualified runtime byte; ADR 0230.
+qualified runtime byte. An independent cleanup latch also restores Native mode
+on every post-migration exit, including interruption before fixture creation;
+ADR 0230.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -21,6 +21,7 @@ stage=initialization
 started_unix=$(date +%s)
 resources_created=false
 host_probe_created=false
+baseline_changed=false
 link_lowered=false
 source_interface=
 artifact_tmp=
@@ -48,9 +49,11 @@ cleanup() {
     if [[ ${link_lowered} == true && -n ${source_node:-} && -n ${source_interface} ]]; then
         node_exec "${source_node}" ip link set dev "${source_interface}" up >/dev/null 2>&1 || true
     fi
-    if [[ ${resources_created} == true ]]; then
+    if [[ ${baseline_changed} == true ]]; then
         "${kc[@]}" -n unf-system set env deployment/unf-controller \
             UNF_ENCRYPTION_BASELINE=native >/dev/null 2>&1 || true
+    fi
+    if [[ ${resources_created} == true ]]; then
         "${kc[@]}" delete namespace "${namespace}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     fi
     if [[ ${host_probe_created} == true ]]; then
@@ -239,6 +242,11 @@ wait_for_convergence() {
 
 set_baseline() {
     local value=$1
+    if [[ ${value} == native ]]; then
+        baseline_changed=false
+    else
+        baseline_changed=true
+    fi
     "${kc[@]}" -n unf-system set env deployment/unf-controller \
         "UNF_ENCRYPTION_BASELINE=${value}" >/dev/null
     "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=10m >/dev/null
@@ -651,8 +659,7 @@ traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required
 traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
 
 stage=exact-cleanup
-"${kc[@]}" -n unf-system set env deployment/unf-controller UNF_ENCRYPTION_BASELINE=native >/dev/null
-"${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=10m >/dev/null
+set_baseline native
 "${kc[@]}" delete namespace "${namespace}" --wait=true --timeout=10m >/dev/null
 resources_created=false
 owned_state_absent=false

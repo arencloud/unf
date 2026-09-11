@@ -31,7 +31,9 @@ The selective-Native scenario now executes before ciphertext, recovery, and
 evidence stages. Generation and epoch waits perform exactly one direct fleet
 snapshot per retry and retain their original bounded outer deadline. Static
 gate checks reject per-sample `oc debug`, nested convergence waits, or future
-stage-order regression.
+stage-order regression. A migration cleanup latch is armed before changing the
+baseline, so interruption restores staged Native mode even when no workload
+fixture has been created yet.
 
 ## Consequences
 
@@ -42,6 +44,8 @@ stage-order regression.
 - Probe Pods are explicit qualification resources, use the already
   acknowledged privileged boundary, and are removed before final agent and
   ClusterOperator evidence.
+- Early interruption cannot leave the cluster in Required mode merely because
+  fixture ownership had not yet been established.
 - This changes qualification machinery only. Runtime `32b5501` and its ADR
   0229 image/evidence admission remain byte-identical.
 

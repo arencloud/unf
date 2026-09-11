@@ -44,6 +44,7 @@ require 'simultaneous replacement of every encrypted endpoint' "${gate}"
 require 'kind: DaemonSet' "${gate}"
 require 'unf-encryption-host-probe' "${gate}"
 require 'chroot /host' "${gate}"
+require 'baseline_changed' "${gate}"
 require 'must_establish_initial_generation' "${root}/bins/unf-agent/src/main.rs"
 require 'oc image info .*--filter-by-os=linux/amd64 -o json' \
     "${root}/hack/deploy-openshift-service-fabric.sh"
