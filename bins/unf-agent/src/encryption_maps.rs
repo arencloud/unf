@@ -148,6 +148,15 @@ impl EncryptionMapSynchronizer {
         self.requires_local_revalidation
     }
 
+    /// A loaded but empty encryption island is not packet authority. During a
+    /// fresh installation or adjacent upgrade, every agent may publish its
+    /// Node-local facts while the prior TC program remains attached, but the
+    /// new tail-call graph must not become reachable until one complete
+    /// proof-carrying generation has committed locally.
+    pub(super) const fn has_active_generation(&self) -> bool {
+        self.active.is_some() && !self.requires_local_revalidation
+    }
+
     /// Physically removes expired established-flow leases for one retired key
     /// epoch and proves no matching connection entry remains. The active map
     /// generation must already have removed the epoch's transport authority.
@@ -1209,5 +1218,6 @@ mod tests {
         let synchronizer = EncryptionMapSynchronizer::recover(maps, state_path, false)
             .expect("fresh kernel maps recover as a quiescent ABI island");
         assert!(!synchronizer.requires_local_revalidation());
+        assert!(!synchronizer.has_active_generation());
     }
 }

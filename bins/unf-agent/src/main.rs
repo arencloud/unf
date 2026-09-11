@@ -174,7 +174,7 @@ const INITIAL_ENCRYPTION_KEY_LIFETIME: Duration = Duration::from_secs(7 * 24 * 6
 const DEFAULT_ENCRYPTION_ROTATE_BEFORE: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_ENCRYPTION_ROTATION_JITTER: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_ENCRYPTION_DRAIN_WINDOW: Duration = Duration::from_secs(5 * 60);
-const ENCRYPTION_STARTUP_REVALIDATION_ATTEMPTS: u8 = 30;
+const ENCRYPTION_STARTUP_REVALIDATION_ATTEMPTS: u16 = 900;
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -7217,6 +7217,8 @@ async fn run_dataplane(
         config.encryption_fast_path_state_path.clone(),
         encryption_pins_existed,
     )?;
+    let must_establish_initial_generation =
+        controller_url.is_some() && !encryption.has_active_generation();
     let mut startup_activation_error = None;
     for attempt in 1..=ENCRYPTION_STARTUP_REVALIDATION_ATTEMPTS {
         match advance_startup_encryption_authority(
@@ -7229,7 +7231,11 @@ async fn run_dataplane(
         {
             Ok(_) => {
                 startup_activation_error = None;
-                if !encryption.requires_local_revalidation() {
+                if encryption_startup_attachment_ready(
+                    must_establish_initial_generation,
+                    encryption.has_active_generation(),
+                    encryption.requires_local_revalidation(),
+                ) {
                     break;
                 }
             }
@@ -7238,7 +7244,7 @@ async fn run_dataplane(
                     ?error,
                     attempt,
                     max_attempts = ENCRYPTION_STARTUP_REVALIDATION_ATTEMPTS,
-                    "startup encryption proof revalidation is incomplete; TC attachment remains fenced"
+                    "startup encryption fleet barrier is incomplete; TC attachment remains fenced"
                 );
                 startup_activation_error = Some(error);
             }
@@ -7254,6 +7260,14 @@ async fn run_dataplane(
         bail!(
             "recovered encryption authority requires a fresh Node-local tri-plane activation latch before TC attachment; exact proof rehydration was unavailable"
         );
+    }
+    if must_establish_initial_generation && !encryption.has_active_generation() {
+        if let Some(error) = startup_activation_error {
+            return Err(error).context(
+                "initial encryption generation could not cross the causal pre-attachment fleet barrier",
+            );
+        }
+        bail!("initial encryption generation did not become proof-carrying before TC attachment");
     }
     // Rehydrating the active slot may reveal a separately durable successor.
     // Only after current authority is safe may that proposal resume exchange.
@@ -9881,6 +9895,14 @@ fn set_path_probe_mark(socket: &tokio::net::UdpSocket, route_mark: u32) -> Resul
 /// the successor map latch, making journal promotion infallible after mutation.
 const fn encryption_activation_is_retirement_fenced(retirement_count: usize) -> bool {
     retirement_count != 0
+}
+
+const fn encryption_startup_attachment_ready(
+    must_establish_initial_generation: bool,
+    has_active_generation: bool,
+    requires_local_revalidation: bool,
+) -> bool {
+    has_active_generation || (!must_establish_initial_generation && !requires_local_revalidation)
 }
 
 async fn collect_live_encryption_path_receipts(
@@ -19344,6 +19366,15 @@ mod tests {
             select_encryption_recovery_slot(EncryptionRecoveryAdmission::Active, true, false),
             None
         );
+    }
+
+    #[test]
+    fn encryption_startup_never_attaches_an_empty_authority_island() {
+        assert!(!encryption_startup_attachment_ready(true, false, false));
+        assert!(!encryption_startup_attachment_ready(true, false, true));
+        assert!(encryption_startup_attachment_ready(true, true, false));
+        assert!(!encryption_startup_attachment_ready(false, false, true));
+        assert!(encryption_startup_attachment_ready(false, false, false));
     }
 
     #[test]

@@ -1035,6 +1035,11 @@ matrix is maintained in the
   Kind gate at runtime `6fe2a92`, qualified by `e1fc112`, with evidence SHA-256
   `f35a0ede…035`. Milestone 9.9 now requires the same immutable runtime on the
   independent five-Node OpenShift gate; ADRs 0158 and 0212.
+- Phase 9.9 adds a Causal Pre-Attachment Fleet Barrier for adjacent upgrades:
+  new agents can exchange authenticated facts while the prior TC program stays
+  authoritative, but no new tail-call graph or attachment is published until
+  the full current fleet commits one proof-carrying generation. Missing
+  authority never masquerades as Native; ADR 0214.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

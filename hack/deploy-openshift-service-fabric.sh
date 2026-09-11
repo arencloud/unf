@@ -318,18 +318,41 @@ wait_for_agent_replacement() {
     local node=$1 old_uid=$2 pod_json=
     for _ in $(seq 1 300); do
         pod_json=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent -o json 2>/dev/null || true)
-        if jq -e --arg node "${node}" --arg uid "${old_uid}" --arg image "${agent_image}" '
+        if jq -e --arg node "${node}" --arg uid "${old_uid}" --arg image "${agent_image}" \
+            --arg phase "${release_phase}" '
             any(.items[];
                 .spec.nodeName == $node and .metadata.uid != $uid
                 and .metadata.deletionTimestamp == null and .status.phase == "Running"
                 and (.spec.containers | all(.image == $image))
-                and (.status.containerStatuses | all(.ready == true)))
+                and (if $phase == "9.9" then
+                    any(.status.containerStatuses[];
+                        .name == "agent" and (.state | has("running")))
+                    and any(.status.containerStatuses[]; .name == "install-primary-cni" and .ready)
+                  else (.status.containerStatuses | all(.ready == true)) end))
         ' <<<"${pod_json}" >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
     done
     echo "agent on ${node} did not become Ready with ${agent_image}" >&2
+    return 1
+}
+
+assert_phase9_agent_staging() {
+    local node=$1 version= status=
+    for _ in $(seq 1 120); do
+        version=$(agent_raw "${node}" /v1/version 2>/dev/null || true)
+        status=$(agent_raw "${node}" /v1/status 2>/dev/null || true)
+        if assert_version "${version}" unf-agent 2>/dev/null \
+            && jq -e '.schema_version == 8 and has("ready") and has("bpf_loaded")' \
+                <<<"${status}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "Phase 9 agent on ${node} did not expose its pre-attachment staging API" >&2
+    jq . <<<"${version}" >&2 || true
+    jq . <<<"${status}" >&2 || true
     return 1
 }
 
@@ -528,7 +551,15 @@ transition_agent() {
         "${kc[@]}" -n unf-system delete pod "${pod}" --wait=false >/dev/null
         wait_for_agent_replacement "${node}" "${old_uid}"
     fi
-    assert_agent "${node}"
+    if [[ ${release_phase} == 9.9 ]]; then
+        # A Phase 9 agent joins the fleet and publishes Node-local facts while
+        # the prior persistent TC program remains authoritative. It becomes
+        # Ready only after every current member can commit the first complete
+        # proof-carrying encryption generation.
+        assert_phase9_agent_staging "${node}"
+    else
+        assert_agent "${node}"
+    fi
     assert_host_service_path "${node}"
     [[ $("${kc[@]}" get --raw /readyz) == ok ]]
     [[ $("${kc[@]}" get node "${node}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == True ]]

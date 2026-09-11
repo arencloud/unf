@@ -1027,6 +1027,12 @@ v1.35.0 transaction. Evidence JSON SHA-256 is `f35a0ede…035`; the independentl
 hashed packet capture recorded 333 WireGuard frames and zero Required-path
 plaintext frames. Milestone 9.8 is Verified; 9.9 independently qualifies the
 same immutable runtime on five-Node dual-stack OpenShift.
+The first OpenShift transition also added the Causal Pre-Attachment Fleet
+Barrier: a new agent may publish authenticated Node-local facts while its prior
+persistent TC path remains authoritative, but cannot expose the new tail graph
+or become Ready until the complete fleet commits a proof-carrying generation.
+This avoids both mixed-version management-path loss and the tempting but unsafe
+alternative of treating absent Required authority as Native; ADR 0214.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
