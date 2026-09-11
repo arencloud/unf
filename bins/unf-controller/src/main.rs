@@ -9457,7 +9457,7 @@ async fn ingest_encryption_activation(
         })?;
     let published = prepared.checkpoint.transaction.desired.published;
     if report.generation != published.generation || report.state_digest != published.state_digest {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::conflict(
             "activation report does not bind the current prepared fast-path generation",
         ));
     }
@@ -9474,7 +9474,7 @@ async fn ingest_encryption_activation(
             ApiError::forbidden("activation Node is absent from the current plan cut")
         })?;
     if cut.generation != report.generation {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::conflict(
             "activation report generation differs from the current plan cut",
         ));
     }
@@ -15976,6 +15976,13 @@ impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
         }
     }

@@ -78,6 +78,11 @@ require 'Causal Readiness Join' \
     "${root}/docs/adr/0234-causal-readiness-join.md"
 require 'Monotonic Platform Health Delta' \
     "${root}/docs/adr/0235-monotonic-platform-health-delta.md"
+require 'Conflict-Acknowledged Activation Supersession' \
+    "${root}/docs/adr/0236-conflict-acknowledged-activation-supersession.md"
+require 'EncryptionActivationPublicationOutcome::Superseded' \
+    "${root}/bins/unf-agent/src/main.rs"
+require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"
 require 'policyRevision:.active.fact.checkpoint.transaction.desired.published.policyRevision' \
     "${gate}"
 require 'UNF_ENCRYPTION_BASELINE' "${overlay}/controller-native-patch.yaml"

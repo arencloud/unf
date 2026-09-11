@@ -1164,6 +1164,12 @@ The Monotonic Platform Health Delta records the initial and final unhealthy
 ClusterOperator sets and rejects the exact `final - baseline` difference. This
 admits operator recovery during qualification without allowing a regression to
 hide behind equal unhealthy counts; ADR 0235.
+Conflict-Acknowledged Activation Supersession gives HTTP 409 one narrow causal
+meaning: a valid queued activation report belongs to a generation the
+controller has already superseded. Only that volatile report is retired; every
+malformed, equivocal, unauthorized, unavailable, or transport-failed report
+remains fail closed, and the successor still needs the complete proof chain;
+ADR 0236.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -10468,7 +10468,7 @@ async fn publish_pending_encryption_activation(
     let Some(report) = generations.pending_activation_report.clone() else {
         return Ok(false);
     };
-    publish_encryption_activation_report(generations, &report).await?;
+    let outcome = publish_encryption_activation_report(generations, &report).await?;
     if generations
         .pending_activation_report
         .as_ref()
@@ -10476,13 +10476,35 @@ async fn publish_pending_encryption_activation(
     {
         generations.pending_activation_report = None;
     }
+    if outcome == EncryptionActivationPublicationOutcome::Superseded {
+        info!(
+            generation = report.generation.get(),
+            "retired controller-confirmed superseded encryption activation report"
+        );
+    }
     Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncryptionActivationPublicationOutcome {
+    Accepted,
+    Superseded,
+}
+
+fn encryption_activation_publication_outcome(
+    status: StatusCode,
+) -> Option<EncryptionActivationPublicationOutcome> {
+    match status {
+        StatusCode::ACCEPTED => Some(EncryptionActivationPublicationOutcome::Accepted),
+        StatusCode::CONFLICT => Some(EncryptionActivationPublicationOutcome::Superseded),
+        _ => None,
+    }
 }
 
 async fn publish_encryption_activation_report(
     generations: &EncryptionGenerationSynchronizer,
     report: &EncryptionActivationReport,
-) -> Result<()> {
+) -> Result<EncryptionActivationPublicationOutcome> {
     let controller_url = generations
         .controller_url
         .as_deref()
@@ -10496,13 +10518,13 @@ async fn publish_encryption_activation_report(
         .send()
         .await
         .context("publish retry-stable encryption activation report")?;
-    if response.status() != StatusCode::ACCEPTED {
-        response
-            .error_for_status()
-            .context("controller rejected encryption activation report")?;
-        bail!("controller returned a non-202 response for encryption activation report");
+    if let Some(outcome) = encryption_activation_publication_outcome(response.status()) {
+        return Ok(outcome);
     }
-    Ok(())
+    response
+        .error_for_status()
+        .context("controller rejected encryption activation report")?;
+    bail!("controller returned a non-202 response for encryption activation report");
 }
 
 async fn preflight_controller_compatibility(
@@ -20295,6 +20317,28 @@ mod tests {
         assert!(
             should_exchange_encryption_generation(&synchronizer),
             "an activation outbox must keep controller reconstruction scheduled"
+        );
+    }
+
+    #[test]
+    fn encryption_activation_publication_distinguishes_supersession_from_rejection() {
+        assert_eq!(
+            encryption_activation_publication_outcome(StatusCode::ACCEPTED),
+            Some(EncryptionActivationPublicationOutcome::Accepted)
+        );
+        assert_eq!(
+            encryption_activation_publication_outcome(StatusCode::CONFLICT),
+            Some(EncryptionActivationPublicationOutcome::Superseded)
+        );
+        assert_eq!(
+            encryption_activation_publication_outcome(StatusCode::BAD_REQUEST),
+            None,
+            "malformed or equivocal reports must remain queued and fail closed"
+        );
+        assert_eq!(
+            encryption_activation_publication_outcome(StatusCode::SERVICE_UNAVAILABLE),
+            None,
+            "retryable controller outages must not discard activation evidence"
         );
     }
 

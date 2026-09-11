@@ -1153,7 +1153,12 @@ matrix is maintained in the
   the independently-green stale view exposed by the reboot; ADR 0234. The
   Monotonic Platform Health Delta admits recovery of an initially unhealthy
   ClusterOperator while rejecting every newly unhealthy name; ADR 0235. The
-  complete cl02 gate remains mandatory.
+  reboot recovery rollout then found a valid predecessor activation report
+  permanently occupying the outbox after a newer controller generation had
+  superseded it. Conflict-Acknowledged Activation Supersession retires only an
+  explicit HTTP 409 predecessor, while all invalid, equivocal, unavailable, or
+  unauthenticated reports remain fail closed; ADR 0236. Fresh full Kind and the
+  complete cl02 gate remain mandatory for the revised runtime.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
