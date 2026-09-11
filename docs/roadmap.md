@@ -1102,6 +1102,13 @@ matrix is maintained in the
   decoding at 64 MB, preserves legacy restart compatibility, and rejects
   corruption before replay. Registry preflight now also proves each digest is
   a real Linux/amd64 manifest rather than an OCI configuration ID; ADR 0223.
+- The first fresh compact-frontier Kind run reached controller replacement and
+  then safely retained predecessor authority when sequential Node cursors made
+  the replacement publish two different pending recovery successors. The
+  Complete Fleet Cursor Recovery Barrier now gathers one authenticated cursor
+  from every exact member, publishes nothing while the cut is incomplete, and
+  emits exactly one successor above the restored catalog and fleet maximum;
+  ADR 0224. Full Kind requalification remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

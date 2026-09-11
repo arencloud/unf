@@ -1091,6 +1091,15 @@ The public development tuple is pinned by registry manifest digest: controller
 Phase 9.9 release record binds them to the exact Kind evidence before rollout.
 This avoids both mixed-version management-path loss and the tempting but unsafe
 alternative of treating absent Required authority as Native; ADR 0214.
+The cl02 reboot then exposed a 1,955,398-byte five-Node frontier/plan. The
+Content-Verified Compact Frontier keeps both in one bounded gzip envelope and
+verifies compressed and decoded lengths and digests before replay; registry
+preflight now rejects OCI configuration IDs masquerading as manifest digests;
+ADR 0223. Its first fresh Kind run subsequently found that sequential agent
+cursors could make a replacement controller publish two different recovery
+successors. The Complete Fleet Cursor Recovery Barrier now waits for every
+exact Node UID and publishes one cut above the fleet maximum. Focused tests
+pass; complete fresh Kind and cl02 evidence remain required; ADR 0224.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

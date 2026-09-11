@@ -434,6 +434,17 @@ struct EncryptionPlanReconciler {
     source: Option<EncryptionPlanSource>,
     generation: Revision,
     refresh_at_unix_ms: Option<u64>,
+    /// A restored catalog may lag a plan already durably admitted by one or
+    /// more agents. Collect the complete authenticated fleet cursor cut
+    /// before minting exactly one recovery successor above its maximum.
+    recovery_cursors: Option<BTreeMap<String, Revision>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncryptionPlanRecoveryJoin {
+    Inactive,
+    Waiting,
+    Complete(Revision),
 }
 
 const ENCRYPTION_OPERATIONS_DURABLE_SCHEMA_VERSION: u16 = 1;
@@ -3646,7 +3657,9 @@ async fn restore_encryption_generation_producer(state: &ControllerState) -> Resu
         mutex_lock(&state.encryption_local_plans)
             .publish(cut.clone())
             .context("restore durable encryption fleet-plan cut")?;
-        mutex_lock(&state.encryption_plan_reconciler).generation = cut.generation;
+        let mut reconciler = mutex_lock(&state.encryption_plan_reconciler);
+        reconciler.generation = cut.generation;
+        reconciler.recovery_cursors = Some(BTreeMap::new());
         info!(
             generation = cut.generation.get(),
             members = cut.members.len(),
@@ -10297,6 +10310,70 @@ fn next_encryption_plan_generation(
     previous.next().max(Revision::new(now_unix_ms)).max(minimum)
 }
 
+fn join_encryption_plan_recovery_cursor(
+    recovery_cursors: &mut Option<BTreeMap<String, Revision>>,
+    members: &[EncryptionGenerationRecipient],
+    recipient: &EncryptionGenerationRecipient,
+    current: Option<&unf_encryption::NodeLocalPlanCursor>,
+    catalog_generation: Revision,
+) -> EncryptionPlanRecoveryJoin {
+    let Some(observations) = recovery_cursors.as_mut() else {
+        return EncryptionPlanRecoveryJoin::Inactive;
+    };
+    let membership_revision = encryption_membership_revision(members);
+    let generation = current
+        .filter(|cursor| {
+            cursor.recipient == *recipient && cursor.membership_revision == membership_revision
+        })
+        .map_or(Revision::INITIAL, |cursor| cursor.generation);
+    observations.insert(recipient.node_uid.clone(), generation);
+    if !members
+        .iter()
+        .all(|member| observations.contains_key(&member.node_uid))
+    {
+        return EncryptionPlanRecoveryJoin::Waiting;
+    }
+    let floor = observations
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(Revision::INITIAL)
+        .max(catalog_generation)
+        .next();
+    *recovery_cursors = None;
+    EncryptionPlanRecoveryJoin::Complete(floor)
+}
+
+fn encryption_plan_minimum_generation(
+    state: &ControllerState,
+    members: &[EncryptionGenerationRecipient],
+    recipient: &EncryptionGenerationRecipient,
+    current: Option<&unf_encryption::NodeLocalPlanCursor>,
+    catalog_generation: Option<Revision>,
+) -> Option<Revision> {
+    let recovery_join = {
+        let mut reconciler = mutex_lock(&state.encryption_plan_reconciler);
+        join_encryption_plan_recovery_cursor(
+            &mut reconciler.recovery_cursors,
+            members,
+            recipient,
+            current,
+            catalog_generation.unwrap_or(Revision::INITIAL),
+        )
+    };
+    match recovery_join {
+        EncryptionPlanRecoveryJoin::Waiting => None,
+        EncryptionPlanRecoveryJoin::Complete(floor) => Some(floor),
+        EncryptionPlanRecoveryJoin::Inactive => Some(match (catalog_generation, current) {
+            (Some(catalog), Some(cursor)) if cursor.generation > catalog => {
+                cursor.generation.next()
+            }
+            (None, Some(cursor)) => cursor.generation.next(),
+            _ => Revision::INITIAL,
+        }),
+    }
+}
+
 fn encryption_nodes(
     state: &ControllerState,
     members: &[EncryptionGenerationRecipient],
@@ -10718,10 +10795,22 @@ fn encryption_plan_for(
     let catalog_generation = mutex_lock(&state.encryption_local_plans)
         .active()
         .map(|cut| cut.generation);
-    let minimum_generation = match (catalog_generation, request.current.as_ref()) {
-        (Some(catalog), Some(current)) if current.generation > catalog => current.generation.next(),
-        (None, Some(current)) => current.generation.next(),
-        _ => Revision::INITIAL,
+    let recovery_active = mutex_lock(&state.encryption_plan_reconciler)
+        .recovery_cursors
+        .is_some();
+    let members = if recovery_active {
+        encryption_generation_membership(state)?.1
+    } else {
+        Vec::new()
+    };
+    let Some(minimum_generation) = encryption_plan_minimum_generation(
+        state,
+        &members,
+        &recipient,
+        request.current.as_ref(),
+        catalog_generation,
+    ) else {
+        return Ok(None);
     };
     if !reconcile_encryption_plan_catalog_at(state, unix_time_millis().max(1), minimum_generation)?
     {
@@ -16461,6 +16550,70 @@ mod tests {
     }
 
     #[test]
+    fn restored_encryption_plan_waits_for_one_complete_fleet_cursor_cut() {
+        let members = ["worker-a", "worker-b", "worker-c"]
+            .into_iter()
+            .map(|name| EncryptionGenerationRecipient {
+                node_name: name.to_owned(),
+                node_uid: format!("{name}-uid"),
+            })
+            .collect::<Vec<_>>();
+        let cursor = |member: &EncryptionGenerationRecipient, generation| {
+            unf_encryption::NodeLocalPlanCursor {
+                controller_epoch: 7,
+                recipient: member.clone(),
+                membership_revision: encryption_membership_revision(&members),
+                generation: Revision::new(generation),
+                snapshot_digest: unf_encryption::NodeLocalPlanSnapshotDigest(
+                    [u8::try_from(generation).unwrap(); 32],
+                ),
+            }
+        };
+        let mut observations = Some(BTreeMap::new());
+        assert_eq!(
+            join_encryption_plan_recovery_cursor(
+                &mut observations,
+                &members,
+                &members[0],
+                Some(&cursor(&members[0], 10)),
+                Revision::new(8),
+            ),
+            EncryptionPlanRecoveryJoin::Waiting
+        );
+        assert_eq!(
+            join_encryption_plan_recovery_cursor(
+                &mut observations,
+                &members,
+                &members[2],
+                Some(&cursor(&members[2], 12)),
+                Revision::new(8),
+            ),
+            EncryptionPlanRecoveryJoin::Waiting
+        );
+        assert_eq!(
+            join_encryption_plan_recovery_cursor(
+                &mut observations,
+                &members,
+                &members[1],
+                Some(&cursor(&members[1], 11)),
+                Revision::new(8),
+            ),
+            EncryptionPlanRecoveryJoin::Complete(Revision::new(13))
+        );
+        assert_eq!(observations, None);
+        assert_eq!(
+            join_encryption_plan_recovery_cursor(
+                &mut observations,
+                &members,
+                &members[0],
+                None,
+                Revision::new(8),
+            ),
+            EncryptionPlanRecoveryJoin::Inactive
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn encryption_plan_poll_projects_one_causal_catalog_and_coalesces_retries() {
         let state = new_state(true);
@@ -16622,6 +16775,7 @@ mod tests {
             source: None,
             generation: first.snapshot.generation,
             refresh_at_unix_ms: None,
+            recovery_cursors: Some(BTreeMap::new()),
         };
         let ahead_request = NodeLocalPlanRequest {
             schema_version: unf_encryption::NODE_LOCAL_PLAN_REQUEST_SCHEMA_VERSION,
