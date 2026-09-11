@@ -1137,7 +1137,12 @@ matrix is maintained in the
   The Non-Perturbing Fleet Witness uses one stable host-networked probe per
   Node, fixes selective-before-evidence execution order, and bounds every retry
   to one snapshot without changing runtime `32b5501`; ADR 0230. The complete
-  cl02 gate remains mandatory.
+  cl02 reboot then exposed an expired Active-plus-Prepared key pair that kept
+  the restored Native selector bound to an obsolete policy revision while
+  fresh fleet-plan reconstruction returned retryable `503`. Expired Authority
+  Recovery atomically revokes the unusable two-slot authority and prepares a
+  fresh fleet-aligned epoch without plaintext fallback or BPF ABI change; ADR
+  0231. A rebuilt immutable tuple and the complete cl02 gate remain mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

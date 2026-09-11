@@ -1115,6 +1115,10 @@ pub enum EpochRevocationReason {
     SuspectedCompromise,
     NodeReplacement,
     OperatorEmergency,
+    /// Every locally retained epoch has exceeded its sealed lifetime. The
+    /// complete stale authority is revoked before a fresh fleet-aligned epoch
+    /// is prepared, so restart recovery cannot reuse expired key material.
+    ExpiredAuthorityRecovery,
     /// A key expired before it ever gained mutually attested packet authority.
     ExpiredBeforeActivation,
     /// A peer advanced the public fleet frontier before this local key became

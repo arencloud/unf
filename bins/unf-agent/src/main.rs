@@ -8135,7 +8135,6 @@ impl EncryptionKeySynchronizer {
         now_unix_ms: u64,
     ) -> Result<bool> {
         const MAX_EPOCH_CATCH_UP_STEPS: usize = 4_096;
-
         let lifetime_ms = u64::try_from(self.key_lifetime.as_millis()).unwrap_or(u64::MAX);
         let authority = self
             .authority
@@ -8147,12 +8146,11 @@ impl EncryptionKeySynchronizer {
                 .authority()
                 .publication()
                 .context("inspect public key epoch frontier")?;
-            let active_epoch = authority
-                .authority()
-                .epochs()
-                .iter()
-                .find(|epoch| epoch.phase() == KeyEpochPhase::Active)
-                .map(unf_encryption::LocalKeyEpoch::epoch);
+            if revoke_expired_active_authority(authority, now_unix_ms, bootstrap.epoch_floor)? {
+                changed = true;
+                continue;
+            }
+            let active_epoch = active_encryption_epoch(authority.authority());
             let transition = authority.authority().epochs().iter().find(|epoch| {
                 matches!(
                     epoch.phase(),
@@ -8308,6 +8306,71 @@ impl EncryptionKeySynchronizer {
         }
         Ok(changed)
     }
+}
+
+/// A controller outage can outlive both the active key and a prepared
+/// successor. Neither is usable after its sealed wall-clock lifetime, and the
+/// expired active predecessor cannot enter a positive drain window. Revoke the
+/// complete expired authority before creating a fresh fleet-aligned epoch.
+fn revoke_expired_active_authority(
+    authority: &mut RuntimeNodeKeyAuthority,
+    now_unix_ms: u64,
+    fleet_epoch_floor: u64,
+) -> Result<bool> {
+    let Some((active_epoch, active_valid_until)) = authority
+        .authority()
+        .epochs()
+        .iter()
+        .find(|epoch| epoch.phase() == KeyEpochPhase::Active)
+        .map(|epoch| (epoch.epoch(), epoch.valid_until_unix_ms()))
+    else {
+        return Ok(false);
+    };
+    if now_unix_ms < active_valid_until {
+        return Ok(false);
+    }
+    let transition = authority
+        .authority()
+        .epochs()
+        .iter()
+        .filter(|epoch| {
+            matches!(
+                epoch.phase(),
+                KeyEpochPhase::Prepared | KeyEpochPhase::MutuallyAttested
+            )
+        })
+        .map(|epoch| (epoch.epoch(), epoch.valid_until_unix_ms()))
+        .next()
+        .filter(|(_, valid_until)| now_unix_ms >= *valid_until);
+    if authority.authority().epochs().iter().any(|epoch| {
+        matches!(
+            epoch.phase(),
+            KeyEpochPhase::Prepared | KeyEpochPhase::MutuallyAttested
+        ) && now_unix_ms < epoch.valid_until_unix_ms()
+    }) {
+        return Ok(false);
+    }
+    let revoke_through = transition.map_or(active_epoch, |(epoch, _)| epoch.max(active_epoch));
+    authority
+        .revoke_through(
+            revoke_through,
+            EpochRevocationReason::ExpiredAuthorityRecovery,
+            now_unix_ms,
+        )
+        .context("durably revoke expired active encryption authority")?;
+    warn!(
+        active_epoch,
+        revoke_through, fleet_epoch_floor, "recovered fully expired active encryption authority"
+    );
+    Ok(true)
+}
+
+fn active_encryption_epoch(authority: &NodeKeyAuthority) -> Option<u64> {
+    authority
+        .epochs()
+        .iter()
+        .find(|epoch| epoch.phase() == KeyEpochPhase::Active)
+        .map(unf_encryption::LocalKeyEpoch::epoch)
 }
 
 fn encryption_epoch_retirement_pending(authority: &NodeKeyAuthority) -> bool {
@@ -19679,6 +19742,119 @@ mod tests {
             .unwrap();
         assert_eq!(converged.revoked_through_epoch, 2);
         assert_eq!(converged.epochs[0].epoch, 3);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn encryption_key_epoch_floor_replaces_fully_expired_active_authority() {
+        let temporary = tempdir().unwrap();
+        let recipient = unf_encryption::EncryptionGenerationRecipient {
+            node_name: "worker-a".to_owned(),
+            node_uid: "uid-a".to_owned(),
+        };
+        let bootstrap = EncryptionKeyBootstrap::issue(
+            11,
+            "cluster-a".to_owned(),
+            Revision::new(7),
+            1,
+            recipient.clone(),
+            vec![recipient],
+        )
+        .unwrap();
+        let mut synchronizer = EncryptionKeySynchronizer::new(
+            None,
+            test_controller_client(),
+            temporary.path().join("token"),
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            temporary.path().join("keys").join("authority.json"),
+        )
+        .unwrap()
+        .with_rotation_timing(
+            Duration::from_secs(10),
+            Duration::from_secs(8),
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        synchronizer.bind_bootstrap(&bootstrap).unwrap();
+
+        let first = &synchronizer
+            .authority
+            .as_ref()
+            .unwrap()
+            .authority()
+            .epochs()[0];
+        let first_epoch = first.epoch();
+        let first_valid_until = first.valid_until_unix_ms();
+        synchronizer
+            .authority
+            .as_mut()
+            .unwrap()
+            .activate_epoch(
+                first_epoch,
+                Revision::new(7),
+                first_valid_until - 9_999,
+                1_000,
+            )
+            .unwrap();
+        assert!(
+            prepare_due_encryption_rotation(
+                &mut synchronizer,
+                &bootstrap,
+                first_valid_until - 7_000,
+            )
+            .unwrap()
+        );
+        let successor_valid_until = synchronizer
+            .authority
+            .as_ref()
+            .unwrap()
+            .authority()
+            .epochs()[1]
+            .valid_until_unix_ms();
+
+        assert!(
+            !synchronizer
+                .reconcile_bootstrap_epoch_floor(&bootstrap, first_valid_until)
+                .unwrap()
+        );
+        let still_viable = synchronizer
+            .authority
+            .as_ref()
+            .unwrap()
+            .authority()
+            .publication()
+            .unwrap();
+        assert_eq!(still_viable.revoked_through_epoch, 0);
+        assert_eq!(still_viable.epochs.len(), 2);
+        assert_eq!(still_viable.epochs[0].phase, KeyEpochPhase::Active);
+        assert_eq!(
+            still_viable.epochs[1].phase,
+            KeyEpochPhase::MutuallyAttested
+        );
+
+        assert!(
+            synchronizer
+                .reconcile_bootstrap_epoch_floor(&bootstrap, successor_valid_until)
+                .unwrap()
+        );
+        let recovered = synchronizer
+            .authority
+            .as_ref()
+            .unwrap()
+            .authority()
+            .publication()
+            .unwrap();
+        assert_eq!(recovered.revoked_through_epoch, 2);
+        assert_eq!(recovered.next_epoch, 4);
+        assert_eq!(recovered.epochs.len(), 1);
+        assert_eq!(recovered.epochs[0].epoch, 3);
+        assert_eq!(recovered.epochs[0].phase, KeyEpochPhase::MutuallyAttested);
+        assert_eq!(
+            recovered.epochs[0].valid_from_unix_ms,
+            successor_valid_until
+        );
     }
 
     #[test]

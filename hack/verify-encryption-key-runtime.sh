@@ -39,10 +39,12 @@ require_text 'response\.status\(\) != StatusCode::ACCEPTED' "${agent}"
 require_text 'encryption_key_bootstrap_creates_recovers_and_uid_fences_private_authority' "${agent}"
 require_text 'fn reconcile_bootstrap_epoch_floor' "${agent}"
 require_text 'encryption_key_epoch_floor_heals_abandoned_pre_activation_state' "${agent}"
+require_text 'encryption_key_epoch_floor_replaces_fully_expired_active_authority' "${agent}"
 require_text 'encryption_key_epoch_floor_defers_until_draining_predecessor_retires' "${agent}"
 require_text 'Durable Edge-Key Bootstrap' docs/adr/0183-durable-edge-key-bootstrap.md
 require_text 'Monotonic Fleet Key Epoch Floor' docs/adr/0215-monotonic-fleet-key-epoch-floor.md
 require_text 'Retirement-Before-Catch-Up' docs/adr/0225-retirement-before-catch-up.md
+require_text 'Expired Authority Recovery' docs/adr/0231-expired-authority-recovery.md
 
 if grep -A 12 'pub struct EncryptionKeyBootstrap {' "${schema}" \
   | grep -Eq 'private|secret'; then

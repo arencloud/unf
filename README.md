@@ -1138,6 +1138,15 @@ and bounds each retry to one fleet snapshot. It needs no SSH and changes no
 qualified runtime byte. An independent cleanup latch also restores Native mode
 on every post-migration exit, including interruption before fixture creation;
 ADR 0230.
+The subsequent simultaneous five-Node reboot exposed a deeper recovery edge:
+each Node retained an expired Active key plus an expired Prepared successor,
+while the restored Native map referenced an older controller policy cut. The
+fail-closed TC finalizer correctly denied managed Pod traffic, but the occupied
+two-slot authority prevented fresh fleet-plan reconstruction. Expired Authority
+Recovery now durably revokes and zeroizes the complete unusable key frontier,
+then prepares a fresh controller-floor-aligned epoch. It never revokes a
+still-current Active key, never exports private material, and never converts a
+missing Required path to Native; ADR 0231.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
