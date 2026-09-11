@@ -45,6 +45,7 @@ membership, monotonic transition, nonce, and capsule checks remain mandatory.
 
 The controller regression test reconstructs an older catalog behind an actual
 successor cursor and requires a new complete cut beyond it. The static Kind gate
-checks the bounded direct convergence loop. The full three-Node dual-stack Kind
-transaction, including natural rotation followed immediately by controller
-replacement, remains mandatory before image publication or cl02 deployment.
+checks the bounded direct convergence loop. Runtime `6d29ac3` passed the full
+fresh three-Node dual-stack transaction, including natural rotation followed
+immediately by controller replacement and convergence to a newer complete cut.
+The independent cl02 qualification remains.

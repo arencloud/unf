@@ -55,7 +55,7 @@ reusable responder.
 
 The structural activation-rehydration gate requires the active participation
 path, exact durable admission/recovery match, current-round cache eviction, and
-non-consuming receipt handling. The full three-Node Kind gate must reproduce
-agent recovery, natural key rotation, controller replacement, a strictly newer
-fleet generation, traffic continuity, and exact cleanup before this runtime may
-be published or used by the five-Node OpenShift gate.
+non-consuming receipt handling. Runtime `6d29ac3` passed the full fresh
+three-Node Kind gate, reproducing agent recovery, natural key rotation,
+controller replacement, a strictly newer fleet generation, traffic continuity,
+and exact cleanup. The independent five-Node OpenShift gate remains.

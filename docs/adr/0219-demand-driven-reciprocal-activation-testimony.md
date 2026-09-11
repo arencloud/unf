@@ -62,7 +62,12 @@ The shared wire type is strict and contains no key, receipt, witness, or permit.
 Encryption-library, controller, and agent suites plus strict Clippy validate the
 new boundary. The activation-rehydration structural gate requires demand
 signaling, exact local matching, non-authoritative receipt validation, report
-publication, and ADR tracking. The full fresh Kind transaction—including link
-fault, agent replacement, rotation, controller replacement, post-recovery
-ClusterIP traffic, operations, performance, cleanup, and rollback—remains the
-promotion gate before immutable images or cl02 qualification.
+publication, and ADR tracking. Runtime and qualifier
+`6d29ac33450e66698eb24e0d0f2afdbd6163085c` passed the full fresh Kind
+transaction, including link fault, agent replacement, rotation, controller
+replacement, post-recovery ClusterIP traffic, operations, performance, cleanup,
+and rollback. Evidence JSON SHA-256 is
+`c432111d67ac66dcf0c653c82b81a65cd5d029b44ce2aada5da818d67c07dfde`;
+capture SHA-256 is
+`d5ace8975b64a9193f4ffeb807be08934dec2d0604a47467e876c70b74e8bf73`.
+Immutable image publication and independent cl02 qualification remain.

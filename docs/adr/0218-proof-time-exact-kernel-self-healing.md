@@ -49,6 +49,6 @@ no key or kernel mutation.
 
 The activation-rehydration gate requires both pending and active proof-time
 repair paths and the existing provider repair primitive. Agent tests and strict
-Clippy must pass. The full Kind gate deliberately lowers the exact owned link,
-then requires natural rotation, agent and controller recovery, ciphertext,
-traffic continuity, cleanup, and rollback before publication.
+Clippy pass. Runtime `6d29ac3` passed the full fresh Kind gate: it deliberately
+lowered the exact owned link, then completed natural rotation, agent and
+controller recovery, ciphertext, traffic continuity, cleanup, and rollback.
