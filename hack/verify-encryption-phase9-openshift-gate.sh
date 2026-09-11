@@ -95,6 +95,8 @@ require 'Immutable Tombstone-Handoff Kind Requalification' \
     "${root}/docs/adr/0241-immutable-tombstone-handoff-kind-requalification.md"
 require 'Admitted Predecessor Settlement' \
     "${root}/docs/adr/0242-admitted-predecessor-settlement.md"
+require 'Immutable Admitted-Predecessor Kind Requalification' \
+    "${root}/docs/adr/0243-immutable-admitted-predecessor-kind-requalification.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"

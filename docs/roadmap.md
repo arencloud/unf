@@ -1176,7 +1176,8 @@ matrix is maintained in the
   pending generation preceding the restored newer plan on all five Nodes.
   Admitted Predecessor Settlement completes that consuming capability before
   compiling its successor and rejects every cursor/journal mismatch; ADR 0242.
-  Its runtime must repeat fresh Kind before cl02 resumes.
+  Exact runtime `180ae2f` passed the fresh full Kind lifecycle and ADR 0243
+  binds its immutable public images and evidence for the resumed cl02 gate.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

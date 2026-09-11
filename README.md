@@ -1202,6 +1202,10 @@ plan had advanced. Admitted Predecessor Settlement verifies its volatile,
 cursor, and journal views are identical, completes the predecessor through the
 ordinary live proof and map commit, and only then compiles the successor. It
 never treats the newer plan as authority to erase or skip admission; ADR 0242.
+Exact runtime `180ae2f` passed the complete fresh three-Node dual-stack,
+kube-proxy-free Kind lifecycle after that change. ADR 0243 binds its anonymous
+Linux/amd64 public images, evidence, and packet capture as the only tuple
+eligible for the resumed cl02 rollout.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
