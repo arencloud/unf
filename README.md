@@ -1021,10 +1021,11 @@ immutable provenance, both encryption modes, IPv4/IPv6 PodIP and Service paths,
 ciphertext-only Required capture, simultaneous Native exception, link-failure
 denial, natural rotation, controller/agent recovery, causal operations,
 performance, egress coexistence, exact cleanup, and optional primary-CNI
-rollback. `make encryption-phase9-kind-gate-test`; ADR 0212. Runtime `6fe2a92`,
-qualified by `e1fc112`, passed that fresh three-Node dual-stack Kubernetes
-v1.35.0 transaction. Evidence JSON SHA-256 is `f35a0ede…035`; the independently
-hashed packet capture recorded 333 WireGuard frames and zero Required-path
+rollback. `make encryption-phase9-kind-gate-test`; ADR 0212. Runtime `1dbef4d`,
+qualified by the same committed revision, passed that fresh three-Node
+dual-stack Kubernetes v1.35.0 transaction. Evidence JSON SHA-256 is
+`d73bd08d…708`; the independently hashed packet capture recorded 280 WireGuard
+frames and zero Required-path
 plaintext frames. Milestone 9.8 is Verified; 9.9 independently qualifies the
 same immutable runtime on five-Node dual-stack OpenShift.
 The first OpenShift transition also added the Causal Pre-Attachment Fleet

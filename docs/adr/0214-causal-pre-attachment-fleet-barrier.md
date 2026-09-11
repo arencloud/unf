@@ -53,5 +53,10 @@ instead of installing an empty authority island.
 The focused agent test proves that an empty island cannot satisfy the attachment
 predicate, including the otherwise quiescent/no-revalidation state. Strict
 Clippy covers the implementation. `make encryption-phase9-openshift-gate-test`
-checks the staged rollout contract, and the exact runtime must pass Kind again
-before a new digest tuple may return to cl02.
+checks the staged rollout contract. Exact runtime and qualification revision
+`1dbef4d6a75a6c2b97c276267f7b43d95b6cae41` then passed the complete fresh
+three-Node dual-stack Kind gate. The evidence JSON SHA-256 is
+`d73bd08db6992c8ddd1855f0f5173d6fa39d91b46fee389500e41ae2f4da8708` and the
+packet-capture SHA-256 is
+`2f944751d201d33efddf417dd842d20aa0ce95a82d83da10df9a3b7389492ed7`.
+Only an image tuple built from that runtime may return to cl02.

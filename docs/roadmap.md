@@ -1032,8 +1032,8 @@ matrix is maintained in the
   rotation authority, transactional WireGuard provider, coalesced fast path,
   bidirectional live proof, secret-free operations, recovery, and benchmarks.
   Milestone 9.8 passed its independent kube-proxy-free three-Node dual-stack
-  Kind gate at runtime `6fe2a92`, qualified by `e1fc112`, with evidence SHA-256
-  `f35a0ede…035`. Milestone 9.9 now requires the same immutable runtime on the
+  Kind gate at safety-fixed runtime and qualifier `1dbef4d`, with evidence
+  SHA-256 `d73bd08d…708`. Milestone 9.9 now requires the same immutable runtime on the
   independent five-Node OpenShift gate; ADRs 0158 and 0212.
 - Phase 9.9 adds a Causal Pre-Attachment Fleet Barrier for adjacent upgrades:
   new agents can exchange authenticated facts while the prior TC program stays
