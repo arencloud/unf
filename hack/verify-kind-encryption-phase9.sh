@@ -187,6 +187,21 @@ wait_generation() {
     return 1
 }
 
+wait_generation_after() {
+    local predecessor=$1 snapshot= generation=
+    for _ in $(seq 1 240); do
+        snapshot=$(wait_generation true)
+        generation=$(jq -r '.[0].generation' <<<"${snapshot}")
+        if [[ ${generation} =~ ^[0-9]+$ ]] && (( generation > predecessor )); then
+            printf '%s\n' "${snapshot}"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "encryption generation did not advance beyond ${predecessor}" >&2
+    return 1
+}
+
 set_baseline() {
     local value=$1
     "${kc[@]}" -n unf-system set env deployment/unf-controller \
@@ -277,6 +292,8 @@ jq -e 'length == 4 and all(.[];
 
 qualification_stage=default-required
 set_baseline required
+pre_fixture_generation=$(wait_generation true)
+pre_fixture_generation=$(jq -r '.[0].generation' <<<"${pre_fixture_generation}")
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Namespace
@@ -357,7 +374,7 @@ spec:
 EOF
 resources_created=true
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pods --all --timeout=180s >/dev/null
-default_generation=$(wait_generation true)
+default_generation=$(wait_generation_after "${pre_fixture_generation}")
 required_pod4=$("${kc[@]}" -n "${namespace}" get pod required-server -o json | jq -er '.status.podIPs[].ip | select(contains("."))')
 required_pod6=$("${kc[@]}" -n "${namespace}" get pod required-server -o json | jq -er '.status.podIPs[].ip | select(contains(":"))')
 native_pod4=$("${kc[@]}" -n "${namespace}" get pod native-server -o json | jq -er '.status.podIPs[].ip | select(contains("."))')
@@ -371,6 +388,7 @@ traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service
 
 qualification_stage=selective-native-exception
 set_baseline native
+pre_selective_generation=$(jq -r '.[0].generation' <<<"${default_generation}")
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: network.unf.io/v1alpha1
 kind: EncryptionPolicy
@@ -385,7 +403,7 @@ spec:
   destinations:
     matchLabels: {app: required-server}
 EOF
-selective_generation=$(wait_generation true)
+selective_generation=$(wait_generation_after "${pre_selective_generation}")
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
 traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
 
