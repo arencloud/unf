@@ -504,9 +504,13 @@ traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required
 initial_epoch=$(jq -r --arg node "${source_node}" '.[] | select(.node == $node) | .epochs | max' <<<"${recovered_generation}")
 rotated_generation=$(wait_epoch_change "${initial_epoch}")
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
+pre_restart_generation=$(jq -r '.[0].generation' <<<"${rotated_generation}")
 "${kc[@]}" -n unf-system rollout restart deployment/unf-controller >/dev/null
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=180s >/dev/null
-restart_generation=$(wait_generation true)
+# A Ready replacement Pod is not evidence that its reconstructed causal plan
+# has crossed the agents. Fence later cleanup behind one strictly newer,
+# fleet-active generation so intent deletion cannot strand an admitted cut.
+restart_generation=$(wait_generation_after "${pre_restart_generation}")
 
 qualification_stage=operations-and-performance
 operations_status=$(controller_raw /v1/encryption/status)
