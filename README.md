@@ -1036,6 +1036,13 @@ Interrupted pre-activation key state now heals through a Monotonic Fleet Key
 Epoch Floor: an expired never-active epoch is durably tombstoned, its public
 successor raises a controller-signed floor, and lagging members converge without
 key reuse, private-key exchange, or lifetime-scale waiting; ADR 0215.
+Controller recovery also preserves duplex-proof liveness through a Reciprocal
+Active-Generation Proof Service. Already-committed Nodes answer only fresh,
+authenticated rounds for their byte-matched durable generation, publish normal
+two-ended kernel/ciphertext evidence, and discard the resulting receipts. They
+gain no new authority, while a peer still holding activation escrow can finish
+without replaying pre-restart nonces or waiting for another generation; ADR
+0216.
 This avoids both mixed-version management-path loss and the tempting but unsafe
 alternative of treating absent Required authority as Native; ADR 0214.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test

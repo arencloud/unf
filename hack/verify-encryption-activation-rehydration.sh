@@ -28,12 +28,19 @@ require_text 'fn select_encryption_recovery_slot' "${agent}"
 require_text 'prepared\.recovery_plan\(\)' "${agent}"
 require_text 'async fn rehydrate_local_proof' "${agent}"
 require_text 'async fn activate_admitted_encryption_generation' "${agent}"
+require_text 'fn active_path_proof_state' "${agent}"
+require_text 'async fn assist_active_encryption_path_proofs' "${agent}"
+require_text 'active\.fact\.checkpoint != admitted\.checkpoint' "${agent}"
+require_text 'missing_assignments' "${agent}"
+require_text 'participate in current active-generation path proof rounds' "${agent}"
+require_text 'let _ = collect_live_encryption_path_receipts' "${agent}"
 require_text 'rehydrate_local_proof\([^)]*\)\.await\?' "${agent}"
 require_text 'requires a fresh Node-local tri-plane activation latch before TC attachment' "${agent}"
 require_text 'recovery_plan_rehydrates_fresh_capability_and_rejects_serialized_authority' crates/unf-encryption/src/fast_path.rs
 require_text 'encryption_recovery_plan_is_owner_only_and_fail_closed' "${agent}"
 require_text 'encryption_recovery_slot_prioritizes_admitted_successor_then_current' "${agent}"
 require_text 'Proof-Rehydrating Activation Escrow' docs/adr/0176-proof-rehydrating-activation-escrow.md
+require_text 'Reciprocal Active-Generation Proof Service' docs/adr/0216-reciprocal-active-generation-proof-service.md
 require_text 'encryption-activation-rehydration-test' docs/project-status.md
 
 rehydrate_line="$(grep -nE 'rehydrate_local_proof\([^)]*\)\.await\?' "${agent}" | head -1 | cut -d: -f1)"

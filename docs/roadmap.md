@@ -1046,6 +1046,11 @@ matrix is maintained in the
   the same successor without reusing key identity, exchanging secrets, or
   waiting for independently staggered lifetimes. Active/draining authority
   cannot leap and bounded catch-up fails closed; ADR 0215.
+- Fresh path-proof rounds survive controller replacement through reciprocal
+  active-generation participation. A byte-matched, already-revalidated Node
+  answers and attests current nonce-bound rounds but discards receipts and gains
+  no activation authority, allowing a still-pending peer to complete the exact
+  two-ended quorum without replay or forced generation churn; ADR 0216.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

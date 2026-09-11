@@ -9086,6 +9086,45 @@ impl EncryptionGenerationSynchronizer {
         Ok(Some((admitted.recipient.clone(), desired, plans)))
     }
 
+    /// Reconstructs non-authoritative proof-participation state for the
+    /// already-active generation. Controller recovery deliberately replaces
+    /// nonce-bound path rounds. A Node that has already committed the same
+    /// generation must therefore remain available to answer and attest those
+    /// fresh rounds for a peer that is still holding activation escrow.
+    fn active_path_proof_state(
+        &self,
+    ) -> Result<
+        Option<(
+            unf_encryption::EncryptionGenerationRecipient,
+            unf_encryption::EncryptionFastPathState,
+            Vec<unf_encryption::WireGuardKernelPlan>,
+        )>,
+    > {
+        if self.pending.is_some() || !self.active_revalidated {
+            return Ok(None);
+        }
+        let Some(admitted) = self.current.as_ref() else {
+            return Ok(None);
+        };
+        let Some(active) = self.recovery.active.as_ref() else {
+            return Ok(None);
+        };
+        if active.fact.recipient != admitted.recipient
+            || active.fact.checkpoint != admitted.checkpoint
+        {
+            bail!("active encryption proof assistance does not match durable admission");
+        }
+        let desired = admitted
+            .checkpoint
+            .desired_state()
+            .context("rebuild active desired generation for path proof assistance")?;
+        Ok(Some((
+            admitted.recipient.clone(),
+            desired,
+            active.plans.clone(),
+        )))
+    }
+
     async fn ensure_probe_routes(&mut self) -> Result<bool> {
         let Some(pending) = self.pending.take() else {
             return Ok(false);
@@ -10024,12 +10063,29 @@ async fn collect_live_encryption_path_receipts(
         .iter()
         .map(|assignment| assignment.round.round_digest)
         .collect::<BTreeSet<_>>();
-    generations
-        .path_proofs
-        .retain(|round, proof| assignment_rounds.contains(round) && proof.round_digest == *round);
-    for proof in execute_live_encryption_path_proofs(recipient, desired, plans, &assignments)
-        .await
-        .context("execute workload-independent encrypted path challenges")?
+    generations.path_proofs.retain(|round, proof| {
+        assignment_rounds.contains(round)
+            && assignments.iter().any(|assignment| {
+                assignment.round.round_digest == *round
+                    && proof.round_digest == *round
+                    && proof
+                        .verify(&assignment.round, current_unix_time_milliseconds())
+                        .is_ok()
+            })
+    });
+    let missing_assignments = assignments
+        .iter()
+        .filter(|assignment| {
+            !generations
+                .path_proofs
+                .contains_key(&assignment.round.round_digest)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for proof in
+        execute_live_encryption_path_proofs(recipient, desired, plans, &missing_assignments)
+            .await
+            .context("execute workload-independent encrypted path challenges")?
     {
         generations
             .path_proofs
@@ -10074,6 +10130,21 @@ async fn collect_live_encryption_path_receipts(
         .json()
         .await
         .context("decode encryption path receipts")
+}
+
+async fn assist_active_encryption_path_proofs(
+    generations: &mut EncryptionGenerationSynchronizer,
+) -> Result<bool> {
+    let Some((recipient, desired, plans)) = generations.active_path_proof_state()? else {
+        return Ok(false);
+    };
+    // Receipts authorize only a pending activation latch. An already-active
+    // Node contributes fresh endpoint evidence but never consumes the
+    // resulting receipt as new local authority.
+    let _ = collect_live_encryption_path_receipts(generations, &recipient, &desired, &plans)
+        .await
+        .context("participate in current active-generation path proof rounds")?;
+    Ok(true)
 }
 
 async fn activate_admitted_encryption_generation(
@@ -15794,6 +15865,14 @@ async fn consume_events(
                     ).await
                 {
                     warn!(error = ?error, "encrypted path activation is not complete; retaining the pending proof capability and active predecessor");
+                }
+                if encryption_generations.pending_activation_report.is_none()
+                    && !encryption_generations.has_controller_admission()
+                    && let Err(error) = assist_active_encryption_path_proofs(
+                        encryption_generations,
+                    ).await
+                {
+                    warn!(error = ?error, "active encryption generation could not assist a fresh peer path-proof round");
                 }
                 if encryption_generations.pending_activation_report.is_some()
                     && let Err(error) = publish_pending_encryption_activation(
