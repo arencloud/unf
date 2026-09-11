@@ -17,10 +17,10 @@ use crate::{
 };
 
 pub const NODE_KEY_TRANSPARENCY_CUT_SCHEMA_VERSION: u16 = 1;
-pub const ENCRYPTION_KEY_BOOTSTRAP_SCHEMA_VERSION: u16 = 1;
+pub const ENCRYPTION_KEY_BOOTSTRAP_SCHEMA_VERSION: u16 = 2;
 pub const MAX_KEY_TRANSPARENCY_MEMBERS: usize = 4_096;
 const NODE_KEY_TRANSPARENCY_CUT_DIGEST_DOMAIN: &[u8] = b"unf.node-key-transparency-cut.v1\0";
-const ENCRYPTION_KEY_BOOTSTRAP_DIGEST_DOMAIN: &[u8] = b"unf.encryption-key-bootstrap.v1\0";
+const ENCRYPTION_KEY_BOOTSTRAP_DIGEST_DOMAIN: &[u8] = b"unf.encryption-key-bootstrap.v2\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -51,6 +51,10 @@ pub struct EncryptionKeyBootstrap {
     pub controller_epoch: u64,
     pub cluster_id: String,
     pub membership_revision: Revision,
+    /// Greatest fleet epoch that a joining member must reach before a
+    /// reciprocal attestation round can be complete. This is a monotonic
+    /// public-only frontier; it never transfers Node-local authority material.
+    pub epoch_floor: u64,
     pub recipient: EncryptionGenerationRecipient,
     pub members: Vec<EncryptionGenerationRecipient>,
     pub bootstrap_digest: EncryptionKeyBootstrapDigest,
@@ -148,12 +152,13 @@ impl EncryptionKeyBootstrap {
         controller_epoch: u64,
         cluster_id: String,
         membership_revision: Revision,
+        epoch_floor: u64,
         recipient: EncryptionGenerationRecipient,
         mut members: Vec<EncryptionGenerationRecipient>,
     ) -> Result<Self, NodeKeyTransparencyError> {
         members.sort();
         validate_membership(&cluster_id, membership_revision, &members)?;
-        if controller_epoch == 0 || members.binary_search(&recipient).is_err() {
+        if controller_epoch == 0 || epoch_floor == 0 || members.binary_search(&recipient).is_err() {
             return Err(NodeKeyTransparencyError::InvalidBootstrap);
         }
         let mut bootstrap = Self {
@@ -161,6 +166,7 @@ impl EncryptionKeyBootstrap {
             controller_epoch,
             cluster_id,
             membership_revision,
+            epoch_floor,
             recipient,
             members,
             bootstrap_digest: EncryptionKeyBootstrapDigest([0; 32]),
@@ -176,6 +182,7 @@ impl EncryptionKeyBootstrap {
         validate_membership(&self.cluster_id, self.membership_revision, &self.members)?;
         if self.schema_version != ENCRYPTION_KEY_BOOTSTRAP_SCHEMA_VERSION
             || self.controller_epoch == 0
+            || self.epoch_floor == 0
             || self.members.binary_search(&self.recipient).is_err()
             || self.bootstrap_digest != self.calculate_digest()?
         {
@@ -206,6 +213,26 @@ impl EncryptionKeyBootstrap {
 }
 
 impl NodeKeyTransparencyLedger {
+    /// Returns the monotonic public epoch frontier observed for this exact
+    /// membership. An empty controller starts at epoch one. A member that
+    /// abandons an unactivated epoch raises the floor so every other member
+    /// converges without waiting for its own key lifetime to expire.
+    #[must_use]
+    pub fn epoch_floor(&self) -> u64 {
+        self.publications
+            .values()
+            .map(|publication| {
+                publication
+                    .next_epoch
+                    .saturating_sub(1)
+                    .max(publication.revoked_through_epoch.saturating_add(1))
+                    .max(publication.retired_through_epoch.saturating_add(1))
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
+
     /// Replaces the exact membership frontier. Any real change drops all
     /// observations atomically so publications cannot cross topology cuts.
     ///

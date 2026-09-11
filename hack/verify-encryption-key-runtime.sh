@@ -19,6 +19,8 @@ schema=crates/unf-encryption/src/key_transparency.rs
 
 require_text 'pub struct EncryptionKeyBootstrap' "${schema}"
 require_text 'pub fn required_peer_uids' "${schema}"
+require_text 'pub epoch_floor: u64' "${schema}"
+require_text 'pub fn epoch_floor' "${schema}"
 require_text 'discover_encryption_cluster_id' "${controller}"
 require_text '\.get\("kube-system"\)' "${controller}"
 require_text '"/v1/state/encryption-key-bootstrap"' "${controller}"
@@ -35,7 +37,10 @@ require_text '\.prepare_epoch\(' "${agent}"
 require_text 'public-only Node encryption key state' "${agent}"
 require_text 'response\.status\(\) != StatusCode::ACCEPTED' "${agent}"
 require_text 'encryption_key_bootstrap_creates_recovers_and_uid_fences_private_authority' "${agent}"
+require_text 'fn reconcile_bootstrap_epoch_floor' "${agent}"
+require_text 'encryption_key_epoch_floor_heals_abandoned_pre_activation_state' "${agent}"
 require_text 'Durable Edge-Key Bootstrap' docs/adr/0183-durable-edge-key-bootstrap.md
+require_text 'Monotonic Fleet Key Epoch Floor' docs/adr/0215-monotonic-fleet-key-epoch-floor.md
 
 if grep -A 12 'pub struct EncryptionKeyBootstrap {' "${schema}" \
   | grep -Eq 'private|secret'; then

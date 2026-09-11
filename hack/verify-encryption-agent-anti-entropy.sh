@@ -25,7 +25,7 @@ require_text 'fact_response\.status\(\) != StatusCode::ACCEPTED' "${agent}"
 require_text 'fn admit_exact_echo' "${agent}"
 require_text 'verify_controller_admission\(&candidate\)' "${agent}"
 require_text 'persist_secure_json\(&self\.state_path, &candidate' "${agent}"
-require_text 'prepared_fact\(\)\.is_some\(\)' "${agent}"
+require_text 'fact_for_publication\(\)\.is_some\(\)' "${agent}"
 require_text 'pub fn verify_controller_admission' "${local_orchestrator}"
 require_text 'encryption_generation_without_local_proof_never_polls_controller' "${agent}"
 require_text 'Echo-Sealed Agent Anti-Entropy Loop' docs/adr/0175-echo-sealed-agent-anti-entropy-loop.md

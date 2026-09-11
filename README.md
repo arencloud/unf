@@ -1032,6 +1032,10 @@ The first OpenShift transition also added the Causal Pre-Attachment Fleet
 Barrier: a new agent may publish authenticated Node-local facts while its prior
 persistent TC path remains authoritative, but cannot expose the new tail graph
 or become Ready until the complete fleet commits a proof-carrying generation.
+Interrupted pre-activation key state now heals through a Monotonic Fleet Key
+Epoch Floor: an expired never-active epoch is durably tombstoned, its public
+successor raises a controller-signed floor, and lagging members converge without
+key reuse, private-key exchange, or lifetime-scale waiting; ADR 0215.
 This avoids both mixed-version management-path loss and the tempting but unsafe
 alternative of treating absent Required authority as Native; ADR 0214.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test

@@ -93,11 +93,12 @@ use unf_encryption::{
     EncryptionPathActivationReceipt, EncryptionPathChallengeDelivery, EncryptionPathEndpointRole,
     EncryptionPathProbeExchange, EncryptionPathProbeFrame, EncryptionPathProbeKind,
     EncryptionPathProofAssignment, EncryptionPathProofRoundDigest,
-    EncryptionRoutePublicationPermit, EpochDrainProof, FileNodeKeyStateStore, KeyEpochPhase,
-    LinuxEncryptionRouteProvider, LinuxPreparedLocalGeneration, LinuxWireGuardProvider,
-    NodeKeyAttestationCut, NodeKeyAttestationRound, NodeKeyAuthority, NodeLocalPlanRequest,
-    NodeLocalRecoveryPlan, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
-    OsWireGuardKeyGenerator, WireGuardKernelPlan,
+    EncryptionRoutePublicationPermit, EpochDrainProof, EpochRevocationReason,
+    FileNodeKeyStateStore, KeyEpochPhase, LinuxEncryptionRouteProvider,
+    LinuxPreparedLocalGeneration, LinuxWireGuardProvider, NodeKeyAttestationCut,
+    NodeKeyAttestationRound, NodeKeyAuthority, NodeLocalPlanRequest, NodeLocalRecoveryPlan,
+    NodeSealedGenerationCapsule, NodeSealedPlanCapsule, OsWireGuardKeyGenerator,
+    WireGuardKernelPlan,
 };
 use unf_gobgp::GoBgpAdapter;
 use unf_ipam::{
@@ -8062,46 +8063,137 @@ impl EncryptionKeySynchronizer {
             {
                 bail!("encryption key bootstrap changed immutable Node authority");
             }
-            return Ok(());
-        }
-
-        ensure_encryption_key_directory(&self.state_path)?;
-        let store = FileNodeKeyStateStore::new(self.state_path.clone());
-        let authority = match fs::symlink_metadata(&self.state_path) {
-            Ok(_) => store
-                .restore(
-                    &bootstrap.cluster_id,
-                    &bootstrap.recipient.node_name,
-                    &bootstrap.recipient.node_uid,
+        } else {
+            ensure_encryption_key_directory(&self.state_path)?;
+            let store = FileNodeKeyStateStore::new(self.state_path.clone());
+            let authority = match fs::symlink_metadata(&self.state_path) {
+                Ok(_) => store
+                    .restore(
+                        &bootstrap.cluster_id,
+                        &bootstrap.recipient.node_name,
+                        &bootstrap.recipient.node_uid,
+                    )
+                    .context("restore exact Node-local encryption key authority")?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => NodeKeyAuthority::new(
+                    bootstrap.cluster_id.clone(),
+                    bootstrap.recipient.node_name.clone(),
+                    bootstrap.recipient.node_uid.clone(),
                 )
-                .context("restore exact Node-local encryption key authority")?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => NodeKeyAuthority::new(
-                bootstrap.cluster_id.clone(),
-                bootstrap.recipient.node_name.clone(),
-                bootstrap.recipient.node_uid.clone(),
-            )
-            .context("create Node-local encryption key authority")?,
-            Err(error) => return Err(error).context("inspect encryption key checkpoint"),
-        };
-        let mut durable =
-            DurableNodeKeyAuthority::create(authority, store, OsWireGuardKeyGenerator)
-                .context("bind durable Node-local encryption key authority")?;
-        if durable.authority().epochs().is_empty() {
-            let now = current_unix_time_milliseconds();
-            let valid_until = now
-                .checked_add(u64::try_from(self.key_lifetime.as_millis()).unwrap_or(u64::MAX))
+                .context("create Node-local encryption key authority")?,
+                Err(error) => return Err(error).context("inspect encryption key checkpoint"),
+            };
+            self.authority = Some(
+                DurableNodeKeyAuthority::create(authority, store, OsWireGuardKeyGenerator)
+                    .context("bind durable Node-local encryption key authority")?,
+            );
+        }
+        self.reconcile_bootstrap_epoch_floor(bootstrap, current_unix_time_milliseconds().max(1))?;
+        Ok(())
+    }
+
+    /// Heals an interrupted pre-activation epoch without weakening the
+    /// monotonic public-key history. The first member that abandons an expired
+    /// epoch raises the controller-signed fleet floor; lagging members then
+    /// tombstone their still-unactivated predecessor and converge immediately
+    /// instead of waiting for independent lifetime expiry.
+    fn reconcile_bootstrap_epoch_floor(
+        &mut self,
+        bootstrap: &EncryptionKeyBootstrap,
+        now_unix_ms: u64,
+    ) -> Result<bool> {
+        const MAX_EPOCH_CATCH_UP_STEPS: usize = 4_096;
+
+        let lifetime_ms = u64::try_from(self.key_lifetime.as_millis()).unwrap_or(u64::MAX);
+        let authority = self
+            .authority
+            .as_mut()
+            .context("Node-local key authority is unavailable for epoch reconciliation")?;
+        let mut changed = false;
+        for _ in 0..MAX_EPOCH_CATCH_UP_STEPS {
+            let publication = authority
+                .authority()
+                .publication()
+                .context("inspect public key epoch frontier")?;
+            let active_epoch = authority
+                .authority()
+                .epochs()
+                .iter()
+                .find(|epoch| epoch.phase() == KeyEpochPhase::Active)
+                .map(unf_encryption::LocalKeyEpoch::epoch);
+            let transition = authority.authority().epochs().iter().find(|epoch| {
+                matches!(
+                    epoch.phase(),
+                    KeyEpochPhase::Prepared | KeyEpochPhase::MutuallyAttested
+                )
+            });
+
+            if let Some(transition) = transition {
+                let epoch = transition.epoch();
+                let expired = now_unix_ms >= transition.valid_until_unix_ms();
+                if active_epoch.is_none() && (expired || epoch < bootstrap.epoch_floor) {
+                    let reason = if expired {
+                        EpochRevocationReason::ExpiredBeforeActivation
+                    } else {
+                        EpochRevocationReason::FleetEpochSuperseded
+                    };
+                    authority
+                        .revoke_through(epoch, reason, now_unix_ms)
+                        .context("durably tombstone abandoned pre-activation key epoch")?;
+                    warn!(
+                        epoch,
+                        fleet_epoch_floor = bootstrap.epoch_floor,
+                        ?reason,
+                        "recovered abandoned pre-activation encryption key epoch"
+                    );
+                    changed = true;
+                    continue;
+                }
+                if epoch < bootstrap.epoch_floor {
+                    bail!(
+                        "active encryption transition epoch {epoch} is behind fleet floor {}",
+                        bootstrap.epoch_floor
+                    );
+                }
+                return Ok(changed);
+            }
+
+            if let Some(active_epoch) = active_epoch {
+                if active_epoch >= bootstrap.epoch_floor {
+                    return Ok(changed);
+                }
+                if publication.next_epoch != bootstrap.epoch_floor {
+                    bail!(
+                        "active encryption epoch {active_epoch} cannot safely leap to fleet floor {}",
+                        bootstrap.epoch_floor
+                    );
+                }
+            }
+
+            let valid_until = now_unix_ms
+                .checked_add(lifetime_ms)
                 .context("initial encryption key lifetime overflowed")?;
-            durable
+            let epoch = authority
                 .prepare_epoch(
                     bootstrap.membership_revision,
                     bootstrap.required_peer_uids(),
-                    now,
+                    now_unix_ms,
                     valid_until,
                 )
-                .context("durably prepare initial Node-local key epoch")?;
+                .context("durably prepare fleet-aligned Node-local key epoch")?;
+            changed = true;
+            if epoch < bootstrap.epoch_floor {
+                authority
+                    .revoke_through(
+                        epoch,
+                        EpochRevocationReason::FleetEpochSuperseded,
+                        now_unix_ms,
+                    )
+                    .context("durably skip a never-active key epoch below the fleet floor")?;
+                continue;
+            }
+            return Ok(changed);
         }
-        self.authority = Some(durable);
-        Ok(())
+        bail!("encryption epoch catch-up exceeded {MAX_EPOCH_CATCH_UP_STEPS} bounded steps")
     }
 
     fn bind_attestation_cut(
@@ -19015,6 +19107,7 @@ mod tests {
             11,
             "cluster-a".to_owned(),
             Revision::new(7),
+            1,
             recipient,
             vec![unf_encryption::EncryptionGenerationRecipient {
                 node_name: "worker-a".to_owned(),
@@ -19081,6 +19174,7 @@ mod tests {
             11,
             "cluster-a".to_owned(),
             Revision::new(7),
+            1,
             recipient.clone(),
             vec![recipient],
         )
@@ -19136,6 +19230,7 @@ mod tests {
             12,
             "cluster-a".to_owned(),
             Revision::new(8),
+            1,
             unf_encryption::EncryptionGenerationRecipient {
                 node_name: "worker-a".to_owned(),
                 node_uid: "replacement-uid".to_owned(),
@@ -19147,6 +19242,93 @@ mod tests {
         )
         .unwrap();
         assert!(recovered.bind_bootstrap(&replacement).is_err());
+    }
+
+    #[test]
+    fn encryption_key_epoch_floor_heals_abandoned_pre_activation_state() {
+        let temporary = tempdir().unwrap();
+        let members = vec![
+            unf_encryption::EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-a".to_owned(),
+            },
+            unf_encryption::EncryptionGenerationRecipient {
+                node_name: "worker-b".to_owned(),
+                node_uid: "uid-b".to_owned(),
+            },
+        ];
+        let bootstrap = EncryptionKeyBootstrap::issue(
+            11,
+            "cluster-a".to_owned(),
+            Revision::new(7),
+            1,
+            members[0].clone(),
+            members.clone(),
+        )
+        .unwrap();
+        let mut synchronizer = EncryptionKeySynchronizer::new(
+            None,
+            test_controller_client(),
+            temporary.path().join("token"),
+            Duration::from_secs(2),
+            "worker-a".to_owned(),
+            temporary.path().join("keys").join("authority.json"),
+        )
+        .unwrap()
+        .with_rotation_timing(
+            Duration::from_secs(600),
+            Duration::from_secs(480),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        synchronizer.bind_bootstrap(&bootstrap).unwrap();
+        let expired_at = synchronizer
+            .authority
+            .as_ref()
+            .unwrap()
+            .authority()
+            .epochs()[0]
+            .valid_until_unix_ms();
+
+        assert!(
+            synchronizer
+                .reconcile_bootstrap_epoch_floor(&bootstrap, expired_at)
+                .unwrap()
+        );
+        let recovered = synchronizer
+            .authority
+            .as_ref()
+            .unwrap()
+            .authority()
+            .publication()
+            .unwrap();
+        assert_eq!(recovered.revoked_through_epoch, 1);
+        assert_eq!(recovered.epochs[0].epoch, 2);
+
+        let advanced = EncryptionKeyBootstrap::issue(
+            11,
+            "cluster-a".to_owned(),
+            Revision::new(7),
+            3,
+            members[0].clone(),
+            members,
+        )
+        .unwrap();
+        assert!(
+            synchronizer
+                .reconcile_bootstrap_epoch_floor(&advanced, expired_at)
+                .unwrap()
+        );
+        let converged = synchronizer
+            .authority
+            .as_ref()
+            .unwrap()
+            .authority()
+            .publication()
+            .unwrap();
+        assert_eq!(converged.revoked_through_epoch, 2);
+        assert_eq!(converged.epochs[0].epoch, 3);
     }
 
     fn complete_reciprocal_attestation_cut(
@@ -19236,6 +19418,7 @@ mod tests {
             11,
             "cluster-a".to_owned(),
             Revision::new(7),
+            1,
             members[0].clone(),
             members.clone(),
         )

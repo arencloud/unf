@@ -10521,10 +10521,12 @@ fn encryption_key_bootstrap_for(
                 "authenticated agent Node is absent from encryption key membership",
             )
         })?;
+    let epoch_floor = mutex_lock(&state.encryption_key_transparency).epoch_floor();
     EncryptionKeyBootstrap::issue(
         state.identity_epoch,
         state.encryption_cluster_id.clone(),
         membership_revision,
+        epoch_floor,
         recipient,
         members,
     )

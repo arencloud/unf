@@ -1115,6 +1115,11 @@ pub enum EpochRevocationReason {
     SuspectedCompromise,
     NodeReplacement,
     OperatorEmergency,
+    /// A key expired before it ever gained mutually attested packet authority.
+    ExpiredBeforeActivation,
+    /// A peer advanced the public fleet frontier before this local key became
+    /// active, so the unpublished transition is causally obsolete.
+    FleetEpochSuperseded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

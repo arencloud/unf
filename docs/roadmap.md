@@ -1040,6 +1040,12 @@ matrix is maintained in the
   authoritative, but no new tail-call graph or attachment is published until
   the full current fleet commits one proof-carrying generation. Missing
   authority never masquerades as Native; ADR 0214.
+- Interrupted pre-activation key preparation heals through a Monotonic Fleet
+  Key Epoch Floor. The first recovered Node durably tombstones its expired
+  never-active epoch and raises a signed public frontier; lagging members adopt
+  the same successor without reusing key identity, exchanging secrets, or
+  waiting for independently staggered lifetimes. Active/draining authority
+  cannot leap and bounded catch-up fails closed; ADR 0215.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
