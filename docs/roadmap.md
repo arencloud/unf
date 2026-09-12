@@ -1245,8 +1245,12 @@ matrix is maintained in the
   the primary-CNI host alias bypasses Service readiness and one agent can
   overlap multiple authority materializations. ADR 0260 moves readiness to the
   internal API itself, rejects concurrent work without queueing, and fences
-  every response by informer-cut revision. A fresh immutable successor and the
-  complete cl02 gate remain mandatory.
+  every response by informer-cut revision. Exact successor `73057c1` passed a
+  completely fresh three-Node dual-stack, kube-proxy-free lifecycle; ADR 0261
+  binds its public immutable images, 336-frame ciphertext proof, zero Required
+  plaintext, complete fault/rotation/recovery matrix, loss-free operations,
+  exact cleanup, and no-CNI rollback. The preserved-state cl02 rollout and
+  complete platform gate remain mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

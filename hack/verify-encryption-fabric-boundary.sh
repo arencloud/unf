@@ -83,6 +83,9 @@ require_text docs/adr/0259-immutable-informer-cut-kind-requalification.md \
 require_text docs/adr/0260-cut-fenced-single-flight-authority-admission.md \
     'Cut-Fenced Single-Flight Authority Admission' \
     "host-network agent authority admission must be constant-space and cut-fenced"
+require_text docs/adr/0261-immutable-cut-fenced-kind-requalification.md \
+    'Immutable Cut-Fenced Kind Requalification' \
+    "cut-fenced authority admission must retain immutable fresh-Kind provenance"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"

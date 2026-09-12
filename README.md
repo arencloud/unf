@@ -1309,7 +1309,13 @@ authority loops and cause an OOM kill. Cut-Fenced Single-Flight Authority
 Admission now enforces readiness on the internal API, rejects concurrent work
 without queueing, and discards any response crossing an informer revision.
 ADR 0260. A fresh immutable Kind successor and the full cl02 gate remain
-required.
+required. Exact successor `73057c1` has now passed that newly created,
+three-Node dual-stack, kube-proxy-free lifecycle: 336 WireGuard frames carried
+Required traffic with zero plaintext, all eight Required faults failed closed
+while all eight Native probes stayed live, rotation and replacement recovered,
+295 causal operation records remained loss-free, and exact cleanup plus no-CNI
+rollback passed. ADR 0261 pins its public immutable images and evidence. Only
+the preserved-state cl02 rollout and complete platform gate remain.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
