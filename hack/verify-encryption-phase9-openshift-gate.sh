@@ -65,6 +65,8 @@ require 'request_requires_authority_materialization' \
     "${root}/bins/unf-controller/src/main.rs"
 require 'response_with_authority_delivery_lease' \
     "${root}/bins/unf-controller/src/main.rs"
+require 'Immutable Delivery-Leased Kind Requalification' \
+    "${root}/docs/adr/0267-immutable-delivery-leased-kind-requalification.md"
 require 'native_only_generation_closes_without_encrypted_path_exchange' \
     "${root}/bins/unf-agent/src/main.rs"
 require '/v1/state/encryption-activation-testimony' "${root}/bins/unf-agent/src/main.rs"

@@ -1349,7 +1349,12 @@ outliving their materialization permits and repeatedly OOM-killing the
 2-GiB-limited controller before generation advancement. End-to-End Authority
 Delivery Lease now owns both permits through response completion or disconnect,
 so serialization and socket backpressure remain inside the same constant-memory
-domain. ADR 0266. Fresh immutable Kind and complete cl02 qualification remain.
+domain. ADR 0266. Exact successor `3026662` then passed a completely fresh
+three-Node dual-stack, kube-proxy-free lifecycle with 404 WireGuard frames,
+zero Required plaintext, the full fault/rotation/replacement matrix, 295
+loss-free operations, Phase 8 coexistence, exact cleanup, and no-CNI rollback.
+ADR 0267 pins its anonymous-public immutable image and evidence tuple. Complete
+preserved-state cl02 qualification remains.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

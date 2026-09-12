@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for Phase 9.9 implementation and requalification
+Implemented and Kind-qualified; OpenShift qualification pending
 
 ## Context
 
@@ -51,3 +51,7 @@ remains capped at 16 active-plus-waiting requests.
 - Full workspace checks, a new fresh Kind lifecycle, immutable successor
   images, preserved-state cl02 deployment, and the complete platform gate are
   mandatory before Phase 9.9 can close.
+
+ADR 0267 records the independent fresh-Kind result and exact successor tuple.
+The preserved-state cl02 deployment and complete platform gate remain the only
+unclosed acceptance boundary.

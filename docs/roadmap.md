@@ -1276,8 +1276,12 @@ matrix is maintained in the
   2-GiB controller because large buffered response bodies outlived the
   materialization permits. ADR 0266's End-to-End Authority Delivery Lease owns
   both permits through body completion or disconnect, extending the constant
-  bound across serialization and socket backpressure. Fresh immutable Kind and
-  complete cl02 qualification remain mandatory.
+  bound across serialization and socket backpressure. Exact successor
+  `3026662` passed a completely fresh three-Node dual-stack, kube-proxy-free
+  lifecycle; ADR 0267 binds its immutable public images, 404 WireGuard frames
+  with zero Required plaintext, complete fault/rotation/replacement coverage,
+  295 loss-free operations, exact cleanup, and no-CNI rollback. Complete
+  preserved-state cl02 qualification remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
