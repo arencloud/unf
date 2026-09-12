@@ -1207,8 +1207,10 @@ matrix is maintained in the
   controller memory. ADR 0252 adds a Policy-Relevance Quotient: cached exact
   endpoints retain only policies that can select each directional pair, the
   unchanged evaluator covers every relevant class, and an oversized cut is
-  refused before allocation. Fresh Kind and complete cl02 qualification remain
-  mandatory.
+  refused before allocation. Exact runtime `046b1b2` passed the fresh full Kind
+  lifecycle; ADR 0253 pins its public immutable images, evidence, and packet
+  capture as the sole tuple eligible for preserved-state cl02 deployment.
+  Complete cl02 qualification remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

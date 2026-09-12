@@ -1252,7 +1252,12 @@ workload pair until the controller was evicted under memory pressure. The
 Policy-Relevance Quotient caches enriched endpoints, retains only policies that
 can select the exact directional pair, preserves the unchanged evaluator over
 every relevant address/protocol/port class, and fails closed before an explicit
-work bound; ADR 0252. A new exact Kind and cl02 tuple is required.
+work bound; ADR 0252. Exact runtime `046b1b2` passed the complete fresh
+three-Node dual-stack, kube-proxy-free Kind lifecycle with 335 WireGuard frames,
+zero Required plaintext, eight-of-eight fail-closed Required probes, natural
+rotation and replacement recovery, 298 loss-free operations, exact cleanup, and
+rollback. ADR 0253 binds its anonymously pullable images and evidence as the
+only tuple eligible for preserved-state cl02 qualification.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

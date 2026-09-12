@@ -115,6 +115,8 @@ require 'Immutable Compact-Chain Kind Requalification' \
     "${root}/docs/adr/0251-immutable-compact-chain-kind-requalification.md"
 require 'Policy-Relevance Quotient' \
     "${root}/docs/adr/0252-policy-relevance-quotient.md"
+require 'Immutable Policy-Relevance Kind Requalification' \
+    "${root}/docs/adr/0253-immutable-policy-relevance-kind-requalification.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"

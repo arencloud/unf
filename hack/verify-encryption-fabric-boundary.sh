@@ -59,6 +59,9 @@ require_text docs/adr/0250-compact-causal-tombstone-chain.md \
 require_text docs/adr/0252-policy-relevance-quotient.md \
     'Policy-Relevance Quotient' \
     "encryption planning must not scan irrelevant cluster policy partitions"
+require_text docs/adr/0253-immutable-policy-relevance-kind-requalification.md \
+    'Immutable Policy-Relevance Kind Requalification' \
+    "the corrected policy planner must retain immutable fresh-Kind provenance"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"
