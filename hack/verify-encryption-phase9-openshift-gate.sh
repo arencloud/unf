@@ -117,6 +117,10 @@ require 'Policy-Relevance Quotient' \
     "${root}/docs/adr/0252-policy-relevance-quotient.md"
 require 'Immutable Policy-Relevance Kind Requalification' \
     "${root}/docs/adr/0253-immutable-policy-relevance-kind-requalification.md"
+require '.status.phase == "Running"' \
+    "${root}/hack/verify-openshift-encryption-phase9.sh"
+require 'Live-Set Immutable Runtime Census' \
+    "${root}/docs/adr/0254-live-set-immutable-runtime-census.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"

@@ -1258,6 +1258,12 @@ zero Required plaintext, eight-of-eight fail-closed Required probes, natural
 rotation and replacement recovery, 298 loss-free operations, exact cleanup, and
 rollback. ADR 0253 binds its anonymously pullable images and evidence as the
 only tuple eligible for preserved-state cl02 qualification.
+The exact tuple then deployed on all five cl02 Nodes with five converged agents
+and 169 MiB controller RSS at the same real policy scale. The first platform
+preflight found that historical evicted controller Pod objects polluted an
+otherwise exact live-image count. The Live-Set Immutable Runtime Census counts
+only non-deleting Running Pods and still requires one Ready zero-restart
+controller plus five Ready zero-restart agents at the pinned digests; ADR 0254.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

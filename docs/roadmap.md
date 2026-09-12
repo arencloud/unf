@@ -1210,7 +1210,11 @@ matrix is maintained in the
   refused before allocation. Exact runtime `046b1b2` passed the fresh full Kind
   lifecycle; ADR 0253 pins its public immutable images, evidence, and packet
   capture as the sole tuple eligible for preserved-state cl02 deployment.
-  Complete cl02 qualification remains mandatory.
+  It deployed with all five agents converged and bounded controller memory. ADR
+  0254 makes the immutable runtime census operate on the live non-deleting
+  Running Pod set, so historical eviction records remain diagnostic evidence
+  without impersonating additional live controllers. Complete cl02
+  qualification remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

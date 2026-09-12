@@ -476,6 +476,7 @@ done < <("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent -
 jq -e 'length == 5' <<<"${agent_versions}" >/dev/null
 images_json=$("${kc[@]}" -n unf-system get pods -o json | jq -c '
     [.items[]
+     | select(.metadata.deletionTimestamp == null and .status.phase == "Running")
      | select(.metadata.labels["app.kubernetes.io/name"] == "unf-agent"
          or .metadata.labels["app.kubernetes.io/name"] == "unf-controller")
      | .metadata.name as $pod | .spec.nodeName as $node | .spec.containers[] as $spec

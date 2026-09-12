@@ -62,6 +62,9 @@ require_text docs/adr/0252-policy-relevance-quotient.md \
 require_text docs/adr/0253-immutable-policy-relevance-kind-requalification.md \
     'Immutable Policy-Relevance Kind Requalification' \
     "the corrected policy planner must retain immutable fresh-Kind provenance"
+require_text docs/adr/0254-live-set-immutable-runtime-census.md \
+    'Live-Set Immutable Runtime Census' \
+    "platform image provenance must distinguish live runtime from terminated diagnostics"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"
