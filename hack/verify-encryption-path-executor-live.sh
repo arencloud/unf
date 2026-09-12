@@ -71,6 +71,14 @@ for ns in "${ns_a}" "${ns_b}"; do
     sudo -n ip netns exec "${ns}" sysctl -q -w net.ipv4.conf.default.rp_filter=0
     sudo -n ip netns exec "${ns}" sysctl -q -w net.ipv4.conf.unfwg0.rp_filter=0
 done
+
+# Reproduce a peer arriving after the production four-second attempt timeout.
+# This isolated loopback check proves only exact, expiring response service;
+# real WireGuard delivery and counter-backed evidence are checked below.
+sudo -n ip netns exec "${ns_a}" "${test_binary}" --exact \
+    tests::privileged_path_probe_timeout_preserves_only_expiring_responder \
+    --ignored --nocapture
+
 sudo -n ip -n "${ns_a}" address add 192.0.2.1/30 dev underlay0
 sudo -n ip -n "${ns_b}" address add 192.0.2.2/30 dev underlay0
 sudo -n ip -n "${ns_a}" address add 10.250.1.254/32 dev unfwg0

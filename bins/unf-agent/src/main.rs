@@ -10330,11 +10330,22 @@ async fn execute_live_encryption_path_proofs(
     }
     let mut exchanges =
         BTreeMap::<EncryptionPathProofRoundDigest, Vec<EncryptionPathProbeExchange>>::new();
+    let mut first_error = None;
     while let Some(result) = tasks.join_next().await {
-        for exchange in result
-            .context("join encrypted path probe task")?
-            .context("exchange encrypted path probe group")?
+        let group = match result
+            .context("join encrypted path probe task")
+            .and_then(|result| result.context("exchange encrypted path probe group"))
         {
+            Ok(group) => group,
+            Err(error) => {
+                // Let every family reach its bounded deadline and install its
+                // responder lease. Dropping JoinSet on the first timeout
+                // would abort the other family's responder before handoff.
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        for exchange in group {
             let assignment = assignments_by_round
                 .get(&exchange.round_digest)
                 .context("wire exchange has no authenticated assignment")?;
@@ -10357,6 +10368,9 @@ async fn execute_live_encryption_path_proofs(
                 .or_default()
                 .push(sealed);
         }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
 
     let mut after_by_plan = BTreeMap::new();
@@ -10525,7 +10539,15 @@ async fn exchange_encryption_path_probe_group(
                 }
             }
             () = tokio::time::sleep_until(deadline) => {
-                bail!("encrypted path probe rendezvous timed out");
+                let total = work.len();
+                // A bounded attempt timing out creates no transcript or
+                // activation authority. Keep only its exact nonce-bound
+                // responder through the original round expiry so a later
+                // peer is not forced to overlap this local four-second poll.
+                spawn_encryption_path_probe_responder_lease(
+                    socket, work, work_index, round_deadline,
+                );
+                bail!("encrypted path probe rendezvous timed out ({remaining}/{total} responses missing)");
             }
         }
     }
@@ -10553,6 +10575,7 @@ fn spawn_encryption_path_probe_responder_lease(
         let mut buffer = [0_u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES];
         loop {
             tokio::select! {
+                biased;
                 () = tokio::time::sleep_until(deadline) => break,
                 received = socket.recv_from(&mut buffer) => {
                     let received = match received {
@@ -21037,6 +21060,93 @@ mod tests {
             request: live_path_probe_frame(1, family, seed),
             response: live_path_probe_frame(2, family, seed),
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CAP_NET_ADMIN for marked loopback sockets"]
+    async fn privileged_path_probe_timeout_preserves_only_expiring_responder() {
+        let first: IpAddr = "127.0.0.242".parse().unwrap();
+        let delayed: IpAddr = "127.0.0.243".parse().unwrap();
+        let expires_at = current_unix_time_milliseconds() + 10_000;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let work = live_path_probe_work(1, delayed, 0, 244, expires_at);
+        let result = exchange_encryption_path_probe_group(
+            PathProbeSocketKey {
+                local_address: first,
+            },
+            vec![work],
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a missing peer must yield no local transcript"
+        );
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("rendezvous timed out")
+        );
+
+        // The peer begins only after the first endpoint's four-second attempt
+        // has failed. Its exact nonce is still live, but no local proof exists.
+        let peer_work = live_path_probe_work(1, first, 0, 244, expires_at);
+        let invalid_socket = path_probe_socket(&PathProbeSocketKey {
+            local_address: delayed,
+        })
+        .unwrap();
+        for changed_byte in [8, 40] {
+            let mut invalid = peer_work.request;
+            invalid[changed_byte] ^= 1;
+            invalid_socket
+                .send_to(&invalid, SocketAddr::new(first, ENCRYPTION_PATH_PROBE_PORT))
+                .await
+                .unwrap();
+            let mut buffer = [0; ENCRYPTION_PATH_PROBE_FRAME_BYTES];
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(150),
+                    invalid_socket.recv_from(&mut buffer)
+                )
+                .await
+                .is_err(),
+                "a retained responder must ignore foreign rounds and altered nonces"
+            );
+        }
+        drop(invalid_socket);
+        let result = exchange_encryption_path_probe_group(
+            PathProbeSocketKey {
+                local_address: delayed,
+            },
+            vec![peer_work.clone()],
+        )
+        .await
+        .expect("a timed-out endpoint must still answer an exact live round");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].response, peer_work.response);
+
+        tokio::time::sleep_until(deadline + Duration::from_millis(100)).await;
+        let socket = path_probe_socket(&PathProbeSocketKey {
+            local_address: delayed,
+        })
+        .unwrap();
+        socket
+            .send_to(
+                &peer_work.request,
+                SocketAddr::new(first, ENCRYPTION_PATH_PROBE_PORT),
+            )
+            .await
+            .unwrap();
+        let mut buffer = [0; ENCRYPTION_PATH_PROBE_FRAME_BYTES];
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(250), socket.recv_from(&mut buffer))
+                    .await,
+                Ok(Ok(_))
+            ),
+            "the responder must not extend the authenticated round lifetime"
+        );
     }
 
     #[tokio::test]
