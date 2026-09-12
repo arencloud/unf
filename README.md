@@ -1337,7 +1337,12 @@ one expensive materialization, admits at most 16 active-plus-FIFO-waiting
 requests, and rejects overflow. Constant-work version and authenticated status
 traffic retain readiness/revision fencing without entering the heavy lane, and
 compatibility preflight now retries bounded backpressure before BPF access.
-ADR 0264. Fresh immutable Kind and cl02 qualification remain required.
+ADR 0264. Exact successor `3ffa0a6` then passed a completely fresh three-Node
+dual-stack, kube-proxy-free lifecycle with 392 WireGuard frames, zero Required
+plaintext, the full fault/rotation/replacement matrix, 282 loss-free operations,
+Phase 8 coexistence, exact cleanup, and no-CNI rollback. ADR 0265 pins its
+anonymous-public immutable image and evidence tuple. Complete preserved-state
+cl02 qualification remains required.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

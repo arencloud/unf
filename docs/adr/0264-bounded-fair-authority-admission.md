@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for Phase 9.9 implementation and requalification
+Accepted; implemented and qualified by ADR 0265
 
 ## Context
 

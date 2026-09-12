@@ -95,6 +95,9 @@ require_text docs/adr/0263-immutable-causal-startup-kind-requalification.md \
 require_text docs/adr/0264-bounded-fair-authority-admission.md \
     'Bounded Fair Authority Admission' \
     "authority materialization must combine bounded memory with admitted progress"
+require_text docs/adr/0265-immutable-bounded-fair-kind-requalification.md \
+    'Immutable Bounded-Fair Kind Requalification' \
+    "bounded-fair admission must retain immutable fresh-Kind provenance"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"

@@ -1265,8 +1265,12 @@ matrix is maintained in the
   all five agents with transient errors and two stale reports. ADR 0264 adds a
   fixed 16-request FIFO admission domain around the one materializer, keeps
   constant-work compatibility/status on a cut-fenced control lane, and extends
-  bounded pre-BPF retry to compatibility admission. Fresh immutable Kind and
-  complete cl02 qualification remain mandatory.
+  bounded pre-BPF retry to compatibility admission. Exact successor `3ffa0a6`
+  passed a completely fresh three-Node dual-stack, kube-proxy-free lifecycle;
+  ADR 0265 binds its immutable public images, 392 WireGuard frames with zero
+  Required plaintext, complete fault/rotation/replacement coverage, 282
+  loss-free operations, exact cleanup, and no-CNI rollback. Complete
+  preserved-state cl02 qualification remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

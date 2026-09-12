@@ -175,10 +175,9 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Validate ADR 0264's Bounded Fair Authority Admission, run a completely fresh
-Kind lifecycle, and publish only its exact digest-pinned successor. Deploy it
-to cl02 without deleting preserved Node-local authority and rerun the complete
-bounded platform gate. The gate
+Deploy ADR 0265's exact fresh-Kind-qualified Bounded Fair Authority Admission
+successor to cl02 without deleting preserved Node-local authority and rerun the
+complete bounded platform gate. The gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as
 preserving RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct
 and Service traffic, selective fail-closed behavior, rotation/recovery, exact
