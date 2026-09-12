@@ -9175,6 +9175,22 @@ impl EncryptionGenerationSynchronizer {
             .map(|recovery| &recovery.fact)
     }
 
+    /// Only the exact durable admission can repair controller backpressure.
+    /// A newer prepared plan must never be advertised as already admitted.
+    fn fact_for_admission_recovery(&self) -> Option<&EncryptionGenerationFact> {
+        let current = self.current.as_ref()?;
+        self.recovery
+            .active
+            .iter()
+            .chain(self.recovery.pending.iter())
+            .chain(self.recovery.tombstoned_predecessor.iter())
+            .find(|plan| {
+                plan.fact.recipient == current.recipient
+                    && plan.fact.checkpoint == current.checkpoint
+            })
+            .map(|plan| &plan.fact)
+    }
+
     fn pending_generation(&self) -> Option<Revision> {
         let prepared = match self.pending.as_ref()? {
             PendingEncryptionGeneration::Prepared { prepared, .. }
@@ -10160,6 +10176,30 @@ async fn synchronize_encryption_generation(
         .controller_url
         .as_deref()
         .context("encryption generation synchronization has no controller URL")?;
+    if let Some(admitted) = synchronizer.fact_for_admission_recovery() {
+        admitted
+            .verify()
+            .context("verify durable encryption admission fact")?;
+        let response = synchronizer
+            .client
+            .current()
+            .post(format!(
+                "{controller_url}/v1/state/encryption-admitted-generation-facts"
+            ))
+            .bearer_auth(read_agent_token(&synchronizer.agent_token_path)?)
+            .json(admitted)
+            .send()
+            .await
+            .context("publish durable encryption admission fact")?;
+        // An older controller has only the prepared-fact endpoint. Preserve
+        // rolling compatibility, but never ignore a rejection by a new one.
+        if response.status() != StatusCode::NOT_FOUND && response.status() != StatusCode::ACCEPTED {
+            response
+                .error_for_status()
+                .context("controller rejected durable encryption admission fact")?;
+            bail!("controller returned a non-202 response for durable encryption admission fact");
+        }
+    }
     if let Some(fact) = &fact {
         fact.verify()
             .context("verify Node-local generation fact before publication")?;
@@ -20094,6 +20134,10 @@ mod tests {
                 .unwrap()
         );
         let fact = generations.fact_for_publication().unwrap();
+        assert!(
+            generations.fact_for_admission_recovery().is_none(),
+            "preparation alone is not durable admission"
+        );
         assert_eq!(
             fact.checkpoint.transaction.desired.published.generation,
             Revision::new(19)
@@ -20140,6 +20184,7 @@ mod tests {
         generations
             .admit_exact_echo(&request, &capsule, &fact)
             .unwrap();
+        assert_eq!(generations.fact_for_admission_recovery(), Some(&fact));
         assert!(
             generations
                 .must_settle_admitted_pending_before(Revision::new(20))

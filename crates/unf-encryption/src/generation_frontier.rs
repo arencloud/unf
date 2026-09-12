@@ -371,6 +371,50 @@ impl EncryptionGenerationProducer {
             .as_ref()
             .is_none_or(|active| self.acknowledged.len() == active.members.len())
     }
+
+    /// Recovers a lost controller write from a complete cut of authenticated
+    /// durable Node admissions, not merely prepared generation facts. The caller
+    /// must collect these separately and authenticate every current Node UID.
+    /// This restores controller backpressure only, never kernel authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects mutation, membership drift, equivocation and skipped predecessors
+    /// before changing either the frontier or its acknowledgements. A complete
+    /// admitted successor also proves adoption of its exact predecessor, even
+    /// when that predecessor's controller receipts were not persisted.
+    pub fn recover_admitted(
+        &mut self,
+        candidate: EncryptionGenerationFrontier,
+    ) -> Result<bool, EncryptionGenerationFrontierError> {
+        candidate.verify()?;
+        match &self.active {
+            Some(active) if candidate.revision < active.revision => return Ok(false),
+            Some(active) if active == &candidate => {
+                if self.is_fully_acknowledged() {
+                    return Ok(false);
+                }
+            }
+            Some(active) => require_successor(active, &candidate)?,
+            None => require_initial(&candidate)?,
+        }
+        let acknowledged = candidate
+            .generations
+            .iter()
+            .map(|generation| {
+                let recipient = generation.recipient.clone();
+                let receipt = EncryptionGenerationAcknowledgement {
+                    recipient: recipient.clone(),
+                    published: generation.checkpoint.transaction.desired.published,
+                    frontier_digest: candidate.frontier_digest,
+                };
+                (recipient, receipt)
+            })
+            .collect();
+        self.active = Some(candidate);
+        self.acknowledged = acknowledged;
+        Ok(true)
+    }
 }
 
 impl EncryptionGenerationProducerCheckpoint {

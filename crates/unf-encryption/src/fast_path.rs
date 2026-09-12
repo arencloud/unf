@@ -2880,6 +2880,152 @@ mod tests {
         ));
     }
 
+    fn dormant_recovery_frontier(
+        revision: u64,
+        prior: Option<&EncryptionGenerationFrontier>,
+    ) -> EncryptionGenerationFrontier {
+        let bank = u8::from(!revision.is_multiple_of(2));
+        let state = compile_encryption_fast_path(context_at(bank, revision), &[], &[]).unwrap();
+        let members = (0..5)
+            .map(|index| EncryptionGenerationRecipient {
+                node_name: format!("worker-{index}"),
+                node_uid: format!("uid-worker-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let generations = members
+            .iter()
+            .map(|recipient| PreparedNodeEncryptionGeneration {
+                recipient: recipient.clone(),
+                checkpoint: FastPathMapCheckpoint::begin(
+                    Revision::new(revision),
+                    &state,
+                    prior
+                        .and_then(|frontier| frontier.checkpoint_for(recipient))
+                        .map(|checkpoint| checkpoint.transaction.desired.published),
+                )
+                .unwrap(),
+            })
+            .collect();
+        EncryptionGenerationFrontier::issue(Revision::new(revision), members, generations).unwrap()
+    }
+
+    #[test]
+    fn durable_admissions_recover_only_the_exact_missing_frontier() {
+        let first = dormant_recovery_frontier(21, None);
+        let second = dormant_recovery_frontier(22, Some(&first));
+        let third = dormant_recovery_frontier(23, Some(&second));
+        let mut producer = EncryptionGenerationProducer::default();
+        producer.publish(first.clone()).unwrap();
+        // Even the predecessor receipts may have been lost by the controller.
+        assert!(!producer.is_fully_acknowledged());
+        let mut admitted = EncryptionGenerationFactReconciler::default();
+        let mut prepared = EncryptionGenerationFactReconciler::default();
+        for ledger in [&mut admitted, &mut prepared] {
+            ledger
+                .replace_membership(Revision::new(9), first.members.clone())
+                .unwrap();
+        }
+        for generation in &third.generations {
+            prepared
+                .observe(
+                    EncryptionGenerationFact::issue(
+                        Revision::new(9),
+                        generation.recipient.clone(),
+                        generation.checkpoint.clone(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        assert!(
+            producer
+                .publish(prepared.candidate().unwrap().unwrap())
+                .is_err()
+        );
+        for (index, generation) in second.generations.iter().enumerate() {
+            admitted
+                .observe(
+                    EncryptionGenerationFact::issue(
+                        Revision::new(9),
+                        generation.recipient.clone(),
+                        generation.checkpoint.clone(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            if index < 4 {
+                assert!(admitted.candidate().unwrap().is_none());
+                assert_eq!(producer.active(), Some(&first));
+            }
+        }
+        assert!(
+            producer
+                .recover_admitted(admitted.candidate().unwrap().unwrap())
+                .unwrap()
+        );
+        assert!(producer.is_fully_acknowledged());
+        assert!(!producer.recover_admitted(second).unwrap());
+        assert!(!producer.recover_admitted(first).unwrap());
+        producer
+            .publish(prepared.candidate().unwrap().unwrap())
+            .unwrap();
+        assert_eq!(producer.active(), Some(&third));
+        assert!(
+            !producer.is_fully_acknowledged(),
+            "new prepared cuts still require admissions"
+        );
+        assert!(producer.recover_admitted(third).unwrap());
+        EncryptionGenerationProducer::restore(producer.checkpoint().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn admission_recovery_rejects_skips_and_mutations_without_partial_receipts() {
+        let first = dormant_recovery_frontier(21, None);
+        let second = dormant_recovery_frontier(22, Some(&first));
+        let third = dormant_recovery_frontier(23, Some(&second));
+        let mut producer = EncryptionGenerationProducer::default();
+        assert!(producer.recover_admitted(second.clone()).is_err());
+        producer.publish(first.clone()).unwrap();
+        let before = producer.checkpoint().unwrap();
+        let mut tampered = second.clone();
+        tampered.frontier_digest.0[0] ^= 1;
+        let mut replacement = second.clone();
+        replacement.members[0].node_uid = "replacement".to_owned();
+        replacement.generations[0].recipient = replacement.members[0].clone();
+        let replacement = EncryptionGenerationFrontier::issue(
+            replacement.revision,
+            replacement.members,
+            replacement.generations,
+        )
+        .unwrap();
+        let other = compile_encryption_fast_path(context_at(0, 21), &[], &[]).unwrap();
+        let equivocation = EncryptionGenerationFrontier::issue(
+            first.revision,
+            first.members.clone(),
+            first
+                .generations
+                .iter()
+                .map(|generation| PreparedNodeEncryptionGeneration {
+                    recipient: generation.recipient.clone(),
+                    checkpoint: FastPathMapCheckpoint::begin(Revision::new(21), &other, None)
+                        .unwrap(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        for invalid in [
+            third,
+            tampered,
+            replacement,
+            equivocation,
+            dormant_recovery_frontier(22, None),
+        ] {
+            assert!(producer.recover_admitted(invalid).is_err());
+            assert_eq!(producer.checkpoint().unwrap(), before);
+        }
+        assert!(producer.recover_admitted(second).unwrap());
+    }
+
     #[test]
     fn causal_proof_ladder_refuses_controller_substitution_and_reuse() {
         let fixture = fixture(7);

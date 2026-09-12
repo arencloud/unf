@@ -585,6 +585,7 @@ struct ControllerState {
     /// Kernel route proof and map activation deliberately remain agent-local.
     encryption_generations: Mutex<EncryptionGenerationProducer>,
     encryption_generation_facts: Mutex<EncryptionGenerationFactReconciler>,
+    encryption_admitted_generation_facts: Mutex<EncryptionGenerationFactReconciler>,
     encryption_generations_dirty: AtomicBool,
     encryption_generation_store: Option<Api<ConfigMap>>,
     /// Complete secret-free compiler inputs awaiting authenticated Node pulls.
@@ -1646,6 +1647,10 @@ async fn spawn_internal_api(
             "/v1/state/encryption-generation-facts",
             post(ingest_encryption_generation_fact),
         )
+        .route(
+            "/v1/state/encryption-admitted-generation-facts",
+            post(ingest_encryption_admitted_generation_fact),
+        )
         .route("/v1/state/encryption-plan", post(encryption_plan))
         .route(
             "/v1/state/encryption-key-bootstrap",
@@ -2205,6 +2210,9 @@ fn new_state_with_client_and_selector(
         egress_release_authorities: RwLock::new(BTreeMap::new()),
         encryption_generations: Mutex::new(EncryptionGenerationProducer::default()),
         encryption_generation_facts: Mutex::new(EncryptionGenerationFactReconciler::default()),
+        encryption_admitted_generation_facts: Mutex::new(
+            EncryptionGenerationFactReconciler::default(),
+        ),
         encryption_generations_dirty: AtomicBool::new(false),
         encryption_generation_store: config_map_store.clone(),
         encryption_local_plans: Mutex::new(NodeLocalPlanCatalog::default()),
@@ -9948,7 +9956,17 @@ async fn ingest_encryption_generation_fact(
     Json(fact): Json<EncryptionGenerationFact>,
 ) -> Result<StatusCode, ApiError> {
     let agent = authenticate_internal_agent(&state, &headers).await?;
-    reconcile_encryption_generation_fact(&state, &agent, fact)?;
+    reconcile_encryption_generation_fact(&state, &agent, fact, false)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn ingest_encryption_admitted_generation_fact(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(fact): Json<EncryptionGenerationFact>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    reconcile_encryption_generation_fact(&state, &agent, fact, true)?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -9956,6 +9974,7 @@ fn reconcile_encryption_generation_fact(
     state: &ControllerState,
     agent: &AuthenticatedAgent,
     fact: EncryptionGenerationFact,
+    admitted: bool,
 ) -> Result<(), ApiError> {
     if !agent_application_is_current(state, agent) {
         return Err(ApiError::forbidden(
@@ -9980,8 +9999,22 @@ fn reconcile_encryption_generation_fact(
             "encryption generation fact targets a different or replaced Node",
         ));
     }
+    let fact_revision = fact.checkpoint.transaction.transaction_revision;
+    let admission_already_recovered = admitted && {
+        let producer = mutex_lock(&state.encryption_generations);
+        producer.active().is_some_and(|active| {
+            active.revision > fact_revision
+                || (producer.is_fully_acknowledged()
+                    && active.checkpoint_for(&fact.recipient) == Some(&fact.checkpoint))
+        })
+    };
     let outcome = {
-        let mut reconciler = mutex_lock(&state.encryption_generation_facts);
+        let ledger = if admitted {
+            &state.encryption_admitted_generation_facts
+        } else {
+            &state.encryption_generation_facts
+        };
+        let mut reconciler = mutex_lock(ledger);
         reconciler
             .replace_membership(membership_revision, members)
             .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
@@ -9991,6 +10024,31 @@ fn reconcile_encryption_generation_fact(
     };
     if outcome == EncryptionGenerationFactOutcome::Accepted {
         state.metrics.encryption_generation_facts_accepted.inc();
+    }
+    if admitted {
+        if outcome == EncryptionGenerationFactOutcome::Unchanged && admission_already_recovered {
+            return Ok(());
+        }
+        let candidate = mutex_lock(&state.encryption_admitted_generation_facts)
+            .candidate()
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        if let Some(candidate) = candidate {
+            let recovered = mutex_lock(&state.encryption_generations)
+                .recover_admitted(candidate)
+                .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+            if recovered {
+                state
+                    .encryption_generations_dirty
+                    .store(true, Ordering::Release);
+                info!(
+                    membership_revision = membership_revision.get(),
+                    "recovered exact encryption frontier from complete authenticated durable admissions"
+                );
+            }
+        }
+        // Prepared successors use their own endpoint. A later prepared cut
+        // must not make acknowledgement of this admitted cut fail.
+        return Ok(());
     }
     let published = publish_reconciled_encryption_generation(state)?;
     if published {
@@ -18054,6 +18112,108 @@ mod tests {
             .unwrap()
             .insert("unexpected".to_owned(), serde_json::json!(true));
         assert!(decode_encryption_generation_producer(&unknown.to_string()).is_err());
+    }
+
+    #[test]
+    fn admitted_generation_facts_are_current_pod_uid_scoped_and_idempotent() {
+        let state = new_state(true);
+        let agent = authenticated_egress_agent("worker-a");
+        install_authenticated_agent(&state, &agent);
+        write_lock(&state.nodes).insert(
+            agent.node_name.clone(),
+            TopologyNode {
+                name: agent.node_name.clone(),
+                ready: true,
+                labels: BTreeMap::new(),
+            },
+        );
+        let (membership, members) = encryption_generation_membership(&state).unwrap();
+        let compiled = unf_encryption::compile_encryption_fast_path(
+            unf_encryption::FastPathCompileContext {
+                generation: Revision::new(11),
+                policy_revision: Revision::new(7),
+                service_revision: Revision::new(8),
+                egress_revision: Revision::new(9),
+                bank: 0,
+                now_unix_ms: 1,
+                now_monotonic_ns: 1,
+            },
+            &[],
+            &[],
+        )
+        .unwrap();
+        let checkpoint =
+            unf_encryption::FastPathMapCheckpoint::begin(Revision::new(11), &compiled, None)
+                .unwrap();
+        let fact =
+            EncryptionGenerationFact::issue(membership, members[0].clone(), checkpoint).unwrap();
+        let mut replaced_agent = agent.clone();
+        replaced_agent.pod_uid = "replaced-pod".to_owned();
+        assert_eq!(
+            reconcile_encryption_generation_fact(&state, &replaced_agent, fact.clone(), true)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        let mut foreign = members[0].clone();
+        foreign.node_uid = "replacement-node".to_owned();
+        let foreign =
+            EncryptionGenerationFact::issue(membership, foreign, fact.checkpoint.clone()).unwrap();
+        assert_eq!(
+            reconcile_encryption_generation_fact(&state, &agent, foreign, true)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        reconcile_encryption_generation_fact(&state, &agent, fact.clone(), false).unwrap();
+        assert!(!mutex_lock(&state.encryption_generations).is_fully_acknowledged());
+        reconcile_encryption_generation_fact(&state, &agent, fact.clone(), true).unwrap();
+        assert!(mutex_lock(&state.encryption_generations).is_fully_acknowledged());
+        assert!(
+            state
+                .encryption_generations_dirty
+                .swap(false, Ordering::AcqRel)
+        );
+        reconcile_encryption_generation_fact(&state, &agent, fact, true).unwrap();
+        assert!(!state.encryption_generations_dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[ignore = "requires UNF_ENCRYPTION_ADMISSION_CAPTURE_PREFIX for public cl02 checkpoint and Node facts"]
+    fn admitted_generation_recovers_captured_cl02_missing_frontier() {
+        let prefix = std::env::var("UNF_ENCRYPTION_ADMISSION_CAPTURE_PREFIX").unwrap();
+        let config_map: ConfigMap = serde_json::from_slice(
+            &std::fs::read(format!("{prefix}-frontier-store.json")).unwrap(),
+        )
+        .unwrap();
+        let (mut producer, _) = decode_compact_encryption_generation_store(
+            &config_map.data.unwrap()[ENCRYPTION_GENERATION_STORE_DESCRIPTOR_KEY],
+            &config_map.binary_data.unwrap()[ENCRYPTION_GENERATION_STORE_PAYLOAD_KEY].0,
+        )
+        .unwrap();
+        let original = producer.checkpoint().unwrap();
+        let members = producer.active().unwrap().members.clone();
+        let mut admitted = EncryptionGenerationFactReconciler::default();
+        for (index, member) in members.iter().enumerate() {
+            let fact: EncryptionGenerationFact = serde_json::from_slice(
+                &std::fs::read(format!("{prefix}-{}-active-fact.json", member.node_name)).unwrap(),
+            )
+            .unwrap();
+            admitted
+                .replace_membership(fact.membership_revision, members.clone())
+                .unwrap();
+            admitted.observe(fact).unwrap();
+            if index + 1 < members.len() {
+                assert!(admitted.candidate().unwrap().is_none());
+                assert_eq!(producer.checkpoint().unwrap(), original);
+            }
+        }
+        let candidate = admitted.candidate().unwrap().unwrap();
+        assert!(candidate.revision > producer.active().unwrap().revision);
+        assert!(producer.recover_admitted(candidate.clone()).unwrap());
+        assert!(producer.is_fully_acknowledged());
+        assert!(!producer.recover_admitted(candidate).unwrap());
+        EncryptionGenerationProducer::restore(producer.checkpoint().unwrap()).unwrap();
     }
 
     fn checkpoint_codec_fixture() -> (

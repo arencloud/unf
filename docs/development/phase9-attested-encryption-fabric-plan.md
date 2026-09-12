@@ -178,8 +178,10 @@ require independent architecture and gates.
 Following the user's 2026-09-12 instruction, platform verification now runs on
 cl02 first, then fresh Kind. Local checks precede image publication. A candidate
 release record declares `qualificationOrder: openshift-first` and Kind `pending`
-with no invented hashes or platform observations. Deploy ADR 0279's bounded-recovery
-successor to cl02 preserving Node-local authority and run the full gate, then
+with no invented hashes or platform observations. ADR 0279's deployment failed
+on a missing intermediate frontier, despite Native intent being configured.
+Qualify ADR 0281's authenticated durable-admission recovery on cl02, preserving
+Node-local authority and proving actual encryption convergence, then run the full gate and
 qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as
 preserving RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct
