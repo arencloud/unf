@@ -1199,8 +1199,10 @@ matrix is maintained in the
   admissions. ADR 0250 adds a Compact Causal Tombstone Chain: digest-bearing
   intermediate transactions prove every logical edge back to the last
   physical map without retaining another full dataplane image, while authority
-  remains zero until a fresh successor commits. Fresh Kind and cl02
-  qualification remain mandatory.
+  remains zero until a fresh successor commits. Exact runtime `0590d9b` passed
+  the fresh full Kind lifecycle; ADR 0251 binds its immutable public images and
+  evidence as the sole tuple eligible for preserved-state cl02 recovery. The
+  complete cl02 qualification remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

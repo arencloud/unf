@@ -109,6 +109,10 @@ require 'Continuous Tombstoned Predecessor Bridge' \
     "${root}/docs/adr/0248-continuous-tombstoned-predecessor-bridge.md"
 require 'Immutable Continuous-Bridge Kind Requalification' \
     "${root}/docs/adr/0249-immutable-continuous-bridge-kind-requalification.md"
+require 'Compact Causal Tombstone Chain' \
+    "${root}/docs/adr/0250-compact-causal-tombstone-chain.md"
+require 'Immutable Compact-Chain Kind Requalification' \
+    "${root}/docs/adr/0251-immutable-compact-chain-kind-requalification.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"

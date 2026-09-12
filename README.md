@@ -1240,8 +1240,11 @@ physical map. The Compact Causal Tombstone Chain retains only each
 digest-bearing intermediate transaction plus the newest full admission,
 verifies every predecessor edge on restart, and keeps map authority zero until
 a fresh successor commits; ADR 0250. This avoids both unbounded full-image
-retention and unsafe ancestry collapse. A fresh Kind and cl02 qualification
-tuple is required before Phase 9 can close.
+retention and unsafe ancestry collapse. Exact runtime `0590d9b` passed the
+complete fresh three-Node dual-stack, kube-proxy-free Kind lifecycle. ADR 0251
+binds its anonymously pullable Linux/amd64 images, evidence, and packet capture
+as the only tuple eligible for preserved-state cl02 recovery and the complete
+Phase 9.9 gate.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
