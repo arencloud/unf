@@ -10941,23 +10941,38 @@ async fn preflight_controller_compatibility(
     controller_url: &str,
     token_path: &Path,
 ) -> Result<()> {
-    let response = match authenticated_get(
-        client,
-        format!(
-            "{controller_url}/v1/version?serviceSnapshotSchemaVersion={SERVICE_SNAPSHOT_SCHEMA_VERSION}"
-        ),
-        token_path,
-    )?
-    .send()
-    .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            warn!(
-                %error,
-                "controller compatibility preflight unavailable; retaining offline-start recovery"
-            );
-            return Ok(());
+    let mut authority_attempt = 1;
+    let response = loop {
+        match authenticated_get(
+            client,
+            format!(
+                "{controller_url}/v1/version?serviceSnapshotSchemaVersion={SERVICE_SNAPSHOT_SCHEMA_VERSION}"
+            ),
+            token_path,
+        )?
+        .send()
+        .await
+        {
+            Ok(response)
+                if startup_authority_retry(response.status(), authority_attempt) =>
+            {
+                warn!(
+                    status = %response.status(),
+                    attempt = authority_attempt,
+                    max_attempts = STARTUP_AUTHORITY_ATTEMPTS,
+                    "controller compatibility admission is busy; persistent BPF access remains fenced"
+                );
+                authority_attempt += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Ok(response) => break response,
+            Err(error) => {
+                warn!(
+                    %error,
+                    "controller compatibility preflight unavailable; retaining offline-start recovery"
+                );
+                return Ok(());
+            }
         }
     };
     let compatibility: ComponentCompatibility = response

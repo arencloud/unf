@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted as the Phase 9.9 OpenShift candidate
+Historical Kind qualification; rejected by the cl02 platform gate
 
 ## Context
 
@@ -49,3 +49,16 @@ The packet capture SHA-256 is
 - The release record and OpenShift overlay pin only this successor.
 - cl02 must accept exact preserved-state serial replacement and then pass the
   complete Phase 9.9 gate before Phase 9 can be marked Verified.
+
+## Platform result
+
+The corrected encryption preflight passed on the controller-colocated Node,
+but cl02 rejected the tuple at full convergence. One other agent restarted
+twice when the constant-work compatibility endpoint competed for the same
+zero-waiter materialization permit. More importantly, all five otherwise Ready
+agents accumulated hundreds of rejected Service and LoadBalancer reads; two
+status reports became stale and zero reports cleared their transient error
+state within the five-minute convergence budget. The controller stayed Ready
+with zero restarts and 104–189 MiB RSS, confirming a liveness rather than memory
+failure. ADR 0264 replaces zero-waiter load shedding with fixed-capacity FIFO
+admission while preserving exactly one materialization.

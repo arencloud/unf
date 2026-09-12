@@ -1329,6 +1329,15 @@ the full fault/rotation/replacement matrix, 308 loss-free operations, Phase 8
 coexistence, exact cleanup, and no-CNI rollback. ADR 0263 pins its public
 immutable image and evidence tuple. The resumed serial cl02 deployment and
 complete platform gate remain required.
+That gate kept the controller at zero restarts and 104–189 MiB RSS, but rejected
+the tuple when zero-waiter shedding starved all five agents: hundreds of
+Service/LoadBalancer retries left zero convergence reports and two stale
+reports after five minutes. Bounded Fair Authority Admission retains exactly
+one expensive materialization, admits at most 16 active-plus-FIFO-waiting
+requests, and rejects overflow. Constant-work version and authenticated status
+traffic retain readiness/revision fencing without entering the heavy lane, and
+compatibility preflight now retries bounded backpressure before BPF access.
+ADR 0264. Fresh immutable Kind and cl02 qualification remain required.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

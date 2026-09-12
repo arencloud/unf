@@ -57,6 +57,12 @@ require 'reconcile_bootstrap_epoch_floor' "${root}/bins/unf-agent/src/main.rs"
 require 'startup_authority_retry' "${root}/bins/unf-agent/src/main.rs"
 require 'controller authority admission is busy; encryption identity preflight remains fenced' \
     "${root}/bins/unf-agent/src/main.rs"
+require 'controller compatibility admission is busy; persistent BPF access remains fenced' \
+    "${root}/bins/unf-agent/src/main.rs"
+require 'AGENT_AUTHORITY_ADMISSION_CAPACITY: usize = 16' \
+    "${root}/bins/unf-controller/src/main.rs"
+require 'request_requires_authority_materialization' \
+    "${root}/bins/unf-controller/src/main.rs"
 require 'native_only_generation_closes_without_encrypted_path_exchange' \
     "${root}/bins/unf-agent/src/main.rs"
 require '/v1/state/encryption-activation-testimony' "${root}/bins/unf-agent/src/main.rs"

@@ -1260,7 +1260,13 @@ matrix is maintained in the
   WireGuard frames with zero Required plaintext, complete fault/rotation/
   replacement matrix, 308 loss-free operations, exact cleanup, and no-CNI
   rollback. The resumed serial cl02 deployment and complete gate remain
-  mandatory.
+  mandatory. cl02 rejected that tuple at full convergence: the controller
+  remained at zero restarts and 104–189 MiB RSS, but zero-waiter shedding left
+  all five agents with transient errors and two stale reports. ADR 0264 adds a
+  fixed 16-request FIFO admission domain around the one materializer, keeps
+  constant-work compatibility/status on a cut-fenced control lane, and extends
+  bounded pre-BPF retry to compatibility admission. Fresh immutable Kind and
+  complete cl02 qualification remain mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

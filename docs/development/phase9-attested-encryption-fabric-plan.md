@@ -22,7 +22,7 @@ separately revisioned. The authoritative state remains in
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
 | 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `2b1184f` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADR 0263. Default-Required and explicit-selective PodIP/Service traffic, 269 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent/controller replacement, 308 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `63978ec…24dbf`; packet-capture SHA-256 is `047780b…8874c` |
-| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0263 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and bounded recovery/evidence boundaries. `73057c1` proved the controller bound then exposed the agent preflight liveness gap. Causal Startup Admission Retry corrects it, and exact successor `2b1184f` passed fresh Kind with public immutable images pinned. Resumed preserved-state deployment and the complete cl02 platform gate remain |
+| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0264 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and bounded recovery/evidence boundaries. `2b1184f` kept the controller at zero restarts and 104–189 MiB but zero-waiter shedding starved all agents, leaving zero converged and two stale reports. Bounded Fair Authority Admission keeps one materializer, a fixed 16-request FIFO domain, cut-fenced constant-work compatibility/status, and bounded compatibility retry. Fresh Kind, immutable public images, preserved-state deployment, and the complete cl02 gate remain |
 
 ## Accepted Phase 9 gate
 
@@ -175,8 +175,10 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Deploy exact ADR 0263 successor `2b1184f` to cl02 without deleting preserved
-Node-local authority and rerun the complete bounded platform gate. The gate
+Validate ADR 0264's Bounded Fair Authority Admission, run a completely fresh
+Kind lifecycle, and publish only its exact digest-pinned successor. Deploy it
+to cl02 without deleting preserved Node-local authority and rerun the complete
+bounded platform gate. The gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as
 preserving RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct
 and Service traffic, selective fail-closed behavior, rotation/recovery, exact

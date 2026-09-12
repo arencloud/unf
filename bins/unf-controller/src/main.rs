@@ -233,6 +233,7 @@ const INITIAL_WATCH_SECURITY_POLICIES: u64 = 1 << 5;
 const INITIAL_WATCH_NETWORK_POLICIES: u64 = 1 << 6;
 const INITIAL_WATCH_ENCRYPTION_POLICIES: u64 = 1 << 7;
 const AGENT_AUTHORITY_MAX_IN_FLIGHT: usize = 1;
+const AGENT_AUTHORITY_ADMISSION_CAPACITY: usize = 16;
 const INITIAL_AGENT_AUTHORITY_WATCHES: u64 = INITIAL_WATCH_PODS
     | INITIAL_WATCH_NAMESPACES
     | INITIAL_WATCH_NODES
@@ -511,6 +512,7 @@ struct ControllerState {
     initial_agent_authority_watches: AtomicU64,
     agent_authority_cut_revision: AtomicU64,
     agent_authority_admission: Semaphore,
+    agent_authority_admission_slots: Semaphore,
     identity_epoch: u64,
     offline: bool,
     agent_node_selector: Option<String>,
@@ -2121,6 +2123,7 @@ fn new_state_with_client_and_selector(
         }),
         agent_authority_cut_revision: AtomicU64::new(0),
         agent_authority_admission: Semaphore::new(AGENT_AUTHORITY_MAX_IN_FLIGHT),
+        agent_authority_admission_slots: Semaphore::new(AGENT_AUTHORITY_ADMISSION_CAPACITY),
         identity_epoch: controller_epoch(),
         offline,
         agent_node_selector,
@@ -16324,11 +16327,20 @@ async fn admit_agent_authority_request(
         return ApiError::service_unavailable("controller authoritative informer cut is not ready")
             .into_response();
     }
-    let Ok(_permit) = state.agent_authority_admission.try_acquire() else {
-        return ApiError::service_unavailable(
-            "controller authority materialization is already in flight",
-        )
-        .into_response();
+    let _admission = if request_requires_authority_materialization(&request) {
+        let Ok(slot) = state.agent_authority_admission_slots.try_acquire() else {
+            return ApiError::service_unavailable(
+                "controller authority admission queue is at its fixed capacity",
+            )
+            .into_response();
+        };
+        let Ok(permit) = state.agent_authority_admission.acquire().await else {
+            return ApiError::service_unavailable("controller authority admission is closed")
+                .into_response();
+        };
+        Some((slot, permit))
+    } else {
+        None
     };
     let cut_revision = state.agent_authority_cut_revision.load(Ordering::Acquire);
     if !state.ready.load(Ordering::Acquire) {
@@ -16349,6 +16361,12 @@ async fn admit_agent_authority_request(
         )
         .into_response()
     }
+}
+
+fn request_requires_authority_materialization(request: &Request) -> bool {
+    let path = request.uri().path();
+    path != "/v1/version"
+        && !(path == "/v1/state/agents" && request.method() == axum::http::Method::POST)
 }
 
 fn begin_topology_initialization(state: &ControllerState) {
@@ -16467,7 +16485,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_authority_admission_is_single_flight_and_revision_fenced() {
+    fn agent_authority_admission_is_bounded_single_flight_and_revision_fenced() {
         let state = new_state_with_client_and_selector(
             false,
             None,
@@ -16492,19 +16510,64 @@ mod tests {
             state.agent_authority_admission.available_permits(),
             AGENT_AUTHORITY_MAX_IN_FLIGHT
         );
+        assert_eq!(
+            state.agent_authority_admission_slots.available_permits(),
+            AGENT_AUTHORITY_ADMISSION_CAPACITY
+        );
 
+        let slots: Vec<_> = (0..AGENT_AUTHORITY_ADMISSION_CAPACITY)
+            .map(|_| {
+                state
+                    .agent_authority_admission_slots
+                    .try_acquire()
+                    .expect("fixed admission capacity must be available")
+            })
+            .collect();
+        assert!(state.agent_authority_admission_slots.try_acquire().is_err());
         let permit = state
             .agent_authority_admission
             .try_acquire()
             .expect("first authority materialization must be admitted");
         assert!(state.agent_authority_admission.try_acquire().is_err());
         drop(permit);
+        drop(slots);
         assert_eq!(state.agent_authority_admission.available_permits(), 1);
+        assert_eq!(
+            state.agent_authority_admission_slots.available_permits(),
+            AGENT_AUTHORITY_ADMISSION_CAPACITY
+        );
 
         let revision = state.agent_authority_cut_revision.load(Ordering::Acquire);
         begin_initial_agent_authority_watch(&state, INITIAL_WATCH_PODS);
         assert!(state.agent_authority_cut_revision.load(Ordering::Acquire) > revision);
         assert!(!state.ready.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn constant_work_internal_requests_bypass_only_the_materialization_lane() {
+        let request = |method, path| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        assert!(!request_requires_authority_materialization(&request(
+            axum::http::Method::GET,
+            "/v1/version",
+        )));
+        assert!(!request_requires_authority_materialization(&request(
+            axum::http::Method::POST,
+            "/v1/state/agents",
+        )));
+        assert!(request_requires_authority_materialization(&request(
+            axum::http::Method::GET,
+            "/v1/state/agents",
+        )));
+        assert!(request_requires_authority_materialization(&request(
+            axum::http::Method::GET,
+            "/v1/state/policies",
+        )));
     }
 
     #[test]

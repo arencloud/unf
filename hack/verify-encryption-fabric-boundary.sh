@@ -92,6 +92,9 @@ require_text docs/adr/0262-causal-startup-admission-retry.md \
 require_text docs/adr/0263-immutable-causal-startup-kind-requalification.md \
     'Immutable Causal-Startup Kind Requalification' \
     "causal startup retry must retain immutable fresh-Kind provenance"
+require_text docs/adr/0264-bounded-fair-authority-admission.md \
+    'Bounded Fair Authority Admission' \
+    "authority materialization must combine bounded memory with admitted progress"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"
@@ -104,6 +107,9 @@ require_text bins/unf-controller/src/main.rs \
 require_text bins/unf-controller/src/main.rs \
     'AGENT_AUTHORITY_MAX_IN_FLIGHT: usize = 1' \
     "internal authority materialization must be single-flight"
+require_text bins/unf-controller/src/main.rs \
+    'AGENT_AUTHORITY_ADMISSION_CAPACITY: usize = 16' \
+    "internal authority admission must have a fixed queue bound"
 require_text bins/unf-controller/src/main.rs \
     'admit_agent_authority_request' \
     "the host-network internal API must enforce authority admission"
