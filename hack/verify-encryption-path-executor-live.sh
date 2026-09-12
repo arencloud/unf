@@ -115,6 +115,7 @@ run_endpoint() {
         "UNF_PATH_PROBE_LIVE_ROLE=${role}"
         "UNF_PATH_PROBE_LIVE_MARK=${probe_mark}"
         "UNF_PATH_PROBE_LIVE_ROUND=${round}"
+        "UNF_PATH_PROBE_LIVE_ROUNDS=${UNF_PATH_PROBE_LIVE_ROUNDS:-1}"
     )
     if [[ ${expectation} == timeout ]]; then
         environment+=("UNF_PATH_PROBE_EXPECT_TIMEOUT=1")

@@ -10236,6 +10236,18 @@ struct PathProbeWireExchange {
     response: [u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES],
 }
 
+fn index_path_probe_work(
+    work: &[PathProbeWork],
+) -> Result<BTreeMap<EncryptionPathProofRoundDigest, usize>> {
+    let mut index = BTreeMap::new();
+    for (offset, item) in work.iter().enumerate() {
+        if index.insert(item.round_digest, offset).is_some() {
+            bail!("path probe group contains a duplicate round");
+        }
+    }
+    Ok(index)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn execute_live_encryption_path_proofs(
     recipient: &unf_encryption::EncryptionGenerationRecipient,
@@ -10252,7 +10264,14 @@ async fn execute_live_encryption_path_proofs(
     let mut plan_by_round = BTreeMap::new();
     let mut before_by_plan = BTreeMap::new();
     let mut groups = BTreeMap::<PathProbeSocketKey, Vec<PathProbeWork>>::new();
+    let mut assignments_by_round = BTreeMap::new();
     for assignment in assignments {
+        if assignments_by_round
+            .insert(assignment.round.round_digest, assignment)
+            .is_some()
+        {
+            bail!("path execution contains a duplicate assigned round");
+        }
         if assignment.generation != desired_generation || !assignment.includes(recipient) {
             bail!("path assignment does not belong to the pending local generation");
         }
@@ -10316,9 +10335,8 @@ async fn execute_live_encryption_path_proofs(
             .context("join encrypted path probe task")?
             .context("exchange encrypted path probe group")?
         {
-            let assignment = assignments
-                .iter()
-                .find(|assignment| assignment.round.round_digest == exchange.round_digest)
+            let assignment = assignments_by_round
+                .get(&exchange.round_digest)
                 .context("wire exchange has no authenticated assignment")?;
             let target = assignment
                 .probe_targets_from_assignment_batch(batch, recipient)?
@@ -10416,13 +10434,10 @@ async fn exchange_encryption_path_probe_group(
     work: Vec<PathProbeWork>,
 ) -> Result<Vec<PathProbeWireExchange>> {
     let socket = path_probe_socket(&key)?;
-    let mut pending = BTreeMap::<
-        EncryptionPathProofRoundDigest,
-        (
-            [u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES],
-            Option<[u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES]>,
-        ),
-    >::new();
+    let work_index = index_path_probe_work(&work)?;
+    let mut responses = vec![None; work.len()];
+    let mut remaining = work.len();
+    let mut send_cursor = 0;
     let now_unix_ms = current_unix_time_milliseconds();
     let round_valid_for_ms = work
         .iter()
@@ -10434,14 +10449,6 @@ async fn exchange_encryption_path_probe_group(
     if valid_for_ms < 250 {
         bail!("path proof round expires before a bounded exchange can run");
     }
-    for item in &work {
-        if pending
-            .insert(item.round_digest, (item.request, None))
-            .is_some()
-        {
-            bail!("path probe group contains a duplicate round");
-        }
-    }
     let started = tokio::time::Instant::now();
     let deadline = started + Duration::from_millis(valid_for_ms);
     let round_deadline = started + Duration::from_millis(round_valid_for_ms);
@@ -10449,41 +10456,55 @@ async fn exchange_encryption_path_probe_group(
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut buffer = [0_u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES];
     loop {
-        if pending.values().all(|(_, response)| response.is_some()) {
+        if remaining == 0 {
             // Proof completion is asymmetric: one independently scheduled
             // endpoint can finish before its peer has received every family.
             // Return the local transcript immediately, but retain this exact
             // nonce-bound responder until the authenticated round expires.
             // This decouples activation latency from scheduler skew without
             // creating reusable reachability authority.
-            spawn_encryption_path_probe_responder_lease(socket, work.clone(), round_deadline);
+            spawn_encryption_path_probe_responder_lease(
+                socket,
+                work.clone(),
+                work_index,
+                round_deadline,
+            );
             break;
         }
         tokio::select! {
             _ = retry.tick() => {
-                for item in &work {
-                    let (request, response) = pending
-                        .get(&item.round_digest)
-                        .context("path probe request disappeared")?;
-                    if response.is_none() {
-                        set_path_probe_mark(&socket, item.route_mark)?;
-                        socket.send_to(
-                            request,
-                            SocketAddr::new(item.peer_address, ENCRYPTION_PATH_PROBE_PORT),
-                        ).await.context("send encrypted path probe request")?;
-                    }
+                if send_cursor == work.len() {
+                    send_cursor = 0;
                 }
+            }
+            sent = async {
+                let item = &work[send_cursor];
+                if responses[send_cursor].is_none() {
+                    set_path_probe_mark(&socket, item.route_mark)?;
+                    socket.send_to(
+                        &item.request,
+                        SocketAddr::new(item.peer_address, ENCRYPTION_PATH_PROBE_PORT),
+                    ).await.context("send encrypted path probe request")?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }, if send_cursor < work.len() => {
+                sent?;
+                // One work item per select turn lets receive and deadline
+                // processing compete fairly even with thousands of rounds.
+                send_cursor += 1;
             }
             received = socket.recv_from(&mut buffer) => {
                 let (length, peer) = received.context("receive encrypted path probe frame")?;
                 let frame = EncryptionPathProbeFrame::decode(&buffer[..length])?;
-                let Some(item) = work.iter().find(|item| {
-                    item.round_digest == frame.round_digest()
-                        && item.family == frame.family()
-                        && peer == SocketAddr::new(item.peer_address, ENCRYPTION_PATH_PROBE_PORT)
-                }) else {
+                let Some(&offset) = work_index.get(&frame.round_digest()) else {
                     continue;
                 };
+                let item = &work[offset];
+                if item.family != frame.family()
+                    || peer != SocketAddr::new(item.peer_address, ENCRYPTION_PATH_PROBE_PORT)
+                {
+                    continue;
+                }
                 match frame.kind() {
                     EncryptionPathProbeKind::Request => {
                         if buffer[..length] != item.request {
@@ -10497,9 +10518,9 @@ async fn exchange_encryption_path_probe_group(
                         if buffer[..length] != item.response {
                             continue;
                         }
-                        pending.get_mut(&frame.round_digest())
-                            .context("path probe response has no pending request")?.1 =
-                            Some(buffer[..length].try_into().expect("validated fixed probe frame"));
+                        if responses[offset].replace(item.response).is_none() {
+                            remaining -= 1;
+                        }
                     }
                 }
             }
@@ -10509,15 +10530,13 @@ async fn exchange_encryption_path_probe_group(
         }
     }
     work.into_iter()
-        .map(|item| {
-            let (request, response) = pending
-                .remove(&item.round_digest)
-                .context("completed path probe transcript disappeared")?;
+        .zip(responses)
+        .map(|(item, response)| {
             Ok(PathProbeWireExchange {
                 round_digest: item.round_digest,
                 family: item.family,
                 peer_address: item.peer_address,
-                request,
+                request: item.request,
                 response: response.context("path probe completed without a response")?,
             })
         })
@@ -10527,6 +10546,7 @@ async fn exchange_encryption_path_probe_group(
 fn spawn_encryption_path_probe_responder_lease(
     socket: tokio::net::UdpSocket,
     work: Vec<PathProbeWork>,
+    work_index: BTreeMap<EncryptionPathProofRoundDigest, usize>,
     deadline: tokio::time::Instant,
 ) {
     tokio::spawn(async move {
@@ -10545,6 +10565,7 @@ fn spawn_encryption_path_probe_responder_lease(
                     if let Err(error) = respond_to_encryption_path_probe(
                         &socket,
                         &work,
+                        &work_index,
                         &buffer,
                         received,
                     ).await {
@@ -10559,6 +10580,7 @@ fn spawn_encryption_path_probe_responder_lease(
 async fn respond_to_encryption_path_probe(
     socket: &tokio::net::UdpSocket,
     work: &[PathProbeWork],
+    work_index: &BTreeMap<EncryptionPathProofRoundDigest, usize>,
     buffer: &[u8; ENCRYPTION_PATH_PROBE_FRAME_BYTES],
     received: (usize, SocketAddr),
 ) -> Result<()> {
@@ -10567,14 +10589,14 @@ async fn respond_to_encryption_path_probe(
     if frame.kind() != EncryptionPathProbeKind::Request {
         return Ok(());
     }
-    let Some(item) = work.iter().find(|item| {
-        item.round_digest == frame.round_digest()
-            && item.family == frame.family()
-            && peer == SocketAddr::new(item.peer_address, ENCRYPTION_PATH_PROBE_PORT)
-    }) else {
+    let Some(&offset) = work_index.get(&frame.round_digest()) else {
         return Ok(());
     };
-    if buffer[..length] != item.request {
+    let item = &work[offset];
+    if item.family != frame.family()
+        || peer != SocketAddr::new(item.peer_address, ENCRYPTION_PATH_PROBE_PORT)
+        || buffer[..length] != item.request
+    {
         return Ok(());
     }
     set_path_probe_mark(socket, item.route_mark)?;
@@ -10669,17 +10691,15 @@ async fn collect_live_encryption_path_receipts(
     let assignments = assignment_batch.assignments();
     let assignment_rounds = assignments
         .iter()
-        .map(|assignment| assignment.round.round_digest)
-        .collect::<BTreeSet<_>>();
+        .map(|assignment| (assignment.round.round_digest, assignment))
+        .collect::<BTreeMap<_, _>>();
     generations.path_proofs.retain(|round, proof| {
-        assignment_rounds.contains(round)
-            && assignments.iter().any(|assignment| {
-                assignment.round.round_digest == *round
-                    && proof.round_digest == *round
-                    && proof
-                        .verify(&assignment.round, current_unix_time_milliseconds())
-                        .is_ok()
-            })
+        assignment_rounds.get(round).is_some_and(|assignment| {
+            proof.round_digest == *round
+                && proof
+                    .verify(&assignment.round, current_unix_time_milliseconds())
+                    .is_ok()
+        })
     });
     let missing_assignments = assignments
         .iter()
@@ -20975,6 +20995,10 @@ mod tests {
             .expect("missing live round")
             .parse::<u8>()
             .expect("invalid live round");
+        let rounds = std::env::var("UNF_PATH_PROBE_LIVE_ROUNDS").map_or(1, |value| {
+            value.parse::<usize>().expect("invalid round count")
+        });
+        assert!((1..=4096).contains(&rounds));
         let (local_v4, peer_v4, local_v6, peer_v6) = match role.as_str() {
             "a" => (
                 "10.250.1.254",
@@ -20999,25 +21023,27 @@ mod tests {
             PathProbeSocketKey {
                 local_address: local_v4.parse().unwrap(),
             },
-            vec![live_path_probe_work(
+            live_path_probe_work_set(
                 unf_encryption::PATH_FAMILY_IPV4,
                 peer_v4.parse().unwrap(),
                 route_mark,
                 seed,
                 expires_at,
-            )],
+                rounds,
+            ),
         );
         let ipv6 = exchange_encryption_path_probe_group(
             PathProbeSocketKey {
                 local_address: local_v6.parse().unwrap(),
             },
-            vec![live_path_probe_work(
+            live_path_probe_work_set(
                 unf_encryption::PATH_FAMILY_IPV6,
                 peer_v6.parse().unwrap(),
                 route_mark,
                 seed,
                 expires_at,
-            )],
+                rounds,
+            ),
         );
         let (ipv4, ipv6) = tokio::join!(ipv4, ipv6);
         if std::env::var_os("UNF_PATH_PROBE_EXPECT_TIMEOUT").is_some() {
@@ -21031,12 +21057,52 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let ipv4 = ipv4.expect("IPv4 live nonce rendezvous failed");
         let ipv6 = ipv6.expect("IPv6 live nonce rendezvous failed");
-        assert_eq!(ipv4.len(), 1);
-        assert_eq!(ipv6.len(), 1);
+        assert_eq!(ipv4.len(), rounds);
+        assert_eq!(ipv6.len(), rounds);
         assert_eq!(ipv4[0].response[6], 2);
         assert_eq!(ipv6[0].response[6], 2);
         assert_eq!(ipv4[0].round_digest.0, [seed; 32]);
         assert_eq!(ipv6[0].round_digest.0, [seed; 32]);
+    }
+
+    fn live_path_probe_work_set(
+        family: u8,
+        peer: IpAddr,
+        mark: u32,
+        seed: u8,
+        expires_at: u64,
+        rounds: usize,
+    ) -> Vec<PathProbeWork> {
+        (0..rounds)
+            .map(|index| {
+                let mut work = live_path_probe_work(family, peer, mark, seed, expires_at);
+                if index != 0 {
+                    work.round_digest.0[..8].copy_from_slice(
+                        &u64::try_from(index)
+                            .expect("bounded round index")
+                            .to_be_bytes(),
+                    );
+                    work.request[8..40].copy_from_slice(&work.round_digest.0);
+                    work.response[8..40].copy_from_slice(&work.round_digest.0);
+                }
+                work
+            })
+            .collect()
+    }
+
+    #[test]
+    fn encryption_probe_index_covers_large_exact_round_sets_and_rejects_duplicates() {
+        let mut work = live_path_probe_work_set(1, "127.0.0.2".parse().unwrap(), 0, 7, 9_000, 4096);
+        let index = index_path_probe_work(&work).unwrap();
+        assert_eq!(index.len(), work.len());
+        for (offset, item) in work.iter().enumerate().rev() {
+            assert_eq!(index.get(&item.round_digest), Some(&offset));
+            let frame = EncryptionPathProbeFrame::decode(&item.response).unwrap();
+            assert_eq!(frame.round_digest(), item.round_digest);
+        }
+        assert!(!index.contains_key(&EncryptionPathProofRoundDigest([255; 32])));
+        work.push(work[0].clone());
+        assert!(index_path_probe_work(&work).is_err());
     }
 
     #[test]
