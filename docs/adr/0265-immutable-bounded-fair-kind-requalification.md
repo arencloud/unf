@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for Phase 9.9 platform qualification
+Historical Kind qualification; rejected by the cl02 platform gate
 
 ## Context
 
@@ -50,3 +50,20 @@ The packet capture SHA-256 is
 - The release record and OpenShift overlay pin only this successor.
 - cl02 must accept exact preserved-state serial replacement and then pass the
   complete Phase 9.9 gate before Phase 9 can be marked Verified.
+
+## Platform result
+
+The preserved-state controller-first and five-Node serial transition passed:
+all five agents converged without restart, kube-proxy remained absent, and the
+controller stayed at zero restarts with 94 MiB observed RSS. The complete gate
+then changed the baseline to Required and exposed a narrower lifetime gap. The
+controller was repeatedly OOM-killed at its 2-GiB limit before the first new
+generation could advance. Its retained fleet cut was only 22,179,791 bytes
+uncompressed, so one durable plan was not itself near the limit.
+
+The materialization permits were released as soon as Axum constructed a
+response. Buffered policy and plan bodies remained live while agents received
+them, allowing later requests to materialize additional large bodies outside
+the admission domain. ADR 0266 extends both permits through response-body
+completion or disconnect. The gate restored Native mode and all six UNF pods
+returned Ready.

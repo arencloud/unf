@@ -98,6 +98,9 @@ require_text docs/adr/0264-bounded-fair-authority-admission.md \
 require_text docs/adr/0265-immutable-bounded-fair-kind-requalification.md \
     'Immutable Bounded-Fair Kind Requalification' \
     "bounded-fair admission must retain immutable fresh-Kind provenance"
+require_text docs/adr/0266-end-to-end-authority-delivery-lease.md \
+    'End-to-End Authority Delivery Lease' \
+    "authority admission must cover response-body delivery lifetime"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use axum::body::Body;
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::middleware::{self, Next};
@@ -38,7 +39,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -511,8 +512,8 @@ struct ControllerState {
     ready: AtomicBool,
     initial_agent_authority_watches: AtomicU64,
     agent_authority_cut_revision: AtomicU64,
-    agent_authority_admission: Semaphore,
-    agent_authority_admission_slots: Semaphore,
+    agent_authority_admission: Arc<Semaphore>,
+    agent_authority_admission_slots: Arc<Semaphore>,
     identity_epoch: u64,
     offline: bool,
     agent_node_selector: Option<String>,
@@ -2122,8 +2123,10 @@ fn new_state_with_client_and_selector(
             INITIAL_AGENT_AUTHORITY_WATCHES
         }),
         agent_authority_cut_revision: AtomicU64::new(0),
-        agent_authority_admission: Semaphore::new(AGENT_AUTHORITY_MAX_IN_FLIGHT),
-        agent_authority_admission_slots: Semaphore::new(AGENT_AUTHORITY_ADMISSION_CAPACITY),
+        agent_authority_admission: Arc::new(Semaphore::new(AGENT_AUTHORITY_MAX_IN_FLIGHT)),
+        agent_authority_admission_slots: Arc::new(Semaphore::new(
+            AGENT_AUTHORITY_ADMISSION_CAPACITY,
+        )),
         identity_epoch: controller_epoch(),
         offline,
         agent_node_selector,
@@ -16327,14 +16330,18 @@ async fn admit_agent_authority_request(
         return ApiError::service_unavailable("controller authoritative informer cut is not ready")
             .into_response();
     }
-    let _admission = if request_requires_authority_materialization(&request) {
-        let Ok(slot) = state.agent_authority_admission_slots.try_acquire() else {
+    let admission = if request_requires_authority_materialization(&request) {
+        let Ok(slot) = Arc::clone(&state.agent_authority_admission_slots).try_acquire_owned()
+        else {
             return ApiError::service_unavailable(
                 "controller authority admission queue is at its fixed capacity",
             )
             .into_response();
         };
-        let Ok(permit) = state.agent_authority_admission.acquire().await else {
+        let Ok(permit) = Arc::clone(&state.agent_authority_admission)
+            .acquire_owned()
+            .await
+        else {
             return ApiError::service_unavailable("controller authority admission is closed")
                 .into_response();
         };
@@ -16354,13 +16361,32 @@ async fn admit_agent_authority_request(
     if state.ready.load(Ordering::Acquire)
         && state.agent_authority_cut_revision.load(Ordering::Acquire) == cut_revision
     {
-        response
+        match admission {
+            Some(permits) => response_with_authority_delivery_lease(response, permits),
+            None => response,
+        }
     } else {
         ApiError::service_unavailable(
             "controller authoritative informer cut changed during materialization",
         )
         .into_response()
     }
+}
+
+/// Retains both admission permits until the response body is fully consumed or
+/// dropped. Handler completion only proves that a bounded snapshot has been
+/// serialized; releasing here would allow multiple large buffered authority
+/// bodies to coexist while agents receive them.
+fn response_with_authority_delivery_lease(
+    response: Response,
+    permits: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let guarded = futures::stream::unfold(
+        (body.into_data_stream(), permits),
+        |(mut body, permits)| async move { body.next().await.map(|chunk| (chunk, (body, permits))) },
+    );
+    Response::from_parts(parts, Body::from_stream(guarded))
 }
 
 fn request_requires_authority_materialization(request: &Request) -> bool {
@@ -16541,6 +16567,31 @@ mod tests {
         begin_initial_agent_authority_watch(&state, INITIAL_WATCH_PODS);
         assert!(state.agent_authority_cut_revision.load(Ordering::Acquire) > revision);
         assert!(!state.ready.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn agent_authority_delivery_retains_permits_until_body_completion() {
+        let slots = Arc::new(Semaphore::new(1));
+        let materializers = Arc::new(Semaphore::new(1));
+        let permits = (
+            Arc::clone(&slots).try_acquire_owned().unwrap(),
+            Arc::clone(&materializers).try_acquire_owned().unwrap(),
+        );
+        let response = response_with_authority_delivery_lease(
+            Response::new(Body::from(vec![7_u8; 4_096])),
+            permits,
+        );
+        assert_eq!(slots.available_permits(), 0);
+        assert_eq!(materializers.available_permits(), 0);
+
+        let mut body = response.into_body().into_data_stream();
+        let chunk = body.next().await.unwrap().unwrap();
+        assert_eq!(chunk.len(), 4_096);
+        assert_eq!(slots.available_permits(), 0);
+        assert_eq!(materializers.available_permits(), 0);
+        assert!(body.next().await.is_none());
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(materializers.available_permits(), 1);
     }
 
     #[test]
