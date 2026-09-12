@@ -822,7 +822,7 @@ impl EncryptionPathProofAssignmentIndex {
         contract: &AttestedEncryptionPathContract,
     ) -> Result<(), EncryptionPathProofError> {
         self.round.verify()?;
-        let expected_round = EncryptionPathProofRound::issue(
+        let expected_round = EncryptionPathProofRound::issue_for_verified_contract(
             contract,
             self.plan_index,
             self.round.nonce,
@@ -955,11 +955,13 @@ impl AdmittedEncryptionPathProofAssignmentBatch {
         &self,
         assignment: &EncryptionPathProofAssignmentIndex,
     ) -> Result<&AttestedEncryptionPathContract, EncryptionPathProofError> {
-        if !self.selections.contains(&(
-            assignment.contract_digest,
-            assignment.plan_index,
-            assignment.round.round_digest,
-        )) {
+        if assignment.generation != self.batch.generation
+            || !self.selections.contains(&(
+                assignment.contract_digest,
+                assignment.plan_index,
+                assignment.round.round_digest,
+            ))
+        {
             return Err(EncryptionPathProofError::InvalidContractPlan);
         }
         let contract = self.batch.contract_for(assignment)?;
@@ -1111,7 +1113,7 @@ impl EncryptionPathProofCoordinator {
                 contract_digest,
                 plan_index,
             };
-            assignment.verify_with(contract)?;
+            assignment.verify_with_verified_contract(contract)?;
             let ledger = EncryptionPathProofLedger::new(round.clone())?;
             if paths
                 .insert(
@@ -2043,6 +2045,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn compact_assignment_replays_contract_once_per_boundary() {
+        for plan_count in [1, 64, 256] {
+            let contract = fixture_contract_with_plans(plan_count);
+            let mut coordinator = EncryptionPathProofCoordinator::default();
+            crate::CONTRACT_INTEGRITY_REPLAYS.with(|count| count.set(0));
+            coordinator
+                .replace_contract_batches(Revision::new(14), vec![contract], 1_500, 8_000)
+                .unwrap();
+            assert_eq!(
+                crate::CONTRACT_INTEGRITY_REPLAYS.with(std::cell::Cell::get),
+                1
+            );
+            let batch = coordinator.assignment_batch_for(&recipient("node-a", "uid-a"));
+            crate::CONTRACT_INTEGRITY_REPLAYS.with(|count| count.set(0));
+            let admitted = batch.admit().unwrap();
+            assert_eq!(
+                crate::CONTRACT_INTEGRITY_REPLAYS.with(std::cell::Cell::get),
+                1
+            );
+            for assignment in admitted.assignments() {
+                admitted.contract_for(assignment).unwrap();
+                assignment
+                    .probe_targets_from_assignment_batch(&admitted, &recipient("node-a", "uid-a"))
+                    .unwrap();
+            }
+            assert_eq!(
+                crate::CONTRACT_INTEGRITY_REPLAYS.with(std::cell::Cell::get),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn contract_deduplicated_assignment_batch_is_linear_and_fails_closed() {
         let contract = fixture_contract_with_plans(64);
         let mut coordinator = EncryptionPathProofCoordinator::default();
@@ -2068,6 +2103,15 @@ pub(crate) mod tests {
             .unwrap()
             .verify()
             .unwrap();
+
+        let admitted = batch.clone().admit().unwrap();
+        let mut selection = admitted.assignments()[0].clone();
+        admitted.contract_for(&selection).unwrap();
+        selection.generation = Revision::new(15);
+        assert!(admitted.contract_for(&selection).is_err());
+        selection.generation = Revision::new(14);
+        selection.round.source.node_uid.push_str("-foreign");
+        assert!(admitted.contract_for(&selection).is_err());
 
         let mut digest_mutated = batch.clone();
         digest_mutated.assignments[0].contract_digest.0[0] ^= 1;

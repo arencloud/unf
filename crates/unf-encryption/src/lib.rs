@@ -602,6 +602,11 @@ pub enum EncryptionContractError {
     UnknownWitnessSelection,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CONTRACT_INTEGRITY_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl AttestedEncryptionPathContract {
     /// Issues one canonical exact-source-Node contract from complete facts.
     ///
@@ -665,6 +670,8 @@ impl AttestedEncryptionPathContract {
     ///
     /// Rejects schema drift or any digest-covered mutation.
     pub fn verify_integrity(&self) -> Result<(), EncryptionContractError> {
+        #[cfg(test)]
+        CONTRACT_INTEGRITY_REPLAYS.with(|count| count.set(count.get() + 1));
         if self.schema_version != ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION {
             return Err(EncryptionContractError::UnsupportedSchema {
                 actual: self.schema_version,

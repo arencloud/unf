@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented; fresh Kind and OpenShift qualification pending
+Implemented; OpenShift-first and subsequent fresh Kind qualification pending
 
 ## Context
 
@@ -78,3 +78,15 @@ do not change.
 - Full workspace checks, a completely fresh Kind lifecycle, immutable public
   successor images, exact preserved-state cl02 deployment, and the complete
   OpenShift gate remain mandatory before Phase 9 is Verified.
+
+## Follow-up review
+
+The 2026-09-12 resume found two full-integrity calls still inside the verified
+selection path. Both now use the private verified-contract constructor;
+standalone untrusted inputs retain complete integrity replay. A test-only
+thread-local counter proves exactly one full replay at coordinator construction
+and one at batch admission for 1, 64, and 256 plans, with none added by admitted
+lookups or beacon derivation. Admitted lookups reject generation substitution.
+The user changed platform order to cl02 first, then fresh Kind. Both results
+remain required. Post-phase work is tracked in the
+[stabilization plan](../development/stabilization-and-scale-plan.md).
