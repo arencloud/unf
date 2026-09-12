@@ -14,7 +14,8 @@ use unf_common::Revision;
 
 use crate::{
     AuthenticatedNodeIdentity, CausalEpochBarrierDigest, EncryptionGenerationRecipient,
-    KeyEpochPhase, NodeKeyTransparencyCut, NodeKeyTransparencyCutDigest, PeerEpochAcknowledgement,
+    KeyEpochPhase, NodeKeyPublication, NodeKeyTransparencyCut, NodeKeyTransparencyCutDigest,
+    PeerEpochAcknowledgement,
 };
 
 pub const NODE_KEY_ATTESTATION_SCHEMA_VERSION: u16 = 1;
@@ -94,11 +95,12 @@ pub struct NodeKeyAttestationLedger {
 
 impl NodeKeyAttestationRound {
     /// Freezes a complete public transparency cut into one reciprocal witness
-    /// round. Every multi-Node member must expose exactly one prepared epoch.
+    /// round for a common unfinished epoch. Already-active members may witness
+    /// a peer's unfinished activation after controller replacement.
     ///
     /// # Errors
     ///
-    /// Rejects incomplete, expired, already-progressed, or ambiguous input.
+    /// Rejects incomplete, expired, fully active, or ambiguous input.
     pub fn issue(
         transparency: &NodeKeyTransparencyCut,
         issued_at_unix_ms: u64,
@@ -111,31 +113,43 @@ impl NodeKeyAttestationRound {
         }
         let peer_count = u32::try_from(transparency.members.len().saturating_sub(1))
             .map_err(|_| NodeKeyAttestationError::InvalidRound)?;
+        // Publications contain at most two epochs. Intersect that bounded set,
+        // rather than requiring every peer to have retained the Prepared phase.
+        // Never reopen a fully active cut or use a draining/expired predecessor.
+        let candidates = transparency.publications[0]
+            .epochs
+            .iter()
+            .filter(|candidate| {
+                transparency.publications.iter().all(|publication| {
+                    publication.epochs.iter().any(|epoch| {
+                        epoch.epoch == candidate.epoch
+                            && epoch.phase != KeyEpochPhase::Draining
+                            && epoch.topology_revision == transparency.membership_revision
+                            && epoch.required_peer_count == peer_count
+                            && issued_at_unix_ms >= epoch.valid_from_unix_ms
+                            && issued_at_unix_ms < epoch.valid_until_unix_ms
+                    })
+                }) && transparency.publications.iter().any(|publication| {
+                    publication.epochs.iter().any(|epoch| {
+                        epoch.epoch == candidate.epoch && epoch.phase != KeyEpochPhase::Active
+                    })
+                })
+            })
+            .map(|epoch| epoch.epoch)
+            .collect::<Vec<_>>();
+        let [common_epoch] = candidates.as_slice() else {
+            return Err(NodeKeyAttestationError::AmbiguousProposal);
+        };
         let proposals = transparency
             .members
             .iter()
             .zip(&transparency.publications)
             .map(|(member, publication)| {
-                let candidates = publication
+                let epoch = publication
                     .epochs
                     .iter()
-                    .filter(|epoch| {
-                        epoch.phase == KeyEpochPhase::Prepared
-                            || transparency.members.len() == 1
-                                && epoch.phase == KeyEpochPhase::MutuallyAttested
-                    })
-                    .collect::<Vec<_>>();
-                let [epoch] = candidates.as_slice() else {
-                    return Err(NodeKeyAttestationError::AmbiguousProposal);
-                };
-                if epoch.required_peer_count != peer_count
-                    || epoch.acknowledged_peer_count != 0
-                    || transparency.members.len() > 1 && epoch.readiness_digest.is_some()
-                    || issued_at_unix_ms < epoch.valid_from_unix_ms
-                    || issued_at_unix_ms >= epoch.valid_until_unix_ms
-                {
-                    return Err(NodeKeyAttestationError::InvalidRound);
-                }
+                    .find(|epoch| epoch.epoch == *common_epoch)
+                    .ok_or(NodeKeyAttestationError::AmbiguousProposal)?;
                 Ok(NodeKeyAttestationProposal {
                     recipient: member.clone(),
                     epoch: epoch.epoch,
@@ -158,6 +172,51 @@ impl NodeKeyAttestationRound {
         round.round_digest = round.calculate_digest()?;
         round.verify()?;
         Ok(round)
+    }
+
+    /// Binds a witness or activation to the caller's exact retained public epoch.
+    /// A controller's digest is not evidence that the local key still exists.
+    ///
+    /// # Errors
+    ///
+    /// Rejects foreign identity, changed barrier/lifetime, topology drift,
+    /// draining or missing authority, and any expired proposal in the round.
+    pub fn verify_publication(
+        &self,
+        publication: &NodeKeyPublication,
+        now_unix_ms: u64,
+    ) -> Result<(), NodeKeyAttestationError> {
+        self.verify()?;
+        publication
+            .verify()
+            .map_err(|_| NodeKeyAttestationError::InvalidRound)?;
+        let proposal = self
+            .proposals
+            .iter()
+            .find(|proposal| {
+                proposal.recipient.node_name == publication.node_name
+                    && proposal.recipient.node_uid == publication.node_uid
+            })
+            .ok_or(NodeKeyAttestationError::ForeignPeer)?;
+        if self.cluster_id != publication.cluster_id
+            || now_unix_ms < self.issued_at_unix_ms
+            || self
+                .proposals
+                .iter()
+                .any(|proposal| now_unix_ms >= proposal.valid_until_unix_ms)
+            || !publication.epochs.iter().any(|epoch| {
+                epoch.epoch == proposal.epoch
+                    && epoch.phase != KeyEpochPhase::Draining
+                    && epoch.topology_revision == self.membership_revision
+                    && epoch.barrier_digest == proposal.barrier_digest
+                    && epoch.valid_from_unix_ms == proposal.valid_from_unix_ms
+                    && epoch.valid_until_unix_ms == proposal.valid_until_unix_ms
+                    && epoch.required_peer_count as usize == self.members.len() - 1
+            })
+        {
+            return Err(NodeKeyAttestationError::InvalidRound);
+        }
+        Ok(())
     }
 
     /// Replays canonical membership, proposal coverage, lifetime, and digest.
@@ -408,10 +467,13 @@ impl NodeKeyAttestationLedger {
                 return Ok(true);
             }
         }
-        self.round = Some(NodeKeyAttestationRound::issue(
-            transparency,
-            issued_at_unix_ms,
-        )?);
+        self.round = Some(
+            match NodeKeyAttestationRound::issue(transparency, issued_at_unix_ms) {
+                Ok(round) => round,
+                Err(NodeKeyAttestationError::AmbiguousProposal) => return Ok(false),
+                Err(error) => return Err(error),
+            },
+        );
         self.rows.clear();
         Ok(true)
     }
@@ -539,7 +601,7 @@ pub enum NodeKeyAttestationError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{cell::Cell, collections::BTreeSet, rc::Rc};
 
     use super::*;
     use crate::{NodeKeyAuthority, NodeKeyTransparencyLedger, OsWireGuardKeyGenerator};
@@ -601,6 +663,320 @@ mod tests {
         }
         let cut = transparency.complete_cut().unwrap().unwrap();
         (members, authorities, cut)
+    }
+
+    fn public_cut(
+        members: &[EncryptionGenerationRecipient],
+        authorities: &[NodeKeyAuthority],
+    ) -> NodeKeyTransparencyCut {
+        let mut transparency = NodeKeyTransparencyLedger::default();
+        transparency
+            .replace_membership("cluster-a".to_owned(), Revision::new(7), members.to_vec())
+            .unwrap();
+        for (member, authority) in members.iter().zip(authorities) {
+            transparency
+                .observe(&identity(member), authority.publication().unwrap())
+                .unwrap();
+        }
+        transparency.complete_cut().unwrap().unwrap()
+    }
+
+    fn complete_round(transparency: &NodeKeyTransparencyCut, now: u64) -> NodeKeyAttestationLedger {
+        let mut ledger = NodeKeyAttestationLedger::default();
+        assert!(ledger.begin_if_needed(transparency, now).unwrap());
+        let round = ledger.round().unwrap().clone();
+        for member in &transparency.members {
+            ledger
+                .observe_row(&identity(member), round.row_for(member).unwrap(), now)
+                .unwrap();
+        }
+        ledger
+    }
+
+    #[test]
+    fn replacement_resumes_prepared_attested_and_active_peers_without_reopening_active_cut() {
+        let (members, mut authorities, transparency) = prepared_fleet();
+        let original = complete_round(&transparency, NOW + 1);
+        for index in 1..3 {
+            for ack in original
+                .complete_cut_for(&members[index])
+                .unwrap()
+                .unwrap()
+                .acknowledgements
+            {
+                authorities[index]
+                    .acknowledge_epoch(&ack.peer_node_uid.clone(), ack, NOW + 2)
+                    .unwrap();
+            }
+        }
+        authorities[2]
+            .activate_epoch(1, Revision::new(7), NOW + 3, 1_000)
+            .unwrap();
+        let mixed = public_cut(&members, &authorities);
+        let mut restarted = NodeKeyAttestationLedger::default();
+        assert!(restarted.begin_if_needed(&mixed, NOW + 4).unwrap());
+        let round = restarted.round().unwrap().clone();
+        assert_ne!(round.round_digest, original.round().unwrap().round_digest);
+        assert_eq!(round.proposals, original.round().unwrap().proposals);
+        for (member, authority) in members.iter().zip(&authorities).take(2) {
+            round
+                .verify_publication(&authority.publication().unwrap(), NOW + 4)
+                .unwrap();
+            restarted
+                .observe_row(&identity(member), round.row_for(member).unwrap(), NOW + 4)
+                .unwrap();
+        }
+        assert!(restarted.complete_cut_for(&members[0]).unwrap().is_none());
+        round
+            .verify_publication(&authorities[2].publication().unwrap(), NOW + 4)
+            .unwrap();
+        restarted
+            .observe_row(
+                &identity(&members[2]),
+                round.row_for(&members[2]).unwrap(),
+                NOW + 4,
+            )
+            .unwrap();
+        for ack in restarted
+            .complete_cut_for(&members[0])
+            .unwrap()
+            .unwrap()
+            .acknowledgements
+        {
+            authorities[0]
+                .acknowledge_epoch(&ack.peer_node_uid.clone(), ack, NOW + 4)
+                .unwrap();
+        }
+        for authority in &mut authorities[..2] {
+            authority
+                .activate_epoch(1, Revision::new(7), NOW + 5, 1_000)
+                .unwrap();
+        }
+        let all_active = public_cut(&members, &authorities);
+        assert!(
+            !NodeKeyAttestationLedger::default()
+                .begin_if_needed(&all_active, NOW + 6)
+                .unwrap()
+        );
+        assert!(!restarted.begin_if_needed(&all_active, NOW + 6).unwrap());
+        assert_eq!(restarted.round().unwrap(), &round);
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingStore {
+        writes: Rc<Cell<usize>>,
+        fail: Rc<Cell<bool>>,
+    }
+
+    impl crate::NodeKeyStateStore for CountingStore {
+        fn persist(&self, _: &NodeKeyAuthority) -> Result<(), crate::KeyAuthorityError> {
+            if self.fail.get() {
+                return Err(crate::KeyAuthorityError::Io(std::io::Error::other(
+                    "injected failure",
+                )));
+            }
+            self.writes.set(self.writes.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reconstructed_cut_preserves_partial_acknowledgements_in_one_atomic_write() {
+        let (members, mut authorities, transparency) = prepared_fleet();
+        let original = complete_round(&transparency, NOW + 1);
+        let old_cut = original.complete_cut_for(&members[0]).unwrap().unwrap();
+        let first = old_cut.acknowledgements[0].clone();
+        let mut conflicting = authorities[0].clone();
+        let mut wrong_binding = first.clone();
+        wrong_binding.peer_public_epoch += 1;
+        conflicting
+            .acknowledge_epoch(&first.peer_node_uid, wrong_binding, NOW + 1)
+            .unwrap();
+        let mut conflicting = crate::DurableNodeKeyAuthority::create(
+            conflicting,
+            CountingStore::default(),
+            OsWireGuardKeyGenerator,
+        )
+        .unwrap();
+        let conflict_before = conflicting.authority().publication().unwrap();
+        assert!(matches!(
+            conflicting.acknowledge_attestation_cut(&old_cut, NOW + 2),
+            Err(crate::KeyAuthorityError::AcknowledgementMutation)
+        ));
+        assert_eq!(
+            conflicting.authority().publication().unwrap(),
+            conflict_before
+        );
+        authorities[0]
+            .acknowledge_epoch(&first.peer_node_uid, first.clone(), NOW + 1)
+            .unwrap();
+        let restarted = complete_round(&public_cut(&members, &authorities), NOW + 2);
+        let cut = restarted.complete_cut_for(&members[0]).unwrap().unwrap();
+        // The ordinary single-ack API still refuses a changed observation.
+        assert!(matches!(
+            authorities[0].acknowledge_epoch(
+                &first.peer_node_uid,
+                cut.acknowledgements[0].clone(),
+                NOW + 2
+            ),
+            Err(crate::KeyAuthorityError::AcknowledgementMutation)
+        ));
+        let store = CountingStore::default();
+        let mut durable = crate::DurableNodeKeyAuthority::create(
+            authorities.remove(0),
+            store.clone(),
+            OsWireGuardKeyGenerator,
+        )
+        .unwrap();
+        let before = durable.authority().publication().unwrap();
+        store.fail.set(true);
+        assert!(durable.acknowledge_attestation_cut(&cut, NOW + 2).is_err());
+        assert_eq!(durable.authority().publication().unwrap(), before);
+        assert_eq!(store.writes.get(), 1);
+        store.fail.set(false);
+        assert!(durable.acknowledge_attestation_cut(&cut, NOW + 2).unwrap());
+        assert_eq!(store.writes.get(), 2);
+        assert_eq!(
+            durable.authority().epochs()[0].phase(),
+            KeyEpochPhase::MutuallyAttested
+        );
+        assert!(!durable.acknowledge_attestation_cut(&cut, NOW + 3).unwrap());
+        assert_eq!(store.writes.get(), 2);
+        assert!(
+            durable
+                .acknowledge_attestation_cut(&cut, NOW + 100_000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn witness_requires_retained_identity_barrier_and_live_common_epoch() {
+        let (members, mut authorities, transparency) = prepared_fleet();
+        let round = NodeKeyAttestationRound::issue(&transparency, NOW + 1).unwrap();
+        let publication = authorities[0].publication().unwrap();
+        let mut changed = round.clone();
+        changed.proposals[0].valid_until_unix_ms += 1;
+        changed.round_digest = changed.calculate_digest().unwrap();
+        assert!(changed.verify_publication(&publication, NOW + 2).is_err());
+        let mut changed = round.clone();
+        changed.membership_revision = Revision::new(8);
+        changed.round_digest = changed.calculate_digest().unwrap();
+        assert!(changed.verify_publication(&publication, NOW + 2).is_err());
+        assert!(round.verify_publication(&publication, NOW).is_err());
+        assert!(
+            round
+                .verify_publication(&publication, NOW + 100_000)
+                .is_err()
+        );
+        // Same identity and epoch number, but newly generated authority/barrier.
+        let (_, replacement, _) = prepared_fleet();
+        assert!(
+            round
+                .verify_publication(&replacement[0].publication().unwrap(), NOW + 2)
+                .is_err()
+        );
+        let foreign = NodeKeyAuthority::new(
+            "cluster-a".to_owned(),
+            "a".to_owned(),
+            "replacement-uid".to_owned(),
+        )
+        .unwrap();
+        assert!(
+            round
+                .verify_publication(&foreign.publication().unwrap(), NOW + 2)
+                .is_err()
+        );
+        authorities[0]
+            .revoke_through(
+                1,
+                crate::EpochRevocationReason::FleetEpochSuperseded,
+                NOW + 2,
+            )
+            .unwrap();
+        assert!(
+            round
+                .verify_publication(&authorities[0].publication().unwrap(), NOW + 2)
+                .is_err()
+        );
+        let incomplete = public_cut(&members, &authorities);
+        assert!(
+            !NodeKeyAttestationLedger::default()
+                .begin_if_needed(&incomplete, NOW + 3)
+                .unwrap()
+        );
+        assert!(
+            !NodeKeyAttestationLedger::default()
+                .begin_if_needed(&transparency, NOW + 100_000)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn draining_predecessor_cannot_witness_a_reconstructed_round() {
+        let (members, mut authorities, first) = prepared_fleet();
+        let original = complete_round(&first, NOW + 1);
+        for (member, authority) in members.iter().zip(&mut authorities) {
+            for ack in original
+                .complete_cut_for(member)
+                .unwrap()
+                .unwrap()
+                .acknowledgements
+            {
+                authority
+                    .acknowledge_epoch(&ack.peer_node_uid.clone(), ack, NOW + 2)
+                    .unwrap();
+            }
+            authority
+                .activate_epoch(1, Revision::new(7), NOW + 3, 1_000)
+                .unwrap();
+            authority
+                .prepare_epoch(
+                    Revision::new(7),
+                    members
+                        .iter()
+                        .filter(|peer| *peer != member)
+                        .map(|peer| peer.node_uid.clone())
+                        .collect(),
+                    NOW + 4,
+                    NOW + 200_000,
+                    &mut OsWireGuardKeyGenerator,
+                )
+                .unwrap();
+        }
+        let successor = complete_round(&public_cut(&members, &authorities), NOW + 5);
+        for ack in successor
+            .complete_cut_for(&members[0])
+            .unwrap()
+            .unwrap()
+            .acknowledgements
+        {
+            authorities[0]
+                .acknowledge_epoch(&ack.peer_node_uid.clone(), ack, NOW + 6)
+                .unwrap();
+        }
+        authorities[0]
+            .activate_epoch(2, Revision::new(7), NOW + 7, 1_000)
+            .unwrap();
+        assert!(
+            original
+                .round()
+                .unwrap()
+                .verify_publication(&authorities[0].publication().unwrap(), NOW + 8)
+                .is_err()
+        );
+        let recovered =
+            NodeKeyAttestationRound::issue(&public_cut(&members, &authorities), NOW + 8).unwrap();
+        assert!(
+            recovered
+                .proposals
+                .iter()
+                .all(|proposal| proposal.epoch == 2)
+        );
+        assert!(
+            recovered
+                .verify_publication(&authorities[0].publication().unwrap(), NOW + 8)
+                .is_ok()
+        );
     }
 
     #[test]

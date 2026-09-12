@@ -8334,25 +8334,9 @@ impl EncryptionKeySynchronizer {
             .iter()
             .find(|proposal| proposal.recipient == cut.recipient)
             .context("key attestation cut has no local proposal")?;
-        let phase = authority
-            .authority()
-            .epochs()
-            .iter()
-            .find(|epoch| epoch.epoch() == target.epoch)
-            .map(unf_encryption::LocalKeyEpoch::phase)
-            .context("key attestation cut targets an unknown local epoch")?;
-        let mut changed = false;
-        if phase == unf_encryption::KeyEpochPhase::Prepared {
-            for acknowledgement in &cut.acknowledgements {
-                changed |= authority
-                    .acknowledge_epoch(
-                        &acknowledgement.peer_node_uid,
-                        acknowledgement.clone(),
-                        now_unix_ms,
-                    )
-                    .context("durably record reciprocal peer key acknowledgement")?;
-            }
-        }
+        let mut changed = authority
+            .acknowledge_attestation_cut(cut, now_unix_ms)
+            .context("durably record complete reciprocal key attestation")?;
         let phase = authority
             .authority()
             .epochs()
@@ -8736,6 +8720,9 @@ async fn synchronize_encryption_keys(synchronizer: &mut EncryptionKeySynchronize
         .authority()
         .publication()
         .context("verify local key identity for reciprocal attestation")?;
+    round
+        .verify_publication(&publication, current_unix_time_milliseconds())
+        .context("bind reciprocal witness to the retained local key epoch")?;
     let peer = round
         .members
         .iter()

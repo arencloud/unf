@@ -11361,35 +11361,12 @@ fn ingest_encryption_keys_for_at(
             .map_err(|error| ApiError::service_unavailable(error.to_string()))?
     };
     if let Some(complete_cut) = complete_cut {
-        // A controller restart can reconstruct an already mutually-attested
-        // public cut directly from agents. Reopening a witness round would be
-        // both impossible (there is no Prepared epoch) and unnecessary. A
-        // complete higher Prepared epoch must, however, open its reciprocal
-        // round while the predecessor is still Active; waiting for the old
-        // window to expire makes a positive drain mathematically impossible.
-        let prepared_epochs = complete_cut
-            .publications
-            .iter()
-            .filter_map(|publication| {
-                let candidates = publication
-                    .epochs
-                    .iter()
-                    .filter(|epoch| epoch.phase == unf_encryption::KeyEpochPhase::Prepared)
-                    .map(|epoch| epoch.epoch)
-                    .collect::<Vec<_>>();
-                let [epoch] = candidates.as_slice() else {
-                    return None;
-                };
-                Some(*epoch)
-            })
-            .collect::<Vec<_>>();
-        let complete_prepared_epoch = prepared_epochs.len() == complete_cut.publications.len()
-            && prepared_epochs.windows(2).all(|pair| pair[0] == pair[1]);
-        if complete_prepared_epoch {
-            mutex_lock(&state.encryption_key_attestations)
-                .begin_if_needed(&complete_cut, now_unix_ms)
-                .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-        }
+        // The bounded common-epoch selector can resume partial activation
+        // after restart; already-active peers witness without changing keys.
+        // Fully active cuts do not reopen a round.
+        mutex_lock(&state.encryption_key_attestations)
+            .begin_if_needed(&complete_cut, now_unix_ms)
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
     }
     Ok(())
 }
@@ -17963,6 +17940,11 @@ mod tests {
             let cut = encryption_key_attestation_cut_for(&state, agent).unwrap();
             cut.verify().unwrap();
             assert_eq!(cut.acknowledgements.len(), 1);
+            if index == 1 {
+                // Simulate replacement after only the first Node consumes its
+                // complete column. The other still publishes Prepared.
+                continue;
+            }
             for acknowledgement in cut.acknowledgements {
                 authorities[index]
                     .acknowledge_epoch(
@@ -17998,7 +17980,7 @@ mod tests {
                 authority.publication().unwrap(),
                 now + 3,
             )
-            .expect("restart must reconstruct a mutually-attested public cut");
+            .expect("restart must reconstruct a mixed-phase public cut");
         }
         assert!(
             mutex_lock(&restarted.encryption_key_transparency)
@@ -18009,9 +17991,27 @@ mod tests {
         assert!(
             mutex_lock(&restarted.encryption_key_attestations)
                 .round()
-                .is_none(),
-            "already-ready authority must not reopen an impossible attestation round"
+                .is_some(),
+            "ready peers must witness the unfinished member after replacement"
         );
+        let resumed = encryption_key_attestation_round_for(&restarted, &agents[0]).unwrap();
+        for (agent, member) in agents.iter().zip(&members) {
+            ingest_encryption_key_attestation_row_for(
+                &restarted,
+                agent,
+                resumed.row_for(member).unwrap(),
+                now + 3,
+            )
+            .unwrap();
+        }
+        for ack in encryption_key_attestation_cut_for(&restarted, &agents[1])
+            .unwrap()
+            .acknowledgements
+        {
+            authorities[1]
+                .acknowledge_epoch(&ack.peer_node_uid.clone(), ack, now + 3)
+                .unwrap();
+        }
 
         let peer_uids = members
             .iter()

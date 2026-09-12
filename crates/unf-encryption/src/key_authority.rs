@@ -1333,6 +1333,104 @@ impl<S: NodeKeyStateStore, G: WireGuardKeyGenerator> DurableNodeKeyAuthority<S, 
         Ok(changed)
     }
 
+    /// Atomically persists a complete authenticated attestation column.
+    ///
+    /// The caller must obtain the cut over the authenticated controller channel.
+    /// A reconstructed round may have a later observation time. Previously
+    /// durable acknowledgements are preserved byte-for-byte, never overwritten;
+    /// only missing peers are added after every retained binding is checked.
+    /// This uses one persistence transaction, not one fsync per peer.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incomplete/foreign/stale cuts, changed existing bindings, invalid
+    /// authority or persistence failure without changing the in-memory authority.
+    pub fn acknowledge_attestation_cut(
+        &mut self,
+        cut: &crate::NodeKeyAttestationCut,
+        now_unix_ms: u64,
+    ) -> Result<bool, KeyAuthorityError> {
+        cut.verify()
+            .map_err(|_| KeyAuthorityError::InvalidAcknowledgement)?;
+        let publication = self.authority.publication()?;
+        cut.round
+            .verify_publication(&publication, now_unix_ms)
+            .map_err(|_| KeyAuthorityError::InvalidAcknowledgement)?;
+        if cut.recipient.node_name != publication.node_name
+            || cut.recipient.node_uid != publication.node_uid
+        {
+            return Err(KeyAuthorityError::InvalidAcknowledgement);
+        }
+        let target = cut
+            .round
+            .proposals
+            .iter()
+            .find(|proposal| proposal.recipient == cut.recipient)
+            .ok_or(KeyAuthorityError::InvalidAcknowledgement)?;
+        let local = self
+            .authority
+            .epochs
+            .iter()
+            .find(|epoch| epoch.epoch == target.epoch)
+            .ok_or(KeyAuthorityError::UnknownEpoch(target.epoch))?;
+        if local.phase != KeyEpochPhase::Prepared {
+            return Ok(false);
+        }
+        let required_peers = cut
+            .round
+            .members
+            .iter()
+            .filter(|member| *member != &cut.recipient)
+            .map(|member| member.node_uid.clone())
+            .collect::<BTreeSet<_>>();
+        if required_peers != local.barrier.required_peer_uids {
+            return Err(KeyAuthorityError::InvalidAcknowledgement);
+        }
+        let incoming = cut
+            .acknowledgements
+            .iter()
+            .map(|acknowledgement| (&acknowledgement.peer_node_uid, acknowledgement))
+            .collect::<BTreeMap<_, _>>();
+        for (peer, previous) in &local.acknowledgements {
+            let next = incoming
+                .get(peer)
+                .copied()
+                .ok_or(KeyAuthorityError::InvalidAcknowledgement)?;
+            let mut same_binding = next.clone();
+            same_binding.observed_at_unix_ms = previous.observed_at_unix_ms;
+            if &same_binding != previous || next.observed_at_unix_ms < previous.observed_at_unix_ms
+            {
+                return Err(KeyAuthorityError::AcknowledgementMutation);
+            }
+        }
+        let missing = cut.acknowledgements.iter().filter(|acknowledgement| {
+            !local
+                .acknowledgements
+                .contains_key(&acknowledgement.peer_node_uid)
+        });
+        let mut candidate = self.authority.clone();
+        let epoch = candidate
+            .epochs
+            .iter_mut()
+            .find(|epoch| epoch.epoch == target.epoch)
+            .ok_or(KeyAuthorityError::UnknownEpoch(target.epoch))?;
+        for acknowledgement in missing {
+            epoch.acknowledgements.insert(
+                acknowledgement.peer_node_uid.clone(),
+                acknowledgement.clone(),
+            );
+        }
+        // Complete-cut verification above binds every acknowledgement to this
+        // exact barrier and peer set. Validate/clone/hash the authority once,
+        // rather than repeating whole-state work for every missing peer.
+        epoch.readiness = Some(issue_readiness_certificate(epoch)?);
+        epoch.phase = KeyEpochPhase::MutuallyAttested;
+        candidate.bump_revision()?;
+        candidate.validate()?;
+        self.commit(candidate)?;
+        Ok(true)
+    }
+
     /// Durably activates an epoch and begins prior-epoch draining.
     ///
     /// # Errors

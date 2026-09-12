@@ -1,6 +1,6 @@
 # Phase 9 attested encryption-fabric execution plan
 
-Last reviewed: **2026-09-12**
+Last reviewed: **2026-09-13**
 
 Phase 9 implements master-prompt §25 as an identity-bound encryption fabric.
 It starts with kernel WireGuard for intra-cluster L3 transport and prepares a
@@ -22,7 +22,7 @@ separately revisioned. The authoritative state remains in
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
 | 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `30266627f42321cd90613c00cb5ba71ac648e02f` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADR 0267. Default-Required and explicit-selective PodIP/Service traffic, 404 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent/controller replacement, 295 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `7801aa7d…0775`; packet-capture SHA-256 is `aff51bb9…f03` |
-| 9.9 | OpenShift qualification | **In progress** | ADR 0275's replica-aware runtime passed cl02 deployment and initial Required migration but failed post-fixture convergence. ADRs 0276–0278 add deadline-bound timeout responders, a bounded/versioned recovery codec fallback and explicit persistence qualification. ADR 0279 stages the successor for cl02 first, then fresh Kind. Rotation/workload-change convergence and bounded operations-loss accounting remain open |
+| 9.9 | OpenShift qualification | **In progress** | ADR 0283's runtime recovered the exact missing frontier on cl02, then failed the full Required migration gate. ADR 0284 adds mixed-phase reciprocal key recovery and atomic complete-column persistence. Preserved-state recovery, migration, ciphertext/fail-closed behavior, rotation/replacement, bounded persistence/operations and exact cleanup must pass on cl02 before fresh Kind qualifies the identical runtime |
 
 ## Accepted Phase 9 gate
 
@@ -185,7 +185,9 @@ preserving Node-local authority and reaching the initially pending Native cut.
 The subsequent full gate failed during Required migration; post-trap journals
 remain split across Native/Required cuts, so cleanup is not verified. Repair and
 requalify mixed-phase key attestation and generation recovery without deleting
-durable authority. Run the full current-cut lifecycle gate, then
+durable authority. ADR 0284 implements mixed-phase witness reconstruction and
+atomic complete-column persistence; qualify that repair on preserved cl02 state.
+Run the full current-cut lifecycle gate, then
 qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as
 preserving RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct

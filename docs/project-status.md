@@ -549,6 +549,10 @@ code gap under investigation. The full current-cut lifecycle gate and successor
 Kind remain unverified; six operator problems remain visible. ADR 0283 records
 the failure separately from the successful deployment.
 
+ADR 0284 adds bounded common-epoch mixed-phase witness reconstruction, exact
+local-epoch binding and atomic complete-column persistence. It is a repair
+candidate, not a passed cl02/Kind qualification or a heavy-load performance claim.
+
 ## Updating this tracker
 
 Every phase-affecting change must update the relevant table in the same change.
