@@ -1202,7 +1202,13 @@ matrix is maintained in the
   remains zero until a fresh successor commits. Exact runtime `0590d9b` passed
   the fresh full Kind lifecycle; ADR 0251 binds its immutable public images and
   evidence as the sole tuple eligible for preserved-state cl02 recovery. The
-  complete cl02 qualification remains mandatory.
+  tuple recovered that state, but Required-baseline planning then expanded
+  every cluster policy's ports across every workload pair and exhausted
+  controller memory. ADR 0252 adds a Policy-Relevance Quotient: cached exact
+  endpoints retain only policies that can select each directional pair, the
+  unchanged evaluator covers every relevant class, and an oversized cut is
+  refused before allocation. Fresh Kind and complete cl02 qualification remain
+  mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

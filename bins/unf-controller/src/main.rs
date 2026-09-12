@@ -10473,6 +10473,8 @@ fn encryption_workloads(
         .collect()
 }
 
+const MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS: usize = 8 * 1024 * 1024;
+
 fn policy_sample_ports(policies: &[PolicyIr], destination: &Endpoint) -> BTreeSet<u16> {
     let mut ports = BTreeSet::from([0, 1, u16::MAX]);
     ports.extend(destination.named_ports.values().copied());
@@ -10497,6 +10499,25 @@ fn policy_sample_ports(policies: &[PolicyIr], destination: &Endpoint) -> BTreeSe
         }
     }
     ports
+}
+
+/// Reduces policy truth to the only policies that can select either endpoint
+/// of this directional identity pair. Evaluation against the reduced slice is
+/// exact because policy applicability depends only on direction and the
+/// selected endpoint; rules are still evaluated without approximation.
+fn relevant_encryption_policies(
+    policies: &[PolicyIr],
+    source: &Endpoint,
+    destination: &Endpoint,
+) -> Vec<PolicyIr> {
+    policies
+        .iter()
+        .filter(|policy| match policy.direction {
+            PolicyDirection::Ingress => policy.target.matches(destination),
+            PolicyDirection::Egress => policy.target.matches(source),
+        })
+        .cloned()
+        .collect()
 }
 
 fn policy_address_samples(
@@ -10581,7 +10602,7 @@ fn record_effective_policy_observation(
 fn encryption_policy_observations(
     state: &ControllerState,
     members: &[EncryptionGenerationRecipient],
-) -> Vec<EncryptionPolicyObservation> {
+) -> Result<Vec<EncryptionPolicyObservation>, ApiError> {
     let member_names = members
         .iter()
         .map(|member| member.node_name.as_str())
@@ -10597,11 +10618,18 @@ fn encryption_policy_observations(
                     .as_deref()
                     .is_some_and(|node| member_names.contains(node))
         })
+        .map(|pod| {
+            (
+                pod,
+                endpoint_with_namespace_labels(&pod.endpoint, &namespaces),
+            )
+        })
         .collect::<Vec<_>>();
     let policies = compiled_policies(state);
     let mut observations = BTreeMap::new();
-    for source in &pods {
-        for destination in &pods {
+    let mut evaluated_classes = 0usize;
+    for (source, source_endpoint) in &pods {
+        for (destination, destination_endpoint) in &pods {
             if source.node_name == destination.node_name {
                 continue;
             }
@@ -10609,31 +10637,51 @@ fn encryption_policy_observations(
                 source: source.endpoint.identity,
                 destination: destination.endpoint.identity,
             };
-            let source_endpoint = endpoint_with_namespace_labels(&source.endpoint, &namespaces);
-            let destination_endpoint =
-                endpoint_with_namespace_labels(&destination.endpoint, &namespaces);
-            let ports = policy_sample_ports(&policies, &destination_endpoint);
-            for (source_ipv4, source_ipv6, destination_addresses) in
-                policy_address_samples(source, destination)
-            {
+            let relevant =
+                relevant_encryption_policies(&policies, source_endpoint, destination_endpoint);
+            if relevant.is_empty() {
+                // The projection represents this exact case as an implicit
+                // NoApplicablePolicy allow. No sampled observation is needed.
+                continue;
+            }
+            let ports = policy_sample_ports(&relevant, destination_endpoint);
+            let address_samples = policy_address_samples(source, destination);
+            let pair_classes = address_samples
+                .len()
+                .checked_mul(ports.len())
+                .and_then(|count| count.checked_mul(4))
+                .ok_or_else(|| {
+                    ApiError::service_unavailable(
+                        "encryption policy-relevance quotient overflowed its work bound",
+                    )
+                })?;
+            evaluated_classes = evaluated_classes
+                .checked_add(pair_classes)
+                .filter(|count| *count <= MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS)
+                .ok_or_else(|| {
+                    ApiError::service_unavailable(format!(
+                        "encryption policy-relevance quotient exceeds {MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS} exact classes"
+                    ))
+                })?;
+            for (source_ipv4, source_ipv6, destination_addresses) in address_samples {
                 for protocol in [Protocol::Icmp, Protocol::Tcp, Protocol::Udp, Protocol::Sctp] {
                     for destination_port in &ports {
                         let flow = Flow {
-                            source: &source_endpoint,
-                            destination: &destination_endpoint,
+                            source: source_endpoint,
+                            destination: destination_endpoint,
                             protocol,
                             destination_port: *destination_port,
                             source_ipv4,
                             source_ipv6,
                         };
                         let ingress = evaluate_for_direction_with_addresses(
-                            &policies,
+                            &relevant,
                             PolicyDirection::Ingress,
                             flow,
                             destination_addresses,
                         );
                         let egress = evaluate_for_direction_with_addresses(
-                            &policies,
+                            &relevant,
                             PolicyDirection::Egress,
                             flow,
                             destination_addresses,
@@ -10649,7 +10697,14 @@ fn encryption_policy_observations(
             }
         }
     }
-    observations.into_values().collect()
+    debug!(
+        workload_count = pods.len(),
+        policy_count = policies.len(),
+        evaluated_classes,
+        observation_count = observations.len(),
+        "compiled exact policy-relevance quotient for encryption demand"
+    );
+    Ok(observations.into_values().collect())
 }
 
 fn reconcile_encryption_plan_catalog_at(
@@ -10704,7 +10759,7 @@ fn reconcile_encryption_plan_catalog_at(
     let _policy_cut = read_lock(&state.policy_state_guard);
     let nodes = encryption_nodes(state, &members)?;
     let workloads = encryption_workloads(state, &members);
-    let policy_observations = encryption_policy_observations(state, &members);
+    let policy_observations = encryption_policy_observations(state, &members)?;
     let projection = project_encryption_epoch(
         &state.encryption_cluster_id,
         active_epoch,
@@ -19418,6 +19473,52 @@ mod tests {
             *mutex_lock(&state.encryption_intent_revision),
             initial_revision.next().next()
         );
+    }
+
+    #[test]
+    fn encryption_policy_relevance_quotient_discards_only_inapplicable_policies() {
+        let relevant =
+            PolicyCompiler::compile(PolicyId::new(1), security_policy("protect-api", "Allow"))
+                .unwrap();
+        let mut unrelated = security_policy("unrelated-api", "Deny");
+        unrelated.metadata.namespace = Some("unrelated".to_owned());
+        let unrelated = PolicyCompiler::compile(PolicyId::new(2), unrelated).unwrap();
+        let policies = vec![relevant, unrelated];
+        let source = pod_record(11, "frontend", "client", "client").endpoint;
+        let destination = pod_record(21, "backend", "server", "server").endpoint;
+        let quotient = relevant_encryption_policies(&policies, &source, &destination);
+        assert_eq!(quotient.len(), 1);
+
+        for (protocol, port) in [
+            (Protocol::Tcp, 0),
+            (Protocol::Tcp, 8080),
+            (Protocol::Tcp, 8081),
+            (Protocol::Udp, 8080),
+        ] {
+            let flow = Flow {
+                source: &source,
+                destination: &destination,
+                protocol,
+                destination_port: port,
+                source_ipv4: None,
+                source_ipv6: None,
+            };
+            assert_eq!(
+                evaluate_for_direction_with_addresses(
+                    &policies,
+                    PolicyDirection::Ingress,
+                    flow,
+                    DestinationAddresses::default(),
+                ),
+                evaluate_for_direction_with_addresses(
+                    &quotient,
+                    PolicyDirection::Ingress,
+                    flow,
+                    DestinationAddresses::default(),
+                ),
+                "the relevance quotient must preserve exact policy decisions"
+            );
+        }
     }
 
     fn network_policy(port: &serde_json::Value, protocol: &str) -> NetworkPolicy {

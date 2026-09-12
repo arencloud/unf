@@ -1245,6 +1245,14 @@ complete fresh three-Node dual-stack, kube-proxy-free Kind lifecycle. ADR 0251
 binds its anonymously pullable Linux/amd64 images, evidence, and packet capture
 as the only tuple eligible for preserved-state cl02 recovery and the complete
 Phase 9.9 gate.
+That tuple recovered the live two-hop residue and made all five agents Ready,
+but Required-baseline planning exposed a cluster-scale Cartesian policy scan:
+unrelated NetworkPolicy port partitions were reevaluated for every cross-Node
+workload pair until the controller was evicted under memory pressure. The
+Policy-Relevance Quotient caches enriched endpoints, retains only policies that
+can select the exact directional pair, preserves the unchanged evaluator over
+every relevant address/protocol/port class, and fails closed before an explicit
+work bound; ADR 0252. A new exact Kind and cl02 tuple is required.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

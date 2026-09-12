@@ -56,6 +56,15 @@ require_text docs/adr/0158-bound-attested-encryption-fabric.md \
 require_text docs/adr/0250-compact-causal-tombstone-chain.md \
     'Compact Causal Tombstone Chain' \
     "consecutive tombstoned admissions must retain compact causal ancestry"
+require_text docs/adr/0252-policy-relevance-quotient.md \
+    'Policy-Relevance Quotient' \
+    "encryption planning must not scan irrelevant cluster policy partitions"
+require_text bins/unf-controller/src/main.rs \
+    'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
+    "exact encryption policy planning must have a pre-allocation work bound"
+require_text bins/unf-controller/src/main.rs \
+    'relevant_encryption_policies' \
+    "encryption planning must preserve only pair-applicable policy truth"
 require_text bins/unf-agent/src/encryption_maps.rs \
     'ancestry: Vec<FastPathMapTransaction>' \
     "the map bridge must retain digest-bearing compact transaction ancestry"
