@@ -1234,6 +1234,14 @@ ADR 0248. Exact runtime `f89ae63` then passed the complete fresh three-Node
 dual-stack, kube-proxy-free Kind lifecycle. ADR 0249 binds its anonymously
 pullable Linux/amd64 images, evidence, and packet capture as the only tuple
 eligible for continuous bridge recovery and the complete Phase 9.9 gate.
+The reboot then exposed two consecutive tombstoned admissions: the newer
+admission extended the already skipped logical generation rather than the last
+physical map. The Compact Causal Tombstone Chain retains only each
+digest-bearing intermediate transaction plus the newest full admission,
+verifies every predecessor edge on restart, and keeps map authority zero until
+a fresh successor commits; ADR 0250. This avoids both unbounded full-image
+retention and unsafe ancestry collapse. A fresh Kind and cl02 qualification
+tuple is required before Phase 9 can close.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

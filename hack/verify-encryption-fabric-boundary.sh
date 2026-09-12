@@ -53,6 +53,15 @@ require_text docs/development/phase9-attested-encryption-fabric-plan.md \
 require_text docs/adr/0158-bound-attested-encryption-fabric.md \
     'recency alone is insufficient.' \
     "configuration and path proof must remain distinct"
+require_text docs/adr/0250-compact-causal-tombstone-chain.md \
+    'Compact Causal Tombstone Chain' \
+    "consecutive tombstoned admissions must retain compact causal ancestry"
+require_text bins/unf-agent/src/encryption_maps.rs \
+    'ancestry: Vec<FastPathMapTransaction>' \
+    "the map bridge must retain digest-bearing compact transaction ancestry"
+require_text bins/unf-agent/src/main.rs \
+    'tombstoned_ancestry: Vec<FastPathMapTransaction>' \
+    "the Linux recovery journal must retain matching compact ancestry"
 require_text docs/architecture/components.md \
     'The accepted Phase 9 boundary keeps encryption intent, key authority,' \
     "component ownership must remain explicit"

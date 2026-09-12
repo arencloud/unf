@@ -1195,7 +1195,12 @@ matrix is maintained in the
   reconciliation, allowing only the newer authenticated fresh-key successor.
   Exact runtime `f89ae63` passed the fresh full Kind lifecycle; ADR 0249 binds
   its immutable public images and evidence as the sole tuple eligible for the
-  resumed cl02 gate. Complete platform qualification remains mandatory.
+  resumed cl02 gate. A later reboot carried two consecutive tombstoned
+  admissions. ADR 0250 adds a Compact Causal Tombstone Chain: digest-bearing
+  intermediate transactions prove every logical edge back to the last
+  physical map without retaining another full dataplane image, while authority
+  remains zero until a fresh successor commits. Fresh Kind and cl02
+  qualification remain mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

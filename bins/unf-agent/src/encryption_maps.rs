@@ -11,6 +11,7 @@ use aya::maps::lpm_trie::Key as AyaLpmKey;
 use aya::maps::{
     Array as AyaArray, HashMap as AyaHashMap, IterableMap, LpmTrie as AyaLpmTrie, MapData,
 };
+use serde::{Deserialize, Serialize};
 use tracing::info;
 use unf_ebpf_common::{
     ENCRYPTION_BANK_COUNT, ENCRYPTION_CONNECTION_MAP_CAPACITY,
@@ -26,8 +27,9 @@ use unf_ebpf_common::{
 use unf_encryption::{
     AdmittedEncryptionGeneration, EncryptionActivationMode, EncryptionActivationWitness,
     EncryptionFastPathState, EncryptionGenerationPathProofPermit, EncryptionRoutePublicationPermit,
-    FastPathMapCheckpoint, FastPathMapRecoveryAction, FastPathMapTransactionPhase,
-    FastPathPublishedGeneration, LinuxPreparedLocalGeneration, PathProvenEncryptionActivationLatch,
+    FastPathMapCheckpoint, FastPathMapRecoveryAction, FastPathMapTransaction,
+    FastPathMapTransactionPhase, FastPathPublishedGeneration, LinuxPreparedLocalGeneration,
+    PathProvenEncryptionActivationLatch,
 };
 
 use super::{load_secure_json, persist_secure_json, reject_node_block_symlinks};
@@ -54,6 +56,92 @@ struct EncryptionMapMutationStats {
     retained: usize,
 }
 
+const TOMBSTONED_PREDECESSOR_BRIDGE_SCHEMA_VERSION: u16 = 1;
+
+/// Compact, crash-durable proof that a logical predecessor remains causally
+/// connected to the last physically published map. Intermediate transactions
+/// retain their independently verified digests without duplicating their
+/// potentially large decision/path authority vectors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TombstonedPredecessorBridge {
+    schema_version: u16,
+    ancestry: Vec<FastPathMapTransaction>,
+    admitted: AdmittedEncryptionGeneration,
+}
+
+impl TombstonedPredecessorBridge {
+    fn first(
+        physical: FastPathPublishedGeneration,
+        admitted: AdmittedEncryptionGeneration,
+    ) -> Result<Self> {
+        let bridge = Self {
+            schema_version: TOMBSTONED_PREDECESSOR_BRIDGE_SCHEMA_VERSION,
+            ancestry: Vec::new(),
+            admitted,
+        };
+        bridge.verify_against(physical)?;
+        Ok(bridge)
+    }
+
+    fn advance(
+        &self,
+        physical: FastPathPublishedGeneration,
+        admitted: AdmittedEncryptionGeneration,
+    ) -> Result<Self> {
+        self.verify_against(physical)?;
+        admitted
+            .verify()
+            .context("verify successor tombstoned predecessor admission")?;
+        if admitted.checkpoint.transaction.prior
+            != Some(self.admitted.checkpoint.transaction.desired.published)
+        {
+            bail!("tombstoned predecessor does not extend the logical map bridge");
+        }
+        let mut advanced = self.clone();
+        advanced
+            .ancestry
+            .push(self.admitted.checkpoint.transaction.clone());
+        advanced.admitted = admitted;
+        advanced.verify_against(physical)?;
+        Ok(advanced)
+    }
+
+    fn verify_against(&self, physical: FastPathPublishedGeneration) -> Result<()> {
+        if self.schema_version != TOMBSTONED_PREDECESSOR_BRIDGE_SCHEMA_VERSION {
+            bail!("unsupported tombstoned predecessor bridge schema");
+        }
+        self.admitted
+            .verify()
+            .context("verify logical tombstoned predecessor admission")?;
+        let mut cursor = physical;
+        for transaction in &self.ancestry {
+            transaction
+                .verify()
+                .context("verify compact tombstoned predecessor ancestry")?;
+            if transaction.prior != Some(cursor) {
+                bail!("tombstoned predecessor ancestry is not causally contiguous");
+            }
+            cursor = transaction.desired.published;
+        }
+        if self.admitted.checkpoint.transaction.prior != Some(cursor) {
+            bail!("tombstoned predecessor bridge does not extend the physical map");
+        }
+        Ok(())
+    }
+
+    const fn logical_published(&self) -> FastPathPublishedGeneration {
+        self.admitted.checkpoint.transaction.desired.published
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PersistedTombstonedPredecessorBridge {
+    Current(TombstonedPredecessorBridge),
+    Legacy(AdmittedEncryptionGeneration),
+}
+
 pub(super) struct EncryptionMaps {
     pub(super) decisions: AyaHashMap<MapData, [u8; 12], [u8; 72]>,
     pub(super) transports: AyaHashMap<MapData, [u8; 16], [u8; 80]>,
@@ -69,7 +157,7 @@ pub(super) struct EncryptionMapSynchronizer {
     tombstoned_predecessor_path: PathBuf,
     active: Option<FastPathMapCheckpoint>,
     pending: Option<FastPathMapCheckpoint>,
-    tombstoned_predecessor: Option<AdmittedEncryptionGeneration>,
+    tombstoned_predecessor: Option<TombstonedPredecessorBridge>,
     requires_local_revalidation: bool,
 }
 
@@ -97,7 +185,7 @@ impl EncryptionMapSynchronizer {
         let current = load_optional_checkpoint(&synchronizer.state_path, "encryption fast path")?;
         let pending_path = pending_checkpoint_path(&synchronizer.state_path)?;
         let pending = load_optional_checkpoint(&pending_path, "pending encryption fast path")?;
-        let mut tombstoned_predecessor = load_optional_admitted_generation(
+        let mut tombstoned_predecessor = load_optional_tombstoned_predecessor_bridge(
             &synchronizer.tombstoned_predecessor_path,
             "tombstoned encryption predecessor bridge",
         )?;
@@ -119,7 +207,7 @@ impl EncryptionMapSynchronizer {
                 .map(|checkpoint| checkpoint.transaction.desired.published);
             let bridged = tombstoned_predecessor
                 .as_ref()
-                .map(|admitted| admitted.checkpoint.transaction.desired.published);
+                .map(TombstonedPredecessorBridge::logical_published);
             if checkpoint.transaction.prior != physical && checkpoint.transaction.prior != bridged {
                 bail!("pending encryption checkpoint does not bind the current generation");
             }
@@ -132,8 +220,13 @@ impl EncryptionMapSynchronizer {
         } else if let Some(checkpoint) = current {
             if let Some(bridge) = tombstoned_predecessor.as_ref() {
                 let physical = checkpoint.transaction.desired.published;
-                let skipped = bridge.checkpoint.transaction.desired.published;
-                if bridge.checkpoint.transaction.prior == Some(physical) {
+                let skipped = bridge.logical_published();
+                if checkpoint.transaction.prior == Some(skipped) {
+                    synchronizer.require_exact_published(&checkpoint)?;
+                    remove_checkpoint(&synchronizer.tombstoned_predecessor_path)?;
+                    tombstoned_predecessor = None;
+                } else {
+                    bridge.verify_against(physical)?;
                     let observed = synchronizer
                         .maps
                         .config
@@ -142,12 +235,6 @@ impl EncryptionMapSynchronizer {
                     if observed != [0; 48] {
                         synchronizer.require_exact_published(&checkpoint)?;
                     }
-                } else if checkpoint.transaction.prior == Some(skipped) {
-                    synchronizer.require_exact_published(&checkpoint)?;
-                    remove_checkpoint(&synchronizer.tombstoned_predecessor_path)?;
-                    tombstoned_predecessor = None;
-                } else {
-                    bail!("tombstoned encryption predecessor bridge lost causal ancestry");
                 }
             } else {
                 synchronizer.require_exact_published(&checkpoint)?;
@@ -162,9 +249,7 @@ impl EncryptionMapSynchronizer {
                 .active
                 .as_ref()
                 .context("tombstoned predecessor bridge has no physical map checkpoint")?;
-            if bridge.checkpoint.transaction.prior != Some(physical.transaction.desired.published) {
-                bail!("tombstoned encryption predecessor bridge does not extend the physical map");
-            }
+            bridge.verify_against(physical.transaction.desired.published)?;
         }
         synchronizer.tombstoned_predecessor = tombstoned_predecessor;
 
@@ -223,20 +308,26 @@ impl EncryptionMapSynchronizer {
             .active
             .as_ref()
             .context("tombstoned predecessor bridge has no physical map checkpoint")?;
-        if admitted.checkpoint.transaction.prior != Some(physical.transaction.desired.published) {
-            bail!("tombstoned predecessor does not immediately extend the physical map");
-        }
-        if let Some(existing) = &self.tombstoned_predecessor {
-            if existing != admitted {
-                bail!("a different tombstoned predecessor bridge is already durable");
+        let bridge = match &self.tombstoned_predecessor {
+            Some(existing) if existing.admitted == *admitted => {
+                existing.verify_against(physical.transaction.desired.published)?;
+                existing.clone()
             }
-        } else {
+            Some(existing) => {
+                existing.advance(physical.transaction.desired.published, admitted.clone())?
+            }
+            None => TombstonedPredecessorBridge::first(
+                physical.transaction.desired.published,
+                admitted.clone(),
+            )?,
+        };
+        if self.tombstoned_predecessor.as_ref() != Some(&bridge) {
             persist_secure_json(
                 &self.tombstoned_predecessor_path,
-                admitted,
+                &bridge,
                 "tombstoned encryption predecessor bridge",
             )?;
-            self.tombstoned_predecessor = Some(admitted.clone());
+            self.tombstoned_predecessor = Some(bridge);
         }
         self.maps
             .config
@@ -404,7 +495,7 @@ impl EncryptionMapSynchronizer {
         let current = self
             .tombstoned_predecessor
             .as_ref()
-            .map(|bridge| bridge.checkpoint.clone())
+            .map(|bridge| bridge.admitted.checkpoint.clone())
             .or_else(|| self.active.clone());
         if let Err(error) = self.recover_pending(current.as_ref(), checkpoint, &pending_path) {
             self.pending =
@@ -429,7 +520,7 @@ impl EncryptionMapSynchronizer {
     fn logical_predecessor(&self) -> Option<FastPathPublishedGeneration> {
         self.tombstoned_predecessor
             .as_ref()
-            .map(|bridge| bridge.checkpoint.transaction.desired.published)
+            .map(TombstonedPredecessorBridge::logical_published)
             .or_else(|| {
                 self.active
                     .as_ref()
@@ -543,12 +634,12 @@ impl EncryptionMapSynchronizer {
         }
         if observed_config == [0; 48]
             && self.tombstoned_predecessor.as_ref().is_some_and(|bridge| {
-                current.is_some_and(|checkpoint| checkpoint == &bridge.checkpoint)
-                    && pending.transaction.prior
-                        == Some(bridge.checkpoint.transaction.desired.published)
+                current.is_some_and(|checkpoint| checkpoint == &bridge.admitted.checkpoint)
+                    && pending.transaction.prior == Some(bridge.logical_published())
                     && self.active.as_ref().is_some_and(|physical| {
-                        bridge.checkpoint.transaction.prior
-                            == Some(physical.transaction.desired.published)
+                        bridge
+                            .verify_against(physical.transaction.desired.published)
+                            .is_ok()
                     })
             })
         {
@@ -1163,18 +1254,30 @@ fn tombstoned_predecessor_path(path: &Path) -> Result<PathBuf> {
     Ok(path.with_file_name(format!("{file_name}.tombstoned-predecessor")))
 }
 
-fn load_optional_admitted_generation(
+fn load_optional_tombstoned_predecessor_bridge(
     path: &Path,
     description: &str,
-) -> Result<Option<AdmittedEncryptionGeneration>> {
+) -> Result<Option<TombstonedPredecessorBridge>> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("inspect {description}")),
         Ok(_) => {
-            let admitted = load_secure_json(path, description)?;
-            AdmittedEncryptionGeneration::verify(&admitted)
-                .with_context(|| format!("verify {description}"))?;
-            Ok(Some(admitted))
+            let persisted: PersistedTombstonedPredecessorBridge =
+                load_secure_json(path, description)?;
+            let bridge = match persisted {
+                PersistedTombstonedPredecessorBridge::Current(bridge) => bridge,
+                PersistedTombstonedPredecessorBridge::Legacy(admitted) => {
+                    admitted
+                        .verify()
+                        .with_context(|| format!("verify legacy {description}"))?;
+                    TombstonedPredecessorBridge {
+                        schema_version: TOMBSTONED_PREDECESSOR_BRIDGE_SCHEMA_VERSION,
+                        ancestry: Vec::new(),
+                        admitted,
+                    }
+                }
+            };
+            Ok(Some(bridge))
         }
     }
 }
@@ -1236,11 +1339,90 @@ mod tests {
     use super::*;
     use aya::EbpfLoader;
     use tempfile::tempdir;
-    use unf_common::IdentityId;
+    use unf_common::{IdentityId, Revision};
     use unf_ebpf_common::{
         ENCRYPTION_DECISION_FLAG_POLICY_AUTHORIZED, ENCRYPTION_DECISION_FLAG_SELECTION_BOUND,
         ENCRYPTION_TRANSPORT_ACTIVE,
     };
+    use unf_encryption::{
+        EncryptionDisposition, EncryptionGenerationRecipient, EncryptionGenerationRequest,
+        FastPathCompileContext, FastPathDecisionInput, NodeSealedGenerationCapsule,
+        compile_encryption_fast_path,
+    };
+
+    fn admitted_native_generation(
+        generation: u64,
+        bank: u8,
+        current: Option<&AdmittedEncryptionGeneration>,
+    ) -> AdmittedEncryptionGeneration {
+        let state = compile_encryption_fast_path(
+            FastPathCompileContext {
+                generation: Revision::new(generation),
+                policy_revision: Revision::new(7),
+                service_revision: Revision::new(8),
+                egress_revision: Revision::new(9),
+                bank,
+                now_unix_ms: 1,
+                now_monotonic_ns: 1,
+            },
+            &[],
+            &[FastPathDecisionInput {
+                source_identity: IdentityId::new(101),
+                destination_identity: IdentityId::new(202),
+                disposition: EncryptionDisposition::Native,
+                contract_epoch: None,
+                plan_index: None,
+            }],
+        )
+        .unwrap();
+        let checkpoint = FastPathMapCheckpoint::begin(
+            Revision::new(generation),
+            &state,
+            current.map(AdmittedEncryptionGeneration::published),
+        )
+        .unwrap();
+        let request = EncryptionGenerationRequest::issue(
+            "worker-a".to_owned(),
+            current,
+            [u8::try_from(generation).unwrap(); 32],
+        )
+        .unwrap();
+        NodeSealedGenerationCapsule::issue(
+            1,
+            EncryptionGenerationRecipient {
+                node_name: "worker-a".to_owned(),
+                node_uid: "uid-a".to_owned(),
+            },
+            &request,
+            checkpoint,
+        )
+        .unwrap()
+        .admit(&request, current)
+        .unwrap()
+    }
+
+    #[test]
+    fn tombstoned_bridge_compacts_consecutive_admitted_predecessors() {
+        let physical = admitted_native_generation(11, 0, None);
+        let skipped_one = admitted_native_generation(12, 1, Some(&physical));
+        let bridge =
+            TombstonedPredecessorBridge::first(physical.published(), skipped_one.clone()).unwrap();
+        assert!(bridge.ancestry.is_empty());
+
+        let skipped_two = admitted_native_generation(13, 0, Some(&skipped_one));
+        let bridge = bridge
+            .advance(physical.published(), skipped_two.clone())
+            .unwrap();
+        bridge.verify_against(physical.published()).unwrap();
+        assert_eq!(bridge.ancestry.len(), 1);
+        assert_eq!(bridge.logical_published(), skipped_two.published());
+
+        let unrelated = admitted_native_generation(14, 1, Some(&physical));
+        assert!(bridge.advance(physical.published(), unrelated).is_err());
+        let mut corrupted = bridge;
+        corrupted.ancestry[0].transaction_revision = Revision::new(99);
+        assert!(corrupted.verify_against(physical.published()).is_err());
+    }
 
     #[test]
     fn fixed_width_encoding_matches_the_shared_encryption_abi() {

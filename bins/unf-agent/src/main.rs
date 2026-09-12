@@ -94,7 +94,7 @@ use unf_encryption::{
     EncryptionPathEndpointRole, EncryptionPathProbeExchange, EncryptionPathProbeFrame,
     EncryptionPathProbeKind, EncryptionPathProofAssignment, EncryptionPathProofRoundDigest,
     EncryptionRoutePublicationPermit, EpochDrainProof, EpochRevocationReason,
-    FileNodeKeyStateStore, KeyEpochPhase, LinuxEncryptionRouteProvider,
+    FastPathMapTransaction, FileNodeKeyStateStore, KeyEpochPhase, LinuxEncryptionRouteProvider,
     LinuxPreparedLocalGeneration, LinuxWireGuardProvider, NodeKeyAttestationCut,
     NodeKeyAttestationRound, NodeKeyAuthority, NodeKeyPublication, NodeLocalPlanRequest,
     NodeLocalRecoveryPlan, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
@@ -1138,6 +1138,8 @@ struct EncryptionRecoveryJournal {
     #[serde(default)]
     tombstoned_predecessor: Option<NodeLocalRecoveryPlan>,
     #[serde(default)]
+    tombstoned_ancestry: Vec<FastPathMapTransaction>,
+    #[serde(default)]
     retiring: Vec<WireGuardKernelPlan>,
 }
 
@@ -1192,6 +1194,7 @@ impl EncryptionRecoveryJournal {
             active: None,
             pending: None,
             tombstoned_predecessor: None,
+            tombstoned_ancestry: Vec::new(),
             retiring: Vec::new(),
         }
     }
@@ -1258,15 +1261,32 @@ impl EncryptionRecoveryJournal {
                 bail!("retiring encryption plan is foreign or overlaps live authority");
             }
         }
-        if let Some(tombstoned) = &self.tombstoned_predecessor
-            && (tombstoned.plans.is_empty()
-                || tombstoned.fact.checkpoint.transaction.prior
-                    != self
-                        .active
-                        .as_ref()
-                        .map(|active| active.fact.checkpoint.transaction.desired.published))
-        {
-            bail!("tombstoned encryption predecessor lost its physical ancestry");
+        match (&self.active, &self.tombstoned_predecessor) {
+            (Some(active), Some(tombstoned)) => {
+                if tombstoned.plans.is_empty() {
+                    bail!("tombstoned encryption predecessor has no Linux recovery plan");
+                }
+                let mut cursor = active.fact.checkpoint.transaction.desired.published;
+                for transaction in &self.tombstoned_ancestry {
+                    transaction
+                        .verify()
+                        .context("verify compact tombstoned recovery ancestry")?;
+                    if transaction.prior != Some(cursor) {
+                        bail!("tombstoned recovery ancestry is not causally contiguous");
+                    }
+                    cursor = transaction.desired.published;
+                }
+                if tombstoned.fact.checkpoint.transaction.prior != Some(cursor) {
+                    bail!("tombstoned encryption predecessor lost its physical ancestry");
+                }
+            }
+            (_, None) if !self.tombstoned_ancestry.is_empty() => {
+                bail!("tombstoned recovery ancestry has no logical predecessor");
+            }
+            (None, Some(_)) => {
+                bail!("tombstoned encryption predecessor has no physical recovery plan");
+            }
+            _ => {}
         }
         match (&self.active, &self.pending) {
             (Some(active), Some(pending))
@@ -9397,6 +9417,11 @@ impl EncryptionGenerationSynchronizer {
                 .context("remove tombstoned admitted WireGuard stage")?;
         }
         let mut recovery = self.recovery.clone();
+        if let Some(previous) = &recovery.tombstoned_predecessor {
+            recovery
+                .tombstoned_ancestry
+                .push(previous.fact.checkpoint.transaction.clone());
+        }
         recovery.tombstoned_predecessor = recovery.pending.take();
         recovery.verify(&self.node_name, self.current.as_ref())?;
         persist_secure_json(
@@ -9736,6 +9761,7 @@ impl EncryptionGenerationSynchronizer {
                 recovery.retiring = removed;
                 recovery.active = Some(successor);
                 recovery.tombstoned_predecessor = None;
+                recovery.tombstoned_ancestry.clear();
                 recovery.verify(&self.node_name, self.current.as_ref())?;
                 persist_secure_json(
                     &self.recovery_plan_path,

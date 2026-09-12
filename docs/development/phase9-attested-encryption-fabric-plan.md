@@ -22,7 +22,7 @@ separately revisioned. The authoritative state remains in
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
 | 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `f89ae63` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADR 0249. Default-Required and explicit-selective PodIP/Service traffic, 336 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent/controller replacement, 308 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `f933114…a25a`; packet-capture SHA-256 is `b3d23e9…07e8` |
-| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0249 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and bounded recovery/evidence boundaries. Continuous reconciliation now invokes the same persist-first fail-closed bridge as startup; exact runtime `f89ae63` passed fresh Kind and is published immutably. cl02 must cross its preserved tombstoned epoch-42 admission and pass the complete platform gate |
+| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0250 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and bounded recovery/evidence boundaries. A cl02 reboot proved two consecutive admitted generations can be tombstoned before a fresh successor arrives. The Compact Causal Tombstone Chain retains verified transaction edges back to the physical map while remaining zero-authority. Fresh Kind publication, preserved-state cl02 recovery, and the complete platform gate remain |
 
 ## Accepted Phase 9 gate
 
@@ -175,10 +175,11 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Deploy the ADR 0249 immutable tuple to cl02 from its preserved active
-generation and tombstoned admitted
-epoch-42 successor, proving that continuous reconciliation crosses to the
-newer authenticated fresh-key plan without plaintext or key reuse. Rerun the complete
+Run the complete fresh Kind lifecycle for ADR 0250's Compact Causal Tombstone
+Chain, publish its exact immutable runtime, then deploy it to cl02 without
+deleting the preserved physical generation or consecutive tombstoned
+admissions. Prove the agent crosses the verified logical chain to a newer
+authenticated fresh-key plan without plaintext or key reuse. Rerun the complete
 qualification with the
 non-perturbing and bounded Node-local witness,
 causal readiness join, monotonic platform-health delta, and whole-gate API
