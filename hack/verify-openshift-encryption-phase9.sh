@@ -28,6 +28,7 @@ link_lowered=false
 source_interface=
 artifact_tmp=
 diagnostics_collected=false
+checkpoint_persistence_checks='[]'
 
 collect_diagnostics() {
     [[ ${diagnostics_collected} == false ]] || return 0
@@ -298,8 +299,38 @@ wait_for_convergence() {
     return 1
 }
 
+assert_checkpoint_persistence() {
+    local label=$1 metrics checkpoint controller pod node controller_state snapshot
+    metrics=$(controller_raw /metrics | jq -Rsc '
+        [split("\n")[] | capture("^unf_encryption_generation_persistence_(?<kind>writes|errors)_total (?<value>[0-9]+)$")]
+        | select(length == 2 and ([.[].kind] | unique | length) == 2)
+        | map({key:.kind,value:(.value|tonumber)}) | from_entries')
+    checkpoint=$(oc_read -n unf-system get configmap unf-encryption-generation-frontier -o json \
+        | jq -ce '.data["checkpoint.json"] as $encoded | ($encoded|fromjson) as $descriptor
+            | {descriptor:$descriptor,storedBytes:(($encoded|utf8bytelength)+$descriptor.compressedBytes)}')
+    controller=$(controller_pod_and_node)
+    IFS=$'\t' read -r pod node <<<"${controller}"
+    controller_state=$(oc_read -n unf-system get pod "${pod}" -o json | jq -ce '{
+        controllerPod:.metadata.name,
+        controllerRestarts:([.status.containerStatuses[]|select(.name=="controller")][0].restartCount),
+        controllerMemoryLimit:([.spec.containers[]|select(.name=="controller")][0].resources.limits.memory)}')
+    snapshot=$(jq -cn --arg stage "${label}" --argjson metrics "${metrics}" \
+        --argjson checkpoint "${checkpoint}" --argjson controller "${controller_state}" \
+        '$metrics + $checkpoint + $controller + {stage:$stage}')
+    if ! jq -L "${project_root}/hack" -e 'include "phase9-qualification"; phase9_checkpoint_persistence_valid' \
+        <<<"${snapshot}" >/dev/null; then
+        echo "checkpoint persistence qualification failed: ${snapshot}" >&2
+        return 1
+    fi
+    if [[ ${label} == final-native ]]; then
+        jq -e '.descriptor.schemaVersion == 1 and .descriptor.codec == "gzip"' <<<"${snapshot}" >/dev/null
+    fi
+    checkpoint_persistence_checks=$(jq -c --argjson snapshot "${snapshot}" '. + [$snapshot]' <<<"${checkpoint_persistence_checks}")
+}
+
 set_baseline() {
     local value=$1
+    assert_checkpoint_persistence "before-baseline-${value}"
     if [[ ${value} == native ]]; then
         baseline_changed=false
     else
@@ -494,6 +525,7 @@ native_generation=$(wait_generation)
 native_generation_id=$(jq -r '.[0].generation' <<<"${native_generation}")
 set_baseline required
 required_baseline_generation=$(wait_generation_after "${native_generation_id}")
+assert_checkpoint_persistence required-migration
 
 stage=fixture
 resources_created=true
@@ -564,6 +596,7 @@ EOF
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pods --all --timeout=10m >/dev/null
 pre_fixture_generation=$(jq -r '.[0].generation' <<<"${required_baseline_generation}")
 default_generation=$(wait_generation_after "${pre_fixture_generation}")
+assert_checkpoint_persistence required-fixture
 required_pod4=$("${kc[@]}" -n "${namespace}" get pod required-server -o json | jq -er '.status.podIPs[].ip | select(contains("."))')
 required_pod6=$("${kc[@]}" -n "${namespace}" get pod required-server -o json | jq -er '.status.podIPs[].ip | select(contains(":"))')
 native_pod4=$("${kc[@]}" -n "${namespace}" get pod native-server -o json | jq -er '.status.podIPs[].ip | select(contains("."))')
@@ -704,9 +737,11 @@ initial_epoch=$(jq -r --arg node "${source_node}" '.[] | select(.node == $node) 
 rotated_generation=$(wait_epoch_change "${initial_epoch}")
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
 pre_restart_generation=$(jq -r '.[0].generation' <<<"${rotated_generation}")
+assert_checkpoint_persistence before-controller-replacement
 "${kc[@]}" -n unf-system rollout restart deployment/unf-controller >/dev/null
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=10m >/dev/null
 restart_generation=$(wait_generation_after "${pre_restart_generation}")
+assert_checkpoint_persistence after-controller-replacement
 
 stage=operations-and-convergence
 operations_status=$(controller_raw /v1/encryption/status)
@@ -742,6 +777,7 @@ done
 host_probe_created=false
 final_agents=$(wait_for_convergence)
 "${kc[@]}" wait --for=condition=Ready nodes --all --timeout=10m >/dev/null
+assert_checkpoint_persistence final-native
 final_unhealthy=$(unhealthy_operators)
 new_unhealthy=$(jq -cn --argjson baseline "${baseline_unhealthy}" \
     --argjson final "${final_unhealthy}" '$final - $baseline')
@@ -782,7 +818,8 @@ jq -n \
     --argjson restartGeneration "${restart_generation}" --argjson operations "${operations_status}" \
     --argjson initialAgents "${initial_agents}" --argjson finalAgents "${final_agents}" \
     --argjson baselineUnhealthy "${baseline_unhealthy}" --argjson finalUnhealthy "${final_unhealthy}" \
-    --argjson newUnhealthy "${new_unhealthy}" '
+    --argjson newUnhealthy "${new_unhealthy}" \
+    --argjson checkpointChecks "${checkpoint_persistence_checks}" '
     {schemaVersion:1,milestone:"9.9",result:"passed",generatedAt:$generatedAt,
       context:$context,infrastructure:$infrastructure,runtimeRevision:$runtimeRevision,
       qualificationRevision:$qualificationRevision,openshiftVersion:$openshiftVersion,
@@ -799,6 +836,7 @@ jq -n \
         nativePlaintextFrames:$nativePlaintextFrames},
       failClosed:{requiredBlocked:$requiredBlocked,nativeSucceeded:$nativeSucceeded},
       recovery:{agent:$recoveredGeneration,controller:$restartGeneration},
+      checkpointPersistence:{result:"passed",checks:$checkpointChecks,finalGzipCompatible:true},
       rotation:{result:"passed",generations:$rotatedGeneration},
       operations:{result:"passed",generation:$operations.generation,
         completeThroughSequence:$operations.completeThroughSequence,

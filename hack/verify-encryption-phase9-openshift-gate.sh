@@ -10,6 +10,7 @@ trap 'rm -f "${rendered}"' EXIT
 
 bash -n "${gate}"
 bash "${root}/hack/verify-phase9-qualification-order.sh"
+bash "${root}/hack/verify-phase9-checkpoint-persistence.sh"
 oc kustomize "${overlay}" >"${rendered}"
 jq -L "${root}/hack" -e '
   include "phase9-qualification";
@@ -37,6 +38,8 @@ require 'wait_epoch_change' "${gate}"
 require '/v1/encryption/status' "${gate}"
 require 'lossAffected == false' "${gate}"
 require 'exact-cleanup' "${gate}"
+require 'assert_checkpoint_persistence' "${gate}"
+require 'checkpointPersistence' "${gate}"
 require 'baseline_unhealthy' "${gate}"
 require 'final_unhealthy' "${gate}"
 require 'new_unhealthy=' "${gate}"

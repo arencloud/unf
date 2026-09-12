@@ -34,6 +34,7 @@ These observations guide later work; they do not mark S1–S5 complete.
 | Six pre-existing unhealthy operators: authentication, console, ingress, insights, kube-controller-manager and network | Investigate DNS/route timeouts separately from UNF pod readiness; network reports an unsafe `DisableMultiNetwork` change. Record attribution and repeat before/after health checks |
 | One agent cgroup had no memory limit; the controller's configured request is below measured CPU use | Measure all agents, BPF memory and scheduler impact before choosing requests/limits; avoid OOM-triggered dataplane disruption |
 | Large policy and encryption snapshots are repeatedly materialized | Profile steady-state pulls, unchanged-input work and churn before introducing conditional delivery or caching; preserve epoch/digest and authentication checks |
+| Encryption operations retain 512 records, while a five-Node Required activation emits 5,972 path observations; cumulative `lossAffected` includes intentional historical eviction | Preserve truthful loss accounting. Develop bounded evidence/coalescing or scoped continuous verification before claiming loss-free operations; do not clear history or ignore the flag to obtain a pass |
 
 A preliminary one-file CLI compression experiment on the captured roughly
 22-MB checkpoint produced 795,360 bytes with gzip level 6 and 332,688 bytes with
@@ -51,3 +52,10 @@ the exact overflowing cut was not captured. No backend, dependency, recovery
 format or bound was changed. The failed experiments were removed before building
 the replica-coverage candidate. A bounded persistence solution still needs its
 own recovery and rollover verification.
+
+ADR 0277 subsequently implements a versioned, window-bounded fallback only for
+cuts whose old gzip representation cannot fit. The actual Rust implementation
+round-trips the captured 22,164,122-byte envelope at 336,656 compressed bytes,
+versus 791,134 for gzip. Normal compatible writes stay gzip. cl02 transition,
+replacement and final-compatible-format evidence remain pending; ADR 0278 adds
+explicit zero-persistence-error checks around those lifecycle boundaries.
