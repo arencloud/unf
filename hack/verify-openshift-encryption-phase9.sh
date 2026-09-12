@@ -38,8 +38,10 @@ collect_diagnostics() {
     "${kc[@]}" get nodes -o wide >"${diagnostics}/nodes.txt" 2>&1 || true
     "${kc[@]}" -n unf-system get pods -o wide >"${diagnostics}/unf-pods.txt" 2>&1 || true
     timeout 60 "${kc[@]}" -n unf-system logs deployment/unf-controller --all-pods=true \
+        --tail=-1 --since=1h --limit-bytes=8388608 \
         >"${diagnostics}/controller.log" 2>&1 || true
     timeout 60 "${kc[@]}" -n unf-system logs daemonset/unf-agent --all-pods=true --prefix \
+        --tail=-1 --since=1h --limit-bytes=8388608 \
         >"${diagnostics}/agents.log" 2>&1 || true
     "${kc[@]}" -n "${namespace}" get all,encryptionpolicy.network.unf.io -o yaml \
         >"${diagnostics}/fixture.yaml" 2>&1 || true

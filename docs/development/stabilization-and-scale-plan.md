@@ -29,6 +29,7 @@ These observations guide later work; they do not mark S1–S5 complete.
 
 | Observation | Required follow-up |
 |---|---|
+| `24a66ca` recovered the missing frontier, but the full cl02 gate failed during Required migration; Native cleanup intent left split journals and mixed Prepared/Active key epochs | Repair restart-safe key attestation and generation recovery, preserve exact key expiry and admission barriers, and prove actual cleanup before Kind or scale claims |
 | `cfff9c3` stayed within the 2-GiB controller limit without OOM, but Required migration timed out with 5,972 proof selections | Requalify ADRs 0270–0272 on cl02 before Kind; keep exact runtime and evidence provenance |
 | A recovery checkpoint briefly needed approximately 912 KB, exceeding its 900 KB bound; a later cut fit | Remove the persistence gap with bounded, integrity-checked storage and explicit migration/recovery compatibility; do not simply increase the bound |
 | The persistence gap stranded all five agents at startup: their durable active generation was one exact successor ahead of the controller, with a newer pending Native cut | Qualify ADR 0281's authenticated complete-admission recovery; preserve predecessor checks and verify actual encryption state, not only policy/Service convergence |

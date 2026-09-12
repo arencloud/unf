@@ -2,7 +2,7 @@
 
 Date: 2026-09-13
 
-Status: cl02 preserved-state deployment and missing-frontier recovery passed; full gates pending
+Status: cl02 preserved-state deployment and missing-frontier recovery passed; full cl02 gate failed
 
 Runtime `24a66ca946dee9f42b2f4d9fccfe2118838dde73` adds ADR 0281's exact,
 authenticated durable-admission recovery to the bounded checkpoint fallback and
@@ -59,3 +59,27 @@ policy/Service revisions. The full gate must still prove current-cut convergence
 and all migration/traffic/failure/rotation/replacement/cleanup boundaries.
 Six unhealthy operators remained visible after initial Native recovery; neither
 complete cluster health nor Phase 9 completion is claimed.
+
+## Full gate failure after deployment
+
+Qualifier `c0f2e67` failed during `explicitly-acknowledged-required-migration`:
+the five-Node current-cut wait did not advance beyond `1789252096383` within
+360 seconds. Deployment recovery remains verified, but does not qualify this
+later migration. The failure trap requested Native intent; it did not prove
+Native cleanup. Subsequent public journal captures showed one Node active on
+Required generation `1789252472485` (epoch 388), four on older Native generation
+`1789252123396`, and differing pending generations. Therefore cleanup is **not
+converged**, despite all agents remaining Ready with zero restarts.
+
+Public-only key metadata showed four Nodes had activated epoch 389 while one
+still had it Prepared. One active-generation repair reported retired/unknown
+epoch 388. The controller's Prepared-only witness-round reconstruction cannot
+recover mixed activation phases after restart; this is a reproducible code gap,
+not yet a complete causal account of the migration failure. No private key
+bytes were captured, and no authority files were deleted or rewritten.
+
+Both platform gates now request an explicit one-hour log window, all matching
+lines up to 8 MiB per Pod, and a 60-second collection deadline. Previously the
+implicit multi-Pod tail could retain only ten lines. These remain bounded,
+potentially truncated diagnostics, not a complete audit log. Full cl02 migration,
+recovery and exact cleanup must pass before testing the successor on Kind.

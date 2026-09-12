@@ -182,7 +182,10 @@ with no invented hashes or platform observations. ADR 0279's deployment failed
 on a missing intermediate frontier, despite Native intent being configured.
 ADR 0283's guarded deployment and exact missing-frontier recovery passed on cl02,
 preserving Node-local authority and reaching the initially pending Native cut.
-Run the full current-cut lifecycle gate, then
+The subsequent full gate failed during Required migration; post-trap journals
+remain split across Native/Required cuts, so cleanup is not verified. Repair and
+requalify mixed-phase key attestation and generation recovery without deleting
+durable authority. Run the full current-cut lifecycle gate, then
 qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as
 preserving RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct

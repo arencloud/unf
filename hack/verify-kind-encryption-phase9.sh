@@ -42,9 +42,11 @@ collect_diagnostics() {
     mkdir -p "${diagnostics_dir}"
     "${kc[@]}" get nodes -o wide >"${diagnostics_dir}/nodes.txt" 2>&1 || true
     "${kc[@]}" -n unf-system get pods -o wide >"${diagnostics_dir}/unf-pods.txt" 2>&1 || true
-    "${kc[@]}" -n unf-system logs deployment/unf-controller --all-pods=true \
+    timeout 60 "${kc[@]}" -n unf-system logs deployment/unf-controller --all-pods=true \
+        --tail=-1 --since=1h --limit-bytes=8388608 \
         >"${diagnostics_dir}/controller.log" 2>&1 || true
-    "${kc[@]}" -n unf-system logs daemonset/unf-agent --all-pods=true --prefix \
+    timeout 60 "${kc[@]}" -n unf-system logs daemonset/unf-agent --all-pods=true --prefix \
+        --tail=-1 --since=1h --limit-bytes=8388608 \
         >"${diagnostics_dir}/agents.log" 2>&1 || true
     "${kc[@]}" -n "${namespace}" get all,encryptionpolicy.network.unf.io -o yaml \
         >"${diagnostics_dir}/fixture.yaml" 2>&1 || true

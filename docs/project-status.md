@@ -542,8 +542,12 @@ cl02's path count; it does not mark the pending full lifecycle gates verified.
 ADR 0283 publishes runtime `24a66ca` with digest-pinned recovery images; cl02
 preserved-state deployment and the exact missing-frontier recovery passed.
 All five journals reached the pending Native cut with zero transports and no
-pending generation. The full current-cut lifecycle gate and successor Kind
-remain pending; six operator problems remain visible.
+pending generation. The subsequent full cl02 gate failed during Required
+migration. Post-trap journals are split across Native/Required generations;
+cleanup is not converged. Mixed-phase key-attestation recovery is a confirmed
+code gap under investigation. The full current-cut lifecycle gate and successor
+Kind remain unverified; six operator problems remain visible. ADR 0283 records
+the failure separately from the successful deployment.
 
 ## Updating this tracker
 
