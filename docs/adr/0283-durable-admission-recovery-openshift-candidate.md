@@ -2,7 +2,7 @@
 
 Date: 2026-09-13
 
-Status: Published; cl02 deployment and full platform qualification pending
+Status: cl02 preserved-state deployment and missing-frontier recovery passed; full gates pending
 
 Runtime `24a66ca946dee9f42b2f4d9fccfe2118838dde73` adds ADR 0281's exact,
 authenticated durable-admission recovery to the bounded checkpoint fallback and
@@ -40,3 +40,22 @@ ciphertext, failure, rotation/replacement, persistence, operations and exact
 cleanup gate on cl02 before qualifying identical runtime images on Kind.
 Phase 9 and stabilization/scale readiness remain unverified until their separate
 exit criteria pass.
+
+## cl02 deployment result
+
+Qualifier `31b7d33f1e8063c648db8c91d9f47d33e4f355ae` passed the guarded staged
+deployment. Archived deployment evidence SHA-256:
+`a1a1b2d706743db8e99f81406cede3948f1bb25797eff0edc74c7509a1b37a6b`.
+The controller logged complete authenticated admission recovery, then ordinary
+successor publication. All five new agents reached 2/2 Ready with zero restarts.
+Independent Node-journal captures showed generation `1789245583383` active on
+all five Nodes, no pending generations, empty epoch lists and zero transports.
+The saved controller frontier matched; five persistence writes and zero errors
+were observed, using ordinary schema-v1 gzip within the existing bound.
+
+This repairs the actual one-generation gap without deleting or rewriting Node
+authority. Subsequent pull-synchronized publication began catching up to current
+policy/Service revisions. The full gate must still prove current-cut convergence
+and all migration/traffic/failure/rotation/replacement/cleanup boundaries.
+Six unhealthy operators remained visible after initial Native recovery; neither
+complete cluster health nor Phase 9 completion is claimed.

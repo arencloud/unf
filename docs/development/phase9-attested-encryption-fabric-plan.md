@@ -180,8 +180,9 @@ cl02 first, then fresh Kind. Local checks precede image publication. A candidate
 release record declares `qualificationOrder: openshift-first` and Kind `pending`
 with no invented hashes or platform observations. ADR 0279's deployment failed
 on a missing intermediate frontier, despite Native intent being configured.
-Qualify ADR 0283's published authenticated durable-admission recovery on cl02, preserving
-Node-local authority and proving actual encryption convergence, then run the full gate and
+ADR 0283's guarded deployment and exact missing-frontier recovery passed on cl02,
+preserving Node-local authority and reaching the initially pending Native cut.
+Run the full current-cut lifecycle gate, then
 qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as
 preserving RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct
