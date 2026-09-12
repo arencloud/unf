@@ -704,6 +704,77 @@ mod tests {
     }
 
     #[test]
+    fn required_five_node_cluster_scale_remains_bounded() {
+        const NODES: usize = 5;
+        const ENDPOINTS_PER_NODE: usize = 24;
+        let nodes = (0..NODES)
+            .map(|index| {
+                node(
+                    &format!("worker-{index}"),
+                    &format!("uid-{index}"),
+                    42 + u8::try_from(index).unwrap(),
+                    1 + u8::try_from(index).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let endpoints = nodes
+            .iter()
+            .enumerate()
+            .flat_map(|(node_index, node)| {
+                (0..ENDPOINTS_PER_NODE).map(move |endpoint_index| {
+                    let ordinal = node_index * ENDPOINTS_PER_NODE + endpoint_index + 1;
+                    EncryptionEndpointFact {
+                        identity: IdentityId::new(u32::try_from(ordinal).unwrap()),
+                        workload_uid: format!("pod-{ordinal}"),
+                        node: node.clone(),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let policies = endpoints
+            .iter()
+            .flat_map(|source| {
+                endpoints
+                    .iter()
+                    .filter(|destination| destination.node.uid != source.node.uid)
+                    .map(move |destination| EncryptionPolicyFact {
+                        source: source.identity,
+                        destination: destination.identity,
+                        allowed: true,
+                        reason: PolicyReason::NoApplicablePolicy,
+                        policy_ids: Vec::new(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        let paths = nodes
+            .iter()
+            .flat_map(|source| {
+                nodes
+                    .iter()
+                    .filter(|destination| destination.uid != source.uid)
+                    .map(move |destination| path(source, destination))
+            })
+            .collect::<Vec<_>>();
+        let mut scale = input(true);
+        scale.nodes = nodes.clone();
+        scale.endpoints = endpoints;
+        scale.policies = policies;
+        scale.paths = paths;
+        scale.key_cut = ready_key_cut(&nodes, true);
+
+        let cut = produce_fleet_plan_cut(scale).unwrap();
+        cut.verify().unwrap();
+        assert_eq!(cut.plans.len(), NODES);
+        assert_eq!(
+            cut.plans
+                .iter()
+                .map(|plan| plan.decisions.len())
+                .sum::<usize>(),
+            NODES * ENDPOINTS_PER_NODE * (NODES - 1) * ENDPOINTS_PER_NODE
+        );
+    }
+
+    #[test]
     fn selective_cut_proves_native_authority_without_a_fake_kernel_epoch() {
         let mut input = input(true);
         input.model = EncryptionModel::normalize(

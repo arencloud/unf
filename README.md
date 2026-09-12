@@ -1264,6 +1264,16 @@ preflight found that historical evicted controller Pod objects polluted an
 otherwise exact live-image count. The Live-Set Immutable Runtime Census counts
 only non-deleting Running Pods and still requires one Ready zero-restart
 controller plus five Ready zero-restart agents at the pinned digests; ADR 0254.
+The subsequent Required replay isolated a second hot path inside the relevant
+class evaluator. The Work-Capped Zero-Allocation Enforcement Fold partitions
+borrowed directional policies once, selects the exact winning enforcement
+decision in one ordered pass, omits non-authoritative shadow/audit material,
+and checks the complete pair cost before evaluation. A five-Node regression at
+the observed 116-workload/133-policy scale completes in 0.47 seconds and 26,252
+KiB RSS as a direct debug test; OpenShift also contains regressions within a
+2-GiB controller cgroup instead of pressuring a Node. Policy decisions remain
+byte-for-byte equivalent to the full evaluator; ADR 0255. Fresh immutable Kind
+and preserved-state cl02 qualification remain required.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

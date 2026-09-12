@@ -21,6 +21,17 @@ spec:
       containers:
         - name: controller
           imagePullPolicy: IfNotPresent
+          # Keep a controller regression inside its Pod cgroup so reconciliation
+          # can fail closed without placing an OpenShift control-plane Node
+          # under memory pressure. Production-scale Phase 9 tests must remain
+          # comfortably below this ceiling.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
           # The controller must be able to bootstrap while UNF's Service
           # dataplane is unavailable on a rebooting host. The deployment gate
           # replaces this sentinel with Infrastructure.status.apiServerInternalURI.

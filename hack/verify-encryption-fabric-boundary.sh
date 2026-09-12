@@ -65,9 +65,15 @@ require_text docs/adr/0253-immutable-policy-relevance-kind-requalification.md \
 require_text docs/adr/0254-live-set-immutable-runtime-census.md \
     'Live-Set Immutable Runtime Census' \
     "platform image provenance must distinguish live runtime from terminated diagnostics"
+require_text docs/adr/0255-work-capped-zero-allocation-enforcement-fold.md \
+    'Work-Capped Zero-Allocation Enforcement Fold' \
+    "exact high-cardinality policy evaluation must remain allocation-free and bounded"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"
+require_text crates/unf-policy/src/lib.rs \
+    'evaluate_preselected_enforcement_with_addresses' \
+    "preselected encryption policy enforcement must use the compact evaluator"
 require_text bins/unf-controller/src/main.rs \
     'relevant_encryption_policies' \
     "encryption planning must preserve only pair-applicable policy truth"

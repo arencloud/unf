@@ -22,7 +22,7 @@ separately revisioned. The authoritative state remains in
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
 | 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `046b1b2` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADR 0253. Default-Required and explicit-selective PodIP/Service traffic, 335 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent/controller replacement, 298 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `3c7255f…270b4`; packet-capture SHA-256 is `c4c4e5b…fc1f2` |
-| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0254 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and bounded recovery/evidence boundaries. Runtime `0590d9b` recovered the preserved consecutive tombstone chain, but the Required switch exposed a cluster-wide Cartesian scan across policies that could not select a pair. The Policy-Relevance Quotient caches enriched endpoints, evaluates only exact applicable partitions, preserves full evaluator semantics, and fails closed before an explicit class-work bound. Exact runtime `046b1b2` passed fresh Kind and is pinned through public immutable digests. Its first cl02 preflight safely stopped because historical evicted Pod records polluted the immutable census; ADR 0254 now admits only the exact Ready live set. The complete platform gate remains |
+| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0255 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and bounded recovery/evidence boundaries. Runtime `0590d9b` recovered the preserved consecutive tombstone chain, but Required planning exposed cluster-scale policy work. The Policy-Relevance Quotient retains exact applicable partitions; the Work-Capped Zero-Allocation Enforcement Fold now borrows those partitions, selects the same enforce result without per-class heap allocation, and rejects an oversized pair before evaluation. Its 116-workload/133-policy/five-Node regression completes in 0.47 seconds and 26,252 KiB RSS as a direct debug test. Exact runtime `046b1b2` remains historical Kind evidence; fresh immutable Kind publication and the complete cl02 platform gate remain |
 
 ## Accepted Phase 9 gate
 
@@ -175,15 +175,11 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Run the complete fresh Kind lifecycle for ADR 0250's Compact Causal Tombstone
-Chain, publish its exact immutable runtime, then deploy it to cl02 without
-deleting the preserved physical generation or consecutive tombstoned
-admissions. Prove the agent crosses the verified logical chain to a newer
-authenticated fresh-key plan without plaintext or key reuse. Rerun the complete
-qualification with the
-non-perturbing and bounded Node-local witness,
-causal readiness join, monotonic platform-health delta, and whole-gate API
-deadline. The OpenShift gate must preserve RHCOS/SELinux/CRI-O facts,
-cross-worker encrypted IPv4/IPv6 direct and Service traffic,
-rotation/recovery, exact cleanup, agent convergence, kube-proxy absence, and
-the before/after ClusterOperator state.
+Commit ADR 0255's exact runtime, run the complete fresh dual-stack,
+kube-proxy-free Kind lifecycle, and publish only its digest-pinned images and
+evidence. Then deploy that tuple to cl02 without deleting preserved Node-local
+authority and rerun the complete bounded platform gate. The gate must preserve
+RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct and Service
+traffic, selective fail-closed behavior, rotation/recovery, exact cleanup,
+agent convergence, kube-proxy absence, and the before/after ClusterOperator
+state.

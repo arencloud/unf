@@ -411,6 +411,16 @@ pub struct PolicyDecision {
     pub audits: Vec<RuleProvenance>,
 }
 
+/// Allocation-free enforcement result for callers that have already selected
+/// the exact directional policy partition. It deliberately excludes shadow and
+/// audit detail because those do not participate in dataplane authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyEnforcementDecision {
+    pub verdict: Verdict,
+    pub reason: DecisionReason,
+    pub policy_id: Option<PolicyId>,
+}
+
 #[expect(
     clippy::trivially_copy_pass_by_ref,
     reason = "serde skip_serializing_if requires a predicate accepting a reference"
@@ -674,6 +684,45 @@ pub fn evaluate_for_direction_with_addresses(
         policy_id,
         rule_id,
         audits,
+    }
+}
+
+/// Evaluates enforcement over an already selected directional policy slice.
+///
+/// The caller must provide only policies whose direction and target select the
+/// flow endpoint for `direction`. This avoids rebuilding applicable, shadow,
+/// and audit vectors in high-cardinality batch projections while preserving
+/// the exact enforce verdict, reason, and policy provenance.
+#[must_use]
+pub fn evaluate_preselected_enforcement_with_addresses(
+    policies: &[&PolicyIr],
+    direction: PolicyDirection,
+    flow: Flow<'_>,
+    destination_addresses: DestinationAddresses,
+) -> PolicyEnforcementDecision {
+    let selected_endpoint = match direction {
+        PolicyDirection::Ingress => flow.destination,
+        PolicyDirection::Egress => flow.source,
+    };
+    debug_assert!(policies.iter().all(|policy| {
+        policy.direction == direction && policy.target.matches(selected_endpoint)
+    }));
+    let (verdict, reason, policy_id, _) = decide_for_mode(
+        policies,
+        flow,
+        destination_addresses,
+        PolicyEnforcementMode::Enforce,
+    )
+    .unwrap_or((
+        Verdict::Allow,
+        DecisionReason::NoApplicablePolicy,
+        None,
+        None,
+    ));
+    PolicyEnforcementDecision {
+        verdict,
+        reason,
+        policy_id,
     }
 }
 
@@ -1910,16 +1959,19 @@ fn decide_for_mode(
     destination_addresses: DestinationAddresses,
     mode: PolicyEnforcementMode,
 ) -> Option<(Verdict, DecisionReason, Option<PolicyId>, Option<RuleId>)> {
-    let mut candidates = Vec::new();
-    let policies_for_mode: Vec<_> = policies
+    let mut best = None;
+    let mut consider = |candidate: RankedDecision| {
+        if best
+            .as_ref()
+            .is_none_or(|current| compare_decisions(&candidate, current).is_lt())
+        {
+            best = Some(candidate);
+        }
+    };
+    for policy in policies
         .iter()
         .copied()
-        .filter(|policy| policy.enforcement_mode == mode)
-        .collect();
-    for policy in policies_for_mode
-        .iter()
-        .copied()
-        .filter(|policy| policy.origin == PolicyOrigin::Native)
+        .filter(|policy| policy.enforcement_mode == mode && policy.origin == PolicyOrigin::Native)
     {
         let matched = policy
             .rules
@@ -1929,17 +1981,17 @@ fn decide_for_mode(
             .filter(|rule| rule.action != PolicyAction::Audit)
             .peekable();
         if enforcing_rules.peek().is_some() {
-            candidates.extend(enforcing_rules.map(|rule| {
-                (
+            for rule in enforcing_rules {
+                consider((
                     policy.priority,
                     rule.action,
                     policy.id,
                     Some(rule.id),
                     DecisionReason::ExplicitRule,
-                )
-            }));
+                ));
+            }
         } else if policy.default_action != PolicyAction::Audit {
-            candidates.push((
+            consider((
                 policy.priority,
                 policy.default_action,
                 policy.id,
@@ -1949,48 +2001,43 @@ fn decide_for_mode(
         }
     }
 
-    let compatibility_policies: Vec<_> = policies_for_mode
+    let mut compatibility_rule_matched = false;
+    for rule in policies
         .iter()
         .copied()
-        .filter(|policy| policy.origin == PolicyOrigin::KubernetesNetworkPolicy)
-        .collect();
-    let compatibility_rules: Vec<_> = compatibility_policies
-        .iter()
+        .filter(|policy| {
+            policy.enforcement_mode == mode
+                && policy.origin == PolicyOrigin::KubernetesNetworkPolicy
+        })
         .flat_map(|policy| &policy.rules)
         .filter(|rule| rule_matches(rule, flow, destination_addresses))
-        .collect();
-    if compatibility_rules.is_empty() {
-        let mut defaults: Vec<_> = compatibility_policies
-            .iter()
-            .filter(|policy| policy.default_action != PolicyAction::Audit)
-            .map(|policy| {
-                (
-                    policy.priority,
-                    policy.default_action,
-                    policy.id,
-                    None,
-                    DecisionReason::DefaultAction,
-                )
-            })
-            .collect();
-        defaults.sort_by(compare_decisions);
-        if let Some(default) = defaults.first() {
-            candidates.push(*default);
+    {
+        compatibility_rule_matched = true;
+        consider((
+            KUBERNETES_NETWORK_POLICY_PRIORITY,
+            rule.action,
+            rule.provenance.policy_id,
+            Some(rule.id),
+            DecisionReason::ExplicitRule,
+        ));
+    }
+    if !compatibility_rule_matched {
+        for policy in policies.iter().copied().filter(|policy| {
+            policy.enforcement_mode == mode
+                && policy.origin == PolicyOrigin::KubernetesNetworkPolicy
+                && policy.default_action != PolicyAction::Audit
+        }) {
+            consider((
+                policy.priority,
+                policy.default_action,
+                policy.id,
+                None,
+                DecisionReason::DefaultAction,
+            ));
         }
-    } else {
-        candidates.extend(compatibility_rules.into_iter().map(|rule| {
-            (
-                KUBERNETES_NETWORK_POLICY_PRIORITY,
-                rule.action,
-                rule.provenance.policy_id,
-                Some(rule.id),
-                DecisionReason::ExplicitRule,
-            )
-        }));
     }
 
-    candidates.sort_by(compare_decisions);
-    candidates.first().map(|candidate| {
+    best.map(|candidate| {
         (
             action_verdict(candidate.1),
             candidate.4,
@@ -2221,6 +2268,104 @@ mod tests {
         );
         assert_eq!(unisolated.verdict, Verdict::Allow);
         assert_eq!(unisolated.reason, DecisionReason::NoApplicablePolicy);
+    }
+
+    #[test]
+    fn preselected_enforcement_is_exact_for_mixed_policy_modes_and_origins() {
+        let source = endpoint("frontend", "client");
+        let destination = endpoint("backend", "server");
+        let unrelated_destination = endpoint("backend", "database");
+
+        let native = policy(
+            1,
+            100,
+            Action::Allow,
+            Action::Deny,
+            EnforcementMode::Enforce,
+            Some(8080),
+        );
+        let shadow = policy(
+            2,
+            1,
+            Action::Deny,
+            Action::Deny,
+            EnforcementMode::Shadow,
+            Some(8080),
+        );
+        let audit = policy(
+            3,
+            2,
+            Action::Audit,
+            Action::Audit,
+            EnforcementMode::Enforce,
+            Some(8080),
+        );
+        let mut compatibility_allow = policy(
+            4,
+            KUBERNETES_NETWORK_POLICY_PRIORITY,
+            Action::Allow,
+            Action::Deny,
+            EnforcementMode::Enforce,
+            Some(8443),
+        );
+        compatibility_allow.origin = PolicyOrigin::KubernetesNetworkPolicy;
+        let mut compatibility_default = policy(
+            5,
+            KUBERNETES_NETWORK_POLICY_PRIORITY,
+            Action::Allow,
+            Action::Deny,
+            EnforcementMode::Enforce,
+            Some(9443),
+        );
+        compatibility_default.origin = PolicyOrigin::KubernetesNetworkPolicy;
+        let policies = vec![
+            native,
+            shadow,
+            audit,
+            compatibility_allow,
+            compatibility_default,
+            egress_policy(),
+        ];
+
+        for (selected_destination, port) in [
+            (&destination, 8080),
+            (&destination, 8443),
+            (&destination, 9443),
+            (&destination, 65535),
+            (&unrelated_destination, 8080),
+        ] {
+            let flow = test_flow(&source, selected_destination, port);
+            for direction in [PolicyDirection::Ingress, PolicyDirection::Egress] {
+                let selected_endpoint = match direction {
+                    PolicyDirection::Ingress => flow.destination,
+                    PolicyDirection::Egress => flow.source,
+                };
+                let applicable = policies
+                    .iter()
+                    .filter(|policy| {
+                        policy.direction == direction && policy.target.matches(selected_endpoint)
+                    })
+                    .collect::<Vec<_>>();
+                let complete = evaluate_for_direction_with_addresses(
+                    &policies,
+                    direction,
+                    flow,
+                    DestinationAddresses::default(),
+                );
+                let reduced = evaluate_preselected_enforcement_with_addresses(
+                    &applicable,
+                    direction,
+                    flow,
+                    DestinationAddresses::default(),
+                );
+
+                assert_eq!(
+                    (complete.verdict, complete.reason, complete.policy_id),
+                    (reduced.verdict, reduced.reason, reduced.policy_id),
+                    "preselected enforcement diverged for {direction:?} port {port}"
+                );
+            }
+        }
     }
 
     #[test]

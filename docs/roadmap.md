@@ -1214,7 +1214,15 @@ matrix is maintained in the
   0254 makes the immutable runtime census operate on the live non-deleting
   Running Pod set, so historical eviction records remain diagnostic evidence
   without impersonating additional live controllers. Complete cl02
-  qualification remains mandatory.
+  qualification remains mandatory. The following Required replay isolated
+  general policy-explanation allocations inside each relevant L4 class. ADR
+  0255 adds the Work-Capped Zero-Allocation Enforcement Fold: borrowed
+  directional partitions preserve the exact Native/Kubernetes decision order,
+  omit shadow/audit data that cannot authorize encryption, and preflight the
+  complete pair work. The observed five-Node 116-workload/133-policy regression
+  completes in 0.47 seconds with 26,252 KiB direct-test RSS, while a 2-GiB
+  controller cgroup contains future regressions. Fresh immutable Kind and the
+  complete cl02 gate remain mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
