@@ -1230,7 +1230,10 @@ then exposed the same tombstoned-admission race between periodic key and plan
 ticks. The Continuous Tombstoned Predecessor Bridge shares the exact
 persist-first, fail-close-first transition between startup and steady-state
 reconciliation, so key expiry after admission cannot require a process restart;
-ADR 0248. Its revised runtime requires fresh Kind and cl02 qualification.
+ADR 0248. Exact runtime `f89ae63` then passed the complete fresh three-Node
+dual-stack, kube-proxy-free Kind lifecycle. ADR 0249 binds its anonymously
+pullable Linux/amd64 images, evidence, and packet capture as the only tuple
+eligible for continuous bridge recovery and the complete Phase 9.9 gate.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -107,6 +107,8 @@ require 'Immutable Tombstoned-Predecessor-Bridge Kind Requalification' \
     "${root}/docs/adr/0247-immutable-tombstoned-predecessor-bridge-kind-requalification.md"
 require 'Continuous Tombstoned Predecessor Bridge' \
     "${root}/docs/adr/0248-continuous-tombstoned-predecessor-bridge.md"
+require 'Immutable Continuous-Bridge Kind Requalification' \
+    "${root}/docs/adr/0249-immutable-continuous-bridge-kind-requalification.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"
