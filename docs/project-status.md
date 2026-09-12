@@ -552,6 +552,9 @@ the failure separately from the successful deployment.
 ADR 0284 adds bounded common-epoch mixed-phase witness reconstruction, exact
 local-epoch binding and atomic complete-column persistence. It is a repair
 candidate, not a passed cl02/Kind qualification or a heavy-load performance claim.
+The cl02 qualifier now separately asserts actual Native/Required journal modes
+and retains baseline-migration and final-Native snapshots; a newer Native cut
+cannot be mistaken for successful Required migration.
 
 ## Updating this tracker
 

@@ -232,9 +232,12 @@ current_revision_cut() {
 }
 
 generation_matches_current_cut() {
-    local snapshot=$1 cut=$2
-    jq -e --argjson expected "${#nodes[@]}" --argjson cut "${cut}" '
+    local snapshot=$1 cut=$2 mode=${3:-any}
+    jq -L "${project_root}/hack" -e --arg mode "${mode}" \
+        --argjson expected "${#nodes[@]}" --argjson cut "${cut}" '
+        include "phase9-qualification";
         length == $expected
+        and phase9_generation_mode_valid($mode)
         and all(.[];
             .pending == null and .generation != null
             and .policyRevision == $cut.policyRevision
@@ -248,11 +251,11 @@ generation_matches_current_cut() {
 }
 
 wait_generation() {
-    local snapshot= cut= deadline=$((SECONDS + convergence_timeout_seconds))
+    local mode=${1:-any} snapshot= cut= deadline=$((SECONDS + convergence_timeout_seconds))
     while (( SECONDS < deadline )); do
         cut=$(current_revision_cut 2>/dev/null || true)
         snapshot=$(generation_snapshot 2>/dev/null || true)
-        if [[ -n ${cut} ]] && generation_matches_current_cut "${snapshot}" "${cut}"; then
+        if [[ -n ${cut} ]] && generation_matches_current_cut "${snapshot}" "${cut}" "${mode}"; then
             printf '%s\n' "${snapshot}"
             return 0
         fi
@@ -264,13 +267,13 @@ wait_generation() {
 }
 
 wait_generation_after() {
-    local predecessor=$1 snapshot= generation= cut=
+    local predecessor=$1 mode=${2:-any} snapshot= generation= cut=
     local deadline=$((SECONDS + convergence_timeout_seconds))
     while (( SECONDS < deadline )); do
         cut=$(current_revision_cut 2>/dev/null || true)
         snapshot=$(generation_snapshot 2>/dev/null || true)
         generation=$(jq -r '.[0].generation // empty' <<<"${snapshot}" 2>/dev/null || true)
-        if [[ -n ${cut} ]] && generation_matches_current_cut "${snapshot}" "${cut}" \
+        if [[ -n ${cut} ]] && generation_matches_current_cut "${snapshot}" "${cut}" "${mode}" \
             && [[ ${generation} =~ ^[0-9]+$ ]] && (( generation > predecessor )); then
             printf '%s\n' "${snapshot}"
             return 0
@@ -278,6 +281,8 @@ wait_generation_after() {
         sleep 1
     done
     echo "encryption generation did not advance beyond ${predecessor}" >&2
+    jq -cn --arg mode "${mode}" --argjson snapshot "${snapshot:-null}" \
+        '{expectedMode:$mode,lastSnapshot:$snapshot}' >&2 || true
     return 1
 }
 
@@ -526,10 +531,10 @@ jq -e --arg controller "${controller_image}" --arg agent "${agent_image}" '
 stage=explicitly-acknowledged-required-migration
 operations_directory="${diagnostics}/operations"
 operations_baseline=$(phase9_operations_capture baseline "${operations_directory}")
-native_generation=$(wait_generation)
+native_generation=$(wait_generation native)
 native_generation_id=$(jq -r '.[0].generation' <<<"${native_generation}")
 set_baseline required
-required_baseline_generation=$(wait_generation_after "${native_generation_id}")
+required_baseline_generation=$(wait_generation_after "${native_generation_id}" required)
 assert_checkpoint_persistence required-migration
 
 stage=fixture
@@ -783,6 +788,7 @@ while (( SECONDS < cleanup_deadline )); do
 done
 [[ ${owned_state_absent} == true ]]
 [[ $("${kc[@]}" get encryptionpolicies.network.unf.io -A -o json | jq '.items | length') == 0 ]]
+final_native_generation=$(wait_generation native)
 "${kc[@]}" delete namespace "${host_probe_namespace}" --wait=true --timeout=10m >/dev/null
 host_probe_created=false
 final_agents=$(wait_for_convergence)
@@ -824,6 +830,8 @@ jq -n \
     --argjson nodes "${node_evidence}" --argjson images "${images_observed}" \
     --argjson controllerVersion "${controller_version}" --argjson agentVersions "${agent_versions}" \
     --argjson requiredGeneration "${default_generation}" --argjson selectiveGeneration "${selective_generation}" \
+    --argjson baselineRequiredGeneration "${required_baseline_generation}" \
+    --argjson finalNativeGeneration "${final_native_generation}" \
     --argjson recoveredGeneration "${recovered_generation}" --argjson rotatedGeneration "${rotated_generation}" \
     --argjson restartGeneration "${restart_generation}" --argjson operations "${operations_status}" \
     --argjson operationsEvidence "${operations_evidence}" \
@@ -839,7 +847,8 @@ jq -n \
       deployEvidence:$deployEvidence,topology:{nodeCount:($nodes|length),sourceNode:$sourceNode,
         destinationNode:$destinationNode},nodes:$nodes,imagesObserved:$images,
       componentVersions:{controller:$controllerVersion,agents:$agentVersions},
-      migration:{explicitlyAcknowledged:true,defaultRequired:"passed",generations:$requiredGeneration},
+      migration:{explicitlyAcknowledged:true,defaultRequired:"passed",generations:$requiredGeneration,
+        baselineGenerations:$baselineRequiredGeneration},
       selective:{result:"passed",generations:$selectiveGeneration},
       traffic:{directDualStack:"passed",serviceDualStack:"passed"},
       capture:{path:$capturePath,sha256:$captureSha256,bytes:$captureBytes,
@@ -853,7 +862,8 @@ jq -n \
         completeThroughSequence:$operations.completeThroughSequence,
         retainedRecords:$operations.retainedRecords,lossAffected:$operations.lossAffected,
         continuity:$operationsEvidence},
-      cleanup:"passed",initialAgents:$initialAgents,finalAgents:$finalAgents,
+      cleanup:"passed",cleanupGenerations:$finalNativeGeneration,
+      initialAgents:$initialAgents,finalAgents:$finalAgents,
       baselineUnhealthyOperators:$baselineUnhealthy,finalUnhealthyOperators:$finalUnhealthy,
       newlyUnhealthyOperators:$newUnhealthy,
       verified:["exact public image digests","five-node dual-stack UNF primary CNI",

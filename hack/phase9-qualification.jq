@@ -32,6 +32,18 @@ def phase9_checkpoint_persistence_valid:
   and (.storedBytes | type == "number" and . > 0 and . <= 900000 and floor == .)
   and .storedBytes > .descriptor.compressedBytes;
 
+# This is a journal-state assertion, not proof of ciphertext or traffic.
+# cl02's baseline migration requires encrypted plans on every managed Node;
+# selective fixtures may legitimately leave uninvolved Nodes Native.
+def phase9_generation_mode_valid($mode):
+  type == "array" and length > 0
+  and all(.[]; (.epochs | type == "array")
+    and all(.epochs[]; type == "number" and . > 0 and floor == .))
+  and (if $mode == "native" then all(.[]; .epochs | length == 0)
+       elif $mode == "required" then all(.[]; .epochs | length > 0)
+       elif $mode == "any" then true
+       else false end);
+
 # Both inputs MUST first pass the independent typed/hash-chain CLI verifier.
 # This comparison adds restart continuity, not full-history completeness.
 # Intentional bounded retention remains explicit; upstream loss is not waived.

@@ -4,6 +4,7 @@ set -Eeuo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 gate=${root}/hack/verify-openshift-encryption-phase9.sh
 bash "${root}/hack/verify-phase9-operations-continuity.sh"
+bash "${root}/hack/verify-phase9-generation-mode.sh"
 overlay=${root}/deploy/openshift-primary-cni/encryption-phase9
 release=${overlay}/release.json
 rendered=$(mktemp)
@@ -31,6 +32,9 @@ require() {
 require 'UNF_OPENSHIFT_ENCRYPTION_ACKNOWLEDGE_DISPOSABLE' "${gate}"
 require 'UNF_OPENSHIFT_ENCRYPTION_ACKNOWLEDGE_MIGRATION' "${gate}"
 require 'explicitly-acknowledged-required-migration' "${gate}"
+require 'native_generation=\$\(wait_generation native\)' "${gate}"
+require 'native_generation_id.*required\)' "${gate}"
+require 'final_native_generation=\$\(wait_generation native\)' "${gate}"
 require 'selective-native-exception' "${gate}"
 require 'ciphertext-and-fail-closed' "${gate}"
 require 'tcpdump.*br-ex' "${gate}"

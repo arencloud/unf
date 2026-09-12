@@ -83,3 +83,11 @@ lines up to 8 MiB per Pod, and a 60-second collection deadline. Previously the
 implicit multi-Pod tail could retain only ten lines. These remain bounded,
 potentially truncated diagnostics, not a complete audit log. Full cl02 migration,
 recovery and exact cleanup must pass before testing the successor on Kind.
+
+The follow-up qualifier also checks journal mode explicitly. Initial Native and
+final cleanup require empty epoch arrays; cl02's baseline Required migration
+requires nonempty valid epochs on all five managed Nodes. A newer Native cut
+can no longer satisfy that migration wait merely by racing the controller
+rollout. Selective fixtures still permit uninvolved Native Nodes. These journal
+checks supplement, not replace, live ciphertext, traffic and exact kernel
+cleanup tests. Migration-baseline and cleanup snapshots are retained in evidence.
