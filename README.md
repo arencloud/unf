@@ -1282,6 +1282,14 @@ Pending-Checkpoint Cleanup Closure validates that exact Node-owned prepared
 payload with the same strict committed-checkpoint contract before removing it;
 unknown state remains a hard failure. Runtime and BPF behavior are unchanged;
 ADR 0256. A clean full Kind rerun remains mandatory.
+Exact runtime and qualifier `a728017` then passed that complete fresh
+three-Node dual-stack, kube-proxy-free lifecycle. The evidence records 399
+WireGuard frames with zero Required plaintext, eight-of-eight Required fault
+probes blocked beside eight-of-eight Native successes, natural rotation,
+agent/controller replacement, 298 loss-free operation records, Phase 8 egress
+coexistence, exact cleanup, and restored no-CNI baseline. ADR 0257 binds its
+anonymous-public Linux/amd64 image digests plus evidence and capture hashes as
+the sole tuple eligible for the cl02 platform gate.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

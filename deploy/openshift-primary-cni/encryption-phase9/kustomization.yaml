@@ -5,10 +5,10 @@ resources:
 images:
   - name: quay.io/arencloud/unf-controller-dev
     newName: quay.io/arencloud/unf-controller-dev
-    digest: sha256:6cabe78993e42e91ce129f220e89d27ba2416490e7ba84d8de2e5cf28bb15413
+    digest: sha256:ba7a153a04720a0f34aa6659d85605cbf04e62160a73cc1ac160780ffc78c1f9
   - name: quay.io/arencloud/unf-agent-dev
     newName: quay.io/arencloud/unf-agent-dev
-    digest: sha256:8576eb514213fa686060392fa5a44daa910d7b3d0a59c690a907cbce75cfe7c2
+    digest: sha256:1d36b8c273fa225e0cf036995382928763a39abd461abfe8efb7f355560d9fd1
 patches:
   - path: controller-native-patch.yaml
   - path: agent-rotation-patch.yaml

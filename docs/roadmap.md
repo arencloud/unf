@@ -1228,6 +1228,12 @@ matrix is maintained in the
   cleanup over that one producer-owned name only after the same strict
   committed-checkpoint validation; arbitrary residue still fails. A completely
   fresh full Kind run remains mandatory.
+  Exact runtime and qualifier `a728017` then passed that fresh full lifecycle,
+  including 399 WireGuard frames with zero Required plaintext, the complete
+  fault/rotation/replacement matrix, Phase 8 coexistence, exact cleanup, and
+  restored no-CNI baseline. ADR 0257 binds its anonymous-public Linux/amd64
+  digests and evidence as the sole tuple eligible for cl02; the complete
+  platform gate remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

@@ -71,6 +71,9 @@ require_text docs/adr/0255-work-capped-zero-allocation-enforcement-fold.md \
 require_text docs/adr/0256-loadbalancer-pending-checkpoint-cleanup-closure.md \
     'LoadBalancer Pending-Checkpoint Cleanup Closure' \
     "the full Kind lifecycle must close a validated prepared LoadBalancer checkpoint"
+require_text docs/adr/0257-immutable-work-capped-kind-requalification.md \
+    'Immutable Work-Capped Kind Requalification' \
+    "the bounded planner must retain immutable fresh-Kind provenance"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"
