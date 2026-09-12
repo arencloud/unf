@@ -187,6 +187,9 @@ remain split across Native/Required cuts, so cleanup is not verified. Repair and
 requalify mixed-phase key attestation and generation recovery without deleting
 durable authority. ADR 0284 implements mixed-phase witness reconstruction and
 atomic complete-column persistence; qualify that repair on preserved cl02 state.
+Its deployment and Required/selective dual-stack traffic checks passed, but the
+full gate stopped on a retired fault-target interface. ADR 0285 replaces that
+qualifier assumption with exact live admitted-link selection on both platforms.
 Run the full current-cut lifecycle gate, then
 qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as

@@ -5,6 +5,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 gate=${root}/hack/verify-openshift-encryption-phase9.sh
 bash "${root}/hack/verify-phase9-operations-continuity.sh"
 bash "${root}/hack/verify-phase9-generation-mode.sh"
+bash "${root}/hack/verify-phase9-link-fault.sh"
 overlay=${root}/deploy/openshift-primary-cni/encryption-phase9
 release=${overlay}/release.json
 rendered=$(mktemp)

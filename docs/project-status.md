@@ -557,8 +557,11 @@ and retains baseline-migration and final-Native snapshots; a newer Native cut
 cannot be mistaken for successful Required migration.
 Runtime `cb59e90` is published as the next digest-pinned cl02-first candidate;
 its guarded preserved-state cl02 deployment passed with exact versions,
-five-agent convergence and zero restarts (ADR 0284). The full lifecycle result,
-then matching-image Kind, remain open.
+five-agent convergence and zero restarts (ADR 0284). The full gate subsequently
+passed Required/selective convergence and dual-stack PodIP/ClusterIP traffic,
+then failed selecting a retired interface before ciphertext/fail-closed tests.
+ADR 0285 repairs live fault-target selection; full cl02 qualification and
+matching-image Kind remain open.
 
 ## Updating this tracker
 

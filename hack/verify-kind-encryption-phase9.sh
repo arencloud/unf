@@ -20,13 +20,17 @@ temporary_dir=$(mktemp -d)
 capture_host_path=${temporary_dir}/underlay.pcap
 qualification_stage=preflight
 source "${project_root}/hack/phase9-operations.sh"
+source "${project_root}/hack/phase9-link-fault.sh"
 resources_created=false
 link_lowered=false
-lowered_source_interfaces=()
 capture_node=
 capture_pod=
 kc=(kubectl --kubeconfig "${kubeconfig}" --context "${context}")
 runtime=(sudo "${container_runtime}")
+
+phase9_link_exec() {
+    timeout 20 "${runtime[@]}" exec "${source_node}" "$@"
+}
 
 bool() {
     [[ $1 == true || $1 == false ]] || {
@@ -60,6 +64,9 @@ collect_diagnostics() {
 report_failure() {
     local status=$?
     local line=${BASH_LINENO[0]:-unknown}
+    if [[ ${link_lowered} == true ]] && restore_owned_encryption_links; then
+        link_lowered=false
+    fi
     collect_diagnostics
     echo "Phase 9.8 Kind qualification failed during ${qualification_stage} at line ${line}: ${BASH_COMMAND}" >&2
     echo "diagnostics: ${diagnostics_dir}" >&2
@@ -68,10 +75,7 @@ report_failure() {
 
 cleanup() {
     if [[ ${link_lowered} == true && -n ${source_node:-} ]]; then
-        for interface in "${lowered_source_interfaces[@]}"; do
-            "${runtime[@]}" exec "${source_node}" ip link set dev "${interface}" up \
-                >/dev/null 2>&1 || true
-        done
+        restore_owned_encryption_links >/dev/null 2>&1 || true
     fi
     if [[ ${resources_created} == true ]]; then
         "${kc[@]}" delete namespace "${namespace}" --ignore-not-found --wait=false \
@@ -83,7 +87,7 @@ cleanup() {
 trap report_failure ERR
 trap cleanup EXIT
 
-for command in awk cargo curl git jq kubectl rg sha256sum sudo tcpdump "${container_runtime}"; do
+for command in awk cargo curl git jq kubectl rg sha256sum sudo tcpdump timeout "${container_runtime}"; do
     command -v "${command}" >/dev/null 2>&1 || {
         echo "${command} is required for Phase 9.8 Kind qualification" >&2
         exit 1
@@ -234,37 +238,6 @@ http_probe() {
     done
     echo "HTTP readiness probe failed from ${pod} to ${address}:${port}" >&2
     return 1
-}
-
-lower_owned_encryption_links() {
-    local interface alias
-    local -a current_interfaces=()
-    mapfile -t current_interfaces < <(
-        "${runtime[@]}" exec "${source_node}" ip -j -details link show type wireguard |
-            jq -er '.[] | select((.ifalias // "") | startswith("unf:encryption:v2:")) | .ifname' |
-            sort -u
-    )
-    (( ${#current_interfaces[@]} > 0 && ${#current_interfaces[@]} <= 2 )) || {
-        echo "expected one or two exactly owned UNF encryption links, found ${#current_interfaces[@]}" >&2
-        return 1
-    }
-    for interface in "${current_interfaces[@]}"; do
-        [[ ${interface} =~ ^unfwg[0-9]{10}$ ]] || {
-            echo "refusing unexpected encryption interface ${interface@Q}" >&2
-            return 1
-        }
-        alias=$("${runtime[@]}" exec "${source_node}" ip -j -details link show dev "${interface}" |
-            jq -er '.[0].ifalias')
-        [[ ${alias} == unf:encryption:v2:* ]] || {
-            echo "refusing encryption link without exact v2 UNF ownership" >&2
-            return 1
-        }
-        "${runtime[@]}" exec "${source_node}" ip link set dev "${interface}" down
-        if [[ ! " ${lowered_source_interfaces[*]} " =~ " ${interface} " ]]; then
-            lowered_source_interfaces+=("${interface}")
-        fi
-    done
-    link_lowered=true
 }
 
 http_probe_fails() {
@@ -524,9 +497,7 @@ if [[ ${required_blocked} != 8 || ${native_succeeded} != 8 ]]; then
     echo "link-fault matrix mismatch: Required denied ${required_blocked}/8, Native succeeded ${native_succeeded}/8" >&2
     false
 fi
-for interface in "${lowered_source_interfaces[@]}"; do
-    "${runtime[@]}" exec "${source_node}" ip link set dev "${interface}" up
-done
+restore_owned_encryption_links
 link_lowered=false
 capture_exit=
 for _ in $(seq 1 60); do

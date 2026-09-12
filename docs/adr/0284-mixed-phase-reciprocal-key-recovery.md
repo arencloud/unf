@@ -93,3 +93,8 @@ snapshot is not a continuous availability or resource-efficiency claim.
 Actual current-cut Native/Required modes, traffic, failure/rotation/replacement,
 persistence and exact cleanup still require the separate full cl02 gate, then
 matching-image Kind qualification.
+
+The subsequent full gate (`1e37477`) advanced through Required and selective
+dual-stack PodIP/ClusterIP traffic, then failed selecting a retired interface at
+the start of the ciphertext/fail-closed stage. ADR 0285 repairs the qualifier's
+first-plan assumption and records the boundary; this is not a full gate pass.

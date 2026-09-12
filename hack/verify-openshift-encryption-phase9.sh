@@ -25,11 +25,15 @@ resources_created=false
 host_probe_created=false
 baseline_changed=false
 link_lowered=false
-source_interface=
 artifact_tmp=
 diagnostics_collected=false
 checkpoint_persistence_checks='[]'
 source "${project_root}/hack/phase9-operations.sh"
+source "${project_root}/hack/phase9-link-fault.sh"
+
+phase9_link_exec() {
+    node_exec "${source_node}" "$@"
+}
 
 collect_diagnostics() {
     [[ ${diagnostics_collected} == false ]] || return 0
@@ -52,8 +56,8 @@ cleanup() {
     local status=$?
     trap - ERR EXIT
     set +e
-    if [[ ${link_lowered} == true && -n ${source_node:-} && -n ${source_interface} ]]; then
-        node_exec "${source_node}" ip link set dev "${source_interface}" up >/dev/null 2>&1 || true
+    if [[ ${link_lowered} == true && -n ${source_node:-} ]]; then
+        restore_owned_encryption_links >/dev/null 2>&1 || true
     fi
     if [[ ${baseline_changed} == true ]]; then
         "${kc[@]}" -n unf-system set env deployment/unf-controller \
@@ -72,6 +76,9 @@ cleanup() {
 
 failure() {
     local status=$?
+    if [[ ${link_lowered} == true ]] && restore_owned_encryption_links; then
+        link_lowered=false
+    fi
     collect_diagnostics
     echo "OpenShift Phase 9.9 qualification failed during ${stage} at line ${BASH_LINENO[0]}: ${BASH_COMMAND}" >&2
     echo "diagnostics: ${diagnostics}" >&2
@@ -636,13 +643,6 @@ traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required
 traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
 
 stage=ciphertext-and-fail-closed
-source_interface=$(node_exec "${source_node}" jq -er '.active.plans[0].interfaceName' \
-    /var/lib/unf/cni/v1/encryption-generation.json.recovery-plan)
-source_alias=$(node_exec "${source_node}" ip -j -details link show dev "${source_interface}" | jq -er '.[0].ifalias')
-[[ ${source_alias} == unf:encryption:* ]] || {
-    echo "refusing to operate an encryption link without the exact UNF ownership alias" >&2
-    exit 1
-}
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -675,11 +675,13 @@ for _ in $(seq 1 4); do
     traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
     traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
 done
-node_exec "${source_node}" ip link set dev "${source_interface}" down >/dev/null
-link_lowered=true
+lower_owned_encryption_links
 required_blocked=0
 native_succeeded=0
 for family in 4 6 4 6 4 6 4 6; do
+    # Keep the intended outage across natural rotation, including an admitted
+    # successor, without selecting a retired plans[0] or a foreign link.
+    lower_owned_encryption_links
     if [[ ${family} == 4 ]]; then
         required_target=${required_pod4}; native_target=${native_pod4}
     else
@@ -693,7 +695,7 @@ for family in 4 6 4 6 4 6 4 6; do
     fi
 done
 [[ ${required_blocked} == 8 && ${native_succeeded} == 8 ]]
-node_exec "${source_node}" ip link set dev "${source_interface}" up >/dev/null
+restore_owned_encryption_links
 link_lowered=false
 capture_exit=
 for _ in $(seq 1 90); do
