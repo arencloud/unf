@@ -62,3 +62,17 @@ and both platform static gates. These are not live platform results.
 Publish immutable images, then verify preserved-state cl02
 recovery and the full lifecycle gate before matching-image Kind qualification.
 Phase 9 and stabilization/scale readiness remain open.
+
+## Candidate publication
+
+Runtime `cb59e9080a4cce5544c1ae3c69974233d53d8c52` is built from the committed
+Containerfile with the same isolated temporary image store used in ADR 0283.
+Both binaries contain that exact revision and require no dynamic libzstd.
+The release record pins the public controller and agent manifests by digest;
+test tools are unchanged. Anonymous registry reads independently verify those
+manifests. Kind remains explicitly pending with `qualificationOrder` set to
+`openshift-first`. The qualifier additionally rejects newer Native journal
+cuts during Required migration and retains actual final-Native journal evidence.
+
+Publishing these images does not mark deployment, lifecycle qualification,
+Phase 9, or stabilization complete. Preserve current authority during rollout.
