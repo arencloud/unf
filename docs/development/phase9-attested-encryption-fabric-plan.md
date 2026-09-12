@@ -22,7 +22,7 @@ separately revisioned. The authoritative state remains in
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
 | 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `30266627f42321cd90613c00cb5ba71ac648e02f` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADR 0267. Default-Required and explicit-selective PodIP/Service traffic, 404 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent/controller replacement, 295 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `7801aa7d…0775`; packet-capture SHA-256 is `aff51bb9…f03` |
-| 9.9 | OpenShift qualification | **In progress** | ADR 0269 records exact `cfff9c3` deployment success and Required-activation timeout without OOM at 2 GiB. ADRs 0270–0272 implement indexed fair probe exchange, lifetime-bound catalog reuse and atomic batches of up to 64 endpoint proofs. Complete successor cl02 qualification runs first, then fresh Kind. The transient recovery checkpoint-size gap remains tracked |
+| 9.9 | OpenShift qualification | **In progress** | ADRs 0269 and 0273 record successful preserved-state deployments but failed Required migrations. Bounded, indexed proof exchange reached remote quorums on `c02e060`, exposing an incompatible one-receipt-per-decision assumption for replicated identities. ADR 0274 implements exact assignment-bound replica coverage without changing the wire/BPF schema. Complete successor cl02 qualification runs first, then fresh Kind. The transient recovery checkpoint-size gap remains tracked |
 
 ## Accepted Phase 9 gate
 
@@ -178,8 +178,8 @@ require independent architecture and gates.
 Following the user's 2026-09-12 instruction, platform verification now runs on
 cl02 first, then fresh Kind. Local checks precede image publication. A candidate
 release record declares `qualificationOrder: openshift-first` and Kind `pending`
-with no invented hashes or platform observations. Deploy ADR 0273's immutable
-`c02e060` successor to cl02 preserving Node-local authority and run the full gate, then
+with no invented hashes or platform observations. Deploy ADR 0274's replica-aware
+successor to cl02 preserving Node-local authority and run the full gate, then
 qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as
 preserving RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct
