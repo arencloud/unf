@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted for Phase 9.9 requalification
+Accepted for public readiness; insufficient alone for OpenShift bootstrap and
+amended by ADR 0260
 
 ## Context
 
@@ -17,11 +18,13 @@ and EncryptionPolicy relists formed one complete authority cut.
 That admitted a recomputation stampede over partial, repeatedly changing
 snapshots. The process was deterministically killed at approximately 2.09 GiB
 RSS under a 2-GiB limit, 8.37 GiB under an 8-GiB diagnostic limit, and 15.4 GiB
-under a 16-GiB diagnostic limit. Disconnecting the controller Service from the
-agents allowed the same process to finish all relists at 71–147 MiB. Reconnecting
-all five agents after the relists completed remained at 73–148 MiB with no
-restart. The planner and steady-state pull paths were therefore not the failed
-boundary; premature Service admission was.
+under a 16-GiB diagnostic limit. Changing the controller Service selector
+appeared to isolate delivery and the same process finished relists at
+71–147 MiB. That experiment's attribution was later invalidated: OpenShift
+agents use a host alias pointing directly to the host-network controller and
+do not traverse this Service. The readiness barrier remains necessary for
+Service consumers, but ADR 0260 records the actual direct-bootstrap admission
+boundary and the corrected replay.
 
 The OpenShift gate also counted 360 iterations as a six-minute timeout even
 though each iteration could perform five sequential bounded remote reads. Its

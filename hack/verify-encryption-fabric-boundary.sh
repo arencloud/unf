@@ -80,6 +80,9 @@ require_text docs/adr/0258-informer-cut-admission-barrier.md \
 require_text docs/adr/0259-immutable-informer-cut-kind-requalification.md \
     'Immutable Informer-Cut Kind Requalification' \
     "the informer-cut barrier must retain immutable fresh-Kind provenance"
+require_text docs/adr/0260-cut-fenced-single-flight-authority-admission.md \
+    'Cut-Fenced Single-Flight Authority Admission' \
+    "host-network agent authority admission must be constant-space and cut-fenced"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"
@@ -89,6 +92,15 @@ require_text bins/unf-controller/src/main.rs \
 require_text bins/unf-controller/src/main.rs \
     'finish_initial_agent_authority_watch' \
     "informer relists must close the agent authority readiness barrier"
+require_text bins/unf-controller/src/main.rs \
+    'AGENT_AUTHORITY_MAX_IN_FLIGHT: usize = 1' \
+    "internal authority materialization must be single-flight"
+require_text bins/unf-controller/src/main.rs \
+    'admit_agent_authority_request' \
+    "the host-network internal API must enforce authority admission"
+require_text bins/unf-controller/src/main.rs \
+    'agent_authority_cut_revision' \
+    "materialized authority responses must be fenced by informer cut revision"
 require_text crates/unf-policy/src/lib.rs \
     'evaluate_preselected_enforcement_with_addresses' \
     "preselected encryption policy enforcement must use the compact evaluator"

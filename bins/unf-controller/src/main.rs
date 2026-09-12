@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use axum::extract::{Query, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -37,6 +38,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -230,6 +232,7 @@ const INITIAL_WATCH_ENDPOINT_SLICES: u64 = 1 << 4;
 const INITIAL_WATCH_SECURITY_POLICIES: u64 = 1 << 5;
 const INITIAL_WATCH_NETWORK_POLICIES: u64 = 1 << 6;
 const INITIAL_WATCH_ENCRYPTION_POLICIES: u64 = 1 << 7;
+const AGENT_AUTHORITY_MAX_IN_FLIGHT: usize = 1;
 const INITIAL_AGENT_AUTHORITY_WATCHES: u64 = INITIAL_WATCH_PODS
     | INITIAL_WATCH_NAMESPACES
     | INITIAL_WATCH_NODES
@@ -506,6 +509,8 @@ struct DurableEncryptionGenerationDescriptor {
 struct ControllerState {
     ready: AtomicBool,
     initial_agent_authority_watches: AtomicU64,
+    agent_authority_cut_revision: AtomicU64,
+    agent_authority_admission: Semaphore,
     identity_epoch: u64,
     offline: bool,
     agent_node_selector: Option<String>,
@@ -1594,6 +1599,7 @@ async fn spawn_internal_api(
         cancellation.clone(),
         tasks,
     );
+    let admission_state = Arc::clone(&state);
     let internal_app = Router::new()
         .route("/v1/version", get(version))
         .route("/v1/state/identities", get(identity_snapshot))
@@ -1710,6 +1716,10 @@ async fn spawn_internal_api(
         )
         .route("/v1/state/agents", post(ingest_agent_status))
         .route("/v1/telemetry/flows", post(ingest_flows))
+        .layer(middleware::from_fn_with_state(
+            admission_state,
+            admit_agent_authority_request,
+        ))
         .with_state(state);
     let internal_listener =
         std::net::TcpListener::bind(args.internal_listen).with_context(|| {
@@ -2109,6 +2119,8 @@ fn new_state_with_client_and_selector(
         } else {
             INITIAL_AGENT_AUTHORITY_WATCHES
         }),
+        agent_authority_cut_revision: AtomicU64::new(0),
+        agent_authority_admission: Semaphore::new(AGENT_AUTHORITY_MAX_IN_FLIGHT),
         identity_epoch: controller_epoch(),
         offline,
         agent_node_selector,
@@ -16275,6 +16287,9 @@ fn capture_topology_history(state: &ControllerState) {
 
 fn begin_initial_agent_authority_watch(state: &ControllerState, watch: u64) {
     state
+        .agent_authority_cut_revision
+        .fetch_add(1, Ordering::AcqRel);
+    state
         .initial_agent_authority_watches
         .fetch_or(watch, Ordering::AcqRel);
     state.ready.store(false, Ordering::Release);
@@ -16284,6 +16299,9 @@ fn finish_initial_agent_authority_watch(state: &ControllerState, watch: u64) {
     state
         .initial_agent_authority_watches
         .fetch_and(!watch, Ordering::AcqRel);
+    state
+        .agent_authority_cut_revision
+        .fetch_add(1, Ordering::AcqRel);
     publish_controller_readiness(state);
 }
 
@@ -16294,6 +16312,42 @@ fn publish_controller_readiness(state: &ControllerState) {
         == 0
     {
         state.ready.store(true, Ordering::Release);
+    }
+}
+
+async fn admit_agent_authority_request(
+    State(state): State<Arc<ControllerState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !state.ready.load(Ordering::Acquire) {
+        return ApiError::service_unavailable("controller authoritative informer cut is not ready")
+            .into_response();
+    }
+    let Ok(_permit) = state.agent_authority_admission.try_acquire() else {
+        return ApiError::service_unavailable(
+            "controller authority materialization is already in flight",
+        )
+        .into_response();
+    };
+    let cut_revision = state.agent_authority_cut_revision.load(Ordering::Acquire);
+    if !state.ready.load(Ordering::Acquire) {
+        return ApiError::service_unavailable(
+            "controller authoritative informer cut changed before admission",
+        )
+        .into_response();
+    }
+
+    let response = next.run(request).await;
+    if state.ready.load(Ordering::Acquire)
+        && state.agent_authority_cut_revision.load(Ordering::Acquire) == cut_revision
+    {
+        response
+    } else {
+        ApiError::service_unavailable(
+            "controller authoritative informer cut changed during materialization",
+        )
+        .into_response()
     }
 }
 
@@ -16410,6 +16464,47 @@ mod tests {
         assert!(!state.ready.load(Ordering::Acquire));
         finish_initial_agent_authority_watch(&state, INITIAL_WATCH_PODS);
         assert!(state.ready.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn agent_authority_admission_is_single_flight_and_revision_fenced() {
+        let state = new_state_with_client_and_selector(
+            false,
+            None,
+            None,
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Required,
+        );
+        for watch in [
+            INITIAL_WATCH_PODS,
+            INITIAL_WATCH_NAMESPACES,
+            INITIAL_WATCH_NODES,
+            INITIAL_WATCH_SERVICES,
+            INITIAL_WATCH_ENDPOINT_SLICES,
+            INITIAL_WATCH_SECURITY_POLICIES,
+            INITIAL_WATCH_NETWORK_POLICIES,
+            INITIAL_WATCH_ENCRYPTION_POLICIES,
+        ] {
+            finish_initial_agent_authority_watch(&state, watch);
+        }
+        assert!(state.ready.load(Ordering::Acquire));
+        assert_eq!(
+            state.agent_authority_admission.available_permits(),
+            AGENT_AUTHORITY_MAX_IN_FLIGHT
+        );
+
+        let permit = state
+            .agent_authority_admission
+            .try_acquire()
+            .expect("first authority materialization must be admitted");
+        assert!(state.agent_authority_admission.try_acquire().is_err());
+        drop(permit);
+        assert_eq!(state.agent_authority_admission.available_permits(), 1);
+
+        let revision = state.agent_authority_cut_revision.load(Ordering::Acquire);
+        begin_initial_agent_authority_watch(&state, INITIAL_WATCH_PODS);
+        assert!(state.agent_authority_cut_revision.load(Ordering::Acquire) > revision);
+        assert!(!state.ready.load(Ordering::Acquire));
     }
 
     #[test]

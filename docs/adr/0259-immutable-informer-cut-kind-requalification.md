@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted and verified for Phase 9.9 release admission
+Historical Kind qualification; rejected by the cl02 platform gate
 
 ## Context
 
@@ -49,3 +49,14 @@ The packet capture SHA-256 is
 - cl02 must accept this exact tuple, preserve Node-local recovery state, prove
   cold controller replacement remains inside the 2-GiB cgroup, and pass the
   complete platform gate before Phase 9 closes.
+
+## Platform result
+
+cl02 rejected this tuple. OpenShift primary-CNI agents resolve
+`unf-primary-controller.internal` through a Pod `hostAliases` entry pointing
+directly at the host-network controller Node. They therefore bypass the
+readiness-aware Service and reached port 9964 while the controller was
+unready. One released agent was sufficient to trigger overlapping authority
+materializations and an OOM kill. ADR 0260 replaces Service-only admission
+with readiness-, concurrency-, and cut-revision enforcement on the internal
+API itself.
