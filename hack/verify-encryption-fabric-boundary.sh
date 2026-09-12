@@ -104,6 +104,18 @@ require_text docs/adr/0266-end-to-end-authority-delivery-lease.md \
 require_text docs/adr/0267-immutable-delivery-leased-kind-requalification.md \
     'Immutable Delivery-Leased Kind Requalification' \
     "delivery-leased authority must retain immutable fresh-Kind provenance"
+require_text docs/adr/0268-contract-deduplicated-causal-assignment-batch.md \
+    'Contract-Deduplicated Causal Assignment Batch' \
+    "path-proof work must not duplicate a complete contract per plan"
+require_text crates/unf-encryption/src/path_proof.rs \
+    'AdmittedEncryptionPathProofAssignmentBatch' \
+    "compact path-proof contracts must be replayed once before indexed use"
+require_text bins/unf-agent/src/main.rs \
+    'assignmentBatchSchemaVersion=1' \
+    "agents must explicitly negotiate compact path-proof work"
+require_text bins/unf-controller/src/main.rs \
+    'LEGACY_ENCRYPTION_ASSIGNMENT_EXPANSION_LIMIT' \
+    "legacy path-proof expansion must fail before unbounded allocation"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"

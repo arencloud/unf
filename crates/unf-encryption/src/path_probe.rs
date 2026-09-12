@@ -5,7 +5,8 @@ use std::net::IpAddr;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    EncryptionGenerationRecipient, EncryptionPathEndpointRole, EncryptionPathProofAssignment,
+    AdmittedEncryptionPathProofAssignmentBatch, EncryptionGenerationRecipient,
+    EncryptionPathEndpointRole, EncryptionPathProofAssignment, EncryptionPathProofAssignmentIndex,
     EncryptionPathProofError, EncryptionPathProofRound, EncryptionPathProofRoundDigest,
     PATH_FAMILY_IPV4, PATH_FAMILY_IPV6, derive_wireguard_proof_addresses,
 };
@@ -260,6 +261,85 @@ impl EncryptionPathChallengeDelivery {
         })
     }
 
+    /// Joins exchanges for one compact batch selection without duplicating its
+    /// batch-owned contract.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the same malformed or incomplete evidence as [`Self::issue`].
+    pub fn issue_indexed(
+        assignment: &EncryptionPathProofAssignmentIndex,
+        contract: &crate::AttestedEncryptionPathContract,
+        recipient: &EncryptionGenerationRecipient,
+        exchanges: Vec<EncryptionPathProbeExchange>,
+    ) -> Result<Self, EncryptionPathProofError> {
+        assignment.verify_with(contract)?;
+        Self::issue_indexed_for_verified_contract(assignment, contract, recipient, exchanges)
+    }
+
+    /// Joins an exact selection from a batch whose contracts were replayed
+    /// once at admission.
+    ///
+    /// # Errors
+    ///
+    /// Rejects foreign work and every malformed exchange rejected by
+    /// [`Self::issue_indexed`].
+    pub fn issue_from_assignment_batch(
+        batch: &AdmittedEncryptionPathProofAssignmentBatch,
+        assignment: &EncryptionPathProofAssignmentIndex,
+        recipient: &EncryptionGenerationRecipient,
+        exchanges: Vec<EncryptionPathProbeExchange>,
+    ) -> Result<Self, EncryptionPathProofError> {
+        let contract = batch.contract_for(assignment)?;
+        Self::issue_indexed_for_verified_contract(assignment, contract, recipient, exchanges)
+    }
+
+    fn issue_indexed_for_verified_contract(
+        assignment: &EncryptionPathProofAssignmentIndex,
+        contract: &crate::AttestedEncryptionPathContract,
+        recipient: &EncryptionGenerationRecipient,
+        mut exchanges: Vec<EncryptionPathProbeExchange>,
+    ) -> Result<Self, EncryptionPathProofError> {
+        let (local_node, peer_node) = indexed_endpoint_nodes(assignment, contract, recipient)?;
+        let local = derive_wireguard_proof_addresses(&local_node.pod_cidrs)
+            .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+        let peer = derive_wireguard_proof_addresses(&peer_node.pod_cidrs)
+            .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+        exchanges.sort_by_key(|exchange| exchange.request.family);
+        let required = [PATH_FAMILY_IPV4, PATH_FAMILY_IPV6]
+            .into_iter()
+            .filter(|family| assignment.round.family_mask & family != 0)
+            .collect::<Vec<_>>();
+        if exchanges.len() != required.len()
+            || exchanges
+                .iter()
+                .map(|exchange| exchange.request.family)
+                .collect::<Vec<_>>()
+                != required
+        {
+            return Err(EncryptionPathProofError::ChallengeMismatch);
+        }
+        for exchange in &exchanges {
+            exchange
+                .request
+                .verify_for(&assignment.round, EncryptionPathProbeKind::Request)?;
+            exchange
+                .response
+                .verify_for(&assignment.round, EncryptionPathProbeKind::Response)?;
+            let expected_local = beacon_for_family(&local, exchange.request.family)?;
+            let expected_peer = beacon_for_family(&peer, exchange.request.family)?;
+            if exchange.local_address != expected_local || exchange.peer_address != expected_peer {
+                return Err(EncryptionPathProofError::ChallengeMismatch);
+            }
+        }
+        let transcript_digest = indexed_delivery_digest(assignment, recipient, &exchanges);
+        Ok(Self {
+            round_digest: assignment.round.round_digest,
+            family_mask: assignment.round.family_mask,
+            transcript_digest,
+        })
+    }
+
     pub(crate) fn verify_for(
         &self,
         round: &EncryptionPathProofRound,
@@ -355,12 +435,175 @@ impl EncryptionPathProofAssignment {
     }
 }
 
+impl EncryptionPathProofAssignmentIndex {
+    /// Resolves this endpoint's role against the batch-owned contract.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, mismatched, or foreign selections.
+    pub fn endpoint_role_with(
+        &self,
+        contract: &crate::AttestedEncryptionPathContract,
+        recipient: &EncryptionGenerationRecipient,
+    ) -> Result<EncryptionPathEndpointRole, EncryptionPathProofError> {
+        self.verify_with(contract)?;
+        self.endpoint_role_for_verified_contract(recipient)
+    }
+
+    /// Resolves the endpoint role from one admitted compact-batch selection.
+    ///
+    /// # Errors
+    ///
+    /// Rejects foreign or unadmitted work.
+    pub fn endpoint_role_from_assignment_batch(
+        &self,
+        batch: &AdmittedEncryptionPathProofAssignmentBatch,
+        recipient: &EncryptionGenerationRecipient,
+    ) -> Result<EncryptionPathEndpointRole, EncryptionPathProofError> {
+        batch.contract_for(self)?;
+        self.endpoint_role_for_verified_contract(recipient)
+    }
+
+    fn endpoint_role_for_verified_contract(
+        &self,
+        recipient: &EncryptionGenerationRecipient,
+    ) -> Result<EncryptionPathEndpointRole, EncryptionPathProofError> {
+        if recipient == &self.round.source {
+            Ok(EncryptionPathEndpointRole::Source)
+        } else if recipient == &self.round.destination {
+            Ok(EncryptionPathEndpointRole::Destination)
+        } else {
+            Err(EncryptionPathProofError::ForeignNode)
+        }
+    }
+
+    /// Returns the selected local path from the batch-owned contract.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, missing, or foreign selections.
+    pub fn local_path_with<'a>(
+        &self,
+        contract: &'a crate::AttestedEncryptionPathContract,
+        recipient: &EncryptionGenerationRecipient,
+    ) -> Result<&'a crate::EncryptionPathFact, EncryptionPathProofError> {
+        let role = self.endpoint_role_with(contract, recipient)?;
+        let plan = contract
+            .plans
+            .get(self.plan_index)
+            .ok_or(EncryptionPathProofError::InvalidContractPlan)?;
+        Ok(match role {
+            EncryptionPathEndpointRole::Source => &plan.transport.forward,
+            EncryptionPathEndpointRole::Destination => &plan.transport.reverse,
+        })
+    }
+
+    /// Returns the selected local path from an admitted compact batch.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, missing, foreign, or unadmitted work.
+    pub fn local_path_from_assignment_batch<'a>(
+        &self,
+        batch: &'a AdmittedEncryptionPathProofAssignmentBatch,
+        recipient: &EncryptionGenerationRecipient,
+    ) -> Result<&'a crate::EncryptionPathFact, EncryptionPathProofError> {
+        let contract = batch.contract_for(self)?;
+        let role = self.endpoint_role_for_verified_contract(recipient)?;
+        let plan = contract
+            .plans
+            .get(self.plan_index)
+            .ok_or(EncryptionPathProofError::InvalidContractPlan)?;
+        Ok(match role {
+            EncryptionPathEndpointRole::Source => &plan.transport.forward,
+            EncryptionPathEndpointRole::Destination => &plan.transport.reverse,
+        })
+    }
+
+    /// Derives exact proof beacons without owning a duplicate contract.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed CIDRs, missing family coverage, or foreign work.
+    pub fn probe_targets_with(
+        &self,
+        contract: &crate::AttestedEncryptionPathContract,
+        recipient: &EncryptionGenerationRecipient,
+    ) -> Result<Vec<EncryptionPathProbeTarget>, EncryptionPathProofError> {
+        self.verify_with(contract)?;
+        let (local_node, peer_node) = indexed_endpoint_nodes(self, contract, recipient)?;
+        let local = derive_wireguard_proof_addresses(&local_node.pod_cidrs)
+            .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+        let peer = derive_wireguard_proof_addresses(&peer_node.pod_cidrs)
+            .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+        [PATH_FAMILY_IPV4, PATH_FAMILY_IPV6]
+            .into_iter()
+            .filter(|family| self.round.family_mask & family != 0)
+            .map(|family| {
+                Ok(EncryptionPathProbeTarget {
+                    family,
+                    local_address: beacon_for_family(&local, family)?,
+                    peer_address: beacon_for_family(&peer, family)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Derives exact beacons from an admitted compact batch without rehashing
+    /// the shared contract.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, missing, foreign, or unadmitted work.
+    pub fn probe_targets_from_assignment_batch(
+        &self,
+        batch: &AdmittedEncryptionPathProofAssignmentBatch,
+        recipient: &EncryptionGenerationRecipient,
+    ) -> Result<Vec<EncryptionPathProbeTarget>, EncryptionPathProofError> {
+        let contract = batch.contract_for(self)?;
+        let (local_node, peer_node) = indexed_endpoint_nodes(self, contract, recipient)?;
+        let local = derive_wireguard_proof_addresses(&local_node.pod_cidrs)
+            .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+        let peer = derive_wireguard_proof_addresses(&peer_node.pod_cidrs)
+            .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+        [PATH_FAMILY_IPV4, PATH_FAMILY_IPV6]
+            .into_iter()
+            .filter(|family| self.round.family_mask & family != 0)
+            .map(|family| {
+                Ok(EncryptionPathProbeTarget {
+                    family,
+                    local_address: beacon_for_family(&local, family)?,
+                    peer_address: beacon_for_family(&peer, family)?,
+                })
+            })
+            .collect()
+    }
+}
+
 fn endpoint_nodes<'a>(
     assignment: &'a EncryptionPathProofAssignment,
     recipient: &EncryptionGenerationRecipient,
 ) -> Result<(&'a crate::EncryptionNode, &'a crate::EncryptionNode), EncryptionPathProofError> {
     let plan = assignment
         .contract
+        .plans
+        .get(assignment.plan_index)
+        .ok_or(EncryptionPathProofError::InvalidContractPlan)?;
+    if recipient == &assignment.round.source {
+        Ok((&plan.source.node, &plan.destination.node))
+    } else if recipient == &assignment.round.destination {
+        Ok((&plan.destination.node, &plan.source.node))
+    } else {
+        Err(EncryptionPathProofError::ForeignNode)
+    }
+}
+
+fn indexed_endpoint_nodes<'a>(
+    assignment: &EncryptionPathProofAssignmentIndex,
+    contract: &'a crate::AttestedEncryptionPathContract,
+    recipient: &EncryptionGenerationRecipient,
+) -> Result<(&'a crate::EncryptionNode, &'a crate::EncryptionNode), EncryptionPathProofError> {
+    let plan = contract
         .plans
         .get(assignment.plan_index)
         .ok_or(EncryptionPathProofError::InvalidContractPlan)?;
@@ -415,12 +658,40 @@ fn delivery_digest(
     hasher.finalize().into()
 }
 
+fn indexed_delivery_digest(
+    assignment: &EncryptionPathProofAssignmentIndex,
+    recipient: &EncryptionGenerationRecipient,
+    exchanges: &[EncryptionPathProbeExchange],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(DELIVERY_DOMAIN);
+    hasher.update(assignment.generation.get().to_be_bytes());
+    hasher.update(assignment.round.round_digest.0);
+    hasher.update((recipient.node_uid.len() as u64).to_be_bytes());
+    hasher.update(recipient.node_uid.as_bytes());
+    for exchange in exchanges {
+        hasher.update([exchange.request.family]);
+        match exchange.local_address {
+            IpAddr::V4(address) => hasher.update(address.octets()),
+            IpAddr::V6(address) => hasher.update(address.octets()),
+        }
+        match exchange.peer_address {
+            IpAddr::V4(address) => hasher.update(address.octets()),
+            IpAddr::V6(address) => hasher.update(address.octets()),
+        }
+        hasher.update(exchange.request.encode());
+        hasher.update(exchange.response.encode());
+    }
+    hasher.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::path_proof::tests::assignment_fixture;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn fixed_probe_frames_and_delivery_reject_mutation_partial_and_foreign_beacons() {
         let assignment = assignment_fixture();
         let recipient = assignment.round.source.clone();
@@ -455,7 +726,43 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let delivery =
-            EncryptionPathChallengeDelivery::issue(&assignment, &recipient, exchanges).unwrap();
+            EncryptionPathChallengeDelivery::issue(&assignment, &recipient, exchanges.clone())
+                .unwrap();
+        let indexed = EncryptionPathProofAssignmentIndex {
+            schema_version: crate::ENCRYPTION_PATH_PROOF_SCHEMA_VERSION,
+            generation: assignment.generation,
+            round: assignment.round.clone(),
+            contract_digest: assignment.contract.contract_digest,
+            plan_index: assignment.plan_index,
+        };
+        let indexed_delivery = EncryptionPathChallengeDelivery::issue_indexed(
+            &indexed,
+            &assignment.contract,
+            &recipient,
+            exchanges.clone(),
+        )
+        .unwrap();
+        assert_eq!(indexed_delivery.family_mask(), delivery.family_mask());
+        assert_eq!(
+            indexed_delivery.transcript_digest(),
+            delivery.transcript_digest()
+        );
+        let batch = crate::EncryptionPathProofAssignmentBatch {
+            schema_version: crate::ENCRYPTION_PATH_PROOF_ASSIGNMENT_BATCH_SCHEMA_VERSION,
+            generation: assignment.generation,
+            contracts: vec![assignment.contract.clone()],
+            assignments: vec![indexed.clone()],
+        }
+        .admit()
+        .unwrap();
+        let admitted_delivery = EncryptionPathChallengeDelivery::issue_from_assignment_batch(
+            &batch, &indexed, &recipient, exchanges,
+        )
+        .unwrap();
+        assert_eq!(
+            admitted_delivery.transcript_digest(),
+            delivery.transcript_digest()
+        );
         delivery.verify_for(&assignment.round).unwrap();
         assert_ne!(delivery.transcript_digest(), [0; 32]);
 

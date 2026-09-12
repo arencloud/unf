@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for Phase 9.9 OpenShift qualification
+Rejected by Phase 9.9 OpenShift qualification; immutable Kind evidence retained
 
 ## Context
 
@@ -46,6 +46,9 @@ The packet capture SHA-256 is
 
 - ADR 0265 remains the historical proof of bounded-fair admission and the
   response-lifetime failure found on cl02; its tuple is no longer deployable.
-- The release record and OpenShift overlay pin only this successor.
-- cl02 must accept exact preserved-state serial replacement and then pass the
-  complete Phase 9.9 gate before Phase 9 can be marked Verified.
+- The preserved-state cl02 deployment accepted this exact tuple on five Nodes,
+  but the Required migration exposed per-plan full-contract duplication and
+  repeatedly exceeded the controller memory limit before generation advance.
+- This tuple must not be redeployed as the Phase 9.9 candidate. ADR 0268 defines
+  the contract-deduplicated successor boundary; this ADR's Kind evidence remains
+  historical and immutable.

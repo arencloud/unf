@@ -86,19 +86,20 @@ use unf_egress::{
     seal_egress_bgp_snapshot, verify_egress_bgp_config, verify_egress_reachability_plan,
 };
 use unf_encryption::{
-    AdmittedEncryptionGeneration, AdmittedNodeLocalPlan, AuthenticatedNodeIdentity,
-    DurableNodeKeyAuthority, ENCRYPTION_PATH_PROBE_FRAME_BYTES, ENCRYPTION_PATH_PROBE_PORT,
-    EncryptionActivationReport, EncryptionActivationTestimonyRequest, EncryptionEndpointPathProof,
-    EncryptionGenerationFact, EncryptionGenerationPathProofPermit, EncryptionGenerationRequest,
-    EncryptionKeyBootstrap, EncryptionPathActivationReceipt, EncryptionPathChallengeDelivery,
-    EncryptionPathEndpointRole, EncryptionPathProbeExchange, EncryptionPathProbeFrame,
-    EncryptionPathProbeKind, EncryptionPathProofAssignment, EncryptionPathProofRoundDigest,
-    EncryptionRoutePublicationPermit, EpochDrainProof, EpochRevocationReason,
-    FastPathMapTransaction, FileNodeKeyStateStore, KeyEpochPhase, LinuxEncryptionRouteProvider,
-    LinuxPreparedLocalGeneration, LinuxWireGuardProvider, NodeKeyAttestationCut,
-    NodeKeyAttestationRound, NodeKeyAuthority, NodeKeyPublication, NodeLocalPlanRequest,
-    NodeLocalRecoveryPlan, NodeSealedGenerationCapsule, NodeSealedPlanCapsule,
-    OsWireGuardKeyGenerator, WireGuardKernelPlan, WireGuardPublicKey,
+    AdmittedEncryptionGeneration, AdmittedEncryptionPathProofAssignmentBatch,
+    AdmittedNodeLocalPlan, AuthenticatedNodeIdentity, DurableNodeKeyAuthority,
+    ENCRYPTION_PATH_PROBE_FRAME_BYTES, ENCRYPTION_PATH_PROBE_PORT, EncryptionActivationReport,
+    EncryptionActivationTestimonyRequest, EncryptionEndpointPathProof, EncryptionGenerationFact,
+    EncryptionGenerationPathProofPermit, EncryptionGenerationRequest, EncryptionKeyBootstrap,
+    EncryptionPathActivationReceipt, EncryptionPathChallengeDelivery, EncryptionPathEndpointRole,
+    EncryptionPathProbeExchange, EncryptionPathProbeFrame, EncryptionPathProbeKind,
+    EncryptionPathProofAssignmentBatch, EncryptionPathProofAssignmentIndex,
+    EncryptionPathProofRoundDigest, EncryptionRoutePublicationPermit, EpochDrainProof,
+    EpochRevocationReason, FastPathMapTransaction, FileNodeKeyStateStore, KeyEpochPhase,
+    LinuxEncryptionRouteProvider, LinuxPreparedLocalGeneration, LinuxWireGuardProvider,
+    NodeKeyAttestationCut, NodeKeyAttestationRound, NodeKeyAuthority, NodeKeyPublication,
+    NodeLocalPlanRequest, NodeLocalRecoveryPlan, NodeSealedGenerationCapsule,
+    NodeSealedPlanCapsule, OsWireGuardKeyGenerator, WireGuardKernelPlan, WireGuardPublicKey,
     validate_encryption_generation_path_receipts,
 };
 use unf_gobgp::GoBgpAdapter;
@@ -10240,7 +10241,8 @@ async fn execute_live_encryption_path_proofs(
     recipient: &unf_encryption::EncryptionGenerationRecipient,
     desired: &unf_encryption::EncryptionFastPathState,
     plans: &[WireGuardKernelPlan],
-    assignments: &[EncryptionPathProofAssignment],
+    batch: &AdmittedEncryptionPathProofAssignmentBatch,
+    assignments: &[EncryptionPathProofAssignmentIndex],
 ) -> Result<Vec<EncryptionEndpointPathProof>> {
     if assignments.is_empty() {
         return Ok(Vec::new());
@@ -10251,14 +10253,11 @@ async fn execute_live_encryption_path_proofs(
     let mut before_by_plan = BTreeMap::new();
     let mut groups = BTreeMap::<PathProbeSocketKey, Vec<PathProbeWork>>::new();
     for assignment in assignments {
-        assignment
-            .verify()
-            .context("verify live encryption path assignment")?;
         if assignment.generation != desired_generation || !assignment.includes(recipient) {
             bail!("path assignment does not belong to the pending local generation");
         }
         let path = assignment
-            .local_path(recipient)
+            .local_path_from_assignment_batch(batch, recipient)
             .context("resolve local path proof contract")?;
         let plan = plans
             .iter()
@@ -10284,7 +10283,7 @@ async fn execute_live_encryption_path_proofs(
         let route_mark = encryption_route_mark(plan.fwmark)
             .context("derive proof socket policy-route mark from WireGuard fwmark")?;
         for target in assignment
-            .probe_targets(recipient)
+            .probe_targets_from_assignment_batch(batch, recipient)
             .context("derive exact contract proof beacons")?
         {
             let request = EncryptionPathProbeFrame::request(&assignment.round, target.family)?;
@@ -10322,7 +10321,7 @@ async fn execute_live_encryption_path_proofs(
                 .find(|assignment| assignment.round.round_digest == exchange.round_digest)
                 .context("wire exchange has no authenticated assignment")?;
             let target = assignment
-                .probe_targets(recipient)?
+                .probe_targets_from_assignment_batch(batch, recipient)?
                 .into_iter()
                 .find(|target| {
                     target.family == exchange.family && target.peer_address == exchange.peer_address
@@ -10361,11 +10360,13 @@ async fn execute_live_encryption_path_proofs(
     assignments
         .iter()
         .map(|assignment| {
+            let contract = batch
+                .contract_for(assignment)
+                .context("resolve compact endpoint-proof contract")?;
             let role = assignment
-                .endpoint_role(recipient)
+                .endpoint_role_from_assignment_batch(batch, recipient)
                 .context("resolve local endpoint path role")?;
-            let contract_plan = assignment
-                .contract
+            let contract_plan = contract
                 .plans
                 .get(assignment.plan_index)
                 .context("path proof contract plan disappeared")?;
@@ -10378,7 +10379,8 @@ async fn execute_live_encryption_path_proofs(
                 node_name: recipient.node_name.clone(),
                 node_uid: recipient.node_uid.clone(),
             };
-            let delivery = EncryptionPathChallengeDelivery::issue(
+            let delivery = EncryptionPathChallengeDelivery::issue_from_assignment_batch(
+                batch,
                 assignment,
                 recipient,
                 exchanges
@@ -10389,10 +10391,9 @@ async fn execute_live_encryption_path_proofs(
             let plan_key = plan_by_round
                 .get(&assignment.round.round_digest)
                 .context("path proof lost its local kernel-plan binding")?;
-            EncryptionEndpointPathProof::issue(
-                &assignment.round,
-                &assignment.contract,
-                assignment.plan_index,
+            EncryptionEndpointPathProof::issue_from_assignment_batch(
+                batch,
+                assignment,
                 role,
                 &authenticated,
                 before_by_plan
@@ -10626,6 +10627,7 @@ const fn encryption_startup_attachment_ready(
     has_active_generation || (!must_establish_initial_generation && !requires_local_revalidation)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn collect_live_encryption_path_receipts(
     generations: &mut EncryptionGenerationSynchronizer,
     recipient: &unf_encryption::EncryptionGenerationRecipient,
@@ -10646,9 +10648,11 @@ async fn collect_live_encryption_path_receipts(
         .controller_url
         .clone()
         .context("encryption path receipt synchronization has no controller URL")?;
-    let assignments: Vec<EncryptionPathProofAssignment> = authenticated_get(
+    let assignment_batch: EncryptionPathProofAssignmentBatch = authenticated_get(
         &generations.client,
-        format!("{controller_url}/v1/state/encryption-path-proof-assignments"),
+        format!(
+            "{controller_url}/v1/state/encryption-path-proof-assignments?assignmentBatchSchemaVersion=1"
+        ),
         &generations.agent_token_path,
     )?
     .send()
@@ -10658,7 +10662,11 @@ async fn collect_live_encryption_path_receipts(
     .context("controller rejected encrypted path proof assignments")?
     .json()
     .await
-    .context("decode encrypted path proof assignments")?;
+    .context("decode compact encrypted path proof assignment batch")?;
+    let assignment_batch = assignment_batch
+        .admit()
+        .context("verify compact encrypted path proof assignment batch")?;
+    let assignments = assignment_batch.assignments();
     let assignment_rounds = assignments
         .iter()
         .map(|assignment| assignment.round.round_digest)
@@ -10682,17 +10690,22 @@ async fn collect_live_encryption_path_receipts(
         })
         .cloned()
         .collect::<Vec<_>>();
-    for proof in
-        execute_live_encryption_path_proofs(recipient, desired, plans, &missing_assignments)
-            .await
-            .context("execute workload-independent encrypted path challenges")?
+    for proof in execute_live_encryption_path_proofs(
+        recipient,
+        desired,
+        plans,
+        &assignment_batch,
+        &missing_assignments,
+    )
+    .await
+    .context("execute workload-independent encrypted path challenges")?
     {
         generations
             .path_proofs
             .entry(proof.round_digest)
             .or_insert(proof);
     }
-    for assignment in &assignments {
+    for assignment in assignments {
         let proof = generations
             .path_proofs
             .get(&assignment.round.round_digest)

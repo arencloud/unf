@@ -1281,7 +1281,14 @@ matrix is maintained in the
   lifecycle; ADR 0267 binds its immutable public images, 404 WireGuard frames
   with zero Required plaintext, complete fault/rotation/replacement coverage,
   295 loss-free operations, exact cleanup, and no-CNI rollback. Complete
-  preserved-state cl02 qualification remains mandatory.
+  preserved-state cl02 deployment passed, but its Required transition rejected
+  the tuple: the coordinator and assignment endpoint duplicated each complete
+  multi-plan contract once per proof selection and exceeded the controller
+  memory bound. ADR 0268 replaces that quadratic authority shape with a sorted
+  contract table, lightweight digest/index/round selections, once-only
+  consuming admission, logarithmic lookup, and an 8-MiB pre-allocation fence
+  for legacy expansion. Fresh Kind and complete cl02 requalification remain
+  mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

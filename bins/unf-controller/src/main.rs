@@ -79,7 +79,8 @@ use unf_egress::{
     verify_egress_bfd_evidence_report, verify_egress_internet_snapshot,
 };
 use unf_encryption::{
-    AuthenticatedNodeIdentity, EncryptionActivationReport, EncryptionActivationReportDigest,
+    AuthenticatedNodeIdentity, ENCRYPTION_PATH_PROOF_ASSIGNMENT_BATCH_SCHEMA_VERSION,
+    EncryptionActivationReport, EncryptionActivationReportDigest,
     EncryptionActivationTestimonyRequest, EncryptionBaseline, EncryptionDisposition,
     EncryptionEndpointPathProof, EncryptionFrontierPublishOutcome,
     EncryptionGenerationDistributionError, EncryptionGenerationFact,
@@ -90,12 +91,11 @@ use unf_encryption::{
     EncryptionModel, EncryptionOperationalObservation, EncryptionOperationalOutcome,
     EncryptionOperationalStage, EncryptionOperationsHistoryCheckpoint, EncryptionOperationsLedger,
     EncryptionOperationsStatus, EncryptionPathActivationReceipt, EncryptionPathProofAdmission,
-    EncryptionPathProofAssignment, EncryptionPathProofCoordinator, EncryptionPolicyObservation,
-    FastPathEpochState, FleetDrainingEpochInput, FleetPlanProductionInput, IpPrefix,
-    KubernetesEncryptionNodeSnapshot, KubernetesEncryptionProjection,
-    KubernetesEncryptionProjectionInput, KubernetesEncryptionWorkloadSnapshot,
-    ManagedIdentitySelector, NodeKeyAttestationCut, NodeKeyAttestationLedger,
-    NodeKeyAttestationRound, NodeKeyAttestationRow, NodeKeyPublication,
+    EncryptionPathProofCoordinator, EncryptionPolicyObservation, FastPathEpochState,
+    FleetDrainingEpochInput, FleetPlanProductionInput, IpPrefix, KubernetesEncryptionNodeSnapshot,
+    KubernetesEncryptionProjection, KubernetesEncryptionProjectionInput,
+    KubernetesEncryptionWorkloadSnapshot, ManagedIdentitySelector, NodeKeyAttestationCut,
+    NodeKeyAttestationLedger, NodeKeyAttestationRound, NodeKeyAttestationRow, NodeKeyPublication,
     NodeKeyTransparencyCutDigest, NodeKeyTransparencyLedger, NodeLocalPlanCatalog,
     NodeLocalPlanDistributionError, NodeLocalPlanFleetCut, NodeLocalPlanRequest,
     NodeSealedGenerationCapsule, NodeSealedPlanCapsule, produce_fleet_plan_cut,
@@ -191,6 +191,7 @@ const ENCRYPTION_GENERATION_STORE_PAYLOAD_KEY: &str = "checkpoint.gz";
 const ENCRYPTION_GENERATION_STORE_SCHEMA_VERSION: u16 = 1;
 const ENCRYPTION_GENERATION_STORE_DATA_LIMIT: usize = 900_000;
 const ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT: usize = 64_000_000;
+const LEGACY_ENCRYPTION_ASSIGNMENT_EXPANSION_LIMIT: usize = 8 * 1024 * 1024;
 const ENCRYPTION_GENERATION_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const ENCRYPTION_OPERATIONS_STORE_NAME: &str = "unf-encryption-operations";
 const ENCRYPTION_OPERATIONS_STORE_KEY: &str = "operations.json";
@@ -1184,6 +1185,12 @@ struct FlowHistoryQuery {
     since_unix_ms: Option<u64>,
     until_unix_ms: Option<u64>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct EncryptionPathProofAssignmentQuery {
+    assignment_batch_schema_version: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -9323,16 +9330,54 @@ async fn encryption_key_attestation_cut(
 
 async fn encryption_path_proof_assignments(
     State(state): State<Arc<ControllerState>>,
+    Query(query): Query<EncryptionPathProofAssignmentQuery>,
     headers: HeaderMap,
-) -> Result<Json<Vec<EncryptionPathProofAssignment>>, ApiError> {
+) -> Result<Response, ApiError> {
     let agent = authenticate_internal_agent(&state, &headers).await?;
     require_current_encryption_agent(&state, &agent)?;
     let now = unix_time_millis();
     synchronize_encryption_path_proofs(&state, now)?;
     let recipient = encryption_recipient(&state, &agent)?;
-    Ok(Json(
-        mutex_lock(&state.encryption_path_proofs).assignments_for(&recipient),
-    ))
+    let coordinator = mutex_lock(&state.encryption_path_proofs);
+    match query.assignment_batch_schema_version {
+        Some(ENCRYPTION_PATH_PROOF_ASSIGNMENT_BATCH_SCHEMA_VERSION) => {
+            Ok(Json(coordinator.assignment_batch_for(&recipient)).into_response())
+        }
+        Some(version) => Err(ApiError::bad_request(format!(
+            "unsupported encryption path-proof assignment batch schema {version}; expected {ENCRYPTION_PATH_PROOF_ASSIGNMENT_BATCH_SCHEMA_VERSION}"
+        ))),
+        None => {
+            let batch = coordinator.assignment_batch_for(&recipient);
+            let contract_sizes = batch
+                .contracts
+                .iter()
+                .map(|contract| {
+                    serde_json::to_vec(contract)
+                        .map(|encoded| (contract.contract_digest, encoded.len()))
+                        .map_err(|error| ApiError::internal(error.to_string()))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let expanded_bytes = batch
+                .assignments
+                .iter()
+                .try_fold(0_usize, |total, assignment| {
+                    total.checked_add(
+                        contract_sizes
+                            .get(&assignment.contract_digest)
+                            .copied()
+                            .unwrap_or(LEGACY_ENCRYPTION_ASSIGNMENT_EXPANSION_LIMIT),
+                    )
+                });
+            if expanded_bytes
+                .is_none_or(|bytes| bytes > LEGACY_ENCRYPTION_ASSIGNMENT_EXPANSION_LIMIT)
+            {
+                return Err(ApiError::service_unavailable(format!(
+                    "legacy encryption path-proof assignment expansion exceeds {LEGACY_ENCRYPTION_ASSIGNMENT_EXPANSION_LIMIT} bytes; negotiate assignmentBatchSchemaVersion={ENCRYPTION_PATH_PROOF_ASSIGNMENT_BATCH_SCHEMA_VERSION}"
+                )));
+            }
+            Ok(Json(coordinator.assignments_for(&recipient)).into_response())
+        }
+    }
 }
 
 async fn ingest_encryption_path_proof(
@@ -9671,13 +9716,11 @@ fn synchronize_encryption_path_proofs(
                 ));
             }
             lifetime_ms = lifetime_ms.min(epoch.contract.valid_until_unix_ms - now_unix_ms);
-            contracts.extend(
-                (0..epoch.contract.plans.len()).map(|index| (epoch.contract.clone(), index)),
-            );
+            contracts.push(epoch.contract.clone());
         }
     }
     let changed = mutex_lock(&state.encryption_path_proofs)
-        .replace_contracts(cut.generation, contracts, now_unix_ms, lifetime_ms)
+        .replace_contract_batches(cut.generation, contracts, now_unix_ms, lifetime_ms)
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
     if changed {
         for local_plan in &cut.plans {

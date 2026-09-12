@@ -538,7 +538,7 @@ pub struct EncryptionFailureEnvelope {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AttestedEncryptionContractDigest(pub [u8; 32]);
 

@@ -1354,7 +1354,16 @@ three-Node dual-stack, kube-proxy-free lifecycle with 404 WireGuard frames,
 zero Required plaintext, the full fault/rotation/replacement matrix, 295
 loss-free operations, Phase 8 coexistence, exact cleanup, and no-CNI rollback.
 ADR 0267 pins its anonymous-public immutable image and evidence tuple. Complete
-preserved-state cl02 qualification remains.
+preserved-state deployment reached 5/5 agents with kube-proxy absent, but the
+Required migration rejected that tuple: live path-proof authority cloned and
+serialized a complete multi-plan contract once per selected plan, exceeding
+the controller memory bound. Contract-Deduplicated Causal Assignment Batch v1
+now carries each immutable contract once plus lightweight digest/index/round
+selections. A consuming admission replays each contract once, later proof work
+uses only admitted selections with logarithmic lookup, and legacy expanded
+responses fail before allocation above 8 MiB. ADR 0268 records this correction.
+A fresh Kind lifecycle, immutable successor images, exact cl02 redeployment,
+and the complete platform gate remain.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

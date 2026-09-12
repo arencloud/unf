@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub const ENCRYPTION_PATH_PROOF_SCHEMA_VERSION: u16 = 2;
+pub const ENCRYPTION_PATH_PROOF_ASSIGNMENT_BATCH_SCHEMA_VERSION: u16 = 1;
 pub const MAX_ENCRYPTION_PATH_PROOF_LIFETIME_MS: u64 = 60_000;
 pub const PATH_FAMILY_IPV4: u8 = 1;
 pub const PATH_FAMILY_IPV6: u8 = 2;
@@ -139,6 +140,41 @@ pub struct EncryptionPathProofAssignment {
     pub plan_index: usize,
 }
 
+/// Compact reference to one plan inside a contract carried once by an
+/// [`EncryptionPathProofAssignmentBatch`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionPathProofAssignmentIndex {
+    pub schema_version: u16,
+    pub generation: unf_common::Revision,
+    pub round: EncryptionPathProofRound,
+    pub contract_digest: AttestedEncryptionContractDigest,
+    pub plan_index: usize,
+}
+
+/// One endpoint's path-proof work with each immutable contract represented
+/// exactly once, independent of the number of selected plans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionPathProofAssignmentBatch {
+    pub schema_version: u16,
+    pub generation: unf_common::Revision,
+    pub contracts: Vec<AttestedEncryptionPathContract>,
+    pub assignments: Vec<EncryptionPathProofAssignmentIndex>,
+}
+
+/// A fully replayed compact batch. Its private selection index makes contract
+/// access both fail-closed and logarithmic without rehashing a full contract
+/// for every selected plan.
+pub struct AdmittedEncryptionPathProofAssignmentBatch {
+    batch: EncryptionPathProofAssignmentBatch,
+    selections: BTreeSet<(
+        AttestedEncryptionContractDigest,
+        usize,
+        EncryptionPathProofRoundDigest,
+    )>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionPathProofAdmission {
     AcceptedPendingPeer,
@@ -154,7 +190,7 @@ pub struct EncryptionPathProofLedger {
 
 #[derive(Debug)]
 struct CoordinatedPathProof {
-    assignment: EncryptionPathProofAssignment,
+    assignment: EncryptionPathProofAssignmentIndex,
     ledger: EncryptionPathProofLedger,
 }
 
@@ -164,6 +200,7 @@ struct CoordinatedPathProof {
 pub struct EncryptionPathProofCoordinator {
     generation: unf_common::Revision,
     source_digest: [u8; 32],
+    contracts: BTreeMap<AttestedEncryptionContractDigest, AttestedEncryptionPathContract>,
     paths: BTreeMap<EncryptionPathProofRoundDigest, CoordinatedPathProof>,
 }
 
@@ -234,6 +271,24 @@ impl EncryptionPathProofRound {
         )
     }
 
+    fn fresh_for_verified_contract(
+        contract: &AttestedEncryptionPathContract,
+        plan_index: usize,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    ) -> Result<Self, EncryptionPathProofError> {
+        let mut nonce = [0_u8; 32];
+        getrandom::fill(&mut nonce)
+            .map_err(|error| EncryptionPathProofError::CanonicalEncoding(error.to_string()))?;
+        Self::issue_for_verified_contract(
+            contract,
+            plan_index,
+            nonce,
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+        )
+    }
+
     /// Deterministic constructor for replay and constrained runtimes.
     ///
     /// # Errors
@@ -250,6 +305,22 @@ impl EncryptionPathProofRound {
         contract
             .verify_integrity()
             .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+        Self::issue_for_verified_contract(
+            contract,
+            plan_index,
+            nonce,
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+        )
+    }
+
+    fn issue_for_verified_contract(
+        contract: &AttestedEncryptionPathContract,
+        plan_index: usize,
+        nonce: [u8; 32],
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    ) -> Result<Self, EncryptionPathProofError> {
         let plan = contract
             .plans
             .get(plan_index)
@@ -371,6 +442,63 @@ impl EncryptionEndpointPathProof {
         contract
             .verify_integrity()
             .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+        Self::issue_for_verified_contract(
+            round,
+            contract,
+            plan_index,
+            role,
+            authenticated,
+            before,
+            after,
+            delivery,
+            observed_at_unix_ms,
+        )
+    }
+
+    /// Issues a proof from a contract selection admitted once with its compact
+    /// batch, avoiding repeated whole-contract hashing per path.
+    ///
+    /// # Errors
+    ///
+    /// Rejects foreign work and every malformed kernel or delivery fact
+    /// rejected by [`Self::issue`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_from_assignment_batch(
+        batch: &AdmittedEncryptionPathProofAssignmentBatch,
+        assignment: &EncryptionPathProofAssignmentIndex,
+        role: EncryptionPathEndpointRole,
+        authenticated: &AuthenticatedNodeIdentity,
+        before: &WireGuardKernelSnapshot,
+        after: &WireGuardKernelSnapshot,
+        delivery: &EncryptionPathChallengeDelivery,
+        observed_at_unix_ms: u64,
+    ) -> Result<Self, EncryptionPathProofError> {
+        let contract = batch.contract_for(assignment)?;
+        Self::issue_for_verified_contract(
+            &assignment.round,
+            contract,
+            assignment.plan_index,
+            role,
+            authenticated,
+            before,
+            after,
+            delivery,
+            observed_at_unix_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn issue_for_verified_contract(
+        round: &EncryptionPathProofRound,
+        contract: &AttestedEncryptionPathContract,
+        plan_index: usize,
+        role: EncryptionPathEndpointRole,
+        authenticated: &AuthenticatedNodeIdentity,
+        before: &WireGuardKernelSnapshot,
+        after: &WireGuardKernelSnapshot,
+        delivery: &EncryptionPathChallengeDelivery,
+        observed_at_unix_ms: u64,
+    ) -> Result<Self, EncryptionPathProofError> {
         let plan = contract
             .plans
             .get(plan_index)
@@ -644,7 +772,7 @@ impl EncryptionPathProofAssignment {
             .verify_integrity()
             .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
         self.round.verify()?;
-        let expected_round = EncryptionPathProofRound::issue(
+        let expected_round = EncryptionPathProofRound::issue_for_verified_contract(
             &self.contract,
             self.plan_index,
             self.round.nonce,
@@ -672,6 +800,174 @@ impl EncryptionPathProofAssignment {
     }
 }
 
+impl EncryptionPathProofAssignmentIndex {
+    /// Verifies this lightweight selection against its batch-owned contract.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a digest mismatch, malformed contract, invalid plan index, or
+    /// a round that is not the exact deterministic replay of the selection.
+    pub fn verify_with(
+        &self,
+        contract: &AttestedEncryptionPathContract,
+    ) -> Result<(), EncryptionPathProofError> {
+        contract
+            .verify_integrity()
+            .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+        self.verify_with_verified_contract(contract)
+    }
+
+    fn verify_with_verified_contract(
+        &self,
+        contract: &AttestedEncryptionPathContract,
+    ) -> Result<(), EncryptionPathProofError> {
+        self.round.verify()?;
+        let expected_round = EncryptionPathProofRound::issue(
+            contract,
+            self.plan_index,
+            self.round.nonce,
+            self.round.issued_at_unix_ms,
+            self.round.expires_at_unix_ms,
+        )?;
+        if self.schema_version != ENCRYPTION_PATH_PROOF_SCHEMA_VERSION
+            || self.generation == unf_common::Revision::INITIAL
+            || self.contract_digest != contract.contract_digest
+            || self.round != expected_round
+            || self.round.contract_digest != self.contract_digest
+        {
+            return Err(EncryptionPathProofError::InvalidContractPlan);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn includes(&self, recipient: &EncryptionGenerationRecipient) -> bool {
+        &self.round.source == recipient || &self.round.destination == recipient
+    }
+}
+
+impl EncryptionPathProofAssignmentBatch {
+    /// Resolves one lightweight selection to the unique immutable contract in
+    /// this batch.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an absent or duplicate contract digest.
+    pub fn contract_for(
+        &self,
+        assignment: &EncryptionPathProofAssignmentIndex,
+    ) -> Result<&AttestedEncryptionPathContract, EncryptionPathProofError> {
+        self.contracts
+            .binary_search_by_key(&assignment.contract_digest, |contract| {
+                contract.contract_digest
+            })
+            .ok()
+            .and_then(|index| self.contracts.get(index))
+            .ok_or(EncryptionPathProofError::InvalidContractPlan)
+    }
+
+    /// Independently replays the compact contract table and every selection.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, duplicate, unreferenced, cross-generation, or
+    /// digest-mutated state.
+    pub fn verify(&self) -> Result<(), EncryptionPathProofError> {
+        if self.schema_version != ENCRYPTION_PATH_PROOF_ASSIGNMENT_BATCH_SCHEMA_VERSION
+            || self.generation == unf_common::Revision::INITIAL
+        {
+            return Err(EncryptionPathProofError::InvalidContractPlan);
+        }
+        if self
+            .contracts
+            .windows(2)
+            .any(|contracts| contracts[0].contract_digest >= contracts[1].contract_digest)
+        {
+            return Err(EncryptionPathProofError::InvalidContractPlan);
+        }
+        for contract in &self.contracts {
+            contract
+                .verify_integrity()
+                .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
+        }
+        let contract_digests = self
+            .contracts
+            .iter()
+            .map(|contract| contract.contract_digest)
+            .collect::<BTreeSet<_>>();
+        let mut selections = BTreeSet::new();
+        let mut referenced = BTreeSet::new();
+        for assignment in &self.assignments {
+            if assignment.generation != self.generation
+                || !selections.insert((assignment.contract_digest, assignment.plan_index))
+            {
+                return Err(EncryptionPathProofError::InvalidContractPlan);
+            }
+            let contract = self.contract_for(assignment)?;
+            assignment.verify_with_verified_contract(contract)?;
+            referenced.insert(assignment.contract_digest);
+        }
+        if referenced != contract_digests {
+            return Err(EncryptionPathProofError::InvalidContractPlan);
+        }
+        Ok(())
+    }
+
+    /// Consumes this untrusted wire batch after one complete integrity replay.
+    ///
+    /// # Errors
+    ///
+    /// Rejects every condition rejected by [`Self::verify`].
+    pub fn admit(
+        self,
+    ) -> Result<AdmittedEncryptionPathProofAssignmentBatch, EncryptionPathProofError> {
+        self.verify()?;
+        let selections = self
+            .assignments
+            .iter()
+            .map(|assignment| {
+                (
+                    assignment.contract_digest,
+                    assignment.plan_index,
+                    assignment.round.round_digest,
+                )
+            })
+            .collect();
+        Ok(AdmittedEncryptionPathProofAssignmentBatch {
+            batch: self,
+            selections,
+        })
+    }
+}
+
+impl AdmittedEncryptionPathProofAssignmentBatch {
+    #[must_use]
+    pub fn assignments(&self) -> &[EncryptionPathProofAssignmentIndex] {
+        &self.batch.assignments
+    }
+
+    /// Resolves only an exact selection admitted by this batch.
+    ///
+    /// # Errors
+    ///
+    /// Rejects foreign work and any selection-to-contract mismatch.
+    pub fn contract_for(
+        &self,
+        assignment: &EncryptionPathProofAssignmentIndex,
+    ) -> Result<&AttestedEncryptionPathContract, EncryptionPathProofError> {
+        if !self.selections.contains(&(
+            assignment.contract_digest,
+            assignment.plan_index,
+            assignment.round.round_digest,
+        )) {
+            return Err(EncryptionPathProofError::InvalidContractPlan);
+        }
+        let contract = self.batch.contract_for(assignment)?;
+        assignment.verify_with_verified_contract(contract)?;
+        Ok(contract)
+    }
+}
+
 impl EncryptionPathProofCoordinator {
     /// Atomically replaces the full challenge set for one fleet generation.
     ///
@@ -683,7 +979,63 @@ impl EncryptionPathProofCoordinator {
     pub fn replace_contracts(
         &mut self,
         generation: unf_common::Revision,
-        mut contracts: Vec<(AttestedEncryptionPathContract, usize)>,
+        contracts: Vec<(AttestedEncryptionPathContract, usize)>,
+        issued_at_unix_ms: u64,
+        lifetime_ms: u64,
+    ) -> Result<bool, EncryptionPathProofError> {
+        let mut unique = BTreeMap::new();
+        let mut selections = Vec::with_capacity(contracts.len());
+        for (contract, plan_index) in contracts {
+            selections.push((contract.contract_digest, plan_index));
+            if unique
+                .insert(contract.contract_digest, contract.clone())
+                .is_some_and(|previous| previous != contract)
+            {
+                return Err(EncryptionPathProofError::InvalidContractPlan);
+            }
+        }
+        self.replace_contract_selection(
+            generation,
+            unique.into_values().collect(),
+            selections,
+            issued_at_unix_ms,
+            lifetime_ms,
+        )
+    }
+
+    /// Atomically replaces a generation while expanding only lightweight plan
+    /// indexes. Every full contract remains represented exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the same invalid authority as [`Self::replace_contracts`].
+    pub fn replace_contract_batches(
+        &mut self,
+        generation: unf_common::Revision,
+        contracts: Vec<AttestedEncryptionPathContract>,
+        issued_at_unix_ms: u64,
+        lifetime_ms: u64,
+    ) -> Result<bool, EncryptionPathProofError> {
+        let selections = contracts
+            .iter()
+            .flat_map(|contract| {
+                (0..contract.plans.len()).map(|index| (contract.contract_digest, index))
+            })
+            .collect();
+        self.replace_contract_selection(
+            generation,
+            contracts,
+            selections,
+            issued_at_unix_ms,
+            lifetime_ms,
+        )
+    }
+
+    fn replace_contract_selection(
+        &mut self,
+        generation: unf_common::Revision,
+        contracts: Vec<AttestedEncryptionPathContract>,
+        mut selections: Vec<(AttestedEncryptionContractDigest, usize)>,
         issued_at_unix_ms: u64,
         lifetime_ms: u64,
     ) -> Result<bool, EncryptionPathProofError> {
@@ -693,30 +1045,33 @@ impl EncryptionPathProofCoordinator {
         {
             return Err(EncryptionPathProofError::InvalidRound);
         }
-        contracts.sort_by_key(|(contract, plan_index)| (contract.contract_digest.0, *plan_index));
-        if contracts.windows(2).any(|pair| {
-            (pair[0].0.contract_digest, pair[0].1) == (pair[1].0.contract_digest, pair[1].1)
-        }) {
-            return Err(EncryptionPathProofError::InvalidContractPlan);
-        }
-        for (contract, plan_index) in &contracts {
+        let mut contract_table = BTreeMap::new();
+        for contract in contracts {
             contract
                 .verify_integrity()
                 .map_err(|error| EncryptionPathProofError::InvalidContract(error.to_string()))?;
-            contract
+            if contract_table
+                .insert(contract.contract_digest, contract)
+                .is_some()
+            {
+                return Err(EncryptionPathProofError::InvalidContractPlan);
+            }
+        }
+        selections.sort_unstable();
+        if selections.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(EncryptionPathProofError::InvalidContractPlan);
+        }
+        for (contract_digest, plan_index) in &selections {
+            contract_table
+                .get(contract_digest)
+                .ok_or(EncryptionPathProofError::InvalidContractPlan)?
                 .plans
                 .get(*plan_index)
                 .ok_or(EncryptionPathProofError::InvalidContractPlan)?;
         }
         let source_digest = hash(
             b"unf.encryption-path-proof-source.v1\0",
-            &(
-                generation,
-                contracts
-                    .iter()
-                    .map(|(contract, index)| (contract.contract_digest, *index))
-                    .collect::<Vec<_>>(),
-            ),
+            &(generation, &selections),
         )?;
         if generation < self.generation
             || generation == self.generation
@@ -739,21 +1094,24 @@ impl EncryptionPathProofCoordinator {
             .checked_add(lifetime_ms)
             .ok_or(EncryptionPathProofError::InvalidRound)?;
         let mut paths = BTreeMap::new();
-        for (contract, plan_index) in contracts {
-            let round = EncryptionPathProofRound::fresh(
-                &contract,
+        for (contract_digest, plan_index) in selections {
+            let contract = contract_table
+                .get(&contract_digest)
+                .ok_or(EncryptionPathProofError::InvalidContractPlan)?;
+            let round = EncryptionPathProofRound::fresh_for_verified_contract(
+                contract,
                 plan_index,
                 issued_at_unix_ms,
                 expires_at_unix_ms,
             )?;
-            let assignment = EncryptionPathProofAssignment {
+            let assignment = EncryptionPathProofAssignmentIndex {
                 schema_version: ENCRYPTION_PATH_PROOF_SCHEMA_VERSION,
                 generation,
                 round: round.clone(),
-                contract,
+                contract_digest,
                 plan_index,
             };
-            assignment.verify()?;
+            assignment.verify_with(contract)?;
             let ledger = EncryptionPathProofLedger::new(round.clone())?;
             if paths
                 .insert(
@@ -767,8 +1125,38 @@ impl EncryptionPathProofCoordinator {
         }
         self.generation = generation;
         self.source_digest = source_digest;
+        self.contracts = contract_table;
         self.paths = paths;
         Ok(true)
+    }
+
+    /// Returns compact endpoint work with each referenced contract carried
+    /// exactly once.
+    #[must_use]
+    pub fn assignment_batch_for(
+        &self,
+        recipient: &EncryptionGenerationRecipient,
+    ) -> EncryptionPathProofAssignmentBatch {
+        let assignments = self
+            .paths
+            .values()
+            .filter(|path| path.assignment.includes(recipient))
+            .map(|path| path.assignment.clone())
+            .collect::<Vec<_>>();
+        let referenced = assignments
+            .iter()
+            .map(|assignment| assignment.contract_digest)
+            .collect::<BTreeSet<_>>();
+        let contracts = referenced
+            .into_iter()
+            .filter_map(|digest| self.contracts.get(&digest).cloned())
+            .collect();
+        EncryptionPathProofAssignmentBatch {
+            schema_version: ENCRYPTION_PATH_PROOF_ASSIGNMENT_BATCH_SCHEMA_VERSION,
+            generation: self.generation,
+            contracts,
+            assignments,
+        }
     }
 
     /// Returns only immutable work assigned to the authenticated endpoint.
@@ -780,7 +1168,18 @@ impl EncryptionPathProofCoordinator {
         self.paths
             .values()
             .filter(|path| path.assignment.includes(recipient))
-            .map(|path| path.assignment.clone())
+            .filter_map(|path| {
+                self.contracts
+                    .get(&path.assignment.contract_digest)
+                    .cloned()
+                    .map(|contract| EncryptionPathProofAssignment {
+                        schema_version: path.assignment.schema_version,
+                        generation: path.assignment.generation,
+                        round: path.assignment.round.clone(),
+                        contract,
+                        plan_index: path.assignment.plan_index,
+                    })
+            })
             .collect()
     }
 
@@ -1253,6 +1652,33 @@ pub(crate) mod tests {
         contract
     }
 
+    fn fixture_contract_with_plans(plan_count: usize) -> AttestedEncryptionPathContract {
+        let mut contract = fixture_contract();
+        let template = contract.plans[0].clone();
+        contract.plans = (0..plan_count)
+            .map(|index| {
+                let mut plan = template.clone();
+                let identity_offset = u32::try_from(index).unwrap();
+                plan.source.identity = IdentityId::new(100 + identity_offset);
+                plan.source.workload_uid = format!("pod-a-{index}");
+                plan.destination.identity = IdentityId::new(10_000 + identity_offset);
+                plan.destination.workload_uid = format!("pod-b-{index}");
+                plan
+            })
+            .collect();
+        contract.contract_digest = crate::contract_digest(
+            contract.contract_revision,
+            &contract.local_node,
+            contract.valid_from_unix_ms,
+            contract.valid_until_unix_ms,
+            &contract.plans,
+            &contract.verified_invariants,
+            &contract.failure_envelope,
+        )
+        .unwrap();
+        contract
+    }
+
     pub(crate) fn assignment_fixture() -> EncryptionPathProofAssignment {
         let contract = fixture_contract();
         let round = EncryptionPathProofRound::issue(&contract, 0, [9; 32], 1_500, 10_000).unwrap();
@@ -1423,6 +1849,34 @@ pub(crate) mod tests {
     fn causal_duplex_quorum_requires_both_authenticated_counter_backed_transcripts() {
         let contract = fixture_contract();
         let round = EncryptionPathProofRound::issue(&contract, 0, [9; 32], 1_500, 10_000).unwrap();
+        let indexed = EncryptionPathProofAssignmentIndex {
+            schema_version: ENCRYPTION_PATH_PROOF_SCHEMA_VERSION,
+            generation: Revision::new(10),
+            round: round.clone(),
+            contract_digest: contract.contract_digest,
+            plan_index: 0,
+        };
+        let batch = EncryptionPathProofAssignmentBatch {
+            schema_version: ENCRYPTION_PATH_PROOF_ASSIGNMENT_BATCH_SCHEMA_VERSION,
+            generation: Revision::new(10),
+            contracts: vec![contract.clone()],
+            assignments: vec![indexed.clone()],
+        }
+        .admit()
+        .unwrap();
+        let role = EncryptionPathEndpointRole::Source;
+        let admitted_proof = EncryptionEndpointPathProof::issue_from_assignment_batch(
+            &batch,
+            &indexed,
+            role,
+            &auth(role),
+            &snapshot(&contract, role, 10, 20),
+            &snapshot(&contract, role, 110, 120),
+            &delivery(&round, &contract, role),
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(admitted_proof, proof(&round, &contract, role));
         let mut ledger = EncryptionPathProofLedger::new(round.clone()).unwrap();
         let source = proof(&round, &contract, EncryptionPathEndpointRole::Source);
         assert_eq!(
@@ -1586,5 +2040,48 @@ pub(crate) mod tests {
             coordinator.replace_contracts(Revision::new(12), vec![(contract, 0)], 3_000, 8_000,),
             Err(EncryptionPathProofError::GenerationConflict)
         ));
+    }
+
+    #[test]
+    fn contract_deduplicated_assignment_batch_is_linear_and_fails_closed() {
+        let contract = fixture_contract_with_plans(64);
+        let mut coordinator = EncryptionPathProofCoordinator::default();
+        assert_eq!(
+            coordinator.replace_contract_batches(
+                Revision::new(14),
+                vec![contract.clone()],
+                1_500,
+                8_000,
+            ),
+            Ok(true)
+        );
+        let source = recipient("node-a", "uid-a");
+        let batch = coordinator.assignment_batch_for(&source);
+        assert_eq!(batch.contracts, vec![contract]);
+        assert_eq!(batch.assignments.len(), 64);
+        batch.verify().unwrap();
+
+        let encoded = serde_json::to_vec(&batch).unwrap();
+        let legacy = serde_json::to_vec(&coordinator.assignments_for(&source)).unwrap();
+        assert!(encoded.len() * 16 < legacy.len());
+        serde_json::from_slice::<EncryptionPathProofAssignmentBatch>(&encoded)
+            .unwrap()
+            .verify()
+            .unwrap();
+
+        let mut digest_mutated = batch.clone();
+        digest_mutated.assignments[0].contract_digest.0[0] ^= 1;
+        assert_eq!(
+            digest_mutated.verify(),
+            Err(EncryptionPathProofError::InvalidContractPlan)
+        );
+        let mut duplicate_contract = batch;
+        duplicate_contract
+            .contracts
+            .push(duplicate_contract.contracts[0].clone());
+        assert_eq!(
+            duplicate_contract.verify(),
+            Err(EncryptionPathProofError::InvalidContractPlan)
+        );
     }
 }

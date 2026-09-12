@@ -67,6 +67,10 @@ require 'response_with_authority_delivery_lease' \
     "${root}/bins/unf-controller/src/main.rs"
 require 'Immutable Delivery-Leased Kind Requalification' \
     "${root}/docs/adr/0267-immutable-delivery-leased-kind-requalification.md"
+require 'Contract-Deduplicated Causal Assignment Batch' \
+    "${root}/docs/adr/0268-contract-deduplicated-causal-assignment-batch.md"
+require 'assignmentBatchSchemaVersion=1' "${root}/bins/unf-agent/src/main.rs"
+require 'replace_contract_batches' "${root}/bins/unf-controller/src/main.rs"
 require 'native_only_generation_closes_without_encrypted_path_exchange' \
     "${root}/bins/unf-agent/src/main.rs"
 require '/v1/state/encryption-activation-testimony' "${root}/bins/unf-agent/src/main.rs"
