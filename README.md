@@ -1323,7 +1323,12 @@ preflight treated intentional authority `503` backpressure as fatal after the
 node-block preflight had correctly retried it. Causal Startup Admission Retry
 now applies one bounded 120-call, pre-BPF, fail-closed retry contract to both
 reads without queueing controller work or mutating durable authority. ADR 0262.
-A new immutable Kind successor and complete cl02 gate remain required.
+Exact successor `2b1184f` passed a completely new three-Node dual-stack,
+kube-proxy-free lifecycle with 269 WireGuard frames, zero Required plaintext,
+the full fault/rotation/replacement matrix, 308 loss-free operations, Phase 8
+coexistence, exact cleanup, and no-CNI rollback. ADR 0263 pins its public
+immutable image and evidence tuple. The resumed serial cl02 deployment and
+complete platform gate remain required.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

@@ -1255,7 +1255,12 @@ matrix is maintained in the
   restarts. Its serial replacement gate then found encryption identity
   preflight treating intentional `503` backpressure as fatal. ADR 0262 applies
   the same bounded pre-BPF retry contract already used by node-block bootstrap.
-  A new immutable Kind successor and the complete cl02 gate remain mandatory.
+  Exact successor `2b1184f` passed a completely fresh three-Node dual-stack,
+  kube-proxy-free lifecycle; ADR 0263 binds its public immutable images, 269
+  WireGuard frames with zero Required plaintext, complete fault/rotation/
+  replacement matrix, 308 loss-free operations, exact cleanup, and no-CNI
+  rollback. The resumed serial cl02 deployment and complete gate remain
+  mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
