@@ -12,6 +12,7 @@ axum.workspace = true
 axum-server.workspace = true
 clap.workspace = true
 flate2.workspace = true
+zstd.workspace = true
 futures.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true

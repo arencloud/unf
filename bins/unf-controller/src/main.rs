@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::body::Body;
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
@@ -187,8 +187,11 @@ const ENCRYPTION_GENERATION_STORE_NAME: &str = "unf-encryption-generation-fronti
 const ENCRYPTION_GENERATION_STORE_KEY: &str = "frontier.json";
 const ENCRYPTION_PLAN_STORE_KEY: &str = "plans.json";
 const ENCRYPTION_GENERATION_STORE_DESCRIPTOR_KEY: &str = "checkpoint.json";
+// Legacy storage key; the versioned descriptor, not this suffix, selects the codec.
 const ENCRYPTION_GENERATION_STORE_PAYLOAD_KEY: &str = "checkpoint.gz";
 const ENCRYPTION_GENERATION_STORE_SCHEMA_VERSION: u16 = 1;
+const ENCRYPTION_GENERATION_STORE_ZSTD_SCHEMA_VERSION: u16 = 2;
+const ENCRYPTION_GENERATION_STORE_WINDOW_LOG: u32 = 21;
 const ENCRYPTION_GENERATION_STORE_DATA_LIMIT: usize = 900_000;
 const ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT: usize = 64_000_000;
 const LEGACY_ENCRYPTION_ASSIGNMENT_EXPANSION_LIMIT: usize = 8 * 1024 * 1024;
@@ -3776,14 +3779,24 @@ fn encode_compact_encryption_generation_store(
             ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT
         ));
     }
+    let (descriptor, compressed) =
+        pack_encryption_generation_store(&payload, ENCRYPTION_GENERATION_STORE_DATA_LIMIT)?;
+    Ok((descriptor, compressed, payload.len()))
+}
+
+fn pack_encryption_generation_store(
+    payload: &[u8],
+    stored_limit: usize,
+) -> Result<(String, Vec<u8>)> {
+    let payload_sha256 = Sha256::digest(payload).into();
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder
-        .write_all(&payload)
+        .write_all(payload)
         .context("compress encryption generation-store payload")?;
     let compressed = encoder
         .finish()
         .context("finish encryption generation-store compression")?;
-    let descriptor = DurableEncryptionGenerationDescriptor {
+    let mut descriptor = DurableEncryptionGenerationDescriptor {
         schema_version: ENCRYPTION_GENERATION_STORE_SCHEMA_VERSION,
         codec: "gzip".to_owned(),
         compressed_bytes: u64::try_from(compressed.len())
@@ -3791,11 +3804,37 @@ fn encode_compact_encryption_generation_store(
         uncompressed_bytes: u64::try_from(payload.len())
             .context("encryption generation-store size exceeds u64")?,
         compressed_sha256: Sha256::digest(&compressed).into(),
-        payload_sha256: Sha256::digest(&payload).into(),
+        payload_sha256,
     };
-    let descriptor = serde_json::to_string(&descriptor)
+    let encoded_descriptor = serde_json::to_string(&descriptor)
         .context("encode compact encryption generation-store descriptor")?;
-    Ok((descriptor, compressed, payload.len()))
+    if encoded_descriptor.len().saturating_add(compressed.len()) <= stored_limit {
+        return Ok((encoded_descriptor, compressed));
+    }
+    // Keep the old representation for every cut it can store. Only cuts
+    // outside that previous capacity use the new, explicitly versioned codec.
+    drop(compressed);
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3)
+        .context("create bounded encryption checkpoint compressor")?;
+    encoder.window_log(ENCRYPTION_GENERATION_STORE_WINDOW_LOG)?;
+    encoder.include_checksum(true)?;
+    encoder.write_all(payload)?;
+    let compressed = encoder
+        .finish()
+        .context("finish zstd encryption checkpoint")?;
+    descriptor.schema_version = ENCRYPTION_GENERATION_STORE_ZSTD_SCHEMA_VERSION;
+    "zstd".clone_into(&mut descriptor.codec);
+    descriptor.compressed_bytes = u64::try_from(compressed.len())?;
+    descriptor.compressed_sha256 = Sha256::digest(&compressed).into();
+    let encoded_descriptor = serde_json::to_string(&descriptor)?;
+    let stored_size = encoded_descriptor.len().saturating_add(compressed.len());
+    if stored_size > stored_limit {
+        bail!(
+            "compact durable encryption generation frontier and plan require {stored_size} bytes ({} decoded) after bounded fallback; ConfigMap limit is {stored_limit}",
+            payload.len()
+        );
+    }
+    Ok((encoded_descriptor, compressed))
 }
 
 fn decode_compact_encryption_generation_store(
@@ -3805,8 +3844,12 @@ fn decode_compact_encryption_generation_store(
     let descriptor: DurableEncryptionGenerationDescriptor =
         serde_json::from_str(encoded_descriptor)
             .context("decode compact encryption generation-store descriptor")?;
-    if descriptor.schema_version != ENCRYPTION_GENERATION_STORE_SCHEMA_VERSION
-        || descriptor.codec != "gzip"
+    if !matches!(
+        (descriptor.schema_version, descriptor.codec.as_str()),
+        (ENCRYPTION_GENERATION_STORE_SCHEMA_VERSION, "gzip")
+            | (ENCRYPTION_GENERATION_STORE_ZSTD_SCHEMA_VERSION, "zstd")
+    ) || encoded_descriptor.len().saturating_add(compressed.len())
+        > ENCRYPTION_GENERATION_STORE_DATA_LIMIT
         || descriptor.compressed_bytes != u64::try_from(compressed.len()).unwrap_or(u64::MAX)
         || descriptor.uncompressed_bytes
             > u64::try_from(ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT).unwrap_or(u64::MAX)
@@ -3817,14 +3860,28 @@ fn decode_compact_encryption_generation_store(
         ));
     }
     let mut payload = Vec::new();
-    GzDecoder::new(compressed)
-        .take(
-            u64::try_from(ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT)
-                .unwrap_or(u64::MAX)
-                .saturating_add(1),
-        )
-        .read_to_end(&mut payload)
-        .context("decompress encryption generation-store payload")?;
+    // The declaration is itself capped above. Read at most one extra byte to
+    // reject expansion before allocating the full global decoded limit.
+    let decoded_limit = descriptor.uncompressed_bytes.saturating_add(1);
+    if descriptor.codec == "gzip" {
+        GzDecoder::new(compressed)
+            .take(decoded_limit)
+            .read_to_end(&mut payload)
+            .context("decompress encryption generation-store payload")?;
+    } else {
+        let mut decoder = zstd::stream::read::Decoder::with_buffer(compressed)
+            .context("open zstd encryption checkpoint")?
+            .single_frame();
+        decoder.window_log_max(ENCRYPTION_GENERATION_STORE_WINDOW_LOG)?;
+        decoder
+            .by_ref()
+            .take(decoded_limit)
+            .read_to_end(&mut payload)
+            .context("decompress bounded zstd encryption checkpoint")?;
+        if !decoder.finish().is_empty() {
+            bail!("zstd encryption checkpoint contains trailing data");
+        }
+    }
     if descriptor.uncompressed_bytes != u64::try_from(payload.len()).unwrap_or(u64::MAX)
         || payload.len() > ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT
         || descriptor.payload_sha256 != <[u8; 32]>::from(Sha256::digest(&payload))
@@ -17999,8 +18056,10 @@ mod tests {
         assert!(decode_encryption_generation_producer(&unknown.to_string()).is_err());
     }
 
-    #[test]
-    fn compact_encryption_generation_store_is_bounded_and_content_verified() {
+    fn checkpoint_codec_fixture() -> (
+        EncryptionGenerationProducerCheckpoint,
+        NodeLocalPlanFleetCut,
+    ) {
         let checkpoint = EncryptionGenerationProducer::default()
             .checkpoint()
             .unwrap();
@@ -18035,6 +18094,12 @@ mod tests {
         let cut =
             NodeLocalPlanFleetCut::issue(Revision::new(7), Revision::new(10), recipients, plans)
                 .unwrap();
+        (checkpoint, cut)
+    }
+
+    #[test]
+    fn compact_encryption_generation_store_is_bounded_and_content_verified() {
+        let (checkpoint, cut) = checkpoint_codec_fixture();
         let (descriptor, payload, uncompressed) =
             encode_compact_encryption_generation_store(checkpoint.clone(), Some(cut.clone()))
                 .unwrap();
@@ -18044,7 +18109,78 @@ mod tests {
         let (restored, restored_plan) =
             decode_compact_encryption_generation_store(&descriptor, &payload).unwrap();
         assert_eq!(restored.checkpoint().unwrap(), checkpoint);
+        assert_eq!(restored_plan, Some(cut.clone()));
+        let old_descriptor: DurableEncryptionGenerationDescriptor =
+            serde_json::from_str(&descriptor).unwrap();
+        assert_eq!(old_descriptor.schema_version, 1);
+        assert_eq!(old_descriptor.codec, "gzip");
+
+        let mut decoded = Vec::new();
+        GzDecoder::new(payload.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        let limit = descriptor.len() + payload.len() - 1;
+        let (fallback_descriptor, fallback_payload) =
+            pack_encryption_generation_store(&decoded, limit).unwrap();
+        assert!(fallback_descriptor.len() + fallback_payload.len() <= limit);
+        let fallback: DurableEncryptionGenerationDescriptor =
+            serde_json::from_str(&fallback_descriptor).unwrap();
+        assert_eq!(fallback.schema_version, 2);
+        assert_eq!(fallback.codec, "zstd");
+        assert_eq!(fallback.payload_sha256, old_descriptor.payload_sha256);
+        let (restored, restored_plan) =
+            decode_compact_encryption_generation_store(&fallback_descriptor, &fallback_payload)
+                .unwrap();
+        assert_eq!(restored.checkpoint().unwrap(), checkpoint);
         assert_eq!(restored_plan, Some(cut));
+        assert!(pack_encryption_generation_store(&decoded, 1).is_err());
+
+        for (schema, codec) in [(1, "zstd"), (2, "gzip"), (3, "zstd"), (2, "unknown")] {
+            let mut changed = fallback.clone();
+            changed.schema_version = schema;
+            changed.codec = codec.to_owned();
+            assert!(
+                decode_compact_encryption_generation_store(
+                    &serde_json::to_string(&changed).unwrap(),
+                    &fallback_payload
+                )
+                .is_err()
+            );
+        }
+        for length in [
+            1,
+            u64::try_from(ENCRYPTION_GENERATION_STORE_UNCOMPRESSED_LIMIT).unwrap() + 1,
+        ] {
+            let mut changed = fallback.clone();
+            changed.uncompressed_bytes = length;
+            assert!(
+                decode_compact_encryption_generation_store(
+                    &serde_json::to_string(&changed).unwrap(),
+                    &fallback_payload
+                )
+                .is_err()
+            );
+        }
+        let mut corrupted_fallback = fallback_payload.clone();
+        corrupted_fallback[0] ^= 1;
+        assert!(
+            decode_compact_encryption_generation_store(&fallback_descriptor, &corrupted_fallback)
+                .is_err()
+        );
+        let mut trailing = fallback_payload.clone();
+        trailing.extend_from_slice(&fallback_payload);
+        let mut changed = fallback.clone();
+        changed.compressed_bytes = trailing.len() as u64;
+        changed.compressed_sha256 = Sha256::digest(&trailing).into();
+        assert!(
+            decode_compact_encryption_generation_store(
+                &serde_json::to_string(&changed).unwrap(),
+                &trailing
+            )
+            .is_err()
+        );
+
+        assert_checkpoint_window_bound(decoded, fallback);
 
         let mut corrupted = payload.clone();
         corrupted[0] ^= u8::MAX;
@@ -18058,6 +18194,60 @@ mod tests {
                 &payload
             )
             .is_err()
+        );
+    }
+
+    fn assert_checkpoint_window_bound(
+        mut decoded: Vec<u8>,
+        mut descriptor: DurableEncryptionGenerationDescriptor,
+    ) {
+        // A valid envelope with harmless whitespace would restore normally,
+        // but an oversized frame window must fail before materialization.
+        decoded.resize(3 * 1024 * 1024, b' ');
+        let mut large_window = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        large_window.window_log(22).unwrap();
+        large_window.write_all(&decoded).unwrap();
+        let large_window = large_window.finish().unwrap();
+        descriptor.compressed_bytes = large_window.len() as u64;
+        descriptor.compressed_sha256 = Sha256::digest(&large_window).into();
+        descriptor.uncompressed_bytes = decoded.len() as u64;
+        descriptor.payload_sha256 = Sha256::digest(&decoded).into();
+        let error = decode_compact_encryption_generation_store(
+            &serde_json::to_string(&descriptor).unwrap(),
+            &large_window,
+        )
+        .expect_err("large frame windows must be refused");
+        assert!(format!("{error:#}").contains("too much memory"));
+    }
+
+    #[test]
+    #[ignore = "requires UNF_ENCRYPTION_CHECKPOINT_PROFILE pointing to a local public checkpoint capture"]
+    fn encryption_checkpoint_fallback_capture_profile() {
+        let payload =
+            std::fs::read(std::env::var("UNF_ENCRYPTION_CHECKPOINT_PROFILE").unwrap()).unwrap();
+        let (gzip_descriptor, gzip) =
+            pack_encryption_generation_store(&payload, usize::MAX).unwrap();
+        let started = std::time::Instant::now();
+        let (descriptor, compressed) =
+            pack_encryption_generation_store(&payload, gzip_descriptor.len() + gzip.len() - 1)
+                .unwrap();
+        let fallback: DurableEncryptionGenerationDescriptor =
+            serde_json::from_str(&descriptor).unwrap();
+        assert_eq!(fallback.codec, "zstd");
+        let original = decode_compact_encryption_generation_store(&gzip_descriptor, &gzip).unwrap();
+        let restored =
+            decode_compact_encryption_generation_store(&descriptor, &compressed).unwrap();
+        assert_eq!(
+            original.0.checkpoint().unwrap(),
+            restored.0.checkpoint().unwrap()
+        );
+        assert_eq!(original.1, restored.1);
+        println!(
+            "decoded_bytes={} gzip_bytes={} fallback_bytes={} diagnostic_elapsed_ms={}",
+            payload.len(),
+            gzip.len(),
+            compressed.len(),
+            started.elapsed().as_millis()
         );
     }
 
