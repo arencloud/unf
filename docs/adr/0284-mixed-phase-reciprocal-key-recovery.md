@@ -76,3 +76,20 @@ cuts during Required migration and retains actual final-Native journal evidence.
 
 Publishing these images does not mark deployment, lifecycle qualification,
 Phase 9, or stabilization complete. Preserve current authority during rollout.
+
+## cl02 staged deployment
+
+Qualifier `beff00a0708227286bf87610a7ee53730558bc93` passed the guarded
+preserved-state deployment of this candidate. All five agents and the controller
+were Ready with zero restarts; the evidence records exact versions, five-agent
+convergence, ABI-v15/encryption-v2 staging and kube-proxy absence. Archived
+deployment evidence SHA-256:
+`0f58de7b7c1a98aa6c8ff4b37bdf8b5b8c8d9cbc99928952927d60a5a89d6805`.
+
+The last agent temporarily retained its startup admission fence before the
+controller published the complete generation. No authority was removed to clear
+that fence. Revision convergence fluctuated during startup; a passing recorded
+snapshot is not a continuous availability or resource-efficiency claim.
+Actual current-cut Native/Required modes, traffic, failure/rotation/replacement,
+persistence and exact cleanup still require the separate full cl02 gate, then
+matching-image Kind qualification.

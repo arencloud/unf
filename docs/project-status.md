@@ -556,7 +556,9 @@ The cl02 qualifier now separately asserts actual Native/Required journal modes
 and retains baseline-migration and final-Native snapshots; a newer Native cut
 cannot be mistaken for successful Required migration.
 Runtime `cb59e90` is published as the next digest-pinned cl02-first candidate;
-its live deployment and lifecycle result, then matching-image Kind, remain open.
+its guarded preserved-state cl02 deployment passed with exact versions,
+five-agent convergence and zero restarts (ADR 0284). The full lifecycle result,
+then matching-image Kind, remain open.
 
 ## Updating this tracker
 
