@@ -86,6 +86,9 @@ require_text docs/adr/0260-cut-fenced-single-flight-authority-admission.md \
 require_text docs/adr/0261-immutable-cut-fenced-kind-requalification.md \
     'Immutable Cut-Fenced Kind Requalification' \
     "cut-fenced authority admission must retain immutable fresh-Kind provenance"
+require_text docs/adr/0262-causal-startup-admission-retry.md \
+    'Causal Startup Admission Retry' \
+    "agent startup must honor intentional authority backpressure without opening BPF state"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"

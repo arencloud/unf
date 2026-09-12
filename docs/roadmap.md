@@ -1250,7 +1250,12 @@ matrix is maintained in the
   binds its public immutable images, 336-frame ciphertext proof, zero Required
   plaintext, complete fault/rotation/recovery matrix, loss-free operations,
   exact cleanup, and no-CNI rollback. The preserved-state cl02 rollout and
-  complete platform gate remain mandatory.
+  complete platform gate remain mandatory. cl02 proved the controller bound:
+  five cold agents converged in 81 seconds at 136 MiB controller RSS with zero
+  restarts. Its serial replacement gate then found encryption identity
+  preflight treating intentional `503` backpressure as fatal. ADR 0262 applies
+  the same bounded pre-BPF retry contract already used by node-block bootstrap.
+  A new immutable Kind successor and the complete cl02 gate remain mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

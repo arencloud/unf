@@ -1315,7 +1315,15 @@ Required traffic with zero plaintext, all eight Required faults failed closed
 while all eight Native probes stayed live, rotation and replacement recovered,
 295 causal operation records remained loss-free, and exact cleanup plus no-CNI
 rollback passed. ADR 0261 pins its public immutable images and evidence. Only
-the preserved-state cl02 rollout and complete platform gate remain.
+the preserved-state cl02 rollout could determine platform acceptance.
+cl02 confirmed the controller bound when five cold agents converged in 81
+seconds with zero controller restarts and 136 MiB RSS. The required serial
+replacement then exposed a distinct agent-side gap: encryption identity
+preflight treated intentional authority `503` backpressure as fatal after the
+node-block preflight had correctly retried it. Causal Startup Admission Retry
+now applies one bounded 120-call, pre-BPF, fail-closed retry contract to both
+reads without queueing controller work or mutating durable authority. ADR 0262.
+A new immutable Kind successor and complete cl02 gate remain required.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

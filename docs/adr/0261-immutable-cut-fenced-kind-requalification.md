@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted as the Phase 9.9 OpenShift candidate
+Historical Kind qualification; rejected by the cl02 platform gate
 
 ## Context
 
@@ -51,3 +51,15 @@ The packet capture SHA-256 is
 - cl02 must preserve the Node-local state, admit the complete cold five-agent
   retry herd without exceeding the 2-GiB controller cgroup, and pass the full
   Phase 9.9 platform gate before Phase 9 can be marked Verified.
+
+## Platform result
+
+cl02 proved the controller-side bound: all five cold agents converged in 81
+seconds while the controller remained Ready with zero restarts and 136 MiB RSS
+under its 2-GiB limit. The subsequent required serial agent replacement exposed
+an agent-side liveness gap. Node-block bootstrap retries a fail-fast authority
+`503`, but the following pre-BPF encryption identity bootstrap treated the same
+admission response as fatal. Four steady agents could therefore keep the
+replacement in kubelet restart backoff even though the controller remained
+healthy. ADR 0262 extends the same bounded, fail-closed retry contract across
+that second pre-BPF admission boundary.

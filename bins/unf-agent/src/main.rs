@@ -177,7 +177,7 @@ const DEFAULT_ENCRYPTION_ROTATE_BEFORE: Duration = Duration::from_secs(24 * 60 *
 const DEFAULT_ENCRYPTION_ROTATION_JITTER: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_ENCRYPTION_DRAIN_WINDOW: Duration = Duration::from_secs(5 * 60);
 const ENCRYPTION_STARTUP_REVALIDATION_ATTEMPTS: u16 = 900;
-const NODE_BLOCK_STARTUP_AUTHORITY_ATTEMPTS: u16 = 120;
+const STARTUP_AUTHORITY_ATTEMPTS: u16 = 120;
 const MAX_SERVICE_ERROR_BYTES: usize = 1_024;
 const MAX_DURABLE_STATE_BYTES: u64 = 64 * 1024 * 1024;
 const NODE_PORT_SERVICE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -2274,15 +2274,12 @@ async fn resolve_cni_provider(
                 )?;
                 match request.send().await {
                     Ok(response)
-                        if node_block_startup_authority_retry(
-                            response.status(),
-                            authority_attempt,
-                        ) =>
+                        if startup_authority_retry(response.status(), authority_attempt) =>
                     {
                         warn!(
                             status = %response.status(),
                             attempt = authority_attempt,
-                            max_attempts = NODE_BLOCK_STARTUP_AUTHORITY_ATTEMPTS,
+                            max_attempts = STARTUP_AUTHORITY_ATTEMPTS,
                             "controller has not observed replacement Pod authority; startup remains fenced"
                         );
                         authority_attempt += 1;
@@ -2334,8 +2331,8 @@ async fn resolve_cni_provider(
     }
 }
 
-fn node_block_startup_authority_retry(status: StatusCode, attempt: u16) -> bool {
-    attempt < NODE_BLOCK_STARTUP_AUTHORITY_ATTEMPTS
+fn startup_authority_retry(status: StatusCode, attempt: u16) -> bool {
+    attempt < STARTUP_AUTHORITY_ATTEMPTS
         && matches!(
             status,
             StatusCode::FORBIDDEN | StatusCode::SERVICE_UNAVAILABLE
@@ -8658,22 +8655,40 @@ async fn preflight_encryption_node_identity(
     let Some(controller_url) = controller_url else {
         return Ok(None);
     };
-    match fetch_encryption_key_bootstrap(client, controller_url, token_path).await {
-        Ok(bootstrap) => {
-            bootstrap
-                .verify()
-                .context("verify pre-BPF encryption Node identity")?;
-            Ok(Some(bootstrap))
+    let mut authority_attempt = 1;
+    loop {
+        match fetch_encryption_key_bootstrap(client, controller_url, token_path).await {
+            Ok(bootstrap) => {
+                bootstrap
+                    .verify()
+                    .context("verify pre-BPF encryption Node identity")?;
+                return Ok(Some(bootstrap));
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<reqwest::Error>()
+                    .and_then(reqwest::Error::status)
+                    .is_some_and(|status| startup_authority_retry(status, authority_attempt)) =>
+            {
+                warn!(
+                    %error,
+                    attempt = authority_attempt,
+                    max_attempts = STARTUP_AUTHORITY_ATTEMPTS,
+                    "controller authority admission is busy; encryption identity preflight remains fenced"
+                );
+                authority_attempt += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(|error| error.is_connect() || error.is_timeout()) =>
+            {
+                warn!(%error, "encryption Node-identity preflight unavailable; retaining offline-start recovery");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
         }
-        Err(error)
-            if error
-                .downcast_ref::<reqwest::Error>()
-                .is_some_and(|error| error.is_connect() || error.is_timeout()) =>
-        {
-            warn!(%error, "encryption Node-identity preflight unavailable; retaining offline-start recovery");
-            Ok(None)
-        }
-        Err(error) => Err(error),
     }
 }
 
@@ -21189,20 +21204,17 @@ mod tests {
 
     #[test]
     fn replacement_pod_authority_retry_is_bounded_and_fail_closed() {
-        assert!(node_block_startup_authority_retry(StatusCode::FORBIDDEN, 1));
-        assert!(node_block_startup_authority_retry(
+        assert!(startup_authority_retry(StatusCode::FORBIDDEN, 1));
+        assert!(startup_authority_retry(
             StatusCode::SERVICE_UNAVAILABLE,
-            NODE_BLOCK_STARTUP_AUTHORITY_ATTEMPTS - 1
+            STARTUP_AUTHORITY_ATTEMPTS - 1
         ));
-        assert!(!node_block_startup_authority_retry(
+        assert!(!startup_authority_retry(
             StatusCode::FORBIDDEN,
-            NODE_BLOCK_STARTUP_AUTHORITY_ATTEMPTS
+            STARTUP_AUTHORITY_ATTEMPTS
         ));
-        assert!(!node_block_startup_authority_retry(
-            StatusCode::UNAUTHORIZED,
-            1
-        ));
-        assert!(!node_block_startup_authority_retry(StatusCode::OK, 1));
+        assert!(!startup_authority_retry(StatusCode::UNAUTHORIZED, 1));
+        assert!(!startup_authority_retry(StatusCode::OK, 1));
     }
 
     #[test]

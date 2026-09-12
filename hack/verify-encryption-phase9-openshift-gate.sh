@@ -54,7 +54,9 @@ require 'must_establish_initial_generation' "${root}/bins/unf-agent/src/main.rs"
 require 'oc image info .*--filter-by-os=linux/amd64 -o json' \
     "${root}/hack/deploy-openshift-service-fabric.sh"
 require 'reconcile_bootstrap_epoch_floor' "${root}/bins/unf-agent/src/main.rs"
-require 'node_block_startup_authority_retry' "${root}/bins/unf-agent/src/main.rs"
+require 'startup_authority_retry' "${root}/bins/unf-agent/src/main.rs"
+require 'controller authority admission is busy; encryption identity preflight remains fenced' \
+    "${root}/bins/unf-agent/src/main.rs"
 require 'native_only_generation_closes_without_encrypted_path_exchange' \
     "${root}/bins/unf-agent/src/main.rs"
 require '/v1/state/encryption-activation-testimony' "${root}/bins/unf-agent/src/main.rs"
