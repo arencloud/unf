@@ -31,3 +31,27 @@ def phase9_checkpoint_persistence_valid:
   and (.descriptor.uncompressedBytes | type == "number" and . > 0 and . <= 64000000 and floor == .)
   and (.storedBytes | type == "number" and . > 0 and . <= 900000 and floor == .)
   and .storedBytes > .descriptor.compressedBytes;
+
+# Both inputs MUST first pass the independent typed/hash-chain CLI verifier.
+# This comparison adds restart continuity, not full-history completeness.
+# Intentional bounded retention remains explicit; upstream loss is not waived.
+def phase9_operations_continuity_valid:
+  .before as $before | .after as $after |
+  ($before.counters.cells | flatten) as $oldCounters |
+  ($after.counters.cells | flatten) as $newCounters |
+  INDEX($after.records[]; .sequence | tostring) as $retained |
+  $before.schemaVersion == 1 and $after.schemaVersion == 1
+  and ($before.records | length > 0 and length <= 512)
+  and ($after.records | length > 0 and length <= 512)
+  and $before.reportedLostObservations == 0 and $after.reportedLostObservations == 0
+  and $after.revision >= $before.revision
+  and $after.generation >= $before.generation
+  and $after.evictedRecords >= $before.evictedRecords
+  and $after.evictedObservations >= $before.evictedObservations
+  and ($oldCounters | length) == 54 and ($newCounters | length) == 54
+  and all(range(0; $oldCounters | length); . as $index | $newCounters[$index] >= $oldCounters[$index])
+  and (if $before.revision == $after.revision then $before == $after else true end)
+  and all($before.records[]; . as $record |
+    $retained[.sequence | tostring] as $overlap | $overlap == null or $overlap == $record)
+  and (if $after.records[0].sequence == ($before.records[-1].sequence + 1)
+    then $after.anchorDigest == $before.records[-1].recordDigest else true end);

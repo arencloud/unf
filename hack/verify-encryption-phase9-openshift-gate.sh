@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 gate=${root}/hack/verify-openshift-encryption-phase9.sh
+bash "${root}/hack/verify-phase9-operations-continuity.sh"
 overlay=${root}/deploy/openshift-primary-cni/encryption-phase9
 release=${overlay}/release.json
 rendered=$(mktemp)
@@ -36,7 +37,9 @@ require 'tcpdump.*br-ex' "${gate}"
 require 'requiredPlaintextFrames' "${gate}"
 require 'wait_epoch_change' "${gate}"
 require '/v1/encryption/status' "${gate}"
-require 'lossAffected == false' "${gate}"
+require 'phase9_operations_continuity' "${gate}"
+require 'reportedLostObservations == 0' "${gate}"
+require 'encryption-history --file' "${root}/hack/phase9-operations.sh"
 require 'exact-cleanup' "${gate}"
 require 'assert_checkpoint_persistence' "${gate}"
 require 'checkpointPersistence' "${gate}"

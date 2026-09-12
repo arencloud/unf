@@ -35,7 +35,7 @@ These observations guide later work; they do not mark S1–S5 complete.
 | Six pre-existing unhealthy operators: authentication, console, ingress, insights, kube-controller-manager and network | Investigate DNS/route timeouts separately from UNF pod readiness; network reports an unsafe `DisableMultiNetwork` change. Record attribution and repeat before/after health checks |
 | One agent cgroup had no memory limit; the controller's configured request is below measured CPU use | Measure all agents, BPF memory and scheduler impact before choosing requests/limits; avoid OOM-triggered dataplane disruption |
 | Large policy and encryption snapshots are repeatedly materialized | Profile steady-state pulls, unchanged-input work and churn before introducing conditional delivery or caching; preserve epoch/digest and authentication checks |
-| Encryption operations retain 512 records, while a five-Node Required activation emits 5,972 path observations; cumulative `lossAffected` includes intentional historical eviction | Preserve truthful loss accounting. Develop bounded evidence/coalescing or scoped continuous verification before claiming loss-free operations; do not clear history or ignore the flag to obtain a pass |
+| Encryption operations retain 512 records, while a five-Node Required activation emits 5,972 path observations; cumulative `lossAffected` includes intentional historical eviction | ADR 0282 adds independent checkpoint replay and restart comparison with explicit retention and zero upstream loss. Qualify both full platform runs; never clear history or silently raise retention |
 
 A preliminary one-file CLI compression experiment on the captured roughly
 22-MB checkpoint produced 795,360 bytes with gzip level 6 and 332,688 bytes with

@@ -535,6 +535,11 @@ release gate.
 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `30266627f42321cd90613c00cb5ba71ac648e02f` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate. Evidence SHA-256 `7801aa7d09e5a8caea3e1168b4f45afdc15f330ce6d80c1192eaecade9ea0775`; capture SHA-256 `aff51bb96ba6ca85b59d76ea7400749613ad021a9da4bb0d5ce5ffb46d1ecf03`, with 404 WireGuard frames and zero Required plaintext. Eight Required probes failed closed while eight Native probes succeeded; natural rotation, controlled agent/controller replacement, 295 loss-free operations, egress coexistence, exact cleanup, and rollback passed; ADR 0267 |
 | OpenShift platform qualification | **In progress** | ADRs 0213–0281 record the qualification boundary and cl02 findings. Replica-aware receipt joining passed Required migration, but later checkpoint gaps lost an intermediate controller frontier. Bounded fallback candidate `d128aab` deployed but all five agents remained startup-fenced; Native intent did not mean encryption had converged. ADR 0281 adds exact complete authenticated durable-admission recovery without weakening predecessor checks. The full RHCOS/SELinux/CRI-O, ciphertext, selective fail-closed, rotation/recovery, bounded operations, cleanup, convergence, kube-proxy-absence and ClusterOperator gate remains pending on cl02 first, then fresh Kind for the same successor images. Historical Kind evidence above does not qualify a new runtime |
 
+Phase 9 successor operations qualification follows ADR 0282: independently
+replayed bounded history, monotonic restart counters, explicit retention eviction
+and zero upstream loss. This replaces an unachievable no-eviction assertion at
+cl02's path count; it does not mark the pending full lifecycle gates verified.
+
 ## Updating this tracker
 
 Every phase-affecting change must update the relevant table in the same change.

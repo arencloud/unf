@@ -29,6 +29,7 @@ source_interface=
 artifact_tmp=
 diagnostics_collected=false
 checkpoint_persistence_checks='[]'
+source "${project_root}/hack/phase9-operations.sh"
 
 collect_diagnostics() {
     [[ ${diagnostics_collected} == false ]] || return 0
@@ -80,7 +81,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for command in git jq oc rg sha256sum stat tcpdump timeout unlink; do
+for command in cargo git jq oc rg sha256sum stat tcpdump timeout unlink; do
     command -v "${command}" >/dev/null || {
         echo "OpenShift Phase 9.9 prerequisite is missing: ${command}" >&2
         exit 1
@@ -521,6 +522,8 @@ jq -e --arg controller "${controller_image}" --arg agent "${agent_image}" '
 ' <<<"${images_json}" >/dev/null
 
 stage=explicitly-acknowledged-required-migration
+operations_directory="${diagnostics}/operations"
+operations_baseline=$(phase9_operations_capture baseline "${operations_directory}")
 native_generation=$(wait_generation)
 native_generation_id=$(jq -r '.[0].generation' <<<"${native_generation}")
 set_baseline required
@@ -738,6 +741,8 @@ rotated_generation=$(wait_epoch_change "${initial_epoch}")
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
 pre_restart_generation=$(jq -r '.[0].generation' <<<"${rotated_generation}")
 assert_checkpoint_persistence before-controller-replacement
+operations_before_restart=$(phase9_operations_capture before-restart "${operations_directory}")
+phase9_operations_continuity "${operations_baseline}" "${operations_before_restart}"
 "${kc[@]}" -n unf-system rollout restart deployment/unf-controller >/dev/null
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=10m >/dev/null
 restart_generation=$(wait_generation_after "${pre_restart_generation}")
@@ -745,10 +750,13 @@ assert_checkpoint_persistence after-controller-replacement
 
 stage=operations-and-convergence
 operations_status=$(controller_raw /v1/encryption/status)
-operations_history=$(controller_raw /v1/encryption/history)
-jq -e '.schemaVersion == 1 and .generation > 0 and .lossAffected == false
-    and .completeThroughSequence > 0 and .retainedRecords > 0' <<<"${operations_status}" >/dev/null
-jq -e '.schemaVersion == 1 and (.records | length) > 0' <<<"${operations_history}" >/dev/null
+operations_after_restart=$(phase9_operations_capture after-restart "${operations_directory}")
+phase9_operations_continuity "${operations_before_restart}" "${operations_after_restart}"
+operations_evidence=$(phase9_operations_evidence "${operations_baseline}" "${operations_after_restart}")
+jq -e '.schemaVersion == 1 and .generation > 0 and .reportedLostObservations == 0
+    and .lossAffected == (.evictedObservations > 0 or .reportedLostObservations > 0)
+    and .completeThroughSequence > 0 and .retainedRecords > 0
+    and .retainedRecords <= 512' <<<"${operations_status}" >/dev/null
 final_agents=$(wait_for_convergence)
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
 traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
@@ -816,6 +824,7 @@ jq -n \
     --argjson requiredGeneration "${default_generation}" --argjson selectiveGeneration "${selective_generation}" \
     --argjson recoveredGeneration "${recovered_generation}" --argjson rotatedGeneration "${rotated_generation}" \
     --argjson restartGeneration "${restart_generation}" --argjson operations "${operations_status}" \
+    --argjson operationsEvidence "${operations_evidence}" \
     --argjson initialAgents "${initial_agents}" --argjson finalAgents "${final_agents}" \
     --argjson baselineUnhealthy "${baseline_unhealthy}" --argjson finalUnhealthy "${final_unhealthy}" \
     --argjson newUnhealthy "${new_unhealthy}" \
@@ -840,7 +849,8 @@ jq -n \
       rotation:{result:"passed",generations:$rotatedGeneration},
       operations:{result:"passed",generation:$operations.generation,
         completeThroughSequence:$operations.completeThroughSequence,
-        retainedRecords:$operations.retainedRecords,lossAffected:$operations.lossAffected},
+        retainedRecords:$operations.retainedRecords,lossAffected:$operations.lossAffected,
+        continuity:$operationsEvidence},
       cleanup:"passed",initialAgents:$initialAgents,finalAgents:$finalAgents,
       baselineUnhealthyOperators:$baselineUnhealthy,finalUnhealthyOperators:$finalUnhealthy,
       newlyUnhealthyOperators:$newUnhealthy,
@@ -849,7 +859,7 @@ jq -n \
         "explicitly acknowledged Native-to-Required migration","cross-worker IPv4 and IPv6 PodIP and ClusterIP",
         "WireGuard-positive Required-plaintext-negative underlay capture",
         "Required fail-closed with simultaneous Native exception","natural two-epoch rotation",
-        "controlled agent replacement and separate controller replacement","loss-free causal operations",
+        "controlled agent replacement and separate controller replacement","independently verified bounded causal history with explicit retention loss",
         "exact intent, link, route, and fixture cleanup","five-agent final convergence",
         "no newly unhealthy ClusterOperator beyond the recorded baseline"],
       excluded:["production availability and scale","simultaneous replacement of every encrypted endpoint",

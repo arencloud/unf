@@ -19,6 +19,7 @@ diagnostics_dir=${UNF_PHASE9_KIND_DIAGNOSTICS:-"${project_root}/.artifacts/phase
 temporary_dir=$(mktemp -d)
 capture_host_path=${temporary_dir}/underlay.pcap
 qualification_stage=preflight
+source "${project_root}/hack/phase9-operations.sh"
 resources_created=false
 link_lowered=false
 lowered_source_interfaces=()
@@ -80,7 +81,7 @@ cleanup() {
 trap report_failure ERR
 trap cleanup EXIT
 
-for command in awk curl git jq kubectl rg sha256sum sudo tcpdump "${container_runtime}"; do
+for command in awk cargo curl git jq kubectl rg sha256sum sudo tcpdump "${container_runtime}"; do
     command -v "${command}" >/dev/null 2>&1 || {
         echo "${command} is required for Phase 9.8 Kind qualification" >&2
         exit 1
@@ -346,9 +347,11 @@ jq -e 'length == 4 and all(.[];
 }
 
 qualification_stage=default-required
+operations_directory="${project_root}/.artifacts/phase9-kind-operations"
 set_baseline required
 pre_fixture_generation=$(wait_generation true)
 pre_fixture_generation=$(jq -r '.[0].generation' <<<"${pre_fixture_generation}")
+operations_baseline=$(phase9_operations_capture baseline "${operations_directory}")
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Namespace
@@ -575,6 +578,8 @@ initial_epoch=$(jq -r --arg node "${source_node}" '.[] | select(.node == $node) 
 rotated_generation=$(wait_epoch_change "${initial_epoch}")
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
 pre_restart_generation=$(jq -r '.[0].generation' <<<"${rotated_generation}")
+operations_before_restart=$(phase9_operations_capture before-restart "${operations_directory}")
+phase9_operations_continuity "${operations_baseline}" "${operations_before_restart}"
 "${kc[@]}" -n unf-system rollout restart deployment/unf-controller >/dev/null
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=180s >/dev/null
 # A Ready replacement Pod is not evidence that its reconstructed causal plan
@@ -584,10 +589,13 @@ restart_generation=$(wait_generation_after "${pre_restart_generation}")
 
 qualification_stage=operations-and-performance
 operations_status=$(controller_raw /v1/encryption/status)
-operations_history=$(controller_raw /v1/encryption/history)
-jq -e '.schemaVersion == 1 and .generation > 0 and .lossAffected == false
-    and .completeThroughSequence > 0 and .retainedRecords > 0' <<<"${operations_status}" >/dev/null
-jq -e '.schemaVersion == 1 and (.records | length) > 0' <<<"${operations_history}" >/dev/null
+operations_after_restart=$(phase9_operations_capture after-restart "${operations_directory}")
+phase9_operations_continuity "${operations_before_restart}" "${operations_after_restart}"
+operations_evidence=$(phase9_operations_evidence "${operations_baseline}" "${operations_after_restart}")
+jq -e '.schemaVersion == 1 and .generation > 0 and .reportedLostObservations == 0
+    and .lossAffected == (.evictedObservations > 0 or .reportedLostObservations > 0)
+    and .completeThroughSequence > 0 and .retainedRecords > 0
+    and .retainedRecords <= 512' <<<"${operations_status}" >/dev/null
 "${project_root}/hack/verify-encryption-performance.sh" >/dev/null
 performance_started=$(date +%s%N)
 for _ in $(seq 1 16); do
@@ -652,7 +660,7 @@ jq -n \
     --argjson performanceElapsedNs "${performance_elapsed_ns}" \
     --arg egress "${egress_result}" \
     --arg rollback "$(if [[ ${run_rollback} == true ]]; then printf pending; else printf skipped; fi)" \
-    --argjson operations "${operations_status}" '
+    --argjson operations "${operations_status}" --argjson operationsEvidence "${operations_evidence}" '
     {
       schemaVersion: 1,
       milestone: "9.8",
@@ -674,7 +682,8 @@ jq -n \
       rotation: {result:"passed", generations:$rotatedGeneration},
       operations: {result:"passed", generation:$operations.generation,
         completeThroughSequence:$operations.completeThroughSequence,
-        retainedRecords:$operations.retainedRecords, lossAffected:$operations.lossAffected},
+        retainedRecords:$operations.retainedRecords, lossAffected:$operations.lossAffected,
+        continuity:$operationsEvidence},
       performance: {result:"passed", requests:32, elapsedNanoseconds:$performanceElapsedNs,
         committedLedger:"docs/benchmarks/phase9-encryption-performance.json"},
       egressCoexistence: $egress,

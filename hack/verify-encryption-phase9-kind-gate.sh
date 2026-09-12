@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 gate=${root}/hack/verify-kind-encryption-phase9.sh
+bash "${root}/hack/verify-phase9-operations-continuity.sh"
 overlay=${root}/deploy/kind-encryption-phase9
 
 bash -n "${gate}"
@@ -23,6 +24,8 @@ require 'selective-native-exception' "${gate}"
 require 'ciphertext-and-fail-closed' "${gate}"
 require 'wait_epoch_change' "${gate}"
 require '/v1/encryption/status' "${gate}"
+require 'phase9_operations_continuity' "${gate}"
+require 'reportedLostObservations == 0' "${gate}"
 require 'verify-kind-egress-lifecycle.sh' "${gate}"
 require 'verify-encryption-performance.sh' "${gate}"
 require 'rollback-kind-primary-cni.sh' "${gate}"
