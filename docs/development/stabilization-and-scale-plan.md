@@ -22,3 +22,21 @@ measurements. Resource improvements need repeatable equal-workload comparisons.
 Five-node evidence establishes a lab envelope; higher node counts require their
 own evidence. Do not claim unlimited scale or superiority without measurements
 (master prompt §§57–59).
+
+## Risks observed during the Phase 9 resume
+
+These observations guide later work; they do not mark S1–S5 complete.
+
+| Observation | Required follow-up |
+|---|---|
+| `cfff9c3` stayed within the 2-GiB controller limit without OOM, but Required migration timed out with 5,972 proof selections | Requalify ADRs 0270–0272 on cl02 before Kind; keep exact runtime and evidence provenance |
+| A recovery checkpoint briefly needed approximately 912 KB, exceeding its 900 KB bound; a later cut fit | Remove the persistence gap with bounded, integrity-checked storage and explicit migration/recovery compatibility; do not simply increase the bound |
+| Six pre-existing unhealthy operators: authentication, console, ingress, insights, kube-controller-manager and network | Investigate DNS/route timeouts separately from UNF pod readiness; network reports an unsafe `DisableMultiNetwork` change. Record attribution and repeat before/after health checks |
+| One agent cgroup had no memory limit; the controller's configured request is below measured CPU use | Measure all agents, BPF memory and scheduler impact before choosing requests/limits; avoid OOM-triggered dataplane disruption |
+| Large policy and encryption snapshots are repeatedly materialized | Profile steady-state pulls, unchanged-input work and churn before introducing conditional delivery or caching; preserve epoch/digest and authentication checks |
+
+A preliminary one-file CLI compression experiment on the captured roughly
+22-MB checkpoint produced 795,360 bytes with gzip level 6 and 332,688 bytes with
+zstd level 3. This is neither a production-code benchmark nor a codec migration
+decision. Any adoption must measure the actual Rust implementation, preserve
+bounded decode and integrity checks, and define rollback compatibility.
