@@ -509,6 +509,25 @@ struct DurableEncryptionGenerationDescriptor {
     payload_sha256: [u8; 32],
 }
 
+/// Reuses only the exact, already-admitted immutable catalog cut and only
+/// within its current proof-round lifetime. This is not endpoint evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncryptionProofSynchronizationStamp {
+    generation: Revision,
+    cut_digest: unf_encryption::NodeLocalPlanFleetCutDigest,
+    valid_from_unix_ms: u64,
+    valid_until_unix_ms: u64,
+}
+
+impl EncryptionProofSynchronizationStamp {
+    fn matches(&self, cut: &NodeLocalPlanFleetCut, now_unix_ms: u64) -> bool {
+        self.generation == cut.generation
+            && self.cut_digest == cut.cut_digest
+            && now_unix_ms >= self.valid_from_unix_ms
+            && now_unix_ms < self.valid_until_unix_ms
+    }
+}
+
 struct ControllerState {
     ready: AtomicBool,
     initial_agent_authority_watches: AtomicU64,
@@ -572,6 +591,7 @@ struct ControllerState {
     encryption_key_transparency: Mutex<NodeKeyTransparencyLedger>,
     encryption_key_attestations: Mutex<NodeKeyAttestationLedger>,
     encryption_path_proofs: Mutex<EncryptionPathProofCoordinator>,
+    encryption_proof_synchronization: Mutex<Option<EncryptionProofSynchronizationStamp>>,
     encryption_operations: Mutex<EncryptionOperationsLedger>,
     encryption_activation_cursors: Mutex<BTreeMap<String, EncryptionActivationCursor>>,
     encryption_operations_dirty: AtomicBool,
@@ -2185,6 +2205,7 @@ fn new_state_with_client_and_selector(
         encryption_key_transparency: Mutex::new(NodeKeyTransparencyLedger::default()),
         encryption_key_attestations: Mutex::new(NodeKeyAttestationLedger::default()),
         encryption_path_proofs: Mutex::new(EncryptionPathProofCoordinator::default()),
+        encryption_proof_synchronization: Mutex::new(None),
         encryption_operations: Mutex::new(EncryptionOperationsLedger::default()),
         encryption_activation_cursors: Mutex::new(BTreeMap::new()),
         encryption_operations_dirty: AtomicBool::new(false),
@@ -9686,10 +9707,21 @@ fn synchronize_encryption_path_proofs(
     state: &ControllerState,
     now_unix_ms: u64,
 ) -> Result<(), ApiError> {
-    let cut = mutex_lock(&state.encryption_local_plans)
-        .active()
-        .cloned()
-        .ok_or_else(|| ApiError::service_unavailable("encryption plan cut is unavailable"))?;
+    // Serialize round renewal as well as initial construction. Catalog
+    // publication verifies every cut and exposes no mutable active reference.
+    // An unchanged current cut can therefore avoid cloning and hashing the
+    // entire fleet for each individual endpoint proof.
+    let mut synchronization = mutex_lock(&state.encryption_proof_synchronization);
+    let cut = {
+        let catalog = mutex_lock(&state.encryption_local_plans);
+        let cut = catalog
+            .active()
+            .ok_or_else(|| ApiError::service_unavailable("encryption plan cut is unavailable"))?;
+        if synchronization.is_some_and(|stamp| stamp.matches(cut, now_unix_ms)) {
+            return Ok(());
+        }
+        cut.clone()
+    };
     cut.verify()
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
     let mut contracts = Vec::new();
@@ -9757,6 +9789,12 @@ fn synchronize_encryption_path_proofs(
             }
         }
     }
+    *synchronization = Some(EncryptionProofSynchronizationStamp {
+        generation: cut.generation,
+        cut_digest: cut.cut_digest,
+        valid_from_unix_ms: now_unix_ms,
+        valid_until_unix_ms: now_unix_ms.saturating_add(lifetime_ms),
+    });
     Ok(())
 }
 
@@ -17579,6 +17617,35 @@ mod tests {
             .unwrap();
 
         synchronize_encryption_path_proofs(&state, 10_000).unwrap();
+        let stamp = mutex_lock(&state.encryption_proof_synchronization).unwrap();
+        for now in 10_001..11_001 {
+            synchronize_encryption_path_proofs(&state, now).unwrap();
+            assert_eq!(
+                mutex_lock(&state.encryption_proof_synchronization).unwrap(),
+                stamp,
+                "unchanged admitted cuts must not rebuild on every proof request"
+            );
+        }
+        let mut changed_cut = mutex_lock(&state.encryption_local_plans)
+            .active()
+            .unwrap()
+            .clone();
+        assert!(stamp.matches(&changed_cut, 10_000));
+        assert!(!stamp.matches(&changed_cut, 9_999));
+        assert!(!stamp.matches(&changed_cut, 40_000));
+        changed_cut.cut_digest.0[0] ^= 1;
+        assert!(!stamp.matches(&changed_cut, 10_000));
+        changed_cut.cut_digest = stamp.cut_digest;
+        changed_cut.generation = Revision::new(11);
+        assert!(!stamp.matches(&changed_cut, 10_000));
+        synchronize_encryption_path_proofs(&state, 40_000).unwrap();
+        assert_eq!(
+            mutex_lock(&state.encryption_proof_synchronization)
+                .unwrap()
+                .valid_from_unix_ms,
+            40_000,
+            "expiry must re-enter validation and round renewal"
+        );
         assert_eq!(
             mutex_lock(&state.encryption_path_proofs).generation(),
             Revision::new(10)
