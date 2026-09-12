@@ -1189,7 +1189,11 @@ matrix is maintained in the
   fresh-key successor across the physical map gap; ADR 0246. Exact runtime
   `b64282a` passed the fresh full Kind lifecycle; ADR 0247 binds its immutable
   public images and evidence as the sole tuple eligible for the resumed cl02
-  bridge recovery. Complete cl02 qualification remains mandatory.
+  bridge recovery. That tuple crossed the reboot residue, but a gate-induced
+  baseline change admitted epoch 42 immediately before authority expiry. ADR
+  0248 exposes the same persist-first fail-closed bridge to continuous plan
+  reconciliation, allowing only the newer authenticated fresh-key successor.
+  Fresh Kind and complete cl02 qualification remain mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

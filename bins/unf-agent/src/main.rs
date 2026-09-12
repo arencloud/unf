@@ -7482,21 +7482,15 @@ async fn advance_startup_encryption_authority(
                 if let Some(plan) = plans.current.as_ref() {
                     let desired = plan.snapshot.generation;
                     generations.supersede_stale_active_revalidation(desired);
-                    if let Some(authority) = keys.authority.as_ref()
-                        && let Some(admitted) = generations
-                            .tombstoned_admitted_pending(desired, authority.authority())
-                            .context("classify admitted startup predecessor key authority")?
-                    {
-                        encryption
-                            .begin_verified_tombstoned_predecessor_bridge(&admitted)
-                            .context("quarantine tombstoned startup predecessor")?;
-                        if !generations
-                            .abandon_tombstoned_admitted_pending(desired, authority.authority())
-                            .await
-                            .context("retire tombstoned admitted startup predecessor")?
-                        {
-                            bail!("tombstoned startup predecessor changed after map quarantine");
-                        }
+                    if let Some(authority) = keys.authority.as_ref() {
+                        bridge_tombstoned_admitted_predecessor(
+                            generations,
+                            encryption,
+                            desired,
+                            authority.authority(),
+                        )
+                        .await
+                        .context("bridge tombstoned admitted startup predecessor")?;
                     }
                     settle_admitted_predecessor = generations
                         .must_settle_admitted_pending_before(desired)
@@ -9879,6 +9873,35 @@ async fn prepare_admitted_encryption_plan(
         .await
         .context("compile authenticated plan against exact Node-local keys and Linux readback")?;
     generations.offer_prepared(prepared)
+}
+
+/// Crosses an admitted generation whose complete local key set became
+/// tombstoned before activation. The map bridge is durable and fail-closed
+/// before Linux authority is removed, so this transition is safe both during
+/// startup reconstruction and continuous reconciliation.
+async fn bridge_tombstoned_admitted_predecessor(
+    generations: &mut EncryptionGenerationSynchronizer,
+    encryption: &mut EncryptionMapSynchronizer,
+    desired: Revision,
+    key_authority: &NodeKeyAuthority,
+) -> Result<bool> {
+    let Some(admitted) = generations
+        .tombstoned_admitted_pending(desired, key_authority)
+        .context("classify admitted predecessor key authority")?
+    else {
+        return Ok(false);
+    };
+    encryption
+        .begin_verified_tombstoned_predecessor_bridge(&admitted)
+        .context("quarantine tombstoned admitted predecessor")?;
+    if !generations
+        .abandon_tombstoned_admitted_pending(desired, key_authority)
+        .await
+        .context("retire tombstoned admitted predecessor")?
+    {
+        bail!("tombstoned admitted predecessor changed after map quarantine");
+    }
+    Ok(true)
 }
 
 fn retire_transport_free_drained_encryption_epoch(
@@ -16454,6 +16477,20 @@ async fn consume_events(
                         if let Some(current) = encryption_plans.current.as_ref()
                             && let Some(authority) = encryption_keys.authority.as_ref()
                         {
+                            if let Err(error) = bridge_tombstoned_admitted_predecessor(
+                                encryption_generations,
+                                encryption,
+                                current.snapshot.generation,
+                                authority.authority(),
+                            )
+                            .await
+                            {
+                                warn!(
+                                    ?error,
+                                    "tombstoned admitted predecessor could not enter its fail-closed runtime bridge"
+                                );
+                                continue;
+                            }
                             match encryption_generations.must_settle_admitted_pending_before(
                                 current.snapshot.generation,
                             ) {

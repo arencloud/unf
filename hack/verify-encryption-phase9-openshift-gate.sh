@@ -105,6 +105,8 @@ require 'Fail-Closed Tombstoned Predecessor Bridge' \
     "${root}/docs/adr/0246-fail-closed-tombstoned-predecessor-bridge.md"
 require 'Immutable Tombstoned-Predecessor-Bridge Kind Requalification' \
     "${root}/docs/adr/0247-immutable-tombstoned-predecessor-bridge-kind-requalification.md"
+require 'Continuous Tombstoned Predecessor Bridge' \
+    "${root}/docs/adr/0248-continuous-tombstoned-predecessor-bridge.md"
 require 'EncryptionActivationPublicationOutcome::Superseded' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'ApiError::conflict' "${root}/bins/unf-controller/src/main.rs"
@@ -116,6 +118,9 @@ require 'abandon_tombstoned_admitted_pending' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'begin_verified_tombstoned_predecessor_bridge' \
     "${root}/bins/unf-agent/src/encryption_maps.rs"
+require 'bridge_tombstoned_admitted_predecessor' \
+    "${root}/bins/unf-agent/src/main.rs"
+require 'fail-closed runtime bridge' "${root}/bins/unf-agent/src/main.rs"
 require 'unknown untombstoned key epoch' \
     "${root}/bins/unf-agent/src/main.rs"
 require 'policyRevision:.active.fact.checkpoint.transaction.desired.published.policyRevision' \
