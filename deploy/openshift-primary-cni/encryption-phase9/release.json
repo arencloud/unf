@@ -1,17 +1,13 @@
 {
   "schemaVersion": 1,
   "phase": "9.9",
-  "sourceRevision": "30266627f42321cd90613c00cb5ba71ac648e02f",
+  "sourceRevision": "cfff9c36c29a7c306a6dbf0457b85ce8c1065632",
+  "qualificationOrder": "openshift-first",
   "kindQualification": {
     "schemaVersion": 1,
     "milestone": "9.8",
-    "context": "kind-unf-service-dev",
-    "runtimeRevision": "30266627f42321cd90613c00cb5ba71ac648e02f",
-    "qualificationRevision": "30266627f42321cd90613c00cb5ba71ac648e02f",
-    "evidenceSha256": "7801aa7d09e5a8caea3e1168b4f45afdc15f330ce6d80c1192eaecade9ea0775",
-    "captureSha256": "aff51bb96ba6ca85b59d76ea7400749613ad021a9da4bb0d5ce5ffb46d1ecf03",
-    "kubeProxyPresent": false,
-    "result": "passed"
+    "runtimeRevision": "cfff9c36c29a7c306a6dbf0457b85ce8c1065632",
+    "result": "pending"
   },
   "contracts": {
     "compatibilitySchemaVersion": 2,
@@ -34,8 +30,8 @@
     "flowExportSchemaVersion": 7
   },
   "images": {
-    "controller": "quay.io/arencloud/unf-controller-dev@sha256:936f6ef5da7f08234f2e3d34f10484f100837044d6071ba1c911262bdcd6352a",
-    "agent": "quay.io/arencloud/unf-agent-dev@sha256:ed7eca8069dcf3c8b483d04cafc423cf254ba375ecd3ab82666beaf37c3fffa4",
+    "controller": "quay.io/arencloud/unf-controller-dev@sha256:08c8df0d5335c4124c995ec2ab5c37350f17312db23ec0e56de78562e11e3444",
+    "agent": "quay.io/arencloud/unf-agent-dev@sha256:0f406d453e8f1ea03fe44056810cb3e4df414d4f58ff3a3728d96edfd9380054",
     "testTools": "quay.io/arencloud/unf-test-tools-dev@sha256:e9cce439d92d0f7d3d6751f234e397a7efc29f9983bc0ae8fc318432c4ff2352"
   }
 }
