@@ -22,6 +22,8 @@ use crate::{
 
 pub const ENCRYPTION_PATH_PROOF_SCHEMA_VERSION: u16 = 2;
 pub const ENCRYPTION_PATH_PROOF_ASSIGNMENT_BATCH_SCHEMA_VERSION: u16 = 1;
+pub const ENCRYPTION_ENDPOINT_PATH_PROOF_BATCH_SCHEMA_VERSION: u16 = 1;
+pub const MAX_ENCRYPTION_ENDPOINT_PATH_PROOF_BATCH: usize = 64;
 pub const MAX_ENCRYPTION_PATH_PROOF_LIFETIME_MS: u64 = 60_000;
 pub const PATH_FAMILY_IPV4: u8 = 1;
 pub const PATH_FAMILY_IPV6: u8 = 2;
@@ -182,10 +184,20 @@ pub enum EncryptionPathProofAdmission {
     Idempotent,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EncryptionPathProofLedger {
     round: EncryptionPathProofRound,
     proofs: BTreeMap<EncryptionPathEndpointRole, EncryptionEndpointPathProof>,
+}
+
+/// Bounded, generation-fenced endpoint publication. It contains no new
+/// authority: each proof retains its independent nonce and duplex evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionEndpointPathProofBatch {
+    pub schema_version: u16,
+    pub generation: Revision,
+    pub proofs: Vec<EncryptionEndpointPathProof>,
 }
 
 #[derive(Debug)]
@@ -1204,6 +1216,56 @@ impl EncryptionPathProofCoordinator {
             .observe(authenticated, proof, now_unix_ms)
     }
 
+    /// Admits a bounded batch atomically, cloning only touched ledgers, never
+    /// contracts or the fleet catalog. Retrying an accepted batch is idempotent.
+    ///
+    /// # Errors
+    /// Rejects invalid schema/size/generation, duplicate rounds, and any proof
+    /// rejected by standalone admission without retaining a valid prefix.
+    ///
+    /// # Panics
+    /// Panics if an exclusively borrowed, already-staged round disappears,
+    /// which indicates an internal coordinator invariant violation.
+    pub fn observe_batch(
+        &mut self,
+        authenticated: &AuthenticatedNodeIdentity,
+        batch: &EncryptionEndpointPathProofBatch,
+        now_unix_ms: u64,
+    ) -> Result<Vec<EncryptionPathProofAdmission>, EncryptionPathProofError> {
+        if batch.schema_version != ENCRYPTION_ENDPOINT_PATH_PROOF_BATCH_SCHEMA_VERSION
+            || batch.generation != self.generation
+            || batch.proofs.is_empty()
+            || batch.proofs.len() > MAX_ENCRYPTION_ENDPOINT_PATH_PROOF_BATCH
+        {
+            return Err(EncryptionPathProofError::InvalidGenerationProof);
+        }
+        let mut seen = BTreeSet::new();
+        let mut staged = Vec::with_capacity(batch.proofs.len());
+        for proof in &batch.proofs {
+            if !seen.insert(proof.round_digest) {
+                return Err(EncryptionPathProofError::ReplayOrEquivocation);
+            }
+            let mut ledger = self
+                .paths
+                .get(&proof.round_digest)
+                .ok_or(EncryptionPathProofError::ReplayOrEquivocation)?
+                .ledger
+                .clone();
+            let admission = ledger.observe(authenticated, proof.clone(), now_unix_ms)?;
+            staged.push((proof.round_digest, ledger, admission));
+        }
+        Ok(staged
+            .into_iter()
+            .map(|(round, ledger, admission)| {
+                self.paths
+                    .get_mut(&round)
+                    .expect("exclusively staged round exists")
+                    .ledger = ledger;
+                admission
+            })
+            .collect())
+    }
+
     /// Returns current completed receipts owned by one source endpoint.
     ///
     /// Destination participation proves duplex reachability, but only the
@@ -1962,6 +2024,128 @@ pub(crate) mod tests {
             .unwrap()
             .insert("handshakeIsEnough".into(), serde_json::json!(true));
         assert!(serde_json::from_value::<EncryptionPathProofRound>(value).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn endpoint_proof_batches_are_bounded_atomic_generation_fenced_and_idempotent() {
+        let contract = fixture_contract();
+        let mut coordinator = EncryptionPathProofCoordinator::default();
+        coordinator
+            .replace_contract_batches(Revision::new(10), vec![contract.clone()], 1_500, 8_500)
+            .unwrap();
+        let round = coordinator
+            .paths
+            .values()
+            .next()
+            .unwrap()
+            .assignment
+            .round
+            .clone();
+        let source = EncryptionPathEndpointRole::Source;
+        let batch = EncryptionEndpointPathProofBatch {
+            schema_version: ENCRYPTION_ENDPOINT_PATH_PROOF_BATCH_SCHEMA_VERSION,
+            generation: Revision::new(10),
+            proofs: vec![proof(&round, &contract, source)],
+        };
+        let mut invalid = batch.clone();
+        let mut unknown = batch.proofs[0].clone();
+        unknown.round_digest.0[0] ^= 1;
+        invalid.proofs.push(unknown);
+        assert!(
+            coordinator
+                .observe_batch(&auth(source), &invalid, 2_100)
+                .is_err()
+        );
+        assert!(
+            coordinator
+                .paths
+                .values()
+                .all(|path| path.ledger.proofs.is_empty()),
+            "a rejected tail must not retain the valid prefix"
+        );
+        invalid = batch.clone();
+        invalid.proofs.push(batch.proofs[0].clone());
+        assert!(
+            coordinator
+                .observe_batch(&auth(source), &invalid, 2_100)
+                .is_err()
+        );
+        invalid = batch.clone();
+        invalid.generation = Revision::new(11);
+        assert!(
+            coordinator
+                .observe_batch(&auth(source), &invalid, 2_100)
+                .is_err()
+        );
+        invalid = batch.clone();
+        invalid.schema_version += 1;
+        assert!(
+            coordinator
+                .observe_batch(&auth(source), &invalid, 2_100)
+                .is_err()
+        );
+        invalid = batch.clone();
+        invalid.proofs.clear();
+        assert!(
+            coordinator
+                .observe_batch(&auth(source), &invalid, 2_100)
+                .is_err()
+        );
+        invalid.proofs =
+            vec![batch.proofs[0].clone(); MAX_ENCRYPTION_ENDPOINT_PATH_PROOF_BATCH + 1];
+        assert!(
+            coordinator
+                .observe_batch(&auth(source), &invalid, 2_100)
+                .is_err()
+        );
+        let destination = EncryptionPathEndpointRole::Destination;
+        assert!(
+            coordinator
+                .observe_batch(&auth(destination), &batch, 2_100)
+                .is_err()
+        );
+        assert!(
+            coordinator
+                .observe_batch(&auth(source), &batch, 10_000)
+                .is_err()
+        );
+        assert!(
+            coordinator
+                .paths
+                .values()
+                .all(|path| path.ledger.proofs.is_empty())
+        );
+        assert_eq!(
+            coordinator
+                .observe_batch(&auth(source), &batch, 2_100)
+                .unwrap(),
+            vec![EncryptionPathProofAdmission::AcceptedPendingPeer]
+        );
+        assert_eq!(
+            coordinator
+                .observe_batch(&auth(source), &batch, 2_100)
+                .unwrap(),
+            vec![EncryptionPathProofAdmission::Idempotent]
+        );
+        let destination_batch = EncryptionEndpointPathProofBatch {
+            proofs: vec![proof(&round, &contract, destination)],
+            ..batch.clone()
+        };
+        assert_eq!(
+            coordinator
+                .observe_batch(&auth(destination), &destination_batch, 2_100)
+                .unwrap(),
+            vec![EncryptionPathProofAdmission::AcceptedComplete]
+        );
+        let encoded = serde_json::to_value(&batch).unwrap();
+        assert_eq!(
+            serde_json::from_value::<EncryptionEndpointPathProofBatch>(encoded.clone()).unwrap(),
+            batch
+        );
+        let mut unknown_field = encoded;
+        unknown_field["trustBatchWithoutProofs"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<EncryptionEndpointPathProofBatch>(unknown_field).is_err());
     }
 
     #[test]

@@ -10725,20 +10725,32 @@ async fn collect_live_encryption_path_receipts(
             .entry(proof.round_digest)
             .or_insert(proof);
     }
-    for assignment in assignments {
-        let proof = generations
-            .path_proofs
-            .get(&assignment.round.round_digest)
-            .context("live path executor did not produce every assigned proof")?;
-        proof
-            .verify(&assignment.round, current_unix_time_milliseconds())
-            .context("revalidate cached endpoint path proof before publication")?;
+    let token = read_agent_token(&generations.agent_token_path)?;
+    for chunk in assignments.chunks(unf_encryption::MAX_ENCRYPTION_ENDPOINT_PATH_PROOF_BATCH) {
+        let mut proofs = Vec::with_capacity(chunk.len());
+        for assignment in chunk {
+            let proof = generations
+                .path_proofs
+                .get(&assignment.round.round_digest)
+                .context("live path executor did not produce every assigned proof")?;
+            proof
+                .verify(&assignment.round, current_unix_time_milliseconds())
+                .context("revalidate cached endpoint path proof before publication")?;
+            proofs.push(proof.clone());
+        }
+        let batch = unf_encryption::EncryptionEndpointPathProofBatch {
+            schema_version: unf_encryption::ENCRYPTION_ENDPOINT_PATH_PROOF_BATCH_SCHEMA_VERSION,
+            generation: chunk[0].generation,
+            proofs,
+        };
         let response = generations
             .client
             .current()
-            .post(format!("{controller_url}/v1/state/encryption-path-proofs"))
-            .bearer_auth(read_agent_token(&generations.agent_token_path)?)
-            .json(proof)
+            .post(format!(
+                "{controller_url}/v1/state/encryption-path-proof-batches"
+            ))
+            .bearer_auth(&token)
+            .json(&batch)
             .send()
             .await
             .context("publish encrypted endpoint path proof")?;

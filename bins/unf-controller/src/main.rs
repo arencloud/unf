@@ -1670,6 +1670,10 @@ async fn spawn_internal_api(
             post(ingest_encryption_path_proof),
         )
         .route(
+            "/v1/state/encryption-path-proof-batches",
+            post(ingest_encryption_path_proof_batch),
+        )
+        .route(
             "/v1/state/encryption-path-receipts",
             get(encryption_path_receipts),
         )
@@ -9416,9 +9420,53 @@ async fn ingest_encryption_path_proof(
     let admission = mutex_lock(&state.encryption_path_proofs)
         .observe(&encryption_authenticated_node(&state, &agent)?, proof, now)
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    record_encryption_path_proof_admission(
+        &state,
+        now,
+        generation,
+        contract_digest,
+        epoch,
+        admission,
+    )?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn ingest_encryption_path_proof_batch(
+    State(state): State<Arc<ControllerState>>,
+    headers: HeaderMap,
+    Json(batch): Json<unf_encryption::EncryptionEndpointPathProofBatch>,
+) -> Result<StatusCode, ApiError> {
+    let agent = authenticate_internal_agent(&state, &headers).await?;
+    require_current_encryption_agent(&state, &agent)?;
+    let now = unix_time_millis();
+    synchronize_encryption_path_proofs(&state, now)?;
+    let admissions = mutex_lock(&state.encryption_path_proofs)
+        .observe_batch(&encryption_authenticated_node(&state, &agent)?, &batch, now)
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    for (proof, admission) in batch.proofs.into_iter().zip(admissions) {
+        record_encryption_path_proof_admission(
+            &state,
+            now,
+            batch.generation,
+            proof.contract_digest,
+            proof.epoch,
+            admission,
+        )?;
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+fn record_encryption_path_proof_admission(
+    state: &ControllerState,
+    now: u64,
+    generation: Revision,
+    contract_digest: unf_encryption::AttestedEncryptionContractDigest,
+    epoch: u64,
+    admission: EncryptionPathProofAdmission,
+) -> Result<(), ApiError> {
     if admission != EncryptionPathProofAdmission::Idempotent {
         record_encryption_operation(
-            &state,
+            state,
             EncryptionOperationalObservation::issue(
                 now,
                 generation,
@@ -9432,7 +9480,7 @@ async fn ingest_encryption_path_proof(
     }
     if admission == EncryptionPathProofAdmission::AcceptedComplete {
         record_encryption_operation(
-            &state,
+            state,
             EncryptionOperationalObservation::issue(
                 now,
                 generation,
@@ -9444,7 +9492,7 @@ async fn ingest_encryption_path_proof(
             .map_err(|error| ApiError::internal(error.to_string()))?,
         )?;
     }
-    Ok(StatusCode::ACCEPTED)
+    Ok(())
 }
 
 async fn encryption_path_receipts(
