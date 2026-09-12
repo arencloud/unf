@@ -40,3 +40,14 @@ A preliminary one-file CLI compression experiment on the captured roughly
 zstd level 3. This is neither a production-code benchmark nor a codec migration
 decision. Any adoption must measure the actual Rust implementation, preserve
 bounded decode and integrity checks, and define rollback compatibility.
+
+The follow-up Rust gzip experiment used the same 22,164,122-byte public checkpoint
+capture. The existing miniz backend produced 791,134 bytes at its default level
+and 788,764 at its highest level: only 2,370 bytes saved, insufficient evidence
+for the observed roughly 13-KB overflow. Experimental zlib-rs produced 960,543
+and 802,704 bytes; the host C zlib backend produced 772,137 and 802,704 bytes.
+These are single-capture size measurements, not production CPU benchmarks;
+the exact overflowing cut was not captured. No backend, dependency, recovery
+format or bound was changed. The failed experiments were removed before building
+the replica-coverage candidate. A bounded persistence solution still needs its
+own recovery and rollover verification.
