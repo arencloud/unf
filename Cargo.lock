@@ -3622,6 +3622,7 @@ dependencies = [
  "serde_yaml",
  "tokio",
  "unf-api",
+ "unf-encryption",
  "unf-state",
 ]
 

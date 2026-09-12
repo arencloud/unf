@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -108,8 +109,12 @@ enum Command {
     },
     /// Show the loss-explicit encryption operations watermark.
     EncryptionStatus,
-    /// Show bounded, hash-chained encryption lifecycle evidence.
-    EncryptionHistory,
+    /// Independently verify and show bounded, hash-chained encryption evidence.
+    EncryptionHistory {
+        /// Verify a saved JSON checkpoint without contacting the controller.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
     /// Explain the minimum missing cause on one inter-Pod encryption path.
     EncryptionExplain {
         /// Source pod as namespace/name.
@@ -527,12 +532,8 @@ async fn run() -> Result<()> {
             )
             .await?
         }
-        Command::EncryptionHistory => {
-            get_json(
-                &client,
-                &format!("{}/v1/encryption/history", cli.controller_url),
-            )
-            .await?
+        Command::EncryptionHistory { file } => {
+            encryption_history_value(&client, &cli.controller_url, file.as_ref()).await?
         }
         Command::EncryptionExplain {
             from,
@@ -914,6 +915,61 @@ async fn shadow_impact_value(
         analyze_shadow_impact(&snapshot, analysis_source).context("analyze shadow impact")?,
     )
     .context("serialize shadow-impact report")
+}
+
+const ENCRYPTION_HISTORY_INPUT_LIMIT: usize = 1024 * 1024;
+
+async fn encryption_history_value(
+    client: &reqwest::Client,
+    controller_url: &str,
+    file: Option<&PathBuf>,
+) -> Result<Value> {
+    let mut encoded = Vec::new();
+    if let Some(path) = file {
+        let input = std::fs::File::open(path).context("open saved encryption history")?;
+        if !input.metadata()?.is_file() {
+            bail!("saved encryption history must be a regular file");
+        }
+        input
+            .take((ENCRYPTION_HISTORY_INPUT_LIMIT + 1) as u64)
+            .read_to_end(&mut encoded)?;
+    } else {
+        let mut response = client
+            .get(format!("{controller_url}/v1/encryption/history"))
+            .send()
+            .await
+            .context("request encryption history")?;
+        if response.status() != StatusCode::OK {
+            bail!(
+                "controller rejected encryption history: {}",
+                response.status()
+            );
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > ENCRYPTION_HISTORY_INPUT_LIMIT as u64)
+        {
+            bail!("encryption history exceeds the 1-MiB input bound");
+        }
+        while let Some(chunk) = response.chunk().await? {
+            if encoded.len().saturating_add(chunk.len()) > ENCRYPTION_HISTORY_INPUT_LIMIT {
+                bail!("encryption history exceeds the 1-MiB input bound");
+            }
+            encoded.extend_from_slice(&chunk);
+        }
+    }
+    verify_encryption_history(&encoded)
+}
+
+fn verify_encryption_history(encoded: &[u8]) -> Result<Value> {
+    if encoded.len() > ENCRYPTION_HISTORY_INPUT_LIMIT {
+        bail!("encryption history exceeds the 1-MiB input bound");
+    }
+    let checkpoint: unf_encryption::EncryptionOperationsHistoryCheckpoint =
+        serde_json::from_slice(encoded).context("decode strict encryption history checkpoint")?;
+    let ledger = unf_encryption::EncryptionOperationsLedger::restore(checkpoint)
+        .context("verify encryption history chain, counters and loss accounting")?;
+    serde_json::to_value(ledger.checkpoint()).context("encode verified encryption history")
 }
 
 async fn get_json(client: &reqwest::Client, url: &str) -> Result<Value> {
@@ -2487,6 +2543,77 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["unfctl", "encryption-status"]).is_ok());
         assert!(Cli::try_parse_from(["unfctl", "encryption-history"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["unfctl", "encryption-history", "--file", "history.json"]).is_ok()
+        );
+    }
+
+    fn encryption_history_fixture() -> Value {
+        let mut ledger = unf_encryption::EncryptionOperationsLedger::default();
+        for sequence in 1..=514 {
+            ledger
+                .observe(
+                    unf_encryption::EncryptionOperationalObservation::issue(
+                        sequence,
+                        serde_json::from_value(serde_json::json!(1)).unwrap(),
+                        unf_encryption::EncryptionOperationalStage::Lifecycle,
+                        unf_encryption::EncryptionOperationalOutcome::Activated,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        serde_json::to_value(ledger.checkpoint()).unwrap()
+    }
+
+    #[test]
+    fn encryption_history_verification_preserves_retention_and_rejects_tampering() {
+        let fixture = encryption_history_fixture();
+        assert_eq!(fixture["evictedRecords"], 2);
+        assert_eq!(fixture["evictedObservations"], 2);
+        assert_eq!(
+            verify_encryption_history(&serde_json::to_vec(&fixture).unwrap()).unwrap(),
+            fixture
+        );
+        for field in ["sequence", "recordDigest", "previousRecordDigest"] {
+            let mut changed = fixture.clone();
+            changed["records"][0][field] = serde_json::json!(0);
+            assert!(verify_encryption_history(&serde_json::to_vec(&changed).unwrap()).is_err());
+        }
+        let mut changed = fixture.clone();
+        changed["unknownField"] = serde_json::json!(true);
+        assert!(verify_encryption_history(&serde_json::to_vec(&changed).unwrap()).is_err());
+        assert!(
+            verify_encryption_history(&vec![b' '; ENCRYPTION_HISTORY_INPUT_LIMIT + 1]).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_encryption_history_never_contacts_the_controller() {
+        use std::io::Write as _;
+        let fixture = encryption_history_fixture();
+        let path = std::env::temp_dir().join(format!(
+            "unf-history-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&fixture).unwrap())
+            .unwrap();
+        drop(file);
+        let result =
+            encryption_history_value(&reqwest::Client::new(), "not a valid URL", Some(&path)).await;
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result.unwrap(), fixture);
     }
 
     #[test]

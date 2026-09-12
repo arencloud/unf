@@ -2,7 +2,7 @@
 
 Date: 2026-09-12
 
-Status: Candidate; cl02 and successor Kind qualification pending
+Status: cl02 deployment failed during startup revalidation; full gates pending
 
 Runtime `d128aabd777c5caa71ea522ed091f0471467a327` combines the proven
 replica-aware receipt join with deadline-bound timeout responders (ADR 0276)
@@ -36,3 +36,26 @@ misclassified as API keys and one explicitly invalid Bearer-token fixture that
 requires HTTP 401. No actual credential was found in those flagged locations.
 No scanner rule or path was suppressed, and recent milestone scans remained
 clean. Raw reports and all operational credentials stay in ignored local paths.
+
+## Deployment result and durable-gap diagnosis
+
+Harness `7ce4ed6` installed the exact controller and five agents, but deployment
+timed out with agent startup attachment fenced. No full encryption gate or Kind
+run followed. Native intent remained configured, yet node journals showed that
+the earlier failed run had not finished its Native encryption transition.
+
+The saved controller frontier was generation `1789245078215`, acknowledged by
+all five Nodes. Independently captured public active facts from all five Node
+journals agreed on generation `1789245125471`, each with that saved frontier as
+its exact prior. Their pending Native cut was `1789245583383`. Authenticated
+replay of the existing pending fact returned HTTP 503 with `encryption generation
+frontier predecessor mismatch`: the controller lacked the intermediate frontier.
+The earlier checkpoint-write gap had survived subsequent policy/Service
+convergence and ordinary pod readiness.
+
+No checkpoint or Node authority was deleted or manually rewritten. Recovery
+must reconstruct the exact missing frontier from authenticated durable Node
+facts, preserving the existing predecessor check and refusing skipped history.
+Temporary host-debug Pods used for capture were removed automatically. The new
+fallback has local verification but has not yet qualified this transition on
+cl02; publication alone does not repair already-missing controller history.
