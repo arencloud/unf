@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use unf_common::Revision;
+use unf_common::{IdentityId, Revision};
 
 use crate::{
     AttestedEncryptionContractDigest, AttestedEncryptionPathContract, AuthenticatedNodeIdentity,
@@ -222,6 +222,7 @@ pub struct EncryptionGenerationPathProofPermit {
     recipient: EncryptionGenerationRecipient,
     state_digest: EncryptionFastPathDigest,
     receipts: Vec<EncryptionPathActivationReceipt>,
+    plan_identities: Option<Vec<(IdentityId, IdentityId)>>,
     valid_until_unix_ms: u64,
     witness: EncryptionGenerationPathProofWitness,
 }
@@ -1333,7 +1334,33 @@ impl EncryptionGenerationPathProofPermit {
     pub fn issue(
         state: &EncryptionFastPathState,
         recipient: EncryptionGenerationRecipient,
+        receipts: Vec<EncryptionPathActivationReceipt>,
+        now_unix_ms: u64,
+    ) -> Result<Self, EncryptionPathProofError> {
+        Self::issue_with_batch(state, recipient, receipts, None, now_unix_ms)
+    }
+
+    /// Joins direct and replicated decisions through exact admitted plan
+    /// identities. Only compact private bindings survive construction; the
+    /// full assignment batch is consumed and released before map publication.
+    ///
+    /// # Errors
+    /// Rejects foreign generations/rounds and incomplete or divergent coverage.
+    pub fn issue_from_assignment_batch(
+        state: &EncryptionFastPathState,
+        recipient: EncryptionGenerationRecipient,
+        receipts: Vec<EncryptionPathActivationReceipt>,
+        batch: AdmittedEncryptionPathProofAssignmentBatch,
+        now_unix_ms: u64,
+    ) -> Result<Self, EncryptionPathProofError> {
+        Self::issue_with_batch(state, recipient, receipts, Some(batch), now_unix_ms)
+    }
+
+    fn issue_with_batch(
+        state: &EncryptionFastPathState,
+        recipient: EncryptionGenerationRecipient,
         mut receipts: Vec<EncryptionPathActivationReceipt>,
+        batch: Option<AdmittedEncryptionPathProofAssignmentBatch>,
         now_unix_ms: u64,
     ) -> Result<Self, EncryptionPathProofError> {
         state
@@ -1346,8 +1373,21 @@ impl EncryptionGenerationPathProofPermit {
         {
             return Err(EncryptionPathProofError::InvalidGenerationProof);
         }
-        let valid_until_unix_ms =
-            validate_generation_coverage(state, &recipient, &receipts, now_unix_ms)?;
+        let plan_identities = batch
+            .as_ref()
+            .map(|batch| receipt_plan_identities(state, batch, &receipts))
+            .transpose()?;
+        drop(batch);
+        let valid_until_unix_ms = match &plan_identities {
+            Some(identities) => validate_replica_aware_generation_coverage(
+                state,
+                &recipient,
+                &receipts,
+                identities,
+                now_unix_ms,
+            )?,
+            None => validate_generation_coverage(state, &recipient, &receipts, now_unix_ms)?,
+        };
         let witness = generation_path_witness(
             state.state_digest,
             &recipient,
@@ -1358,6 +1398,7 @@ impl EncryptionGenerationPathProofPermit {
             recipient,
             state_digest: state.state_digest,
             receipts,
+            plan_identities,
             valid_until_unix_ms,
             witness,
         })
@@ -1377,8 +1418,16 @@ impl EncryptionGenerationPathProofPermit {
         state
             .verify_integrity()
             .map_err(EncryptionPathProofError::InvalidFastPath)?;
-        let valid_until =
-            validate_generation_coverage(state, recipient, &self.receipts, now_unix_ms)?;
+        let valid_until = match &self.plan_identities {
+            Some(identities) => validate_replica_aware_generation_coverage(
+                state,
+                recipient,
+                &self.receipts,
+                identities,
+                now_unix_ms,
+            )?,
+            None => validate_generation_coverage(state, recipient, &self.receipts, now_unix_ms)?,
+        };
         if &self.recipient != recipient
             || self.state_digest != state.state_digest
             || self.valid_until_unix_ms != valid_until
@@ -1399,6 +1448,29 @@ impl EncryptionGenerationPathProofPermit {
     pub const fn witness(&self) -> EncryptionGenerationPathProofWitness {
         self.witness
     }
+}
+
+/// Coverage-only fixture; endpoint transcript/counter admission is exercised
+/// separately by the ledger and live `WireGuard` tests.
+#[cfg(test)]
+pub(crate) fn test_activation_receipt(
+    round: EncryptionPathProofRound,
+    kernel: [u8; 32],
+) -> EncryptionPathActivationReceipt {
+    let mut receipt = EncryptionPathActivationReceipt {
+        schema_version: ENCRYPTION_PATH_PROOF_SCHEMA_VERSION,
+        source_proof_digest: EncryptionEndpointPathProofDigest([1; 32]),
+        destination_proof_digest: EncryptionEndpointPathProofDigest([2; 32]),
+        source_kernel_configuration_digest: WireGuardKernelConfigurationDigest(kernel),
+        destination_kernel_configuration_digest: WireGuardKernelConfigurationDigest([3; 32]),
+        admitted_at_unix_ms: round.issued_at_unix_ms + 1,
+        valid_until_unix_ms: round.expires_at_unix_ms,
+        activation_digest: EncryptionPathActivationDigest([0; 32]),
+        round,
+    };
+    receipt.activation_digest = receipt.calculate_digest().unwrap();
+    receipt.verify(receipt.admitted_at_unix_ms).unwrap();
+    receipt
 }
 
 /// Checks whether current duplex receipts cover one exact local generation
@@ -1429,6 +1501,156 @@ pub fn validate_encryption_generation_path_receipts(
         return Err(EncryptionPathProofError::InvalidGenerationProof);
     }
     validate_generation_coverage(state, recipient, receipts, now_unix_ms).map(|_| ())
+}
+
+/// Validates complete direct/replica coverage without issuing a map capability.
+///
+/// # Errors
+/// Rejects unbound rounds, foreign generations and any incomplete, extra,
+/// expired or kernel-divergent plan evidence.
+pub fn validate_encryption_generation_path_receipts_from_assignment_batch(
+    state: &EncryptionFastPathState,
+    recipient: &EncryptionGenerationRecipient,
+    receipts: &[EncryptionPathActivationReceipt],
+    batch: &AdmittedEncryptionPathProofAssignmentBatch,
+    now_unix_ms: u64,
+) -> Result<(), EncryptionPathProofError> {
+    state
+        .verify_integrity()
+        .map_err(EncryptionPathProofError::InvalidFastPath)?;
+    let identities = receipt_plan_identities(state, batch, receipts)?;
+    validate_replica_aware_generation_coverage(state, recipient, receipts, &identities, now_unix_ms)
+        .map(|_| ())
+}
+
+fn receipt_plan_identities(
+    state: &EncryptionFastPathState,
+    batch: &AdmittedEncryptionPathProofAssignmentBatch,
+    receipts: &[EncryptionPathActivationReceipt],
+) -> Result<Vec<(IdentityId, IdentityId)>, EncryptionPathProofError> {
+    if batch.batch.generation != Revision::new(state.config.generation) {
+        return Err(EncryptionPathProofError::InvalidGenerationProof);
+    }
+    let assignments = batch
+        .assignments()
+        .iter()
+        .map(|assignment| (assignment.round.round_digest, assignment))
+        .collect::<BTreeMap<_, _>>();
+    if assignments.len() != batch.assignments().len() {
+        return Err(EncryptionPathProofError::InvalidGenerationProof);
+    }
+    receipts
+        .iter()
+        .map(|receipt| {
+            let assignment = assignments
+                .get(&receipt.round.round_digest)
+                .ok_or(EncryptionPathProofError::InvalidGenerationProof)?;
+            if assignment.round != receipt.round {
+                return Err(EncryptionPathProofError::InvalidGenerationProof);
+            }
+            let plan = batch
+                .contract_for(assignment)?
+                .plans
+                .get(assignment.plan_index)
+                .ok_or(EncryptionPathProofError::InvalidGenerationProof)?;
+            Ok((plan.source.identity, plan.destination.identity))
+        })
+        .collect()
+}
+
+fn validate_replica_aware_generation_coverage(
+    state: &EncryptionFastPathState,
+    recipient: &EncryptionGenerationRecipient,
+    receipts: &[EncryptionPathActivationReceipt],
+    identities: &[(IdentityId, IdentityId)],
+    now_unix_ms: u64,
+) -> Result<u64, EncryptionPathProofError> {
+    if receipts.len() != identities.len() {
+        return Err(EncryptionPathProofError::InvalidGenerationProof);
+    }
+    let mut groups = BTreeMap::<_, Vec<_>>::new();
+    let mut unique = BTreeSet::new();
+    let mut valid_until = u64::MAX;
+    for (receipt, identity) in receipts.iter().zip(identities) {
+        receipt
+            .verify(now_unix_ms)
+            .map_err(|_| EncryptionPathProofError::InvalidGenerationProof)?;
+        if receipt.round.source != *recipient || !unique.insert(receipt.activation_digest.0) {
+            return Err(EncryptionPathProofError::InvalidGenerationProof);
+        }
+        groups.entry(*identity).or_default().push(receipt);
+        valid_until = valid_until.min(receipt.valid_until_unix_ms);
+    }
+    let transports = state
+        .transport_authority
+        .iter()
+        .map(|transport| (transport.transport_id, transport))
+        .collect::<BTreeMap<_, _>>();
+    let replica_transports = state
+        .transport_authority
+        .iter()
+        .map(|transport| {
+            (
+                transport.destination_node_uid.as_str(),
+                transport.key_epoch,
+                transport.kernel_configuration_digest,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    for decision in state
+        .decision_authority
+        .iter()
+        .filter(|decision| decision.disposition == EncryptionDisposition::Required)
+    {
+        let group = groups
+            .remove(&(decision.source_identity, decision.destination_identity))
+            .ok_or(EncryptionPathProofError::InvalidGenerationProof)?;
+        let mut witnesses = Vec::with_capacity(group.len());
+        for receipt in &group {
+            if Some(receipt.round.contract_revision) != decision.contract_revision
+                || Some(receipt.round.epoch) != decision.key_epoch
+            {
+                return Err(EncryptionPathProofError::InvalidGenerationProof);
+            }
+            let transport_matches = match decision.transport_id {
+                Some(id) => transports.get(&id).is_some_and(|transport| {
+                    transport.destination_node_uid == receipt.round.destination.node_uid
+                        && transport.key_epoch == receipt.round.epoch
+                        && transport.kernel_configuration_digest
+                            == receipt.source_kernel_configuration_digest.0
+                }),
+                None => replica_transports.contains(&(
+                    receipt.round.destination.node_uid.as_str(),
+                    receipt.round.epoch,
+                    receipt.source_kernel_configuration_digest.0,
+                )),
+            };
+            if !transport_matches {
+                return Err(EncryptionPathProofError::InvalidGenerationProof);
+            }
+            witnesses.push(receipt.round.decision_witness.0);
+        }
+        witnesses.sort_unstable();
+        let matches = if decision.transport_id.is_some() {
+            witnesses.len() == 1 && witnesses[0] == decision.decision_witness
+        } else {
+            witnesses.len() > 1
+                && !witnesses.windows(2).any(|pair| pair[0] == pair[1])
+                && crate::fast_path::aggregate_decision_witness(
+                    Revision::new(state.config.generation),
+                    decision.source_identity,
+                    decision.destination_identity,
+                    &witnesses,
+                ) == decision.decision_witness
+        };
+        if !matches {
+            return Err(EncryptionPathProofError::InvalidGenerationProof);
+        }
+    }
+    if !groups.is_empty() || now_unix_ms >= valid_until {
+        return Err(EncryptionPathProofError::InvalidGenerationProof);
+    }
+    Ok(valid_until)
 }
 
 fn validate_generation_coverage(

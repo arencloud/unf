@@ -559,7 +559,12 @@ fn compile_replicated_decision<'a>(
         transport_id: None,
         contract_revision: Some(contract_revision),
         key_epoch: Some(key_epoch),
-        decision_witness: aggregate_decision_witness(context, source, destination, &plan_witnesses),
+        decision_witness: aggregate_decision_witness(
+            context.generation,
+            source,
+            destination,
+            &plan_witnesses,
+        ),
     })
 }
 
@@ -1144,15 +1149,15 @@ fn path_binding_witness(
     Ok(witness)
 }
 
-fn aggregate_decision_witness(
-    context: FastPathCompileContext,
+pub(crate) fn aggregate_decision_witness(
+    generation: Revision,
     source: IdentityId,
     destination: IdentityId,
     plan_witnesses: &[[u8; 16]],
 ) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(b"unf.encryption-replica-decision.v1\0");
-    hasher.update(context.generation.get().to_be_bytes());
+    hasher.update(generation.get().to_be_bytes());
     hasher.update(source.get().to_be_bytes());
     hasher.update(destination.get().to_be_bytes());
     for witness in plan_witnesses {
@@ -1959,6 +1964,217 @@ mod tests {
             mutated.verify_integrity(),
             Err(FastPathError::IntegrityMismatch)
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn replicated_identity_requires_each_exact_assignment_receipt() {
+        use crate::{
+            EncryptionGenerationPathProofPermit, EncryptionPathProofAssignmentBatch,
+            EncryptionPathProofAssignmentIndex, EncryptionPathProofRound,
+        };
+        let fixture = fixture_with_replica(7, true);
+        let epoch = FastPathEpochAdmission {
+            contract: &fixture.contract,
+            transaction: &fixture.transaction,
+            readback: &fixture.snapshot,
+            readiness_digest: [7; 32],
+            state: FastPathEpochState::Active,
+            drain_until_monotonic_ns: 0,
+        };
+        let inputs = fixture
+            .contract
+            .plans
+            .iter()
+            .enumerate()
+            .filter(|(_, plan)| {
+                plan.source.identity == IdentityId::new(11)
+                    && plan.destination.identity == IdentityId::new(21)
+            })
+            .map(|(plan_index, _)| FastPathDecisionInput {
+                source_identity: IdentityId::new(11),
+                destination_identity: IdentityId::new(21),
+                disposition: EncryptionDisposition::Required,
+                contract_epoch: Some(7),
+                plan_index: Some(plan_index),
+            })
+            .collect::<Vec<_>>();
+        let state = compile_encryption_fast_path(context_at(1, 1), &[epoch], &inputs).unwrap();
+        let assignments = inputs
+            .iter()
+            .map(|input| {
+                let plan_index = input.plan_index.unwrap();
+                EncryptionPathProofAssignmentIndex {
+                    schema_version: crate::ENCRYPTION_PATH_PROOF_SCHEMA_VERSION,
+                    generation: Revision::new(1),
+                    round: EncryptionPathProofRound::issue(
+                        &fixture.contract,
+                        plan_index,
+                        [7; 32],
+                        1_000,
+                        2_000,
+                    )
+                    .unwrap(),
+                    contract_digest: fixture.contract.contract_digest,
+                    plan_index,
+                }
+            })
+            .collect::<Vec<_>>();
+        let recipient = assignments[0].round.source.clone();
+        let batch = EncryptionPathProofAssignmentBatch {
+            schema_version: crate::ENCRYPTION_PATH_PROOF_ASSIGNMENT_BATCH_SCHEMA_VERSION,
+            generation: Revision::new(1),
+            contracts: vec![fixture.contract.clone()],
+            assignments,
+        };
+        let kernel = state.transport_authority[0].kernel_configuration_digest;
+        let receipts = batch
+            .assignments
+            .iter()
+            .map(|assignment| {
+                crate::path_proof::test_activation_receipt(assignment.round.clone(), kernel)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(state.decision_authority.len(), 1);
+        assert!(state.decision_authority[0].transport_id.is_none());
+        assert!(
+            EncryptionGenerationPathProofPermit::issue(
+                &state,
+                recipient.clone(),
+                receipts.clone(),
+                1_500
+            )
+            .is_err()
+        );
+        let permit = EncryptionGenerationPathProofPermit::issue_from_assignment_batch(
+            &state,
+            recipient.clone(),
+            receipts.clone(),
+            batch.clone().admit().unwrap(),
+            1_500,
+        )
+        .unwrap();
+        permit.verify_for(&state, &recipient, 1_999).unwrap();
+        assert!(permit.verify_for(&state, &recipient, 2_000).is_err());
+        let direct_state = compile_encryption_fast_path(
+            context_at(1, 1),
+            &[FastPathEpochAdmission {
+                contract: &fixture.contract,
+                transaction: &fixture.transaction,
+                readback: &fixture.snapshot,
+                readiness_digest: [7; 32],
+                state: FastPathEpochState::Active,
+                drain_until_monotonic_ns: 0,
+            }],
+            &inputs[..1],
+        )
+        .unwrap();
+        let direct_receipts = vec![receipts[0].clone()];
+        let legacy = EncryptionGenerationPathProofPermit::issue(
+            &direct_state,
+            recipient.clone(),
+            direct_receipts.clone(),
+            1_500,
+        )
+        .unwrap();
+        let indexed = EncryptionGenerationPathProofPermit::issue_from_assignment_batch(
+            &direct_state,
+            recipient.clone(),
+            direct_receipts,
+            batch.clone().admit().unwrap(),
+            1_500,
+        )
+        .unwrap();
+        assert_eq!(legacy.witness(), indexed.witness());
+        let mut reversed = receipts.clone();
+        reversed.reverse();
+        crate::validate_encryption_generation_path_receipts_from_assignment_batch(
+            &state,
+            &recipient,
+            &reversed,
+            &batch.clone().admit().unwrap(),
+            1_500,
+        )
+        .unwrap();
+        let reject = |receipts, batch: EncryptionPathProofAssignmentBatch| {
+            assert!(
+                EncryptionGenerationPathProofPermit::issue_from_assignment_batch(
+                    &state,
+                    recipient.clone(),
+                    receipts,
+                    batch.admit().unwrap(),
+                    1_500,
+                )
+                .is_err()
+            );
+        };
+        reject(receipts[..1].to_vec(), batch.clone());
+        let mut duplicate = receipts.clone();
+        duplicate.push(receipts[0].clone());
+        reject(duplicate, batch.clone());
+        let mut wrong_kernel = receipts.clone();
+        wrong_kernel[0] = crate::path_proof::test_activation_receipt(
+            batch.assignments[0].round.clone(),
+            [99; 32],
+        );
+        reject(wrong_kernel, batch.clone());
+        let extra_index = fixture
+            .contract
+            .plans
+            .iter()
+            .position(|plan| {
+                plan.source.identity == IdentityId::new(11)
+                    && plan.destination.identity == IdentityId::new(22)
+            })
+            .unwrap();
+        let mut extra_assignment = batch.assignments[0].clone();
+        extra_assignment.plan_index = extra_index;
+        extra_assignment.round =
+            EncryptionPathProofRound::issue(&fixture.contract, extra_index, [66; 32], 1_000, 2_000)
+                .unwrap();
+        let mut extra_receipts = receipts.clone();
+        extra_receipts.push(crate::path_proof::test_activation_receipt(
+            extra_assignment.round.clone(),
+            kernel,
+        ));
+        let mut extra_batch = batch.clone();
+        extra_batch.assignments.push(extra_assignment);
+        reject(extra_receipts, extra_batch);
+        let mut foreign_generation = batch.clone();
+        foreign_generation.generation = Revision::new(2);
+        for assignment in &mut foreign_generation.assignments {
+            assignment.generation = Revision::new(2);
+        }
+        reject(receipts.clone(), foreign_generation);
+        let mut repeated_plan = batch.clone();
+        let mut repeated = repeated_plan.assignments[0].clone();
+        repeated.round = EncryptionPathProofRound::issue(
+            &fixture.contract,
+            repeated.plan_index,
+            [33; 32],
+            1_000,
+            2_000,
+        )
+        .unwrap();
+        repeated_plan.assignments.push(repeated);
+        assert!(repeated_plan.admit().is_err());
+        let mut substituted_round = receipts.clone();
+        substituted_round[0] = crate::path_proof::test_activation_receipt(
+            EncryptionPathProofRound::issue(
+                &fixture.contract,
+                batch.assignments[0].plan_index,
+                [44; 32],
+                1_000,
+                2_000,
+            )
+            .unwrap(),
+            kernel,
+        );
+        reject(substituted_round, batch.clone());
+        let mut foreign = recipient.clone();
+        foreign.node_uid.push_str("-foreign");
+        assert!(permit.verify_for(&state, &foreign, 1_500).is_err());
     }
 
     #[test]

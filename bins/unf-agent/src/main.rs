@@ -10649,13 +10649,62 @@ const fn encryption_startup_attachment_ready(
     has_active_generation || (!must_establish_initial_generation && !requires_local_revalidation)
 }
 
+struct LiveEncryptionPathReceipts {
+    receipts: Vec<EncryptionPathActivationReceipt>,
+    assignments: Option<AdmittedEncryptionPathProofAssignmentBatch>,
+}
+
+impl LiveEncryptionPathReceipts {
+    fn verify(
+        &self,
+        state: &unf_encryption::EncryptionFastPathState,
+        recipient: &unf_encryption::EncryptionGenerationRecipient,
+        now: u64,
+    ) -> Result<(), unf_encryption::EncryptionPathProofError> {
+        match &self.assignments {
+            Some(batch) => {
+                unf_encryption::validate_encryption_generation_path_receipts_from_assignment_batch(
+                    state,
+                    recipient,
+                    &self.receipts,
+                    batch,
+                    now,
+                )
+            }
+            None => {
+                validate_encryption_generation_path_receipts(state, recipient, &self.receipts, now)
+            }
+        }
+    }
+
+    fn into_permit(
+        self,
+        state: &unf_encryption::EncryptionFastPathState,
+        recipient: unf_encryption::EncryptionGenerationRecipient,
+        now: u64,
+    ) -> Result<EncryptionGenerationPathProofPermit, unf_encryption::EncryptionPathProofError> {
+        match self.assignments {
+            Some(batch) => EncryptionGenerationPathProofPermit::issue_from_assignment_batch(
+                state,
+                recipient,
+                self.receipts,
+                batch,
+                now,
+            ),
+            None => {
+                EncryptionGenerationPathProofPermit::issue(state, recipient, self.receipts, now)
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn collect_live_encryption_path_receipts(
     generations: &mut EncryptionGenerationSynchronizer,
     recipient: &unf_encryption::EncryptionGenerationRecipient,
     desired: &unf_encryption::EncryptionFastPathState,
     plans: &[unf_encryption::WireGuardKernelPlan],
-) -> Result<Vec<EncryptionPathActivationReceipt>> {
+) -> Result<LiveEncryptionPathReceipts> {
     if !generation_requires_live_encryption_path_receipts(desired) {
         desired
             .verify_integrity()
@@ -10664,7 +10713,10 @@ async fn collect_live_encryption_path_receipts(
             bail!("Native-only encryption generation retained unexpected kernel plans");
         }
         generations.path_proofs.clear();
-        return Ok(Vec::new());
+        return Ok(LiveEncryptionPathReceipts {
+            receipts: Vec::new(),
+            assignments: None,
+        });
     }
     let controller_url = generations
         .controller_url
@@ -10769,12 +10821,16 @@ async fn collect_live_encryption_path_receipts(
     .send()
     .await
     .context("request current duplex encryption path receipts")?;
-    response
+    let receipts = response
         .error_for_status()
         .context("controller rejected encryption path receipt request")?
         .json()
         .await
-        .context("decode encryption path receipts")
+        .context("decode encryption path receipts")?;
+    Ok(LiveEncryptionPathReceipts {
+        receipts,
+        assignments: Some(assignment_batch),
+    })
 }
 
 fn generation_requires_live_encryption_path_receipts(
@@ -10845,14 +10901,7 @@ async fn assist_active_encryption_path_proofs(
         .context("participate in current active-generation path proof rounds")?;
     if request.report_required {
         let now_unix_ms = current_unix_time_milliseconds();
-        if validate_encryption_generation_path_receipts(
-            &desired,
-            &recipient,
-            &receipts,
-            now_unix_ms,
-        )
-        .is_err()
-        {
+        if receipts.verify(&desired, &recipient, now_unix_ms).is_err() {
             return Ok(true);
         }
         let report = EncryptionActivationReport::issue(
@@ -10860,7 +10909,7 @@ async fn assist_active_encryption_path_proofs(
             request.generation,
             request.state_digest,
             now_unix_ms,
-            &receipts,
+            &receipts.receipts,
         )
         .context("seal active-generation recovery testimony")?;
         publish_encryption_activation_report(generations, &report)
@@ -10897,12 +10946,12 @@ async fn activate_admitted_encryption_generation(
         Revision::new(desired.config.generation),
         desired.state_digest,
         now_unix_ms,
-        &receipts,
+        &receipts.receipts,
     )
     .context("seal retry-stable encryption activation observation")?;
-    let path_permit =
-        EncryptionGenerationPathProofPermit::issue(&desired, recipient, receipts, now_unix_ms)
-            .context("join complete live path receipts to the desired generation")?;
+    let path_permit = receipts
+        .into_permit(&desired, recipient, now_unix_ms)
+        .context("join complete live path receipts to the desired generation")?;
     let Some((prepared, admitted, route_permit, slot)) = generations.take_admitted_capability()
     else {
         bail!("admitted encryption capability changed during path-proof exchange");
@@ -20136,10 +20185,8 @@ mod tests {
             collect_live_encryption_path_receipts(&mut generations, &recipient, &state, &[])
                 .await
                 .unwrap();
-        assert!(receipts.is_empty());
-        let permit =
-            EncryptionGenerationPathProofPermit::issue(&state, recipient.clone(), receipts, 1)
-                .unwrap();
+        assert!(receipts.receipts.is_empty());
+        let permit = receipts.into_permit(&state, recipient.clone(), 1).unwrap();
         permit.verify_for(&state, &recipient, 1).unwrap();
     }
 
