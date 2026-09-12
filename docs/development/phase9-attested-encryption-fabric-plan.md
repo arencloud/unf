@@ -178,8 +178,8 @@ require independent architecture and gates.
 Following the user's 2026-09-12 instruction, platform verification now runs on
 cl02 first, then fresh Kind. Local checks precede image publication. A candidate
 release record declares `qualificationOrder: openshift-first` and Kind `pending`
-with no invented hashes or platform observations. Deploy the immutable ADR 0268
-successor to cl02 preserving Node-local authority and run the full gate, then
+with no invented hashes or platform observations. Deploy ADR 0273's immutable
+`c02e060` successor to cl02 preserving Node-local authority and run the full gate, then
 qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as
 preserving RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct
