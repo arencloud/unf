@@ -126,6 +126,7 @@ for node in "${nodes[@]}"; do
         services=${state_dir}/service-snapshot.json
         selection=${services}.selection
         load_balancers=${state_dir}/load-balancer-reachability.json
+        load_balancers_pending=${load_balancers}.pending
         marker=${state_dir}/install.env
         binary=/opt/cni/bin/unf
         config=/etc/cni/net.d/10-unf.conflist
@@ -442,6 +443,10 @@ EOF
                 validate_load_balancer_snapshot "$load_balancers"
                 rm -f "$load_balancers"
             fi
+            if [ -e "$load_balancers_pending" ]; then
+                validate_load_balancer_snapshot "$load_balancers_pending"
+                rm -f "$load_balancers_pending"
+            fi
             cleanup_pending_deletes
             cleanup_durable_temporaries
             cleanup_encryption_kernel_state
@@ -508,13 +513,17 @@ EOF
         if [ -e "$load_balancers" ]; then
             validate_load_balancer_snapshot "$load_balancers"
         fi
+        if [ -e "$load_balancers_pending" ]; then
+            validate_load_balancer_snapshot "$load_balancers_pending"
+        fi
 
         cleanup_durable_temporaries
 
         rm -f "$binary" "$config"
         rm -f "${state_dir}/attachments.json" "${state_dir}/node-block.json" \
             "$routes" "$services" "${services}.pending" "$selection" \
-            "${selection}.pending" "$load_balancers" "$marker"
+            "${selection}.pending" "$load_balancers" \
+            "$load_balancers_pending" "$marker"
         cleanup_pending_deletes
         cleanup_encryption_state
         rmdir "$state_dir"

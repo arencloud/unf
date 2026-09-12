@@ -1274,6 +1274,14 @@ KiB RSS as a direct debug test; OpenShift also contains regressions within a
 2-GiB controller cgroup instead of pressuring a Node. Policy decisions remain
 byte-for-byte equivalent to the full evaluator; ADR 0255. Fresh immutable Kind
 and preserved-state cl02 qualification remain required.
+That first complete Kind run passed the runtime, ciphertext, fault, rotation,
+replacement, and egress-coexistence stages, then correctly refused no-CNI
+rollback because a replaced agent retained its ordinary
+`load-balancer-reachability.json.pending` checkpoint. LoadBalancer
+Pending-Checkpoint Cleanup Closure validates that exact Node-owned prepared
+payload with the same strict committed-checkpoint contract before removing it;
+unknown state remains a hard failure. Runtime and BPF behavior are unchanged;
+ADR 0256. A clean full Kind rerun remains mandatory.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

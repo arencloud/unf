@@ -1222,7 +1222,12 @@ matrix is maintained in the
   complete pair work. The observed five-Node 116-workload/133-policy regression
   completes in 0.47 seconds with 26,252 KiB direct-test RSS, while a 2-GiB
   controller cgroup contains future regressions. Fresh immutable Kind and the
-  complete cl02 gate remain mandatory.
+  complete cl02 gate remain mandatory. The first full rerun passed through
+  Phase 8 egress coexistence and then refused final rollback on a replaced
+  agent's valid ordinary LoadBalancer `.pending` checkpoint. ADR 0256 closes
+  cleanup over that one producer-owned name only after the same strict
+  committed-checkpoint validation; arbitrary residue still fails. A completely
+  fresh full Kind run remains mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

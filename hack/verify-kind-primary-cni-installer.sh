@@ -31,6 +31,10 @@ grep -q '.service-snapshot.json.pending.tmp' \
     "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q '.load-balancer-reachability.json.pending.tmp' \
     "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'load_balancers_pending=${load_balancers}.pending' \
+    "${project_root}/hack/rollback-kind-primary-cni.sh"
+grep -q 'validate_load_balancer_snapshot "$load_balancers_pending"' \
+    "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q '.authority.json.tmp' "${project_root}/hack/rollback-kind-primary-cni.sh"
 grep -q 'encryption-generation.json.recovery-plan' \
     "${project_root}/hack/rollback-kind-primary-cni.sh"

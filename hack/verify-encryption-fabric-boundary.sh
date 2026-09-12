@@ -68,6 +68,9 @@ require_text docs/adr/0254-live-set-immutable-runtime-census.md \
 require_text docs/adr/0255-work-capped-zero-allocation-enforcement-fold.md \
     'Work-Capped Zero-Allocation Enforcement Fold' \
     "exact high-cardinality policy evaluation must remain allocation-free and bounded"
+require_text docs/adr/0256-loadbalancer-pending-checkpoint-cleanup-closure.md \
+    'LoadBalancer Pending-Checkpoint Cleanup Closure' \
+    "the full Kind lifecycle must close a validated prepared LoadBalancer checkpoint"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"
