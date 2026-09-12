@@ -93,15 +93,11 @@ if [[ -n $(git -C "${project_root}" status --porcelain) ]]; then
     echo "qualification requires a clean committed worktree" >&2
     exit 1
 fi
-if ! jq -e '
+if ! jq -L "${project_root}/hack" -e '
+    include "phase9-qualification";
     .schemaVersion == 1 and .phase == "9.9"
     and (.sourceRevision | test("^[0-9a-f]{40}$"))
-    and .kindQualification.schemaVersion == 1 and .kindQualification.milestone == "9.8"
-    and .kindQualification.runtimeRevision == .sourceRevision
-    and (.kindQualification.qualificationRevision | test("^[0-9a-f]{40}$"))
-    and (.kindQualification.evidenceSha256 | test("^[0-9a-f]{64}$"))
-    and (.kindQualification.captureSha256 | test("^[0-9a-f]{64}$"))
-    and .kindQualification.result == "passed" and .kindQualification.kubeProxyPresent == false
+    and phase9_kind_qualification_valid
     and .contracts.persistentBpfStateAbiVersion == 15
     and .contracts.encryptionModelSchemaVersion == 1
     and .contracts.encryptionPlanSchemaVersion == 2
@@ -810,7 +806,7 @@ jq -n \
       cleanup:"passed",initialAgents:$initialAgents,finalAgents:$finalAgents,
       baselineUnhealthyOperators:$baselineUnhealthy,finalUnhealthyOperators:$finalUnhealthy,
       newlyUnhealthyOperators:$newUnhealthy,
-      verified:["exact Kind-qualified public image digests","five-node dual-stack UNF primary CNI",
+      verified:["exact public image digests","five-node dual-stack UNF primary CNI",
         "OpenShift RHCOS, enforcing SELinux, and CRI-O","kube-proxy absence",
         "explicitly acknowledged Native-to-Required migration","cross-worker IPv4 and IPv6 PodIP and ClusterIP",
         "WireGuard-positive Required-plaintext-negative underlay capture",

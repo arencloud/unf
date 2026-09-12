@@ -1364,6 +1364,10 @@ uses only admitted selections with logarithmic lookup, and legacy expanded
 responses fail before allocation above 8 MiB. ADR 0268 records this correction.
 A fresh Kind lifecycle, immutable successor images, exact cl02 redeployment,
 and the complete platform gate remain.
+The current execution order is local checks, immutable image publication,
+cl02 qualification, then fresh Kind qualification. Both platforms must pass
+before Phase 9 closes. Subsequent resource and heavy-load work is tracked in
+the [stabilization and scale plan](docs/development/stabilization-and-scale-plan.md).
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

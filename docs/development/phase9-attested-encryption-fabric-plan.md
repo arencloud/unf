@@ -175,12 +175,18 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Validate ADR 0268's Contract-Deduplicated Causal Assignment Batch with the full
-workspace boundary, run a completely fresh Kind lifecycle, and publish only its
-exact digest-pinned successor. Deploy it to cl02 without deleting preserved
-Node-local authority and rerun the complete bounded platform gate. The gate
+Following the user's 2026-09-12 instruction, platform verification now runs on
+cl02 first, then fresh Kind. Local checks precede image publication. A candidate
+release record declares `qualificationOrder: openshift-first` and Kind `pending`
+with no invented hashes or platform observations. Deploy the immutable ADR 0268
+successor to cl02 preserving Node-local authority and run the full gate, then
+qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as
 preserving RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct
 and Service traffic, selective fail-closed behavior, rotation/recovery, exact
 cleanup, agent convergence, kube-proxy absence, and the before/after
 ClusterOperator state.
+
+After Phase 9 closes, follow the committed
+[stabilization and scale plan](stabilization-and-scale-plan.md), with a separate
+commit and evidence record for every step.

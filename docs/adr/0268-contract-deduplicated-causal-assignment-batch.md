@@ -90,3 +90,11 @@ lookups or beacon derivation. Admitted lookups reject generation substitution.
 The user changed platform order to cl02 first, then fresh Kind. Both results
 remain required. Post-phase work is tracked in the
 [stabilization plan](../development/stabilization-and-scale-plan.md).
+
+The release validator explicitly accepts pending Kind evidence only when the
+record declares `qualificationOrder: openshift-first`, the runtime revision
+matches, and all observation/hash fields are absent or null. Passed evidence
+still requires both hashes, a qualifier revision and kube-proxy absence. The
+platform report claims immutable image verification without claiming prior
+Kind qualification. The qualification-order regression covers both valid
+orders and rejects incomplete or fabricated evidence.

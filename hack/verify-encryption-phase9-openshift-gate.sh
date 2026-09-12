@@ -9,13 +9,12 @@ rendered=$(mktemp)
 trap 'rm -f "${rendered}"' EXIT
 
 bash -n "${gate}"
+bash "${root}/hack/verify-phase9-qualification-order.sh"
 oc kustomize "${overlay}" >"${rendered}"
-jq -e '
+jq -L "${root}/hack" -e '
+  include "phase9-qualification";
   .schemaVersion == 1 and .phase == "9.9"
-  and .kindQualification.milestone == "9.8"
-  and .kindQualification.runtimeRevision == .sourceRevision
-  and .kindQualification.result == "passed"
-  and .kindQualification.kubeProxyPresent == false
+  and phase9_kind_qualification_valid
   and .contracts.encryptionMapAbiVersion == 2
   and all(.images[]; test("@sha256:[0-9a-f]{64}$"))
 ' "${release}" >/dev/null

@@ -36,7 +36,8 @@ if [[ ! -s ${kubeconfig} || $(stat -c '%a' "${kubeconfig}") != 600 ]]; then
     echo "deployment requires a non-empty mode-0600 kubeconfig: ${kubeconfig}" >&2
     exit 1
 fi
-if [[ ! -s ${release_record} ]] || ! jq -e '
+if [[ ! -s ${release_record} ]] || ! jq -L "${project_root}/hack" -e '
+    include "phase9-qualification";
     .schemaVersion == 1
     and (.phase == "5.8" or .phase == "6.9" or .phase == "7.10" or .phase == "8.11" or .phase == "9.9")
     and (.sourceRevision | test("^[0-9a-f]{40}$"))
@@ -91,13 +92,7 @@ if [[ ! -s ${release_record} ]] || ! jq -e '
           and .contracts.agentStatusSchemaVersion == 8
           and .contracts.flowExportSchemaVersion == 7)
       or (.phase == "9.9"
-          and .kindQualification.schemaVersion == 1
-          and .kindQualification.milestone == "9.8"
-          and .kindQualification.runtimeRevision == .sourceRevision
-          and (.kindQualification.qualificationRevision | test("^[0-9a-f]{40}$"))
-          and (.kindQualification.evidenceSha256 | test("^[0-9a-f]{64}$"))
-          and (.kindQualification.captureSha256 | test("^[0-9a-f]{64}$"))
-          and .kindQualification.kubeProxyPresent == false
+          and phase9_kind_qualification_valid
           and (.contracts | type == "object")
           and .contracts.compatibilitySchemaVersion == 2
           and .contracts.persistentBpfStateAbiVersion == 15
@@ -117,7 +112,7 @@ if [[ ! -s ${release_record} ]] || ! jq -e '
           and .contracts.encryptionMapAbiVersion == 2
           and .contracts.agentStatusSchemaVersion == 8
           and .contracts.flowExportSchemaVersion == 7))
-    and .kindQualification.result == "passed"
+    and (.phase == "9.9" or .kindQualification.result == "passed")
     and all(.images[]; test("^quay\\.io/arencloud/unf-[a-z-]+-dev@sha256:[0-9a-f]{64}$"))
 ' "${release_record}" >/dev/null; then
     echo "release record is missing or invalid: ${release_record}" >&2
