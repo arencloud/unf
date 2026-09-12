@@ -222,6 +222,22 @@ const FLOW_HISTORY_DURABLE_ENTRY_LIMIT: usize = 1_024;
 const FLOW_HISTORY_CONFIG_MAP_DATA_LIMIT: usize = 900_000;
 const FLOW_HISTORY_PERSISTENCE_INTERVAL: Duration = Duration::from_secs(2);
 const FLOW_HISTORY_MAX_FUTURE_SKEW_MILLIS: u64 = 60_000;
+const INITIAL_WATCH_PODS: u64 = 1 << 0;
+const INITIAL_WATCH_NAMESPACES: u64 = 1 << 1;
+const INITIAL_WATCH_NODES: u64 = 1 << 2;
+const INITIAL_WATCH_SERVICES: u64 = 1 << 3;
+const INITIAL_WATCH_ENDPOINT_SLICES: u64 = 1 << 4;
+const INITIAL_WATCH_SECURITY_POLICIES: u64 = 1 << 5;
+const INITIAL_WATCH_NETWORK_POLICIES: u64 = 1 << 6;
+const INITIAL_WATCH_ENCRYPTION_POLICIES: u64 = 1 << 7;
+const INITIAL_AGENT_AUTHORITY_WATCHES: u64 = INITIAL_WATCH_PODS
+    | INITIAL_WATCH_NAMESPACES
+    | INITIAL_WATCH_NODES
+    | INITIAL_WATCH_SERVICES
+    | INITIAL_WATCH_ENDPOINT_SLICES
+    | INITIAL_WATCH_SECURITY_POLICIES
+    | INITIAL_WATCH_NETWORK_POLICIES
+    | INITIAL_WATCH_ENCRYPTION_POLICIES;
 const TOPOLOGY_HISTORY_STORE_NAME: &str = "unf-topology-history";
 const TOPOLOGY_HISTORY_STORE_KEY: &str = "history.json";
 const TOPOLOGY_HISTORY_CONFIG_MAP_DATA_LIMIT: usize = 900_000;
@@ -489,6 +505,7 @@ struct DurableEncryptionGenerationDescriptor {
 
 struct ControllerState {
     ready: AtomicBool,
+    initial_agent_authority_watches: AtomicU64,
     identity_epoch: u64,
     offline: bool,
     agent_node_selector: Option<String>,
@@ -1485,7 +1502,7 @@ async fn main() -> Result<()> {
             cancellation.clone(),
         );
         spawn_watchers(&mut tasks, client, Arc::clone(&state), cancellation.clone());
-        state.ready.store(true, Ordering::Release);
+        publish_controller_readiness(&state);
     }
 
     let public_app = Router::new()
@@ -2087,6 +2104,11 @@ fn new_state_with_client_and_selector(
         .map(Api::<ApiEgressReachabilityPlan>::all);
     ControllerState {
         ready: AtomicBool::new(offline),
+        initial_agent_authority_watches: AtomicU64::new(if offline {
+            0
+        } else {
+            INITIAL_AGENT_AUTHORITY_WATCHES
+        }),
         identity_epoch: controller_epoch(),
         offline,
         agent_node_selector,
@@ -4499,6 +4521,7 @@ fn apply_pod_event(state: &ControllerState, event: Event<Pod>) {
         }
         Event::Delete(pod) => remove_pod(state, &object_key(&pod)),
         Event::Init => {
+            begin_initial_agent_authority_watch(state, INITIAL_WATCH_PODS);
             begin_topology_initialization(state);
             let had_pods = !read_lock(&state.pods).is_empty();
             write_lock(&state.pods).clear();
@@ -4508,7 +4531,10 @@ fn apply_pod_event(state: &ControllerState, event: Event<Pod>) {
                 bump_topology_revision(state);
             }
         }
-        Event::InitDone => finish_topology_initialization(state),
+        Event::InitDone => {
+            finish_topology_initialization(state);
+            finish_initial_agent_authority_watch(state, INITIAL_WATCH_PODS);
+        }
     }
 }
 
@@ -4757,13 +4783,16 @@ fn apply_namespace_event(state: &ControllerState, event: Event<Namespace>) {
             }
         }
         Event::Init => {
+            begin_initial_agent_authority_watch(state, INITIAL_WATCH_NAMESPACES);
             let had_namespaces = !read_lock(&state.namespaces).is_empty();
             write_lock(&state.namespaces).clear();
             if had_namespaces {
                 bump_policy_revision(state);
             }
         }
-        Event::InitDone => {}
+        Event::InitDone => {
+            finish_initial_agent_authority_watch(state, INITIAL_WATCH_NAMESPACES);
+        }
     }
 }
 
@@ -6341,6 +6370,7 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
             }
         }
         Event::Init => {
+            begin_initial_agent_authority_watch(state, INITIAL_WATCH_NODES);
             begin_topology_initialization(state);
             *mutex_lock(&state.node_port_node_initialization) = Some(BTreeSet::new());
             *mutex_lock(&state.node_block_initialization) = Some(BTreeMap::new());
@@ -6388,6 +6418,7 @@ fn apply_node_event(state: &ControllerState, event: Event<Node>) {
                 state.metrics.errors.inc();
                 warn!(%error, "Node relist HA drain trigger rejected; retaining durable ownership");
             }
+            finish_initial_agent_authority_watch(state, INITIAL_WATCH_NODES);
         }
     }
 }
@@ -6862,6 +6893,7 @@ fn apply_service_event(state: &ControllerState, event: Event<Service>) {
             }
         }
         Event::Init => {
+            begin_initial_agent_authority_watch(state, INITIAL_WATCH_SERVICES);
             begin_topology_initialization(state);
             let had_services = !read_lock(&state.services).is_empty();
             write_lock(&state.services).clear();
@@ -6870,7 +6902,10 @@ fn apply_service_event(state: &ControllerState, event: Event<Service>) {
                 bump_service_and_topology_revision(state);
             }
         }
-        Event::InitDone => finish_topology_initialization(state),
+        Event::InitDone => {
+            finish_topology_initialization(state);
+            finish_initial_agent_authority_watch(state, INITIAL_WATCH_SERVICES);
+        }
     }
 }
 
@@ -7317,6 +7352,7 @@ fn apply_endpoint_slice_event(state: &ControllerState, event: Event<EndpointSlic
             }
         }
         Event::Init => {
+            begin_initial_agent_authority_watch(state, INITIAL_WATCH_ENDPOINT_SLICES);
             begin_topology_initialization(state);
             let had_endpoint_slices = !read_lock(&state.endpoint_slices).is_empty();
             write_lock(&state.endpoint_slices).clear();
@@ -7325,7 +7361,10 @@ fn apply_endpoint_slice_event(state: &ControllerState, event: Event<EndpointSlic
                 bump_service_and_topology_revision(state);
             }
         }
-        Event::InitDone => finish_topology_initialization(state),
+        Event::InitDone => {
+            finish_topology_initialization(state);
+            finish_initial_agent_authority_watch(state, INITIAL_WATCH_ENDPOINT_SLICES);
+        }
     }
 }
 
@@ -7559,6 +7598,7 @@ fn apply_encryption_policy_event(state: &ControllerState, event: Event<Encryptio
             }
         }
         Event::Init => {
+            begin_initial_agent_authority_watch(state, INITIAL_WATCH_ENCRYPTION_POLICIES);
             *mutex_lock(&state.encryption_policy_initialization) = Some(BTreeMap::new());
         }
         Event::InitApply(policy) => {
@@ -7572,15 +7612,15 @@ fn apply_encryption_policy_event(state: &ControllerState, event: Event<Encryptio
             }
         }
         Event::InitDone => {
-            let Some(staged) = mutex_lock(&state.encryption_policy_initialization).take() else {
-                return;
-            };
-            let mut current = write_lock(&state.encryption_policies);
-            if !encryption_policy_maps_equal(&current, &staged) {
-                *current = staged;
-                drop(current);
-                bump_encryption_intent_revision(state);
+            if let Some(staged) = mutex_lock(&state.encryption_policy_initialization).take() {
+                let mut current = write_lock(&state.encryption_policies);
+                if !encryption_policy_maps_equal(&current, &staged) {
+                    *current = staged;
+                    drop(current);
+                    bump_encryption_intent_revision(state);
+                }
             }
+            finish_initial_agent_authority_watch(state, INITIAL_WATCH_ENCRYPTION_POLICIES);
         }
     }
 }
@@ -7625,6 +7665,7 @@ fn apply_policy_event(state: &ControllerState, event: Event<SecurityPolicy>) {
             }
         }
         Event::Init => {
+            begin_initial_agent_authority_watch(state, INITIAL_WATCH_SECURITY_POLICIES);
             write_lock(&state.security_policies).clear();
             let had_policies = !read_lock(&state.compiled_security_policies).is_empty();
             write_lock(&state.compiled_security_policies).clear();
@@ -7632,7 +7673,9 @@ fn apply_policy_event(state: &ControllerState, event: Event<SecurityPolicy>) {
                 bump_policy_revision(state);
             }
         }
-        Event::InitDone => {}
+        Event::InitDone => {
+            finish_initial_agent_authority_watch(state, INITIAL_WATCH_SECURITY_POLICIES);
+        }
     }
 }
 
@@ -7702,6 +7745,7 @@ fn apply_network_policy_event(state: &ControllerState, event: Event<NetworkPolic
             }
         }
         Event::Init => {
+            begin_initial_agent_authority_watch(state, INITIAL_WATCH_NETWORK_POLICIES);
             write_lock(&state.network_policies).clear();
             write_lock(&state.rejected_network_policies).clear();
             let had_policies = !read_lock(&state.compiled_network_policies).is_empty();
@@ -7710,7 +7754,9 @@ fn apply_network_policy_event(state: &ControllerState, event: Event<NetworkPolic
                 bump_policy_revision(state);
             }
         }
-        Event::InitDone => {}
+        Event::InitDone => {
+            finish_initial_agent_authority_watch(state, INITIAL_WATCH_NETWORK_POLICIES);
+        }
     }
 }
 
@@ -16227,6 +16273,30 @@ fn capture_topology_history(state: &ControllerState) {
     state.topology_history_dirty.store(true, Ordering::Release);
 }
 
+fn begin_initial_agent_authority_watch(state: &ControllerState, watch: u64) {
+    state
+        .initial_agent_authority_watches
+        .fetch_or(watch, Ordering::AcqRel);
+    state.ready.store(false, Ordering::Release);
+}
+
+fn finish_initial_agent_authority_watch(state: &ControllerState, watch: u64) {
+    state
+        .initial_agent_authority_watches
+        .fetch_and(!watch, Ordering::AcqRel);
+    publish_controller_readiness(state);
+}
+
+fn publish_controller_readiness(state: &ControllerState) {
+    if state
+        .initial_agent_authority_watches
+        .load(Ordering::Acquire)
+        == 0
+    {
+        state.ready.store(true, Ordering::Release);
+    }
+}
+
 fn begin_topology_initialization(state: &ControllerState) {
     state
         .topology_initializations
@@ -16307,6 +16377,40 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connected_readiness_waits_for_one_complete_agent_authority_cut() {
+        let state = new_state_with_client_and_selector(
+            false,
+            None,
+            None,
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Required,
+        );
+        assert!(!state.ready.load(Ordering::Acquire));
+
+        let watches = [
+            INITIAL_WATCH_PODS,
+            INITIAL_WATCH_NAMESPACES,
+            INITIAL_WATCH_NODES,
+            INITIAL_WATCH_SERVICES,
+            INITIAL_WATCH_ENDPOINT_SLICES,
+            INITIAL_WATCH_SECURITY_POLICIES,
+            INITIAL_WATCH_NETWORK_POLICIES,
+            INITIAL_WATCH_ENCRYPTION_POLICIES,
+        ];
+        for watch in &watches[..watches.len() - 1] {
+            finish_initial_agent_authority_watch(&state, *watch);
+            assert!(!state.ready.load(Ordering::Acquire));
+        }
+        finish_initial_agent_authority_watch(&state, watches[watches.len() - 1]);
+        assert!(state.ready.load(Ordering::Acquire));
+
+        begin_initial_agent_authority_watch(&state, INITIAL_WATCH_PODS);
+        assert!(!state.ready.load(Ordering::Acquire));
+        finish_initial_agent_authority_watch(&state, INITIAL_WATCH_PODS);
+        assert!(state.ready.load(Ordering::Acquire));
+    }
 
     #[test]
     fn consecutive_encryption_epochs_lease_distinct_bounded_udp_sockets() {

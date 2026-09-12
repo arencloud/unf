@@ -22,7 +22,7 @@ separately revisioned. The authoritative state remains in
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
 | 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `a728017` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADR 0257. Default-Required and explicit-selective PodIP/Service traffic, 399 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent/controller replacement, 298 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, validated pending-checkpoint closure, and no-CNI rollback passed. Evidence JSON SHA-256 is `7015cf0…b4c5`; packet-capture SHA-256 is `4dd6263…415d` |
-| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0257 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and bounded recovery/evidence boundaries. The Policy-Relevance Quotient and Work-Capped Zero-Allocation Enforcement Fold preserve exact decisions at the observed 116-workload/133-policy scale. Exact runtime `a728017` passed complete fresh Kind, including ADR 0256 cleanup closure, and its anonymous-public Linux/amd64 images are pinned by release record. Preserved-state deployment and the complete cl02 platform gate remain |
+| 9.9 | OpenShift qualification | **In progress** | ADRs 0213–0258 and `make encryption-phase9-openshift-gate-test` define the digest-pinned acknowledged migration and bounded recovery/evidence boundaries. cl02 rejected `a728017` after a cold restart admitted five agent retry streams before eight authoritative informer relists completed; diagnostics saturated 2-, 8-, and 16-GiB cgroups, while post-relist delivery stayed at 73–148 MiB. The Informer-Cut Admission Barrier now withholds readiness through startup/relist completion and the gate uses real wall-clock deadlines. Its successor needs complete fresh Kind admission, public immutable digests, preserved-state deployment, and the complete cl02 platform gate |
 
 ## Accepted Phase 9 gate
 
@@ -175,11 +175,12 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Commit ADR 0255's exact runtime, run the complete fresh dual-stack,
-kube-proxy-free Kind lifecycle, and publish only its digest-pinned images and
-evidence. Then deploy that tuple to cl02 without deleting preserved Node-local
-authority and rerun the complete bounded platform gate. The gate must preserve
-RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct and Service
-traffic, selective fail-closed behavior, rotation/recovery, exact cleanup,
-agent convergence, kube-proxy absence, and the before/after ClusterOperator
-state.
+Commit ADR 0258's informer-cut barrier, run the complete fresh dual-stack,
+kube-proxy-free Kind lifecycle, and publish only its digest-pinned successor
+images and evidence. Then deploy that tuple to cl02 without deleting preserved
+Node-local authority and rerun the complete bounded platform gate. The gate
+must prove the controller replacement stays inside its 2-GiB cgroup as well as
+preserving RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct
+and Service traffic, selective fail-closed behavior, rotation/recovery, exact
+cleanup, agent convergence, kube-proxy absence, and the before/after
+ClusterOperator state.

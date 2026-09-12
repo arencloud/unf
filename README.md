@@ -1290,6 +1290,16 @@ agent/controller replacement, 298 loss-free operation records, Phase 8 egress
 coexistence, exact cleanup, and restored no-CNI baseline. ADR 0257 binds its
 anonymous-public Linux/amd64 image digests plus evidence and capture hashes as
 the sole tuple eligible for the cl02 platform gate.
+cl02 then proved that eligibility is not qualification. A cold controller
+restart exposed its Service before the initial authoritative informer cut was
+complete, so five retrying agents repeatedly requested partial snapshots and
+saturated even a 16-GiB diagnostic cgroup. The same controller stayed at
+71–148 MiB when delivery waited for relist completion and remained stable after
+all five agents reconnected. The Informer-Cut Admission Barrier now keeps the
+Pod unready through eight fixed authoritative relists and withdraws readiness
+during later relists; agents retain their last-known-good dataplane meanwhile.
+OpenShift convergence loops also use real wall-clock deadlines. ADR 0258. A
+fresh Kind-qualified immutable successor and the full cl02 gate remain required.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before

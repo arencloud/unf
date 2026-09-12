@@ -5,6 +5,7 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 kubeconfig=${KUBECONFIG:-"${project_root}/.tools/cl02-audit.kubeconfig"}
 context=${KUBE_CONTEXT:-}
 request_timeout=${UNF_OPENSHIFT_ENCRYPTION_REQUEST_TIMEOUT:-20s}
+convergence_timeout_seconds=${UNF_OPENSHIFT_ENCRYPTION_CONVERGENCE_TIMEOUT_SECONDS:-360}
 expected_infrastructure=${UNF_OPENSHIFT_ENCRYPTION_EXPECTED_INFRASTRUCTURE:-}
 disposable_ack=${UNF_OPENSHIFT_ENCRYPTION_ACKNOWLEDGE_DISPOSABLE:-}
 migration_ack=${UNF_OPENSHIFT_ENCRYPTION_ACKNOWLEDGE_MIGRATION:-}
@@ -247,8 +248,8 @@ generation_matches_current_cut() {
 }
 
 wait_generation() {
-    local snapshot= cut=
-    for _ in $(seq 1 360); do
+    local snapshot= cut= deadline=$((SECONDS + convergence_timeout_seconds))
+    while (( SECONDS < deadline )); do
         cut=$(current_revision_cut 2>/dev/null || true)
         snapshot=$(generation_snapshot 2>/dev/null || true)
         if [[ -n ${cut} ]] && generation_matches_current_cut "${snapshot}" "${cut}"; then
@@ -264,7 +265,8 @@ wait_generation() {
 
 wait_generation_after() {
     local predecessor=$1 snapshot= generation= cut=
-    for _ in $(seq 1 360); do
+    local deadline=$((SECONDS + convergence_timeout_seconds))
+    while (( SECONDS < deadline )); do
         cut=$(current_revision_cut 2>/dev/null || true)
         snapshot=$(generation_snapshot 2>/dev/null || true)
         generation=$(jq -r '.[0].generation // empty' <<<"${snapshot}" 2>/dev/null || true)
@@ -280,8 +282,8 @@ wait_generation_after() {
 }
 
 wait_for_convergence() {
-    local snapshot=
-    for _ in $(seq 1 360); do
+    local snapshot= deadline=$((SECONDS + convergence_timeout_seconds))
+    while (( SECONDS < deadline )); do
         snapshot=$(controller_raw /v1/state/agents 2>/dev/null || true)
         if jq -e --argjson expected "${#nodes[@]}" '
             .schema_version == 8 and .expected_agents == $expected
@@ -339,7 +341,8 @@ traffic_matrix() {
 
 wait_epoch_change() {
     local initial_epoch=$1 snapshot= epoch= cut=
-    for _ in $(seq 1 360); do
+    local deadline=$((SECONDS + convergence_timeout_seconds))
+    while (( SECONDS < deadline )); do
         cut=$(current_revision_cut 2>/dev/null || true)
         snapshot=$(generation_snapshot 2>/dev/null || true)
         epoch=$(jq -r --arg node "${source_node}" '
@@ -684,7 +687,8 @@ old_agent=$(jq -er '.items[] | select(.metadata.deletionTimestamp == null) | .me
 old_agent_uid=$(jq -er --arg pod "${old_agent}" '.items[] | select(.metadata.name == $pod) | .metadata.uid' <<<"${old_agent_json}")
 "${kc[@]}" -n unf-system delete pod "${old_agent}" --wait=false >/dev/null
 replacement_agent_uid=
-for _ in $(seq 1 360); do
+replacement_deadline=$((SECONDS + convergence_timeout_seconds))
+while (( SECONDS < replacement_deadline )); do
     replacement_agent_uid=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent \
         --field-selector "spec.nodeName=${source_node}" -o json 2>/dev/null | jq -r --arg old "${old_agent_uid}" '
         .items[] | select(.metadata.uid != $old and .metadata.deletionTimestamp == null
@@ -723,7 +727,8 @@ set_baseline native
 "${kc[@]}" delete namespace "${namespace}" --wait=true --timeout=10m >/dev/null
 resources_created=false
 owned_state_absent=false
-for _ in $(seq 1 360); do
+cleanup_deadline=$((SECONDS + convergence_timeout_seconds))
+while (( SECONDS < cleanup_deadline )); do
     owned_state_absent=true
     for node in "${nodes[@]}"; do
         if node_exec "${node}" sh -euc \

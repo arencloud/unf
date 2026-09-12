@@ -74,9 +74,18 @@ require_text docs/adr/0256-loadbalancer-pending-checkpoint-cleanup-closure.md \
 require_text docs/adr/0257-immutable-work-capped-kind-requalification.md \
     'Immutable Work-Capped Kind Requalification' \
     "the bounded planner must retain immutable fresh-Kind provenance"
+require_text docs/adr/0258-informer-cut-admission-barrier.md \
+    'Informer-Cut Admission Barrier' \
+    "agent pull admission must wait for one complete informer authority cut"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"
+require_text bins/unf-controller/src/main.rs \
+    'INITIAL_AGENT_AUTHORITY_WATCHES' \
+    "agent pull readiness must wait for one complete informer authority cut"
+require_text bins/unf-controller/src/main.rs \
+    'finish_initial_agent_authority_watch' \
+    "informer relists must close the agent authority readiness barrier"
 require_text crates/unf-policy/src/lib.rs \
     'evaluate_preselected_enforcement_with_addresses' \
     "preselected encryption policy enforcement must use the compact evaluator"
@@ -101,6 +110,9 @@ require_text docs/roadmap.md \
 require_text Makefile \
     'encryption-fabric-boundary-test:' \
     "the architecture gate must be invocable"
+require_text hack/verify-openshift-encryption-phase9.sh \
+    'convergence_timeout_seconds' \
+    "OpenShift convergence waits must carry one real wall-clock budget"
 
 for milestone in 9.2 9.3 9.4 9.5 9.6 9.7 9.8 9.9; do
     require_text docs/development/phase9-attested-encryption-fabric-plan.md \

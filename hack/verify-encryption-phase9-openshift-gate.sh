@@ -167,6 +167,10 @@ done
 
 for bounded_wait in wait_generation wait_generation_after wait_epoch_change; do
     wait_body=$(sed -n "/^${bounded_wait}()/,/^}/p" "${gate}")
+    rg -q 'SECONDS < deadline' <<<"${wait_body}" || {
+        echo "${bounded_wait} must use a wall-clock convergence deadline" >&2
+        exit 1
+    }
     rg -q 'current_revision_cut' <<<"${wait_body}" || {
         echo "${bounded_wait} must join the current agent and egress revision cut" >&2
         exit 1
@@ -176,6 +180,14 @@ for bounded_wait in wait_generation wait_generation_after wait_epoch_change; do
         exit 1
     }
 done
+
+wait_body=$(sed -n '/^wait_for_convergence()/,/^}/p' "${gate}")
+rg -q 'SECONDS < deadline' <<<"${wait_body}" || {
+    echo "wait_for_convergence must use a wall-clock convergence deadline" >&2
+    exit 1
+}
+require 'replacement_deadline=.*convergence_timeout_seconds' "${gate}"
+require 'cleanup_deadline=.*convergence_timeout_seconds' "${gate}"
 
 selective_line=$(rg -n '^stage=selective-native-exception$' "${gate}" | cut -d: -f1)
 ciphertext_line=$(rg -n '^stage=ciphertext-and-fail-closed$' "${gate}" | cut -d: -f1)

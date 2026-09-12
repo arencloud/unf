@@ -1234,6 +1234,14 @@ matrix is maintained in the
   restored no-CNI baseline. ADR 0257 binds its anonymous-public Linux/amd64
   digests and evidence as the sole tuple eligible for cl02; the complete
   platform gate remains mandatory.
+  cl02 rejected that tuple as final after a cold restart published the
+  controller Service before eight authoritative informer relists completed.
+  Five retry streams drove partial-snapshot recomputation through 2-, 8-, and
+  16-GiB cgroup limits, while delaying delivery until relist completion held
+  the same process at 71–148 MiB and remained stable after reconnection. ADR
+  0258 adds the constant-space Informer-Cut Admission Barrier and real
+  wall-clock qualification deadlines. Its fresh Kind-qualified immutable
+  successor and complete cl02 gate remain mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale
