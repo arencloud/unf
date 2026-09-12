@@ -1240,8 +1240,10 @@ matrix is maintained in the
   16-GiB cgroup limits, while delaying delivery until relist completion held
   the same process at 71–148 MiB and remained stable after reconnection. ADR
   0258 adds the constant-space Informer-Cut Admission Barrier and real
-  wall-clock qualification deadlines. Its fresh Kind-qualified immutable
-  successor and complete cl02 gate remain mandatory.
+  wall-clock qualification deadlines. Exact successor `fbd6244` passed a new
+  complete fresh Kind lifecycle, and ADR 0259 binds its anonymous-public
+  Linux/amd64 digests plus evidence hashes. The complete cl02 gate remains
+  mandatory.
 - Cross-cluster networking, overlapping CIDRs, global services, mTLS,
   post-quantum cryptography, TPM attestation, IPsec/MACsec, L7, Gateway API,
   transparent host/control-plane encryption, and production availability/scale

@@ -77,6 +77,9 @@ require_text docs/adr/0257-immutable-work-capped-kind-requalification.md \
 require_text docs/adr/0258-informer-cut-admission-barrier.md \
     'Informer-Cut Admission Barrier' \
     "agent pull admission must wait for one complete informer authority cut"
+require_text docs/adr/0259-immutable-informer-cut-kind-requalification.md \
+    'Immutable Informer-Cut Kind Requalification' \
+    "the informer-cut barrier must retain immutable fresh-Kind provenance"
 require_text bins/unf-controller/src/main.rs \
     'MAX_ENCRYPTION_POLICY_CLASS_EVALUATIONS' \
     "exact encryption policy planning must have a pre-allocation work bound"

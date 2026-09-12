@@ -1298,8 +1298,12 @@ saturated even a 16-GiB diagnostic cgroup. The same controller stayed at
 all five agents reconnected. The Informer-Cut Admission Barrier now keeps the
 Pod unready through eight fixed authoritative relists and withdraws readiness
 during later relists; agents retain their last-known-good dataplane meanwhile.
-OpenShift convergence loops also use real wall-clock deadlines. ADR 0258. A
-fresh Kind-qualified immutable successor and the full cl02 gate remain required.
+OpenShift convergence loops also use real wall-clock deadlines. ADR 0258.
+Exact successor `fbd6244` passed a new complete fresh Kind lifecycle: 258
+WireGuard frames with zero Required plaintext, the full fault/rotation/recovery
+matrix, 358 loss-free operation records, egress coexistence, exact cleanup, and
+no-CNI rollback. ADR 0259 pins its anonymous-public Linux/amd64 image digests
+and evidence hashes. The full cl02 gate remains required.
 A focused incompatible-version gate builds deliberately schema/ABI-skewed test
 images, requires the local ABI-directory invariant to reject agent startup
 before persistent BPF access, requires live policy-schema rejection before
