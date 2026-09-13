@@ -552,6 +552,11 @@ cl02 staged deployment and adoption-fenced Native gate: 24 allowed cases,
 eight unsolicited reverse denials, exact fixture cleanup and five-agent
 convergence. Retained Kind recovery is next; the full platform rows stay open.
 
+ADR 0305 records retained Kind controller-only recovery: the original
+two-receipt/mixed-cursor frontier advances to a fresh Native generation with
+three receipts while all old agent Pod UIDs and zero restart counts remain
+unchanged. Matching-image agents and Native traffic qualification remain next.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.
