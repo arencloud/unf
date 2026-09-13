@@ -43,6 +43,8 @@ ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pa
 cl02/Kind kernel lifecycle validation and the actual locality consumer remain
 pending. Existing unbound attachments are never silently upgraded into locality
 authority. This prerequisite does not close L3.
+ADR 0328 adds the isolated production CNI/kernel ownership qualifier; platform
+execution is pending, cl02 before identical-image retained Kind.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,
