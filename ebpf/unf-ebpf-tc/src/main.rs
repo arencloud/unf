@@ -2609,7 +2609,22 @@ fn insert_service_slot(value: &ServiceConnectionValue, key: &ServiceConnectionKe
     // SAFETY: this invocation owns the CPU-local slot. Copy before calling any
     // helper that can mutate SERVICE_CONNECTIONS, without a 104-byte stack copy.
     #[allow(unsafe_code)]
-    let incumbent = unsafe { scratch.write(*stored); &*scratch };
+    let incumbent = unsafe {
+        // The repr(C) ABI is exactly thirteen aligned u64 words. Volatile,
+        // constant-offset copies prevent LLVM turning this into a byte loop
+        // whose state exploration exhausted the RHCOS verifier budget.
+        const { assert!(core::mem::size_of::<ServiceConnectionValue>() == 13 * 8); }
+        const { assert!(core::mem::align_of::<ServiceConnectionValue>() == 8); }
+        let source = core::ptr::from_ref(stored).cast::<u64>();
+        let destination = scratch.cast::<u64>();
+        macro_rules! copy_words {
+            ($($offset:literal),*) => { $(
+                destination.add($offset).write_volatile(source.add($offset).read_volatile());
+            )* };
+        }
+        copy_words!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+        &*scratch
+    };
     let Some(timeout) = unf_ebpf_common::connection_timeout_ns(incumbent.protocol) else {
         return false;
     };

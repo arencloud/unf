@@ -617,6 +617,13 @@ self-contained agent kernel tests and the separately configured live WireGuard
 probe. Exact-image cl02 deployment/log/continuity qualification is next, before
 Kind. Phase 9 and the S1–S5 measured stabilization program remain open.
 
+ADR 0314 records the cl02 verifier rejection of that first expiry candidate and
+the minimal fixed-width copy repair. The old object reproduces the instruction
+budget failure in an isolated cl02 fixture; the repaired object loads all 14
+programs without host attachment. The three affected agents recovered on the
+prior image without resetting state. A new exact-image rollout and traffic
+qualification remain required; Kind has not received the rejected candidate.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.

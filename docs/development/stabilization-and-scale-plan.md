@@ -34,6 +34,10 @@ ADR 0314 rejects candidate `5505d00` on cl02's RHCOS verifier budget despite
 local kernel passes. Rollout stopped after three replacements; previous-image
 recovery preserves state. Reduce verified instruction/state exploration and
 prove isolated cl02 loading before another rollout. Kind remains untouched.
+The minimal thirteen-word copy repair now passes isolated cl02 loading of all
+fourteen programs; the same observer reproduces the original rejection. All
+three prior-image agents recovered without state resets. Runtime deployment
+and Native/churn traffic qualification are still pending; this is not closure.
 
 S2 profiling lead, not an attributed CPU result: `policy_snapshot` calls
 `dataplane_policy_state` for every authenticated pull; the latter clones the
