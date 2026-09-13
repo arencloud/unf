@@ -52,6 +52,13 @@ authenticated, loopback-only port-forward for controller observations, removed
 on exit. Agent API version checks remain separate. No dataplane check falls
 back to that management tunnel.
 
+The next old-runtime attempt passed version checks but timed out downloading
+OpenAPI before Pod creation. Its empty owned Namespace was removed. Fixture
+creation now uses server-side apply without client-side schema download;
+ordinary API resource validation, admission and field ownership still apply,
+and ownership conflicts are never forced. This observer/setup failure is not
+evidence of either allowed or denied traffic.
+
 ## Open boundaries
 
 Required locality with identities replicated across local and remote Nodes,

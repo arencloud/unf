@@ -78,6 +78,10 @@ destination_node=${workers[1]}
 "${kc[@]}" create namespace "$namespace" --save-config >/dev/null
 owned=true
 stage=fixture
+# The API server still performs normal resource validation and admission.
+# Avoid the failing cluster-wide OpenAPI download for this fixed fixture; SSA
+# owns only newly created objects and must never force an ownership conflict.
+fixture_apply=("${kc[@]}" apply --server-side --field-manager=unf-native-qualification --validate=false -f -)
 for pod in client local-server remote-server; do
     node=$source_node
     role=server
@@ -87,16 +91,16 @@ for pod in client local-server remote-server; do
       {apiVersion:"v1",kind:"Pod",metadata:{name:$pod,namespace:$namespace,labels:{app:$pod,role:$role}},spec:{
         nodeSelector:{"kubernetes.io/hostname":$node},containers:[{name:"probe",image:$image,imagePullPolicy:"IfNotPresent",
           command:["sh","-ec","/usr/local/bin/unf-udp-echo 4 5353 & /usr/local/bin/unf-udp-echo 6 5353 & exec /usr/local/bin/unf-flow-receiver 8080"]}]}}' |
-      "${kc[@]}" apply -f - >/dev/null
+      "${fixture_apply[@]}" >/dev/null
     if [[ $role == server ]]; then
         jq -cn --arg namespace "$namespace" --arg pod "$pod" '
           {apiVersion:"v1",kind:"Service",metadata:{name:$pod,namespace:$namespace},spec:{ipFamilyPolicy:"RequireDualStack",
            selector:{app:$pod},ports:[{name:"tcp",port:8080,targetPort:8080,protocol:"TCP"},{name:"udp",port:5353,targetPort:5353,protocol:"UDP"}]}}' |
-          "${kc[@]}" apply -f - >/dev/null
+          "${fixture_apply[@]}" >/dev/null
     fi
 done
 "${kc[@]}" -n "$namespace" wait --for=condition=Ready pods --all --timeout=180s >/dev/null
-"${kc[@]}" apply -f - >/dev/null <<EOF
+"${fixture_apply[@]}" >/dev/null <<EOF
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata: {name: isolate-all, namespace: $namespace}
