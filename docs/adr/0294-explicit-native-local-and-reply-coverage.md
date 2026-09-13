@@ -46,11 +46,19 @@ positive Namespace absence and agent convergence. cl02 runs before matching-imag
 fresh Kind. Neither live result is claimed in this implementation commit.
 
 The initial old-runtime live attempt stopped at observer preflight: the
-controller's loopback-bound API rejected a Pod-IP proxy request. No fixture was
+controller API's Pod-IP proxy request returned BadRequest. No fixture was
 created and this is not a traffic result. The qualifier now uses one owned,
 authenticated, loopback-only port-forward for controller observations, removed
 on exit. Agent API version checks remain separate. No dataplane check falls
 back to that management tunnel.
+
+Subsequent socket and Deployment inspection correct the initial binding
+inference: the controller listens on `0.0.0.0:9962`, not only loopback. Controlled
+proxy requests identify the actual cause: `--request-timeout=15s` appends a
+`timeout` query parameter, which the strict version endpoint rejects as unknown.
+The same request without that parameter succeeds, while explicitly adding it
+reproduces HTTP 400 with the field-validation error. Preserve strict API query
+validation; bound management reads without injecting unrelated query fields.
 
 The next old-runtime attempt passed version checks but timed out downloading
 OpenAPI before Pod creation. Its empty owned Namespace was removed. Fixture

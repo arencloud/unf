@@ -46,8 +46,8 @@ fi
 "${kc[@]}" get encryptionpolicies.network.unf.io -A -o json | jq -e '.items|length==0' >/dev/null
 controller=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller -o json |
     jq -er '[.items[]|select(.metadata.deletionTimestamp==null and .status.phase=="Running")]|select(length==1)|.[0].metadata.name')
-# cl02's controller observer binds loopback. Use a single authenticated,
-# loopback-only tunnel, never treat a failed Pod-IP proxy as dataplane denial.
+# Use a single authenticated, loopback-only management tunnel. A failed
+# Pod-IP proxy is an observer error, never evidence of dataplane denial.
 "${kc[@]}" -n unf-system port-forward --address=127.0.0.1 "pod/$controller" :9962 > "$directory/controller-forward.log" 2>&1 &
 forward_pid=$!
 controller_port=
