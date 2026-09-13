@@ -1,4 +1,5 @@
 use std::env;
+use std::io::{self, BufRead, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
@@ -54,6 +55,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "readback" => {
             plan.readback().await?;
+        }
+        "observe" => {
+            let mut observation = plan.observe().await?;
+            println!("observation-ready");
+            io::stdout().flush()?;
+            for command in io::stdin().lock().lines() {
+                match command?.as_str() {
+                    "recheck" => {
+                        match observation.recheck().await {
+                            Ok(()) => println!("observation-current"),
+                            Err(error) => println!("observation-rejected: {error}"),
+                        }
+                        io::stdout().flush()?;
+                    }
+                    "finish" => break,
+                    _ => return Err("unsupported observation command".into()),
+                }
+            }
         }
         "delete" => {
             plan.delete().await?;

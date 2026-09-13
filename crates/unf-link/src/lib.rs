@@ -29,7 +29,10 @@ const EGRESS_OWNER_PREFIX: &str = "unf:egress-address:v1:";
 pub const EGRESS_GATEWAY_INTERFACE: &str = "unf-egress0";
 const MAX_GATEWAY_ADDRESSES: usize = 4_096;
 
+mod observation;
 mod peer_identity;
+
+pub use observation::VethObservation;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct AssignedAddress {
@@ -546,6 +549,31 @@ impl VethPlan {
     pub async fn readback(&self) -> Result<LinkReadback, LinkError> {
         let namespace = open_namespace(&self.netns)?;
         let host_namespace = peer_identity::open_current_namespace()?;
+        self.readback_in_namespaces(&namespace, &host_namespace)
+            .await
+    }
+
+    /// Retains both namespace descriptors alongside independently checked link
+    /// state. This is an observation, not a packet-time device capability.
+    ///
+    /// # Errors
+    /// Rejects missing, foreign or drifting endpoints and namespace paths.
+    pub async fn observe(&self) -> Result<VethObservation, LinkError> {
+        let namespace = open_namespace(&self.netns)?;
+        let host_namespace = peer_identity::open_current_namespace()?;
+        let readback = self
+            .readback_in_namespaces(&namespace, &host_namespace)
+            .await?;
+        let observation = VethObservation::new(self.clone(), readback, host_namespace, namespace);
+        observation.check_namespace_paths()?;
+        Ok(observation)
+    }
+
+    async fn readback_in_namespaces(
+        &self,
+        namespace: &File,
+        host_namespace: &File,
+    ) -> Result<LinkReadback, LinkError> {
         let (connection, handle, _) =
             new_connection().map_err(|source| LinkError::OpenNetlink {
                 operation: "open host connection",
@@ -553,8 +581,10 @@ impl VethPlan {
             })?;
         tokio::spawn(connection);
         let plan = self.clone();
+        let host_namespace =
+            clone_namespace(host_namespace, Path::new("/proc/thread-self/ns/net"))?;
         let peer = run_in_namespace(
-            clone_namespace(&namespace, &self.netns)?,
+            clone_namespace(namespace, &self.netns)?,
             move || async move {
                 let (connection, handle, _) =
                     new_connection().map_err(|source| LinkError::OpenNetlink {
@@ -574,7 +604,7 @@ impl VethPlan {
             self.mtu,
             self.host_address,
         )?;
-        let peer_namespace_id = peer_identity::namespace_id(&handle, &namespace).await?;
+        let peer_namespace_id = peer_identity::namespace_id(&handle, namespace).await?;
         peer_identity::validate_pair(&host, &peer.link, peer_namespace_id, peer.host_namespace_id)?;
         Ok(LinkReadback {
             host_index: host.header.index,

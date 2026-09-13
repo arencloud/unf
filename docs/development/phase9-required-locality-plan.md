@@ -51,6 +51,9 @@ candidate retirement. Two positive and 105 negative local gate cases pass.
 ADRs 0353–0354 verify the complete live expanded gate on identical `f984db9`
 images, cl02 before retained Kind, with reviewed logs and preserved state.
 This closes candidate distribution, not continuous lifetime or packet admission.
+ADR 0355 adds locally verified descriptor-retaining veth observations, strict
+rechecks and sticky retirement. Isolated cl02-before-Kind qualification remains
+pending; holding namespace FDs does not pin device placement or close L3.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

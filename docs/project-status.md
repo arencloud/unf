@@ -665,6 +665,10 @@ WireGuard frames, zero captured Required plaintext, zero capture loss and
 full Native cleanup. Both live fleets now run `f984db9`. Current/rotated logs
 are reviewed; per-packet log amplification and transition warnings remain
 stabilization findings. Consuming locality and full Phase 9/S1–S5 stay open.
+ADR 0355 adds opaque held-namespace veth observations with strict snapshot
+rechecks and sticky retirement on failure/cancellation (807 passing workspace
+tests, 26 ignored). The isolated cl02/Kind fixture is pending. This preserves
+namespace identity for a later consumer, not continuous packet-time authority.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
