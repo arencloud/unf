@@ -24,8 +24,8 @@ while test "$(date +%s)" -lt "$deadline"; do
         ok=false
         if test "$status" = 0 && printf '%s\n' "$response" | grep -Eq 'HTTP/1\.[01] 200( |$)'; then ok=true; else failures=$((failures+1)); fi
         ended=$(date +%s%3N)
-        jq -cn --arg label "$label" --argjson at "$started" --argjson elapsed "$((ended-started))" --argjson ok "$ok" --argjson status "$status" \
-            '{type:"sample",label:$label,unixMs:$at,elapsedMs:$elapsed,ok:$ok,wgetExit:$status}'
+        jq -cn --arg target_name "$label" --argjson at "$started" --argjson elapsed "$((ended-started))" --argjson ok "$ok" --argjson status "$status" \
+            '{type:"sample",label:$target_name,unixMs:$at,elapsedMs:$elapsed,ok:$ok,wgetExit:$status}'
         samples=$((samples+1))
     done <<EOF
 $rows

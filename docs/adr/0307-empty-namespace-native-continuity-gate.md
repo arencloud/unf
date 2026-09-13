@@ -46,3 +46,15 @@ cleanup are tested too. No test-tools or runtime image change is required.
 
 Commit the repaired qualifier before repeating cl02. Only a complete cl02 pass
 permits the same continuity test on Kind. Preserve failed windows and logs.
+
+Qualifier `bf98c0f` repeated the original Native checks successfully, then
+stopped before mutations because the image's jq parser rejects `$label` as a
+variable name (accepted by host jq 1.8.1). The repaired EXIT cleanup completed
+without the earlier scope error; both temporary namespaces were confirmed
+absent. Rename that variable and run the entire deterministic shell probe
+regression inside the exact test-tools image `e9cce439…2352`: it passes with
+network disabled, a read-only root filesystem, no capabilities, a non-root
+UID, only the test scripts mounted read-only, and no cluster credentials.
+The test harness itself now uses grep available in that image. Host regressions
+also pass. No namespace-change/continuity result is claimed for either failed
+observer attempt. Repeat cl02 using this image-tested qualifier.

@@ -27,7 +27,7 @@ if bash -c 'set -Eeuo pipefail; source "$1"; directory=$2; kc=(false); native_tr
     continuity-test "$root/hack/native-transport-continuity.sh" "$temporary" 2> "$temporary/cleanup-error"; then
     echo 'observer failure was accepted' >&2; exit 1
 fi
-if rg -q 'unbound variable' "$temporary/cleanup-error"; then
+if grep -q 'unbound variable' "$temporary/cleanup-error"; then
     echo 'continuity EXIT cleanup lost its scope' >&2; exit 1
 fi
 bash -n "$root/hack/native-transport-continuity.sh"
