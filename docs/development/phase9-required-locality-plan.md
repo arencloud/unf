@@ -58,6 +58,8 @@ ADR 0333 adds a locally verified OpenShift candidate-protocol installation gate:
 787 workspace tests pass. Its isolated cl02/Kind packaging qualification and
 the Kind live upgrade ordering remain open; no live installation has changed.
 ADR 0334 verifies the isolated packaging slice on cl02; matching Kind is next.
+ADR 0335 completes that identical-image Kind packaging gate. Live rollout,
+runtime UID capture and consuming locality integration remain open.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,
