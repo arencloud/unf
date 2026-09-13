@@ -574,6 +574,12 @@ eight Native paths during empty-namespace create/relabel/delete, with failures
 retained per sample and no retry-to-pass. Local probe regressions pass; cl02
 must pass before running this slice on Kind.
 
+ADR 0308 records a real cl02 continuity failure after the observer repairs:
+10/208 fresh connections failed across all eight paths; policy revision
+advanced while identity/Service/topology revisions remained unchanged. All
+agents reported converged and no runtime restarted. Namespace no-op handling
+is the next regression-backed repair; this slice has not run on Kind.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.
