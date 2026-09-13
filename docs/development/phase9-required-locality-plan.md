@@ -77,6 +77,9 @@ ADR 0340 strengthens ADD/strict attachment readback with descriptor-anchored
 namespace IDs and reciprocal veth references; 790 workspace tests pass.
 The expanded isolated impostor red/green gate is pending on cl02, then Kind.
 This remains snapshot evidence, not a packet-time device-lifetime capability.
+ADR 0341 verifies the expanded isolated cl02 gate, including old-accept/new-reject
+namespace impostors with matching reciprocal index numbers. Matching Kind is
+next; live binaries remain unchanged.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

@@ -597,6 +597,9 @@ Required locality consumption, L4/L5, Q and S1–S5 remain open.
 ADR 0340 adds namespace-anchored reciprocal veth readback and a cloned-peer
 red/green qualifier. All 790 workspace tests and strict Clippy pass; isolated
 cl02 then matching Kind execution remains pending. Live fleets stay `450de80`.
+ADR 0341 verifies isolated cl02 namespace-impostor red/green behavior and all
+fourteen ownership negatives with cleanup; matching Kind is next. Current
+controller/agent/installer logs are reviewed; runtime remains `450de80`.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
