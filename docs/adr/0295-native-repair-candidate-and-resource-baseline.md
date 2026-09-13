@@ -58,11 +58,21 @@ interval. Memory columns are end-of-window observations, not synchronized peaks.
 | Component/Node suffix | CPU cores | Cgroup MiB | Process RSS MiB |
 |---|---:|---:|---:|
 | controller / 89-00-a5 | 1.335 | 80.9 | 95.5 |
-| agent / 89-00-a5 | 0.155 | 605.1 | 15.1 |
-| agent / 7f-81-3f | 0.248 | 662.8 | 22.6 |
-| agent / 47-5e-1b | 0.253 | 635.6 | 22.2 |
-| agent / 27-b6-49 | 0.180 | 343.4 | 20.0 |
-| agent / 74-2b-8d | 0.176 | 602.6 | 20.2 |
+| agent / 89-00-a5 | 0.155 | 605.1 | Withdrawn: wrong PID |
+| agent / 7f-81-3f | 0.248 | 662.8 | Withdrawn: wrong PID |
+| agent / 47-5e-1b | 0.253 | 635.6 | Withdrawn: wrong PID |
+| agent / 27-b6-49 | 0.180 | 343.4 | Withdrawn: wrong PID |
+| agent / 74-2b-8d | 0.176 | 602.6 | Withdrawn: wrong PID |
+
+Correction, 2026-09-13: the initial sampler read `/proc/1/status`. Agents use
+`hostPID: true`, and a direct process-name check identifies PID 1 as host
+`systemd`, not UNF. The previously reported 15–23 MiB agent RSS values are
+invalid and must not inform resource budgets. The controller does not use the
+host PID namespace. Cgroup CPU/memory measurements are independent of this
+process-selection mistake. Subsequent samples identify exactly one
+`/usr/local/bin/unf-component` executable among the container's `cgroup.procs`
+before collecting its RSS; a missing or ambiguous match fails the sample.
+Raw historical artifacts remain unchanged so the correction is auditable.
 
 Cgroup accounting and RSS measure different things; do not infer a leak or
 attribute their difference exclusively to BPF. All sampled memory OOM counters
