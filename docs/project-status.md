@@ -594,6 +594,9 @@ plaintext and exact cleanup. Both fleets now run that immutable source with
 zero current UNF restarts. Logs and retained rotated CRI files are reviewed;
 warnings, INFO amplification and the retired-controller log gap remain visible.
 Required locality consumption, L4/L5, Q and S1–S5 remain open.
+ADR 0340 adds namespace-anchored reciprocal veth readback and a cloned-peer
+red/green qualifier. All 790 workspace tests and strict Clippy pass; isolated
+cl02 then matching Kind execution remains pending. Live fleets stay `450de80`.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

@@ -29,6 +29,8 @@ const EGRESS_OWNER_PREFIX: &str = "unf:egress-address:v1:";
 pub const EGRESS_GATEWAY_INTERFACE: &str = "unf-egress0";
 const MAX_GATEWAY_ADDRESSES: usize = 4_096;
 
+mod peer_identity;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct AssignedAddress {
     pub address: IpAddr,
@@ -325,6 +327,7 @@ impl VethPlan {
     /// failures, or state that differs from the durable plan.
     pub async fn apply(&self) -> Result<LinkReadback, LinkError> {
         let namespace = open_namespace(&self.netns)?;
+        let host_namespace = peer_identity::open_current_namespace()?;
         let (connection, handle, _) =
             new_connection().map_err(|source| LinkError::OpenNetlink {
                 operation: "open host connection",
@@ -333,7 +336,9 @@ impl VethPlan {
         tokio::spawn(connection);
         self.ensure_host(&handle).await?;
         self.move_temporary_peer(&handle, &namespace).await?;
-        let peer = self.configure_and_read_peer(namespace).await?;
+        let peer = self
+            .configure_and_read_peer(clone_namespace(&namespace, &self.netns)?, host_namespace)
+            .await?;
         let host = require_link(&handle, &self.host_name).await?;
         validate_ready_link(
             &host,
@@ -342,6 +347,8 @@ impl VethPlan {
             self.mtu,
             self.host_address,
         )?;
+        let peer_namespace_id = peer_identity::namespace_id(&handle, &namespace).await?;
+        peer_identity::validate_pair(&host, &peer.link, peer_namespace_id, peer.host_namespace_id)?;
         Ok(LinkReadback {
             host_index: host.header.index,
             peer_index: peer.index,
@@ -538,12 +545,27 @@ impl VethPlan {
     /// does not match the plan.
     pub async fn readback(&self) -> Result<LinkReadback, LinkError> {
         let namespace = open_namespace(&self.netns)?;
+        let host_namespace = peer_identity::open_current_namespace()?;
         let (connection, handle, _) =
             new_connection().map_err(|source| LinkError::OpenNetlink {
                 operation: "open host connection",
                 source,
             })?;
         tokio::spawn(connection);
+        let plan = self.clone();
+        let peer = run_in_namespace(
+            clone_namespace(&namespace, &self.netns)?,
+            move || async move {
+                let (connection, handle, _) =
+                    new_connection().map_err(|source| LinkError::OpenNetlink {
+                        operation: "open container connection",
+                        source,
+                    })?;
+                tokio::spawn(connection);
+                read_peer(&handle, &plan, &host_namespace).await
+            },
+        )
+        .await?;
         let host = require_link(&handle, &self.host_name).await?;
         validate_ready_link(
             &host,
@@ -552,17 +574,8 @@ impl VethPlan {
             self.mtu,
             self.host_address,
         )?;
-        let plan = self.clone();
-        let peer = run_in_namespace(namespace, move || async move {
-            let (connection, handle, _) =
-                new_connection().map_err(|source| LinkError::OpenNetlink {
-                    operation: "open container connection",
-                    source,
-                })?;
-            tokio::spawn(connection);
-            read_peer(&handle, &plan).await
-        })
-        .await?;
+        let peer_namespace_id = peer_identity::namespace_id(&handle, &namespace).await?;
+        peer_identity::validate_pair(&host, &peer.link, peer_namespace_id, peer.host_namespace_id)?;
         Ok(LinkReadback {
             host_index: host.header.index,
             peer_index: peer.index,
@@ -724,7 +737,11 @@ impl VethPlan {
         .await
     }
 
-    async fn configure_and_read_peer(&self, namespace: File) -> Result<PeerReadback, LinkError> {
+    async fn configure_and_read_peer(
+        &self,
+        namespace: File,
+        host_namespace: File,
+    ) -> Result<PeerReadback, LinkError> {
         let plan = self.clone();
         run_in_namespace(namespace, move || async move {
             let (connection, handle, _) =
@@ -783,7 +800,7 @@ impl VethPlan {
                         source,
                     })?;
             }
-            read_peer(&handle, &plan).await
+            read_peer(&handle, &plan, &host_namespace).await
         })
         .await
     }
@@ -1320,10 +1337,16 @@ impl GatewayAddressPlan {
 #[derive(Debug)]
 struct PeerReadback {
     index: u32,
+    link: LinkMessage,
+    host_namespace_id: i32,
     addresses: BTreeSet<AssignedAddress>,
 }
 
-async fn read_peer(handle: &Handle, plan: &VethPlan) -> Result<PeerReadback, LinkError> {
+async fn read_peer(
+    handle: &Handle,
+    plan: &VethPlan,
+    host_namespace: &File,
+) -> Result<PeerReadback, LinkError> {
     let peer = require_link(handle, &plan.container_name).await?;
     validate_ready_link(
         &peer,
@@ -1371,6 +1394,8 @@ async fn read_peer(handle: &Handle, plan: &VethPlan) -> Result<PeerReadback, Lin
     }
     Ok(PeerReadback {
         index: peer.header.index,
+        link: peer,
+        host_namespace_id: peer_identity::namespace_id(handle, host_namespace).await?,
         addresses: expected,
     })
 }
@@ -1709,6 +1734,15 @@ where
     })
     .await
     .map_err(|error| LinkError::NamespaceJoin(error.to_string()))?
+}
+
+fn clone_namespace(namespace: &File, path: &Path) -> Result<File, LinkError> {
+    namespace
+        .try_clone()
+        .map_err(|source| LinkError::OpenNamespace {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn open_namespace(path: &Path) -> Result<File, LinkError> {

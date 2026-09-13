@@ -5,13 +5,20 @@ umask 077
 [[ ${UNF_CNI_OWNERSHIP_ISOLATED_CONTAINER:-} == yes && $EUID == 0 ]]
 binary=${UNF_CNI_OWNERSHIP_BINARY:-/usr/local/bin/disposable-lifecycle}
 [[ -x $binary ]]
-for command in ip jq sha256sum mktemp; do command -v "$command" >/dev/null; done
+predecessor_binary=${UNF_CNI_OWNERSHIP_PREDECESSOR_BINARY:-/usr/local/bin/previous-disposable-lifecycle}
+[[ -x $predecessor_binary ]]
+for command in ip jq sha256sum mktemp mount umount; do command -v "$command" >/dev/null; done
 directory=$(mktemp -d /tmp/unf-cni-ownership.XXXXXX)
 suffix=${directory##*.}
 host_namespace=unf-own-h-$suffix
 pod_namespace=unf-own-p-$suffix
+decoy_host_namespace=unf-own-dh-$suffix
+decoy_pod_namespace=unf-own-dp-$suffix
 host_created=false
 pod_created=false
+decoy_host_created=false
+decoy_pod_created=false
+namespace_overmounted=false
 stage=namespace-setup
 cleanup() {
     local result=$?
@@ -20,6 +27,9 @@ cleanup() {
         printf 'Last CNI response at failed boundary:\n' >&2
         cat "$directory/last-cni-response.json" >&2
     fi
+    if [[ $namespace_overmounted == true ]]; then umount "/run/netns/$pod_namespace" || result=1; fi
+    if [[ $decoy_pod_created == true ]]; then ip netns del "$decoy_pod_namespace" || result=1; fi
+    if [[ $decoy_host_created == true ]]; then ip netns del "$decoy_host_namespace" || result=1; fi
     if [[ $pod_created == true ]]; then ip netns del "$pod_namespace" || result=1; fi
     if [[ $host_created == true ]]; then ip netns del "$host_namespace" || result=1; fi
     printf 'CNI ownership qualification exit=%s stage=%s evidence=%s\n' "$result" "$stage" "$directory"
@@ -59,6 +69,8 @@ expect_denied() {
             jq -e '.code==11 and (.details|contains("alias"))' "$directory/$name.json" >/dev/null;;
         missing-*-route)
             jq -e '.code==11 and (.details|contains("Host state is incomplete"))' "$directory/$name.json" >/dev/null;;
+        namespace-impostor-*)
+            jq -e '.code==11 and (.details|contains("veth peer index or namespace"))' "$directory/$name.json" >/dev/null;;
         *) return 1;;
     esac
 }
@@ -167,6 +179,53 @@ ip -n "$host_namespace" -6 route add fd44:0:0:44::2/128 dev "$interface" proto 1
 run_cni CHECK "$bound_check" 'K8S_POD_UID=pod-uid-a'
 [[ $(sha256sum "$state") == "$before" ]]
 
+stage=namespace-impostor
+# Two unrelated pairs can have identical namespace-local indexes and public
+# ownership attributes. Clone the entire peer-side CHECK shape, but keep its
+# real peer in a different namespace. Never move or replace the genuine pair.
+ip netns add "$decoy_host_namespace"
+decoy_host_created=true
+ip netns add "$decoy_pod_namespace"
+decoy_pod_created=true
+host_index=$(ip -n "$host_namespace" -j link show dev "$interface" | jq -er '.[0].ifindex')
+peer_index=$(ip -n "$pod_namespace" -j link show dev eth0 | jq -er '.[0].ifindex')
+host_mac=$(ip -n "$host_namespace" -j link show dev "$interface" | jq -er '.[0].address')
+peer_mac=$(ip -n "$pod_namespace" -j link show dev eth0 | jq -er '.[0].address')
+peer_alias=$(ip -n "$pod_namespace" -j link show dev eth0 | jq -er '.[0].ifalias')
+ip -n "$decoy_host_namespace" link add name decoy index "$host_index" mtu 1400 address "$host_mac" \
+    type veth peer name eth0 index "$peer_index" netns "$decoy_pod_namespace" mtu 1400 address "$peer_mac"
+ip -n "$decoy_host_namespace" link set dev decoy alias "$bound_alias" up
+ip -n "$decoy_pod_namespace" link set dev eth0 alias "$peer_alias" up
+ip -n "$decoy_pod_namespace" addr add 10.244.44.2/32 dev eth0
+ip -n "$decoy_pod_namespace" addr add fd44:0:0:44::2/128 dev eth0
+ip -n "$decoy_pod_namespace" -4 route add 10.244.44.1/32 dev eth0 proto 196 scope link
+ip -n "$decoy_pod_namespace" -4 route add default via 10.244.44.1 dev eth0 proto 196 onlink
+ip -n "$decoy_pod_namespace" -6 route add fd44:0:0:44::1/128 dev eth0 proto 196
+ip -n "$decoy_pod_namespace" -6 route add default via fd44:0:0:44::1 dev eth0 proto 196 onlink
+ip -n "$decoy_pod_namespace" neigh replace 10.244.44.1 lladdr "$host_mac" nud permanent dev eth0
+ip -n "$decoy_pod_namespace" neigh replace fd44:0:0:44::1 lladdr "$host_mac" nud permanent dev eth0
+# Ensure both expected namespaces have assigned IDs. A rejection must be for
+# the wrong peer reference, not merely a missing namespace-ID mapping.
+ip netns exec "$host_namespace" ip netns set "$decoy_pod_namespace" auto
+ip netns exec "$decoy_pod_namespace" ip netns set "$host_namespace" auto
+ip -n "$host_namespace" -j -details link show dev "$interface" > "$directory/genuine-host.json"
+ip -n "$decoy_pod_namespace" -j -details link show dev eth0 > "$directory/impostor-peer.json"
+jq -en --slurpfile host "$directory/genuine-host.json" --slurpfile peer "$directory/impostor-peer.json" \
+    '$host[0][0].link_index==$peer[0][0].ifindex and $peer[0][0].link_index==$host[0][0].ifindex' >/dev/null
+mount --bind "/run/netns/$decoy_pod_namespace" "/run/netns/$pod_namespace"
+namespace_overmounted=true
+candidate_binary=$binary
+binary=$predecessor_binary
+run_cni CHECK "$bound_check" 'K8S_POD_UID=pod-uid-a' > "$directory/predecessor-impostor-check.json"
+run_cni ADD "$config" 'K8S_POD_UID=pod-uid-a' > "$directory/predecessor-impostor-add.json"
+binary=$candidate_binary
+expect_denied namespace-impostor-check run_cni CHECK "$bound_check" 'K8S_POD_UID=pod-uid-a'
+expect_denied namespace-impostor-add run_cni ADD "$config" 'K8S_POD_UID=pod-uid-a'
+[[ $(sha256sum "$state") == "$before" ]]
+umount "/run/netns/$pod_namespace"
+namespace_overmounted=false
+run_cni CHECK "$bound_check" 'K8S_POD_UID=pod-uid-a'
+
 stage=normal-delete-and-address-reuse
 run_cni DEL "$config" ''
 assert_no_resources
@@ -193,7 +252,9 @@ run_cni DEL "$config" ''
 assert_no_resources
 stage=verified
 jq -n --arg binarySha256 "$(sha256sum "$binary" | cut -d ' ' -f1)" \
+    --arg predecessorSha256 "$(sha256sum "$predecessor_binary" | cut -d ' ' -f1)" \
     '{schemaVersion:1,result:"passed",scope:"isolated-cni-workload-ownership",binarySha256:$binarySha256,
       legacyReplay:true,uidBinding:true,restart:true,aliasDrift:true,dualStackRouteDrift:true,
-      addressReuse:true,negativeCases:12,normalCleanup:true,creationRecovery:true,
+      addressReuse:true,negativeCases:14,normalCleanup:true,creationRecovery:true,
+      namespaceAnchoredPair:true,namespaceImpostorRedGreen:true,predecessorSha256:$predecessorSha256,
       creationRecoveryStates:["unsealed","peerSealed","sealedHostUp","preparingDelete"],liveLocalityAdmission:false}'

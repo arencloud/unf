@@ -73,6 +73,10 @@ ADR 0339 verifies that matching Kind rollout and expanded live gate: three
 runtime UID/nonce bindings and retirements, 24 allowed/eight denied requests,
 positive ciphertext and exact cleanup. Both fleets now run `450de80`.
 The actual authenticated kernel locality consumer remains the next L3 boundary.
+ADR 0340 strengthens ADD/strict attachment readback with descriptor-anchored
+namespace IDs and reciprocal veth references; 790 workspace tests pass.
+The expanded isolated impostor red/green gate is pending on cl02, then Kind.
+This remains snapshot evidence, not a packet-time device-lifetime capability.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

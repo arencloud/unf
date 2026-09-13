@@ -1,5 +1,7 @@
 ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm
 ARG TEST_TOOLS_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:e9cce439d92d0f7d3d6751f234e397a7efc29f9983bc0ae8fc318432c4ff2352
+ARG OWNERSHIP_PREDECESSOR_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:95a9286327290d5bda418db3c079e69455572e801f3ab93399987e6e57ff87e9
+FROM ${OWNERSHIP_PREDECESSOR_IMAGE} AS predecessor
 FROM ${RUST_IMAGE} AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -12,5 +14,6 @@ FROM ${TEST_TOOLS_IMAGE}
 ARG UNF_SOURCE_REVISION
 LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
 COPY --from=builder /src/target/release/examples/disposable_lifecycle /usr/local/bin/disposable-lifecycle
+COPY --from=predecessor /usr/local/bin/disposable-lifecycle /usr/local/bin/previous-disposable-lifecycle
 COPY hack/verify-cni-workload-ownership.sh /usr/local/bin/verify-cni-workload-ownership
 ENTRYPOINT ["bash", "/usr/local/bin/verify-cni-workload-ownership"]
