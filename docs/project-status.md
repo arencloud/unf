@@ -559,7 +559,10 @@ the banked consuming boundary are next.
 ADR 0327 implements L3a's CNI Pod-incarnation ownership prerequisite, with
 explicit legacy journal/request compatibility and kernel alias fencing. All 778
 workspace tests and strict Clippy pass; no live runtime or encryption behavior
-is changed. Isolated cl02 kernel validation is next, before Kind.
+is changed. ADR 0328's creation-only alias seal fixes the observed cl02
+new-veth alias gap. The complete isolated cl02 CNI/kernel gate passes all eleven
+negative checks and cleanup, with 779 workspace tests passing. Matching-image
+Kind is next; no Required locality or full platform row is closed by this gate.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 
