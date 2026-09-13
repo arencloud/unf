@@ -77,6 +77,10 @@ ADR 0347 adds bounded, nonce/current-cut-fenced locality placement distribution
 at the controller/wire boundary, with 797 local tests passing. The size check
 uses a counting writer, but serialization/copying still require measurement.
 No agent polling or live packet admission is introduced; S1–S5 remain open.
+ADR 0348 then adds Required-only background candidate fetching with unchanged-cut
+reuse, bounded streaming and a single worker slot retained through cancelled
+CPU replay. All 803 local tests pass. Resource savings and live distribution
+still need platform measurement; no packet admission is enabled by this cache.
 
 Repair evidence is retained chronologically in the ADRs:
 

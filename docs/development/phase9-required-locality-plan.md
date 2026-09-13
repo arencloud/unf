@@ -40,8 +40,10 @@ Required path authoritative; it never becomes a Native fallback.
 
 ADR 0347 adds the locally verified nonce-bound controller/wire distribution
 boundary. Current-Pod/Node authentication, guarded placement coordinates,
-bounded wire and independent source replay do not activate locality. Agent
-streaming/current-cut handoff and cl02-before-Kind qualification remain pending.
+bounded wire and independent source replay do not activate locality. ADR 0348
+adds the locally verified Required-only background agent fetch, bounded stream,
+single replay slot and current-cut handoff. Candidate status and live
+cl02-before-Kind distribution qualification remain pending.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

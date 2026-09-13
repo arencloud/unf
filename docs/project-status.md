@@ -633,6 +633,10 @@ ADR 0347 adds the locally verified nonce-bound locality controller endpoint and
 bounded replay wire contract (797 passing workspace tests, 26 ignored).
 Agent fetch, kernel admission and platform qualification remain pending;
 live runtime and Phase 9/stabilization verification states are unchanged.
+ADR 0348 adds the agent's locally verified bounded background candidate fetch
+(803 passing tests, 26 ignored), with unchanged-cut reuse and one replay slot.
+Native operation does not fetch locality metadata. Candidate status and live
+distribution qualification remain next; no local packet authority is enabled.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

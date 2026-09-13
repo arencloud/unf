@@ -1,3 +1,5 @@
+mod encryption_locality;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -1109,6 +1111,7 @@ struct EncryptionPlanSynchronizer {
     node_name: String,
     state_path: PathBuf,
     current: Option<AdmittedNodeLocalPlan>,
+    locality: encryption_locality::PlacementCache,
 }
 
 type RuntimeNodeKeyAuthority =
@@ -8038,6 +8041,7 @@ fn build_controller_client(
     let mut builder = reqwest::Client::builder()
         .timeout(CONTROLLER_REQUEST_TIMEOUT)
         .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
         .tls_certs_only(certificates);
     if let Some((hostname, address)) = controller_resolution {
         builder = builder.resolve(hostname, *address);
@@ -8840,6 +8844,7 @@ impl EncryptionPlanSynchronizer {
             node_name,
             state_path,
             current,
+            locality: encryption_locality::PlacementCache::default(),
         })
     }
 
@@ -16733,8 +16738,14 @@ async fn consume_events(
                                 "encryption plan could not consume exact Node-local key and kernel truth"
                             ),
                         }
+                        if let Err(error) = encryption_locality::synchronize(
+                            encryption_plans, encryption_keys, state,
+                        ).await {
+                            warn!(%error, "locality placement fetch failed; no local packet authority admitted");
+                        }
                     }
                     Err(error) => {
+                        encryption_plans.locality.clear();
                         warn!(%error, "encryption plan synchronization failed; retaining exact durable predecessor");
                     }
                 }
@@ -28828,7 +28839,7 @@ mod tests {
         assert_eq!(u32::from(legacy_tc_handle(Direction::Egress)), 0x554e_0002);
     }
 
-    fn test_agent_state() -> AgentState {
+    pub(super) fn test_agent_state() -> AgentState {
         new_state(
             KernelCapabilities {
                 kernel_release: "test".to_owned(),
