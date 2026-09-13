@@ -542,7 +542,9 @@ expiry/empty-Namespace continuity on cl02 then matching-image retained Kind.
 ADR 0318 implements locally verified policy-tracked Required reply contracts
 with explicit initiating-pair provenance. ADRs 0320–0321 record failed cl02
 reply qualification and correct capture setup occurring after admission;
-the corrected scoped gate must pass cl02 before retained Kind advances.
+ADR 0322 verifies the corrected scoped cl02 gate: 12 Required requests,
+12 Native controls, eight reverse denials, zero Required plaintext and exact
+cleanup. Matching-image retained Kind is next.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 

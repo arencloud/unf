@@ -25,7 +25,9 @@ verified; Kind is not advanced past the failed cl02 gate.
 ADR 0321 records a later destination-side revision mismatch during a failed
 Native TCP control and moves capture-object preparation before admission.
 This corrects a moving-fixture qualifier, not S4's policy/Service update
-continuity requirement; the corrected cl02 result remains pending.
+continuity requirement. ADR 0322 verifies the corrected scoped cl02 reply
+gate (12 Required requests, 12 Native controls, eight reverse denials,
+ciphertext and Native cleanup); matching-image retained Kind is next.
 
 Next: qualify Required replies on cl02 before Kind, finish Required locality/replica coverage and full current
 runtime lifecycle qualification, cl02 before Kind. Empty-Namespace no-op

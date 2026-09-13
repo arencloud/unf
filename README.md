@@ -745,7 +745,9 @@ matching-image retained Kind (ADRs 0316–0317). Required reply contracts now
 have explicit initiating-policy provenance and local regression coverage;
 live Required replies and locality remain pending. The cl02 reply gate exposed
 a destination revision fence; observer setup now precedes adoption, with
-corrected qualification pending (ADRs 0318, 0320–0321).
+the corrected scoped cl02 gate now passes all 24 requests, eight reverse
+denials, ciphertext and cleanup checks. Matching Kind remains next
+(ADRs 0318, 0320–0322).
 The [stabilization and scale plan](docs/development/stabilization-and-scale-plan.md)
 tracks operator/reachability findings, log volume, feature interactions and
 resource-versus-load measurements. Bounded qualification does not mean
