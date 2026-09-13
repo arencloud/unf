@@ -49,3 +49,15 @@ packet/overlimit count matches the intended sequence, but the failed run remains
 failed. The observer now requires explicit `skip_hw` and rejects contradictory
 `skip_sw`/`in_hw` flags. Its positive and 112 mutation checks pass locally.
 A new complete cl02 run is required; this is not a hardware-evidence waiver.
+
+ADR 0345 then verifies the complete corrected cl02 gate. Matching Kind's first
+`44d3502` attempt fails its initial IPv4 positive control; IPv6 arrives and
+receivers remain running. Its fixture lacks a reverse route to the source.
+Read-only Node inventory observes `rp_filter=2` for all/default/eth0, consistent
+with reverse-path validation, but the original private namespace settings were
+not captured; do not claim conclusive cause from Node defaults alone. Target
+fixtures now install and verify legitimate reverse routes without disabling
+source validation, and retain their exact namespace RPF settings. Failure-time
+links, addresses, routes, neighbors, sockets, TC actions and filters are also
+captured before private cleanup. Both platforms require complete new-image
+reruns; the failed Kind attempt is not promoted.

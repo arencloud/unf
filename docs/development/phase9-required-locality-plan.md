@@ -94,6 +94,10 @@ ADR 0345 verifies the complete corrected cl02 target-device reference gate:
 eight positive payloads, four exact denied attempts, rename/down/recovery and
 no implicit rebinding on ifindex reuse. Matching Kind remains pending. This
 primitive does not establish source/peer lifetime or live locality permission.
+The first matching Kind device-reference gate fails its IPv4 positive control.
+ADR 0344 records missing fixture reverse routes, observed Node RPF defaults and
+the diagnostic gap. Exact reverse-route/RPF readback and failure capture are
+added; a corrected-image cl02 rerun must precede matching Kind again.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

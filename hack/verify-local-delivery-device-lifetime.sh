@@ -16,6 +16,21 @@ stage=setup
 cleanup() {
     local result=$?
     trap - EXIT
+    if (( result != 0 )); then
+        # Preserve failed observers too; missing readback is never absence proof.
+        for namespace in "${namespaces[@]}"; do
+            for object in link address route neigh; do
+                ip -n "$namespace" -j -details "$object" show > "$directory/failed-$namespace-$object.json" \
+                    2> "$directory/failed-$namespace-$object.observer.log" || true
+            done
+            ip -n "$namespace" -j -6 route show > "$directory/failed-$namespace-route6.json" 2> "$directory/failed-$namespace-route6.observer.log" || true
+            ip netns exec "$namespace" ss -H -lun > "$directory/failed-$namespace-sockets.txt" 2> "$directory/failed-$namespace-sockets.observer.log" || true
+        done
+        if declare -F fabric_tc >/dev/null; then
+            fabric_tc -j -s actions ls action mirred > "$directory/failed-actions.json" 2> "$directory/failed-actions.observer.log" || true
+            fabric_tc -j -s filter show dev source ingress > "$directory/failed-filters.json" 2> "$directory/failed-filters.observer.log" || true
+        fi
+    fi
     for pid in "${servers[@]}"; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
@@ -53,6 +68,15 @@ create_target() {
     ip -n "$namespace" link set eth0 up
     ip -n "$namespace" addr add 10.244.46.2/32 dev eth0
     ip -n "$namespace" addr add fd46::2/128 dev eth0 nodad
+    # A valid reverse route is needed even for a one-way receiver when the
+    # kernel's namespace defaults enable strict/loose IPv4 reverse-path checks.
+    # Preserve those defaults; do not disable source validation to pass a probe.
+    ip -n "$namespace" route add 10.244.45.2/32 dev eth0
+    ip -n "$namespace" -6 route add fd45::2/128 dev eth0
+    ip netns exec "$namespace" cat /proc/sys/net/ipv4/conf/all/rp_filter \
+        /proc/sys/net/ipv4/conf/eth0/rp_filter > "$directory/rpf-$namespace.txt"
+    ip -n "$namespace" -j route get 10.244.45.2 > "$directory/reverse-route-$namespace.json"
+    jq -e 'length==1 and .[0].dev=="eth0"' "$directory/reverse-route-$namespace.json" >/dev/null
     ip -n "$fabric" -j -details link show target > "$directory/target-$namespace.json"
     jq -e '.[0].ifindex==301 and .[0].address=="02:46:00:00:00:01"' "$directory/target-$namespace.json" >/dev/null
 }

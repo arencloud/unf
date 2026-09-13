@@ -619,6 +619,10 @@ flags and passes 112 local mutations; full cl02 rerun remains pending.
 ADR 0345 verifies that complete cl02 rerun with exact eight-payload/four-denial
 statistics, target invalidation and explicit recovery. Matching Kind is next;
 source/peer lifetime and the authenticated locality consumer remain open.
+The first matching Kind target-device gate fails its IPv4 positive control.
+Fixture reverse routes and failure-time kernel evidence are strengthened;
+the corrected image must pass cl02 before matching Kind. ADR 0344 retains
+the failure and separates observed Node RPF settings from unproven causality.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
